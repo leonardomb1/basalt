@@ -1,5 +1,7 @@
 //! Map lanes (filter, project, a join probe): each lane maps its share, and the
-//! output is written in file order, as a serial run writes it.
+//! output is written in file order, as a serial run writes it. A right or full
+//! join's lanes mark one shared match bitset; its unmatched build rows are written
+//! once by the driver after every lane is done, so they come last, as serially.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
@@ -11,6 +13,7 @@ const Stats = @import("../env.zig").Stats;
 const WorkQueue = @import("../lanes.zig").WorkQueue;
 const ast = @import("../../lang/ast.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
+const buildLaneJoinDrain = @import("join.zig").buildLaneJoinDrain;
 const buildMapChain = @import("../plan.zig").buildMapChain;
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const connect_mod = @import("../connect.zig");
@@ -343,6 +346,10 @@ fn runParallelMapImpl(
     else
         try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
+    if (lane_join) |lj| if (ctx.queue.failure() == null) {
+        const drained = try writeLaneJoinDrain(env, lj, sink_mode, &ctx.sink_mtx, ctx.queue.nitems);
+        _ = ctx.rows_out.fetchAdd(drained, .monotonic);
+    };
     const units = ctx.queue.nitems;
     env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
         split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
@@ -362,6 +369,36 @@ fn runParallelMapImpl(
     return true;
 }
 
+/// Once every lane is done, a right/full join's unmatched build rows go through
+/// the join's suffix into the sink, after all the lanes' output: the shared sink,
+/// or one more lane sink numbered `lane_idx`, opened only if there is a row to write.
+fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx: *std.Thread.Mutex, lane_idx: usize) !u64 {
+    var state = std.heap.ArenaAllocator.init(env.gpa);
+    defer state.deinit();
+    var batch_arena = std.heap.ArenaAllocator.init(env.gpa);
+    defer batch_arena.deinit();
+    const chain = (try buildLaneJoinDrain(state.allocator(), env.params_expr, env.errctx, lj)) orelse return 0;
+    var own: ?driver.Sink = null;
+    errdefer if (own) |sk| sk.abort();
+    var out: u64 = 0;
+    while (try chain.next(batch_arena.allocator())) |b| {
+        if (b.len > 0) {
+            if (own == null) switch (sink_mode) {
+                .shared => {},
+                .per_lane => |pl| own = try pl.open(pl.ctx, env.gpa, lane_idx),
+            };
+            try parallel.writeLaneBatch(sink_mode, mtx, own, batch_arena.allocator(), b);
+            out += b.len;
+        }
+        _ = batch_arena.reset(.retain_capacity);
+    }
+    if (own) |sk| {
+        own = null;
+        try sk.close();
+    }
+    return out;
+}
+
 /// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`
 /// ranges, at least one per lane, so the reorder window holds a few MB per lane.
 fn orderedUnits(split: LaneSplit, nthreads: usize) usize {
@@ -378,7 +415,7 @@ pub fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 }
 
 pub fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    if (!mapJoinKindLaneSafe(shape.join.kind)) return false;
     return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
 }
 
@@ -422,6 +459,13 @@ pub fn joinKindLaneSafe(kind: ast.JoinKind) bool {
         if (std.mem.eql(u8, @tagName(kind), ok)) return true;
     }
     return false;
+}
+
+/// The kinds a single map+join may probe on lanes: the lookup-only ones, plus right
+/// and full, whose lanes mark one shared match bitset and whose unmatched build rows
+/// `writeLaneJoinDrain` writes once, after the lanes.
+pub fn mapJoinKindLaneSafe(kind: ast.JoinKind) bool {
+    return joinKindLaneSafe(kind) or kind == .right or kind == .full;
 }
 
 const SqlMapJoinCtx = struct {
@@ -521,7 +565,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const arena = env.arena;
     if (stages[0].node != .read) return false;
     const desc = (try sqlDescForStage(env, stages[0])) orelse return false;
-    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    if (!mapJoinKindLaneSafe(shape.join.kind)) return false;
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
     if (src_base >= env.sources.items.len) return false;
 
@@ -571,6 +615,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
 
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
+    stats.rows_out += try writeLaneJoinDrain(env, lp.lane, sink_mode, &ctx.sink_mtx, nlanes);
     if (sink_mode == .shared) {
         shared_open = false;
         try sink_mode.shared.close();
@@ -583,7 +628,7 @@ pub fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage,
 }
 
 pub fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!joinKindLaneSafe(shape.join.kind)) return false;
+    if (!mapJoinKindLaneSafe(shape.join.kind)) return false;
     return runParallelCsvMapImpl(env, rd, shape.prefix, shape, w, opts, stats, lanes_used);
 }
 
@@ -601,4 +646,7 @@ test "join kinds allowed on the parallel probe path" {
     try std.testing.expect(joinKindLaneSafe(.cross));
     try std.testing.expect(!joinKindLaneSafe(.right));
     try std.testing.expect(!joinKindLaneSafe(.full));
+    try std.testing.expect(mapJoinKindLaneSafe(.right));
+    try std.testing.expect(mapJoinKindLaneSafe(.full));
+    try std.testing.expect(mapJoinKindLaneSafe(.inner));
 }

@@ -409,6 +409,12 @@ test "parallel CSV aggregate: the partitioned combine is reproducible" {
 /// thread count. `$IN`/`$LOOKUP` in `body` are replaced with the two paths; the
 /// result comes back as written, since lanes keep file order.
 fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8, threads: usize) ![]u8 {
+    var lanes: usize = 0;
+    return runJoinLanes(alloc, tmp, body, threads, &lanes);
+}
+
+/// `runJoinThreaded`, also reporting how many lanes the run used.
+fn runJoinLanes(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8, threads: usize, lanes: *usize) ![]u8 {
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const out_name = try std.fmt.allocPrint(alloc, "out{d}.csv", .{threads});
@@ -433,9 +439,11 @@ fn runJoinThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []c
     const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
+    var summary: basalt.obs.Summary = .{ .run_id = 0 };
+    _ = run(alloc, prog, .{ .threads = threads, .summary_out = &summary }, &rdiag) catch |e| {
         return e;
     };
+    lanes.* = summary.threads;
     return tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
 }
 
@@ -530,6 +538,142 @@ test "parallel join then GROUP BY matches serial" {
 
     try std.testing.expectEqualStrings("label,n\nApple,400\nBanana,400\nCherry,400\n", serial);
     try std.testing.expectEqualStrings(serial, par);
+}
+
+/// A probe side with null codes and a code nothing on the right has, and a build
+/// side with a duplicate key, a null key and keys nothing on the left has.
+fn writeOuterJoinFixtures(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,code\n");
+    for (0..3000) |i| {
+        if (i % 7 == 0) {
+            try in.writer().print("{d},\n", .{i});
+        } else try in.writer().print("{d},{c}\n", .{ i, "ABCDE"[i % 5] });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "code,label\nA,Apple\nX,Xigua\nB,Banana\n,Nul\nA,Avocado\nZ,Zucchini\nC,Cherry\n" });
+}
+
+/// The rows of `body` at -j 1 and at -j 4, which must be identical and the -j 4 run
+/// must have used lanes; returns the -j 4 output.
+fn outerJoinSerialVsLanes(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []const u8) ![]u8 {
+    var serial_lanes: usize = 0;
+    const serial = try runJoinLanes(alloc, tmp, body, 1, &serial_lanes);
+    defer alloc.free(serial);
+    var par_lanes: usize = 0;
+    const par = try runJoinLanes(alloc, tmp, body, 4, &par_lanes);
+    errdefer alloc.free(par);
+    try std.testing.expectEqualStrings(serial, par);
+    try std.testing.expect(par_lanes > 1);
+    return par;
+}
+
+test "parallel join: RIGHT and FULL joins run on lanes and drain the unmatched build rows once, last, in build order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeOuterJoinFixtures(alloc, &tmp);
+
+    const with = "WITH labels AS (SELECT * FROM '$LOOKUP') SELECT t.id, l.code, l.label FROM '$IN' t ";
+    const Case = struct { body: []const u8, lines: usize, head: []const u8, tail: []const u8 };
+    const cases = [_]Case{
+        .{
+            .body = with ++ "RIGHT JOIN labels l ON t.code = l.code",
+            .lines = 2060,
+            .head = "id,code,label\n1,B,Banana\n2,C,Cherry\n5,A,Apple\n5,A,Avocado\n6,B,Banana\n",
+            .tail = "\n2995,A,Apple\n2995,A,Avocado\n2997,C,Cherry\n,X,Xigua\n,,Nul\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "FULL JOIN labels l ON t.code = l.code",
+            .lines = 3518,
+            .head = "id,code,label\n0,,\n1,B,Banana\n2,C,Cherry\n3,,\n4,,\n5,A,Apple\n5,A,Avocado\n",
+            .tail = "\n2997,C,Cherry\n2998,,\n2999,,\n,X,Xigua\n,,Nul\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "RIGHT JOIN labels l ON t.code = l.code AND t.id < 3",
+            .lines = 8,
+            .head = "id,code,label\n1,B,Banana\n2,C,Cherry\n",
+            .tail = "\n2,C,Cherry\n,A,Apple\n,X,Xigua\n,,Nul\n,A,Avocado\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "FULL JOIN labels l ON t.code = l.code AND t.id < 3",
+            .lines = 3006,
+            .head = "id,code,label\n0,,\n1,B,Banana\n2,C,Cherry\n3,,\n",
+            .tail = "\n2999,,\n,A,Apple\n,X,Xigua\n,,Nul\n,A,Avocado\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "FULL JOIN labels l ON t.code = l.code WHERE t.id IS NULL OR t.id < 6",
+            .lines = 11,
+            .head = "id,code,label\n0,,\n1,B,Banana\n2,C,Cherry\n3,,\n4,,\n5,A,Apple\n5,A,Avocado\n",
+            .tail = "\n5,A,Avocado\n,X,Xigua\n,,Nul\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "RIGHT JOIN labels l ON t.code = l.code WHERE l.label <> 'Banana'",
+            .lines = 1546,
+            .head = "id,code,label\n2,C,Cherry\n5,A,Apple\n5,A,Avocado\n",
+            .tail = "\n2995,A,Avocado\n2997,C,Cherry\n,X,Xigua\n,,Nul\n,Z,Zucchini\n",
+        },
+        .{
+            .body = with ++ "RIGHT JOIN labels l ON t.code = l.code WHERE t.id IS NULL",
+            .lines = 4,
+            .head = "id,code,label\n,X,Xigua\n",
+            .tail = "\n,X,Xigua\n,,Nul\n,Z,Zucchini\n",
+        },
+    };
+    for (cases) |case| {
+        const out = try outerJoinSerialVsLanes(alloc, &tmp, case.body);
+        defer alloc.free(out);
+        try std.testing.expectEqual(case.lines, std.mem.count(u8, out, "\n"));
+        try std.testing.expect(std.mem.startsWith(u8, out, case.head));
+        try std.testing.expect(std.mem.endsWith(u8, out, case.tail));
+    }
+}
+
+test "parallel join: a FULL join's drained rows land after the lanes' row groups in a Parquet sink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeOuterJoinFixtures(alloc, &tmp);
+    const body =
+        "WITH labels AS (SELECT * FROM '$LOOKUP') " ++
+        "SELECT t.id, l.code, l.label FROM '$IN' t FULL JOIN labels l ON t.code = l.code";
+
+    var outs: [2][]u8 = undefined;
+    for ([_]usize{ 1, 4 }, &outs) |threads, *out| {
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+        defer alloc.free(in_path);
+        const lookup_path = try std.fs.path.join(alloc, &.{ base, "lookup.csv" });
+        defer alloc.free(lookup_path);
+        const pq_path = try std.fs.path.join(alloc, &.{ base, "out.parquet" });
+        defer alloc.free(pq_path);
+        const back_path = try std.fs.path.join(alloc, &.{ base, "back.csv" });
+        defer alloc.free(back_path);
+        const q1 = try std.mem.replaceOwned(u8, alloc, body, "$IN", in_path);
+        defer alloc.free(q1);
+        const q2 = try std.mem.replaceOwned(u8, alloc, q1, "$LOOKUP", lookup_path);
+        defer alloc.free(q2);
+        const load = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ pq_path, q2 });
+        defer alloc.free(load);
+        const back = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT * FROM '{s}';", .{ back_path, pq_path });
+        defer alloc.free(back);
+
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        var rdiag: Diag = .{};
+        var summary: basalt.obs.Summary = .{ .run_id = 0 };
+        _ = try run(alloc, try parser.parseSource(parena.allocator(), load, &pdiag), .{ .threads = threads, .summary_out = &summary }, &rdiag);
+        if (threads > 1) try std.testing.expect(summary.threads > 1);
+        _ = try run(alloc, try parser.parseSource(parena.allocator(), back, &pdiag), .{ .threads = 1 }, &rdiag);
+        out.* = try tmp.dir.readFileAlloc(alloc, "back.csv", 1 << 20);
+    }
+    defer for (outs) |o| alloc.free(o);
+    try std.testing.expectEqualStrings(outs[0], outs[1]);
+    try std.testing.expectEqual(@as(usize, 3518), std.mem.count(u8, outs[1], "\n"));
+    try std.testing.expect(std.mem.endsWith(u8, outs[1], "\n2999,,\n,X,Xigua\n,,Nul\n,Z,Zucchini\n"));
 }
 
 test "a CSV read with a delimiter and an encoding fans out over lanes and reads each chunk in that dialect" {

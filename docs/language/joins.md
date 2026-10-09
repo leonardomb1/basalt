@@ -45,9 +45,12 @@ unless `a.amt` is already in the list. A pipeline shaped `read | filters | join
 | filters | write` probes in parallel under `-j` — over local CSV/Parquet
 morsels, and over key-range splits for a splittable SQL source. A chain of
 joins followed by `GROUP BY` fans out the same way (`read | filters |
-join+ | filters | aggregate | sort/limit | write`). Right and full joins stay
-serial in every case: they have to emit the build rows nothing matched, and each
-lane would emit those from its own copy of the match tracking.
+join+ | filters | aggregate | sort/limit | write`). Right and full joins probe
+in parallel in the first shape: every lane marks the build rows it matched in
+one shared set, and once all lanes are done the build rows nothing matched are
+written once, in build order, through the filters after the join, after
+every other row, as a serial run writes them. Under a `GROUP BY` they stay
+serial.
 
 ## Spilling
 

@@ -69,6 +69,7 @@ pub const LaneJoin = struct {
     kind: ast.JoinKind,
     null_aware: bool,
     suffix: []const ast.Stage,
+    shared_matched: ?[]std.atomic.Value(u64) = null,
 };
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
@@ -107,6 +108,11 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
         env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, join_hints) });
         return null;
     };
+    const shared_matched: ?[]std.atomic.Value(u64) = if (j.kind == .right or j.kind == .full) blk: {
+        const words = try arena.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
+        @memset(words, std.atomic.Value(u64).init(0));
+        break :blk words;
+    } else null;
 
     return .{
         .lane = .{
@@ -124,6 +130,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .kind = j.kind,
             .null_aware = j.null_aware,
             .suffix = suffix,
+            .shared_matched = shared_matched,
         },
         .out_schema = final_schema,
     };
@@ -144,7 +151,158 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .null_aware = lj.null_aware,
         .residual = lj.residual,
         .pair_schema = lj.pair_schema,
+        .shared_matched = lj.shared_matched,
         .state = ta,
     };
     return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
+}
+
+/// A right/full lane join's unmatched build rows, left side null, in build order
+/// and through the join's suffix: a join over an empty probe whose match flags are
+/// read from `shared_matched`, the one bitset (made by `resolveLaneJoin`) every
+/// lane's probe marks. Null for every other kind. Call it once, after every lane
+/// has finished probing.
+pub fn buildLaneJoinDrain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin) !?op.Op {
+    const words = lj.shared_matched orelse return null;
+    const matched = try ta.alloc(bool, lj.index.rows());
+    for (matched, 0..) |*m, r| m.* = words[r >> 6].load(.monotonic) & (@as(u64, 1) << @intCast(r & 63)) != 0;
+    const none = try ta.create(op.Union);
+    none.* = .{ .children = &.{} };
+    const j = try ta.create(op.Join);
+    j.* = .{
+        .probe = .{ .union_ = none },
+        .build = null,
+        .index = lj.index,
+        .left_keys = lj.left_keys,
+        .right_keys = lj.right_keys,
+        .left_schema = lj.left_schema,
+        .right_schema = lj.right_schema,
+        .out_schema = lj.out_schema,
+        .kind = lj.kind,
+        .null_aware = lj.null_aware,
+        .residual = lj.residual,
+        .pair_schema = lj.pair_schema,
+        .matched = matched,
+        .probe_done = true,
+        .state = ta,
+    };
+    return try buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
+}
+
+const op_testing = @import("../../exec/op/testing_util.zig");
+
+const TestLane = struct {
+    lj: LaneJoin,
+    probe: []const op.Batch,
+    params: *std.StringHashMap(*const ast.Expr),
+    rows: usize = 0,
+    err: ?anyerror = null,
+
+    fn run(self: *TestLane) void {
+        self.probeAll() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn probeAll(self: *TestLane) !void {
+        var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var ts = op_testing.TestSource{ .schema_ = op_testing.join_left_schema, .batches = self.probe };
+        var scan = op.Scan{ .src = ts.src() };
+        const chain = try buildLaneJoinChain(a, self.params, null, self.lj, .{ .scan = &scan });
+        while (try chain.next(a)) |b| self.rows += b.len;
+    }
+};
+
+test "lane joins: right and full lanes mark one shared bitset, and one drain emits each unmatched build row once, in build order" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var params = std.StringHashMap(*const ast.Expr).init(a);
+
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const not_x = try a.create(ast.Expr);
+    not_x.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+
+    const build = try op_testing.kvBatch(a, &op_testing.join_right_schema, &.{ 1, 1, 2, 4, null }, &.{ "x", "y", "z", "w", "m" });
+    const probes = [_][]const op.Batch{
+        &.{try op_testing.kvBatch(a, &op_testing.join_left_schema, &.{1}, &.{"a"})},
+        &.{try op_testing.kvBatch(a, &op_testing.join_left_schema, &.{ 2, null }, &.{ "b", "n" })},
+        &.{try op_testing.kvBatch(a, &op_testing.join_left_schema, &.{ 1, 3 }, &.{ "c", "d" })},
+        &.{},
+    };
+
+    const Case = struct { kind: ast.JoinKind, residual: ?*const ast.Expr, lane_rows: usize, drained: []const ?[]const u8 };
+    const cases = [_]Case{
+        .{ .kind = .right, .residual = null, .lane_rows = 5, .drained = &.{ "w", "m" } },
+        .{ .kind = .full, .residual = null, .lane_rows = 7, .drained = &.{ "w", "m" } },
+        .{ .kind = .right, .residual = not_x, .lane_rows = 3, .drained = &.{ "x", "w", "m" } },
+        .{ .kind = .full, .residual = not_x, .lane_rows = 5, .drained = &.{ "x", "w", "m" } },
+    };
+    for (cases) |case| {
+        const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize));
+        const words = try a.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
+        @memset(words, std.atomic.Value(u64).init(0));
+        const lj = LaneJoin{
+            .index = index,
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .probe_schema = &op_testing.join_left_schema,
+            .residual = case.residual,
+            .pair_schema = if (case.residual != null) &op_testing.join_both_schema else null,
+            .left_schema = &op_testing.join_left_schema,
+            .right_schema = &op_testing.join_right_schema,
+            .out_schema = &op_testing.join_both_schema,
+            .kind = case.kind,
+            .null_aware = false,
+            .suffix = &.{},
+            .shared_matched = words,
+        };
+
+        var lanes: [probes.len]TestLane = undefined;
+        var threads: [probes.len]std.Thread = undefined;
+        for (&lanes, &threads, probes) |*l, *t, p| {
+            l.* = .{ .lj = lj, .probe = p, .params = &params };
+            t.* = try std.Thread.spawn(.{}, TestLane.run, .{l});
+        }
+        var lane_rows: usize = 0;
+        for (&lanes, threads) |*l, t| {
+            t.join();
+            if (l.err) |e| return e;
+            lane_rows += l.rows;
+        }
+        try std.testing.expectEqual(case.lane_rows, lane_rows);
+
+        const drain = (try buildLaneJoinDrain(a, &params, null, lj)).?;
+        const got = try op_testing.JoinRows.collect(a, drain, 3);
+        const no_left = try a.alloc(?i64, case.drained.len);
+        @memset(no_left, null);
+        try got.expect(no_left, case.drained);
+    }
+}
+
+test "lane joins: only right and full joins get a drain" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var params = std.StringHashMap(*const ast.Expr).init(a);
+    const build = try op_testing.kvBatch(a, &op_testing.join_right_schema, &.{1}, &.{"x"});
+    const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize));
+    const lj = LaneJoin{
+        .index = index,
+        .left_keys = &.{0},
+        .right_keys = &.{0},
+        .probe_schema = &op_testing.join_left_schema,
+        .left_schema = &op_testing.join_left_schema,
+        .right_schema = &op_testing.join_right_schema,
+        .out_schema = &op_testing.join_both_schema,
+        .kind = .left,
+        .null_aware = false,
+        .suffix = &.{},
+    };
+    try std.testing.expect((try buildLaneJoinDrain(a, &params, null, lj)) == null);
 }

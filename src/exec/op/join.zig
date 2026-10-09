@@ -453,6 +453,7 @@ pub const Join = struct {
     push_cap: usize = default_push_cap,
 
     matched: ?[]bool = null,
+    shared_matched: ?[]std.atomic.Value(u64) = null,
     drain_pos: usize = 0,
     probe_done: bool = false,
     prefetched: bool = false,
@@ -523,7 +524,7 @@ pub const Join = struct {
             self.index = made;
             break :blk made;
         };
-        if ((self.kind == .right or self.kind == .full) and self.matched == null) {
+        if ((self.kind == .right or self.kind == .full) and self.matched == null and self.shared_matched == null) {
             const m = try self.state.alloc(bool, ix.build_batch.len);
             @memset(m, false);
             self.matched = m;
@@ -727,6 +728,7 @@ pub const Join = struct {
                         try ridx.append(br);
                         if (fill_right) try rnull.append(false);
                         if (self.matched) |m| m[br] = true;
+                        if (self.shared_matched) |sm| markShared(sm, br);
                         cur = ix.chainNext(br);
                     }
                 },
@@ -782,6 +784,7 @@ pub const Join = struct {
                 try ridx.append(cr.items[p]);
                 if (fill_right) try rnull.append(false);
                 if (self.matched) |m| m[cr.items[p]] = true;
+                if (self.shared_matched) |sm| markShared(sm, cr.items[p]);
             }
             switch (self.kind) {
                 .semi => if (hit) try lidx.append(r),
@@ -862,6 +865,16 @@ fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column
     var i: usize = 0;
     while (i < n) : (i += 1) try b.append(.null);
     return b.finish();
+}
+
+/// Sets build row `row`'s bit in `shared_matched`, the match bitset of a right or
+/// full join whose index several lanes probe: such a join drains nothing itself,
+/// its unmatched rows are drained once by whoever ran the lanes. The load first
+/// keeps a hot build row's word a shared read once its bit is set.
+fn markShared(words: []std.atomic.Value(u64), row: usize) void {
+    const w = &words[row >> 6];
+    const bit = @as(u64, 1) << @intCast(row & 63);
+    if (w.load(.monotonic) & bit == 0) _ = w.fetchOr(bit, .monotonic);
 }
 
 test "join: inner/left/semi/anti; null keys never match, duplicate build keys fan out" {

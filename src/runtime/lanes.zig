@@ -9,9 +9,11 @@
 //! `LaneRows` is the only difference between the parquet and CSV copies of a lane
 //! body (row-group morsels off a shared queue vs one newline-aligned byte range),
 //! and `LaneSplit` names how the input divides so a shape has one implementation.
-//! Only right and full joins are kept off the lanes: they must emit unmatched build
-//! rows, and each lane tracking its own matches emitted them once per lane (a
-//! `RIGHT JOIN` under `COUNT(*)` returned 160 instead of 10 at `-j 16`). A join's
+//! Right and full joins must emit unmatched build rows, and each lane tracking its
+//! own matches emitted them once per lane (a `RIGHT JOIN` under `COUNT(*)` returned
+//! 160 instead of 10 at `-j 16`). On the map+join paths every lane marks one
+//! shared match bitset and the driver drains the unmatched rows once, after the
+//! lanes, through the join's suffix; under an aggregate they stay serial. A join's
 //! build side is materialized once into a read-only index before any lane exists,
 //! and its post-join stages are prevalidated so a lane rebuild cannot fail; each
 //! lane still builds its own `op.Join` for its mutable stats and scratch.
