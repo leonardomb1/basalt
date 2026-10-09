@@ -242,6 +242,18 @@ pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, disti
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
 pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
+/// An `=` of the ON whose sides the parser cannot tell apart, its columns written
+/// without a table (`trim(code) = cast(cr AS string)`). The plan decides by where
+/// the columns resolve: one side each makes a computed key, named `left_name` and
+/// `right_name` on the side that computes it; both on one side make a filter.
+pub const DeferredKey = struct {
+    a: *Expr,
+    b: *Expr,
+    left_name: []const u8,
+    right_name: []const u8,
+    pos: Pos,
+};
+
 pub const Join = struct {
     kind: JoinKind,
     binding: []const u8,
@@ -250,6 +262,7 @@ pub const Join = struct {
     right_keys: []const QualName,
     null_aware: bool = false,
     right_filter: ?*Expr = null,
+    deferred: []const DeferredKey = &.{},
 
     pub fn rightStages(self: Join, arena: std.mem.Allocator, stages: []const Stage) ![]const Stage {
         const f = self.right_filter orelse return stages;

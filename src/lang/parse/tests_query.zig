@@ -292,6 +292,24 @@ test "sql: a computed key in ON — each side computes its own column, dropped a
     try testing.expectEqual(@as(usize, 2), st[3].node.select[0].star_except.len);
 }
 
+test "sql: an `=` of bare columns in ON is left for the plan to place, its key columns dropped after the join" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a,
+        \\WITH base AS (SELECT * FROM 'c.csv')
+        \\SELECT * FROM 's.xlsx' INNER JOIN base ON TRIM(cc_code) = CAST(cr AS varchar);
+    );
+    const st = prog.stmts[2].output.stages;
+    const j = st[1].node.join;
+    try testing.expectEqual(@as(usize, 0), j.left_keys.len);
+    try testing.expectEqual(@as(usize, 1), j.deferred.len);
+    try testing.expectEqualStrings("cc_code", j.deferred[0].a.call.args[0].field.parts[0]);
+    const drop = st[2].node.select[0].star_except;
+    try testing.expectEqualStrings(j.deferred[0].left_name, drop[0]);
+    try testing.expectEqualStrings(j.deferred[0].right_name, drop[1]);
+}
+
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

@@ -14,6 +14,7 @@ const lastPart = @import("../analyze.zig").lastPart;
 const mk = @import("../analyze.zig").mk;
 const std = @import("std");
 const substExpr = @import("../analyze.zig").substExpr;
+const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
 const types = @import("../../lang/types.zig");
 const tfld = @import("testing_util.zig").tfld;
 
@@ -241,10 +242,119 @@ fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.Q
     return fail(diag, "join key `{s}` is not a column of the joined side", .{ln});
 }
 
+/// A join with its deferred keys placed: `join` keys them like any other, and `left`
+/// and `right` are the stages each side runs first, computing those keys (and
+/// filtering by an `=` both of whose values are one side's).
+pub const KeyPrep = struct {
+    join: ast.Join,
+    left: []const ast.Stage = &.{},
+    right: []const ast.Stage = &.{},
+};
+
+const Fit = struct { left: bool = true, right: bool = true, unknown: ?[]const u8 = null };
+
+/// Whether every column of `e` is the left side's, and whether every one is the
+/// right side's; the first that is neither's, for the error.
+fn fitOf(arena: std.mem.Allocator, e: *const ast.Expr, left: types.Schema, right: types.Schema) !Fit {
+    var quals = std.array_list.Managed(ast.QualName).init(arena);
+    try collectQuals(arena, e, &quals);
+    var f = Fit{};
+    for (quals.items) |q| {
+        if (q.dollar) continue;
+        const in_l = left.resolve(q.parts) != null;
+        const in_r = q.parts.len == 1 and right.indexOf(q.parts[0]) != null;
+        f.left = f.left and in_l;
+        f.right = f.right and in_r;
+        if (!in_l and !in_r and f.unknown == null) f.unknown = lastPart(q);
+    }
+    return f;
+}
+
+/// Places each deferred key by where its columns resolve, as `joinPair` does for a
+/// plain one: a value of each side makes a computed key; two of the left side make
+/// a filter of an inner join's left rows, two of the right side narrow the right.
+pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!KeyPrep {
+    if (j.deferred.len == 0) return .{ .join = j };
+    var lk = std.array_list.Managed(ast.QualName).init(arena);
+    var rk = std.array_list.Managed(ast.QualName).init(arena);
+    try lk.appendSlice(j.left_keys);
+    try rk.appendSlice(j.right_keys);
+    var lcomp = std.array_list.Managed(ast.SelectItem).init(arena);
+    var rcomp = std.array_list.Managed(ast.SelectItem).init(arena);
+    var lfilt = std.array_list.Managed(ast.Stage).init(arena);
+    var rfilt = std.array_list.Managed(ast.Stage).init(arena);
+    const rname = if (j.alias.len > 0) j.alias else j.binding;
+    for (j.deferred) |d| {
+        const fa = try fitOf(arena, d.a, left, right);
+        const fb = try fitOf(arena, d.b, left, right);
+        const as_written = fa.left and fb.right;
+        const flipped = fb.left and fa.right;
+        const eq = try arena.create(ast.Expr);
+        eq.* = .{ .binary = .{ .op = .eq, .l = d.a, .r = d.b } };
+        if (fa.unknown orelse fb.unknown) |u|
+            return failPos(diag, d.pos, "unknown column `{s}` in the ON of the join with `{s}` — neither side has it", .{ u, rname });
+        if (as_written and flipped)
+            return failPos(diag, d.pos, "the ON of the join with `{s}` is ambiguous — the columns of each side of its `=` exist on both sides; qualify them (`{s}.col`)", .{ rname, rname });
+        if (as_written or flipped) {
+            const le = if (as_written) d.a else d.b;
+            const re = if (as_written) d.b else d.a;
+            try lcomp.append(.{ .computed = .{ .name = d.left_name, .expr = le } });
+            try rcomp.append(.{ .computed = .{ .name = d.right_name, .expr = re } });
+            try lk.append(try qualOne(arena, d.left_name));
+            try rk.append(try qualOne(arena, d.right_name));
+        } else if (fa.left and fb.left) {
+            if (j.kind != .inner)
+                return failPos(diag, d.pos, "this {s} JOIN's ON compares two values of the left side; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(j.kind)});
+            try lfilt.append(.{ .node = .{ .filter = eq }, .hints = &.{}, .pos = d.pos });
+        } else if (fa.right and fb.right) {
+            try rfilt.append(.{ .node = .{ .filter = eq }, .hints = &.{}, .pos = d.pos });
+        } else return failPos(diag, d.pos, "each value of an `=` in the ON of the join with `{s}` must name one side's columns, not both", .{rname});
+    }
+    if (lk.items.len == 0)
+        return failPos(diag, j.deferred[0].pos, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
+    if (lcomp.items.len > 0) {
+        try lcomp.insert(0, .star);
+        try lfilt.append(.{ .node = .{ .select = try lcomp.toOwnedSlice() }, .hints = &.{}, .pos = j.deferred[0].pos });
+    }
+    if (rcomp.items.len > 0) {
+        try rcomp.insert(0, .star);
+        try rfilt.append(.{ .node = .{ .select = try rcomp.toOwnedSlice() }, .hints = &.{}, .pos = j.deferred[0].pos });
+    }
+    var out = j;
+    out.left_keys = try lk.toOwnedSlice();
+    out.right_keys = try rk.toOwnedSlice();
+    out.deferred = &.{};
+    return .{ .join = out, .left = try lfilt.toOwnedSlice(), .right = try rfilt.toOwnedSlice() };
+}
+
+fn failPos(diag: *Diag, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+    const e = fail(diag, fmt, args);
+    diag.pos = pos;
+    return e;
+}
+
+fn qualOne(arena: std.mem.Allocator, name: []const u8) !ast.QualName {
+    const parts = try arena.alloc([]const u8, 1);
+    parts[0] = name;
+    return .{ .parts = parts };
+}
+
+/// The schema `stages` (filters and selects, as `orientKeys` makes) leave of `in`.
+pub fn prepSchema(arena: std.mem.Allocator, in: types.Schema, stages: []const ast.Stage, params: *const ParamMap, diag: *Diag) Error!types.Schema {
+    var sch = in;
+    for (stages) |st| switch (st.node) {
+        .filter => |e| _ = try checkFilter(arena, sch, e, params, diag),
+        .select => |items| sch = try schemaOfCols(arena, try selectCols(arena, sch, items, params, diag)),
+        else => unreachable,
+    };
+    return sch;
+}
+
 /// The `_r` suffix keeps bumping until free: two output fields with one name make the
 /// second unreachable, since every lookup goes through `Schema.indexOf`.
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
+    if (j.deferred.len > 0) return fail(diag, "internal error: a join's keys were not placed (orientKeys) before planning it", .{});
     if (j.kind != .cross and j.left_keys.len == 0) return fail(diag, "join needs at least one `ON <column> = <column>` pair", .{});
 
     const lks = try arena.alloc(usize, j.left_keys.len);
@@ -528,4 +638,48 @@ test "analyze: a numeric aggregate of a string literal says to double-quote a co
     lit.* = .{ .str_lit = "Kick-Off" };
     try std.testing.expectError(error.AnalyzeFailed, aggResultType(a, .sum, lit, .{ .fields = &f }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "sum(\"Kick-Off\")") != null);
+}
+
+test "orientKeys: each value goes to the side its columns are on; one side's pair is a filter; ambiguity and strays are refused" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const int = types.Type.init(.int);
+    const str = types.Type.init(.string);
+    const left = types.Schema{ .fields = &.{ .{ .name = "cr", .ty = int }, .{ .name = "d", .ty = int } } };
+    const right = types.Schema{ .fields = &.{ .{ .name = "code", .ty = str }, .{ .name = "e", .ty = int } } };
+    const both = types.Schema{ .fields = &.{ .{ .name = "cr", .ty = int }, .{ .name = "code", .ty = str } } };
+    const pos = ast.Pos{ .line = 1, .col = 1 };
+    const fld = tfld;
+    var diag = Diag{};
+
+    // `code = cr`, written right first: the key goes left `cr`, right `code`.
+    const flipped = ast.Join{ .kind = .inner, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
+        .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos },
+        .{ .a = try fld(a, "d"), .b = try fld(a, "cr"), .left_name = "__l2", .right_name = "__r2", .pos = pos },
+    } };
+    const p = try orientKeys(a, left, right, flipped, &diag);
+    try std.testing.expectEqual(@as(usize, 1), p.join.left_keys.len);
+    try std.testing.expectEqualStrings("__l", p.join.left_keys[0].parts[0]);
+    try std.testing.expectEqualStrings("__r", p.join.right_keys[0].parts[0]);
+    try std.testing.expect(p.left[0].node == .filter);
+    try std.testing.expectEqualStrings("cr", p.left[1].node.select[1].computed.expr.field.parts[0]);
+    try std.testing.expectEqualStrings("code", p.right[0].node.select[1].computed.expr.field.parts[0]);
+
+    const stray = ast.Join{ .kind = .inner, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
+        .{ .a = try fld(a, "cr"), .b = try fld(a, "nope"), .left_name = "__l", .right_name = "__r", .pos = pos },
+    } };
+    try std.testing.expectError(error.AnalyzeFailed, orientKeys(a, left, right, stray, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown column `nope`") != null);
+
+    const amb = ast.Join{ .kind = .inner, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
+        .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos },
+    } };
+    try std.testing.expectError(error.AnalyzeFailed, orientKeys(a, both, both, amb, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
+
+    const left_only = ast.Join{ .kind = .left, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
+        .{ .a = try fld(a, "cr"), .b = try fld(a, "d"), .left_name = "__l", .right_name = "__r", .pos = pos },
+    } };
+    try std.testing.expectError(error.AnalyzeFailed, orientKeys(a, left, right, left_only, &diag));
 }

@@ -165,6 +165,9 @@ pub const ExplodePlan = @import("analyze/schema.zig").ExplodePlan;
 pub const explodePlan = @import("analyze/schema.zig").explodePlan;
 pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;
 pub const joinPlan = @import("analyze/schema.zig").joinPlan;
+pub const orientKeys = @import("analyze/schema.zig").orientKeys;
+pub const prepSchema = @import("analyze/schema.zig").prepSchema;
+pub const KeyPrep = @import("analyze/schema.zig").KeyPrep;
 const bindBodyVars = @import("analyze/schema.zig").bindBodyVars;
 const typedZero = @import("analyze/schema.zig").typedZero;
 pub const render = @import("analyze/render.zig").render;
@@ -941,7 +944,10 @@ const Ctx = struct {
                     k.schema orelse return null
                 else
                     return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
-                return (try joinPlan(self.arena, in, right, j, self.diag)).schema;
+                const prep = try orientKeys(self.arena, in, right, j, self.diag);
+                const l2 = try prepSchema(self.arena, in, prep.left, self.params, self.diag);
+                const r2 = try prepSchema(self.arena, right, prep.right, self.params, self.diag);
+                return (try joinPlan(self.arena, l2, r2, prep.join, self.diag)).schema;
             },
             else => return null,
         }

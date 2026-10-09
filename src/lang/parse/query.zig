@@ -523,6 +523,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
         var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        var deferred = std.array_list.Managed(ast.DeferredKey).init(self.arena);
         for (lateral_keys) |lk| {
             try left_keys.append(stripQual(lk.left, &aliases));
             const rp = try self.arena.alloc([]const u8, 1);
@@ -592,6 +593,26 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         }
                         continue;
                     }
+                    // No side names the right table and a column is bare, so only the
+                    // schemas can say which side each value belongs to.
+                    if (!sl.right and !sr.right and sl.other and sr.other and
+                        (try self.hasBareField(c.binary.l) or try self.hasBareField(c.binary.r)))
+                    {
+                        self.derived_n += 1;
+                        const ln = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                        self.derived_n += 1;
+                        const rn = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                        try deferred.append(.{
+                            .a = try self.stripExpr(c.binary.l, &aliases),
+                            .b = try self.stripExpr(c.binary.r, &aliases),
+                            .left_name = ln,
+                            .right_name = rn,
+                            .pos = .{ .line = opos.line, .col = opos.col },
+                        });
+                        try key_cols.append(ln);
+                        try key_cols.append(rn);
+                        continue;
+                    }
                 }
                 if (!try self.namesOtherSide(c, rname)) {
                     const e = try self.stripRightExpr(c, rname);
@@ -600,7 +621,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post_filters.append(c);
                 } else return self.fail(.{ .line = opos.line, .col = opos.col }, "this {s} JOIN's ON compares the left side otherwise than by `=` to a right column; only an inner join can take that — filter in WHERE, or in a CTE first", .{@tagName(kind)});
             }
-            if (left_keys.items.len == 0)
+            if (left_keys.items.len == 0 and deferred.items.len == 0)
                 return self.fail(.{ .line = opos.line, .col = opos.col }, "the ON of a join needs at least one `=` between a left and a right value to join by — `b.k = a.k`, or computed: `trim(b.k) = cast(a.k AS string)`", .{});
             if (narrow != null or right_computed.items.len > 0) {
                 self.derived_n += 1;
@@ -634,6 +655,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .alias = jalias orelse binding,
                 .left_keys = try left_keys.toOwnedSlice(),
                 .right_keys = try right_keys.toOwnedSlice(),
+                .deferred = try deferred.toOwnedSlice(),
             } },
             .hints = try jhints.toOwnedSlice(),
             .pos = jpos,

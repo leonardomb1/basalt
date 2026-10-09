@@ -46,6 +46,10 @@ pub const LaneJoin = struct {
     index: *op.JoinIndex,
     left_keys: []const usize,
     right_keys: []const usize,
+    /// What each lane's probe rows go through before the join (computing keys whose
+    /// side the plan placed), and their schema before it.
+    probe_prep: []const ast.Stage = &.{},
+    probe_schema: *const types.Schema,
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
@@ -66,23 +70,29 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(arena, binding.stages)));
 
     var ad = analyze.Diag{};
-    const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
+    const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
+    const lsch = try mapChainSchema(env, prep.left, left_schema);
+    const rsch = try mapChainSchema(env, prep.right, build.schema);
+    const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
     const out = try schemaPtr(arena, jp.schema);
-    const right_schema = try schemaPtr(arena, build.schema);
+    const right_schema = try schemaPtr(arena, rsch);
     const right_keys = try planKeys(arena, jp, "rk");
 
     const final_schema = try mapChainSchema(env, suffix, out.*);
 
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
-    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build.op, right_schema, right_keys, try joinBuildCap(env, join_hints));
+    const build_op = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
+    const index = try op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, try joinBuildCap(env, join_hints));
 
     return .{
         .lane = .{
             .index = index,
             .left_keys = try planKeys(arena, jp, "lk"),
             .right_keys = right_keys,
-            .left_schema = try schemaPtr(arena, left_schema),
+            .probe_prep = prep.left,
+            .probe_schema = try schemaPtr(arena, left_schema),
+            .left_schema = try schemaPtr(arena, lsch),
             .right_schema = right_schema,
             .out_schema = out,
             .kind = j.kind,
@@ -96,7 +106,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
 pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin, probe: op.Op) !op.Op {
     const j = try ta.create(op.Join);
     j.* = .{
-        .probe = probe,
+        .probe = try buildChainFrom(ta, params, errctx, lj.probe_prep, probe, lj.probe_schema.*),
         .build = null,
         .index = lj.index,
         .left_keys = lj.left_keys,

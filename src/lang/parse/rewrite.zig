@@ -383,6 +383,23 @@ pub fn sidesOf(self: *Parser, e: *ast.Expr, rname: []const u8) Error!struct { ri
     return .{ .right = right, .other = other };
 }
 
+/// Whether `e` names a column without its table.
+pub fn hasBareField(self: *Parser, e: *ast.Expr) Error!bool {
+    const Ctx = struct { p: *Parser, bare: *bool };
+    const S = struct {
+        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+            if (node.* == .field) {
+                if (!node.field.dollar and node.field.parts.len == 1) cx.bare.* = true;
+                return @constCast(node);
+            }
+            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+        }
+    };
+    var bare = false;
+    _ = try S.recur(.{ .p = self, .bare = &bare }, e);
+    return bare;
+}
+
 pub fn qualOne(self: *Parser, name: []const u8) Error!ast.QualName {
     const parts = try self.arena.alloc([]const u8, 1);
     parts[0] = name;

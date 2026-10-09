@@ -580,6 +580,35 @@ test "join: two-key ON matches on both columns" {
     try std.testing.expectEqualStrings("id,label\n1,first\n2,second\n", out);
 }
 
+test "join: computed keys of bare columns take their side from where the columns are, in either order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "sheet.csv", .data = "cr,flag\n1005,yes\n1048,no\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "centers.csv", .data = "cc_code,cc_name\n1005  ,North\n1048  ,South\n2000  ,West\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const sheet = try std.fs.path.join(alloc, &.{ base, "sheet.csv" });
+    defer alloc.free(sheet);
+    const centers = try std.fs.path.join(alloc, &.{ base, "centers.csv" });
+    defer alloc.free(centers);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+
+    for ([_][]const u8{ "trim(cc_code) = CAST(cr AS varchar)", "CAST(cr AS varchar) = trim(cc_code)" }) |on| {
+        const script = try std.fmt.allocPrint(
+            alloc,
+            "LOAD INTO '{s}' AS\nWITH base AS (SELECT * FROM '{s}' WHERE trim(cc_code) <> '2000')\n" ++
+                "SELECT * FROM '{s}' INNER JOIN base ON {s};",
+            .{ out_path, centers, sheet, on },
+        );
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("cr,flag,cc_code,cc_name\n1005,yes,1005  ,North\n1048,no,1048  ,South\n", out);
+    }
+}
+
 test "join: duplicate build keys fan out (inner); semi/anti reduce to existence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

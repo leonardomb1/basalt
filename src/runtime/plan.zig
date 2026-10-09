@@ -196,6 +196,8 @@ pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
                 for (w.funcs) |f| if (f.arg) |q| try putField(&set, q, right.items);
             },
             .join => |j| {
+                // A key whose side the plan decides could name either side's columns.
+                if (j.deferred.len > 0) return null;
                 for (j.left_keys) |q| try set.put(q.parts[q.parts.len - 1], {});
                 try right.append(if (j.alias.len > 0) j.alias else j.binding);
             },
@@ -696,17 +698,20 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
     const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages)));
 
     var ad = analyze.Diag{};
-    const jp = analyze.joinPlan(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
+    const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
+    const lsch = try mapChainSchema(env, prep.left, left_schema);
+    const rsch = try mapChainSchema(env, prep.right, build.schema);
+    const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
     const out = try schemaPtr(arena, jp.schema);
     const o = try arena.create(op.Join);
     o.* = .{
-        .probe = probe,
-        .build = build.op,
+        .probe = try buildChainFrom(arena, env.params_expr, env.errctx, prep.left, probe, left_schema),
+        .build = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema),
         .index = null,
         .left_keys = jp.lks,
         .right_keys = jp.rks,
-        .left_schema = try schemaPtr(arena, left_schema),
-        .right_schema = try schemaPtr(arena, build.schema),
+        .left_schema = try schemaPtr(arena, lsch),
+        .right_schema = try schemaPtr(arena, rsch),
         .out_schema = out,
         .kind = j.kind,
         .null_aware = j.null_aware,

@@ -630,6 +630,7 @@ pub const Parser = struct {
     pub const singleName = @import("parse/rewrite.zig").singleName;
     pub const havingRewrite = @import("parse/rewrite.zig").havingRewrite;
     pub const sidesOf = @import("parse/rewrite.zig").sidesOf;
+    pub const hasBareField = @import("parse/rewrite.zig").hasBareField;
     pub const qualOne = @import("parse/rewrite.zig").qualOne;
     pub const namesOtherSide = @import("parse/rewrite.zig").namesOtherSide;
     pub const stripRightExpr = @import("parse/rewrite.zig").stripRightExpr;

@@ -7,8 +7,11 @@ function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, i
 read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
 side, `AND`-combined for composite keys, written in either order; a null key
 never matches. A key may be computed — `trim(t.code) = CAST(x.code AS string)`,
-each side naming only its own table — and each side then computes it before the
-join, out of sight of `SELECT *`. Keys of two types (a spreadsheet's number
+each value naming one side's columns — and each side then computes it before the
+join, out of sight of `SELECT *`. Columns need no table when the names say which
+side they are: `trim(code) = CAST(cr AS varchar)` finds `code` and `cr` in the two
+sides' columns, in either order, and is refused as ambiguous only when both
+values' columns exist on both sides. Keys of two types (a spreadsheet's number
 against a table's text) do not join until one is cast. The rest of an `ON` is a
 condition: one naming only the right side, or no column (`1 = 1`), narrows the
 right side before the join — right for an outer join too, and pushed down to a
