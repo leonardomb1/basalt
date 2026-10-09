@@ -58,6 +58,10 @@ pub fn render(plan: Plan, w: anytype) !void {
                 try indent(w, depth + 1);
                 try w.print("key pushdown: {s}\n", .{st.key_pushdown});
             }
+            if (st.join_order.len > 0) {
+                try indent(w, depth + 1);
+                try w.print("join order: {s}\n", .{st.join_order});
+            }
         }
 
         depth += 1;

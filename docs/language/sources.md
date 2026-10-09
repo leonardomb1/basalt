@@ -140,7 +140,9 @@ A read's `WITH (...)` takes `key = value` pairs and bare flags. `PAGINATE BY` an
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
 **Joins** — on the `JOIN` clause: `max_build = '16GB'` sets the right side's
-memory ceiling, past which the join spills to disk ([Joins](joins.md)).
+memory ceiling, past which the join spills to disk ([Joins](joins.md));
+`join_order = 'written'` (default `'auto'`) keeps an inner join's right side in
+memory and its place in a chain, whatever the size estimates say.
 
 `WHERE` on a REST source runs in basalt after the fetch; on a SQL table it is
 pushdown. Same word, different plan — `EXPLAIN` shows which.

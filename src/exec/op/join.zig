@@ -497,6 +497,7 @@ pub const Join = struct {
     state: std.mem.Allocator,
     err: ?*ErrCtx = null,
     build_cap: ?usize = null,
+    note: []const u8 = "",
 
     /// Spilling: with a `space`, a build side past `spill_at` bytes switches the
     /// join to grace mode instead of failing, splitting a partition at most

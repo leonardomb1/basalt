@@ -60,6 +60,7 @@ const folder = @import("../connect/folder.zig");
 const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
 const keypush = @import("keypush.zig");
+const joinorder = @import("joinorder.zig");
 const op = @import("../exec/op.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
@@ -212,6 +213,7 @@ pub const Stage = struct {
     right_pushdown: []const u8 = "",
     /// Which side's SQL read a join narrows by the other side's keys, if either.
     key_pushdown: []const u8 = "",
+    join_order: []const u8 = "",
     out_schema: ?types.Schema = null,
 };
 
@@ -758,6 +760,8 @@ const Ctx = struct {
             errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
             if (st.node == .join) si.key_pushdown = try self.keyPushNote(stages[0..si_at], st);
+            if (st.node == .join and joinorder.mode(st.hints) == .invalid) return fail(self.diag, "join_order is 'auto' or 'written'", .{});
+            if (st.node == .join) si.join_order = joinorder.staticNote(st, stages[si_at + 1 ..]);
             if (si.breaker) {
                 has_breaker = true;
                 breakers += 1;

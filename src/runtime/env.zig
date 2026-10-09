@@ -179,6 +179,7 @@ pub const FactsCache = struct {
     mu: std.Thread.Mutex = .{},
     arena: std.heap.ArenaAllocator,
     map: std.StringHashMap(*const pushdown.Facts),
+    rows: std.StringHashMapUnmanaged(?u64) = .{},
 
     pub fn init(gpa: std.mem.Allocator) FactsCache {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .map = std.StringHashMap(*const pushdown.Facts).init(gpa) };

@@ -39,6 +39,7 @@ const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
 const keypush = @import("keypush.zig");
+const joinorder = @import("joinorder.zig");
 const obs = @import("obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
@@ -334,7 +335,7 @@ const LateReq = struct { dialect: keypush.Dialect, out: *?*keypush.LateSql };
 
 /// The pipeline's own read opened late for the first join after it, which hands
 /// it the right side's keys; `prefix` is what lies between them.
-const ProbeTake = struct { late: *keypush.LateSql, prefix: []const ast.Stage };
+pub const ProbeTake = struct { late: *keypush.LateSql, prefix: []const ast.Stage };
 
 /// The first join after `stages[0]` whose right side's keys narrow this SQL read:
 /// only filters and selects between, a kind that drops unmatched left rows, and
@@ -429,10 +430,14 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             si += 1;
             continue;
         }
-        const r = if (take != null and si == take_at)
-            try buildJoin(env, stage.node.join, stage.hints, schema, current, take)
-        else
-            try buildStage(env, stage, current, schema);
+        if (stage.node == .join) {
+            const j = try joinorder.buildAt(env, stages, si, current, schema, if (take != null and si == take_at) take else null);
+            current = j.res.op;
+            schema = j.res.schema;
+            si = j.next - 1;
+            continue;
+        }
+        const r = try buildStage(env, stage, current, schema);
         current = r.op;
         schema = r.schema;
     }
@@ -752,9 +757,17 @@ pub fn laneJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
 }
 
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
-    const arena = env.arena;
+    const a = try assembleJoin(env, j, hints, try joinSide(env, j, hints), left_schema, probe, take);
+    return .{ .op = .{ .join = a.o }, .schema = a.schema };
+}
+
+pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_late: ?*keypush.LateSql };
+
+/// A join's right side, planned, with its SQL read when that read takes the left
+/// side's keys.
+pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint) anyerror!JoinSide {
     if (env.bindings.get(j.binding) == null)
-        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
     const rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
     var right_late: ?*keypush.LateSql = null;
     const a_dialect = if (!keypush.disabled(hints) and keypush.rightMayNarrow(j)) keypush.sqlDialect(env, rstages) else null;
@@ -762,6 +775,18 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
         try buildPipelineWith(env, rstages, .{ .dialect = d, .out = &right_late })
     else
         try buildPipeline(env, rstages);
+    return .{ .rstages = rstages, .build = build, .right_late = right_late };
+}
+
+pub const Assembled = struct { o: *op.Join, schema: types.Schema };
+
+/// The join as written over a planned right side: `probe` streams, the right side
+/// is indexed, and the output is the left columns then the right.
+pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinSide, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!Assembled {
+    const arena = env.arena;
+    const rstages = side.rstages;
+    const build = side.build;
+    const right_late = side.right_late;
 
     var ad = analyze.Diag{};
     const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
@@ -802,7 +827,7 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
             o.push_probe = t.late.push();
         }
     }
-    return .{ .op = .{ .join = o }, .schema = out.* };
+    return .{ .o = o, .schema = out.* };
 }
 
 /// Whether a pipeline over a local file small enough to read ahead runs serially,
@@ -882,6 +907,8 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
 }
 
 test {
+    _ = @import("estimate.zig");
+    _ = @import("joinorder.zig");
     _ = @import("plan/discover.zig");
     _ = @import("plan/union.zig");
 }

@@ -1229,3 +1229,175 @@ test "a chain of CTEs, each reading the one before, gives the same rows inlined 
         try expectFile(&tmp, "joined.csv", "id,grp\n2,a\n");
     }
 }
+
+fn readOut(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8) ![]u8 {
+    return tmp.dir.readFileAlloc(alloc, name, 1 << 22);
+}
+
+fn expectSameFiles(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, a: []const u8, b: []const u8) !void {
+    const x = try readOut(alloc, tmp, a);
+    defer alloc.free(x);
+    const y = try readOut(alloc, tmp, b);
+    defer alloc.free(y);
+    try std.testing.expectEqualStrings(x, y);
+}
+
+fn expectDifferentFiles(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, a: []const u8, b: []const u8) !void {
+    const x = try readOut(alloc, tmp, a);
+    defer alloc.free(x);
+    const y = try readOut(alloc, tmp, b);
+    defer alloc.free(y);
+    try std.testing.expect(!std.mem.eql(u8, x, y));
+}
+
+fn writeJoinOrderInputs(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
+    try tmp.dir.writeFile(.{ .sub_path = "small.csv", .data = "k,v\n1,a\n1,b\n2,c\n,n\n7,z\n" });
+    var big = std.array_list.Managed(u8).init(alloc);
+    defer big.deinit();
+    try big.appendSlice("k,v,w\n");
+    for (0..400) |i| {
+        if (i % 50 == 0) try big.writer().print(",x{d},{d}\n", .{ i, i }) else try big.writer().print("{d},x{d},{d}\n", .{ i % 5, i, i });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "big.csv", .data = big.items });
+}
+
+test "join order: a left side four times smaller is held in memory, with the written columns and rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinOrderInputs(alloc, &tmp);
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/auto.csv' AS
+        \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k ORDER BY s.k, s.v, b.w;
+        \\LOAD INTO '$B/written.csv' AS
+        \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') ORDER BY s.k, s.v, b.w;
+        \\LOAD INTO '$B/auto_agg.csv' AS
+        \\SELECT s.v, COUNT(*) AS n, SUM(b.w) AS t FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k GROUP BY s.v ORDER BY s.v;
+        \\LOAD INTO '$B/written_agg.csv' AS
+        \\SELECT s.v, COUNT(*) AS n, SUM(b.w) AS t FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') GROUP BY s.v ORDER BY s.v;
+        \\LOAD INTO '$B/auto_ties.csv' AS
+        \\SELECT s.v, b.w FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k ORDER BY s.k;
+        \\LOAD INTO '$B/written_ties.csv' AS
+        \\SELECT s.v, b.w FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') ORDER BY s.k;
+        \\LOAD INTO '$B/unsorted.csv' AS
+        \\SELECT s.v, b.w FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k;
+        \\LOAD INTO '$B/unsorted_written.csv' AS
+        \\SELECT s.v, b.w FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written');
+    , 1, &.{});
+    const auto = try readOut(alloc, &tmp, "auto.csv");
+    defer alloc.free(auto);
+    try std.testing.expect(std.mem.startsWith(u8, auto, "k,v,k_r,v_r,w\n1,a,1,x1,1\n1,a,1,x6,6\n"));
+    try std.testing.expectEqual(@as(usize, 1 + 2 * 80 + 80), std.mem.count(u8, auto, "\n"));
+    try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
+    try expectSameFiles(alloc, &tmp, "auto_agg.csv", "written_agg.csv");
+    try expectDifferentFiles(alloc, &tmp, "auto_ties.csv", "written_ties.csv");
+    try expectSameFiles(alloc, &tmp, "unsorted.csv", "unsorted_written.csv");
+}
+
+test "join order: a turned-around join that spills gives the written rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinOrderInputs(alloc, &tmp);
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\LOAD INTO '$B/auto.csv' AS
+        \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k ORDER BY s.k, s.v, b.w;
+        \\LOAD INTO '$B/written.csv' AS
+        \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') ORDER BY s.k, s.v, b.w;
+    , "$B", base);
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+
+    var want: ?[]u8 = null;
+    defer if (want) |w| alloc.free(w);
+    for ([_]usize{ 2 << 30, 64 }) |op_memory| {
+        var rdiag: Diag = .{};
+        _ = try run(alloc, prog, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
+        try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
+        const got = try readOut(alloc, &tmp, "auto.csv");
+        if (want) |w| {
+            defer alloc.free(got);
+            try std.testing.expectEqualStrings(w, got);
+        } else want = got;
+    }
+}
+
+test "join order: a left side larger than the right stays the probe side" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinOrderInputs(alloc, &tmp);
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/auto.csv' AS
+        \\SELECT * FROM '$B/big.csv' b JOIN '$B/small.csv' s ON b.k = s.k ORDER BY b.k;
+        \\LOAD INTO '$B/written.csv' AS
+        \\SELECT * FROM '$B/big.csv' b JOIN '$B/small.csv' s ON b.k = s.k WITH (join_order = 'written') ORDER BY b.k;
+    , 1, &.{});
+    const auto = try readOut(alloc, &tmp, "auto.csv");
+    defer alloc.free(auto);
+    try std.testing.expect(std.mem.startsWith(u8, auto, "k,v,w,k_r,v_r\n1,x1,1,1,a\n1,x1,1,1,b\n"));
+    try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
+}
+
+test "join order: a star chain of inner joins runs smallest side first, the written columns kept" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    try buf.appendSlice("id,a,b,c\n");
+    for (0..60) |i| {
+        if (i % 13 == 0) try buf.writer().print("{d},,{d},{d}\n", .{ i, i % 3, i % 5 }) else try buf.writer().print("{d},{d},{d},{d}\n", .{ i, i % 4, i % 3, i % 5 });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "f.csv", .data = buf.items });
+    buf.clearRetainingCapacity();
+    try buf.appendSlice("a,name\n");
+    for (0..40) |i| try buf.writer().print("{d},da{d}\n", .{ i % 4, i });
+    try tmp.dir.writeFile(.{ .sub_path = "da.csv", .data = buf.items });
+    try tmp.dir.writeFile(.{ .sub_path = "db.csv", .data = "b,name\n0,b0\n1,b1\n1,b1x\n" });
+    buf.clearRetainingCapacity();
+    try buf.appendSlice("c,name\n");
+    for (0..20) |i| try buf.writer().print("{d},dc{d}\n", .{ i % 5, i });
+    try tmp.dir.writeFile(.{ .sub_path = "dc.csv", .data = buf.items });
+
+    const q = "SELECT * FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a JOIN '$B/db.csv' db ON f.b = db.b JOIN '$B/dc.csv' dc ON f.c = dc.c";
+    const qw = "SELECT * FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a WITH (join_order = 'written') JOIN '$B/db.csv' db ON f.b = db.b WITH (join_order = 'written') JOIN '$B/dc.csv' dc ON f.c = dc.c WITH (join_order = 'written')";
+    const sorted = " ORDER BY id, name, name_r, name_r2;\n";
+    const ties = " ORDER BY id;\n";
+    const script = try std.mem.concat(alloc, u8, &.{
+        "LOAD INTO '$B/auto.csv' AS ",                                                                                                                                                                                                                  q,                                                                                                                                                                                                                                                                                                                                         sorted,
+        "LOAD INTO '$B/written.csv' AS ",                                                                                                                                                                                                               qw,                                                                                                                                                                                                                                                                                                                                        sorted,
+        "LOAD INTO '$B/auto_ties.csv' AS ",                                                                                                                                                                                                             q,                                                                                                                                                                                                                                                                                                                                         ties,
+        "LOAD INTO '$B/written_ties.csv' AS ",                                                                                                                                                                                                          qw,                                                                                                                                                                                                                                                                                                                                        ties,
+        "LOAD INTO '$B/auto_agg.csv' AS SELECT db.name AS bn, COUNT(*) AS n, SUM(f.id) AS s FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a JOIN '$B/db.csv' db ON f.b = db.b JOIN '$B/dc.csv' dc ON f.c = dc.c GROUP BY db.name ORDER BY bn;\n",   "LOAD INTO '$B/written_agg.csv' AS SELECT db.name AS bn, COUNT(*) AS n, SUM(f.id) AS s FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a WITH (join_order = 'written') JOIN '$B/db.csv' db ON f.b = db.b WITH (join_order = 'written') JOIN '$B/dc.csv' dc ON f.c = dc.c WITH (join_order = 'written') GROUP BY db.name ORDER BY bn;\n", "LOAD INTO '$B/linked.csv' AS SELECT f.id, da.name, db.name AS bn FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a JOIN '$B/db.csv' db ON da.a = db.b ORDER BY f.id;\n",
+        "LOAD INTO '$B/linked_written.csv' AS SELECT f.id, da.name, db.name AS bn FROM '$B/f.csv' f JOIN '$B/da.csv' da ON f.a = da.a WITH (join_order = 'written') JOIN '$B/db.csv' db ON da.a = db.b WITH (join_order = 'written') ORDER BY f.id;\n",
+    });
+    defer alloc.free(script);
+    try checkAndRun(alloc, &tmp, script, 1, &.{});
+
+    const auto = try readOut(alloc, &tmp, "auto.csv");
+    defer alloc.free(auto);
+    try std.testing.expect(std.mem.startsWith(u8, auto, "id,a,b,c,a_r,name,b_r,name_r,c_r,name_r2\n1,1,1,1,1,da1,1,b1,1,dc1\n"));
+    try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
+    try expectSameFiles(alloc, &tmp, "auto_agg.csv", "written_agg.csv");
+    try expectDifferentFiles(alloc, &tmp, "auto_ties.csv", "written_ties.csv");
+    try expectSameFiles(alloc, &tmp, "linked.csv", "linked_written.csv");
+}
+
+test "join order: an unknown join_order is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinOrderInputs(alloc, &tmp);
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp,
+        \\LOAD INTO '$B/x.csv' AS
+        \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'best') ORDER BY s.k;
+    , "join_order is 'auto' or 'written'");
+}

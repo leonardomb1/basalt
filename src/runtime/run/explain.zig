@@ -91,5 +91,9 @@ fn explainNode(arena: std.mem.Allocator, node: op.Op, buf: *std.array_list.Manag
         st.rows,
         st.calls,
     });
+    if (node == .join and node.join.note.len > 0) {
+        try buf.appendNTimes(' ', depth * 2 + 2);
+        try buf.writer().print("{s}\n", .{node.join.note});
+    }
     for (kids.items) |k| try explainNode(arena, k, buf, depth + 1);
 }

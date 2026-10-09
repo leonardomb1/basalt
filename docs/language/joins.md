@@ -1,7 +1,9 @@
 # Joins
 
-Joins are hash equi-joins: the right side is materialized and indexed once, the
-left side streams through. The right side is a CTE, a `(SELECT ...)`, a table
+Joins are hash equi-joins: one side is materialized and indexed once, the other
+streams through — the right side is indexed unless the left is estimated much
+smaller ([Which side is held in memory](#which-side-is-held-in-memory)). The
+right side is a CTE, a `(SELECT ...)`, a table
 function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, its
 `WITH (...)` after the alias) or a connection's table (`JOIN sr.db.t AS t`),
 read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
@@ -52,6 +54,50 @@ written once, in build order, through the filters after the join, after
 every other row, as a serial run writes them. Under a `GROUP BY` they stay
 serial.
 
+## Which side is held in memory
+
+An inner join holds its right side in memory and streams the left side through
+it, unless the left side is estimated at least four times smaller: then the left
+side is indexed and the right side streams. A chain of inner joins that all key
+on the columns of the table they start from (a fact table and its dimensions,
+`f JOIN a ON f.x = a.x JOIN b ON f.y = b.y`) runs its smallest side first. The
+result is the written query's — same columns in the same order, same names
+(`_r` suffixes included), same rows — and only the order of the rows can differ.
+So neither choice is made unless the rows are reordered anyway: a `GROUP BY`,
+an aggregate or an `ORDER BY` must follow the joins, with only `WHERE`
+conditions, projections and other joins between. A pipeline that only filters,
+projects and joins keeps its source's order, as [Queries](queries.md) promises.
+
+The estimates are cheap and taken when the query is planned: a Parquet file's
+row count from its footer, a CSV, TSV or JSON-lines file's from its size and the
+lines in its first 64 KiB, another local file's size, a SQL table's catalog
+statistics (PostgreSQL's `pg_class.reltuples`, MySQL, StarRocks and Doris's
+`information_schema.TABLES.TABLE_ROWS`, SQL Server's `sys.partitions`), asked once
+per run. A side's `WHERE` keeps its table's estimate. Rows are compared with
+rows, else bytes with bytes; a side that cannot be estimated — a remote file, a
+folder, a SQL query, a REST read, a side that aggregates or joins before this
+join, a table never analyzed — keeps the join as written. A left side whose
+estimated bytes pass the join's spill threshold is not moved into memory.
+
+Only inner joins are turned around; left, right, full, semi, anti, cross and
+`NOT IN` joins always index their right side. The choice applies where a join
+runs serially; a pipeline whose joins run in parallel lanes (see above) probes
+with its head read in every lane and keeps the written order — a right side too
+big for the lanes sends the pipeline back to the serial plan, where the choice is
+made. Key pushdown follows the sides: a SQL right side streamed through an
+indexed left side takes the left side's keys once that side is indexed, with no
+read-ahead. `EXPLAIN ANALYZE` (and `run --explain`) prints the choice under the
+join, e.g. `build: left (est. 1.2k rows vs 3.4M rows)`; plain `EXPLAIN` only says
+when it will be decided. `WITH (join_order = 'written')` on a join keeps it as
+written, its right side in memory and its place in the chain:
+
+```sql
+SELECT o.id, c.name
+FROM 'customers_eu.csv' c
+JOIN 'orders.parquet' o ON o.cust = c.id WITH (join_order = 'written')
+ORDER BY o.id;
+```
+
 ## Spilling
 
 The build side is held in memory up to `--op-memory` (2 GiB by default), or the
@@ -92,7 +138,8 @@ JOIN sr.erp.cost_centers c ON trim(c.code) = CAST(s.cr AS varchar);
 A SQL right side takes the left side's keys: the left side is read first, into
 memory, and replayed into the join. Past 100,000 rows or 64 MB the read-ahead
 stops and the right side is read in full, so a large left side costs nothing
-extra. A local file of up to 64 MB joined to a SQL table runs serially even
+extra; a join turned around (above) sends the keys once the left side is
+indexed instead. A local file of up to 64 MB joined to a SQL table runs serially even
 under `-j`, so the table can take its keys; a bigger one keeps its lanes. Otherwise a SQL left read right before the first join takes the right
 side's keys once that side is indexed, under `-j` too, where every split reads
 with them. A side takes keys only where the join never outputs its unmatched
