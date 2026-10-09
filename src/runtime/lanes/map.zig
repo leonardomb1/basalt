@@ -28,6 +28,8 @@ const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
 const planSplit = @import("../connect.zig").planSplit;
 const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
+const keyExprs = @import("../plan.zig").keyExprs;
+const keypush = @import("../keypush.zig");
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
@@ -533,6 +535,17 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
 
     const lp = try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema);
 
+    // The build side is indexed: its keys narrow every split's read.
+    var where_extra: ?[]const u8 = null;
+    if (keypush.leftMayNarrow(shape.join) and !keypush.disabled(shape.join_hints)) {
+        const trace = try std.mem.concat(arena, ast.Stage, &.{ shape.prefix, lp.lane.probe_prep });
+        if (try keyExprs(arena, trace, lp.lane.left_key_names)) |exprs| {
+            const keys = try op.collectKeys(arena, &.{lp.lane.index.build_batch}, lp.lane.right_keys, op.default_push_cap);
+            where_extra = try keypush.render(arena, desc.dialect, src_schema.*, exprs, keys);
+            if (where_extra) |x| env.log.log(.debug, "key pushdown into {s} splits: WHERE {s}", .{ @tagName(desc.dialect), if (x.len > 400) x[0..400] else x });
+        }
+    }
+
     env.sink_name = sinkLabel(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
         .{ .shared = try openSink(env, w, lp.out_schema) };
@@ -540,7 +553,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     errdefer if (shared_open) sink_mode.shared.abort();
 
     var ctx = SqlMapJoinCtx{
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
         .predicates = sp.predicates,
         .src_schema = src_schema,
         .prefix = shape.prefix,

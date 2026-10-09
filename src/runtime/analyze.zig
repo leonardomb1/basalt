@@ -59,6 +59,8 @@ const xlsx = @import("../format/xlsx.zig");
 const folder = @import("../connect/folder.zig");
 const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
+const keypush = @import("keypush.zig");
+const op = @import("../exec/op.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
@@ -207,6 +209,8 @@ pub const Stage = struct {
     breaker: bool,
     right_scan: ?[]const u8 = null,
     right_pushdown: []const u8 = "",
+    /// Which side's SQL read a join narrows by the other side's keys, if either.
+    key_pushdown: []const u8 = "",
     out_schema: ?types.Schema = null,
 };
 
@@ -749,9 +753,10 @@ const Ctx = struct {
         var sql_fanout = true;
         var seen_breaker = false;
         var cur: ?types.Schema = source.schema;
-        for (stages[1 .. stages.len - 1]) |st| {
+        for (stages[1 .. stages.len - 1], 1..) |st, si_at| {
             errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
+            if (st.node == .join) si.key_pushdown = try self.keyPushNote(stages[0..si_at], st);
             if (si.breaker) {
                 has_breaker = true;
                 breakers += 1;
@@ -983,6 +988,37 @@ const Ctx = struct {
         if (try self.previewPushdown(stages)) |pv| src.pushdown = pv.where;
         st.right_pushdown = src.pushdown;
         return st;
+    }
+
+    /// What `plan.buildJoin` will do for key pushdown, as `EXPLAIN` tells it: a SQL
+    /// right side takes the left side's keys, else a SQL left read right before
+    /// the first join takes the right side's.
+    fn keyPushNote(self: *Ctx, before: []const ast.Stage, st: ast.Stage) ![]const u8 {
+        const j = st.node.join;
+        if (keypush.disabled(st.hints)) return "";
+        const b = self.bindings.get(j.binding) orelse return "";
+        if (b.stages.len == 0) return "";
+        const right = (try self.inlineHead(try j.rightStages(self.arena, b.stages))).stages;
+        if (keypush.rightMayNarrow(j) and self.sqlSide(right))
+            return try std.fmt.allocPrint(self.arena, "the right read takes the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
+        if (keypush.leftMayNarrow(j) and self.sqlSide(before))
+            return "the left read takes the right side's keys";
+        return "";
+    }
+
+    /// A SQL table or query read followed by only filters and selects.
+    fn sqlSide(self: *Ctx, stages: []const ast.Stage) bool {
+        if (stages.len == 0 or stages[0].node != .read) return false;
+        const rd = stages[0].node.read;
+        if (rd.form != .table and rd.form != .query) return false;
+        const conn = self.connections.get(rd.connector) orelse return false;
+        const c = registry.Connector.parse(conn.connector) orelse return false;
+        if (c.sqlRead() == null) return false;
+        for (stages[1..]) |x| switch (x.node) {
+            .filter, .select => {},
+            else => return false,
+        };
+        return true;
     }
 
     /// The binding chain at the head of `stages` laid out in front of the rest, as

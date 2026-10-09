@@ -10,6 +10,7 @@ const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
+const keyset = @import("keyset.zig");
 const std = @import("std");
 const op_mod = @import("../op.zig");
 const types = @import("../../lang/types.zig");
@@ -242,6 +243,12 @@ pub const JoinIndex = struct {
     }
 };
 
+/// Key pushdown's limits: the probe rows and bytes read ahead before giving up,
+/// and the distinct values sent per key before a range stands in for them.
+pub const default_prefetch_rows: usize = 100_000;
+pub const default_prefetch_bytes: usize = 64 << 20;
+pub const default_push_cap: usize = 1000;
+
 pub const Join = struct {
     stats: Stats = .{},
     probe: Op,
@@ -258,16 +265,37 @@ pub const Join = struct {
     err: ?*ErrCtx = null,
     build_cap: ?usize = null,
 
+    /// Key pushdown. `push_build` gets the probe side's keys before the build side
+    /// is read: the probe is read ahead into memory up to `prefetch_rows` /
+    /// `prefetch_bytes` and replayed, and past either the read-ahead stops and no
+    /// keys are sent. `push_probe` gets the build side's keys once it is indexed,
+    /// before the first probe row. At most `push_cap` distinct values per key.
+    push_build: ?keyset.KeyPush = null,
+    push_probe: ?keyset.KeyPush = null,
+    prefetch_rows: usize = default_prefetch_rows,
+    prefetch_bytes: usize = default_prefetch_bytes,
+    push_cap: usize = default_push_cap,
+
     matched: ?[]bool = null,
     drain_pos: usize = 0,
     probe_done: bool = false,
+    prefetched: bool = false,
+    probe_ended: bool = false,
+    probe_pushed: bool = false,
+    replay: []const Batch = &.{},
+    replay_pos: usize = 0,
 
     const drain_chunk = 4096;
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.push_build != null and !self.prefetched) try self.prefetch(arena);
         const ix = try self.ensureIndex(arena);
+        if (self.push_probe) |kp| if (!self.probe_pushed) {
+            self.probe_pushed = true;
+            try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
+        };
         while (!self.probe_done) {
-            if (try self.probe.next(arena)) |lb| {
+            if (try self.nextProbe(arena)) |lb| {
                 const out = try self.joinBatch(arena, ix, lb);
                 if (out.len > 0) return out;
             } else {
@@ -275,6 +303,37 @@ pub const Join = struct {
             }
         }
         return self.drain(arena, ix);
+    }
+
+    fn nextProbe(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.replay_pos < self.replay.len) {
+            self.replay_pos += 1;
+            return self.replay[self.replay_pos - 1];
+        }
+        if (self.probe_ended) return null;
+        return self.probe.next(arena);
+    }
+
+    /// Reads the probe side ahead, kept in `state`, and sends its keys when it ended
+    /// within the limits; past them it sends none and the build side reads in full.
+    fn prefetch(self: *Join, arena: std.mem.Allocator) anyerror!void {
+        self.prefetched = true;
+        var held = std.array_list.Managed(Batch).init(self.state);
+        var rows: usize = 0;
+        var bytes: usize = 0;
+        while (rows <= self.prefetch_rows and bytes <= self.prefetch_bytes) {
+            const b = (try self.probe.next(arena)) orelse {
+                self.probe_ended = true;
+                break;
+            };
+            if (b.len == 0) continue;
+            try held.append(try b.deepCopy(self.state));
+            rows += b.len;
+            for (b.columns) |*col| bytes += columnBytes(col);
+        }
+        self.replay = held.items;
+        if (self.probe_ended)
+            try self.push_build.?.apply(self.push_build.?.ctx, try keyset.collect(self.state, self.replay, self.left_keys, self.push_cap));
     }
 
     fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!*JoinIndex {
@@ -465,6 +524,55 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
         };
         const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
         try got.expect(case.keys, case.rvs);
+    }
+}
+
+test "join: key pushdown sends one side's keys first and replays a read-ahead probe unchanged" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Rec = struct {
+        got: ?[]const keyset.KeyValues = null,
+        calls: usize = 0,
+        fn apply(ctx: *anyopaque, keys: []const keyset.KeyValues) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.got = keys;
+            self.calls += 1;
+        }
+    };
+    // Each case: read-ahead limit, then whether the probe's keys reach the build side.
+    for ([_]struct { rows: usize, sent: bool }{ .{ .rows = 100, .sent = true }, .{ .rows = 1, .sent = false } }) |case| {
+        const lb = [_]Batch{
+            try kvBatch(a, &join_left_schema, &.{ 1, 2 }, &.{ "a", "b" }),
+            try kvBatch(a, &join_left_schema, &.{ null, 3, 1 }, &.{ "n", "c", "d" }),
+        };
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 1, 4, null }, &.{ "x", "z", "m" })};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var to_build = Rec{};
+        var to_probe = Rec{};
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_both_schema,
+            .kind = .left,
+            .state = a,
+            .push_build = .{ .ctx = &to_build, .apply = Rec.apply },
+            .push_probe = .{ .ctx = &to_probe, .apply = Rec.apply },
+            .prefetch_rows = case.rows,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
+        try got.expect(&.{ 1, 2, null, 3, 1 }, &.{ "x", null, null, null, "x" });
+        try testing.expectEqual(@as(usize, if (case.sent) 1 else 0), to_build.calls);
+        if (case.sent) try testing.expectEqual(@as(usize, 3), to_build.got.?[0].values.len);
+        try testing.expectEqual(@as(usize, 1), to_probe.calls);
+        try testing.expectEqual(@as(usize, 2), to_probe.got.?[0].values.len);
     }
 }
 

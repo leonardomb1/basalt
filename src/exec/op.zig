@@ -299,6 +299,12 @@ pub var join_build_byte_cap: usize = 4 << 30;
 pub const KeyClass = @import("op/join.zig").KeyClass;
 pub const JoinIndex = @import("op/join.zig").JoinIndex;
 pub const Join = @import("op/join.zig").Join;
+pub const KeyValues = @import("op/keyset.zig").KeyValues;
+pub const KeyPush = @import("op/keyset.zig").KeyPush;
+pub const collectKeys = @import("op/keyset.zig").collect;
+pub const default_prefetch_rows = @import("op/join.zig").default_prefetch_rows;
+pub const default_prefetch_bytes = @import("op/join.zig").default_prefetch_bytes;
+pub const default_push_cap = @import("op/join.zig").default_push_cap;
 
 pub const Scan = struct {
     stats: Stats = .{},
@@ -592,6 +598,7 @@ test {
     _ = @import("op/distinct.zig");
     _ = @import("op/explode.zig");
     _ = @import("op/join.zig");
+    _ = @import("op/keyset.zig");
     _ = @import("op/sort.zig");
     _ = @import("op/topn.zig");
     _ = @import("op/window.zig");

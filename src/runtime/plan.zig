@@ -38,6 +38,7 @@ const pqdecode = @import("../format/parquet/read.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
+const keypush = @import("keypush.zig");
 const obs = @import("obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
@@ -322,16 +323,62 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
 }
 
 pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
+    return buildPipelineWith(env, stages_in, null);
+}
+
+/// A join's request that the pipeline's SQL read open late, to take its keys.
+const LateReq = struct { dialect: keypush.Dialect, out: *?*keypush.LateSql };
+
+/// The pipeline's own read opened late for the first join after it, which hands
+/// it the right side's keys; `prefix` is what lies between them.
+const ProbeTake = struct { late: *keypush.LateSql, prefix: []const ast.Stage };
+
+/// The first join after `stages[0]` whose right side's keys narrow this SQL read:
+/// only filters and selects between, a kind that drops unmatched left rows, and
+/// a right side that is not itself taking the left side's keys.
+fn probeTaker(env: *Env, stages: []const ast.Stage) !?struct { idx: usize, dialect: keypush.Dialect } {
+    for (stages[1..], 1..) |st, i| switch (st.node) {
+        .filter, .select => {},
+        .join => |j| {
+            if (keypush.disabled(st.hints) or !keypush.leftMayNarrow(j)) return null;
+            const d = keypush.sqlDialect(env, stages[0..i]) orelse return null;
+            if (try rightTakes(env, j, st.hints)) return null;
+            return .{ .idx = i, .dialect = d };
+        },
+        else => return null,
+    };
+    return null;
+}
+
+/// Whether the join's right side is a SQL read that takes the left side's keys.
+pub fn rightTakes(env: *Env, j: ast.Join, hints: []const ast.Hint) !bool {
+    if (keypush.disabled(hints) or !keypush.rightMayNarrow(j)) return false;
+    const b = env.bindings.get(j.binding) orelse return false;
+    return keypush.sqlDialect(env, try inlineHeadBindings(env, try j.rightStages(env.arena, b.stages))) != null;
+}
+
+fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq) anyerror!PipeRes {
     const stages = try projectSqlRead(env, stages_in);
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     if (try metaShortcut(env, stages)) |r| return r;
 
     var current: op.Op = undefined;
     var schema: types.Schema = undefined;
+    var take: ?ProbeTake = null;
+    var take_at: usize = 0;
 
     switch (stages[0].node) {
         .read => |rd| {
-            const raw = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+            const raw = if (late_req) |lr| blk: {
+                const l = try keypush.LateSql.open(env, rd, stages[0].hints, lr.dialect);
+                lr.out.* = l;
+                break :blk l.source();
+            } else if (try probeTaker(env, stages)) |pt| blk: {
+                const l = try keypush.LateSql.open(env, rd, stages[0].hints, pt.dialect);
+                take = .{ .late = l, .prefix = stages[1..pt.idx] };
+                take_at = pt.idx;
+                break :blk l.source();
+            } else try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
             const src = cs.source();
@@ -379,7 +426,10 @@ pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
             si += 1;
             continue;
         }
-        const r = try buildStage(env, stage, current, schema);
+        const r = if (take != null and si == take_at)
+            try buildJoin(env, stage.node.join, stage.hints, schema, current, take)
+        else
+            try buildStage(env, stage, current, schema);
         current = r.op;
         schema = r.schema;
     }
@@ -563,7 +613,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             return .{ .op = .{ .window = o }, .schema = out };
         },
         .aggregate => |ag| return buildAggregate(env, ag, schema, child),
-        .join => |j| return buildJoin(env, j, stage.hints, schema, child),
+        .join => |j| return buildJoin(env, j, stage.hints, schema, child, null),
         .explode => |ex| {
             var ad = analyze.Diag{};
             const ep = analyze.explodePlan(arena, schema, ex, &ad) catch |e| return aErr(env, &ad, e);
@@ -691,11 +741,17 @@ pub fn prepareJoinSide(env: *Env, stages_in: []const ast.Stage) ![]const ast.Sta
     return descendLeadingWhere(env, stages);
 }
 
-fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op) anyerror!PipeRes {
+fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
     const arena = env.arena;
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-    const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages)));
+    const rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
+    var right_late: ?*keypush.LateSql = null;
+    const a_dialect = if (!keypush.disabled(hints) and keypush.rightMayNarrow(j)) keypush.sqlDialect(env, rstages) else null;
+    const build = if (a_dialect) |d|
+        try buildPipelineWith(env, rstages, .{ .dialect = d, .out = &right_late })
+    else
+        try buildPipeline(env, rstages);
 
     var ad = analyze.Diag{};
     const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
@@ -719,7 +775,42 @@ fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types
         .err = env.errctx,
         .build_cap = try joinBuildCap(env, hints),
     };
+    if (right_late) |rl| {
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex| {
+            rl.exprs = ex;
+            o.push_build = rl.push();
+        }
+    } else if (take) |t| {
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex| {
+            t.late.exprs = ex;
+            o.push_probe = t.late.push();
+        }
+    }
     return .{ .op = .{ .join = o }, .schema = out.* };
+}
+
+/// Whether a pipeline over a local file small enough to read ahead runs serially,
+/// so a join's SQL right side can take its keys: the lanes read the right side in
+/// full. A larger file would pass the read-ahead cap and gain nothing.
+pub fn keysPreferSerial(env: *Env, stages: []const ast.Stage) !bool {
+    if (stages.len == 0 or stages[0].node != .read) return false;
+    const rd = stages[0].node.read;
+    if (rd.form != .path or csv.CsvReader.isUrl(rd.form.path)) return false;
+    const st = std.fs.cwd().statFile(rd.form.path) catch return false;
+    if (st.kind != .file or st.size > op.default_prefetch_bytes) return false;
+    for (stages[1..]) |s| if (s.node == .join and try rightTakes(env, s.node.join, s.hints)) return true;
+    return false;
+}
+
+/// Each join key traced to its read's columns, or null when none of them is.
+pub fn keyExprs(arena: std.mem.Allocator, stages: []const ast.Stage, keys: []const ast.QualName) !?[]const ?*ast.Expr {
+    const out = try arena.alloc(?*ast.Expr, keys.len);
+    var any = false;
+    for (keys, out) |k, *e| {
+        e.* = try keypush.traceKey(arena, stages, k.last());
+        if (e.* != null) any = true;
+    }
+    return if (any) out else null;
 }
 
 pub fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {

@@ -54,6 +54,10 @@ pub fn render(plan: Plan, w: anytype) !void {
                     try w.print("pushdown: {s}\n", .{st.right_pushdown});
                 }
             }
+            if (st.key_pushdown.len > 0) {
+                try indent(w, depth + 1);
+                try w.print("key pushdown: {s}\n", .{st.key_pushdown});
+            }
         }
 
         depth += 1;

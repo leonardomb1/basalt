@@ -31,6 +31,7 @@ const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
 const isLocalParquetRead = @import("../connect.zig").isLocalParquetRead;
+const keysPreferSerial = @import("../plan.zig").keysPreferSerial;
 const laneEligible = @import("../lanes.zig").laneEligible;
 const localRead = @import("../connect/source.zig").localRead;
 const mem_connector = @import("../connect.zig").mem_connector;
@@ -301,7 +302,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         @memcpy(joined[b.stages.len..], head_stages[1..]);
         head_stages = joined;
     }
-    if (laneEligible(head_stages, opts)) {
+    if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
         if (classifyLaneShape(head_stages)) |shape| {
             const rd = head_stages[0].node.read;
             if (isLocalParquetRead(rd) or isFolderRead(rd)) {

@@ -50,6 +50,8 @@ pub const LaneJoin = struct {
     /// side the plan placed), and their schema before it.
     probe_prep: []const ast.Stage = &.{},
     probe_schema: *const types.Schema,
+    /// The probe side's key columns by name, for tracing them to its read.
+    left_key_names: []const ast.QualName = &.{},
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
@@ -91,6 +93,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .left_keys = try planKeys(arena, jp, "lk"),
             .right_keys = right_keys,
             .probe_prep = prep.left,
+            .left_key_names = prep.join.left_keys,
             .probe_schema = try schemaPtr(arena, left_schema),
             .left_schema = try schemaPtr(arena, lsch),
             .right_schema = right_schema,

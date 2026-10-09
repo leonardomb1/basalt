@@ -691,6 +691,7 @@ test {
     _ = @import("env.zig");
     _ = @import("connect.zig");
     _ = @import("plan.zig");
+    _ = @import("keypush.zig");
     _ = @import("lanes.zig");
     _ = @import("script.zig");
 }

@@ -34,3 +34,37 @@ lane would emit those from its own copy of the match tracking. The build side is
 fully resident; past 4 GiB the run fails fast instead of eating the host — raise
 the ceiling per join with `WITH (max_build = '16GB')` on the join clause, filter
 the CTE, or flip the join.
+
+## Key pushdown
+
+When one side of a join is a SQL table, the other side's key values narrow its
+read, so joining a small sheet to a large table reads only the table's matching
+rows:
+
+```sql
+CREATE CONNECTION sr TYPE starrocks OPTIONS (host = 'fe', database = 'erp');
+SELECT s.cr, c.name
+FROM 'centers.xlsx' s
+JOIN sr.erp.cost_centers c ON trim(c.code) = CAST(s.cr AS varchar);
+-- the table is read as … WHERE TRIM(`code`) IN ('1005', '1048')
+```
+
+A SQL right side takes the left side's keys: the left side is read first, into
+memory, and replayed into the join. Past 100,000 rows or 64 MB the read-ahead
+stops and the right side is read in full, so a large left side costs nothing
+extra. A local file of up to 64 MB joined to a SQL table runs serially even
+under `-j`, so the table can take its keys; a bigger one keeps its lanes. Otherwise a SQL left read right before the first join takes the right
+side's keys once that side is indexed, under `-j` too, where every split reads
+with them. A side takes keys only where the join never outputs its unmatched
+rows — the right side of an inner, left, semi or anti join, the left side of an
+inner, right or semi one — and not under `NOT IN`. A side with anything but
+filters and selects between its read and the join, or a key that is no
+function of the read's columns, takes nothing.
+
+Up to 1,000 distinct values go as `IN (…)`; past that a number, decimal, date or
+timestamp key goes as its `>= min AND <= max` range, and a text key as nothing,
+since the database's collation may order text otherwise. A value the dialect
+cannot spell exactly drops that key's predicate, never just the value: the
+read may return more rows than match, which the join discards, never fewer. An
+empty side reads nothing (`WHERE 1 = 0`). `EXPLAIN` names the side that takes
+the keys; `WITH (key_pushdown = false)` on the join turns it off.

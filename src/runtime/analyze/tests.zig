@@ -202,6 +202,36 @@ test "analyze: a condition in ON on a connection's table on the right is the WHE
     try std.testing.expect(std.mem.indexOf(u8, join.?.right_pushdown, "text comparisons decided by the collation at run time") != null);
 }
 
+test "analyze: EXPLAIN tells which side's SQL read takes the other side's join keys" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { join: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        // A SQL right side takes the file's keys; a SQL left side the file's otherwise.
+        .{ .join = "FROM 'sheet.csv' s JOIN pg.centers AS c ON c.code = s.cr", .want = "the right read takes the left side's keys" },
+        .{ .join = "FROM pg.orders AS o JOIN 'sheet.csv' s ON s.cr = o.code", .want = "the left read takes the right side's keys" },
+        // A left join keeps every left row, and the hint turns it off.
+        .{ .join = "FROM pg.orders AS o LEFT JOIN 'sheet.csv' s ON s.cr = o.code", .want = "" },
+        .{ .join = "FROM 'sheet.csv' s JOIN pg.centers AS c ON c.code = s.cr WITH (key_pushdown = false)", .want = "" },
+    };
+    for (cases) |c| {
+        var diag = Diag{};
+        const src = try std.fmt.allocPrint(a,
+            \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');
+            \\LOAD INTO '/tmp/x.csv' AS SELECT * {s};
+        , .{c.join});
+        const plan = try analyze(a, try parse(a, src), &diag);
+        var join: ?Stage = null;
+        for (plan.outputs[0].stages) |st| {
+            if (std.mem.eql(u8, st.kind, "join")) join = st;
+        }
+        if (c.want.len == 0) {
+            try std.testing.expectEqualStrings("", join.?.key_pushdown);
+        } else try std.testing.expect(std.mem.startsWith(u8, join.?.key_pushdown, c.want));
+    }
+}
+
 test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
