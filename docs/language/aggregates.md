@@ -65,6 +65,21 @@ exact too, as are `count_if`, `bool_and`/`bool_or` and the `bit_*` aggregates.
 The variances and deviations combine their lanes the same fixed way, so they
 share `SUM`'s float caveat: `ROUND` them before comparing runs at different `-j`.
 
+**`SUM` over a text column is exact**, as SQL sums exact numbers — a CSV column of
+quoted numbers (`"1500"`, `"12.50"`), read as text, still totals to the cent. Each
+value is read strictly as an exact number: digits, an optional sign and at most
+one `.`. The result's type is fixed at plan time from the values the CSV reader
+sampled to type the file (its first 1024 rows): `INT` when they are whole,
+`DECIMAL(38, s)` when the most decimal places among them is `s`. Text with no
+sample to go by — a database's text column, or an expression such as
+`SUM(trim(v))` — sums as an `INT`.
+
+A value the sum cannot add exactly fails the run, naming the cast that would:
+`'1.255'` past a sum typed `DECIMAL(38, 2)` (trailing zeros aside — `'1.500'` is
+`1.50`) asks for `SUM(CAST(v AS DECIMAL(38, 3)))`, and exponent form (`'1e3'`),
+`nan` or `inf` for `SUM(CAST(v AS FLOAT))`. `AVG` and the other numeric
+aggregates read text as `FLOAT`. The same rules hold for `SUM(...) OVER (...)`.
+
 **Past `--op-memory`, a `GROUP BY` spills to disk** (see
 [Spilling to disk](../tools/cli.md#spilling-to-disk)): groups it already holds keep
 folding in memory, and rows of new groups go to disk by a hash of their key, to be

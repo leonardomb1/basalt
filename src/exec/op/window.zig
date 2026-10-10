@@ -34,10 +34,12 @@ const Sort = @import("sort.zig").Sort;
 const Stats = @import("../op.zig").Stats;
 const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
+const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
+const eval = @import("../eval.zig");
 const rescaleTo = @import("../eval.zig").rescaleTo;
 const decimalOverflow = @import("../eval.zig").decimalOverflow;
 const fitsPrecision = @import("../eval.zig").fitsPrecision;
@@ -61,6 +63,15 @@ fn decStep(acc: *i128, v: Value, scale: u8, sub: bool) !void {
     };
     const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
     acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return decimalOverflow();
+}
+
+/// A text argument of a numeric window aggregate read as the plain aggregate reads
+/// it: exactly for a SUM into an INT or DECIMAL, else as a FLOAT.
+fn numericArg(arena: std.mem.Allocator, f: ast.WinFn, out_ty: types.Type, v: Value) !Value {
+    if (v != .string or f != .agg or aggregates.spec(f.agg).arg != .numeric) return v;
+    if (f.agg == .sum and out_ty.kind != .float) return eval.exactSumText(v.string, out_ty);
+    const to = types.Type.init(.float);
+    return eval.castValueTyped(arena, v, to) catch |e| if (e == error.CastFailed) eval.castFailure(arena, v, to) else e;
 }
 
 fn asF64Opt(v: Value) ?f64 {
@@ -845,7 +856,7 @@ pub const Window = struct {
             var bd = try column.Builder.initCapacity(arena, out_ty, n);
             const vals: []Value = if (f.arg) |ai| blk: {
                 const vs = try arena.alloc(Value, n);
-                for (idx, vs) |row, *v| v.* = all.columns[ai].getValue(row);
+                for (idx, vs) |row, *v| v.* = try numericArg(arena, f.func, out_ty, all.columns[ai].getValue(row));
                 break :blk vs;
             } else &.{};
             switch (f.func) {

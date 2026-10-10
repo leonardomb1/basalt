@@ -136,6 +136,8 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
 
 /// Refuses `SUM('Kick-Off')`: single quotes make a string, which once summed to 0. A
 /// decimal sum stays decimal; typed as int it once reported the unscaled integer.
+/// A text sum is exact: DECIMAL(38, s) when the text's sampled numbers show `s`
+/// decimal places (a sniffed CSV column's `scale`), else INT.
 pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, in: types.Schema, diag: *Diag) Error!types.Type {
     const sp = aggregates.spec(func);
     if (sp.arg == .star_or_any) return types.Type.init(.int);
@@ -148,7 +150,8 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
     return switch (sp.result) {
         .count => types.Type.init(.int),
         .sum => switch (at.kind) {
-            .float, .string => types.Type.init(.float).withNull(true),
+            .float => types.Type.init(.float).withNull(true),
+            .string => if (at.scale > 0) types.Type.decimal(38, at.scale).withNull(true) else types.Type.init(.int).withNull(true),
             .decimal => types.Type.decimal(38, at.scale).withNull(true),
             else => types.Type.init(.int).withNull(true),
         },
@@ -175,6 +178,7 @@ pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
             .sum => switch (src.kind) {
                 .int => types.Type.init(.int).asNullable(),
                 .decimal => types.Type.decimal(38, src.scale).asNullable(),
+                .string => if (src.scale > 0) types.Type.decimal(38, src.scale).asNullable() else types.Type.init(.int).asNullable(),
                 else => types.Type.init(.float).asNullable(),
             },
             else => switch (aggregates.spec(a).result) {

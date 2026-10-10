@@ -786,22 +786,51 @@ test "join: computed keys of bare columns take their side from where the columns
     }
 }
 
-test "aggregate: SUM over a text column of decimals sums as FLOAT, and 1_000 stays text" {
+test "aggregate: SUM over text is exact, typed by the sampled scale; AVG stays FLOAT" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "g,s,u\na,\"1.5\",1_000\na,\"2.25\",2\n" });
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
-    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT g, SUM(s) AS total, MAX(u) AS u FROM '{s}' GROUP BY g;", .{ out_path, in_path });
-    defer alloc.free(script);
-    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    const input = "g,s,i,u\na,\"1.5\",\"9007199254740993\",1_000\na,\"2.25\",\"1\",2\nb,\"3\",\"2\",3\n";
+    const out = try runToString(alloc, &tmp, input, "SELECT g, SUM(s) AS s, SUM(i) AS i, AVG(s) AS a, MAX(u) AS u FROM '$IN' GROUP BY g ORDER BY g");
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("g,total,u\na,3.75,2\n", out);
+    try std.testing.expectEqualStrings("g,s,i,a,u\na,3.75,9007199254740994,1.875,2\nb,3.00,2,3,3\n", out);
+    const win = try runToString(alloc, &tmp, input, "SELECT g, SUM(s) OVER (PARTITION BY g) AS w, SUM(i) OVER (PARTITION BY g) AS wi FROM '$IN' ORDER BY g, w");
+    defer alloc.free(win);
+    try std.testing.expectEqualStrings("g,w,wi\na,3.75,9007199254740994\na,3.75,9007199254740994\nb,3.00,2\n", win);
+}
+
+test "aggregate: SUM over text refuses what it cannot add exactly, naming the CAST that can" {
+    const alloc = std.testing.allocator;
+    var late: std.Io.Writer.Allocating = .init(alloc);
+    defer late.deinit();
+    try late.writer.writeAll("s\n");
+    for (0..1100) |_| try late.writer.writeAll("\"1.5\"\n");
+    try late.writer.writeAll("\"1.255\"\n");
+    const cases = [_]struct { input: []const u8, want: []const u8 }{
+        .{ .input = late.written(), .want = "'1.255' has 3 decimal places, more than the 1" },
+        .{ .input = "s\n\"1\"\n\"1e3\"\n", .want = "sum CAST(x AS FLOAT)" },
+        .{ .input = "s\n\"1\"\n\"nan\"\n", .want = "sum CAST(x AS FLOAT)" },
+        .{ .input = "s\n\"1\"\n\"abc\"\n", .want = "'abc' is not a number" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = c.input });
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT SUM(s) AS s FROM '{s}/in.csv';", .{ base, base });
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_| return error.TestUnexpectedResult else |_| {}
+        if (std.mem.indexOf(u8, rdiag.msg, c.want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ c.want, rdiag.msg });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "join: an outer join's ON beyond its keys picks matching pairs and keeps the rest unmatched" {

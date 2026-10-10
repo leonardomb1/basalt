@@ -123,7 +123,7 @@ pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const
     const to = argCast(agg) orelse return col;
     if (to.kind == .string) return col;
     var out = try column.Builder.initCapacity(arena, to, b.len);
-    for (0..b.len) |r| try out.append(try self.castArg(arena, to, col.getValue(r)));
+    for (0..b.len) |r| try out.append(try self.castArg(arena, agg, to, col.getValue(r)));
     return out.finish();
 }
 
@@ -136,13 +136,15 @@ pub fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, 
     if (v != .string) return v;
     const to = argCast(agg) orelse return v;
     if (to.kind == .string) return v;
-    return self.castArg(arena, to, v);
+    return self.castArg(arena, agg, to, v);
 }
 
-pub fn castArg(self: *Aggregate, arena: std.mem.Allocator, to: types.Type, v: Value) anyerror!Value {
+/// A text `SUM` into an INT or DECIMAL adds exactly or fails; it never rounds.
+pub fn castArg(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, to: types.Type, v: Value) anyerror!Value {
     if (v.isNull()) return v;
-    return eval.castValueTyped(arena, v, to) catch |err| {
-        const e = if (err == error.CastFailed) eval.castFailure(arena, v, to) else err;
+    const exact = agg.func == .sum and v == .string and to.kind != .float;
+    return (if (exact) eval.exactSumText(v.string, to) else eval.castValueTyped(arena, v, to)) catch |err| {
+        const e = if (err == error.CastFailed and !exact) eval.castFailure(arena, v, to) else err;
         if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(e)});
         return e;
     };

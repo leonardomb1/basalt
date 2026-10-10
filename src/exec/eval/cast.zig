@@ -10,6 +10,9 @@ const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
+const clip = @import("support.zig").clip;
+const decimalOverflow = @import("support.zig").decimalOverflow;
+const failWith = @import("support.zig").failWith;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
 const valueToString = @import("format.zig").valueToString;
@@ -21,6 +24,36 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
     const r = rescaleTo(asDecimalValue(v) orelse return error.CastFailed, ty.scale) orelse return error.CastFailed;
     if (!fitsPrecision(r.unscaled, ty.precision)) return error.CastFailed;
     return .{ .decimal = r };
+}
+
+/// Text as `SUM` over a text column adds it: an exact number in `ty` (an INT, or a
+/// DECIMAL whose scale the column's sampled text set), never rounded. More decimal
+/// places than that scale (beyond trailing zeros), exponent form, `nan` and `inf`
+/// fail with the CAST that sums them.
+pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
+    const s = trim(text);
+    const want: u8 = if (ty.kind == .decimal) ty.scale else 0;
+    const d: Decimal = switch (sql.parseDecimalText(s) orelse {
+        if (parseFloatStrict(s) != null)
+            return failWith(error.CastFailed, "SUM: '{s}' is not an exact number; sum CAST(x AS FLOAT) to add it as a float", .{clip(s)});
+        return failWith(error.CastFailed, "SUM: '{s}' is not a number", .{clip(s)});
+    }) {
+        .decimal => |x| x,
+        .int => |x| .{ .unscaled = x, .scale = 0 },
+        else => return error.CastFailed,
+    };
+    if (d.scale > want and @rem(d.unscaled, powTen(d.scale - want)) != 0) {
+        if (want == 0)
+            return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the column's sampled values are whole, so the sum is an INT; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
+        return failWith(error.CastFailed, "SUM: '{s}' has {d} decimal places, more than the {d} of the column's sampled values the sum is typed by; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale, want, d.scale });
+    }
+    const r = rescaleTo(d, want) orelse return decimalOverflow();
+    if (ty.kind == .decimal) {
+        if (!fitsPrecision(r.unscaled, max_digits)) return decimalOverflow();
+        return .{ .decimal = r };
+    }
+    return .{ .int = std.math.cast(i64, r.unscaled) orelse
+        return failWith(error.IntOverflow, "SUM: '{s}' is past the INT range; sum CAST(x AS DECIMAL(38, 0)) instead", .{clip(s)}) };
 }
 
 /// The decimal a value reads as before it meets a target's scale and precision.
@@ -248,6 +281,18 @@ test "decimals lose digits by rounding half away from zero, on every path" {
     try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = 1e300 }, types.Type.decimal(10, 2)));
     try std.testing.expectError(error.CastFailed, castValueTyped(ar.allocator(), .{ .float = std.math.nan(f64) }, types.Type.decimal(10, 2)));
     try std.testing.expectEqual(@as(i128, -1235), (try castValueTyped(ar.allocator(), .{ .string = "-12.345" }, types.Type.decimal(10, 2))).decimal.unscaled);
+}
+
+test "exactSumText adds text exactly or fails, never rounding" {
+    const d2 = types.Type.decimal(38, 2);
+    try std.testing.expectEqual(@as(i128, 150), (try exactSumText(" 1.5 ", d2)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 150), (try exactSumText("1.500", d2)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try exactSumText("9007199254740993", types.Type.init(.int))).int);
+    try std.testing.expectError(error.CastFailed, exactSumText("1.255", d2));
+    try std.testing.expectError(error.CastFailed, exactSumText("1.5", types.Type.init(.int)));
+    try std.testing.expectError(error.CastFailed, exactSumText("1e3", d2));
+    try std.testing.expectError(error.CastFailed, exactSumText("nan", d2));
+    try std.testing.expectError(error.IntOverflow, exactSumText("99999999999999999999", types.Type.init(.int)));
 }
 
 test "castValue: conversions succeed and failures are CastFailed specifically" {

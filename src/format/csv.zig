@@ -858,7 +858,7 @@ fn sliceClose(_: *anyopaque) void {}
 pub const SAMPLE_ROWS = 1024;
 
 const TypeSniffer = struct {
-    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true };
+    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true, scale: u8 = 0 };
     cols: []ColState,
     delim: u8,
 
@@ -877,6 +877,7 @@ const TypeSniffer = struct {
                 c.all_float = false;
                 c.all_date = false;
                 i += 1;
+                const start = i;
                 while (i < line.len) {
                     if (line[i] == '"') {
                         if (i + 1 < line.len and line[i + 1] == '"') {
@@ -888,12 +889,14 @@ const TypeSniffer = struct {
                     }
                     i += 1;
                 }
+                noteScale(c, line[start..@max(start, i -| 1)]);
             } else {
                 const start = i;
                 while (i < line.len and line[i] != self.delim) i += 1;
                 const raw = line[start..i];
                 if (raw.len > 0) {
                     c.seen = true;
+                    noteScale(c, raw);
                     if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
                     if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
                         c.all_int = false;
@@ -912,10 +915,31 @@ const TypeSniffer = struct {
         }
     }
 
+    /// The most decimal places of a plain number in the cell (`1.25`, `"-3.5"`), which
+    /// a text column carries in its type's `scale` for `SUM` to type its exact result.
+    fn noteScale(c: *ColState, cell: []const u8) void {
+        const t = std.mem.trim(u8, cell, " ");
+        var i: usize = if (t.len > 0 and (t[0] == '-' or t[0] == '+')) 1 else 0;
+        var digits: usize = 0;
+        var places: ?usize = null;
+        while (i < t.len) : (i += 1) {
+            if (t[i] >= '0' and t[i] <= '9') {
+                digits += 1;
+                if (places) |*p| p.* += 1;
+            } else if (t[i] == '.' and places == null) {
+                places = 0;
+            } else return;
+        }
+        if (digits == 0 or digits > 38) return;
+        c.scale = @max(c.scale, @as(u8, @intCast(places orelse 0)));
+    }
+
     fn resolve(self: *const TypeSniffer, j: usize) types.Type {
         const c = self.cols[j];
         const k: types.TypeKind = if (!c.seen) .string else if (c.all_int) .int else if (c.all_float) .float else if (c.all_date) .date else .string;
-        return types.Type.init(k).asNullable();
+        var t = types.Type.init(k).asNullable();
+        if (k == .string) t.scale = c.scale;
+        return t;
     }
 };
 
@@ -1780,6 +1804,17 @@ test "TypeSniffer: int/float promotion, leading zeros and quoted cells force str
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(4).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(5).kind);
     try std.testing.expectEqual(types.TypeKind.int, s.resolve(6).kind);
+}
+
+test "TypeSniffer: a text column keeps its sampled numbers' most decimal places for SUM" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var s = try TypeSniffer.init(ar.allocator(), 3, ',');
+    s.feed("\"1.5\",\"7\",\"1e3\"");
+    s.feed("\"-2.125\",\"007\",\"a.b\"");
+    try std.testing.expectEqual(@as(u8, 3), s.resolve(0).scale);
+    try std.testing.expectEqual(@as(u8, 0), s.resolve(1).scale);
+    try std.testing.expectEqual(@as(u8, 0), s.resolve(2).scale);
 }
 
 test "TypeSniffer: cells split on the dialect's delimiter, not always a comma" {

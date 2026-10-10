@@ -316,6 +316,7 @@ pub const builtins = @import("eval/functions.zig").builtins;
 pub const lookupBuiltin = @import("eval/functions.zig").lookupBuiltin;
 const vectorized = @import("eval/fn_vec.zig").vectorized;
 pub const castValueTyped = @import("eval/cast.zig").castValueTyped;
+pub const exactSumText = @import("eval/cast.zig").exactSumText;
 pub const floatToDecimal = @import("eval/cast.zig").floatToDecimal;
 pub const roundScaleDown = @import("eval/cast.zig").roundScaleDown;
 pub const rescaleTo = @import("eval/cast.zig").rescaleTo;
