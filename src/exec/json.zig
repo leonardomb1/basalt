@@ -7,11 +7,11 @@
 //! what is returned is decoded. Everything after `validate` assumes it passed and
 //! does not check the text again.
 //!
-//! What it accepts and refuses is `std.json`'s exactly: a cell that is not JSON was
-//! an error and still is, duplicate keys included. A document it is not sure of
-//! (nesting deeper than `max_depth`, more open keys than `max_keys`, an escaped key
-//! longer than `max_key_bytes`) is handed to `std.json` to decide, so those cases
-//! are exact by construction. The values it returns are `std.json`'s too, as
+//! What it accepts and refuses is `std.json`'s exactly, with duplicate keys allowed
+//! as RFC 8259 allows them and the last one read (`duplicate_field_behavior =
+//! .use_last`): a cell that is not JSON was an error and still is. A document
+//! nested deeper than `max_depth` is handed to `std.json` to decide, so that case
+//! is exact by construction. The values it returns are `std.json`'s too, as
 //! `eval.jsonToValue` makes them (strings unquoted, numbers and booleans as their
 //! text, containers as compact JSON); a randomized test holds the two against each
 //! other.
@@ -21,15 +21,15 @@ const std = @import("std");
 pub const Error = error{ InvalidJson, OutOfMemory };
 
 const max_depth = 128;
-const max_keys = 256;
-const max_key_bytes = 256;
+
+const parse_options: std.json.ParseOptions = .{ .duplicate_field_behavior = .use_last };
 
 pub fn validate(arena: std.mem.Allocator, text: []const u8) Error!void {
     var v = Validator{ .t = text };
     v.run() catch |e| switch (e) {
         error.Invalid => return error.InvalidJson,
         error.Fallback => {
-            _ = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e2|
+            _ = std.json.parseFromSliceLeaky(std.json.Value, arena, text, parse_options) catch |e2|
                 return if (e2 == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
         },
     };
@@ -39,8 +39,6 @@ const Validator = struct {
     t: []const u8,
     i: usize = 0,
     depth: usize = 0,
-    keys: [max_keys][]const u8 = undefined,
-    nkeys: usize = 0,
 
     const E = error{ Invalid, Fallback };
 
@@ -153,8 +151,6 @@ const Validator = struct {
         defer v.depth -= 1;
         const t = v.t;
         v.i += 1;
-        const base = v.nkeys;
-        defer v.nkeys = base;
         v.ws();
         if (v.i < t.len and t[v.i] == '}') {
             v.i += 1;
@@ -163,11 +159,7 @@ const Validator = struct {
         while (true) {
             v.ws();
             if (v.i >= t.len or t[v.i] != '"') return error.Invalid;
-            const key = try v.string();
-            for (v.keys[base..v.nkeys]) |k| if (try keysEqual(k, key)) return error.Invalid;
-            if (v.nkeys == max_keys) return error.Fallback;
-            v.keys[v.nkeys] = key;
-            v.nkeys += 1;
+            _ = try v.string();
             v.ws();
             if (v.i >= t.len or t[v.i] != ':') return error.Invalid;
             v.i += 1;
@@ -211,17 +203,6 @@ const Validator = struct {
                 else => return error.Invalid,
             }
         }
-    }
-
-    fn keysEqual(a: []const u8, b: []const u8) E!bool {
-        if (std.mem.eql(u8, a, b)) return true;
-        const ea = std.mem.indexOfScalar(u8, a, '\\') != null;
-        const eb = std.mem.indexOfScalar(u8, b, '\\') != null;
-        if (!ea and !eb) return false;
-        if (a.len > max_key_bytes or b.len > max_key_bytes) return error.Fallback;
-        var ba: [max_key_bytes]u8 = undefined;
-        var bb: [max_key_bytes]u8 = undefined;
-        return std.mem.eql(u8, decodeInto(&ba, a), decodeInto(&bb, b));
     }
 };
 
@@ -298,9 +279,12 @@ fn valueEnd(t: []const u8, i: usize) usize {
     }
 }
 
+/// Where the value of `key` starts in the object at `i`; of the last one when the
+/// key repeats.
 fn member(arena: std.mem.Allocator, t: []const u8, i: usize, key: []const u8) Error!?usize {
     var j = skipWs(t, i + 1);
     if (t[j] == '}') return null;
+    var found: ?usize = null;
     while (true) {
         const ke = stringEnd(t, j);
         const raw = t[j + 1 .. ke - 1];
@@ -309,9 +293,9 @@ fn member(arena: std.mem.Allocator, t: []const u8, i: usize, key: []const u8) Er
             std.mem.eql(u8, raw, key)
         else
             std.mem.eql(u8, try decodeString(arena, raw), key);
-        if (hit) return j;
+        if (hit) found = j;
         j = skipWs(t, valueEnd(t, j));
-        if (t[j] == '}') return null;
+        if (t[j] == '}') return found;
         j = skipWs(t, j + 1);
     }
 }
@@ -539,13 +523,16 @@ test "json: accepts and refuses what std.json does" {
         "{\"\":0}",          "[\"\x7f\"]",              "truex",                             "[1]x",
     };
     for (cases) |c| {
-        const want = if (std.json.parseFromSliceLeaky(std.json.Value, a, c, .{})) |_| true else |_| false;
+        const want = if (std.json.parseFromSliceLeaky(std.json.Value, a, c, parse_options)) |_| true else |_| false;
         const got = if (validate(a, c)) |_| true else |_| false;
         if (want != got) {
             std.debug.print("validate disagrees on `{s}`: std.json {}, here {}\n", .{ c, want, got });
             return error.TestUnexpectedResult;
         }
     }
+    const dup = "{\"a\":1,\"b\":{\"c\":2},\"\\u0061\":3}";
+    try testing.expectEqualStrings("3", (try path(a, dup, "a")).?);
+    try testing.expectEqualStrings("2", (try path(a, dup, "b.c")).?);
 }
 
 fn genValue(r: std.Random, w: *std.Io.Writer, depth: usize) !void {
@@ -611,7 +598,7 @@ test "json: reads every generated document as std.json does, and every damaged o
             doc[at] = ([_]u8{ '"', '\\', ',', ']', '}', '1', ' ', 0x01, 0xff, 'e' })[r.uintLessThan(usize, 10)];
         }
 
-        const tree = std.json.parseFromSliceLeaky(std.json.Value, a, doc, .{}) catch null;
+        const tree = std.json.parseFromSliceLeaky(std.json.Value, a, doc, parse_options) catch null;
         const ok = if (validate(a, doc)) |_| true else |_| false;
         if (ok != (tree != null)) {
             std.debug.print("validate disagrees on `{s}`: std.json {}, here {}\n", .{ doc, tree != null, ok });
@@ -619,14 +606,18 @@ test "json: reads every generated document as std.json does, and every damaged o
         }
         const t = tree orelse continue;
         checked += 1;
+        const dups = if (std.json.parseFromSliceLeaky(std.json.Value, a, doc, .{})) |_| false else |_| true;
         for (paths) |p| {
-            const want: Value = if (eval.jsonPath(t, p)) |leaf| try eval.jsonToValue(a, leaf) else .null;
+            const leaf = eval.jsonPath(t, p);
+            if (dups and leaf != null and (leaf.? == .object or leaf.? == .array)) continue;
+            const want: Value = if (leaf) |l| try eval.jsonToValue(a, l) else .null;
             const mine: Cell = if (try path(a, doc, p)) |raw| try cell(a, raw) else .null;
             if (!try sameCell(a, mine, want)) {
                 std.debug.print("path `{s}` of `{s}`: std.json {any}, here {any}\n", .{ p, doc, want, mine });
                 return error.TestUnexpectedResult;
             }
         }
+        if (dups) continue;
         if (t == .array) {
             var it = Elements.root(doc);
             for (t.array.items) |item| {

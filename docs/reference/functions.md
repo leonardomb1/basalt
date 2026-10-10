@@ -20,14 +20,14 @@ never fails a load.
 | `strlen(s)` | the number of bytes |
 | `lower(s)`, `upper(s)` | the text in one case; Latin, Greek and Cyrillic map one character to one (`ß` stays) |
 | `trim(s)` | the text without leading and trailing spaces |
-| `substr(s, start[, length])` | the characters from `start` (from 1) on, or `length` of them |
+| `substr(s, start[, length])` | the characters from `start` (from 1) on, or `length` of them; as in Postgres, a `start` before 1 spends `length` from there, so `substr('hello', 0, 2)` is `h` and `substr('hello', -1, 3)` is `h` |
 | `left(s, n)`, `right(s, n)` | the first or last `n` characters |
 | `lpad(s, length[, fill])`, `rpad(s, length[, fill])` | the text padded on the left or right to `length` with `fill` (a space by default); longer text is cut to `length` |
 | `replace(s, from, to)` | every `from` replaced by `to` |
 | `translate(s, from, to)` | each character of `from` mapped to the one at the same place in `to`, deleted when `to` is shorter: `translate(cnpj, './-', '')` keeps the digits |
 | `concat(a, …)` | the values joined; null when any value is (`a \|\| b` is the same) |
 | `concat_ws(sep, a, …)` | the values joined with `sep`, skipping nulls |
-| `split_part(s, delimiter, n)` | the `n`-th piece (from 1), `''` past the last |
+| `split_part(s, delimiter, n)` | the `n`-th piece (from 1), or with a negative `n` counting from the end (`-1` is the last); `''` past either end or for `n = 0`; with an empty delimiter the whole text is the one piece, as in Postgres 14 |
 | `strpos(s, sub)` | where `sub` first starts (from 1), `0` when it does not occur |
 | `starts_with(s, prefix)`, `ends_with(s, suffix)`, `contains(s, sub)` | whether the text starts with, ends with or holds the other |
 | `like(s, pattern)` | `s LIKE pattern` as a call |

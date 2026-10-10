@@ -76,6 +76,36 @@ pub const TypeError = error{ TypeError, OutOfMemory };
 pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, InvalidJson, OutOfMemory };
 const evalLit = @import("eval/testing_util.zig").evalLit;
 
+/// Where an expression was written, as far as its columns and calls tell.
+fn exprSpan(e: *const ast.Expr) ?ast.Span {
+    return switch (e.*) {
+        .field => |q| q.span,
+        .call => |c| c.span,
+        .cast => |c| exprSpan(c.e),
+        .unary => |u| exprSpan(u.e),
+        .binary => |b| joinSpans(exprSpan(b.l), exprSpan(b.r)),
+        else => null,
+    };
+}
+
+fn joinSpans(a: ?ast.Span, b: ?ast.Span) ?ast.Span {
+    if (a != null and b != null) return .{ .start = a.?.start, .end = b.?.end };
+    return a orelse b;
+}
+
+/// A comparison operand as the message names it: a column, a literal, else its kind.
+fn operandText(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}![]const u8 {
+    return switch (e.*) {
+        .field => |q| try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
+        .str_lit => |v| try std.fmt.allocPrint(arena, "'{s}'", .{v}),
+        .int_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .float_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .bool_lit => |v| if (v) "true" else "false",
+        .call => |c| try std.fmt.allocPrint(arena, "`{s}(…)`", .{c.name}),
+        else => "an expression",
+    };
+}
+
 pub const TypeCtx = struct {
     schema: types.Schema,
     arena: std.mem.Allocator,
@@ -135,6 +165,15 @@ pub const TypeCtx = struct {
         }
     }
 
+    /// A comparison of two types that never compare: both operands and types named,
+    /// the span covering what of them is known.
+    fn incomparable(self: *TypeCtx, b: ast.Expr.Binary, lt: Type, rt: Type) TypeError {
+        self.span = joinSpans(exprSpan(b.l), exprSpan(b.r));
+        return self.err("cannot compare {s} ({s}) with {s} ({s}) — CAST one side to the other's type", .{
+            try operandText(self.arena, b.l), try lt.name(self.arena), try operandText(self.arena, b.r), try rt.name(self.arena),
+        });
+    }
+
     fn typeOfBinary(self: *TypeCtx, b: ast.Expr.Binary) TypeError!Type {
         const lt = try self.typeOf(b.l);
         const rt = try self.typeOf(b.r);
@@ -153,7 +192,7 @@ pub const TypeCtx = struct {
             .eq, .ne, .lt, .le, .gt, .ge => {
                 if (!comparable(lt, rt) and
                     !try self.temporalLit(b.r, lt) and
-                    !try self.temporalLit(b.l, rt)) return self.err("incomparable operands", .{});
+                    !try self.temporalLit(b.l, rt)) return self.incomparable(b, lt, rt);
                 return Type{ .kind = .bool, .nullable = nn };
             },
             .@"and", .@"or" => {
@@ -407,7 +446,14 @@ test "string builtins: padding truncates, ends take negatives, split_part clamps
     try std.testing.expectEqualStrings("b", (try evalLit(a, "split_part('a,b,c', ',', 2)")).string);
     try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', ',', 9)")).string);
     try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', ',', 0)")).string);
-    try std.testing.expect((try evalLit(a, "split_part('a,b,c', '', 1)")).isNull());
+    try std.testing.expectEqualStrings("a,b,c", (try evalLit(a, "split_part('a,b,c', '', 1)")).string);
+    try std.testing.expectEqualStrings("a,b,c", (try evalLit(a, "split_part('a,b,c', '', -1)")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', '', 2)")).string);
+    try std.testing.expectEqualStrings("c", (try evalLit(a, "split_part('a,b,c', ',', -1)")).string);
+    try std.testing.expectEqualStrings("a", (try evalLit(a, "split_part('a,b,c', ',', -3)")).string);
+    try std.testing.expectEqualStrings("", (try evalLit(a, "split_part('a,b,c', ',', -4)")).string);
+    try std.testing.expectEqualStrings("h", (try evalLit(a, "substr('hello', 0, 2)")).string);
+    try std.testing.expectEqualStrings("h", (try evalLit(a, "substr('hello', -1, 3)")).string);
 
     try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "strpos('abcd', 'cd')")).int);
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "strpos('abcd', 'z')")).int);
@@ -540,6 +586,11 @@ test "array helpers: chars, json_range, json_length, json_slice, json_concat" {
     try std.testing.expectEqualStrings("[1,{\"k\":2},3]", try str(a, "json_concat('[1]', '[{\"k\": 2}, 3]')"));
     try std.testing.expect((try evalLit(a, "json_concat('[1]', NULL)")) == .null);
     try std.testing.expectEqual(@as(i64, 8), (try evalLit(a, "11 - json_reduce(chars('112223330001'), 0, (acc, c, i) -> acc + (ascii(c) - 48) * CAST(json_get('[5,4,3,2,9,8,7,6,5,4,3,2]', CAST(i AS STRING)) AS INT)) % 11")).int);
+
+    try std.testing.expectError(error.TypeMismatch, evalLit(a, "json_reduce('[1, \"a\"]', 0, (s, x) -> s + x)"));
+    try std.testing.expectEqualStrings("json_reduce: the lambda could not compute with element [1], \"a\" — text is not a number; CAST it or drop it with json_filter first", takeFailure(error.TypeMismatch).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "json_reduce('[1, 2.5]', 0, (s, x) -> s + x)"));
+    try std.testing.expect(std.mem.startsWith(u8, takeFailure(error.CastFailed).?, "json_reduce: element [1], 2.5, made the lambda return 3.5"));
 }
 
 test "check-time errors: bad strftime directive, sub-day date_add on a date" {

@@ -41,12 +41,13 @@ pub const Arg = enum {
         };
     }
 
+    /// The argument kind as a message names it, article included: "an INT".
     pub fn word(self: Arg) []const u8 {
         return switch (self) {
-            .star_or_any, .any => "",
-            .numeric => "numeric",
-            .int => "INT",
-            .bool => "BOOL",
+            .star_or_any, .any => "any",
+            .numeric => "a numeric",
+            .int => "an INT",
+            .bool => "a BOOL",
         };
     }
 };

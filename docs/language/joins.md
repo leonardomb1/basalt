@@ -40,7 +40,13 @@ LEFT JOIN 'prices.csv' p
 A right or full join keeps every right row the same way, so there a condition
 on the right side alone decides matches too rather than narrowing it. `CROSS
 JOIN <cte>` takes no `ON`; an `ON` with no condition across the sides (only
-`b.del <> '*'`) pairs every left row with every right row it leaves.
+`b.del <> '*'`) pairs every left row with every right row it leaves. A cross
+join holds its right side in memory like a [join without a
+key](#joins-without-a-key), up to its `max_build` or 4 GiB, and emits the pairs
+65,536 at a time, so a `WHERE` after it filters them as they come. The join's
+own options (`max_build`, `join_order`, `key_pushdown`) may sit in a joined
+path's `WITH (...)` after the alias — `CROSS JOIN 'big.parquet' p WITH
+(max_build = '1GB')` — and apply to the join.
 Right-side columns that collide with a left name come back suffixed `_r`, and
 `_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows. A
 qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
@@ -152,7 +158,7 @@ once with "a single join key holds N rows, more than --op-memory allows" —
 raise `--op-memory` or `max_build`, or filter that key out; one under it is held
 whole. A partition still past that after 4 levels fails too. A `NOT IN` build side
 never spills, since one null on it changes every row's answer, and fails with
-the build-too-large error past the limit.
+an error naming the limit once it passes `--op-memory`.
 Under `-j` a build side past the limit sends the pipeline back to a serial run,
 which reads that side again — a second query for a SQL source. `--spill-cap`
 bounds the disk a run's spills hold at once (8 GiB by default; a partition's files

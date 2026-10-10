@@ -186,8 +186,18 @@ pub fn lessV(a: Value, b: Value) bool {
 }
 
 /// Quickselect: `xs[k]` becomes the k-th smallest, smaller before, larger after.
-/// Median-of-three pivot, Hoare partition; expected O(n).
-pub fn selectNth(xs: []f64, k: usize) f64 {
+/// Median-of-three pivot, Hoare partition; expected O(n). NaN orders above every
+/// number, as `eval.orderF64` has it, so the NaNs are moved to the end first.
+pub fn selectNth(xs_all: []f64, k: usize) f64 {
+    var m: usize = 0;
+    for (xs_all) |x| {
+        if (std.math.isNan(x)) continue;
+        xs_all[m] = x;
+        m += 1;
+    }
+    @memset(xs_all[m..], std.math.nan(f64));
+    if (k >= m) return std.math.nan(f64);
+    const xs = xs_all[0..m];
     var lo: usize = 0;
     var hi: usize = xs.len - 1;
     while (lo < hi) {
@@ -542,4 +552,15 @@ test "integer SUM: exact across batches, an error only when the total leaves i64
     var acc = Aggregate.Acc{ .n = 5 };
     for ([_][]const i64{ &.{ max, max }, &.{ -max, -max }, &.{5} }) |part| acc.sum_i += sumIntCol(part);
     try testing.expectEqual(Value{ .int = 5 }, try Aggregate.finalizeAcc(acc, agg));
+}
+
+test "aggregate: selectNth orders NaN above every number" {
+    const nan = std.math.nan(f64);
+    var xs = [_]f64{ 0, -0.0, nan, nan, 1.5 };
+    try std.testing.expectEqual(@as(f64, 1.5), selectNth(&xs, 2));
+    var ys = [_]f64{ nan, 3, 1, nan, 2 };
+    try std.testing.expectEqual(@as(f64, 3), selectNth(&ys, 2));
+    try std.testing.expect(std.math.isNan(selectNth(&ys, 3)));
+    var zs = [_]f64{ nan, nan };
+    try std.testing.expect(std.math.isNan(selectNth(&zs, 0)));
 }

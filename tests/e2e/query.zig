@@ -601,6 +601,44 @@ test "join spill: partitions still past max_build split again, and one key past 
     while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
 }
 
+test "cross join and NOT IN keep their in-memory caps" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var big = std.array_list.Managed(u8).init(alloc);
+    defer big.deinit();
+    try big.appendSlice("t\n");
+    for (0..2000) |i| try big.writer().print("some longer text value {d}\n", .{i});
+    try tmp.dir.writeFile(.{ .sub_path = "big.csv", .data = big.items });
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "s\na\nb\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const cases = [_]struct { sql: []const u8, op_memory: ?usize, msg: []const u8 }{
+        .{ .sql = "LOAD INTO '{s}/out.csv' AS SELECT count(*) AS n FROM '{s}/l.csv' s CROSS JOIN '{s}/big.csv' p WITH (max_build = '1KB');", .op_memory = null, .msg = "exceeds its cap" },
+        .{ .sql = "LOAD INTO '{s}/out.csv' AS SELECT count(*) AS n FROM '{s}/l.csv' WHERE s NOT IN (SELECT t FROM '{s}/big.csv');", .op_memory = 1024, .msg = "NOT IN subquery's rows pass the 1024-byte limit" },
+    };
+    inline for (cases) |c| for ([_]usize{ 1, 4 }) |threads| {
+        const script = try std.fmt.allocPrint(alloc, c.sql, .{ base, base, base });
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        var opts: basalt.env.RunOptions = .{ .threads = threads, .log = .{ .quiet = true } };
+        if (c.op_memory) |m| opts.op_memory = m;
+        try std.testing.expectError(error.JoinBuildTooLarge, run(alloc, prog, opts, &rdiag));
+        try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, c.msg) != null);
+    };
+
+    const ok = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT count(*) AS n FROM '{s}/l.csv' s CROSS JOIN '{s}/big.csv' p;", .{ base, base, base });
+    defer alloc.free(ok);
+    const out = try runScriptOpts(alloc, &tmp, ok, .{ .log = .{ .quiet = true } });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("n\n4000\n", out);
+}
+
 test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
