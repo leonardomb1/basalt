@@ -113,7 +113,9 @@ shape for this reader), nor is bzip2.
 
 `LOAD INTO 'orders.csv.gz'` writes gzip, at about `gzip -6`'s size, and `APPEND`
 adds a member to an existing one. Other codecs are refused at plan time: zstd
-output is not supported, and Parquet and Arrow compress their own pages.
+output is not supported, and Parquet and Arrow compress their own pages. A `.zip`
+is read only: `LOAD INTO 'x.zip'` and `LOAD INTO 'x.zip :: a.csv'` are refused
+at plan time too.
 
 A file inside a zip is addressed with `::`, the separator ClickHouse uses for the
 same idea:

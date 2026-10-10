@@ -1298,11 +1298,14 @@ pub const CsvWriter = struct {
     }
 
     /// `.append` resumes at the file's end and writes the header only to an empty file,
-    /// so a second header never lands among the rows. Objects, SFTP and SMB are written
-    /// whole (through a `.part`), so they cannot append.
+    /// so a second header never lands among the rows; a file with rows must already
+    /// have this header, and one missing its last newline gets it first, or the first
+    /// new row would join the last old one. Objects, SFTP and SMB are written whole
+    /// (through a `.part`), so they cannot append.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
+        var newline = false;
         if (sftp.isUrl(path)) {
             if (mode == .append) return error.AppendNotSupported;
             self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
@@ -1316,12 +1319,18 @@ pub const CsvWriter = struct {
             const obj = try objstore.parse(arena, path);
             self.* = .{ .backend = .{ .object = try obj.openWriter(arena, client, "text/csv") } };
         } else {
-            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{ .truncate = mode == .truncate }) } };
+            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{ .truncate = mode == .truncate, .read = mode == .append }) } };
             self.fw = self.backend.file.writer(&self.write_buf);
             if (mode == .append) {
+                errdefer self.backend.file.close();
                 const end = try self.backend.file.getEndPos();
+                if (end > 0) {
+                    const prior = try appendTarget(arena, self.backend.file, end, splitCodec(path).codec);
+                    header = prior.empty;
+                    newline = !prior.empty and !prior.ends_nl;
+                    if (!prior.empty) try checkAppendHeader(arena, path, prior.header, schema, dialect);
+                }
                 try self.fw.seekTo(end);
-                header = end == 0;
             }
         }
 
@@ -1332,6 +1341,7 @@ pub const CsvWriter = struct {
         }
 
         self.dialect = dialect;
+        if (newline) try self.out().writeByte('\n');
         if (header) {
             const w = self.out();
             for (schema.fields, 0..) |f, i| {
@@ -1341,6 +1351,66 @@ pub const CsvWriter = struct {
             try w.writeByte('\n');
         }
         return self;
+    }
+
+    const Prior = struct { empty: bool, ends_nl: bool, header: []const u8 };
+
+    /// The existing content an append extends: whether it is empty (a `.gz` of no
+    /// bytes is), whether it ends in a newline, and its header record. A `.gz` streams
+    /// through once for its last byte, in constant memory.
+    fn appendTarget(arena: std.mem.Allocator, file: std.fs.File, end: u64, codec: Codec) !Prior {
+        const buf = try arena.alloc(u8, LINE_BUF);
+        var fr = file.reader(buf);
+        var gz: Gunzip = undefined;
+        var r: *std.Io.Reader = &fr.interface;
+        if (codec == .gzip) {
+            gz.init(r, try arena.alloc(u8, codecBuffer(.gzip)), try arena.alloc(u8, LINE_BUF));
+            r = &gz.interface;
+        }
+        var head = std.array_list.Managed(u8).init(arena);
+        var in_header = true;
+        var in_q = false;
+        var last: ?u8 = null;
+        while (true) {
+            const got = r.peekGreedy(1) catch |e| switch (e) {
+                error.EndOfStream => break,
+                else => |x| return x,
+            };
+            last = got[got.len - 1];
+            if (in_header) {
+                for (got, 0..) |c, k| {
+                    if (c == '"') in_q = !in_q;
+                    if (c == '\n' and !in_q) {
+                        try head.appendSlice(got[0..k]);
+                        in_header = false;
+                        break;
+                    }
+                } else try head.appendSlice(got);
+            }
+            r.toss(got.len);
+            if (!in_header and codec == .none) {
+                var one: [1]u8 = undefined;
+                _ = try file.preadAll(&one, end - 1);
+                last = one[0];
+                break;
+            }
+        }
+        return .{ .empty = last == null, .ends_nl = last == '\n', .header = head.items };
+    }
+
+    fn checkAppendHeader(arena: std.mem.Allocator, path: []const u8, line: []const u8, schema: types.Schema, d: Dialect) !void {
+        const have_line = trimCr(stripBom(line));
+        const have = try headerFields(arena, have_line, d);
+        const same = have.len == schema.fields.len and for (have, schema.fields) |h, f| {
+            if (!std.mem.eql(u8, h.name, f.name)) break false;
+        } else true;
+        if (same) return;
+        var want = std.array_list.Managed(u8).init(arena);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try want.append(d.delim);
+            try want.appendSlice(f.name);
+        }
+        return explainf(error.AppendHeaderMismatch, "`{s}` has the header `{s}`, but this APPEND writes `{s}` — appended rows must have the file's columns, in its order", .{ path, clip(have_line), clip(want.items) });
     }
 
     pub fn openStdout(arena: std.mem.Allocator, schema: types.Schema, dialect: Dialect) !*CsvWriter {
@@ -2197,6 +2267,43 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
         try std.testing.expectEqual(@as(i64, 7), back.columns[1].getValue(0).int);
         try std.testing.expectEqualDeep(c.first, back.columns[0].getValue(0));
     }
+}
+
+test "csv writer: an append ends a last line first, keeps the header it finds, writes one where none is" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = try typedSchema(a, &.{"a"}, &.{.int});
+    const batch = try parseSlice(a, &schema, "2\n");
+    const append = struct {
+        fn run(al: std.mem.Allocator, path: []const u8, s: types.Schema, b: Batch) !void {
+            const w = try CsvWriter.open(al, path, s, .append, .{});
+            try w.writeBatch(al, b);
+            try w.close();
+        }
+    }.run;
+
+    try tmp.dir.writeFile(.{ .sub_path = "ap.csv", .data = "a\n1" });
+    const ap = try tmp.dir.realpathAlloc(a, "ap.csv");
+    try append(a, ap, schema, batch);
+    try std.testing.expectEqualStrings("a\n1\n2\n", try tmp.dir.readFileAlloc(a, "ap.csv", 1024));
+
+    const gz_path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "ap.csv.gz" });
+    const gz_bytes = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try tmp.dir.writeFile(.{ .sub_path = "ap.csv.gz", .data = &gz_bytes });
+    try append(a, gz_path, schema, batch);
+    try append(a, gz_path, schema, batch);
+    const r = try CsvReader.open(a, gz_path, .{});
+    defer r.close();
+    try std.testing.expectEqualStrings("a", r.schema.fields[0].name);
+    try std.testing.expectEqual(@as(usize, 2), (try r.next(a)).?.len);
+
+    try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "b,a\nx,1\n" });
+    try std.testing.expectError(error.AppendHeaderMismatch, append(a, try tmp.dir.realpathAlloc(a, "m.csv"), schema, batch));
+    try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.AppendHeaderMismatch).?, "m.csv` has the header `b,a`, but this APPEND writes `a` — appended rows must have the file's columns, in its order"));
+    try std.testing.expectEqualStrings("b,a\nx,1\n", try tmp.dir.readFileAlloc(a, "m.csv", 1024));
 }
 
 test "csv writer: renderBatch produces exactly what writeBatch writes" {
