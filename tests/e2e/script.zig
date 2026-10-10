@@ -891,6 +891,40 @@ test "a plan failure carries the failing stage's position" {
     try std.testing.expectEqual(@as(u32, 7), rdiag.pos.?.col);
 }
 
+test "script-level refusals point at the offending declaration or name, in check and run alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "u.csv", .data = "name\nana\nbob\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const Case = struct { src: []const u8, line: u32, col: u32, check: bool = true };
+    const cases = [_]Case{
+        .{ .src = "LET b = 1 +\n  $a;\nLET a = 2;\nSELECT $b AS v;", .line = 2, .col = 3 },
+        .{ .src = "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nSELECT $a AS v;", .line = 2, .col = 1 },
+        .{ .src = "PARAM a INT DEFAULT 2;\n  LET a = 3;\nSELECT $a AS v;", .line = 2, .col = 3 },
+        .{ .src = "SELECT 1 AS v;\n  LET bad = 1 / 0;", .line = 2, .col = 3 },
+        .{ .src = "FOR EACH ROW OF ('$B/u.csv') AS (nm)\n  THROW 'boom ' || $nm WHEN $nm = 'bob';\nEND FOR;\nSELECT 1 AS v;", .line = 2, .col = 3, .check = false },
+    };
+    for (cases) |c| {
+        const script = try std.mem.replaceOwned(u8, alloc, c.src, "$B", base);
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        try std.testing.expect(std.meta.isError(run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+        try std.testing.expectEqual(c.line, rdiag.pos.?.line);
+        try std.testing.expectEqual(c.col, rdiag.pos.?.col);
+        if (!c.check) continue;
+        var adiag = analyze.Diag{};
+        try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+        try std.testing.expectEqual(c.line, adiag.pos.?.line);
+        try std.testing.expectEqual(c.col, adiag.pos.?.col);
+    }
+}
+
 test "a FOR EACH discovery query may read a table function, a derived table or a CTE" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

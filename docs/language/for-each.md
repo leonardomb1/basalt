@@ -87,6 +87,6 @@ The same holes are filled in every `'...'` string literal and file path of a
 statement, not only raw bodies: from the row's loop variables (or a statement
 function's parameters), else from the script's `PARAM`s and `LET`s — so
 `'lit ${x}'` reads `PARAM x` even outside any loop. A bare `${name}` that
-nothing binds is left as written, since a nested loop fills its own variables
-when its row renders; write `$name` in an expression to have an unbound name
-refused at plan time.
+nothing binds is left as written, so text that merely contains `${` passes
+through; write `$name` in an expression to have an unbound name refused at
+plan time.
