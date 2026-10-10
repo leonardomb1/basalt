@@ -156,12 +156,24 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
     if (agg.func == .count and agg.arg == null) return Partial{ .nvalid = b.len };
     if (foldsRowwise(agg.func)) return null;
     const e = agg.arg orelse return null;
+    if (agg.func == .sum and agg.ty.kind == .decimal) {
+        const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| {
+            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
+            return err;
+        };
+        if (fused) |f| return Partial{ .nvalid = f.nvalid, .sum_i = f.sum };
+    }
     const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| {
         if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
         return err;
     };
-    if (col.ty.kind != .int and col.ty.kind != .float) return null;
     const n = b.len;
+    if (col.ty.kind == .decimal) return switch (agg.func) {
+        .count => Partial{ .nvalid = simd.popcountValid(col.validity.bits, n) },
+        .sum => if (agg.ty.kind == .decimal) try sumDecimals(col, agg.ty.scale, n) else null,
+        else => null,
+    };
+    if (col.ty.kind != .int and col.ty.kind != .float) return null;
     const nvalid = simd.popcountValid(col.validity.bits, n);
     var p = Partial{ .nvalid = nvalid };
     if (nvalid == 0) return p;
@@ -179,6 +191,18 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
         .min, .max => p.ext = reduceExtreme(col, agg.func, n),
     }
     return p;
+}
+
+/// A batch's DECIMAL SUM with `addExact`'s normalization, each value at `scale`.
+fn sumDecimals(col: column.Column, scale: u8, n: usize) error{IntOverflow}!Partial {
+    const nvalid = simd.popcountValid(col.validity.bits, n);
+    var s: i128 = 0;
+    for (col.data.dec[0..n], 0..) |d, i| {
+        if (nvalid != n and !col.validity.get(i)) continue;
+        const u = if (d.scale == scale) d.unscaled else (eval.rescaleTo(d, scale) orelse return eval.decimalOverflow()).unscaled;
+        s = std.math.add(i128, s, u) catch return eval.decimalOverflow();
+    }
+    return .{ .nvalid = nvalid, .sum_i = s };
 }
 
 /// Whether `reduceBatch` leaves an aggregate to the row-wise fold, decided before
@@ -199,7 +223,7 @@ pub fn mergePartial(acc: *Acc, agg: Agg, p: Partial) error{IntOverflow}!void {
             if (agg.ty.kind == .float)
                 acc.sum_f += p.sum_f
             else
-                acc.sum_i = std.math.add(i128, acc.sum_i, p.sum_i) catch return error.IntOverflow;
+                acc.sum_i = std.math.add(i128, acc.sum_i, p.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
             acc.n += @intCast(p.nvalid);
         },
         .avg => if (p.nvalid > 0) {

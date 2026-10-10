@@ -446,9 +446,10 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     try bld.append(.{ .decimal = .{ .unscaled = 150, .scale = 2 } });
     try bld.append(.{ .decimal = .{ .unscaled = 1, .scale = 3 } });
     try bld.append(.null);
+    try bld.append(.{ .decimal = .{ .unscaled = 15, .scale = 7 } });
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try bld.finish();
-    const batches = [_]Batch{.{ .schema = &in_schema, .columns = cols, .len = 4 }};
+    const batches = [_]Batch{.{ .schema = &in_schema, .columns = cols, .len = 5 }};
 
     const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"n"} } };
     const aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = col_ty }};
@@ -460,7 +461,26 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     const out = (try agg.next(a)).?;
     const d = out.columns[0].getValue(0).decimal;
     try testing.expectEqual(@as(u8, 6), d.scale);
-    try testing.expectEqual(@as(i128, 3_001_000), d.unscaled);
+    try testing.expectEqual(@as(i128, 3_001_002), d.unscaled);
+
+    var rows = [_]Aggregate.Acc{.{}};
+    try agg.foldRowwise(a, batches[0], &rows);
+    var vecs = [_]Aggregate.Acc{.{}};
+    try testing.expect(try agg.foldVectorized(a, batches[0], &vecs));
+    try testing.expectEqual(rows[0].sum_i, vecs[0].sum_i);
+    try testing.expectEqual(rows[0].n, vecs[0].n);
+
+    const top: i128 = std.math.powi(i128, 10, 38) catch unreachable;
+    var big = column.Builder.init(a, types.Type.decimal(38, 0));
+    try big.append(.{ .decimal = .{ .unscaled = top - 1, .scale = 0 } });
+    try big.append(.{ .decimal = .{ .unscaled = top - 1, .scale = 0 } });
+    const big_cols = try a.alloc(column.Column, 1);
+    big_cols[0] = try big.finish();
+    const big_schema = types.Schema{ .fields = &.{.{ .name = "n", .ty = types.Type.decimal(38, 0) }} };
+    const big_aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = types.Type.decimal(38, 0) }};
+    var over = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &big_schema, .by = &.{}, .aggs = &big_aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
+    var acc = [_]Aggregate.Acc{.{}};
+    try testing.expectError(error.IntOverflow, over.foldVectorized(a, .{ .schema = &big_schema, .columns = big_cols, .len = 2 }, &acc));
 }
 
 test "aggregate: global vectorized reductions honor nulls; empty input edge cases" {

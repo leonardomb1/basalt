@@ -16,12 +16,16 @@ const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const decimalArithType = @import("row.zig").decimalArithType;
 const decimalOp = @import("row.zig").decimalOp;
+const decimalOverflow = @import("support.zig").decimalOverflow;
 const evalRow = @import("row.zig").evalRow;
 const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
+const rescaleTo = @import("cast.zig").rescaleTo;
+const simd = @import("../simd.zig");
 const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
+const max_digits = @import("cast.zig").max_digits;
 const orderF64 = @import("support.zig").orderF64;
 const parseIsoDate = @import("time.zig").parseIsoDate;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
@@ -316,10 +320,12 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             return numOpVec(arena, b.op, ln, rn, batch.len);
         },
         .eq, .ne, .lt, .le, .gt, .ge => {
+            if (try decOpCmpVec(arena, b, batch)) |v| return v;
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
             if (try intDecCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
+            if (try decColCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try decCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try asNum(arena, l, batch.len)) |ln| {
                 if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
@@ -690,32 +696,207 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
 fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
     const out = try arena.alloc(Decimal, n);
-    var bm = try Bitmap.initFull(arena, n);
-    var any = false;
-    for (0..n) |i| {
-        if (!vecValid(l, i) or !vecValid(r, i)) {
-            out[i] = .{ .unscaled = 0, .scale = ty.scale };
-            bm.setValid(i, false);
-            any = true;
-            continue;
-        }
-        out[i] = try (decimalOp(op, decAt(l, i), decAt(r, i)) orelse unreachable);
-    }
+    const bm = try bothValid(arena, l, r, n);
+    const any = !bm.allSet(n);
+    if (any) for (out, 0..) |*o, i| if (!bm.get(i)) {
+        o.* = .{ .unscaled = 0, .scale = ty.scale };
+    };
+    var sink = StoreSink{ .out = out };
+    try decApply(op, l, r, &sink, bm, any);
     return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
 }
 
-/// An INT column against a decimal constant (`x > 2.5`), exactly but on the int
-/// lane: the constant becomes the whole-number bound that decides the same rows.
-/// Null when the operands are not that shape or the bound passes INT's range.
-fn intDecCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
-    const flip = l == .scalar;
-    const col = if (flip) r else l;
-    const lit = if (flip) l else r;
-    if (col != .col or col.col.ty.kind != .int or lit != .scalar or lit.scalar != .decimal) return null;
-    const d = lit.scalar.decimal;
-    const p = std.math.powi(i128, 10, d.scale) catch return null;
-    const fl = @divFloor(d.unscaled, p);
-    const exact = @mod(d.unscaled, p) == 0;
+pub const DecSum = struct { sum: i128, nvalid: usize };
+
+/// `SUM(l op r)` over one batch as `addExact` adds it at `scale`, with no decimal
+/// column built between; null when `expr` is not a decimal operation.
+pub fn decSum(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scale: u8) EvalError!?DecSum {
+    return decSumVec(arena, expr, batch, scale) catch |e| switch (e) {
+        error.Unsupported => null,
+        else => |x| x,
+    };
+}
+
+fn decSumVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scale: u8) VecError!?DecSum {
+    if (expr.* != .binary) return null;
+    const b = expr.binary;
+    switch (b.op) {
+        .add, .sub, .mul, .div, .mod => {},
+        else => return null,
+    }
+    forgetFailure();
+    const l = try evalVec(arena, b.l, batch);
+    const r = try evalVec(arena, b.r, batch);
+    if (scalarNull(l) or scalarNull(r)) return null;
+    _ = decimalArithType(b.op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
+    const bm = try bothValid(arena, l, r, batch.len);
+    var sink = SumSink{ .scale = scale };
+    try decApply(b.op, l, r, &sink, bm, !bm.allSet(batch.len));
+    return .{ .sum = sink.sum, .nvalid = simd.popcountValid(bm.bits, batch.len) };
+}
+
+fn bothValid(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!Bitmap {
+    const bm = try Bitmap.initFull(arena, n);
+    for ([_]Vec{ l, r }) |v| if (v == .col) for (bm.bits, v.col.validity.bits[0..bm.bits.len]) |*o, x| {
+        o.* &= x;
+    };
+    return bm;
+}
+
+const StoreSink = struct {
+    out: []Decimal,
+
+    inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
+        self.out[i] = d;
+    }
+};
+
+const SumSink = struct {
+    sum: i128 = 0,
+    scale: u8,
+
+    inline fn put(self: *SumSink, _: usize, d: Decimal) VecError!void {
+        const u = if (d.scale == self.scale) d.unscaled else (rescaleTo(d, self.scale) orelse return decimalOverflow()).unscaled;
+        self.sum = std.math.add(i128, self.sum, u) catch return decimalOverflow();
+    }
+};
+
+/// Every valid row's `decimalOp` handed to `sink` in row order.
+fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bool) VecError!void {
+    const lanes = switch (op) {
+        inline .add, .sub, .mul, .mod => |cop| try decLanes(cop, l, r, sink, valid, any),
+        else => false,
+    };
+    if (!lanes) for (0..valid.len) |i| {
+        if (any and !valid.get(i)) continue;
+        try sink.put(i, try (decimalOp(op, decAt(l, i), decAt(r, i)) orelse unreachable));
+    };
+}
+
+const Side = enum { int, dec, one };
+
+fn sideOf(v: Vec) Side {
+    return switch (v) {
+        .scalar => .one,
+        .col => |c| if (c.ty.kind == .int) .int else .dec,
+    };
+}
+
+fn sideScale(v: Vec) u8 {
+    return switch (v) {
+        .scalar => |s| asDecimal(s).?.scale,
+        .col => |c| if (c.ty.kind == .int) 0 else c.ty.scale,
+    };
+}
+
+/// `decimalOp` over whole operands, each read at one scale (0 for an INT column, a
+/// decimal column's type scale) and brought to the result scale once. An element
+/// off its side's scale, or one i128 cannot settle, takes `decimalOp` itself, so
+/// values and errors match the row path. False when the shapes do not fit.
+fn decLanes(comptime op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bool) VecError!bool {
+    switch (sideOf(l)) {
+        inline else => |lk| switch (sideOf(r)) {
+            inline else => |rk| {
+                if (lk == .one and rk == .one) return false;
+                const ls = sideScale(l);
+                const rs = sideScale(r);
+                const s: u16 = if (op == .mul) @as(u16, ls) + rs else @max(ls, rs);
+                if (s > max_digits or (op != .mul and (s - ls > 18 or s - rs > 18))) return false;
+                const fl: i128 = if (op == .mul) 1 else pow10(@intCast(s - ls));
+                const fr: i128 = if (op == .mul) 1 else pow10(@intCast(s - rs));
+                const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, fl) catch return false else 0;
+                const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, fr) catch return false else 0;
+                const lane = DecLane{ .l = l, .r = r, .a = laneSrc(l, ls, fl, lc), .b = laneSrc(r, rs, fr, rc), .s = @intCast(s) };
+                const narrow = op == .mul and lk != .dec and rk != .dec and std.math.cast(i64, lc) != null and std.math.cast(i64, rc) != null;
+                if (narrow) try decLoop(op, lk, rk, true, lane, sink, valid, any) else try decLoop(op, lk, rk, false, lane, sink, valid, any);
+                return true;
+            },
+        },
+    }
+}
+
+const DecLane = struct { l: Vec, r: Vec, a: LaneSrc, b: LaneSrc, s: u8 };
+
+const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{}, scale: u8, f: i128, c: i128 };
+
+fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
+    return switch (v) {
+        .scalar => .{ .scale = scale, .f = f, .c = c },
+        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = col.data.dec, .scale = scale, .f = f, .c = c },
+    };
+}
+
+fn pow10(k: u8) i128 {
+    return std.math.powi(i128, 10, k) catch unreachable;
+}
+
+/// `narrow`: both sides fit i64, so a product is one widening multiply that
+/// cannot pass 38 digits.
+fn decLoop(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: DecLane, sink: anytype, valid: Bitmap, any: bool) VecError!void {
+    const limit: u128 = @intCast(pow10(max_digits));
+    const la = ln.a;
+    const lb = ln.b;
+    const s = ln.s;
+    for (0..valid.len) |i| {
+        if (any and !valid.get(i)) continue;
+        if (laneAt(op, lk, la, i)) |a| if (laneAt(op, rk, lb, i)) |b| {
+            const u: ?i128 = switch (op) {
+                .add => addOrNull(a, b),
+                .sub => subOrNull(a, b),
+                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else mulOrNull(a, b),
+                .mod => if (b == 0 or b == -1) null else @rem(a, b),
+                else => unreachable,
+            };
+            if (u) |x| if (narrow or @abs(x) < limit) {
+                try sink.put(i, .{ .unscaled = x, .scale = s });
+                continue;
+            };
+        };
+        try sink.put(i, try (decimalOp(op, decAt(ln.l, i), decAt(ln.r, i)) orelse unreachable));
+    }
+}
+
+inline fn laneAt(comptime op: ast.BinOp, comptime k: Side, src: LaneSrc, i: usize) ?i128 {
+    return switch (k) {
+        .one => src.c,
+        .int => if (op == .mul) src.ints[i] else @as(i128, src.ints[i]) * src.f,
+        .dec => blk: {
+            const d = src.decs[i];
+            if (d.scale != src.scale) break :blk null;
+            break :blk if (op == .mul or src.f == 1) d.unscaled else mulOrNull(d.unscaled, src.f);
+        },
+    };
+}
+
+inline fn addOrNull(a: i128, b: i128) ?i128 {
+    const r = @addWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+inline fn subOrNull(a: i128, b: i128) ?i128 {
+    const r = @subWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+inline fn mulOrNull(a: i128, b: i128) ?i128 {
+    const r = @mulWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+/// A comparison against constant `d` at a column's scale `sc` (`x > 2.5` over INT
+/// is `x > 2`): the operator and whole bound that decide the same rows, with the
+/// constant on the right. `never` is a bound no element falls below. Null when
+/// the bound passes i128.
+fn cmpBound(op: ast.BinOp, flip: bool, d: Decimal, sc: u8, never: i128) ?struct { op: ast.BinOp, bound: i128 } {
+    var fl: i128 = undefined;
+    var exact = true;
+    if (d.scale <= sc) {
+        fl = std.math.mul(i128, d.unscaled, pow10(sc - d.scale)) catch return null;
+    } else {
+        const p = std.math.powi(i128, 10, d.scale - sc) catch return null;
+        fl = @divFloor(d.unscaled, p);
+        exact = @mod(d.unscaled, p) == 0;
+    }
     const ce = if (exact) fl else fl + 1;
     const o: ast.BinOp = if (!flip) op else switch (op) {
         .lt => .gt,
@@ -724,19 +905,136 @@ fn intDecCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
         .ge => .le,
         else => op,
     };
-    const never = std.math.minInt(i64);
-    const pick: struct { op: ast.BinOp, bound: i128 } = switch (o) {
+    return switch (o) {
         .gt => .{ .op = .gt, .bound = fl },
         .ge => .{ .op = .ge, .bound = ce },
         .lt => .{ .op = .lt, .bound = ce },
         .le => .{ .op = .le, .bound = fl },
         .eq => if (exact) .{ .op = .eq, .bound = fl } else .{ .op = .lt, .bound = never },
         .ne => if (exact) .{ .op = .ne, .bound = fl } else .{ .op = .ge, .bound = never },
-        else => return null,
+        else => null,
     };
+}
+
+/// An INT column against a decimal constant (`x > 2.5`), exactly but on the int
+/// lane. Null when the operands are not that shape or the bound passes INT's range.
+fn intDecCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const flip = l == .scalar;
+    const col = if (flip) r else l;
+    const lit = if (flip) l else r;
+    if (col != .col or col.col.ty.kind != .int or lit != .scalar or lit.scalar != .decimal) return null;
+    const pick = cmpBound(op, flip, lit.scalar.decimal, 0, std.math.minInt(i64)) orelse return null;
     const bound = std.math.cast(i64, pick.bound) orelse return null;
     const ln = (try asNum(arena, col, n)).?;
     return try numOpVec(arena, pick.op, ln, .{ .iscalar = bound }, n);
+}
+
+/// A decimal operation against a numeric literal (`x * 0.5 > 100`), each row's
+/// result compared as it is made instead of built into a column first.
+fn decOpCmpVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecError!?Vec {
+    const flip = isNumLit(b.l);
+    const arith = if (flip) b.r else b.l;
+    if (!isNumLit(if (flip) b.l else b.r) or arith.* != .binary) return null;
+    const a = arith.binary;
+    switch (a.op) {
+        .add, .sub, .mul, .mod => {},
+        else => return null,
+    }
+    if (numKind(arith, batch) != .decimal) return null;
+    const lit = (try evalVecNode(arena, if (flip) b.l else b.r, batch)).scalar;
+    const l = try evalVec(arena, a.l, batch);
+    const r = try evalVec(arena, a.r, batch);
+    if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
+    _ = decimalArithType(a.op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
+    const n = batch.len;
+    const d = asDecimal(lit) orelse return null;
+    const sc: u16 = if (a.op == .mul) @as(u16, sideScale(l)) + sideScale(r) else @max(sideScale(l), sideScale(r));
+    const pick = if (sc <= max_digits) cmpBound(b.op, flip, d, @intCast(sc), std.math.minInt(i128)) else null;
+    const bm = try bothValid(arena, l, r, n);
+    const any = !bm.allSet(n);
+    var sink = CmpSink{
+        .out = try arena.alloc(bool, n),
+        .op = b.op,
+        .flip = flip,
+        .lit = d,
+        .scale = if (pick != null) @intCast(sc) else 0xFF,
+        .fast_op = if (pick) |p| p.op else b.op,
+        .bound = if (pick) |p| p.bound else 0,
+    };
+    if (any) @memset(sink.out, false);
+    try decApply(a.op, l, r, &sink, bm, any);
+    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = sink.out });
+}
+
+/// The numeric kind an arithmetic tree evaluates to, read off the batch without
+/// evaluating it; null for anything else.
+fn numKind(e: *const ast.Expr, batch: Batch) ?types.TypeKind {
+    return switch (e.*) {
+        .int_lit => .int,
+        .dec_lit => .decimal,
+        .float_lit => .float,
+        .field => |q| batch.columns[fieldIndex(batch.schema.*, q) orelse return null].ty.kind,
+        .binary => |b| switch (b.op) {
+            .add, .sub, .mul, .div, .mod => {
+                const lk = numKind(b.l, batch) orelse return null;
+                const rk = numKind(b.r, batch) orelse return null;
+                for ([_]types.TypeKind{ lk, rk }) |k| if (k != .int and k != .decimal and k != .float) return null;
+                if (lk == .float or rk == .float) return .float;
+                return if (lk == .decimal or rk == .decimal) .decimal else .int;
+            },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn isNumLit(e: *const ast.Expr) bool {
+    return e.* == .int_lit or e.* == .dec_lit;
+}
+
+const CmpSink = struct {
+    out: []bool,
+    op: ast.BinOp,
+    flip: bool,
+    lit: Decimal,
+    scale: u8,
+    fast_op: ast.BinOp,
+    bound: i128,
+
+    inline fn put(self: *CmpSink, i: usize, d: Decimal) VecError!void {
+        self.out[i] = if (d.scale == self.scale)
+            cmpResult(self.fast_op, std.math.order(d.unscaled, self.bound))
+        else
+            cmpResult(self.op, if (self.flip) self.lit.order(d) else d.order(self.lit));
+    }
+};
+
+/// A decimal column against an INT or decimal constant, compared on the unscaled
+/// values at the column's type scale; an element at another scale compares in full.
+fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const flip = l == .scalar;
+    const col = if (flip) r else l;
+    const lit = if (flip) l else r;
+    if (col != .col or col.col.ty.kind != .decimal or lit != .scalar) return null;
+    const d = asDecimal(lit.scalar) orelse return null;
+    const c = col.col;
+    const pick = cmpBound(op, flip, d, c.ty.scale, std.math.minInt(i128)) orelse return null;
+    const out = try arena.alloc(bool, n);
+    switch (pick.op) {
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec[0..n], out) |x, *o| {
+            o.* = if (x.scale == c.ty.scale)
+                cmpResult(cop, std.math.order(x.unscaled, pick.bound))
+            else
+                cmpResult(op, if (flip) d.order(x) else x.order(d));
+        },
+        else => unreachable,
+    }
+    const bm = Bitmap{ .bits = try arena.dupe(u8, c.validity.bits[0 .. (n + 7) / 8]), .len = n };
+    const any = !bm.allSet(n);
+    if (any) for (out, 0..) |*o, i| if (!bm.get(i)) {
+        o.* = false;
+    };
+    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
 }
 
 /// Exact comparison when one side is a decimal and the other a decimal or an int;
@@ -1414,4 +1712,110 @@ test "try_cast yields null exactly where cast raises" {
     const out = try evalColumn(a, e, batch, ty);
     try std.testing.expectEqual(@as(i64, 3), out.getValue(0).int);
     try std.testing.expect(out.getValue(1).isNull());
+}
+
+test "decimal arithmetic and comparisons on the vector lanes match the row path, values and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const dec_ty = Type.decimal(38, 2).asNullable();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+        .{ .name = "d", .ty = dec_ty },
+        .{ .name = "e", .ty = dec_ty },
+    } };
+    const top: i128 = std.math.powi(i128, 10, 38) catch unreachable;
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    const exprs = [_][]const u8{
+        "x * 0.5",                                          "0.5 * x",                                      "x * 1.25 + 3",
+        "x - 0.25",                                         "-1.25 - x",                                    "x % 7.5",
+        "x % 0.00",                                         "d * 2",                                        "d * x",
+        "d + e",                                            "d - e",                                        "d * e",
+        "d % e",                                            "d % -3.5",                                     "e + 99999999999999999999999999999999.99",
+        "x * 0.00000000000000000000000000000000001",        "d * 0.00000000000000000000000000000000000001", "x + 0.0000000000000000000001",
+        "d * -1",                                           "x * 9999999999999999999999.5",                 "x * 0.5 > 100",
+        "d > 2.5",                                          "2.5 < d",                                      "d = 1.5",
+        "d <> 1.505",                                       "d >= x",                                       "d <= -0.001",
+        "e < 3",                                            "d = 100000000000000000000000000000000000.5",   "100 < x * 0.5",
+        "x * 1.25 + 3 >= 50",                               "d * 2 = 5",                                    "d + e < -3.5",
+        "d * 0.00000000000000000000000000000000000001 > 0", "x % 7.5 <> 2",                                 "x % 0.00 > 1",
+        "e - x <= 0.001",
+    };
+    for (0..2) |round| {
+        const wide = round == 1;
+        const n = 160;
+        var xs: [n]?i64 = undefined;
+        var db = column.Builder.init(a, dec_ty);
+        var eb = column.Builder.init(a, dec_ty);
+        for (0..n) |i| {
+            xs[i] = switch (rnd.uintLessThan(u8, 10)) {
+                0 => null,
+                1 => if (wide) std.math.minInt(i64) else 0,
+                2 => if (wide) std.math.maxInt(i64) else -1,
+                else => if (wide) rnd.int(i64) else rnd.intRangeAtMost(i64, -100_000, 100_000),
+            };
+            for ([_]*column.Builder{ &db, &eb }) |b| {
+                const pick = rnd.uintLessThan(u8, 12);
+                if (pick == 0) {
+                    try b.append(.null);
+                    continue;
+                }
+                const scale: u8 = switch (pick) {
+                    1 => 0,
+                    2 => 5,
+                    else => 2,
+                };
+                const unscaled: i128 = if (!wide)
+                    rnd.intRangeAtMost(i128, -10_000_000, 10_000_000)
+                else switch (pick % 4) {
+                    0 => top - 1,
+                    1 => -(top - 1),
+                    else => rnd.intRangeAtMost(i128, -(top - 1), top - 1),
+                };
+                try b.append(.{ .decimal = .{ .unscaled = unscaled, .scale = scale } });
+            }
+        }
+        var cols = [_]column.Column{ try column.intColumn(a, &xs), try db.finish(), try eb.finish() };
+        const batch = Batch{ .schema = &schema, .columns = &cols, .len = n };
+        for (exprs) |src| {
+            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const e = try parser.parseExprStr(a, src, &diag);
+            var ctx = TypeCtx{ .schema = schema, .arena = a };
+            const ty = try ctx.typeOf(e);
+            if (evalVecNode(a, e, batch)) |_| {} else |err| try std.testing.expect(err != error.Unsupported);
+            const got = evalColumn(a, e, batch, ty) catch |err| {
+                const first = for (0..n) |i| {
+                    _ = evalRow(a, e, batch, i) catch |row_err| break row_err;
+                } else return error.TestUnexpectedResult;
+                try std.testing.expectEqual(first, err);
+                if (ty.kind == .decimal) try std.testing.expectError(first, decSum(a, e, batch, ty.scale));
+                continue;
+            };
+            var sum: ?i128 = 0;
+            var nvalid: usize = 0;
+            for (0..n) |i| {
+                const want = try evalRow(a, e, batch, i);
+                const have = got.getValue(i);
+                try std.testing.expectEqual(want.isNull(), have.isNull());
+                if (want.isNull()) continue;
+                switch (want) {
+                    .bool => |w| try std.testing.expectEqual(w, have.bool),
+                    .decimal => |w| {
+                        try std.testing.expectEqual(w.unscaled, have.decimal.unscaled);
+                        try std.testing.expectEqual(w.scale, have.decimal.scale);
+                        nvalid += 1;
+                        if (sum) |acc| sum = if (rescaleTo(w, ty.scale)) |x| std.math.add(i128, acc, x.unscaled) catch null else null;
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            }
+            if (ty.kind != .decimal) continue;
+            if (sum) |want| {
+                const got_sum = (try decSum(a, e, batch, ty.scale)).?;
+                try std.testing.expectEqual(want, got_sum.sum);
+                try std.testing.expectEqual(nvalid, got_sum.nvalid);
+            } else try std.testing.expectError(error.IntOverflow, decSum(a, e, batch, ty.scale));
+        }
+    }
 }

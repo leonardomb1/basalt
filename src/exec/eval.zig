@@ -351,6 +351,7 @@ pub fn comparable(a: Type, b: Type) bool {
 }
 
 pub const evalColumn = @import("eval/vec.zig").evalColumn;
+pub const decSum = @import("eval/vec.zig").decSum;
 const evalColumnRowwise = @import("eval/vec.zig").evalColumnRowwise;
 const evalVec = @import("eval/vec.zig").evalVec;
 const evalVecNode = @import("eval/vec.zig").evalVecNode;
