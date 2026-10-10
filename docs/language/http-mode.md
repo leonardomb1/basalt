@@ -27,7 +27,10 @@ WHERE tipo IN ('leitura', 'alarme');
 - **`FROM BODY (schema)`** declares the request contract. The body (JSON array
   or single object) is validated row by row: a missing/null `NOT NULL` column
   or an unreadable value rejects the request with a message naming the row —
-  served as **422**. Extra keys are dropped. `JSON` columns ride as text.
+  served as **422**. A value is read as `CAST` reads it: a `DATE`, `TIME` or
+  `TIMESTAMP` from its ISO text, a `DECIMAL` from text or a JSON number, a
+  `BOOL` from `true`/`false` (any case) or a number, `BYTES` from a string's
+  bytes. Extra keys are dropped. `JSON` columns ride as text.
 - **`FROM HEADER('X-Tenant')`** on a `PARAM` binds it from that request header
   (case-insensitive); bare `FROM HEADER` matches the param's own name. A param
   binds only from its declared source: `?tenant=` in the URL cannot stand in

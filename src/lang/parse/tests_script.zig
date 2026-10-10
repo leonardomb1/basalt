@@ -380,7 +380,7 @@ test "sql: http reads — GET/POST calls, connection clauses, resources" {
         \\PARAM code STRING DEFAULT 'br';
         \\CREATE RESOURCE rc.countries AS GET('/countries', region = 'europe')
         \\  PAGINATE BY page (param = 'p');
-        \\SELECT * FROM rc.GET('/alpha/' || $code, fields = 'name');
+        \\SELECT * FROM rc.GET('/alpha/' || $code, fields = 'name', since = NULL);
         \\SELECT * FROM rc.POST('/search', body = $$ {"q": 1} $$);
         \\SELECT * FROM rc.countries WITH (items = 'rows');
         \\SHOW TABLES FROM rc LIKE 'c%';
@@ -393,6 +393,7 @@ test "sql: http reads — GET/POST calls, connection clauses, resources" {
     try testing.expectEqualStrings("rc", get.node.read.connector);
     try testing.expectEqualStrings("/alpha/${code}", get.node.read.form.path);
     try testing.expectEqualStrings("name", hintStr(get.hints, "query:fields").?);
+    try testing.expect(hintStr(get.hints, "query:since") == null);
 
     const post = prog.stmts[4].output.stages[0];
     try testing.expectEqualStrings("/search", post.node.read.form.path);

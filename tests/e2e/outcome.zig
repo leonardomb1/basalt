@@ -91,6 +91,23 @@ test "onWire names a closed or failed database socket as transient, and leaves t
     try std.testing.expect(!isTransient(error.WriteFailed));
 }
 
+test "a cancel during an http read's first fetch reports as aborted, not as a failed read" {
+    const alloc = std.testing.allocator;
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), "SELECT x FROM HTTP('http://127.0.0.1:9/x');", &pdiag);
+    basalt.runtime.requestAbort();
+    defer basalt.runtime.resetAbort();
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.Aborted, run(alloc, prog, .{}, &rdiag));
+}
+
+test "a failed name lookup is transient, as the exit-code table says" {
+    try std.testing.expect(isTransient(error.UnknownHostName));
+    try std.testing.expect(isTransient(error.TemporaryNameServerFailure));
+}
+
 const LoadLog = struct {
     mu: std.Thread.Mutex = .{},
     arena: std.mem.Allocator,

@@ -16,7 +16,7 @@ A query reads from one source, named after `FROM`, and joins may read more
 | SFTP | `FROM 'sftp://bank/retorno/2026-10.csv'` — `bank` a `CREATE CONNECTION bank TYPE sftp` (below), or `sftp://user@host[:port]/path`; any file format, a trailing `/` a folder; `LOAD INTO 'sftp://…'` writes |
 | FTP | `FROM 'ftp://ftp.example.org/dados/arquivo.csv'` — anonymous, `ftp://user:pass@host/path`, or `ftp://name/path` through a `CREATE CONNECTION name TYPE ftp`; downloaded once per run, then read like a local file in any format; a trailing `/` a folder; read only ([FTP](../connectors/ftp.md)) |
 | Windows share (SMB) | `FROM 'smb://fs/share/2026-10.xlsx'` — `fs` a `CREATE CONNECTION fs TYPE smb` (below), or `smb://[domain;]user@host/share/path`; any file format, a trailing `/` a folder; `LOAD INTO 'smb://…'` writes |
-| REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param, and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
+| REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param (`name = NULL` leaves it out), and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
 | REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` ([HTTP APIs](../connectors/http.md)) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
 | request body | `FROM BODY (col TYPE [NOT NULL], ...)` ([HTTP mode](http-mode.md)) |
@@ -70,7 +70,9 @@ source is asked to do are on [Pushdown](pushdown.md).
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
   `size`→`page_size`, `total`→`total_field`, `field`→`cursor_field`,
-  `start`→`start_page`, `max`→`max_pages`); unknown keys pass through.
+  `start`→`start_page`, `max`→`max_pages`); unknown keys pass through. A
+  cursor that is a full `http(s)://` URL is fetched as given; any other is
+  URL-encoded into the cursor parameter.
 - **`RETRY n [ON (429, 503)]`** — retries + retryable statuses.
 - **`WITH (delimiter = ';', encoding = 'latin1')`** — the CSV dialect. The
   delimiter is one character, or the word `tab`; the encodings are `utf8`
@@ -165,5 +167,7 @@ WHERE downloads > 0;
 The rows are the array at `items` (or the response itself); a single object —
 a detail endpoint's answer — is one row. Columns are typed from the first
 object: numbers, booleans and strings as themselves, nested objects and arrays
-as JSON text, which `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
-apart.
+as JSON text. A later row's value is read into its column as `CAST` would read
+it, and one that cannot be — `"yes"` in a `BOOL` column, `1e300` in an `INT` —
+is `NULL` rather than a guess. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
+the nested JSON text apart.

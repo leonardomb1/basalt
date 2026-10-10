@@ -11,6 +11,7 @@ const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
+const eval = @import("../exec/eval.zig");
 
 const json = std.json;
 
@@ -101,7 +102,8 @@ pub fn schemaFromBodyCols(arena: std.mem.Allocator, cols: []const types.BodyCol)
 }
 
 /// Strict pass before the lenient `coerce`: a missing or null required column, or a
-/// value the declared type cannot read, fails the whole request at the first bad row.
+/// value the declared type cannot read (by `readJson`), fails the whole request at the
+/// first bad row.
 pub fn validateBody(
     items: []const json.Value,
     cols: []const types.BodyCol,
@@ -123,40 +125,12 @@ pub fn validateBody(
                 }
                 continue;
             }
-            if (!coercible(jv.?, c.ty.kind)) {
+            if (c.ty.kind != .string and try readJson(msg_arena, jv.?, c.ty) == null) {
                 msg_out.* = try std.fmt.allocPrint(msg_arena, "body row {d}: column `{s}` cannot be read as {s}", .{ i, c.name, @tagName(c.ty.kind) });
                 return error.BodySchemaViolation;
             }
         }
     }
-}
-
-fn coercible(v: json.Value, kind: types.TypeKind) bool {
-    return switch (kind) {
-        .int => switch (v) {
-            .integer, .bool => true,
-            .float => true,
-            .string => |s| blk: {
-                _ = std.fmt.parseInt(i64, s, 10) catch break :blk false;
-                break :blk true;
-            },
-            else => false,
-        },
-        .float => switch (v) {
-            .float, .integer => true,
-            .number_string, .string => |s| blk: {
-                _ = std.fmt.parseFloat(f64, s) catch break :blk false;
-                break :blk true;
-            },
-            else => false,
-        },
-        .bool => switch (v) {
-            .bool, .integer => true,
-            .string => true,
-            else => false,
-        },
-        else => true,
-    };
 }
 
 /// Schema from the first object's keys and value types, all nullable. Shared by
@@ -200,31 +174,33 @@ fn inferType(v: json.Value) types.Type {
     }).asNullable();
 }
 
+/// A value the column's type cannot read becomes null, so an inferred schema survives
+/// later rows that drift; a declared schema rejected such rows in `validateBody`.
 fn coerce(arena: std.mem.Allocator, jv: ?json.Value, ty: types.Type) !Value {
     const v = jv orelse return .null;
+    return try readJson(arena, v, ty) orelse .null;
+}
+
+/// A JSON value as `ty`, read as CAST reads it (strings as text, numbers and booleans
+/// as themselves); null when the type cannot read it. Strings keep any value as text,
+/// BYTES takes a string's raw bytes.
+fn readJson(arena: std.mem.Allocator, v: json.Value, ty: types.Type) !?Value {
     if (v == .null) return .null;
-    return switch (ty.kind) {
-        .int => switch (v) {
-            .integer => |x| .{ .int = x },
-            .float => |x| .{ .int = @intFromFloat(x) },
-            .bool => |x| .{ .int = if (x) 1 else 0 },
-            .string => |s| .{ .int = std.fmt.parseInt(i64, s, 10) catch return .null },
-            else => .null,
-        },
-        .float => switch (v) {
-            .float => |x| .{ .float = x },
-            .integer => |x| .{ .float = @floatFromInt(x) },
-            .number_string, .string => |s| .{ .float = std.fmt.parseFloat(f64, s) catch return .null },
-            else => .null,
-        },
-        .bool => switch (v) {
-            .bool => |x| .{ .bool = x },
-            .integer => |x| .{ .bool = x != 0 },
-            .string => |s| .{ .bool = std.mem.eql(u8, s, "true") },
-            else => .null,
-        },
-        .string => .{ .string = try jsonToString(arena, v) },
-        else => .null,
+    switch (ty.kind) {
+        .string => return .{ .string = try jsonToString(arena, v) },
+        .bytes => return if (v == .string) .{ .bytes = try arena.dupe(u8, v.string) } else null,
+        else => {},
+    }
+    const src: Value = switch (v) {
+        .integer => |x| .{ .int = x },
+        .float => |x| .{ .float = x },
+        .bool => |x| .{ .bool = x },
+        .string, .number_string => |s| .{ .string = s },
+        else => return null,
+    };
+    return eval.castValueTyped(arena, src, ty) catch |e| switch (e) {
+        error.OutOfMemory => e,
+        else => null,
     };
 }
 
@@ -361,4 +337,66 @@ test "inferred schema: object payloads type as string and keep JSON text" {
     try std.testing.expectEqualStrings(
         \\{"a":[1,2]}
     , s.batch.columns[1].getValue(0).string);
+}
+
+test "declared body columns read as CAST reads them; unreadable values are rejected" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decl = [_]types.BodyCol{
+        .{ .name = "d", .ty = types.Type.init(.date), .not_null = true },
+        .{ .name = "m", .ty = types.Type.decimal(10, 2), .not_null = true },
+        .{ .name = "ts", .ty = types.Type.init(.timestamp) },
+        .{ .name = "t", .ty = types.Type.init(.time) },
+        .{ .name = "b", .ty = types.Type.init(.bytes) },
+        .{ .name = "ok", .ty = types.Type.init(.bool) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    };
+    var msg: []const u8 = "";
+    var s = try RequestSource.open(gpa,
+        \\[{"d":"2026-02-01","m":"1.25","ts":"2026-02-01 10:00:00","t":"10:30","b":"xy","ok":"TRUE","n":"7"},
+        \\ {"d":"2026-02-02","m":3.5,"ok":true,"n":2.0}]
+    , &decl, a, &msg);
+    defer s.close();
+    try std.testing.expectEqual(@as(i32, 20485), s.batch.columns[0].getValue(0).date);
+    try std.testing.expectEqual(@as(i128, 125), s.batch.columns[1].getValue(0).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 350), s.batch.columns[1].getValue(1).decimal.unscaled);
+    try std.testing.expect(!s.batch.columns[2].getValue(0).isNull());
+    try std.testing.expectEqual(@as(i64, 37_800_000_000), s.batch.columns[3].getValue(0).time);
+    try std.testing.expectEqualStrings("xy", s.batch.columns[4].getValue(0).bytes);
+    try std.testing.expect(s.batch.columns[5].getValue(0).bool);
+    try std.testing.expectEqual(@as(i64, 7), s.batch.columns[6].getValue(0).int);
+
+    const bad = [_][]const u8{
+        \\{"d":"garbage","m":"1"}
+        ,
+        \\{"d":"2026-02-01","m":"1,5"}
+        ,
+        \\{"d":"2026-02-01","m":"1","ok":"yes"}
+        ,
+        \\{"d":"2026-02-01","m":"1","ok":"maybe"}
+        ,
+        \\{"d":"2026-02-01","m":"1","n":1e300}
+        ,
+        \\{"d":"2026-02-01","m":"1","b":5}
+        ,
+    };
+    for (bad) |body| {
+        try std.testing.expectError(error.BodySchemaViolation, RequestSource.open(gpa, body, &decl, a, &msg));
+        try std.testing.expect(std.mem.indexOf(u8, msg, "row 0") != null);
+    }
+}
+
+test "inferred schema: a later value its column cannot read is null, not a guess" {
+    const gpa = std.testing.allocator;
+    var msg: []const u8 = "";
+    var s = try RequestSource.open(gpa,
+        \\[{"ok":true,"n":1},{"ok":"yes","n":1e300},{"ok":"str","n":"9"}]
+    , null, gpa, &msg);
+    defer s.close();
+    try std.testing.expect(s.batch.columns[0].getValue(1).isNull());
+    try std.testing.expect(s.batch.columns[0].getValue(2).isNull());
+    try std.testing.expect(s.batch.columns[1].getValue(1).isNull());
+    try std.testing.expectEqual(@as(i64, 9), s.batch.columns[1].getValue(2).int);
 }

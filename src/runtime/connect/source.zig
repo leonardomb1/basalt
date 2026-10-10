@@ -13,6 +13,7 @@ const connectWhy = @import("dbconfig.zig").connectWhy;
 const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
+const eval = @import("../../exec/eval.zig");
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const folder = @import("../../connect/folder.zig");
 const forHintName = @import("../env.zig").forHintName;
@@ -254,7 +255,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var hopts = http_client.optsFromHints(hints);
         hopts.logger = env.log;
         const s = http_client.HttpSource.open(env.arena, env.gpa, rd.form.path, hopts) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ rd.form.path, @errorName(e) }));
+            return httpOpenFailed(env, e, rd.form.path);
         return s.source();
     }
     if (std.mem.eql(u8, rd.connector, "unit")) {
@@ -339,7 +340,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
         const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, path, hopts) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ path, @errorName(e) }));
+            return httpOpenFailed(env, e, path);
         return s.source();
     }
     if (sqlConnInfo(conn)) |info| {
@@ -361,6 +362,17 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         }
     }
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
+}
+
+/// A failed first fetch as a plan error naming the URL and status; a cancel stays
+/// `Aborted` so the run reports it as cancelled, not failed.
+fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
+    if (e == error.Aborted) return e;
+    const msg = if (eval.takeFailure(e)) |why|
+        try std.fmt.allocPrint(env.arena, "http read failed: {s} ({s})", .{ why, @errorName(e) })
+    else
+        try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ url, @errorName(e) });
+    return planErrT(env.diag, e, msg);
 }
 
 /// Params substitute as literals; a leading `-` is folded here since `substExpr`

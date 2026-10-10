@@ -804,7 +804,7 @@ fn runScript(
     const elapsed: u64 = @intCast(std.time.milliTimestamp() - t0);
     const e = failed orelse return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads });
     if (e == error.OutOfMemory) return error.OutOfMemory;
-    if (e == error.Aborted) {
+    if (e == error.Aborted or runtime.aborting()) {
         runtime.resetAbort();
         return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads });
     }
