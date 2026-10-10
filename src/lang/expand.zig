@@ -275,11 +275,12 @@ fn mkNull(cx: *Ctx) Error!*ast.Expr {
 }
 
 /// A literal of the leaf scalar at `path`. An unbound binding (offline `check`)
-/// yields `null`; a missing key or non-scalar leaf at run time is an error.
+/// yields `null`; a missing key or non-scalar leaf at run time is an error. A `?.`
+/// makes both keys beside it optional: `filtro?.uf` is null when `filtro` is missing.
 fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8, safe: []const bool) Error!*ast.Expr {
     var cur = maybe_val orelse return mkNull(cx);
     for (path, 0..) |key, i| {
-        const seg_safe = i < safe.len and safe[i];
+        const seg_safe = (i < safe.len and safe[i]) or (i + 1 < safe.len and safe[i + 1]);
         switch (cur) {
             .object => |o| cur = o.get(key) orelse {
                 if (seg_safe) return mkNull(cx);
@@ -719,6 +720,13 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
     var m2: []const u8 = "";
     const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
     try std.testing.expect(outputSelect(o2)[0].computed.expr.* == .null_lit);
+
+    var d4 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p4 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.filtro?.uf AS h FROM 'x';", &d4);
+    var m4: []const u8 = "";
+    const o4 = try expandProgram(a, p4, "{\"a\":1}", &m4);
+    try std.testing.expect(outputSelect(o4)[0].computed.expr.* == .null_lit);
 
     var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const p3 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
