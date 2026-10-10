@@ -799,7 +799,7 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },
-        .{ .q = "SELECT g, SUM(v) FROM 'x.csv' GROUP BY g ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
+        .{ .q = "SELECT g FROM 'x.csv' ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
     };
     for (cases) |c| {
         var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };

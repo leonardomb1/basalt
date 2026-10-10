@@ -415,3 +415,37 @@ test "GROUP BY, HAVING and ORDER BY bind only the same expression; unselected ke
         try std.testing.expectEqualStrings(c.want, got);
     }
 }
+
+test "an expression over grouping expressions sits in SELECT, HAVING and ORDER BY; ORDER BY may add aggregates of its own" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const t_csv = "g,x\nab,1\nAb,5\ncd,2\ncd,10\nef,3\n";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT upper(g), COUNT(*) AS n, lower(upper(g)) || 'x' AS z FROM '$IN' GROUP BY upper(g) ORDER BY 1", .want = "upper(g),n,z\nAB,2,abx\nCD,2,cdx\nEF,1,efx\n" },
+        .{ .q = "SELECT COUNT(*) AS n, lower(upper(g)) AS z FROM '$IN' GROUP BY upper(g) HAVING lower(upper(g)) <> 'ef' ORDER BY lower(upper(g)) DESC", .want = "n,z\n2,cd\n2,ab\n" },
+        .{ .q = "SELECT g || '!' AS z, upper(g) || COUNT(*) AS w FROM '$IN' GROUP BY g ORDER BY g", .want = "z,w\nAb!,AB1\nab!,AB1\ncd!,CD2\nef!,EF1\n" },
+        .{ .q = "SELECT g, SUM(x) AS s FROM '$IN' GROUP BY g ORDER BY SUM(x) / COUNT(*) DESC, MAX(x)", .want = "g,s\ncd,12\nAb,5\nef,3\nab,1\n" },
+        .{ .q = "SELECT g FROM '$IN' GROUP BY g HAVING COUNT(*) > 0 ORDER BY MIN(x) DESC LIMIT 2", .want = "g\nAb\nef\n" },
+        .{ .q = "SELECT COUNT(*) AS n FROM '$IN' GROUP BY upper(g) ORDER BY MAX(x) + 0", .want = "n\n1\n2\n2\n" },
+        .{ .q = "SELECT SUM(x) AS s FROM '$IN' ORDER BY MAX(x)", .want = "s\n21\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, t_csv, c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const refused = [_][2][]const u8{
+        .{ "SELECT upper(g), lower(g) FROM 'in.csv' GROUP BY upper(g);", "`g` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY" },
+        .{ "SELECT count(*) FROM 'in.csv' GROUP BY upper(g) HAVING g > 'a';", "`g` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY" },
+        .{ "SELECT g, count(*) FROM 'in.csv' GROUP BY g ORDER BY max(x) + x;", "`x` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY" },
+        .{ "SELECT DISTINCT g, count(*) FROM 'in.csv' GROUP BY g ORDER BY max(x);", "with SELECT DISTINCT, an aggregate in ORDER BY must be one the SELECT list computes" },
+    };
+    for (refused) |r| {
+        try std.testing.expectError(error.ParseFailed, parser.parseSource(ar.allocator(), r[0], &pdiag));
+        try std.testing.expectEqualStrings(r[1], pdiag.msg);
+    }
+}

@@ -27,7 +27,7 @@ LIMIT 100 OFFSET 20;
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant; a `GROUP BY` with no aggregate in `SELECT` or `HAVING` and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text answers a `FLOAT`, as `AVG` does; `SUM(CAST(x AS DECIMAL(18,2)))` keeps money exact |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, an expression whose columns are all covered by grouping keys or grouping expressions it repeats (`lower(upper(g))` under `GROUP BY upper(g)`; see [Aggregates](aggregates.md)), or a plan-time constant; a `GROUP BY` with no aggregate in `SELECT` or `HAVING` and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text answers a `FLOAT`, as `AVG` does; `SUM(CAST(x AS DECIMAL(18,2)))` keeps money exact |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. A NaN orders above every number, as in `ORDER BY` and Postgres, so it is the median only when the middle falls on one. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down) |
@@ -106,5 +106,8 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 - `ORDER BY` may name a column the `SELECT` list does not project, or an
   expression over the columns (`ORDER BY price - discount`). It is carried
   through the projection as a hidden column and dropped after the `LIMIT`, so
-  sorting by it costs nothing in the output. An aggregate in `ORDER BY` must
-  repeat one the `SELECT` list computes.
+  sorting by it costs nothing in the output. In a grouped query `ORDER BY` may
+  also name an aggregate the `SELECT` list leaves out (`ORDER BY MAX(x)`,
+  `ORDER BY SUM(x) / COUNT(*) DESC`), computed beside the others and dropped
+  the same way; under `SELECT DISTINCT` or after a set operation it must repeat
+  one the list computes.

@@ -706,6 +706,7 @@ pub const Parser = struct {
         union_branch: ?BranchInfo,
         expr_aliases: []const ExprAlias = &.{},
         out_keys: ?[]const ast.QualName = null,
+        group: ?[]const ast.QualName = null,
     };
 
     pub const parseSelectCore = @import("parse/query.zig").parseSelectCore;

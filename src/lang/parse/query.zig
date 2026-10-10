@@ -192,10 +192,13 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
 
     const first = try self.parseSelectCore();
 
-    if (self.isKw("union") or self.isKw("intersect") or self.isKw("except")) {
+    var grouped: ?[]const ast.QualName = null;
+    const set_op = self.isKw("union") or self.isKw("intersect") or self.isKw("except");
+    if (set_op) {
         try self.parseUnionTail(first, stages);
     } else {
         try stages.appendSlice(first.stages);
+        if (stages.items[stages.items.len - 1].node != .distinct) grouped = first.group;
     }
 
     var hidden_drop: ?[]const ast.SelectItem = null;
@@ -208,6 +211,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         var stripped = std.array_list.Managed(bool).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        var sort_aggs = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
             var q: ast.QualName = undefined;
             var was_qual = false;
@@ -245,10 +249,21 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         const b = try self.bindName(e, first.expr_aliases);
                         q = try self.singleName(b.name);
                         if (!b.item) {
-                            if (containsAgg(e))
-                                return self.fail(kpos, "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
-                            if (!providesName(computed.items, b.name))
-                                try computed.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(e, &first.aliases) } });
+                            if (grouped) |g| {
+                                const r = try groupedSortKey(self, e, g, first, stages.items, &sort_aggs, kpos);
+                                if (r.* == .field and r.field.parts.len == 1) {
+                                    q = r.field;
+                                } else if (!providesName(computed.items, b.name)) {
+                                    try computed.append(.{ .computed = .{ .name = b.name, .expr = r } });
+                                }
+                            } else {
+                                if (containsAgg(e) and first.group != null and !set_op)
+                                    return self.fail(kpos, "with SELECT DISTINCT, an aggregate in ORDER BY must be one the SELECT list computes", .{});
+                                if (containsAgg(e))
+                                    return self.fail(kpos, "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
+                                if (!providesName(computed.items, b.name))
+                                    try computed.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(e, &first.aliases) } });
+                            }
                         }
                     },
                 }
@@ -315,18 +330,21 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 }
             }
         }
-        if (!extend_proj and computed.items.len > 0) {
-            const tail = stages.items[stages.items.len - 1].node;
-            if (visible != null or (tail == .distinct and tail.distinct.on != null))
-                return self.fail(self.curPos(), "ORDER BY with DISTINCT ON sorts by columns or SELECT items, not by a new expression — add it to the SELECT list", .{});
-            var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        if (!extend_proj and (computed.items.len > 0 or sort_aggs.items.len > 0)) {
             var names = std.array_list.Managed([]const u8).init(self.arena);
-            try ext.append(.star);
-            for (computed.items) |c| {
-                try ext.append(c);
-                try names.append(c.computed.name);
+            try names.appendSlice(sort_aggs.items);
+            if (computed.items.len > 0) {
+                const tail = stages.items[stages.items.len - 1].node;
+                if (visible != null or (tail == .distinct and tail.distinct.on != null))
+                    return self.fail(self.curPos(), "ORDER BY with DISTINCT ON sorts by columns or SELECT items, not by a new expression — add it to the SELECT list", .{});
+                var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+                try ext.append(.star);
+                for (computed.items) |c| {
+                    try ext.append(c);
+                    try names.append(c.computed.name);
+                }
+                try stages.append(.{ .node = .{ .select = try ext.toOwnedSlice() }, .hints = &.{}, .pos = self.curPos() });
             }
-            try stages.append(.{ .node = .{ .select = try ext.toOwnedSlice() }, .hints = &.{}, .pos = self.curPos() });
             const drop = try self.arena.alloc(ast.SelectItem, 1);
             drop[0] = .{ .star_except = try names.toOwnedSlice() };
             hidden_drop = drop;
@@ -346,6 +364,47 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
 
     if (hidden_drop) |keep|
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
+}
+
+/// An ORDER BY expression of a grouped query, read past the aggregate: a grouping
+/// expression it spells is that key's column, an aggregate the SELECT list leaves out
+/// is computed beside the others and named in `added` (dropped after the LIMIT, as
+/// HAVING's are), and any other column is refused, as in the SELECT list.
+fn groupedSortKey(self: *Parser, e: *ast.Expr, group: []const ast.QualName, first: Core, stages: []ast.Stage, added: *std.array_list.Managed([]const u8), pos: Pos) Error!*ast.Expr {
+    const keyed = try self.stripExpr(try self.groupKeyRefs(e, group, first.expr_aliases), &first.aliases);
+    var ai = stages.len;
+    while (ai > 0 and stages[ai - 1].node != .aggregate) ai -= 1;
+    if (ai == 0) return keyed;
+    const ag = &stages[ai - 1].node.aggregate;
+    var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
+    try aggs.appendSlice(ag.aggs);
+    const r = try self.liftAggs(keyed, &aggs, first.expr_aliases, pos);
+    try self.groupedOnly(r, group, aggs.items, &.{}, pos);
+    if (aggs.items.len == ag.aggs.len) return r;
+    for (aggs.items[ag.aggs.len..]) |a| {
+        if (a.distinct and a.func != .count)
+            return self.fail(pos, "DISTINCT is only supported inside COUNT", .{});
+        try added.append(a.name);
+        if (a.arg) |arg| try carryAggInput(self, stages, ai - 1, arg);
+    }
+    ag.aggs = try aggs.toOwnedSlice();
+    return r;
+}
+
+/// The columns `arg` reads, added to the projection the aggregate at `ai` reads
+/// through when it names its columns one by one.
+fn carryAggInput(self: *Parser, stages: []ast.Stage, ai: usize, arg: *const ast.Expr) Error!void {
+    if (ai == 0 or stages[ai - 1].node != .select) return;
+    const pre = stages[ai - 1].node.select;
+    for (pre) |it| if (it != .field and it != .computed) return;
+    var needed = std.array_list.Managed(ast.QualName).init(self.arena);
+    try self.collectFields(arg, &needed);
+    var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+    try ext.appendSlice(pre);
+    for (needed.items) |q| {
+        if (q.parts.len == 1 and !q.dollar and !providesName(ext.items, q.last())) try ext.append(.{ .field = q });
+    }
+    stages[ai - 1].node = .{ .select = try ext.toOwnedSlice() };
 }
 
 /// `LIMIT n|ALL`, `OFFSET m [ROWS]` and `FETCH FIRST|NEXT [n] ROWS ONLY`, OFFSET before
@@ -1039,13 +1098,22 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         }
                     }
                     if (containsAgg(stripped)) {
-                        const outer = try self.liftAggs(stripped, &aggs, expr_aliases.items, pos);
+                        const keyed = if (group.len > 0) try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases) else stripped;
+                        const outer = try self.liftAggs(keyed, &aggs, expr_aliases.items, pos);
+                        try self.groupedOnly(outer, group, aggs.items, &.{}, pos);
                         try post.append(.{ .computed = .{ .name = c.name, .expr = outer } });
                         lifted = true;
                         continue;
                     }
                     if (group.len > 0 and stripped.* == .field and isGroupKey(group, stripped.field)) {
                         try post.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
+                        lifted = true;
+                        continue;
+                    }
+                    if (group.len > 0 and !isGroupKey(group, try self.singleName(c.name)) and !self.constItemExpr(stripped)) {
+                        const keyed = try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases);
+                        try self.groupedOnly(keyed, group, aggs.items, &.{}, pos);
+                        try post.append(.{ .computed = .{ .name = c.name, .expr = keyed } });
                         lifted = true;
                         continue;
                     }
@@ -1174,7 +1242,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             .pos = pos,
         });
         if (having) |h| {
-            const hf = try self.havingRewrite(h, expr_aliases.items);
+            const keyed = if (group.len > 0) try self.groupKeyRefs(h, group, expr_aliases.items) else h;
+            const hf = try self.stripExpr(try self.havingRewrite(keyed, expr_aliases.items), &aliases);
+            try self.groupedOnly(hf, group, aggs_out, &.{}, pos);
             try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
         }
         if (!lifted and aggOrderDiffers(post.items, group, aggs_out)) lifted = true;
@@ -1247,7 +1317,14 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     try self.settleQuals(quals.items, &aliases, outer_quals);
-    return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice(), .out_keys = out_keys };
+    return .{
+        .stages = try stages.toOwnedSlice(),
+        .aliases = aliases,
+        .union_branch = union_branch,
+        .expr_aliases = try expr_aliases.toOwnedSlice(),
+        .out_keys = out_keys,
+        .group = if (agg_mode and win_calls.items.len == 0) group else null,
+    };
 }
 
 const KeySide = enum { left, right, loose };

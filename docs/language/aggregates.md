@@ -31,6 +31,28 @@ FROM 'orders.parquet' GROUP BY region;
 A plain *column* still may not: it has no single value per group, so it must be
 wrapped in an aggregate or named in `GROUP BY`.
 
+An expression is fine when every column in it is covered: by a grouping key, or
+by a grouping *expression* it repeats, which then counts as one value per group as
+SQL has it. The same holds in `HAVING` and `ORDER BY`, and an aggregate may sit
+inside such an expression:
+
+```sql
+SELECT upper(region) AS r, lower(upper(region)) || '-x' AS tag,
+       upper(region) || ': ' || COUNT(*) AS label
+FROM 'orders.parquet'
+GROUP BY upper(region)
+HAVING lower(upper(region)) <> 'north';
+```
+
+`lower(region)` there is refused: `region` itself is not grouped, only
+`upper(region)` is.
+
+`ORDER BY` may also sort by an aggregate the `SELECT` list does not compute —
+`ORDER BY MAX(amount) DESC`, `ORDER BY SUM(amount) / COUNT(*)` — which is
+computed beside the others and dropped after the `LIMIT`, as an aggregate only
+`HAVING` names is. Under `SELECT DISTINCT` it must be one of the list's, as SQL
+requires, and after a `UNION` it must name an output column.
+
 ## FILTER
 
 Any aggregate takes `FILTER (WHERE <condition>)`, folding only the rows where the
