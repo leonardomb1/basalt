@@ -1,7 +1,8 @@
 //! HTTP trigger host for `@http` scripts. Each matching request runs the pipeline
 //! once: query-string values bind params, the request body feeds `read request`,
-//! and the response is a JSON run summary. Single-threaded accept loop (one request
-//! at a time); scale out with replicas behind a load balancer.
+//! and the response is a JSON run summary. A thread per connection keeps the health
+//! probes answering, but pipeline runs go one at a time; scale out with replicas
+//! behind a load balancer.
 //!
 //! Two entry points: `serve` hosts a single program; `serveDir` hosts every `@http`
 //! script in a directory, routing by each script's declared `@http(path=…)` and
@@ -222,12 +223,16 @@ fn listen(host: []const u8, port: u16) !std.net.Server {
     return net_server;
 }
 
-/// Answer a request whose head could not be read: 431 when it overflows the read
-/// buffer, 400 when it is not valid HTTP; nothing when the client went away.
-fn rejectHead(out: *std.Io.Writer, err: std.http.Server.ReceiveHeadError) void {
+/// Answer a request whose head (`seen`, the bytes read of it) could not be read:
+/// 431 when its headers overflow the read buffer, 400 when its request line does
+/// or it is not valid or complete HTTP; nothing when the client sent nothing.
+fn rejectHead(out: *std.Io.Writer, err: std.http.Server.ReceiveHeadError, seen: []const u8) void {
     const status: std.http.Status, const msg: []const u8 = switch (err) {
-        error.HttpHeadersOversize => .{ .request_header_fields_too_large, "request head over the 64 KiB limit" },
-        error.HttpHeadersInvalid => .{ .bad_request, "malformed HTTP request" },
+        error.HttpHeadersOversize => if (std.mem.indexOfScalar(u8, seen, '\n') == null)
+            .{ .bad_request, "request line over the 64 KiB limit" }
+        else
+            .{ .request_header_fields_too_large, "request head over the 64 KiB limit" },
+        error.HttpHeadersInvalid, error.HttpRequestTruncated => .{ .bad_request, "malformed HTTP request" },
         else => return,
     };
     const prefix = "{\"status\":\"error\",\"retryable\":false,\"error\":\"";
@@ -260,14 +265,45 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, por
     var net_server = try listen(host, port);
     defer net_server.deinit();
     banner(net_server.listen_address, &routes);
-    const threads = std.Thread.getCpuCount() catch 1;
-    var read_buf: [64 * 1024]u8 = undefined;
+    var conns = Conns{ .gpa = gpa, .routes = &routes, .threads = std.Thread.getCpuCount() catch 1 };
+    defer conns.drain();
     while (!runtime.aborting()) {
         const conn = net_server.accept() catch continue;
-        handleConn(gpa, &routes, conn, &read_buf, threads) catch {};
-        conn.stream.close();
+        conns.dispatch(conn);
     }
 }
+
+const Conns = struct {
+    gpa: std.mem.Allocator,
+    routes: []const Route,
+    threads: usize,
+    work: std.Thread.Mutex = .{},
+    in_flight: std.atomic.Value(usize) = .init(0),
+
+    const max_threads = 64;
+
+    /// Past `max_threads`, or when a spawn fails, the connection is served inline.
+    fn dispatch(self: *Conns, conn: std.net.Server.Connection) void {
+        if (self.in_flight.fetchAdd(1, .acq_rel) < max_threads) {
+            if (std.Thread.spawn(.{}, serveConn, .{ self, conn })) |t| {
+                t.detach();
+                return;
+            } else |_| {}
+        }
+        serveConn(self, conn);
+    }
+
+    fn serveConn(self: *Conns, conn: std.net.Server.Connection) void {
+        defer _ = self.in_flight.fetchSub(1, .acq_rel);
+        var read_buf: [64 * 1024]u8 = undefined;
+        handleConn(self, conn, &read_buf) catch {};
+        conn.stream.close();
+    }
+
+    fn drain(self: *Conns) void {
+        while (self.in_flight.load(.acquire) > 0) std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+};
 
 const Registry = struct {
     gpa: std.mem.Allocator,
@@ -365,8 +401,8 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
     defer net_server.deinit();
     banner(net_server.listen_address, reg.routes);
     if (watch) log(.info, "watching {s} for changes", .{dir_path});
-    const threads = std.Thread.getCpuCount() catch 1;
-    var read_buf: [64 * 1024]u8 = undefined;
+    var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = std.Thread.getCpuCount() catch 1 };
+    defer conns.drain();
     var fp: u64 = if (watch) dirFingerprint(dir_path) else 0;
     var last_check: i64 = 0;
     while (!runtime.aborting()) {
@@ -384,16 +420,18 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
         }
         if (do_reload) {
             if (loadDir(gpa, dir_path)) |new_reg| {
+                conns.work.lock();
                 reg.deinit();
                 reg = new_reg;
+                conns.routes = reg.routes;
+                conns.work.unlock();
                 if (watch) fp = dirFingerprint(dir_path);
                 log(.info, "reloaded {s}", .{dir_path});
                 banner(net_server.listen_address, reg.routes);
             } else |e| log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
         }
         const conn = net_server.accept() catch continue;
-        handleConn(gpa, reg.routes, conn, &read_buf, threads) catch {};
-        conn.stream.close();
+        conns.dispatch(conn);
     }
 }
 
@@ -404,13 +442,14 @@ fn findRoute(routes: []const Route, req_path: []const u8) ?Route {
     return null;
 }
 
-fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Server.Connection, read_buf: []u8, threads: usize) !void {
+fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !void {
+    const gpa = conns.gpa;
     var send_buf: [16 * 1024]u8 = undefined;
     var creader = conn.stream.reader(read_buf);
     var cwriter = conn.stream.writer(&send_buf);
     var http = std.http.Server.init(creader.interface(), &cwriter.interface);
     while (http.reader.state == .ready) {
-        var req = http.receiveHead() catch |e| return rejectHead(&cwriter.interface, e);
+        var req = http.receiveHead() catch |e| return rejectHead(&cwriter.interface, e, http.reader.in.buffered());
 
         const target = req.head.target;
         const q = std.mem.indexOfScalar(u8, target, '?');
@@ -424,7 +463,9 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
             return;
         }
 
-        const route = findRoute(routes, req_path) orelse {
+        conns.work.lock();
+        defer conns.work.unlock();
+        const route = findRoute(conns.routes, req_path) orelse {
             try req.respond("{\"status\":\"error\",\"error\":\"not found\"}\n", .{ .status = .not_found, .keep_alive = false });
             return;
         };
@@ -485,7 +526,7 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
         defer sink.deinit();
-        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = threads, .outcomes = &sink, .log = g_log_cfg }, &diag);
+        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = conns.threads, .outcomes = &sink, .log = g_log_cfg }, &diag);
 
         var out = std.array_list.Managed(u8).init(gpa);
         defer out.deinit();
@@ -717,11 +758,12 @@ test "buffered endpoint: accept -> WAL -> drain through the pipeline" {
 }
 
 fn acceptN(gpa: std.mem.Allocator, routes: []const Route, srv: *std.net.Server, n: usize) void {
+    var conns = Conns{ .gpa = gpa, .routes = routes, .threads = 1 };
     var read_buf: [64 * 1024]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const conn = srv.accept() catch return;
-        handleConn(gpa, routes, conn, &read_buf, 1) catch {};
+        handleConn(&conns, conn, &read_buf) catch {};
         conn.stream.close();
     }
 }
@@ -771,10 +813,10 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     var srv = try addr.listen(.{ .reuse_address = true });
     defer srv.deinit();
     const port = srv.listen_address.getPort();
-    const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 5) });
+    const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 6) });
     var joined = false;
     defer if (!joined) {
-        for (0..5) |_| if (std.net.tcpConnectToAddress(srv.listen_address)) |c| c.close() else |_| {};
+        for (0..6) |_| if (std.net.tcpConnectToAddress(srv.listen_address)) |c| c.close() else |_| {};
         th.join();
     };
 
@@ -830,11 +872,13 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     }
     for ([_][2][]const u8{
         .{ "GARBAGE\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET /hdr HTTP/1.1\r\nHost: x\r\n", "HTTP/1.1 400 " },
         .{ "POST /hdr HTTP/1.1\r\ncontent-length: 99999999999\r\n\r\n", "HTTP/1.1 413 " },
     }) |c| {
         const s = try std.net.tcpConnectToAddress(srv.listen_address);
         defer s.close();
         try s.writeAll(c[0]);
+        try std.posix.shutdown(s.handle, .send);
         var rbuf: [512]u8 = undefined;
         var r = s.reader(&rbuf);
         const got = try r.interface().takeArray(13);
@@ -907,6 +951,26 @@ test "dropForeignParams: a query string binds only query params, never a LET, he
     try std.testing.expectEqualStrings("tenant", params.items[0].key);
     try std.testing.expectEqualStrings("acme", params.items[0].val);
     try std.testing.expectEqualStrings("day", params.items[1].key);
+}
+
+test "health probes answer while a request holds the run lock" {
+    initLog(.{ .quiet = true });
+    var srv = try listen("127.0.0.1", 0);
+    defer srv.deinit();
+    var conns = Conns{ .gpa = std.testing.allocator, .routes = &.{}, .threads = 1 };
+    conns.work.lock();
+    defer conns.drain();
+    defer conns.work.unlock();
+
+    const s = try std.net.tcpConnectToAddress(srv.listen_address);
+    defer s.close();
+    const tv = std.posix.timeval{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try s.writeAll("GET /healthz HTTP/1.1\r\n\r\n");
+    conns.dispatch(try srv.accept());
+    var rbuf: [256]u8 = undefined;
+    var r = s.reader(&rbuf);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 ", try r.interface().takeArray(13));
 }
 
 test "listen refuses a port another server already holds" {
