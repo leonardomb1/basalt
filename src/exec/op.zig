@@ -153,7 +153,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.IntOverflow => "integer overflow — the value does not fit a 64-bit integer",
         error.JsonNotArray => "JSON_EACH needs a JSON array (got an object or a scalar)",
         error.InvalidJson => "invalid JSON — json_get and JSON_EACH need a JSON document, and the json_* array functions a JSON array",
-        error.PatternTooComplex => "regular expression gave up: too much backtracking — anchor it, or replace a nested quantifier like `(a+)+` with a flat one",
+        error.PatternTooComplex => "regular expression gave up: too much backtracking, or a group repeated more than about 2,000 times in one match — replace a nested quantifier like `(a+)+` with a flat one, and a repeated group with a class or a single quantified character (`(?:a|b)+` as `[ab]+`)",
         error.CsvHeaderMismatch => "a file in the folder has another header than the first — a folder read takes CSVs of one layout",
         error.InterpFailed => "a `${...}` interpolation failed",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",

@@ -14,7 +14,9 @@
 //! `FixedBufferAllocator` over stack memory: matching a column costs no heap
 //! traffic and nothing to free. Matching is continuation-passing (`Cont` is
 //! what remains once the current atom succeeds), which is what lets a group
-//! backtrack into the sequence that follows it.
+//! backtrack into the sequence that follows it. The subject is matched by
+//! character: `.`, a class or a literal takes one UTF-8 code point, and a byte
+//! that starts no valid sequence is a character of its own.
 //!
 //! Backtracking is worst-case exponential, so every `find` runs under a
 //! `Budget` and gives up with `PatternTooComplex`, an error and never a null,
@@ -23,12 +25,13 @@
 //! of `a`s doubles its splits per character (28 took 2.5 seconds, 40 would take
 //! hours); the allowance is far above what the depth cap allows, plus a
 //! per-character term so a long subject with a cheap pattern never trips it.
-//! `depth` bounds deep blowup: the matcher recurses once per repetition, and
-//! past the stack is a segfault no caller can catch. The cap claims 4 MiB of
-//! stack at a measured, rounded-up cost per frame, three frames per subject
-//! character, which makes it a ceiling on subject length (about 900 characters
-//! in Debug, 3600 in release). Carrying the continuation stack on the heap
-//! would remove it; until a query needs longer text, this is the cheap half.
+//! `depth` bounds deep blowup: the matcher recurses once per repetition of a
+//! group, and past the stack is a segfault no caller can catch (a repeated
+//! literal, `.` or class loops instead, so it repeats without limit). The cap
+//! claims 4 MiB of stack at a measured, rounded-up cost per frame, up to five
+//! frames per repetition, which makes it a ceiling on how often a group repeats
+//! in one match (`max_group_reps`: about 540 in Debug, 2,180 in release).
+//! Carrying the continuation stack on the heap would remove it.
 
 const std = @import("std");
 
@@ -37,12 +40,44 @@ pub const Error = error{ BadPattern, OutOfMemory, PatternTooComplex };
 pub const max_groups = 10;
 pub const Captures = [max_groups]?[2]usize;
 
-const Class = struct {
-    neg: bool,
-    bits: [32]u8,
+/// One unit of the subject: a UTF-8 code point, or a byte that starts no valid
+/// sequence, numbered past the code points (`invalid_base + byte`).
+const Unit = struct { cp: u21, len: u3 };
 
-    fn has(self: Class, c: u8) bool {
-        const in = (self.bits[c >> 3] >> @intCast(c & 7)) & 1 != 0;
+const invalid_base: u21 = 0x110000;
+
+fn unitAt(s: []const u8, pos: usize) Unit {
+    const c = s[pos];
+    if (c < 0x80) return .{ .cp = c, .len = 1 };
+    const lone: Unit = .{ .cp = invalid_base + c, .len = 1 };
+    const n = std.unicode.utf8ByteSequenceLength(c) catch return lone;
+    if (pos + n > s.len) return lone;
+    const cp = std.unicode.utf8Decode(s[pos..][0..n]) catch return lone;
+    return .{ .cp = cp, .len = n };
+}
+
+/// The start of the unit that ends at `p`, no earlier than `lo` (both unit
+/// boundaries): a valid sequence ending there is the unit, else the last byte.
+fn unitBefore(s: []const u8, lo: usize, p: usize) usize {
+    var len: usize = @min(4, p - lo);
+    while (len > 1) : (len -= 1) {
+        const q = p - len;
+        if (s[q] >= 0xC0 and unitAt(s, q).len == len) return q;
+    }
+    return p - 1;
+}
+
+const Class = struct {
+    neg: bool = false,
+    bits: [32]u8 = .{0} ** 32,
+    ranges: []const [2]u21 = &.{},
+
+    fn has(self: Class, cp: u21) bool {
+        const in = if (cp < 256)
+            (self.bits[cp >> 3] >> @intCast(cp & 7)) & 1 != 0
+        else for (self.ranges) |r| {
+            if (cp >= r[0] and cp <= r[1]) break true;
+        } else false;
         return in != self.neg;
     }
 
@@ -52,7 +87,7 @@ const Class = struct {
 };
 
 const Atom = union(enum) {
-    lit: u8,
+    lit: u21,
     any,
     class: Class,
     bol,
@@ -83,7 +118,7 @@ const Budget = struct {
 
     const max_depth = stack_allowance / stack_per_level;
 
-    pub const max_subject_len = max_depth / 3;
+    pub const max_group_reps = max_depth / 5;
 
     fn init(subject_len: usize) Budget {
         return .{ .steps = 10_000_000 + 4 * @as(u64, subject_len) };
@@ -137,7 +172,7 @@ pub const Regex = struct {
     pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
         var budget = Budget.init(s.len);
         var start = from;
-        while (start <= s.len) : (start += 1) {
+        while (start <= s.len) : (start += if (start < s.len) unitAt(s, start).len else 1) {
             caps.* = .{null} ** max_groups;
             const done: Cont = .done;
             for (self.alt) |branch| {
@@ -175,6 +210,7 @@ fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps
     defer b.leave();
     if (i == items.len) return resume_(cont, s, pos, caps, b);
     const it = items[i];
+    if (it.atom != .group and it.atom != .bol and it.atom != .eol) return stepUnits(items, i, rep, s, pos, caps, cont, b);
     if (it.lazy) {
         if (rep >= it.min) {
             if (try step(items, i + 1, 0, s, pos, caps, cont, b)) |e| return e;
@@ -193,13 +229,54 @@ fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps
     return null;
 }
 
+/// A repeated single-unit atom (literal, `.`, class) walked in a loop rather than
+/// a frame per repetition: greedy takes every unit it can, then gives them back
+/// one at a time; lazy takes one more only when the rest fails.
+fn stepUnits(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont, b: *Budget) Error!?usize {
+    const it = items[i];
+    var n = rep;
+    var p = pos;
+    if (it.lazy) {
+        while (true) {
+            if (n >= it.min) {
+                if (try step(items, i + 1, 0, s, p, caps, cont, b)) |e| return e;
+            }
+            if (n >= it.max) return null;
+            p = unitMatch(it.atom, s, p) orelse return null;
+            n += 1;
+        }
+    }
+    while (n < it.max) {
+        p = unitMatch(it.atom, s, p) orelse break;
+        n += 1;
+    }
+    while (n >= it.min) {
+        if (try step(items, i + 1, 0, s, p, caps, cont, b)) |e| return e;
+        if (n == rep) break;
+        p = unitBefore(s, pos, p);
+        n -= 1;
+    }
+    return null;
+}
+
+/// Where a single-unit atom ends when it matches at `pos`.
+fn unitMatch(a: Atom, s: []const u8, pos: usize) ?usize {
+    if (pos >= s.len) return null;
+    const u = unitAt(s, pos);
+    const ok = switch (a) {
+        .lit => |c| u.cp == c,
+        .any => true,
+        .class => |cl| cl.has(u.cp),
+        else => unreachable,
+    };
+    return if (ok) pos + u.len else null;
+}
+
 fn matchAtom(a: Atom, s: []const u8, pos: usize, caps: *Captures, k: *const Cont, b: *Budget) Error!?usize {
     switch (a) {
         .bol => return if (pos == 0) resume_(k, s, pos, caps, b) else null,
         .eol => return if (pos == s.len) resume_(k, s, pos, caps, b) else null,
-        .lit => |c| return if (pos < s.len and s[pos] == c) resume_(k, s, pos + 1, caps, b) else null,
-        .any => return if (pos < s.len) resume_(k, s, pos + 1, caps, b) else null,
-        .class => |cl| return if (pos < s.len and cl.has(s[pos])) resume_(k, s, pos + 1, caps, b) else null,
+        .lit, .any, .class => return if (unitMatch(a, s, pos)) |e| resume_(k, s, e, caps, b) else null,
         .group => |g| {
             for (g.alt) |branch| {
                 if (g.cap) |ci| {
@@ -327,12 +404,17 @@ const Parser = struct {
             '\\' => {
                 if (self.i >= self.src.len) return Error.BadPattern;
                 const e = self.src[self.i];
+                if (e >= 0x80) return .{ .lit = self.unit() };
                 self.i += 1;
                 return try escapeAtom(e);
             },
             else => {
+                if (c >= 0x80) {
+                    self.i -= 1;
+                    return .{ .lit = self.unit() };
+                }
                 if (!self.icase or !std.ascii.isAlphabetic(c)) return .{ .lit = c };
-                var cl = Class{ .neg = false, .bits = .{0} ** 32 };
+                var cl = Class{};
                 cl.set(std.ascii.toLower(c));
                 cl.set(std.ascii.toUpper(c));
                 return .{ .class = cl };
@@ -340,8 +422,16 @@ const Parser = struct {
         }
     }
 
+    /// The pattern's unit at `i`, consumed.
+    fn unit(self: *Parser) u21 {
+        const u = unitAt(self.src, self.i);
+        self.i += u.len;
+        return u.cp;
+    }
+
     fn parseClass(self: *Parser) Error!Class {
-        var cl = Class{ .neg = false, .bits = .{0} ** 32 };
+        var cl = Class{};
+        var ranges = std.array_list.Managed([2]u21).init(self.gpa);
         if (self.i < self.src.len and self.src[self.i] == '^') {
             cl.neg = true;
             self.i += 1;
@@ -349,34 +439,40 @@ const Parser = struct {
         var first = true;
         while (self.i < self.src.len and (self.src[self.i] != ']' or first)) {
             first = false;
-            var lo = self.src[self.i];
-            self.i += 1;
-            if (lo == '\\') {
-                if (self.i >= self.src.len) return Error.BadPattern;
-                const e = self.src[self.i];
-                self.i += 1;
+            var lo: u21 = undefined;
+            if (self.src[self.i] == '\\' and self.i + 1 < self.src.len and self.src[self.i + 1] < 0x80) {
+                const e = self.src[self.i + 1];
+                self.i += 2;
                 switch (try escapeAtom(e)) {
                     .class => |sub| {
                         for (0..256) |b| {
                             if (sub.has(@intCast(b))) cl.set(@intCast(b));
                         }
+                        if (sub.neg) try ranges.append(.{ 256, std.math.maxInt(u21) });
                         continue;
                     },
                     .lit => |l| lo = l,
                     else => return Error.BadPattern,
                 }
-            }
-            if (self.i + 1 < self.src.len and self.src[self.i] == '-' and self.src[self.i + 1] != ']') {
-                const hi = self.src[self.i + 1];
-                self.i += 2;
-                var b: usize = lo;
-                while (b <= hi) : (b += 1) cl.set(@intCast(b));
             } else {
-                cl.set(lo);
+                if (self.src[self.i] == '\\') {
+                    self.i += 1;
+                    if (self.i >= self.src.len) return Error.BadPattern;
+                }
+                lo = self.unit();
             }
+            var hi = lo;
+            if (self.i + 1 < self.src.len and self.src[self.i] == '-' and self.src[self.i + 1] != ']') {
+                self.i += 1;
+                hi = self.unit();
+            }
+            var b: u21 = lo;
+            while (b <= hi and b < 256) : (b += 1) cl.set(@intCast(b));
+            if (hi >= 256 and hi >= lo) try ranges.append(.{ @max(lo, 256), hi });
         }
         if (self.i >= self.src.len) return Error.BadPattern;
         self.i += 1;
+        cl.ranges = try ranges.toOwnedSlice();
         if (self.icase) for ('a'..'z' + 1) |lc| {
             const l: u8 = @intCast(lc);
             const u = std.ascii.toUpper(l);
@@ -393,7 +489,7 @@ const Parser = struct {
 /// A letter or digit escape outside the supported set is refused rather than read as
 /// the character: `\1` would otherwise match a literal `1` and `\b` a `b`.
 fn escapeAtom(e: u8) Error!Atom {
-    var cl = Class{ .neg = false, .bits = .{0} ** 32 };
+    var cl = Class{};
     switch (e) {
         'd', 'D' => {
             for ('0'..'9' + 1) |b| cl.set(@intCast(b));
@@ -467,8 +563,9 @@ fn replaceRe(out: std.mem.Allocator, re: Regex, s: []const u8, repl: []const u8,
         at = span[1];
         if (!all) break;
         if (span[0] == span[1]) {
-            if (at < s.len) try buf.append(s[at]);
-            at += 1;
+            const n: usize = if (at < s.len) unitAt(s, at).len else 1;
+            if (at < s.len) try buf.appendSlice(s[at..][0..n]);
+            at += n;
         }
     }
     if (!replaced) return s;
@@ -606,6 +703,36 @@ test "regex: a backreference or an unknown letter escape is refused, a punctuati
     try std.testing.expectEqual([2]usize{ 0, 4 }, (try re.find(".$\\-", 0, &caps)).?);
 }
 
+test "regex: characters are UTF-8 code points, a stray byte one of its own" {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    var re = try Regex.compile(a, "^a.ão$");
+    try std.testing.expect((try re.find("ação", 0, &caps)) != null);
+    re = try Regex.compile(a, "[ç]");
+    try std.testing.expectEqual([2]usize{ 1, 3 }, (try re.find("ação", 0, &caps)).?);
+    re = try Regex.compile(a, "^[à-ú]+$");
+    try std.testing.expect((try re.find("çãé", 0, &caps)) != null);
+    try std.testing.expect((try re.find("çaé", 0, &caps)) == null);
+    re = try Regex.compile(a, "^ç{2}€?$");
+    try std.testing.expect((try re.find("çç€", 0, &caps)) != null);
+    re = try Regex.compile(a, "^[^a]$");
+    try std.testing.expect((try re.find("€", 0, &caps)) != null);
+    try std.testing.expect((try re.find("\xff", 0, &caps)) != null);
+    re = try Regex.compile(a, "^.{3}$");
+    try std.testing.expect((try re.find("a\xffç", 0, &caps)) != null);
+    re = try Regex.compile(a, "\\W+");
+    try std.testing.expectEqual([2]usize{ 1, 6 }, (try re.find("aç€b", 0, &caps)).?);
+    re = try Regex.compile(a, "^.*ç");
+    try std.testing.expectEqual([2]usize{ 0, 7 }, (try re.find("éçxç", 0, &caps)).?);
+    re = try Regex.compile(a, "^(.+)€\xffx$");
+    try std.testing.expectEqual([2]usize{ 0, 9 }, (try re.find("€a€\xffx", 0, &caps)).?);
+    try std.testing.expectEqual([2]usize{ 0, 4 }, caps[1].?);
+    try std.testing.expectEqualStrings("-é-ç-", try replaceAllRe(a, try Regex.compile(a, "x*"), "éç", "-"));
+}
+
 test "regex: no match leaves the subject alone" {
     var buf: [8 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
@@ -625,11 +752,20 @@ test "regex: a pathological pattern gives up instead of hanging" {
     const deep = try Regex.compile(a, "a{1,1000000}b");
     try std.testing.expectError(Error.PatternTooComplex, deep.find("a" ** 100_000, 0, &caps));
 
-    const n = Budget.max_subject_len / 2;
+    const n = 100_000;
+    const run = "a" ** n;
     const plain = try Regex.compile(a, "[a-z]+9");
-    const hit = "a" ** (Budget.max_subject_len / 2) ++ "9";
+    const hit = run ++ "9";
     try std.testing.expectEqual([2]usize{ 0, n + 1 }, (try plain.find(hit, 0, &caps)).?);
-    try std.testing.expect((try plain.find(hit[0..n], 0, &caps)) == null);
+    try std.testing.expect((try plain.find(hit[0..2000], 0, &caps)) == null);
+    for ([_][]const u8{ "^a+$", "^a+?$", "^.*$", "^[^b]{2,}$" }) |pat| {
+        const re2 = try Regex.compile(a, pat);
+        try std.testing.expectEqual([2]usize{ 0, n }, (try re2.find(run, 0, &caps)).?);
+    }
+    const grp = try Regex.compile(a, "^(a)+$");
+    const reps = Budget.max_group_reps;
+    try std.testing.expectEqual([2]usize{ 0, reps / 2 }, (try grp.find(run[0 .. reps / 2], 0, &caps)).?);
+    try std.testing.expectError(Error.PatternTooComplex, grp.find(run[0 .. reps * 2], 0, &caps));
 
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
