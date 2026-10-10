@@ -6,7 +6,13 @@ and Excel — unless `WITH (format = ...)` names one ([Sources](sources.md#sourc
 ## CSV
 
 A header name in double quotes loses its quotes (`""` inside is one quote) and
-may hold the delimiter: `"Valor Total"` is the column `Valor Total`.
+may hold the delimiter: `"Valor Total"` is the column `Valor Total`. Lines end in
+`\n`, `\r\n` or a bare `\r` (old Mac exports), a quoted value keeps any line break
+inside it, and a record may run to 64 MiB — past that the read stops with an error
+naming the file and line, as a file that is not CSV or a quote left open would
+otherwise be read into memory whole. Every row must have one field per
+header column: a row with more or fewer is an error naming the file, the line and
+both counts, never padded with nulls or cut short.
 
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
@@ -42,8 +48,9 @@ A workbook's cells carry their own types, so a column's type is decided from
 every row, not a sample (a CSV's first 1024): numbers are `INT` when each is an
 integer below 2^53 and `FLOAT` otherwise; numbers in a date or time format are
 `DATE`, `TIMESTAMP` or `TIME` (to the millisecond, as Excel keeps them; a
-1904-based workbook is read as such, and serials before 1 March 1900 are a day
-late, as in Excel); booleans are `BOOL`; and any text in a column makes it
+1904-based workbook is read as such, and a date before 1 March 1900 reads as
+the one Excel shows, though Excel's calendar holds a 29 February 1900 that never
+was: that serial reads as 28 February); booleans are `BOOL`; and any text in a column makes it
 `STRING`, a number there keeping the digits the file stored — so a "Total" row
 of text at the bottom turns its column to text instead of failing the load.
 Empty cells and error values (`#N/A`, `#DIV/0!`) are null; a formula reads as
@@ -82,7 +89,9 @@ microseconds or nanoseconds all read as basalt's microsecond `timestamp`/`time`;
 nanoseconds floor to the microsecond. A UTC-adjusted timestamp reads as its UTC
 wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
 carried. `DATE`, `DECIMAL`, `STRING`/`ENUM`/`JSON` and `INTEGER` map as their
-converted twins do; a `UUID` stays `bytes`.
+converted twins do; a `UUID` stays `bytes`. An unsigned integer (`UINT8` to
+`UINT64`) reads as its unsigned value, and a `UINT64` above 2^63−1 is an error
+naming the column, never a wraparound.
 
 A struct's fields read as flat dotted columns (`addr.city`). Everything
 repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them —
@@ -107,7 +116,9 @@ shape for this reader), nor is bzip2.
 
 `LOAD INTO 'orders.csv.gz'` writes gzip, at about `gzip -6`'s size, and `APPEND`
 adds a member to an existing one. Other codecs are refused at plan time: zstd
-output is not supported, and Parquet and Arrow compress their own pages.
+output is not supported, and Parquet and Arrow compress their own pages. A `.zip`
+is read only: `LOAD INTO 'x.zip'` and `LOAD INTO 'x.zip :: a.csv'` are refused
+at plan time too.
 
 A file inside a zip is addressed with `::`, the separator ClickHouse uses for the
 same idea:

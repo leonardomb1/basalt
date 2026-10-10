@@ -22,6 +22,9 @@ const parquet = @import("footer.zig");
 const std = @import("std");
 const temporalScale = @import("logical.zig").temporalScale;
 const types = @import("../../lang/types.zig");
+const unsignedBits = @import("logical.zig").unsignedBits;
+const asUnsigned = @import("logical.zig").asUnsigned;
+const eval = @import("../../exec/eval.zig");
 const Reader = @import("read.zig").Reader;
 const fx = @import("testing_util.zig").fx;
 const testing = std.testing;
@@ -71,7 +74,7 @@ pub fn readColumnChunkLevels(
 
     while (produced < entries) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
+        const pg = try readPageOf(arena, file_bytes, offset, meta, elem);
         offset = pg.next_offset;
 
         switch (pg.header.ty) {
@@ -90,8 +93,33 @@ pub fn readColumnChunkLevels(
         }
     }
     const col = try b.finish();
+    try readUnsigned(elem, col);
     if (list) |shape| return assembleLists(arena, col, levels.?.reps.items, levels.?.defs.items, max_def, shape, rows);
     return col;
+}
+
+fn readPageOf(arena: std.mem.Allocator, file_bytes: []const u8, offset: usize, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement) !parquet.Page {
+    return parquet.readPage(arena, file_bytes, offset, meta.compression) catch |e| {
+        if (e != error.UnsupportedCodec) return e;
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` is compressed with {s}, which basalt does not read (it reads snappy, gzip, zstd and lz4)", .{ elem.name, @tagName(meta.compression) }) catch "a parquet codec basalt does not read";
+        return @errorCast(eval.explain(e, msg));
+    };
+}
+
+/// Every decode path sign-extends a physical int, so an unsigned column is mended
+/// once here; a UINT64 past 2^63-1 is refused rather than read negative.
+fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) Error!void {
+    if (col.ty.kind != .int) return;
+    const bits = unsignedBits(elem) orelse return;
+    for (col.data.i64, 0..) |*x, i| {
+        if (!col.validity.get(i)) continue;
+        x.* = asUnsigned(bits, x.*) orelse {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` holds the UINT64 {d}, past 2^63-1, the largest basalt int", .{ elem.name, @as(u64, @bitCast(x.*)) }) catch "a parquet UINT64 past 2^63-1";
+            return @errorCast(eval.explain(Error.ParquetIntOverflow, msg));
+        };
+    }
 }
 
 pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };
@@ -120,7 +148,7 @@ pub fn readEntries(
     var produced: usize = 0;
     while (produced < entries) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
+        const pg = try readPageOf(arena, file_bytes, offset, meta, elem);
         offset = pg.next_offset;
         switch (pg.header.ty) {
             .dictionary_page => {
@@ -138,6 +166,7 @@ pub fn readEntries(
         }
     }
     const vals = try b.finish();
+    try readUnsigned(elem, vals);
     if (vals.len != levels.reps.items.len or vals.len != levels.defs.items.len) return Error.CorruptParquetPage;
     return .{ .vals = vals, .reps = levels.reps.items, .defs = levels.defs.items };
 }

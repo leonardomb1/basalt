@@ -15,6 +15,8 @@ const eval = @import("../../exec/eval.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
 const temporalScale = @import("logical.zig").temporalScale;
+const unsignedBits = @import("logical.zig").unsignedBits;
+const asUnsigned = @import("logical.zig").asUnsigned;
 const types = @import("../../lang/types.zig");
 const collectLeaves = @import("schema.zig").collectLeaves;
 const fx_logical = @import("testing_util.zig").fx_logical;
@@ -40,8 +42,8 @@ pub fn groupMayMatch(
         const meta = g.columns[lf.chunk_idx].meta orelse continue;
         const elem = schema[lf.schema_idx];
 
-        const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
-        const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
+        const lo = statValue(elem, meta, meta.stats.min) orelse continue;
+        const hi = statValue(elem, meta, meta.stats.max) orelse continue;
 
         const excluded = switch (b.op) {
             .lt => (cmp(lo, b.value) orelse .lt) != .lt,
@@ -83,8 +85,8 @@ pub fn groupMayHoldKeys(
         if (lf.chunk_idx >= g.columns.len) continue;
         const meta = g.columns[lf.chunk_idx].meta orelse continue;
         const elem = schema[lf.schema_idx];
-        const lo = statValue(elem, meta.ty, meta.stats.min) orelse continue;
-        const hi = statValue(elem, meta.ty, meta.stats.max) orelse continue;
+        const lo = statValue(elem, meta, meta.stats.min) orelse continue;
+        const hi = statValue(elem, meta, meta.stats.max) orelse continue;
         if (k.values.len > 0) {
             for (k.values) |v| {
                 if (!sameKind(lo, v) or !sameKind(hi, v)) break;
@@ -130,10 +132,10 @@ pub fn groupBeatsThreshold(
     const elem = schema[lf.schema_idx];
 
     if (t.desc) {
-        const hi = statValue(elem, meta.ty, meta.stats.max) orelse return true;
+        const hi = statValue(elem, meta, meta.stats.max) orelse return true;
         return cmp(hi, t.value) == .gt;
     }
-    const lo = statValue(elem, meta.ty, meta.stats.min) orelse return true;
+    const lo = statValue(elem, meta, meta.stats.min) orelse return true;
     return cmp(lo, t.value) == .lt;
 }
 
@@ -154,8 +156,8 @@ pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
             .byte_array, .fixed_len_byte_array => return null,
             else => {},
         }
-        const mn = statValue(elem, meta.ty, meta.stats.min) orelse return null;
-        const mx = statValue(elem, meta.ty, meta.stats.max) orelse return null;
+        const mn = statValue(elem, meta, meta.stats.min) orelse return null;
+        const mx = statValue(elem, meta, meta.stats.max) orelse return null;
         if (lo == null) lo = mn else lo = if ((cmp(mn, lo.?) orelse return null) == .lt) mn else lo;
         if (hi == null) hi = mx else hi = if ((cmp(mx, hi.?) orelse return null) == .gt) mx else hi;
     }
@@ -185,11 +187,17 @@ pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
     return (try basaltType(e)).asNullable();
 }
 
-fn statValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: ?[]const u8) ?Value {
+/// An unsigned bound reads as its unsigned value; one only the deprecated signed-order
+/// `min`/`max` gave, or a UINT64 past 2^63-1, is unknown.
+fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]const u8) ?Value {
     const b = raw orelse return null;
     const ty = basaltType(elem) catch return null;
-    var cur = PlainCursor.init(phys, elem.type_length orelse 0, b);
+    var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, b);
     const v = cur.next() catch return null;
+    if (ty.kind == .int and v == .int) if (unsignedBits(elem)) |bits| {
+        if (meta.stats.legacy) return null;
+        return .{ .int = asUnsigned(bits, v.int) orelse return null };
+    };
     return coerce(ty, v, temporalScale(elem));
 }
 
@@ -263,6 +271,25 @@ test "cmp: an unorderable pair is unknown, never a fabricated equality" {
     try std.testing.expect(cmp(.{ .int = 5 }, .{ .string = "5" }) == null);
     try std.testing.expect(cmp(.{ .string = "a" }, .{ .int = 1 }) == null);
     try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .timestamp = 0 }, .{ .string = "1970-01-02" }).?);
+}
+
+test "unsigned statistics compare in unsigned order" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "u", .ty = .int32, .repetition = .optional, .converted_type = 13 },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "u", .max_def = 1, .max_rep = 0 }};
+    var lo: [4]u8 = undefined;
+    var hi: [4]u8 = undefined;
+    std.mem.writeInt(u32, &lo, 5, .little);
+    std.mem.writeInt(u32, &hi, 3_000_000_000, .little);
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int32, .stats = .{ .min = &lo, .max = &hi } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 2 };
+    const above = [_]Bound{.{ .column = "u", .op = .gt, .value = .{ .int = 2_000_000_000 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &above));
+    chunks[0].meta.?.stats.legacy = true;
+    const beyond = [_]Bound{.{ .column = "u", .op = .gt, .value = .{ .int = 4_000_000_000 } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &beyond));
 }
 
 test "row groups are skipped only when statistics prove no row can match" {

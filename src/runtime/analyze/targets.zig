@@ -112,6 +112,8 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
 /// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    if (csv.splitArchive(path) != null)
+        return "basalt reads `.zip` archives but does not write them; write a `.csv` or `.csv.gz`";
     const codec = csv.splitCodec(path).codec;
     if (codec == .none) return null;
     const fmt = explicit orelse formatOfPath(path) orelse .csv;

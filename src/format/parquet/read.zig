@@ -71,6 +71,7 @@ pub const Error = error{
     CorruptParquetPage,
     UnsupportedParquetSchema,
     UnsupportedParquetEncoding,
+    ParquetIntOverflow,
 } || std.mem.Allocator.Error;
 
 pub const BitReader = @import("encoding.zig").BitReader;
@@ -145,6 +146,7 @@ pub const Reader = struct {
     tally: ?*driver.ScanTally = null,
     rg: usize = 0,
     rg_end: ?usize = null,
+    path: []const u8 = "",
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -222,6 +224,7 @@ pub const Reader = struct {
             .leaves = try keep.toOwnedSlice(),
             .outputs = try outputs.toOwnedSlice(),
             .boundaries = try chunkBoundaries(arena, md, footer_start),
+            .path = path,
         };
         return self;
     }
@@ -255,7 +258,7 @@ pub const Reader = struct {
                 .leaf => |li| {
                     const lf = self.leaves[li];
                     const chunk = try self.chunkOf(arena, g, lf);
-                    cols[ci] = try readColumnChunkLevels(
+                    cols[ci] = readColumnChunkLevels(
                         arena,
                         chunk.bytes,
                         chunk.meta,
@@ -265,14 +268,14 @@ pub const Reader = struct {
                         lf.max_rep,
                         lf.list,
                         chunk.start,
-                    );
+                    ) catch |e| return self.named(e);
                 },
                 .nested => |n| {
                     const entries = try arena.alloc(Entries, n.leaves.len);
                     for (entries, n.leaves) |*e, li| {
                         const lf = self.leaves[li];
                         const chunk = try self.chunkOf(arena, g, lf);
-                        e.* = try readEntries(arena, chunk.bytes, chunk.meta, self.md.schema[lf.schema_idx], lf.max_def, lf.max_rep, chunk.start);
+                        e.* = readEntries(arena, chunk.bytes, chunk.meta, self.md.schema[lf.schema_idx], lf.max_def, lf.max_rep, chunk.start) catch |err| return self.named(err);
                     }
                     cols[ci] = try assembleNested(arena, &n.root, entries, rows);
                 },
@@ -283,6 +286,17 @@ pub const Reader = struct {
     }
 
     const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
+
+    /// A decode failure's account, prefixed with this file, which a folder read needs.
+    fn named(self: *const Reader, e: anyerror) anyerror {
+        const why = eval.takeFailure(e) orelse return e;
+        var buf: [480]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "`{s}`: {s}", .{ self.path, why }) catch blk: {
+            @memcpy(buf[buf.len - 3 ..], "...");
+            break :blk buf[0..];
+        };
+        return eval.explain(e, msg);
+    }
 
     fn chunkOf(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, lf: Leaf) !Chunk {
         if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
@@ -303,22 +317,63 @@ pub const Reader = struct {
 };
 
 /// How a folder file's columns differ from the first file's, in words; null when
-/// they do not. Nullability is not compared.
-pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema) ?[]const u8 {
+/// they do not. Nullability is not compared. `requested` is the projection, so a
+/// column one file stands in with (a projection it holds none of) is not blamed.
+pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema, requested: ?[]const []const u8) ?[]const u8 {
     for (want.fields, 0..) |w, k| {
         if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
         const g = got.fields[k];
         if (!std.mem.eql(u8, w.name, g.name)) {
             for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
                 return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+            const asked = if (requested) |r| for (r) |n| {
+                if (std.mem.eql(u8, n, g.name)) break true;
+            } else false else true;
+            if (asked) for (want.fields) |o| {
+                if (std.mem.eql(u8, o.name, g.name)) break;
+            } else return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
             return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
         }
         if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
-            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, @tagName(g.ty.kind), @tagName(w.ty.kind) }) catch "a column has another type";
+            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, typeName(arena, g.ty), typeName(arena, w.ty) }) catch "a column has another type";
     }
     if (got.fields.len > want.fields.len)
         return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
     return null;
+}
+
+fn typeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
+    if (t.kind != .decimal) return @tagName(t.kind);
+    return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
+}
+
+test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 is an error naming the column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings(
+        \\u8=255 u16=65535 u32=4294967295 u64=9223372036854775807
+        \\u8=1 u16=2 u32=3000000000 u64=4
+        \\u8=1 u16=2 u32=3000000000 u64=4
+        \\
+    , try readAllText(a, @embedFile("../testdata/unsigned.parquet"), "u.parquet"));
+    try testing.expectError(Error.ParquetIntOverflow, readAllText(a, @embedFile("../testdata/unsigned_big.parquet"), "b.parquet"));
+    try testing.expect(std.mem.endsWith(u8, eval.takeFailure(Error.ParquetIntOverflow).?, "b.parquet`: parquet column `big` holds the UINT64 18446744073709551615, past 2^63-1, the largest basalt int"));
+}
+
+test "a folder mismatch shows decimal precision and names the column the first file lacks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const d102 = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.decimal(10, 2) }} };
+    const d123 = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.decimal(12, 3) }} };
+    try testing.expectEqualStrings("column `f` is decimal(12,3) there, not decimal(10,2)", schemaMismatch(a, d102, d123, null).?);
+    const id = types.Schema{ .fields = &.{.{ .name = "id", .ty = types.Type.init(.int) }} };
+    const extra = types.Schema{ .fields = &.{.{ .name = "extra", .ty = types.Type.init(.int) }} };
+    try testing.expectEqualStrings("it has a column `extra` the first file lacks", schemaMismatch(a, id, extra, &.{"extra"}).?);
+    try testing.expectEqualStrings("it has no column `extra`", schemaMismatch(a, extra, id, &.{"extra"}).?);
+    const both = types.Schema{ .fields = &.{ .{ .name = "x", .ty = types.Type.init(.int) }, .{ .name = "id", .ty = types.Type.init(.int) } } };
+    try testing.expectEqualStrings("its columns are in another order (`x` where `id` is expected)", schemaMismatch(a, id, both, null).?);
 }
 
 pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const u8, first: []const u8, why: []const u8) []const u8 {

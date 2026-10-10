@@ -61,7 +61,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
-    const why = analyze.appendUnsupported(w.target) orelse return .append;
+    const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, write each run to its own path, or accumulate with `INTO BUFFER` and load the buffer once", .{ w.target, why }));
 }
 

@@ -21,6 +21,14 @@ const conv_timestamp_millis = 9;
 
 const conv_timestamp_micros = 10;
 
+const conv_uint8 = 11;
+
+const conv_uint16 = 12;
+
+const conv_uint32 = 13;
+
+const conv_uint64 = 14;
+
 const conv_json = 19;
 
 const conv_bson = 20;
@@ -135,6 +143,33 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
     };
 }
 
+/// The width of an unsigned integer column (`INTEGER(n, false)` or `UINT_n`), whose
+/// physical value is stored sign-extended; null for a signed one.
+pub fn unsignedBits(e: parquet.SchemaElement) ?u8 {
+    if (e.logical_type) |lt| switch (lt) {
+        .integer => |it| return if (it.signed) null else @intCast(@max(8, it.bit_width)),
+        else => return null,
+    };
+    return switch (e.converted_type orelse return null) {
+        conv_uint8 => 8,
+        conv_uint16 => 16,
+        conv_uint32 => 32,
+        conv_uint64 => 64,
+        else => null,
+    };
+}
+
+/// The unsigned value a physical int holds, or null for a UINT64 past 2^63-1.
+pub fn asUnsigned(bits: u8, x: i64) ?i64 {
+    const u: u64 = @bitCast(x);
+    return switch (bits) {
+        8 => @as(u8, @truncate(u)),
+        16 => @as(u16, @truncate(u)),
+        32 => @as(u32, @truncate(u)),
+        else => std.math.cast(i64, u),
+    };
+}
+
 fn decimalOf(e: parquet.SchemaElement) types.Type {
     const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
     const s: u8 = if (e.scale) |x| @intCast(@max(0, @min(38, x))) else 0;
@@ -191,6 +226,19 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = .required })).nullable == false);
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = opt })).nullable);
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
+}
+
+test "unsigned columns read their stored value, a UINT64 past 2^63-1 none" {
+    const u32c = logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = false } });
+    try testing.expectEqual(@as(?u8, 32), unsignedBits(u32c));
+    try testing.expectEqual(@as(?u8, null), unsignedBits(logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = true } })));
+    try testing.expectEqual(@as(?u8, 16), unsignedBits(.{ .ty = .int32, .converted_type = 12 }));
+    try testing.expectEqual(@as(?u8, null), unsignedBits(.{ .ty = .int32 }));
+    try testing.expectEqual(@as(?i64, 3_000_000_000), asUnsigned(32, -1_294_967_296));
+    try testing.expectEqual(@as(?i64, 255), asUnsigned(8, -1));
+    try testing.expectEqual(@as(?i64, 65535), asUnsigned(16, -1));
+    try testing.expectEqual(@as(?i64, 7), asUnsigned(64, 7));
+    try testing.expectEqual(@as(?i64, null), asUnsigned(64, -1));
 }
 
 test "temporal scale converts millisecond columns and leaves micros alone" {

@@ -5,7 +5,10 @@
 //! a quoted field belongs to the value. Only a quote at the start of a field
 //! opens one; a mid-field `"` (`12" pipe`) is data, since treating it as an
 //! opener once swallowed every following row. Unquoted empty is null and `""`
-//! is an empty string. A physical line is at most 64 KiB (`StreamTooLong`).
+//! is an empty string. Lines end in `\n`, `\r\n` or, when the stream starts so, a
+//! bare `\r`; a line longer than the read buffer is gathered, and a record past
+//! `MAX_RECORD` is refused (no CSV, or a quote left open) to keep memory bounded. A
+//! row with more or fewer fields than the header is an error naming its file and line.
 //!
 //! The delimiter and the source encoding are a `Dialect`, because the CSV a
 //! statistics office or regulator publishes is often `;`-separated latin-1.
@@ -61,6 +64,7 @@ const deflate = @import("deflate.zig");
 
 const BATCH_ROWS = 1024;
 const LINE_BUF = 64 * 1024;
+const MAX_RECORD = 64 * 1024 * 1024;
 
 pub const Encoding = enum {
     utf8,
@@ -258,19 +262,26 @@ pub const CsvReader = struct {
     read_buf: [LINE_BUF]u8 = undefined,
     rdr: *std.Io.Reader = undefined,
     schema: types.Schema,
-    pending: []const []const u8 = &.{},
+    pending: []const Pending = &.{},
     pending_i: usize = 0,
     stream_eof: bool = false,
     done: bool = false,
     rest_urls: []const []const u8 = &.{},
     header_line: []const u8 = "",
     join_buf: std.array_list.Managed(u8) = undefined,
+    long_buf: std.array_list.Managed(u8) = undefined,
+    path: []const u8 = "",
+    codec: Codec = .none,
+    eol: u8 = '\n',
+    line_no: u64 = 0,
+    rec_line: u64 = 0,
     codec_state: std.http.Decompress = undefined,
     gunzip: Gunzip = undefined,
     codec_bufs: ?CodecBufs = null,
     slot: ?[]const i16 = null,
 
     const CodecBufs = struct { window: []u8, buf: []u8 };
+    const Pending = struct { text: []const u8, line_no: u64, path: []const u8 };
 
     const Backend = union(enum) {
         file: FileBackend,
@@ -296,6 +307,15 @@ pub const CsvReader = struct {
         const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
         self.slot = p.slot;
         self.schema = p.schema;
+    }
+
+    /// Starts reading `path` from `self.rdr`: its codec, its line ending and line count.
+    fn begin(self: *CsvReader, path: []const u8, name: []const u8) !void {
+        self.path = path;
+        self.line_no = 0;
+        self.codec = splitCodec(name).codec;
+        try self.decodeAs(self.codec);
+        self.eol = sniffEol(self.rdr);
     }
 
     fn decodeAs(self: *CsvReader, codec: Codec) !void {
@@ -331,6 +351,7 @@ pub const CsvReader = struct {
             .schema = undefined,
             .done = false,
             .join_buf = std.array_list.Managed(u8).init(arena),
+            .long_buf = std.array_list.Managed(u8).init(arena),
         };
         if (folder.isFolder(path)) {
             const all = try folder.list(arena, path);
@@ -352,6 +373,7 @@ pub const CsvReader = struct {
             .schema = undefined,
             .done = false,
             .join_buf = std.array_list.Managed(u8).init(arena),
+            .long_buf = std.array_list.Managed(u8).init(arena),
             .rest_urls = files[1..],
         };
         return self.openFirst(files[0]);
@@ -412,14 +434,17 @@ pub const CsvReader = struct {
             self.rdr = &self.backend.file.fr.interface;
         }
 
-        try self.decodeAs(splitCodec(if (splitArchive(first)) |ar| (ar.member orelse ar.archive) else first).codec);
+        try self.begin(first, switch (self.backend) {
+            .member => |m| m.name,
+            else => first,
+        });
 
         const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
         var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, header, self.dialect));
 
         var sniff = try TypeSniffer.init(arena, fields.items.len, self.dialect.delim);
-        var pending = std.array_list.Managed([]const u8).init(arena);
+        var pending = std.array_list.Managed(Pending).init(arena);
         while (pending.items.len < SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
                 if (try self.advance()) continue;
@@ -429,7 +454,7 @@ pub const CsvReader = struct {
             if (line.len == 0) continue;
             const own = try arena.dupe(u8, line);
             sniff.feed(own);
-            try pending.append(own);
+            try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
         }
         for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
 
@@ -447,8 +472,10 @@ pub const CsvReader = struct {
         var rows: usize = 0;
         while (rows < BATCH_ROWS) {
             var line: []const u8 = undefined;
+            var at: Pending = .{ .text = "", .line_no = 0, .path = "" };
             if (self.pending_i < self.pending.len) {
-                line = self.pending[self.pending_i];
+                at = self.pending[self.pending_i];
+                line = at.text;
                 self.pending_i += 1;
             } else {
                 if (self.stream_eof) {
@@ -466,9 +493,11 @@ pub const CsvReader = struct {
                     self.done = true;
                     break;
                 };
+                at = .{ .text = line, .line_no = self.rec_line, .path = self.path };
             }
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders, self.dialect, self.slot);
+            splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
+                return rowFailure(e, at.path, at.line_no, line, self.schema, self.dialect, self.slot);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -490,9 +519,7 @@ pub const CsvReader = struct {
                 const st2 = try sftp.Stream.open(self.arena, url);
                 self.backend = .{ .sftp = st2 };
                 self.rdr = &st2.interface;
-                try self.decodeAs(splitCodec(url).codec);
-                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                try self.nextHeader(url);
                 return true;
             },
             .smb => |st| {
@@ -500,9 +527,7 @@ pub const CsvReader = struct {
                 const st2 = try smb.Stream.open(self.arena, url);
                 self.backend = .{ .smb = st2 };
                 self.rdr = &st2.interface;
-                try self.decodeAs(splitCodec(url).codec);
-                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                try self.nextHeader(url);
                 return true;
             },
             .file => |*f| {
@@ -510,9 +535,7 @@ pub const CsvReader = struct {
                 f.file = try std.fs.cwd().openFile(url, .{});
                 f.fr = f.file.reader(&self.read_buf);
                 self.rdr = &f.fr.interface;
-                try self.decodeAs(splitCodec(url).codec);
-                const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-                if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+                try self.nextHeader(url);
                 return true;
             },
             .member => {},
@@ -532,10 +555,16 @@ pub const CsvReader = struct {
         const dbuf: []u8 = if (win > 0) try self.arena.alloc(u8, win) else &.{};
         self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
 
-        try self.decodeAs(splitCodec(url).codec);
-        const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-        if (!std.mem.eql(u8, std.mem.trim(u8, stripBom(hdr), " \t\r"), self.header_line)) return error.CsvHeaderMismatch;
+        try self.nextHeader(url);
         return true;
+    }
+
+    fn nextHeader(self: *CsvReader, url: []const u8) !void {
+        try self.begin(url, url);
+        const hdr = (try self.readLine()) orelse return error.EmptyCsv;
+        const got = std.mem.trim(u8, stripBom(hdr), " \t\r");
+        if (!std.mem.eql(u8, got, self.header_line))
+            return explainf(error.CsvHeaderMismatch, "`{s}` has the header `{s}`, not the first file's `{s}` — a folder read takes CSVs of one layout", .{ url, clip(got), clip(self.header_line) });
     }
 
     pub fn close(self: *CsvReader) void {
@@ -563,25 +592,89 @@ pub const CsvReader = struct {
     }
 
     /// One record, which may span physical lines. Balanced quotes take the zero-copy
-    /// path; only a continued record is joined, into a buffer reused across records.
+    /// path; only a continued record is joined, into a buffer reused across records,
+    /// and only its new line is scanned for quotes. A `\r` is cut only where the record
+    /// ends, so a quoted CRLF keeps it.
     fn readLine(self: *CsvReader) !?[]const u8 {
-        const first = (try self.rdr.takeDelimiter('\n')) orelse return null;
-        var s: []const u8 = first;
-        if (s.len > 0 and s[s.len - 1] == '\r') s = s[0 .. s.len - 1];
-        if (!quotesOpen(s, self.dialect.delim)) return s;
+        self.rec_line = self.line_no + 1;
+        const first = (try self.takePhysical()) orelse return null;
+        if (!quotesOpen(first, self.dialect.delim, false)) return trimCr(first);
 
         self.join_buf.clearRetainingCapacity();
-        try self.join_buf.appendSlice(s);
-        while (quotesOpen(self.join_buf.items, self.dialect.delim)) {
-            const more = (try self.rdr.takeDelimiter('\n')) orelse break;
-            var m: []const u8 = more;
-            if (m.len > 0 and m[m.len - 1] == '\r') m = m[0 .. m.len - 1];
-            try self.join_buf.append('\n');
-            try self.join_buf.appendSlice(m);
+        try self.join_buf.appendSlice(first);
+        var quoted = true;
+        while (quoted) {
+            const more = (try self.takePhysical()) orelse break;
+            quoted = quotesOpen(more, self.dialect.delim, true);
+            if (self.join_buf.items.len + more.len >= MAX_RECORD)
+                return explainf(error.CsvRecordTooLong, "`{s}`: the record from line {d} runs past {d} MiB without closing its quote — is a quote left open?", .{ self.path, self.rec_line, MAX_RECORD >> 20 });
+            try self.join_buf.append(self.eol);
+            try self.join_buf.appendSlice(more);
         }
-        return self.join_buf.items;
+        return trimCr(self.join_buf.items);
+    }
+
+    /// A line past the read buffer is gathered into `long_buf`, up to `MAX_RECORD`; a
+    /// truncated or corrupt compressed stream is named with where it broke.
+    fn takePhysical(self: *CsvReader) !?[]const u8 {
+        const line = self.rdr.takeDelimiter(self.eol) catch |e| switch (e) {
+            error.StreamTooLong => return try self.takeLong(),
+            error.ReadFailed => return self.readFailed(),
+        };
+        if (line != null) self.line_no += 1;
+        return line;
+    }
+
+    fn takeLong(self: *CsvReader) ![]const u8 {
+        self.long_buf.clearRetainingCapacity();
+        while (true) {
+            const part = self.rdr.takeDelimiter(self.eol) catch |e| switch (e) {
+                error.StreamTooLong => {
+                    const held = self.rdr.buffered();
+                    if (self.long_buf.items.len + held.len >= MAX_RECORD)
+                        return explainf(error.CsvRecordTooLong, "`{s}` line {d} is longer than {d} MiB — is it a CSV?", .{ self.path, self.line_no + 1, MAX_RECORD >> 20 });
+                    try self.long_buf.appendSlice(held);
+                    self.rdr.toss(held.len);
+                    continue;
+                },
+                error.ReadFailed => return self.readFailed(),
+            };
+            if (part) |p| try self.long_buf.appendSlice(p);
+            self.line_no += 1;
+            return self.long_buf.items;
+        }
+    }
+
+    fn readFailed(self: *CsvReader) anyerror {
+        if (self.codec == .none) return error.ReadFailed;
+        return explainf(error.ReadFailed, "`{s}`: the {s} stream is truncated or corrupt (it broke after line {d})", .{ self.path, @tagName(self.codec), self.line_no });
     }
 };
+
+fn trimCr(s: []const u8) []const u8 {
+    return if (s.len > 0 and s[s.len - 1] == '\r') s[0 .. s.len - 1] else s;
+}
+
+/// `\r` when the start of the stream ends its lines with a bare carriage return
+/// (classic Mac OS, some exports), else `\n`.
+fn sniffEol(r: *std.Io.Reader) u8 {
+    const head = r.peekGreedy(1) catch return '\n';
+    if (std.mem.indexOfScalar(u8, head, '\n') != null) return '\n';
+    const cr = std.mem.indexOfScalar(u8, head, '\r') orelse return '\n';
+    return if (cr + 1 < head.len) '\r' else '\n';
+}
+
+fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+    var buf: [480]u8 = undefined;
+    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch blk: {
+        @memcpy(buf[buf.len - 3 ..], "...");
+        break :blk buf[0..];
+    });
+}
+
+fn clip(s: []const u8) []const u8 {
+    return if (s.len <= 80) s else s[0..80];
+}
 
 /// A header without the UTF-8 byte-order mark Excel writes before "CSV UTF-8" files,
 /// which would otherwise stick to the first column's name.
@@ -594,6 +687,7 @@ pub const MappedCsv = struct {
     body: []const u8,
     schema: types.Schema,
     file: std.fs.File,
+    path: []const u8 = "",
     quoted_newlines: bool = false,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
@@ -614,12 +708,12 @@ pub const MappedCsv = struct {
         const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
         errdefer std.posix.munmap(data);
 
-        const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.EmptyCsv;
-        var header = stripBom(data[0..nl]);
-        if (header.len > 0 and header[header.len - 1] == '\r') header = header[0 .. header.len - 1];
-        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, header, dialect));
+        if (std.mem.indexOfScalar(u8, data, '\n') == null) return error.NotMappable;
+        const head = scanRecord(data, 0, dialect.delim);
+        if (data[head.next - 1] != '\n') return error.EmptyCsv;
+        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, stripBom(head.line), dialect));
 
-        const body = data[nl + 1 ..];
+        const body = data[head.next..];
         var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
         var fed: usize = 0;
         var pos: usize = 0;
@@ -638,10 +732,16 @@ pub const MappedCsv = struct {
             .body = body,
             .schema = .{ .fields = try fields.toOwnedSlice() },
             .file = file,
+            .path = try arena.dupe(u8, path),
             .dialect = dialect,
             .quoted_newlines = hasQuotedNewline(body, dialect.delim),
         };
         return self;
+    }
+
+    /// A reader of the i-th of `n` chunks, its failures naming this file and line.
+    pub fn reader(self: *const MappedCsv, i: usize, n: usize, schema: *const types.Schema) CsvSliceReader {
+        return .{ .data = self.chunk(i, n), .schema = schema, .dialect = self.dialect, .slot = self.slot, .path = self.path, .whole = self.data };
     }
 
     /// The i-th of `n` newline-aligned chunks of the body; a line belongs to the
@@ -702,6 +802,8 @@ pub const CsvSliceReader = struct {
     schema: *const types.Schema,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
+    path: []const u8 = "",
+    whole: []const u8 = "",
 
     pub fn next(self: *CsvSliceReader, arena: std.mem.Allocator) !?Batch {
         if (self.pos >= self.data.len) return null;
@@ -715,7 +817,8 @@ pub const CsvSliceReader = struct {
             const line = rec.line;
             self.pos = rec.next;
             if (line.len == 0) continue;
-            try splitInto(arena, line, builders, self.dialect, self.slot);
+            splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
+                return rowFailure(e, self.path, self.lineOf(line), line, self.schema.*, self.dialect, self.slot);
             rows += 1;
         }
         if (rows == 0) return null;
@@ -726,6 +829,14 @@ pub const CsvSliceReader = struct {
 
     pub fn source(self: *CsvSliceReader) driver.Source {
         return .{ .ptr = self, .vtable = &slice_vtable };
+    }
+
+    /// Counted only for an error message: a split file has no quoted newline, so its
+    /// newlines are its line breaks.
+    fn lineOf(self: *const CsvSliceReader, line: []const u8) u64 {
+        const base = if (self.whole.len > 0) self.whole else self.data;
+        const off = @intFromPtr(line.ptr) -| @intFromPtr(base.ptr);
+        return std.mem.count(u8, base[0..@min(off, base.len)], "\n") + 1;
     }
 };
 
@@ -926,12 +1037,14 @@ fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const 
     return .{ .line = data[start..end], .next = data.len };
 }
 
-/// Whether a quoted field is left open. `""` counts two, so parity is the state;
-/// a quoteless line is one SIMD scan (a byte walk capped the parse at ~75 MB/s).
-fn quotesOpen(line: []const u8, delim: u8) bool {
-    const first_q = std.mem.indexOfScalar(u8, line, '"') orelse return false;
-    var in_q = false;
-    var at_field = first_q == 0 or line[first_q - 1] == delim;
+/// Whether a quoted field is left open at the end of `line`, which starts inside one
+/// when `in_quote` (a continuation line), so a long record is scanned once, not once
+/// per line. `""` counts two, so parity is the state; a quoteless line is one SIMD
+/// scan (a byte walk capped the parse at ~75 MB/s).
+fn quotesOpen(line: []const u8, delim: u8, in_quote: bool) bool {
+    const first_q = std.mem.indexOfScalar(u8, line, '"') orelse return in_quote;
+    var in_q = in_quote;
+    var at_field = !in_quote and (first_q == 0 or line[first_q - 1] == delim);
     var i: usize = first_q;
     while (i < line.len) : (i += 1) {
         const c = line[i];
@@ -979,7 +1092,8 @@ pub const Projection = struct {
     }
 };
 
-/// Missing trailing fields are null; extra ones are ignored. A quoted field with no
+/// A row with more or fewer fields than the header is `CsvRaggedRow`: padding or
+/// cutting it once loaded a shifted row without a word. A quoted field with no
 /// `""` is a slice of the line. Text after a closing quote stays in the field up to
 /// the delimiter: ending at the quote once silently shifted a row's values by one.
 fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Builder, d: Dialect, slot: ?[]const i16) !void {
@@ -1024,13 +1138,13 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
                 const raw = if (buf) |*bb| try bb.toOwnedSlice() else line[start..end];
                 try putCell(arena, bld, raw, true, d.encoding);
             }
-            if (i < line.len and line[i] == d.delim) i += 1;
         } else {
             const start = i;
             i = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
             if (dest) |bld| try putCell(arena, bld, line[start..i], false, d.encoding);
-            if (i < line.len and line[i] == d.delim) i += 1;
         }
+        if ((i < line.len) != (col + 1 < ncols)) return error.CsvRaggedRow;
+        i += 1;
     }
 }
 
@@ -1042,27 +1156,88 @@ fn splitPlain(arena: std.mem.Allocator, line: []const u8, builders: []column.Bui
     var col: usize = 0;
     var start: usize = 0;
     var i: usize = 0;
-    scan: {
-        while (i + V <= line.len) : (i += V) {
-            var m: u32 = @bitCast(@as(Vec, line[i..][0..V].*) == dv);
-            while (m != 0) : (m &= m - 1) {
-                const p = i + @ctz(m);
-                try putField(arena, builders, slot, col, line[start..p], d.encoding);
-                start = p + 1;
-                col += 1;
-                if (col == ncols) break :scan;
-            }
-        }
-        while (i < line.len) : (i += 1) if (line[i] == d.delim) {
-            try putField(arena, builders, slot, col, line[start..i], d.encoding);
-            start = i + 1;
+    while (i + V <= line.len) : (i += V) {
+        var m: u32 = @bitCast(@as(Vec, line[i..][0..V].*) == dv);
+        while (m != 0) : (m &= m - 1) {
+            const p = i + @ctz(m);
+            if (col + 1 == ncols) return error.CsvRaggedRow;
+            try putField(arena, builders, slot, col, line[start..p], d.encoding);
+            start = p + 1;
             col += 1;
-            if (col == ncols) break :scan;
-        };
-        try putField(arena, builders, slot, col, line[start..], d.encoding);
-        col += 1;
-        while (col < ncols) : (col += 1) try putField(arena, builders, slot, col, "", d.encoding);
+        }
     }
+    while (i < line.len) : (i += 1) if (line[i] == d.delim) {
+        if (col + 1 == ncols) return error.CsvRaggedRow;
+        try putField(arena, builders, slot, col, line[start..i], d.encoding);
+        start = i + 1;
+        col += 1;
+    };
+    if (col + 1 != ncols) return error.CsvRaggedRow;
+    try putField(arena, builders, slot, col, line[start..], d.encoding);
+}
+
+/// The file, line and field behind a row `splitInto` refused, found by walking the
+/// row again; only a failing read pays for it.
+fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, schema: types.Schema, d: Dialect, slot: ?[]const i16) anyerror {
+    const ncols = if (slot) |sl| sl.len else schema.fields.len;
+    var where_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const where = (if (path.len > 0)
+        std.fmt.bufPrint(&where_buf, "`{s}` line {d}", .{ path, line_no })
+    else
+        std.fmt.bufPrint(&where_buf, "line {d}", .{line_no})) catch "a row";
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i <= line.len) : (n += 1) {
+        const raw = nextField(line, &i, d.delim);
+        if (e != error.CsvTypeMismatch or n >= ncols) continue;
+        const f = if (slot) |sl| (if (sl[n] >= 0) schema.fields[@intCast(sl[n])] else continue) else schema.fields[n];
+        if (cellParses(f.ty.kind, raw)) continue;
+        const want: []const u8 = switch (f.ty.kind) {
+            .int => "an INT",
+            .float => "a FLOAT",
+            .date => "a DATE",
+            else => @tagName(f.ty.kind),
+        };
+        return explainf(e, "{s}, column `{s}`: '{s}' is not {s}, the type sniffed from the first {d} rows", .{ where, f.name, clip(raw), want, SAMPLE_ROWS });
+    }
+    if (e == error.CsvRaggedRow)
+        return explainf(e, "{s} has {d} fields, the header {d} — a row must have one field per column", .{ where, n, ncols });
+    return e;
+}
+
+/// One field's text from `line[i.*]` (a quoted one without its quotes, `""` kept),
+/// moving `i` past its delimiter; past the end once the last field is taken.
+fn nextField(line: []const u8, i: *usize, delim: u8) []const u8 {
+    const start = i.*;
+    var j = start;
+    var lo = start;
+    var hi: ?usize = null;
+    if (j < line.len and line[j] == '"') {
+        lo = j + 1;
+        j += 1;
+        while (j < line.len) : (j += 1) {
+            if (line[j] != '"') continue;
+            if (j + 1 < line.len and line[j + 1] == '"') {
+                j += 1;
+                continue;
+            }
+            hi = j;
+            break;
+        }
+    }
+    const end = std.mem.indexOfScalarPos(u8, line, @min(j, line.len), delim) orelse line.len;
+    i.* = end + 1;
+    return line[lo..(hi orelse end)];
+}
+
+fn cellParses(kind: types.TypeKind, raw: []const u8) bool {
+    if (raw.len == 0) return true;
+    return switch (kind) {
+        .int => (std.fmt.parseInt(i64, raw, 10) catch null) != null,
+        .float => (std.fmt.parseFloat(f64, raw) catch null) != null,
+        .date => eval.parseIsoDate(raw) != null,
+        else => true,
+    };
 }
 
 inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?[]const i16, col: usize, raw: []const u8, enc: Encoding) !void {
@@ -1131,12 +1306,15 @@ pub const CsvWriter = struct {
     }
 
     /// `.append` resumes at the file's end and writes the header only to an empty file,
-    /// so a second header never lands among the rows. Objects, SFTP and SMB are written
-    /// whole (through a `.part`), so they cannot append; a local file is written whole
-    /// too unless appended to.
+    /// so a second header never lands among the rows; a file with rows must already
+    /// have this header, and one missing its last newline gets it first, or the first
+    /// new row would join the last old one. Objects, SFTP and SMB are written whole
+    /// (through a `.part`), so they cannot append; a local file is written whole too
+    /// unless appended to.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
+        var newline = false;
         if (sftp.isUrl(path)) {
             if (mode == .append) return error.AppendNotSupported;
             self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
@@ -1151,12 +1329,18 @@ pub const CsvWriter = struct {
             self.* = .{ .backend = .{ .object = try obj.openWriter(arena, client, "text/csv") } };
         } else {
             self.* = .{ .backend = undefined };
-            self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false }) else try self.part.create(path) };
+            self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true }) else try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
             if (mode == .append) {
+                errdefer self.backend.file.close();
                 const end = try self.backend.file.getEndPos();
+                if (end > 0) {
+                    const prior = try appendTarget(arena, self.backend.file, end, splitCodec(path).codec);
+                    header = prior.empty;
+                    newline = !prior.empty and !prior.ends_nl;
+                    if (!prior.empty) try checkAppendHeader(arena, path, prior.header, schema, dialect);
+                }
                 try self.fw.seekTo(end);
-                header = end == 0;
             }
         }
 
@@ -1167,6 +1351,7 @@ pub const CsvWriter = struct {
         }
 
         self.dialect = dialect;
+        if (newline) try self.out().writeByte('\n');
         if (header) {
             const w = self.out();
             for (schema.fields, 0..) |f, i| {
@@ -1176,6 +1361,66 @@ pub const CsvWriter = struct {
             try w.writeByte('\n');
         }
         return self;
+    }
+
+    const Prior = struct { empty: bool, ends_nl: bool, header: []const u8 };
+
+    /// The existing content an append extends: whether it is empty (a `.gz` of no
+    /// bytes is), whether it ends in a newline, and its header record. A `.gz` streams
+    /// through once for its last byte, in constant memory.
+    fn appendTarget(arena: std.mem.Allocator, file: std.fs.File, end: u64, codec: Codec) !Prior {
+        const buf = try arena.alloc(u8, LINE_BUF);
+        var fr = file.reader(buf);
+        var gz: Gunzip = undefined;
+        var r: *std.Io.Reader = &fr.interface;
+        if (codec == .gzip) {
+            gz.init(r, try arena.alloc(u8, codecBuffer(.gzip)), try arena.alloc(u8, LINE_BUF));
+            r = &gz.interface;
+        }
+        var head = std.array_list.Managed(u8).init(arena);
+        var in_header = true;
+        var in_q = false;
+        var last: ?u8 = null;
+        while (true) {
+            const got = r.peekGreedy(1) catch |e| switch (e) {
+                error.EndOfStream => break,
+                else => |x| return x,
+            };
+            last = got[got.len - 1];
+            if (in_header) {
+                for (got, 0..) |c, k| {
+                    if (c == '"') in_q = !in_q;
+                    if (c == '\n' and !in_q) {
+                        try head.appendSlice(got[0..k]);
+                        in_header = false;
+                        break;
+                    }
+                } else try head.appendSlice(got);
+            }
+            r.toss(got.len);
+            if (!in_header and codec == .none) {
+                var one: [1]u8 = undefined;
+                _ = try file.preadAll(&one, end - 1);
+                last = one[0];
+                break;
+            }
+        }
+        return .{ .empty = last == null, .ends_nl = last == '\n', .header = head.items };
+    }
+
+    fn checkAppendHeader(arena: std.mem.Allocator, path: []const u8, line: []const u8, schema: types.Schema, d: Dialect) !void {
+        const have_line = trimCr(stripBom(line));
+        const have = try headerFields(arena, have_line, d);
+        const same = have.len == schema.fields.len and for (have, schema.fields) |h, f| {
+            if (!std.mem.eql(u8, h.name, f.name)) break false;
+        } else true;
+        if (same) return;
+        var want = std.array_list.Managed(u8).init(arena);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try want.append(d.delim);
+            try want.appendSlice(f.name);
+        }
+        return explainf(error.AppendHeaderMismatch, "`{s}` has the header `{s}`, but this APPEND writes `{s}` — appended rows must have the file's columns, in its order", .{ path, clip(have_line), clip(want.items) });
     }
 
     pub fn openStdout(arena: std.mem.Allocator, schema: types.Schema, dialect: Dialect) !*CsvWriter {
@@ -1450,18 +1695,23 @@ test "csv parsing: quoted fields, escaped quotes, empty fields" {
     try std.testing.expectEqualStrings("3", b.columns[2].getValue(1).string);
 }
 
-test "csv parsing: CRLF endings, blank lines, ragged rows" {
+test "csv parsing: CRLF endings, blank lines, and a ragged row is an error naming its line" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const schema = try stringSchema(a, &.{ "a", "b", "c" });
 
-    const b = try parseSlice(a, &schema, "1,2,3\r\n\r\n4,5\r\n6,7,8,NINE\n");
+    const b = try parseSlice(a, &schema, "1,2,3\r\n\r\n4,5,\r\n6,7,8\n");
     try std.testing.expectEqual(@as(usize, 3), b.len);
     try std.testing.expectEqualStrings("3", b.columns[2].getValue(0).string);
     try std.testing.expect(b.columns[2].getValue(1).isNull());
-    try std.testing.expectEqualStrings("6", b.columns[0].getValue(2).string);
     try std.testing.expectEqualStrings("8", b.columns[2].getValue(2).string);
+
+    try std.testing.expectError(error.CsvRaggedRow, parseSlice(a, &schema, "1,2,3\n4,5\n"));
+    try std.testing.expectEqualStrings("line 2 has 2 fields, the header 3 — a row must have one field per column", eval.takeFailure(error.CsvRaggedRow).?);
+    try std.testing.expectError(error.CsvRaggedRow, parseSlice(a, &schema, "1,2,3,4\n"));
+    try std.testing.expectError(error.CsvRaggedRow, parseSlice(a, &schema, "1,\"2,x\",3,\n"));
+    try std.testing.expectError(error.CsvRaggedRow, parseSlice(a, &schema, "1,\"2\"\n"));
 }
 
 test "csv parsing: leading/trailing empty fields and last line without newline" {
@@ -1579,6 +1829,76 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
         break :blk null;
     }) |_| {}
     try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+    const why = eval.takeFailure(error.CsvTypeMismatch).?;
+    try std.testing.expect(std.mem.endsWith(u8, why, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows"));
+
+    const mb = try MappedCsv.open(a, bad_path, .{});
+    defer mb.close();
+    var sr = mb.reader(0, 1, &mb.schema);
+    err = null;
+    while (sr.next(a) catch |e| blk: {
+        err = e;
+        break :blk null;
+    }) |_| {}
+    try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+    try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows"));
+}
+
+fn readAllRows(a: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    const r = try CsvReader.open(a, path, .{});
+    defer r.close();
+    var out = std.array_list.Managed([]const u8).init(a);
+    for (r.schema.fields) |f| try out.append(f.name);
+    while (try r.next(a)) |b| {
+        for (0..b.len) |i| for (b.columns) |c| try out.append(try eval.valueToString(a, c.getValue(i)));
+    }
+    return out.items;
+}
+
+test "csv reader: a quoted CRLF keeps its CR, bare-CR files read, no line is too long" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const long = try a.alloc(u8, 3 * LINE_BUF);
+    @memset(long, 'x');
+    try tmp.dir.writeFile(.{ .sub_path = "crlf.csv", .data = "id,v\r\n1,\"a\r\nb\"\r\n2,c\r\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "cr.csv", .data = "id,n\r1,x\r2,\"y\rz\"\r" });
+    try tmp.dir.writeFile(.{ .sub_path = "long.csv", .data = try std.mem.concat(a, u8, &.{ "a,b\n1,", long, "\n2,\"", long, "\n", long, "\"\n" }) });
+
+    const crlf = try readAllRows(a, try tmp.dir.realpathAlloc(a, "crlf.csv"));
+    try std.testing.expectEqualStrings("a\r\nb", crlf[3]);
+    try std.testing.expectEqualStrings("c", crlf[5]);
+
+    const cr = try readAllRows(a, try tmp.dir.realpathAlloc(a, "cr.csv"));
+    try std.testing.expectEqual(@as(usize, 6), cr.len);
+    try std.testing.expectEqualStrings("n", cr[1]);
+    try std.testing.expectEqualStrings("y\rz", cr[5]);
+
+    const lg = try readAllRows(a, try tmp.dir.realpathAlloc(a, "long.csv"));
+    try std.testing.expectEqual(@as(usize, 6), lg.len);
+    try std.testing.expectEqual(long.len, lg[3].len);
+    try std.testing.expectEqual(2 * long.len + 1, lg[5].len);
+}
+
+test "a quoted header name may hold a newline, in the serial and the mapped reader" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "h.csv", .data = "\"multi\nline\",b\n1,2\n" });
+    const path = try tmp.dir.realpathAlloc(a, "h.csv");
+    const rows = try readAllRows(a, path);
+    try std.testing.expectEqualStrings("multi\nline", rows[0]);
+    try std.testing.expectEqualStrings("2", rows[3]);
+    const m = try MappedCsv.open(a, path, .{});
+    defer m.close();
+    try std.testing.expectEqualStrings("multi\nline", m.schema.fields[0].name);
+    var sr = m.reader(0, 1, &m.schema);
+    const b = (try sr.next(a)).?;
+    try std.testing.expectEqual(@as(i64, 2), b.columns[1].getValue(0).int);
 }
 
 test "a UTF-8 byte-order mark, as Excel writes it, is not part of the first column's name" {
@@ -1739,6 +2059,19 @@ test "csv reader: a zip member reads, and MappedCsv refuses both containers" {
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, ref, .{}));
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, gpath, .{}));
     try std.testing.expectError(error.NotMappable, MappedCsv.open(a, zpath, .{}));
+}
+
+test "csv reader: a lone zip member's own name picks its codec" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "zg.zip", .data = @embedFile("testdata/gz_member.zip") });
+    const rows = try readAllRows(a, try tmp.dir.realpathAlloc(a, "zg.zip"));
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    try std.testing.expectEqualStrings("x", rows[0]);
+    try std.testing.expectEqualStrings("2", rows[2]);
 }
 
 test "Encoding.parse accepts the spellings the wild uses" {
@@ -1958,6 +2291,43 @@ test "csv writer: a delimiter that collides with a number still round-trips" {
     }
 }
 
+test "csv writer: an append ends a last line first, keeps the header it finds, writes one where none is" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const schema = try typedSchema(a, &.{"a"}, &.{.int});
+    const batch = try parseSlice(a, &schema, "2\n");
+    const append = struct {
+        fn run(al: std.mem.Allocator, path: []const u8, s: types.Schema, b: Batch) !void {
+            const w = try CsvWriter.open(al, path, s, .append, .{});
+            try w.writeBatch(al, b);
+            try w.close();
+        }
+    }.run;
+
+    try tmp.dir.writeFile(.{ .sub_path = "ap.csv", .data = "a\n1" });
+    const ap = try tmp.dir.realpathAlloc(a, "ap.csv");
+    try append(a, ap, schema, batch);
+    try std.testing.expectEqualStrings("a\n1\n2\n", try tmp.dir.readFileAlloc(a, "ap.csv", 1024));
+
+    const gz_path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "ap.csv.gz" });
+    const gz_bytes = [_]u8{ 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try tmp.dir.writeFile(.{ .sub_path = "ap.csv.gz", .data = &gz_bytes });
+    try append(a, gz_path, schema, batch);
+    try append(a, gz_path, schema, batch);
+    const r = try CsvReader.open(a, gz_path, .{});
+    defer r.close();
+    try std.testing.expectEqualStrings("a", r.schema.fields[0].name);
+    try std.testing.expectEqual(@as(usize, 2), (try r.next(a)).?.len);
+
+    try tmp.dir.writeFile(.{ .sub_path = "m.csv", .data = "b,a\nx,1\n" });
+    try std.testing.expectError(error.AppendHeaderMismatch, append(a, try tmp.dir.realpathAlloc(a, "m.csv"), schema, batch));
+    try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.AppendHeaderMismatch).?, "m.csv` has the header `b,a`, but this APPEND writes `a` — appended rows must have the file's columns, in its order"));
+    try std.testing.expectEqualStrings("b,a\nx,1\n", try tmp.dir.readFileAlloc(a, "m.csv", 1024));
+}
+
 test "csv writer: renderBatch produces exactly what writeBatch writes" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -2013,10 +2383,14 @@ test "scanRecord: a newline inside a quoted field stays in the value" {
 }
 
 test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" {
-    try std.testing.expect(quotesOpen("1,\"line A", ','));
-    try std.testing.expect(!quotesOpen("1,\"line A\"", ','));
-    try std.testing.expect(!quotesOpen("plain,row", ','));
-    try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\"", ','));
+    try std.testing.expect(quotesOpen("1,\"line A", ',', false));
+    try std.testing.expect(!quotesOpen("1,\"line A\"", ',', false));
+    try std.testing.expect(!quotesOpen("plain,row", ',', false));
+    try std.testing.expect(!quotesOpen("a,\"he said \"\"hi\"\"\"", ',', false));
+    try std.testing.expect(quotesOpen("still inside", ',', true));
+    try std.testing.expect(!quotesOpen("end\",2", ',', true));
+    try std.testing.expect(quotesOpen("end\",\"again", ',', true));
+    try std.testing.expect(quotesOpen("a \"\"quoted\"\" word", ',', true));
 
     try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n", ','));
     try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n", ','));
@@ -2055,7 +2429,7 @@ test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an app
     try std.testing.expectEqualStrings("beta", names.items[1]);
 }
 
-test "splitInto: delimiter bitmask across chunk edges, missing and extra fields, a projection" {
+test "splitInto: delimiter bitmask across chunk edges, missing and extra fields refused, a projection" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -2063,9 +2437,12 @@ test "splitInto: delimiter bitmask across chunk edges, missing and extra fields,
     const I = types.Type.init(.int).asNullable();
 
     var bs = [_]column.Builder{ column.Builder.init(a, I), column.Builder.init(a, S), column.Builder.init(a, S), column.Builder.init(a, I) };
-    try splitInto(a, "12345678901,abcdefghijklmnopqrstu,vwxyzABCDEFGHIJKLMNOP,42,extra,more", &bs, .{}, null);
-    try splitInto(a, "7,x", &bs, .{}, null);
+    try splitInto(a, "12345678901,abcdefghijklmnopqrstu,vwxyzABCDEFGHIJKLMNOP,42", &bs, .{}, null);
+    try splitInto(a, "7,x,,", &bs, .{}, null);
     try splitInto(a, "8,\"q,\"\"t\"\"\",,9", &bs, .{}, null);
+    var extra = [_]column.Builder{ column.Builder.init(a, I), column.Builder.init(a, S), column.Builder.init(a, S), column.Builder.init(a, I) };
+    try std.testing.expectError(error.CsvRaggedRow, splitInto(a, "12345678901,abcdefghijklmnopqrstu,vwxyzABCDEFGHIJKLMNOP,42,extra,more", &extra, .{}, null));
+    try std.testing.expectError(error.CsvRaggedRow, splitInto(a, "7,x", &extra, .{}, null));
     const c0 = try bs[0].finish();
     const c1 = try bs[1].finish();
     const c2 = try bs[2].finish();

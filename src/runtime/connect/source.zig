@@ -15,6 +15,7 @@ const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
 const evalCfgStr = @import("register.zig").evalCfgStr;
+const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const forHintName = @import("../env.zig").forHintName;
 const ftp = @import("../../store/ftp.zig");
@@ -176,7 +177,10 @@ pub fn noteParquet(env: *Env, pr: *pqdecode.Reader) void {
 fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source {
     const r = arrowread.Reader.openProjected(env.arena, path, project) catch |e| {
         const why = switch (e) {
-            error.UnsupportedArrow => "an Arrow type or feature basalt does not read",
+            error.UnsupportedArrow => if (eval.takeFailure(e)) |w|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read {s}", .{w}))
+            else
+                "an Arrow type or feature basalt does not read",
             error.NotArrow => "not an Arrow IPC file or stream",
             error.CorruptArrow => "the file is truncated or corrupt",
             else => try pathFail(env.arena, path, e),

@@ -1147,7 +1147,8 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     if (w.mode == .upsert)
         return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
     if (w.mode == .append) {
-        if (appendUnsupported(w.target)) |why|
+        const fmt = if (std.mem.eql(u8, w.connector, "csv")) try formatFromHints(hints, diag) else null;
+        if (appendUnsupported(w.target, fmt)) |why|
             return fail(diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
     }
 }

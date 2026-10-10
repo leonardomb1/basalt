@@ -353,7 +353,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     const slot = &ctx.slots[i];
     const wa = slot.arena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect, .slot = ctx.mapped.slot };
+    var reader = ctx.mapped.reader(i, ctx.queue.nitems, ctx.csv_schema);
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
@@ -433,7 +433,7 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
     if (held.* == null) {
         const path = m.files[it.file];
         const r = try pqdecode.Reader.openProjected(scratch, path, m.project);
-        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema)) |why| {
+        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema, m.project)) |why| {
             r.close();
             return eval.explain(error.ParquetFolderMismatch, pqdecode.mismatchMessage(scratch, m.root orelse "", path, m.files[0], why));
         };

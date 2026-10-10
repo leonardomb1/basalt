@@ -11,6 +11,7 @@ const smb = @import("../../store/smb.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx.zig");
+const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
 const Stage = @import("../analyze.zig").Stage;
 const analyze = @import("../analyze.zig").analyze;
@@ -97,11 +98,13 @@ pub fn render(plan: Plan, w: anytype) !void {
 /// Why `APPEND` cannot be honoured for a file target, or null: a parquet footer is
 /// written last, a block blob is committed whole, and a server file is renamed into
 /// place. Shared with the runtime planner.
-pub fn appendUnsupported(target: []const u8) ?[]const u8 {
+pub fn appendUnsupported(target: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
     if (sftp.isUrl(target) or smb.isUrl(target)) return "a file on a server is written to `name.part` and renamed over the target once complete, never extended";
-    if (pqwrite.Writer.isPath(target)) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
-    if (arrowread.isPath(target)) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
+    const parquet = if (explicit) |f| f == .parquet else pqwrite.Writer.isPath(target);
+    const arrow = if (explicit) |f| f == .arrow else arrowread.isPath(target);
+    if (parquet) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
+    if (arrow) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
     return null;
 }
 

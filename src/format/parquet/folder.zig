@@ -73,7 +73,7 @@ pub const Folder = struct {
     }
 
     fn mismatch(self: *Folder, got: types.Schema) ?[]const u8 {
-        return schemaMismatch(self.arena, self.schema, got);
+        return schemaMismatch(self.arena, self.schema, got, self.project);
     }
 
     pub fn close(self: *Folder) void {

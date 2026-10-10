@@ -106,6 +106,7 @@ pub const Statistics = struct {
     null_count: ?i64 = null,
     min: ?[]const u8 = null,
     max: ?[]const u8 = null,
+    legacy: bool = false,
 };
 
 pub const ColumnMetaData = struct {
@@ -422,6 +423,7 @@ fn readStatistics(r: *thrift.Reader) Error!Statistics {
         }
     }
     try r.structEnd();
+    st.legacy = (st.min == null and legacy_min != null) or (st.max == null and legacy_max != null);
     if (st.min == null) st.min = legacy_min;
     if (st.max == null) st.max = legacy_max;
     return st;

@@ -54,7 +54,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
         },
         .csv => |c| {
             const rd = try scratch.create(csv.CsvSliceReader);
-            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema, .dialect = c.mapped.dialect, .slot = c.mapped.slot };
+            rd.* = c.mapped.reader(c.chunk, c.of, c.schema);
             return rd.source();
         },
     }
@@ -107,7 +107,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
             const r = if (k == 0) probe else pqdecode.Reader.openProjected(arena, f, project) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(arena, "could not read parquet `{s}` ({s})", .{ f, @errorName(e) }));
             defer if (k != 0) r.close();
-            if (k != 0) if (pqdecode.schemaMismatch(arena, schema, r.schema)) |why|
+            if (k != 0) if (pqdecode.schemaMismatch(arena, schema, r.schema, project)) |why|
                 return planErr(env.diag, pqdecode.mismatchMessage(arena, root.?, f, files[0], why));
             for (0..r.md.row_groups.len) |g| try items.append(.{ .file = @intCast(k), .rg = @intCast(g), .rg_end = @intCast(g + 1) });
         }

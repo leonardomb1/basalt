@@ -39,8 +39,14 @@ AS
   previous one in place (a device or a symlink as the target is written in
   place). Explicit `APPEND` accumulates for CSV only: the file is
   opened without truncating and the header row is written only when it was
-  absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` and
-  Arrow IPC (the footer indexes every row group or batch and is written last,
+  absent or empty (a `.csv.gz` whose content is empty counts as empty). A file
+  that already has a header must have this load's columns — the same names, in
+  the same order — or the load fails naming both headers before writing a byte;
+  appending `b, a` under `a, b` would file every value under the wrong column. A
+  file whose last line has no newline gets one first, so the first new row never
+  joins the last old one. Explicit `APPEND` is a plan-time error for `.parquet` and
+  Arrow IPC, whether named by extension or by `WITH (format = ...)` (the footer
+  indexes every row group or batch and is written last,
   so appending means rewriting the file), for `az://` / `s3://` (an object is
   replaced on write, never extended), and for `sftp://` / `smb://` (the file is
   written beside the target and renamed over it) — use `REPLACE`, a per-run
