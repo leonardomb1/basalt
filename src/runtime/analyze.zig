@@ -254,7 +254,7 @@ fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, d
     return failPos(diag, t.pos, "{s}", .{try eval.valueToString(arena, m)});
 }
 
-fn failPos(diag: *Diag, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     const e = fail(diag, fmt, args);
     diag.pos = pos;
     return e;
@@ -465,9 +465,10 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, cli.len);
     for (cli, json_args) |o, *ja| ja.* = .{ .name = o.name, .text = o.value };
-    const program = expand.expandProgramWith(arena, raw_program, null, json_args, &expand_msg) catch |e| switch (e) {
+    var expand_at: ?ast.Pos = null;
+    const program = expand.expandProgramAt(arena, raw_program, null, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ExpandFailed => return fail(diag, "{s}", .{expand_msg}),
+        error.ExpandFailed => return failPos(diag, expand_at, "{s}", .{expand_msg}),
     };
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return fail(diag, "internal error: the parsed program has no kind statement", .{});
@@ -688,23 +689,7 @@ pub fn misplacedDecl(arena: std.mem.Allocator, stmts: []const ast.Stmt, where: e
     return null;
 }
 
-pub fn stmtPos(s: ast.Stmt) ?ast.Pos {
-    return switch (s) {
-        .kind => |k| k.pos,
-        .param => |p| p.pos,
-        .connection => |c| c.pos,
-        .binding => |b| b.pos,
-        .output => |p| p.pos,
-        .for_each => |fe| fe.pos,
-        .match => |m| m.pos,
-        .func => |fd| fd.pos,
-        .let_const => |l| l.pos,
-        .print => |p| p.pos,
-        .call => |c| c.pos,
-        .throw => |t| t.pos,
-        .explain => |e| e.pos,
-    };
-}
+pub const stmtPos = ast.stmtPos;
 
 /// One pipeline against declarations already in scope, for the executor's
 /// `EXPLAIN <query>;`, which holds these maps (params folded) and hands them over.

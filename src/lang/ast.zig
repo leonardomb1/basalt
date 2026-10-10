@@ -614,6 +614,24 @@ pub const Stmt = union(enum) {
     explain: ExplainStmt,
 };
 
+pub fn stmtPos(s: Stmt) ?Pos {
+    return switch (s) {
+        .kind => |k| k.pos,
+        .param => |p| p.pos,
+        .connection => |c| c.pos,
+        .binding => |b| b.pos,
+        .output => |p| p.pos,
+        .for_each => |fe| fe.pos,
+        .match => |m| m.pos,
+        .func => |fd| fd.pos,
+        .let_const => |l| l.pos,
+        .print => |p| p.pos,
+        .call => |c| c.pos,
+        .throw => |t| t.pos,
+        .explain => |e| e.pos,
+    };
+}
+
 pub const ExplainMode = enum { none, plan, analyze, describe };
 
 pub const ExplainStmt = struct {

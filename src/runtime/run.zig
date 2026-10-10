@@ -177,9 +177,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
     for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
-    const program = expand.expandProgramWith(arena, raw_program, opts.request_body, json_args, &expand_msg) catch |e| switch (e) {
+    var expand_at: ?ast.Pos = null;
+    const program = expand.expandProgramAt(arena, raw_program, opts.request_body, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        error.ExpandFailed => return planErr(diag, expand_msg),
+        error.ExpandFailed => {
+            const err = planErr(diag, expand_msg);
+            diag.pos = expand_at;
+            return err;
+        },
     };
 
     if (program.stmts.len == 0 or program.stmts[0] != .kind)

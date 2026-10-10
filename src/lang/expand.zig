@@ -36,7 +36,17 @@ const Ctx = struct {
     fns: *const std.StringHashMap(ast.FnDecl),
     json: *const std.StringHashMap(?std.json.Value),
     msg: *[]const u8,
+    at: *?ast.Pos,
+    pinned: bool = false,
     budget: usize = max_nodes,
+
+    /// The innermost failing call names the place, as the error unwinds through its callers.
+    fn pin(self: *Ctx, span: ?ast.Span) void {
+        if (self.pinned) return;
+        const sp = span orelse return;
+        self.at.* = sp.start;
+        self.pinned = true;
+    }
 };
 
 const Subst = std.StringHashMap(*ast.Expr);
@@ -51,8 +61,16 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
 /// A JSON PARAM binds from its `args` text first, then the request body, then a string
 /// DEFAULT; with none of them (offline `check`) its paths read as null.
 pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
+    var at: ?ast.Pos = null;
+    return expandProgramAt(arena, program, body, args, msg, &at);
+}
+
+/// `expandProgramWith`, with `at` set on failure to where the problem is: the failing
+/// call, else the statement or declaration holding it.
+pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
+        at.* = s.func.pos;
         if (builtins.lookup(s.func.name) != null or parser.isAggName(s.func.name)) {
             msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
@@ -64,6 +82,7 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
         try fns.put(s.func.name, s.func);
     };
 
+    at.* = null;
     var json = std.StringHashMap(?std.json.Value).init(arena);
     var has_json = false;
     for (program.stmts) |s| if (s == .param and s.param.is_json) {
@@ -76,6 +95,7 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
             return error.ExpandFailed;
         };
         for (program.stmts) |s| if (s == .param and s.param.is_json) {
+            at.* = s.param.pos;
             var val = parsed;
             if (val == null) if (s.param.default) |d| if (d.* == .str_lit) {
                 val = parseJsonArg(arena, s.param.name, d.str_lit, msg) catch |e| return e;
@@ -87,10 +107,12 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
         };
     }
 
-    var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
+    at.* = null;
+    var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg, .at = at };
     var out = std.array_list.Managed(ast.Stmt).init(arena);
     for (program.stmts) |s| {
         if (s == .func and s.func.body != .stmts) continue;
+        at.* = ast.stmtPos(s);
         try out.append(try expandStmt(&cx, s));
     }
     return .{ .stmts = try out.toOwnedSlice() };
@@ -357,6 +379,7 @@ fn expandLetIn(cx: *Ctx, l: ast.Expr.LetIn, subst: ?*Subst, depth: usize) Error!
 }
 
 fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*ast.Expr {
+    errdefer cx.pin(c.span);
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, subst, depth);
 
@@ -526,6 +549,13 @@ test "expandProgram rejects recursion and arity mismatch" {
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
+
+    var at: ?ast.Pos = null;
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, null, &.{}, &m2, &at));
+    try std.testing.expectEqual(@as(u32, 2), at.?.line);
+    try std.testing.expectEqual(@as(u32, 8), at.?.col);
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, null, &.{}, &m1, &at));
+    try std.testing.expectEqual(@as(u32, 1), at.?.line);
 }
 
 test "expandProgram bounds total nodes, not just nesting depth" {

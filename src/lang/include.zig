@@ -239,7 +239,7 @@ fn parseDirective(ctx: *Ctx, s: []const u8, label: []const u8, line: u32, col: u
     if (tail.len == 0 or tail[0] != ';') return ctx.fail(label, line, col, "missing `;` after @include", .{});
     tail = std.mem.trimLeft(u8, tail[1..], " \t");
     if (tail.len != 0 and !std.mem.startsWith(u8, tail, "--"))
-        return ctx.fail(label, line, col, "unexpected text after @include — one file per directive", .{});
+        return ctx.fail(label, line, col + @as(u32, @intCast(s.len - tail.len)), "unexpected text after @include — one file per directive", .{});
     return path;
 }
 
@@ -609,6 +609,7 @@ test "malformed directives are parse errors" {
     var d3: Diag = .{};
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a.sql'; 'b.sql';\n", "m.sql", ".", &d3));
     try testing.expect(std.mem.indexOf(u8, d3.parse.msg, "one file per directive") != null);
+    try testing.expectEqual(@as(u32, 19), d3.parse.col);
 }
 
 test "a script without directives is parsed unchanged" {

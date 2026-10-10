@@ -670,14 +670,21 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                         first_err = std.fmt.allocPrint(env.arena, "row {s}: {s}", .{ label, emsg }) catch null;
                     if (on_error == .stop) {
                         if (isTransient(e)) env.diag.retryable = true;
-                        if (first_err) |why|
-                            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each {s}", .{why}));
+                        if (first_err) |why| {
+                            const at = env.diag.pos;
+                            const err = planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each {s}", .{why}));
+                            env.diag.pos = at orelse fe.pos;
+                            return err;
+                        }
                         return error.PlanFailed;
                     }
                 }
             }
-            if (failures > 0 and opts.outcomes == null)
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
+            if (failures > 0 and opts.outcomes == null) {
+                const err = planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
+                env.diag.pos = fe.pos;
+                return err;
+            }
         },
         .parallel => {
             var wopts = opts;
@@ -697,7 +704,9 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                     try std.fmt.allocPrint(env.arena, "for-each {s}", .{first})
                 else
                     try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, first });
-                return planErr(env.diag, why);
+                const err = planErr(env.diag, why);
+                env.diag.pos = fe.pos;
+                return err;
             }
         },
     }
