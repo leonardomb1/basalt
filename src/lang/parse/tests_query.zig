@@ -107,6 +107,17 @@ test "sql: two calls in one query get their own bindings, the body's CTEs includ
     try testing.expectEqualStrings("b", args.items[1]);
 }
 
+test "sql: LIMIT and OFFSET name the `$param` they cannot take" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM lim INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $lim;", &diag));
+    try testing.expectEqualStrings("LIMIT takes an integer literal, not `$lim`", diag.msg);
+    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM o INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT 2 OFFSET $o;", &diag));
+    try testing.expectEqualStrings("OFFSET takes an integer literal, not `$o`", diag.msg);
+}
+
 test "sql: a table function call is checked where it is written" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

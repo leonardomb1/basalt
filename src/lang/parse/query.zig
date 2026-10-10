@@ -277,11 +277,13 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     }
 
     if (self.eatKw("limit")) {
+        try literalCount(self, "LIMIT");
         const n = try self.expect(.int);
         const count = std.fmt.parseInt(u64, n.text, 10) catch
             return self.fail(self.curPos(), "bad LIMIT `{s}`", .{n.text});
         var offset: u64 = 0;
         if (self.eatKw("offset")) {
+            try literalCount(self, "OFFSET");
             const m = try self.expect(.int);
             offset = std.fmt.parseInt(u64, m.text, 10) catch
                 return self.fail(self.curPos(), "bad OFFSET `{s}`", .{m.text});
@@ -291,6 +293,13 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
 
     if (hidden_drop) |keep|
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
+}
+
+/// LIMIT and OFFSET take an integer literal; a `$name` there is named in the refusal.
+fn literalCount(self: *Parser, what: []const u8) Error!void {
+    if (!self.at(.dollar_ident)) return;
+    const t = self.cur();
+    return self.fail(self.curPos(), "{s} takes an integer literal, not `${s}`", .{ what, t.text });
 }
 
 /// Index of the projection a sort reads through. A `DISTINCT ON` is looked through
