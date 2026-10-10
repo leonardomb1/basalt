@@ -340,30 +340,62 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             try stages.append(sort_stage);
     }
 
-    if (self.eatKw("limit")) {
-        try literalCount(self, "LIMIT");
-        const n = try self.expect(.int);
-        const count = std.fmt.parseInt(u64, n.text, 10) catch
-            return self.fail(self.curPos(), "bad LIMIT `{s}`", .{n.text});
-        var offset: u64 = 0;
-        if (self.eatKw("offset")) {
-            try literalCount(self, "OFFSET");
-            const m = try self.expect(.int);
-            offset = std.fmt.parseInt(u64, m.text, 10) catch
-                return self.fail(self.curPos(), "bad OFFSET `{s}`", .{m.text});
-        }
-        try stages.append(.{ .node = .{ .limit = .{ .count = count, .offset = offset } }, .hints = &.{}, .pos = self.curPos() });
-    }
+    const lpos = self.curPos();
+    if (try parseLimit(self)) |lim|
+        try stages.append(.{ .node = .{ .limit = lim }, .hints = &.{}, .pos = lpos });
 
     if (hidden_drop) |keep|
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
 }
 
-/// LIMIT and OFFSET take an integer literal; a `$name` there is named in the refusal.
-fn literalCount(self: *Parser, what: []const u8) Error!void {
-    if (!self.at(.dollar_ident)) return;
-    const t = self.cur();
-    return self.fail(self.curPos(), "{s} takes an integer literal, not `${s}`", .{ what, t.text });
+/// `LIMIT n|ALL`, `OFFSET m [ROWS]` and `FETCH FIRST|NEXT [n] ROWS ONLY`, OFFSET before
+/// or after the other, as SQL allows; FETCH is the standard's spelling of LIMIT.
+fn parseLimit(self: *Parser) Error!?ast.Limit {
+    var lim: ast.Limit = .{ .count = std.math.maxInt(u64) };
+    var counted = false;
+    var offset = false;
+    while (true) {
+        const kpos = self.curPos();
+        if (self.isKw("limit") or self.isKw("fetch")) {
+            if (counted) return self.fail(kpos, "a query takes one LIMIT or FETCH FIRST", .{});
+            counted = true;
+            if (self.eatKw("limit")) {
+                if (!self.eatKw("all")) try limitCount(self, "LIMIT", &lim.count, &lim.count_expr);
+                continue;
+            }
+            _ = self.advance();
+            if (!self.eatKw("first") and !self.eatKw("next"))
+                return self.fail(self.curPos(), "expected `FIRST` or `NEXT` after FETCH", .{});
+            if (self.isKw("row") or self.isKw("rows")) lim.count = 1 else try limitCount(self, "FETCH FIRST", &lim.count, &lim.count_expr);
+            if (!self.eatKw("row") and !self.eatKw("rows"))
+                return self.fail(self.curPos(), "expected `ROWS ONLY` after FETCH FIRST n", .{});
+            if (self.isKw("with"))
+                return self.fail(self.curPos(), "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY", .{});
+            try self.expectKw("only");
+        } else if (self.eatKw("offset")) {
+            if (offset) return self.fail(kpos, "a query takes one OFFSET", .{});
+            offset = true;
+            try limitCount(self, "OFFSET", &lim.offset, &lim.offset_expr);
+            _ = self.eatKw("row") or self.eatKw("rows");
+        } else break;
+    }
+    return if (counted or offset) lim else null;
+}
+
+/// A LIMIT or OFFSET value: an integer literal is read here; any other constant, an
+/// expression of `$name`s and literals, is kept to evaluate once those have values.
+/// A column has no single value to take, so it is refused.
+fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error!void {
+    const vpos = self.curPos();
+    const e = try self.parseExpr();
+    if (e.* == .int_lit) {
+        if (e.int_lit < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, e.int_lit });
+        n.* = @intCast(e.int_lit);
+        return;
+    }
+    if (!self.constItemExpr(e))
+        return self.fail(vpos, "{s} takes a constant: an integer, a `$param` or LET, or an expression of them, not a column", .{what});
+    expr.* = e;
 }
 
 /// Index of the projection a sort reads through. A `DISTINCT ON` is looked through

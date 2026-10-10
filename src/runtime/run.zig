@@ -143,7 +143,7 @@ const wholeAggStages = @import("lanes.zig").wholeAggStages;
 const topNStages = @import("lanes.zig").topNStages;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
-const renderPipeline = @import("script.zig").renderPipeline;
+const renderBound = @import("script.zig").renderBound;
 const renderScriptScope = @import("script.zig").renderScriptScope;
 const runCall = @import("script.zig").runCall;
 const runForEach = @import("script.zig").runForEach;
@@ -678,18 +678,18 @@ pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptio
 fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
         .output => |p| {
-            const pipe = try renderPipeline(env.arena, p, lr);
+            const pipe = try renderBound(env, p, lr);
             try runOutput(env, pipe, opts, stats, lanes_used, batch_arena);
         },
         .explain => |e| {
-            const pipe = try renderPipeline(env.arena, e.pipeline, lr);
+            const pipe = try renderBound(env, e.pipeline, lr);
             try runExplain(env, .{ .mode = e.mode, .pipeline = pipe, .pos = e.pos }, opts, stats, lanes_used, batch_arena);
         },
         .match => |m| try runForMatch(env, m, lr, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, lr),
         .call => |c| try runCall(env, c, lr, opts, stats, lanes_used, batch_arena, runForBody),
         .throw => |t| try runThrow(env, t, lr),
-        .binding => |b| try env.bindings.put(b.name, try renderPipeline(env.arena, b.pipeline, lr)),
+        .binding => |b| try env.bindings.put(b.name, try renderBound(env, b.pipeline, lr)),
         .for_each => |fe| try runForEach(env, try renderForSource(env.arena, fe, lr), opts, stats, lanes_used, batch_arena, runForBody, &lr),
         .let_const => |l| {
             env.diag.stamp(l.pos);

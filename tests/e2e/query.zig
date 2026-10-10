@@ -12,6 +12,7 @@ const runScript = @import("harness.zig").runScript;
 const runScriptOpts = @import("harness.zig").runScriptOpts;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
+const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 
 test "union all by name: a branch may be any query, not just a table" {
     const alloc = std.testing.allocator;
@@ -684,6 +685,33 @@ test "empty source and an all-dropping filter still write just the header" {
     const dropped = try runToString(alloc, &tmp, "id,v\n1,10\n2,20\n", "SELECT * FROM '$IN' WHERE v = 999");
     defer alloc.free(dropped);
     try std.testing.expectEqualStrings("id,v\n", dropped);
+}
+
+test "limit: LIMIT and OFFSET take PARAMs, LETs, loop variables and constant expressions; FETCH FIRST is LIMIT" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "n.csv", .data = "id\n5\n3\n1\n4\n2\n" });
+    try checkAndRun(alloc, &tmp,
+        \\PARAM n INT DEFAULT 2;
+        \\LET m = $n + 1;
+        \\LOAD INTO '$B/param.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id LIMIT $n OFFSET $n - 1;
+        \\LOAD INTO '$B/let.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id DESC LIMIT $m;
+        \\LOAD INTO '$B/fetch.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id OFFSET 1 ROWS FETCH FIRST 2 * 1 ROWS ONLY;
+        \\LOAD INTO '$B/offset.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id OFFSET 3;
+        \\LOAD INTO '$B/cte.csv' AS WITH c AS (SELECT id FROM '$B/n.csv' ORDER BY id LIMIT $n + 0) SELECT * FROM c;
+        \\FOR EACH ROW OF (SELECT id FROM '$B/n.csv' WHERE id = 3) AS (k)
+        \\  LOAD INTO '$B/loop.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id LIMIT $k;
+        \\END FOR;
+    , 1, &.{});
+    try expectFile(&tmp, "param.csv", "id\n2\n3\n");
+    try expectFile(&tmp, "let.csv", "id\n5\n4\n3\n");
+    try expectFile(&tmp, "fetch.csv", "id\n2\n3\n");
+    try expectFile(&tmp, "offset.csv", "id\n4\n5\n");
+    try expectFile(&tmp, "cte.csv", "id\n1\n2\n");
+    try expectFile(&tmp, "loop.csv", "id\n1\n2\n3\n");
+
+    try expectRefusedAlike(alloc, &tmp, "SELECT id FROM '$B/n.csv' LIMIT 1 - 2;", "LIMIT must not be negative, got -1");
 }
 
 test "limit: plain (unfused) limit takes the first N; offset past the end empties" {

@@ -107,15 +107,39 @@ test "sql: two calls in one query get their own bindings, the body's CTEs includ
     try testing.expectEqualStrings("b", args.items[1]);
 }
 
-test "sql: LIMIT and OFFSET name the `$param` they cannot take" {
+test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const Case = struct { q: []const u8, count: u64, offset: u64, exprs: bool = false };
+    const cases = [_]Case{
+        .{ .q = "SELECT id FROM 't.csv' LIMIT 2 OFFSET 3;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 3 LIMIT 2;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 3 ROWS FETCH FIRST 2 ROWS ONLY;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' FETCH NEXT ROW ONLY;", .count = 1, .offset = 0 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 4;", .count = std.math.maxInt(u64), .offset = 4 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT ALL;", .count = std.math.maxInt(u64), .offset = 0 },
+        .{ .q = "PARAM n INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $n * 2 OFFSET $n;", .count = std.math.maxInt(u64), .offset = 0, .exprs = true },
+    };
+    for (cases) |c| {
+        const prog = try parseTest(a, c.q);
+        const out = prog.stmts[prog.stmts.len - 1].output;
+        const lim = out.stages[out.stages.len - 2].node.limit;
+        try testing.expectEqual(c.count, lim.count);
+        try testing.expectEqual(c.offset, lim.offset);
+        try testing.expectEqual(c.exprs, lim.count_expr != null and lim.offset_expr != null);
+    }
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM lim INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $lim;", &diag));
-    try testing.expectEqualStrings("LIMIT takes an integer literal, not `$lim`", diag.msg);
-    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM o INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT 2 OFFSET $o;", &diag));
-    try testing.expectEqualStrings("OFFSET takes an integer literal, not `$o`", diag.msg);
+    const refused = [_][2][]const u8{
+        .{ "SELECT id FROM 't.csv' LIMIT id;", "LIMIT takes a constant: an integer, a `$param` or LET, or an expression of them, not a column" },
+        .{ "SELECT id FROM 't.csv' LIMIT 1 FETCH FIRST 2 ROWS ONLY;", "a query takes one LIMIT or FETCH FIRST" },
+        .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY" },
+        .{ "SELECT id FROM 't.csv' OFFSET 1 OFFSET 2;", "a query takes one OFFSET" },
+    };
+    for (refused) |r| {
+        try testing.expectError(error.ParseFailed, parseSource(a, r[0], &diag));
+        try testing.expectEqualStrings(r[1], diag.msg);
+    }
 }
 
 test "sql: a table function call is checked where it is written" {

@@ -225,6 +225,7 @@ const reserved_after_source = [_][]const u8{
     "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
     "paginate", "retry",    "create", "param",   "having", "and",       "or",
     "not",      "explain",  "costs",  "analyze", "except", "intersect", "window",
+    "fetch",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {
