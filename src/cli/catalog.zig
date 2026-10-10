@@ -184,6 +184,60 @@ pub fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, curs
     return .{ .start = offer.start, .items = items };
 }
 
+/// The variables of every `FOR EACH ... AS (a, b:INT)` still open at `cursor`, read
+/// from the text, as a script being typed will not parse.
+fn loopVarsAt(text: []const u8, cursor: usize, out: *std.array_list.Managed([]const u8)) !void {
+    const upto = text[0..@min(cursor, text.len)];
+    var open: [16]usize = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < upto.len) : (i += 1) {
+        if (upto[i] == '\'') {
+            i = std.mem.indexOfScalarPos(u8, upto, i + 1, '\'') orelse return;
+            continue;
+        }
+        if (i > 0 and (std.ascii.isAlphanumeric(upto[i - 1]) or upto[i - 1] == '_')) continue;
+        if (wordsAt(upto, i, "for", "each")) {
+            if (n < open.len) open[n] = i;
+            n += 1;
+        } else if (wordsAt(upto, i, "end", "for")) {
+            n -|= 1;
+        }
+    }
+    for (open[0..@min(n, open.len)]) |start| {
+        var depth: usize = 0;
+        var k = start;
+        while (k < upto.len) : (k += 1) {
+            switch (upto[k]) {
+                '\'' => k = std.mem.indexOfScalarPos(u8, upto, k + 1, '\'') orelse break,
+                '(' => depth += 1,
+                ')' => depth -|= 1,
+                else => if (depth == 0 and wordsAt(upto, k, "as", "(") and !(std.ascii.isAlphanumeric(upto[k - 1]) or upto[k - 1] == '_')) {
+                    const lp = std.mem.indexOfScalarPos(u8, upto, k, '(').?;
+                    const rp = std.mem.indexOfScalarPos(u8, upto, lp, ')') orelse break;
+                    var it = std.mem.tokenizeAny(u8, upto[lp + 1 .. rp], ", \t\r\n");
+                    while (it.next()) |w| {
+                        var e: usize = 0;
+                        while (e < w.len and (std.ascii.isAlphanumeric(w[e]) or w[e] == '_')) e += 1;
+                        if (e > 0 and (e == w.len or w[e] == ':')) try out.append(w[0..e]);
+                    }
+                    break;
+                },
+            }
+        }
+    }
+}
+
+/// `a` then `b` at `i`, case-insensitive, separated by whitespace; `b` may be `(`.
+fn wordsAt(s: []const u8, i: usize, a: []const u8, b: []const u8) bool {
+    if (i + a.len > s.len or !std.ascii.eqlIgnoreCase(s[i .. i + a.len], a)) return false;
+    var j = i + a.len;
+    if (j < s.len and (std.ascii.isAlphanumeric(s[j]) or s[j] == '_')) return false;
+    while (j < s.len and std.ascii.isWhitespace(s[j])) j += 1;
+    if (j + b.len > s.len or !std.ascii.eqlIgnoreCase(s[j .. j + b.len], b)) return false;
+    return b[0] == '(' or j + b.len == s.len or !(std.ascii.isAlphanumeric(s[j + b.len]) or s[j + b.len] == '_');
+}
+
 /// Never asks for the columns of a name the cursor is still typing at the end of the
 /// text, which would send a catalog query on every keystroke.
 pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, cursor: usize) anyerror!Offer {
@@ -196,6 +250,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         .param, .let => try params.append(e.name),
         .endpoint, .resource => {},
     };
+    try loopVarsAt(text, cursor, &params);
 
     var ctes = std.array_list.Managed([]const u8).init(arena);
     var i: usize = 0;
@@ -317,6 +372,26 @@ test "suggestFor: a half-typed script's own declarations and a local file's colu
     try writeOffer(&aw.writer, cols, text.len);
     const parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
     try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("items").?.array.items.len);
+}
+
+test "suggestFor: a FOR EACH body offers its loop variables, and only inside the loop" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
+
+    const inside = "FOR EACH ROW OF (WITH w AS (SELECT name AS has FROM 'u.csv') SELECT has, 1 FROM w) AS (nm, nx:INT)\n  SELECT $n";
+    const got = try suggestFor(a, &cx, inside, inside.len);
+    try std.testing.expectEqual(@as(usize, 2), got.items.len);
+    try std.testing.expectEqualStrings("$nm", got.items[0].text);
+    try std.testing.expectEqualStrings("$nx", got.items[1].text);
+
+    const after = "FOR EACH ROW OF ('u.csv') AS (nm)\n  SELECT 1 AS v;\nEND FOR;\nSELECT $n";
+    try std.testing.expectEqual(@as(usize, 0), (try suggestFor(a, &cx, after, after.len)).items.len);
 }
 
 test "an offer with no candidates still starts at the word being typed, not the top of the cell" {
