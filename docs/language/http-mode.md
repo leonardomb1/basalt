@@ -20,13 +20,18 @@ WHERE tipo IN ('leitura', 'alarme');
   address) narrows it; `DOC` feeds the startup banner. SIGHUP, or `--watch` on a change,
   reloads the scripts. `GET /healthz` and `/readyz` answer `200` for a load
   balancer. `basalt run script.sql --port N` serves a single script the same
-  way.
+  way; without `--port`, `run` refuses an endpoint script instead of guessing
+  a port. A port already in use is an error, not a second listener.
+- A request body is capped at 64 MiB (**413** past it) and the request head
+  at 64 KiB (**431**); a request that is not valid HTTP gets **400**.
 - **`FROM BODY (schema)`** declares the request contract. The body (JSON array
   or single object) is validated row by row: a missing/null `NOT NULL` column
   or an unreadable value rejects the request with a message naming the row —
   served as **422**. Extra keys are dropped. `JSON` columns ride as text.
 - **`FROM HEADER('X-Tenant')`** on a `PARAM` binds it from that request header
-  (case-insensitive); bare `FROM HEADER` matches the param's own name.
+  (case-insensitive); bare `FROM HEADER` matches the param's own name. A param
+  binds only from its declared source: `?tenant=` in the URL cannot stand in
+  for, or override, a header or body param.
 - Status contract: success → `200` + summary JSON; per-item failures → `207`;
   permanent error → `422`; transient → `503` + `Retry-After`.
 

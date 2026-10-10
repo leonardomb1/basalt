@@ -3,7 +3,7 @@
 //!   basalt check <script>|-c <script>
 //!   basalt repl
 //!   basalt kernel
-//! `run` executes (HTTP mode when the script declares an endpoint); `check`
+//! `run` executes (HTTP mode on `--port` when the script declares an endpoint); `check`
 //! validates and plans without running; `serve <dir>` hosts every `@http` script
 //! in a directory and reloads it on SIGHUP. A script comes from a file path or,
 //! with `-c/--command`, inline; `@include` resolves against its directory, or the
@@ -182,7 +182,7 @@ fn usage(w: anytype) !void {
         \\
         \\usage:
         \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N] [--host IP]
-        \\               run a pipeline; HTTP mode when the script declares CREATE ENDPOINT
+        \\               run a pipeline; --port N serves a CREATE ENDPOINT script
         \\  basalt serve <dir> [--port N] [--host IP] [--watch] [--log-format FMT] [--log-level LVL]
         \\               host every endpoint script in a dir (SIGHUP or -w reloads)
         \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2]

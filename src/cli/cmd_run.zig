@@ -1,4 +1,4 @@
-//! `basalt run`: run a script once, or serve it when it declares an endpoint.
+//! `basalt run`: run a script once, or serve it on `--port` when it declares an endpoint.
 
 const ErrOut = @import("args.zig").ErrOut;
 const analyze = @import("../runtime/analyze.zig");
@@ -34,7 +34,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
-    var port: u16 = 8080;
+    var port: ?u16 = null;
     var host: []const u8 = http_server.default_host;
     var threads: usize = std.Thread.getCpuCount() catch 1;
     var log = runtime.LogConfig{};
@@ -130,7 +130,11 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     }
 
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
-        http_server.serve(alloc, prog, host, port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
+        const serve_port = port orelse {
+            try stderr.print("error: {s} declares CREATE ENDPOINT: add `--port N` to serve it, or host its folder with `basalt serve <dir>`\n", .{src.label});
+            return 2;
+        };
+        http_server.serve(alloc, prog, host, serve_port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         };
@@ -204,4 +208,14 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return if (all_retryable) 75 else 1;
     }
     return 0;
+}
+
+test "run refuses an endpoint script without --port instead of serving it" {
+    var argv = [_][:0]u8{
+        @constCast("basalt"),
+        @constCast("run"),
+        @constCast("-c"),
+        @constCast("CREATE ENDPOINT '/x'; SELECT 1 AS one;"),
+    };
+    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &argv));
 }
