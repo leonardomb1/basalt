@@ -416,6 +416,25 @@ test "GROUP BY, HAVING and ORDER BY bind only the same expression; unselected ke
     }
 }
 
+test "a bare GROUP BY name is the input column before a SELECT alias of it; ORDER BY takes the output name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const t_csv = "g,v\nab,1\nAb,2\ncd,3\n";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT upper(g) AS g, SUM(v) AS s FROM '$IN' GROUP BY g HAVING g <> 'ab' ORDER BY s", .want = "g,s\nAB,2\nCD,3\n" },
+        .{ .q = "SELECT g AS h, upper(g) AS g, COUNT(*) AS n FROM '$IN' GROUP BY g ORDER BY 1", .want = "h,g,n\nAb,AB,1\nab,AB,1\ncd,CD,1\n" },
+        .{ .q = "SELECT upper(g) AS g, COUNT(*) AS n FROM '$IN' GROUP BY upper(g) ORDER BY g", .want = "g,n\nAB,2\nCD,1\n" },
+        .{ .q = "SELECT upper(g) AS u, COUNT(*) AS n FROM '$IN' GROUP BY u ORDER BY u", .want = "u,n\nAB,2\nCD,1\n" },
+        .{ .q = "SELECT -v AS v FROM '$IN' ORDER BY v", .want = "v\n-3\n-2\n-1\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, t_csv, c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "a grouping expression matches however its columns are written: with the table's alias, quoted or bare" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

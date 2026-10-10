@@ -844,4 +844,5 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         try testing.expectEqualStrings(c.msg, diag.msg);
     }
     _ = try parseTest(a, "SELECT g FROM 'x.csv' GROUP BY g HAVING COUNT(*) > 1;");
+    _ = try parseTest(a, "SELECT g, upper(g) AS g, COUNT(*) FROM 'x.csv' GROUP BY g;");
 }

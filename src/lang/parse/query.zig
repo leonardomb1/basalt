@@ -403,6 +403,28 @@ fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualNa
     return self.fail(at, "for SELECT DISTINCT, ORDER BY `{s}` must appear in the select list", .{try std.mem.join(self.arena, ".", written.parts)});
 }
 
+/// What a bare GROUP BY name groups by. SQL reads it as an input column first and as
+/// a SELECT item's alias only when no input column has the name: one the list reads
+/// (`SELECT g`, or `upper(g) AS g`) surely exists, so the input wins; otherwise the
+/// alias is taken, as the parser cannot see the input's columns.
+fn groupNameHome(self: *Parser, raw: anytype, n: []const u8, aliases: *const AliasSet) Error!enum { input, input_under_alias, alias } {
+    for (raw) |ri| if (ri == .item and ri.item == .field) {
+        const f = stripQual(ri.item.field, aliases);
+        if (f.parts.len == 1 and std.mem.eql(u8, f.last(), n)) return .input;
+    };
+    for (raw) |ri| if (ri == .item and ri.item == .computed and std.mem.eql(u8, ri.item.computed.name, n)) {
+        const e = try self.stripExpr(ri.item.computed.expr, aliases);
+        if (e.* == .field and !e.field.dollar and e.field.parts.len == 1 and std.mem.eql(u8, e.field.parts[0], n)) return .input;
+        return if (Window.refsName(e, n)) .input_under_alias else .alias;
+    };
+    return .input;
+}
+
+fn nameListed(names: []const []const u8, n: []const u8) bool {
+    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
+    return false;
+}
+
 /// Refuses an ORDER BY or GROUP BY on a name two SELECT items share, unless they are
 /// the same expression, as SQL does.
 fn unambiguous(self: *Parser, dups: []const Parser.DupName, name: []const u8, clause: []const u8, at: Pos) Error!void {
@@ -1170,6 +1192,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
 
     var group: []const ast.QualName = &.{};
     var group_hidden = std.array_list.Managed(ast.SelectItem).init(self.arena);
+    var input_named = std.array_list.Managed([]const u8).init(self.arena);
     if (self.eatKw("group")) {
         try self.expectKw("by");
         var keys = std.array_list.Managed(ast.QualName).init(self.arena);
@@ -1193,7 +1216,14 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     else => return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n}),
                 };
             } else if (ge.* == .field) {
-                if (ge.field.parts.len == 1) try unambiguous(self, dups.items, ge.field.parts[0], "GROUP BY", pos);
+                if (ge.field.parts.len == 1) {
+                    const n = ge.field.parts[0];
+                    switch (try groupNameHome(self, raw_items.items, n, &aliases)) {
+                        .input => {},
+                        .input_under_alias => try input_named.append(n),
+                        .alias => try unambiguous(self, dups.items, n, "GROUP BY", pos),
+                    }
+                }
                 q = stripQual(ge.field, &aliases);
             } else {
                 if (containsAgg(ge)) return self.fail(pos, "GROUP BY cannot group on an aggregate", .{});
@@ -1205,6 +1235,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             if (!self.eat(.comma)) break;
         }
         group = try keys.toOwnedSlice();
+        if (input_named.items.len > 0) {
+            var kept_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
+            for (expr_aliases.items) |m| if (!nameListed(input_named.items, m.out)) try kept_aliases.append(m);
+            expr_aliases = kept_aliases;
+        }
     }
 
     var having: ?*ast.Expr = null;
@@ -1322,7 +1357,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         lifted = true;
                         continue;
                     }
-                    if (group.len > 0 and !isGroupKey(group, try self.singleName(c.name)) and !self.constItemExpr(stripped)) {
+                    if (group.len > 0 and (!isGroupKey(group, try self.singleName(c.name)) or nameListed(input_named.items, c.name)) and !self.constItemExpr(stripped)) {
                         const keyed = try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases);
                         try self.groupedOnly(keyed, group, aggs.items, &.{}, pos);
                         try post.append(.{ .computed = .{ .name = c.name, .expr = keyed } });

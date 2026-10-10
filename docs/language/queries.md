@@ -90,6 +90,16 @@ refused, naming it, whether written in the SELECT list or brought in by `*`.
 Two plain columns of the same name from a join's two sides are not a repeat:
 the later is named `_r` — see [Joins](joins.md).
 
+A bare name in `GROUP BY` is an input column first, as in SQL, and a SELECT
+item's alias only when no input column has that name: `SELECT upper(g) AS g,
+COUNT(*) ... GROUP BY g` groups by the column `g`, and so does `SELECT g,
+upper(g) AS g ... GROUP BY g`. `ORDER BY` reads a bare name the other way round,
+as the output column first (`SELECT -v AS v ... ORDER BY v` sorts by `-v`). The
+parser does not see a file's or table's columns, so an alias whose expression does
+not read a column of its own name (`SELECT g AS v ... GROUP BY v`) is taken as the
+alias even when the input has a column `v`, where SQL would group by that column —
+give such an alias another name.
+
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
 expression — same columns, same literals to the letter, spacing and keyword case
