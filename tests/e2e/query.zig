@@ -754,6 +754,30 @@ test "limit: a fraction rounds as PostgreSQL casts it; a negative one is refused
     try expectRefusedAlike(alloc, &tmp, "SELECT 1 AS id LIMIT CAST(-1.5 AS DECIMAL(3,1));", "LIMIT must not be negative, got -2");
 }
 
+test "csv: a column with no value in the whole file compares and unifies with any type, as a NULL does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "empty.csv", .data = "k\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "nulls.csv", .data = "k,n\n1,\n2,\n" });
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT id FROM '$IN' WHERE id NOT IN (SELECT k FROM '$B/empty.csv')", .want = "id\n1\n2\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE id NOT IN (SELECT n FROM '$B/nulls.csv')", .want = "id\n" },
+        .{ .q = "SELECT t.id, n.k FROM '$IN' t LEFT JOIN '$B/nulls.csv' n ON t.id = n.n", .want = "id,k\n1,\n2,\n" },
+        .{ .q = "SELECT id FROM '$IN' UNION ALL SELECT n FROM '$B/nulls.csv'", .want = "id\n1\n2\n\n\n" },
+        .{ .q = "SELECT k, coalesce(n, 0) + 1 AS c FROM '$B/nulls.csv'", .want = "k,c\n1,1\n2,1\n" },
+    };
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const got = try runToString(alloc, &tmp, "id\n1\n2\n", q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "join: an empty build side drops all rows (inner) and null-fills (left)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

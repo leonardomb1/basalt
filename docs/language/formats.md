@@ -21,6 +21,12 @@ work on it directly, and a parquet sink stores it as a date. A string function
 on it (`substr(day, 1, 7)`, `day LIKE '2026%'`) still sees the ISO text. A cell
 past the sample that does not parse as the inferred type is an error, never a
 silent coercion. Timestamps are not sniffed; `CAST(ts AS TIMESTAMP)` as before.
+A column with no value at all — a header-only file, or one whose every cell is
+empty — is all NULL, and when the sample covered the whole file it is of unknown
+type, as SQL types a NULL: it compares and unifies with any type (`id NOT IN
+(SELECT k FROM 'empty.csv')` against an `INT` column, a join, a `UNION`), and it
+is a string where shown or written. A larger file's empty sample stays a string,
+since the rows past it may hold text.
 
 ## Parquet
 

@@ -456,6 +456,7 @@ pub const CsvReader = struct {
             sniff.feed(own);
             try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
         }
+        sniff.whole = self.stream_eof;
         for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
 
         self.pending = try pending.toOwnedSlice();
@@ -725,6 +726,7 @@ pub const MappedCsv = struct {
             sniff.feed(line);
             fed += 1;
         }
+        sniff.whole = pos >= body.len;
         for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
 
         self.* = .{
@@ -861,6 +863,7 @@ const TypeSniffer = struct {
     const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true, scale: u8 = 0 };
     cols: []ColState,
     delim: u8,
+    whole: bool = false,
 
     fn init(arena: std.mem.Allocator, ncols: usize, delim: u8) !TypeSniffer {
         const cols = try arena.alloc(ColState, ncols);
@@ -934,8 +937,13 @@ const TypeSniffer = struct {
         c.scale = @max(c.scale, @as(u8, @intCast(places orelse 0)));
     }
 
+    /// A column's type from its sampled cells. One with no value at all in a sample
+    /// that read the whole file holds only NULLs, so it is of unknown type, as SQL
+    /// types a NULL: it compares and unifies with any type and is text where shown
+    /// or written. Past the sample it may hold text, so there it stays a string.
     fn resolve(self: *const TypeSniffer, j: usize) types.Type {
         const c = self.cols[j];
+        if (!c.seen and self.whole) return .{ .kind = .string, .nullable = true, .unknown = true };
         const k: types.TypeKind = if (!c.seen) .string else if (c.all_int) .int else if (c.all_float) .float else if (c.all_date) .date else .string;
         var t = types.Type.init(k).asNullable();
         if (k == .string) t.scale = c.scale;
@@ -1804,6 +1812,18 @@ test "TypeSniffer: int/float promotion, leading zeros and quoted cells force str
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(4).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(5).kind);
     try std.testing.expectEqual(types.TypeKind.int, s.resolve(6).kind);
+}
+
+test "TypeSniffer: a column with no value is of unknown type only when the sample read the whole file" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var s = try TypeSniffer.init(ar.allocator(), 2, ',');
+    s.feed("1,");
+    try std.testing.expect(!s.resolve(1).unknown);
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(1).kind);
+    s.whole = true;
+    try std.testing.expect(s.resolve(1).unknown);
+    try std.testing.expect(!s.resolve(0).unknown);
 }
 
 test "TypeSniffer: a text column keeps its sampled numbers' most decimal places for SUM" {
