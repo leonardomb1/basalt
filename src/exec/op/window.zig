@@ -393,9 +393,9 @@ pub const Window = struct {
     /// rounding of a row that left, at O(1) amortized per row.
     fn TwoStack(comptime T: type, comptime identity: T, comptime combine: fn (T, T) T) type {
         return struct {
-            back: std.ArrayListUnmanaged(T) = .{},
+            back: std.ArrayList(T) = .empty,
             back_agg: T = identity,
-            front: std.ArrayListUnmanaged(T) = .{},
+            front: std.ArrayList(T) = .empty,
 
             const Self = @This();
 
@@ -747,7 +747,7 @@ pub const Window = struct {
         }
 
         fn total(s: *const Slide) f64 {
-            return if (s.seen_float) s.fsum.get() else @floatFromInt(s.acc_i);
+            return s.fsum.get() + @as(f64, @floatFromInt(s.acc_i));
         }
 
         fn result(s: *Slide) !Value {
