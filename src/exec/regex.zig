@@ -12,11 +12,18 @@
 //!
 //! Compilation takes an allocator so callers can hand it a
 //! `FixedBufferAllocator` over stack memory. Matching is continuation-passing
-//! (`Cont` is what remains once the current atom succeeds), which is what lets a
-//! group backtrack into the sequence that follows it, run as a loop over an
-//! explicit stack of choice points (`Machine`): a short match stays in a stack
-//! buffer, and a group repeated once per character of a long subject grows the
-//! stacks on the heap rather than recursing. The subject is matched by
+//! (`Cont` is what remains once the current atom succeeds, an index into
+//! `Machine.conts`; `seq` resumes an item after a repetition that began at
+//! `start`), which is what lets a group backtrack into the sequence that follows
+//! it, run as a loop over an explicit stack of choice points (`Choice`: a step to
+//! retry, a lazy group's one more repetition, a group's next alternative, a
+//! repeated single-unit item giving back or taking one more unit, or a capture to
+//! put back). A short match stays in a stack buffer, and a group repeated once
+//! per character of a long subject grows the stacks on the heap rather than
+//! recursing; continuations made after a choice point are dropped when it is
+//! taken, so both stacks hold only the current path. Either stack past
+//! `Machine.max_frames` (about 70 MiB at worst, a group repeated about 500,000
+//! times in one match) gives up with `PatternTooComplex`. The subject is matched by
 //! character: `.`, a class or a literal takes one UTF-8 code point, and a byte
 //! that starts no valid sequence is a character of its own.
 //!
@@ -25,8 +32,7 @@
 //! pathological pattern cannot read as a non-matching one: `(a|aa)+b` against a
 //! run of `a`s doubles its splits per character (28 took 2.5 seconds, 40 would
 //! take hours). The allowance has a per-character term so a long subject with a
-//! cheap pattern never trips it, and either stack past `Machine.max_frames` gives
-//! up the same way. A repetition of a group beyond its minimum that matches
+//! cheap pattern never trips it. A repetition of a group beyond its minimum that matches
 //! nothing ends the loop, so `(a*)*` cannot spin.
 
 const std = @import("std");
@@ -130,7 +136,7 @@ pub const Regex = struct {
     /// Leftmost match span at or after `from`, with `caps` filled (index 0 is
     /// the whole match). `PatternTooComplex` means gave up, not no match.
     pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
-        var sfa = std.heap.stackFallback(8 * 1024, std.heap.page_allocator);
+        var sfa = std.heap.stackFallback(8 * 1024, std.heap.smp_allocator);
         var m = Machine{ .s = s, .caps = caps, .gpa = sfa.get(), .steps = 10_000_000 + 4 * @as(u64, s.len) };
         defer m.deinit();
         var start = from;
@@ -147,9 +153,6 @@ pub const Regex = struct {
     }
 };
 
-/// What remains once the current atom succeeds, as an index into `Machine.conts`
-/// (0 is `done`). `seq` resumes `items[i]` after its `rep`-th repetition, which
-/// began at `start`.
 const Cont = union(enum) {
     done,
     seq: struct { items: []const Item, i: usize, rep: u32, start: usize, next: u32 },
@@ -158,10 +161,6 @@ const Cont = union(enum) {
 
 const StepAt = struct { items: []const Item, i: usize, rep: u32, pos: usize, cont: u32 };
 
-/// A choice point to come back to on failure, or a capture to put back on the way.
-/// `more` is a lazy group's second choice, one more repetition; `branch` a group's
-/// next alternative; `units` a repeated single-unit item giving back (greedy) or
-/// taking (lazy) one more unit, `n` units in and ending at `p`.
 const Choice = union(enum) {
     step: StepAt,
     more: StepAt,
@@ -174,9 +173,6 @@ const Frame = struct { choice: Choice, nconts: u32 };
 
 const State = union(enum) { step: StepAt, resume_: struct { cont: u32, pos: usize }, fail };
 
-/// One `find`'s backtracking state, kept on the heap so a group may repeat once per
-/// character of a long subject. Continuations made after a choice point are dropped
-/// when it is taken, so both stacks hold only the current path.
 const Machine = struct {
     s: []const u8,
     caps: *Captures,
@@ -185,8 +181,6 @@ const Machine = struct {
     stack: std.ArrayList(Frame) = .empty,
     steps: u64,
 
-    /// Ceiling on either stack: about 70 MiB at worst, and a group repeated in one
-    /// match about 500,000 times (two entries per repetition on each).
     const max_frames = 1 << 20;
 
     fn deinit(m: *Machine) void {

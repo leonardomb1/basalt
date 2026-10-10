@@ -44,7 +44,7 @@ pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
     };
     if (d.scale > want and @rem(d.unscaled, powTen(d.scale - want)) != 0) {
         if (want == 0)
-            return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the column's sampled values are whole, so the sum is an INT; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
+            return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the sum is an INT, as no value sampled at plan time had any; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
         return failWith(error.CastFailed, "SUM: '{s}' has {d} decimal places, more than the {d} of the column's sampled values the sum is typed by; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale, want, d.scale });
     }
     const r = rescaleTo(d, want) orelse return decimalOverflow();

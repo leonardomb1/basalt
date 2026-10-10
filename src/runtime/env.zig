@@ -394,7 +394,7 @@ pub const LoopRow = struct {
         return if (i < self.types.len) self.types[i] else null;
     }
 
-    /// A cell's value; a NULL PARAM, LET or CALL argument renders as "" but stays NULL here.
+    /// A cell's value; a NULL PARAM or LET renders as "" but stays NULL here.
     fn valueAt(self: LoopRow, arena: std.mem.Allocator, i: usize) Value {
         if (i < self.nulls.len and self.nulls[i]) return .null;
         return loopValue(arena, self.cells[i], self.typeAt(i));

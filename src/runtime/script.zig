@@ -548,20 +548,18 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     const pnames = try env.arena.alloc([]const u8, fd.params.len);
     const ptypes = try env.arena.alloc(?types.Type, fd.params.len);
     const cells = try env.arena.alloc([]const u8, fd.params.len);
-    const nulls = try env.arena.alloc(bool, fd.params.len);
     for (fd.params, c.args, 0..) |p, a, i| {
         pnames[i] = p.name;
         ptypes[i] = p.ty;
         const v = eval.constEval(env.arena, a, names.items, values.items) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, @errorName(e) }));
         cells[i] = try eval.valueToString(env.arena, v);
-        nulls[i] = v.isNull();
     }
 
     env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
     env.call_depth += 1;
     defer env.call_depth -= 1;
-    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .nulls = nulls, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
+    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
 }
 
 /// Render a `PRINT` argument with the helper that formats any cell, so a
