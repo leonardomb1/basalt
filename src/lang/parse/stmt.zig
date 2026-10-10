@@ -11,6 +11,7 @@ const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
+const nameApart = @import("../sql_parser.zig").nameApart;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const std = @import("std");
 
@@ -336,6 +337,7 @@ pub fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.Selec
         .missing => try items.append(.{ .field = k.* }),
     };
     if (items.items.len == visible) return null;
+    nameApart(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
     return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
 }
 
@@ -366,7 +368,10 @@ pub fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)
     while (true) {
         if (self.eatKw("pushdown")) {
             _ = try self.expect(.lparen);
+            const outer_quals = self.qual_sink;
+            self.qual_sink = null;
             const e = try self.parseExpr();
+            self.qual_sink = outer_quals;
             _ = try self.expect(.rparen);
             const frag = try self.exprToTemplate(e);
             if (frag.len > 0)

@@ -21,7 +21,8 @@ LET hi = (SELECT max(ts) FROM 'lake/orders.parquet');
 SELECT * FROM conn.orders WHERE ts > $hi;
 ```
 
-The subquery of `IN` must produce exactly one named column, and the test must sit
+The subquery of `IN` must produce exactly one named column — a `UNION`,
+`INTERSECT` or `EXCEPT` of such queries is named by its first — and the test must sit
 as a **top-level AND condition of `WHERE`** — under an `OR`, a `NOT` or a `CASE`
 it cannot be lifted into a join without changing what the predicate means, so
 those shapes are parse errors (spell them as an explicit join). The left side
@@ -42,5 +43,7 @@ what an extraction script usually means — say so in the subquery:
 and the useful form is correlated. A **correlated** subquery — one referencing a
 column of the outer query — has no equivalent here and is not planned: it needs
 either decorrelation in an optimiser or per-row execution of the inner query, and
-the second is fatal for a streaming engine. Rewrite it as a join — the equality
+the second is fatal for a streaming engine. A subquery that names a table of the
+query around it (`WHERE b.s = a.s`) is refused, pointing at that column; a
+name without a table is always the subquery's own column. Rewrite it as a join — the equality
 correlation `EXISTS` usually carries is exactly `IN` on that key.

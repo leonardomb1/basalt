@@ -21,6 +21,7 @@ const isGroupKey = @import("../sql_parser.zig").isGroupKey;
 const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource;
 const itemLabel = @import("../sql_parser.zig").itemLabel;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
+const nameApart = @import("../sql_parser.zig").nameApart;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
@@ -28,6 +29,7 @@ const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
+const stripsAlias = @import("../sql_parser.zig").stripsAlias;
 
 /// A computed file target (`IDENTIFIER(...)`) must spell its extension literally: it
 /// picks the writer and the legal dispositions at plan time, before any row is read.
@@ -198,6 +200,10 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     var hidden_drop: ?[]const ast.SelectItem = null;
     if (self.eatKw("order")) {
         try self.expectKw("by");
+        var order_quals = std.array_list.Managed(Parser.QualRef).init(self.arena);
+        const outer_quals = self.qual_sink;
+        self.qual_sink = &order_quals;
+        defer self.qual_sink = outer_quals;
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         while (true) {
@@ -248,6 +254,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             try keys.append(.{ .field = q, .desc = desc });
             if (!self.eat(.comma)) break;
         }
+        try self.settleQuals(order_quals.items, &first.aliases, outer_quals);
         const sort_keys = try keys.toOwnedSlice();
 
         var visible: ?[]const ast.SelectItem = null;
@@ -287,8 +294,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     try extended.append(hidden);
                 }
                 if (extended.items.len != proj.len) {
+                    nameApart(self.arena, extended.items[0..proj.len]) catch return error.OutOfMemory;
+                    hidden_drop = keepOutputs(self.arena, visible orelse extended.items[0..proj.len]) catch return error.OutOfMemory;
                     stages.items[si].node.select = try extended.toOwnedSlice();
-                    hidden_drop = keepOutputs(self.arena, visible orelse proj) catch return error.OutOfMemory;
                 }
             }
         }
@@ -366,6 +374,10 @@ pub fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
 pub fn parseSelectCore(self: *Parser) Error!Core {
     const pos = self.curPos();
     try self.expectKw("select");
+    var quals = std.array_list.Managed(Parser.QualRef).init(self.arena);
+    const outer_quals = self.qual_sink;
+    self.qual_sink = &quals;
+    defer self.qual_sink = outer_quals;
 
     var distinct = false;
     var distinct_on: ?[]ast.QualName = null;
@@ -375,8 +387,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (self.eatKw("on")) {
             _ = try self.expect(.lparen);
             var cols = std.array_list.Managed(ast.QualName).init(self.arena);
-            try cols.append(try self.parseColRef());
-            while (self.eat(.comma)) try cols.append(try self.parseColRef());
+            while (true) {
+                const cpos = self.curPos();
+                const q = try self.parseColRef();
+                try self.noteQual(q, cpos);
+                try cols.append(q);
+                if (!self.eat(.comma)) break;
+            }
             _ = try self.expect(.rparen);
             distinct_on = try cols.toOwnedSlice();
         }
@@ -473,7 +490,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .item => |it| switch (it) {
                     .field => |f| f,
                     .computed => |c| try self.singleName(c.name),
-                    .star, .star_except, .star_rename => {
+                    .star, .star_except, .star_rename, .star_of => {
                         all = false;
                         continue;
                     },
@@ -498,7 +515,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     while (true) {
         if (self.eatKw("pushdown")) {
             _ = try self.expect(.lparen);
+            self.qual_sink = null;
             const e = try self.parseExpr();
+            self.qual_sink = &quals;
             _ = try self.expect(.rparen);
             const frag = try self.exprToTemplate(e);
             if (frag.len > 0)
@@ -578,6 +597,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var read_join_hints: []const ast.Hint = &.{};
         var binding: []const u8 = undefined;
         var bpos: Pos = undefined;
+        var own: []const u8 = "";
         const reads = self.at(.string) or
             (self.isKw("identifier") and self.peekTag() == .lparen) or
             (self.at(.ident) and self.peekTag() == .dot and !self.isLet(self.cur().text));
@@ -587,6 +607,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             jalias = d.alias;
             bpos = d.alias_pos;
             read_join_hints = d.join_hints;
+            own = d.own;
         } else {
             binding = try self.expectIdent();
             bpos = self.prevPos();
@@ -611,9 +632,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         } else if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
             jalias = self.advance().text;
             try self.claimAlias(&aliases, jalias.?, self.prevPos(), .right);
+        } else if (own.len > 0 and !aliases.knows(own)) {
+            jalias = own;
+            try self.claimAlias(&aliases, own, bpos, .right);
         } else try self.claimAlias(&aliases, binding, bpos, .reserved);
         var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
         var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
+        var pins = std.array_list.Managed(ast.KeyPin).init(self.arena);
         var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
         var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
@@ -625,6 +650,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const rp = try self.arena.alloc([]const u8, 1);
             rp[0] = lk.right;
             try right_keys.append(.{ .parts = rp });
+            try pins.append(.{ .left = true, .right = true });
         }
         if (lateral and lateral_keys.len > 0 and kind == .cross) kind = .inner;
         if (lateral and self.isKw("on") and self.peekTag() == .ident and eqlNoCase(self.peekTok().text, "true")) {
@@ -639,6 +665,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const u = try self.parseUsing(kind, binding, jpos, &left_keys, &right_keys);
             using_sel = u.select;
             if (jalias == null) jalias = binding;
+            aliases.setUsing(jalias.?, u.select);
             binding = u.binding;
         } else {
             if (!self.isKw("on"))
@@ -664,12 +691,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 {
                     const a = c.binary.l.field;
                     const b = c.binary.r.field;
-                    const a_right = qualHasPrefix(a, rname);
-                    if (a_right != qualHasPrefix(b, rname) or (!a_right and (a.parts.len == 1 or b.parts.len == 1))) {
-                        const l = if (a_right) b else a;
-                        const r = if (a_right) a else b;
+                    const sa = keySide(a, rname);
+                    const sb = keySide(b, rname);
+                    if (sa != sb or sa == .loose) {
+                        const flip = sa == .right or sb == .left;
+                        const l = if (flip) b else a;
+                        const r = if (flip) a else b;
                         try left_keys.append(stripQual(l, &aliases));
                         try right_keys.append(stripPrefix(r, rname));
+                        try pins.append(.{ .left = keySide(l, rname) == .left, .right = keySide(r, rname) == .right });
                         continue;
                     }
                 }
@@ -683,6 +713,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     if ((l_left and r_right) or (l_right and r_left)) {
                         const le = if (l_left) c.binary.l else c.binary.r;
                         const re = if (l_left) c.binary.r else c.binary.l;
+                        try pins.append(.{ .left = le.* == .field and le.field.parts.len > 1, .right = true });
                         if (le.* == .field) {
                             try left_keys.append(stripQual(le.field, &aliases));
                         } else {
@@ -716,6 +747,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                             .left_name = ln,
                             .right_name = rn,
                             .pos = .{ .line = opos.line, .col = opos.col },
+                            .a_left = try self.hasQualField(c.binary.l),
+                            .b_left = try self.hasQualField(c.binary.r),
                         });
                         try key_cols.append(ln);
                         try key_cols.append(rn);
@@ -773,6 +806,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .alias = jalias orelse binding,
                 .left_keys = try left_keys.toOwnedSlice(),
                 .right_keys = try right_keys.toOwnedSlice(),
+                .pins = try pins.toOwnedSlice(),
                 .deferred = try deferred.toOwnedSlice(),
                 .residual = residual,
             } },
@@ -814,6 +848,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     .binding = sj.binding,
                     .left_keys = lk,
                     .right_keys = rk,
+                    .pins = &.{.{ .left = true, .right = true }},
                     .null_aware = sj.negated,
                 } },
                 .hints = &.{},
@@ -898,11 +933,18 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         switch (ri) {
             .win => |wi| try post.append(.{ .computed = .{ .name = win_calls.items[wi].out.?, .expr = try self.mk(.{ .field = try self.singleName(win_calls.items[wi].hidden) }) } }),
             .qstar => |alias| {
-                if (!aliases.has(alias))
+                if (!aliases.knows(alias))
                     return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });
-                try items.append(.star);
-                try post.append(.star);
-                star_count += 1;
+                const rights = try aliases.rights(self.arena);
+                if (rights.len == 0) {
+                    try items.append(.star);
+                    try post.append(.star);
+                    star_count += 1;
+                } else {
+                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (stripsAlias(&aliases, alias)) "" else alias, .rights = rights } };
+                    try items.append(if (win_calls.items.len > 0) .star else so);
+                    try post.append(so);
+                }
             },
             .item => |it| switch (it) {
                 .star => {
@@ -910,7 +952,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post.append(.star);
                     star_count += 1;
                 },
-                .star_except, .star_rename => {
+                .star_except, .star_rename, .star_of => {
                     try items.append(it);
                     try post.append(it);
                 },
@@ -1028,7 +1070,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var kept = std.array_list.Managed(ast.SelectItem).init(self.arena);
         for (items.items) |it| {
             switch (it) {
-                .star, .star_except, .star_rename => if (needs_pre)
+                .star, .star_except, .star_rename, .star_of => if (needs_pre)
                     return self.fail(pos, "`*` cannot be combined with a computed GROUP BY key", .{}),
                 .computed => |c| {
                     if (isGroupKey(group, try self.singleName(c.name))) {
@@ -1122,6 +1164,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         for (post.items) |it| try out_items.append(switch (it) {
             .star => .{ .star_except = drop.items },
+            .star_of => |so| .{ .star_of = .{ .rel = so.rel, .rights = so.rights, .drop = drop.items } },
             .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, drop.items }) },
             else => it,
         });
@@ -1141,14 +1184,24 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
+    try self.settleQuals(quals.items, &aliases, outer_quals);
     return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice(), .out_keys = out_keys };
+}
+
+const KeySide = enum { left, right, loose };
+
+/// The side an ON key column names by its qualifier: the joined table's (`rname.x`),
+/// any other table's, or none written.
+fn keySide(q: ast.QualName, rname: []const u8) KeySide {
+    if (q.parts.len == 1) return .loose;
+    return if (qualHasPrefix(q, rname)) .right else .left;
 }
 
 /// Whether a projection already yields a column called `name`, so a window's
 /// reference to it need not be carried.
 fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
     for (items) |it| switch (it) {
-        .star => return true,
+        .star, .star_of => return true,
         .star_except => |ex| {
             for (ex) |x| {
                 if (std.ascii.eqlIgnoreCase(x, name)) break;

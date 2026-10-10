@@ -209,11 +209,15 @@ pub const SelectItem = union(enum) {
     star,
     star_except: []const []const u8,
     star_rename: []const Rename,
+    star_of: StarOf,
     field: QualName,
     computed: Computed,
 
     pub const Computed = struct { name: []const u8, expr: *Expr };
     pub const Rename = struct { from: []const u8, to: []const u8 };
+    /// `t.*` over a join: the columns of the join side `rel`, or with `rel` empty the
+    /// FROM table's, those of none of the join sides `rights`; less the hidden `drop`.
+    pub const StarOf = struct { rel: []const u8 = "", rights: []const []const u8 = &.{}, drop: []const []const u8 = &.{} };
 };
 
 pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };
@@ -279,14 +283,23 @@ pub fn hasSearch(e: *const Expr) bool {
 /// An `=` of the ON whose sides the parser cannot tell apart, its columns written
 /// without a table (`trim(code) = cast(cr AS string)`). The plan decides by where
 /// the columns resolve: one side each makes a computed key, named `left_name` and
-/// `right_name` on the side that computes it; both on one side make a filter.
+/// `right_name` on the side that computes it; both on one side make a filter. A
+/// value with a column qualified by a left table's name (`a_left`, `b_left`) is
+/// the left side's.
 pub const DeferredKey = struct {
     a: *Expr,
     b: *Expr,
     left_name: []const u8,
     right_name: []const u8,
     pos: Pos,
+    a_left: bool = false,
+    b_left: bool = false,
 };
+
+/// Whether a key pair's left and right columns were placed by a qualifier (`e.mgr =
+/// m.id`); a loose one, or a pair past the end of `Join.pins`, is placed by where
+/// its names resolve.
+pub const KeyPin = struct { left: bool = false, right: bool = false };
 
 pub const Join = struct {
     kind: JoinKind,
@@ -294,6 +307,7 @@ pub const Join = struct {
     alias: []const u8 = "",
     left_keys: []const QualName,
     right_keys: []const QualName,
+    pins: []const KeyPin = &.{},
     null_aware: bool = false,
     right_filter: ?*Expr = null,
     deferred: []const DeferredKey = &.{},

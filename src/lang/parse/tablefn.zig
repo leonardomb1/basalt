@@ -307,7 +307,7 @@ pub fn parseJoinRead(self: *Parser) Error!Derived {
         .pipeline = .{ .stages = stages, .pos = rpos },
         .pos = rpos,
     } });
-    return .{ .binding = name, .alias = alias, .alias_pos = rpos, .join_hints = try join_hints.toOwnedSlice() };
+    return .{ .binding = name, .alias = alias, .alias_pos = rpos, .join_hints = try join_hints.toOwnedSlice(), .own = scratch.implicit };
 }
 
 /// A parenthesized query in expression or LET position, `(` consumed, its bindings
@@ -323,8 +323,9 @@ pub fn parseSubqueryPipeline(self: *Parser) Error!ast.Pipeline {
 }
 
 /// Output name of a pipeline's single column, or null, walked back from the last
-/// stage as the plan will resolve it.
-pub fn firstOutName(stages: []const ast.Stage) ?[]const u8 {
+/// stage as the plan will resolve it. A positional set operation is named by its
+/// first branch, a binding still pending.
+pub fn firstOutName(self: *const Parser, stages: []const ast.Stage) ?[]const u8 {
     var i = stages.len;
     while (i > 0) {
         i -= 1;
@@ -341,6 +342,17 @@ pub fn firstOutName(stages: []const ast.Stage) ?[]const u8 {
                 if (ag.by.len + ag.aggs.len != 1) return null;
                 if (ag.aggs.len == 1) return ag.aggs[0].name;
                 return ag.by[0].parts[ag.by[0].parts.len - 1];
+            },
+            .union_ => |u| {
+                if (!u.positional or u.branches.len == 0) return null;
+                const bp = u.branches[0].pipeline orelse return null;
+                if (bp.stages.len != 1 or bp.stages[0].node != .ref) return null;
+                const name = bp.stages[0].node.ref;
+                for (self.pending_bindings.items) |st| {
+                    if (st == .binding and std.mem.eql(u8, st.binding.name, name))
+                        return self.firstOutName(st.binding.pipeline.stages);
+                }
+                return null;
             },
             .filter, .sort, .limit, .distinct => {},
             else => return null,
@@ -403,7 +415,7 @@ pub fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u
     for (items) |it| switch (it) {
         .field => |f| if (std.mem.eql(u8, f.last(), nm)) return nm,
         .computed => |cc| if (cc.expr.* == .field and std.mem.eql(u8, cc.expr.field.last(), nm)) return cc.name,
-        .star => return nm,
+        .star, .star_of => return nm,
         .star_except => |ex| {
             for (ex) |x| {
                 if (std.mem.eql(u8, x, nm)) break;

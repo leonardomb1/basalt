@@ -27,7 +27,28 @@ pub const Col = struct {
     base: []const u8 = "",
 };
 
-/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there.
+fn colNamed(cols: []const Col, name: []const u8) bool {
+    for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
+    return false;
+}
+
+/// `want` unless an earlier column took it; then `joined`, the name the column has
+/// in its input, suffixed `_r` (`_r2`, …) until free.
+fn freeName(arena: std.mem.Allocator, cols: []const Col, want: []const u8, joined: []const u8) Error![]const u8 {
+    if (!colNamed(cols, want)) return want;
+    var nm = joined;
+    var n: usize = 0;
+    while (colNamed(cols, nm)) : (n += 1) {
+        nm = if (n == 0)
+            try std.fmt.allocPrint(arena, "{s}_r", .{joined})
+        else
+            try std.fmt.allocPrint(arena, "{s}_r{d}", .{ joined, n + 1 });
+    }
+    return nm;
+}
+
+/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there
+/// (`freeName`); so is each column of `b.*`.
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
@@ -50,13 +71,17 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
             }
         },
+        .star_of => |so| for (in.fields, 0..) |f, idx| {
+            if (so.rel.len > 0) {
+                if (!std.mem.eql(u8, f.rel, so.rel)) continue;
+            } else if (nameIn(so.rights, f.rel)) continue;
+            if (nameIn(so.drop, f.name)) continue;
+            const nm = try freeName(arena, cols.items, if (f.base.len > 0) f.base else f.name, f.name);
+            try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
+        },
         .field => |q| {
-            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
-            var nm = lastPart(q);
-            for (cols.items) |c| if (std.mem.eql(u8, c.name, nm)) {
-                nm = in.fields[idx].name;
-                break;
-            };
+            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{try std.mem.join(arena, ".", q.parts)});
+            const nm = try freeName(arena, cols.items, lastPart(q), in.fields[idx].name);
             try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
         },
         .computed => |c| {
@@ -401,10 +426,11 @@ pub const JoinPlan = struct {
     left_nullable: bool,
 };
 
-/// The parser orients by alias prefix, which unqualified names lack, so the side is
-/// decided by where each name resolves. Both readings resolving to different columns
-/// is ambiguous; a left key may carry an earlier join's alias.
-fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, diag: *Diag) Error![2]usize {
+/// A pair the parser pinned by a qualifier binds as written. A loose one, its columns
+/// written without a table, is placed by where each name resolves; both readings
+/// resolving is ambiguous, even for one name on both sides (`ON code = code`). A
+/// left key may carry an earlier join's alias.
+fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, pin: ast.KeyPin, diag: *Diag) Error![2]usize {
     const ln = lastPart(lq);
     const rn = lastPart(rq);
     const l_in_l = left.resolve(lq.parts);
@@ -412,10 +438,18 @@ fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.Q
     const r_in_l = left.resolve(rq.parts);
     const r_in_r = right.indexOf(rn);
 
+    if (pin.left or pin.right) {
+        const li = l_in_l orelse return fail(diag, "unknown left join key `{s}`", .{ln});
+        const ri = r_in_r orelse return fail(diag, "join key `{s}` is not a column of the joined side", .{rn});
+        return .{ li, ri };
+    }
     const as_written = l_in_l != null and r_in_r != null;
     const flipped = r_in_l != null and l_in_r != null;
-    if (as_written and flipped and !std.mem.eql(u8, ln, rn))
+    if (as_written and flipped) {
+        if (std.mem.eql(u8, ln, rn))
+            return fail(diag, "join key `{s}` is ambiguous — both sides have `{s}`; qualify it (`a.{s} = b.{s}`) or join USING ({s})", .{ ln, ln, ln, ln, ln });
         return fail(diag, "join key `{s}` is ambiguous — `{s}` and `{s}` both exist on both sides; qualify them", .{ ln, ln, rn });
+    }
     if (as_written) return .{ l_in_l.?, r_in_r.? };
     if (flipped) return .{ r_in_l.?, l_in_r.? };
     if (l_in_l == null and l_in_r == null) return fail(diag, "unknown left join key `{s}`", .{ln});
@@ -471,8 +505,10 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
     const rname = if (j.alias.len > 0) j.alias else j.binding;
     var residual = j.residual;
     for (j.deferred) |d| {
-        const fa = try fitOf(arena, d.a, left, right);
-        const fb = try fitOf(arena, d.b, left, right);
+        var fa = try fitOf(arena, d.a, left, right);
+        var fb = try fitOf(arena, d.b, left, right);
+        if (d.a_left) fa.right = false;
+        if (d.b_left) fb.right = false;
         const as_written = fa.left and fb.right;
         const flipped = fb.left and fa.right;
         const eq = try arena.create(ast.Expr);
@@ -551,20 +587,23 @@ pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.S
 }
 
 /// The `_r` suffix keeps bumping until free: two output fields with one name make the
-/// second unreachable, since every lookup goes through `Schema.indexOf`.
+/// second unreachable, since every lookup goes through `Schema.indexOf`. Any two
+/// numeric keys compare, as the key hash folds int, float and decimal alike. A left
+/// column still carrying the right side's name from a CTE's own join loses it, as
+/// that name now means the right side.
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
     if (j.deferred.len > 0) return fail(diag, "internal error: a join's keys were not placed (orientKeys) before planning it", .{});
 
     const lks = try arena.alloc(usize, j.left_keys.len);
     const rks = try arena.alloc(usize, j.right_keys.len);
-    for (j.left_keys, j.right_keys, lks, rks) |lq, rq, *lo, *ro| {
-        const pair = try joinPair(left, right, lq, rq, diag);
+    for (j.left_keys, j.right_keys, lks, rks, 0..) |lq, rq, *lo, *ro, i| {
+        const pair = try joinPair(left, right, lq, rq, if (i < j.pins.len) j.pins[i] else .{}, diag);
         lo.* = pair[0];
         ro.* = pair[1];
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
-        if (types.Type.unify(lt, rt) == null)
+        if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
             return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
     }
 
@@ -572,8 +611,12 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     const right_nullable = (j.kind == .left or j.kind == .full);
     const left_nullable = (j.kind == .right or j.kind == .full);
 
+    const rel = if (j.alias.len != 0) j.alias else j.binding;
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = f.rel, .base = f.base });
+    for (left.fields) |f| {
+        const stale = std.mem.eql(u8, f.rel, rel);
+        try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = if (stale) "" else f.rel, .base = if (stale) "" else f.base });
+    }
     if (emit_right) for (right.fields) |f| {
         var name = f.name;
         var n: usize = 0;
@@ -598,6 +641,10 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         .right_nullable = right_nullable,
         .left_nullable = left_nullable,
     };
+}
+
+fn isNumeric(k: types.TypeKind) bool {
+    return k == .int or k == .float or k == .decimal;
 }
 
 fn nameIn(names: []const []const u8, n: []const u8) bool {
@@ -648,6 +695,8 @@ pub fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr
     return e;
 }
 
+const both_pinned: []const ast.KeyPin = &.{.{ .left = true, .right = true }};
+
 test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the right side" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -661,7 +710,7 @@ test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the righ
 
     const keys: []const ast.QualName = &.{key};
 
-    const inner = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const inner = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expectEqual(@as(usize, 1), inner.lks[0]);
     try std.testing.expectEqual(@as(usize, 0), inner.rks[0]);
     try std.testing.expectEqual(@as(usize, 4), inner.schema.fields.len);
@@ -669,25 +718,25 @@ test "joinPlan: collision suffix `_r`, left-nullability, semi/anti drop the righ
     try std.testing.expectEqualStrings("label", inner.schema.fields[3].name);
     try std.testing.expect(!inner.schema.fields[3].ty.nullable);
 
-    const lj = try joinPlan(a, left, right, .{ .kind = .left, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const lj = try joinPlan(a, left, right, .{ .kind = .left, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expect(lj.right_nullable);
     try std.testing.expect(lj.schema.fields[2].ty.nullable and lj.schema.fields[3].ty.nullable);
     try std.testing.expect(!lj.schema.fields[0].ty.nullable);
 
-    const semi = try joinPlan(a, left, right, .{ .kind = .semi, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const semi = try joinPlan(a, left, right, .{ .kind = .semi, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expect(!semi.emit_right);
     try std.testing.expectEqual(@as(usize, 2), semi.schema.fields.len);
 
-    const rj = try joinPlan(a, left, right, .{ .kind = .right, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const rj = try joinPlan(a, left, right, .{ .kind = .right, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expect(rj.left_nullable and !rj.right_nullable);
     try std.testing.expect(rj.schema.fields[0].ty.nullable);
-    const fj = try joinPlan(a, left, right, .{ .kind = .full, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const fj = try joinPlan(a, left, right, .{ .kind = .full, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expect(fj.left_nullable and fj.right_nullable);
     const cj = try joinPlan(a, left, right, .{ .kind = .cross, .binding = "r", .left_keys = &.{}, .right_keys = &.{} }, &diag);
     try std.testing.expectEqual(@as(usize, 0), cj.lks.len);
     try std.testing.expectEqual(@as(usize, 4), cj.schema.fields.len);
 
-    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"nope"} }}, .right_keys = keys }, &diag));
+    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"nope"} }}, .right_keys = keys, .pins = both_pinned }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown left join key") != null);
 }
 
@@ -709,7 +758,7 @@ test "joinPlan: the `_r` suffix keeps bumping until the name is actually free" {
     } };
     var diag = Diag{};
     const keys: []const ast.QualName = &.{.{ .parts = &.{"id"} }};
-    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys }, &diag);
+    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = keys, .right_keys = keys, .pins = both_pinned }, &diag);
     try std.testing.expectEqual(@as(usize, 6), p.schema.fields.len);
     try std.testing.expectEqualStrings("id_r", p.schema.fields[3].name);
     try std.testing.expectEqualStrings("x_r2", p.schema.fields[4].name);
@@ -761,14 +810,45 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
 
+    try std.testing.expectError(error.AnalyzeFailed, joinPlan(a, both_l, both_r, .{
+        .kind = .inner,
+        .binding = "r",
+        .left_keys = &.{k_a},
+        .right_keys = &.{k_a},
+    }, &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "both sides have `a`") != null);
+
     const same = try joinPlan(a, both_l, both_r, .{
         .kind = .inner,
         .binding = "r",
         .left_keys = &.{k_a},
         .right_keys = &.{k_a},
+        .pins = &.{.{ .left = true, .right = true }},
     }, &diag);
     try std.testing.expectEqualSlices(usize, &.{0}, same.lks);
     try std.testing.expectEqualSlices(usize, &.{1}, same.rks);
+
+    const pinned = try joinPlan(a, both_l, both_r, .{
+        .kind = .inner,
+        .binding = "r",
+        .left_keys = &.{k_a},
+        .right_keys = &.{k_b},
+        .pins = &.{.{ .left = true }},
+    }, &diag);
+    try std.testing.expectEqualSlices(usize, &.{0}, pinned.lks);
+    try std.testing.expectEqualSlices(usize, &.{0}, pinned.rks);
+}
+
+test "joinPlan: a float key joins a decimal key, as an int one does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.init(.float) }} };
+    const right = types.Schema{ .fields = &.{.{ .name = "d", .ty = types.Type.decimal(4, 1) }} };
+    var diag = Diag{};
+    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"f"} }}, .right_keys = &.{.{ .parts = &.{"d"} }} }, &diag);
+    try std.testing.expectEqualSlices(usize, &.{0}, p.lks);
+    try std.testing.expectEqualSlices(usize, &.{0}, p.rks);
 }
 
 test "aggregatePlan: result types per function and group-key passthrough" {
@@ -875,6 +955,13 @@ test "orientKeys: each value goes to the side its columns are on; one side's pai
     } };
     try std.testing.expectError(error.AnalyzeFailed, orientKeys(a, both, both, amb, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "ambiguous") != null);
+
+    const qualified = ast.Join{ .kind = .inner, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
+        .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos, .b_left = true },
+    } };
+    const qp = try orientKeys(a, both, both, qualified, &diag);
+    try std.testing.expectEqualStrings("cr", qp.left[0].node.select[1].computed.expr.field.parts[0]);
+    try std.testing.expectEqualStrings("code", qp.right[0].node.select[1].computed.expr.field.parts[0]);
 
     const left_only = ast.Join{ .kind = .left, .binding = "r", .left_keys = &.{}, .right_keys = &.{}, .deferred = &.{
         .{ .a = try fld(a, "code"), .b = try fld(a, "cr"), .left_name = "__l", .right_name = "__r", .pos = pos },

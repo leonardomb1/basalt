@@ -126,7 +126,7 @@ fn starExcept(after: []const ast.Stage) ?[]const []const u8 {
     var found: ?[]const []const u8 = null;
     for (after[0].node.select) |it| switch (it) {
         .star_except => |names| found = names,
-        .star, .star_rename => return null,
+        .star, .star_rename, .star_of => return null,
         else => {},
     };
     return found;

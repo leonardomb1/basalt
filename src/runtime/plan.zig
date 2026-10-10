@@ -239,7 +239,7 @@ const Needs = struct {
                     }
                     if (items.len == 1 and items[0] == .star_except) continue;
                     for (items) |it| switch (it) {
-                        .star, .star_except, .star_rename => return null,
+                        .star, .star_except, .star_rename, .star_of => return null,
                         .field => |q| try self.field(q),
                         .computed => |c| try self.expr(c.expr),
                     };

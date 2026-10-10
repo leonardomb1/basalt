@@ -52,7 +52,12 @@ Right-side columns that collide with a left name come back suffixed `_r`, and
 qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
 right side's `amt` everywhere in the query (`SELECT`, `WHERE`, `GROUP BY`,
 `ORDER BY`, a later join's `ON`), and `SELECT b.amt` calls its output `amt`
-unless `a.amt` is already in the list. A pipeline shaped `read | filters | join
+unless `a.amt` is already in the list (then `amt_r`). `b.*` is the right side's
+columns alone, each named so too, and `a.*` the FROM table's. A qualifier must
+name a table of the query — its alias, or its own name when it has none
+(`FROM c`, `FROM sr.db.t` as `t`, `FROM 'dir/l.csv'` as `l`) — or the query is
+refused (`unknown table`); `b.x` where `b` has no `x` is an unknown field,
+never another side's `x`. A pipeline shaped `read | filters | join
 | filters | write` probes in parallel under `-j` — over local CSV/Parquet
 morsels, and over key-range splits for a splittable SQL source. A chain of
 joins followed by `GROUP BY` fans out the same way (`read | filters |

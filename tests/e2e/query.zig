@@ -131,6 +131,11 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k IS NOT NULL)", .want = "k\n1\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 100)", .want = "k\n1\n\n2\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv')", .want = "k\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' UNION SELECT 1 AS k)", .want = "k\n1\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' UNION ALL SELECT 1 AS k)", .want = "k\n1\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' INTERSECT SELECT 2 AS k)", .want = "k\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' EXCEPT SELECT 2 AS k)", .want = "k\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 2 UNION SELECT 1 AS k UNION ALL SELECT 1 AS k)", .want = "k\n2\n" },
     };
     for (cases) |c| {
         const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
@@ -1532,4 +1537,79 @@ test "join order: an unknown join_order is refused" {
         \\LOAD INTO '$B/x.csv' AS
         \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'best') ORDER BY s.k;
     , "join_order is 'auto' or 'written'");
+}
+
+const QualCase = struct { q: []const u8, want: []const u8 };
+
+/// Each query of `cases` over the qualifier fixtures (`$B` the tmp dir), its CSV output
+/// against `want`.
+fn runQualCases(cases: []const QualCase) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,s,v\n1,a,10.5\n2,b,\n2,b2,3.0\n,n,1.0\n3,c,2.0\n4,e,4.0\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n2,x\n2,y\n3,z\n,nn\n5,w\n1,u\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "emp.csv", .data = "id,mgr,name\n1,,boss\n2,1,ann\n3,1,bob\n4,2,cy\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name,amt\n1,ana,10.5\n2,bob,20.25\n3,cid,\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "items.csv", .data = "name,item,q\nana,x,1\nana,y,2\nbob,z,3\neve,w,4\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+}
+
+test "join: qualified keys bind to their side, a self-join too; an unqualified name on both sides is refused" {
+    try runQualCases(&.{
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e LEFT JOIN '$B/emp.csv' m ON m.id = e.mgr ORDER BY e.id", .want = "name,mname\nboss,\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN (SELECT * FROM '$B/emp.csv') m ON m.id = e.mgr ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "WITH c AS (SELECT * FROM '$B/emp.csv') SELECT e.name, m.name AS mname FROM '$B/emp.csv' e LEFT JOIN c m ON e.mgr = m.id ORDER BY e.id", .want = "name,mname\nboss,\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, g.name AS gname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id JOIN '$B/emp.csv' g ON m.mgr = g.id", .want = "name,gname\ncy,boss\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON CAST(id AS string) = trim(CAST(e.mgr AS string)) ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+    });
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c1.csv", .data = "code,a\nx,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c2.csv", .data = "code,b\nx,2\n" });
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/c1.csv' a JOIN '$B/c2.csv' b ON code = code;", "join key `code` is ambiguous");
+}
+
+test "join: `t.*` is that table's columns alone, by their own names unless taken; `b.x` is only `b`'s" {
+    try runQualCases(&.{
+        .{ .q = "SELECT i.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name ORDER BY i.item", .want = "name,item,q\nana,x,1\nana,y,2\nbob,z,3\n" },
+        .{ .q = "SELECT t.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name WHERE i.item = 'z'", .want = "id,name,amt\n2,bob,20.25\n" },
+        .{ .q = "SELECT t.*, i.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name WHERE i.item = 'z'", .want = "id,name,amt,name_r,item,q\n2,bob,20.25,bob,z,3\n" },
+        .{ .q = "SELECT i.*, row_number() OVER (ORDER BY t.id, i.item) AS rn FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name", .want = "name,item,q,rn\nana,x,1,1\nana,y,2,2\nbob,z,3,3\n" },
+        .{ .q = "SELECT g.* FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id JOIN '$B/emp.csv' g ON m.mgr = g.id", .want = "id,mgr,name\n1,,boss\n" },
+        .{ .q = "SELECT i.name, i.item FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.name = 'bob'", .want = "name,item\nbob,z\n" },
+        .{ .q = "SELECT l.k FROM '$B/l.csv' WHERE l.k > 3", .want = "k\n4\n" },
+        .{ .q = "SELECT r.* FROM '$B/l.csv' JOIN '$B/r.csv' ON l.k = r.k WHERE l.s = 'c'", .want = "k,s\n3,z\n" },
+        .{ .q = "WITH c AS (SELECT a.k, b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k) SELECT c.*, b.* FROM c JOIN '$B/items.csv' b ON c.s = b.item WHERE c.s = 'z'", .want = "k,s,name,item,q\n3,z,bob,z,3\n" },
+    });
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n1,x\n" });
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown field `b.v`");
+}
+
+test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
+    try runQualCases(&.{
+        .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\nu,a\n" },
+        .{ .q = "SELECT a.s, b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\na,u\n" },
+        .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
+        .{ .q = "SELECT DISTINCT ON (b.k) b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
+    });
 }

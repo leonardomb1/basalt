@@ -1120,6 +1120,7 @@ const Ctx = struct {
                 .star => try buf.appendSlice("*"),
                 .star_except => try buf.appendSlice("* except (…)"),
                 .star_rename => try buf.appendSlice("* rename (…)"),
+                .star_of => |so| try buf.appendSlice(if (so.rel.len > 0) try std.fmt.allocPrint(self.arena, "{s}.*", .{so.rel}) else "*"),
                 .field => |q| try buf.appendSlice(lastPart(q)),
                 .computed => |c| try buf.appendSlice(c.name),
             }
