@@ -225,12 +225,13 @@ A window is a **breaker**: a row's value is not known until its whole partition 
 arrived, so memory is bounded by the input, as for `ORDER BY`, `DISTINCT` and
 `GROUP BY` (a window does not spill). Each stage sorts once, then resolves every
 row's frame by two forward-moving edges, so a frame of any size costs the same:
-an aggregate adds the rows entering and takes back the rows leaving — `MIN`/`MAX`
-through a monotonic queue, the variances by Welford's update and its inverse (exact
-over integers), `COUNT(DISTINCT)` by per-value counts. `MEDIAN`, `bit_and` and
-`bit_or` cannot take a row back: a frame that only grows adds to them, any other is
-recomputed. A float `SUM` or `AVG` over a sliding frame can differ from a fresh
-total in the last bits.
+an aggregate adds the rows entering and takes back the rows leaving — exactly for
+integer and decimal sums, counts and the variances over integers, `MIN`/`MAX`
+through a monotonic queue, `COUNT(DISTINCT)` by per-value counts. A float `SUM`,
+`AVG` or variance, `bit_and` and `bit_or` combine partial results kept in two
+stacks, never subtracting a row that left, so a sliding float total is as accurate
+as a fresh one. `MEDIAN` keeps the frame's two halves in two heaps, a logarithmic
+cost per row.
 
 `DISTINCT ON (...)` remains the cheaper way to keep one row per key — without an
 `ORDER BY` it streams, where `ROW_NUMBER() ... = 1` would not.

@@ -346,15 +346,17 @@ const Case = struct { q: []const u8, want: []const u8 };
 
 const sales_csv = "id,k,t,v\n1,a,1,10\n2,a,2,\n3,a,2,30\n4,a,5,40\n5,b,1,5\n6,b,3,\n7,b,4,7\n";
 const days_csv = "day,amt\n2024-01-01,1\n2024-01-02,2\n2024-01-02,3\n2024-01-05,4\n2024-01-06,5\n";
+const floats_csv = "id,f\n1,1000000000.5\n2,0.001\n3,0.002\n4,0.003\n";
 
-/// Each case's query over `$B/s.csv` (`sales_csv`) and `$B/d.csv` (`days_csv`),
-/// loaded into a CSV and compared whole.
+/// Each case's query over `$B/s.csv` (`sales_csv`), `$B/d.csv` (`days_csv`) and
+/// `$B/f.csv` (`floats_csv`), loaded into a CSV and compared whole.
 fn expectCases(cases: []const Case) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = sales_csv });
     try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = days_csv });
+    try tmp.dir.writeFile(.{ .sub_path = "f.csv", .data = floats_csv });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     for (cases) |c| {
@@ -403,6 +405,13 @@ test "window functions: value functions, distribution, and every aggregate over 
             .want = "k,id,med,sd,vp,dt,all_big,any_big_yet\na,1,30,15.275252316519467,155.55555555555557,3,true,false\na,2,30,15.275252316519467,155.55555555555557,3,true,false\na,3,30,15.275252316519467,155.55555555555557,3,true,false\na,4,30,15.275252316519467,155.55555555555557,3,true,true\nb,5,6,1.4142135623730951,1,3,false,false\nb,6,6,1.4142135623730951,1,3,false,false\nb,7,6,1.4142135623730951,1,3,false,false\n",
         },
     });
+}
+
+test "window float aggregates keep no rounding from rows that left; MEDIAN over a shrinking frame" {
+    try expectCases(&.{.{
+        .q = "SELECT id, VAR_POP(f) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vp, SUM(f) OVER (ORDER BY id ROWS 1 PRECEDING) AS s, VAR_SAMP(f) OVER (ORDER BY id ROWS 1 PRECEDING) AS vs, MEDIAN(f) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS med FROM '$B/f.csv' ORDER BY id",
+        .want = "id,vp,s,vs,med\n1,0,1000000000.5,,0.0025\n2,0,1000000000.501,500000000498999940,0.002\n3,0,0.003,0.0000005,0.0025\n4,0,0.005,0.0000005,0.003\n",
+    }});
 }
 
 test "window IGNORE NULLS: LAG, LEAD, FIRST_VALUE and LAST_VALUE skip nulls, after the call or inside it" {
