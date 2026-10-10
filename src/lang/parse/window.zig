@@ -450,7 +450,7 @@ pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, ma
     const S = struct {
         fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
             switch (node.*) {
-                .field, .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .lambda_var => return @constCast(node),
+                .field, .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => return @constCast(node),
                 .call => |c| if (aggregates.lookup(c.name) != null) return @constCast(node),
                 else => {},
             }
@@ -472,7 +472,7 @@ pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, ma
 pub fn refsName(e: *const ast.Expr, name: []const u8) bool {
     return switch (e.*) {
         .field => |q| !q.dollar and q.parts.len == 1 and std.mem.eql(u8, q.parts[0], name),
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .lambda_var => false,
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => false,
         .unary => |u| refsName(u.e, name),
         .binary => |b| refsName(b.l, name) or refsName(b.r, name),
         .call => |c| for (c.args) |a| {

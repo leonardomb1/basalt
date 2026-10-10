@@ -440,7 +440,7 @@ pub fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u
 pub fn containsExpr(e: *const ast.Expr, needle: *const ast.Expr) bool {
     if (e == needle) return true;
     return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => false,
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => false,
         .lambda => |l| containsExpr(l.body, needle),
         .unary => |u| containsExpr(u.e, needle),
         .binary => |b| containsExpr(b.l, needle) or containsExpr(b.r, needle),

@@ -122,11 +122,18 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
 }
 
 fn powTen(n: u8) i128 {
-    var r: i128 = 1;
-    var i: u8 = 0;
-    while (i < n) : (i += 1) r *= 10;
-    return r;
+    return pow10_i128[n];
 }
+
+const pow10_i128 = blk: {
+    var t: [39]i128 = undefined;
+    var r: i128 = 1;
+    for (&t) |*e| {
+        e.* = r;
+        r *%= 10;
+    }
+    break :blk t;
+};
 
 /// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
 /// float8 to numeric. Null for a non-finite value or one past 38 digits.
@@ -154,11 +161,13 @@ pub fn floatToDecimal(x: f64) ?Decimal {
 }
 
 /// The scale `round(decimal, digits)` answers in: the digits when they are a
-/// literal (as DuckDB types it), else the input's own.
+/// literal (as DuckDB types it; a negative one is scale 0), else the input's own.
 pub fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
     if (c.args.len < 2) return 0;
-    if (c.args[1].* != .int_lit) return in_scale;
-    return @intCast(std.math.clamp(c.args[1].int_lit, 0, in_scale));
+    const d = c.args[1];
+    if (d.* == .unary and d.unary.op == .neg and d.unary.e.* == .int_lit) return 0;
+    if (d.* != .int_lit) return in_scale;
+    return @intCast(std.math.clamp(d.int_lit, 0, in_scale));
 }
 
 pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {

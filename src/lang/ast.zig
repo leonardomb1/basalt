@@ -90,6 +90,7 @@ pub const Expr = union(enum) {
     bool_lit: bool,
     int_lit: i64,
     float_lit: f64,
+    dec_lit: DecLit,
     str_lit: []const u8,
     field: QualName,
     unary: Unary,
@@ -103,6 +104,36 @@ pub const Expr = union(enum) {
     lambda: Lambda,
     lambda_var: []const u8,
 
+    pub const DecLit = struct {
+        unscaled: i128 align(8),
+        scale: u8,
+
+        /// Its digits, at least its scale and one: `0.05` is `DECIMAL(2,2)`.
+        pub fn precision(self: DecLit) u8 {
+            var n: u8 = 0;
+            var u = @abs(self.unscaled);
+            while (u > 0) : (u /= 10) n += 1;
+            return @max(n, self.scale, 1);
+        }
+
+        /// The literal as SQL writes it, every scale digit kept: `10.00`, `0.5`.
+        pub fn format(self: DecLit, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            var buf: [48]u8 = undefined;
+            const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(self.unscaled)}) catch unreachable;
+            if (self.unscaled < 0) try w.writeByte('-');
+            if (digits.len <= self.scale) {
+                try w.writeAll("0.");
+                try w.splatByteAll('0', self.scale - digits.len);
+                return w.writeAll(digits);
+            }
+            const int_len = digits.len - self.scale;
+            try w.writeAll(digits[0..int_len]);
+            if (self.scale > 0) {
+                try w.writeByte('.');
+                try w.writeAll(digits[int_len..]);
+            }
+        }
+    };
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
     pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null };
@@ -137,7 +168,7 @@ fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
 /// fields, so no pass can drop one on rebuild (that bug hit `is_null.kind` three times).
 pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, comptime recur: anytype) !*Expr {
     return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => @constCast(e),
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => @constCast(e),
         .lambda => |l| try mkExpr(arena, .{ .lambda = .{ .params = l.params, .body = try recur(ctx, l.body) } }),
         .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
         .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
@@ -272,7 +303,7 @@ pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
 /// it needs, so a filter holding one is never moved across a select or a join.
 pub fn hasSearch(e: *const Expr) bool {
     return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .field, .lambda_var => false,
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => false,
         .unary => |u| hasSearch(u.e),
         .binary => |b| hasSearch(b.l) or hasSearch(b.r),
         .call => |c| blk: {

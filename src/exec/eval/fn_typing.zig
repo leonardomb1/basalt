@@ -10,6 +10,7 @@ const bindParams = @import("row.zig").bindParams;
 const boolish = @import("../eval.zig").boolish;
 const comparable = @import("../eval.zig").comparable;
 const dateDiff = @import("time.zig").dateDiff;
+const decimalArithType = @import("row.zig").decimalArithType;
 const eq = @import("support.zig").eq;
 const intish = @import("../eval.zig").intish;
 const lambdaSlots = @import("row.zig").lambdaSlots;
@@ -197,6 +198,7 @@ pub const typing = struct {
         const a = try self.argType(c, 0);
         if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{name});
         if (a.unknown or a.kind == .int) return a;
+        if (a.kind == .decimal) return Type.decimal(@min(38, (a.precision -| a.scale) + 1), 0).withNull(a.nullable);
         return Type.init(.float).withNull(a.nullable);
     }
 
@@ -217,9 +219,10 @@ pub const typing = struct {
         if (c.args.len != 2) return self.err("`mod` takes (a, b)", .{});
         const a = try self.argType(c, 0);
         const b = try self.argType(c, 1);
-        if (!(a.kind == .int or a.unknown) or !(b.kind == .int or b.unknown))
-            return self.err("`mod` needs integer arguments", .{});
-        return Type.init(.int).asNullable();
+        if (!numericish(a) or !numericish(b)) return self.err("`mod` needs numeric arguments", .{});
+        const nn = a.nullable or b.nullable or a.unknown or b.unknown;
+        if (decimalArithType(.mod, a, b)) |dt| return dt.withNull(nn);
+        return Type.init(if (a.kind == .float or b.kind == .float) .float else .int).withNull(nn);
     }
 
     pub fn power(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
@@ -241,6 +244,8 @@ pub const typing = struct {
         if (c.args.len != 1) return self.err("`sign` takes one argument", .{});
         const a = try self.argType(c, 0);
         if (!numericish(a)) return self.err("`sign` needs a numeric argument", .{});
+        if (a.kind == .decimal) return Type.decimal(1, 0).withNull(a.nullable);
+        if (a.kind == .float) return a;
         return Type.init(.int).withNull(a.nullable or a.unknown);
     }
 

@@ -70,7 +70,8 @@ the last one, `initial` for an empty array and null for a null cell.
 `(acc, x, i) -> …` adds the position. The accumulator keeps `initial`'s type,
 widened to what the body returns from it (a DECIMAL total stays a DECIMAL, a
 date a date); a FLOAT element arriving in an INT or DECIMAL total stops the
-statement rather than being cut short — start from `0.0` to sum floats. An
+statement rather than being cut short — start from `0e0` to sum floats (`0.0`
+is a DECIMAL, like any literal with a point and no exponent). An
 element the body cannot compare or compute with stops it too, naming the
 element (`element [1], "a"`), where `json_transform` would put null: a null
 mid-fold would quietly undo everything folded before it.

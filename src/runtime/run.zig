@@ -516,6 +516,7 @@ pub fn constEvalDefault(expr: *const ast.Expr, diag: *Diag) !Value {
     return switch (expr.*) {
         .int_lit => |i| .{ .int = i },
         .float_lit => |f| .{ .float = f },
+        .dec_lit => |d| .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } },
         .str_lit => |s| .{ .string = s },
         .bool_lit => |b| .{ .bool = b },
         .null_lit => .null,

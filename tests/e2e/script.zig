@@ -283,6 +283,24 @@ test "param substitution filters by a CLI-bound value" {
     try std.testing.expectEqualStrings("id\n1\n2\n", out);
 }
 
+test "PARAM: a FLOAT defaulting to 0.5 is a float, a DECIMAL one keeps its scale" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "PARAM rate FLOAT DEFAULT 0.5;\nPARAM fee DECIMAL(10,2) DEFAULT 2.5;\nLOAD INTO '{s}/out.csv' AS SELECT id, $rate * amount AS r, $fee AS f FROM '{s}/in.csv';",
+        .{ base, base },
+    );
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,r,f\n1,50,2.50\n", out);
+}
+
 test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

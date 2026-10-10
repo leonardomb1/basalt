@@ -1,9 +1,11 @@
 //! The row form of each built-in function.
 
 const Batch = @import("../batch.zig").Batch;
+const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const accNode = @import("row.zig").accNode;
+const arith = @import("row.zig").arith;
 const addUnits = @import("time.zig").addUnits;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
@@ -376,8 +378,20 @@ pub const per_row = struct {
         if (v.isNull()) return .null;
         if (v == .int) return v;
         if (!isNum(v)) return error.TypeMismatch;
+        if (v == .decimal) return Value{ .decimal = wholeDecimal(v.decimal, eq(c.name, "floor")) };
         const x = toF64(v);
         return Value{ .float = if (eq(c.name, "floor")) @floor(x) else @ceil(x) };
+    }
+
+    /// A decimal floored or ceiled to scale 0, exactly.
+    fn wholeDecimal(d: Decimal, down: bool) Decimal {
+        const p = std.math.powi(i128, 10, d.scale) catch return .{ .unscaled = 0, .scale = 0 };
+        var q = @divTrunc(d.unscaled, p);
+        if (@rem(d.unscaled, p) != 0) {
+            if (down and d.unscaled < 0) q -= 1;
+            if (!down and d.unscaled > 0) q += 1;
+        }
+        return .{ .unscaled = q, .scale = 0 };
     }
 
     pub fn round(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -399,10 +413,7 @@ pub const per_row = struct {
         const a = try evalRow(arena, c.args[0], batch, row);
         const b = try evalRow(arena, c.args[1], batch, row);
         if (a.isNull() or b.isNull()) return .null;
-        const d = toI64(b);
-        if (d == 0) return .null;
-        if (d == -1) return Value{ .int = 0 };
-        return Value{ .int = @rem(toI64(a), d) };
+        return arith(.mod, a, b);
     }
 
     pub fn power(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -424,7 +435,12 @@ pub const per_row = struct {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         const x = toF64(v);
-        return Value{ .int = if (x > 0) @as(i64, 1) else if (x < 0) @as(i64, -1) else @as(i64, 0) };
+        const sg: i64 = if (x > 0) 1 else if (x < 0) -1 else 0;
+        return switch (v) {
+            .decimal => Value{ .decimal = .{ .unscaled = sg, .scale = 0 } },
+            .float => Value{ .float = if (std.math.isNan(x)) x else @floatFromInt(sg) },
+            else => Value{ .int = sg },
+        };
     }
 
     pub fn nullif(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -573,7 +589,7 @@ pub const per_row = struct {
                 return failWith(e, "json_reduce: the lambda could not compute with element [{d}], {s} — text is not a number; CAST it or drop it with json_filter first", .{ idx, clip(el) });
             };
             if (r == .float and (ty.kind == .int or ty.kind == .decimal) and !ty.unknown)
-                return failWith(error.CastFailed, "json_reduce: element [{d}], {s}, made the lambda return {d}, which {s} accumulator cannot hold — start from a FLOAT (0.0)", .{ idx, clip(el), r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
+                return failWith(error.CastFailed, "json_reduce: element [{d}], {s}, made the lambda return {d}, which {s} accumulator cannot hold — start from a FLOAT (0e0)", .{ idx, clip(el), r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
             acc = if (r.isNull() or ty.unknown) r else try castValueTyped(arena, r, ty);
         }
         return acc;
