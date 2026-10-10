@@ -304,6 +304,7 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
+            if (try decCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try asNum(arena, l, batch.len)) |ln| {
                 if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
             }
@@ -647,7 +648,7 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
         .scalar => |s| return switch (s) {
             .int => |x| Num{ .iscalar = x },
             .float => |x| Num{ .fscalar = x },
-            .decimal => |d| Num{ .fscalar = toF64(.{ .decimal = d }) },
+            .decimal => |d| Num{ .fscalar = d.keyF64() },
             else => null,
         },
         .col => |c| return switch (c.ty.kind) {
@@ -655,7 +656,7 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
             .float => Num{ .fcol = .{ .d = c.data.f64, .v = c.validity } },
             .decimal => blk: {
                 const out = try arena.alloc(f64, n);
-                for (c.data.dec, 0..) |d, i| out[i] = d.toF64();
+                for (c.data.dec, 0..) |d, i| out[i] = d.keyF64();
                 break :blk Num{ .fcol = .{ .d = out, .v = c.validity } };
             },
             else => null,
@@ -680,6 +681,27 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
         out[i] = try (decimalOp(op, decAt(l, i), decAt(r, i)) orelse unreachable);
     }
     return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
+}
+
+/// Exact comparison when one side is a decimal and the other a decimal or an int;
+/// the float kernels would merge decimals past 15 digits.
+fn decCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const lt = vecType(l) orelse return null;
+    const rt = vecType(r) orelse return null;
+    if (lt.kind != .decimal and rt.kind != .decimal) return null;
+    const out = try arena.alloc(bool, n);
+    var bm = try Bitmap.initFull(arena, n);
+    var any = false;
+    for (0..n) |i| {
+        if (!vecValid(l, i) or !vecValid(r, i)) {
+            out[i] = false;
+            bm.setValid(i, false);
+            any = true;
+            continue;
+        }
+        out[i] = cmpResult(op, decAt(l, i).order(decAt(r, i)));
+    }
+    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
 }
 
 fn vecType(v: Vec) ?Type {

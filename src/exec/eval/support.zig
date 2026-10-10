@@ -4,6 +4,7 @@
 const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
+const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const evalRow = @import("row.zig").evalRow;
@@ -56,6 +57,15 @@ pub fn toF64(v: Value) f64 {
         .decimal => |d| d.toF64(),
         else => 0,
     };
+}
+
+/// The f64 a number hashes and meets a float as (`Decimal.keyF64`).
+pub fn keyF64(v: Value) f64 {
+    return if (v == .decimal) v.decimal.keyF64() else toF64(v);
+}
+
+fn exactDecimal(v: Value) Decimal {
+    return if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
 }
 
 const RegexCache = struct {
@@ -175,11 +185,13 @@ pub fn orderF64(x: f64, y: f64) std.math.Order {
 }
 
 /// Bytes compare by content: a null answer here once made MIN/MAX over a bytes
-/// column keep the first value forever.
+/// column keep the first value forever. Decimals compare exactly with each other
+/// and with ints; through f64 they merged distinct 18-digit values in GROUP BY.
 pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (isNum(a) and isNum(b)) {
         if (a == .int and b == .int) return std.math.order(a.int, b.int);
-        return orderF64(toF64(a), toF64(b));
+        if (a != .float and b != .float) return exactDecimal(a).order(exactDecimal(b));
+        return orderF64(keyF64(a), keyF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
     if (a == .bytes and b == .bytes) return std.mem.order(u8, a.bytes, b.bytes);
@@ -377,4 +389,19 @@ test "field resolution: the memo verifies its entry instead of trusting it" {
     try std.testing.expectEqual(@as(usize, 3), fieldIndex(wide, q.of(a, "col39")).?);
     try std.testing.expect(fieldIndex(tiny, q.of(a, "col39")) == null);
     try std.testing.expectEqual(@as(usize, 0), fieldIndex(tiny, q.of(a, "z")).?);
+}
+
+test "compareValues: decimals order exactly against decimals and ints, at any scale gap" {
+    const d = struct {
+        fn v(u: i128, s: u8) Value {
+            return .{ .decimal = .{ .unscaled = u, .scale = s } };
+        }
+    }.v;
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(d(10000000000000001, 0), d(10000000000000000, 0)).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(d(123456789012345678, 8), d(123456789012345679, 8)).?);
+    try std.testing.expectEqual(std.math.Order.eq, compareValues(d(150, 2), d(15, 1)).?);
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(d(10000000000000001, 0), .{ .int = 10000000000000000 }).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(d(1, 200), d(1, 0)).?);
+    try std.testing.expectEqual(std.math.Order.gt, compareValues(d(std.math.maxInt(i128), 0), d(-1, 100)).?);
+    try std.testing.expectEqual(std.math.Order.lt, compareValues(d(-std.math.maxInt(i128), 0), d(1, 60)).?);
 }
