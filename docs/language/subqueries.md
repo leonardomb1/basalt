@@ -21,7 +21,8 @@ LET hi = (SELECT max(ts) FROM 'lake/orders.parquet');
 SELECT * FROM conn.orders WHERE ts > $hi;
 ```
 
-The subquery of `IN` must produce exactly one named column, and the test must sit
+The subquery of `IN` must produce exactly one named column — a `UNION`,
+`INTERSECT` or `EXCEPT` of such queries is named by its first — and the test must sit
 as a **top-level AND condition of `WHERE`** — under an `OR`, a `NOT` or a `CASE`
 it cannot be lifted into a join without changing what the predicate means, so
 those shapes are parse errors (spell them as an explicit join). The left side

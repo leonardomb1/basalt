@@ -8,7 +8,6 @@ const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
-const firstOutName = Parser.firstOutName;
 const max_expr_depth = Parser.max_expr_depth;
 const max_paren_depth = Parser.max_paren_depth;
 const std = @import("std");
@@ -202,7 +201,7 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
                 if (lhs.* != .field)
                     return self.fail(inpos, "the left side of IN (SELECT ...) must be a plain column", .{});
                 const pipe = try self.parseSubqueryPipeline();
-                const col = firstOutName(pipe.stages) orelse
+                const col = self.firstOutName(pipe.stages) orelse
                     return self.fail(inpos, "the subquery of IN must produce exactly one named column", .{});
                 self.derived_n += 1;
                 const bname = try std.fmt.allocPrint(self.arena, "__insq{d}", .{self.derived_n});

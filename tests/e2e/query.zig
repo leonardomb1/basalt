@@ -131,6 +131,11 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k IS NOT NULL)", .want = "k\n1\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 100)", .want = "k\n1\n\n2\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv')", .want = "k\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' UNION SELECT 1 AS k)", .want = "k\n1\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' UNION ALL SELECT 1 AS k)", .want = "k\n1\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' INTERSECT SELECT 2 AS k)", .want = "k\n2\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' EXCEPT SELECT 2 AS k)", .want = "k\n" },
+        .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 2 UNION SELECT 1 AS k UNION ALL SELECT 1 AS k)", .want = "k\n2\n" },
     };
     for (cases) |c| {
         const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
