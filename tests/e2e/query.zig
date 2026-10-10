@@ -1639,3 +1639,33 @@ test "join: a second column of one name is named apart, hidden sort and DISTINCT
         .{ .q = "SELECT DISTINCT ON (b.k) b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
     });
 }
+
+test "where: a quoted literal against a number or bool is read as one, exactly; one that does not read so is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in = "id,amt,f,ok\n1,99999.50,1.5,true\n2,100000.25,2.5,false\n3,,,\n";
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(amt AS DECIMAL(10,2)) < '100000'", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(amt AS DECIMAL(10,2)) <= ' 99999.505 '", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE '2' > id", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE id IN ('1', '3')", .want = "id\n1\n3\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE f >= '2.5'", .want = "id\n2\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(ok AS BOOL) = 'yes'", .want = "id\n1\n" },
+        .{ .q = "SELECT id, id = '2' AS two FROM '$IN' WHERE id < 3", .want = "id,two\n1,false\n2,true\n" },
+    };
+    for (cases) |c| {
+        const out = try runToString(alloc, &tmp, in, c.q);
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = in });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(amt AS DECIMAL(10,2)) = '1,5';", "`1,5` is not a valid decimal literal");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE id = '1.5';", "`1.5` is not a valid int literal");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(id AS STRING) = id;", "cannot compare");
+}

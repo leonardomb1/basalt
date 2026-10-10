@@ -16,6 +16,7 @@ const op = @import("../../exec/op.zig");
 const std = @import("std");
 const substExpr = @import("../analyze.zig").substExpr;
 const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
+const coerceLits = @import("../analyze.zig").coerceLits;
 const types = @import("../../lang/types.zig");
 const tfld = @import("testing_util.zig").tfld;
 
@@ -96,7 +97,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         .computed => |c| {
             const e = try substExpr(arena, c.expr, params);
             const ty = try exprType(arena, in, e, diag);
-            try cols.append(.{ .name = c.name, .ty = ty, .source = .{ .expr = e } });
+            try cols.append(.{ .name = c.name, .ty = ty, .source = .{ .expr = try coerceLits(arena, in, e) } });
         },
     };
     return cols.toOwnedSlice();
@@ -112,7 +113,7 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
     const pred = try substExpr(arena, pred0, params);
     const t = try exprType(arena, in, pred, diag);
     if (!(t.kind == .bool or t.unknown)) return fail(diag, "filter predicate must be bool", .{});
-    return pred;
+    return coerceLits(arena, in, pred);
 }
 
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
@@ -138,8 +139,9 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     }
     const aggs = try arena.alloc(Agg, ag.aggs.len);
     for (ag.aggs, 0..) |item, i| {
-        const arg: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
-        const ty = try aggResultType(arena, item.func, arg, in, diag);
+        const sub: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
+        const ty = try aggResultType(arena, item.func, sub, in, diag);
+        const arg: ?*const ast.Expr = if (sub) |a| try coerceLits(arena, in, a) else null;
         aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct };
         try fields.append(.{ .name = item.name, .ty = ty });
     }

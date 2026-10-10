@@ -76,7 +76,16 @@ columns it has not seen.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and
-  `'01/07/2013'` are errors from `check`, not silent text comparisons.
+  `'01/07/2013'` are errors from `check`, not silent text comparisons. A quoted
+  literal compared with a number or a bool is read the same way, as SQL reads
+  an untyped literal by the other operand: `amount < '100000'` compares
+  numbers (a decimal one exactly, at the literal's own scale), `id IN ('1',
+  '2')` ints, `active = 'yes'` bools (`true`/`false`, `t`/`f`, `yes`/`no`,
+  `on`/`off`, `1`/`0`, any case). Surrounding spaces are ignored; anything else
+  that does not read as the type — `'1,5'`, or `'1.5'` against an INT — is an
+  error from `check`; pushed down to a SQL source whose column types are known,
+  it is sent as that number or bool. A text *column* against a number still needs a `CAST`, as it
+  does in PostgreSQL.
 - `"Valor Total"` — a quoted column name ([Scripts](../language/scripts.md)), valid anywhere a bare name is:
   `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, an alias (`AS "Total Geral"`), and
   after a qualifier (`t."Valor Total"`).
