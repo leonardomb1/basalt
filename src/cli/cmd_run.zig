@@ -225,7 +225,9 @@ fn reportFailedItems(eo: ErrOut, sink: *runtime.OutcomeSink) !u8 {
 }
 
 test "reportFailedItems: under --log-format json every line is an NDJSON event" {
-    var sink = runtime.OutcomeSink.init(std.testing.allocator);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var sink = runtime.OutcomeSink.init(ar.allocator());
     defer sink.deinit();
     sink.record("ana", false, "unknown field `nope`", false);
     sink.recordShown("bob", false, "shown", false, true);

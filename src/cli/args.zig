@@ -264,7 +264,7 @@ test "loadSource: a second script, or a path beside -c, is a usage error" {
     for (bad) |argv| {
         var w = std.Io.Writer.fixed(&out);
         try std.testing.expectError(error.Usage, loadSource(a, "run", try testArgv(a, argv), &w));
-        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "s.sql") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), ".sql`") != null);
     }
     var w = std.Io.Writer.fixed(&out);
     const src = try loadSource(a, "run", try testArgv(a, &.{ "basalt", "run", "-p", "k=v", "-c", "SELECT 1 AS v;", "--format", "json" }), &w);
