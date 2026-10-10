@@ -239,11 +239,13 @@ fn postItemName(it: ast.SelectItem) ?[]const u8 {
 }
 
 /// Whether the SELECT list orders columns otherwise than the aggregate stage emits
-/// them (keys first), so the caller must add a reordering projection.
+/// them (keys first) or emits a grouping key it never asked for, so the caller must add
+/// a projection.
 pub fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, aggs: []const ast.AggItem) bool {
-    if (post.len != group.len + aggs.len) return false;
+    for (post) |it| if (postItemName(it) == null) return false;
+    if (post.len != group.len + aggs.len) return true;
     for (post, 0..) |it, i| {
-        const want = postItemName(it) orelse return false;
+        const want = postItemName(it).?;
         const natural = if (i < group.len) group[i].last() else aggs[i - group.len].name;
         if (!std.mem.eql(u8, want, natural)) return true;
     }
@@ -347,6 +349,7 @@ pub const Parser = struct {
     const_names: std.array_list.Managed([]const u8) = undefined,
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
     derived_n: usize = 0,
+    hidden_keys: std.ArrayList([2][]const u8) = .empty,
     pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
     in_where: bool = false,
     win_sink: ?*std.array_list.Managed(WinCall) = null,
@@ -469,8 +472,9 @@ pub const Parser = struct {
         return self.fail(self.curPos(), "expected a column name, found {s}", .{self.curTag().describe()});
     }
 
-    /// Name for a computed item written without `AS`, joined from its tokens (`count(*)`).
-    /// ORDER BY synthesizes the same text, which binds it to the item it repeats.
+    /// Name for a computed item written without `AS`, joined from its tokens lowercased
+    /// (`count(*)`); a string literal keeps its quotes and case, so `upper('cat')` is not
+    /// `upper(cat)`. ORDER BY synthesizes the same text to find a window item it repeats.
     pub fn synthName(self: *Parser, start: usize) Error![]const u8 {
         return self.synthRange(start, self.i);
     }
@@ -478,9 +482,16 @@ pub const Parser = struct {
     pub fn synthRange(self: *Parser, start: usize, end: usize) Error![]const u8 {
         var buf = std.array_list.Managed(u8).init(self.arena);
         for (self.toks[start..end]) |t| {
-            for (t.text) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory;
+            if (t.tag == .string) {
+                try buf.append('\'');
+                for (t.text) |c| {
+                    if (c == '\'') try buf.append('\'');
+                    try buf.append(c);
+                }
+                try buf.append('\'');
+            } else for (t.text) |c| try buf.append(std.ascii.toLower(c));
         }
-        return buf.toOwnedSlice() catch return error.OutOfMemory;
+        return buf.toOwnedSlice();
     }
 
     pub fn fail(self: *Parser, pos: Pos, comptime fmt: []const u8, args: anytype) Error {
@@ -583,6 +594,7 @@ pub const Parser = struct {
         aliases: AliasSet,
         union_branch: ?BranchInfo,
         expr_aliases: []const ExprAlias = &.{},
+        out_keys: ?[]const ast.QualName = null,
     };
 
     pub const parseSelectCore = @import("parse/query.zig").parseSelectCore;
@@ -656,6 +668,7 @@ pub const Parser = struct {
     pub const parseQualNameTok = @import("parse/rewrite.zig").parseQualNameTok;
     pub const collectFields = @import("parse/rewrite.zig").collectFields;
     pub const exprKey = @import("parse/rewrite.zig").exprKey;
+    pub const bindName = @import("parse/rewrite.zig").bindName;
     pub const containsAgg = @import("parse/rewrite.zig").containsAgg;
     pub const repointPostItem = @import("parse/rewrite.zig").repointPostItem;
     pub const constItemExpr = @import("parse/rewrite.zig").constItemExpr;

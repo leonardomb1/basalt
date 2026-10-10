@@ -386,3 +386,32 @@ test "GROUP BY and DISTINCT past --op-memory spill to disk and return what they 
     var it = dir.iterate();
     try std.testing.expect((try it.next()) == null);
 }
+
+test "GROUP BY, HAVING and ORDER BY bind only the same expression; unselected keys stay out; ORDER BY takes expressions and positions" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const q_csv = "\"Valor Total\",cat\n10,x\n20,y\n30,x\n-5,\n";
+    const r_csv = "k,s\n2,x\n2,y\n3,z\n,nn\n5,w\n1,u\n";
+    const cases = [_]struct { in: []const u8, q: []const u8, want: []const u8 }{
+        .{ .in = q_csv, .q = "SELECT upper('cat') AS u, COUNT(*) AS n FROM '$IN' GROUP BY upper(cat) ORDER BY n", .want = "u,n\nCAT,1\nCAT,1\nCAT,2\n" },
+        .{ .in = q_csv, .q = "SELECT cat, count_if(cat = 'x') AS a FROM '$IN' GROUP BY cat HAVING count_if(cat = 'X') > 0", .want = "cat,a\n" },
+        .{ .in = q_csv, .q = "SELECT replace(cat, 'y', 'A') AS r FROM '$IN' WHERE cat <> '' ORDER BY replace(cat, 'Y', 'A')", .want = "r\nx\nx\nA\n" },
+        .{ .in = q_csv, .q = "SELECT cat FROM '$IN' GROUP BY cat HAVING COUNT(*) > 1", .want = "cat\nx\n" },
+        .{ .in = q_csv, .q = "SELECT count(*) AS n FROM '$IN' GROUP BY replace(cat, 'x', 'A'), replace(cat, 'x', 'a') ORDER BY n", .want = "n\n1\n1\n2\n" },
+        .{ .in = q_csv, .q = "SELECT upper(cat) AS u, count(*) AS n FROM '$IN' GROUP BY upper(cat) HAVING sum(\"Valor Total\") > 15 ORDER BY u", .want = "u,n\nX,2\nY,1\n" },
+        .{ .in = q_csv, .q = "SELECT \"Valor Total\" AS v FROM '$IN' ORDER BY \"Valor Total\" - 1", .want = "v\n-5\n10\n20\n30\n" },
+        .{ .in = q_csv, .q = "SELECT cat, \"Valor Total\" AS v FROM '$IN' ORDER BY 2 DESC", .want = "cat,v\nx,30\ny,20\nx,10\n,-5\n" },
+        .{ .in = q_csv, .q = "SELECT cat FROM '$IN' WHERE cat <> '' ORDER BY cat || 'a' DESC", .want = "cat\ny\nx\nx\n" },
+        .{ .in = q_csv, .q = "SELECT DISTINCT cat FROM '$IN' ORDER BY coalesce(cat, 'a')", .want = "cat\n\nx\ny\n" },
+        .{ .in = q_csv, .q = "SELECT cat, SUM(\"Valor Total\") / COUNT(*) AS m FROM '$IN' WHERE cat <> '' GROUP BY cat ORDER BY SUM(\"Valor Total\") / COUNT(*) DESC, 1", .want = "cat,m\nx,20\ny,20\n" },
+        .{ .in = r_csv, .q = "SELECT count(*) AS c FROM '$IN' GROUP BY k ORDER BY k", .want = "c\n1\n2\n1\n1\n1\n" },
+        .{ .in = r_csv, .q = "SELECT k FROM '$IN' WHERE k > (SELECT count(*) FROM '$IN' GROUP BY k HAVING count(*) > 1) ORDER BY k", .want = "k\n3\n5\n" },
+        .{ .in = r_csv, .q = "SELECT k FROM '$IN' WHERE k IN (SELECT max(k) FROM '$IN' GROUP BY s) ORDER BY k", .want = "k\n1\n2\n2\n3\n5\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, c.in, c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}

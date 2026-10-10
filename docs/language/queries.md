@@ -27,7 +27,7 @@ LIMIT 100 OFFSET 20;
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant; a `GROUP BY` with no aggregate and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text answers a `FLOAT`, as `AVG` does; `SUM(CAST(x AS DECIMAL(18,2)))` keeps money exact |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant; a `GROUP BY` with no aggregate in `SELECT` or `HAVING` and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text answers a `FLOAT`, as `AVG` does; `SUM(CAST(x AS DECIMAL(18,2)))` keeps money exact |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down) |
@@ -38,7 +38,7 @@ LIMIT 100 OFFSET 20;
 | `SUM(x) FILTER (WHERE cond)` | any aggregate over only the rows where `cond` holds — under `GROUP BY`, over the whole table or over a window; see [Aggregates](aggregates.md#filter) |
 | `f(...) OVER (PARTITION BY .. ORDER BY .. [frame])` | window — a value per row from its partition and frame, anywhere in a `SELECT` item; see [Window functions](windows.md) |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
-| `ORDER BY a DESC, b` | sort — nulls last in both directions; `NULLS FIRST`/`NULLS LAST` are not accepted |
+| `ORDER BY a DESC, b` | sort — by columns, expressions (`ORDER BY x - 1`, `ORDER BY upper(s)`) or positions (`ORDER BY 2`); nulls last in both directions; `NULLS FIRST`/`NULLS LAST` are not accepted |
 | `LIMIT n [OFFSET m]` | limit |
 | `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
@@ -70,11 +70,17 @@ key — but their order without `ORDER BY` is not that of an in-memory run.
 
 A computed `SELECT` item does not need `AS`. Without one it is named after the
 text of its expression, lowercased and stripped of spaces — `COUNT(*)` becomes
-`count(*)`, `ClientIP - 1` becomes `clientip-1`. An explicit alias always wins.
+`count(*)`, `ClientIP - 1` becomes `clientip-1`. A string literal keeps its quotes
+and its case, so `upper('cat')` and `upper(cat)` are two names. An explicit alias
+always wins. Two items may not share a name: `SELECT a, b AS a` is refused, and
+naming one of them otherwise fixes it. (Same-named columns of a join's two sides
+come apart on their own — see [Joins](joins.md).)
 
-The same naming is what lets `GROUP BY` and `ORDER BY` repeat an expression
-instead of its alias: both sides render the expression the same way, so they
-bind to the one column the projection already produced.
+`GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
+it binds to the one column the projection already produced when it is the same
+expression — same columns, same literals to the letter, spacing and keyword case
+aside. One that differs is a new expression: `ORDER BY upper(s)` beside
+`SELECT upper('s')` sorts by the column `s`, uppercased.
 
 ```sql
 SELECT AdvEngineID, COUNT(*) FROM hits
@@ -90,8 +96,15 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 - **Column order is the `SELECT` list's**, not the aggregate's. `SELECT k, SUM(x), k2`
   writes `k, sum, k2`; the engine folds grouping keys before aggregates internally and
   reorders the projection back on the way out.
-- `GROUP BY <n>` is positional — it names the *n*-th `SELECT` item.
-- `GROUP BY <expr>` accepts a computed key (`GROUP BY ClientIP - 1`).
-- `ORDER BY` may name a column the `SELECT` list does not project. It is
-  carried through the projection as a hidden column and dropped after the
-  `LIMIT`, so sorting by an unselected column costs nothing in the output.
+- `GROUP BY <n>` is positional — it names the *n*-th `SELECT` item, which may not
+  be an aggregate.
+- `GROUP BY <expr>` accepts a computed key (`GROUP BY ClientIP - 1`). A key the
+  `SELECT` list does not name groups the rows but is not written out:
+  `SELECT COUNT(*) AS c ... GROUP BY k` has the one column `c`.
+- `ORDER BY <n>` is positional too — it sorts by the *n*-th `SELECT` item, so the
+  list may not be `*` before it.
+- `ORDER BY` may name a column the `SELECT` list does not project, or an
+  expression over the columns (`ORDER BY price - discount`). It is carried
+  through the projection as a hidden column and dropped after the `LIMIT`, so
+  sorting by it costs nothing in the output. An aggregate in `ORDER BY` must
+  repeat one the `SELECT` list computes.

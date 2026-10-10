@@ -9,7 +9,6 @@ const Pos = @import("../sql_parser.zig").Pos;
 const aggFunc = @import("../sql_parser.zig").aggFunc;
 const ast = @import("../ast.zig");
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
-const resolveExprAlias = Parser.resolveExprAlias;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
@@ -73,41 +72,50 @@ pub fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Man
     }
 }
 
-/// Render an expression as `synthName` renders tokens, so HAVING matches the item that
-/// computed it. Arguments render in full: rendering them as `?` once merged
+/// Render an expression as the key GROUP BY, ORDER BY, HAVING and lifted aggregates
+/// bind by. It is exact where SQL is: columns keep their case, string literals their
+/// quotes and case, operators their grouping, so two different expressions never
+/// share a key. Arguments render in full: rendering them as `?` once merged
 /// `sum(v*2)` and `sum(v+100)` into one accumulator.
 pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u8)) Error!void {
     switch (e.*) {
-        .field => |q| for (q.parts, 0..) |part, i| {
-            if (i != 0) buf.append('.') catch return error.OutOfMemory;
-            for (part) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory;
+        .field => |q| {
+            if (q.dollar) try buf.append('$');
+            for (q.parts, 0..) |part, i| {
+                if (i != 0) try buf.append('.');
+                if (i < q.safe.len and q.safe[i]) try buf.append('?');
+                if (plainName(part)) try buf.appendSlice(part) else try quoteInto(buf, part, '"');
+            }
         },
-        .int_lit => |v| buf.writer().print("{d}", .{v}) catch return error.OutOfMemory,
-        .str_lit => |v| for (v) |c| buf.append(std.ascii.toLower(c)) catch return error.OutOfMemory,
+        .int_lit => |v| try buf.print("{d}", .{v}),
+        .float_lit => |v| try buf.print("{e}", .{v}),
+        .str_lit => |v| try quoteInto(buf, v, '\''),
+        .bool_lit => |v| try buf.appendSlice(if (v) "true" else "false"),
+        .null_lit => try buf.appendSlice("null"),
         .call => |c| {
-            for (c.name) |ch| buf.append(std.ascii.toLower(ch)) catch return error.OutOfMemory;
-            buf.append('(') catch return error.OutOfMemory;
-            if (c.args.len == 0) buf.append('*') catch return error.OutOfMemory;
+            for (c.name) |ch| try buf.append(std.ascii.toLower(ch));
+            try buf.append('(');
+            if (c.distinct) try buf.appendSlice("distinct ");
+            if (c.args.len == 0) try buf.append('*');
             for (c.args, 0..) |a, i| {
-                if (i != 0) buf.append(',') catch return error.OutOfMemory;
+                if (i != 0) try buf.append(',');
                 try self.exprKey(a, buf);
             }
-            buf.append(')') catch return error.OutOfMemory;
+            try buf.append(')');
         },
-        .float_lit => |v| buf.writer().print("{d}", .{v}) catch return error.OutOfMemory,
-        .bool_lit => |v| buf.appendSlice(if (v) "true" else "false") catch return error.OutOfMemory,
-        .null_lit => buf.appendSlice("null") catch return error.OutOfMemory,
         .unary => |u| {
-            buf.appendSlice(switch (u.op) {
-                .neg => "-",
-                .not => "not ",
-                .bit_not => "~",
-            }) catch return error.OutOfMemory;
+            try buf.appendSlice(switch (u.op) {
+                .neg => "(-",
+                .not => "(not ",
+                .bit_not => "(~",
+            });
             try self.exprKey(u.e, buf);
+            try buf.append(')');
         },
         .binary => |b| {
+            try buf.append('(');
             try self.exprKey(b.l, buf);
-            buf.appendSlice(switch (b.op) {
+            try buf.appendSlice(switch (b.op) {
                 .add => "+",
                 .sub => "-",
                 .mul => "*",
@@ -126,42 +134,101 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
                 .ge => ">=",
                 .@"and" => " and ",
                 .@"or" => " or ",
-            }) catch return error.OutOfMemory;
+            });
             try self.exprKey(b.r, buf);
+            try buf.append(')');
         },
         .cast => |c| {
-            buf.appendSlice("cast(") catch return error.OutOfMemory;
+            try buf.appendSlice("cast(");
             try self.exprKey(c.e, buf);
-            buf.appendSlice(" as ") catch return error.OutOfMemory;
-            buf.appendSlice(@tagName(c.ty.kind)) catch return error.OutOfMemory;
-            if (c.safe) buf.append('?') catch return error.OutOfMemory;
-            buf.append(')') catch return error.OutOfMemory;
+            try buf.print(" as {s}", .{try c.ty.name(self.arena)});
+            if (c.safe) try buf.append('?');
+            try buf.append(')');
         },
         .is_null => |n| {
+            try buf.append('(');
             try self.exprKey(n.e, buf);
-            buf.appendSlice(if (n.negated) " is not " else " is ") catch return error.OutOfMemory;
-            buf.appendSlice(@tagName(n.kind)) catch return error.OutOfMemory;
+            try buf.appendSlice(if (n.negated) " is not " else " is ");
+            try buf.appendSlice(@tagName(n.kind));
+            try buf.append(')');
         },
         .cond => |c| {
-            buf.appendSlice("if(") catch return error.OutOfMemory;
+            try buf.appendSlice("if(");
             try self.exprKey(c.cond, buf);
-            buf.append(',') catch return error.OutOfMemory;
+            try buf.append(',');
             try self.exprKey(c.then, buf);
-            buf.append(',') catch return error.OutOfMemory;
+            try buf.append(',');
             try self.exprKey(c.els, buf);
-            buf.append(')') catch return error.OutOfMemory;
+            try buf.append(')');
+        },
+        .match => |m| {
+            try buf.appendSlice("match(");
+            if (m.subject) |s| try self.exprKey(s, buf);
+            for (m.arms) |arm| {
+                try buf.appendSlice(if (arm.is_default) ";else" else ";when");
+                for (arm.pats) |p| {
+                    try buf.append(' ');
+                    try self.exprKey(p, buf);
+                }
+                if (arm.guard) |g| {
+                    try buf.appendSlice(" if ");
+                    try self.exprKey(g, buf);
+                }
+                try buf.appendSlice(" then ");
+                try self.exprKey(arm.value, buf);
+            }
+            try buf.append(')');
+        },
+        .let_in => |l| {
+            try buf.print("let({s}=", .{l.name});
+            try self.exprKey(l.value, buf);
+            try buf.appendSlice(" in ");
+            try self.exprKey(l.body, buf);
+            try buf.append(')');
         },
         .lambda => |l| {
+            try buf.append('(');
             for (l.params, 0..) |pp, k| {
-                if (k > 0) buf.append(',') catch return error.OutOfMemory;
-                buf.appendSlice(pp) catch return error.OutOfMemory;
+                if (k > 0) try buf.append(',');
+                try buf.appendSlice(pp);
             }
-            buf.appendSlice("->") catch return error.OutOfMemory;
+            try buf.appendSlice(")->");
             try self.exprKey(l.body, buf);
         },
-        .lambda_var => |n| buf.appendSlice(n) catch return error.OutOfMemory,
-        else => buf.append('?') catch return error.OutOfMemory,
+        .lambda_var => |n| try buf.appendSlice(n),
     }
+}
+
+fn plainName(s: []const u8) bool {
+    if (s.len == 0 or std.ascii.isDigit(s[0])) return false;
+    for (s) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_')) return false;
+    return true;
+}
+
+/// `s` between `q` quotes, an inner `q` doubled.
+fn quoteInto(buf: *std.array_list.Managed(u8), s: []const u8, q: u8) Error!void {
+    try buf.append(q);
+    for (s) |c| {
+        if (c == q) try buf.append(q);
+        try buf.append(c);
+    }
+    try buf.append(q);
+}
+
+pub const Bound = struct { name: []const u8, item: bool };
+
+/// The name `e` binds to: the SELECT item it repeats, else a hidden `__aN` that every
+/// mention of the same expression shares. Hidden names stay plain, as a pushed-down
+/// query writes them as aliases.
+pub fn bindName(self: *Parser, e: *const ast.Expr, map: []const ExprAlias) Error!Bound {
+    var buf = std.array_list.Managed(u8).init(self.arena);
+    try self.exprKey(e, &buf);
+    for (map) |m| if (std.mem.eql(u8, m.synth, buf.items)) return .{ .name = m.out, .item = true };
+    for (self.hidden_keys.items) |hk| if (std.mem.eql(u8, hk[0], buf.items)) return .{ .name = hk[1], .item = false };
+    self.derived_n += 1;
+    const name = try std.fmt.allocPrint(self.arena, "__a{d}", .{self.derived_n});
+    try self.hidden_keys.append(self.arena, .{ try buf.toOwnedSlice(), name });
+    return .{ .name = name, .item = false };
 }
 
 /// Whether an aggregate call is buried inside an expression, as in `round(avg(x), 2)`.
@@ -258,9 +325,7 @@ pub fn liftAggs(
                         if (containsAgg(a))
                             return cx.p.fail(cx.pos, "aggregate functions cannot be nested", .{});
                     }
-                    var buf = std.array_list.Managed(u8).init(cx.p.arena);
-                    try cx.p.exprKey(node, &buf);
-                    const key = resolveExprAlias(cx.m, buf.toOwnedSlice() catch return error.OutOfMemory);
+                    const key = (try cx.p.bindName(node, cx.m)).name;
 
                     var seen = false;
                     for (cx.a.items) |it| {
@@ -297,10 +362,7 @@ pub fn addHavingAggs(
     switch (h.*) {
         .call => |c| {
             if (aggFunc(c.name)) |f| {
-                var buf = std.array_list.Managed(u8).init(self.arena);
-                try self.exprKey(h, &buf);
-                const key = buf.toOwnedSlice() catch return error.OutOfMemory;
-                const want = resolveExprAlias(map, key);
+                const want = (try self.bindName(h, map)).name;
                 for (aggs.items) |it| {
                     if (std.mem.eql(u8, it.name, want)) return false;
                 }
@@ -350,11 +412,8 @@ pub fn havingRewrite(self: *Parser, e: *ast.Expr, map: []const ExprAlias) Error!
     const S = struct {
         fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
             if (node.* == .call and aggFunc(node.call.name) != null) {
-                var buf = std.array_list.Managed(u8).init(cx.p.arena);
-                try cx.p.exprKey(node, &buf);
-                const key = buf.toOwnedSlice() catch return error.OutOfMemory;
                 const parts = cx.p.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
-                parts[0] = resolveExprAlias(cx.m, key);
+                parts[0] = (try cx.p.bindName(node, cx.m)).name;
                 return cx.p.mk(.{ .field = .{ .parts = parts } });
             }
             return ast.rebuildExpr(cx.p.arena, node, cx, recur);
