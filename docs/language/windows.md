@@ -33,8 +33,9 @@ FROM 'movimentos.csv';
   `ORDER BY` inside `OVER (...)` — it is what they number by — and take no frame;
   writing one is an error rather than being ignored.
 - `NTILE`'s bucket count and `NTH_VALUE`'s position are positive whole numbers;
-  `LAG`/`LEAD`'s offset a non-negative one. Their `default` is a constant — a
-  literal, a `$param` or an expression over them — cast to the column's type
+  `LAG`/`LEAD`'s offset a non-negative one — each a constant: a literal, a
+  `$param` or an expression over them (`NTILE($buckets)`, `LAG(amount, 2 * 7)`).
+  `LAG`/`LEAD`'s `default` is a constant too, cast to the column's type
   (`LAG(amount, 1, 0)`).
 - `DISTINCT` is accepted inside `COUNT` only.
 - The names are not reserved: a column called `rank` still reads as a column.
@@ -127,7 +128,8 @@ The frame is the slice of the partition an aggregate or a value function reads:
 ## IGNORE NULLS
 
 `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` take `IGNORE NULLS` —
-after the call, as in the standard, or inside it — to look through null values.
+after the call, as in the standard, or inside it right after the first argument
+(`LEAD(x IGNORE NULLS, 2)`) — to look through null values; one of them, once.
 `RESPECT NULLS`, the default, is accepted too. Carrying the last known value
 forward:
 

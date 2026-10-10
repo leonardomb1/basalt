@@ -610,6 +610,7 @@ pub const Parser = struct {
     pub const WinCall = @import("parse/window.zig").WinCall;
     pub const NamedWindow = @import("parse/window.zig").NamedWindow;
     pub const parseNullTreatment = @import("parse/window.zig").parseNullTreatment;
+    pub const moreNullTreatment = @import("parse/window.zig").moreNullTreatment;
     pub const parseFilterClause = @import("parse/window.zig").parseFilterClause;
     pub const applyFilter = @import("parse/window.zig").applyFilter;
     pub const parseWindowCall = @import("parse/window.zig").parseWindowCall;

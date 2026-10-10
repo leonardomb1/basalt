@@ -674,6 +674,10 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             const ok = try arena.alloc(op.Sort.Key, wp.ord.len);
             for (wd.order_by, wp.ord, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
             for (wd.funcs, wp.funcs, 0..) |f, *out, i| {
+                if (f.offset_expr) |e| {
+                    var od = analyze.Diag{};
+                    out.offset = analyze.windowOffset(arena, f, try analyze.substExpr(arena, e, env.params_expr), &od) catch |err| return aErr(env, &od, err);
+                }
                 const d = f.default orelse continue;
                 const q = f.arg orelse continue;
                 const ty = wp.schema.fields[schema.fields.len + i].ty;

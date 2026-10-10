@@ -500,6 +500,13 @@ test "a window over a computed GROUP BY key reads the key's column" {
     });
 }
 
+test "IGNORE NULLS inside a call with more arguments; constant NTILE, NTH_VALUE and LAG arguments" {
+    try expectCases(&.{.{
+        .q = "SELECT id, LEAD(v IGNORE NULLS, 1) OVER (PARTITION BY k ORDER BY id) AS ld, LAG(v IGNORE NULLS, 1, 0) OVER (PARTITION BY k ORDER BY id) AS lg, NTILE(1 + 1) OVER (ORDER BY id) AS nt, NTH_VALUE(v IGNORE NULLS, 3 - 1) OVER (PARTITION BY k ORDER BY id) AS nv, LAG(id, 4 / 2) OVER (ORDER BY id) AS l2 FROM '$B/s.csv' ORDER BY id",
+        .want = "id,ld,lg,nt,nv,l2\n1,30,0,1,,\n2,30,10,1,,\n3,40,10,1,30,1\n4,,30,1,30,2\n5,7,0,2,,3\n6,7,5,2,,4\n7,,5,2,7,5\n",
+    }});
+}
+
 test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -510,6 +517,8 @@ test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a w
     try expectRefusedAlike(alloc, &tmp, "SELECT BOOL_AND(v) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "`bool_and` needs a BOOL argument");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(nope * 2) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "unknown field `nope`");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (PARTITION BY nope) AS s FROM '$B/s.csv';", "unknown field `nope`");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (ORDER BY upper(k) RANGE 1 PRECEDING) AS s FROM '$B/s.csv';", "ORDER BY key; `upper(k)` is string");
+    try expectRefusedAlike(alloc, &tmp, "SELECT NTILE(1 - 1) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "NTILE takes a positive whole number of buckets");
 }
 
 /// A CSV large enough to split across lanes: an id, a group, and a value that is

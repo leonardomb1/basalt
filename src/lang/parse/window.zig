@@ -58,6 +58,7 @@ pub const WinCall = struct {
     func: ast.WinFn,
     arg: ?*ast.Expr = null,
     offset: i64 = 1,
+    offset_expr: ?*ast.Expr = null,
     default: ?*ast.Expr = null,
     distinct: bool = false,
     ignore_nulls: bool = false,
@@ -75,6 +76,15 @@ pub fn parseNullTreatment(self: *Parser) ?bool {
     _ = self.advance();
     _ = self.advance();
     return ignore;
+}
+
+/// A further `IGNORE NULLS` / `RESPECT NULLS` into `nulls`, refused when one was
+/// already given.
+pub fn moreNullTreatment(self: *Parser, nulls: *?bool) Error!void {
+    const pos = self.curPos();
+    const n = parseNullTreatment(self) orelse return;
+    if (nulls.* != null) return self.fail(pos, "IGNORE NULLS / RESPECT NULLS is given twice in one call", .{});
+    nulls.* = n;
 }
 
 /// `FILTER (WHERE c)` after a call, or null with nothing consumed.
@@ -148,6 +158,14 @@ fn wholeNumber(e: *const ast.Expr) ?i64 {
     return if (e.* == .int_lit) e.int_lit else null;
 }
 
+/// Whether `e` reads no column, so the planner can fold it (`1 + 1`, `$n`).
+fn constant(self: *Parser, e: *const ast.Expr) Error!bool {
+    var fields = std.array_list.Managed(ast.QualName).init(self.arena);
+    try self.collectFields(e, &fields);
+    for (fields.items) |q| if (!q.dollar) return false;
+    return true;
+}
+
 pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!void {
     const name = call.name;
     switch (call.func) {
@@ -158,9 +176,13 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                     return self.fail(call.pos, "`{s}()` takes no arguments", .{name}),
                 .ntile => {
                     if (args.len != 1) return self.fail(call.pos, "NTILE takes one argument, the number of buckets", .{});
-                    const n = wholeNumber(args[0]) orelse 0;
-                    if (n < 1) return self.fail(call.pos, "NTILE takes a positive whole number of buckets", .{});
-                    call.offset = n;
+                    if (wholeNumber(args[0]) == null and try constant(self, args[0])) {
+                        call.offset_expr = args[0];
+                    } else {
+                        const n = wholeNumber(args[0]) orelse 0;
+                        if (n < 1) return self.fail(call.pos, "NTILE takes a positive whole number of buckets", .{});
+                        call.offset = n;
+                    }
                 },
                 .lag, .lead => {
                     if (args.len < 1 or args.len > 3) return self.fail(call.pos, "`{s}` takes (column[, offset[, default]])", .{name});
@@ -169,9 +191,17 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                         const o = args[1];
                         if (o.* == .unary and o.unary.op == .neg and o.unary.e.* == .int_lit)
                             return self.fail(call.pos, "LAG/LEAD offset must not be negative — use the other function", .{});
-                        call.offset = wholeNumber(o) orelse return self.fail(call.pos, "LAG/LEAD offset must be an integer", .{});
+                        if (wholeNumber(o)) |n| {
+                            call.offset = n;
+                        } else if (try constant(self, o)) {
+                            call.offset_expr = o;
+                        } else return self.fail(call.pos, "LAG/LEAD offset must be a constant integer", .{});
                     }
-                    if (args.len == 3) call.default = args[2];
+                    if (args.len == 3) {
+                        if (!try constant(self, args[2]))
+                            return self.fail(call.pos, "LAG/LEAD default must be a constant — a literal, an expression of literals or a $param", .{});
+                        call.default = args[2];
+                    }
                 },
                 .first_value, .last_value => {
                     if (args.len != 1) return self.fail(call.pos, "`{s}` takes one argument", .{name});
@@ -180,9 +210,13 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                 .nth_value => {
                     if (args.len != 2) return self.fail(call.pos, "NTH_VALUE takes (column, n)", .{});
                     call.arg = args[0];
-                    const n = wholeNumber(args[1]) orelse 0;
-                    if (n < 1) return self.fail(call.pos, "NTH_VALUE's position must be a positive whole number", .{});
-                    call.offset = n;
+                    if (wholeNumber(args[1]) == null and try constant(self, args[1])) {
+                        call.offset_expr = args[1];
+                    } else {
+                        const n = wholeNumber(args[1]) orelse 0;
+                        if (n < 1) return self.fail(call.pos, "NTH_VALUE's position must be a positive whole number", .{});
+                        call.offset = n;
+                    }
                 },
             }
         },
@@ -335,7 +369,7 @@ pub fn parseBound(self: *Parser) Error!ast.FrameBound {
     }
     if (self.eatKw("preceding")) return .{ .preceding = off };
     if (self.eatKw("following")) return .{ .following = off };
-    return self.fail(self.curPos(), "expected PRECEDING or FOLLOWING after a frame offset", .{});
+    return self.fail(self.curPos(), "expected PRECEDING or FOLLOWING after the frame offset `{s}`, found `{s}` — an offset is plain digits, without an exponent", .{ off.text, self.toks[self.i].text });
 }
 
 /// `WINDOW w AS (...)[, ...]` after HAVING.
@@ -520,6 +554,13 @@ pub const Lower = struct {
         return self.p.qualOne(name);
     }
 
+    /// The expression a computed first ORDER BY key was written as, for messages.
+    fn label(self: *const Lower, ord: []const ast.SortKey) ?[]const u8 {
+        if (ord.len == 0) return null;
+        for (self.seen.items) |s| if (std.mem.eql(u8, s[1], ord[0].field.last())) return s[0];
+        return null;
+    }
+
     /// `e`, an item evaluated after the windows, with each column it reads carried
     /// through them; a qualified one (`b.amt`) is computed into a hidden column.
     pub fn carryExpr(self: *Lower, e: *ast.Expr) Error!*ast.Expr {
@@ -544,6 +585,7 @@ pub const Lower = struct {
     pub fn stages(self: *Lower, specs: []const Spec, pos: Pos) Error![]const ast.Stage {
         const Group = struct {
             key: []const u8,
+            label: ?[]const u8,
             part: []const ast.QualName,
             ord: []const ast.SortKey,
             funcs: std.array_list.Managed(ast.WindowFunc),
@@ -571,6 +613,7 @@ pub const Lower = struct {
                 .out = c.hidden,
                 .arg = arg,
                 .offset = c.offset,
+                .offset_expr = c.offset_expr,
                 .default = c.default,
                 .distinct = c.distinct,
                 .ignore_nulls = c.ignore_nulls,
@@ -579,7 +622,7 @@ pub const Lower = struct {
             const g = for (groups.items) |*g| {
                 if (std.mem.eql(u8, g.key, key.items)) break g;
             } else blk: {
-                try groups.append(.{ .key = key.items, .part = part, .ord = ord, .funcs = std.array_list.Managed(ast.WindowFunc).init(self.p.arena) });
+                try groups.append(.{ .key = key.items, .label = self.label(ord), .part = part, .ord = ord, .funcs = std.array_list.Managed(ast.WindowFunc).init(self.p.arena) });
                 break :blk &groups.items[groups.items.len - 1];
             };
             try g.funcs.append(wf);
@@ -611,7 +654,7 @@ pub const Lower = struct {
             out[0] = .{ .node = .{ .window = .{ .funcs = f } }, .hints = &.{}, .pos = pos };
         }
         for (plan.items, out[lead..]) |*g, *st| st.* = .{
-            .node = .{ .window = .{ .funcs = try g.funcs.toOwnedSlice(), .partition_by = g.part, .order_by = g.ord } },
+            .node = .{ .window = .{ .funcs = try g.funcs.toOwnedSlice(), .partition_by = g.part, .order_by = g.ord, .key_label = g.label } },
             .hints = &.{},
             .pos = pos,
         };
