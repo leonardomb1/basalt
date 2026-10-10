@@ -466,6 +466,7 @@ pub fn literalKind(e: *const ast.Expr) ?types.TypeKind {
         .bool_lit => types.TypeKind.bool,
         .int_lit => types.TypeKind.int,
         .float_lit => types.TypeKind.float,
+        .dec_lit => types.TypeKind.decimal,
         .str_lit => types.TypeKind.string,
         else => null,
     };
@@ -474,7 +475,7 @@ pub fn literalKind(e: *const ast.Expr) ?types.TypeKind {
 pub fn acceptsLiteral(want: types.TypeKind, got: types.TypeKind) bool {
     if (want == got) return true;
     return switch (want) {
-        .float, .decimal => got == .int or got == .float,
+        .float, .decimal => got.isNumeric(),
         .date, .time, .timestamp, .bytes => got == .string,
         else => false,
     };

@@ -7,6 +7,8 @@
 //!     `SELECT "Exchange rate"` a constant instead of the column.
 //!   - raw SQL literals: $$...$$ / $tag$...$tag$ (dollar-quoting, verbatim body)
 //!   - `$name` lexes as .dollar_ident (a PARAM reference)
+//!   - numbers: `42` is .int; `2.5`, `.5` and `1e3` are .float, the parser telling
+//!     an exact decimal (a point) from a float (an exponent)
 //!   - `;` statement terminator, `<>` as not-equal, `||` concat over bitwise `|`
 
 const std = @import("std");
@@ -74,7 +76,21 @@ pub const Lexer = struct {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
     }
     fn isIdentChar(c: u8) bool {
-        return isIdentStart(c) or (c >= '0' and c <= '9');
+        return isIdentStart(c) or isDigit(c);
+    }
+
+    fn isDigit(c: u8) bool {
+        return c >= '0' and c <= '9';
+    }
+
+    /// A byte after which `.` qualifies a name or path (`t.col`, `$job.0`, `f().x`)
+    /// rather than starting a number like `.5`.
+    fn continuesName(c: u8) bool {
+        return isIdentChar(c) or c >= 0x80 or c == ')' or c == ']' or c == '"' or c == '$' or c == '`';
+    }
+
+    fn digits(self: *Lexer) void {
+        while (self.i < self.src.len and isDigit(self.src[self.i])) _ = self.bump();
     }
 
     /// Unescape a single-quoted body: `''` -> `'`. Allocates only when needed.
@@ -116,16 +132,20 @@ pub const Lexer = struct {
             return self.make(.ident, self.src[start..self.i], line, col);
         }
 
-        if (c >= '0' and c <= '9') {
+        if (isDigit(c) or (c == '.' and isDigit(self.peek(1)) and (self.i == 0 or !continuesName(self.src[self.i - 1])))) {
             const start = self.i;
             var is_float = false;
-            while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') _ = self.bump();
-            if (self.i + 1 < self.src.len and self.src[self.i] == '.' and
-                self.src[self.i + 1] >= '0' and self.src[self.i + 1] <= '9')
-            {
+            self.digits();
+            if (self.i < self.src.len and self.src[self.i] == '.' and isDigit(self.peek(1))) {
                 is_float = true;
                 _ = self.bump();
-                while (self.i < self.src.len and self.src[self.i] >= '0' and self.src[self.i] <= '9') _ = self.bump();
+                self.digits();
+            }
+            const sign: usize = if (self.peek(1) == '+' or self.peek(1) == '-') 1 else 0;
+            if ((self.peek(0) == 'e' or self.peek(0) == 'E') and isDigit(self.peek(1 + sign))) {
+                is_float = true;
+                for (0..1 + sign) |_| _ = self.bump();
+                self.digits();
             }
             return self.make(if (is_float) .float else .int, self.src[start..self.i], line, col);
         }
@@ -341,6 +361,28 @@ test "sql lexer: keywords, strings, dollar quoting, params" {
     try testing.expectEqual(token.Tag.string, toks[12].tag);
     try testing.expectEqualStrings("a$$b", toks[12].text);
     try testing.expectEqual(token.Tag.eof, toks[13].tag);
+}
+
+test "sql lexer: numbers with a leading point or an exponent; a point after a name qualifies it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const toks = try tokenize(a, ".5 1e3 2.5E-1 7e+2 1e t.5 f().5 3");
+    const want = [_]struct { tag: token.Tag, text: []const u8 }{
+        .{ .tag = .float, .text = ".5" },     .{ .tag = .float, .text = "1e3" },
+        .{ .tag = .float, .text = "2.5E-1" }, .{ .tag = .float, .text = "7e+2" },
+        .{ .tag = .int, .text = "1" },        .{ .tag = .ident, .text = "e" },
+        .{ .tag = .ident, .text = "t" },      .{ .tag = .dot, .text = "." },
+        .{ .tag = .int, .text = "5" },        .{ .tag = .ident, .text = "f" },
+        .{ .tag = .lparen, .text = "(" },     .{ .tag = .rparen, .text = ")" },
+        .{ .tag = .dot, .text = "." },        .{ .tag = .int, .text = "5" },
+        .{ .tag = .int, .text = "3" },
+    };
+    for (want, toks[0..want.len]) |w, t| {
+        try testing.expectEqual(w.tag, t.tag);
+        try testing.expectEqualStrings(w.text, t.text);
+    }
 }
 
 test "sql lexer: block comments and operators" {

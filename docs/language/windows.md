@@ -219,7 +219,7 @@ expression).
 | `PERCENT_RANK`, `CUME_DIST` | `FLOAT`, never null |
 | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `MIN`, `MAX` | the column's type |
 | `SUM` | `INT` over ints, an exact `DECIMAL(38, s)` at the column's scale over decimals, else `FLOAT` |
-| `AVG`, `MEDIAN`, the variances and deviations | `FLOAT` |
+| `AVG`, `MEDIAN`, the variances and deviations | `FLOAT`, over INT and DECIMAL too (PostgreSQL's `avg` of those is a `numeric`; see [Aggregates](aggregates.md)) |
 | `bool_and`, `bool_or` | `BOOL` |
 | `bit_and`, `bit_or`, `bit_xor` | `INT` |
 

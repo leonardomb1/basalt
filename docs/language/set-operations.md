@@ -2,7 +2,9 @@
 
 `UNION ALL` is SQL's: branches line up **by position**, under the first branch's
 column names, and must have the same number of columns. Types widen per column
-(an int meeting a float is a float); a pair with no common type is an error.
+(an int meeting a decimal is a decimal at the decimal's scale, so `1` beside
+`2.5` reads `1.0`; anything meeting a float is a float); a pair with no common
+type is an error.
 `UNION` without `ALL` also removes duplicate rows — from everything to its left, so
 `a UNION b UNION ALL c` deduplicates `a ∪ b` and then appends `c`.
 

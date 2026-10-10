@@ -91,7 +91,7 @@ test "union: plain UNION [ALL] lines branches up by position" {
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{ .q = "SELECT k AS a FROM '$B/t1.csv' UNION ALL SELECT k AS b FROM '$B/t2.csv'", .want = "a\n1\n2\n3\n2\n3\n4\n" },
         .{ .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' ORDER BY k", .want = "k\n1\n2\n3\n4\n" },
-        .{ .q = "SELECT k FROM '$B/t1.csv' WHERE k = 1 UNION ALL SELECT 2.5 AS x FROM '$B/t2.csv' WHERE k = 2", .want = "k\n1\n2.5\n" },
+        .{ .q = "SELECT k FROM '$B/t1.csv' WHERE k = 1 UNION ALL SELECT 2.5 AS x FROM '$B/t2.csv' WHERE k = 2", .want = "k\n1.0\n2.5\n" },
         .{
             .q = "SELECT k FROM '$B/t1.csv' UNION SELECT k FROM '$B/t2.csv' UNION ALL SELECT k FROM '$B/t1.csv' WHERE k = 1 ORDER BY k",
             .want = "k\n1\n1\n2\n3\n4\n",
@@ -1070,7 +1070,7 @@ test "generated sources: SELECT with no FROM and RANGE(lo, hi)" {
     try std.testing.expectEqualStrings("i\n2\n4\n", r);
 }
 
-test "decimal arithmetic is exact: + - * stay DECIMAL, / is a float" {
+test "decimal arithmetic is exact: + - * / stay DECIMAL, / at PostgreSQL's numeric scale" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1083,7 +1083,20 @@ test "decimal arithmetic is exact: + - * stay DECIMAL, / is a float" {
         \\FROM '$IN'
     );
     defer alloc.free(got);
-    try std.testing.expectEqualStrings("s,d,p,p3,q\n1.40,0.80,0.3300,3.30,0.55\n50074774.17,7675946.01,612140715257016.0672,86626080.27,14437680.045\n", got);
+    try std.testing.expectEqualStrings("s,d,p,p3,q\n1.40,0.80,0.3300,3.30,0.55000000000000000000\n50074774.17,7675946.01,612140715257016.0672,86626080.27,14437680.045000000000\n", got);
+}
+
+test "numeric literals and division over columns answer as PostgreSQL does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "i,f,d,n\n7,0.1,1.25,\n-7,2.5,2.50,1.5\n",
+        \\SELECT i / 2 AS h, i * 0.5 AS m, CAST(d AS DECIMAL(10,2)) / 3 AS q, f > 0.1 AS g,
+        \\       i < 2.5 AS lt, coalesce(n, 0.0) AS c, i / 2e0 AS fl
+        \\FROM '$IN'
+    );
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("h,m,q,g,lt,c,fl\n3,3.5,0.41666666666666666667,false,false,0,3.5\n-3,-3.5,0.83333333333333333333,true,true,1.5,-3.5\n", got);
 }
 
 test "table functions: defaults, a join side, two calls with their own CTEs, one calling another" {

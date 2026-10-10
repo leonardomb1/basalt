@@ -27,8 +27,10 @@
 //! Numeric rules, each fixed after a wrong answer: i64 arithmetic is checked,
 //! since the shipped ReleaseFast build makes overflow undefined (and `minInt / -1`
 //! traps with SIGFPE); `%` takes the dividend's sign for ints, floats and
-//! decimals alike; DECIMAL `+ - * %` is exact on i128 unscaled integers (`/` and
-//! any float operand stay float), so `1.1 + 0.3` is not 1.4000000000000001.
+//! decimals alike; a literal with a point is a DECIMAL and DECIMAL `+ - * / %` is
+//! exact on i128 unscaled integers (any float operand makes a float), so `1.1 +
+//! 0.3` is not 1.4000000000000001, and `/` takes PostgreSQL's numeric scale. A
+//! zero divisor fails for every kind, a float's too.
 //! Every decimal rounding (casts, sinks, aggregates, `round`) is half away from
 //! zero, as PostgreSQL does, and a float becomes a decimal through its 15
 //! significant digits, so 12.345 rounds to 12.35. Floats order totally, NaN equal
@@ -99,7 +101,8 @@ fn operandText(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}!
         .field => |q| try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
         .str_lit => |v| try std.fmt.allocPrint(arena, "'{s}'", .{v}),
         .int_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
-        .float_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
+        .float_lit => |v| try std.fmt.allocPrint(arena, "{e}", .{v}),
+        .dec_lit => |d| try formatDecimal(arena, d.unscaled, d.scale),
         .bool_lit => |v| if (v) "true" else "false",
         .call => |c| try std.fmt.allocPrint(arena, "`{s}(…)`", .{c.name}),
         else => "an expression",
@@ -118,6 +121,7 @@ pub const TypeCtx = struct {
             .bool_lit => return Type.init(.bool),
             .int_lit => return Type.init(.int),
             .float_lit => return Type.init(.float),
+            .dec_lit => |d| return Type.decimal(d.precision(), d.scale),
             .str_lit => return Type.init(.string),
             .field => |q| {
                 self.span = q.span;
@@ -425,33 +429,47 @@ test "type errors: unknown field and non-bool not" {
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "bool operand") != null);
 }
 
-test "math builtins: rounding direction, guarded mod, domain edges" {
+test "math builtins: rounding direction, mod by zero, domain edges, decimal in decimal out" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const dec = struct {
+        fn f(al: std.mem.Allocator, src: []const u8, unscaled: i128, scale: u8) !void {
+            const d = (try evalLit(al, src)).decimal;
+            try std.testing.expectEqual(unscaled, d.unscaled);
+            try std.testing.expectEqual(scale, d.scale);
+        }
+    }.f;
 
     try std.testing.expectEqual(@as(i64, 7), (try evalLit(a, "abs(-7)")).int);
-    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "abs(-2.5)")).float);
+    try dec(a, "abs(-2.50)", 250, 2);
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "abs(-2.5e0)")).float);
     try std.testing.expect((try evalLit(a, "abs(null)")).isNull());
 
     try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "floor(5)")).int);
     try std.testing.expectEqual(@as(i64, 5), (try evalLit(a, "round(5)")).int);
-    try std.testing.expectEqual(@as(f64, 2.0), (try evalLit(a, "floor(2.7)")).float);
-    try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "ceil(2.1)")).float);
+    try dec(a, "floor(2.7)", 2, 0);
+    try dec(a, "floor(-2.5)", -3, 0);
+    try dec(a, "ceil(2.1)", 3, 0);
+    try dec(a, "ceil(-0.5)", 0, 0);
+    try std.testing.expectEqual(@as(f64, 2.0), (try evalLit(a, "floor(2.7e0)")).float);
 
-    try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "round(2.5)")).float);
-    try std.testing.expectEqual(@as(f64, -3.0), (try evalLit(a, "round(-2.5)")).float);
-    try std.testing.expectEqual(@as(f64, 2.13), (try evalLit(a, "round(2.125, 2)")).float);
+    try dec(a, "round(2.5)", 3, 0);
+    try dec(a, "round(-2.5)", -3, 0);
+    try dec(a, "round(2.125, 2)", 213, 2);
+    try std.testing.expectEqual(@as(f64, 2.13), (try evalLit(a, "round(2.125e0, 2)")).float);
 
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "mod(7, 3)")).int);
     try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "mod(-7, 3)")).int);
-    try std.testing.expect((try evalLit(a, "mod(7, 0)")).isNull());
+    try dec(a, "mod(-7.5, 2.25)", -75, 2);
+    try std.testing.expectError(error.DivByZero, evalLit(a, "mod(7, 0)"));
 
     try std.testing.expectEqual(@as(f64, 8.0), (try evalLit(a, "power(2, 3)")).float);
     try std.testing.expectEqual(@as(f64, 3.0), (try evalLit(a, "sqrt(9)")).float);
     try std.testing.expect((try evalLit(a, "sqrt(-1)")).isNull());
 
-    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "sign(-0.5)")).int);
+    try dec(a, "sign(-0.5)", -1, 0);
+    try std.testing.expectEqual(@as(f64, -1), (try evalLit(a, "sign(-0.5e0)")).float);
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "sign(0)")).int);
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "sign(42)")).int);
 }
@@ -669,8 +687,9 @@ test "numeric semantics: % truncates for every kind; decimals round, negate and 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectEqual(@as(f64, -2), (try evalLit(a, "-5.0 % 3")).float);
-    try std.testing.expectEqual(@as(f64, -1.5), (try evalLit(a, "-5.5 % 2")).float);
+    try std.testing.expectEqual(@as(f64, -2), (try evalLit(a, "-5.0e0 % 3")).float);
+    try std.testing.expectEqual(@as(f64, -1.5), (try evalLit(a, "-5.5e0 % 2")).float);
+    try std.testing.expectEqual(@as(i128, -15), (try evalLit(a, "-5.5 % 2")).decimal.unscaled);
     const m = (try evalLit(a, "CAST(-1.005 AS DECIMAL(10,3)) % 2")).decimal;
     try std.testing.expectEqual(@as(i128, -1005), m.unscaled);
     try std.testing.expectEqual(@as(u8, 3), m.scale);
@@ -679,12 +698,71 @@ test "numeric semantics: % truncates for every kind; decimals round, negate and 
     try std.testing.expectEqual(@as(i128, -101), r.unscaled);
     try std.testing.expectEqual(@as(u8, 2), r.scale);
     try std.testing.expectEqual(@as(i128, 3), (try evalLit(a, "round(CAST(2.5 AS DECIMAL(4,1)))")).decimal.unscaled);
-    try std.testing.expectEqual(@as(i128, 1000), (try evalLit(a, "round(CAST(149.9 AS DECIMAL(5,1)), -2)")).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 100), (try evalLit(a, "round(CAST(149.9 AS DECIMAL(5,1)), -2)")).decimal.unscaled);
 
     try std.testing.expectEqual(@as(i128, -25), (try evalLit(a, "-CAST(2.5 AS DECIMAL(4,1))")).decimal.unscaled);
-    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS INT)")).int);
-    try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "CAST(CAST(-2.5 AS DECIMAL(4,1)) AS INT)")).int);
-    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "CAST(CAST(2.5 AS DECIMAL(4,1)) AS DOUBLE)")).float);
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "CAST(2.5 AS INT)")).int);
+    try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "CAST(-2.5 AS INT)")).int);
+    try std.testing.expectEqual(@as(i64, 2), (try evalLit(a, "CAST(2.5e0 AS INT)")).int);
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "CAST(2.5 AS DOUBLE)")).float);
+}
+
+test "numeric literals: a point makes an exact DECIMAL, an exponent a FLOAT, a wide integer a DECIMAL" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var ctx = TypeCtx{ .schema = .{ .fields = &.{} }, .arena = a };
+    const typed = struct {
+        fn f(c: *TypeCtx, al: std.mem.Allocator, d: *parser.Diagnostic, src: []const u8) !Type {
+            return c.typeOf(try parser.parseExprStr(al, src, d));
+        }
+    }.f;
+
+    const t = try typed(&ctx, a, &diag, "10.00");
+    try std.testing.expectEqual(types.TypeKind.decimal, t.kind);
+    try std.testing.expectEqual(@as(u8, 4), t.precision);
+    try std.testing.expectEqual(@as(u8, 2), t.scale);
+    try std.testing.expectEqual(@as(u8, 2), (try typed(&ctx, a, &diag, "0.05")).precision);
+    try std.testing.expectEqual(@as(u8, 1), (try typed(&ctx, a, &diag, ".5")).scale);
+    try std.testing.expectEqual(types.TypeKind.float, (try typed(&ctx, a, &diag, "1e3")).kind);
+    try std.testing.expectEqual(types.TypeKind.float, (try typed(&ctx, a, &diag, "2.5E-1")).kind);
+    try std.testing.expectEqual(types.TypeKind.decimal, (try typed(&ctx, a, &diag, "9223372036854775808")).kind);
+    try std.testing.expectEqual(types.TypeKind.int, (try typed(&ctx, a, &diag, "-9223372036854775808")).kind);
+    try std.testing.expect(std.meta.isError(parser.parseExprStr(a, "123456789012345678901234567890123456789", &diag)));
+
+    try std.testing.expect((try evalLit(a, "0.1 + 0.2 = 0.3")).bool);
+    try std.testing.expectEqual(@as(f64, 1000), (try evalLit(a, "1e3")).float);
+    try std.testing.expectEqual(@as(f64, 0.25), (try evalLit(a, ".25e0")).float);
+}
+
+test "division: INT / INT truncates, a DECIMAL quotient takes PostgreSQL's scale, any zero divisor fails" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const dec = struct {
+        fn f(al: std.mem.Allocator, src: []const u8, want: []const u8) !void {
+            const d = (try evalLit(al, src)).decimal;
+            try std.testing.expectEqualStrings(want, try formatDecimal(al, d.unscaled, d.scale));
+        }
+    }.f;
+    try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "7 / 2")).int);
+    try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "-7 / 2")).int);
+    try dec(a, "1 / 3.0", "0.33333333333333333333");
+    try dec(a, "10 / 3.0", "3.3333333333333333");
+    try dec(a, "7.0 / 2", "3.5000000000000000");
+    try dec(a, "9999 / 10000.0", "0.99990000000000000000");
+    try dec(a, "10000 / 9999.0", "1.0001000100010001");
+    try dec(a, "1 / 3000000.0", "0.000000333333333333333333");
+    try dec(a, "2 / 0.0001", "20000.000000000000");
+    try dec(a, "-1 / 6.0", "-0.16666666666666666667");
+    try dec(a, "12345678901234567890.5 / 0.0003", "41152263004115226301666.6667");
+    try dec(a, "123456789012345678901234567890 / 7", "17636684144620811271604938270");
+    try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "5 / 2e0")).float);
+    try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0"));
+    try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0.0"));
+    try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0e0"));
+    try std.testing.expectError(error.DivByZero, evalLit(a, "1.5 % 0"));
 }
 
 test {

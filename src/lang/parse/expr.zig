@@ -287,6 +287,8 @@ pub fn parseUnary(self: *Parser) Error!*ast.Expr {
     defer self.unary_nest -= 1;
     if (self.eat(.minus)) {
         const e = try self.parseUnary();
+        if (e.* == .dec_lit and e.dec_lit.scale == 0 and e.dec_lit.unscaled == -@as(i128, std.math.minInt(i64)))
+            return self.mk(.{ .int_lit = std.math.minInt(i64) });
         return self.mk(.{ .unary = .{ .op = .neg, .e = e } });
     }
     if (self.eat(.tilde)) {
@@ -301,23 +303,53 @@ pub fn parseUnary(self: *Parser) Error!*ast.Expr {
     return self.parsePrimary();
 }
 
+/// An integer that fits INT is one; one with a point is an exact DECIMAL, as is an
+/// integer past INT's range; one with an exponent is a FLOAT. Kept out of
+/// `parsePrimary` so the recursion through it keeps a small frame.
+noinline fn numberLiteral(self: *Parser) Error!*ast.Expr {
+    const pos = self.curPos();
+    const t = self.advance();
+    if (std.mem.indexOfAny(u8, t.text, "eE") != null) {
+        const v = std.fmt.parseFloat(f64, t.text) catch
+            return self.fail(pos, "bad float `{s}`", .{t.text});
+        return self.mk(.{ .float_lit = v });
+    }
+    if (t.tag == .int) if (std.fmt.parseInt(i64, t.text, 10)) |v| return self.mk(.{ .int_lit = v }) else |_| {};
+    const d = decimalLiteral(t.text) orelse
+        return self.fail(pos, "numeric literal `{s}` has more than 38 digits", .{t.text});
+    return self.mk(.{ .dec_lit = d });
+}
+
+/// Digits with at most one `.`, read exactly: the scale is the digits written after
+/// the point, so `10.00` is 1000 at scale 2. Null past 38 digits.
+pub fn decimalLiteral(text: []const u8) ?ast.Expr.DecLit {
+    var unscaled: i128 = 0;
+    var scale: u8 = 0;
+    var digits: u8 = 0;
+    var frac = false;
+    for (text) |ch| {
+        if (ch == '.') {
+            frac = true;
+            continue;
+        }
+        if (frac) scale += 1;
+        if (unscaled == 0 and ch == '0') {
+            if (scale > 38) return null;
+            continue;
+        }
+        digits += 1;
+        if (digits > 38 or scale > 38) return null;
+        unscaled = unscaled * 10 + (ch - '0');
+    }
+    return .{ .unscaled = unscaled, .scale = scale };
+}
+
 /// An aggregate refuses arguments past its maximum: extras were once dropped, so
 /// `SUM(x, id)` answered `SUM(x)`.
 pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
     const t = self.cur();
     switch (t.tag) {
-        .int => {
-            _ = self.advance();
-            const v = std.fmt.parseInt(i64, t.text, 10) catch
-                return self.fail(self.curPos(), "bad integer `{s}`", .{t.text});
-            return self.mk(.{ .int_lit = v });
-        },
-        .float => {
-            _ = self.advance();
-            const v = std.fmt.parseFloat(f64, t.text) catch
-                return self.fail(self.curPos(), "bad float `{s}`", .{t.text});
-            return self.mk(.{ .float_lit = v });
-        },
+        .int, .float => return numberLiteral(self),
         .string => {
             _ = self.advance();
             return self.mk(.{ .str_lit = t.text });

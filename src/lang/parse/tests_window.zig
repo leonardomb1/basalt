@@ -87,7 +87,7 @@ test "window frames: a start after its end, impossible bounds and bad offsets ar
         try expectRefused(a, src, c[1]);
     }
     try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY k, t RANGE 1 PRECEDING) AS s FROM 'in.csv';", "RANGE with an offset needs exactly one ORDER BY key");
-    try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY t ROWS 1e300 PRECEDING) AS s FROM 'in.csv';", "after the frame offset `1`, found `e300`");
+    try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY t ROWS 1e300 PRECEDING) AS s FROM 'in.csv';", "a ROWS offset is a whole number of rows");
     try expectRefused(a, "SELECT SUM(v) OVER (RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS s FROM 'in.csv';", "RANGE with an offset needs exactly one ORDER BY key");
     _ = try parseTest(a, "SELECT SUM(v) OVER (ORDER BY k, t RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM 'in.csv';");
     _ = try parseTest(a, "SELECT SUM(v) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM 'in.csv';");

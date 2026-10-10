@@ -154,11 +154,13 @@ pub fn floatToDecimal(x: f64) ?Decimal {
 }
 
 /// The scale `round(decimal, digits)` answers in: the digits when they are a
-/// literal (as DuckDB types it), else the input's own.
+/// literal (as DuckDB types it; a negative one is scale 0), else the input's own.
 pub fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
     if (c.args.len < 2) return 0;
-    if (c.args[1].* != .int_lit) return in_scale;
-    return @intCast(std.math.clamp(c.args[1].int_lit, 0, in_scale));
+    const d = c.args[1];
+    if (d.* == .unary and d.unary.op == .neg and d.unary.e.* == .int_lit) return 0;
+    if (d.* != .int_lit) return in_scale;
+    return @intCast(std.math.clamp(d.int_lit, 0, in_scale));
 }
 
 pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {

@@ -99,13 +99,13 @@ The hashes are over the value's text. For a row's change key, write
 
 | function | returns |
 |---|---|
-| `abs(x)` | the absolute value |
-| `floor(x)`, `ceil(x)` | rounded down or up to a whole number |
-| `round(x[, digits])` | rounded half away from zero, to `digits` decimal places; deliberately engine-side, never pushed down. On a DECIMAL it is exact, and a literal `digits` answers `DECIMAL(p, digits)` |
-| `mod(a, b)` | the remainder, with the dividend's sign: `mod(-7, 3)` is `-1` |
-| `power(base, exponent)` | `base` raised to `exponent` |
-| `sqrt(x)` | the square root |
-| `sign(x)` | `-1`, `0` or `1` |
+| `abs(x)` | the absolute value, of `x`'s type |
+| `floor(x)`, `ceil(x)` | rounded down or up to a whole number: an INT stays one, a DECIMAL is an exact `DECIMAL(p, 0)`, a FLOAT a FLOAT |
+| `round(x[, digits])` | rounded half away from zero, to `digits` decimal places; deliberately engine-side, never pushed down. On a DECIMAL it is exact, and a literal `digits` answers `DECIMAL(p, digits)` (a negative one `DECIMAL(p, 0)`: `round(1234.5, -2)` is `1200`) |
+| `mod(a, b)` | `a % b`: the remainder, with the dividend's sign — `mod(-7, 3)` is `-1`, `mod(-7.5, 2.25)` is `-0.75`; typed as `%` is, and a zero `b` fails the run |
+| `power(base, exponent)` | `base` raised to `exponent`, a FLOAT (PostgreSQL answers a `numeric` for a numeric base) |
+| `sqrt(x)` | the square root, a FLOAT (PostgreSQL answers a `numeric` for a numeric `x`) |
+| `sign(x)` | `-1`, `0` or `1`, of `x`'s kind (an INT, a `DECIMAL(1,0)` or a FLOAT) |
 
 ## Nulls and comparison
 

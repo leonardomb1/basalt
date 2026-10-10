@@ -48,7 +48,10 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
                     try params.put(p.name, try parseParamValue(arena, p.ty, raw.string, diag));
                     continue;
                 }
+                if (p.ty.kind == .int and (raw == .float or raw == .decimal))
+                    return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: its DEFAULT is not an integer", .{p.name}));
                 v = switch (p.ty.kind) {
+                    .float => if (raw == .int or raw == .decimal) Value{ .float = eval.toF64(raw) } else raw,
                     .date, .time, .timestamp, .decimal => if (raw == .null) raw else eval.castValueTyped(arena, raw, p.ty) catch
                         return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", analyze.paramTextProblem(arena, p.ty, if (raw == .string) raw.string else "") orelse try p.ty.name(arena) })),
                     else => raw,

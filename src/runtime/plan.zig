@@ -354,6 +354,7 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
     const v: Value = switch (b.r.*) {
         .int_lit => |x| .{ .int = x },
         .float_lit => |x| .{ .float = x },
+        .dec_lit => |x| .{ .decimal = .{ .unscaled = x.unscaled, .scale = x.scale } },
         .str_lit => |x| .{ .string = x },
         else => return,
     };

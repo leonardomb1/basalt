@@ -429,7 +429,8 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
         .null_lit => try buf.appendSlice("null"),
         .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
         .int_lit => |v| try buf.writer().print("{d}", .{v}),
-        .float_lit => |v| try buf.writer().print("{d}", .{v}),
+        .float_lit => |v| try buf.writer().print("{e}", .{v}),
+        .dec_lit => |v| try buf.writer().print("{f}", .{v}),
         .str_lit => |s| {
             try buf.append('\'');
             for (s) |ch| {

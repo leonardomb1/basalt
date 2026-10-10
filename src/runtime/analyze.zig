@@ -479,10 +479,16 @@ fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error
 }
 
 /// A DATE, TIME, TIMESTAMP or DECIMAL param is its text CAST to the declared type
-/// (`env.mkLit`), so `date_add('day', 1, $d)` types as the run does.
+/// (`env.mkLit`), so `date_add('day', 1, $d)` types as the run does; a FLOAT one
+/// defaulting to `0.5` is that float.
 fn typedParam(arena: std.mem.Allocator, ty: types.Type, e: *const ast.Expr) Error!*const ast.Expr {
     return switch (ty.kind) {
         .date, .time, .timestamp, .decimal => mk(arena, .{ .cast = .{ .e = @constCast(e), .ty = ty } }),
+        .float => switch (e.*) {
+            .int_lit => |i| mk(arena, .{ .float_lit = @floatFromInt(i) }),
+            .dec_lit => |d| mk(arena, .{ .float_lit = @as(f64, @floatFromInt(d.unscaled)) / std.math.pow(f64, 10, @floatFromInt(d.scale)) }),
+            else => e,
+        },
         else => e,
     };
 }
@@ -627,6 +633,8 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         };
         if (text) |t| if (paramTextProblem(arena, p.ty, t)) |want|
             return fail(diag, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, t, want });
+        if (p.ty.kind == .int) if (p.default) |d| if (d.* == .dec_lit or d.* == .float_lit)
+            return fail(diag, "PARAM `{s}`: its DEFAULT is not an integer", .{p.name});
         const pe = bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty));
         try params_map.put(p.name, pe);
         if (bound != null or p.default != null) if (eval.constEval(arena, pe, &.{}, &.{})) |v| {
@@ -723,7 +731,7 @@ fn anyDynamicName(names: []const ast.QualName) bool {
 
 fn exprHasDynamicName(e: *const ast.Expr) bool {
     return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .lambda_var => false,
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => false,
         .lambda => |l| exprHasDynamicName(l.body),
         .field => |q| isDynamicName(q),
         .unary => |u| exprHasDynamicName(u.e),

@@ -41,8 +41,20 @@ columns it has not seen.
   down to PostgreSQL as written and to MySQL, StarRocks and Doris as `<=>`, and
   stays in the engine on SQL Server.
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
+- **Numeric literals** are typed as the standard types them: `42` is an `INT`
+  (one past INT's range, up to 38 digits, is an exact `DECIMAL(p, 0)`); a
+  literal with a point and no exponent — `2.5`, `.5`, `10.00` — is an exact
+  `DECIMAL(p, s)` with the digits as written (`10.00` is `DECIMAL(4,2)`, `0.05`
+  is `DECIMAL(2,2)`); one with an exponent — `1e3`, `2.5E-1` — is a `FLOAT`
+  (PostgreSQL reads it as `numeric` too; basalt follows the standard's
+  approximate literal). So `0.1 + 0.2 = 0.3` is true, `x * 0.5` on an INT
+  column is a `DECIMAL`, and `0e0` (or `CAST(0 AS DOUBLE)`) is the way to write
+  a float zero.
 - `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
-  `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text
+  `CAST(x AS TIMESTAMP)` — implicit widening is int→decimal→float only: an int
+  beside a decimal is a decimal, a decimal beside a float a float, as
+  PostgreSQL resolves `numeric` beside `float8` (`coalesce(f, 0.0)` over a
+  FLOAT `f` is a FLOAT). Text
   parses as `YYYY-MM-DD[ HH:MM:SS]`, and a day the month does not have
   (`'2023-02-29'`, `'2024-04-31'`) fails rather than rolling into the next month.
   Text to a number is **strict**: surrounding spaces aside, an optional sign,
@@ -75,17 +87,30 @@ columns it has not seen.
   they compare as floats.
 - **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
   decimal and an int) answer a decimal at the wider operand's scale, `*` one at
-  the summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
-  `1.40`, not `1.4000000000000001`, so a `SUM` cast to `DECIMAL` stays exact
-  when this month's total is subtracted from last month's. A product's scale
-  stops at 38, rounding half away from zero past it. A result (or a `SUM`) of
-  more than 38 digits fails with `decimal overflow: more than 38 digits` — cast
-  an operand to a smaller scale first. `/` has no finite
-  scale and stays float, as does anything with a float operand (a literal like
-  `0.3` is a float). `round(x, n)` on a decimal is exact too, and with a literal
-  `n` answers `DECIMAL(p, n)`; `-x` stays a decimal, and `CAST(x AS INT)` rounds
-  half away from zero. `%` takes the dividend's sign for every numeric kind:
-  `-5.5 % 2` is `-1.5`.
+  the summed scale — `1.1 + 0.3` is `1.4`, not `1.4000000000000001`, so a `SUM`
+  cast to `DECIMAL` stays exact when this month's total is subtracted from last
+  month's. A product's scale stops at 38, rounding half away from zero past it.
+  A result (or a `SUM`) of more than 38 digits fails with `decimal overflow:
+  more than 38 digits` — cast an operand to a smaller scale first. Anything
+  with a float operand is a float. `round(x, n)` on a decimal is exact too, and
+  with a literal `n` answers `DECIMAL(p, n)`; `-x`, `abs`, `floor`, `ceil`,
+  `sign` and `mod` stay decimals, and `CAST(x AS INT)` rounds half away from
+  zero. `%` takes the dividend's sign for every numeric kind: `-5.5 % 2` is
+  `-1.5`.
+- **Division follows the operands' types**, as PostgreSQL divides. `INT / INT`
+  is an `INT`, truncated toward zero: `7 / 2` is `3`, `-7 / 2` is `-3`, and so
+  `SUM(x) / COUNT(*)` over an INT column truncates — write `SUM(x) * 1.0 /
+  COUNT(*)` or `AVG(x)` for the fraction. A decimal divided by a decimal or an
+  int is an exact decimal at PostgreSQL's numeric scale: at least 16
+  significant digits and no fewer decimals than either operand, rounded half
+  away from zero — `1 / 3.0` is `0.33333333333333333333`, `7.0 / 2` is
+  `3.5000000000000000`, `10 / 3.0` is `3.3333333333333333`. The 38-digit limit
+  caps that scale where PostgreSQL would go on. Its column type is `DECIMAL(p,
+  s)` with `s` the operands' larger scale but at least 16 while the whole
+  digits leave room, so a file column gets that many decimals. A float divides
+  as a float. A zero divisor — in `/`, `%` or `mod`, for every numeric kind,
+  a float's included — fails the run with `division by zero`, as in
+  PostgreSQL.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and

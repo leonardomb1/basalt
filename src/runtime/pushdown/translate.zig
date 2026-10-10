@@ -82,7 +82,7 @@ fn numericKind(k: types.TypeKind) bool {
 /// schema at hand says is numeric. A nested numeric cast is checked on its own.
 fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     return switch (e.*) {
-        .int_lit, .float_lit => true,
+        .int_lit, .float_lit, .dec_lit => true,
         .str_lit => |s| plainNumber(s),
         .field => |q| blk: {
             if (schema.fields.len == 0) break :blk false;
@@ -158,7 +158,7 @@ const Tx = struct {
     fn kind(self: Tx, e: *const ast.Expr) Kind {
         return switch (e.*) {
             .str_lit => .{ .text = .{ .facts = null } },
-            .int_lit, .float_lit, .bool_lit, .null_lit => .other,
+            .int_lit, .float_lit, .dec_lit, .bool_lit, .null_lit => .other,
             .field => |q| blk: {
                 if (q.parts.len != 1) break :blk .unknown;
                 if (self.factsOf(q.parts[0])) |f| break :blk if (f.text) Kind{ .text = .{ .facts = f } } else .other;
@@ -232,6 +232,7 @@ const Tx = struct {
             .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
             .int_lit => |v| return try self.fmt("{d}", .{v}),
             .float_lit => |v| return try self.fmt("{d}", .{v}),
+            .dec_lit => |v| return try self.fmt("{f}", .{v}),
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .str_lit => |s| {
                 if (self.dialect == .sqlserver and !asciiPrintable(s)) return null;
@@ -293,7 +294,7 @@ const Tx = struct {
             const sk = self.kind(subj);
             if (sk == .text) return null;
             if (sk == .unknown) for (m.arms) |arm| for (arm.pats) |p| switch (p.*) {
-                .int_lit, .float_lit => {},
+                .int_lit, .float_lit, .dec_lit => {},
                 else => return null,
             };
             const s = (try self.value(subj)) orelse return null;
@@ -344,7 +345,7 @@ const Tx = struct {
 
     fn isLit(e: *const ast.Expr) bool {
         return switch (e.*) {
-            .str_lit, .int_lit, .float_lit, .bool_lit, .null_lit => true,
+            .str_lit, .int_lit, .float_lit, .dec_lit, .bool_lit, .null_lit => true,
             else => false,
         };
     }

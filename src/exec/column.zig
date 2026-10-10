@@ -484,7 +484,7 @@ pub const Builder = struct {
             .i32 => |*l| try l.append(if (ok) v.date else 0),
             .i64 => |*l| try l.append(if (ok) self.asI64(v) else 0),
             .f64 => |*l| try l.append(if (ok) self.asF64(v) else 0),
-            .dec => |*l| try l.append(if (ok) v.decimal else .{ .unscaled = 0, .scale = self.ty.scale }),
+            .dec => |*l| try l.append(self.asDec(v)),
             .bytes => |*l| {
                 if (ok) try l.values.appendSlice(self.asBytes(v));
                 try l.ends.append(@intCast(l.values.items.len));
@@ -505,6 +505,15 @@ pub const Builder = struct {
                 .decimal => |d| @intFromFloat(d.toF64()),
                 else => 0,
             },
+        };
+    }
+
+    /// An INT read as a scale-0 decimal, as an INT arm beside a DECIMAL one types.
+    fn asDec(self: *Builder, v: Value) value.Decimal {
+        return switch (v) {
+            .decimal => |d| d,
+            .int => |x| .{ .unscaled = x, .scale = 0 },
+            else => .{ .unscaled = 0, .scale = self.ty.scale },
         };
     }
 

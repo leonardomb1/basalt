@@ -450,7 +450,7 @@ test "windows in expressions, ORDER BY, expression keys and arguments, and over 
         },
         .{
             .q = "SELECT k, SUM(v) AS s, SUM(SUM(v)) OVER () AS total, ROUND(100.0 * SUM(v) / SUM(SUM(v)) OVER (), 1) AS pct, RANK() OVER (ORDER BY SUM(v) DESC) AS rk FROM '$B/s.csv' GROUP BY k ORDER BY rk",
-            .want = "k,s,total,pct,rk\na,80,92,87,1\nb,12,92,13,2\n",
+            .want = "k,s,total,pct,rk\na,80,92,87.0,1\nb,12,92,13.0,2\n",
         },
         .{
             .q = "SELECT * FROM (SELECT id, k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM '$B/s.csv') r WHERE rn <= 2 ORDER BY id",

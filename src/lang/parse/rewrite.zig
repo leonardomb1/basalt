@@ -68,7 +68,7 @@ pub fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Man
                 try self.collectFields(arm.value, out);
             }
         },
-        .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit => {},
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit => {},
     }
 }
 
@@ -89,6 +89,7 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
         },
         .int_lit => |v| try buf.print("{d}", .{v}),
         .float_lit => |v| try buf.print("{e}", .{v}),
+        .dec_lit => |v| try buf.print("{f}", .{v}),
         .str_lit => |v| try quoteInto(buf, v, '\''),
         .bool_lit => |v| try buf.appendSlice(if (v) "true" else "false"),
         .null_lit => try buf.appendSlice("null"),
@@ -285,7 +286,7 @@ pub fn repointPostItem(
 /// calls, any `$name`), so it may sit beside aggregates. A bare column never is.
 pub fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
     return switch (e.*) {
-        .int_lit, .float_lit, .str_lit, .bool_lit, .null_lit => true,
+        .int_lit, .float_lit, .dec_lit, .str_lit, .bool_lit, .null_lit => true,
         .field => |q| q.dollar,
         .lambda => |l| self.constItemExpr(l.body),
         .lambda_var => true,

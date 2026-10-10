@@ -1,10 +1,10 @@
 //! The engine's canonical type system: the type lattice every column and value
 //! speaks, the nullability flag, and the implicit-widening / unification rules.
 //!
-//! Coercion policy: implicit widening only (`int -> decimal`, `int -> float`);
-//! everything else needs an explicit `cast`. Nulls follow SQL three-valued logic,
-//! tracked as a per-type `nullable` flag; a bare `null` literal is `unknown` and
-//! unifies with anything.
+//! Coercion policy: implicit widening only (`int -> decimal -> float`, as
+//! PostgreSQL resolves numeric beside float8); everything else needs an explicit
+//! `cast`. Nulls follow SQL three-valued logic, tracked as a per-type `nullable`
+//! flag; a bare `null` literal is `unknown` and unifies with anything.
 //!
 //! `BodyCol` (a declared `FROM BODY (...)` column) lives here so the connect layer
 //! does not need the AST. A `Field`'s `rel`/`base` are set on columns a join's
@@ -84,7 +84,7 @@ pub const Type = struct {
 
     pub fn canWiden(from: TypeKind, to: TypeKind) bool {
         if (from == to) return true;
-        return from == .int and (to == .decimal or to == .float);
+        return (from == .int and (to == .decimal or to == .float)) or (from == .decimal and to == .float);
     }
 
     /// The common type of two `if`/`match` arms, or null if they don't unify.
@@ -103,6 +103,8 @@ pub const Type = struct {
             }
             return t;
         }
+        if (a.kind == .int and b.kind == .decimal) return unify(decimal(19, 0).withNull(a.nullable), b);
+        if (b.kind == .int and a.kind == .decimal) return unify(a, decimal(19, 0).withNull(b.nullable));
         if (canWiden(a.kind, b.kind)) {
             var t = b;
             t.nullable = nn;
@@ -147,11 +149,12 @@ pub const Schema = struct {
     }
 };
 
-test "canWiden follows int-only widening" {
+test "canWiden follows int -> decimal -> float" {
     try std.testing.expect(Type.canWiden(.int, .float));
     try std.testing.expect(Type.canWiden(.int, .decimal));
     try std.testing.expect(Type.canWiden(.int, .int));
-    try std.testing.expect(!Type.canWiden(.decimal, .float));
+    try std.testing.expect(Type.canWiden(.decimal, .float));
+    try std.testing.expect(!Type.canWiden(.float, .decimal));
     try std.testing.expect(!Type.canWiden(.float, .int));
     try std.testing.expect(!Type.canWiden(.string, .bytes));
 }
@@ -180,16 +183,18 @@ test "unify: unknown-null unifies with any type, yielding it nullable" {
     try std.testing.expect(ub.nullable);
 }
 
-test "unify decimals keeps both sides' whole digits and the larger scale; int widens into decimal" {
+test "unify decimals keeps both sides' whole digits and the larger scale; an int widens as DECIMAL(19,0)" {
     const u = Type.unify(Type.decimal(18, 2), Type.decimal(10, 4)).?;
     try std.testing.expectEqual(TypeKind.decimal, u.kind);
     try std.testing.expectEqual(@as(u8, 20), u.precision);
     try std.testing.expectEqual(@as(u8, 4), u.scale);
 
-    const w = Type.unify(Type.init(.int), Type.decimal(12, 3)).?;
+    const w = Type.unify(Type.init(.int), Type.decimal(2, 1)).?;
     try std.testing.expectEqual(TypeKind.decimal, w.kind);
-    try std.testing.expectEqual(@as(u8, 12), w.precision);
-    try std.testing.expectEqual(@as(u8, 3), w.scale);
+    try std.testing.expectEqual(@as(u8, 20), w.precision);
+    try std.testing.expectEqual(@as(u8, 1), w.scale);
+
+    try std.testing.expectEqual(TypeKind.float, Type.unify(Type.decimal(2, 1), Type.init(.float)).?.kind);
 }
 
 test "eql compares decimal parameters but ignores nullability" {

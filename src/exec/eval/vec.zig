@@ -48,9 +48,21 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
-        .col => |c| c,
+        .col => |c| if (numericDrift(c.ty, out_ty)) rebuildAs(arena, c, out_ty) else c,
         .scalar => |s| broadcastScalar(arena, s, out_ty, batch.len),
     };
+}
+
+/// Whether a column's numeric kind differs from the one its expression types as:
+/// `coalesce(f, 0.5)` over a FLOAT `f` that is null all batch holds decimals.
+fn numericDrift(have: Type, want: Type) bool {
+    return !want.unknown and have.kind != want.kind and have.kind.isNumeric() and want.kind.isNumeric();
+}
+
+fn rebuildAs(arena: std.mem.Allocator, c: Column, ty: Type) EvalError!Column {
+    var b = column.Builder.init(arena, ty);
+    for (0..c.len) |i| try b.append(c.getValue(i));
+    return b.finish();
 }
 
 pub fn evalColumnRowwise(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, out_ty: Type) EvalError!column.Column {
@@ -105,6 +117,7 @@ pub fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch
         .bool_lit => |b| return .{ .scalar = .{ .bool = b } },
         .int_lit => |i| return .{ .scalar = .{ .int = i } },
         .float_lit => |f| return .{ .scalar = .{ .float = f } },
+        .dec_lit => |d| return .{ .scalar = .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } } },
         .str_lit => |s| return .{ .scalar = .{ .string = s } },
         .field => |q| {
             const idx = fieldIndex(batch.schema.*, q) orelse return error.TypeMismatch;
@@ -306,6 +319,7 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
             if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
+            if (try intDecCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try decCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try asNum(arena, l, batch.len)) |ln| {
                 if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
@@ -367,15 +381,15 @@ fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
     };
 }
 
-/// Int div/mod raise on a zero divisor and int add/sub/mul on overflow; f64
+/// Div/mod raise on a zero divisor and int add/sub/mul on overflow; f64
 /// compares through `orderF64`, since `std.math.order` is `unreachable` on NaN.
 inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
     return switch (op) {
         .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
         .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
         .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
-        .div => if (T == i64) intDiv(a, d) else a / d,
-        .mod => if (T == i64) intRem(a, d) else @rem(a, d),
+        .div => if (T == i64) intDiv(a, d) else if (d == 0) error.DivByZero else a / d,
+        .mod => if (T == i64) intRem(a, d) else if (d == 0) error.DivByZero else @rem(a, d),
         .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, if (T == f64) orderF64(a, d) else std.math.order(a, d)),
         else => unreachable,
     };
@@ -690,6 +704,41 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
     return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
 }
 
+/// An INT column against a decimal constant (`x > 2.5`), exactly but on the int
+/// lane: the constant becomes the whole-number bound that decides the same rows.
+/// Null when the operands are not that shape or the bound passes INT's range.
+fn intDecCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    const flip = l == .scalar;
+    const col = if (flip) r else l;
+    const lit = if (flip) l else r;
+    if (col != .col or col.col.ty.kind != .int or lit != .scalar or lit.scalar != .decimal) return null;
+    const d = lit.scalar.decimal;
+    const p = std.math.powi(i128, 10, d.scale) catch return null;
+    const fl = @divFloor(d.unscaled, p);
+    const exact = @mod(d.unscaled, p) == 0;
+    const ce = if (exact) fl else fl + 1;
+    const o: ast.BinOp = if (!flip) op else switch (op) {
+        .lt => .gt,
+        .le => .ge,
+        .gt => .lt,
+        .ge => .le,
+        else => op,
+    };
+    const never = std.math.minInt(i64);
+    const pick: struct { op: ast.BinOp, bound: i128 } = switch (o) {
+        .gt => .{ .op = .gt, .bound = fl },
+        .ge => .{ .op = .ge, .bound = ce },
+        .lt => .{ .op = .lt, .bound = ce },
+        .le => .{ .op = .le, .bound = fl },
+        .eq => if (exact) .{ .op = .eq, .bound = fl } else .{ .op = .lt, .bound = never },
+        .ne => if (exact) .{ .op = .ne, .bound = fl } else .{ .op = .ge, .bound = never },
+        else => return null,
+    };
+    const bound = std.math.cast(i64, pick.bound) orelse return null;
+    const ln = (try asNum(arena, col, n)).?;
+    return try numOpVec(arena, pick.op, ln, .{ .iscalar = bound }, n);
+}
+
 /// Exact comparison when one side is a decimal and the other a decimal or an int;
 /// the float kernels would merge decimals past 15 digits.
 fn decCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
@@ -715,7 +764,7 @@ fn vecType(v: Vec) ?Type {
     return switch (v) {
         .scalar => |s| switch (s) {
             .int => Type.init(.int),
-            .decimal => |d| Type.decimal(0, d.scale),
+            .decimal => |d| Type.decimal((ast.Expr.DecLit{ .unscaled = d.unscaled, .scale = d.scale }).precision(), d.scale),
             else => null,
         },
         .col => |c| if (c.ty.kind == .int or c.ty.kind == .decimal) c.ty else null,
@@ -1273,7 +1322,7 @@ test "bitwise operators and hex builtins" {
     }
 }
 
-test "int division/modulo by zero raise DivByZero; float division yields inf" {
+test "division and modulo by zero raise DivByZero for every numeric kind" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1293,9 +1342,34 @@ test "int division/modulo by zero raise DivByZero; float division yields inf" {
 
     var fzero = ast.Expr{ .float_lit = 0.0 };
     var fdiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &fzero } };
-    const out = try evalColumn(a, &fdiv, batch, Type.init(.float).asNullable());
-    try std.testing.expect(std.math.isInf(out.getValue(0).float));
-    try std.testing.expect(out.getValue(1).isNull());
+    try std.testing.expectError(error.DivByZero, evalColumn(a, &fdiv, batch, Type.init(.float).asNullable()));
+    var dzero = ast.Expr{ .dec_lit = .{ .unscaled = 0, .scale = 1 } };
+    var ddiv = ast.Expr{ .binary = .{ .op = .div, .l = &fx, .r = &dzero } };
+    try std.testing.expectError(error.DivByZero, evalColumn(a, &ddiv, batch, Type.decimal(38, 16).asNullable()));
+}
+
+test "an INT column against a decimal constant compares exactly on the int lane, either side" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int).asNullable() }} };
+    const x = try column.intColumn(a, &.{ -3, -2, -1, 0, 1, 2, 3, null });
+    var cols = [_]column.Column{x};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 8 };
+    const ops = [_][]const u8{ "<", "<=", ">", ">=", "=", "<>" };
+    const lits = [_][]const u8{ "-1.5", "2.0", "0.5", "-2", "99999999999999999999.5" };
+    for (ops) |op| for (lits) |lit| for ([_]bool{ false, true }) |flip| {
+        const src = if (flip) try std.fmt.allocPrint(a, "{s} {s} x", .{ lit, op }) else try std.fmt.allocPrint(a, "x {s} {s}", .{ op, lit });
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, src, &diag);
+        const got = try evalColumn(a, e, batch, Type.init(.bool).asNullable());
+        for (0..batch.len) |i| {
+            const want = try evalRow(a, e, batch, i);
+            const have = got.getValue(i);
+            try std.testing.expectEqual(want.isNull(), have.isNull());
+            if (!want.isNull()) try std.testing.expectEqual(want.bool, have.bool);
+        }
+    };
 }
 
 test "evalColumn over an empty batch yields an empty column" {

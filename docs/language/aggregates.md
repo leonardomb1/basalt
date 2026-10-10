@@ -102,6 +102,14 @@ A value the sum cannot add exactly fails the run, naming the cast that would:
 `nan` or `inf` for `SUM(CAST(v AS FLOAT))`. `AVG` and the other numeric
 aggregates read text as `FLOAT`. The same rules hold for `SUM(...) OVER (...)`.
 
+**`AVG` is a `FLOAT`** whatever it averages, and so are `MEDIAN`, the variances
+and the deviations — a deliberate difference from PostgreSQL, whose `avg` of an
+INT or `numeric` column is a `numeric`. For PostgreSQL's exact mean, divide
+the exact sum: `SUM(x) * 1.0 / COUNT(x)` over an INT column, `SUM(x) /
+COUNT(x)` over a DECIMAL one (an exact decimal quotient, see
+[division](../reference/expressions.md)). `SUM(x) / COUNT(x)` over an INT
+column is integer division and truncates, as in PostgreSQL.
+
 **Past `--op-memory`, a `GROUP BY` spills to disk** (see
 [Spilling to disk](../tools/cli.md#spilling-to-disk)): groups it already holds keep
 folding in memory, and rows of new groups go to disk by a hash of their key, to be
