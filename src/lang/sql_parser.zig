@@ -621,6 +621,7 @@ pub const Parser = struct {
     pub const resolveSpec = @import("parse/window.zig").resolveSpec;
     pub const checkCall = @import("parse/window.zig").checkCall;
     pub const groupedOnly = @import("parse/window.zig").groupedOnly;
+    pub const groupKeyRefs = @import("parse/window.zig").groupKeyRefs;
     pub const parseFromSource = @import("parse/from.zig").parseFromSource;
     pub const parseSubQuery = @import("parse/from.zig").parseSubQuery;
     pub const parseEachTableOf = @import("parse/from.zig").parseEachTableOf;

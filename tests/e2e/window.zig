@@ -487,6 +487,19 @@ test "a window without ORDER BY counts in input order beside windows that sort" 
     try std.testing.expectEqualStrings("id,rn,s,f,l,ps\n1,3,1,1,4,1\n2,1,3,2,4,2\n3,4,5,1,4,4\n4,2,7,2,4,6\n", out);
 }
 
+test "a window over a computed GROUP BY key reads the key's column" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT upper(k) AS K2, COUNT(*) AS c, SUM(COUNT(*)) OVER (ORDER BY upper(k)) AS r FROM '$B/s.csv' GROUP BY upper(k) ORDER BY K2",
+            .want = "K2,c,r\nA,4,4\nB,3,7\n",
+        },
+        .{
+            .q = "SELECT upper(k) AS K2, SUM(v) AS s, SUM(SUM(v)) OVER (PARTITION BY upper(k)) AS p, LAG(lower(upper(k))) OVER (ORDER BY SUM(v)) AS prev FROM '$B/s.csv' GROUP BY 1 ORDER BY K2",
+            .want = "K2,s,p,prev\nA,80,80,b\nB,12,12,\n",
+        },
+    });
+}
+
 test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

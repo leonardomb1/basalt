@@ -906,17 +906,18 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 return if (containsAgg(e)) p.liftAggs(e, a, m, at) else e;
             }
         };
+        const ea = expr_aliases.items;
         for (win_post.items) |at| {
             const it = &post.items[at].computed;
-            it.expr = try L.lift(self, it.expr, &aggs, expr_aliases.items, pos);
+            it.expr = try L.lift(self, try self.groupKeyRefs(it.expr, group, ea), &aggs, ea, pos);
             lifted = true;
         }
         for (win_calls.items, specs) |*c, *sp| {
-            if (c.arg) |a| c.arg = try L.lift(self, a, &aggs, expr_aliases.items, pos);
+            if (c.arg) |a| c.arg = try L.lift(self, try self.groupKeyRefs(a, group, ea), &aggs, ea, pos);
             const part = try self.arena.dupe(*ast.Expr, sp.partition);
-            for (part) |*e| e.* = try L.lift(self, e.*, &aggs, expr_aliases.items, pos);
+            for (part) |*e| e.* = try L.lift(self, try self.groupKeyRefs(e.*, group, ea), &aggs, ea, pos);
             const ord = try self.arena.dupe(Window.OrderExpr, sp.order);
-            for (ord) |*k| k.e = try L.lift(self, k.e, &aggs, expr_aliases.items, pos);
+            for (ord) |*k| k.e = try L.lift(self, try self.groupKeyRefs(k.e, group, ea), &aggs, ea, pos);
             sp.partition = part;
             sp.order = ord;
         }

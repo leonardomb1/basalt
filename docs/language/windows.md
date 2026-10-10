@@ -204,7 +204,10 @@ FROM 'movimentos.csv'
 GROUP BY conta;
 ```
 
-A column a window reads there must be a grouping key or inside an aggregate.
+A column a window reads there must be a grouping key or inside an aggregate; a
+computed key is read as `GROUP BY` writes it (`OVER (ORDER BY upper(conta))` under
+`GROUP BY upper(conta)`, or under `GROUP BY 1` when the first item is that
+expression).
 
 ## Types
 
