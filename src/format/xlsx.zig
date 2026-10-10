@@ -578,21 +578,35 @@ pub fn sheetNames(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []cons
     return names.items;
 }
 
-/// Days from the workbook's epoch (1899-12-30 or 1904-01-01) to 1970-01-01. Excel
-/// counts a 29 February 1900 that never was, so 1900 serials below 61 read a day late.
-fn epochOffset(date1904: bool) i64 {
-    return if (date1904) 24107 else 25569;
+/// Days from the workbook's epoch (1899-12-30 or 1904-01-01) to 1970-01-01, less the
+/// day Excel's 1900 calendar adds before March 1900: it counts a 29 February 1900 that
+/// never was, so serial 1 is 1900-01-01 and 59 is 28 February, as Excel shows them;
+/// 60, the missing day, reads as 28 February too, as openpyxl reads it.
+fn epochOffset(serial: f64, date1904: bool) i64 {
+    if (date1904) return 24107;
+    return if (serial >= 1 and serial < 60) 25568 else 25569;
 }
 
 fn serialDays(serial: f64, date1904: bool) i64 {
-    return @as(i64, @intFromFloat(@floor(serial))) - epochOffset(date1904);
+    return @as(i64, @intFromFloat(@floor(serial))) - epochOffset(serial, date1904);
 }
 
 /// To the millisecond: a day's fraction in a double cannot say 23:59:59.5 exactly, and
 /// Excel itself keeps times to the millisecond.
 fn serialMicros(serial: f64, date1904: bool) i64 {
     const ms: i64 = @intFromFloat(@round(serial * 86_400_000.0));
-    return (ms - epochOffset(date1904) * 86_400_000) * 1000;
+    return (ms - epochOffset(serial, date1904) * 86_400_000) * 1000;
+}
+
+test "1900 serials before March read as the dates Excel shows" {
+    const day = 86_400_000_000;
+    try std.testing.expectEqual(@as(i64, -25567), serialDays(1, false));
+    try std.testing.expectEqual(@as(i64, -25509), serialDays(59, false));
+    try std.testing.expectEqual(@as(i64, -25509), serialDays(60, false));
+    try std.testing.expectEqual(@as(i64, -25508), serialDays(61, false));
+    try std.testing.expectEqual(@as(i64, -25509 * day + day / 2), serialMicros(59.5, false));
+    try std.testing.expectEqual(@as(i64, -24107), serialDays(0, true));
+    try std.testing.expectEqual(@as(i64, -24106), serialDays(1, true));
 }
 
 fn dayMicros(serial: f64) i64 {

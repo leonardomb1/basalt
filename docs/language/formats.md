@@ -46,8 +46,9 @@ A workbook's cells carry their own types, so a column's type is decided from
 every row, not a sample (a CSV's first 1024): numbers are `INT` when each is an
 integer below 2^53 and `FLOAT` otherwise; numbers in a date or time format are
 `DATE`, `TIMESTAMP` or `TIME` (to the millisecond, as Excel keeps them; a
-1904-based workbook is read as such, and serials before 1 March 1900 are a day
-late, as in Excel); booleans are `BOOL`; and any text in a column makes it
+1904-based workbook is read as such, and a date before 1 March 1900 reads as
+the one Excel shows, though Excel's calendar holds a 29 February 1900 that never
+was: that serial reads as 28 February); booleans are `BOOL`; and any text in a column makes it
 `STRING`, a number there keeping the digits the file stored — so a "Total" row
 of text at the bottom turns its column to text instead of failing the load.
 Empty cells and error values (`#N/A`, `#DIV/0!`) are null; a formula reads as
