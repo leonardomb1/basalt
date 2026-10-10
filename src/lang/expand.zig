@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtins = @import("../exec/builtins.zig");
+const eval = @import("../exec/eval.zig");
 const parser = @import("sql_parser.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
@@ -171,8 +172,7 @@ fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     }
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
-    const full = try fillDefaults(cx, fd, args);
-    try checkArgTypes(cx, fd, full);
+    const full = try checkArgTypes(cx, fd, try fillDefaults(cx, fd, args));
     return .{ .call = .{ .name = c.name, .args = full, .pos = c.pos } };
 }
 
@@ -372,8 +372,7 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
                 return error.ExpandFailed;
             },
         }
-        const full = try fillDefaults(cx, fd, args);
-        try checkArgTypes(cx, fd, full);
+        const full = try checkArgTypes(cx, fd, try fillDefaults(cx, fd, args));
         var inner = Subst.init(cx.arena);
         for (fd.params, full) |p, av| try inner.put(p.name, av);
         return expandExpr(cx, fd.body.expr, &inner, depth + 1);
@@ -405,15 +404,36 @@ fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const
 }
 
 /// Only a literal argument is decidable at expansion; anything else passes through
-/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and bytes.
-fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
-    for (fd.params, args, 1..) |p, a, n| {
-        const want = (p.ty orelse continue).kind;
-        const got = literalKind(a) orelse continue;
-        if (acceptsLiteral(want, got)) continue;
-        cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
-        return error.ExpandFailed;
+/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and
+/// bytes, a temporal one read as a CAST reads it and passed on as that CAST.
+fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
+    const out = try cx.arena.dupe(*ast.Expr, args);
+    for (fd.params, out, 1..) |p, *a, n| {
+        const ty = p.ty orelse continue;
+        const want = ty.kind;
+        const got = literalKind(a.*) orelse continue;
+        if (!acceptsLiteral(want, got)) {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
+            return error.ExpandFailed;
+        }
+        if (!isTemporalText(ty, a.*)) continue;
+        if (!temporalTextOk(cx.arena, ty, a.*.str_lit)) {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, n, p.name, typeWord(want), a.*.str_lit }) catch "fn argument type mismatch";
+            return error.ExpandFailed;
+        }
+        a.* = try mk(cx, .{ .cast = .{ .e = a.*, .ty = ty } });
     }
+    return out;
+}
+
+/// A string literal passed for a DATE, TIME or TIMESTAMP parameter.
+pub fn isTemporalText(ty: types.Type, e: *const ast.Expr) bool {
+    return e.* == .str_lit and (ty.kind == .date or ty.kind == .time or ty.kind == .timestamp);
+}
+
+pub fn temporalTextOk(arena: std.mem.Allocator, ty: types.Type, text: []const u8) bool {
+    _ = eval.castValueTyped(arena, .{ .string = text }, ty) catch return false;
+    return true;
 }
 
 /// The type of a literal argument, else null; a `null` literal reports null too,
@@ -563,6 +583,14 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .binary);
+
+    const m2 = try expandErr(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-13-01') AS x FROM 'd';");
+    try std.testing.expectEqualStrings("`f`: argument 1 (`a`) expects DATE, got `2026-13-01`", m2);
+    const p2 = try parser.parseSource(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-01-31') AS x FROM 'd';", &diag);
+    const o2 = try expandProgram(a, p2, null, &msg);
+    const cast = outputSelect(o2)[0].computed.expr.cast;
+    try std.testing.expectEqual(types.TypeKind.date, cast.ty.kind);
+    try std.testing.expectEqualStrings("2026-01-31", cast.e.str_lit);
 }
 
 test "expandProgram: a table function is read with FROM, not called as a scalar or with CALL" {

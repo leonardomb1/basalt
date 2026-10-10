@@ -98,10 +98,13 @@ pub fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, 
                 return self.fail(pos, "`{s}`: argument {d} (`{s}`) names a column — pass a row's value with `JOIN LATERAL {s}(...)`", .{ fd.name, i, p.name, fd.name });
             return self.fail(pos, "`{s}`: argument {d} (`{s}`) must be a constant — a literal, a `$param`, or an expression over them", .{ fd.name, i, p.name });
         }
-        const want = (p.ty orelse continue).kind;
+        const ty = p.ty orelse continue;
+        const want = ty.kind;
         const got = expand.literalKind(a.*) orelse continue;
         if (!expand.acceptsLiteral(want, got))
             return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i, p.name, expand.typeWord(want), expand.typeWord(got) });
+        if (expand.isTemporalText(ty, a.*) and !expand.temporalTextOk(self.arena, ty, a.*.str_lit))
+            return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i, p.name, expand.typeWord(want), a.*.str_lit });
     }
     if (self.tvf_depth >= max_tvf_depth)
         return self.fail(pos, "table function `{s}` nests more than {d} calls deep — does it reach itself?", .{ fd.name, max_tvf_depth });
