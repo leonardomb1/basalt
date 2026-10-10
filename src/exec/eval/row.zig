@@ -18,6 +18,10 @@ const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const rescaleTo = @import("cast.zig").rescaleTo;
+const decimalOverflow = @import("support.zig").decimalOverflow;
+const fitsPrecision = @import("cast.zig").fitsPrecision;
+const max_digits = @import("cast.zig").max_digits;
+const pow10_i256 = @import("../value.zig").pow10_i256;
 const std = @import("std");
 const toF64 = @import("support.zig").toF64;
 const types = @import("../../lang/types.zig");
@@ -191,28 +195,43 @@ pub fn asDecimal(v: Value) ?Decimal {
     };
 }
 
+/// `*` multiplies in i256 so a product past scale 38 can round back to it before
+/// the 38-digit check; any result wider than 38 digits is a decimal overflow.
 pub fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZero }!Decimal {
-    switch (op) {
-        .mul => return .{
-            .unscaled = std.math.mul(i128, a.unscaled, b.unscaled) catch return error.IntOverflow,
-            .scale = a.scale + b.scale,
+    const r: Decimal = switch (op) {
+        .mul => blk: {
+            const p = @as(i256, a.unscaled) * b.unscaled;
+            const s = @as(u16, a.scale) + b.scale;
+            const drop = s -| max_digits;
+            const q = if (drop == 0) p else roundDown256(p, drop);
+            break :blk .{ .unscaled = std.math.cast(i128, q) orelse return decimalOverflow(), .scale = @intCast(s - drop) };
         },
-        .add, .sub => {
+        .add, .sub => blk: {
             const s = @max(a.scale, b.scale);
-            const x = rescaleTo(a, s) orelse return error.IntOverflow;
-            const y = rescaleTo(b, s) orelse return error.IntOverflow;
+            const x = rescaleTo(a, s) orelse return decimalOverflow();
+            const y = rescaleTo(b, s) orelse return decimalOverflow();
             const u = if (op == .add) std.math.add(i128, x.unscaled, y.unscaled) else std.math.sub(i128, x.unscaled, y.unscaled);
-            return .{ .unscaled = u catch return error.IntOverflow, .scale = s };
+            break :blk .{ .unscaled = u catch return decimalOverflow(), .scale = s };
         },
-        .mod => {
+        .mod => blk: {
             const s = @max(a.scale, b.scale);
-            const x = rescaleTo(a, s) orelse return error.IntOverflow;
-            const y = rescaleTo(b, s) orelse return error.IntOverflow;
+            const x = rescaleTo(a, s) orelse return decimalOverflow();
+            const y = rescaleTo(b, s) orelse return decimalOverflow();
             if (y.unscaled == 0) return error.DivByZero;
-            return .{ .unscaled = @rem(x.unscaled, y.unscaled), .scale = s };
+            break :blk .{ .unscaled = @rem(x.unscaled, y.unscaled), .scale = s };
         },
         else => return null,
-    }
+    };
+    if (!fitsPrecision(r.unscaled, max_digits)) return decimalOverflow();
+    return r;
+}
+
+fn roundDown256(u: i256, drop: u16) i256 {
+    if (drop >= pow10_i256.len) return 0;
+    const p = pow10_i256[drop];
+    const q = @divTrunc(u, p);
+    if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
+    return q;
 }
 
 fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {

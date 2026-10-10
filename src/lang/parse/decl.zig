@@ -362,9 +362,10 @@ pub fn parseTypeName(self: *Parser) Error!types.Type {
         var s: u8 = 0;
         if (self.eat(.lparen)) {
             p = try self.expectU8();
-            _ = try self.expect(.comma);
-            s = try self.expectU8();
+            if (self.eat(.comma)) s = try self.expectU8();
             _ = try self.expect(.rparen);
+            if (p < 1 or p > 38) return self.fail(pos, "DECIMAL precision must be 1 to 38, got {d}", .{p});
+            if (s > p) return self.fail(pos, "DECIMAL scale {d} is larger than its precision {d}", .{ s, p });
         }
         return types.Type.decimal(p, s);
     }

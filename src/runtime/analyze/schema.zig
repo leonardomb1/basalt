@@ -123,8 +123,8 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
     return switch (sp.result) {
         .count => types.Type.init(.int),
         .sum => switch (at.kind) {
-            .float => types.Type.init(.float).withNull(true),
-            .decimal => at.withNull(true),
+            .float, .string => types.Type.init(.float).withNull(true),
+            .decimal => types.Type.decimal(38, at.scale).withNull(true),
             else => types.Type.init(.int).withNull(true),
         },
         .float => types.Type.init(.float).withNull(true),
@@ -136,7 +136,7 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
 
 /// Ranking, NTILE and the counts are a non-null int, PERCENT_RANK and CUME_DIST a
 /// non-null float; LAG, LEAD, the value functions, MIN and MAX keep the column's type;
-/// SUM is an INT over ints, a DECIMAL of the column's scale over decimals, as the SUM
+/// SUM is an INT over ints, a DECIMAL(38) of the column's scale over decimals, as the SUM
 /// aggregate is, and a float otherwise; any other aggregate is typed as under GROUP
 /// BY. With an argument it is nullable (an empty frame, the first LAG).
 pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
@@ -149,7 +149,7 @@ pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
         .agg => |a| switch (a) {
             .sum => switch (src.kind) {
                 .int => types.Type.init(.int).asNullable(),
-                .decimal => src.asNullable(),
+                .decimal => types.Type.decimal(38, src.scale).asNullable(),
                 else => types.Type.init(.float).asNullable(),
             },
             else => switch (aggregates.spec(a).result) {

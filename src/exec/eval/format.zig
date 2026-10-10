@@ -137,7 +137,7 @@ test "dates and timestamps before year 0 print with a sign instead of trapping" 
     try writeDate(&w, -719_529);
     try w.writeByte('|');
     try writeDate(&w, -719_530);
-    try std.testing.expectEqualStrings("-0768-02-05 -0768-02-05 00:00:00.000001|0000-01-01|-0001-12-31", w.buffered());
+    try std.testing.expectEqualStrings("-0768-02-04 -0768-02-04 00:00:00.000001|-0001-12-31|-0001-12-30", w.buffered());
 }
 
 test "format temporal values for text sinks" {

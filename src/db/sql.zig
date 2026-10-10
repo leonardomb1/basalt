@@ -1050,7 +1050,7 @@ fn atoiN(s: []const u8) i64 {
 
 fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     const y = if (m <= 2) y0 - 1 else y0;
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const era = @divFloor(y, 400);
     const yoe = y - era * 400;
     const mi: i64 = @intCast(m);
     const di: i64 = @intCast(d);

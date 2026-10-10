@@ -899,12 +899,12 @@ const TypeSniffer = struct {
                         c.all_int = false;
                         c.all_float = false;
                     } else {
-                        if (c.all_int) _ = std.fmt.parseInt(i64, raw, 10) catch {
+                        if (c.all_int and eval.parseIntStrict(raw) == null) {
                             c.all_int = false;
-                        };
-                        if (c.all_float) _ = std.fmt.parseFloat(f64, raw) catch {
+                        }
+                        if (c.all_float and eval.parseFloatStrict(raw) == null) {
                             c.all_float = false;
-                        };
+                        }
                     }
                 }
             }
@@ -922,8 +922,8 @@ const TypeSniffer = struct {
 fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
     switch (b.ty.kind) {
-        .int => try b.appendInt(parseIntFast(raw) orelse (std.fmt.parseInt(i64, raw, 10) catch return error.CsvTypeMismatch)),
-        .float => try b.appendFloat(parseFloatFast(raw) orelse (std.fmt.parseFloat(f64, raw) catch return error.CsvTypeMismatch)),
+        .int => try b.appendInt(parseIntFast(raw) orelse eval.parseIntStrict(raw) orelse return error.CsvTypeMismatch),
+        .float => try b.appendFloat(parseFloatFast(raw) orelse eval.parseFloatStrict(raw) orelse return error.CsvTypeMismatch),
         .date => try b.append(.{ .date = @intCast(eval.parseIsoDate(raw) orelse return error.CsvTypeMismatch) }),
         else => try b.appendStr(raw),
     }

@@ -743,6 +743,24 @@ test "join: computed keys of bare columns take their side from where the columns
     }
 }
 
+test "aggregate: SUM over a text column of decimals sums as FLOAT, and 1_000 stays text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "g,s,u\na,\"1.5\",1_000\na,\"2.25\",2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
+    defer alloc.free(in_path);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT g, SUM(s) AS total, MAX(u) AS u FROM '{s}' GROUP BY g;", .{ out_path, in_path });
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,total,u\na,3.75,2\n", out);
+}
+
 test "join: an outer join's ON beyond its keys picks matching pairs and keeps the rest unmatched" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -14,7 +14,8 @@
 //! float and decimal share one tag and are canonicalized to an f64 before hashing.
 //! Past bugs from getting this wrong: a join between an int key and a float key
 //! matched nothing, a join dropped `-0.0` rows that `WHERE f = 0` matched, and
-//! GROUP BY and DISTINCT disagreed on NaN and decimal-scale groups.
+//! GROUP BY and DISTINCT disagreed on NaN and decimal-scale groups. Decimal equality
+//! is exact while the f64 is not, so distinct 18-digit decimals may share a hash.
 //!
 //! Nulls group together under `valueEq`, but never match in a join: callers skip
 //! null keys before inserting into or probing a `SingleKeyCtx` map.
@@ -55,7 +56,8 @@ pub fn hashTagged(h: *std.hash.Wyhash, tag: std.meta.Tag(Value), payload: []cons
 pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
     switch (v) {
         .int => |x| hashInt(h, x),
-        .float, .decimal => hashNum(h, eval.toF64(v)),
+        .float => |x| hashNum(h, x),
+        .decimal => |d| hashNum(h, d.keyF64()),
         .null => hashTagged(h, .null, &.{}),
         .bool => |x| hashTagged(h, .bool, &[_]u8{@intFromBool(x)}),
         .string => |s| hashTagged(h, .string, s),
@@ -204,4 +206,21 @@ test "hashValue: numerically equal values hash alike ACROSS int/float/decimal" {
     try testing.expect(!valueEq(one_i, .{ .string = "1" }));
     try testing.expect(hashOne(one_i) != hashOne(.{ .string = "1" }));
     try testing.expect(hashOne(one_i) != hashOne(.{ .timestamp = 1 }));
+}
+
+test "decimals compare exactly, and equal ones hash alike at any scale and size" {
+    const a = Value{ .decimal = .{ .unscaled = 123456789012345678, .scale = 8 } };
+    const b = Value{ .decimal = .{ .unscaled = 123456789012345679, .scale = 8 } };
+    try testing.expect(!valueEq(a, b));
+    const a_wide = Value{ .decimal = .{ .unscaled = 12345678901234567800, .scale = 10 } };
+    try testing.expect(valueEq(a, a_wide));
+    try testing.expectEqual(hashOne(a), hashOne(a_wide));
+    const big = Value{ .decimal = .{ .unscaled = 10000000000000001, .scale = 0 } };
+    try testing.expect(!valueEq(big, .{ .int = 10000000000000000 }));
+    try testing.expect(valueEq(big, .{ .int = 10000000000000001 }));
+    try testing.expectEqual(hashOne(big), hashOne(.{ .int = 10000000000000001 }));
+    const huge = Value{ .decimal = .{ .unscaled = 99999999999999999999999999999999999990, .scale = 30 } };
+    const huge_short = Value{ .decimal = .{ .unscaled = 9999999999999999999999999999999999999, .scale = 29 } };
+    try testing.expect(valueEq(huge, huge_short));
+    try testing.expectEqual(hashOne(huge), hashOne(huge_short));
 }

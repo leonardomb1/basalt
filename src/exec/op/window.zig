@@ -36,6 +36,8 @@ const column = @import("../column.zig");
 const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
 const rescaleTo = @import("../eval.zig").rescaleTo;
+const decimalOverflow = @import("../eval.zig").decimalOverflow;
+const fitsPrecision = @import("../eval.zig").fitsPrecision;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
@@ -55,8 +57,8 @@ fn decStep(acc: *i128, v: Value, scale: u8, sub: bool) !void {
         .int => |x| .{ .unscaled = x, .scale = 0 },
         else => return error.TypeMismatch,
     };
-    const u = (rescaleTo(d, scale) orelse return error.CastFailed).unscaled;
-    acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return error.CastFailed;
+    const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
+    acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return decimalOverflow();
 }
 
 fn asF64Opt(v: Value) ?f64 {
@@ -603,7 +605,7 @@ pub const Window = struct {
             return switch (s.agg) {
                 .count => if (s.f.distinct) .{ .int = @intCast(s.seen.count()) } else .{ .int = s.n },
                 .count_if => .{ .int = s.n },
-                .sum => if (s.n == 0) .null else if (s.dec) |sc| .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else if (s.seen_float or !s.out_int) .{ .float = s.acc_f } else try s.w.intSum(s.acc_i),
+                .sum => if (s.n == 0) .null else if (s.dec) |sc| (if (fitsPrecision(s.acc_i, 38)) .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else return decimalOverflow()) else if (s.seen_float or !s.out_int) .{ .float = s.acc_f } else try s.w.intSum(s.acc_i),
                 .avg => if (s.n == 0) .null else .{ .float = (if (s.seen_float) s.acc_f else @as(f64, @floatFromInt(s.acc_i))) / @as(f64, @floatFromInt(s.n)) },
                 .min, .max => if (s.dq_head < s.dq.items.len) s.vals[s.dq.items[s.dq_head]] else .null,
                 .bool_and => if (s.n == 0) .null else .{ .bool = s.t == s.n },

@@ -59,7 +59,7 @@ lanes each total their own slice and the slices are added in a fixed order, so
 rerunning the same command writes the same bytes; but `-j` decides how the input
 is cut, and float addition is not associative, so `-j 4` and `-j 8` can differ in
 the last bits (as can either from `-j 1`). `SUM` over an `INT` or a `DECIMAL` is
-exact and identical everywhere — `SUM(CAST(amount AS DECIMAL(18,2)))` is the way
+exact and identical everywhere (a `DECIMAL(p, s)` sums as `DECIMAL(38, s)`, as DuckDB types it) — `SUM(CAST(amount AS DECIMAL(18,2)))` is the way
 to total money you intend to compare or checksum. `COUNT`, `MIN` and `MAX` are
 exact too, as are `count_if`, `bool_and`/`bool_or` and the `bit_*` aggregates.
 The variances and deviations combine their lanes the same fixed way, so they
