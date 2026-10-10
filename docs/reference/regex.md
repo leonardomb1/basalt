@@ -21,6 +21,8 @@ valid UTF-8 sequence counts as one character. `\d \w \s` cover ASCII only, and
 The matcher backtracks, so a pattern that backtracks without end — a nested
 quantifier like `(a+)+` against text it fails on — stops with an error rather
 than hanging. A repeated literal, `.` or class (`a+`, `.*`, `[^,]{2,}`) repeats
-over text of any length; a repeated group (`(ab)+`, `(?:a|x)*`) repeats at most
-about 2,000 times in one match, past which the match fails with the same error —
-write a group of single characters as a class (`[ax]*`).
+over text of any length; a repeated group (`(ab)+`, `(?:a|x)*`) repeats up to
+about 500,000 times in one match, past which the match fails with the same error —
+write a group of single characters as a class (`[ax]*`), which has no limit. A
+repetition of a group beyond its minimum that matches nothing ends the loop, as
+in PostgreSQL, so `regexp_matches('aab', '^(a*)*b$')` is true.

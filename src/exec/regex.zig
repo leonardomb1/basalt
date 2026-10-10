@@ -11,27 +11,23 @@
 //! return wrong rows.
 //!
 //! Compilation takes an allocator so callers can hand it a
-//! `FixedBufferAllocator` over stack memory: matching a column costs no heap
-//! traffic and nothing to free. Matching is continuation-passing (`Cont` is
-//! what remains once the current atom succeeds), which is what lets a group
-//! backtrack into the sequence that follows it. The subject is matched by
+//! `FixedBufferAllocator` over stack memory. Matching is continuation-passing
+//! (`Cont` is what remains once the current atom succeeds), which is what lets a
+//! group backtrack into the sequence that follows it, run as a loop over an
+//! explicit stack of choice points (`Machine`): a short match stays in a stack
+//! buffer, and a group repeated once per character of a long subject grows the
+//! stacks on the heap rather than recursing. The subject is matched by
 //! character: `.`, a class or a literal takes one UTF-8 code point, and a byte
 //! that starts no valid sequence is a character of its own.
 //!
-//! Backtracking is worst-case exponential, so every `find` runs under a
-//! `Budget` and gives up with `PatternTooComplex`, an error and never a null,
-//! so a pathological pattern cannot read as a non-matching one. Two counters
-//! for two failure modes. `steps` bounds wide blowup: `(a|aa)+b` against a run
-//! of `a`s doubles its splits per character (28 took 2.5 seconds, 40 would take
-//! hours); the allowance is far above what the depth cap allows, plus a
-//! per-character term so a long subject with a cheap pattern never trips it.
-//! `depth` bounds deep blowup: the matcher recurses once per repetition of a
-//! group, and past the stack is a segfault no caller can catch (a repeated
-//! literal, `.` or class loops instead, so it repeats without limit). The cap
-//! claims 4 MiB of stack at a measured, rounded-up cost per frame, up to five
-//! frames per repetition, which makes it a ceiling on how often a group repeats
-//! in one match (`max_group_reps`: about 540 in Debug, 2,180 in release).
-//! Carrying the continuation stack on the heap would remove it.
+//! Backtracking is worst-case exponential, so every `find` runs under a step
+//! budget and gives up with `PatternTooComplex`, an error and never a null, so a
+//! pathological pattern cannot read as a non-matching one: `(a|aa)+b` against a
+//! run of `a`s doubles its splits per character (28 took 2.5 seconds, 40 would
+//! take hours). The allowance has a per-character term so a long subject with a
+//! cheap pattern never trips it, and either stack past `Machine.max_frames` gives
+//! up the same way. A repetition of a group beyond its minimum that matches
+//! nothing ends the loop, so `(a*)*` cannot spin.
 
 const std = @import("std");
 
@@ -99,42 +95,6 @@ const Group = struct { alt: []const []const Item, cap: ?u8 };
 
 const Item = struct { atom: Atom, min: u32 = 1, max: u32 = 1, lazy: bool = false };
 
-const Cont = union(enum) {
-    done,
-    seq: struct { items: []const Item, i: usize, rep: u32, next: *const Cont },
-    close: struct { cap: u8, start: usize, next: *const Cont },
-};
-
-const Budget = struct {
-    steps: u64,
-    depth: u32 = 0,
-
-    const stack_allowance = 4 << 20;
-
-    const stack_per_level: usize = switch (@import("builtin").mode) {
-        .Debug => 1536,
-        else => 384,
-    };
-
-    const max_depth = stack_allowance / stack_per_level;
-
-    pub const max_group_reps = max_depth / 5;
-
-    fn init(subject_len: usize) Budget {
-        return .{ .steps = 10_000_000 + 4 * @as(u64, subject_len) };
-    }
-
-    fn enter(self: *Budget) Error!void {
-        if (self.steps == 0 or self.depth >= max_depth) return Error.PatternTooComplex;
-        self.steps -= 1;
-        self.depth += 1;
-    }
-
-    fn leave(self: *Budget) void {
-        self.depth -= 1;
-    }
-};
-
 /// `icase` matches a letter in either case, as a literal and inside a class.
 pub const Options = struct { icase: bool = false };
 
@@ -170,13 +130,14 @@ pub const Regex = struct {
     /// Leftmost match span at or after `from`, with `caps` filled (index 0 is
     /// the whole match). `PatternTooComplex` means gave up, not no match.
     pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
-        var budget = Budget.init(s.len);
+        var sfa = std.heap.stackFallback(8 * 1024, std.heap.page_allocator);
+        var m = Machine{ .s = s, .caps = caps, .gpa = sfa.get(), .steps = 10_000_000 + 4 * @as(u64, s.len) };
+        defer m.deinit();
         var start = from;
         while (start <= s.len) : (start += if (start < s.len) unitAt(s, start).len else 1) {
             caps.* = .{null} ** max_groups;
-            const done: Cont = .done;
             for (self.alt) |branch| {
-                if (try step(branch, 0, 0, s, start, caps, &done, &budget)) |end| {
+                if (try m.run(branch, start)) |end| {
                     caps[0] = .{ start, end };
                     return .{ start, end };
                 }
@@ -186,77 +147,180 @@ pub const Regex = struct {
     }
 };
 
-fn resume_(k: *const Cont, s: []const u8, pos: usize, caps: *Captures, b: *Budget) Error!?usize {
-    try b.enter();
-    defer b.leave();
-    switch (k.*) {
-        .done => return pos,
-        .seq => |x| return step(x.items, x.i, x.rep, s, pos, caps, x.next, b),
-        .close => |x| {
-            const saved = caps[x.cap];
-            caps[x.cap] = .{ x.start, pos };
-            if (try resume_(x.next, s, pos, caps, b)) |e| return e;
-            caps[x.cap] = saved;
-            return null;
-        },
-    }
-}
+/// What remains once the current atom succeeds, as an index into `Machine.conts`
+/// (0 is `done`). `seq` resumes `items[i]` after its `rep`-th repetition, which
+/// began at `start`.
+const Cont = union(enum) {
+    done,
+    seq: struct { items: []const Item, i: usize, rep: u32, start: usize, next: u32 },
+    close: struct { cap: u8, start: usize, next: u32 },
+};
 
-/// Match `items[i..]` where the item at `i` has already matched `rep` times.
-/// Greedy tries one more repetition before settling for fewer; lazy inverts
-/// only that order, so the set of reachable matches is the same.
-fn step(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont, b: *Budget) Error!?usize {
-    try b.enter();
-    defer b.leave();
-    if (i == items.len) return resume_(cont, s, pos, caps, b);
-    const it = items[i];
-    if (it.atom != .group and it.atom != .bol and it.atom != .eol) return stepUnits(items, i, rep, s, pos, caps, cont, b);
-    if (it.lazy) {
-        if (rep >= it.min) {
-            if (try step(items, i + 1, 0, s, pos, caps, cont, b)) |e| return e;
+const StepAt = struct { items: []const Item, i: usize, rep: u32, pos: usize, cont: u32 };
+
+/// A choice point to come back to on failure, or a capture to put back on the way.
+/// `more` is a lazy group's second choice, one more repetition; `branch` a group's
+/// next alternative; `units` a repeated single-unit item giving back (greedy) or
+/// taking (lazy) one more unit, `n` units in and ending at `p`.
+const Choice = union(enum) {
+    step: StepAt,
+    more: StepAt,
+    branch: struct { items: []const Item, i: usize, b: usize, pos: usize, cont: u32 },
+    units: struct { items: []const Item, i: usize, rep: u32, start: usize, p: usize, n: u32, cont: u32 },
+    restore: struct { cap: u8, saved: ?[2]usize },
+};
+
+const Frame = struct { choice: Choice, nconts: u32 };
+
+const State = union(enum) { step: StepAt, resume_: struct { cont: u32, pos: usize }, fail };
+
+/// One `find`'s backtracking state, kept on the heap so a group may repeat once per
+/// character of a long subject. Continuations made after a choice point are dropped
+/// when it is taken, so both stacks hold only the current path.
+const Machine = struct {
+    s: []const u8,
+    caps: *Captures,
+    gpa: std.mem.Allocator,
+    conts: std.ArrayList(Cont) = .empty,
+    stack: std.ArrayList(Frame) = .empty,
+    steps: u64,
+
+    /// Ceiling on either stack: about 70 MiB at worst, and a group repeated in one
+    /// match about 500,000 times (two entries per repetition on each).
+    const max_frames = 1 << 20;
+
+    fn deinit(m: *Machine) void {
+        m.conts.deinit(m.gpa);
+        m.stack.deinit(m.gpa);
+    }
+
+    fn cont(m: *Machine, c: Cont) Error!u32 {
+        if (m.conts.items.len >= max_frames) return Error.PatternTooComplex;
+        try m.conts.append(m.gpa, c);
+        return @intCast(m.conts.items.len - 1);
+    }
+
+    fn push(m: *Machine, c: Choice) Error!void {
+        if (m.stack.items.len >= max_frames) return Error.PatternTooComplex;
+        try m.stack.append(m.gpa, .{ .choice = c, .nconts = @intCast(m.conts.items.len) });
+    }
+
+    /// Whether `items` match at `pos`, and where the match ends.
+    fn run(m: *Machine, items: []const Item, pos: usize) Error!?usize {
+        m.conts.clearRetainingCapacity();
+        m.stack.clearRetainingCapacity();
+        _ = try m.cont(.done);
+        var st: State = .{ .step = .{ .items = items, .i = 0, .rep = 0, .pos = pos, .cont = 0 } };
+        while (true) {
+            if (m.steps == 0) return Error.PatternTooComplex;
+            m.steps -= 1;
+            st = switch (st) {
+                .step => |x| try m.step(x),
+                .resume_ => |x| switch (m.conts.items[x.cont]) {
+                    .done => return x.pos,
+                    .seq => |q| if (x.pos == q.start and q.rep > q.items[q.i].min and !isUnit(q.items[q.i].atom))
+                        .fail
+                    else
+                        .{ .step = .{ .items = q.items, .i = q.i, .rep = q.rep, .pos = x.pos, .cont = q.next } },
+                    .close => |c| blk: {
+                        try m.push(.{ .restore = .{ .cap = c.cap, .saved = m.caps[c.cap] } });
+                        m.caps[c.cap] = .{ c.start, x.pos };
+                        break :blk .{ .resume_ = .{ .cont = c.next, .pos = x.pos } };
+                    },
+                },
+                .fail => try m.backtrack() orelse return null,
+            };
         }
-        if (rep < it.max) {
-            const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
-            return matchAtom(it.atom, s, pos, caps, &k, b);
+    }
+
+    fn backtrack(m: *Machine) Error!?State {
+        while (m.stack.pop()) |f| {
+            if (f.choice == .restore) {
+                m.caps[f.choice.restore.cap] = f.choice.restore.saved;
+                continue;
+            }
+            m.conts.shrinkRetainingCapacity(f.nconts);
+            return switch (f.choice) {
+                .step => |x| .{ .step = x },
+                .more => |x| try m.repeat(x),
+                .branch => |x| try m.branch(x.items, x.i, x.b, x.pos, x.cont),
+                .units => |x| try m.unitsAgain(x.items, x.i, x.rep, x.start, x.p, x.n, x.cont),
+                .restore => unreachable,
+            };
         }
         return null;
     }
-    if (rep < it.max) {
-        const k = Cont{ .seq = .{ .items = items, .i = i, .rep = rep + 1, .next = cont } };
-        if (try matchAtom(it.atom, s, pos, caps, &k, b)) |e| return e;
-    }
-    if (rep >= it.min) return step(items, i + 1, 0, s, pos, caps, cont, b);
-    return null;
-}
 
-/// A repeated single-unit atom (literal, `.`, class) walked in a loop rather than
-/// a frame per repetition: greedy takes every unit it can, then gives them back
-/// one at a time; lazy takes one more only when the rest fails.
-fn stepUnits(items: []const Item, i: usize, rep: u32, s: []const u8, pos: usize, caps: *Captures, cont: *const Cont, b: *Budget) Error!?usize {
-    const it = items[i];
-    var n = rep;
-    var p = pos;
-    if (it.lazy) {
-        while (true) {
-            if (n >= it.min) {
-                if (try step(items, i + 1, 0, s, p, caps, cont, b)) |e| return e;
-            }
-            if (n >= it.max) return null;
-            p = unitMatch(it.atom, s, p) orelse return null;
+    /// Match `items[i..]` where the item at `i` has already matched `rep` times.
+    /// Greedy tries one more repetition before settling for fewer; lazy inverts
+    /// only that order, so the set of reachable matches is the same.
+    fn step(m: *Machine, x: StepAt) Error!State {
+        if (x.i == x.items.len) return .{ .resume_ = .{ .cont = x.cont, .pos = x.pos } };
+        const it = x.items[x.i];
+        if (isUnit(it.atom)) return m.units(x);
+        const next: StepAt = .{ .items = x.items, .i = x.i + 1, .rep = 0, .pos = x.pos, .cont = x.cont };
+        if (it.lazy and x.rep >= it.min) {
+            if (x.rep < it.max) try m.push(.{ .more = x });
+            return .{ .step = next };
+        }
+        if (x.rep < it.max) {
+            if (x.rep >= it.min) try m.push(.{ .step = next });
+            return m.repeat(x);
+        }
+        return if (x.rep >= it.min) .{ .step = next } else .fail;
+    }
+
+    /// One more repetition of the group or anchor at `items[i]`.
+    fn repeat(m: *Machine, x: StepAt) Error!State {
+        const k = try m.cont(.{ .seq = .{ .items = x.items, .i = x.i, .rep = x.rep + 1, .start = x.pos, .next = x.cont } });
+        return switch (x.items[x.i].atom) {
+            .bol => if (x.pos == 0) .{ .resume_ = .{ .cont = k, .pos = x.pos } } else .fail,
+            .eol => if (x.pos == m.s.len) .{ .resume_ = .{ .cont = k, .pos = x.pos } } else .fail,
+            .group => m.branch(x.items, x.i, 0, x.pos, k),
+            else => unreachable,
+        };
+    }
+
+    fn branch(m: *Machine, items: []const Item, i: usize, b: usize, pos: usize, k: u32) Error!State {
+        const g = items[i].atom.group;
+        if (b + 1 < g.alt.len) try m.push(.{ .branch = .{ .items = items, .i = i, .b = b + 1, .pos = pos, .cont = k } });
+        const next = if (g.cap) |ci| try m.cont(.{ .close = .{ .cap = ci, .start = pos, .next = k } }) else k;
+        return .{ .step = .{ .items = g.alt[b], .i = 0, .rep = 0, .pos = pos, .cont = next } };
+    }
+
+    /// A repeated single-unit atom (literal, `.`, class) walked in a loop, one choice
+    /// point for all its repetitions: greedy takes every unit it can, then gives them
+    /// back one at a time; lazy takes one more only when the rest fails.
+    fn units(m: *Machine, x: StepAt) Error!State {
+        const it = x.items[x.i];
+        var n = x.rep;
+        var p = x.pos;
+        const want = if (it.lazy) it.min else it.max;
+        while (n < want) {
+            p = unitMatch(it.atom, m.s, p) orelse break;
             n += 1;
         }
+        if (n < it.min) return .fail;
+        const again = if (it.lazy) n < it.max else n > x.rep and n > it.min;
+        if (again) try m.push(.{ .units = .{ .items = x.items, .i = x.i, .rep = x.rep, .start = x.pos, .p = p, .n = n, .cont = x.cont } });
+        return .{ .step = .{ .items = x.items, .i = x.i + 1, .rep = 0, .pos = p, .cont = x.cont } };
     }
-    while (n < it.max) {
-        p = unitMatch(it.atom, s, p) orelse break;
-        n += 1;
+
+    fn unitsAgain(m: *Machine, items: []const Item, i: usize, rep: u32, start: usize, p0: usize, n0: u32, k: u32) Error!State {
+        const it = items[i];
+        const p = if (it.lazy) unitMatch(it.atom, m.s, p0) orelse return .fail else unitBefore(m.s, start, p0);
+        const n = if (it.lazy) n0 + 1 else n0 - 1;
+        const again = if (it.lazy) n < it.max else n > rep and n > it.min;
+        if (again) try m.push(.{ .units = .{ .items = items, .i = i, .rep = rep, .start = start, .p = p, .n = n, .cont = k } });
+        return .{ .step = .{ .items = items, .i = i + 1, .rep = 0, .pos = p, .cont = k } };
     }
-    while (n >= it.min) {
-        if (try step(items, i + 1, 0, s, p, caps, cont, b)) |e| return e;
-        if (n == rep) break;
-        p = unitBefore(s, pos, p);
-        n -= 1;
-    }
-    return null;
+};
+
+fn isUnit(a: Atom) bool {
+    return switch (a) {
+        .lit, .any, .class => true,
+        else => false,
+    };
 }
 
 /// Where a single-unit atom ends when it matches at `pos`.
@@ -270,25 +334,6 @@ fn unitMatch(a: Atom, s: []const u8, pos: usize) ?usize {
         else => unreachable,
     };
     return if (ok) pos + u.len else null;
-}
-
-fn matchAtom(a: Atom, s: []const u8, pos: usize, caps: *Captures, k: *const Cont, b: *Budget) Error!?usize {
-    switch (a) {
-        .bol => return if (pos == 0) resume_(k, s, pos, caps, b) else null,
-        .eol => return if (pos == s.len) resume_(k, s, pos, caps, b) else null,
-        .lit, .any, .class => return if (unitMatch(a, s, pos)) |e| resume_(k, s, e, caps, b) else null,
-        .group => |g| {
-            for (g.alt) |branch| {
-                if (g.cap) |ci| {
-                    const closer = Cont{ .close = .{ .cap = ci, .start = pos, .next = k } };
-                    if (try step(branch, 0, 0, s, pos, caps, &closer, b)) |e| return e;
-                } else {
-                    if (try step(branch, 0, 0, s, pos, caps, k, b)) |e| return e;
-                }
-            }
-            return null;
-        },
-    }
 }
 
 const Parser = struct {
@@ -763,13 +808,30 @@ test "regex: a pathological pattern gives up instead of hanging" {
         try std.testing.expectEqual([2]usize{ 0, n }, (try re2.find(run, 0, &caps)).?);
     }
     const grp = try Regex.compile(a, "^(a)+$");
-    const reps = Budget.max_group_reps;
-    try std.testing.expectEqual([2]usize{ 0, reps / 2 }, (try grp.find(run[0 .. reps / 2], 0, &caps)).?);
-    try std.testing.expectError(Error.PatternTooComplex, grp.find(run[0 .. reps * 2], 0, &caps));
+    try std.testing.expectEqual([2]usize{ 0, n }, (try grp.find(run, 0, &caps)).?);
+    try std.testing.expectEqual([2]usize{ n - 1, n }, caps[1].?);
+    const alt = try Regex.compile(a, "^(?:a|b)*?(a)$");
+    try std.testing.expectEqual([2]usize{ 0, n }, (try alt.find(run, 0, &caps)).?);
+    const huge = try std.testing.allocator.alloc(u8, Machine.max_frames);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'a');
+    try std.testing.expectError(Error.PatternTooComplex, grp.find(huge, 0, &caps));
 
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
     try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);
+}
+
+test "regex: a repetition of a group that matches nothing ends the loop" {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try (try Regex.compile(a, "^(a*)*b$")).find("aab", 0, &caps)).?);
+    try std.testing.expectEqual([2]usize{ 0, 3 }, (try (try Regex.compile(a, "(a|)+b")).find("aab", 0, &caps)).?);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, (try (try Regex.compile(a, "^(a?){2}$")).find("", 0, &caps)).?);
+    try std.testing.expect((try (try Regex.compile(a, "^(a*)+$")).find("aab", 0, &caps)) == null);
 }
 
 test "regex: icase folds literals and classes, a negated class included; replaceAllRe advances past empty matches" {
