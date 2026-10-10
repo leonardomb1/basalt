@@ -21,7 +21,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer arena.deinit();
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.fs.File.stderr().writerStreaming(&stderr_buf);
     const stderr = &stderr_file.interface;
     defer stderr.flush() catch {};
 
@@ -139,7 +139,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     if (prog.explain == .plan) {
         var ebuf: [4096]u8 = undefined;
-        var efile = std.fs.File.stdout().writer(&ebuf);
+        var efile = std.fs.File.stdout().writerStreaming(&ebuf);
         const eout = &efile.interface;
         defer eout.flush() catch {};
         var adiag2 = analyze.Diag{};

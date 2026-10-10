@@ -248,7 +248,7 @@ pub fn main() !void {
     const a = arena_state.allocator();
 
     var out_buf: [8192]u8 = undefined;
-    var out_file = std.fs.File.stdout().writer(&out_buf);
+    var out_file = std.fs.File.stdout().writerStreaming(&out_buf);
     const w = &out_file.interface;
     defer w.flush() catch {};
 

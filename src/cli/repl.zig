@@ -174,7 +174,7 @@ pub fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     const in = &in_file.interface;
 
     var msg_buf: [4096]u8 = undefined;
-    var msg_file = std.fs.File.stderr().writer(&msg_buf);
+    var msg_file = std.fs.File.stderr().writerStreaming(&msg_buf);
     const msg = &msg_file.interface;
 
     var sess = Session{ .decls = DeclStore.init(alloc), .tty = std.posix.isatty(std.fs.File.stdin().handle), .catalog = Catalog.init(alloc) };

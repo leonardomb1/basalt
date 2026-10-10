@@ -90,7 +90,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer std.process.argsFree(alloc, args);
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.fs.File.stderr().writerStreaming(&stderr_buf);
     const stderr = &stderr_file.interface;
 
     if (args.len < 2) {
@@ -115,13 +115,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdRepl(alloc));
     } else if (std.mem.eql(u8, verb, "version") or std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
         var stdout_buf: [256]u8 = undefined;
-        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_file = std.fs.File.stdout().writerStreaming(&stdout_buf);
         try stdout_file.interface.print("basalt {s}\n", .{@import("build_options").version});
         try stdout_file.interface.flush();
         return;
     } else if (std.mem.eql(u8, verb, "help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "--help")) {
         var stdout_buf: [4096]u8 = undefined;
-        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_file = std.fs.File.stdout().writerStreaming(&stdout_buf);
         try usage(&stdout_file.interface);
         try stdout_file.interface.flush();
         return;

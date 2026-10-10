@@ -480,7 +480,7 @@ pub fn run(gpa: std.mem.Allocator, g: Grid, rerun: bool) !Exit {
     defer std.posix.tcsetattr(in_fd, .NOW, orig) catch {};
 
     var buf: [16 * 1024]u8 = undefined;
-    var fw = out_file.writer(&buf);
+    var fw = out_file.writerStreaming(&buf);
     const out = &fw.interface;
     try out.writeAll("\x1b[?1049h\x1b[?25l\x1b[2J");
     defer {

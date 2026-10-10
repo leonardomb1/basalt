@@ -67,7 +67,7 @@ pub fn main() !void {
     var sink: u64 = 0;
 
     var out_buf: [4096]u8 = undefined;
-    var out_file = std.fs.File.stdout().writer(&out_buf);
+    var out_file = std.fs.File.stdout().writerStreaming(&out_buf);
     const w = &out_file.interface;
     try w.print("SIMD microbench  (N={d} elems x {d} reps; native lanes i64={d}, f64={d})\n", .{
         N, REPS, simd.lanes(i64), simd.lanes(f64),
