@@ -155,7 +155,11 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
     const x = try substExpr(arena, e, params);
     const v = eval.constEval(arena, x, &.{}, &.{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return fail(diag, "{s} must be a constant: an integer, a `$param` or LET, or an expression of them", .{what}),
+        else => {
+            if (try firstDollar(arena, x)) |q|
+                return failAt(diag, q.span, "unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
+            return fail(diag, "{s} must be a constant: an integer, a `$param` or LET, or an expression of them", .{what});
+        },
     };
     return switch (v) {
         .null => null,
@@ -163,6 +167,24 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
         else => fail(diag, "{s} must be an integer, got {s}", .{ what, @tagName(v) }),
     };
+}
+
+/// The first `$name` in `e`, after substitution one nothing binds.
+fn firstDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!?ast.QualName {
+    const Find = struct {
+        arena: std.mem.Allocator,
+        found: *?ast.QualName,
+        fn recur(f: @This(), x: *const ast.Expr) Error!*ast.Expr {
+            if (x.* == .field) {
+                if (x.field.dollar and f.found.* == null) f.found.* = x.field;
+                return @constCast(x);
+            }
+            return ast.rebuildExpr(f.arena, x, f, recur);
+        }
+    };
+    var found: ?ast.QualName = null;
+    _ = try Find.recur(.{ .arena = arena, .found = &found }, e);
+    return found;
 }
 
 /// Every LIMIT and OFFSET written as an expression, evaluated against `params`, so
