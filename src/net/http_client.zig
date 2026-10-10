@@ -17,7 +17,7 @@
 //!                      `start_offset` (OData `$skip`/`$top` style).
 //!   paginate = cursor  reads `<cursor_field>` (dotted path) from each response;
 //!                      a value starting with http(s):// is the next URL, anything
-//!                      else is sent as `?<cursor_param>=<value>`; stops when the
+//!                      else is sent URL-encoded as `?<cursor_param>=<value>`; stops when the
 //!                      field is missing/null/empty or the page is empty.
 //! `max_pages` caps every mode so a misbehaving API can't loop forever. With
 //! `body` (POST) the page param goes into the body, as form-style APIs expect.
@@ -89,6 +89,7 @@ const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("../connect/driver.zig");
 const request = @import("../connect/request.zig");
+const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
@@ -217,6 +218,10 @@ pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u
     cc.body = try body.toOwnedSlice();
     if (cc.base_url.len == 0) {
         errmsg.* = "missing `base_url`";
+        return error.BadHttpConn;
+    }
+    if (cc.auth == .bearer and cc.token.len == 0) {
+        errmsg.* = "auth 'bearer' needs a `token`";
         return error.BadHttpConn;
     }
     return cc;
@@ -559,13 +564,10 @@ pub const HttpSource = struct {
     pub fn openConn(arena: std.mem.Allocator, gpa: std.mem.Allocator, cc: ConnConfig, path: []const u8, opts: Options) !*HttpSource {
         if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.UrlContainsLineBreak;
         const url = try encodeSpaces(arena, try joinUrl(arena, cc.base_url, path));
+        const headers = try buildHeaders(arena, opts);
+        const self = try arena.create(HttpSource);
         const client = try gpa.create(std.http.Client);
         client.* = initClient(gpa);
-        errdefer {
-            client.deinit();
-            gpa.destroy(client);
-        }
-        const self = try arena.create(HttpSource);
         self.* = .{
             .arena = arena,
             .gpa = gpa,
@@ -573,13 +575,17 @@ pub const HttpSource = struct {
             .base_url = url,
             .auth = null,
             .opts = opts,
-            .headers = try buildHeaders(arena, opts),
+            .headers = headers,
             .schema = undefined,
             .first = null,
             .page_no = if (opts.paginate == .offset) opts.start_offset else opts.start_page,
         };
         self.logger = opts.logger;
         self.slots = std.array_list.Managed(*Slot).init(gpa);
+        errdefer if (self.zombies == 0) {
+            client.deinit();
+            gpa.destroy(client);
+        };
         if (cc.auth != .none) {
             var rcc = cc;
             rcc.login_url = try joinUrl(arena, cc.base_url, cc.login_url);
@@ -1028,9 +1034,14 @@ pub const HttpSource = struct {
     /// first, and only when auth declines does `listedFallback` apply.
     fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
         obs.logOr(self.logger, .warn, "http {d} from {s}: {s}", .{ code, url, body[0..@min(body.len, 300)] });
-        if (code == 401) return error.HttpUnauthorized;
-        if (statusListed(self.opts.retry_statuses, code)) return error.HttpServerBusy;
-        return statusError(code);
+        const e = if (code == 401)
+            error.HttpUnauthorized
+        else if (statusListed(self.opts.retry_statuses, code))
+            error.HttpServerBusy
+        else
+            statusError(code);
+        var buf: [400]u8 = undefined;
+        return eval.explain(e, std.fmt.bufPrint(&buf, "http {d} from {s}", .{ code, url }) catch url);
     }
 
     fn listedFallback(self: *HttpSource, code: u16, e: anyerror) anyerror {
@@ -1153,9 +1164,16 @@ fn appendParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val:
     return std.fmt.allocPrint(arena, "{s}{s}{s}={s}", .{ base, sep, key, val });
 }
 
+/// `base` with `key=val` appended, `val` percent-encoded: a cursor token may hold
+/// `&`, `+` or spaces.
 fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: []const u8) ![]const u8 {
-    const sep: u8 = if (std.mem.indexOfScalar(u8, base, '?') != null) '&' else '?';
-    return std.fmt.allocPrint(arena, "{s}{c}{s}={s}", .{ base, sep, key, val });
+    var buf = std.array_list.Managed(u8).init(arena);
+    try buf.appendSlice(base);
+    try buf.append(if (std.mem.indexOfScalar(u8, base, '?') != null) '&' else '?');
+    try buf.appendSlice(key);
+    try buf.append('=');
+    try formEncode(&buf, val);
+    return buf.toOwnedSlice();
 }
 
 /// Maps a non-200 status to a named error, distinct per fix: 429/5xx are worth a
@@ -1858,6 +1876,42 @@ test "http source: cursor pagination follows token then stops" {
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=t1") != null);
+}
+
+test "http source: a cursor token is URL-encoded; a later page's failure names its status and URL" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        \\{"next":"c 2&x+y","data":[{"id":1}]}
+        ,
+        \\{"err":"bad"}
+    });
+    srv.statuses = &.{ "200 OK", "400 Bad Request" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer srv.finish(th);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
+    defer s.close();
+    try std.testing.expectError(error.HttpBadRequest, drain(s, a));
+    try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=c%202%26x%2By ") != null);
+    const why = eval.takeFailure(error.HttpBadRequest).?;
+    try std.testing.expect(std.mem.startsWith(u8, why, "http 400 from http://127.0.0.1:"));
+    try std.testing.expect(std.mem.endsWith(u8, why, "/items?cursor=c%202%26x%2By"));
+}
+
+test "connFromKvs: bearer auth without a token is an error" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var msg: []const u8 = "";
+    try std.testing.expectError(error.BadHttpConn, connFromKvs(ar.allocator(), &.{
+        .{ .key = "base_url", .value = "http://x" },
+        .{ .key = "auth", .value = "bearer" },
+    }, &msg));
+    try std.testing.expect(std.mem.indexOf(u8, msg, "token") != null);
 }
 
 test "http source: a 404 on open is HttpNotFound" {

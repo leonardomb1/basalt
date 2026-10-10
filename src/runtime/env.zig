@@ -79,6 +79,7 @@ pub fn isTransient(e: anyerror) bool {
         error.TemporaryNameServerFailure,
         error.NameServerFailure,
         error.HostLacksNetworkAddresses,
+        error.UnknownHostName,
         error.HttpServerBusy,
         error.FtpServerBusy,
         error.HttpTransportFailed,
