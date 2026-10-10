@@ -444,8 +444,9 @@ pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, agg
 }
 
 /// `e` with each part that a computed grouping key spells (through the SELECT
-/// list's aliases: `upper(g)` grouped as `G2`) read from that key's column, the only
-/// form of it left past the aggregate.
+/// list's aliases: `upper(g)` grouped as `G2`, or the hidden name of a key the list
+/// leaves out) read from that key's column, the only form of it left past the
+/// aggregate.
 pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, map: []const Parser.ExprAlias) Error!*ast.Expr {
     const Ctx = struct { p: *Parser, group: []const ast.QualName, map: []const Parser.ExprAlias };
     const S = struct {
@@ -457,7 +458,10 @@ pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, ma
             }
             var buf = std.array_list.Managed(u8).init(cx.p.arena);
             try cx.p.exprKey(node, &buf);
-            const name = Parser.resolveExprAlias(cx.map, buf.items);
+            var name = Parser.resolveExprAlias(cx.map, buf.items);
+            if (name.ptr == buf.items.ptr) for (cx.p.hidden_keys.items) |hk| {
+                if (std.mem.eql(u8, hk[0], buf.items)) name = hk[1];
+            };
             for (cx.group) |k| if (k.parts.len == 1 and std.mem.eql(u8, k.parts[0], name))
                 return cx.p.mk(.{ .field = try cx.p.singleName(k.parts[0]) });
             return ast.rebuildExpr(cx.p.arena, node, cx, recur);

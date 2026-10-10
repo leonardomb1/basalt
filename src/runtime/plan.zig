@@ -488,7 +488,9 @@ fn openTaker(env: *Env, stages: []const ast.Stage, want: keypush.Want) !Taken {
 }
 
 fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq) anyerror!PipeRes {
-    const stages = try projectSqlRead(env, stages_in);
+    var ld = analyze.Diag{};
+    const bound = analyze.bindLimits(env.arena, stages_in, env.params_expr, &ld) catch |e| return aErr(env, &ld, e);
+    const stages = try projectSqlRead(env, bound);
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     if (try metaShortcut(env, stages)) |r| return r;
 

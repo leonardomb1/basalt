@@ -50,6 +50,45 @@ const StderrCapture = struct {
     }
 };
 
+test "a shown result repeats a name as SQL does; LOAD INTO refuses one, naming it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "g,x\nab,1\nAb,5\ncd,2\ncd,10\nef,3\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dup.csv", .data = "a,a,b\n1,2,3\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\SELECT x AS a, g AS a, x + 1 AS a FROM '{s}/t.csv' ORDER BY x DESC LIMIT 2;
+        \\SELECT SUM(x) AS s, MAX(x) AS s, COUNT(*), COUNT(*) FROM '{s}/t.csv' GROUP BY g ORDER BY g;
+        \\SELECT g, g FROM '{s}/t.csv' ORDER BY 2 LIMIT 1;
+        \\SELECT * FROM '{s}/dup.csv';
+    , .{ base, base, base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+    const res = run(alloc, prog, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const printed = try out.end(alloc);
+    defer alloc.free(printed);
+    _ = try res;
+    try std.testing.expectEqualStrings(
+        "a,a,a\n10,cd,11\n5,Ab,6\n" ++
+            "s,s,count(*),count(*)\n5,5,1,1\n1,1,1,1\n12,10,2,2\n3,3,1,1\n" ++
+            "g,g\nAb,Ab\n" ++
+            "a,a,b\n1,2,3\n",
+        printed,
+    );
+
+    const load = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/o.csv' AS SELECT * FROM '{s}/dup.csv';", .{ base, base });
+    defer alloc.free(load);
+    try std.testing.expectError(error.PlanFailed, run(alloc, try parser.parseSource(parena.allocator(), load, &pdiag), .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectEqualStrings("LOAD INTO writes each column under its own name, and two columns are named `a` — alias one apart in the SELECT list", rdiag.msg);
+}
+
 test "EXPLAIN mid-script explains that query without running it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

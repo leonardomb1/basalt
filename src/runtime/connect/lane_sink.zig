@@ -89,6 +89,7 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
 /// A per-lane Stream Load or SQL sink for a split pipeline, or null for the
 /// shared-mutex path.
 pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
+    try @import("sink.zig").uniqueTargetColumns(env, w, schema);
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
     if (try buildSqlSinkSpec(env, w, schema)) |spec|

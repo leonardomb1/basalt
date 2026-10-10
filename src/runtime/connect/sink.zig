@@ -168,7 +168,19 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         errdefer inner.abort();
         return StdoutSink.wrap(env, inner, info, cap);
     }
+    try uniqueTargetColumns(env, w, schema);
     return openTargetSink(env, w, schema);
+}
+
+/// `analyze.uniqueColumns` for a LOAD target; a shown result or an in-memory one may
+/// repeat a name.
+pub fn uniqueTargetColumns(env: *Env, w: ast.Write, schema: types.Schema) !void {
+    if (std.mem.eql(u8, w.connector, "stdout") or std.mem.eql(u8, w.connector, mem_connector)) return;
+    var ad = analyze.Diag{};
+    analyze.uniqueColumns(schema, &ad) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ad.msg)),
+    };
 }
 
 fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driver.Sink {

@@ -139,6 +139,77 @@ pub fn substFilterParams(arena: std.mem.Allocator, stages: []const ast.Stage, pa
     return out orelse stages;
 }
 
+/// A LOAD target takes each column by its name, so two of one name (a file whose
+/// header repeats one, `*` beside a same-named item) are refused, naming it.
+pub fn uniqueColumns(schema: types.Schema, diag: *Diag) Error!void {
+    for (schema.fields, 0..) |f, i| for (schema.fields[0..i]) |g| {
+        if (std.mem.eql(u8, f.name, g.name))
+            return fail(diag, "LOAD INTO writes each column under its own name, and two columns are named `{s}` — alias one apart in the SELECT list", .{f.name});
+    };
+}
+
+/// A LIMIT or OFFSET expression's rows: its `$name`s replaced and the whole evaluated
+/// once into a whole number at least 0; null for NULL, which SQL reads as no bound.
+/// Text that spells one is taken too, as a loop variable is text.
+pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const ParamMap, what: []const u8, diag: *Diag) Error!?u64 {
+    const x = try substExpr(arena, e, params);
+    const v = eval.constEval(arena, x, &.{}, &.{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            if (try firstDollar(arena, x)) |q|
+                return failAt(diag, q.span, "unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
+            return fail(diag, "{s} must be a constant: an integer, a `$param` or LET, or an expression of them", .{what});
+        },
+    };
+    return switch (v) {
+        .null => null,
+        .int => |n| if (n < 0) fail(diag, "{s} must not be negative, got {d}", .{ what, n }) else @intCast(n),
+        .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
+        else => fail(diag, "{s} must be an integer, got {s}", .{ what, @tagName(v) }),
+    };
+}
+
+/// The first `$name` in `e`, after substitution one nothing binds.
+fn firstDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!?ast.QualName {
+    const Find = struct {
+        arena: std.mem.Allocator,
+        found: *?ast.QualName,
+        fn recur(f: @This(), x: *const ast.Expr) Error!*ast.Expr {
+            if (x.* == .field) {
+                if (x.field.dollar and f.found.* == null) f.found.* = x.field;
+                return @constCast(x);
+            }
+            return ast.rebuildExpr(f.arena, x, f, recur);
+        }
+    };
+    var found: ?ast.QualName = null;
+    _ = try Find.recur(.{ .arena = arena, .found = &found }, e);
+    return found;
+}
+
+/// Every LIMIT and OFFSET written as an expression, evaluated against `params`, so
+/// top-N, pushdown and the limit itself read plain numbers. Returns `stages` itself
+/// when none is.
+pub fn bindLimits(arena: std.mem.Allocator, stages: []const ast.Stage, params: *const ParamMap, diag: *Diag) Error![]const ast.Stage {
+    var out: ?[]ast.Stage = null;
+    for (stages, 0..) |st, i| {
+        if (st.node != .limit) continue;
+        const l = st.node.limit;
+        if (l.count_expr == null and l.offset_expr == null) continue;
+        errdefer diag.stamp(st.pos);
+        var bound: ast.Limit = .{ .count = l.count, .offset = l.offset };
+        if (l.count_expr) |e| bound.count = (try limitValue(arena, e, params, "LIMIT", diag)) orelse std.math.maxInt(u64);
+        if (l.offset_expr) |e| bound.offset = (try limitValue(arena, e, params, "OFFSET", diag)) orelse 0;
+        const o = out orelse blk: {
+            const copy = try arena.dupe(ast.Stage, stages);
+            out = copy;
+            break :blk copy;
+        };
+        o[i].node = .{ .limit = bound };
+    }
+    return out orelse stages;
+}
+
 pub fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
     const p = try arena.create(ast.Expr);
     p.* = e;
@@ -851,7 +922,7 @@ const Ctx = struct {
     fn checkStmts(self: *Ctx, stmts: []const ast.Stmt, outs: *std.array_list.Managed(Output), top: bool) Error!void {
         for (stmts) |s| switch (s) {
             .binding => |b| {
-                try self.bindings.put(b.name, b.pipeline);
+                try self.bindings.put(b.name, try self.limitsBound(b.pipeline));
                 try self.checkBindingLiterals(b.pipeline);
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
@@ -884,7 +955,7 @@ const Ctx = struct {
         for (stmts) |s| switch (s) {
             .binding => |b| {
                 try saved.append(.{ .name = b.name, .prev = self.bindings.get(b.name) });
-                try self.bindings.put(b.name, b.pipeline);
+                try self.bindings.put(b.name, try self.limitsBound(b.pipeline));
                 try self.checkBindingLiterals(b.pipeline);
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
@@ -903,10 +974,20 @@ const Ctx = struct {
         return e;
     }
 
+    /// `p` with its LIMITs and OFFSETs evaluated as the run does; a problem with one is
+    /// noted and the pipeline kept as written.
+    fn limitsBound(self: *Ctx, p: ast.Pipeline) Error!ast.Pipeline {
+        const stages = bindLimits(self.arena, p.stages, self.params, self.diag) catch |e| {
+            try self.note(e);
+            return p;
+        };
+        return .{ .stages = stages, .pos = p.pos, .show = p.show };
+    }
+
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
         errdefer self.diag.stamp(pipe.pos);
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
-        const head = try self.inlineHead(pipe.stages);
+        const head = try self.inlineHead(try bindLimits(self.arena, pipe.stages, self.params, self.diag));
         const via = head.via;
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
@@ -971,6 +1052,10 @@ const Ctx = struct {
 
         const w = stages[stages.len - 1].node.write;
         const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return e;
+        };
+        if (cur) |c| if (!std.mem.eql(u8, w.connector, "stdout")) uniqueColumns(c, self.diag) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };
@@ -1170,7 +1255,10 @@ const Ctx = struct {
         return switch (st.node) {
             .filter => .{ .kind = "filter", .detail = "", .breaker = false },
             .select => |items| .{ .kind = "select", .detail = try self.selectDetail(items), .breaker = false },
-            .limit => |l| .{ .kind = "limit", .detail = try std.fmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
+            .limit => |l| .{ .kind = "limit", .detail = if (l.count == std.math.maxInt(u64))
+                (if (l.offset > 0) "all (offset)" else "all")
+            else
+                try std.fmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
             .explode => |e| .{ .kind = "explode", .detail = e.field, .breaker = false },
             .distinct => .{ .kind = "distinct", .detail = "", .breaker = true },
             .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },

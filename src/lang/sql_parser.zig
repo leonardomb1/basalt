@@ -249,6 +249,7 @@ const reserved_after_source = [_][]const u8{
     "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
     "paginate", "retry",    "create", "param",   "having", "and",       "or",
     "not",      "explain",  "costs",  "analyze", "except", "intersect", "window",
+    "fetch",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {
@@ -331,6 +332,18 @@ pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
         if (it == .computed and it.computed.expr.* == .field and sameName(it.computed.expr.field, k)) return .{ .renamed = it.computed.name };
     }
     return .missing;
+}
+
+/// Whether the SELECT list outputs the column of a key written with its table
+/// (`a.s`, stripped to `s`) under the key's own name: the same reference, first of
+/// its name. Otherwise `s` there may be another table's column, so the key rides
+/// along under a hidden name.
+pub fn ownsStrippedKey(items: []const ast.SelectItem, k: ast.QualName) bool {
+    for (items, 0..) |it, i| {
+        if (it != .field or !sameName(it.field, k)) continue;
+        return !nameTaken(items[0..i], k.last());
+    }
+    return false;
 }
 
 fn outName(it: ast.SelectItem) ?[]const u8 {
@@ -439,6 +452,7 @@ pub const Parser = struct {
     win_sink: ?*std.array_list.Managed(WinCall) = null,
     qual_sink: ?*std.array_list.Managed(QualRef) = null,
     query_depth: usize = 0,
+    top_names: OutNames = .nested,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
 
@@ -756,7 +770,19 @@ pub const Parser = struct {
         union_branch: ?BranchInfo,
         expr_aliases: []const ExprAlias = &.{},
         out_keys: ?[]const ast.QualName = null,
+        group: ?[]const ast.QualName = null,
+        dups: []const DupName = &.{},
+        final_names: ?[]const ast.SelectItem = null,
     };
+
+    /// A name two or more SELECT items share, and whether they are all the same
+    /// expression, which keeps an ORDER BY or GROUP BY on the name unambiguous.
+    pub const DupName = struct { name: []const u8, same: bool };
+
+    /// Where a query's own SELECT list ends up: a result shown, which may repeat a
+    /// name as SQL allows; a LOAD target, which needs each column named apart; or
+    /// another query (a CTE, a derived table, a subquery), which reads them by name.
+    pub const OutNames = enum { nested, load, show };
 
     pub const parseSelectCore = @import("parse/query.zig").parseSelectCore;
     pub const parseUsing = @import("parse/query.zig").parseUsing;

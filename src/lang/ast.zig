@@ -226,7 +226,10 @@ pub const SelectItem = union(enum) {
 
 pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };
 
-pub const Limit = struct { count: u64, offset: u64 = 0 };
+/// `count_expr` and `offset_expr` are a LIMIT or OFFSET written as an expression of
+/// `$name`s and literals, evaluated into `count` and `offset` once the script's values
+/// are known; until then `count` is no bound.
+pub const Limit = struct { count: u64, offset: u64 = 0, count_expr: ?*Expr = null, offset_expr: ?*Expr = null };
 
 pub const Distinct = struct { on: ?[]const QualName };
 

@@ -107,15 +107,39 @@ test "sql: two calls in one query get their own bindings, the body's CTEs includ
     try testing.expectEqualStrings("b", args.items[1]);
 }
 
-test "sql: LIMIT and OFFSET name the `$param` they cannot take" {
+test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const Case = struct { q: []const u8, count: u64, offset: u64, exprs: bool = false };
+    const cases = [_]Case{
+        .{ .q = "SELECT id FROM 't.csv' LIMIT 2 OFFSET 3;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 3 LIMIT 2;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 3 ROWS FETCH FIRST 2 ROWS ONLY;", .count = 2, .offset = 3 },
+        .{ .q = "SELECT id FROM 't.csv' FETCH NEXT ROW ONLY;", .count = 1, .offset = 0 },
+        .{ .q = "SELECT id FROM 't.csv' OFFSET 4;", .count = std.math.maxInt(u64), .offset = 4 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT ALL;", .count = std.math.maxInt(u64), .offset = 0 },
+        .{ .q = "PARAM n INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $n * 2 OFFSET $n;", .count = std.math.maxInt(u64), .offset = 0, .exprs = true },
+    };
+    for (cases) |c| {
+        const prog = try parseTest(a, c.q);
+        const out = prog.stmts[prog.stmts.len - 1].output;
+        const lim = out.stages[out.stages.len - 2].node.limit;
+        try testing.expectEqual(c.count, lim.count);
+        try testing.expectEqual(c.offset, lim.offset);
+        try testing.expectEqual(c.exprs, lim.count_expr != null and lim.offset_expr != null);
+    }
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM lim INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $lim;", &diag));
-    try testing.expectEqualStrings("LIMIT takes an integer literal, not `$lim`", diag.msg);
-    try testing.expectError(error.ParseFailed, parseSource(a, "PARAM o INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT 2 OFFSET $o;", &diag));
-    try testing.expectEqualStrings("OFFSET takes an integer literal, not `$o`", diag.msg);
+    const refused = [_][2][]const u8{
+        .{ "SELECT id FROM 't.csv' LIMIT id;", "LIMIT takes a constant: an integer, a `$param` or LET, or an expression of them, not a column" },
+        .{ "SELECT id FROM 't.csv' LIMIT 1 FETCH FIRST 2 ROWS ONLY;", "a query takes one LIMIT or FETCH FIRST" },
+        .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY" },
+        .{ "SELECT id FROM 't.csv' OFFSET 1 OFFSET 2;", "a query takes one OFFSET" },
+    };
+    for (refused) |r| {
+        try testing.expectError(error.ParseFailed, parseSource(a, r[0], &diag));
+        try testing.expectEqualStrings(r[1], diag.msg);
+    }
 }
 
 test "sql: a table function call is checked where it is written" {
@@ -767,6 +791,30 @@ test "sql: an expression's name keeps its string literals, so distinct expressio
     try testing.expectEqual(@as(usize, 2), hs[aggStageIndex(hs)].node.aggregate.aggs.len);
 }
 
+test "sql: a shown result may repeat a name; the later item runs hidden and is renamed back last" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT v AS a, g AS a, v AS a FROM 'x.csv' ORDER BY v LIMIT 2;");
+    const st = prog.stmts[prog.stmts.len - 1].output.stages;
+    const last = st[st.len - 2].node.select;
+    try testing.expectEqual(@as(usize, 3), last.len);
+    try testing.expectEqualStrings("a", last[0].field.last());
+    for (last[1..]) |it| {
+        try testing.expectEqualStrings("a", it.computed.name);
+        try testing.expect(std.mem.startsWith(u8, it.computed.expr.field.last(), "__d"));
+    }
+    _ = try parseTest(a, "SELECT v AS a, v AS a FROM 'x.csv' ORDER BY a;");
+    _ = try parseTest(a, "SELECT COUNT(*), COUNT(*) FROM 'x.csv';");
+
+    const p = try parseTest(a, "PARAM p INT DEFAULT 1;\nSELECT $p, $p + 1 FROM 'x.csv';");
+    const ps = p.stmts[p.stmts.len - 1].output.stages;
+    const items = ps[ps.len - 2].node.select;
+    try testing.expectEqualStrings("p", items[0].computed.name);
+    try testing.expect(items[0].computed.expr.field.dollar);
+    try testing.expectEqualStrings("p+1", items[1].computed.name);
+}
+
 test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -774,12 +822,17 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
 
     const cases = [_]struct { q: []const u8, msg: []const u8 }{
         .{ .q = "SELECT g, COUNT(*) FROM 'x.csv' GROUP BY 2;", .msg = "GROUP BY position 2 names the aggregate `count(*)` — a position may only name a grouping key" },
-        .{ .q = "SELECT 1 AS a, 2 AS a;", .msg = "two SELECT items are named `a` — give one a different alias" },
-        .{ .q = "SELECT g, v AS g FROM 'x.csv';", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "LOAD INTO 'o.csv' AS SELECT 1 AS a, 2 AS a;", .msg = "LOAD INTO writes each column under its own name, and two SELECT items are named `a` — give one a different alias" },
+        .{ .q = "WITH c AS (SELECT g, v AS g FROM 'x.csv') SELECT * FROM c;", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "SELECT * FROM (SELECT g, g FROM 'x.csv') d;", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' ORDER BY a;", .msg = "ORDER BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
+        .{ .q = "SELECT g AS a, v AS a, COUNT(*) FROM 'x.csv' GROUP BY a;", .msg = "GROUP BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
+        .{ .q = "SELECT *, v AS a, g AS a FROM 'x.csv';", .msg = "two SELECT items are named `a` — give one a different alias" },
+        .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' UNION ALL BY NAME SELECT v AS a FROM 'x.csv';", .msg = "UNION BY NAME lines columns up by name, and two SELECT items are named `a` — give one a different alias" },
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },
-        .{ .q = "SELECT g, SUM(v) FROM 'x.csv' GROUP BY g ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
+        .{ .q = "SELECT g FROM 'x.csv' ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
     };
     for (cases) |c| {
         var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };

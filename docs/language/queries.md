@@ -27,7 +27,7 @@ LIMIT 100 OFFSET 20;
 | `SELECT a, expr AS x` | projection |
 | `SELECT * EXCLUDE (a, b)` / `EXCEPT` | all-but projection |
 | `SELECT * RENAME (a AS b)` | rename projection |
-| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, or a plan-time constant; a `GROUP BY` with no aggregate in `SELECT` or `HAVING` and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text is exact ([Aggregates](aggregates.md)): an `INT`, or a `DECIMAL(38, s)` when the column's sampled values show `s` decimal places; `AVG` over text is a `FLOAT` |
+| `COUNT(*) / SUM / AVG / MIN / MAX ... GROUP BY k` | aggregate (every other item must be a group key, aliased or not, an expression whose columns are all covered by grouping keys or grouping expressions it repeats (`lower(upper(g))` under `GROUP BY upper(g)`; see [Aggregates](aggregates.md)), or a plan-time constant; a `GROUP BY` with no aggregate in `SELECT` or `HAVING` and no window function is refused — use `SELECT DISTINCT`). A numeric aggregate refuses a non-numeric argument at plan time, and casts text per row — so a CSV column read as text still sums, and text that is not a number fails the run. `SUM` over text is exact ([Aggregates](aggregates.md)): an `INT`, or a `DECIMAL(38, s)` when the column's sampled values show `s` decimal places; `AVG` over text is a `FLOAT` |
 | `ROUND(AVG(x), 2)`, `SUM(a)/COUNT(*)` | an aggregate inside an expression: the calls are computed by the aggregate, the arithmetic around them by a projection after it |
 | `COUNT(DISTINCT x)` | aggregate — combines freely with other aggregates; ignores nulls |
 | `MEDIAN(x)` | aggregate — a float; the mean of the two middle values on an even count; ignores nulls. A NaN orders above every number, as in `ORDER BY` and Postgres, so it is the median only when the middle falls on one. Holds every value of the group until the end, so it is the one aggregate that is not O(1) per group. Engine-side only (never pushed down) |
@@ -39,7 +39,7 @@ LIMIT 100 OFFSET 20;
 | `f(...) OVER (PARTITION BY .. ORDER BY .. [frame])` | window — a value per row from its partition and frame, anywhere in a `SELECT` item; see [Window functions](windows.md) |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort — by columns, expressions (`ORDER BY x - 1`, `ORDER BY upper(s)`) or positions (`ORDER BY 2`); nulls last in both directions; `NULLS FIRST`/`NULLS LAST` are not accepted |
-| `LIMIT n [OFFSET m]` | limit |
+| `LIMIT n [OFFSET m]` | limit — `n` and `m` are constants: an integer, a `$param`, a `LET`, a loop variable, a scalar subquery or an expression of them (`LIMIT $page_size OFFSET ($page - 1) * $page_size`), evaluated once before the query runs; a column is refused, and so is a value that is negative or not a whole number. `LIMIT ALL` and `LIMIT NULL` are no limit, `OFFSET` may come first or stand alone, and the standard spelling `OFFSET m ROWS FETCH FIRST n ROWS ONLY` (`NEXT` for `FIRST`, `ROW` for `ROWS`, `n` 1 when left out) means the same; `WITH TIES` is not supported |
 | `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
 | `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
@@ -68,13 +68,25 @@ key — but their order without `ORDER BY` is not that of an in-memory run.
 
 ## Naming, `GROUP BY` and `ORDER BY`
 
-A computed `SELECT` item does not need `AS`. Without one it is named after the
-text of its expression, lowercased and stripped of spaces — `COUNT(*)` becomes
-`count(*)`, `ClientIP - 1` becomes `clientip-1`. A string literal keeps its quotes
-and its case, so `upper('cat')` and `upper(cat)` are two names. An explicit alias
-always wins. Two items may not share a name: `SELECT a, b AS a` is refused, and
-naming one of them otherwise fixes it. (Same-named columns of a join's two sides
-come apart on their own — see [Joins](joins.md).)
+A plain column keeps its own name, as written in the source (`SELECT MyCol`
+is `MyCol`). A computed `SELECT` item does not need `AS`; without one its name
+is basalt's choice, since SQL leaves it to the implementation: the text of its
+expression with its tokens lowercased and run together, no spaces — `COUNT(*)`
+becomes `count(*)`, `ClientIP - 1` becomes `clientip-1`, `CAST(x AS VARCHAR)`
+becomes `cast(xasvarchar)` and `$p + 1` becomes `p+1` (a `$name` without its
+`$`). A string literal keeps its quotes and its case, so `upper('cat')` and
+`upper(cat)` are two names. A number keeps its digits (`1.50`). An explicit
+alias always wins, and is the way to give a computed column a name you rely on.
+
+A result may repeat a name, as SQL allows: `SELECT a, a` and two unaliased
+`COUNT(*)` print two columns of the same name. `ORDER BY` or `GROUP BY` on such
+a name is ambiguous and refused, unless every item of that name is the same
+expression (`SELECT x AS a, x AS a ... ORDER BY a`). Where the names must tell
+the columns apart, a repeat is refused, naming it: a `LOAD INTO` target, file
+or table, which also refuses a repeat that `*` brings in (a CSV header naming
+`a` twice); and a CTE, derived table or subquery, whose columns the query
+around it reads by name. Two plain columns of the same name from a join's two
+sides are not a repeat: the later is named `_r` — see [Joins](joins.md).
 
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
@@ -106,5 +118,8 @@ GROUP BY DATE_TRUNC('minute', EventTime);          -- binds to m
 - `ORDER BY` may name a column the `SELECT` list does not project, or an
   expression over the columns (`ORDER BY price - discount`). It is carried
   through the projection as a hidden column and dropped after the `LIMIT`, so
-  sorting by it costs nothing in the output. An aggregate in `ORDER BY` must
-  repeat one the `SELECT` list computes.
+  sorting by it costs nothing in the output. In a grouped query `ORDER BY` may
+  also name an aggregate the `SELECT` list leaves out (`ORDER BY MAX(x)`,
+  `ORDER BY SUM(x) / COUNT(*) DESC`), computed beside the others and dropped
+  the same way; under `SELECT DISTINCT` or after a set operation it must repeat
+  one the list computes.

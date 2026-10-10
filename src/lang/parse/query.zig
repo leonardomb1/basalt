@@ -22,6 +22,7 @@ const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource
 const itemLabel = @import("../sql_parser.zig").itemLabel;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
 const nameApart = @import("../sql_parser.zig").nameApart;
+const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
@@ -110,6 +111,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
 
     try self.expectKw("as");
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+    self.top_names = .load;
     try self.parseQuery(out, &stages);
     try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
     _ = try self.expect(.semi);
@@ -119,6 +121,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
 pub fn parseTerminalQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     const pos = self.curPos();
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+    self.top_names = .show;
     try self.parseQuery(out, &stages);
     try stages.append(.{
         .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } },
@@ -162,6 +165,8 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         return self.fail(self.curPos(), "queries nest more than {d} levels deep", .{max_query_depth});
     self.query_depth += 1;
     defer self.query_depth -= 1;
+    const out_names = self.top_names;
+    self.top_names = .nested;
     const outer_in_where = self.in_where;
     self.in_where = false;
     defer self.in_where = outer_in_where;
@@ -189,12 +194,16 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         self.pending_bindings.clearRetainingCapacity();
     };
 
+    self.top_names = out_names;
     const first = try self.parseSelectCore();
 
-    if (self.isKw("union") or self.isKw("intersect") or self.isKw("except")) {
+    var grouped: ?[]const ast.QualName = null;
+    const set_op = self.isKw("union") or self.isKw("intersect") or self.isKw("except");
+    if (set_op) {
         try self.parseUnionTail(first, stages);
     } else {
         try stages.appendSlice(first.stages);
+        if (stages.items[stages.items.len - 1].node != .distinct) grouped = first.group;
     }
 
     var hidden_drop: ?[]const ast.SelectItem = null;
@@ -205,9 +214,12 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         self.qual_sink = &order_quals;
         defer self.qual_sink = outer_quals;
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
+        var stripped = std.array_list.Managed(bool).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        var sort_aggs = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
             var q: ast.QualName = undefined;
+            var was_qual = false;
             if (self.isKw("identifier") and self.peekTag() == .lparen) {
                 q = try self.parseColRef();
             } else {
@@ -233,16 +245,34 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                             return self.fail(kpos, "ORDER BY position {d} is out of range", .{n});
                         q = stripQual(outs[@intCast(n - 1)], &first.aliases);
                     },
-                    .str_lit => |s| q = try self.singleName(s),
-                    .field => |f| q = stripQual(f, &first.aliases),
+                    .str_lit => |s| {
+                        try unambiguous(self, first.dups, s, "ORDER BY", kpos);
+                        q = try self.singleName(s);
+                    },
+                    .field => |f| {
+                        if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
+                        q = stripQual(f, &first.aliases);
+                        was_qual = q.parts.len < f.parts.len;
+                    },
                     else => {
                         const b = try self.bindName(e, first.expr_aliases);
                         q = try self.singleName(b.name);
                         if (!b.item) {
-                            if (containsAgg(e))
-                                return self.fail(kpos, "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
-                            if (!providesName(computed.items, b.name))
-                                try computed.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(e, &first.aliases) } });
+                            if (grouped) |g| {
+                                const r = try groupedSortKey(self, e, g, first, stages.items, &sort_aggs, kpos);
+                                if (r.* == .field and r.field.parts.len == 1) {
+                                    q = r.field;
+                                } else if (!providesName(computed.items, b.name)) {
+                                    try computed.append(.{ .computed = .{ .name = b.name, .expr = r } });
+                                }
+                            } else {
+                                if (containsAgg(e) and first.group != null and !set_op)
+                                    return self.fail(kpos, "with SELECT DISTINCT, an aggregate in ORDER BY must be one the SELECT list computes", .{});
+                                if (containsAgg(e))
+                                    return self.fail(kpos, "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
+                                if (!providesName(computed.items, b.name))
+                                    try computed.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(e, &first.aliases) } });
+                            }
                         }
                     },
                 }
@@ -252,6 +282,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 desc = true;
             } else _ = self.eatKw("asc");
             try keys.append(.{ .field = q, .desc = desc });
+            try stripped.append(was_qual);
             if (!self.eat(.comma)) break;
         }
         try self.settleQuals(order_quals.items, &first.aliases, outer_quals);
@@ -274,7 +305,15 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             if (!wildcard) {
                 var extended = std.array_list.Managed(ast.SelectItem).init(self.arena);
                 try extended.appendSlice(proj);
-                for (sort_keys) |*k| {
+                for (sort_keys, stripped.items) |*k, sq| {
+                    if (sq and (ownsStrippedKey(proj, k.field) or providesName(proj, k.field.last()))) {
+                        if (ownsStrippedKey(proj, k.field)) continue;
+                        const b = try self.bindName(try self.mk(.{ .field = k.field }), &.{});
+                        const hidden: ast.SelectItem = .{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.field }) } };
+                        k.field = try self.singleName(b.name);
+                        if (!providesName(extended.items[proj.len..], b.name)) try extended.append(hidden);
+                        continue;
+                    }
                     if (k.field.parts.len != 1) {
                         switch (keyHome(proj, k.field)) {
                             .as_is => {},
@@ -303,18 +342,21 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         }
         if (!extend_proj and visible == null and stages.items[stages.items.len - 1].node == .select)
             hidden_drop = try self.keepSortedCopies(&stages.items[stages.items.len - 1], sort_keys);
-        if (!extend_proj and computed.items.len > 0) {
-            const tail = stages.items[stages.items.len - 1].node;
-            if (visible != null or (tail == .distinct and tail.distinct.on != null))
-                return self.fail(self.curPos(), "ORDER BY with DISTINCT ON sorts by columns or SELECT items, not by a new expression — add it to the SELECT list", .{});
-            var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        if (!extend_proj and (computed.items.len > 0 or sort_aggs.items.len > 0)) {
             var names = std.array_list.Managed([]const u8).init(self.arena);
-            try ext.append(.star);
-            for (computed.items) |c| {
-                try ext.append(c);
-                try names.append(c.computed.name);
+            try names.appendSlice(sort_aggs.items);
+            if (computed.items.len > 0) {
+                const tail = stages.items[stages.items.len - 1].node;
+                if (visible != null or (tail == .distinct and tail.distinct.on != null))
+                    return self.fail(self.curPos(), "ORDER BY with DISTINCT ON sorts by columns or SELECT items, not by a new expression — add it to the SELECT list", .{});
+                var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+                try ext.append(.star);
+                for (computed.items) |c| {
+                    try ext.append(c);
+                    try names.append(c.computed.name);
+                }
+                try stages.append(.{ .node = .{ .select = try ext.toOwnedSlice() }, .hints = &.{}, .pos = self.curPos() });
             }
-            try stages.append(.{ .node = .{ .select = try ext.toOwnedSlice() }, .hints = &.{}, .pos = self.curPos() });
             const drop = try self.arena.alloc(ast.SelectItem, 1);
             drop[0] = .{ .star_except = try names.toOwnedSlice() };
             hidden_drop = drop;
@@ -328,30 +370,217 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             try stages.append(sort_stage);
     }
 
-    if (self.eatKw("limit")) {
-        try literalCount(self, "LIMIT");
-        const n = try self.expect(.int);
-        const count = std.fmt.parseInt(u64, n.text, 10) catch
-            return self.fail(self.curPos(), "bad LIMIT `{s}`", .{n.text});
-        var offset: u64 = 0;
-        if (self.eatKw("offset")) {
-            try literalCount(self, "OFFSET");
-            const m = try self.expect(.int);
-            offset = std.fmt.parseInt(u64, m.text, 10) catch
-                return self.fail(self.curPos(), "bad OFFSET `{s}`", .{m.text});
-        }
-        try stages.append(.{ .node = .{ .limit = .{ .count = count, .offset = offset } }, .hints = &.{}, .pos = self.curPos() });
-    }
+    const lpos = self.curPos();
+    if (try parseLimit(self)) |lim|
+        try stages.append(.{ .node = .{ .limit = lim }, .hints = &.{}, .pos = lpos });
 
     if (hidden_drop) |keep|
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
+    if (first.final_names) |fin|
+        try stages.append(.{ .node = .{ .select = fin }, .hints = &.{}, .pos = self.curPos() });
 }
 
-/// LIMIT and OFFSET take an integer literal; a `$name` there is named in the refusal.
-fn literalCount(self: *Parser, what: []const u8) Error!void {
-    if (!self.at(.dollar_ident)) return;
-    const t = self.cur();
-    return self.fail(self.curPos(), "{s} takes an integer literal, not `${s}`", .{ what, t.text });
+/// Refuses an ORDER BY or GROUP BY on a name two SELECT items share, unless they are
+/// the same expression, as SQL does.
+fn unambiguous(self: *Parser, dups: []const Parser.DupName, name: []const u8, clause: []const u8, at: Pos) Error!void {
+    for (dups) |d| if (std.mem.eql(u8, d.name, name) and !d.same)
+        return self.fail(at, "{s} `{s}` is ambiguous: two SELECT items are named so — alias one apart", .{ clause, name });
+}
+
+/// Two SELECT items named alike. A shown result keeps both names, as SQL does: the
+/// later item runs under a hidden name (`renamed` holds it beside the shown one) and
+/// a projection at the very end restores it, so nothing that reads columns by name
+/// in between mixes them up. A LOAD target or an enclosing query needs the names
+/// apart, so there it is refused. Two plain columns of which one is written with a
+/// joined table (`b.s`, `a.s`) are not a repeat: the later is named `s_r`, as a
+/// join's colliding columns are.
+fn nameRepeats(
+    self: *Parser,
+    mode: Parser.OutNames,
+    raw: anytype,
+    exprs: []Parser.ExprAlias,
+    wins: []Parser.WinCall,
+    aliases: *const AliasSet,
+    dups: *std.array_list.Managed(Parser.DupName),
+    renamed: *std.array_list.Managed([2][]const u8),
+    pos: Pos,
+) Error!void {
+    const Seen = struct { name: []const u8, key: []const u8, field: bool, qualified: bool };
+    var seen = std.array_list.Managed(Seen).init(self.arena);
+    var star = false;
+    var ea: usize = 0;
+    for (raw) |*ri| {
+        var key = std.array_list.Managed(u8).init(self.arena);
+        var field = false;
+        var qualified = false;
+        var alias_at: ?usize = null;
+        const name: []const u8 = switch (ri.*) {
+            .win => |wi| blk: {
+                alias_at = ea;
+                ea += 1;
+                try key.appendSlice(exprs[alias_at.?].synth);
+                break :blk wins[wi].out.?;
+            },
+            .qstar => {
+                star = true;
+                continue;
+            },
+            .item => |it| switch (it) {
+                .field => |f| blk: {
+                    const s = stripQual(f, aliases);
+                    const fe: ast.Expr = .{ .field = s };
+                    try self.exprKey(&fe, &key);
+                    field = true;
+                    qualified = s.parts.len > 1;
+                    break :blk s.last();
+                },
+                .computed => |c| blk: {
+                    if (c.expr.* != .field or c.expr.field.dollar) {
+                        alias_at = ea;
+                        ea += 1;
+                    }
+                    try self.exprKey(try self.stripExpr(c.expr, aliases), &key);
+                    break :blk c.name;
+                },
+                .star, .star_except, .star_rename, .star_of => {
+                    star = true;
+                    continue;
+                },
+            },
+        };
+        const prev = for (seen.items) |s| {
+            if (std.mem.eql(u8, s.name, name)) break s;
+        } else null;
+        const p = prev orelse {
+            try seen.append(.{ .name = name, .key = key.items, .field = field, .qualified = qualified });
+            continue;
+        };
+        if (field and p.field and (qualified or p.qualified)) continue;
+        switch (mode) {
+            .nested => return self.fail(pos, "two SELECT items are named `{s}` — give one a different alias", .{name}),
+            .load => return self.fail(pos, "LOAD INTO writes each column under its own name, and two SELECT items are named `{s}` — give one a different alias", .{name}),
+            .show => {},
+        }
+        const same = std.mem.eql(u8, p.key, key.items);
+        for (dups.items) |*d| {
+            if (std.mem.eql(u8, d.name, name)) {
+                d.same = d.same and same;
+                break;
+            }
+        } else try dups.append(.{ .name = name, .same = same });
+        self.derived_n += 1;
+        const hidden = try std.fmt.allocPrint(self.arena, "__d{d}", .{self.derived_n});
+        switch (ri.*) {
+            .win => |wi| wins[wi].out = hidden,
+            .item => |it| switch (it) {
+                .field => |f| {
+                    const e = try self.mk(.{ .field = f });
+                    ri.* = .{ .item = .{ .computed = .{ .name = hidden, .expr = e } } };
+                },
+                .computed => |c| {
+                    const e = c.expr;
+                    ri.* = .{ .item = .{ .computed = .{ .name = hidden, .expr = e } } };
+                },
+                else => unreachable,
+            },
+            .qstar => unreachable,
+        }
+        if (alias_at) |i| exprs[i].out = hidden;
+        try renamed.append(.{ hidden, name });
+    }
+    if (star and renamed.items.len > 0)
+        return self.fail(pos, "two SELECT items are named `{s}` — give one a different alias", .{renamed.items[0][1]});
+}
+
+/// An ORDER BY expression of a grouped query, read past the aggregate: a grouping
+/// expression it spells is that key's column, an aggregate the SELECT list leaves out
+/// is computed beside the others and named in `added` (dropped after the LIMIT, as
+/// HAVING's are), and any other column is refused, as in the SELECT list.
+fn groupedSortKey(self: *Parser, e: *ast.Expr, group: []const ast.QualName, first: Core, stages: []ast.Stage, added: *std.array_list.Managed([]const u8), pos: Pos) Error!*ast.Expr {
+    const keyed = try self.stripExpr(try self.groupKeyRefs(e, group, first.expr_aliases), &first.aliases);
+    var ai = stages.len;
+    while (ai > 0 and stages[ai - 1].node != .aggregate) ai -= 1;
+    if (ai == 0) return keyed;
+    const ag = &stages[ai - 1].node.aggregate;
+    var aggs = std.array_list.Managed(ast.AggItem).init(self.arena);
+    try aggs.appendSlice(ag.aggs);
+    const r = try self.liftAggs(keyed, &aggs, first.expr_aliases, pos);
+    try self.groupedOnly(r, group, aggs.items, &.{}, pos);
+    if (aggs.items.len == ag.aggs.len) return r;
+    for (aggs.items[ag.aggs.len..]) |a| {
+        if (a.distinct and a.func != .count)
+            return self.fail(pos, "DISTINCT is only supported inside COUNT", .{});
+        try added.append(a.name);
+        if (a.arg) |arg| try carryAggInput(self, stages, ai - 1, arg);
+    }
+    ag.aggs = try aggs.toOwnedSlice();
+    return r;
+}
+
+/// The columns `arg` reads, added to the projection the aggregate at `ai` reads
+/// through when it names its columns one by one.
+fn carryAggInput(self: *Parser, stages: []ast.Stage, ai: usize, arg: *const ast.Expr) Error!void {
+    if (ai == 0 or stages[ai - 1].node != .select) return;
+    const pre = stages[ai - 1].node.select;
+    for (pre) |it| if (it != .field and it != .computed) return;
+    var needed = std.array_list.Managed(ast.QualName).init(self.arena);
+    try self.collectFields(arg, &needed);
+    var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+    try ext.appendSlice(pre);
+    for (needed.items) |q| {
+        if (q.parts.len == 1 and !q.dollar and !providesName(ext.items, q.last())) try ext.append(.{ .field = q });
+    }
+    stages[ai - 1].node = .{ .select = try ext.toOwnedSlice() };
+}
+
+/// `LIMIT n|ALL`, `OFFSET m [ROWS]` and `FETCH FIRST|NEXT [n] ROWS ONLY`, OFFSET before
+/// or after the other, as SQL allows; FETCH is the standard's spelling of LIMIT.
+fn parseLimit(self: *Parser) Error!?ast.Limit {
+    var lim: ast.Limit = .{ .count = std.math.maxInt(u64) };
+    var counted = false;
+    var offset = false;
+    while (true) {
+        const kpos = self.curPos();
+        if (self.isKw("limit") or self.isKw("fetch")) {
+            if (counted) return self.fail(kpos, "a query takes one LIMIT or FETCH FIRST", .{});
+            counted = true;
+            if (self.eatKw("limit")) {
+                if (!self.eatKw("all")) try limitCount(self, "LIMIT", &lim.count, &lim.count_expr);
+                continue;
+            }
+            _ = self.advance();
+            if (!self.eatKw("first") and !self.eatKw("next"))
+                return self.fail(self.curPos(), "expected `FIRST` or `NEXT` after FETCH", .{});
+            if (self.isKw("row") or self.isKw("rows")) lim.count = 1 else try limitCount(self, "FETCH FIRST", &lim.count, &lim.count_expr);
+            if (!self.eatKw("row") and !self.eatKw("rows"))
+                return self.fail(self.curPos(), "expected `ROWS ONLY` after FETCH FIRST n", .{});
+            if (self.isKw("with"))
+                return self.fail(self.curPos(), "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY", .{});
+            try self.expectKw("only");
+        } else if (self.eatKw("offset")) {
+            if (offset) return self.fail(kpos, "a query takes one OFFSET", .{});
+            offset = true;
+            try limitCount(self, "OFFSET", &lim.offset, &lim.offset_expr);
+            _ = self.eatKw("row") or self.eatKw("rows");
+        } else break;
+    }
+    return if (counted or offset) lim else null;
+}
+
+/// A LIMIT or OFFSET value: an integer literal is read here; any other constant, an
+/// expression of `$name`s and literals, is kept to evaluate once those have values.
+/// A column has no single value to take, so it is refused.
+fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error!void {
+    const vpos = self.curPos();
+    const e = try self.parseExpr();
+    if (e.* == .int_lit) {
+        if (e.int_lit < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, e.int_lit });
+        n.* = @intCast(e.int_lit);
+        return;
+    }
+    if (!self.constItemExpr(e))
+        return self.fail(vpos, "{s} takes a constant: an integer, a `$param` or LET, or an expression of them, not a column", .{what});
+    expr.* = e;
 }
 
 /// Index of the projection a sort reads through. A `DISTINCT ON` is looked through
@@ -386,6 +615,8 @@ pub fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
 pub fn parseSelectCore(self: *Parser) Error!Core {
     const pos = self.curPos();
     try self.expectKw("select");
+    const out_names = self.top_names;
+    self.top_names = .nested;
     var quals = std.array_list.Managed(Parser.QualRef).init(self.arena);
     const outer_quals = self.qual_sink;
     self.qual_sink = &quals;
@@ -468,7 +699,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 if (!self.eat(.comma)) break;
                 continue;
             }
-            const synth: ?[]const u8 = if (e.* == .field) null else try self.synthRange(start, self.i);
+            const synth: ?[]const u8 = if (e.* == .field and !e.field.dollar) null else try self.synthRange(start, self.i);
             const name = try self.itemAlias();
             if (synth) |sy| {
                 var key = std.array_list.Managed(u8).init(self.arena);
@@ -477,7 +708,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             }
             if (name) |n| {
                 try raw_items.append(.{ .item = .{ .computed = .{ .name = n, .expr = e } } });
-            } else if (e.* == .field) {
+            } else if (e.* == .field and !e.field.dollar) {
                 try raw_items.append(.{ .item = .{ .field = e.field } });
             } else {
                 try raw_items.append(.{ .item = .{ .computed = .{ .name = synth.?, .expr = e } } });
@@ -487,35 +718,6 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     self.win_sink = null;
-
-    var out_keys: ?[]const ast.QualName = null;
-    {
-        var keys = std.array_list.Managed(ast.QualName).init(self.arena);
-        var all = true;
-        for (raw_items.items) |ri| {
-            const k: ast.QualName = switch (ri) {
-                .win => |wi| try self.singleName(win_calls.items[wi].out.?),
-                .qstar => {
-                    all = false;
-                    continue;
-                },
-                .item => |it| switch (it) {
-                    .field => |f| f,
-                    .computed => |c| try self.singleName(c.name),
-                    .star, .star_except, .star_rename, .star_of => {
-                        all = false;
-                        continue;
-                    },
-                },
-            };
-            if (k.parts.len == 1) for (keys.items) |o| {
-                if (o.parts.len == 1 and std.mem.eql(u8, o.parts[0], k.parts[0]))
-                    return self.fail(pos, "two SELECT items are named `{s}` — give one a different alias", .{k.parts[0]});
-            };
-            try keys.append(k);
-        }
-        if (all) out_keys = try keys.toOwnedSlice();
-    }
 
     var aliases = AliasSet{};
     var read_hints = std.array_list.Managed(ast.Hint).init(self.arena);
@@ -875,6 +1077,53 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
     }
 
+    var dups = std.array_list.Managed(Parser.DupName).init(self.arena);
+    var renamed = std.array_list.Managed([2][]const u8).init(self.arena);
+    try nameRepeats(self, out_names, raw_items.items, expr_aliases.items, win_calls.items, &aliases, &dups, &renamed, pos);
+
+    var out_keys: ?[]const ast.QualName = null;
+    var final_names: ?[]const ast.SelectItem = null;
+    {
+        var keys = std.array_list.Managed(ast.QualName).init(self.arena);
+        var shown = std.array_list.Managed(ast.SelectItem).init(self.arena);
+        var all = true;
+        for (raw_items.items) |ri| {
+            const k: ast.QualName = switch (ri) {
+                .win => |wi| try self.singleName(win_calls.items[wi].out.?),
+                .qstar => {
+                    all = false;
+                    continue;
+                },
+                .item => |it| switch (it) {
+                    .field => |f| f,
+                    .computed => |c| try self.singleName(c.name),
+                    .star, .star_except, .star_rename, .star_of => {
+                        all = false;
+                        continue;
+                    },
+                },
+            };
+            try keys.append(k);
+            try shown.append(if (ri == .item and ri.item == .field)
+                .{ .field = stripQual(k, &aliases) }
+            else
+                .{ .computed = .{ .name = k.parts[0], .expr = try self.mk(.null_lit) } });
+        }
+        if (all) out_keys = try keys.toOwnedSlice();
+        if (all and renamed.items.len > 0) {
+            nameApart(self.arena, shown.items) catch return error.OutOfMemory;
+            const fin = keepOutputs(self.arena, shown.items) catch return error.OutOfMemory;
+            const restored = try self.arena.dupe(ast.SelectItem, fin);
+            for (restored) |*it| for (renamed.items) |r| {
+                if (it.* == .field and it.field.parts.len == 1 and std.mem.eql(u8, it.field.parts[0], r[0])) {
+                    const e = try self.mk(.{ .field = it.field });
+                    it.* = .{ .computed = .{ .name = r[1], .expr = e } };
+                }
+            };
+            final_names = restored;
+        }
+    }
+
     var group: []const ast.QualName = &.{};
     var group_hidden = std.array_list.Managed(ast.SelectItem).init(self.arena);
     if (self.eatKw("group")) {
@@ -900,6 +1149,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     else => return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n}),
                 };
             } else if (ge.* == .field) {
+                if (ge.field.parts.len == 1) try unambiguous(self, dups.items, ge.field.parts[0], "GROUP BY", pos);
                 q = stripQual(ge.field, &aliases);
             } else {
                 if (containsAgg(ge)) return self.fail(pos, "GROUP BY cannot group on an aggregate", .{});
@@ -937,9 +1187,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var star_count: usize = 0;
     var post = std.array_list.Managed(ast.SelectItem).init(self.arena);
     var lifted = false;
-    if (distinct_on) |on| for (on) |*k| {
-        k.* = stripQual(k.*, &aliases);
-    };
+    var on_stripped: []bool = &.{};
+    if (distinct_on) |on| {
+        on_stripped = try self.arena.alloc(bool, on.len);
+        for (on, on_stripped) |*k, *st| {
+            const sq = stripQual(k.*, &aliases);
+            st.* = sq.parts.len < k.parts.len;
+            k.* = sq;
+        }
+    }
     var win_post = std.array_list.Managed(usize).init(self.arena);
     var using_drop = std.array_list.Managed([]const u8).init(self.arena);
     var using_copies = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
@@ -1010,13 +1266,22 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         }
                     }
                     if (containsAgg(stripped)) {
-                        const outer = try self.liftAggs(stripped, &aggs, expr_aliases.items, pos);
+                        const keyed = if (group.len > 0) try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases) else stripped;
+                        const outer = try self.liftAggs(keyed, &aggs, expr_aliases.items, pos);
+                        try self.groupedOnly(outer, group, aggs.items, &.{}, pos);
                         try post.append(.{ .computed = .{ .name = c.name, .expr = outer } });
                         lifted = true;
                         continue;
                     }
                     if (group.len > 0 and stripped.* == .field and isGroupKey(group, stripped.field)) {
                         try post.append(.{ .computed = .{ .name = c.name, .expr = stripped } });
+                        lifted = true;
+                        continue;
+                    }
+                    if (group.len > 0 and !isGroupKey(group, try self.singleName(c.name)) and !self.constItemExpr(stripped)) {
+                        const keyed = try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases);
+                        try self.groupedOnly(keyed, group, aggs.items, &.{}, pos);
+                        try post.append(.{ .computed = .{ .name = c.name, .expr = keyed } });
                         lifted = true;
                         continue;
                     }
@@ -1145,7 +1410,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             .pos = pos,
         });
         if (having) |h| {
-            const hf = try self.havingRewrite(h, expr_aliases.items);
+            const keyed = if (group.len > 0) try self.groupKeyRefs(h, group, expr_aliases.items) else h;
+            const hf = try self.stripExpr(try self.havingRewrite(keyed, expr_aliases.items), &aliases);
+            try self.groupedOnly(hf, group, aggs_out, &.{}, pos);
             try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
         }
         if (!lifted and aggOrderDiffers(post.items, group, aggs_out)) lifted = true;
@@ -1159,7 +1426,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     } else if (win_calls.items.len == 0) {
         const lone_star = items.items.len == 1 and items.items[0] == .star;
         if (!lone_star) {
-            if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on);
+            if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on, on_stripped);
             try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
     }
@@ -1219,7 +1486,16 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
 
     try self.settleQuals(quals.items, &aliases, outer_quals);
     try self.noteOwnCols(stages.items, quals.items, &aliases);
-    return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice(), .out_keys = out_keys };
+    return .{
+        .stages = try stages.toOwnedSlice(),
+        .aliases = aliases,
+        .union_branch = union_branch,
+        .expr_aliases = try expr_aliases.toOwnedSlice(),
+        .out_keys = out_keys,
+        .group = if (agg_mode and win_calls.items.len == 0) group else null,
+        .dups = try dups.toOwnedSlice(),
+        .final_names = final_names,
+    };
 }
 
 const KeySide = enum { left, right, loose };
@@ -1233,7 +1509,7 @@ fn keySide(q: ast.QualName, rname: []const u8) KeySide {
 
 /// Whether a projection already yields a column called `name`, so a window's
 /// reference to it need not be carried.
-fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
+pub fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
     for (items) |it| switch (it) {
         .star, .star_of => return true,
         .star_except => |ex| {
@@ -1299,6 +1575,8 @@ pub fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Manage
     for (ops.items) |o| if (o.kind != .union_) return self.parseSetOps(cores.items, ops.items, stages, pos);
 
     const by_name = ops.items[0].named;
+    if (by_name and first.dups.len > 0)
+        return self.fail(pos, "UNION BY NAME lines columns up by name, and two SELECT items are named `{s}` — give one a different alias", .{first.dups[0].name});
     var last_distinct: usize = 0;
     for (ops.items, 1..) |o, i| {
         if (o.named != by_name)

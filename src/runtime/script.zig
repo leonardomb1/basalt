@@ -26,6 +26,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const parallel = @import("parallel.zig");
 const pushdown = @import("pushdown.zig");
+const analyze = @import("analyze.zig");
 const Value = @import("../exec/value.zig").Value;
 
 const aborting = @import("env.zig").aborting;
@@ -333,6 +334,12 @@ pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow)
                 for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc };
                 dst.node = .{ .sort = .{ .keys = keys } };
             },
+            .limit => |l| {
+                var r = l;
+                if (l.count_expr) |e| r.count_expr = try renderExpr(arena, e, lr);
+                if (l.offset_expr) |e| r.offset_expr = try renderExpr(arena, e, lr);
+                dst.node = .{ .limit = r };
+            },
             else => {},
         }
     }
@@ -514,11 +521,27 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
 /// Interpolate `${...}` holes against script scope alone, for statements outside
 /// any `FOR EACH`. Runs even with no PARAM or LET, as a hole may be `today()`.
 pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
-    return renderPipeline(env.arena, p, .{
+    return renderBound(env, p, .{
         .names = &[_][]const u8{},
         .cells = &[_][]const u8{},
         .outer = &env.script_scope,
     });
+}
+
+/// `renderPipeline`, then its LIMIT and OFFSET expressions evaluated against the
+/// script's PARAMs and LETs, before anything plans on their numbers.
+pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
+    const r = try renderPipeline(env.arena, p, lr);
+    var ad = analyze.Diag{};
+    const stages = analyze.bindLimits(env.arena, r.stages, env.params_expr, &ad) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => {
+            const pe = planErr(env.diag, try env.arena.dupe(u8, ad.msg));
+            env.diag.pos = ad.pos;
+            return pe;
+        },
+    };
+    return .{ .stages = stages, .pos = r.pos, .show = r.show };
 }
 
 /// `CALL f(a, b)`: a plan-time statement macro run as one sequential FOR EACH
