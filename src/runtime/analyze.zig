@@ -260,6 +260,32 @@ fn failPos(diag: *Diag, pos: ast.Pos, comptime fmt: []const u8, args: anytype) e
     return e;
 }
 
+/// A statement `CASE` arm's string-literal pattern that cannot read as its typed
+/// subject's type, so the arm could never match: `CASE $n WHEN 'x'` with an INT `$n`.
+pub fn patternTypeProblem(arena: std.mem.Allocator, subj: Value, pat: *const ast.Expr) Error!?[]const u8 {
+    if (pat.* != .str_lit) return null;
+    const kind: types.TypeKind = switch (subj) {
+        .int => .int,
+        .float => .float,
+        .bool => .bool,
+        .date => .date,
+        .time => .time,
+        .timestamp => .timestamp,
+        .decimal => .decimal,
+        else => return null,
+    };
+    if (eval.castValue(arena, .{ .string = pat.str_lit }, kind)) |_| return null else |_| {}
+    return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(kind) });
+}
+
+/// The run's `matchArmIndex` refusal, for a top-level `CASE` whose subject folds here.
+fn checkMatchPatterns(arena: std.mem.Allocator, m: ast.StmtMatch, params: *const ParamMap, diag: *Diag) Error!void {
+    const s = m.subject orelse return;
+    const v = eval.constEval(arena, try substExpr(arena, s, params), &.{}, &.{}) catch return;
+    for (m.arms) |arm| for (arm.pats) |p| if (try patternTypeProblem(arena, v, p)) |why|
+        return failPos(diag, m.pos, "{s}", .{why});
+}
+
 pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
@@ -537,7 +563,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             try params_map.put(l.name, ph);
         }
     };
-    for (program.stmts) |s| if (s == .throw) try checkThrow(arena, s.throw, &params_map, diag);
+    for (program.stmts) |s| switch (s) {
+        .throw => |t| try checkThrow(arena, t, &params_map, diag),
+        .match => |m| try checkMatchPatterns(arena, m, &params_map, diag),
+        else => {},
+    };
     try bindBodyVars(arena, program.stmts, &params_map);
 
     var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };

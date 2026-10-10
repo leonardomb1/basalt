@@ -383,6 +383,11 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
     var subj: ?Value = null;
     if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} subject: {s}", .{ ctx, @errorName(e) }));
+    if (subj) |sv| for (m.arms) |arm| for (arm.pats) |p| if (try analyze.patternTypeProblem(env.arena, sv, p)) |why| {
+        const e = planErr(env.diag, why);
+        env.diag.pos = m.pos;
+        return e;
+    };
     for (m.arms, 0..) |arm, i| {
         if (arm.is_default) return i;
         if (arm.guard) |g| {
@@ -650,6 +655,8 @@ pub fn hasSort(stages: []const ast.Stage) bool {
 /// Run one row of a `for` body: each pipeline is rendered with the row's `${var}`
 /// values; a nested loop's source is rendered with the outer row and chains to it.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    if (lr.badCell(env.arena)) |b|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "loop variable `{s}`: `{s}` is not {s}", .{ b.name, b.cell, try b.ty.name(env.arena) }));
     var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(env.arena);
     for (body) |st| if (st == .binding) try saved.append(.{ .name = st.binding.name, .prev = env.bindings.get(st.binding.name) });
     defer {

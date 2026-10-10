@@ -178,6 +178,15 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
+
+    try tmp.dir.writeFile(.{ .sub_path = "nums.csv", .data = "n\nana\n" });
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "loop variable `n`: `ana` is not int") != null);
 }
 
 test "param substitution filters by a CLI-bound value" {
@@ -1223,6 +1232,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\n  LET y = 1;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
         .{ "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate PARAM `a`" },
         .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
+        .{ "PARAM n INT DEFAULT 5;\nCASE $n WHEN 5 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; WHEN 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 2 AS a; END CASE;", "CASE pattern 'x' is not int" },
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
