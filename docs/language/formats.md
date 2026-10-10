@@ -6,7 +6,11 @@ and Excel — unless `WITH (format = ...)` names one ([Sources](sources.md#sourc
 ## CSV
 
 A header name in double quotes loses its quotes (`""` inside is one quote) and
-may hold the delimiter: `"Valor Total"` is the column `Valor Total`.
+may hold the delimiter: `"Valor Total"` is the column `Valor Total`. Lines end in
+`\n`, `\r\n` or a bare `\r` (old Mac exports), a quoted value keeps any line break
+inside it, and no line is too long to read. Every row must have one field per
+header column: a row with more or fewer is an error naming the file, the line and
+both counts, never padded with nulls or cut short.
 
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as

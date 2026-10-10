@@ -74,7 +74,7 @@ pub fn readColumnChunkLevels(
 
     while (produced < entries) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
+        const pg = try readPageOf(arena, file_bytes, offset, meta, elem);
         offset = pg.next_offset;
 
         switch (pg.header.ty) {
@@ -96,6 +96,15 @@ pub fn readColumnChunkLevels(
     try readUnsigned(elem, col);
     if (list) |shape| return assembleLists(arena, col, levels.?.reps.items, levels.?.defs.items, max_def, shape, rows);
     return col;
+}
+
+fn readPageOf(arena: std.mem.Allocator, file_bytes: []const u8, offset: usize, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement) !parquet.Page {
+    return parquet.readPage(arena, file_bytes, offset, meta.compression) catch |e| {
+        if (e != error.UnsupportedCodec) return e;
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` is compressed with {s}, which basalt does not read (it reads snappy, gzip, zstd and lz4)", .{ elem.name, @tagName(meta.compression) }) catch "a parquet codec basalt does not read";
+        return @errorCast(eval.explain(e, msg));
+    };
 }
 
 /// Every decode path sign-extends a physical int, so an unsigned column is mended
@@ -139,7 +148,7 @@ pub fn readEntries(
     var produced: usize = 0;
     while (produced < entries) {
         if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try parquet.readPage(arena, file_bytes, offset, meta.compression);
+        const pg = try readPageOf(arena, file_bytes, offset, meta, elem);
         offset = pg.next_offset;
         switch (pg.header.ty) {
             .dictionary_page => {

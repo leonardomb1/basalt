@@ -509,6 +509,7 @@ fn pathLayer(path: []const u8) []const u8 {
 }
 
 pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]const u8 {
+    if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
     if (sftp.isUrl(path)) if (sftp.lastError().len > 0)
         return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), sftp.lastError() });
     if (smb.isUrl(path)) if (smb.lastError().len > 0)

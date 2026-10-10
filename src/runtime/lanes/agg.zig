@@ -353,7 +353,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     const slot = &ctx.slots[i];
     const wa = slot.arena.allocator();
 
-    var reader = csv.CsvSliceReader{ .data = ctx.mapped.chunk(i, ctx.queue.nitems), .schema = ctx.csv_schema, .dialect = ctx.mapped.dialect, .slot = ctx.mapped.slot };
+    var reader = ctx.mapped.reader(i, ctx.queue.nitems, ctx.csv_schema);
     var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);

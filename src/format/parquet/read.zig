@@ -312,14 +312,22 @@ pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.S
         if (!std.mem.eql(u8, w.name, g.name)) {
             for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
                 return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+            for (want.fields) |o| {
+                if (std.mem.eql(u8, o.name, g.name)) break;
+            } else return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
             return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
         }
         if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
-            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, @tagName(g.ty.kind), @tagName(w.ty.kind) }) catch "a column has another type";
+            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, typeName(arena, g.ty), typeName(arena, w.ty) }) catch "a column has another type";
     }
     if (got.fields.len > want.fields.len)
         return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
     return null;
+}
+
+fn typeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
+    if (t.kind != .decimal) return @tagName(t.kind);
+    return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
 }
 
 pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const u8, first: []const u8, why: []const u8) []const u8 {

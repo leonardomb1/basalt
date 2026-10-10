@@ -54,7 +54,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
         },
         .csv => |c| {
             const rd = try scratch.create(csv.CsvSliceReader);
-            rd.* = .{ .data = c.mapped.chunk(c.chunk, c.of), .schema = c.schema, .dialect = c.mapped.dialect, .slot = c.mapped.slot };
+            rd.* = c.mapped.reader(c.chunk, c.of, c.schema);
             return rd.source();
         },
     }
