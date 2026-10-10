@@ -1550,6 +1550,8 @@ pub fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Manage
     for (ops.items) |o| if (o.kind != .union_) return self.parseSetOps(cores.items, ops.items, stages, pos);
 
     const by_name = ops.items[0].named;
+    if (by_name and first.dups.len > 0)
+        return self.fail(pos, "UNION BY NAME lines columns up by name, and two SELECT items are named `{s}` — give one a different alias", .{first.dups[0].name});
     var last_distinct: usize = 0;
     for (ops.items, 1..) |o, i| {
         if (o.named != by_name)

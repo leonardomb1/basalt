@@ -824,6 +824,7 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' ORDER BY a;", .msg = "ORDER BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT g AS a, v AS a, COUNT(*) FROM 'x.csv' GROUP BY a;", .msg = "GROUP BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT *, v AS a, g AS a FROM 'x.csv';", .msg = "two SELECT items are named `a` — give one a different alias" },
+        .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' UNION ALL BY NAME SELECT v AS a FROM 'x.csv';", .msg = "UNION BY NAME lines columns up by name, and two SELECT items are named `a` — give one a different alias" },
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },

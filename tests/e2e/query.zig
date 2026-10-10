@@ -703,7 +703,16 @@ test "limit: LIMIT and OFFSET take PARAMs, LETs, loop variables and constant exp
         \\FOR EACH ROW OF (SELECT id FROM '$B/n.csv' WHERE id = 3) AS (k)
         \\  LOAD INTO '$B/loop.csv' AS SELECT id FROM '$B/n.csv' ORDER BY id LIMIT $k;
         \\END FOR;
+        \\LET top = (SELECT id FROM '$B/n.csv' ORDER BY id DESC LIMIT $n - 1);
+        \\LOAD INTO '$B/scalar.csv' AS SELECT $top AS t;
+        \\FOR EACH ROW OF (SELECT id FROM '$B/n.csv' ORDER BY id LIMIT $n) AS (k)
+        \\  LOAD INTO IDENTIFIER('$B/d_' || $k || '.csv') AS SELECT $k AS k;
+        \\END FOR;
     , 1, &.{});
+    try expectFile(&tmp, "scalar.csv", "t\n5\n");
+    try expectFile(&tmp, "d_1.csv", "k\n1\n");
+    try expectFile(&tmp, "d_2.csv", "k\n2\n");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("d_3.csv", .{}));
     try expectFile(&tmp, "param.csv", "id\n2\n3\n");
     try expectFile(&tmp, "let.csv", "id\n5\n4\n3\n");
     try expectFile(&tmp, "fetch.csv", "id\n2\n3\n");

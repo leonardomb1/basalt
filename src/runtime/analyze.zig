@@ -1217,7 +1217,10 @@ const Ctx = struct {
         return switch (st.node) {
             .filter => .{ .kind = "filter", .detail = "", .breaker = false },
             .select => |items| .{ .kind = "select", .detail = try self.selectDetail(items), .breaker = false },
-            .limit => |l| .{ .kind = "limit", .detail = try std.fmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
+            .limit => |l| .{ .kind = "limit", .detail = if (l.count == std.math.maxInt(u64))
+                (if (l.offset > 0) "all (offset)" else "all")
+            else
+                try std.fmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
             .explode => |e| .{ .kind = "explode", .detail = e.field, .breaker = false },
             .distinct => .{ .kind = "distinct", .detail = "", .breaker = true },
             .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
