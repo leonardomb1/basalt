@@ -61,6 +61,8 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             for (renames) |r| if (in.indexOf(r.from) == null) {
                 if (std.mem.startsWith(u8, r.to, "__uk"))
                     return fail(diag, "USING column `{s}` is not a column of the joined side", .{r.from});
+                if (std.mem.startsWith(u8, r.to, "__ul"))
+                    return fail(diag, "USING column `{s}` is not a column of the left side", .{r.from});
                 return fail(diag, "unknown rename field `{s}`", .{r.from});
             };
             for (in.fields, 0..) |f, idx| {
@@ -75,12 +77,19 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             if (so.rel.len > 0) {
                 if (!std.mem.eql(u8, f.rel, so.rel)) continue;
             } else if (nameIn(so.rights, f.rel)) continue;
+            if (renameTo(so.copies, f.name)) |key| {
+                try cols.append(.{ .name = try freeName(arena, cols.items, key, key), .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
+                continue;
+            }
             if (nameIn(so.drop, f.name)) continue;
             const nm = try freeName(arena, cols.items, if (f.base.len > 0) f.base else f.name, f.name);
             try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
         },
         .field => |q| {
-            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{try std.mem.join(arena, ".", q.parts)});
+            const idx = in.resolve(q.parts) orelse {
+                if (q.parts.len > 1) return failAt(diag, q.span, "unknown column `{s}`", .{try std.mem.join(arena, ".", q.parts)});
+                return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
+            };
             const nm = try freeName(arena, cols.items, lastPart(q), in.fields[idx].name);
             try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
         },
@@ -108,7 +117,10 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
 
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
-    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
+    for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse {
+        if (q.parts.len > 1) return failAt(diag, q.span, "unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
+        return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
+    };
     return idxs;
 }
 
@@ -594,6 +606,9 @@ pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.S
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
     if (j.deferred.len > 0) return fail(diag, "internal error: a join's keys were not placed (orientKeys) before planning it", .{});
+
+    for (j.own_cols) |q| if (left.indexOf(q.last()) == null)
+        return failAt(diag, q.span, "unknown column `{s}.{s}`", .{ q.parts[0], q.last() });
 
     const lks = try arena.alloc(usize, j.left_keys.len);
     const rks = try arena.alloc(usize, j.right_keys.len);

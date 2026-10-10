@@ -133,21 +133,17 @@ pub const Schema = struct {
 
     /// The column a possibly qualified name refers to. `b.x`, where `b` is a join's
     /// right side, is that side's `x` whatever it was renamed to, and none when that
-    /// side has no `x`; any other qualifier, one the parser has checked names a
-    /// table, leaves the last part alone to decide.
+    /// side has no `x` or is not joined yet: a qualified name never falls back to
+    /// another table's column of that name. (The parser drops the FROM table's own
+    /// alias, which its columns do not carry.)
     pub fn resolve(self: Schema, parts: []const []const u8) ?usize {
         const name = parts[parts.len - 1];
-        if (parts.len > 1) {
-            const rel = parts[parts.len - 2];
-            var side = false;
-            for (self.fields, 0..) |f, i| {
-                if (f.rel.len == 0 or !std.mem.eql(u8, f.rel, rel)) continue;
-                if (std.mem.eql(u8, f.base, name)) return i;
-                side = true;
-            }
-            if (side) return null;
+        if (parts.len == 1) return self.indexOf(name);
+        const rel = parts[parts.len - 2];
+        for (self.fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.rel, rel) and std.mem.eql(u8, f.base, name)) return i;
         }
-        return self.indexOf(name);
+        return null;
     }
 };
 
@@ -204,14 +200,15 @@ test "eql compares decimal parameters but ignores nullability" {
     try std.testing.expect(Type.eql(Type.init(.int).asNullable(), Type.init(.int)));
 }
 
-test "Schema.resolve finds a join's renamed right-side column by its qualified name, and no other side's" {
+test "Schema.resolve finds a join's renamed right-side column by its qualified name, and never another table's" {
     const s = Schema{ .fields = &.{
         .{ .name = "id", .ty = Type.init(.int) },
         .{ .name = "x", .ty = Type.init(.string) },
         .{ .name = "x_r", .ty = Type.init(.int), .rel = "b", .base = "x" },
     } };
     try std.testing.expectEqual(@as(?usize, 2), s.resolve(&.{ "b", "x" }));
-    try std.testing.expectEqual(@as(?usize, 1), s.resolve(&.{ "a", "x" }));
+    try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "a", "x" }));
+    try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "c", "x" }));
     try std.testing.expectEqual(@as(?usize, 1), s.resolve(&.{"x"}));
     try std.testing.expectEqual(@as(?usize, 2), s.resolve(&.{"x_r"}));
     try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "b", "id" }));

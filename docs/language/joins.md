@@ -10,9 +10,12 @@ function, or any source a `FROM` reads — a path (`JOIN 'smb://fs/x.xlsx' x`, i
 `WITH (...)` after the alias) or a connection's table (`JOIN sr.db.t AS t`),
 read as `(SELECT * FROM it)` would be. A key is an `=` between a value of each
 side, `AND`-combined for composite keys, written in either order; a null key
-never matches. `USING (k, d)` joins on the columns of those names on both sides
-and lists each once, first, as SQL does; under a right or full join that column
-is the first non-null of the two. `NATURAL JOIN` is refused — name the shared
+never matches. `USING (k, d)` joins on the columns of those names on both sides,
+and `SELECT *` lists each once, first, as SQL does; under a right or full join
+that column is the first non-null of the two. Each side keeps its own copy too:
+`a.k` and `b.k` are that side's value (null on the rows an outer join adds
+for the other side), and `a.*` and `b.*` list that side's columns in its own
+order, `k` among them. `NATURAL JOIN` is refused — name the shared
 columns with `USING`. A key may be computed — `trim(t.code) = CAST(x.code AS
 string)`, each value naming one side's columns — and each side then computes it
 before the join, out of sight of `SELECT *`. Columns need no table when the names say which
@@ -56,8 +59,9 @@ unless `a.amt` is already in the list (then `amt_r`). `b.*` is the right side's
 columns alone, each named so too, and `a.*` the FROM table's. A qualifier must
 name a table of the query — its alias, or its own name when it has none
 (`FROM c`, `FROM sr.db.t` as `t`, `FROM 'dir/l.csv'` as `l`) — or the query is
-refused (`unknown table`); `b.x` where `b` has no `x` is an unknown field,
-never another side's `x`. A pipeline shaped `read | filters | join
+refused (`unknown table`); `b.x` where `b` has no `x` is an unknown column,
+never another table's `x` — for the FROM table's alias too, and for a table the
+chain joins only later (`ON c.x = a.x` before `JOIN c`). A pipeline shaped `read | filters | join
 | filters | write` probes in parallel under `-j` — over local CSV/Parquet
 morsels, and over key-range splits for a splittable SQL source. A chain of
 joins followed by `GROUP BY` fans out the same way (`read | filters |

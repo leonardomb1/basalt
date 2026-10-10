@@ -255,6 +255,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             if (!self.eat(.comma)) break;
         }
         try self.settleQuals(order_quals.items, &first.aliases, outer_quals);
+        try self.noteOwnCols(stages.items, order_quals.items, &first.aliases);
         const sort_keys = try keys.toOwnedSlice();
 
         var visible: ?[]const ast.SelectItem = null;
@@ -674,7 +675,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const u = try self.parseUsing(kind, binding, jpos, &left_keys, &right_keys);
             using_sel = u.select;
             if (jalias == null) jalias = binding;
-            aliases.setUsing(jalias.?, u.select);
+            aliases.setUsing(jalias.?, u.keys);
             binding = u.binding;
         } else {
             if (!self.isKw("on"))
@@ -938,6 +939,16 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         k.* = stripQual(k.*, &aliases);
     };
     var win_post = std.array_list.Managed(usize).init(self.arena);
+    var using_drop = std.array_list.Managed([]const u8).init(self.arena);
+    var using_copies = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
+    var using_hidden = std.array_list.Managed([]const u8).init(self.arena);
+    try aliases.usingCols(&using_drop, &using_copies, &using_hidden);
+    const copy_names = using_hidden.items;
+    for (raw_items.items) |*ri| if (ri.* == .item and ri.item == .field) {
+        const q = ri.item.field;
+        if (!q.dollar and q.parts.len == 2 and aliases.usingCopy(q.parts[0], q.parts[1]) != null)
+            ri.* = .{ .item = .{ .computed = .{ .name = q.last(), .expr = try self.mk(.{ .field = q }) } } };
+    };
     for (raw_items.items) |ri| {
         switch (ri) {
             .win => |wi| try post.append(.{ .computed = .{ .name = win_calls.items[wi].out.?, .expr = try self.mk(.{ .field = try self.singleName(win_calls.items[wi].hidden) }) } }),
@@ -950,18 +961,24 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post.append(.star);
                     star_count += 1;
                 } else {
-                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (stripsAlias(&aliases, alias)) "" else alias, .rights = rights } };
+                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (stripsAlias(&aliases, alias)) "" else alias, .rights = rights, .drop = using_drop.items, .copies = using_copies.items } };
                     try items.append(if (win_calls.items.len > 0) .star else so);
                     try post.append(so);
                 }
             },
             .item => |it| switch (it) {
                 .star => {
-                    try items.append(.star);
-                    try post.append(.star);
+                    const all: ast.SelectItem = if (copy_names.len > 0) .{ .star_except = copy_names } else .star;
+                    try items.append(all);
+                    try post.append(all);
                     star_count += 1;
                 },
-                .star_except, .star_rename, .star_of => {
+                .star_except => |ex| {
+                    const all: ast.SelectItem = .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, copy_names }) };
+                    try items.append(all);
+                    try post.append(all);
+                },
+                .star_rename, .star_of => {
                     try items.append(it);
                     try post.append(it);
                 },
@@ -1173,7 +1190,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         for (post.items) |it| try out_items.append(switch (it) {
             .star => .{ .star_except = drop.items },
-            .star_of => |so| .{ .star_of = .{ .rel = so.rel, .rights = so.rights, .drop = drop.items } },
+            .star_of => |so| .{ .star_of = .{ .rel = so.rel, .rights = so.rights, .drop = try std.mem.concat(self.arena, []const u8, &.{ so.drop, drop.items }), .copies = so.copies } },
             .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, drop.items }) },
             else => it,
         });
@@ -1194,6 +1211,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     try self.settleQuals(quals.items, &aliases, outer_quals);
+    try self.noteOwnCols(stages.items, quals.items, &aliases);
     return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice(), .out_keys = out_keys };
 }
 
@@ -1384,7 +1402,8 @@ pub fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positiona
 /// `USING (a, b)`: the right side's columns of those names are renamed apart, the
 /// join keys on them, and a select after the join lists each name once, first,
 /// as SQL does — the left value, or under a right or full join the first non-null
-/// of the two — with the renamed copies dropped.
+/// of the two. Each side's own copy stays, the left one renamed apart too, for
+/// `t.k` and `t.*` to name.
 pub fn parseUsing(
     self: *Parser,
     kind: ast.JoinKind,
@@ -1392,18 +1411,22 @@ pub fn parseUsing(
     jpos: Pos,
     left_keys: *std.array_list.Managed(ast.QualName),
     right_keys: *std.array_list.Managed(ast.QualName),
-) Error!struct { binding: []const u8, select: []const ast.SelectItem } {
+) Error!struct { binding: []const u8, select: []const ast.SelectItem, keys: []const AliasSet.UsingKey } {
     _ = try self.expect(.lparen);
     var renames = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
+    var left_renames = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
     var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
-    var drop = std.array_list.Managed([]const u8).init(self.arena);
+    var keys = std.array_list.Managed(AliasSet.UsingKey).init(self.arena);
     while (true) {
         const k = try self.expectIdent();
         self.derived_n += 1;
         const rk = try std.fmt.allocPrint(self.arena, "__uk{d}", .{self.derived_n});
+        const lk = try std.fmt.allocPrint(self.arena, "__ul{d}", .{self.derived_n});
         try renames.append(.{ .from = k, .to = rk });
+        try left_renames.append(.{ .from = k, .to = lk });
         try left_keys.append(try self.qualOne(k));
         try right_keys.append(try self.qualOne(rk));
+        try keys.append(.{ .key = k, .left = (try self.qualOne(lk)).parts, .right = (try self.qualOne(rk)).parts });
         const left = try self.mk(.{ .field = try self.qualOne(k) });
         const value = if (kind == .right or kind == .full) blk: {
             const args = try self.arena.alloc(*ast.Expr, 2);
@@ -1412,12 +1435,10 @@ pub fn parseUsing(
             break :blk try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
         } else left;
         try items.append(.{ .computed = .{ .name = k, .expr = value } });
-        try drop.append(k);
-        try drop.append(rk);
         if (!self.eat(.comma)) break;
     }
     _ = try self.expect(.rparen);
-    try items.append(.{ .star_except = try drop.toOwnedSlice() });
+    try items.append(.{ .star_rename = try left_renames.toOwnedSlice() });
 
     self.derived_n += 1;
     const name = try std.fmt.allocPrint(self.arena, "__derived{d}_using", .{self.derived_n});
@@ -1426,5 +1447,5 @@ pub fn parseUsing(
     st[0] = .{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos };
     st[1] = .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{.{ .star_rename = try renames.toOwnedSlice() }}) }, .hints = &.{}, .pos = jpos };
     try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = st, .pos = jpos }, .pos = jpos } });
-    return .{ .binding = name, .select = try items.toOwnedSlice() };
+    return .{ .binding = name, .select = try items.toOwnedSlice(), .keys = try keys.toOwnedSlice() };
 }

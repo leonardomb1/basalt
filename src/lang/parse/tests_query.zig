@@ -373,7 +373,7 @@ test "sql: an `=` of bare columns in ON is left for the plan to place, its key c
     try testing.expectEqualStrings(j.deferred[0].right_name, drop[1]);
 }
 
-test "sql: USING keys on renamed right columns and lists the names first; NATURAL is refused" {
+test "sql: USING keys on renamed right columns, lists the names first and keeps each side's copy out of `*`; NATURAL is refused" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -387,7 +387,11 @@ test "sql: USING keys on renamed right columns and lists the names first; NATURA
     const sel = st[2].node.select;
     try testing.expectEqualStrings("k", sel[0].computed.name);
     try testing.expectEqualStrings("coalesce", sel[0].computed.expr.call.name);
-    try testing.expectEqual(@as(usize, 4), sel[2].star_except.len);
+    try testing.expectEqual(@as(usize, 2), sel[2].star_rename.len);
+    try testing.expectEqualStrings("k", sel[2].star_rename[0].from);
+    try testing.expect(std.mem.startsWith(u8, sel[2].star_rename[0].to, "__ul"));
+    const out = st[st.len - 2].node.select;
+    try testing.expectEqual(@as(usize, 4), out[0].star_except.len);
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * FROM 'a.csv' a NATURAL JOIN 'b.csv' b;", &diag));

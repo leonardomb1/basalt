@@ -162,9 +162,13 @@ const MAX_ALIASES = 32;
 pub const AliasSet = struct {
     pub const Kind = enum { left, right, reserved };
 
+    /// A `JOIN ... USING` key `key`: the left side's own column kept as `left`, the
+    /// joined side's as `right`, each a one-part name, beside the merged `key`.
+    pub const UsingKey = struct { key: []const u8, left: []const []const u8, right: []const []const u8 };
+
     names: [MAX_ALIASES][]const u8 = undefined,
     kinds: [MAX_ALIASES]Kind = undefined,
-    usings: [MAX_ALIASES][]const ast.SelectItem = undefined,
+    usings: [MAX_ALIASES][]const UsingKey = undefined,
     n: usize = 0,
     implicit: []const u8 = "",
 
@@ -176,20 +180,40 @@ pub const AliasSet = struct {
         self.usings[self.n] = &.{};
         self.n += 1;
     }
-    /// Records the select a `JOIN ... USING` side `name` ends with, whose merged
-    /// columns `name.k` then names.
-    pub fn setUsing(self: *AliasSet, name: []const u8, sel: []const ast.SelectItem) void {
+    /// Records the keys a `JOIN ... USING` side `name` merged.
+    pub fn setUsing(self: *AliasSet, name: []const u8, keys: []const UsingKey) void {
         for (self.names[0..self.n], 0..) |a, i| if (std.mem.eql(u8, a, name)) {
-            self.usings[i] = sel;
+            self.usings[i] = keys;
         };
     }
-    fn usingCol(self: *const AliasSet, name: []const u8, col: []const u8) bool {
-        for (self.names[0..self.n], self.usings[0..self.n]) |a, sel| {
-            if (!std.mem.eql(u8, a, name)) continue;
-            for (sel) |it| if (it == .computed and std.mem.eql(u8, it.computed.name, col)) return true;
+    /// The kept copy `t.col` names under USING, as PostgreSQL reads it: the joined
+    /// side's own key for that side, and for the FROM table its own, which the first
+    /// USING on `col` kept.
+    pub fn usingCopy(self: *const AliasSet, t: []const u8, col: []const u8) ?[]const []const u8 {
+        for (self.names[0..self.n], self.usings[0..self.n]) |a, keys| {
+            if (!std.mem.eql(u8, a, t)) continue;
+            for (keys) |k| if (std.mem.eql(u8, k.key, col)) return k.right;
         }
-        return false;
+        if (!self.strips(t)) return null;
+        for (self.usings[0..self.n]) |keys| for (keys) |k| if (std.mem.eql(u8, k.key, col)) return k.left;
+        return null;
     }
+    /// Every USING key, for the SELECT list: `hidden` gets each side's kept copy, which
+    /// a plain `*` leaves out; `copies` those `t.*` lists in place under the key's name;
+    /// `drop` what no `t.*` lists, the merged keys and a later USING's copy of one.
+    pub fn usingCols(self: *const AliasSet, drop: *std.array_list.Managed([]const u8), copies: *std.array_list.Managed(ast.SelectItem.Rename), hidden: *std.array_list.Managed([]const u8)) !void {
+        for (self.usings[0..self.n]) |ks| for (ks) |k| {
+            try drop.append(k.key);
+            try hidden.append(k.left[0]);
+            try hidden.append(k.right[0]);
+            const seen = for (copies.items) |c| {
+                if (std.mem.eql(u8, c.to, k.key)) break true;
+            } else false;
+            if (seen) try drop.append(k.left[0]) else try copies.append(.{ .from = k.left[0], .to = k.key });
+            try copies.append(.{ .from = k.right[0], .to = k.key });
+        };
+    }
+
     fn strips(self: *const AliasSet, name: []const u8) bool {
         for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
             if (std.mem.eql(u8, a, name)) return k == .left;
@@ -453,6 +477,23 @@ pub const Parser = struct {
             }
             return self.fail(r.pos, "unknown table `{s}` in `{s}.{s}` — no table of this FROM is named or aliased `{s}`", .{ t, t, r.q.last(), t });
         }
+    }
+
+    /// Hands the first join of `stages` each column written with the FROM table's
+    /// alias, which drops it: that table must have the column, as no other may stand in.
+    pub fn noteOwnCols(self: *Parser, stages: []ast.Stage, refs: []const QualRef, aliases: *const AliasSet) Error!void {
+        const j = for (stages) |*st| {
+            if (st.node == .join) break &st.node.join;
+        } else return;
+        var own = std.array_list.Managed(ast.QualName).init(self.arena);
+        try own.appendSlice(j.own_cols);
+        for (refs) |r| {
+            if (r.q.parts.len != 2 or !aliases.strips(r.q.parts[0])) continue;
+            var q = r.q;
+            if (q.span == null) q.span = .{ .start = r.pos, .end = r.pos };
+            try own.append(q);
+        }
+        j.own_cols = try own.toOwnedSlice();
     }
 
     pub const PendingSemiJoin = struct {
@@ -848,9 +889,12 @@ pub fn stripsAlias(aliases: *const AliasSet, name: []const u8) bool {
     return aliases.strips(name);
 }
 
-/// `t.x` as `x` where `t` is the FROM table, or `x` a column `t`'s USING merged.
+/// `t.x` as `x` where `t` is the FROM table; a USING key `t.k` as that table's own
+/// copy of it, not the merged `k`.
 pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
-    if (!q.dollar and q.parts.len > 1 and (aliases.strips(q.parts[0]) or aliases.usingCol(q.parts[0], q.parts[1])))
+    if (q.dollar or q.parts.len < 2) return q;
+    if (q.parts.len == 2) if (aliases.usingCopy(q.parts[0], q.parts[1])) |copy| return .{ .parts = copy, .span = q.span };
+    if (aliases.strips(q.parts[0]))
         return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
     return q;
 }

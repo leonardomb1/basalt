@@ -1602,7 +1602,33 @@ test "join: `t.*` is that table's columns alone, by their own names unless taken
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,2\n" });
     try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n1,x\n" });
-    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown field `b.v`");
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown column `b.v`");
+}
+
+test "join: under USING `t.k` and `t.*` are that side's own, the key in its place; `*` lists the merged key once, first" {
+    try runQualCases(&.{
+        .{ .q = "SELECT t.* FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "id,name,amt\n2,bob,20.25\n" },
+        .{ .q = "SELECT i.* FROM '$B/t.csv' t RIGHT JOIN '$B/items.csv' i USING (name) WHERE i.item = 'w'", .want = "name,item,q\neve,w,4\n" },
+        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.q IS NULL OR i.q > 3", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\n" },
+        .{ .q = "SELECT t.name AS tn, i.name AS iname, name FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE t.name IS NULL OR i.name IS NULL", .want = "tn,iname,name\ncid,,cid\n,eve,eve\n" },
+        .{ .q = "SELECT i.name, count(*) AS n FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.name IS NULL OR i.name = 'ana' GROUP BY i.name ORDER BY n", .want = "name,n\n,1\nana,2\n" },
+    });
+}
+
+test "join: a qualified column is that table's alone, the FROM table's and a later join's too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name\n1,ana\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "items.csv", .data = "name,item,q\nana,x,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "emp.csv", .data = "id,mgr\n1,2\n" });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT a.item FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name WHERE a.q > 0;", "unknown column `a.q`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name JOIN '$B/emp.csv' c ON c.id = a.q;", "unknown column `a.q`");
+    try refuse(alloc, &tmp, "SELECT count(*) FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name GROUP BY a.item;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name ORDER BY a.item;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON c.id = a.id JOIN '$B/emp.csv' c ON c.id = a.id;", "unknown column `c.id`");
 }
 
 test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
