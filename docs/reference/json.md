@@ -22,7 +22,9 @@ the statement.
 `a.b`, `a[0].b` or `a.0.b` (a leading `$.` is allowed). Strings come back
 unquoted, objects and arrays as JSON text; a missing key, an index past the
 end or a JSON `null` is null. A cell that is not JSON is an error, not a
-null. `CAST(json_get(doc, 'n') AS INT)` for a typed value.
+null. A key written twice in one object (JSON allows it) reads as its last
+value, as most parsers take it; an object returned as text keeps both.
+`CAST(json_get(doc, 'n') AS INT)` for a typed value.
 
 ## Lambdas over an array
 
