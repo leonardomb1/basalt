@@ -431,7 +431,10 @@ test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" 
     diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,s\n1,x\n", "SELECT id FROM '$IN' WHERE s > 5", &diag));
     try std.testing.expectEqualStrings("cannot compare `s` (string) with 5 (int) — CAST one side to the other's type", diag.msg);
-    try std.testing.expect(diag.pos != null);
+    diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,s\n1,x\n", "SELECT id FROM '$IN' WHERE CAST(s AS INT) * 2 < upper(s)", &diag));
+    try std.testing.expect(std.mem.startsWith(u8, diag.msg, "cannot compare an expression (int) with `upper(…)` (string)"));
+    try std.testing.expectEqual(@as(u32, "s AS INT) * 2 < upper".len), diag.end.?.col - diag.pos.?.col);
     var ok = Diag{};
     _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
 }

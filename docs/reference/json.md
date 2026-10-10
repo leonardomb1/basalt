@@ -52,9 +52,10 @@ text, which `json_get` and these functions take apart (lambdas nest). The body
 may name the row's columns too (`t -> t = region`); the parameter shadows a
 column of its name. In `json_transform`'s result, text that is a JSON object
 or array (what `json_get` returns for one) goes in as that object or array,
-any other text as a string. An element the body cannot compare — a number
-against text, in an array that mixes kinds — counts as null (the condition is
-not true; `json_transform` puts `null`); a failing `CAST` still fails the run.
+any other text as a string. An element the body cannot compare or compute
+with — a number against text, or text in `+ - * / %`, in an array that mixes
+kinds — counts as null (the condition is not true; `json_transform` puts
+`null`); a failing `CAST` still fails the run.
 A null cell is null; a cell that is JSON but not an array is an error. A
 lambda is an argument of these functions and `json_reduce` only, and never
 descends to a SQL source — the row is filtered here, while the rest of its
@@ -70,8 +71,9 @@ the last one, `initial` for an empty array and null for a null cell.
 widened to what the body returns from it (a DECIMAL total stays a DECIMAL, a
 date a date); a FLOAT element arriving in an INT or DECIMAL total stops the
 statement rather than being cut short — start from `0.0` to sum floats. An
-element the body cannot compare stops it too, where `json_transform` would
-put null: a null mid-fold would quietly undo everything folded before it.
+element the body cannot compare or compute with stops it too, naming the
+element (`element [1], "a"`), where `json_transform` would put null: a null
+mid-fold would quietly undo everything folded before it.
 
 ## Arrays
 

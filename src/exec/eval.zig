@@ -76,12 +76,21 @@ pub const TypeError = error{ TypeError, OutOfMemory };
 pub const EvalError = error{ CastFailed, DivByZero, TypeMismatch, IntOverflow, PatternTooComplex, InvalidJson, OutOfMemory };
 const evalLit = @import("eval/testing_util.zig").evalLit;
 
+/// Where an expression was written, as far as its columns and calls tell.
 fn exprSpan(e: *const ast.Expr) ?ast.Span {
     return switch (e.*) {
         .field => |q| q.span,
         .call => |c| c.span,
+        .cast => |c| exprSpan(c.e),
+        .unary => |u| exprSpan(u.e),
+        .binary => |b| joinSpans(exprSpan(b.l), exprSpan(b.r)),
         else => null,
     };
+}
+
+fn joinSpans(a: ?ast.Span, b: ?ast.Span) ?ast.Span {
+    if (a != null and b != null) return .{ .start = a.?.start, .end = b.?.end };
+    return a orelse b;
 }
 
 /// A comparison operand as the message names it: a column, a literal, else its kind.
@@ -159,9 +168,7 @@ pub const TypeCtx = struct {
     /// A comparison of two types that never compare: both operands and types named,
     /// the span covering what of them is known.
     fn incomparable(self: *TypeCtx, b: ast.Expr.Binary, lt: Type, rt: Type) TypeError {
-        const ls = exprSpan(b.l);
-        const rs = exprSpan(b.r);
-        self.span = if (ls != null and rs != null) .{ .start = ls.?.start, .end = rs.?.end } else ls orelse rs;
+        self.span = joinSpans(exprSpan(b.l), exprSpan(b.r));
         return self.err("cannot compare {s} ({s}) with {s} ({s}) — CAST one side to the other's type", .{
             try operandText(self.arena, b.l), try lt.name(self.arena), try operandText(self.arena, b.r), try rt.name(self.arena),
         });
