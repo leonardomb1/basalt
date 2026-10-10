@@ -264,18 +264,18 @@ fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) 
 /// subject's type, so the arm could never match: `CASE $n WHEN 'x'` with an INT `$n`.
 pub fn patternTypeProblem(arena: std.mem.Allocator, subj: Value, pat: *const ast.Expr) Error!?[]const u8 {
     if (pat.* != .str_lit) return null;
-    const kind: types.TypeKind = switch (subj) {
-        .int => .int,
-        .float => .float,
-        .bool => .bool,
-        .date => .date,
-        .time => .time,
-        .timestamp => .timestamp,
-        .decimal => .decimal,
+    const ty: types.Type = switch (subj) {
+        .int => types.Type.init(.int),
+        .float => types.Type.init(.float),
+        .bool => types.Type.init(.bool),
+        .date => types.Type.init(.date),
+        .time => types.Type.init(.time),
+        .timestamp => types.Type.init(.timestamp),
+        .decimal => |d| types.Type.decimal(38, d.scale),
         else => return null,
     };
-    if (eval.castValue(arena, .{ .string = pat.str_lit }, kind)) |_| return null else |_| {}
-    return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(kind) });
+    if (eval.castValueTyped(arena, .{ .string = pat.str_lit }, ty)) |_| return null else |_| {}
+    return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(ty.kind) });
 }
 
 /// The run's `matchArmIndex` refusal, for a top-level `CASE` whose subject folds here.

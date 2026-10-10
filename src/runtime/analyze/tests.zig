@@ -616,6 +616,22 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
 }
 
+test "patternTypeProblem: a CASE pattern is read as its subject's own type, a decimal's scale included" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const patternTypeProblem = @import("../analyze.zig").patternTypeProblem;
+    const Value = @import("../../exec/value.zig").Value;
+    var lit: ast.Expr = .{ .str_lit = "1.50" };
+    const dec: Value = .{ .decimal = .{ .unscaled = 150, .scale = 2 } };
+    try std.testing.expect(try patternTypeProblem(a, dec, &lit) == null);
+    lit = .{ .str_lit = "abc" };
+    try std.testing.expect(try patternTypeProblem(a, dec, &lit) != null);
+    try std.testing.expect(try patternTypeProblem(a, .{ .int = 5 }, &lit) != null);
+    lit = .{ .str_lit = "5" };
+    try std.testing.expect(try patternTypeProblem(a, .{ .int = 5 }, &lit) == null);
+}
+
 test "analyze: a table function's body is checked where it is declared, called or not" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
