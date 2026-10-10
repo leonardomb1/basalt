@@ -428,6 +428,7 @@ pub const Parser = struct {
     win_sink: ?*std.array_list.Managed(WinCall) = null,
     qual_sink: ?*std.array_list.Managed(QualRef) = null,
     query_depth: usize = 0,
+    top_names: OutNames = .nested,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
 
@@ -707,7 +708,18 @@ pub const Parser = struct {
         expr_aliases: []const ExprAlias = &.{},
         out_keys: ?[]const ast.QualName = null,
         group: ?[]const ast.QualName = null,
+        dups: []const DupName = &.{},
+        final_names: ?[]const ast.SelectItem = null,
     };
+
+    /// A name two or more SELECT items share, and whether they are all the same
+    /// expression, which keeps an ORDER BY or GROUP BY on the name unambiguous.
+    pub const DupName = struct { name: []const u8, same: bool };
+
+    /// Where a query's own SELECT list ends up: a result shown, which may repeat a
+    /// name as SQL allows; a LOAD target, which needs each column named apart; or
+    /// another query (a CTE, a derived table, a subquery), which reads them by name.
+    pub const OutNames = enum { nested, load, show };
 
     pub const parseSelectCore = @import("parse/query.zig").parseSelectCore;
     pub const parseUsing = @import("parse/query.zig").parseUsing;

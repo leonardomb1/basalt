@@ -126,6 +126,7 @@ pub fn parseDescribe(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     _ = self.advance();
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     if (self.isKw("select") or self.isKw("with")) {
+        self.top_names = .show;
         try self.parseQuery(out, &stages);
     } else {
         var aliases = AliasSet{};

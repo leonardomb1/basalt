@@ -787,6 +787,30 @@ test "sql: an expression's name keeps its string literals, so distinct expressio
     try testing.expectEqual(@as(usize, 2), hs[aggStageIndex(hs)].node.aggregate.aggs.len);
 }
 
+test "sql: a shown result may repeat a name; the later item runs hidden and is renamed back last" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT v AS a, g AS a, v AS a FROM 'x.csv' ORDER BY v LIMIT 2;");
+    const st = prog.stmts[prog.stmts.len - 1].output.stages;
+    const last = st[st.len - 2].node.select;
+    try testing.expectEqual(@as(usize, 3), last.len);
+    try testing.expectEqualStrings("a", last[0].field.last());
+    for (last[1..]) |it| {
+        try testing.expectEqualStrings("a", it.computed.name);
+        try testing.expect(std.mem.startsWith(u8, it.computed.expr.field.last(), "__d"));
+    }
+    _ = try parseTest(a, "SELECT v AS a, v AS a FROM 'x.csv' ORDER BY a;");
+    _ = try parseTest(a, "SELECT COUNT(*), COUNT(*) FROM 'x.csv';");
+
+    const p = try parseTest(a, "PARAM p INT DEFAULT 1;\nSELECT $p, $p + 1 FROM 'x.csv';");
+    const ps = p.stmts[p.stmts.len - 1].output.stages;
+    const items = ps[ps.len - 2].node.select;
+    try testing.expectEqualStrings("p", items[0].computed.name);
+    try testing.expect(items[0].computed.expr.field.dollar);
+    try testing.expectEqualStrings("p+1", items[1].computed.name);
+}
+
 test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -794,8 +818,12 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
 
     const cases = [_]struct { q: []const u8, msg: []const u8 }{
         .{ .q = "SELECT g, COUNT(*) FROM 'x.csv' GROUP BY 2;", .msg = "GROUP BY position 2 names the aggregate `count(*)` — a position may only name a grouping key" },
-        .{ .q = "SELECT 1 AS a, 2 AS a;", .msg = "two SELECT items are named `a` — give one a different alias" },
-        .{ .q = "SELECT g, v AS g FROM 'x.csv';", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "LOAD INTO 'o.csv' AS SELECT 1 AS a, 2 AS a;", .msg = "LOAD INTO writes each column under its own name, and two SELECT items are named `a` — give one a different alias" },
+        .{ .q = "WITH c AS (SELECT g, v AS g FROM 'x.csv') SELECT * FROM c;", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "SELECT * FROM (SELECT g, g FROM 'x.csv') d;", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' ORDER BY a;", .msg = "ORDER BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
+        .{ .q = "SELECT g AS a, v AS a, COUNT(*) FROM 'x.csv' GROUP BY a;", .msg = "GROUP BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
+        .{ .q = "SELECT *, v AS a, g AS a FROM 'x.csv';", .msg = "two SELECT items are named `a` — give one a different alias" },
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },

@@ -139,6 +139,15 @@ pub fn substFilterParams(arena: std.mem.Allocator, stages: []const ast.Stage, pa
     return out orelse stages;
 }
 
+/// A LOAD target takes each column by its name, so two of one name (a file whose
+/// header repeats one, `*` beside a same-named item) are refused, naming it.
+pub fn uniqueColumns(schema: types.Schema, diag: *Diag) Error!void {
+    for (schema.fields, 0..) |f, i| for (schema.fields[0..i]) |g| {
+        if (std.mem.eql(u8, f.name, g.name))
+            return fail(diag, "LOAD INTO writes each column under its own name, and two columns are named `{s}` — alias one apart in the SELECT list", .{f.name});
+    };
+}
+
 /// A LIMIT or OFFSET expression's rows: its `$name`s replaced and the whole evaluated
 /// once into a whole number at least 0; null for NULL, which SQL reads as no bound.
 /// Text that spells one is taken too, as a loop variable is text.
@@ -983,6 +992,10 @@ const Ctx = struct {
 
         const w = stages[stages.len - 1].node.write;
         const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return e;
+        };
+        if (cur) |c| if (!std.mem.eql(u8, w.connector, "stdout")) uniqueColumns(c, self.diag) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };

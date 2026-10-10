@@ -68,13 +68,25 @@ key — but their order without `ORDER BY` is not that of an in-memory run.
 
 ## Naming, `GROUP BY` and `ORDER BY`
 
-A computed `SELECT` item does not need `AS`. Without one it is named after the
-text of its expression, lowercased and stripped of spaces — `COUNT(*)` becomes
-`count(*)`, `ClientIP - 1` becomes `clientip-1`. A string literal keeps its quotes
-and its case, so `upper('cat')` and `upper(cat)` are two names. An explicit alias
-always wins. Two items may not share a name: `SELECT a, b AS a` is refused, and
-naming one of them otherwise fixes it. (Same-named columns of a join's two sides
-come apart on their own — see [Joins](joins.md).)
+A plain column keeps its own name, as written in the source (`SELECT MyCol`
+is `MyCol`). A computed `SELECT` item does not need `AS`; without one its name
+is basalt's choice, since SQL leaves it to the implementation: the text of its
+expression with its tokens lowercased and run together, no spaces — `COUNT(*)`
+becomes `count(*)`, `ClientIP - 1` becomes `clientip-1`, `CAST(x AS VARCHAR)`
+becomes `cast(xasvarchar)` and `$p + 1` becomes `p+1` (a `$name` without its
+`$`). A string literal keeps its quotes and its case, so `upper('cat')` and
+`upper(cat)` are two names. A number keeps its digits (`1.50`). An explicit
+alias always wins, and is the way to give a computed column a name you rely on.
+
+A result may repeat a name, as SQL allows: `SELECT a, a` and two unaliased
+`COUNT(*)` print two columns of the same name. `ORDER BY` or `GROUP BY` on such
+a name is ambiguous and refused, unless every item of that name is the same
+expression (`SELECT x AS a, x AS a ... ORDER BY a`). Where the names must tell
+the columns apart, a repeat is refused, naming it: a `LOAD INTO` target, file
+or table, which also refuses a repeat that `*` brings in (a CSV header naming
+`a` twice); and a CTE, derived table or subquery, whose columns the query
+around it reads by name. Two plain columns of the same name from a join's two
+sides are not a repeat: the later is named `_r` — see [Joins](joins.md).
 
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
