@@ -256,6 +256,34 @@ pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
     return .missing;
 }
 
+fn outName(it: ast.SelectItem) ?[]const u8 {
+    return switch (it) {
+        .field => |q| q.last(),
+        .computed => |c| c.name,
+        else => null,
+    };
+}
+
+fn nameTaken(items: []const ast.SelectItem, name: []const u8) bool {
+    for (items) |it| if (outName(it)) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Names a plain column apart from an earlier item of the same name (`SELECT b.s,
+/// a.s`) as `selectCols` would, `s_r`, so a projection that keeps the outputs by
+/// name after hidden keys finds each one.
+pub fn nameApart(arena: std.mem.Allocator, items: []ast.SelectItem) !void {
+    for (items, 0..) |*it, i| {
+        if (it.* != .field or !nameTaken(items[0..i], it.field.last())) continue;
+        var nm = try std.fmt.allocPrint(arena, "{s}_r", .{it.field.last()});
+        var n: usize = 2;
+        while (nameTaken(items, nm)) : (n += 1) nm = try std.fmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
+        const e = try arena.create(ast.Expr);
+        e.* = .{ .field = it.field };
+        it.* = .{ .computed = .{ .name = nm, .expr = e } };
+    }
+}
+
 /// The projection that keeps `items`' outputs and none of the hidden keys beside them;
 /// a plain column is kept by reference, so `b.amt` still finds the right side's column.
 pub fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]const ast.SelectItem {

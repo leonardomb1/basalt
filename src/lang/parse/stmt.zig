@@ -11,6 +11,7 @@ const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
+const nameApart = @import("../sql_parser.zig").nameApart;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const std = @import("std");
 
@@ -336,6 +337,7 @@ pub fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.Selec
         .missing => try items.append(.{ .field = k.* }),
     };
     if (items.items.len == visible) return null;
+    nameApart(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
     return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
 }
 

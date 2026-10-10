@@ -21,6 +21,7 @@ const isGroupKey = @import("../sql_parser.zig").isGroupKey;
 const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource;
 const itemLabel = @import("../sql_parser.zig").itemLabel;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
+const nameApart = @import("../sql_parser.zig").nameApart;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
@@ -262,8 +263,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     if (!have) try extended.append(.{ .field = k.field });
                 }
                 if (extended.items.len != proj.len) {
+                    nameApart(self.arena, extended.items[0..proj.len]) catch return error.OutOfMemory;
+                    hidden_drop = keepOutputs(self.arena, visible orelse extended.items[0..proj.len]) catch return error.OutOfMemory;
                     stages.items[si].node.select = try extended.toOwnedSlice();
-                    hidden_drop = keepOutputs(self.arena, visible orelse proj) catch return error.OutOfMemory;
                 }
             }
         }

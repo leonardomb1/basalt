@@ -27,7 +27,13 @@ pub const Col = struct {
     base: []const u8 = "",
 };
 
-/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there.
+fn colNamed(cols: []const Col, name: []const u8) bool {
+    for (cols) |c| if (std.mem.eql(u8, c.name, name)) return true;
+    return false;
+}
+
+/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there;
+/// then its joined name, suffixed `_r` (`_r2`, …) if that is taken too.
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
@@ -53,10 +59,14 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         .field => |q| {
             const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
             var nm = lastPart(q);
-            for (cols.items) |c| if (std.mem.eql(u8, c.name, nm)) {
-                nm = in.fields[idx].name;
-                break;
-            };
+            if (colNamed(cols.items, nm)) nm = in.fields[idx].name;
+            var n: usize = 0;
+            while (colNamed(cols.items, nm)) : (n += 1) {
+                nm = if (n == 0)
+                    try std.fmt.allocPrint(arena, "{s}_r", .{in.fields[idx].name})
+                else
+                    try std.fmt.allocPrint(arena, "{s}_r{d}", .{ in.fields[idx].name, n + 1 });
+            }
             try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
         },
         .computed => |c| {

@@ -1482,3 +1482,41 @@ test "join order: an unknown join_order is refused" {
         \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'best') ORDER BY s.k;
     , "join_order is 'auto' or 'written'");
 }
+
+const QualCase = struct { q: []const u8, want: []const u8 };
+
+/// Each query of `cases` over the qualifier fixtures (`$B` the tmp dir), its CSV output
+/// against `want`.
+fn runQualCases(cases: []const QualCase) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,s,v\n1,a,10.5\n2,b,\n2,b2,3.0\n,n,1.0\n3,c,2.0\n4,e,4.0\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n2,x\n2,y\n3,z\n,nn\n5,w\n1,u\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "emp.csv", .data = "id,mgr,name\n1,,boss\n2,1,ann\n3,1,bob\n4,2,cy\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name,amt\n1,ana,10.5\n2,bob,20.25\n3,cid,\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "items.csv", .data = "name,item,q\nana,x,1\nana,y,2\nbob,z,3\neve,w,4\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+}
+
+test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
+    try runQualCases(&.{
+        .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\nu,a\n" },
+        .{ .q = "SELECT a.s, b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\na,u\n" },
+        .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
+        .{ .q = "SELECT DISTINCT ON (b.k) b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
+    });
+}
