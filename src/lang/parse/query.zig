@@ -213,6 +213,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         const outer_quals = self.qual_sink;
         self.qual_sink = &order_quals;
         defer self.qual_sink = outer_quals;
+        const outer_keys = self.key_aliases;
+        self.key_aliases = &first.aliases;
+        defer self.key_aliases = outer_keys;
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         var stripped = std.array_list.Managed(bool).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
@@ -655,6 +658,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     const outer_quals = self.qual_sink;
     self.qual_sink = &quals;
     defer self.qual_sink = outer_quals;
+    const outer_keys = self.key_aliases;
+    self.key_aliases = null;
+    defer self.key_aliases = outer_keys;
 
     var distinct = false;
     var distinct_on: ?[]ast.QualName = null;
@@ -737,8 +743,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const name = try self.itemAlias();
             if (synth) |sy| {
                 var key = std.array_list.Managed(u8).init(self.arena);
-                if (win_calls.items.len > before) try key.appendSlice(sy) else try self.exprKey(e, &key);
-                try expr_aliases.append(.{ .synth = try key.toOwnedSlice(), .out = name orelse sy });
+                const keyed = win_calls.items.len == before;
+                if (keyed) try self.exprKey(e, &key) else try key.appendSlice(sy);
+                try expr_aliases.append(.{ .synth = try key.toOwnedSlice(), .out = name orelse sy, .expr = if (keyed) e else null });
             }
             if (name) |n| {
                 try raw_items.append(.{ .item = .{ .computed = .{ .name = n, .expr = e } } });
@@ -1111,6 +1118,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
     }
 
+    self.key_aliases = &aliases;
+    for (expr_aliases.items) |*m| if (m.expr) |e| {
+        var key = std.array_list.Managed(u8).init(self.arena);
+        try self.exprKey(e, &key);
+        m.synth = try key.toOwnedSlice();
+    };
+
     var dups = std.array_list.Managed(Parser.DupName).init(self.arena);
     var renamed = std.array_list.Managed([2][]const u8).init(self.arena);
     try nameRepeats(self, out_names, raw_items.items, expr_aliases.items, win_calls.items, &aliases, &dups, &renamed, pos);
@@ -1382,7 +1396,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
 
     if (agg_mode) {
         if (having) |h| {
-            if (try self.addHavingAggs(h, &aggs, expr_aliases.items)) lifted = true;
+            if (try self.addHavingAggs(try self.stripExpr(h, &aliases), &aggs, expr_aliases.items)) lifted = true;
         }
         if (aggs.items.len == 0 and win_calls.items.len == 0)
             return self.fail(pos, "GROUP BY without aggregate functions in SELECT or HAVING", .{});
@@ -1428,7 +1442,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 if (a.arg) |arg| try self.collectFields(arg, &needed);
             }
             try needed.appendSlice(group);
-            for (needed.items) |q| {
+            for (needed.items) |q0| {
+                const q = stripQual(q0, &aliases);
                 if (q.parts.len != 1) continue;
                 const have = for (kept.items) |it| {
                     if (std.mem.eql(u8, itemLabel(it), q.last())) break true;

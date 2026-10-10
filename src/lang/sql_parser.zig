@@ -453,6 +453,7 @@ pub const Parser = struct {
     qual_sink: ?*std.array_list.Managed(QualRef) = null,
     query_depth: usize = 0,
     top_names: OutNames = .nested,
+    key_aliases: ?*const AliasSet = null,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
 
@@ -775,7 +776,7 @@ pub const Parser = struct {
     pub const distinctDropTail = @import("parse/query.zig").distinctDropTail;
     pub const BranchInfo = struct { read: ast.Read, tag: ?[]const u8, tag_col: ?[]const u8 };
 
-    pub const ExprAlias = struct { synth: []const u8, out: []const u8 };
+    pub const ExprAlias = struct { synth: []const u8, out: []const u8, expr: ?*const ast.Expr = null };
 
     pub const resolveExprAlias = @import("parse/query.zig").resolveExprAlias;
     pub const Core = struct {

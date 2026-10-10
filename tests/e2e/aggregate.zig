@@ -416,6 +416,23 @@ test "GROUP BY, HAVING and ORDER BY bind only the same expression; unselected ke
     }
 }
 
+test "a grouping expression matches however its columns are written: with the table's alias, quoted or bare" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const t_csv = "g,x\nab,1\nAb,5\ncd,2\ncd,10\n";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT upper(g) AS u, COUNT(*) AS n FROM '$IN' t GROUP BY upper(t.g) ORDER BY upper(t.g)", .want = "u,n\nAB,2\nCD,2\n" },
+        .{ .q = "SELECT upper(t.g) AS u, SUM(t.x) AS s FROM '$IN' t GROUP BY upper(\"g\") HAVING SUM(x) > 6 ORDER BY SUM(x)", .want = "u,s\nCD,12\n" },
+        .{ .q = "SELECT t.x + 1 AS y FROM '$IN' t GROUP BY x + 1 HAVING COUNT(t.x) > 0 ORDER BY 1", .want = "y\n2\n3\n6\n11\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, t_csv, c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "an expression over grouping expressions sits in SELECT, HAVING and ORDER BY; ORDER BY may add aggregates of its own" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

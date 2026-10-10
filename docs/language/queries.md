@@ -91,7 +91,8 @@ sides are not a repeat: the later is named `_r` — see [Joins](joins.md).
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
 expression — same columns, same literals to the letter, spacing and keyword case
-aside. One that differs is a new expression: `ORDER BY upper(s)` beside
+aside. A column is the same however it is written: `upper(t.g)` under
+`FROM 'x.csv' t` repeats `upper(g)`, and so does `upper("g")`. One that differs is a new expression: `ORDER BY upper(s)` beside
 `SELECT upper('s')` sorts by the column `s`, uppercased.
 
 ```sql
