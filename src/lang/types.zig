@@ -97,7 +97,8 @@ pub const Type = struct {
             var t = a;
             t.nullable = nn;
             if (a.kind == .decimal) {
-                t.precision = @max(a.precision, b.precision);
+                const whole = @max(a.precision -| a.scale, b.precision -| b.scale);
+                t.precision = if (a.precision == 0 or b.precision == 0) 0 else @min(38, whole + @max(a.scale, b.scale));
                 t.scale = @max(a.scale, b.scale);
             }
             return t;
@@ -178,10 +179,10 @@ test "unify: unknown-null unifies with any type, yielding it nullable" {
     try std.testing.expect(ub.nullable);
 }
 
-test "unify decimals takes max precision/scale; int widens into decimal" {
+test "unify decimals keeps both sides' whole digits and the larger scale; int widens into decimal" {
     const u = Type.unify(Type.decimal(18, 2), Type.decimal(10, 4)).?;
     try std.testing.expectEqual(TypeKind.decimal, u.kind);
-    try std.testing.expectEqual(@as(u8, 18), u.precision);
+    try std.testing.expectEqual(@as(u8, 20), u.precision);
     try std.testing.expectEqual(@as(u8, 4), u.scale);
 
     const w = Type.unify(Type.init(.int), Type.decimal(12, 3)).?;

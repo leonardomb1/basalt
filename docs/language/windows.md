@@ -211,7 +211,7 @@ A column a window reads there must be a grouping key or inside an aggregate.
 | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `COUNT`, `count_if` | `INT`, never null |
 | `PERCENT_RANK`, `CUME_DIST` | `FLOAT`, never null |
 | `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `MIN`, `MAX` | the column's type |
-| `SUM` | `INT` over ints, an exact `DECIMAL` of the column's scale over decimals, else `FLOAT` |
+| `SUM` | `INT` over ints, an exact `DECIMAL(38, s)` at the column's scale over decimals, else `FLOAT` |
 | `AVG`, `MEDIAN`, the variances and deviations | `FLOAT` |
 | `bool_and`, `bool_or` | `BOOL` |
 | `bit_and`, `bit_or`, `bit_xor` | `INT` |
