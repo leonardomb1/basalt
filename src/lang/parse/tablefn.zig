@@ -271,16 +271,27 @@ pub fn parseDerivedTable(self: *Parser) Error!Derived {
     return .{ .binding = name, .alias = alias, .alias_pos = alias_pos };
 }
 
+const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
+
 /// A join's reading right side (path, `IDENTIFIER`, table or query), lowered as
-/// `(SELECT * FROM it) alias` would be, with its read hints.
+/// `(SELECT * FROM it) alias` would be, with its read hints; the join's own
+/// options in that `WITH (...)` (`join_hint_keys`) go to the join instead.
 pub fn parseJoinRead(self: *Parser) Error!Derived {
     const rpos = self.curPos();
     var scratch = AliasSet{};
     var hints = std.array_list.Managed(ast.Hint).init(self.arena);
     const node = try self.parseFromSource(&scratch, &hints);
+    var join_hints = std.array_list.Managed(ast.Hint).init(self.arena);
     if (self.isKw("with") and self.peekTag() == .lparen) {
         _ = self.advance();
-        try self.parseWithHints(&hints);
+        var written = std.array_list.Managed(ast.Hint).init(self.arena);
+        try self.parseWithHints(&written);
+        for (written.items) |h| {
+            const to_join = for (join_hint_keys) |k| {
+                if (std.ascii.eqlIgnoreCase(h.key, k)) break true;
+            } else false;
+            try (if (to_join) &join_hints else &hints).append(h);
+        }
     }
     const alias: ?[]const u8 = if (scratch.n > 0) scratch.names[0] else null;
     self.derived_n += 1;
@@ -296,7 +307,7 @@ pub fn parseJoinRead(self: *Parser) Error!Derived {
         .pipeline = .{ .stages = stages, .pos = rpos },
         .pos = rpos,
     } });
-    return .{ .binding = name, .alias = alias, .alias_pos = rpos };
+    return .{ .binding = name, .alias = alias, .alias_pos = rpos, .join_hints = try join_hints.toOwnedSlice() };
 }
 
 /// A parenthesized query in expression or LET position, `(` consumed, its bindings

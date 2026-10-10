@@ -315,6 +315,7 @@ pub var join_build_byte_cap: usize = 4 << 30;
 pub const KeyClass = @import("op/join.zig").KeyClass;
 pub const JoinIndex = @import("op/join.zig").JoinIndex;
 pub const Join = @import("op/join.zig").Join;
+pub const notInTooLarge = @import("op/join.zig").notInTooLarge;
 pub const NLJoin = @import("op/nljoin.zig").NLJoin;
 pub const nlRangeOf = @import("op/nljoin.zig").rangeOf;
 pub const KeyValues = @import("op/keyset.zig").KeyValues;

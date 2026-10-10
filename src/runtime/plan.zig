@@ -831,7 +831,13 @@ pub fn joinMaySpill(env: *Env, j: ast.Join) bool {
 /// The cap a lane's shared index is built under: the spill threshold where the
 /// serial join could spill instead, so a larger build side falls back to it.
 pub fn laneJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
-    return if (joinMaySpill(env, j)) joinSpillAt(env, hints) else joinBuildCap(env, hints);
+    return if (joinMaySpill(env, j)) joinSpillAt(env, hints) else hashJoinCap(env, j, hints);
+}
+
+/// A hash join's in-memory cap: NOT IN, which never spills, fails past the spill
+/// threshold; every other join holds up to `max_build` or the 4 GiB default.
+fn hashJoinCap(env: *Env, j: ast.Join, hints: []const ast.Hint) !usize {
+    return if (j.null_aware) joinSpillAt(env, hints) else joinBuildCap(env, hints);
 }
 
 fn buildJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, left_schema: types.Schema, probe: op.Op, take: ?ProbeTake) anyerror!PipeRes {
@@ -896,7 +902,7 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         .null_aware = j.null_aware,
         .state = arena,
         .err = env.errctx,
-        .build_cap = try joinBuildCap(env, hints),
+        .build_cap = try hashJoinCap(env, j, hints),
         .space = env.space,
         .spill_at = try joinSpillAt(env, hints),
     };

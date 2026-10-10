@@ -25,7 +25,8 @@
 //! or for right and full joins kept in a file of its own and streamed out last; a
 //! null-key probe row follows partition 0 down. Row order is not kept. NOT IN never spills (a null key
 //! anywhere on the build side changes every probe row's answer), nor CROSS: both
-//! keep the in-memory cap. In grace mode `push_probe` is never applied, so a late
+//! keep the in-memory cap (the planner gives NOT IN the spill threshold as its
+//! cap). CROSS emits its pairs `cross_chunk` at a time. In grace mode `push_probe` is never applied, so a late
 //! probe source opens without a key predicate. Without a `Space` the join fails
 //! with `JoinBuildTooLarge` past `build_cap`, as before.
 
@@ -69,6 +70,11 @@ fn drainBuild(pull: std.mem.Allocator, child: Op, bytes_out: *usize, cap: usize)
     }
     bytes_out.* = bytes;
     return chunks.items;
+}
+
+/// A NOT IN subquery past its cap: it never spills, so the way out is more memory.
+pub fn notInTooLarge(ec: *ErrCtx, cap: usize) void {
+    ec.set("NOT IN subquery's rows pass the {d}-byte limit — a NOT IN build side never spills; raise --op-memory, or filter the subquery", .{cap});
 }
 
 /// `chunks` concatenated into one batch in `state` that is never null, so a join
@@ -372,7 +378,7 @@ pub const JoinIndex = struct {
         var n: usize = 0;
         for (chunks) |b| n += b.len;
         if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
-        if (right_keys.len > 0 and bytes + indexOverhead(n) > cap) return error.JoinBuildTooLarge;
+        if (bytes + (if (right_keys.len > 0) indexOverhead(n) else 0) > cap) return error.JoinBuildTooLarge;
         const batch = try concatBatches(state, chunks, right_schema, n);
 
         const self = try state.create(JoinIndex);
@@ -533,6 +539,11 @@ pub const Join = struct {
     replay: []const Batch = &.{},
     replay_pos: usize = 0,
 
+    cross_mem: ?std.heap.ArenaAllocator = null,
+    cross_batch: ?Batch = null,
+    cross_pos: usize = 0,
+    cross_chunk: usize = 1 << 16,
+
     const drain_chunk = 4096;
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
@@ -542,6 +553,7 @@ pub const Join = struct {
             self.probe_pushed = true;
             try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
         };
+        if (self.kind == .cross) return self.nextCross(arena, ix);
         while (!self.probe_done) {
             if (try self.nextProbe(arena)) |lb| {
                 const out = try self.joinBatch(arena, ix, lb);
@@ -551,6 +563,43 @@ pub const Join = struct {
             }
         }
         return self.drain(arena, ix);
+    }
+
+    /// CROSS: each probe batch, held in `cross_mem`, paired with every build row
+    /// at most `cross_chunk` pairs per call, so no output batch grows with the
+    /// product of the sides.
+    fn nextCross(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
+        const nb = ix.build_batch.len;
+        while (true) {
+            if (self.cross_batch == null) {
+                if (self.probe_done or nb == 0) {
+                    if (self.cross_mem) |*m| m.deinit();
+                    self.cross_mem = null;
+                    return null;
+                }
+                if (self.cross_mem == null) self.cross_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                _ = self.cross_mem.?.reset(.retain_capacity);
+                const lb = (try self.nextProbe(self.cross_mem.?.allocator())) orelse {
+                    self.probe_done = true;
+                    continue;
+                };
+                if (lb.len == 0) continue;
+                self.cross_batch = lb;
+                self.cross_pos = 0;
+            }
+            const lb = self.cross_batch.?;
+            const end = @min(lb.len * nb, self.cross_pos + self.cross_chunk);
+            const n = end - self.cross_pos;
+            const lidx = try arena.alloc(usize, n);
+            const ridx = try arena.alloc(usize, n);
+            for (lidx, ridx, self.cross_pos..) |*l, *r, p| {
+                l.* = p / nb;
+                r.* = p % nb;
+            }
+            self.cross_pos = end;
+            if (end == lb.len * nb) self.cross_batch = null;
+            return try self.gatherOut(arena, ix, lb, lidx, ridx, &.{}, n);
+        }
     }
 
     fn nextProbe(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
@@ -589,7 +638,12 @@ pub const Join = struct {
         if (self.grace != null) return null;
         const ix = self.index orelse blk: {
             const made = (self.buildIndex(arena) catch |e| {
-                if (self.err) |ec| ec.set("{s}", .{failLabel(e)});
+                if (self.err) |ec| {
+                    if (self.null_aware and e == error.JoinBuildTooLarge)
+                        notInTooLarge(ec, self.build_cap orelse op_mod.join_build_byte_cap)
+                    else
+                        ec.set("{s}", .{failLabel(e)});
+                }
                 return e;
             }) orelse return null;
             self.index = made;
@@ -884,18 +938,6 @@ pub const Join = struct {
         var ridx = std.array_list.Managed(usize).init(arena);
         var rnull = std.array_list.Managed(bool).init(arena);
         try lidx.ensureTotalCapacity(lb.len);
-
-        if (self.kind == .cross) {
-            var r: usize = 0;
-            while (r < lb.len) : (r += 1) {
-                var b: usize = 0;
-                while (b < ix.build_batch.len) : (b += 1) {
-                    try lidx.append(r);
-                    try ridx.append(b);
-                }
-            }
-            return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, &.{}, lidx.items.len);
-        }
 
         if (self.residual != null) return self.joinBatchResidual(arena, ix, lb);
         const fill_right = (self.kind == .left or self.kind == .full);
@@ -1339,6 +1381,60 @@ test "join: cross pairs every probe row with every build row" {
     try got.expect(&.{ 1, 1, 1, 2, 2, 2 }, &.{ "x", "y", "z", "x", "y", "z" });
 }
 
+test "join: cross emits bounded batches and keeps its build cap" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, 3 }, &.{ "a", "b", "c" })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9 }, &.{ "x", "y", "z" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+        .cross_chunk = 4,
+    };
+    var keys = std.array_list.Managed(i64).init(a);
+    var rvs = std.array_list.Managed(u8).init(a);
+    while (try jn.next(a)) |b| {
+        try testing.expect(b.len <= 4);
+        for (0..b.len) |r| {
+            try keys.append(b.columns[0].getValue(r).int);
+            try rvs.appendSlice(b.columns[3].getValue(r).string);
+        }
+    }
+    try testing.expectEqualSlices(i64, &.{ 1, 1, 1, 2, 2, 2, 3, 3, 3 }, keys.items);
+    try testing.expectEqualStrings("xyzxyzxyz", rvs.items);
+
+    var lts2 = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts2 = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan2 = Scan{ .src = lts2.src() };
+    var rscan2 = Scan{ .src = rts2.src() };
+    var capped = Join{
+        .probe = .{ .scan = &lscan2 },
+        .build = .{ .scan = &rscan2 },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+        .build_cap = 8,
+    };
+    try testing.expectError(error.JoinBuildTooLarge, capped.next(a));
+}
+
 test "join: the build-size guard reports instead of exhausting memory" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -1649,7 +1745,7 @@ test "join spill: NOT IN never spills and still fails past the build cap" {
     op_mod.join_build_byte_cap = 8;
     defer op_mod.join_build_byte_cap = saved;
     try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .anti, .null_aware = true, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .err = &ec }));
-    try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
+    try testing.expect(std.mem.indexOf(u8, ec.msg, "a NOT IN build side never spills") != null);
     try testing.expectEqual(@as(usize, 0), try sd.files());
 }
 

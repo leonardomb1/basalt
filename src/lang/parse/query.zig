@@ -504,6 +504,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             continue;
         }
         var jalias: ?[]const u8 = null;
+        var read_join_hints: []const ast.Hint = &.{};
         var binding: []const u8 = undefined;
         var bpos: Pos = undefined;
         const reads = self.at(.string) or
@@ -514,6 +515,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             binding = d.binding;
             jalias = d.alias;
             bpos = d.alias_pos;
+            read_join_hints = d.join_hints;
         } else {
             binding = try self.expectIdent();
             bpos = self.prevPos();
@@ -688,6 +690,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             }
         }
         var jhints = std.array_list.Managed(ast.Hint).init(self.arena);
+        try jhints.appendSlice(read_join_hints);
         if (self.isKw("with") and self.peekTag() == .lparen) {
             _ = self.advance();
             try self.parseWithHints(&jhints);

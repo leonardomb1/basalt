@@ -107,8 +107,13 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
     const build_op = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
-    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, try laneJoinCap(env, j, join_hints)) catch |e| {
-        if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) return e;
+    const cap = try laneJoinCap(env, j, join_hints);
+    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, cap) catch |e| {
+        if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
+        if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) {
+            if (e == error.JoinBuildTooLarge) env.errctx.set("{s}", .{op.failLabel(e)});
+            return e;
+        }
         for (env.sources.items[src_base..]) |sc| sc.close();
         env.sources.shrinkRetainingCapacity(src_base);
         env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, join_hints) });
