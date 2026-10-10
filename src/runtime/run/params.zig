@@ -24,9 +24,11 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
                 return planErr(diag, try std.fmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{kv.key}));
         }
     }
-    for (program.stmts) |s| {
+    for (program.stmts, 0..) |s, i| {
         if (s != .param) continue;
         const p = s.param;
+        for (program.stmts[0..i]) |prev| if (prev == .param and std.mem.eql(u8, prev.param.name, p.name))
+            return planErrAt(diag, try std.fmt.allocPrint(arena, "duplicate PARAM `{s}`", .{p.name}), p.pos);
         if (p.is_json) continue;
         var v: ?Value = null;
         for (cli) |kv| {
@@ -82,24 +84,30 @@ pub fn resolveLets(
         const l = s.let_const;
         for (program.stmts) |p| {
             if (p == .param and std.mem.eql(u8, p.param.name, l.name))
-                return planErr(diag, try std.fmt.allocPrint(arena, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name}));
+                return planErrAt(diag, try std.fmt.allocPrint(arena, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name}), l.pos);
         }
         if (params.contains(l.name))
-            return planErr(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}));
+            return planErrAt(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}), l.pos);
 
         if (try analyze.letRefProblem(arena, program, l)) |why| {
-            const e = planErr(diag, why);
-            diag.pos = l.pos;
+            const e = planErrAt(diag, why.msg, if (why.span) |sp| sp.start else l.pos);
+            if (why.span) |sp| diag.end = sp.end;
             return e;
         }
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
-            return planErr(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, errLabel(e) }));
+            return planErrAt(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, errLabel(e) }), l.pos);
         try names.append(l.name);
         try values.append(v);
         try params.put(l.name, v);
         try params_expr.put(l.name, try mkLit(arena, v));
     }
+}
+
+fn planErrAt(diag: *Diag, msg: []const u8, pos: ast.Pos) error{PlanFailed} {
+    const e = planErr(diag, msg);
+    diag.pos = pos;
+    return e;
 }
 
 /// Typed text is read as a CAST reads it: `-p d=2026-02-01` binds what

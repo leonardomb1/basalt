@@ -639,6 +639,14 @@ test "a LET is sealed: `-p` naming one is a plan error, not a silent override" {
     try std.testing.expectError(error.PlanFailed, runLetScript(alloc, script, &[_]ParamArg{.{ .key = "span", .val = "99" }}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "`span` is a LET, not a PARAM") != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20));
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyzeWith(parena.allocator(), prog, &.{.{ .name = "span", .value = "99" }}, &adiag));
+    try std.testing.expect(std.mem.indexOf(u8, adiag.msg, "`span` is a LET, not a PARAM") != null);
 }
 
 test "a LET and a PARAM may not share a name" {
@@ -1197,6 +1205,8 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PARAM n INT DEFAULT 'abc';\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "PARAM `n`: `abc` is not an integer" },
         .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
         .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
+        .{ "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate PARAM `a`" },
+        .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);

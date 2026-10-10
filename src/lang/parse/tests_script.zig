@@ -607,6 +607,18 @@ test "sql: a non-DEFAULT parameter may not follow a defaulted one" {
     try testing.expect(std.mem.indexOf(u8, diag.msg, "without DEFAULT") != null);
 }
 
+test "sql: a function may not name a parameter twice" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a,
+        \\CREATE FUNCTION f(a, a) AS a;
+        \\SELECT f(1, 2) AS v FROM 'x.csv';
+    , &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "parameter `a` is declared twice") != null);
+}
+
 test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

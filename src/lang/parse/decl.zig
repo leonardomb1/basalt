@@ -189,7 +189,9 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     }
     _ = try self.expect(.rparen);
     var seen_default = false;
-    for (params.items) |p| {
+    for (params.items, 0..) |p, i| {
+        for (params.items[0..i]) |q| if (std.mem.eql(u8, q.name, p.name))
+            return self.fail(pos, "`{s}`: parameter `{s}` is declared twice", .{ name, p.name });
         if (p.default != null) {
             seen_default = true;
         } else if (seen_default) {

@@ -256,28 +256,31 @@ pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
 /// The `$name`s an expression reads, in order, repeats included.
-fn dollarRefs(arena: std.mem.Allocator, e: *const ast.Expr) Error![]const []const u8 {
+pub fn dollarRefs(arena: std.mem.Allocator, e: *const ast.Expr) Error![]const ast.QualName {
     const Collect = struct {
         arena: std.mem.Allocator,
-        names: *std.array_list.Managed([]const u8),
+        names: *std.array_list.Managed(ast.QualName),
         fn recur(c: @This(), x: *const ast.Expr) Error!*ast.Expr {
             if (x.* == .field) {
-                if (x.field.dollar) try c.names.append(x.field.parts[0]);
+                if (x.field.dollar) try c.names.append(x.field);
                 return @constCast(x);
             }
             return ast.rebuildExpr(c.arena, x, c, recur);
         }
     };
-    var names = std.array_list.Managed([]const u8).init(arena);
+    var names = std.array_list.Managed(ast.QualName).init(arena);
     _ = try Collect.recur(.{ .arena = arena, .names = &names }, e);
     return names.items;
 }
 
+pub const LetRefProblem = struct { msg: []const u8, span: ?ast.Span };
+
 /// Why an expression LET cannot be folded, or null: it reads a query LET, which is
 /// decided only once queries run, or a `$name` no PARAM or earlier LET declares.
-pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?[]const u8 {
+pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?LetRefProblem {
     const le = l.expr orelse return null;
-    for (try dollarRefs(arena, le)) |n| {
+    for (try dollarRefs(arena, le)) |q| {
+        const n = q.parts[0];
         var declared = false;
         for (program.stmts) |s| switch (s) {
             .param => |p| if (std.mem.eql(u8, p.name, n)) {
@@ -287,12 +290,12 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
                 if (std.mem.eql(u8, other.name, l.name)) break;
                 if (!std.mem.eql(u8, other.name, n)) continue;
                 if (other.expr == null)
-                    return try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n });
+                    return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n }) };
                 declared = true;
             },
             else => {},
         };
-        if (!declared) return try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n });
+        if (!declared) return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n }) };
     }
     return null;
 }
@@ -458,8 +461,15 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     // folded from them — so a LET over them is folded here as the run folds it.
     var known_names = std.array_list.Managed([]const u8).init(arena);
     var known_values = std.array_list.Managed(Value).init(arena);
+    for (cli) |o| for (program.stmts) |s| if (s == .let_const and std.mem.eql(u8, s.let_const.name, o.name))
+        return fail(diag, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{o.name});
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
+        if (params_map.contains(p.name)) {
+            const e = fail(diag, "duplicate PARAM `{s}`", .{p.name});
+            diag.pos = p.pos;
+            return e;
+        }
         var bound: ?*const ast.Expr = null;
         var text: ?[]const u8 = null;
         for (cli) |o| if (std.mem.eql(u8, o.name, p.name)) {
@@ -480,17 +490,26 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     };
     for (program.stmts) |s| if (s == .let_const) {
         const l = s.let_const;
-        if (params_map.contains(l.name))
-            return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
-        if (try letRefProblem(arena, program, l)) |why| {
-            const e = fail(diag, "{s}", .{why});
+        if (params_map.contains(l.name)) {
+            const clash = for (program.stmts) |o| {
+                if (o == .param and std.mem.eql(u8, o.param.name, l.name)) break true;
+            } else false;
+            const e = if (clash)
+                fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name})
+            else
+                fail(diag, "duplicate LET `{s}`", .{l.name});
             diag.pos = l.pos;
+            return e;
+        }
+        if (try letRefProblem(arena, program, l)) |why| {
+            const e = failAt(diag, why.span, "{s}", .{why.msg});
+            if (diag.pos == null) diag.pos = l.pos;
             return e;
         }
         if (l.expr) |le| {
             const refs = try dollarRefs(arena, le);
-            const all_known = for (refs) |n| {
-                if (!containsName(known_names.items, n)) break false;
+            const all_known = for (refs) |q| {
+                if (!containsName(known_names.items, q.parts[0])) break false;
             } else true;
             if (all_known) {
                 const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
