@@ -119,7 +119,7 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
         return fail(diag, "`{s}('{s}')` reads the text '{s}', not a column — a name with spaces or symbols takes double quotes: {s}(\"{s}\")", .{ sp.names[0], a.str_lit, a.str_lit, sp.names[0], a.str_lit });
     const at = try exprType(arena, in, a, diag);
     if (!sp.arg.accepts(at))
-        return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
+        return fail(diag, "`{s}` needs {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
     return switch (sp.result) {
         .count => types.Type.init(.int),
         .sum => switch (at.kind) {
@@ -202,7 +202,7 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
         if (f.func == .agg) {
             const sp = aggregates.spec(f.func.agg);
             if (sp.arg != .star_or_any and !sp.arg.accepts(src))
-                return fail(diag, "`{s}` needs a {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try src.name(arena) });
+                return fail(diag, "`{s}` needs {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try src.name(arena) });
         }
         fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.func, src) };
         o.* = .{

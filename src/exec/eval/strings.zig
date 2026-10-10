@@ -40,13 +40,18 @@ pub fn charOffset(s: []const u8, k: usize) usize {
     return i;
 }
 
+/// Postgres `substr` by characters: positions count from 1, and a start before
+/// the first character still spends `len` from there (`substr('hello', 0, 2)` is
+/// `h`).
 pub fn substrChars(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt: ?i64) ![]const u8 {
     var start: usize = 0;
     if (start1 > 1) start = charOffset(s, @intCast(start1 - 1));
     var end: usize = s.len;
     if (len_opt) |l| {
         if (l <= 0) return "";
-        end = start + charOffset(s[start..], @intCast(l));
+        const stop = start1 +| l;
+        if (stop <= 1) return "";
+        end = start + charOffset(s[start..], @intCast(stop - @max(start1, 1)));
     }
     return arena.dupe(u8, s[start..end]);
 }
@@ -232,6 +237,12 @@ test "UTF-8 string helpers: substr, like, reverse, pad, case-map" {
     try std.testing.expectEqualStrings("SD1", try substrChars(a, "SD1010", 1, 3));
     try std.testing.expectEqualStrings("010", try substrChars(a, "SD1010", 4, null));
     try std.testing.expectEqualStrings("", try substrChars(a, "SD1010", 99, 2));
+    try std.testing.expectEqualStrings("h", try substrChars(a, "hello", 0, 2));
+    try std.testing.expectEqualStrings("h", try substrChars(a, "hello", -1, 3));
+    try std.testing.expectEqualStrings("", try substrChars(a, "hello", -3, 3));
+    try std.testing.expectEqualStrings("hello", try substrChars(a, "hello", -3, null));
+    try std.testing.expectEqualStrings("", try substrChars(a, "hello", std.math.minInt(i64), std.math.maxInt(i64)));
+    try std.testing.expectEqualStrings("llo", try substrChars(a, "hello", 3, std.math.maxInt(i64)));
 
     try std.testing.expect(likeMatch("hello, world", "hello%"));
     try std.testing.expect(likeMatch("hello", "h_llo"));

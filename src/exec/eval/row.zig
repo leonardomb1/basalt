@@ -136,7 +136,10 @@ pub fn intRem(a: i64, b: i64) error{DivByZero}!i64 {
     return @rem(a, b);
 }
 
+/// Text is no operand: the checker refuses it, and where a value's type is only
+/// known at run time (a JSON element in a lambda) it fails rather than reading as 0.
 pub fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
+    if (l == .string or r == .string) return error.TypeMismatch;
     if (l == .int and r == .int) {
         const a = l.int;
         const b = r.int;
@@ -283,7 +286,7 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
 }
 
 pub fn parseJson(arena: std.mem.Allocator, text: []const u8) EvalError!std.json.Value {
-    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e|
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .duplicate_field_behavior = .use_last }) catch |e|
         return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
 }
 

@@ -485,10 +485,12 @@ pub const per_row = struct {
         const nv = try evalRow(arena, c.args[2], batch, row);
         if (sv.isNull() or dv.isNull() or nv.isNull()) return .null;
         const delim = try valueToString(arena, dv);
-        if (delim.len == 0) return .null;
-        const want = toI64(nv);
+        const s = try valueToString(arena, sv);
+        var want = toI64(nv);
+        if (delim.len == 0) return Value{ .string = if (want == 1 or want == -1) try arena.dupe(u8, s) else "" };
+        if (want < 0) want += @as(i64, @intCast(std.mem.count(u8, s, delim))) + 2;
         if (want < 1) return Value{ .string = "" };
-        var it = std.mem.splitSequence(u8, try valueToString(arena, sv), delim);
+        var it = std.mem.splitSequence(u8, s, delim);
         var k: i64 = 0;
         while (it.next()) |part| {
             k += 1;
@@ -566,9 +568,12 @@ pub const per_row = struct {
             slots[0].* = try accNode(arena, acc, ty);
             slots[1].* = try literalOf(arena, try jsonElementValue(arena, el));
             slots[2].* = .{ .int_lit = idx };
-            const r = try evalRow(arena, body, batch, row);
+            const r = evalRow(arena, body, batch, row) catch |e| {
+                if (e != error.TypeMismatch) return e;
+                return failWith(e, "json_reduce: the lambda could not compute with element [{d}], {s} — text is not a number; CAST it or drop it with json_filter first", .{ idx, clip(el) });
+            };
             if (r == .float and (ty.kind == .int or ty.kind == .decimal) and !ty.unknown)
-                return failWith(error.CastFailed, "json_reduce: the lambda returned {d} into {s} accumulator — start from a FLOAT (0.0)", .{ r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
+                return failWith(error.CastFailed, "json_reduce: element [{d}], {s}, made the lambda return {d}, which {s} accumulator cannot hold — start from a FLOAT (0.0)", .{ idx, clip(el), r.float, if (ty.kind == .int) "an INT" else "a DECIMAL" });
             acc = if (r.isNull() or ty.unknown) r else try castValueTyped(arena, r, ty);
         }
         return acc;

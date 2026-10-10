@@ -360,7 +360,7 @@ test "analyze: a join with no `=` key is a range or nested-loop join, its ON che
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "nope") != null);
     diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, csv_data, r ++ "SELECT * FROM '$IN' JOIN r ON name BETWEEN rname AND rid", &diag));
-    try std.testing.expectEqualStrings("incomparable operands", diag.msg);
+    try std.testing.expectEqualStrings("cannot compare `name` (string) with `rid` (int) — CAST one side to the other's type", diag.msg);
 
     diag = Diag{};
     const remote = try analyzeCsv(a, csv_data, "WITH r AS (SELECT * FROM 'http://127.0.0.1:9/r.csv') SELECT * FROM '$IN' JOIN r ON id < r.rid", &diag);
@@ -425,6 +425,13 @@ test "analyze: a numeric aggregate refuses a non-numeric argument at plan time" 
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,d\n1,2024-01-01\n", "SELECT SUM(d) AS s FROM '$IN'", &diag));
     try std.testing.expectEqualStrings("`sum` needs a numeric argument, got date", diag.msg);
+    diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,d\n1,2.5\n", "SELECT bit_and(d) AS s FROM '$IN'", &diag));
+    try std.testing.expectEqualStrings("`bit_and` needs an INT argument, got float", diag.msg);
+    diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyzeCsv(a, "id,s\n1,x\n", "SELECT id FROM '$IN' WHERE s > 5", &diag));
+    try std.testing.expectEqualStrings("cannot compare `s` (string) with 5 (int) — CAST one side to the other's type", diag.msg);
+    try std.testing.expect(diag.pos != null);
     var ok = Diag{};
     _ = try analyzeCsv(a, "id,s\n1,x\n", "SELECT SUM(s) AS n, MIN(s) AS lo FROM '$IN'", &ok);
 }
