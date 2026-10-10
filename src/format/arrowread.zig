@@ -34,8 +34,10 @@
 //! dictionary encodings to their values, and the nested types — lists, structs,
 //! maps — to JSON text, so `json_get` and `UNNEST(JSON_EACH(...))` reach inside
 //! them. Every column is nullable: the bitmap is the truth. A null-typed column is
-//! an all-null `string`. Unions, run-end and list-view encodings are refused by
-//! name in `Reader.why`.
+//! an all-null `string`. A union is refused by name in `Reader.why` only when a
+//! column the query reads holds one; otherwise its buffers are stepped past (a
+//! dense union has offsets, and before IPC V5 a union has a validity buffer).
+//! Run-end and list-view encodings are refused by name whatever is read.
 //!
 //! A projection is a hint, as for parquet: an unknown name is ignored, and one
 //! that names none of the columns still reads rows. Only the first stream of a
@@ -159,6 +161,7 @@ const Kind = enum {
     fixed_list,
     struct_,
     map,
+    union_,
 };
 
 const Field = struct {
@@ -172,6 +175,7 @@ const Field = struct {
     fixed_size: usize = 0,
     dict: ?Dict = null,
     children: []Field = &.{},
+    dense: bool = false,
 
     const Dict = struct { id: i64, index_bits: u16, index_signed: bool };
 
@@ -186,7 +190,7 @@ const Field = struct {
             .timestamp => types.Type.init(.timestamp),
             .utf8, .large_utf8, .utf8_view => types.Type.init(.string),
             .binary, .large_binary, .binary_view, .fixed_binary => types.Type.init(.bytes),
-            .null_, .list, .large_list, .fixed_list, .struct_, .map => types.Type.init(.string),
+            .null_, .list, .large_list, .fixed_list, .struct_, .map, .union_ => types.Type.init(.string),
         };
         return t.asNullable();
     }
@@ -334,6 +338,10 @@ fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
         },
         .struct_ => out.kind = .struct_,
         .map => out.kind = .map,
+        .union_ => {
+            out.kind = .union_;
+            out.dense = if (t) |tt| (try tt.int(i16, 0, 0)) == 1 else false;
+        },
         else => {
             why.* = try std.fmt.allocPrint(arena, "column `{s}`: the Arrow {s} type is not supported", .{ out.name, tagName(tag) });
             return Error.UnsupportedArrow;
@@ -361,6 +369,13 @@ fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
     };
     if (want_children) |n| if (out.children.len != n) return Error.CorruptArrow;
     return out;
+}
+
+/// The name of a union a column holds, itself or nested, which reading it would need.
+fn unionIn(f: Field) ?[]const u8 {
+    if (f.kind == .union_) return f.name;
+    for (f.children) |c| if (unionIn(c)) |n| return n;
+    return null;
 }
 
 fn tagName(t: TypeTag) []const u8 {
@@ -395,6 +410,7 @@ const Walk = struct {
     bufs: Fb.Vec,
     variadic_counts: ?Fb.Vec,
     meta: []const u8,
+    version: i16,
     ni: usize = 0,
     bi: usize = 0,
     vi: usize = 0,
@@ -452,6 +468,12 @@ const Walk = struct {
             },
             .struct_ => {
                 a.bufs = try self.take(1);
+                a.children = try self.arena.alloc(Arr, f.children.len);
+                for (a.children, f.children) |*c, cf| c.* = try self.array(cf);
+            },
+            .union_ => {
+                const validity: usize = if (self.version < 4) 1 else 0;
+                a.bufs = try self.take(validity + @as(usize, if (f.dense) 2 else 1));
                 a.children = try self.arena.alloc(Arr, f.children.len);
                 for (a.children, f.children) |*c, cf| c.* = try self.array(cf);
             },
@@ -598,8 +620,19 @@ pub const Reader = struct {
             }
             try keep.append(i);
         }
-        if (keep.items.len == 0 and self.fields.len > 0) try keep.append(0);
+        if (keep.items.len == 0 and self.fields.len > 0) {
+            for (self.fields, 0..) |f, i| {
+                if (unionIn(f) == null) break try keep.append(i);
+            } else try keep.append(0);
+        }
         self.keep = try keep.toOwnedSlice();
+        for (self.keep) |i| if (unionIn(self.fields[i])) |u| {
+            const f = self.fields[i];
+            return self.refuse(if (f.kind == .union_)
+                try std.fmt.allocPrint(self.arena, "column `{s}`: the Arrow Union type is not supported", .{f.name})
+            else
+                try std.fmt.allocPrint(self.arena, "column `{s}`: its field `{s}` is an Arrow Union, which is not supported", .{ f.name, u }));
+        };
         const out = try self.arena.alloc(types.Schema.Field, self.keep.len);
         for (out, self.keep) |*o, i| o.* = .{ .name = self.fields[i].name, .ty = self.fields[i].basaltType() };
         self.schema = .{ .fields = out };
@@ -737,6 +770,7 @@ pub const Reader = struct {
             .bufs = (try rb.vector(2, 16)) orelse return Error.CorruptArrow,
             .variadic_counts = try rb.vector(4, 8),
             .meta = meta,
+            .version = try (try Fb.root(meta)).int(i16, 0, 0),
         };
     }
 
@@ -868,6 +902,7 @@ pub const Reader = struct {
         }
         switch (f.kind) {
             .null_ => {},
+            .union_ => return Error.UnsupportedArrow,
             .int, .float, .bool_, .decimal, .date_day, .date_ms, .time, .timestamp, .duration, .fixed_binary => {
                 cur.data = try bytesOf(arena, a.bufs[1], c);
                 const need: usize = switch (f.kind) {
@@ -999,6 +1034,7 @@ const Cursor = struct {
         }
         return switch (f.kind) {
             .null_ => .null,
+            .union_ => Error.UnsupportedArrow,
             .int => .{ .int = try intAt(self.data, i, f.bit_width, f.signed) },
             .duration => .{ .int = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
             .float => .{ .float = if (f.bit_width == 32)
@@ -1228,6 +1264,15 @@ test "a refusal names the column: a union, a delta dictionary" {
     const a = ar.allocator();
     try std.testing.expectError(Error.UnsupportedArrow, Reader.openBytes(a, @embedFile("testdata/union.arrow"), null));
     try std.testing.expectEqualStrings("column `u`: the Arrow Union type is not supported", eval.takeFailure(Error.UnsupportedArrow).?);
+    try std.testing.expectEqualStrings("x=1\nx=2\n", try dump(a, @embedFile("testdata/union.arrow"), &.{"x"}));
+    try std.testing.expectEqualStrings("x=1\nx=2\n", try dump(a, @embedFile("testdata/union.arrow"), &.{"nope"}));
+    for ([_][]const u8{ @embedFile("testdata/union_mixed_v5.arrow"), @embedFile("testdata/union_mixed_v4.arrows") }) |bytes| {
+        try std.testing.expectEqualStrings("a=1 b=w c=10.5\na=2 b=null c=11.5\na=null b=y c=12.5\na=4 b=z c=null\n", try dump(a, bytes, &.{ "a", "b", "c" }));
+        try std.testing.expectError(Error.UnsupportedArrow, dump(a, bytes, &.{"st"}));
+        try std.testing.expectEqualStrings("column `st`: its field `u` is an Arrow Union, which is not supported", eval.takeFailure(Error.UnsupportedArrow).?);
+        try std.testing.expectError(Error.UnsupportedArrow, dump(a, bytes, &.{ "a", "s" }));
+        try std.testing.expectEqualStrings("column `s`: the Arrow Union type is not supported", eval.takeFailure(Error.UnsupportedArrow).?);
+    }
     try std.testing.expectError(Error.UnsupportedArrow, dump(a, @embedFile("testdata/dict_delta.arrows"), null));
     try std.testing.expectEqualStrings("column `d`: delta dictionary batches (a dictionary extended mid-stream) are not supported", eval.takeFailure(Error.UnsupportedArrow).?);
 }

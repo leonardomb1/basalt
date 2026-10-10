@@ -73,8 +73,10 @@ dates, times, timestamps and durations in any unit as basalt's own
 (nanoseconds floor to the microsecond; a zoned timestamp is its UTC
 wall-clock). Dictionary-encoded columns — a polars `Categorical` — read as
 their values. Lists, structs and maps read as JSON text, so `json_get` and
-`CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them. Unions and run-end or list-view
-encodings are refused with the column named. Only the first stream of a
+`CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them. A union is refused with the
+column named when the query reads it (or a struct holding one); a file with a union
+column still reads every other column. Run-end and list-view encodings are refused
+with the column named. Only the first stream of a
 `.arrows` holding several is read. An Arrow read is one lane; `-j` does not
 split it yet.
 
