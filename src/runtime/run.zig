@@ -150,6 +150,7 @@ const runForEach = @import("script.zig").runForEach;
 const renderForSource = @import("script.zig").renderForSource;
 const runPrint = @import("script.zig").runPrint;
 const runThrow = @import("script.zig").runThrow;
+const runEarlyThrows = @import("script.zig").runEarlyThrows;
 
 const Scratch = @import("scratch.zig").Scratch;
 
@@ -234,6 +235,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
+    if (try analyze.misplacedDecl(arena, program.stmts[1..], .top)) |m| {
+        const e = planErr(diag, m.msg);
+        diag.pos = m.pos;
+        return e;
+    }
     if (runnable == 0 and !opts.declarations_only)
         return planErr(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`");
 
@@ -293,6 +299,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer if (env.progress != null) progress.stop();
 
     env.script_scope = try buildScriptScope(arena, &params);
+    try runEarlyThrows(&env, program.stmts[1..]);
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;

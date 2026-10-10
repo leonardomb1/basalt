@@ -780,6 +780,20 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
     try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
     try std.testing.expect(!bdiag.retryable);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "never.csv", 1 << 20));
+
+    const late = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}/early.csv' AS SELECT id FROM '{s}/in.csv';
+        \\THROW 'late';
+    , .{ base, base });
+    defer alloc.free(late);
+    const lprog = try parser.parseSource(parena.allocator(), late, &pdiag);
+    var ldiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, lprog, .{}, &ldiag));
+    try std.testing.expectEqualStrings("late", ldiag.msg);
+    try std.testing.expectEqual(@as(u32, 2), ldiag.pos.?.line);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "early.csv", 1 << 20));
+
+    try expectRefusedAlike(alloc, &tmp, "THROW 'x' WHEN 1;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW condition must be a boolean, got int");
 }
 
 test "PRINT runs at the top level and per row inside a FOR EACH body" {
@@ -1205,6 +1219,8 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PARAM n INT DEFAULT 'abc';\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "PARAM `n`: `abc` is not an integer" },
         .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
         .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LET y = 1;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
+        .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\n  LET y = 1;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
         .{ "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate PARAM `a`" },
         .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },

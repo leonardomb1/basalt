@@ -567,15 +567,46 @@ pub fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
         try values.append(kv.value_ptr.*);
     }
 
+    errdefer env.diag.stamp(t.pos);
     if (t.when) |w| {
         const c = eval.constEval(env.arena, w, names.items, values.items) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition: {s}", .{@errorName(e)}));
-        if (!(c == .bool and c.bool)) return;
+        if (c == .null) return;
+        if (c != .bool)
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))}));
+        if (!c.bool) return;
     }
     const m = eval.constEval(env.arena, t.message, names.items, values.items) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW message: {s}", .{@errorName(e)}));
     env.diag.retryable = false;
     return planErr(env.diag, try eval.valueToString(env.arena, m));
+}
+
+/// The top-level THROWs that read only PARAMs and expression LETs, decided before
+/// anything runs; the rest (over a query LET) fire where they stand.
+pub fn runEarlyThrows(env: *Env, stmts: []const ast.Stmt) anyerror!void {
+    for (stmts) |s| {
+        if (s != .throw) continue;
+        const known = for ([_]?*ast.Expr{ s.throw.when, s.throw.message }) |maybe| {
+            const e = maybe orelse continue;
+            if (!try readsOnlyParams(env, e)) break false;
+        } else true;
+        if (known) try runThrow(env, s.throw, no_loop_vars);
+    }
+}
+
+fn readsOnlyParams(env: *Env, e: *const ast.Expr) !bool {
+    const Walk = struct {
+        env: *Env,
+        ok: *bool,
+        fn recur(w: @This(), x: *const ast.Expr) anyerror!*ast.Expr {
+            if (x.* == .field and !(x.field.dollar and w.env.params.contains(x.field.parts[0]))) w.ok.* = false;
+            return ast.rebuildExpr(w.env.arena, x, w, recur);
+        }
+    };
+    var ok = true;
+    _ = try Walk.recur(.{ .env = env, .ok = &ok }, e);
+    return ok;
 }
 
 /// Run the body once per discovered row; `mode` (sequential|parallel) and

@@ -243,12 +243,21 @@ pub const Plan = struct {
 fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, diag: *Diag) Error!void {
     if (t.when) |w| {
         const c = eval.constEval(arena, try substExpr(arena, w, params), &.{}, &.{}) catch
-            return fail(diag, "THROW condition is not decidable at plan time", .{});
-        if (!(c == .bool and c.bool)) return;
+            return failPos(diag, t.pos, "THROW condition is not decidable at plan time", .{});
+        if (c == .null) return;
+        if (c != .bool)
+            return failPos(diag, t.pos, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
+        if (!c.bool) return;
     }
     const m = eval.constEval(arena, try substExpr(arena, t.message, params), &.{}, &.{}) catch
-        return fail(diag, "THROW message is not decidable at plan time", .{});
-    return fail(diag, "{s}", .{try eval.valueToString(arena, m)});
+        return failPos(diag, t.pos, "THROW message is not decidable at plan time", .{});
+    return failPos(diag, t.pos, "{s}", .{try eval.valueToString(arena, m)});
+}
+
+fn failPos(diag: *Diag, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+    const e = fail(diag, fmt, args);
+    diag.pos = pos;
+    return e;
 }
 
 pub const ParamOverride = struct { name: []const u8, value: []const u8 };
@@ -614,6 +623,38 @@ fn countOutputs(stmts: []const ast.Stmt) usize {
         else => 0,
     };
     return n;
+}
+
+pub const Misplaced = struct { msg: []const u8, pos: ?ast.Pos };
+
+/// The first declaration standing where it may not, by `Ctx.checkStmts`'s rules: a
+/// CASE arm (`arm`) holds no LET, PARAM or function, a FOR EACH or statement-function
+/// body (`body`) only queries and script statements. The run asks this up front, so a
+/// body that never executes is refused as `check` refuses it.
+pub fn misplacedDecl(arena: std.mem.Allocator, stmts: []const ast.Stmt, where: enum { top, arm, body }) Error!?Misplaced {
+    for (stmts) |s| {
+        const inner: ?Misplaced = switch (s) {
+            .for_each => |fe| try misplacedDecl(arena, fe.body, .body),
+            .match => |m| for (m.arms) |arm| {
+                if (try misplacedDecl(arena, arm.body, if (where == .body) .body else .arm)) |x| break x;
+            } else null,
+            .func => |fd| switch (where) {
+                .top => if (fd.body == .stmts) try misplacedDecl(arena, fd.body.stmts, .body) else null,
+                .arm => .{ .pos = fd.pos, .msg = try std.fmt.allocPrint(arena, "function `{s}` must be declared at the top level of the script", .{fd.name}) },
+                .body => .{ .pos = fd.pos, .msg = body_stmt_rule },
+            },
+            .let_const => |l| if (where == .top) null else .{ .pos = l.pos, .msg = try std.fmt.allocPrint(arena, "LET `{s}` must be declared at the top level of the script", .{l.name}) },
+            .param => |pd| switch (where) {
+                .top => null,
+                .arm => .{ .pos = pd.pos, .msg = try std.fmt.allocPrint(arena, "PARAM `{s}` must be declared at the top level of the script", .{pd.name}) },
+                .body => .{ .pos = pd.pos, .msg = body_stmt_rule },
+            },
+            .kind, .connection => if (where == .body) .{ .pos = stmtPos(s), .msg = body_stmt_rule } else null,
+            else => null,
+        };
+        if (inner) |x| return x;
+    }
+    return null;
 }
 
 pub fn stmtPos(s: ast.Stmt) ?ast.Pos {
