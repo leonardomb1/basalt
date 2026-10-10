@@ -398,6 +398,8 @@ test "GROUP BY, HAVING and ORDER BY bind only the same expression; unselected ke
         .{ .in = q_csv, .q = "SELECT cat, count_if(cat = 'x') AS a FROM '$IN' GROUP BY cat HAVING count_if(cat = 'X') > 0", .want = "cat,a\n" },
         .{ .in = q_csv, .q = "SELECT replace(cat, 'y', 'A') AS r FROM '$IN' WHERE cat <> '' ORDER BY replace(cat, 'Y', 'A')", .want = "r\nx\nx\nA\n" },
         .{ .in = q_csv, .q = "SELECT cat FROM '$IN' GROUP BY cat HAVING COUNT(*) > 1", .want = "cat\nx\n" },
+        .{ .in = q_csv, .q = "SELECT count(*) AS n FROM '$IN' GROUP BY replace(cat, 'x', 'A'), replace(cat, 'x', 'a') ORDER BY n", .want = "n\n1\n1\n2\n" },
+        .{ .in = q_csv, .q = "SELECT upper(cat) AS u, count(*) AS n FROM '$IN' GROUP BY upper(cat) HAVING sum(\"Valor Total\") > 15 ORDER BY u", .want = "u,n\nX,2\nY,1\n" },
         .{ .in = q_csv, .q = "SELECT \"Valor Total\" AS v FROM '$IN' ORDER BY \"Valor Total\" - 1", .want = "v\n-5\n10\n20\n30\n" },
         .{ .in = q_csv, .q = "SELECT cat, \"Valor Total\" AS v FROM '$IN' ORDER BY 2 DESC", .want = "cat,v\nx,30\ny,20\nx,10\n,-5\n" },
         .{ .in = q_csv, .q = "SELECT cat FROM '$IN' WHERE cat <> '' ORDER BY cat || 'a' DESC", .want = "cat\ny\nx\nx\n" },

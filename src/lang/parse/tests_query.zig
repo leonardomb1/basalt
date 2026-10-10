@@ -546,7 +546,7 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     const ai = aggStageIndex(st);
     const agg = st[ai].node.aggregate;
     try testing.expectEqual(@as(usize, 1), agg.aggs.len);
-    try testing.expectEqualStrings("#avg(v)", agg.aggs[0].name);
+    try testing.expectEqualStrings("__a1", agg.aggs[0].name);
     try testing.expectEqual(ast.AggFunc.avg, agg.aggs[0].func);
 
     const sel = st[ai + 1].node.select;
@@ -554,7 +554,7 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     try testing.expectEqualStrings("g", sel[0].field.last());
     try testing.expectEqualStrings("m", sel[1].computed.name);
     const arg0 = sel[1].computed.expr.call.args[0];
-    try testing.expectEqualStrings("#avg(v)", arg0.field.last());
+    try testing.expectEqualStrings("__a1", arg0.field.last());
 }
 
 test "sql: one aggregate mentioned twice becomes a single output column" {
@@ -580,7 +580,7 @@ test "sql: HAVING may name an aggregate the SELECT list omits" {
     const ai = aggStageIndex(st);
     const agg = st[ai].node.aggregate;
     try testing.expectEqual(@as(usize, 2), agg.aggs.len);
-    try testing.expectEqualStrings("#count(*)", agg.aggs[1].name);
+    try testing.expectEqualStrings("__a1", agg.aggs[1].name);
 
     const sel = st[ai + 2].node.select;
     try testing.expectEqual(@as(usize, 2), sel.len);
@@ -711,7 +711,7 @@ test "sql: an expression's name keeps its string literals, so distinct expressio
     const prog = try parseTest(a, "SELECT upper('cat'), COUNT(*) FROM 'x.csv' GROUP BY upper(cat);");
     const st = firstPipelineStages(prog);
     const agg = st[aggStageIndex(st)].node.aggregate;
-    try testing.expectEqualStrings("#upper(cat)", agg.by[0].last());
+    try testing.expectEqualStrings("__a1", agg.by[0].last());
     const post = st[st.len - 2].node.select;
     try testing.expectEqualStrings("upper('cat')", post[0].computed.name);
 

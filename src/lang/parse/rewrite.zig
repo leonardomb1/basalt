@@ -217,14 +217,18 @@ fn quoteInto(buf: *std.array_list.Managed(u8), s: []const u8, q: u8) Error!void 
 
 pub const Bound = struct { name: []const u8, item: bool };
 
-/// The name `e` binds to: the SELECT item it repeats, else its key marked `#` so it
-/// does not pass for an item's name.
+/// The name `e` binds to: the SELECT item it repeats, else a hidden `__aN` that every
+/// mention of the same expression shares. Hidden names stay plain, as a pushed-down
+/// query writes them as aliases.
 pub fn bindName(self: *Parser, e: *const ast.Expr, map: []const ExprAlias) Error!Bound {
     var buf = std.array_list.Managed(u8).init(self.arena);
     try self.exprKey(e, &buf);
     for (map) |m| if (std.mem.eql(u8, m.synth, buf.items)) return .{ .name = m.out, .item = true };
-    try buf.insert(0, '#');
-    return .{ .name = try buf.toOwnedSlice(), .item = false };
+    for (self.hidden_keys.items) |hk| if (std.mem.eql(u8, hk[0], buf.items)) return .{ .name = hk[1], .item = false };
+    self.derived_n += 1;
+    const name = try std.fmt.allocPrint(self.arena, "__a{d}", .{self.derived_n});
+    try self.hidden_keys.append(self.arena, .{ try buf.toOwnedSlice(), name });
+    return .{ .name = name, .item = false };
 }
 
 /// Whether an aggregate call is buried inside an expression, as in `round(avg(x), 2)`.

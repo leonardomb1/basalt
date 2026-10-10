@@ -200,7 +200,6 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         try self.expectKw("by");
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
-        var computed_keys = std.array_list.Managed([]const u8).init(self.arena);
         while (true) {
             var q: ast.QualName = undefined;
             if (self.isKw("identifier") and self.peekTag() == .lparen) {
@@ -236,16 +235,8 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         if (!b.item) {
                             if (containsAgg(e))
                                 return self.fail(kpos, "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
-                            const at = for (computed_keys.items, 0..) |k, i| {
-                                if (std.mem.eql(u8, k, b.name)) break i;
-                            } else blk: {
-                                self.derived_n += 1;
-                                const name = try std.fmt.allocPrint(self.arena, "__ob{d}", .{self.derived_n});
-                                try computed.append(.{ .computed = .{ .name = name, .expr = try self.stripExpr(e, &first.aliases) } });
-                                try computed_keys.append(b.name);
-                                break :blk computed.items.len - 1;
-                            };
-                            q = try self.singleName(computed.items[at].computed.name);
+                            if (!providesName(computed.items, b.name))
+                                try computed.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(e, &first.aliases) } });
                         }
                     },
                 }

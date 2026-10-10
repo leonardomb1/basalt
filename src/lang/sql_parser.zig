@@ -330,6 +330,7 @@ pub const Parser = struct {
     const_names: std.array_list.Managed([]const u8) = undefined,
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
     derived_n: usize = 0,
+    hidden_keys: std.ArrayList([2][]const u8) = .empty,
     pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
     in_where: bool = false,
     win_sink: ?*std.array_list.Managed(WinCall) = null,
