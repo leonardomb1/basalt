@@ -1013,7 +1013,7 @@ fi
 # opaque rejection instead of being told the keyword was wrong.
 if $B run -q -c "CREATE CONNECTION c TYPE sqlserver OPTIONS (host='h', database='d', auth='ntlmv2', tls='require'); SELECT 1 AS x FROM c.QUERY(\$\$SELECT 1\$\$);" >"$out/ntlm_typo.log" 2>&1; then
   report "ntlm-auth-typo (accepted unknown mode)" bad
-elif grep -q 'must be "sql", "aad" or "ntlm"' "$out/ntlm_typo.log"; then
+elif grep -q 'must be "sql", "aad", "ntlm" or "kerberos"' "$out/ntlm_typo.log"; then
   report ntlm-auth-typo ok
 else
   report "ntlm-auth-typo (wrong error)" bad; head -2 "$out/ntlm_typo.log"
@@ -1117,7 +1117,7 @@ SELECT id, name, amt, flag FROM 'src/format/testdata/$c.parquet' ORDER BY id;"; 
   rm -f "$out/dec_impossible.parquet"
   if $B run -q -c "LOAD INTO '$out/dec_impossible.parquet' AS SELECT CAST(v AS DECIMAL(10,12)) AS d FROM '$out/dec_in.csv';" >"$out/dec_bad.log" 2>&1; then
     report "parquet-decimal-impossible (scale > precision was accepted)" bad
-  elif grep -q "UnsupportedParquetDecimal" "$out/dec_bad.log"; then
+  elif grep -q "DECIMAL scale 12 is larger than its precision 10" "$out/dec_bad.log" && [ ! -e "$out/dec_impossible.parquet" ]; then
     report parquet-decimal-impossible ok
   else
     report "parquet-decimal-impossible (wrong message)" bad
