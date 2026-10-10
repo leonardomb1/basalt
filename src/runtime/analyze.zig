@@ -570,7 +570,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     };
     try bindBodyVars(arena, program.stmts, &params_map);
 
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -727,9 +727,26 @@ const Ctx = struct {
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
     params: *const ParamMap,
+    lets: ?*ParamMap = null,
     diag: *Diag,
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
+
+    /// A query LET is checked where it stands, as the run queries it there, and
+    /// `$name` then reads as a null of its one column's type when that is known.
+    fn checkQueryLet(self: *Ctx, l: ast.LetConst) Error!void {
+        const q = l.query orelse return;
+        const stages = try self.arena.alloc(ast.Stage, q.stages.len + 1);
+        @memcpy(stages[0..q.stages.len], q.stages);
+        stages[q.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = q.pos };
+        const o = try self.attempt(self.analyzeOutput(.{ .stages = stages, .pos = q.pos })) orelse return;
+        if (o.stages.len == 0) return;
+        const schema = o.stages[o.stages.len - 1].out_schema orelse return;
+        if (schema.fields.len != 1) return;
+        const lets = self.lets orelse return;
+        const nul = try mk(self.arena, .null_lit);
+        try lets.put(l.name, try mk(self.arena, .{ .cast = .{ .e = @constCast(nul), .ty = schema.fields[0].ty.asNullable() } }));
+    }
 
     /// A statement's failure: recorded and the caller goes on, or, without an issue
     /// list, returned as the analysis's error.
@@ -773,7 +790,10 @@ const Ctx = struct {
             .func => |fd| if (!top)
                 try self.note(self.failAt(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
             else if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
-            .let_const => |l| if (!top) try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
+            .let_const => |l| if (!top)
+                try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}))
+            else
+                try self.checkQueryLet(l),
             .param => |pd| if (!top) try self.note(self.failAt(pd.pos, "PARAM `{s}` must be declared at the top level of the script", .{pd.name})),
             .kind, .connection, .call, .throw, .print => {},
         };

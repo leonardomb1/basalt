@@ -615,3 +615,25 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     var none = ParamMap.init(a);
     try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
 }
+
+test "analyze: a query LET is checked where it stands and `$name` takes its column's type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const ok = try std.fmt.allocPrint(a, "LET q = (SELECT count(*) AS c FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    var diag = Diag{};
+    const plan = try analyze(a, try parse(a, ok), &diag);
+    const out = plan.outputs[0].stages[plan.outputs[0].stages.len - 1].out_schema.?;
+    try std.testing.expectEqual(types.TypeKind.int, out.fields[0].ty.kind);
+
+    const bad = try std.fmt.allocPrint(a, "LET q = (SELECT nope FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    var bdiag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &bdiag));
+    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "unknown field `nope`") != null);
+}
