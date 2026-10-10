@@ -15,7 +15,6 @@ const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
 const evalCfgStr = @import("register.zig").evalCfgStr;
-const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const forHintName = @import("../env.zig").forHintName;
 const ftp = @import("../../store/ftp.zig");
