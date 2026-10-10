@@ -295,8 +295,9 @@ pub fn asDecimal(v: Value) ?Decimal {
 pub fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZero }!Decimal {
     const r: Decimal = switch (op) {
         .mul => blk: {
-            const p = @as(i256, a.unscaled) * b.unscaled;
             const s = @as(u16, a.scale) + b.scale;
+            if (s <= max_digits) if (std.math.mul(i128, a.unscaled, b.unscaled)) |u| break :blk .{ .unscaled = u, .scale = @intCast(s) } else |_| {};
+            const p = @as(i256, a.unscaled) * b.unscaled;
             const drop = s -| max_digits;
             const q = if (drop == 0) p else roundDown256(p, drop);
             break :blk .{ .unscaled = std.math.cast(i128, q) orelse return decimalOverflow(), .scale = @intCast(s - drop) };

@@ -49,12 +49,25 @@ pub const Decimal = struct {
         const up_a = a.scale < b.scale;
         const diff: u8 = if (up_a) b.scale - a.scale else a.scale - b.scale;
         const raised: i128 = if (up_a) a.unscaled else b.unscaled;
+        if (diff < 39) if (std.math.mul(i128, raised, pow10_i128[diff])) |r| {
+            return if (up_a) std.math.order(r, b.unscaled) else std.math.order(a.unscaled, r);
+        } else |_| {};
         const other: i256 = if (up_a) b.unscaled else a.unscaled;
         const big: i256 = if (diff < pow10_i256.len)
             std.math.mul(i256, raised, pow10_i256[diff]) catch @as(i256, std.math.sign(raised)) * std.math.maxInt(i256)
         else if (raised == 0) 0 else @as(i256, std.math.sign(raised)) * std.math.maxInt(i256);
         return if (up_a) std.math.order(big, other) else std.math.order(other, big);
     }
+};
+
+const pow10_i128 = blk: {
+    var t: [39]i128 = undefined;
+    var r: i128 = 1;
+    for (&t) |*e| {
+        e.* = r;
+        r *%= 10;
+    }
+    break :blk t;
 };
 
 pub const pow10_i256 = blk: {

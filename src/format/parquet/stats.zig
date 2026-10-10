@@ -324,6 +324,19 @@ test "row groups are skipped only when statistics prove no row can match" {
     try testing.expect(groupMayMatch(&schema, &leaves, g, &gt_keep));
     try testing.expect(!groupMayMatch(&schema, &leaves, g, &gt_drop));
 
+    const dec = struct {
+        fn b(op: Bound.Op, unscaled: i128, scale: u8) [1]Bound {
+            return .{.{ .column = "id", .op = op, .value = .{ .decimal = .{ .unscaled = unscaled, .scale = scale } } }};
+        }
+    }.b;
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &dec(.gt, 19995, 2)));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &dec(.gt, 2000, 1)));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &dec(.ge, 20001, 2)));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &dec(.lt, 1005, 1)));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &dec(.lt, 1000, 1)));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &dec(.le, -15, 1)));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &dec(.eq, 15000, 2)));
+
     var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
     const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupMayMatch(&schema, &leaves, g2, &drop));

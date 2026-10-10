@@ -697,6 +697,25 @@ test "translateExpr: AND of comparisons, per-dialect quoting" {
     try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
 }
 
+test "translateExpr: a decimal literal is sent with every digit it was written with, in every dialect" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { lit: ast.Expr.DecLit, want: []const u8 };
+    const cases = [_]Case{
+        .{ .lit = .{ .unscaled = 1000, .scale = 2 }, .want = "10.00" },
+        .{ .lit = .{ .unscaled = 5, .scale = 1 }, .want = "0.5" },
+        .{ .lit = .{ .unscaled = 5, .scale = 3 }, .want = "0.005" },
+        .{ .lit = .{ .unscaled = 12345678901234567890123456789012345678, .scale = 10 }, .want = "1234567890123456789012345678.9012345678" },
+    };
+    for (cases) |c| for ([_]Dialect{ .postgres, .mysql, .sqlserver, .starrocks }) |d| {
+        const lit = try a.create(ast.Expr);
+        lit.* = .{ .dec_lit = c.lit };
+        const got = (try translateExpr(a, try bin(a, .gt, try fld(a, "a"), lit), d, testSchema(), true)).?;
+        try testing.expect(std.mem.endsWith(u8, got, try std.fmt.allocPrint(a, " > {s})", .{c.want})));
+    };
+}
+
 test "translateExpr: a quoted literal against a number or bool column is sent as that type's literal" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
