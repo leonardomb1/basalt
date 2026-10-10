@@ -164,8 +164,12 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
                 lhs = try self.mk(.{ .is_null = .{ .e = lhs, .negated = negated, .kind = .is_null } });
             } else if (self.eatKw("empty")) {
                 lhs = try self.mk(.{ .is_null = .{ .e = lhs, .negated = negated, .kind = .is_empty } });
+            } else if (self.eatKw("distinct")) {
+                try self.expectKw("from");
+                const rhs = try self.parseBin(40);
+                lhs = try self.mk(.{ .binary = .{ .op = if (negated) .not_distinct else .distinct, .l = lhs, .r = rhs } });
             } else {
-                return self.fail(self.curPos(), "expected NULL or EMPTY after IS", .{});
+                return self.fail(self.curPos(), "expected NULL, EMPTY or DISTINCT FROM after IS", .{});
             }
             continue;
         }

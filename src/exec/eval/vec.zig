@@ -292,7 +292,7 @@ fn isNullVec(arena: std.mem.Allocator, n: ast.Expr.IsNull, batch: Batch) VecErro
 fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecError!Vec {
     switch (b.op) {
         .@"and", .@"or" => return boolOpVec(arena, b.op, b.l, b.r, batch),
-        .bit_and, .bit_or, .bit_xor, .shl, .shr => return error.Unsupported,
+        .bit_and, .bit_or, .bit_xor, .shl, .shr, .distinct, .not_distinct => return error.Unsupported,
         .add, .sub, .mul, .div, .mod => {
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);

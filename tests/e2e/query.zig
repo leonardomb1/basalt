@@ -1669,3 +1669,35 @@ test "where: a quoted literal against a number or bool is read as one, exactly; 
     try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE id = '1.5';", "`1.5` is not a valid int literal");
     try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(id AS STRING) = id;", "cannot compare");
 }
+
+test "where: IS [NOT] DISTINCT FROM compares with nulls as values, never null itself; NULL keys never match a join" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,b\n1,p\n3,q\n,r\n" });
+    const in = "a,k\nx,1\ny,2\nz,\n";
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT a FROM '$IN' WHERE k IS DISTINCT FROM 1", .want = "a\ny\nz\n" },
+        .{ .q = "SELECT a FROM '$IN' WHERE k IS NOT DISTINCT FROM NULL", .want = "a\nz\n" },
+        .{ .q = "SELECT a, k IS DISTINCT FROM 2 AS d, k = 2 AS e FROM '$IN'", .want = "a,d,e\nx,true,false\ny,false,true\nz,true,\n" },
+        .{ .q = "SELECT a FROM '$IN' WHERE NOT (k IS DISTINCT FROM '2')", .want = "a\ny\n" },
+        .{ .q = "SELECT l.a, r.b FROM '$IN' l LEFT JOIN '$B/r.csv' r ON l.k IS NOT DISTINCT FROM r.k", .want = "a,b\nx,p\ny,\nz,r\n" },
+        .{ .q = "SELECT l.a, r.b FROM '$IN' l LEFT JOIN '$B/r.csv' r ON l.k = r.k", .want = "a,b\nx,p\ny,\nz,\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l ANTI JOIN '$B/r.csv' r ON l.k = r.k", .want = "a\ny\nz\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv')", .want = "a\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 5)", .want = "a\nx\ny\nz\n" },
+    };
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const out = try runToString(alloc, &tmp, in, q);
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+}

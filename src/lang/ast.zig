@@ -80,7 +80,9 @@ pub const QualName = struct {
     }
 };
 
-pub const BinOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, shl, shr, eq, ne, lt, le, gt, ge, @"and", @"or" };
+/// `distinct` and `not_distinct` are `IS [NOT] DISTINCT FROM`: `<>` and `=` that treat
+/// two nulls as equal and a null as unequal to any value, never null themselves.
+pub const BinOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, shl, shr, eq, ne, lt, le, gt, ge, @"and", @"or", distinct, not_distinct };
 pub const UnOp = enum { neg, not, bit_not };
 
 pub const Expr = union(enum) {

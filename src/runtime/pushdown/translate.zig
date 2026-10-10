@@ -195,6 +195,7 @@ const Tx = struct {
                     return try self.fmt("({s} {s} {s})", .{ l orelse return null, if (b.op == .@"and") "AND" else "OR", r orelse return null });
                 },
                 .eq, .ne, .lt, .le, .gt, .ge => return self.compare(b.op, b.l, b.r, need),
+                .distinct, .not_distinct => return self.distinctPred(b.op, b.l, b.r, need),
                 else => return null,
             },
             .unary => |u| {
@@ -407,6 +408,29 @@ const Tx = struct {
             },
             else => return self.value(&.{ .str_lit = lit }),
         }
+    }
+
+    /// `IS [NOT] DISTINCT FROM` where the source has it: PostgreSQL as written, the
+    /// MySQL family as `<=>`; SQL Server before 2022 has neither, so it stays in the
+    /// engine there. Over text, or a type not known and met by no number, only the
+    /// side a folding collation errs toward is sent; against NULL it is exact.
+    fn distinctPred(self: Tx, op: ast.BinOp, l: *const ast.Expr, r: *const ast.Expr, need: Need) Err!?[]const u8 {
+        const lk = self.kind(l);
+        const rk = self.kind(r);
+        const numeric = (isLit(l) or isLit(r)) and lk != .text and rk != .text;
+        const exact_kind = (lk == .other and rk == .other) or numeric or l.* == .null_lit or r.* == .null_lit;
+        const settled = (op == .not_distinct and need == .superset) or (op == .distinct and need == .subset);
+        if (!exact_kind and !settled) return null;
+        const ls = (try self.value(l)) orelse return null;
+        const rs = (try self.value(r)) orelse return null;
+        return switch (self.dialect) {
+            .postgres => try self.fmt("({s} IS {s}DISTINCT FROM {s})", .{ ls, if (op == .not_distinct) "NOT " else "", rs }),
+            .mysql, .starrocks, .doris => if (op == .not_distinct)
+                try self.fmt("({s} <=> {s})", .{ ls, rs })
+            else
+                try self.fmt("(NOT ({s} <=> {s}))", .{ ls, rs }),
+            .sqlserver => null,
+        };
     }
 
     /// `col op 'L'` over text. Under padding the shorter side compares as if
@@ -691,6 +715,21 @@ test "translateExpr: a quoted literal against a number or bool column is sent as
         const got = try translateExpr(a, try bin(a, c.op, try fld(a, c.col), lit), c.d, sch, true);
         if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
     }
+}
+
+test "translateExpr: IS [NOT] DISTINCT FROM is native on postgres, `<=>` on the MySQL family, engine-side on sqlserver" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = try a.create(ast.Expr);
+    lit.* = .{ .int_lit = 5 };
+    const nd = try bin(a, .not_distinct, try fld(a, "a"), lit);
+    const d = try bin(a, .distinct, try fld(a, "a"), lit);
+    try testing.expectEqualStrings("(\"a\" IS NOT DISTINCT FROM 5)", (try translateExpr(a, nd, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(\"a\" IS DISTINCT FROM 5)", (try translateExpr(a, d, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(`a` <=> 5)", (try translateExpr(a, nd, .mysql, testSchema(), true)).?);
+    try testing.expectEqualStrings("(NOT (`a` <=> 5))", (try translateExpr(a, d, .starrocks, testSchema(), true)).?);
+    try testing.expect((try translateExpr(a, d, .sqlserver, testSchema(), true)) == null);
 }
 
 test "translateExpr: is not null" {

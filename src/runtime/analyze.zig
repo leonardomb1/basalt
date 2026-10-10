@@ -166,7 +166,7 @@ fn coerceRecur(cx: CoerceCtx, e: *const ast.Expr) Error!*ast.Expr {
     const out = try ast.rebuildExpr(cx.arena, e, cx, coerceRecur);
     if (out.* != .binary) return out;
     switch (out.binary.op) {
-        .eq, .ne, .lt, .le, .gt, .ge => {},
+        .eq, .ne, .lt, .le, .gt, .ge, .distinct, .not_distinct => {},
         else => return out,
     }
     const b = out.binary;

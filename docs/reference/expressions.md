@@ -4,6 +4,12 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT ~` → `* / %` →
 `+ - ||` → `<< >>` → `&` → `^` → `|` → comparisons
 `= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
 
+**Nulls** follow SQL's three-valued logic: a comparison with a null is null,
+which a `WHERE`, an `ON` or a `CASE WHEN` treats as false — so a null join key
+never matches, under any join kind, and `x NOT IN (1, NULL)` keeps no row. `AND`
+and `OR` are null only when the other side does not decide them (`false AND
+null` is false, `true OR null` true).
+
 **Scope rule:** `$name` is script/environment scope — a PARAM, a LET, or (in a
 `FOR EACH ROW OF` / statement-function body) a loop variable, resolved at plan
 time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases —
@@ -28,6 +34,12 @@ columns it has not seen.
 - `IF(c, a, b)` kept as sugar.
 - `x IS [NOT] NULL` · `x IS [NOT] EMPTY` (true when null **or** `''`; string
   operands only — handy for loop values).
+- `a IS [NOT] DISTINCT FROM b` — the null-safe `<>` (`=`): two nulls are not
+  distinct, a null and a value are, and the answer is never null.
+  `ON l.k IS NOT DISTINCT FROM r.k` pairs null keys too (as a join without a
+  key). The operands compare as `=` would, a quoted literal included; it pushes
+  down to PostgreSQL as written and to MySQL, StarRocks and Doris as `<=>`, and
+  stays in the engine on SQL Server.
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
 - `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
   `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text

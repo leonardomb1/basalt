@@ -191,13 +191,13 @@ pub const TypeCtx = struct {
                 if (!(intish(lt) and intish(rt))) return self.err("bitwise operators need INT operands", .{});
                 return Type{ .kind = .int, .nullable = nn };
             },
-            .eq, .ne, .lt, .le, .gt, .ge => {
+            .eq, .ne, .lt, .le, .gt, .ge, .distinct, .not_distinct => {
                 if (!comparable(lt, rt) and
                     !try self.temporalLit(b.r, lt) and
                     !try self.temporalLit(b.l, rt) and
                     !try self.typedLit(b.r, lt) and
                     !try self.typedLit(b.l, rt)) return self.incomparable(b, lt, rt);
-                return Type{ .kind = .bool, .nullable = nn };
+                return Type{ .kind = .bool, .nullable = nn and b.op != .distinct and b.op != .not_distinct };
             },
             .@"and", .@"or" => {
                 if (!(boolish(lt) and boolish(rt))) return self.err("`and`/`or` need bool operands", .{});

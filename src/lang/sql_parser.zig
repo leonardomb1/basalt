@@ -864,6 +864,8 @@ pub fn binOpText(op: ast.BinOp) []const u8 {
         .bit_xor => "^",
         .shl => "<<",
         .shr => ">>",
+        .distinct => "IS DISTINCT FROM",
+        .not_distinct => "IS NOT DISTINCT FROM",
     };
 }
 
