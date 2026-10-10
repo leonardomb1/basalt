@@ -543,6 +543,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         } else try self.claimAlias(&aliases, binding, bpos, .reserved);
         var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
         var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);
+        var pins = std.array_list.Managed(ast.KeyPin).init(self.arena);
         var post_filters = std.array_list.Managed(*ast.Expr).init(self.arena);
         var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
@@ -554,6 +555,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const rp = try self.arena.alloc([]const u8, 1);
             rp[0] = lk.right;
             try right_keys.append(.{ .parts = rp });
+            try pins.append(.{ .left = true, .right = true });
         }
         if (lateral and lateral_keys.len > 0 and kind == .cross) kind = .inner;
         if (lateral and self.isKw("on") and self.peekTag() == .ident and eqlNoCase(self.peekTok().text, "true")) {
@@ -593,12 +595,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 {
                     const a = c.binary.l.field;
                     const b = c.binary.r.field;
-                    const a_right = qualHasPrefix(a, rname);
-                    if (a_right != qualHasPrefix(b, rname) or (!a_right and (a.parts.len == 1 or b.parts.len == 1))) {
-                        const l = if (a_right) b else a;
-                        const r = if (a_right) a else b;
+                    const sa = keySide(a, rname);
+                    const sb = keySide(b, rname);
+                    if (sa != sb or sa == .loose) {
+                        const flip = sa == .right or sb == .left;
+                        const l = if (flip) b else a;
+                        const r = if (flip) a else b;
                         try left_keys.append(stripQual(l, &aliases));
                         try right_keys.append(stripPrefix(r, rname));
+                        try pins.append(.{ .left = keySide(l, rname) == .left, .right = keySide(r, rname) == .right });
                         continue;
                     }
                 }
@@ -612,6 +617,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     if ((l_left and r_right) or (l_right and r_left)) {
                         const le = if (l_left) c.binary.l else c.binary.r;
                         const re = if (l_left) c.binary.r else c.binary.l;
+                        try pins.append(.{ .left = le.* == .field and le.field.parts.len > 1, .right = true });
                         if (le.* == .field) {
                             try left_keys.append(stripQual(le.field, &aliases));
                         } else {
@@ -645,6 +651,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                             .left_name = ln,
                             .right_name = rn,
                             .pos = .{ .line = opos.line, .col = opos.col },
+                            .a_left = try self.hasQualField(c.binary.l),
+                            .b_left = try self.hasQualField(c.binary.r),
                         });
                         try key_cols.append(ln);
                         try key_cols.append(rn);
@@ -701,6 +709,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .alias = jalias orelse binding,
                 .left_keys = try left_keys.toOwnedSlice(),
                 .right_keys = try right_keys.toOwnedSlice(),
+                .pins = try pins.toOwnedSlice(),
                 .deferred = try deferred.toOwnedSlice(),
                 .residual = residual,
             } },
@@ -742,6 +751,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     .binding = sj.binding,
                     .left_keys = lk,
                     .right_keys = rk,
+                    .pins = &.{.{ .left = true, .right = true }},
                     .null_aware = sj.negated,
                 } },
                 .hints = &.{},
@@ -1069,6 +1079,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
+}
+
+const KeySide = enum { left, right, loose };
+
+/// The side an ON key column names by its qualifier: the joined table's (`rname.x`),
+/// any other table's, or none written.
+fn keySide(q: ast.QualName, rname: []const u8) KeySide {
+    if (q.parts.len == 1) return .loose;
+    return if (qualHasPrefix(q, rname)) .right else .left;
 }
 
 /// Whether a projection already yields a column called `name`, so a window's

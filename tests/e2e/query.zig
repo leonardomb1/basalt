@@ -1512,6 +1512,23 @@ fn runQualCases(cases: []const QualCase) !void {
     }
 }
 
+test "join: qualified keys bind to their side, a self-join too; an unqualified name on both sides is refused" {
+    try runQualCases(&.{
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e LEFT JOIN '$B/emp.csv' m ON m.id = e.mgr ORDER BY e.id", .want = "name,mname\nboss,\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN (SELECT * FROM '$B/emp.csv') m ON m.id = e.mgr ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "WITH c AS (SELECT * FROM '$B/emp.csv') SELECT e.name, m.name AS mname FROM '$B/emp.csv' e LEFT JOIN c m ON e.mgr = m.id ORDER BY e.id", .want = "name,mname\nboss,\nann,boss\nbob,boss\ncy,ann\n" },
+        .{ .q = "SELECT e.name, g.name AS gname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id JOIN '$B/emp.csv' g ON m.mgr = g.id", .want = "name,gname\ncy,boss\n" },
+        .{ .q = "SELECT e.name, m.name AS mname FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON CAST(id AS string) = trim(CAST(e.mgr AS string)) ORDER BY e.id", .want = "name,mname\nann,boss\nbob,boss\ncy,ann\n" },
+    });
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c1.csv", .data = "code,a\nx,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c2.csv", .data = "code,b\nx,2\n" });
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/c1.csv' a JOIN '$B/c2.csv' b ON code = code;", "join key `code` is ambiguous");
+}
+
 test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
     try runQualCases(&.{
         .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\nu,a\n" },
