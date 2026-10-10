@@ -32,8 +32,12 @@ AS
   needs a table read on a SQL source that exposes it). An empty/unresolved
   upsert key is an error, never a silent no-op.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
-  a bare `LOAD INTO 'x.csv'`, like `REPLACE`, creates or truncates the file, so
-  a rerun replaces it. Explicit `APPEND` accumulates for CSV only: the file is
+  a bare `LOAD INTO 'x.csv'`, like `REPLACE`, replaces the file, so a rerun
+  replaces it. A local file is written whole: the rows go to `x.csv.part`,
+  renamed over `x.csv` once the write completes and deleted if it fails or is
+  interrupted, so a reader never sees a torn file and a failed `LOAD` leaves the
+  previous one in place (a device or a symlink as the target is written in
+  place). Explicit `APPEND` accumulates for CSV only: the file is
   opened without truncating and the header row is written only when it was
   absent or empty. Explicit `APPEND` is a plan-time error for `.parquet` and
   Arrow IPC (the footer indexes every row group or batch and is written last,
