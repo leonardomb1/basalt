@@ -50,7 +50,7 @@ const StderrCapture = struct {
     }
 };
 
-test "a shown result repeats a name as SQL does; LOAD INTO refuses one, naming it" {
+test "a shown result, CTE or derived table repeats a name as SQL does; a reference to it is ambiguous; LOAD INTO refuses one, naming it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -63,7 +63,9 @@ test "a shown result repeats a name as SQL does; LOAD INTO refuses one, naming i
         \\SELECT SUM(x) AS s, MAX(x) AS s, COUNT(*), COUNT(*) FROM '{s}/t.csv' GROUP BY g ORDER BY g;
         \\SELECT g, g FROM '{s}/t.csv' ORDER BY 2 LIMIT 1;
         \\SELECT * FROM '{s}/dup.csv';
-    , .{ base, base, base, base });
+        \\WITH c AS (SELECT g, x AS g, x FROM '{s}/t.csv') SELECT * FROM c WHERE x > 4 ORDER BY x;
+        \\SELECT b, count(*) AS n FROM (SELECT x AS a, g AS a, 1 AS b FROM '{s}/t.csv') d GROUP BY b;
+    , .{ base, base, base, base, base, base });
     defer alloc.free(script);
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
@@ -79,9 +81,19 @@ test "a shown result repeats a name as SQL does; LOAD INTO refuses one, naming i
         "a,a,a\n10,cd,11\n5,Ab,6\n" ++
             "s,s,count(*),count(*)\n5,5,1,1\n1,1,1,1\n12,10,2,2\n3,3,1,1\n" ++
             "g,g\nAb,Ab\n" ++
-            "a,a,b\n1,2,3\n",
+            "a,a,b\n1,2,3\n" ++
+            "g,g,x\nAb,5,5\ncd,10,10\n" ++
+            "b,n\n1,5\n",
         printed,
     );
+
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT g FROM (SELECT g, x AS g FROM '$B/t.csv') d;", "column reference `g` is ambiguous");
+    try refuse(alloc, &tmp, "WITH c AS (SELECT g, x AS g, x FROM '$B/t.csv') SELECT * FROM c WHERE g > 1;", "column reference `g` is ambiguous");
+    try refuse(alloc, &tmp, "SELECT a FROM '$B/dup.csv';", "column reference `a` is ambiguous");
+    try refuse(alloc, &tmp, "SELECT x FROM '$B/t.csv' WHERE x IN (SELECT a FROM (SELECT x AS a, x AS a FROM '$B/t.csv') d);", "column reference `a` is ambiguous");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' t JOIN (SELECT g, g FROM '$B/t.csv') d ON t.g = d.g;", "column reference `g` is ambiguous");
+    try refuse(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM (SELECT g, g FROM '$B/t.csv') d;", "two columns are named `g`");
 
     const load = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/o.csv' AS SELECT * FROM '{s}/dup.csv';", .{ base, base });
     defer alloc.free(load);

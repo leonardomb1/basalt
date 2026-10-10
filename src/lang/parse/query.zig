@@ -314,7 +314,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         const b = try self.bindName(try self.mk(.{ .field = k.field }), &.{});
                         const hidden: ast.SelectItem = .{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.field }) } };
                         k.field = try self.singleName(b.name);
-                        if (!providesName(extended.items[proj.len..], b.name)) try extended.append(hidden);
+                        if (!providesName(extended.items, b.name)) try extended.append(hidden);
                         continue;
                     }
                     if (k.field.parts.len != 1) {
@@ -479,11 +479,7 @@ fn nameRepeats(
             continue;
         };
         if (field and p.field and (qualified or p.qualified)) continue;
-        switch (mode) {
-            .nested => return self.fail(pos, "two SELECT items are named `{s}` — give one a different alias", .{name}),
-            .load => return self.fail(pos, "LOAD INTO writes each column under its own name, and two SELECT items are named `{s}` — give one a different alias", .{name}),
-            .show => {},
-        }
+        if (mode == .load) return self.fail(pos, "LOAD INTO writes each column under its own name, and two SELECT items are named `{s}` — give one a different alias", .{name});
         const same = std.mem.eql(u8, p.key, key.items);
         for (dups.items) |*d| {
             if (std.mem.eql(u8, d.name, name)) {

@@ -357,7 +357,20 @@ fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {
     return mkExpr(arena, .{ .binary = .{ .op = .@"and", .l = l, .r = e } });
 }
 
+/// The input column a projection outputs as `name`, or null when it computes it,
+/// drops it, or outputs two columns of that name (a reference to it is ambiguous).
 fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
+    var named: usize = 0;
+    for (items) |it| switch (it) {
+        .field => |q| if (std.mem.eql(u8, q.last(), name)) {
+            named += 1;
+        },
+        .computed => |c| if (std.mem.eql(u8, c.name, name)) {
+            named += 1;
+        },
+        else => {},
+    };
+    if (named > 1) return null;
     var star = false;
     for (items) |it| switch (it) {
         .star => star = true,

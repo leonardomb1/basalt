@@ -826,8 +826,6 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
     const cases = [_]struct { q: []const u8, msg: []const u8 }{
         .{ .q = "SELECT g, COUNT(*) FROM 'x.csv' GROUP BY 2;", .msg = "GROUP BY position 2 names the aggregate `count(*)` — a position may only name a grouping key" },
         .{ .q = "LOAD INTO 'o.csv' AS SELECT 1 AS a, 2 AS a;", .msg = "LOAD INTO writes each column under its own name, and two SELECT items are named `a` — give one a different alias" },
-        .{ .q = "WITH c AS (SELECT g, v AS g FROM 'x.csv') SELECT * FROM c;", .msg = "two SELECT items are named `g` — give one a different alias" },
-        .{ .q = "SELECT * FROM (SELECT g, g FROM 'x.csv') d;", .msg = "two SELECT items are named `g` — give one a different alias" },
         .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' ORDER BY a;", .msg = "ORDER BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT g AS a, v AS a, COUNT(*) FROM 'x.csv' GROUP BY a;", .msg = "GROUP BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT *, v AS a, g AS a FROM 'x.csv';", .msg = "two SELECT items are named `a` — give one a different alias" },

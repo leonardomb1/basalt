@@ -131,6 +131,18 @@ pub const Schema = struct {
         return null;
     }
 
+    /// Whether two columns share the unqualified `name`, so that a reference to it
+    /// is ambiguous, as SQL reads it. A hidden name the parser gave (`__…`) is one
+    /// expression wherever it repeats, so never.
+    pub fn ambiguous(self: Schema, name: []const u8) bool {
+        if (std.mem.startsWith(u8, name, "__")) return false;
+        var n: usize = 0;
+        for (self.fields) |f| {
+            if (std.mem.eql(u8, f.name, name)) n += 1;
+        }
+        return n > 1;
+    }
+
     /// The column a possibly qualified name refers to. `b.x`, where `b` is a join's
     /// right side, is that side's `x` whatever it was renamed to, and none when that
     /// side has no `x` or is not joined yet: a qualified name never falls back to
@@ -214,4 +226,8 @@ test "Schema.resolve finds a join's renamed right-side column by its qualified n
     try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "b", "id" }));
     try std.testing.expectEqual(@as(?usize, null), s.resolve(&.{ "b", "missing" }));
     try std.testing.expectEqual(@as(?usize, null), s.indexOf("missing"));
+    try std.testing.expect(!s.ambiguous("x"));
+    const dup: Schema = .{ .fields = &.{ .{ .name = "a", .ty = Type.init(.int) }, .{ .name = "a", .ty = Type.init(.string) } } };
+    try std.testing.expect(dup.ambiguous("a"));
+    try std.testing.expect(!dup.ambiguous("b"));
 }

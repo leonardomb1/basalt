@@ -81,12 +81,14 @@ alias always wins, and is the way to give a computed column a name you rely on.
 A result may repeat a name, as SQL allows: `SELECT a, a` and two unaliased
 `COUNT(*)` print two columns of the same name. `ORDER BY` or `GROUP BY` on such
 a name is ambiguous and refused, unless every item of that name is the same
-expression (`SELECT x AS a, x AS a ... ORDER BY a`). Where the names must tell
-the columns apart, a repeat is refused, naming it: a `LOAD INTO` target, file
-or table, which also refuses a repeat that `*` brings in (a CSV header naming
-`a` twice); and a CTE, derived table or subquery, whose columns the query
-around it reads by name. Two plain columns of the same name from a join's two
-sides are not a repeat: the later is named `_r` — see [Joins](joins.md).
+expression (`SELECT x AS a, x AS a ... ORDER BY a`). A CTE, derived table or
+subquery may repeat a name too, and so may a CSV header: `*` over it passes both
+columns through, and only a reference to the repeated name is refused, as
+ambiguous (`SELECT a FROM (SELECT x AS a, y AS a FROM t) d`). A `LOAD INTO`
+target, file or table, takes each column by its name, so there a repeat is
+refused, naming it, whether written in the SELECT list or brought in by `*`.
+Two plain columns of the same name from a join's two sides are not a repeat:
+the later is named `_r` — see [Joins](joins.md).
 
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
