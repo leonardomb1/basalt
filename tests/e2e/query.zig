@@ -735,6 +735,25 @@ test "limit: plain (unfused) limit takes the first N; offset past the end emptie
     try std.testing.expectEqualStrings("id\n", none);
 }
 
+test "limit: a fraction rounds as PostgreSQL casts it; a negative one is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT * FROM '$IN' LIMIT 2.5", .want = "id\n1\n2\n3\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT 1.4999 OFFSET 1.5", .want = "id\n3\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT -0.4", .want = "id\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT CAST(2.5 AS FLOAT)", .want = "id\n1\n2\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT CAST(1.5 AS DECIMAL(3,1))", .want = "id\n1\n2\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, "id\n1\n2\n3\n4\n", c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+    try expectRefusedAlike(alloc, &tmp, "SELECT 1 AS id LIMIT CAST(-1.5 AS DECIMAL(3,1));", "LIMIT must not be negative, got -2");
+}
+
 test "join: an empty build side drops all rows (inner) and null-fills (left)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

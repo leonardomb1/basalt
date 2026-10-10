@@ -119,6 +119,8 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
         .{ .q = "SELECT id FROM 't.csv' FETCH NEXT ROW ONLY;", .count = 1, .offset = 0 },
         .{ .q = "SELECT id FROM 't.csv' OFFSET 4;", .count = std.math.maxInt(u64), .offset = 4 },
         .{ .q = "SELECT id FROM 't.csv' LIMIT ALL;", .count = std.math.maxInt(u64), .offset = 0 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT 2.5 OFFSET 1.4;", .count = 3, .offset = 1 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT -0.4;", .count = 0, .offset = 0 },
         .{ .q = "PARAM n INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $n * 2 OFFSET $n;", .count = std.math.maxInt(u64), .offset = 0, .exprs = true },
     };
     for (cases) |c| {
@@ -135,6 +137,7 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
         .{ "SELECT id FROM 't.csv' LIMIT 1 FETCH FIRST 2 ROWS ONLY;", "a query takes one LIMIT or FETCH FIRST" },
         .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY" },
         .{ "SELECT id FROM 't.csv' OFFSET 1 OFFSET 2;", "a query takes one OFFSET" },
+        .{ "SELECT id FROM 't.csv' LIMIT -0.5;", "LIMIT must not be negative, got -0.5" },
     };
     for (refused) |r| {
         try testing.expectError(error.ParseFailed, parseSource(a, r[0], &diag));

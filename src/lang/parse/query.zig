@@ -567,12 +567,26 @@ fn parseLimit(self: *Parser) Error!?ast.Limit {
     return if (counted or offset) lim else null;
 }
 
-/// A LIMIT or OFFSET value: an integer literal is read here; any other constant, an
-/// expression of `$name`s and literals, is kept to evaluate once those have values.
-/// A column has no single value to take, so it is refused.
+/// A LIMIT or OFFSET value: an integer literal is read here, and a literal with a
+/// fraction is rounded half away from zero, as SQL rounds the exact number it spells
+/// (`LIMIT 2.5` is 3); any other constant, an expression of `$name`s and literals, is
+/// kept to evaluate once those have values. A column has no single value to take, so
+/// it is refused.
 fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error!void {
     const vpos = self.curPos();
     const e = try self.parseExpr();
+    const lit: ?f64 = switch (e.*) {
+        .float_lit => |f| f,
+        .unary => |u| if (u.op == .neg and u.e.* == .float_lit) -u.e.float_lit else null,
+        else => null,
+    };
+    if (lit) |f| {
+        const r = @round(f);
+        if (r < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, f });
+        if (!(r < 0x1p63)) return self.fail(vpos, "{s} {d} is out of range", .{ what, f });
+        n.* = @intFromFloat(r);
+        return;
+    }
     if (e.* == .int_lit) {
         if (e.int_lit < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, e.int_lit });
         n.* = @intCast(e.int_lit);
