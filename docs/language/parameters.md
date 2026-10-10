@@ -28,7 +28,9 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   query-string value is decoded as a browser or a form encodes it: `%C3%A3` is
   `ã`, `+` is a space and `%2B` a plus.
   `FROM QUERY`, `FROM BODY` and `FROM HEADER('X-Name')` say so explicitly; a
-  bare `FROM HEADER` reads the header named like the param.
+  bare `FROM HEADER` reads the header named like the param. In HTTP mode a
+  param binds only from its source, so a query string cannot override a
+  header or body param.
 
 **`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
 folded once at plan time (in declaration order; it may reference `$params` and

@@ -198,17 +198,48 @@ fn httpAttr(program: ast.Program, key: []const u8) ?[]const u8 {
 /// Every interface unless `--host` names one, so a container's port mapping reaches it.
 pub const default_host = "0.0.0.0";
 
+const max_body_bytes = 64 * 1024 * 1024;
+
+/// SO_REUSEADDR only (a restart may rebind past TIME_WAIT); no SO_REUSEPORT, so a
+/// second server on a port already taken fails with AddressInUse instead of
+/// silently sharing its traffic.
 fn listen(host: []const u8, port: u16) !std.net.Server {
+    const posix = std.posix;
     const address = try std.net.Address.parseIp(host, port);
-    var net_server = try address.listen(.{ .reuse_address = true });
+    const fd = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    var net_server: std.net.Server = .{ .listen_address = undefined, .stream = .{ .handle = fd } };
     errdefer net_server.deinit();
-    const tv = std.posix.timeval{ .sec = 1, .usec = 0 };
-    std.posix.setsockopt(net_server.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    var socklen = address.getOsSockLen();
+    posix.bind(fd, &address.any, socklen) catch |e| {
+        if (e == error.AddressInUse) log(.err, "{f} is already in use", .{address});
+        return e;
+    };
+    try posix.listen(fd, 128);
+    try posix.getsockname(fd, &net_server.listen_address.any, &socklen);
+    const tv = posix.timeval{ .sec = 1, .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     return net_server;
 }
 
-fn banner(port: u16, routes: []const Route) void {
-    log(.info, "basalt serving {d} route(s) on http://0.0.0.0:{d}", .{ routes.len, port });
+/// Answer a request whose head could not be read: 431 when it overflows the read
+/// buffer, 400 when it is not valid HTTP; nothing when the client went away.
+fn rejectHead(out: *std.Io.Writer, err: std.http.Server.ReceiveHeadError) void {
+    const status: std.http.Status, const msg: []const u8 = switch (err) {
+        error.HttpHeadersOversize => .{ .request_header_fields_too_large, "request head over the 64 KiB limit" },
+        error.HttpHeadersInvalid => .{ .bad_request, "malformed HTTP request" },
+        else => return,
+    };
+    const prefix = "{\"status\":\"error\",\"retryable\":false,\"error\":\"";
+    const suffix = "\"}\n";
+    out.print("HTTP/1.1 {d} {s}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n{s}{s}{s}", .{
+        @intFromEnum(status), status.phrase() orelse "", prefix.len + msg.len + suffix.len, prefix, msg, suffix,
+    }) catch return;
+    out.flush() catch {};
+}
+
+fn banner(address: std.net.Address, routes: []const Route) void {
+    log(.info, "basalt serving {d} route(s) on http://{f}", .{ routes.len, address });
     for (routes) |r| {
         if (r.doc.len > 0)
             log(.info, "route {s} <- {s} — {s}", .{ r.path, r.label, r.doc })
@@ -228,7 +259,7 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, por
     const routes = [_]Route{.{ .path = httpPath(program), .program = program, .label = "<script>", .doc = httpDoc(program), .buf = bs }};
     var net_server = try listen(host, port);
     defer net_server.deinit();
-    banner(port, &routes);
+    banner(net_server.listen_address, &routes);
     const threads = std.Thread.getCpuCount() catch 1;
     var read_buf: [64 * 1024]u8 = undefined;
     while (!runtime.aborting()) {
@@ -332,7 +363,7 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
     defer reg.deinit();
     var net_server = try listen(host, port);
     defer net_server.deinit();
-    banner(port, reg.routes);
+    banner(net_server.listen_address, reg.routes);
     if (watch) log(.info, "watching {s} for changes", .{dir_path});
     const threads = std.Thread.getCpuCount() catch 1;
     var read_buf: [64 * 1024]u8 = undefined;
@@ -357,7 +388,7 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
                 reg = new_reg;
                 if (watch) fp = dirFingerprint(dir_path);
                 log(.info, "reloaded {s}", .{dir_path});
-                banner(port, reg.routes);
+                banner(net_server.listen_address, reg.routes);
             } else |e| log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
         }
         const conn = net_server.accept() catch continue;
@@ -379,7 +410,7 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
     var cwriter = conn.stream.writer(&send_buf);
     var http = std.http.Server.init(creader.interface(), &cwriter.interface);
     while (http.reader.state == .ready) {
-        var req = http.receiveHead() catch return;
+        var req = http.receiveHead() catch |e| return rejectHead(&cwriter.interface, e);
 
         const target = req.head.target;
         const q = std.mem.indexOfScalar(u8, target, '?');
@@ -398,26 +429,45 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
             return;
         };
 
+        var req_arena = std.heap.ArenaAllocator.init(gpa);
+        defer req_arena.deinit();
+        const ra = req_arena.allocator();
+        var params = std.array_list.Managed(runtime.ParamArg).init(ra);
+        try parseQuery(ra, &params, query);
+        dropForeignParams(&params, route.program);
+        var hdrs = std.array_list.Managed(std.http.Header).init(ra);
+        var hit = req.iterateHeaders();
+        while (hit.next()) |h| try hdrs.append(.{ .name = try ra.dupe(u8, h.name), .value = try ra.dupe(u8, h.value) });
+        try bindHeaderParams(&params, route.program, hdrs.items);
+
+        const too_large = "{\"status\":\"error\",\"retryable\":false,\"error\":\"request body over the 64 MiB limit\"}\n";
+        const json_ct = std.http.Header{ .name = "content-type", .value = "application/json" };
+        if ((req.head.content_length orelse 0) > max_body_bytes) {
+            try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
+            return;
+        }
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = try req.readerExpectContinue(&body_buf);
-        const body = try reader.allocRemaining(gpa, .limited(64 * 1024 * 1024));
+        const body = reader.allocRemaining(gpa, .limited(max_body_bytes)) catch |e| switch (e) {
+            error.StreamTooLong => {
+                try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
+                return;
+            },
+            else => return e,
+        };
         defer gpa.free(body);
 
         if (route.buf) |bs| {
-            var req_arena = std.heap.ArenaAllocator.init(gpa);
-            defer req_arena.deinit();
             var vmsg: []const u8 = "";
-            if (acceptIntoBuffer(bs, req_arena.allocator(), body, &vmsg)) |rows| {
+            if (acceptIntoBuffer(bs, ra, body, &vmsg)) |rows| {
                 var ok_buf: [96]u8 = undefined;
                 const ok = std.fmt.bufPrint(&ok_buf, "{{\"status\":\"accepted\",\"rows\":{d}}}\n", .{rows}) catch unreachable;
-                try req.respond(ok, .{ .status = .ok, .keep_alive = false, .extra_headers = &.{
-                    .{ .name = "content-type", .value = "application/json" },
-                } });
+                try req.respond(ok, .{ .status = .ok, .keep_alive = false, .extra_headers = &.{json_ct} });
             } else |e| switch (e) {
                 error.Backpressure => try req.respond("{\"status\":\"error\",\"retryable\":true,\"error\":\"buffer full\"}\n", .{
                     .status = .service_unavailable,
                     .keep_alive = false,
-                    .extra_headers = &.{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "retry-after", .value = "5" } },
+                    .extra_headers = &.{ json_ct, .{ .name = "retry-after", .value = "5" } },
                 }),
                 error.BodySchemaViolation => {
                     var out = std.array_list.Managed(u8).init(gpa);
@@ -425,27 +475,12 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
                     try out.appendSlice("{\"status\":\"error\",\"retryable\":false,\"error\":\"");
                     try writeJsonStr(out.writer(), vmsg);
                     try out.appendSlice("\"}\n");
-                    try req.respond(out.items, .{ .status = .unprocessable_entity, .keep_alive = false, .extra_headers = &.{
-                        .{ .name = "content-type", .value = "application/json" },
-                    } });
+                    try req.respond(out.items, .{ .status = .unprocessable_entity, .keep_alive = false, .extra_headers = &.{json_ct} });
                 },
                 else => return e,
             }
             return;
         }
-
-        var params = std.array_list.Managed(runtime.ParamArg).init(gpa);
-        defer params.deinit();
-        var query_arena = std.heap.ArenaAllocator.init(gpa);
-        defer query_arena.deinit();
-        try parseQuery(query_arena.allocator(), &params, query);
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(gpa);
-        defer hdrs.deinit();
-        var hit = req.iterateHeaders();
-        while (hit.next()) |h| try hdrs.append(h);
-        try bindHeaderParams(&params, route.program, hdrs.items);
-        dropLetParams(&params, route.program);
 
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
@@ -491,11 +526,10 @@ fn handleConn(gpa: std.mem.Allocator, routes: []const Route, conn: std.net.Serve
             try w.writeAll("\"}\n");
         }
 
-        const ct = std.http.Header{ .name = "content-type", .value = "application/json" };
         if (retry_after) {
-            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{ ct, .{ .name = "retry-after", .value = "5" } } });
+            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{ json_ct, .{ .name = "retry-after", .value = "5" } } });
         } else {
-            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{ct} });
+            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{json_ct} });
         }
         return;
     }
@@ -534,17 +568,24 @@ fn bindHeaderParams(
     }
 }
 
-/// Drop any query-string binding that names a statement-level `LET`: a LET is
-/// sealed, not part of the endpoint's parameter surface.
-fn dropLetParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast.Program) void {
+/// Drop any query-string binding that names a sealed `LET` or a `PARAM` declared to
+/// come from somewhere else (a header, or the body, the default for `JSON`), so a
+/// caller cannot override a header or body value through the URL.
+fn dropForeignParams(params: *std.array_list.Managed(runtime.ParamArg), program: ast.Program) void {
     var i: usize = 0;
     while (i < params.items.len) {
-        var is_let = false;
-        for (program.stmts) |s| {
-            if (s != .let_const) continue;
-            if (std.mem.eql(u8, s.let_const.name, params.items[i].key)) is_let = true;
-        }
-        if (is_let) {
+        var foreign = false;
+        for (program.stmts) |s| switch (s) {
+            .let_const => |l| if (std.mem.eql(u8, l.name, params.items[i].key)) {
+                foreign = true;
+            },
+            .param => |p| if (std.mem.eql(u8, p.name, params.items[i].key)) {
+                const src = p.source orelse (if (p.is_json) ast.ParamSource.body else .query);
+                if (src != .query) foreign = true;
+            },
+            else => {},
+        };
+        if (foreign) {
             _ = params.orderedRemove(i);
         } else {
             i += 1;
@@ -563,9 +604,10 @@ fn parseQuery(arena: std.mem.Allocator, params: *std.array_list.Managed(runtime.
     }
 }
 
-/// A `%` not followed by two hex digits is kept as written.
+/// A `%` not followed by two hex digits is kept as written. The result is always
+/// arena-owned: the request head it came from does not outlive the body read.
 fn decodeQueryPart(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    if (std.mem.indexOfAny(u8, s, "%+") == null) return arena.dupe(u8, s);
     var out = try std.array_list.Managed(u8).initCapacity(arena, s.len);
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -729,10 +771,10 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     var srv = try addr.listen(.{ .reuse_address = true });
     defer srv.deinit();
     const port = srv.listen_address.getPort();
-    const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 3) });
+    const th = try std.Thread.spawn(.{}, acceptN, .{ gpa, &routes, &srv, @as(usize, 5) });
     var joined = false;
     defer if (!joined) {
-        for (0..3) |_| if (std.net.tcpConnectToAddress(srv.listen_address)) |c| c.close() else |_| {};
+        for (0..5) |_| if (std.net.tcpConnectToAddress(srv.listen_address)) |c| c.close() else |_| {};
         th.join();
     };
 
@@ -774,14 +816,29 @@ test "serve integration: buffered accept and FROM HEADER over real HTTP" {
     {
         var aw = std.Io.Writer.Allocating.init(gpa);
         defer aw.deinit();
+        const big = try a.alloc(u8, 200 * 1024);
+        @memset(big, 'x');
         const res = try client.fetch(.{
-            .location = .{ .url = hdr_url },
-            .method = .GET,
+            .location = .{ .url = try std.fmt.allocPrint(a, "{s}?tenant=spoof", .{hdr_url}) },
+            .method = .POST,
+            .payload = big,
             .response_writer = &aw.writer,
             .keep_alive = false,
             .extra_headers = &.{.{ .name = "X-Tenant", .value = "acme" }},
         });
         try std.testing.expectEqual(std.http.Status.ok, res.status);
+    }
+    for ([_][2][]const u8{
+        .{ "GARBAGE\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "POST /hdr HTTP/1.1\r\ncontent-length: 99999999999\r\n\r\n", "HTTP/1.1 413 " },
+    }) |c| {
+        const s = try std.net.tcpConnectToAddress(srv.listen_address);
+        defer s.close();
+        try s.writeAll(c[0]);
+        var rbuf: [512]u8 = undefined;
+        var r = s.reader(&rbuf);
+        const got = try r.interface().takeArray(13);
+        try std.testing.expectEqualStrings(c[1], got);
     }
     th.join();
     joined = true;
@@ -828,7 +885,7 @@ test "parseQuery binds k=v pairs, decodes each side as a form encodes it, and sk
     try std.testing.expectEqual(@as(usize, 0), params.items.len);
 }
 
-test "dropLetParams: a query string cannot bind a sealed LET" {
+test "dropForeignParams: a query string binds only query params, never a LET, header or body param" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -837,15 +894,26 @@ test "dropLetParams: a query string cannot bind a sealed LET" {
         \\CREATE ENDPOINT '/r';
         \\PARAM tenant STRING DEFAULT 'x' FROM QUERY;
         \\LET cutoff = 5;
+        \\PARAM org STRING FROM HEADER('X-Org');
+        \\PARAM job JSON;
+        \\PARAM day INT;
         \\SELECT id FROM 'in.csv' WHERE id > $cutoff;
     , &diag);
 
     var params = std.array_list.Managed(runtime.ParamArg).init(a);
-    try parseQuery(a, &params, "tenant=acme&cutoff=999");
-    dropLetParams(&params, prog);
-    try std.testing.expectEqual(@as(usize, 1), params.items.len);
+    try parseQuery(a, &params, "tenant=acme&cutoff=999&org=evil&job=%7B%7D&day=3");
+    dropForeignParams(&params, prog);
+    try std.testing.expectEqual(@as(usize, 2), params.items.len);
     try std.testing.expectEqualStrings("tenant", params.items[0].key);
     try std.testing.expectEqualStrings("acme", params.items[0].val);
+    try std.testing.expectEqualStrings("day", params.items[1].key);
+}
+
+test "listen refuses a port another server already holds" {
+    initLog(.{ .quiet = true });
+    var first = try listen("127.0.0.1", 0);
+    defer first.deinit();
+    try std.testing.expectError(error.AddressInUse, listen("127.0.0.1", first.listen_address.getPort()));
 }
 
 test "writeJsonStr escapes everything that would break the response body" {
