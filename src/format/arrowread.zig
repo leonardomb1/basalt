@@ -499,6 +499,7 @@ pub const Reader = struct {
     schema: types.Schema,
     dicts: std.AutoHashMap(i64, column.Column),
     why: []const u8 = "",
+    path: []const u8 = "",
     done: bool = false,
     rb_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     cursors: []*Cursor = &.{},
@@ -530,6 +531,7 @@ pub const Reader = struct {
             .keep = &.{},
             .schema = .{ .fields = &.{} },
             .dicts = std.AutoHashMap(i64, column.Column).init(arena),
+            .path = path,
         };
         errdefer self.dicts.deinit();
         try self.init(want);
@@ -579,13 +581,11 @@ pub const Reader = struct {
             sch = first.table;
         } else return Error.NotArrow;
 
-        if ((try sch.int(i16, 0, 0)) != 0) {
-            self.why = "big-endian Arrow data is not supported";
-            return Error.UnsupportedArrow;
-        }
+        if ((try sch.int(i16, 0, 0)) != 0) return self.refuse("big-endian Arrow data is not supported");
         const fv = (try sch.vector(1, 4)) orelse return Error.CorruptArrow;
         self.fields = try self.arena.alloc(Field, fv.len);
-        for (self.fields, 0..) |*f, i| f.* = try parseField(self.arena, try sch.tableAt(fv, i), &self.why);
+        for (self.fields, 0..) |*f, i| f.* = parseField(self.arena, try sch.tableAt(fv, i), &self.why) catch |e|
+            return if (e == Error.UnsupportedArrow) self.refuse(self.why) else e;
 
         var keep = std.array_list.Managed(usize).init(self.arena);
         for (self.fields, 0..) |f, i| {
@@ -757,18 +757,26 @@ pub const Reader = struct {
         self.rb_off = 0;
     }
 
+    /// `why` as the error's account, so the message names what was refused.
+    fn refuse(self: *Reader, why: []const u8) Error {
+        self.why = why;
+        var buf: [480]u8 = undefined;
+        const msg = if (self.path.len == 0) why else std.fmt.bufPrint(&buf, "Arrow IPC `{s}`: {s}", .{ self.path, why }) catch why;
+        return @errorCast(eval.explain(Error.UnsupportedArrow, msg));
+    }
+
     fn readDictionary(self: *Reader, m: Message) !void {
         const id = try m.table.int(i64, 0, 0);
-        if ((try m.table.int(u8, 2, 0)) != 0) {
-            self.why = "delta dictionary batches are not supported";
-            return Error.UnsupportedArrow;
-        }
         const rb = (try m.table.table(1)) orelse return Error.CorruptArrow;
         var vf: ?Field = null;
-        for (self.fields) |f| if (findDict(f, id)) |d| {
+        var col: []const u8 = "?";
+        for (self.fields) |top| if (findDict(top, id)) |d| {
             vf = d;
+            col = top.name;
             break;
         };
+        if ((try m.table.int(u8, 2, 0)) != 0)
+            return self.refuse(try std.fmt.allocPrint(self.arena, "column `{s}`: delta dictionary batches (a dictionary extended mid-stream) are not supported", .{col}));
         var f = vf orelse return;
         f.dict = null;
         var w = try walker(self.arena, rb, m.body, m.meta);
@@ -1212,6 +1220,16 @@ test "not arrow, and every truncation of an IPC file, is an error; a truncated s
     while (n < stream.len) : (n += 7) {
         _ = dump(a, stream[0..n], null) catch continue;
     }
+}
+
+test "a refusal names the column: a union, a delta dictionary" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectError(Error.UnsupportedArrow, Reader.openBytes(a, @embedFile("testdata/union.arrow"), null));
+    try std.testing.expectEqualStrings("column `u`: the Arrow Union type is not supported", eval.takeFailure(Error.UnsupportedArrow).?);
+    try std.testing.expectError(Error.UnsupportedArrow, dump(a, @embedFile("testdata/dict_delta.arrows"), null));
+    try std.testing.expectEqualStrings("column `d`: delta dictionary batches (a dictionary extended mid-stream) are not supported", eval.takeFailure(Error.UnsupportedArrow).?);
 }
 
 test "fuzz: arbitrary bytes behind a valid magic never crash the reader" {
