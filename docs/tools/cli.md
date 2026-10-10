@@ -180,7 +180,7 @@ plain left-aligned table — whether stdout is a terminal, a pipe or a file. Wha
 |------|---------|
 | `0`  | success |
 | `1`  | permanent failure (bad script, data/schema error) — maps to HTTP 422 |
-| `2`  | a malformed command line: an unknown command or option, or a bad option value |
+| `2`  | a malformed command line: an unknown command or option, a bad option value, an argument too many (a second script, a path beside `-c`), or a `-p` name given twice |
 | `75` | transient (`EX_TEMPFAIL`) — safe to retry — maps to HTTP 503 |
 | `130`| aborted (SIGINT) |
 

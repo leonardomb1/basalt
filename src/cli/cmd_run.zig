@@ -8,7 +8,9 @@ const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
 const obs = @import("../runtime/obs.zig");
 const parseLogFormat = @import("args.zig").parseLogFormat;
+const paramProblem = @import("args.zig").paramProblem;
 const parseSrcTo = @import("args.zig").parseSrcTo;
+const repeatedKey = @import("args.zig").repeatedKey;
 const runtime = @import("../runtime/run.zig");
 const sizeFlag = @import("args.zig").sizeFlag;
 const std = @import("std");
@@ -128,6 +130,16 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             };
         } else if (try unknownOption(a, "run", stderr)) return 2;
     }
+    const keys = try arena.allocator().alloc([]const u8, params.items.len);
+    for (params.items, keys) |p, *k| k.* = p.key;
+    if (repeatedKey(keys)) |k| {
+        try stderr.print("error: `-p {s}` given more than once\n", .{k});
+        return 2;
+    }
+    for (keys) |k| if (try paramProblem(arena.allocator(), prog, k)) |why| {
+        try eo.report(.{ .msg = why });
+        return 1;
+    };
 
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
         http_server.serve(alloc, prog, host, port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
