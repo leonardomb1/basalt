@@ -330,6 +330,34 @@ fn typeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
     return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
 }
 
+test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 is an error naming the column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings(
+        \\u8=255 u16=65535 u32=4294967295 u64=9223372036854775807
+        \\u8=1 u16=2 u32=3000000000 u64=4
+        \\u8=1 u16=2 u32=3000000000 u64=4
+        \\
+    , try readAllText(a, @embedFile("../testdata/unsigned.parquet"), "u.parquet"));
+    try testing.expectError(Error.ParquetIntOverflow, readAllText(a, @embedFile("../testdata/unsigned_big.parquet"), "b.parquet"));
+    try testing.expectEqualStrings("parquet column `big` holds the UINT64 18446744073709551615, past 2^63-1, the largest basalt int", eval.takeFailure(Error.ParquetIntOverflow).?);
+}
+
+test "a folder mismatch shows decimal precision and names the column the first file lacks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const d102 = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.decimal(10, 2) }} };
+    const d123 = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.decimal(12, 3) }} };
+    try testing.expectEqualStrings("column `f` is decimal(12,3) there, not decimal(10,2)", schemaMismatch(a, d102, d123).?);
+    const id = types.Schema{ .fields = &.{.{ .name = "id", .ty = types.Type.init(.int) }} };
+    const extra = types.Schema{ .fields = &.{.{ .name = "extra", .ty = types.Type.init(.int) }} };
+    try testing.expectEqualStrings("it has a column `extra` the first file lacks", schemaMismatch(a, id, extra).?);
+    const both = types.Schema{ .fields = &.{ .{ .name = "x", .ty = types.Type.init(.int) }, .{ .name = "id", .ty = types.Type.init(.int) } } };
+    try testing.expectEqualStrings("its columns are in another order (`x` where `id` is expected)", schemaMismatch(a, id, both).?);
+}
+
 pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const u8, first: []const u8, why: []const u8) []const u8 {
     const rel = struct {
         fn f(r: []const u8, x: []const u8) []const u8 {
