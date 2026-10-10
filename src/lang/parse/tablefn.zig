@@ -296,7 +296,7 @@ pub fn parseJoinRead(self: *Parser) Error!Derived {
         .pipeline = .{ .stages = stages, .pos = rpos },
         .pos = rpos,
     } });
-    return .{ .binding = name, .alias = alias, .alias_pos = rpos };
+    return .{ .binding = name, .alias = alias, .alias_pos = rpos, .own = scratch.implicit };
 }
 
 /// A parenthesized query in expression or LET position, `(` consumed, its bindings

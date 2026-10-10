@@ -1538,6 +1538,8 @@ test "join: `t.*` is that table's columns alone, by their own names unless taken
         .{ .q = "SELECT g.* FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id JOIN '$B/emp.csv' g ON m.mgr = g.id", .want = "id,mgr,name\n1,,boss\n" },
         .{ .q = "SELECT i.name, i.item FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.name = 'bob'", .want = "name,item\nbob,z\n" },
         .{ .q = "SELECT l.k FROM '$B/l.csv' WHERE l.k > 3", .want = "k\n4\n" },
+        .{ .q = "SELECT r.* FROM '$B/l.csv' JOIN '$B/r.csv' ON l.k = r.k WHERE l.s = 'c'", .want = "k,s\n3,z\n" },
+        .{ .q = "WITH c AS (SELECT a.k, b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k) SELECT c.*, b.* FROM c JOIN '$B/items.csv' b ON c.s = b.item WHERE c.s = 'z'", .want = "k,s,name,item,q\n3,z,bob,z,3\n" },
     });
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

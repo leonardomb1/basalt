@@ -527,6 +527,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var jalias: ?[]const u8 = null;
         var binding: []const u8 = undefined;
         var bpos: Pos = undefined;
+        var own: []const u8 = "";
         const reads = self.at(.string) or
             (self.isKw("identifier") and self.peekTag() == .lparen) or
             (self.at(.ident) and self.peekTag() == .dot and !self.isLet(self.cur().text));
@@ -535,6 +536,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             binding = d.binding;
             jalias = d.alias;
             bpos = d.alias_pos;
+            own = d.own;
         } else {
             binding = try self.expectIdent();
             bpos = self.prevPos();
@@ -559,6 +561,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         } else if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
             jalias = self.advance().text;
             try self.claimAlias(&aliases, jalias.?, self.prevPos(), .right);
+        } else if (own.len > 0 and !aliases.knows(own)) {
+            jalias = own;
+            try self.claimAlias(&aliases, own, bpos, .right);
         } else try self.claimAlias(&aliases, binding, bpos, .reserved);
         var left_keys = std.array_list.Managed(ast.QualName).init(self.arena);
         var right_keys = std.array_list.Managed(ast.QualName).init(self.arena);

@@ -566,7 +566,10 @@ pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.S
 }
 
 /// The `_r` suffix keeps bumping until free: two output fields with one name make the
-/// second unreachable, since every lookup goes through `Schema.indexOf`.
+/// second unreachable, since every lookup goes through `Schema.indexOf`. Any two
+/// numeric keys compare, as the key hash folds int, float and decimal alike. A left
+/// column still carrying the right side's name from a CTE's own join loses it, as
+/// that name now means the right side.
 pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, diag: *Diag) Error!JoinPlan {
     if (j.left_keys.len != j.right_keys.len) return fail(diag, "join has mismatched key lists", .{});
     if (j.deferred.len > 0) return fail(diag, "internal error: a join's keys were not placed (orientKeys) before planning it", .{});
@@ -587,8 +590,12 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     const right_nullable = (j.kind == .left or j.kind == .full);
     const left_nullable = (j.kind == .right or j.kind == .full);
 
+    const rel = if (j.alias.len != 0) j.alias else j.binding;
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    for (left.fields) |f| try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = f.rel, .base = f.base });
+    for (left.fields) |f| {
+        const stale = std.mem.eql(u8, f.rel, rel);
+        try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = if (stale) "" else f.rel, .base = if (stale) "" else f.base });
+    }
     if (emit_right) for (right.fields) |f| {
         var name = f.name;
         var n: usize = 0;

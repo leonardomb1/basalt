@@ -690,7 +690,7 @@ pub const Parser = struct {
     pub const decorrelate = @import("parse/tablefn.zig").decorrelate;
     pub const inTableFn = @import("parse/tablefn.zig").inTableFn;
     pub const parseDerivedTable = @import("parse/tablefn.zig").parseDerivedTable;
-    pub const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos };
+    pub const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos, own: []const u8 = "" };
 
     pub const parseJoinRead = @import("parse/tablefn.zig").parseJoinRead;
     pub const parseSubqueryPipeline = @import("parse/tablefn.zig").parseSubqueryPipeline;
