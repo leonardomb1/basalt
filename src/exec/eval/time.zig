@@ -240,7 +240,7 @@ pub fn strptimeFmt(text: []const u8, fmt: []const u8) ?i64 {
 
 pub fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
     const y = if (m <= 2) y0 - 1 else y0;
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const era = @divFloor(y, 400);
     const yoe = y - era * 400;
     const mp: i64 = @intCast((m + 9) % 12);
     const doy = @divFloor(153 * mp + 2, 5) + @as(i64, @intCast(d)) - 1;
@@ -265,7 +265,7 @@ pub fn parseIsoDate(s0: []const u8) ?i64 {
     const y = isoNum(s[0..4]) orelse return null;
     const m = isoNum(s[5..7]) orelse return null;
     const d = isoNum(s[8..10]) orelse return null;
-    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
     return daysFromCivil(y, @intCast(m), @intCast(d));
 }
 
@@ -311,7 +311,7 @@ pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
 
 pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const era = @divFloor(z, 146097);
     const doe = z - era * 146097;
     const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
     const y = yoe + era * 400;
@@ -344,4 +344,28 @@ test "timestamps keep sub-second precision through parse and format" {
     const w = parseIsoTimestamp("2026-08-08 12:34:56").?;
     try std.testing.expectEqualStrings("2026-08-08 12:34:56", try formatTimestamp(ar.allocator(), w));
     try std.testing.expect(parseIsoTimestamp("2026-08-08 12:34:56.12x") == null);
+}
+
+test "an impossible day of the month is rejected, not rolled into the next month" {
+    try std.testing.expect(parseIsoDate("2023-02-29") == null);
+    try std.testing.expect(parseIsoDate("2024-04-31") == null);
+    try std.testing.expect(parseIsoTimestamp("2024-02-30 10:00:00") == null);
+    try std.testing.expect(parseIsoDate("2024-02-29") != null);
+    try std.testing.expect(parseIsoDate("2000-02-29") != null);
+    try std.testing.expect(parseIsoDate("1900-02-29") == null);
+}
+
+test "civil dates round-trip through year 0 and negative multiples of 400" {
+    try std.testing.expectEqual(@as(i64, -719528), daysFromCivil(0, 1, 1));
+    try std.testing.expectEqual(@as(i64, -719529), daysFromCivil(-1, 12, 31));
+    const years = [_]i64{ -800, -401, -400, -399, -1, 0, 1, 399, 400, 1970, 2000, 2024 };
+    for (years) |y| for ([_]u32{ 1, 2, 3, 12 }) |m| {
+        const days = daysFromCivil(y, m, 1);
+        const c = civilFromDays(days);
+        try std.testing.expectEqual(y, c.y);
+        try std.testing.expectEqual(m, c.m);
+        try std.testing.expectEqual(@as(u32, 1), c.d);
+        const prev = civilFromDays(days - 1);
+        try std.testing.expectEqual(daysInMonth(prev.y, prev.m), prev.d);
+    };
 }
