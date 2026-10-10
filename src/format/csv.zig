@@ -52,6 +52,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
+const Part = @import("../store/part.zig").Part;
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const zipsrc = @import("zipsrc.zig");
@@ -1101,6 +1102,7 @@ pub const CsvWriter = struct {
     fw: std.fs.File.Writer = undefined,
     owns_file: bool = true,
     gz: ?*deflate.Gzip = null,
+    part: Part = .{},
 
     const Backend = union(enum) {
         file: std.fs.File,
@@ -1130,7 +1132,8 @@ pub const CsvWriter = struct {
 
     /// `.append` resumes at the file's end and writes the header only to an empty file,
     /// so a second header never lands among the rows. Objects, SFTP and SMB are written
-    /// whole (through a `.part`), so they cannot append.
+    /// whole (through a `.part`), so they cannot append; a local file is written whole
+    /// too unless appended to.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
         var header = true;
@@ -1147,7 +1150,8 @@ pub const CsvWriter = struct {
             const obj = try objstore.parse(arena, path);
             self.* = .{ .backend = .{ .object = try obj.openWriter(arena, client, "text/csv") } };
         } else {
-            self.* = .{ .backend = .{ .file = try std.fs.cwd().createFile(path, .{ .truncate = mode == .truncate }) } };
+            self.* = .{ .backend = undefined };
+            self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false }) else try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
             if (mode == .append) {
                 const end = try self.backend.file.getEndPos();
@@ -1244,12 +1248,19 @@ pub const CsvWriter = struct {
                 g.deinit(std.heap.page_allocator);
                 self.gz = null;
             }
-            g.finish() catch |e| return self.specific(e);
+            g.finish() catch |e| {
+                if (self.backend == .file) self.dropFile();
+                return self.specific(e);
+            };
         }
         switch (self.backend) {
             .file => |f| {
-                try self.fw.interface.flush();
+                self.fw.interface.flush() catch |e| {
+                    self.dropFile();
+                    return e;
+                };
                 if (self.owns_file) f.close();
+                try self.part.commit();
             },
             .object => |o| o.finish() catch |e| return self.specific(e),
         }
@@ -1261,9 +1272,14 @@ pub const CsvWriter = struct {
             self.gz = null;
         }
         switch (self.backend) {
-            .file => |f| if (self.owns_file) f.close(),
+            .file => self.dropFile(),
             .object => |o| o.abort(),
         }
+    }
+
+    fn dropFile(self: *CsvWriter) void {
+        if (self.owns_file) self.backend.file.close();
+        self.part.discard();
     }
 
     pub fn sink(self: *CsvWriter) driver.Sink {

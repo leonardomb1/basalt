@@ -294,7 +294,14 @@ pub const Lexer = struct {
                 }
                 return self.make(.invalid, self.src[start..self.i], line, col);
             },
-            else => return self.make(.invalid, self.src[start..self.i], line, col),
+            else => {
+                const n = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                if (n > 1 and start + n <= self.src.len and std.unicode.utf8ValidateSlice(self.src[start .. start + n]))
+                    while (self.i < start + n) {
+                        _ = self.bump();
+                    };
+                return self.make(.invalid, self.src[start..self.i], line, col);
+            },
         }
     }
 };

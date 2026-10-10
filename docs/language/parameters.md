@@ -23,7 +23,11 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   bound to a `TIMESTAMP` is its midnight, `TIME` takes `HH:MM[:SS[.ffffff]]`,
   and a `DECIMAL(10,2)` rounds `12.345` to `12.35`. Text that is not one fails
   the run, and `check`, naming the param and the value. `DECIMAL` alone is
-  `DECIMAL(38,0)`; `DECIMAL(p)` without a scale is refused.
+  `DECIMAL(38,0)`; `DECIMAL(p)` without a scale is refused. `-p` must name a
+  `PARAM` the script declares, once: a misspelt name fails `run` and `check`
+  rather than running on the default, and a name given twice is a malformed
+  command line. A kernel's `params` and an HTTP query string may carry names
+  a script does not declare; those are ignored.
 - Source defaults: scalars bind from the query string, `JSON` from the body. A
   query-string value is decoded as a browser or a form encodes it: `%C3%A3` is
   `ã`, `+` is a space and `%2B` a plus.

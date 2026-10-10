@@ -36,6 +36,7 @@ const column = @import("../exec/column.zig");
 const Column = column.Column;
 const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("../connect/driver.zig");
+const Part = @import("../store/part.zig").Part;
 const flatbuf = @import("flatbuf.zig");
 const rescaleTo = @import("../exec/eval.zig").rescaleTo;
 
@@ -370,6 +371,7 @@ pub const FileSink = struct {
     sw: StreamWriter = undefined,
     blocks: std.array_list.Managed(i64),
     stream: bool,
+    part: Part,
 
     pub fn isPath(path: []const u8) bool {
         inline for (.{ ".arrow", ".arrows", ".feather", ".ipc" }) |ext| {
@@ -383,9 +385,13 @@ pub const FileSink = struct {
         const stream = std.ascii.endsWithIgnoreCase(path, ".arrows");
         const self = try gpa.create(FileSink);
         errdefer gpa.destroy(self);
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        errdefer file.close();
-        self.* = .{ .gpa = gpa, .file = file, .blocks = std.array_list.Managed(i64).init(gpa), .stream = stream };
+        var part = Part{};
+        const file = try part.create(path);
+        errdefer {
+            file.close();
+            part.discard();
+        }
+        self.* = .{ .gpa = gpa, .file = file, .blocks = std.array_list.Managed(i64).init(gpa), .stream = stream, .part = part };
         errdefer self.blocks.deinit();
         self.fw = file.writer(&self.buf);
         var base: u64 = 0;
@@ -402,12 +408,20 @@ pub const FileSink = struct {
     }
 
     pub fn close(self: *FileSink) !void {
-        defer self.deinit();
-        if (self.stream) try self.sw.finish() else try self.sw.finishFile();
+        var part = self.part;
+        const done = if (self.stream) self.sw.finish() else self.sw.finishFile();
+        self.deinit();
+        done catch |e| {
+            part.discard();
+            return e;
+        };
+        try part.commit();
     }
 
     pub fn abort(self: *FileSink) void {
+        var part = self.part;
         self.deinit();
+        part.discard();
     }
 
     fn deinit(self: *FileSink) void {

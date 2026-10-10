@@ -21,21 +21,28 @@ const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 /// Points fd 2 at a file in `dir` until `end`, which restores it and returns what
 /// was written there — where `PRINT`, an `EXPLAIN` statement's plan and the run
 /// logger all go. Tests run one at a time, so the swap is seen by nothing else.
+/// `beginFd` takes stdout the same way, which a printed result would otherwise
+/// write into the test runner's own channel.
 const StderrCapture = struct {
     file: std.fs.File,
     saved: std.posix.fd_t,
+    fd: std.posix.fd_t,
 
     fn begin(dir: std.fs.Dir) !StderrCapture {
-        const file = try dir.createFile("stderr.txt", .{ .read = true, .truncate = true });
+        return beginFd(dir, std.posix.STDERR_FILENO, "stderr.txt");
+    }
+
+    fn beginFd(dir: std.fs.Dir, fd: std.posix.fd_t, name: []const u8) !StderrCapture {
+        const file = try dir.createFile(name, .{ .read = true, .truncate = true });
         errdefer file.close();
-        const saved = try std.posix.dup(std.posix.STDERR_FILENO);
+        const saved = try std.posix.dup(fd);
         errdefer std.posix.close(saved);
-        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
-        return .{ .file = file, .saved = saved };
+        try std.posix.dup2(file.handle, fd);
+        return .{ .file = file, .saved = saved, .fd = fd };
     }
 
     fn end(self: *StderrCapture, alloc: std.mem.Allocator) ![]u8 {
-        std.posix.dup2(self.saved, std.posix.STDERR_FILENO) catch {};
+        std.posix.dup2(self.saved, self.fd) catch {};
         std.posix.close(self.saved);
         defer self.file.close();
         try self.file.seekTo(0);
@@ -416,6 +423,71 @@ test "log defaults to warn: a healthy run writes nothing to stderr" {
     _ = try res;
     try std.testing.expectEqual(obs.Level.warn, (LogConfig{}).level);
     try std.testing.expectEqualStrings("", logged);
+}
+
+test "a lone LOAD logs load_complete under --log-format json at info" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base });
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = run(alloc, prog, .{ .items = true, .log = .{ .format = .json, .level = .info, .summary = .none } }, &rdiag);
+    const logged = try cap.end(alloc);
+    defer alloc.free(logged);
+    _ = try res;
+    try std.testing.expect(std.mem.indexOf(u8, logged, "\"event\":\"load_complete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logged, "\"rows_written\":2") != null);
+}
+
+test "summary: --max-rows counts the printed rows, and a parallel FOR EACH names its source and sink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n3\n4\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\na\nb\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\SELECT id FROM '{s}/in.csv';
+        \\LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';
+    , .{ base, base, base });
+    defer alloc.free(script);
+    const loop = try std.fmt.allocPrint(alloc,
+        \\FOR EACH ROW OF (SELECT name FROM '{s}/names.csv') AS (nm) PARALLEL
+        \\  LOAD INTO IDENTIFIER('{s}/o_' || $nm || '.parquet') AS SELECT id FROM '{s}/in.csv';
+        \\END FOR;
+    , .{ base, base, base });
+    defer alloc.free(loop);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    var summary: obs.Summary = .{ .run_id = 0 };
+    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+    const res = run(alloc, prog, .{ .threads = 2, .max_rows = 2, .stdout_format = .csv, .summary_out = &summary, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const printed = try out.end(alloc);
+    defer alloc.free(printed);
+    _ = try res;
+    try std.testing.expectEqualStrings("id\n1\n2\n", printed);
+    try std.testing.expectEqual(@as(u64, 2 + 4), summary.rows_written);
+
+    var loop_summary: obs.Summary = .{ .run_id = 0 };
+    _ = try run(alloc, try parser.parseSource(parena.allocator(), loop, &pdiag), .{ .threads = 2, .summary_out = &loop_summary, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    try std.testing.expectEqual(@as(u64, 8), loop_summary.rows_written);
+    try std.testing.expectEqualStrings("csv", loop_summary.source);
+    try std.testing.expectEqualStrings("parquet", loop_summary.sink);
 }
 
 test "for-each discovers its rows from an in-engine SELECT" {

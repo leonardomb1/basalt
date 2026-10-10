@@ -190,7 +190,7 @@ const Opts = struct {
 
 pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var err_buf: [4096]u8 = undefined;
-    var err_file = std.fs.File.stderr().writer(&err_buf);
+    var err_file = std.fs.File.stderr().writerStreaming(&err_buf);
     const stderr = &err_file.interface;
     defer stderr.flush() catch {};
 

@@ -48,6 +48,7 @@ const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
 const http_client = @import("../../net/http_client.zig");
 const objstore = @import("../../store/objstore.zig");
+const Part = @import("../../store/part.zig").Part;
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const types = @import("../../lang/types.zig");
@@ -367,6 +368,7 @@ pub const Writer = struct {
     offset: i64 = 0,
     groups: List(RowGroupMeta),
     group_rows: usize = row_group_rows,
+    part: Part = .{},
 
     const Backend = union(enum) {
         file: std.fs.File,
@@ -432,7 +434,7 @@ pub const Writer = struct {
             const obj = try objstore.parse(arena, path);
             self.backend = .{ .object = try obj.openWriter(arena, client, parquet_content_type) };
         } else {
-            self.backend = .{ .file = try std.fs.cwd().createFile(path, .{}) };
+            self.backend = .{ .file = try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
         }
         try self.emit(parquet.magic);
@@ -624,9 +626,11 @@ pub const Writer = struct {
             .file => |f| {
                 self.fw.interface.flush() catch |e| {
                     f.close();
+                    self.part.discard();
                     return e;
                 };
                 f.close();
+                try self.part.commit();
             },
             .object => |o| o.finish() catch |e| return self.specific(e),
             .memory => {},
@@ -643,7 +647,10 @@ pub const Writer = struct {
     pub fn abort(self: *Writer) void {
         self.freeScratch();
         switch (self.backend) {
-            .file => |f| f.close(),
+            .file => |f| {
+                f.close();
+                self.part.discard();
+            },
             .object => |o| o.abort(),
             .memory => {},
         }

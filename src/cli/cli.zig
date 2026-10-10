@@ -90,7 +90,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer std.process.argsFree(alloc, args);
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_file = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_file = std.fs.File.stderr().writerStreaming(&stderr_buf);
     const stderr = &stderr_file.interface;
 
     if (args.len < 2) {
@@ -111,17 +111,18 @@ pub fn run(alloc: std.mem.Allocator) !void {
     } else if (std.mem.eql(u8, verb, "kernel")) {
         std.process.exit(try kernel.cmdKernel(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
-        for (args[2..]) |a| if (try unknownOption(a, "repl", stderr)) std.process.exit(2);
+        if (try unexpectedArg(args, stderr)) std.process.exit(2);
         std.process.exit(try cmdRepl(alloc));
     } else if (std.mem.eql(u8, verb, "version") or std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-V")) {
+        if (try unexpectedArg(args, stderr)) std.process.exit(2);
         var stdout_buf: [256]u8 = undefined;
-        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_file = std.fs.File.stdout().writerStreaming(&stdout_buf);
         try stdout_file.interface.print("basalt {s}\n", .{@import("build_options").version});
         try stdout_file.interface.flush();
         return;
     } else if (std.mem.eql(u8, verb, "help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "--help")) {
         var stdout_buf: [4096]u8 = undefined;
-        var stdout_file = std.fs.File.stdout().writer(&stdout_buf);
+        var stdout_file = std.fs.File.stdout().writerStreaming(&stdout_buf);
         try usage(&stdout_file.interface);
         try stdout_file.interface.flush();
         return;
@@ -131,6 +132,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try usage(stderr);
     try stderr.flush();
     std.process.exit(2);
+}
+
+/// Reports and flushes the first argument after a verb that takes none.
+fn unexpectedArg(args: [][:0]u8, stderr: *std.Io.Writer) !bool {
+    if (args.len <= 2) return false;
+    if (!try unknownOption(args[2], args[1], stderr))
+        try stderr.print("error: unexpected argument `{s}`: `{s}` takes none\n", .{ args[2], args[1] });
+    try stderr.flush();
+    return true;
 }
 
 const scriptArg = @import("args.zig").scriptArg;

@@ -21,7 +21,10 @@ pub fn loadExit(e: LoadError) u8 {
     };
 }
 
+/// Exactly one script: a second path, or a path beside `-c`, is a `Usage` error
+/// rather than silently ignored.
 pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, stderr: *std.Io.Writer) !Source {
+    const first = scriptArg(args);
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
@@ -29,13 +32,21 @@ pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, st
                 try stderr.print("error: missing script after `{s}`\n", .{args[i]});
                 return error.Usage;
             }
+            if (first) |p| {
+                try stderr.print("error: `{s}` and a script path `{s}` both given; give one\n", .{ args[i], args[p] });
+                return error.Usage;
+            }
             return Source{ .label = "<command>", .text = args[i + 1] };
         }
     }
-    const at = scriptArg(args) orelse {
+    const at = first orelse {
         try stderr.print("error: `{s}` requires a <script> path, `-` for stdin, or `-c <script>`\n", .{verb});
         return error.Usage;
     };
+    if (nextPositional(args, at + 1)) |extra| {
+        try stderr.print("error: unexpected argument `{s}`: `{s}` takes one script\n", .{ args[extra], verb });
+        return error.Usage;
+    }
     if (std.mem.eql(u8, args[at], "-")) {
         const text = std.fs.File.stdin().readToEndAlloc(arena, 8 << 20) catch |e| {
             try stderr.print("error: cannot read script from stdin: {s}\n", .{@errorName(e)});
@@ -51,12 +62,16 @@ pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, st
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-const valued_flags = [_][]const u8{ "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
+const valued_flags = [_][]const u8{ "-c", "--command", "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
 
 /// The first argument that is neither a flag nor a flag's value, `-` included, so the
 /// script may come before or after its flags.
 pub fn scriptArg(args: [][:0]u8) ?usize {
-    var i: usize = 2;
+    return nextPositional(args, 2);
+}
+
+fn nextPositional(args: [][:0]u8, from: usize) ?usize {
+    var i = from;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-")) return i;
@@ -69,6 +84,24 @@ pub fn scriptArg(args: [][:0]u8) ?usize {
         }
         return i;
     }
+    return null;
+}
+
+/// Why `-p name=…` cannot bind in `prog`: a LET, or no such PARAM (a typo would
+/// otherwise run on the default). Null when a PARAM of that name is declared.
+pub fn paramProblem(arena: std.mem.Allocator, prog: ast.Program, name: []const u8) !?[]const u8 {
+    for (prog.stmts) |s| switch (s) {
+        .param => |p| if (std.mem.eql(u8, p.name, name)) return null,
+        .let_const => |l| if (std.mem.eql(u8, l.name, name))
+            return try std.fmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{name}),
+        else => {},
+    };
+    return try std.fmt.allocPrint(arena, "`-p {s}`: the script declares no PARAM `{s}`", .{ name, name });
+}
+
+/// The first `-p` key given twice, which would otherwise bind one of the values silently.
+pub fn repeatedKey(keys: []const []const u8) ?[]const u8 {
+    for (keys, 0..) |k, i| for (keys[i + 1 ..]) |o| if (std.mem.eql(u8, k, o)) return k;
     return null;
 }
 
@@ -212,9 +245,58 @@ test "scriptArg: the script is found whatever order flags and it come in" {
         .{ .argv = &.{ "basalt", "run", "--format", "json" }, .want = null },
         .{ .argv = &.{ "basalt", "check", "-p", "out.sql" }, .want = null },
         .{ .argv = &.{ "basalt", "check", "--known", "t1,t2", "x.sql" }, .want = 4 },
+        .{ .argv = &.{ "basalt", "run", "-c", "SELECT 1 AS v;", "--format", "json" }, .want = null },
         .{ .argv = &.{ "basalt", "run", "--spill-dir", "/scratch", "--spill-cap", "1GB", "--op-memory", "64MB", "x.sql" }, .want = 8 },
     };
     for (cases) |c| try std.testing.expectEqual(c.want, scriptArg(try testArgv(a, c.argv)));
+}
+
+test "loadSource: a second script, or a path beside -c, is a usage error" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var out: [512]u8 = undefined;
+    const bad = [_][]const []const u8{
+        &.{ "basalt", "run", "s.sql", "other.sql" },
+        &.{ "basalt", "run", "s.sql", "-c", "SELECT 1 AS v;" },
+        &.{ "basalt", "run", "-c", "SELECT 1 AS v;", "s.sql" },
+    };
+    for (bad) |argv| {
+        var w = std.Io.Writer.fixed(&out);
+        try std.testing.expectError(error.Usage, loadSource(a, "run", try testArgv(a, argv), &w));
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), ".sql`") != null);
+    }
+    var w = std.Io.Writer.fixed(&out);
+    const src = try loadSource(a, "run", try testArgv(a, &.{ "basalt", "run", "-p", "k=v", "-c", "SELECT 1 AS v;", "--format", "json" }), &w);
+    try std.testing.expectEqualStrings("SELECT 1 AS v;", src.text);
+}
+
+test "paramProblem and repeatedKey: -p must name a declared PARAM, once" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: include.Diag = .{};
+    const prog = try include.loadProgram(a, "PARAM d INT DEFAULT 0; LET k = 1; SELECT $d AS v;", "t.sql", ".", &diag);
+    try std.testing.expect((try paramProblem(a, prog, "d")) == null);
+    try std.testing.expect(std.mem.indexOf(u8, (try paramProblem(a, prog, "k")).?, "is a LET") != null);
+    try std.testing.expectEqualStrings("`-p zz`: the script declares no PARAM `zz`", (try paramProblem(a, prog, "zz")).?);
+    try std.testing.expectEqualStrings("d", repeatedKey(&.{ "d", "e", "d" }).?);
+    try std.testing.expect(repeatedKey(&.{ "d", "e" }) == null);
+}
+
+test "a streaming writer appends to a file others also write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("err", .{ .read = true });
+    defer f.close();
+    try f.writeAll("a progress line\n");
+    var buf: [64]u8 = undefined;
+    var fw = f.writerStreaming(&buf);
+    try fw.interface.writeAll("error: boom\n");
+    try fw.interface.flush();
+    var rb: [64]u8 = undefined;
+    const n = try f.preadAll(&rb, 0);
+    try std.testing.expectEqualStrings("a progress line\nerror: boom\n", rb[0..n]);
 }
 
 test "threadFlagValue recognizes all four -j/--threads spellings" {

@@ -101,13 +101,32 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
-        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
+        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
     }
     p.known_conns = opts.known_conns;
     p.known_fns = opts.known_fns;
     p.known_tables = opts.known_tables;
     p.errors = opts.errors;
     return p.parseProgram();
+}
+
+/// `text` as a message can carry it: bytes that are not UTF-8 become `\xNN`, so a
+/// JSON diagnostic stays valid.
+fn shownText(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return text;
+    var out = std.Io.Writer.Allocating.init(arena);
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        if (n > 1 and i + n <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + n])) {
+            out.writer.writeAll(text[i .. i + n]) catch return error.OutOfMemory;
+            i += n;
+        } else {
+            if (text[i] < 0x80) out.writer.writeByte(text[i]) catch return error.OutOfMemory else out.writer.print("\\x{X:0>2}", .{text[i]}) catch return error.OutOfMemory;
+            i += 1;
+        }
+    }
+    return out.written();
 }
 
 /// A type name as a `PARAM` or `CAST` spells it, or null when it is none.
@@ -125,7 +144,7 @@ pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
-        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{t.text});
+        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
     }
     const e = try p.parseExpr();
     if (!p.at(.eof)) return p.fail(p.curPos(), "unexpected trailing input in expression", .{});

@@ -389,6 +389,8 @@ const ForCtx = struct {
     first_err_buf: [640]u8 = undefined,
     first_err_len: usize = 0,
     first_retryable: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    src_name: []const u8 = "",
+    sink_name: []const u8 = "",
 };
 
 /// `item` is the retry identity in the outcome sink (the first cell); `label` the
@@ -458,6 +460,12 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
             forRecordFail(ctx, row[0], label, emsg, isTransient(e) or w_diag.retryable, w_env.item_reported);
         }
         if (w_env.wrote_sink) ctx.wrote_sink.store(true, .monotonic);
+        {
+            ctx.mu.lock();
+            defer ctx.mu.unlock();
+            if (ctx.src_name.len == 0) ctx.src_name = w_env.src_name;
+            if (ctx.sink_name.len == 0) ctx.sink_name = w_env.sink_name;
+        }
         for (w_sources.items) |sc| sc.close();
         if (ctx.base.progress) |p| p.loopTick(ctx.counted);
     }
@@ -658,6 +666,8 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
             stats.rows_out += ctx.rows_out.load(.monotonic);
             lanes_used.* = @max(lanes_used.*, lanes);
             if (ctx.wrote_sink.load(.monotonic)) env.wrote_sink = true;
+            if (env.src_name.len == 0) env.src_name = ctx.src_name;
+            if (env.sink_name.len == 0) env.sink_name = ctx.sink_name;
             const fails = ctx.failures.load(.monotonic);
             if (fails > 0 and (on_error == .stop or opts.outcomes == null)) {
                 if (ctx.first_retryable.load(.monotonic)) env.diag.retryable = true;

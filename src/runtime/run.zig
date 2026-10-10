@@ -277,7 +277,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer facts_cache.deinit();
     env.facts_cache = &facts_cache;
     env.loads = &loads;
-    env.items = opts.items and manyLoads(program.stmts[1..]);
+    env.items = opts.items and (manyLoads(program.stmts[1..]) or opts.log.format == .json);
 
     var progress = obs.Progress{ .logger = &logger, .rows = &rows_read };
     if (opts.progress_hook) |h| {
@@ -323,7 +323,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     stats.source = env.src_name;
     stats.sink = env.sink_name;
 
-    const summary = runSummary(&env, run_id, stats.rows_out, stats.rows_read, stats.elapsed_ms, lanes_used, &loads, &scan, runnable == 1);
+    var summary = runSummary(&env, run_id, stats.rows_out, stats.rows_read, stats.elapsed_ms, lanes_used, &loads, &scan, runnable == 1);
+    if (opts.outcomes) |o| summary.partial = o.failures() > 0;
     switch (opts.log.summary) {
         .json_stdout => if (env.wrote_sink) {
             var sbuf: [1024]u8 = undefined;
@@ -601,11 +602,10 @@ pub fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
     }
     if (!env.items) return;
     if (failed) {
-        env.log.item(.{ .target = env.last_target, .reason = why });
-        env.item_reported = true;
+        env.item_reported = env.log.item(.{ .target = env.last_target, .reason = why });
         return;
     }
-    env.log.item(.{ .target = env.last_target, .rows = f.rows, .elapsed_ms = f.elapsed_ms });
+    _ = env.log.item(.{ .target = env.last_target, .rows = f.rows, .elapsed_ms = f.elapsed_ms });
 }
 
 pub fn targetLabel(arena: std.mem.Allocator, w: ast.Write) ![]const u8 {
