@@ -8,7 +8,9 @@ and Excel — unless `WITH (format = ...)` names one ([Sources](sources.md#sourc
 A header name in double quotes loses its quotes (`""` inside is one quote) and
 may hold the delimiter: `"Valor Total"` is the column `Valor Total`. Lines end in
 `\n`, `\r\n` or a bare `\r` (old Mac exports), a quoted value keeps any line break
-inside it, and no line is too long to read. Every row must have one field per
+inside it, and a record may run to 64 MiB — past that the read stops with an error
+naming the file and line, as a file that is not CSV or a quote left open would
+otherwise be read into memory whole. Every row must have one field per
 header column: a row with more or fewer is an error naming the file, the line and
 both counts, never padded with nulls or cut short.
 

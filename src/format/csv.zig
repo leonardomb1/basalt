@@ -6,8 +6,9 @@
 //! opens one; a mid-field `"` (`12" pipe`) is data, since treating it as an
 //! opener once swallowed every following row. Unquoted empty is null and `""`
 //! is an empty string. Lines end in `\n`, `\r\n` or, when the stream starts so, a
-//! bare `\r`; a line longer than the read buffer is gathered, never refused. A row
-//! with more or fewer fields than the header is an error naming its file and line.
+//! bare `\r`; a line longer than the read buffer is gathered, and a record past
+//! `MAX_RECORD` is refused (no CSV, or a quote left open) to keep memory bounded. A
+//! row with more or fewer fields than the header is an error naming its file and line.
 //!
 //! The delimiter and the source encoding are a `Dialect`, because the CSV a
 //! statistics office or regulator publishes is often `;`-separated latin-1.
@@ -62,6 +63,7 @@ const deflate = @import("deflate.zig");
 
 const BATCH_ROWS = 1024;
 const LINE_BUF = 64 * 1024;
+const MAX_RECORD = 64 * 1024 * 1024;
 
 pub const Encoding = enum {
     utf8,
@@ -603,14 +605,16 @@ pub const CsvReader = struct {
         while (quoted) {
             const more = (try self.takePhysical()) orelse break;
             quoted = quotesOpen(more, self.dialect.delim, true);
+            if (self.join_buf.items.len + more.len >= MAX_RECORD)
+                return explainf(error.CsvRecordTooLong, "`{s}`: the record from line {d} runs past {d} MiB without closing its quote — is a quote left open?", .{ self.path, self.rec_line, MAX_RECORD >> 20 });
             try self.join_buf.append(self.eol);
             try self.join_buf.appendSlice(more);
         }
         return trimCr(self.join_buf.items);
     }
 
-    /// A line past the read buffer is gathered into `long_buf`, so no line length is
-    /// refused; a truncated or corrupt compressed stream is named with where it broke.
+    /// A line past the read buffer is gathered into `long_buf`, up to `MAX_RECORD`; a
+    /// truncated or corrupt compressed stream is named with where it broke.
     fn takePhysical(self: *CsvReader) !?[]const u8 {
         const line = self.rdr.takeDelimiter(self.eol) catch |e| switch (e) {
             error.StreamTooLong => return try self.takeLong(),
@@ -626,6 +630,8 @@ pub const CsvReader = struct {
             const part = self.rdr.takeDelimiter(self.eol) catch |e| switch (e) {
                 error.StreamTooLong => {
                     const held = self.rdr.buffered();
+                    if (self.long_buf.items.len + held.len >= MAX_RECORD)
+                        return explainf(error.CsvRecordTooLong, "`{s}` line {d} is longer than {d} MiB — is it a CSV?", .{ self.path, self.line_no + 1, MAX_RECORD >> 20 });
                     try self.long_buf.appendSlice(held);
                     self.rdr.toss(held.len);
                     continue;

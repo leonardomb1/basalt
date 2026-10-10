@@ -433,7 +433,7 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
     if (held.* == null) {
         const path = m.files[it.file];
         const r = try pqdecode.Reader.openProjected(scratch, path, m.project);
-        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema)) |why| {
+        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema, m.project)) |why| {
             r.close();
             return eval.explain(error.ParquetFolderMismatch, pqdecode.mismatchMessage(scratch, m.root orelse "", path, m.files[0], why));
         };
