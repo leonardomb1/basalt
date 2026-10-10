@@ -404,7 +404,7 @@ pub fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u
     for (items) |it| switch (it) {
         .field => |f| if (std.mem.eql(u8, f.last(), nm)) return nm,
         .computed => |cc| if (cc.expr.* == .field and std.mem.eql(u8, cc.expr.field.last(), nm)) return cc.name,
-        .star => return nm,
+        .star, .star_of => return nm,
         .star_except => |ex| {
             for (ex) |x| {
                 if (std.mem.eql(u8, x, nm)) break;

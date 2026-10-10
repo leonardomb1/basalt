@@ -209,11 +209,15 @@ pub const SelectItem = union(enum) {
     star,
     star_except: []const []const u8,
     star_rename: []const Rename,
+    star_of: StarOf,
     field: QualName,
     computed: Computed,
 
     pub const Computed = struct { name: []const u8, expr: *Expr };
     pub const Rename = struct { from: []const u8, to: []const u8 };
+    /// `t.*` over a join: the columns of the join side `rel`, or with `rel` empty the
+    /// FROM table's, those of none of the join sides `rights`; less the hidden `drop`.
+    pub const StarOf = struct { rel: []const u8 = "", rights: []const []const u8 = &.{}, drop: []const []const u8 = &.{} };
 };
 
 pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };

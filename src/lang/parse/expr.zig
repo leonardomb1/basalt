@@ -343,7 +343,11 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
             _ = try self.expect(.rparen);
             return e;
         },
-        .qident => return self.mk(.{ .field = try self.parseQualNameField() }),
+        .qident => {
+            const q = try self.parseQualNameField();
+            try self.noteQual(q, q.span.?.start);
+            return self.mk(.{ .field = q });
+        },
         .ident => {
             if (eqlNoCase(t.text, "null")) {
                 _ = self.advance();
@@ -441,6 +445,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 return self.mk(.{ .lambda_var = name });
             };
             const q = try self.parseQualNameField();
+            try self.noteQual(q, q.span.?.start);
             return self.mk(.{ .field = q });
         },
         else => return self.fail(self.curPos(), "expected an expression, found {s}", .{t.tag.describe()}),

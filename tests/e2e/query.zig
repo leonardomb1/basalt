@@ -1529,6 +1529,24 @@ test "join: qualified keys bind to their side, a self-join too; an unqualified n
     try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/c1.csv' a JOIN '$B/c2.csv' b ON code = code;", "join key `code` is ambiguous");
 }
 
+test "join: `t.*` is that table's columns alone, by their own names unless taken; `b.x` is only `b`'s" {
+    try runQualCases(&.{
+        .{ .q = "SELECT i.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name ORDER BY i.item", .want = "name,item,q\nana,x,1\nana,y,2\nbob,z,3\n" },
+        .{ .q = "SELECT t.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name WHERE i.item = 'z'", .want = "id,name,amt\n2,bob,20.25\n" },
+        .{ .q = "SELECT t.*, i.* FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name WHERE i.item = 'z'", .want = "id,name,amt,name_r,item,q\n2,bob,20.25,bob,z,3\n" },
+        .{ .q = "SELECT i.*, row_number() OVER (ORDER BY t.id, i.item) AS rn FROM '$B/t.csv' t JOIN '$B/items.csv' i ON t.name = i.name", .want = "name,item,q,rn\nana,x,1,1\nana,y,2,2\nbob,z,3,3\n" },
+        .{ .q = "SELECT g.* FROM '$B/emp.csv' e JOIN '$B/emp.csv' m ON e.mgr = m.id JOIN '$B/emp.csv' g ON m.mgr = g.id", .want = "id,mgr,name\n1,,boss\n" },
+        .{ .q = "SELECT i.name, i.item FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.name = 'bob'", .want = "name,item\nbob,z\n" },
+        .{ .q = "SELECT l.k FROM '$B/l.csv' WHERE l.k > 3", .want = "k\n4\n" },
+    });
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n1,x\n" });
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown field `b.v`");
+}
+
 test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
     try runQualCases(&.{
         .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k = 1", .want = "s,s_r\nu,a\n" },

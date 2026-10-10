@@ -32,8 +32,23 @@ fn colNamed(cols: []const Col, name: []const u8) bool {
     return false;
 }
 
-/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there;
-/// then its joined name, suffixed `_r` (`_r2`, …) if that is taken too.
+/// `want` unless an earlier column took it; then `joined`, the name the column has
+/// in its input, suffixed `_r` (`_r2`, …) until free.
+fn freeName(arena: std.mem.Allocator, cols: []const Col, want: []const u8, joined: []const u8) Error![]const u8 {
+    if (!colNamed(cols, want)) return want;
+    var nm = joined;
+    var n: usize = 0;
+    while (colNamed(cols, nm)) : (n += 1) {
+        nm = if (n == 0)
+            try std.fmt.allocPrint(arena, "{s}_r", .{joined})
+        else
+            try std.fmt.allocPrint(arena, "{s}_r{d}", .{ joined, n + 1 });
+    }
+    return nm;
+}
+
+/// `b.x` is called `x` in the output, as in SQL, unless `a.x` is already there
+/// (`freeName`); so is each column of `b.*`.
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
@@ -56,17 +71,17 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
             }
         },
+        .star_of => |so| for (in.fields, 0..) |f, idx| {
+            if (so.rel.len > 0) {
+                if (!std.mem.eql(u8, f.rel, so.rel)) continue;
+            } else if (nameIn(so.rights, f.rel)) continue;
+            if (nameIn(so.drop, f.name)) continue;
+            const nm = try freeName(arena, cols.items, if (f.base.len > 0) f.base else f.name, f.name);
+            try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
+        },
         .field => |q| {
-            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
-            var nm = lastPart(q);
-            if (colNamed(cols.items, nm)) nm = in.fields[idx].name;
-            var n: usize = 0;
-            while (colNamed(cols.items, nm)) : (n += 1) {
-                nm = if (n == 0)
-                    try std.fmt.allocPrint(arena, "{s}_r", .{in.fields[idx].name})
-                else
-                    try std.fmt.allocPrint(arena, "{s}_r{d}", .{ in.fields[idx].name, n + 1 });
-            }
+            const idx = in.resolve(q.parts) orelse return failAt(diag, q.span, "unknown field `{s}`", .{try std.mem.join(arena, ".", q.parts)});
+            const nm = try freeName(arena, cols.items, lastPart(q), in.fields[idx].name);
             try cols.append(.{ .name = nm, .ty = in.fields[idx].ty, .source = .{ .passthrough = idx }, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
         },
         .computed => |c| {

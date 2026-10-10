@@ -655,6 +655,37 @@ test "sql: IN (SELECT ...) under OR / outside WHERE / multi-column are parse err
     try testing.expect(prog.stmts[1].output.stages[1].node == .filter);
 }
 
+test "sql: a qualifier must name a table of its query; one of the query around is a correlated subquery" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const refused = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "SELECT zz.k FROM 'l.csv' a WHERE zz.k > 2;", .want = "unknown table `zz`" },
+        .{ .src = "SELECT a.k FROM 'l.csv' a ORDER BY zz.k;", .want = "unknown table `zz`" },
+        .{ .src = "SELECT a.k FROM 'l.csv' a JOIN 'r.csv' b ON a.k = zz.k;", .want = "unknown table `zz`" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE k IN (SELECT k FROM 'r.csv' b WHERE b.s = a.s);", .want = "`a.s` names `a` of the query around this subquery" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE v > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);", .want = "correlated subquery is not supported" },
+        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a;", .want = "correlated subquery is not supported" },
+    };
+    for (refused) |c| {
+        try testing.expectError(error.ParseFailed, parseSource(a, c.src, &diag));
+        if (std.mem.indexOf(u8, diag.msg, c.want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ c.want, diag.msg });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const accepted = [_][]const u8{
+        "WITH c AS (SELECT * FROM 'l.csv') SELECT c.k FROM c WHERE c.k > 2;",
+        "SELECT l.k FROM 'dir/l.csv' WHERE l.k > 2 ORDER BY l.k;",
+        "SELECT a.k FROM 'l.csv' a WHERE a.k IN (SELECT b.k FROM 'r.csv' b WHERE b.s <> 'x');",
+        "SELECT a.k, b.s FROM 'l.csv' a JOIN 'r.csv' b ON a.k = b.k ORDER BY b.s;",
+        "SELECT a.k FROM 'l.csv' a PUSHDOWN(x.k > 1);",
+    };
+    for (accepted) |src| _ = try parseSource(a, src, &diag);
+}
+
 test "sql: scalar subquery desugars to a query LET ahead of the statement" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

@@ -372,6 +372,7 @@ fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: 
             }
             star = true;
         },
+        .star_of => return null,
         .field => |q| if (std.mem.eql(u8, q.last(), name)) return q,
         .computed => |c| if (std.mem.eql(u8, c.name, name)) {
             if (c.expr.* == .field and !c.expr.field.dollar) return c.expr.field;

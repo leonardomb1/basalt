@@ -29,6 +29,7 @@ const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
+const stripsAlias = @import("../sql_parser.zig").stripsAlias;
 
 /// A computed file target (`IDENTIFIER(...)`) must spell its extension literally: it
 /// picks the writer and the legal dispositions at plan time, before any row is read.
@@ -199,6 +200,10 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     var hidden_drop: ?[]const ast.SelectItem = null;
     if (self.eatKw("order")) {
         try self.expectKw("by");
+        var order_quals = std.array_list.Managed(Parser.QualRef).init(self.arena);
+        const outer_quals = self.qual_sink;
+        self.qual_sink = &order_quals;
+        defer self.qual_sink = outer_quals;
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
         while (true) {
             var q: ast.QualName = undefined;
@@ -221,7 +226,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     return self.fail(kpos, "a window function in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
                 q = .{ .parts = parts };
             } else {
+                const kpos = self.curPos();
                 q = try self.parseQualNameTok();
+                try self.noteQual(q, kpos);
                 q = stripQual(q, &first.aliases);
             }
             var desc = false;
@@ -231,6 +238,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             try keys.append(.{ .field = q, .desc = desc });
             if (!self.eat(.comma)) break;
         }
+        try self.settleQuals(order_quals.items, &first.aliases, outer_quals);
         const sort_keys = try keys.toOwnedSlice();
 
         var visible: ?[]const ast.SelectItem = null;
@@ -327,6 +335,10 @@ pub fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
 pub fn parseSelectCore(self: *Parser) Error!Core {
     const pos = self.curPos();
     try self.expectKw("select");
+    var quals = std.array_list.Managed(Parser.QualRef).init(self.arena);
+    const outer_quals = self.qual_sink;
+    self.qual_sink = &quals;
+    defer self.qual_sink = outer_quals;
 
     var distinct = false;
     var distinct_on: ?[]ast.QualName = null;
@@ -336,8 +348,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (self.eatKw("on")) {
             _ = try self.expect(.lparen);
             var cols = std.array_list.Managed(ast.QualName).init(self.arena);
-            try cols.append(try self.parseColRef());
-            while (self.eat(.comma)) try cols.append(try self.parseColRef());
+            while (true) {
+                const cpos = self.curPos();
+                const q = try self.parseColRef();
+                try self.noteQual(q, cpos);
+                try cols.append(q);
+                if (!self.eat(.comma)) break;
+            }
             _ = try self.expect(.rparen);
             distinct_on = try cols.toOwnedSlice();
         }
@@ -429,7 +446,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     while (true) {
         if (self.eatKw("pushdown")) {
             _ = try self.expect(.lparen);
+            self.qual_sink = null;
             const e = try self.parseExpr();
+            self.qual_sink = &quals;
             _ = try self.expect(.rparen);
             const frag = try self.exprToTemplate(e);
             if (frag.len > 0)
@@ -570,6 +589,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const u = try self.parseUsing(kind, binding, jpos, &left_keys, &right_keys);
             using_sel = u.select;
             if (jalias == null) jalias = binding;
+            aliases.setUsing(jalias.?, u.select);
             binding = u.binding;
         } else {
             if (!self.isKw("on"))
@@ -835,11 +855,18 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         switch (ri) {
             .win => |wi| try post.append(.{ .field = try self.singleName(win_calls.items[wi].out.?) }),
             .qstar => |alias| {
-                if (!aliases.has(alias))
+                if (!aliases.knows(alias))
                     return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });
-                try items.append(.star);
-                try post.append(.star);
-                star_count += 1;
+                const rights = try aliases.rights(self.arena);
+                if (rights.len == 0) {
+                    try items.append(.star);
+                    try post.append(.star);
+                    star_count += 1;
+                } else {
+                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (stripsAlias(&aliases, alias)) "" else alias, .rights = rights } };
+                    try items.append(if (win_calls.items.len > 0) .star else so);
+                    try post.append(so);
+                }
             },
             .item => |it| switch (it) {
                 .star => {
@@ -847,7 +874,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post.append(.star);
                     star_count += 1;
                 },
-                .star_except, .star_rename => {
+                .star_except, .star_rename, .star_of => {
                     try items.append(it);
                     try post.append(it);
                 },
@@ -1059,6 +1086,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
         for (post.items) |it| try out_items.append(switch (it) {
             .star => .{ .star_except = drop.items },
+            .star_of => |so| .{ .star_of = .{ .rel = so.rel, .rights = so.rights, .drop = drop.items } },
             .star_except => |ex| .{ .star_except = try std.mem.concat(self.arena, []const u8, &.{ ex, drop.items }) },
             else => it,
         });
@@ -1078,6 +1106,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
+    try self.settleQuals(quals.items, &aliases, outer_quals);
     return .{ .stages = try stages.toOwnedSlice(), .aliases = aliases, .union_branch = union_branch, .expr_aliases = try expr_aliases.toOwnedSlice() };
 }
 
@@ -1094,7 +1123,7 @@ fn keySide(q: ast.QualName, rname: []const u8) KeySide {
 /// reference to it need not be carried.
 fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
     for (items) |it| switch (it) {
-        .star => return true,
+        .star, .star_of => return true,
         .star_except => |ex| {
             for (ex) |x| {
                 if (std.ascii.eqlIgnoreCase(x, name)) break;

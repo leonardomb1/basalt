@@ -16,12 +16,14 @@ const types = @import("../types.zig");
 /// connection's table or QUERY. Registers the alias.
 pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
     var node: ast.Stage.Node = undefined;
+    var own: []const u8 = "";
     if (self.at(.lparen)) {
         const d = try self.parseDerivedTable();
         if (d.alias) |a| try self.claimAlias(aliases, a, d.alias_pos, .left);
         return .{ .ref = d.binding };
     } else if (self.at(.string)) {
         node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } };
+        own = pathStem(node.read.form.path);
     } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
         const pos = self.curPos();
         _ = self.advance();
@@ -94,8 +96,9 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         if (self.tvf) |f| if (f.cte(head)) |bname| {
             node = .{ .ref = bname };
             self.eatAliasAs();
-            if (self.at(.ident) and !isReservedAfterSource(self.cur().text))
+            if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
                 try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
+            } else aliases.implicit = head;
             return node;
         };
         const http = if (self.connType(head)) |k| std.mem.eql(u8, k, "http") else false;
@@ -131,9 +134,11 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
                     try parts.append(try self.parseNameSegment());
                 }
                 node = .{ .read = .{ .connector = head, .form = .{ .table = .{ .parts = try parts.toOwnedSlice() } } } };
+                own = node.read.form.table.parts[node.read.form.table.parts.len - 1];
             }
         } else if (self.isLet(head)) {
             node = .{ .ref = head };
+            own = head;
         } else {
             return self.fail(pos, "unknown source `{s}`: not a CTE, connection, or path", .{head});
         }
@@ -141,8 +146,16 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
     self.eatAliasAs();
     if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
         try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
-    }
+    } else aliases.implicit = own;
     return node;
+}
+
+/// A path's file name up to its first dot (`l` of `'dir/l.csv'`), the name SQL lets
+/// an unaliased file go by; none for a templated one.
+fn pathStem(path: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, path, "${") != null) return "";
+    const base = path[if (std.mem.lastIndexOfAny(u8, path, "/\\")) |i| i + 1 else 0..];
+    return base[0 .. std.mem.indexOfScalar(u8, base, '.') orelse base.len];
 }
 
 /// A discovery sub-query: a full SELECT pipeline with no write, run in-engine. Its CTEs

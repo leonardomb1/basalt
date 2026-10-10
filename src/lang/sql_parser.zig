@@ -143,20 +143,50 @@ pub const AliasSet = struct {
 
     names: [MAX_ALIASES][]const u8 = undefined,
     kinds: [MAX_ALIASES]Kind = undefined,
+    usings: [MAX_ALIASES][]const ast.SelectItem = undefined,
     n: usize = 0,
+    implicit: []const u8 = "",
 
     fn put(self: *AliasSet, name: []const u8, kind: Kind) error{ AliasTaken, TooManyAliases }!void {
         for (self.names[0..self.n]) |a| if (std.mem.eql(u8, a, name)) return error.AliasTaken;
         if (self.n == MAX_ALIASES) return error.TooManyAliases;
         self.names[self.n] = name;
         self.kinds[self.n] = kind;
+        self.usings[self.n] = &.{};
         self.n += 1;
+    }
+    /// Records the select a `JOIN ... USING` side `name` ends with, whose merged
+    /// columns `name.k` then names.
+    pub fn setUsing(self: *AliasSet, name: []const u8, sel: []const ast.SelectItem) void {
+        for (self.names[0..self.n], 0..) |a, i| if (std.mem.eql(u8, a, name)) {
+            self.usings[i] = sel;
+        };
+    }
+    fn usingCol(self: *const AliasSet, name: []const u8, col: []const u8) bool {
+        for (self.names[0..self.n], self.usings[0..self.n]) |a, sel| {
+            if (!std.mem.eql(u8, a, name)) continue;
+            for (sel) |it| if (it == .computed and std.mem.eql(u8, it.computed.name, col)) return true;
+        }
+        return false;
     }
     fn strips(self: *const AliasSet, name: []const u8) bool {
         for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
             if (std.mem.eql(u8, a, name)) return k == .left;
         }
-        return false;
+        return self.implicit.len > 0 and std.mem.eql(u8, self.implicit, name);
+    }
+    /// Whether `name` is any table of this FROM: a join side without an alias too,
+    /// and the FROM table's own name when it has none (`implicit`: `FROM c`, `FROM
+    /// conn.db.t`, `FROM 'dir/l.csv'`), which `strips` only while no join claims it.
+    pub fn knows(self: *const AliasSet, name: []const u8) bool {
+        for (self.names[0..self.n]) |a| if (std.mem.eql(u8, a, name)) return true;
+        return self.implicit.len > 0 and std.mem.eql(u8, self.implicit, name);
+    }
+    /// The names of the join sides, which a joined row's columns carry as `rel`.
+    pub fn rights(self: *const AliasSet, arena: std.mem.Allocator) ![]const []const u8 {
+        var out = std.array_list.Managed([]const u8).init(arena);
+        for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| if (k != .left) try out.append(a);
+        return out.toOwnedSlice();
     }
     pub fn has(self: *const AliasSet, name: []const u8) bool {
         for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
@@ -215,7 +245,7 @@ fn postItemName(it: ast.SelectItem) ?[]const u8 {
     return switch (it) {
         .field => |q| q.last(),
         .computed => |c| c.name,
-        .star, .star_except, .star_rename => null,
+        .star, .star_except, .star_rename, .star_of => null,
     };
 }
 
@@ -302,7 +332,7 @@ pub fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]c
 /// What to call a SELECT item in a diagnostic.
 pub fn itemLabel(it: ast.SelectItem) []const u8 {
     return switch (it) {
-        .star, .star_except, .star_rename => "*",
+        .star, .star_except, .star_rename, .star_of => "*",
         .field => |q| q.last(),
         .computed => |c| c.name,
     };
@@ -359,9 +389,47 @@ pub const Parser = struct {
     pending_semijoins: std.array_list.Managed(PendingSemiJoin) = undefined,
     in_where: bool = false,
     win_sink: ?*std.array_list.Managed(WinCall) = null,
+    qual_sink: ?*std.array_list.Managed(QualRef) = null,
     query_depth: usize = 0,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
+
+    /// A column written with a table (`t.x`) inside a query; `inner` once a nested
+    /// query that does not know `t` handed it out to the query around it.
+    pub const QualRef = struct { q: ast.QualName, pos: Pos, inner: bool = false };
+
+    /// Records a qualified column for the query being parsed to check against its
+    /// tables once they are all known. JSON-param paths, lambda parameters, `?.`
+    /// paths (refused when checked) and a table function's own markers are not
+    /// columns of a table.
+    pub fn noteQual(self: *Parser, q: ast.QualName, pos: Pos) Error!void {
+        const sink = self.qual_sink orelse return;
+        if (q.dollar or q.safe.len > 0 or q.parts.len < 2 or q.parts[0].len == 0 or q.parts[0][0] == 0) return;
+        if (self.lambdaParam(q.parts[0]) != null) return;
+        try sink.append(.{ .q = q, .pos = pos });
+    }
+
+    /// Settles a query's qualified columns once its FROM is known: a table of
+    /// its own is fine, unless the column came from a nested query, which makes
+    /// that one correlated; any other is handed out to `outer`, the query around
+    /// this one, or with none an unknown table.
+    pub fn settleQuals(self: *Parser, refs: []const QualRef, aliases: *const AliasSet, outer: ?*std.array_list.Managed(QualRef)) Error!void {
+        for (refs) |r| {
+            const t = r.q.parts[0];
+            if (aliases.knows(t)) {
+                if (r.inner)
+                    return self.fail(r.pos, "`{s}.{s}` names `{s}` of the query around this subquery — a correlated subquery is not supported; write it as a JOIN (an equality with the outer query is an `IN (SELECT ...)` on that key)", .{ t, r.q.last(), t });
+                continue;
+            }
+            if (outer) |o| {
+                var up = r;
+                up.inner = true;
+                try o.append(up);
+                continue;
+            }
+            return self.fail(r.pos, "unknown table `{s}` in `{s}.{s}` — no table of this FROM is named or aliased `{s}`", .{ t, t, r.q.last(), t });
+        }
+    }
 
     pub const PendingSemiJoin = struct {
         sentinel: *ast.Expr,
@@ -744,8 +812,9 @@ pub fn stripsAlias(aliases: *const AliasSet, name: []const u8) bool {
     return aliases.strips(name);
 }
 
+/// `t.x` as `x` where `t` is the FROM table, or `x` a column `t`'s USING merged.
 pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
-    if (!q.dollar and q.parts.len > 1 and aliases.strips(q.parts[0]))
+    if (!q.dollar and q.parts.len > 1 and (aliases.strips(q.parts[0]) or aliases.usingCol(q.parts[0], q.parts[1])))
         return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
     return q;
 }
