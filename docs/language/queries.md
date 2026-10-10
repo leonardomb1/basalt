@@ -39,9 +39,9 @@ LIMIT 100 OFFSET 20;
 | `f(...) OVER (PARTITION BY .. ORDER BY .. [frame])` | window — a value per row from its partition and frame, anywhere in a `SELECT` item; see [Window functions](windows.md) |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
 | `ORDER BY a DESC, b` | sort — by columns, expressions (`ORDER BY x - 1`, `ORDER BY upper(s)`) or positions (`ORDER BY 2`). A null sorts as larger than every value, as in Postgres: last ascending, first under `DESC`; `NULLS FIRST` / `NULLS LAST` after a key places them either way (`ORDER BY ts DESC NULLS LAST`) |
-| `LIMIT n [OFFSET m]` | limit — `n` and `m` are constants: an integer, a `$param`, a `LET`, a loop variable, a scalar subquery or an expression of them (`LIMIT $page_size OFFSET ($page - 1) * $page_size`), evaluated once before the query runs; a column is refused, and so is a value that is negative or not a whole number. `LIMIT ALL` and `LIMIT NULL` are no limit, `OFFSET` may come first or stand alone, and the standard spelling `OFFSET m ROWS FETCH FIRST n ROWS ONLY` (`NEXT` for `FIRST`, `ROW` for `ROWS`, `n` 1 when left out) means the same; `WITH TIES` is not supported |
+| `LIMIT n [OFFSET m]` | limit — `n` and `m` are constants: an integer, a `$param`, a `LET`, a loop variable, a scalar subquery or an expression of them (`LIMIT $page_size OFFSET ($page - 1) * $page_size`), evaluated once before the query runs; a column is refused, and so is a negative value; a fraction rounds to a whole number as PostgreSQL rounds it (`LIMIT 2.5` is 3, an exact number rounding half away from zero, a float to the nearest even), and text must spell a whole number. `LIMIT ALL` and `LIMIT NULL` are no limit, `OFFSET` may come first or stand alone, and the standard spelling `OFFSET m ROWS FETCH FIRST n ROWS ONLY` (`NEXT` for `FIRST`, `ROW` for `ROWS`, `n` 1 when left out) means the same; `WITH TIES` is not supported |
 | `SELECT * EXCEPT (a, b)` / `EXCLUDE` | every column but those; a name not present is ignored, so one list serves tables that differ. Right after a union (`EACH TABLE OF`, `UNION ALL BY NAME`) the names are dropped *before* the branches are reconciled, so a column one table carries with an incompatible type can be excepted instead of failing the load. A name may be `IDENTIFIER(<expr>)` — a `$param` or loop variable rendered at run time, `'a, b'` excluding both and `''` nothing |
-| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
+| `SELECT DISTINCT` / `DISTINCT ON (a, b)` | distinct — under a plain `DISTINCT` an `ORDER BY` column must be one the SELECT list outputs (`SELECT DISTINCT g … ORDER BY v` is refused, as in SQL); `ON` keys are input columns: they need not be in the SELECT list, and may be ones it renames (`DISTINCT ON (grp) grp AS k`). `DISTINCT ON` keeps the first row per key in `ORDER BY` order when there is one (`ORDER BY k, ts DESC` keeps the latest), else the first in input order |
 | `CROSS JOIN UNNEST(SPLIT(tags, ',')) AS tag` | explode (also `UNNEST(col)`) |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
 | `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function ([user functions](user-functions.md)); see [Joins](joins.md) |
@@ -81,17 +81,30 @@ alias always wins, and is the way to give a computed column a name you rely on.
 A result may repeat a name, as SQL allows: `SELECT a, a` and two unaliased
 `COUNT(*)` print two columns of the same name. `ORDER BY` or `GROUP BY` on such
 a name is ambiguous and refused, unless every item of that name is the same
-expression (`SELECT x AS a, x AS a ... ORDER BY a`). Where the names must tell
-the columns apart, a repeat is refused, naming it: a `LOAD INTO` target, file
-or table, which also refuses a repeat that `*` brings in (a CSV header naming
-`a` twice); and a CTE, derived table or subquery, whose columns the query
-around it reads by name. Two plain columns of the same name from a join's two
-sides are not a repeat: the later is named `_r` — see [Joins](joins.md).
+expression (`SELECT x AS a, x AS a ... ORDER BY a`). A CTE, derived table or
+subquery may repeat a name too, and so may a CSV header: `*` over it passes both
+columns through, and only a reference to the repeated name is refused, as
+ambiguous (`SELECT a FROM (SELECT x AS a, y AS a FROM t) d`). A `LOAD INTO`
+target, file or table, takes each column by its name, so there a repeat is
+refused, naming it, whether written in the SELECT list or brought in by `*`.
+Two plain columns of the same name from a join's two sides are not a repeat:
+the later is named `_r` — see [Joins](joins.md).
+
+A bare name in `GROUP BY` is an input column first, as in SQL, and a SELECT
+item's alias only when no input column has that name: `SELECT upper(g) AS g,
+COUNT(*) ... GROUP BY g` groups by the column `g`, and so does `SELECT g,
+upper(g) AS g ... GROUP BY g`. `ORDER BY` reads a bare name the other way round,
+as the output column first (`SELECT -v AS v ... ORDER BY v` sorts by `-v`). The
+parser does not see a file's or table's columns, so an alias whose expression does
+not read a column of its own name (`SELECT g AS v ... GROUP BY v`) is taken as the
+alias even when the input has a column `v`, where SQL would group by that column —
+give such an alias another name.
 
 `GROUP BY`, `ORDER BY` and `HAVING` may repeat an expression instead of its alias:
 it binds to the one column the projection already produced when it is the same
 expression — same columns, same literals to the letter, spacing and keyword case
-aside. One that differs is a new expression: `ORDER BY upper(s)` beside
+aside. A column is the same however it is written: `upper(t.g)` under
+`FROM 'x.csv' t` repeats `upper(g)`, and so does `upper("g")`. One that differs is a new expression: `ORDER BY upper(s)` beside
 `SELECT upper('s')` sorts by the column `s`, uppercased.
 
 ```sql

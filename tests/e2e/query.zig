@@ -759,6 +759,49 @@ test "limit: plain (unfused) limit takes the first N; offset past the end emptie
     try std.testing.expectEqualStrings("id\n", none);
 }
 
+test "limit: a fraction rounds as PostgreSQL casts it; a negative one is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT * FROM '$IN' LIMIT 2.5", .want = "id\n1\n2\n3\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT 1.4999 OFFSET 1.5", .want = "id\n3\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT -0.4", .want = "id\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT CAST(2.5 AS FLOAT)", .want = "id\n1\n2\n" },
+        .{ .q = "SELECT * FROM '$IN' LIMIT CAST(1.5 AS DECIMAL(3,1))", .want = "id\n1\n2\n" },
+    };
+    for (cases) |c| {
+        const got = try runToString(alloc, &tmp, "id\n1\n2\n3\n4\n", c.q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+    try expectRefusedAlike(alloc, &tmp, "SELECT 1 AS id LIMIT CAST(-1.5 AS DECIMAL(3,1));", "LIMIT must not be negative, got -2");
+}
+
+test "csv: a column with no value in the whole file compares and unifies with any type, as a NULL does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "empty.csv", .data = "k\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "nulls.csv", .data = "k,n\n1,\n2,\n" });
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT id FROM '$IN' WHERE id NOT IN (SELECT k FROM '$B/empty.csv')", .want = "id\n1\n2\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE id NOT IN (SELECT n FROM '$B/nulls.csv')", .want = "id\n" },
+        .{ .q = "SELECT t.id, n.k FROM '$IN' t LEFT JOIN '$B/nulls.csv' n ON t.id = n.n", .want = "id,k\n1,\n2,\n" },
+        .{ .q = "SELECT id FROM '$IN' UNION ALL SELECT n FROM '$B/nulls.csv'", .want = "id\n1\n2\n\n\n" },
+        .{ .q = "SELECT k, coalesce(n, 0) + 1 AS c FROM '$B/nulls.csv'", .want = "k,c\n1,1\n2,1\n" },
+    };
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const got = try runToString(alloc, &tmp, "id\n1\n2\n", q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
 test "join: an empty build side drops all rows (inner) and null-fills (left)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1734,7 +1777,22 @@ test "join: under USING `t.k` and `t.*` are that side's own, the key in its plac
         .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\n" },
         .{ .q = "SELECT * RENAME (id AS tid) FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "name,tid,amt,item,q\nbob,2,20.25,z,3\n" },
         .{ .q = "SELECT name, item FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY t.name, item", .want = "name,item\nana,x\nana,y\nbob,z\ncid,\neve,w\n" },
+        .{ .q = "SELECT DISTINCT ON (i.name) * FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) ORDER BY i.name, q DESC", .want = "name,id,amt,item,q\nana,1,10.5,y,2\nbob,2,20.25,z,3\n" },
+        .{ .q = "SELECT DISTINCT i.name FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC", .want = "name\nbob\nana\n" },
     });
+}
+
+test "join: a key or column the parser renamed is named in a message as the query wrote it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,w\n1,x\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,v\n1,10\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "k,v\na,10\n" });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/l.csv' l JOIN '$B/r.csv' r ON upper(l.w) = r.k;", "join keys an ON expression (string) and `k` (int) are not comparable");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/l.csv' l JOIN '$B/s.csv' s USING (k);", "join keys `k` (int) and `k` (string) are not comparable");
+    try refuse(alloc, &tmp, "SELECT count(*) FROM '$B/l.csv' GROUP BY upper(w) HAVING upper(w) > 1;", "cannot compare an expression (string) with 1 (int)");
 }
 
 test "join: a qualified column is that table's alone, the FROM table's and a later join's too" {

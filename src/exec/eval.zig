@@ -95,10 +95,11 @@ fn joinSpans(a: ?ast.Span, b: ?ast.Span) ?ast.Span {
     return a orelse b;
 }
 
-/// A comparison operand as the message names it: a column, a literal, else its kind.
+/// A comparison operand as the message names it: a column, a literal, else its kind
+/// (a column the parser named `__…` stands for an expression the query wrote).
 fn operandText(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}![]const u8 {
     return switch (e.*) {
-        .field => |q| try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
+        .field => |q| if (std.mem.startsWith(u8, lastPart(q), "__")) "an expression" else try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
         .str_lit => |v| try std.fmt.allocPrint(arena, "'{s}'", .{v}),
         .int_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
         .float_lit => |v| try std.fmt.allocPrint(arena, "{e}", .{v}),
@@ -127,6 +128,7 @@ pub const TypeCtx = struct {
                 self.span = q.span;
                 if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
+                if (q.parts.len == 1 and self.schema.ambiguous(q.parts[0])) return self.err("column reference `{s}` is ambiguous", .{q.parts[0]});
                 const idx = fieldIndex(self.schema, q) orelse {
                     if (q.parts.len > 1) return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
                     return self.err("unknown field `{s}`", .{lastPart(q)});

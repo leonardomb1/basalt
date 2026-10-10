@@ -119,6 +119,8 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
         .{ .q = "SELECT id FROM 't.csv' FETCH NEXT ROW ONLY;", .count = 1, .offset = 0 },
         .{ .q = "SELECT id FROM 't.csv' OFFSET 4;", .count = std.math.maxInt(u64), .offset = 4 },
         .{ .q = "SELECT id FROM 't.csv' LIMIT ALL;", .count = std.math.maxInt(u64), .offset = 0 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT 2.5 OFFSET 1.4;", .count = 3, .offset = 1 },
+        .{ .q = "SELECT id FROM 't.csv' LIMIT -0.4;", .count = 0, .offset = 0 },
         .{ .q = "PARAM n INT DEFAULT 1;\nSELECT id FROM 't.csv' LIMIT $n * 2 OFFSET $n;", .count = std.math.maxInt(u64), .offset = 0, .exprs = true },
     };
     for (cases) |c| {
@@ -135,6 +137,7 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
         .{ "SELECT id FROM 't.csv' LIMIT 1 FETCH FIRST 2 ROWS ONLY;", "a query takes one LIMIT or FETCH FIRST" },
         .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY" },
         .{ "SELECT id FROM 't.csv' OFFSET 1 OFFSET 2;", "a query takes one OFFSET" },
+        .{ "SELECT id FROM 't.csv' LIMIT -0.5;", "LIMIT must not be negative, got -0.5" },
     };
     for (refused) |r| {
         try testing.expectError(error.ParseFailed, parseSource(a, r[0], &diag));
@@ -823,8 +826,6 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
     const cases = [_]struct { q: []const u8, msg: []const u8 }{
         .{ .q = "SELECT g, COUNT(*) FROM 'x.csv' GROUP BY 2;", .msg = "GROUP BY position 2 names the aggregate `count(*)` — a position may only name a grouping key" },
         .{ .q = "LOAD INTO 'o.csv' AS SELECT 1 AS a, 2 AS a;", .msg = "LOAD INTO writes each column under its own name, and two SELECT items are named `a` — give one a different alias" },
-        .{ .q = "WITH c AS (SELECT g, v AS g FROM 'x.csv') SELECT * FROM c;", .msg = "two SELECT items are named `g` — give one a different alias" },
-        .{ .q = "SELECT * FROM (SELECT g, g FROM 'x.csv') d;", .msg = "two SELECT items are named `g` — give one a different alias" },
         .{ .q = "SELECT v AS a, g AS a FROM 'x.csv' ORDER BY a;", .msg = "ORDER BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT g AS a, v AS a, COUNT(*) FROM 'x.csv' GROUP BY a;", .msg = "GROUP BY `a` is ambiguous: two SELECT items are named so — alias one apart" },
         .{ .q = "SELECT *, v AS a, g AS a FROM 'x.csv';", .msg = "two SELECT items are named `a` — give one a different alias" },
@@ -832,6 +833,9 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },
+        .{ .q = "SELECT DISTINCT g FROM 'x.csv' ORDER BY v;", .msg = "for SELECT DISTINCT, ORDER BY `v` must appear in the select list" },
+        .{ .q = "SELECT DISTINCT * FROM 'l.csv' l JOIN 'r.csv' r USING (k) ORDER BY r.k;", .msg = "for SELECT DISTINCT, ORDER BY `r.k` must appear in the select list" },
+        .{ .q = "SELECT l.k, COUNT(*) FROM 'l.csv' l JOIN 'r.csv' r USING (k) GROUP BY r.k;", .msg = "`l.k` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
     };
     for (cases) |c| {
@@ -840,4 +844,5 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         try testing.expectEqualStrings(c.msg, diag.msg);
     }
     _ = try parseTest(a, "SELECT g FROM 'x.csv' GROUP BY g HAVING COUNT(*) > 1;");
+    _ = try parseTest(a, "SELECT g, upper(g) AS g, COUNT(*) FROM 'x.csv' GROUP BY g;");
 }

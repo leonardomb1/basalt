@@ -69,7 +69,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             for (in.fields, 0..) |f, idx| {
                 const nm = renameTo(renames, f.name) orelse f.name;
                 for (in.fields[0..idx]) |g|
-                    if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name))
+                    if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name) and !std.mem.eql(u8, f.name, g.name))
                         return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
                 try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
             }
@@ -87,6 +87,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
             try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
         },
         .field => |q| {
+            try single(in, q, diag);
             const idx = in.resolve(q.parts) orelse {
                 if (q.parts.len > 1) return failAt(diag, q.span, "unknown column `{s}`", .{try std.mem.join(arena, ".", q.parts)});
                 return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
@@ -101,6 +102,13 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         },
     };
     return cols.toOwnedSlice();
+}
+
+/// Refuses an unqualified name two columns of `in` share, as SQL does: a derived
+/// table, CTE or file may repeat a name, but a reference to it is ambiguous.
+pub fn single(in: types.Schema, q: ast.QualName, diag: *Diag) Error!void {
+    if (q.parts.len == 1 and in.ambiguous(q.parts[0]))
+        return failAt(diag, q.span, "column reference `{s}` is ambiguous", .{q.parts[0]});
 }
 
 pub fn schemaOfCols(arena: std.mem.Allocator, cols: []const Col) Error!types.Schema {
@@ -118,6 +126,7 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
 
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
+    for (names) |q| try single(in, q, diag);
     for (names, 0..) |q, i| idxs[i] = in.resolve(q.parts) orelse {
         if (q.parts.len > 1) return failAt(diag, q.span, "unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
         return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
@@ -133,6 +142,7 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     const by = try arena.alloc(usize, ag.by.len);
     for (ag.by, 0..) |q, i| {
+        try single(in, q, diag);
         const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
         by[i] = idx;
         try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
@@ -229,7 +239,7 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
         if (ord.len != 1) return fail(diag, "RANGE with an offset needs exactly one ORDER BY key inside OVER (...), a number, date or timestamp", .{});
         const kt = in.fields[ord[0]].ty;
         key_kind = kt.kind;
-        conv = try rangeConv(arena, kt, wd.key_label orelse lastPart(oqs[0]), wd.funcs, diag);
+        conv = try rangeConv(arena, kt, try keyText(arena, wd.key_label orelse lastPart(oqs[0])), wd.funcs, diag);
         break;
     };
     const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
@@ -331,6 +341,13 @@ fn scaledText(text: []const u8, scale: u8) i128 {
     return v;
 }
 
+/// A window's ORDER BY key for a message: as written, or for one only the parser's
+/// hidden name spells, what it is.
+fn keyText(arena: std.mem.Allocator, key: []const u8) Error![]const u8 {
+    if (std.mem.indexOf(u8, key, "__") != null) return "the ORDER BY expression";
+    return std.fmt.allocPrint(arena, "`{s}`", .{key});
+}
+
 /// How a stage's single ORDER BY key reads as a number for its RANGE offsets: a
 /// float as itself, an int at the scale its offsets need, a decimal at its own or
 /// theirs, a date or timestamp in microseconds. A plain number over a date or
@@ -349,11 +366,11 @@ fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: []const u8, funcs: [
     if (kt.unknown) return .{};
     switch (kt.kind) {
         .int, .float, .decimal => if (interval)
-            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
+            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; {s} is {s}", .{ key, try kt.name(arena) }),
         .time => if (plain)
-            return fail(diag, "a RANGE offset over the TIME key `{s}` is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{key}),
+            return fail(diag, "a RANGE offset over the TIME key {s} is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{key}),
         .date, .timestamp => {},
-        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
+        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; {s} is {s}", .{ key, try kt.name(arena) }),
     }
     return switch (kt.kind) {
         .float => .{ .float = true },
@@ -423,6 +440,7 @@ fn exprHasDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!bool {
 pub const ExplodePlan = struct { idx: usize, schema: types.Schema };
 
 pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, diag: *Diag) Error!ExplodePlan {
+    if (in.ambiguous(ex.field)) return fail(diag, "column reference `{s}` is ambiguous", .{ex.field});
     const idx = in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
     const fty = in.fields[idx].ty;
     if (!(fty.kind == .string or fty.kind == .bytes))
@@ -451,6 +469,8 @@ pub const JoinPlan = struct {
 fn joinPair(left: types.Schema, right: types.Schema, lq: ast.QualName, rq: ast.QualName, pin: ast.KeyPin, diag: *Diag) Error![2]usize {
     const ln = lastPart(lq);
     const rn = lastPart(rq);
+    try single(left, lq, diag);
+    if (rq.parts.len == 1 and right.ambiguous(rn)) return failAt(diag, rq.span, "column reference `{s}` is ambiguous", .{rn});
     const l_in_l = left.resolve(lq.parts);
     const l_in_r = right.indexOf(ln);
     const r_in_l = left.resolve(rq.parts);
@@ -625,7 +645,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
         if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
-            return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
+            return fail(diag, "join keys {s} ({s}) and {s} ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ try keyLabel(arena, left.fields[pair[0]].name, lq.last()), @tagName(lt.kind), try keyLabel(arena, right.fields[pair[1]].name, lq.last()), @tagName(rt.kind) });
     }
 
     const emit_right = (j.kind != .semi and j.kind != .anti);
@@ -662,6 +682,14 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         .right_nullable = right_nullable,
         .left_nullable = left_nullable,
     };
+}
+
+/// A join key for a message: its column; a USING side's copy by the key's name
+/// (`using`); a key the parser computed from an ON expression as that.
+fn keyLabel(arena: std.mem.Allocator, name: []const u8, using: []const u8) Error![]const u8 {
+    if (std.mem.startsWith(u8, name, "__u")) return std.fmt.allocPrint(arena, "`{s}`", .{using});
+    if (std.mem.startsWith(u8, name, "__")) return "an ON expression";
+    return std.fmt.allocPrint(arena, "`{s}`", .{name});
 }
 
 fn isNumeric(k: types.TypeKind) bool {

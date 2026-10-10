@@ -76,10 +76,13 @@ pub fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Man
 /// bind by. It is exact where SQL is: columns keep their case, string literals their
 /// quotes and case, operators their grouping, so two different expressions never
 /// share a key. Arguments render in full: rendering them as `?` once merged
-/// `sum(v*2)` and `sum(v+100)` into one accumulator.
+/// `sum(v*2)` and `sum(v+100)` into one accumulator. Once a query's tables are
+/// known (`key_aliases`) a column renders as it resolves, so `a.g` and `g` of the
+/// FROM table `a` share a key.
 pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u8)) Error!void {
     switch (e.*) {
-        .field => |q| {
+        .field => |q0| {
+            const q = if (self.key_aliases) |al| stripQual(q0, al) else q0;
             if (q.dollar) try buf.append('$');
             for (q.parts, 0..) |part, i| {
                 if (i != 0) try buf.append('.');

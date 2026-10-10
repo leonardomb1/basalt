@@ -518,6 +518,7 @@ test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a w
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(nope * 2) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "unknown field `nope`");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (PARTITION BY nope) AS s FROM '$B/s.csv';", "unknown field `nope`");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (ORDER BY upper(k) RANGE 1 PRECEDING) AS s FROM '$B/s.csv';", "ORDER BY key; `upper(k)` is string");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(a.v) OVER (ORDER BY b.k || 'x' RANGE 1 PRECEDING) AS s FROM '$B/s.csv' a JOIN '$B/s.csv' b USING (k);", "ORDER BY key; the ORDER BY expression is string");
     try expectRefusedAlike(alloc, &tmp, "SELECT NTILE(1 - 1) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "NTILE takes a positive whole number of buckets");
 }
 

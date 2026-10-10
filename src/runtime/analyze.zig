@@ -150,7 +150,9 @@ pub fn uniqueColumns(schema: types.Schema, diag: *Diag) Error!void {
 
 /// A LIMIT or OFFSET expression's rows: its `$name`s replaced and the whole evaluated
 /// once into a whole number at least 0; null for NULL, which SQL reads as no bound.
-/// Text that spells one is taken too, as a loop variable is text.
+/// Text that spells one is taken too, as a loop variable is text. A fraction rounds
+/// as PostgreSQL casts it to an integer: a decimal half away from zero, a float to
+/// the nearest even.
 pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const ParamMap, what: []const u8, diag: *Diag) Error!?u64 {
     const x = try substExpr(arena, e, params);
     const v = eval.constEval(arena, x, &.{}, &.{}) catch |err| switch (err) {
@@ -165,8 +167,24 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .null => null,
         .int => |n| if (n < 0) fail(diag, "{s} must not be negative, got {d}", .{ what, n }) else @intCast(n),
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
+        .float => |f| blk: {
+            if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) break :blk fail(diag, "{s} {d} is out of range", .{ what, f });
+            const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
+            break :blk roundedRows(diag, what, @intFromFloat(r));
+        },
+        .decimal => |d| blk: {
+            const p = std.math.powi(i128, 10, d.scale) catch break :blk fail(diag, "{s} is out of range", .{what});
+            var q = @divTrunc(d.unscaled, p);
+            if (@abs(@rem(d.unscaled, p)) * 2 >= p) q += if (d.unscaled < 0) -1 else 1;
+            break :blk roundedRows(diag, what, q);
+        },
         else => fail(diag, "{s} must be an integer, got {s}", .{ what, @tagName(v) }),
     };
+}
+
+fn roundedRows(diag: *Diag, what: []const u8, n: i128) Error!?u64 {
+    if (n < 0) return fail(diag, "{s} must not be negative, got {d}", .{ what, n });
+    return std.math.cast(u64, n) orelse fail(diag, "{s} {d} is out of range", .{ what, n });
 }
 
 /// The first `$name` in `e`, after substitution one nothing binds.
