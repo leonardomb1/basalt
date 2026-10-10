@@ -258,8 +258,13 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
     try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
     try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
     try std.testing.expectEqual(@as(i64, -4), (try castValue(a, .{ .float = -3.9 }, .int)).int);
-    try std.testing.expectEqual(@as(i64, 3), (try castValue(a, .{ .float = 2.5 }, .int)).int);
-    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -2.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 2), (try castValue(a, .{ .float = 2.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 4), (try castValue(a, .{ .float = 3.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -2), (try castValue(a, .{ .float = -2.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -4), (try castValue(a, .{ .float = -3.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 3), (try castValue(a, .{ .float = 2.7 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 3), (try castValue(a, .{ .decimal = .{ .unscaled = 25, .scale = 1 } }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .decimal = .{ .unscaled = -25, .scale = 1 } }, .int)).int);
     try std.testing.expectEqual(@as(i64, 2), (try castValue(a, .{ .float = 2.4 }, .int)).int);
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 9223372036854775807.0 }, .int));
     try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
@@ -270,6 +275,7 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "abc" }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.inf(f64) }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
 }

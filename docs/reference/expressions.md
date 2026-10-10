@@ -54,9 +54,10 @@ columns it has not seen.
 - **`DECIMAL(p, s)` holds at most 38 digits**: `p` is 1 to 38, `s` at most `p`,
   and `DECIMAL(p)` is `DECIMAL(p, 0)`. A cast whose value (after rounding to `s`)
   has more than `p` digits fails — `CAST('1234.5' AS DECIMAL(4,1))` is an error,
-  and `TRY_CAST` gives null. `CAST(x AS INT)` of a float rounds half away from
-  zero, as of a decimal (`2.5` is `3`, `-2.7` is `-3`), and a value past the INT
-  range fails. Decimals compare exactly — `=`, `<`, `GROUP BY`, `DISTINCT`,
+  and `TRY_CAST` gives null. `CAST(x AS INT)` of a float rounds half to even,
+  as PostgreSQL rounds a `float8` (`2.5` is `2`, `3.5` is `4`, `-2.7` is `-3`),
+  while of a decimal it rounds half away from zero (`2.5` is `3`), as PostgreSQL
+  rounds a `numeric`; a value past the INT range, `nan` or `inf` fails. Decimals compare exactly — `=`, `<`, `GROUP BY`, `DISTINCT`,
   joins, `MIN`/`MAX` and sorting tell `1234567890.12345678` from
   `1234567890.12345679` — and against an int exactly too; against a float
   they compare as floats.
