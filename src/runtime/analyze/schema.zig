@@ -123,7 +123,7 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
     return switch (sp.result) {
         .count => types.Type.init(.int),
         .sum => switch (at.kind) {
-            .float => types.Type.init(.float).withNull(true),
+            .float, .string => types.Type.init(.float).withNull(true),
             .decimal => at.withNull(true),
             else => types.Type.init(.int).withNull(true),
         },
