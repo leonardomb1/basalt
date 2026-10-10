@@ -593,6 +593,14 @@ pub const Parser = struct {
         }
         return false;
     }
+    /// A sort key's optional `NULLS FIRST | NULLS LAST`, defaulting as PostgreSQL does:
+    /// nulls sort as larger than every value, so first exactly when the key is DESC.
+    pub fn parseNullsFirst(self: *Parser, desc: bool) Error!bool {
+        if (!self.eatKw("nulls")) return desc;
+        if (self.eatKw("first")) return true;
+        if (self.eatKw("last")) return false;
+        return self.fail(self.curPos(), "expected FIRST or LAST after NULLS", .{});
+    }
     pub fn expect(self: *Parser, tag: Tag) Error!Token {
         if (self.at(tag)) return self.advance();
         return self.fail(self.curPos(), "expected {s}, found {s}", .{ tag.describe(), self.curTag().describe() });

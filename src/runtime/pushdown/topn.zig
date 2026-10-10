@@ -14,7 +14,7 @@ pub const TopN = struct {
     rows: u64,
     keys: []const Key = &.{},
 
-    pub const Key = struct { col: []const u8, desc: bool };
+    pub const Key = struct { col: []const u8, desc: bool, nulls_first: bool };
 
     pub fn describe(self: TopN, arena: std.mem.Allocator) ![]const u8 {
         var out = std.array_list.Managed(u8).init(arena);
@@ -22,6 +22,7 @@ pub const TopN = struct {
             try out.appendSlice(if (i == 0) "order by " else ", ");
             try out.appendSlice(k.col);
             if (k.desc) try out.appendSlice(" desc");
+            if (k.nulls_first != k.desc) try out.appendSlice(if (k.nulls_first) " nulls first" else " nulls last");
         }
         if (out.items.len > 0) try out.append(' ');
         try out.writer().print("limit {d}", .{self.rows});
@@ -70,7 +71,7 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
             why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a plain source column", .{k.field.last()});
             return null;
         };
-        out.* = .{ .col = col, .desc = k.desc };
+        out.* = .{ .col = col, .desc = k.desc, .nulls_first = k.nulls_first };
     }
     return .{ .rows = rows, .keys = keys };
 }
@@ -166,18 +167,20 @@ pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8
     return try renderTopN(arena, dialect, base_sql, t);
 }
 
-/// `base_sql` ordered nulls-last and capped: `NULLS LAST` on postgres, a leading
-/// `k IS NULL` key on mysql, a `CASE` key and `TOP` on sqlserver.
+/// `base_sql` ordered with each key's nulls placed as the engine places them, and
+/// capped: `NULLS FIRST`/`NULLS LAST` on postgres, a leading `k IS NULL` key on
+/// mysql, a `CASE` key and `TOP` on sqlserver.
 pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, t: TopN) ![]const u8 {
     var ob = std.array_list.Managed(u8).init(arena);
     for (t.keys, 0..) |k, i| {
         if (i > 0) try ob.appendSlice(", ");
         const q = try split.quoteIdent(arena, dialect, k.col);
         const dir = if (k.desc) " DESC" else "";
+        const nf = k.nulls_first;
         switch (dialect) {
-            .postgres => try ob.writer().print("{s}{s} NULLS LAST", .{ q, dir }),
-            .mysql, .starrocks, .doris => try ob.writer().print("({s} IS NULL), {s}{s}", .{ q, q, dir }),
-            .sqlserver => try ob.writer().print("CASE WHEN {s} IS NULL THEN 1 ELSE 0 END, {s}{s}", .{ q, q, dir }),
+            .postgres => try ob.writer().print("{s}{s} {s}", .{ q, dir, if (nf) "NULLS FIRST" else "NULLS LAST" }),
+            .mysql, .starrocks, .doris => try ob.writer().print("({s} IS NULL){s}, {s}{s}", .{ q, if (nf) " DESC" else "", q, dir }),
+            .sqlserver => try ob.writer().print("CASE WHEN {s} IS NULL THEN {d} ELSE {d} END, {s}{s}", .{ q, @intFromBool(!nf), @intFromBool(nf), q, dir }),
         }
     }
     const order: []const u8 = if (ob.items.len > 0) try std.fmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";
@@ -216,26 +219,26 @@ test "top-N: key types the source orders as the engine does, and filters that mu
     try std.testing.expect(std.mem.indexOf(u8, why, "does not translate") != null);
 }
 
-test "top-N: each dialect's spelling of nulls-last ordering and the row cap" {
+test "top-N: each dialect's spelling of the keys' null placement and the row cap" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const t = TopN{ .rows = 10, .keys = &.{ .{ .col = "v", .desc = true }, .{ .col = "id", .desc = false } } };
+    const t = TopN{ .rows = 10, .keys = &.{ .{ .col = "v", .desc = true, .nulls_first = true }, .{ .col = "id", .desc = false, .nulls_first = false }, .{ .col = "w", .desc = false, .nulls_first = true } } };
     const base = "SELECT * FROM t";
     try std.testing.expectEqualStrings(
-        "SELECT * FROM (SELECT * FROM t) _t ORDER BY \"v\" DESC NULLS LAST, \"id\" NULLS LAST LIMIT 10",
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY \"v\" DESC NULLS FIRST, \"id\" NULLS LAST, \"w\" NULLS FIRST LIMIT 10",
         try renderTopN(a, .postgres, base, t),
     );
     try std.testing.expectEqualStrings(
-        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL), `v` DESC, (`id` IS NULL), `id` LIMIT 10",
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL) DESC, `v` DESC, (`id` IS NULL), `id`, (`w` IS NULL) DESC, `w` LIMIT 10",
         try renderTopN(a, .mysql, base, t),
     );
     try std.testing.expectEqualStrings(
-        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL), `v` DESC, (`id` IS NULL), `id` LIMIT 10",
+        "SELECT * FROM (SELECT * FROM t) _t ORDER BY (`v` IS NULL) DESC, `v` DESC, (`id` IS NULL), `id`, (`w` IS NULL) DESC, `w` LIMIT 10",
         try renderTopN(a, .starrocks, base, t),
     );
     try std.testing.expectEqualStrings(
-        "SELECT TOP (10) * FROM (SELECT * FROM t) _t ORDER BY CASE WHEN [v] IS NULL THEN 1 ELSE 0 END, [v] DESC, CASE WHEN [id] IS NULL THEN 1 ELSE 0 END, [id]",
+        "SELECT TOP (10) * FROM (SELECT * FROM t) _t ORDER BY CASE WHEN [v] IS NULL THEN 0 ELSE 1 END, [v] DESC, CASE WHEN [id] IS NULL THEN 1 ELSE 0 END, [id], CASE WHEN [w] IS NULL THEN 0 ELSE 1 END, [w]",
         try renderTopN(a, .sqlserver, base, t),
     );
     try std.testing.expectEqualStrings("SELECT TOP (5) * FROM (SELECT * FROM t) _t", try renderTopN(a, .sqlserver, base, .{ .rows = 5 }));

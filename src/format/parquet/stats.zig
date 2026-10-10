@@ -118,7 +118,7 @@ fn sameKind(stat: Value, v: Value) bool {
 }
 
 /// Whether a row group could hold a row entering the current top-N; only a
-/// proven strict miss returns false.
+/// proven strict miss returns false. With nulls first, any null in the group could.
 pub fn groupBeatsThreshold(
     schema: []const parquet.SchemaElement,
     leaves: []const Leaf,
@@ -130,6 +130,7 @@ pub fn groupBeatsThreshold(
     if (lf.chunk_idx >= g.columns.len) return true;
     const meta = g.columns[lf.chunk_idx].meta orelse return true;
     const elem = schema[lf.schema_idx];
+    if (t.nulls_first and elem.repetition != .required and (meta.stats.null_count orelse 1) > 0) return true;
 
     if (t.desc) {
         const hi = statValue(elem, meta, meta.stats.max) orelse return true;
@@ -426,6 +427,11 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = false, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "nosuch", .desc = true, .full = true, .value = .{ .int = 500 } }));
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .full = true, .value = .null }));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "v", .desc = true, .nulls_first = true, .full = true, .value = .{ .int = 500 } }));
+    var nully = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi, .null_count = 2 } } }};
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, .{ .columns = &nully, .num_rows = 10 }, .{ .column = "v", .desc = true, .nulls_first = true, .full = true, .value = .{ .int = 500 } }));
+    var no_nulls = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi, .null_count = 0 } } }};
+    try testing.expect(!groupBeatsThreshold(&schema, &leaves, .{ .columns = &no_nulls, .num_rows = 10 }, .{ .column = "v", .desc = true, .nulls_first = true, .full = true, .value = .{ .int = 500 } }));
     var bare = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64 } }};
     const g2 = parquet.RowGroup{ .columns = &bare, .num_rows = 10 };
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g2, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));

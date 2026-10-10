@@ -7,8 +7,9 @@
 //! forward as the row does, whatever the bounds, so ROWS bounds are arithmetic,
 //! RANGE `CURRENT ROW` is the peer group, and a RANGE offset walks two pointers over
 //! the single order key (made ascending, a DESC key negated). Order-key nulls sort
-//! last and are one another's peers: a null row's offset bound is the null group,
-//! and a non-null row's offset never reaches it (UNBOUNDED FOLLOWING does).
+//! first or last as the key places them and are one another's peers: a null row's
+//! offset bound is the null group, and a non-null row's offset never reaches it
+//! (UNBOUNDED PRECEDING or FOLLOWING does).
 //!
 //! An aggregate slides over the frames: rows enter at the end edge and leave at the
 //! start edge. Exact state takes a row back by subtraction (integer and decimal sums,
@@ -131,7 +132,7 @@ pub const Window = struct {
 
     fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
         for (self.ord) |k| {
-            const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+            const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
             if (o != .eq) return o == .lt;
         }
         return false;
@@ -195,7 +196,7 @@ pub const Window = struct {
         std.mem.sort(Parts.Entry, order, {}, struct {
             fn lt(_: void, a: Parts.Entry, b: Parts.Entry) bool {
                 for (a.key_ptr.*, b.key_ptr.*) |x, y| {
-                    const o = keyOrder(x, y, false);
+                    const o = keyOrder(x, y, false, false);
                     if (o != .eq) return o == .lt;
                 }
                 return false;
@@ -358,12 +359,16 @@ pub const Window = struct {
         return if (T == f64) o.float else o.int;
     }
 
-    /// RANGE frames over one partition `[ps, pe)` whose non-null keys ascend: each
-    /// offset edge is the first position past a target, found by a pointer that only
-    /// moves forward as the keys grow.
+    /// RANGE frames over one partition `[ps, pe)` whose non-null keys ascend in one
+    /// block `[lo, hi)`, the nulls before or after it: each offset edge is the first
+    /// position past a target, found by a pointer that only moves forward as the keys
+    /// grow.
     fn rangeOffsets(comptime T: type, keys: []const T, null_at: []const bool, l: Layout, fr: Frame, ps: usize, pe: usize, fs: []usize, fe: []usize) void {
-        var nb = ps;
-        while (nb < pe and !null_at[nb]) nb += 1;
+        var lo = ps;
+        while (lo < pe and null_at[lo]) lo += 1;
+        var hi = lo;
+        while (hi < pe and !null_at[hi]) hi += 1;
+        const ns, const ne = if (lo > ps) .{ ps, lo } else .{ hi, pe };
         const Ptr = struct {
             at: usize,
             fn lower(p: *@This(), ks: []const T, end: usize, target: T) usize {
@@ -375,22 +380,22 @@ pub const Window = struct {
                 return p.at;
             }
         };
-        var sp = Ptr{ .at = ps };
-        var ep = Ptr{ .at = ps };
+        var sp = Ptr{ .at = lo };
+        var ep = Ptr{ .at = lo };
         for (ps..pe) |k| {
-            const is_null = k >= nb;
+            const is_null = null_at[k];
             const s: usize = switch (fr.start) {
                 .unbounded_preceding => ps,
                 .current_row => l.gstart[k],
-                .preceding => |o| if (is_null) nb else sp.lower(keys, nb, keys[k] - offOf(T, o)),
-                .following => |o| if (is_null) nb else sp.lower(keys, nb, keys[k] + offOf(T, o)),
+                .preceding => |o| if (is_null) ns else sp.lower(keys, hi, keys[k] - offOf(T, o)),
+                .following => |o| if (is_null) ns else sp.lower(keys, hi, keys[k] + offOf(T, o)),
                 .unbounded_following => pe,
             };
             const e: usize = switch (fr.end) {
                 .unbounded_preceding => ps,
                 .current_row => l.gend[k],
-                .preceding => |o| if (is_null) pe else ep.upper(keys, nb, keys[k] - offOf(T, o)),
-                .following => |o| if (is_null) pe else ep.upper(keys, nb, keys[k] + offOf(T, o)),
+                .preceding => |o| if (is_null) ne else ep.upper(keys, hi, keys[k] - offOf(T, o)),
+                .following => |o| if (is_null) ne else ep.upper(keys, hi, keys[k] + offOf(T, o)),
                 .unbounded_following => pe,
             };
             fs[k] = s;
@@ -832,8 +837,8 @@ pub const Window = struct {
         for (idx, 0..) |*x, i| x.* = i;
 
         const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
-        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
-        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
+        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k);
+        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k);
         try sortIdxThreads(arena, idx, arrs, self.threads);
         const parts = arrs[0..self.part.len];
         const ords = arrs[self.part.len..];
@@ -982,24 +987,28 @@ const TestSource = @import("testing_util.zig").TestSource;
 
 const BruteRow = struct { p: ?i64, o: ?i64, v: ?i64 };
 
-fn orderNullsLast(x: ?i64, y: ?i64, desc: bool) std.math.Order {
+const Dir = struct { desc: bool, nf: bool };
+
+const dirs = [_]Dir{ .{ .desc = false, .nf = false }, .{ .desc = false, .nf = true }, .{ .desc = true, .nf = false }, .{ .desc = true, .nf = true } };
+
+fn orderNulls(x: ?i64, y: ?i64, d: Dir) std.math.Order {
     if (x == null or y == null) {
         if (x == null and y == null) return .eq;
-        return if (x == null) .gt else .lt;
+        return if ((x == null) == d.nf) .lt else .gt;
     }
     const o = std.math.order(x.?, y.?);
-    return if (desc) o.invert() else o;
+    return if (d.desc) o.invert() else o;
 }
 
 /// The rows in the order the operator sorts them: partition, then order key (DESC
-/// flipping it), nulls last either way, ties in input order.
-fn bruteSort(a: std.mem.Allocator, rows: []const BruteRow, desc: bool) ![]BruteRow {
+/// flipping it, nulls placed as `dir` says), ties in input order.
+fn bruteSort(a: std.mem.Allocator, rows: []const BruteRow, dir: Dir) ![]BruteRow {
     const out = try a.dupe(BruteRow, rows);
-    std.sort.block(BruteRow, out, desc, struct {
-        fn lt(d: bool, l: BruteRow, r: BruteRow) bool {
-            const po = orderNullsLast(l.p, r.p, false);
+    std.sort.block(BruteRow, out, dir, struct {
+        fn lt(d: Dir, l: BruteRow, r: BruteRow) bool {
+            const po = orderNulls(l.p, r.p, .{ .desc = false, .nf = false });
             if (po != .eq) return po == .lt;
-            return orderNullsLast(l.o, r.o, d) == .lt;
+            return orderNulls(l.o, r.o, d) == .lt;
         }
     }.lt);
     return out;
@@ -1018,16 +1027,16 @@ fn boundN(b: Window.Bound) i64 {
 }
 
 /// Whether sorted row `j` is in row `k`'s frame, from the frame's definition.
-fn inFrame(rows: []const BruteRow, k: usize, j: usize, fr: Window.Frame, desc: bool) bool {
+fn inFrame(rows: []const BruteRow, k: usize, j: usize, fr: Window.Frame, dir: Dir) bool {
     var yk: i64 = @intCast(k);
     var yj: i64 = @intCast(j);
     if (fr.range) {
         const cur = rows[k].o;
         const x = rows[j].o;
-        if (cur == null) return x == null or fr.start == .unbounded_preceding;
-        if (x == null) return fr.end == .unbounded_following;
-        yk = if (desc) -cur.? else cur.?;
-        yj = if (desc) -x.? else x.?;
+        if (cur == null) return x == null or (if (dir.nf) fr.end == .unbounded_following else fr.start == .unbounded_preceding);
+        if (x == null) return if (dir.nf) fr.start == .unbounded_preceding else fr.end == .unbounded_following;
+        yk = if (dir.desc) -cur.? else cur.?;
+        yj = if (dir.desc) -x.? else x.?;
     }
     const lo_ok = switch (fr.start) {
         .unbounded_preceding => true,
@@ -1054,10 +1063,10 @@ fn partitionOf(rows: []const BruteRow, k: usize) [2]usize {
     return .{ ps, pe };
 }
 
-fn bruteValue(a: std.mem.Allocator, rows: []const BruteRow, k: usize, f: Window.Func, desc: bool) !Value {
+fn bruteValue(a: std.mem.Allocator, rows: []const BruteRow, k: usize, f: Window.Func, dir: Dir) !Value {
     const ps, const pe = partitionOf(rows, k);
     var frame = std.array_list.Managed(?i64).init(a);
-    for (ps..pe) |j| if (inFrame(rows, k, j, f.frame, desc)) try frame.append(rows[j].v);
+    for (ps..pe) |j| if (inFrame(rows, k, j, f.frame, dir)) try frame.append(rows[j].v);
     var nn = std.array_list.Managed(?i64).init(a);
     for (frame.items) |x| if (x != null) try nn.append(x);
     var xs = std.array_list.Managed(i64).init(a);
@@ -1157,7 +1166,7 @@ fn windowOutType(f: Window.Func) types.Type {
 }
 
 /// The operator's output for `funcs` over `rows` (columns p, o, v), in its order.
-fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window.Func, desc: bool, with_order: bool) ![]Batch {
+fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window.Func, dir: Dir, with_order: bool) ![]Batch {
     const in_schema = try a.create(types.Schema);
     in_schema.* = .{ .fields = &.{
         .{ .name = "p", .ty = types.Type.init(.int).asNullable() },
@@ -1194,8 +1203,8 @@ fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window
         .child = .{ .scan = scan },
         .in_schema = in_schema,
         .out_schema = out_schema,
-        .part = &[_]Sort.Key{.{ .idx = 0, .desc = false }},
-        .ord = if (with_order) try a.dupe(Sort.Key, &[_]Sort.Key{.{ .idx = 1, .desc = desc }}) else &.{},
+        .part = &[_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }},
+        .ord = if (with_order) try a.dupe(Sort.Key, &[_]Sort.Key{.{ .idx = 1, .desc = dir.desc, .nulls_first = dir.nf }}) else &.{},
         .funcs = funcs,
     };
     var out = std.array_list.Managed(Batch).init(a);
@@ -1246,9 +1255,9 @@ test "window frames: every bound pair, ROWS and RANGE, ties, nulls and edges mat
     try bounds.append(.current_row);
     for (offs) |n| try bounds.append(.{ .following = .{ .rows = n, .int = n } });
     try bounds.append(.unbounded_following);
-    for ([_]usize{ 0, 1, 2, 7, 40 }) |n| for ([_]bool{ false, true }) |desc| for ([_]bool{ false, true }) |range| {
+    for ([_]usize{ 0, 1, 2, 7, 40 }) |n| for (dirs) |dir| for ([_]bool{ false, true }) |range| {
         const rows = try randomRows(a, rnd, n);
-        const sorted = try bruteSort(a, rows, desc);
+        const sorted = try bruteSort(a, rows, dir);
         var funcs = std.array_list.Managed(Window.Func).init(a);
         for (bounds.items) |s| for (bounds.items) |e| {
             if (s == .unbounded_following or e == .unbounded_preceding or boundRank(s) > boundRank(e)) continue;
@@ -1259,10 +1268,10 @@ test "window frames: every bound pair, ROWS and RANGE, ties, nulls and edges mat
             for ([_]ast.WinKind{ .first_value, .last_value, .nth_value }) |vk| for ([_]bool{ false, true }) |ign|
                 try funcs.append(.{ .func = .{ .win = vk }, .arg = 2, .offset = 2, .ignore_nulls = ign, .frame = fr });
         };
-        const out = try runWindow(a, rows, funcs.items, desc, true);
+        const out = try runWindow(a, rows, funcs.items, dir, true);
         var at: usize = 0;
         for (out) |b| for (0..b.len) |r| {
-            for (funcs.items, 0..) |f, fi| try expectSameValue(try bruteValue(a, sorted, at, f, desc), b.columns[3 + fi].getValue(r));
+            for (funcs.items, 0..) |f, fi| try expectSameValue(try bruteValue(a, sorted, at, f, dir), b.columns[3 + fi].getValue(r));
             at += 1;
         };
         try testing.expectEqual(n, at);
@@ -1275,9 +1284,9 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
     const a = ar.allocator();
     var prng = std.Random.DefaultPrng.init(0xfeed);
     const rnd = prng.random();
-    for ([_]usize{ 0, 1, 3, 25, 60 }) |n| for ([_]bool{ false, true }) |desc| {
+    for ([_]usize{ 0, 1, 3, 25, 60 }) |n| for (dirs) |dir| {
         const rows = try randomRows(a, rnd, n);
-        const sorted = try bruteSort(a, rows, desc);
+        const sorted = try bruteSort(a, rows, dir);
         var funcs = std.array_list.Managed(Window.Func).init(a);
         for ([_]i64{ 0, 1, 2, 4 }) |off| for ([_]bool{ false, true }) |ign| {
             try funcs.append(.{ .func = .{ .win = .lag }, .arg = 2, .offset = off, .ignore_nulls = ign });
@@ -1287,7 +1296,7 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
         try funcs.append(.{ .func = .{ .win = .rank } });
         try funcs.append(.{ .func = .{ .win = .percent_rank } });
         try funcs.append(.{ .func = .{ .win = .cume_dist } });
-        const out = try runWindow(a, rows, funcs.items, desc, true);
+        const out = try runWindow(a, rows, funcs.items, dir, true);
         var at: usize = 0;
         for (out) |b| for (0..b.len) |r| {
             const ps, const pe = partitionOf(sorted, at);
@@ -1298,7 +1307,7 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
             const size = pe - ps;
             for (funcs.items, 0..) |f, fi| {
                 const want: Value = switch (f.func.win) {
-                    .lag, .lead => try bruteValue(a, sorted, at, f, desc),
+                    .lag, .lead => try bruteValue(a, sorted, at, f, dir),
                     .ntile => blk: {
                         const bk: usize = @intCast(f.offset);
                         const q = size / bk;
@@ -1336,7 +1345,7 @@ test "window without ORDER BY: the default frame is the whole partition, a ROWS 
         .{ .func = .{ .agg = .sum }, .arg = 2, .frame = .{ .range = false, .start = .{ .preceding = .{ .rows = 1 } }, .end = .current_row } },
         .{ .func = .{ .win = .last_value }, .arg = 2 },
     };
-    const out = try runWindow(a, &rows, &funcs, false, false);
+    const out = try runWindow(a, &rows, &funcs, dirs[0], false);
     const want = [_][3]?i64{ .{ 3, 1, 2 }, .{ 3, 3, 2 }, .{ 10, 4, 6 }, .{ 10, 4, 6 }, .{ 10, 6, 6 } };
     var at: usize = 0;
     for (out) |b| for (0..b.len) |r| {

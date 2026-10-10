@@ -281,7 +281,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             if (self.eatKw("desc")) {
                 desc = true;
             } else _ = self.eatKw("asc");
-            try keys.append(.{ .field = q, .desc = desc });
+            try keys.append(.{ .field = q, .desc = desc, .nulls_first = try self.parseNullsFirst(desc) });
             try stripped.append(was_qual);
             if (!self.eat(.comma)) break;
         }
@@ -1176,7 +1176,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         const part = try self.arena.alloc(*ast.Expr, r.partition.len);
         for (r.partition, part) |e, *o| o.* = try self.stripExpr(e, &aliases);
         const ord = try self.arena.alloc(Window.OrderExpr, r.order.len);
-        for (r.order, ord) |k, *o| o.* = .{ .e = try self.stripExpr(k.e, &aliases), .desc = k.desc };
+        for (r.order, ord) |k, *o| o.* = .{ .e = try self.stripExpr(k.e, &aliases), .desc = k.desc, .nulls_first = k.nulls_first };
         sp.* = .{ .partition = part, .order = ord, .frame = r.frame, .pos = r.pos };
     }
 

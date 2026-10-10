@@ -442,7 +442,7 @@ test "windows in expressions, ORDER BY, expression keys and arguments, and over 
     try expectCases(&.{
         .{
             .q = "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) + 100 AS rn, v - LAG(v) OVER (PARTITION BY k ORDER BY id) AS delta, CASE WHEN RANK() OVER (PARTITION BY k ORDER BY v DESC) = 1 THEN 'top' ELSE '-' END AS best, ROUND(AVG(v) OVER (PARTITION BY k), 2) AS mean FROM '$B/s.csv' ORDER BY ROW_NUMBER() OVER (PARTITION BY k ORDER BY id) + 100, id",
-            .want = "id,rn,delta,best,mean\n1,101,,-,26.67\n5,101,,-,6\n2,102,,-,26.67\n6,102,,-,6\n3,103,,-,26.67\n7,103,,top,6\n4,104,10,top,26.67\n",
+            .want = "id,rn,delta,best,mean\n1,101,,-,26.67\n5,101,,-,6\n2,102,,top,26.67\n6,102,,top,6\n3,103,,-,26.67\n7,103,,-,6\n4,104,10,-,26.67\n",
         },
         .{
             .q = "SELECT id, SUM(v * t) OVER (PARTITION BY substr(k, 1, 1) ORDER BY t + id) AS weighted, MAX(v) OVER (ORDER BY id % 3, id) AS m, MIN(t) OVER (PARTITION BY v IS NULL) AS mt FROM '$B/s.csv' ORDER BY id",
@@ -454,7 +454,7 @@ test "windows in expressions, ORDER BY, expression keys and arguments, and over 
         },
         .{
             .q = "SELECT * FROM (SELECT id, k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM '$B/s.csv') r WHERE rn <= 2 ORDER BY id",
-            .want = "id,k,rn\n3,a,2\n4,a,1\n5,b,2\n7,b,1\n",
+            .want = "id,k,rn\n2,a,1\n4,a,2\n6,b,1\n7,b,2\n",
         },
     });
 }

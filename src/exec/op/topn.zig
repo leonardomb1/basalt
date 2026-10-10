@@ -74,7 +74,7 @@ pub const TopN = struct {
                 self.seq_base = @as(u64, it.*) << 40;
                 self.seen = 0;
             };
-            const k0 = if (self.keys.len > 0) self.keys[0] else Sort.Key{ .idx = 0, .desc = false };
+            const k0 = if (self.keys.len > 0) self.keys[0] else Sort.Key{ .idx = 0, .desc = false, .nulls_first = false };
             const kc = &b.columns[k0.idx];
             const typed: enum { none, int, float } = if (self.keys.len == 0) .none else switch (kc.ty.kind) {
                 .int, .time, .timestamp => .int,
@@ -94,7 +94,7 @@ pub const TopN = struct {
                 const w = heap.items[0][k0.idx];
                 while (r < b.len) : (r += 1) {
                     if (typed != .none and !w.isNull()) {
-                        const worse = if (!kc.validity.get(r)) true else switch (typed) {
+                        const worse = if (!kc.validity.get(r)) !k0.nulls_first else switch (typed) {
                             .int => switch (w) {
                                 .int, .time, .timestamp => |y| if (k0.desc) kc.data.i64[r] < y else kc.data.i64[r] > y,
                                 else => false,
@@ -121,7 +121,7 @@ pub const TopN = struct {
                             const k = c.top.keys[0];
                             const xn = !c.kc.validity.get(x);
                             const yn = !c.kc.validity.get(y);
-                            if (xn != yn) return yn;
+                            if (xn != yn) return if (k.nulls_first) xn else yn;
                             const nan = c.typed == .float and (std.math.isNan(c.kc.data.f64[x]) or std.math.isNan(c.kc.data.f64[y]));
                             if (!xn and !nan) {
                                 const o = switch (c.typed) {
@@ -134,7 +134,7 @@ pub const TopN = struct {
                             if (!nan) rest = rest[1..];
                         }
                         for (rest) |k| {
-                            const o = keyOrder(c.b.columns[k.idx].getValue(x), c.b.columns[k.idx].getValue(y), k.desc);
+                            const o = keyOrder(c.b.columns[k.idx].getValue(x), c.b.columns[k.idx].getValue(y), k.desc, k.nulls_first);
                             if (o != .eq) return o == .lt;
                         }
                         return x < y;
@@ -190,7 +190,7 @@ pub const TopN = struct {
     /// a lane reading row groups out of order meets rows earlier than some it keeps.
     fn rowLess(self: *TopN, b: Batch, r: usize, e: Entry) bool {
         for (self.keys) |k| {
-            const o = keyOrder(b.columns[k.idx].getValue(r), e[k.idx], k.desc);
+            const o = keyOrder(b.columns[k.idx].getValue(r), e[k.idx], k.desc, k.nulls_first);
             if (o != .eq) return o == .lt;
         }
         return self.seq_base + self.seen < entrySeq(e);
@@ -209,7 +209,7 @@ pub const TopN = struct {
 
 pub fn entryLess(a: TopN.Entry, b: TopN.Entry, keys: []const Sort.Key) bool {
     for (keys) |k| {
-        const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+        const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
         if (o != .eq) return o == .lt;
     }
     return entrySeq(a) < entrySeq(b);
@@ -233,7 +233,7 @@ fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
 /// yields the eviction candidate. Of two equal rows the later is worse.
 fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.math.Order {
     for (keys) |k| {
-        const o = keyOrder(a[k.idx], b[k.idx], k.desc);
+        const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
         if (o != .eq) return o.invert();
     }
     if (entrySeq(a) != entrySeq(b)) return std.math.order(entrySeq(b), entrySeq(a));
@@ -298,7 +298,7 @@ test "top_n keeps best rows across batches, honors offset, matches full sort" {
         .{ .count = 5, .offset = 6, .desc = true },
     };
     for (cases, 0..) |tc, ci| {
-        const keys = try a.dupe(Sort.Key, &.{.{ .idx = 0, .desc = tc.desc }});
+        const keys = try a.dupe(Sort.Key, &.{.{ .idx = 0, .desc = tc.desc, .nulls_first = false }});
 
         var ts = TestSource{ .schema_ = schema, .batches = &batches };
         var scan = Scan{ .src = ts.src() };
@@ -371,7 +371,7 @@ test "top_n: equal keys rank by input position, also when a lane reads items out
     var tn = TopN{
         .child = .{ .scan = &scan },
         .in_schema = &schema,
-        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }},
+        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true, .nulls_first = false }},
         .count = 2,
         .offset = 0,
         .state = a,

@@ -31,7 +31,8 @@
 //! present, since postgres NUMERIC carries a per-value scale and raw unscaled ints
 //! sorted 0.5 after 0.10), a string up to 31 bytes is its zero-padded bytes with
 //! the length in the last byte, and a longer one is a 24-byte prefix whose ties the
-//! comparator settles. Nulls sort last in either direction, NaN sorts last and -0.0
+//! comparator settles. Nulls sort first or last as each key says (by default as
+//! larger than every value: last ascending, first DESC), NaN sorts last and -0.0
 //! equals 0.0, as `eval.orderF64`. A comparator sort of 10M strings took 22s. The
 //! parallel sort splits rows into ranges on the first key's leading bits, one range
 //! per thread, and gives exactly the serial result.
@@ -308,6 +309,7 @@ const SortCtx = @import("op/sort.zig").SortCtx;
 const sortIdx = @import("op/sort.zig").sortIdx;
 pub const TopN = @import("op/topn.zig").TopN;
 pub const entryLess = @import("op/topn.zig").entryLess;
+pub const keyOrder = @import("op/sort.zig").keyOrder;
 pub const Aggregate = @import("op/aggregate.zig").Aggregate;
 pub const dupeValue = @import("op/aggregate.zig").dupeValue;
 const sumIntCol = @import("op/aggregate.zig").sumIntCol;

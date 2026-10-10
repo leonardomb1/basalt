@@ -331,7 +331,7 @@ pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow)
             },
             .sort => |st| {
                 const keys = try arena.alloc(ast.SortKey, st.keys.len);
-                for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc };
+                for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc, .nulls_first = k.nulls_first };
                 dst.node = .{ .sort = .{ .keys = keys } };
             },
             .limit => |l| {

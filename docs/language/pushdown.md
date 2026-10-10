@@ -113,8 +113,9 @@ crosses the wire. The answer never changes, only where the work happens;
   | LIMIT n [OFFSET m]` asks the source for `n + m` rows: `LIMIT` on
   postgres/mysql/StarRocks, `TOP` on sqlserver. Without `ORDER BY` any `n + m`
   rows are an answer, so it always descends. With one, the source orders them
-  first — nulls last in both directions, as the engine does (`NULLS LAST`;
-  a leading `k IS NULL` key on mysql/StarRocks; a `CASE` key on sqlserver) —
+  first — each key's nulls first or last exactly as the engine places them
+  (`NULLS FIRST` / `NULLS LAST` on postgres; a leading `k IS NULL` key,
+  descending for nulls first, on mysql/StarRocks; a `CASE` key on sqlserver) —
   and the engine still sorts, offsets and cuts what arrives, so the final order
   is its own. It descends only when the answer cannot change:
   - every `WHERE` before the limit translates (the rules above) — the source counts

@@ -44,10 +44,11 @@ FROM 'movimentos.csv';
 
 `PARTITION BY` is optional; without it the whole input is one partition, and its
 nulls group together as in `GROUP BY`. `ORDER BY` sorts within the partition, `DESC`
-per key; **nulls sort last** either way (`NULLS FIRST` / `NULLS LAST` are not
-accepted). Keys and arguments may be any expression — `PARTITION BY substr(conta,
-1, 3)`, `ORDER BY qtd * preco`, `SUM(qtd * preco)` — computed into hidden columns
-before the window runs.
+per key, and places nulls as the query's `ORDER BY` does: **last ascending, first
+under `DESC`**, unless `NULLS FIRST` / `NULLS LAST` follows the key. Keys and
+arguments may be any expression — `PARTITION BY substr(conta, 1, 3)`, `ORDER BY
+qtd * preco`, `SUM(qtd * preco)` — computed into hidden columns before the window
+runs.
 
 A window used more than once can be named after `HAVING`:
 
@@ -112,7 +113,8 @@ The frame is the slice of the partition an aggregate or a value function reads:
   MINUTE | SECOND` (also written `INTERVAL '<n> days'`); a `TIME` key takes only the
   interval. With `DESC` "preceding" means larger keys, as the order runs. A row
   whose key is null has its peers, the other nulls, as its offset frame, and a
-  non-null row's offset never reaches the nulls (`UNBOUNDED FOLLOWING` does):
+  non-null row's offset never reaches the nulls (`UNBOUNDED FOLLOWING` does, or
+  `UNBOUNDED PRECEDING` when they sort first):
 
   ```sql
   SELECT data, valor,

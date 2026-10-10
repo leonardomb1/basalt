@@ -88,6 +88,7 @@ pub fn pow10f(n: u8) f64 {
 pub const Threshold = struct {
     column: []const u8 = "",
     desc: bool = false,
+    nulls_first: bool = false,
     full: bool = false,
     value: Value = .null,
 };

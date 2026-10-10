@@ -11,7 +11,7 @@
 //! `batch_rows`-row batches across pulls. Runs are cut in input order and the merge
 //! prefers the earlier source on equal keys, so the result is the stable in-memory
 //! sort's row for row. Heads compare with `KeyArr.orderAcross`, the in-memory
-//! comparator across two batches: same nulls-last, DESC, `orderF64` and byte order;
+//! comparator across two batches: same null placement, DESC, `orderF64` and byte order;
 //! decimals, scaled per batch, compare exactly at the larger scale. Input that never
 //! passes the limit is sorted in memory exactly as without a space. The disk cap is
 //! booked per byte written, merge passes included, and not given back on delete.
@@ -56,7 +56,8 @@ pub const Sort = struct {
     gpa: std.mem.Allocator = std.heap.page_allocator,
     merge: ?*Merge = null,
 
-    pub const Key = struct { idx: usize, desc: bool };
+    /// `nulls_first` places nulls before every value, otherwise after.
+    pub const Key = struct { idx: usize, desc: bool, nulls_first: bool };
 
     pub fn next(self: *Sort, arena: std.mem.Allocator) anyerror!?Batch {
         errdefer self.dropMerge();
@@ -91,7 +92,7 @@ pub const Sort = struct {
         const idx = try arena.alloc(usize, all.len);
         for (idx, 0..) |*x, i| x.* = i;
         const arrs = try arena.alloc(KeyArr, self.keys.len);
-        for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k.desc);
+        for (self.keys, arrs) |k, *a| a.* = try KeyArr.prepare(arena, all.columns[k.idx], k);
         try sortIdxThreads(arena, idx, arrs, self.threads);
         return .{ .idx = idx, .arrs = arrs };
     }
@@ -289,7 +290,7 @@ pub const Merge = struct {
                     const b = (try r.next(a)) orelse break;
                     if (b.len == 0) continue;
                     const arrs = try a.alloc(KeyArr, keys.len);
-                    for (keys, arrs) |k, *x| x.* = try KeyArr.prepare(a, b.columns[k.idx], k.desc);
+                    for (keys, arrs) |k, *x| x.* = try KeyArr.prepare(a, b.columns[k.idx], k);
                     self.cols = b.columns;
                     self.arrs = arrs;
                     self.pos = 0;
@@ -473,6 +474,7 @@ pub const Merge = struct {
 
 pub const KeyArr = struct {
     desc: bool,
+    nulls_first: bool,
     valid: column.Bitmap,
     data: Data,
     col: column.Column,
@@ -486,7 +488,7 @@ pub const KeyArr = struct {
         boxed: column.Column,
     };
 
-    pub fn prepare(arena: std.mem.Allocator, col: column.Column, desc: bool) !KeyArr {
+    pub fn prepare(arena: std.mem.Allocator, col: column.Column, key: Sort.Key) !KeyArr {
         const n = col.len;
         var scale: u8 = 0;
         const data: Data = switch (col.ty.kind) {
@@ -519,7 +521,7 @@ pub const KeyArr = struct {
             },
             else => .{ .boxed = col },
         };
-        return .{ .desc = desc, .valid = col.validity, .data = data, .col = col, .scale = scale };
+        return .{ .desc = key.desc, .nulls_first = key.nulls_first, .valid = col.validity, .data = data, .col = col, .scale = scale };
     }
 
     /// `order` between row `a` of this batch's key and row `c` of `other`, the same
@@ -529,10 +531,7 @@ pub const KeyArr = struct {
     pub fn orderAcross(self: KeyArr, a: usize, other: KeyArr, c: usize) std.math.Order {
         const an = !self.valid.get(a);
         const bn = !other.valid.get(c);
-        if (an or bn) {
-            if (an and bn) return .eq;
-            return if (an) .gt else .lt;
-        }
+        if (an or bn) return nullOrder(an, bn, self.nulls_first);
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| if (other.data == .ints) std.math.order(v[a], other.data.ints[c]) else return self.boxedAcross(a, other, c),
             .floats => |v| if (other.data == .floats) eval.orderF64(v[a], other.data.floats[c]) else return self.boxedAcross(a, other, c),
@@ -545,7 +544,7 @@ pub const KeyArr = struct {
     }
 
     fn boxedAcross(self: KeyArr, a: usize, other: KeyArr, c: usize) std.math.Order {
-        return keyOrder(self.col.getValue(a), other.col.getValue(c), self.desc);
+        return keyOrder(self.col.getValue(a), other.col.getValue(c), self.desc, self.nulls_first);
     }
 
     fn orderScaled(x: i128, sx: u8, y: i128, sy: u8) ?std.math.Order {
@@ -561,16 +560,13 @@ pub const KeyArr = struct {
     pub fn order(self: KeyArr, a: usize, c: usize) std.math.Order {
         const an = !self.valid.get(a);
         const bn = !self.valid.get(c);
-        if (an or bn) {
-            if (an and bn) return .eq;
-            return if (an) .gt else .lt;
-        }
+        if (an or bn) return nullOrder(an, bn, self.nulls_first);
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| std.math.order(v[a], v[c]),
             .floats => |v| eval.orderF64(v[a], v[c]),
             .decs => |v| std.math.order(v[a], v[c]),
             .strs => |v| std.mem.order(u8, v[a], v[c]),
-            .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc),
+            .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc, self.nulls_first),
         };
         if (ord == .eq) return .eq;
         return if (self.desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
@@ -646,7 +642,7 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
             for (pairs, idx) |pr, *x| x.* = pr.i;
         }
         if (p.nulls) {
-            for (pairs, idx) |*pr, i| pr.* = .{ .k = @intFromBool(!k.valid.get(i)), .i = @intCast(i) };
+            for (pairs, idx) |*pr, i| pr.* = .{ .k = @intFromBool(k.valid.get(i) == k.nulls_first), .i = @intCast(i) };
             radixSortPairs(pairs, tmp, counts);
             for (pairs, idx) |pr, *x| x.* = pr.i;
         }
@@ -655,7 +651,8 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
 }
 
 /// Deal rows, in input order, into ranges of the first key split where a histogram
-/// puts about one thread's share (nulls in a range of their own), and sort each on
+/// puts about one thread's share (nulls in a range of their own, first or last as
+/// the key places them), and sort each on
 /// its own thread. False when not worth it or the first key cannot split.
 fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize) !bool {
     const n = idx.len;
@@ -694,8 +691,11 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
         acc += h;
         if (cur + 1 < nthreads and acc * nthreads >= nonnull * (cur + 1)) cur += 1;
     }
-    const null_range = cur + 1;
-    const nranges = null_range + 1;
+    const nranges = cur + 2;
+    const null_range: usize = if (k0.nulls_first) 0 else cur + 1;
+    if (k0.nulls_first) {
+        for (&of_digit) |*d| d.* += 1;
+    }
     var size = [_]usize{0} ** 66;
     var range_of = try arena.alloc(u8, n);
     for (0..n) |row| {
@@ -876,21 +876,23 @@ fn orderedWord(k: KeyArr, i: usize) u64 {
     return if (k.desc) ~w else w;
 }
 
-/// Order of two sort-key values: nulls always last, `desc` flips non-null order.
-/// Shared by `SortCtx.lessThan` and Top-N.
-pub fn keyOrder(va: Value, vb: Value, desc: bool) std.math.Order {
+fn nullOrder(an: bool, bn: bool, nulls_first: bool) std.math.Order {
+    if (an and bn) return .eq;
+    return if (an == nulls_first) .lt else .gt;
+}
+
+/// Order of two sort-key values: nulls before or after every value as `nulls_first`
+/// says, `desc` flips non-null order. Shared by `SortCtx.lessThan` and Top-N.
+pub fn keyOrder(va: Value, vb: Value, desc: bool, nulls_first: bool) std.math.Order {
     const an = va.isNull();
     const bn = vb.isNull();
-    if (an or bn) {
-        if (an and bn) return .eq;
-        return if (an) .gt else .lt;
-    }
+    if (an or bn) return nullOrder(an, bn, nulls_first);
     const ord = eval.compareValues(va, vb) orelse return .eq;
     if (ord == .eq) return .eq;
     return if (desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
 }
 
-test "sort: descending order with nulls always last" {
+test "sort: nulls first or last in either direction" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -899,15 +901,43 @@ test "sort: descending order with nulls always last" {
         try intBatch(a, &int_schema, &.{ 3, null }),
         try intBatch(a, &int_schema, &.{ 1, 2 }),
     };
-    var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
-    var scan = Scan{ .src = ts.src() };
-    var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }} };
-    try testing.expectEqualDeep(@as([]const ?i64, &.{ 3, 2, 1, null }), try drainInts(a, .{ .sort = &srt }));
+    const cases = [_]struct { key: Sort.Key, want: []const ?i64 }{
+        .{ .key = .{ .idx = 0, .desc = false, .nulls_first = false }, .want = &.{ 1, 2, 3, null } },
+        .{ .key = .{ .idx = 0, .desc = false, .nulls_first = true }, .want = &.{ null, 1, 2, 3 } },
+        .{ .key = .{ .idx = 0, .desc = true, .nulls_first = true }, .want = &.{ null, 3, 2, 1 } },
+        .{ .key = .{ .idx = 0, .desc = true, .nulls_first = false }, .want = &.{ 3, 2, 1, null } },
+    };
+    for (cases) |c| {
+        var ts = TestSource{ .schema_ = int_schema, .batches = &batches };
+        var scan = Scan{ .src = ts.src() };
+        var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &int_schema, .keys = &[_]Sort.Key{c.key} };
+        try testing.expectEqualDeep(c.want, try drainInts(a, .{ .sort = &srt }));
+    }
+}
 
-    var ts_asc = TestSource{ .schema_ = int_schema, .batches = &batches };
-    var scan_asc = Scan{ .src = ts_asc.src() };
-    var srt_asc = Sort{ .child = .{ .scan = &scan_asc }, .in_schema = &int_schema, .keys = &[_]Sort.Key{.{ .idx = 0, .desc = false }} };
-    try testing.expectEqualDeep(@as([]const ?i64, &.{ 1, 2, 3, null }), try drainInts(a, .{ .sort = &srt_asc }));
+test "sortIdxThreads: the parallel split places the null range first or last as the key says" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x9a11);
+    const rnd = prng.random();
+    const n = (1 << 17) + 999;
+    var b = column.Builder.init(a, types.Type.init(.int).asNullable());
+    for (0..n) |_| try b.append(if (rnd.uintLessThan(u8, 7) == 0) .null else Value{ .int = rnd.intRangeAtMost(i64, -50_000, 50_000) });
+    const col = try b.finish();
+    for ([_]bool{ false, true }) |desc| for ([_]bool{ false, true }) |nf| {
+        const arrs = [_]KeyArr{try KeyArr.prepare(a, col, .{ .idx = 0, .desc = desc, .nulls_first = nf })};
+        const want = try a.alloc(usize, n);
+        const got = try a.alloc(usize, n);
+        for (want, got, 0..) |*x, *y, i| {
+            x.* = i;
+            y.* = i;
+        }
+        std.mem.sort(usize, want, SortCtx{ .arrs = &arrs }, SortCtx.lessThan);
+        try sortIdxThreads(a, got, &arrs, 4);
+        try testing.expectEqualSlices(usize, want, got);
+        try testing.expectEqual(nf, !col.validity.get(got[0]));
+    };
 }
 
 test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
@@ -977,7 +1007,7 @@ test "sortIdx: the radix words order rows exactly as the comparator does" {
                     } },
                 });
             }
-            k.* = try KeyArr.prepare(a, try b.finish(), rnd.boolean());
+            k.* = try KeyArr.prepare(a, try b.finish(), .{ .idx = 0, .desc = rnd.boolean(), .nulls_first = rnd.boolean() });
         }
         const want = try a.alloc(usize, n);
         const got = try a.alloc(usize, n);
@@ -1132,7 +1162,7 @@ test "sort spill: merged runs give the in-memory order row for row on mixed keys
         const batches = try mixedBatches(a, rnd, 5 + rnd.uintLessThan(usize, 30), 60);
         const nkeys = 1 + rnd.uintLessThan(usize, 3);
         const keys = try a.alloc(Sort.Key, nkeys);
-        for (keys) |*k| k.* = .{ .idx = rnd.uintLessThan(usize, 6), .desc = rnd.boolean() };
+        for (keys) |*k| k.* = .{ .idx = rnd.uintLessThan(usize, 6), .desc = rnd.boolean(), .nulls_first = rnd.boolean() };
         const cfg = SortRun{
             .space = td.ds.space(),
             .spill_at = ([_]usize{ 0, 500, 2000, 6000 })[round % 4],
@@ -1158,7 +1188,7 @@ test "sort spill: many runs merge in passes past the fan-in, ascending and desce
 
     const batches = try mixedBatches(a, rnd, 90, 40);
     for ([_]bool{ false, true }) |desc| {
-        const keys = [_]Sort.Key{ .{ .idx = 0, .desc = desc }, .{ .idx = 3, .desc = !desc } };
+        const keys = [_]Sort.Key{ .{ .idx = 0, .desc = desc, .nulls_first = !desc }, .{ .idx = 3, .desc = !desc, .nulls_first = !desc } };
         const want = try drainSorted(a, batches, &keys, .{});
         for ([_]usize{ 2, 3, 5, 64 }) |fan_in| {
             const td = try SpillDir.init(std.math.maxInt(u64));
@@ -1195,7 +1225,7 @@ test "sort spill: duplicate keys keep input order across runs" {
     var srt = Sort{
         .child = .{ .scan = &scan },
         .in_schema = &kv_schema,
-        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true }},
+        .keys = &[_]Sort.Key{.{ .idx = 0, .desc = true, .nulls_first = false }},
         .space = td.ds.space(),
         .spill_at = 0,
         .fan_in = 2,
@@ -1219,7 +1249,7 @@ test "sort spill: empty input, empty batches and a single batch" {
     const a = ar.allocator();
     const td = try SpillDir.init(std.math.maxInt(u64));
     defer td.deinit();
-    const keys = [_]Sort.Key{.{ .idx = 0, .desc = false }};
+    const keys = [_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }};
     const cfg = SortRun{ .space = td.ds.space(), .spill_at = 0, .batch_rows = 3 };
 
     try testing.expectEqual(@as(usize, 0), (try drainSorted(a, &.{}, &keys, cfg)).len);
@@ -1240,7 +1270,7 @@ test "sort spill: a disk cap too small fails with SpillCapExceeded and leaves no
     defer td.deinit();
     var prng = std.Random.DefaultPrng.init(11);
     const batches = try mixedBatches(a, prng.random(), 20, 40);
-    const keys = [_]Sort.Key{.{ .idx = 1, .desc = false }};
+    const keys = [_]Sort.Key{.{ .idx = 1, .desc = false, .nulls_first = true }};
     try testing.expectError(error.SpillCapExceeded, drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 0 }));
     try testing.expectEqual(@as(usize, 0), try td.count());
 }
@@ -1253,7 +1283,7 @@ test "sort spill: input under the limit is sorted in memory without touching the
     defer td.deinit();
     var prng = std.Random.DefaultPrng.init(3);
     const batches = try mixedBatches(a, prng.random(), 10, 30);
-    const keys = [_]Sort.Key{ .{ .idx = 3, .desc = false }, .{ .idx = 2, .desc = true } };
+    const keys = [_]Sort.Key{ .{ .idx = 3, .desc = false, .nulls_first = false }, .{ .idx = 2, .desc = true, .nulls_first = true } };
     try expectSameRows(try drainSorted(a, batches, &keys, .{}), try drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 1 << 30 }));
     try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
 }

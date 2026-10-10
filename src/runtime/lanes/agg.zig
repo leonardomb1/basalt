@@ -722,21 +722,19 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     var sel: ?[]const []const u32 = null;
     if (topNTail(tail)) |tn| {
-        var cols = std.array_list.Managed(usize).init(arena);
-        var descs = std.array_list.Managed(bool).init(arena);
+        var keys = std.array_list.Managed(op.Sort.Key).init(arena);
         var ok = true;
         for (tn.keys) |k| {
             const idx = out_schema.resolve(k.field.parts) orelse {
                 ok = false;
                 break;
             };
-            try cols.append(idx);
-            try descs.append(k.desc);
+            try keys.append(.{ .idx = idx, .desc = k.desc, .nulls_first = k.nulls_first });
         }
         if (ok) {
             var tctx = PqTopNCtx{
                 .parts = parts,
-                .order = .{ .cols = cols.items, .desc = descs.items, .by_len = apl.by.len, .aggs = aggs },
+                .order = .{ .keys = keys.items, .by_len = apl.by.len, .aggs = aggs },
                 .n = tn.n,
                 .queue = .{ .nitems = pq_parts },
                 .sel = try arena.alloc([]const u32, pq_parts),

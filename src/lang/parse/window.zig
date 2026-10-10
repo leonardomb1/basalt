@@ -41,7 +41,7 @@ const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
 const std = @import("std");
 
-pub const OrderExpr = struct { e: *ast.Expr, desc: bool };
+pub const OrderExpr = struct { e: *ast.Expr, desc: bool, nulls_first: bool };
 
 pub const Spec = struct {
     base: ?[]const u8 = null,
@@ -250,9 +250,7 @@ pub fn parseSpecBody(self: *Parser, pos: Pos) Error!Spec {
             const e = try self.parseExpr();
             var desc = false;
             if (self.eatKw("desc")) desc = true else _ = self.eatKw("asc");
-            if (self.isKw("nulls"))
-                return self.fail(self.curPos(), "NULLS FIRST / NULLS LAST is not supported inside OVER — nulls sort last in either direction", .{});
-            try keys.append(.{ .e = e, .desc = desc });
+            try keys.append(.{ .e = e, .desc = desc, .nulls_first = try self.parseNullsFirst(desc) });
             if (!self.eat(.comma)) break;
         }
         spec.order = try keys.toOwnedSlice();
@@ -599,7 +597,7 @@ pub const Lower = struct {
             const part = try self.p.arena.alloc(ast.QualName, sp.partition.len);
             for (sp.partition, part) |e, *q| q.* = try self.column(e);
             const ord = try self.p.arena.alloc(ast.SortKey, sp.order.len);
-            for (sp.order, ord) |o, *k| k.* = .{ .field = try self.column(o.e), .desc = o.desc };
+            for (sp.order, ord) |o, *k| k.* = .{ .field = try self.column(o.e), .desc = o.desc, .nulls_first = o.nulls_first };
             var key = std.array_list.Managed(u8).init(self.p.arena);
             for (part) |q| {
                 try key.appendSlice(q.last());
@@ -608,7 +606,8 @@ pub const Lower = struct {
             try key.append('|');
             for (ord) |k| {
                 try key.appendSlice(k.field.last());
-                try key.appendSlice(if (k.desc) " desc," else ",");
+                try key.appendSlice(if (k.desc) " desc" else "");
+                try key.appendSlice(if (k.nulls_first) " nf," else ",");
             }
             const arg: ?ast.QualName = if (c.arg) |a| try self.column(a) else null;
             try self.hidden.append(c.hidden);
@@ -644,7 +643,7 @@ pub const Lower = struct {
                 ordinal = try self.p.qualOne(name);
             }
             const ord = try self.p.arena.alloc(ast.SortKey, 1);
-            ord[0] = .{ .field = ordinal.?, .desc = false };
+            ord[0] = .{ .field = ordinal.?, .desc = false, .nulls_first = false };
             g.ord = ord;
             for (g.funcs.items) |*f| {
                 if (f.frame == null or f.frame.?.unit == .range) f.frame = .{ .unit = .rows, .start = .unbounded_preceding, .end = .unbounded_following };

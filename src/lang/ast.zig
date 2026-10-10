@@ -233,7 +233,17 @@ pub const Limit = struct { count: u64, offset: u64 = 0, count_expr: ?*Expr = nul
 
 pub const Distinct = struct { on: ?[]const QualName };
 
-pub const SortKey = struct { field: QualName, desc: bool };
+/// `nulls_first` is resolved at parse time: as written, or else as DESC.
+pub const SortKey = struct {
+    field: QualName,
+    desc: bool,
+    nulls_first: bool,
+
+    pub fn nullsLabel(self: SortKey) []const u8 {
+        if (self.nulls_first == self.desc) return "";
+        return if (self.nulls_first) " NULLS FIRST" else " NULLS LAST";
+    }
+};
 pub const Sort = struct { keys: []const SortKey };
 
 pub const AggFunc = enum {
@@ -488,7 +498,7 @@ pub fn windowDetail(arena: std.mem.Allocator, wd: Window) ![]const u8 {
     }
     if (wd.order_by.len > 0) {
         try w.writeAll(if (wd.partition_by.len > 0) " ORDER BY " else "ORDER BY ");
-        for (wd.order_by, 0..) |k, i| try w.print("{s}{s}{s}", .{ if (i > 0) ", " else "", k.field.last(), if (k.desc) " DESC" else "" });
+        for (wd.order_by, 0..) |k, i| try w.print("{s}{s}{s}{s}", .{ if (i > 0) ", " else "", k.field.last(), if (k.desc) " DESC" else "", k.nullsLabel() });
     }
     if (wd.partition_by.len + wd.order_by.len == 0) try w.writeAll("whole input");
     try w.writeAll(": ");

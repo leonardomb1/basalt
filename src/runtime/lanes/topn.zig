@@ -56,18 +56,17 @@ fn groupSortValue(set: *const op.Aggregate.GroupSet, gi: usize, col: usize, by_l
 }
 
 const GroupOrder = struct {
-    cols: []const usize,
-    desc: []const bool,
+    keys: []const op.Sort.Key,
     by_len: usize,
     aggs: []const op.Aggregate.Agg,
     set: *const op.Aggregate.GroupSet = undefined,
 
     fn less(self: GroupOrder, a: u32, b: u32) bool {
-        for (self.cols, self.desc) |c, d| {
-            const av = groupSortValue(self.set, a, c, self.by_len, self.aggs);
-            const bv = groupSortValue(self.set, b, c, self.by_len, self.aggs);
-            const o = eval.compareValues(av, bv) orelse .eq;
-            if (o != .eq) return if (d) o == .gt else o == .lt;
+        for (self.keys) |k| {
+            const av = groupSortValue(self.set, a, k.idx, self.by_len, self.aggs);
+            const bv = groupSortValue(self.set, b, k.idx, self.by_len, self.aggs);
+            const o = op.keyOrder(av, bv, k.desc, k.nulls_first);
+            if (o != .eq) return o == .lt;
         }
         return false;
     }
@@ -199,7 +198,7 @@ fn runParallelTopN(
     var ad = analyze.Diag{};
     const idxs = analyze.fieldIndices(arena, row_schema.*, qs, &ad) catch |e| return aErr(env, &ad, e);
     const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
-    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
 
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);

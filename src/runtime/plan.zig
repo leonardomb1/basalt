@@ -583,14 +583,14 @@ pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: t
     var ad = analyze.Diag{};
     const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
     const ks = try arena.alloc(op.Sort.Key, s.keys.len);
-    for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+    for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
     const o = try arena.create(op.TopN);
     o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
 
     if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
         if (env.pq_reader != null or env.pq_folder != null) {
             const t = try arena.create(Threshold);
-            t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc };
+            t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc, .nulls_first = s.keys[0].nulls_first };
             if (env.pq_reader) |pr| pr.threshold = t;
             if (env.pq_folder) |f| f.threshold = t;
             o.threshold = t;
@@ -663,7 +663,7 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             var ad = analyze.Diag{};
             const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
             const ks = try arena.alloc(op.Sort.Key, s.keys.len);
-            for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+            for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
             const o = try arena.create(op.Sort);
             o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .threads = env.sort_threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
             return .{ .op = .{ .sort = o }, .schema = schema };
@@ -672,9 +672,9 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
             var ad = analyze.Diag{};
             const wp = analyze.windowPlan(arena, schema, wd, &ad) catch |e| return aErr(env, &ad, e);
             const pk = try arena.alloc(op.Sort.Key, wp.part.len);
-            for (wp.part, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false };
+            for (wp.part, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false, .nulls_first = false };
             const ok = try arena.alloc(op.Sort.Key, wp.ord.len);
-            for (wd.order_by, wp.ord, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc };
+            for (wd.order_by, wp.ord, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
             for (wd.funcs, wp.funcs, 0..) |f, *out, i| {
                 if (f.offset_expr) |e| {
                     var od = analyze.Diag{};

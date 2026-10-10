@@ -35,7 +35,7 @@
 //! over no rows yields one row. A top-N (`TopN`) is never authoritative: the
 //! engine re-sorts and re-limits, so the source need only send a sufficient set,
 //! which holds when every earlier filter runs at the source and the keys order
-//! alike, nulls last.
+//! alike, nulls placed per key as the engine places them.
 //!
 //! The test schema arrays are file-scope on purpose: as function locals,
 //! `&.{…}` pointed at a stack temporary that dangled in release builds.

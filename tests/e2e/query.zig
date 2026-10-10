@@ -312,18 +312,42 @@ test "CSV -> filter/select -> CSV round-trips" {
     try std.testing.expectEqualStrings("id,amount\n1,100\n3,200\n", out);
 }
 
-test "sort: numeric desc, nulls last" {
+test "sort: nulls sort as the largest value unless NULLS FIRST or NULLS LAST says" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const out = try runToString(
-        alloc,
-        &tmp,
-        "id,amount\n1,100\n2,\n3,200\n",
-        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC",
-    );
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("id,amt\n3,200\n1,100\n2,\n", out);
+    const cases = [_]struct { order: []const u8, want: []const u8 }{
+        .{ .order = "amt DESC", .want = "id,amt\n2,\n3,200\n1,100\n" },
+        .{ .order = "amt", .want = "id,amt\n1,100\n3,200\n2,\n" },
+        .{ .order = "amt DESC NULLS LAST", .want = "id,amt\n3,200\n1,100\n2,\n" },
+        .{ .order = "amt ASC NULLS FIRST", .want = "id,amt\n2,\n1,100\n3,200\n" },
+        .{ .order = "amt NULLS FIRST LIMIT 2", .want = "id,amt\n2,\n1,100\n" },
+        .{ .order = "amt DESC NULLS LAST LIMIT 1", .want = "id,amt\n3,200\n" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const sql = try std.fmt.allocPrint(alloc, "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY {s}", .{c.order});
+        defer alloc.free(sql);
+        const out = try runToString(alloc, &tmp, "id,amount\n1,100\n2,\n3,200\n", sql);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "window: NULLS FIRST / LAST inside OVER and in a named window order the rows numbered" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY a DESC) AS rn FROM '$IN' ORDER BY id", .want = "id,rn\n1,3\n2,1\n3,2\n" },
+        .{ .sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY a NULLS FIRST) AS rn FROM '$IN' ORDER BY id", .want = "id,rn\n1,2\n2,1\n3,3\n" },
+        .{ .sql = "SELECT id, ROW_NUMBER() OVER w AS rn FROM '$IN' WINDOW w AS (ORDER BY a DESC NULLS LAST) ORDER BY id", .want = "id,rn\n1,2\n2,3\n3,1\n" },
+        .{ .sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY a) AS x, ROW_NUMBER() OVER (ORDER BY a NULLS FIRST) AS y FROM '$IN' ORDER BY id", .want = "id,x,y\n1,1,2\n2,3,1\n3,2,3\n" },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runToString(alloc, &tmp, "id,a\n1,1\n2,\n3,5\n", c.sql);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
 }
 
 test "distinct: multi-column key (value-keyed)" {
@@ -348,7 +372,7 @@ test "top-N: sort | limit fuses to the K largest, in order" {
         alloc,
         &tmp,
         "id,amount\n1,100\n2,50\n3,200\n4,\n5,150\n",
-        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 2",
+        "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC NULLS LAST LIMIT 2",
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n", out);
@@ -365,10 +389,10 @@ test "top-N: offset skips before taking" {
         "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 2 OFFSET 1",
     );
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("id,amt\n5,150\n1,100\n", out);
+    try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n", out);
 }
 
-test "top-N: nulls sort last, matching a full sort | limit-all" {
+test "top-N: nulls sort first under DESC, matching a full sort | limit-all" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -379,7 +403,7 @@ test "top-N: nulls sort last, matching a full sort | limit-all" {
         "SELECT id, CAST(amount AS INT) AS amt FROM '$IN' ORDER BY amt DESC LIMIT 99",
     );
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("id,amt\n3,200\n5,150\n1,100\n2,50\n4,\n", out);
+    try std.testing.expectEqualStrings("id,amt\n4,\n3,200\n5,150\n1,100\n2,50\n", out);
 }
 
 test "join: an inner join drops the unmatched probe row" {
@@ -1211,7 +1235,7 @@ test "JOIN LATERAL passes a row's column to a table function as a join on it" {
     }
 }
 
-test "sort: the radix fast path keeps input order on ties, honors DESC and multi-key; nulls still sort last" {
+test "sort: the radix fast path keeps input order on ties, honors DESC and multi-key; nulls sort first under DESC" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1223,7 +1247,7 @@ test "sort: the radix fast path keeps input order on ties, honors DESC and multi
     try std.testing.expectEqualStrings("i\n4\n1\n2\n0\n", multi);
     const nulls = try runToString(alloc, &tmp, "i,k\n0,1\n1,0\n2,1\n3,\n4,0\n", "SELECT i FROM '$IN' ORDER BY k DESC");
     defer alloc.free(nulls);
-    try std.testing.expectEqualStrings("i\n0\n2\n1\n4\n3\n", nulls);
+    try std.testing.expectEqualStrings("i\n3\n0\n2\n1\n4\n", nulls);
 }
 
 test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to the in-memory result" {
@@ -1248,7 +1272,7 @@ test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to t
         fn less(_: void, a: Row, b: Row) bool {
             if (a.k == null or b.k == null) {
                 if (a.k == null and b.k == null) return sLess(a.s, b.s);
-                return b.k == null;
+                return a.k == null;
             }
             if (a.k.? != b.k.?) return a.k.? > b.k.?;
             return sLess(a.s, b.s);
@@ -1330,7 +1354,7 @@ test "join: `b.col` names the right side's column even when the join renamed it 
             \\SELECT a.id, r.amt FROM '$B/a.csv' a JOIN r ON a.id = r.id ORDER BY a.id;
         , threads, &.{});
         try expectFile(&tmp, "both.csv", "id,amt,amt_r\n1,10,100\n2,20,200\n");
-        try expectFile(&tmp, "filt.csv", "id,bamt,tot\n2,200,220\n3,,\n");
+        try expectFile(&tmp, "filt.csv", "id,bamt,tot\n3,,\n2,200,220\n");
         try expectFile(&tmp, "agg.csv", "grp,sb,sa\np,100,10\nq,200,20\n");
         try expectFile(&tmp, "chain.csv", "id,amt,camt\n2,200,200\n");
         try expectFile(&tmp, "unaliased.csv", "id,amt\n1,100\n2,200\n");
@@ -1694,7 +1718,7 @@ test "join: under USING `t.k` and `t.*` are that side's own, the key in its plac
         .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.q IS NULL OR i.q > 3", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\n" },
         .{ .q = "SELECT t.name AS tn, i.name AS iname, name FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE t.name IS NULL OR i.name IS NULL", .want = "tn,iname,name\ncid,,cid\n,eve,eve\n" },
         .{ .q = "SELECT i.name, count(*) AS n FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.name IS NULL OR i.name = 'ana' GROUP BY i.name ORDER BY n", .want = "name,n\n,1\nana,2\n" },
-        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\ncid,3,,,\n" },
+        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\n" },
         .{ .q = "SELECT * RENAME (id AS tid) FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "name,tid,amt,item,q\nbob,2,20.25,z,3\n" },
         .{ .q = "SELECT name, item FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY t.name, item", .want = "name,item\nana,x\nana,y\nbob,z\ncid,\neve,w\n" },
     });
