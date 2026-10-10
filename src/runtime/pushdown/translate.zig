@@ -388,14 +388,19 @@ const Tx = struct {
 
     /// A quoted literal against a non-text operand, as sent: the number or bool it
     /// reads as against a number or bool column, as the engine reads it, or null when
-    /// it does not read so plainly; quoted against anything else.
+    /// it does not read so plainly; quoted against anything else. Against a column of
+    /// a type not known, a number stays in the engine on the MySQL family, which
+    /// compares a decimal with a string as doubles.
     fn typedLit(self: Tx, col: *const ast.Expr, lit: []const u8) Err!?[]const u8 {
+        const t = std.mem.trim(u8, lit, " \t\r\n");
         const ck = blk: {
             if (col.* != .field or col.field.parts.len != 1) break :blk null;
             const i = self.o.schema.indexOf(col.field.parts[0]) orelse break :blk null;
             break :blk self.o.schema.fields[i].ty.kind;
-        } orelse return self.value(&.{ .str_lit = lit });
-        const t = std.mem.trim(u8, lit, " \t\r\n");
+        } orelse {
+            if (self.dialect.mysqlWire() and plainNumber(t)) return null;
+            return self.value(&.{ .str_lit = lit });
+        };
         switch (ck) {
             .int, .float, .decimal => {
                 if (!plainNumber(t) or (ck == .int and std.mem.indexOfScalar(u8, t, '.') != null)) return null;
@@ -715,6 +720,13 @@ test "translateExpr: a quoted literal against a number or bool column is sent as
         const got = try translateExpr(a, try bin(a, c.op, try fld(a, c.col), lit), c.d, sch, true);
         if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
     }
+    const five = try a.create(ast.Expr);
+    five.* = .{ .str_lit = "5" };
+    const cast = try a.create(ast.Expr);
+    cast.* = .{ .cast = .{ .e = try intLit(a, 7), .ty = types.Type.decimal(10, 2) } };
+    const untyped = try bin(a, .lt, cast, five);
+    try testing.expect((try translateExpr(a, untyped, .mysql, .{ .fields = &.{} }, false)) == null);
+    try testing.expect(std.mem.endsWith(u8, (try translateExpr(a, untyped, .postgres, .{ .fields = &.{} }, false)).?, " < '5')"));
 }
 
 test "translateExpr: IS [NOT] DISTINCT FROM is native on postgres, `<=>` on the MySQL family, engine-side on sqlserver" {

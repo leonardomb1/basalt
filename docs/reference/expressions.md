@@ -95,8 +95,11 @@ columns it has not seen.
   '2')` ints, `active = 'yes'` bools (`true`/`false`, `t`/`f`, `yes`/`no`,
   `on`/`off`, `1`/`0`, any case). Surrounding spaces are ignored; anything else
   that does not read as the type — `'1,5'`, or `'1.5'` against an INT — is an
-  error from `check`; pushed down to a SQL source whose column types are known,
-  it is sent as that number or bool. A text *column* against a number still needs a `CAST`, as it
+  error from `check`. Pushed down to a SQL source whose column types are known,
+  it is sent as that number or bool; where they are not yet, PostgreSQL and SQL
+  Server get the quoted literal, which they read the same way, and MySQL,
+  StarRocks and Doris, which would compare a decimal with it as doubles, leave
+  a number to the engine. A text *column* against a number still needs a `CAST`, as it
   does in PostgreSQL.
 - `"Valor Total"` — a quoted column name ([Scripts](../language/scripts.md)), valid anywhere a bare name is:
   `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, an alias (`AS "Total Geral"`), and
