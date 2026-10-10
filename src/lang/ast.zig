@@ -542,7 +542,12 @@ pub const FnDecl = struct {
     body: FnBody,
     replace: bool = false,
     pos: Pos,
+    table_check: ?TableCheck = null,
 };
+
+/// A table function's body as parsed where it is declared, its `$params` left
+/// unbound, kept so `check` can type it whether or not anything calls it.
+pub const TableCheck = struct { bindings: []const Stmt, pipeline: Pipeline };
 
 pub const CallStmt = struct {
     name: []const u8,

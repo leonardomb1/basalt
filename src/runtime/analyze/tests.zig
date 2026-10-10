@@ -616,6 +616,27 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
 }
 
+test "analyze: a table function's body is checked where it is declared, called or not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const bad = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT nope FROM '{s}' WHERE id = $m;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in });
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown field `nope`") != null);
+    try std.testing.expectEqual(@as(u32, 1), diag.pos.?.line);
+
+    const ok = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT id, upper($m) AS u, (SELECT max(id) FROM '{s}') AS mx FROM '{s}' WHERE id = $m AND $d IS NOT NULL;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in, in });
+    var okdiag = Diag{};
+    _ = try analyze(a, try parse(a, ok), &okdiag);
+}
+
 test "analyze: a query LET is checked where it stands and `$name` takes its column's type" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

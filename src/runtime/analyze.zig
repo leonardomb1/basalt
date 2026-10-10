@@ -574,6 +574,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
+    for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| try ctx.checkTableFn(s.func, tc);
 
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
 }
@@ -731,6 +732,52 @@ const Ctx = struct {
     diag: *Diag,
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
+
+    /// A table function's body, typed where it is declared with each parameter a null
+    /// of its declared type, so one nothing calls is checked too. A problem a call
+    /// already reported at the same place is not reported twice.
+    fn checkTableFn(self: *Ctx, fd: ast.FnDecl, tc: ast.TableCheck) Error!void {
+        var scoped = ParamMap.init(self.arena);
+        var it = self.params.iterator();
+        while (it.next()) |kv| try scoped.put(kv.key_ptr.*, kv.value_ptr.*);
+        for (fd.params) |p| {
+            const nul = try mk(self.arena, .null_lit);
+            try scoped.put(p.name, if (p.ty) |ty| try mk(self.arena, .{ .cast = .{ .e = @constCast(nul), .ty = ty.asNullable() } }) else nul);
+        }
+        const outer = self.params;
+        self.params = &scoped;
+        defer self.params = outer;
+        var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(self.arena);
+        defer {
+            var i = saved.items.len;
+            while (i > 0) {
+                i -= 1;
+                const sv = saved.items[i];
+                if (sv.prev) |p| self.bindings.put(sv.name, p) catch {} else _ = self.bindings.remove(sv.name);
+            }
+        }
+        for (tc.bindings) |b| switch (b) {
+            .binding => |bd| {
+                try saved.append(.{ .name = bd.name, .prev = self.bindings.get(bd.name) });
+                try self.bindings.put(bd.name, bd.pipeline);
+            },
+            .let_const => |l| try scoped.put(l.name, try mk(self.arena, .null_lit)),
+            else => {},
+        };
+        const stages = try self.arena.alloc(ast.Stage, tc.pipeline.stages.len + 1);
+        @memcpy(stages[0..tc.pipeline.stages.len], tc.pipeline.stages);
+        stages[tc.pipeline.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = tc.pipeline.pos };
+        _ = self.analyzeOutput(.{ .stages = stages, .pos = tc.pipeline.pos }) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            if (self.issues) |list| for (list.items) |is| {
+                if (std.mem.eql(u8, is.msg, self.diag.msg) and std.meta.eql(is.pos, self.diag.pos)) {
+                    self.diag.* = .{};
+                    return;
+                }
+            };
+            return self.note(e);
+        };
+    }
 
     /// A query LET is checked where it stands, as the run queries it there, and
     /// `$name` then reads as a null of its one column's type when that is known.
