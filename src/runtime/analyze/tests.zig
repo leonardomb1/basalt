@@ -625,3 +625,62 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     var none = ParamMap.init(a);
     try std.testing.expect((try substFilterParams(a, stages, &none)).ptr == stages.ptr);
 }
+
+test "patternTypeProblem: a CASE pattern is read as its subject's own type, a decimal's scale included" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const patternTypeProblem = @import("../analyze.zig").patternTypeProblem;
+    const Value = @import("../../exec/value.zig").Value;
+    var lit: ast.Expr = .{ .str_lit = "1.50" };
+    const dec: Value = .{ .decimal = .{ .unscaled = 150, .scale = 2 } };
+    try std.testing.expect(try patternTypeProblem(a, dec, &lit) == null);
+    lit = .{ .str_lit = "abc" };
+    try std.testing.expect(try patternTypeProblem(a, dec, &lit) != null);
+    try std.testing.expect(try patternTypeProblem(a, .{ .int = 5 }, &lit) != null);
+    lit = .{ .str_lit = "5" };
+    try std.testing.expect(try patternTypeProblem(a, .{ .int = 5 }, &lit) == null);
+}
+
+test "analyze: a table function's body is checked where it is declared, called or not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const bad = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT nope FROM '{s}' WHERE id = $m;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in });
+    var diag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &diag));
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown field `nope`") != null);
+    try std.testing.expectEqual(@as(u32, 1), diag.pos.?.line);
+
+    const ok = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT id, upper($m) AS u, (SELECT max(id) FROM '{s}') AS mx FROM '{s}' WHERE id = $m AND $d IS NOT NULL;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in, in });
+    var okdiag = Diag{};
+    _ = try analyze(a, try parse(a, ok), &okdiag);
+}
+
+test "analyze: a query LET is checked where it stands and `$name` takes its column's type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+
+    const ok = try std.fmt.allocPrint(a, "LET q = (SELECT count(*) AS c FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    var diag = Diag{};
+    const plan = try analyze(a, try parse(a, ok), &diag);
+    const out = plan.outputs[0].stages[plan.outputs[0].stages.len - 1].out_schema.?;
+    try std.testing.expectEqual(types.TypeKind.int, out.fields[0].ty.kind);
+
+    const bad = try std.fmt.allocPrint(a, "LET q = (SELECT nope FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    var bdiag = Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &bdiag));
+    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "unknown field `nope`") != null);
+}

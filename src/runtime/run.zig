@@ -150,6 +150,7 @@ const runForEach = @import("script.zig").runForEach;
 const renderForSource = @import("script.zig").renderForSource;
 const runPrint = @import("script.zig").runPrint;
 const runThrow = @import("script.zig").runThrow;
+const runEarlyThrows = @import("script.zig").runEarlyThrows;
 
 const Scratch = @import("scratch.zig").Scratch;
 
@@ -176,9 +177,14 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
     for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
-    const program = expand.expandProgramWith(arena, raw_program, opts.request_body, json_args, &expand_msg) catch |e| switch (e) {
+    var expand_at: ?ast.Pos = null;
+    const program = expand.expandProgramAt(arena, raw_program, opts.request_body, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return e,
-        error.ExpandFailed => return planErr(diag, expand_msg),
+        error.ExpandFailed => {
+            const err = planErr(diag, expand_msg);
+            diag.pos = expand_at;
+            return err;
+        },
     };
 
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
@@ -234,6 +240,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
+    if (try analyze.misplacedDecl(arena, program.stmts[1..], .top)) |m| {
+        const e = planErr(diag, m.msg);
+        diag.pos = m.pos;
+        return e;
+    }
     if (runnable == 0 and !opts.declarations_only)
         return planErr(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`");
 
@@ -293,6 +304,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer if (env.progress != null) progress.stop();
 
     env.script_scope = try buildScriptScope(arena, &params);
+    try runEarlyThrows(&env, program.stmts[1..]);
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
@@ -377,6 +389,11 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
     var subj: ?Value = null;
     if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} subject: {s}", .{ ctx, @errorName(e) }));
+    if (subj) |sv| for (m.arms) |arm| for (arm.pats) |p| if (try analyze.patternTypeProblem(env.arena, sv, p)) |why| {
+        const e = planErr(env.diag, why);
+        env.diag.pos = m.pos;
+        return e;
+    };
     for (m.arms, 0..) |arm, i| {
         if (arm.is_default) return i;
         if (arm.guard) |g| {
@@ -643,6 +660,8 @@ pub fn hasSort(stages: []const ast.Stage) bool {
 /// Run one row of a `for` body: each pipeline is rendered with the row's `${var}`
 /// values; a nested loop's source is rendered with the outer row and chains to it.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    if (lr.badCell(env.arena)) |b|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "loop variable `{s}`: `{s}` is not {s}", .{ b.name, b.cell, try b.ty.name(env.arena) }));
     var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(env.arena);
     for (body) |st| if (st == .binding) try saved.append(.{ .name = st.binding.name, .prev = env.bindings.get(st.binding.name) });
     defer {

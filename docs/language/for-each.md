@@ -75,10 +75,18 @@ unknown column per row (``for-each row c=nope: unknown field `nope```).
 the PK from source metadata — a raw `QUERY(...)` read cannot. This is why the
 catalog holds only `{name, where}`, never a PK.
 
-## Raw `${...}` interpolation (raw SQL bodies only)
+## Raw `${...}` interpolation
 
 Inside a raw `QUERY($$...$$)` or `PUSHDOWN($$...$$)` literal, `${var}` /
 `${ <expr> }` still splices loop values into the SQL text (C#-style: nested
 string literals in the hole need no escaping) — `QUERY($$SELECT ${cols} FROM
 ${name}$$)`. Prefer `$var` + `IDENTIFIER()` everywhere a *name* is meant;
 reach for `${...}` only when you are literally building a raw SQL string.
+
+The same holes are filled in every `'...'` string literal and file path of a
+statement, not only raw bodies: from the row's loop variables (or a statement
+function's parameters), else from the script's `PARAM`s and `LET`s — so
+`'lit ${x}'` reads `PARAM x` even outside any loop. A bare `${name}` that
+nothing binds is left as written, so text that merely contains `${` passes
+through; write `$name` in an expression to have an unbound name refused at
+plan time.

@@ -209,6 +209,15 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
+
+    try tmp.dir.writeFile(.{ .sub_path = "nums.csv", .data = "n\nana\n" });
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "loop variable `n`: `ana` is not int") != null);
 }
 
 test "param substitution filters by a CLI-bound value" {
@@ -735,6 +744,14 @@ test "a LET is sealed: `-p` naming one is a plan error, not a silent override" {
     try std.testing.expectError(error.PlanFailed, runLetScript(alloc, script, &[_]ParamArg{.{ .key = "span", .val = "99" }}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "`span` is a LET, not a PARAM") != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 20));
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyzeWith(parena.allocator(), prog, &.{.{ .name = "span", .value = "99" }}, &adiag));
+    try std.testing.expect(std.mem.indexOf(u8, adiag.msg, "`span` is a LET, not a PARAM") != null);
 }
 
 test "a LET and a PARAM may not share a name" {
@@ -868,6 +885,20 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
     try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
     try std.testing.expect(!bdiag.retryable);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "never.csv", 1 << 20));
+
+    const late = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}/early.csv' AS SELECT id FROM '{s}/in.csv';
+        \\THROW 'late';
+    , .{ base, base });
+    defer alloc.free(late);
+    const lprog = try parser.parseSource(parena.allocator(), late, &pdiag);
+    var ldiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, lprog, .{}, &ldiag));
+    try std.testing.expectEqualStrings("late", ldiag.msg);
+    try std.testing.expectEqual(@as(u32, 2), ldiag.pos.?.line);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "early.csv", 1 << 20));
+
+    try expectRefusedAlike(alloc, &tmp, "THROW 'x' WHEN 1;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW condition must be a boolean, got int");
 }
 
 test "PRINT runs at the top level and per row inside a FOR EACH body" {
@@ -954,6 +985,40 @@ test "a plan failure carries the failing stage's position" {
     try std.testing.expectEqualStrings("unknown field `nosuch`", rdiag.msg);
     try std.testing.expectEqual(@as(u32, 4), rdiag.pos.?.line);
     try std.testing.expectEqual(@as(u32, 7), rdiag.pos.?.col);
+}
+
+test "script-level refusals point at the offending declaration or name, in check and run alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "u.csv", .data = "name\nana\nbob\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const Case = struct { src: []const u8, line: u32, col: u32, check: bool = true };
+    const cases = [_]Case{
+        .{ .src = "LET b = 1 +\n  $a;\nLET a = 2;\nSELECT $b AS v;", .line = 2, .col = 3 },
+        .{ .src = "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nSELECT $a AS v;", .line = 2, .col = 1 },
+        .{ .src = "PARAM a INT DEFAULT 2;\n  LET a = 3;\nSELECT $a AS v;", .line = 2, .col = 3 },
+        .{ .src = "SELECT 1 AS v;\n  LET bad = 1 / 0;", .line = 2, .col = 3 },
+        .{ .src = "FOR EACH ROW OF ('$B/u.csv') AS (nm)\n  THROW 'boom ' || $nm WHEN $nm = 'bob';\nEND FOR;\nSELECT 1 AS v;", .line = 2, .col = 3, .check = false },
+    };
+    for (cases) |c| {
+        const script = try std.mem.replaceOwned(u8, alloc, c.src, "$B", base);
+        defer alloc.free(script);
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        try std.testing.expect(std.meta.isError(run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+        try std.testing.expectEqual(c.line, rdiag.pos.?.line);
+        try std.testing.expectEqual(c.col, rdiag.pos.?.col);
+        if (!c.check) continue;
+        var adiag = analyze.Diag{};
+        try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+        try std.testing.expectEqual(c.line, adiag.pos.?.line);
+        try std.testing.expectEqual(c.col, adiag.pos.?.col);
+    }
 }
 
 test "a FOR EACH discovery query may read a table function, a derived table or a CTE" {
@@ -1296,6 +1361,11 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PARAM n INT DEFAULT 'abc';\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "PARAM `n`: `abc` is not an integer" },
         .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
         .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LET y = 1;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
+        .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\n  LET y = 1;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
+        .{ "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate PARAM `a`" },
+        .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
+        .{ "PARAM n INT DEFAULT 5;\nCASE $n WHEN 5 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; WHEN 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 2 AS a; END CASE;", "CASE pattern 'x' is not int" },
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);

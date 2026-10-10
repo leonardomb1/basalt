@@ -5,6 +5,8 @@ const Catalog = @import("catalog.zig").Catalog;
 const Completer = @import("catalog.zig").Completer;
 const DeclId = @import("entry.zig").DeclId;
 const DeclStore = @import("entry.zig").DeclStore;
+const declOf = @import("entry.zig").declOf;
+const splitStatements = @import("entry.zig").splitStatements;
 const Editor = @import("line.zig").Editor;
 const LetFreezer = @import("prepare.zig").LetFreezer;
 const LineResult = @import("line.zig").Result;
@@ -326,11 +328,14 @@ fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
 }
 
 /// The entry's statements, each cut at its own last top-level `;`, so a statement
-/// function is one statement however many `;`s its body holds.
+/// function is one statement however many `;`s its body holds. Engine-made bindings
+/// (`__scalar1`, `__derived2`) are not the person's and are skipped; a `CREATE
+/// RESOURCE`, which leaves no statement behind, is found in the text between.
 pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, prog: ast.Program) ![]EntryStmt {
     const Found = struct { off: usize, stmt: ast.Stmt };
     var found = std.array_list.Managed(Found).init(arena);
     for (prog.stmts[1..]) |st| {
+        if (engineMade(st)) continue;
         const pos = analyze.stmtPos(st) orelse continue;
         const off = offsetOf(text, pos) orelse continue;
         if (off < entry_at) continue;
@@ -342,15 +347,12 @@ pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usi
         }
     }.lt);
     var out = std.array_list.Managed(EntryStmt).init(arena);
+    const lead_end = if (found.items.len > 0) found.items[0].off else text.len;
+    try appendResources(&out, try splitStatements(arena, text[entry_at..lead_end]));
     for (found.items, 0..) |f, i| {
         if (i + 1 < found.items.len and found.items[i + 1].off == f.off) continue;
         const end = if (i + 1 < found.items.len) found.items[i + 1].off else text.len;
         var piece = text[f.off..end];
-        var last: ?usize = null;
-        var k: usize = 0;
-        while (nextTopSemi(piece, k)) |p| : (k = p + 1) last = p;
-        if (last) |p| piece = piece[0..p];
-        piece = std.mem.trim(u8, piece, " \t\r\n");
         const id: ?DeclId = switch (f.stmt) {
             .connection => |c| .{ .kind = .connection, .name = c.name },
             .func => |fd| .{ .kind = .function, .name = fd.name },
@@ -358,9 +360,37 @@ pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usi
             .let_const => |l| .{ .kind = .let, .name = l.name },
             else => null,
         };
+        if (!(f.stmt == .func and f.stmt.func.body == .stmts)) {
+            const parts = try splitStatements(arena, piece);
+            if (parts.len > 0) {
+                try out.append(.{ .id = id, .text = parts[0] });
+                try appendResources(&out, parts[1..]);
+                continue;
+            }
+        }
+        var last: ?usize = null;
+        var k: usize = 0;
+        while (nextTopSemi(piece, k)) |p| : (k = p + 1) last = p;
+        if (last) |p| piece = piece[0..p];
+        piece = std.mem.trim(u8, piece, " \t\r\n");
         try out.append(.{ .id = id, .text = piece });
     }
     return out.toOwnedSlice();
+}
+
+fn engineMade(st: ast.Stmt) bool {
+    return switch (st) {
+        .let_const => |l| std.mem.startsWith(u8, l.name, "__scalar"),
+        .binding => |b| std.mem.startsWith(u8, b.name, "__"),
+        else => false,
+    };
+}
+
+fn appendResources(out: *std.array_list.Managed(EntryStmt), parts: []const []const u8) !void {
+    for (parts) |part| {
+        const id = declOf(part) orelse continue;
+        if (id.kind == .resource) try out.append(.{ .id = id, .text = part });
+    }
 }
 
 /// Only a position inside the entry, the part the person typed, gets a caret.
@@ -755,6 +785,27 @@ fn replHelp(msg: *std.Io.Writer) !void {
         \\  they wrap it. A paste is inserted as text, never run line by line.
         \\
     );
+}
+
+test "entryStatements: an engine-made scalar subquery LET is not a declaration; a resource is" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const entry =
+        \\CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://localhost:1');
+        \\CREATE RESOURCE h.r AS GET('/x');
+        \\SELECT (SELECT count(*) FROM RANGE(3)) AS c;
+    ;
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, entry, &diag);
+    const got = try entryStatements(a, entry, 0, prog);
+    try std.testing.expectEqual(@as(usize, 3), got.len);
+    try std.testing.expectEqual(DeclKind.connection, got[0].id.?.kind);
+    try std.testing.expectEqualStrings("CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://localhost:1')", got[0].text);
+    try std.testing.expectEqual(DeclKind.resource, got[1].id.?.kind);
+    try std.testing.expectEqualStrings("h.r", got[1].id.?.name);
+    try std.testing.expect(got[2].id == null);
+    try std.testing.expectEqualStrings("SELECT (SELECT count(*) FROM RANGE(3)) AS c", got[2].text);
 }
 
 test "entryStatements: a statement function is one declaration, its body's `;`s notwithstanding" {

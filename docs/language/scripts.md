@@ -35,8 +35,11 @@ reach it.
 `THROW <message> [WHEN <condition>];` asserts what the engine cannot infer.
 Both operands are ordinary expressions over `$params` and `$lets` ([Expressions](../reference/expressions.md)), so they
 are decided at plan time: an absent or true condition aborts the script before a
-row is read, with `message` as the error text verbatim; a false condition is a
-no-op. `basalt check` rejects a script whose guard fires, so a bad invocation is
+row is read, with `message` as the error text verbatim; a false or null
+condition is a no-op, and one that is not a boolean is an error. That holds
+wherever the `THROW` stands among the top-level statements. One that reads a
+query `LET`, or sits in a `FOR EACH`, `CASE` or statement-function body, is
+decided when reached instead, so the statements before it have run. `basalt check` rejects a script whose guard fires, so a bad invocation is
 caught without connecting to anything. A fired guard is permanent, never
 transient — exit `1`, never `75` ([exit codes](../tools/cli.md#exit-codes)), so a scheduler will not retry it.
 

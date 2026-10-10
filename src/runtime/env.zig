@@ -428,6 +428,20 @@ pub const LoopRow = struct {
         return if (self.outer) |o| o.loopVar(arena, name) else null;
     }
 
+    /// This row's first typed variable whose non-blank cell does not parse as its type.
+    pub fn badCell(self: LoopRow, arena: std.mem.Allocator) ?struct { name: []const u8, cell: []const u8, ty: types.Type } {
+        for (self.names, self.cells, 0..) |nm, cell, i| {
+            const t = self.typeAt(i) orelse continue;
+            if (cell.len == 0) continue;
+            switch (t.kind) {
+                .int, .float, .bool => _ = eval.castValue(arena, .{ .string = cell }, t.kind) catch
+                    return .{ .name = nm, .cell = cell, .ty = t },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     pub fn lookup(self: LoopRow, name: []const u8) ?[]const u8 {
         for (self.names, self.cells) |nm, val| {
             if (std.mem.eql(u8, nm, name)) return val;
@@ -562,8 +576,9 @@ pub fn schemaPtr(arena: std.mem.Allocator, schema: types.Schema) !*types.Schema 
     return p;
 }
 
-/// A loop cell as its declared type. A blank cell, or one a numeric or bool type
-/// cannot parse, binds to null, so a typed guard does not match a missing value.
+/// A loop cell as its declared type. A blank cell binds to null, so a typed guard
+/// does not match a missing value; one the type cannot parse is refused before the
+/// body runs (`LoopRow.badCell`).
 pub fn loopValue(arena: std.mem.Allocator, cell: []const u8, ty: ?types.Type) Value {
     const t = ty orelse return .{ .string = cell };
     if (cell.len == 0) return .null;

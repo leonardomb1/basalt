@@ -132,6 +132,7 @@ pub const ErrOut = struct {
     json: bool,
     label: []const u8,
     bare: bool = false,
+    files: []const []const u8 = &.{},
 
     const Located = struct {
         msg: []const u8,
@@ -143,7 +144,7 @@ pub const ErrOut = struct {
     };
 
     pub fn report(self: ErrOut, e: Located) !void {
-        const file = e.file orelse self.label;
+        const file = e.file orelse (ast.Program{ .stmts = &.{}, .files = self.files }).fileOf(e.pos) orelse self.label;
         if (!self.json) {
             return printDiag(self.w, file, if (e.transient) " (transient)" else "", e.pos, e.msg);
         }

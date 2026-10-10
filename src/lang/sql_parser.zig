@@ -95,10 +95,12 @@ pub const Options = struct {
     known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
+    file: u16 = 0,
 };
 
 pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
+    for (toks) |*t| t.file = opts.file;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
@@ -470,11 +472,11 @@ pub const Parser = struct {
     }
     pub fn curPos(self: *Parser) Pos {
         const t = self.toks[self.i];
-        return .{ .line = t.line, .col = t.col };
+        return .{ .line = t.line, .col = t.col, .file = t.file };
     }
     pub fn spanFrom(self: *Parser, start: Pos) ast.Span {
         const t = self.toks[if (self.i > 0) self.i - 1 else 0];
-        return .{ .start = start, .end = .{ .line = t.end_line, .col = t.end_col } };
+        return .{ .start = start, .end = .{ .line = t.end_line, .col = t.end_col, .file = t.file } };
     }
     pub fn peekTag(self: *Parser) Tag {
         const j = self.i + 1;
@@ -525,7 +527,7 @@ pub const Parser = struct {
 
     pub fn prevPos(self: *Parser) Pos {
         const t = self.toks[if (self.i > 0) self.i - 1 else 0];
-        return .{ .line = t.line, .col = t.col };
+        return .{ .line = t.line, .col = t.col, .file = t.file };
     }
 
     /// `AS` before a source's alias, eaten only when an alias follows, so `... AS SELECT`

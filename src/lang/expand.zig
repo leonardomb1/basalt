@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const builtins = @import("../exec/builtins.zig");
+const eval = @import("../exec/eval.zig");
 const parser = @import("sql_parser.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
@@ -35,7 +36,17 @@ const Ctx = struct {
     fns: *const std.StringHashMap(ast.FnDecl),
     json: *const std.StringHashMap(?std.json.Value),
     msg: *[]const u8,
+    at: *?ast.Pos,
+    pinned: bool = false,
     budget: usize = max_nodes,
+
+    /// The innermost failing call names the place, as the error unwinds through its callers.
+    fn pin(self: *Ctx, span: ?ast.Span) void {
+        if (self.pinned) return;
+        const sp = span orelse return;
+        self.at.* = sp.start;
+        self.pinned = true;
+    }
 };
 
 const Subst = std.StringHashMap(*ast.Expr);
@@ -50,8 +61,16 @@ pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]co
 /// A JSON PARAM binds from its `args` text first, then the request body, then a string
 /// DEFAULT; with none of them (offline `check`) its paths read as null.
 pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
+    var at: ?ast.Pos = null;
+    return expandProgramAt(arena, program, body, args, msg, &at);
+}
+
+/// `expandProgramWith`, with `at` set on failure to where the problem is: the failing
+/// call, else the statement or declaration holding it.
+pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
+        at.* = s.func.pos;
         if (builtins.lookup(s.func.name) != null or parser.isAggName(s.func.name)) {
             msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
@@ -63,6 +82,7 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
         try fns.put(s.func.name, s.func);
     };
 
+    at.* = null;
     var json = std.StringHashMap(?std.json.Value).init(arena);
     var has_json = false;
     for (program.stmts) |s| if (s == .param and s.param.is_json) {
@@ -75,6 +95,7 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
             return error.ExpandFailed;
         };
         for (program.stmts) |s| if (s == .param and s.param.is_json) {
+            at.* = s.param.pos;
             var val = parsed;
             if (val == null) if (s.param.default) |d| if (d.* == .str_lit) {
                 val = parseJsonArg(arena, s.param.name, d.str_lit, msg) catch |e| return e;
@@ -86,10 +107,12 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?
         };
     }
 
-    var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg };
+    at.* = null;
+    var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg, .at = at };
     var out = std.array_list.Managed(ast.Stmt).init(arena);
     for (program.stmts) |s| {
         if (s == .func and s.func.body != .stmts) continue;
+        at.* = ast.stmtPos(s);
         try out.append(try expandStmt(&cx, s));
     }
     return .{ .stmts = try out.toOwnedSlice() };
@@ -171,8 +194,7 @@ fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     }
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
-    const full = try fillDefaults(cx, fd, args);
-    try checkArgTypes(cx, fd, full);
+    const full = try checkArgTypes(cx, fd, try fillDefaults(cx, fd, args));
     return .{ .call = .{ .name = c.name, .args = full, .pos = c.pos } };
 }
 
@@ -275,11 +297,12 @@ fn mkNull(cx: *Ctx) Error!*ast.Expr {
 }
 
 /// A literal of the leaf scalar at `path`. An unbound binding (offline `check`)
-/// yields `null`; a missing key or non-scalar leaf at run time is an error.
+/// yields `null`; a missing key or non-scalar leaf at run time is an error. A `?.`
+/// makes both keys beside it optional: `filtro?.uf` is null when `filtro` is missing.
 fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8, safe: []const bool) Error!*ast.Expr {
     var cur = maybe_val orelse return mkNull(cx);
     for (path, 0..) |key, i| {
-        const seg_safe = i < safe.len and safe[i];
+        const seg_safe = (i < safe.len and safe[i]) or (i + 1 < safe.len and safe[i + 1]);
         switch (cur) {
             .object => |o| cur = o.get(key) orelse {
                 if (seg_safe) return mkNull(cx);
@@ -356,6 +379,7 @@ fn expandLetIn(cx: *Ctx, l: ast.Expr.LetIn, subst: ?*Subst, depth: usize) Error!
 }
 
 fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*ast.Expr {
+    errdefer cx.pin(c.span);
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, subst, depth);
 
@@ -371,8 +395,7 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
                 return error.ExpandFailed;
             },
         }
-        const full = try fillDefaults(cx, fd, args);
-        try checkArgTypes(cx, fd, full);
+        const full = try checkArgTypes(cx, fd, try fillDefaults(cx, fd, args));
         var inner = Subst.init(cx.arena);
         for (fd.params, full) |p, av| try inner.put(p.name, av);
         return expandExpr(cx, fd.body.expr, &inner, depth + 1);
@@ -404,15 +427,36 @@ fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const
 }
 
 /// Only a literal argument is decidable at expansion; anything else passes through
-/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and bytes.
-fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error!void {
-    for (fd.params, args, 1..) |p, a, n| {
-        const want = (p.ty orelse continue).kind;
-        const got = literalKind(a) orelse continue;
-        if (acceptsLiteral(want, got)) continue;
-        cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
-        return error.ExpandFailed;
+/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and
+/// bytes, a temporal one read as a CAST reads it and passed on as that CAST.
+fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
+    const out = try cx.arena.dupe(*ast.Expr, args);
+    for (fd.params, out, 1..) |p, *a, n| {
+        const ty = p.ty orelse continue;
+        const want = ty.kind;
+        const got = literalKind(a.*) orelse continue;
+        if (!acceptsLiteral(want, got)) {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
+            return error.ExpandFailed;
+        }
+        if (!isTemporalText(ty, a.*)) continue;
+        if (!temporalTextOk(cx.arena, ty, a.*.str_lit)) {
+            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, n, p.name, typeWord(want), a.*.str_lit }) catch "fn argument type mismatch";
+            return error.ExpandFailed;
+        }
+        a.* = try mk(cx, .{ .cast = .{ .e = a.*, .ty = ty } });
     }
+    return out;
+}
+
+/// A string literal passed for a DATE, TIME or TIMESTAMP parameter.
+pub fn isTemporalText(ty: types.Type, e: *const ast.Expr) bool {
+    return e.* == .str_lit and (ty.kind == .date or ty.kind == .time or ty.kind == .timestamp);
+}
+
+pub fn temporalTextOk(arena: std.mem.Allocator, ty: types.Type, text: []const u8) bool {
+    _ = eval.castValueTyped(arena, .{ .string = text }, ty) catch return false;
+    return true;
 }
 
 /// The type of a literal argument, else null; a `null` literal reports null too,
@@ -505,6 +549,13 @@ test "expandProgram rejects recursion and arity mismatch" {
     var m2: []const u8 = "";
     try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
+
+    var at: ?ast.Pos = null;
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, null, &.{}, &m2, &at));
+    try std.testing.expectEqual(@as(u32, 2), at.?.line);
+    try std.testing.expectEqual(@as(u32, 8), at.?.col);
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, null, &.{}, &m1, &at));
+    try std.testing.expectEqual(@as(u32, 1), at.?.line);
 }
 
 test "expandProgram bounds total nodes, not just nesting depth" {
@@ -562,6 +613,14 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, null, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .binary);
+
+    const m2 = try expandErr(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-13-01') AS x FROM 'd';");
+    try std.testing.expectEqualStrings("`f`: argument 1 (`a`) expects DATE, got `2026-13-01`", m2);
+    const p2 = try parser.parseSource(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-01-31') AS x FROM 'd';", &diag);
+    const o2 = try expandProgram(a, p2, null, &msg);
+    const cast = outputSelect(o2)[0].computed.expr.cast;
+    try std.testing.expectEqual(types.TypeKind.date, cast.ty.kind);
+    try std.testing.expectEqualStrings("2026-01-31", cast.e.str_lit);
 }
 
 test "expandProgram: a table function is read with FROM, not called as a scalar or with CALL" {
@@ -719,6 +778,13 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
     var m2: []const u8 = "";
     const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
     try std.testing.expect(outputSelect(o2)[0].computed.expr.* == .null_lit);
+
+    var d4 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const p4 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+        "SELECT $job.filtro?.uf AS h FROM 'x';", &d4);
+    var m4: []const u8 = "";
+    const o4 = try expandProgram(a, p4, "{\"a\":1}", &m4);
+    try std.testing.expect(outputSelect(o4)[0].computed.expr.* == .null_lit);
 
     var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const p3 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++

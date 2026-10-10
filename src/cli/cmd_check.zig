@@ -53,7 +53,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
         .issues = &found,
         .declarations_only = opts.declarations_only or perrs.items.len > 0,
     }, &adiag);
-    for (found.items) |f| try issues.append(.{ .msg = f.msg, .pos = f.pos, .end = f.end });
+    for (found.items) |f| try issues.append(.{ .msg = f.msg, .pos = f.pos, .end = f.end, .file = prog.fileOf(f.pos) });
 
     std.mem.sort(CheckIssue, issues.items, {}, struct {
         fn lt(_: void, x: CheckIssue, y: CheckIssue) bool {
@@ -176,4 +176,19 @@ test "checkText: every problem in script order, known tables typed or not, nothi
 
     try std.testing.expectEqual(@as(usize, 0), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{ .declarations_only = true })).len);
     try std.testing.expectEqual(@as(usize, 1), (try checkText(a, "PARAM n INT DEFAULT 1;", "t.sql", ".", .{})).len);
+}
+
+test "checkText: a problem inside an @include'd file names that file with its own line" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("lib");
+    try tmp.dir.writeFile(.{ .sub_path = "lib/bad.sql", .data = "CREATE FUNCTION ok(x) AS x;\n\nSELECT nope FROM RANGE(3);\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const issues = try checkText(a, "@include 'lib/bad.sql';\nSELECT 1 AS v;", "main.sql", base, .{});
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expect(std.mem.endsWith(u8, issues[0].file.?, "lib/bad.sql"));
+    try std.testing.expectEqual(@as(u32, 3), issues[0].pos.?.line);
 }

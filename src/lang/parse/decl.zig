@@ -190,7 +190,9 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     }
     _ = try self.expect(.rparen);
     var seen_default = false;
-    for (params.items) |p| {
+    for (params.items, 0..) |p, i| {
+        for (params.items[0..i]) |q| if (std.mem.eql(u8, q.name, p.name))
+            return self.fail(pos, "`{s}`: parameter `{s}` is declared twice", .{ name, p.name });
         if (p.default != null) {
             seen_default = true;
         } else if (seen_default) {
@@ -202,7 +204,8 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
         try self.expectKw("as");
         if (!self.isKw("select") and !self.isKw("with"))
             return self.fail(self.curPos(), "`{s}`: a table function's body is a query — SELECT ... or WITH ...", .{name});
-        const fd = ast.FnDecl{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .table = try self.checkTableBody() }, .replace = replace, .pos = pos };
+        const body = try self.checkTableBody();
+        const fd = ast.FnDecl{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .table = body.toks }, .replace = replace, .pos = pos, .table_check = body.check };
         try self.table_fns.append(fd);
         return fd;
     }

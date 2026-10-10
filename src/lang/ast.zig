@@ -61,7 +61,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const token = @import("token.zig");
 
-pub const Pos = struct { line: u32, col: u32 };
+/// `file` indexes `Program.files`: 0 is the script itself, others an `@include`d file.
+pub const Pos = struct { line: u32, col: u32, file: u16 = 0 };
 
 pub const Span = struct { start: Pos, end: Pos };
 
@@ -558,7 +559,12 @@ pub const FnDecl = struct {
     body: FnBody,
     replace: bool = false,
     pos: Pos,
+    table_check: ?TableCheck = null,
 };
+
+/// A table function's body as parsed where it is declared, its `$params` left
+/// unbound, kept so `check` can type it whether or not anything calls it.
+pub const TableCheck = struct { bindings: []const Stmt, pipeline: Pipeline };
 
 pub const CallStmt = struct {
     name: []const u8,
@@ -625,6 +631,24 @@ pub const Stmt = union(enum) {
     explain: ExplainStmt,
 };
 
+pub fn stmtPos(s: Stmt) ?Pos {
+    return switch (s) {
+        .kind => |k| k.pos,
+        .param => |p| p.pos,
+        .connection => |c| c.pos,
+        .binding => |b| b.pos,
+        .output => |p| p.pos,
+        .for_each => |fe| fe.pos,
+        .match => |m| m.pos,
+        .func => |fd| fd.pos,
+        .let_const => |l| l.pos,
+        .print => |p| p.pos,
+        .call => |c| c.pos,
+        .throw => |t| t.pos,
+        .explain => |e| e.pos,
+    };
+}
+
 pub const ExplainMode = enum { none, plan, analyze, describe };
 
 pub const ExplainStmt = struct {
@@ -633,7 +657,18 @@ pub const ExplainStmt = struct {
     pos: Pos,
 };
 
-pub const Program = struct { stmts: []const Stmt, explain: ExplainMode = .none };
+pub const Program = struct {
+    stmts: []const Stmt,
+    explain: ExplainMode = .none,
+    files: []const []const u8 = &.{},
+
+    /// The file a position lies in, or null for the script itself.
+    pub fn fileOf(self: Program, pos: ?Pos) ?[]const u8 {
+        const p = pos orelse return null;
+        if (p.file == 0 or p.file >= self.files.len) return null;
+        return self.files[p.file];
+    }
+};
 
 test "rebuildExpr identity copies every field — no silent drop" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

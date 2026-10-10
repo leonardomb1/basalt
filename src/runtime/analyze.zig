@@ -244,12 +244,47 @@ pub const Plan = struct {
 fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, diag: *Diag) Error!void {
     if (t.when) |w| {
         const c = eval.constEval(arena, try substExpr(arena, w, params), &.{}, &.{}) catch
-            return fail(diag, "THROW condition is not decidable at plan time", .{});
-        if (!(c == .bool and c.bool)) return;
+            return failPos(diag, t.pos, "THROW condition is not decidable at plan time", .{});
+        if (c == .null) return;
+        if (c != .bool)
+            return failPos(diag, t.pos, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
+        if (!c.bool) return;
     }
     const m = eval.constEval(arena, try substExpr(arena, t.message, params), &.{}, &.{}) catch
-        return fail(diag, "THROW message is not decidable at plan time", .{});
-    return fail(diag, "{s}", .{try eval.valueToString(arena, m)});
+        return failPos(diag, t.pos, "THROW message is not decidable at plan time", .{});
+    return failPos(diag, t.pos, "{s}", .{try eval.valueToString(arena, m)});
+}
+
+fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+    const e = fail(diag, fmt, args);
+    diag.pos = pos;
+    return e;
+}
+
+/// A statement `CASE` arm's string-literal pattern that cannot read as its typed
+/// subject's type, so the arm could never match: `CASE $n WHEN 'x'` with an INT `$n`.
+pub fn patternTypeProblem(arena: std.mem.Allocator, subj: Value, pat: *const ast.Expr) Error!?[]const u8 {
+    if (pat.* != .str_lit) return null;
+    const ty: types.Type = switch (subj) {
+        .int => types.Type.init(.int),
+        .float => types.Type.init(.float),
+        .bool => types.Type.init(.bool),
+        .date => types.Type.init(.date),
+        .time => types.Type.init(.time),
+        .timestamp => types.Type.init(.timestamp),
+        .decimal => |d| types.Type.decimal(38, d.scale),
+        else => return null,
+    };
+    if (eval.castValueTyped(arena, .{ .string = pat.str_lit }, ty)) |_| return null else |_| {}
+    return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(ty.kind) });
+}
+
+/// The run's `matchArmIndex` refusal, for a top-level `CASE` whose subject folds here.
+fn checkMatchPatterns(arena: std.mem.Allocator, m: ast.StmtMatch, params: *const ParamMap, diag: *Diag) Error!void {
+    const s = m.subject orelse return;
+    const v = eval.constEval(arena, try substExpr(arena, s, params), &.{}, &.{}) catch return;
+    for (m.arms) |arm| for (arm.pats) |p| if (try patternTypeProblem(arena, v, p)) |why|
+        return failPos(diag, m.pos, "{s}", .{why});
 }
 
 pub const ParamOverride = struct { name: []const u8, value: []const u8 };
@@ -257,28 +292,31 @@ pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
 /// The `$name`s an expression reads, in order, repeats included.
-fn dollarRefs(arena: std.mem.Allocator, e: *const ast.Expr) Error![]const []const u8 {
+pub fn dollarRefs(arena: std.mem.Allocator, e: *const ast.Expr) Error![]const ast.QualName {
     const Collect = struct {
         arena: std.mem.Allocator,
-        names: *std.array_list.Managed([]const u8),
+        names: *std.array_list.Managed(ast.QualName),
         fn recur(c: @This(), x: *const ast.Expr) Error!*ast.Expr {
             if (x.* == .field) {
-                if (x.field.dollar) try c.names.append(x.field.parts[0]);
+                if (x.field.dollar) try c.names.append(x.field);
                 return @constCast(x);
             }
             return ast.rebuildExpr(c.arena, x, c, recur);
         }
     };
-    var names = std.array_list.Managed([]const u8).init(arena);
+    var names = std.array_list.Managed(ast.QualName).init(arena);
     _ = try Collect.recur(.{ .arena = arena, .names = &names }, e);
     return names.items;
 }
 
+pub const LetRefProblem = struct { msg: []const u8, span: ?ast.Span };
+
 /// Why an expression LET cannot be folded, or null: it reads a query LET, which is
 /// decided only once queries run, or a `$name` no PARAM or earlier LET declares.
-pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?[]const u8 {
+pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetConst) Error!?LetRefProblem {
     const le = l.expr orelse return null;
-    for (try dollarRefs(arena, le)) |n| {
+    for (try dollarRefs(arena, le)) |q| {
+        const n = q.parts[0];
         var declared = false;
         for (program.stmts) |s| switch (s) {
             .param => |p| if (std.mem.eql(u8, p.name, n)) {
@@ -288,12 +326,12 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
                 if (std.mem.eql(u8, other.name, l.name)) break;
                 if (!std.mem.eql(u8, other.name, n)) continue;
                 if (other.expr == null)
-                    return try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n });
+                    return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n }) };
                 declared = true;
             },
             else => {},
         };
-        if (!declared) return try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n });
+        if (!declared) return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n }) };
     }
     return null;
 }
@@ -428,9 +466,10 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, cli.len);
     for (cli, json_args) |o, *ja| ja.* = .{ .name = o.name, .text = o.value };
-    const program = expand.expandProgramWith(arena, raw_program, null, json_args, &expand_msg) catch |e| switch (e) {
+    var expand_at: ?ast.Pos = null;
+    const program = expand.expandProgramAt(arena, raw_program, null, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.ExpandFailed => return fail(diag, "{s}", .{expand_msg}),
+        error.ExpandFailed => return failPos(diag, expand_at, "{s}", .{expand_msg}),
     };
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return fail(diag, "internal error: the parsed program has no kind statement", .{});
@@ -459,8 +498,15 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     // folded from them — so a LET over them is folded here as the run folds it.
     var known_names = std.array_list.Managed([]const u8).init(arena);
     var known_values = std.array_list.Managed(Value).init(arena);
+    for (cli) |o| for (program.stmts) |s| if (s == .let_const and std.mem.eql(u8, s.let_const.name, o.name))
+        return fail(diag, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{o.name});
     for (program.stmts) |s| if (s == .param) {
         const p = s.param;
+        if (params_map.contains(p.name)) {
+            const e = fail(diag, "duplicate PARAM `{s}`", .{p.name});
+            diag.pos = p.pos;
+            return e;
+        }
         var bound: ?*const ast.Expr = null;
         var text: ?[]const u8 = null;
         for (cli) |o| if (std.mem.eql(u8, o.name, p.name)) {
@@ -481,17 +527,26 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     };
     for (program.stmts) |s| if (s == .let_const) {
         const l = s.let_const;
-        if (params_map.contains(l.name))
-            return fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name});
-        if (try letRefProblem(arena, program, l)) |why| {
-            const e = fail(diag, "{s}", .{why});
+        if (params_map.contains(l.name)) {
+            const clash = for (program.stmts) |o| {
+                if (o == .param and std.mem.eql(u8, o.param.name, l.name)) break true;
+            } else false;
+            const e = if (clash)
+                fail(diag, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name})
+            else
+                fail(diag, "duplicate LET `{s}`", .{l.name});
             diag.pos = l.pos;
+            return e;
+        }
+        if (try letRefProblem(arena, program, l)) |why| {
+            const e = failAt(diag, why.span, "{s}", .{why.msg});
+            if (diag.pos == null) diag.pos = l.pos;
             return e;
         }
         if (l.expr) |le| {
             const refs = try dollarRefs(arena, le);
-            const all_known = for (refs) |n| {
-                if (!containsName(known_names.items, n)) break false;
+            const all_known = for (refs) |q| {
+                if (!containsName(known_names.items, q.parts[0])) break false;
             } else true;
             if (all_known) {
                 const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
@@ -510,13 +565,18 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             try params_map.put(l.name, ph);
         }
     };
-    for (program.stmts) |s| if (s == .throw) try checkThrow(arena, s.throw, &params_map, diag);
+    for (program.stmts) |s| switch (s) {
+        .throw => |t| try checkThrow(arena, t, &params_map, diag),
+        .match => |m| try checkMatchPatterns(arena, m, &params_map, diag),
+        else => {},
+    };
     try bindBodyVars(arena, program.stmts, &params_map);
 
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
+    for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| try ctx.checkTableFn(s.func, tc);
 
     return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
 }
@@ -598,23 +658,39 @@ fn countOutputs(stmts: []const ast.Stmt) usize {
     return n;
 }
 
-pub fn stmtPos(s: ast.Stmt) ?ast.Pos {
-    return switch (s) {
-        .kind => |k| k.pos,
-        .param => |p| p.pos,
-        .connection => |c| c.pos,
-        .binding => |b| b.pos,
-        .output => |p| p.pos,
-        .for_each => |fe| fe.pos,
-        .match => |m| m.pos,
-        .func => |fd| fd.pos,
-        .let_const => |l| l.pos,
-        .print => |p| p.pos,
-        .call => |c| c.pos,
-        .throw => |t| t.pos,
-        .explain => |e| e.pos,
-    };
+pub const Misplaced = struct { msg: []const u8, pos: ?ast.Pos };
+
+/// The first declaration standing where it may not, by `Ctx.checkStmts`'s rules: a
+/// CASE arm (`arm`) holds no LET, PARAM or function, a FOR EACH or statement-function
+/// body (`body`) only queries and script statements. The run asks this up front, so a
+/// body that never executes is refused as `check` refuses it.
+pub fn misplacedDecl(arena: std.mem.Allocator, stmts: []const ast.Stmt, where: enum { top, arm, body }) Error!?Misplaced {
+    for (stmts) |s| {
+        const inner: ?Misplaced = switch (s) {
+            .for_each => |fe| try misplacedDecl(arena, fe.body, .body),
+            .match => |m| for (m.arms) |arm| {
+                if (try misplacedDecl(arena, arm.body, if (where == .body) .body else .arm)) |x| break x;
+            } else null,
+            .func => |fd| switch (where) {
+                .top => if (fd.body == .stmts) try misplacedDecl(arena, fd.body.stmts, .body) else null,
+                .arm => .{ .pos = fd.pos, .msg = try std.fmt.allocPrint(arena, "function `{s}` must be declared at the top level of the script", .{fd.name}) },
+                .body => .{ .pos = fd.pos, .msg = body_stmt_rule },
+            },
+            .let_const => |l| if (where == .top) null else .{ .pos = l.pos, .msg = try std.fmt.allocPrint(arena, "LET `{s}` must be declared at the top level of the script", .{l.name}) },
+            .param => |pd| switch (where) {
+                .top => null,
+                .arm => .{ .pos = pd.pos, .msg = try std.fmt.allocPrint(arena, "PARAM `{s}` must be declared at the top level of the script", .{pd.name}) },
+                .body => .{ .pos = pd.pos, .msg = body_stmt_rule },
+            },
+            .kind, .connection => if (where == .body) .{ .pos = stmtPos(s), .msg = body_stmt_rule } else null,
+            else => null,
+        };
+        if (inner) |x| return x;
+    }
+    return null;
 }
+
+pub const stmtPos = ast.stmtPos;
 
 /// One pipeline against declarations already in scope, for the executor's
 /// `EXPLAIN <query>;`, which holds these maps (params folded) and hands them over.
@@ -638,9 +714,72 @@ const Ctx = struct {
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
     params: *const ParamMap,
+    lets: ?*ParamMap = null,
     diag: *Diag,
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
+
+    /// A table function's body, typed where it is declared with each parameter a null
+    /// of its declared type, so one nothing calls is checked too. A problem a call
+    /// already reported at the same place is not reported twice.
+    fn checkTableFn(self: *Ctx, fd: ast.FnDecl, tc: ast.TableCheck) Error!void {
+        var scoped = ParamMap.init(self.arena);
+        var it = self.params.iterator();
+        while (it.next()) |kv| try scoped.put(kv.key_ptr.*, kv.value_ptr.*);
+        for (fd.params) |p| {
+            const nul = try mk(self.arena, .null_lit);
+            try scoped.put(p.name, if (p.ty) |ty| try mk(self.arena, .{ .cast = .{ .e = @constCast(nul), .ty = ty.asNullable() } }) else nul);
+        }
+        const outer = self.params;
+        self.params = &scoped;
+        defer self.params = outer;
+        var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(self.arena);
+        defer {
+            var i = saved.items.len;
+            while (i > 0) {
+                i -= 1;
+                const sv = saved.items[i];
+                if (sv.prev) |p| self.bindings.put(sv.name, p) catch {} else _ = self.bindings.remove(sv.name);
+            }
+        }
+        for (tc.bindings) |b| switch (b) {
+            .binding => |bd| {
+                try saved.append(.{ .name = bd.name, .prev = self.bindings.get(bd.name) });
+                try self.bindings.put(bd.name, bd.pipeline);
+            },
+            .let_const => |l| try scoped.put(l.name, try mk(self.arena, .null_lit)),
+            else => {},
+        };
+        const stages = try self.arena.alloc(ast.Stage, tc.pipeline.stages.len + 1);
+        @memcpy(stages[0..tc.pipeline.stages.len], tc.pipeline.stages);
+        stages[tc.pipeline.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = tc.pipeline.pos };
+        _ = self.analyzeOutput(.{ .stages = stages, .pos = tc.pipeline.pos }) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            if (self.issues) |list| for (list.items) |is| {
+                if (std.mem.eql(u8, is.msg, self.diag.msg) and std.meta.eql(is.pos, self.diag.pos)) {
+                    self.diag.* = .{};
+                    return;
+                }
+            };
+            return self.note(e);
+        };
+    }
+
+    /// A query LET is checked where it stands, as the run queries it there, and
+    /// `$name` then reads as a null of its one column's type when that is known.
+    fn checkQueryLet(self: *Ctx, l: ast.LetConst) Error!void {
+        const q = l.query orelse return;
+        const stages = try self.arena.alloc(ast.Stage, q.stages.len + 1);
+        @memcpy(stages[0..q.stages.len], q.stages);
+        stages[q.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = q.pos };
+        const o = try self.attempt(self.analyzeOutput(.{ .stages = stages, .pos = q.pos })) orelse return;
+        if (o.stages.len == 0) return;
+        const schema = o.stages[o.stages.len - 1].out_schema orelse return;
+        if (schema.fields.len != 1) return;
+        const lets = self.lets orelse return;
+        const nul = try mk(self.arena, .null_lit);
+        try lets.put(l.name, try mk(self.arena, .{ .cast = .{ .e = @constCast(nul), .ty = schema.fields[0].ty.asNullable() } }));
+    }
 
     /// A statement's failure: recorded and the caller goes on, or, without an issue
     /// list, returned as the analysis's error.
@@ -684,7 +823,10 @@ const Ctx = struct {
             .func => |fd| if (!top)
                 try self.note(self.failAt(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
             else if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
-            .let_const => |l| if (!top) try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
+            .let_const => |l| if (!top)
+                try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}))
+            else
+                try self.checkQueryLet(l),
             .param => |pd| if (!top) try self.note(self.failAt(pd.pos, "PARAM `{s}` must be declared at the top level of the script", .{pd.name})),
             .kind, .connection, .call, .throw, .print => {},
         };
