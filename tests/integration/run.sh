@@ -130,8 +130,8 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM db.basalt_vol;"; 
 # pushed query must answer exactly what the engine alone does — the reference
 # adds `to_hex(id) IS NOT NULL`, always true and never pushed, which keeps the
 # whole sort here — and the debug log must show whether it descended. The keys
-# carry nulls, so a source ordering them its own way (postgres DESC puts them
-# first) shows up as a diff.
+# carry nulls, so a source placing them otherwise than the engine (mysql and
+# sqlserver put them first ascending) shows up as a diff.
 topnrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
   local decl=$2
   if ! brun run -c "$decl
@@ -154,7 +154,9 @@ LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(v AS INT) AS v, CAST(
       diff "$g.ref" "$g.csv" | head -8 || true
     fi
   }
-  tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 4"            pushed int-desc-nulls-last
+  tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 4"            pushed int-desc-nulls-first
+  tq "$1" "id, v"      ""      "ORDER BY v DESC NULLS LAST, id LIMIT 4" pushed int-desc-nulls-last
+  tq "$1" "id, ts"     ""      "ORDER BY ts NULLS FIRST, id LIMIT 4"    pushed timestamp-asc-nulls-first
   tq "$1" "id, v"      ""      "ORDER BY v DESC, id LIMIT 8"            pushed int-desc-every-row
   tq "$1" "id, ts"     ""      "ORDER BY ts, id LIMIT 8"                pushed timestamp-asc-nulls-last
   tq "$1" "id, amt"    ""      "ORDER BY amt DESC, id LIMIT 3 OFFSET 2" pushed decimal-with-offset
