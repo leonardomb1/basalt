@@ -82,7 +82,9 @@ microseconds or nanoseconds all read as basalt's microsecond `timestamp`/`time`;
 nanoseconds floor to the microsecond. A UTC-adjusted timestamp reads as its UTC
 wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
 carried. `DATE`, `DECIMAL`, `STRING`/`ENUM`/`JSON` and `INTEGER` map as their
-converted twins do; a `UUID` stays `bytes`.
+converted twins do; a `UUID` stays `bytes`. An unsigned integer (`UINT8` to
+`UINT64`) reads as its unsigned value, and a `UINT64` above 2^63−1 is an error
+naming the column, never a wraparound.
 
 A struct's fields read as flat dotted columns (`addr.city`). Everything
 repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them —

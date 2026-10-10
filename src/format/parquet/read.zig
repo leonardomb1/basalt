@@ -71,6 +71,7 @@ pub const Error = error{
     CorruptParquetPage,
     UnsupportedParquetSchema,
     UnsupportedParquetEncoding,
+    ParquetIntOverflow,
 } || std.mem.Allocator.Error;
 
 pub const BitReader = @import("encoding.zig").BitReader;
