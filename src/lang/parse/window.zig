@@ -8,12 +8,16 @@
 //! `Lower` turns the calls into stages: a projection computing every expression key
 //! or argument into a hidden `__wa<n>` column (one per distinct expression) and
 //! carrying the columns later items read, one window stage per distinct PARTITION
-//! BY / ORDER BY in order of first appearance, each sorting its own input, and the
-//! SELECT list's projection, which evaluates an expression around a window over its
-//! hidden column. Every call writes its hidden column, renamed by the last projection,
-//! so an alias never shadows a column a window reads (`SUM(x) OVER (...) AS x`). Over a
-//! GROUP BY the windows run after the aggregate and HAVING, their aggregates lifted
-//! into the aggregate stage like any other (`SUM(SUM(x)) OVER ()`).
+//! BY / ORDER BY, each sorting its own input, and the SELECT list's projection, which
+//! evaluates an expression around a window over its hidden column. Every call writes
+//! its hidden column, renamed by that last projection, so an alias never shadows a
+//! column a window reads (`SUM(x) OVER (...) AS x`). Over a GROUP BY the windows run
+//! after the aggregate and HAVING, their aggregates lifted into the aggregate stage
+//! like any other (`SUM(SUM(x)) OVER ()`).
+//!
+//! Stages without ORDER BY run first, in order of appearance, so the first reads the
+//! input order; a later one that depends on that order (a value function, a ROWS
+//! frame) orders by a hidden ROW_NUMBER taken before any stage sorts.
 //!
 //! A call's `Spec` is its own keys and frame, or a named window (`base`) taken whole
 //! when `bare` (`OVER w`), else extended (`OVER (w ORDER BY t)`).
@@ -438,6 +442,17 @@ pub fn refsWindow(e: *const ast.Expr, calls: []const WinCall) bool {
     return false;
 }
 
+/// Whether functions over a window without ORDER BY read the rows' input order: a
+/// value function, or a ROWS frame narrower than the partition.
+fn inputOrdered(funcs: []const ast.WindowFunc) bool {
+    for (funcs) |f| {
+        if (f.func == .win) return true;
+        const fr = f.frame orelse continue;
+        if (fr.unit == .rows and !(fr.start == .unbounded_preceding and fr.end == .unbounded_following)) return true;
+    }
+    return false;
+}
+
 pub const Lower = struct {
     p: *Parser,
     calls: []WinCall,
@@ -546,8 +561,33 @@ pub const Lower = struct {
             };
             try g.funcs.append(wf);
         }
-        const out = try self.p.arena.alloc(ast.Stage, groups.items.len);
-        for (groups.items, out) |*g, *st| st.* = .{
+        var plan = std.array_list.Managed(Group).init(self.p.arena);
+        for (groups.items) |g| if (g.ord.len == 0) try plan.append(g);
+        for (groups.items) |g| if (g.ord.len > 0) try plan.append(g);
+        var ordinal: ?ast.QualName = null;
+        for (plan.items[@min(1, plan.items.len)..]) |*g| {
+            if (g.ord.len > 0 or !inputOrdered(g.funcs.items)) continue;
+            if (ordinal == null) {
+                self.p.derived_n += 1;
+                const name = try std.fmt.allocPrint(self.p.arena, "__w{d}", .{self.p.derived_n});
+                try self.hidden.append(name);
+                ordinal = try self.p.qualOne(name);
+            }
+            const ord = try self.p.arena.alloc(ast.SortKey, 1);
+            ord[0] = .{ .field = ordinal.?, .desc = false };
+            g.ord = ord;
+            for (g.funcs.items) |*f| {
+                if (f.frame == null or f.frame.?.unit == .range) f.frame = .{ .unit = .rows, .start = .unbounded_preceding, .end = .unbounded_following };
+            }
+        }
+        const lead: usize = if (ordinal != null) 1 else 0;
+        const out = try self.p.arena.alloc(ast.Stage, lead + plan.items.len);
+        if (ordinal) |q| {
+            const f = try self.p.arena.alloc(ast.WindowFunc, 1);
+            f[0] = .{ .func = .{ .win = .row_number }, .out = q.last() };
+            out[0] = .{ .node = .{ .window = .{ .funcs = f } }, .hints = &.{}, .pos = pos };
+        }
+        for (plan.items, out[lead..]) |*g, *st| st.* = .{
             .node = .{ .window = .{ .funcs = try g.funcs.toOwnedSlice(), .partition_by = g.part, .order_by = g.ord } },
             .hints = &.{},
             .pos = pos,

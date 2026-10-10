@@ -120,7 +120,9 @@ The frame is the slice of the partition an aggregate or a value function reads:
   FROM 'movimentos.csv';
   ```
 
-- Without `ORDER BY` a `ROWS` frame counts in input order, as the rows arrive.
+- Without `ORDER BY` a `ROWS` frame — and `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` —
+  counts in input order, as the rows arrive, whatever other windows of the query
+  sort by.
 
 ## IGNORE NULLS
 

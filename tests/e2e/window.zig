@@ -473,6 +473,20 @@ test "a window aliased to a column a window reads yields the window, not the col
     });
 }
 
+test "a window without ORDER BY counts in input order beside windows that sort" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(
+        alloc,
+        &tmp,
+        "id,k\n1,2\n2,1\n3,2\n4,1\n",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY k) AS rn, SUM(id) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, FIRST_VALUE(id) OVER (PARTITION BY k) AS f, LAST_VALUE(id) OVER () AS l, SUM(id) OVER (PARTITION BY k ROWS 1 PRECEDING) AS ps FROM '$IN' ORDER BY id",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,rn,s,f,l,ps\n1,3,1,1,4,1\n2,1,3,2,4,2\n3,4,5,1,4,4\n4,2,7,2,4,6\n", out);
+}
+
 test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
