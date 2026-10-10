@@ -70,11 +70,12 @@ pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Man
         const apos = self.curPos();
         const key = try self.expectIdent();
         _ = try self.expect(.assign);
-        const val = try self.exprToTemplate(try self.parseExpr());
+        const expr = try self.parseExpr();
+        const val = try self.exprToTemplate(expr);
         if (eqlNoCase(key, "body")) {
             if (!post) return self.fail(apos, "GET takes no body — use {s}.POST(path, body = ...)", .{conn});
             try hints.append(.{ .key = "body", .value = .{ .str = val }, .pos = apos });
-        } else {
+        } else if (expr.* != .null_lit) {
             try hints.append(.{ .key = try std.fmt.allocPrint(self.arena, "query:{s}", .{key}), .value = .{ .str = val }, .pos = apos });
         }
     }
