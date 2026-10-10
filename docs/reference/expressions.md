@@ -4,6 +4,12 @@ SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT ~` → `* / %` →
 `+ - ||` → `<< >>` → `&` → `^` → `|` → comparisons
 `= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
 
+**Nulls** follow SQL's three-valued logic: a comparison with a null is null,
+which a `WHERE`, an `ON` or a `CASE WHEN` treats as false — so a null join key
+never matches, under any join kind, and `x NOT IN (1, NULL)` keeps no row. `AND`
+and `OR` are null only when the other side does not decide them (`false AND
+null` is false, `true OR null` true).
+
 **Scope rule:** `$name` is script/environment scope — a PARAM, a LET, or (in a
 `FOR EACH ROW OF` / statement-function body) a loop variable, resolved at plan
 time. Bare names are row/local scope — columns, `LET … IN` bindings, aliases —
@@ -28,6 +34,12 @@ columns it has not seen.
 - `IF(c, a, b)` kept as sugar.
 - `x IS [NOT] NULL` · `x IS [NOT] EMPTY` (true when null **or** `''`; string
   operands only — handy for loop values).
+- `a IS [NOT] DISTINCT FROM b` — the null-safe `<>` (`=`): two nulls are not
+  distinct, a null and a value are, and the answer is never null.
+  `ON l.k IS NOT DISTINCT FROM r.k` pairs null keys too (as a join without a
+  key). The operands compare as `=` would, a quoted literal included; it pushes
+  down to PostgreSQL as written and to MySQL, StarRocks and Doris as `<=>`, and
+  stays in the engine on SQL Server.
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
 - `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
   `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text
@@ -77,7 +89,19 @@ columns it has not seen.
 - A `DATE`/`TIMESTAMP` column compares directly against an ISO string literal
   (`WHERE d >= '2013-07-01'`). The literal is coerced to the column's type,
   never the reverse, and it is validated at plan time — so `'2013-13-01'` and
-  `'01/07/2013'` are errors from `check`, not silent text comparisons.
+  `'01/07/2013'` are errors from `check`, not silent text comparisons. A quoted
+  literal compared with a number or a bool is read the same way, as SQL reads
+  an untyped literal by the other operand: `amount < '100000'` compares
+  numbers (a decimal one exactly, at the literal's own scale), `id IN ('1',
+  '2')` ints, `active = 'yes'` bools (`true`/`false`, `t`/`f`, `yes`/`no`,
+  `on`/`off`, `1`/`0`, any case). Surrounding spaces are ignored; anything else
+  that does not read as the type — `'1,5'`, or `'1.5'` against an INT — is an
+  error from `check`. Pushed down to a SQL source whose column types are known,
+  it is sent as that number or bool; where they are not yet, PostgreSQL and SQL
+  Server get the quoted literal, which they read the same way, and MySQL,
+  StarRocks and Doris, which would compare a decimal with it as doubles, leave
+  a number to the engine. A text *column* against a number still needs a `CAST`, as it
+  does in PostgreSQL.
 - `"Valor Total"` — a quoted column name ([Scripts](../language/scripts.md)), valid anywhere a bare name is:
   `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, an alias (`AS "Total Geral"`), and
   after a qualifier (`t."Valor Total"`).

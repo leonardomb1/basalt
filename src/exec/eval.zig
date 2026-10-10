@@ -123,8 +123,10 @@ pub const TypeCtx = struct {
                 self.span = q.span;
                 if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
-                const idx = fieldIndex(self.schema, q) orelse
+                const idx = fieldIndex(self.schema, q) orelse {
+                    if (q.parts.len > 1) return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
                     return self.err("unknown field `{s}`", .{lastPart(q)});
+                };
                 self.span = null;
                 return self.schema.fields[idx].ty;
             },
@@ -189,11 +191,13 @@ pub const TypeCtx = struct {
                 if (!(intish(lt) and intish(rt))) return self.err("bitwise operators need INT operands", .{});
                 return Type{ .kind = .int, .nullable = nn };
             },
-            .eq, .ne, .lt, .le, .gt, .ge => {
+            .eq, .ne, .lt, .le, .gt, .ge, .distinct, .not_distinct => {
                 if (!comparable(lt, rt) and
                     !try self.temporalLit(b.r, lt) and
-                    !try self.temporalLit(b.l, rt)) return self.incomparable(b, lt, rt);
-                return Type{ .kind = .bool, .nullable = nn };
+                    !try self.temporalLit(b.l, rt) and
+                    !try self.typedLit(b.r, lt) and
+                    !try self.typedLit(b.l, rt)) return self.incomparable(b, lt, rt);
+                return Type{ .kind = .bool, .nullable = nn and b.op != .distinct and b.op != .not_distinct };
             },
             .@"and", .@"or" => {
                 if (!(boolish(lt) and boolish(rt))) return self.err("`and`/`or` need bool operands", .{});
@@ -212,6 +216,16 @@ pub const TypeCtx = struct {
         else
             parseIsoTimestamp(e.str_lit) != null;
         if (!ok) return self.err("`{s}` is not a valid {s} literal", .{ e.str_lit, @tagName(other.kind) });
+        return true;
+    }
+
+    /// A number or bool compared against a string literal: the literal must read as
+    /// that type, checked here as `temporalLit` checks a date's.
+    fn typedLit(self: *TypeCtx, e: *const ast.Expr, other: Type) TypeError!bool {
+        if (e.* != .str_lit or other.unknown) return false;
+        if (!other.kind.isNumeric() and other.kind != .bool) return false;
+        if (try litAs(self.arena, e.str_lit, other) == null)
+            return self.err("`{s}` is not a valid {s} literal", .{ e.str_lit, @tagName(other.kind) });
         return true;
     }
 
@@ -280,6 +294,37 @@ pub const TypeCtx = struct {
         return t;
     }
 };
+
+/// A quoted literal read as a number or bool of `ty`'s kind, as SQL types an untyped
+/// literal by the operand it meets: an INT strictly, a FLOAT or DECIMAL as written
+/// (a decimal at its own scale, so `'1.005'` stays exact), a bool as PostgreSQL
+/// reads one (`t`, `yes`, `on`, `1`, any case). Null when it does not read so.
+pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMemory}!?ast.Expr {
+    const s = std.mem.trim(u8, text, " \t\r\n");
+    switch (ty.kind) {
+        .int => return .{ .int_lit = parseIntStrict(s) orelse return null },
+        .float => return .{ .float_lit = parseFloatStrict(s) orelse return null },
+        .decimal => {
+            const d = @import("eval/cast.zig").asDecimalValue(.{ .string = s }) orelse return null;
+            const inner = try arena.create(ast.Expr);
+            inner.* = .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) };
+            return .{ .cast = .{ .e = inner, .ty = Type.decimal(38, d.scale) } };
+        },
+        .bool => return .{ .bool_lit = boolText(s) orelse return null },
+        else => return null,
+    }
+}
+
+fn boolText(s: []const u8) ?bool {
+    if (s.len == 0 or s.len > 5) return null;
+    var buf: [5]u8 = undefined;
+    const w = std.ascii.lowerString(&buf, s);
+    if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
+    if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
+    for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
+    for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
+    return null;
+}
 
 pub fn numericish(t: Type) bool {
     return t.kind.isNumeric() or t.unknown;

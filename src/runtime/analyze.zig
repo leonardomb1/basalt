@@ -153,6 +153,44 @@ pub fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, 
     };
 }
 
+const CoerceCtx = struct { arena: std.mem.Allocator, schema: types.Schema };
+
+/// `e` with each quoted literal compared against a number or a bool made that
+/// type's literal (`eval.litAs`), as SQL types an untyped literal by the other
+/// operand: run after type checking, which refuses one that does not read so.
+pub fn coerceLits(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr) Error!*const ast.Expr {
+    return coerceRecur(.{ .arena = arena, .schema = in }, e);
+}
+
+fn coerceRecur(cx: CoerceCtx, e: *const ast.Expr) Error!*ast.Expr {
+    const out = try ast.rebuildExpr(cx.arena, e, cx, coerceRecur);
+    if (out.* != .binary) return out;
+    switch (out.binary.op) {
+        .eq, .ne, .lt, .le, .gt, .ge, .distinct, .not_distinct => {},
+        else => return out,
+    }
+    const b = out.binary;
+    if (b.l.* == .str_lit and b.r.* != .str_lit) {
+        if (try litFor(cx, b.l.str_lit, b.r)) |lit| out.binary.l = lit;
+    } else if (b.r.* == .str_lit and b.l.* != .str_lit) {
+        if (try litFor(cx, b.r.str_lit, b.l)) |lit| out.binary.r = lit;
+    }
+    return out;
+}
+
+fn litFor(cx: CoerceCtx, text: []const u8, other: *const ast.Expr) Error!?*ast.Expr {
+    var tc = eval.TypeCtx{ .schema = cx.schema, .arena = cx.arena };
+    const t = tc.typeOf(other) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TypeError => return null,
+    };
+    if (t.unknown or !(t.kind.isNumeric() or t.kind == .bool)) return null;
+    const lit = (try eval.litAs(cx.arena, text, t)) orelse return null;
+    const p = try cx.arena.create(ast.Expr);
+    p.* = lit;
+    return p;
+}
+
 pub const Col = @import("analyze/schema.zig").Col;
 pub const selectCols = @import("analyze/schema.zig").selectCols;
 pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;

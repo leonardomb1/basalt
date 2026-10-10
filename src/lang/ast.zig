@@ -80,7 +80,9 @@ pub const QualName = struct {
     }
 };
 
-pub const BinOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, shl, shr, eq, ne, lt, le, gt, ge, @"and", @"or" };
+/// `distinct` and `not_distinct` are `IS [NOT] DISTINCT FROM`: `<>` and `=` that treat
+/// two nulls as equal and a null as unequal to any value, never null themselves.
+pub const BinOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, shl, shr, eq, ne, lt, le, gt, ge, @"and", @"or", distinct, not_distinct };
 pub const UnOp = enum { neg, not, bit_not };
 
 pub const Expr = union(enum) {
@@ -218,7 +220,8 @@ pub const SelectItem = union(enum) {
     pub const Rename = struct { from: []const u8, to: []const u8 };
     /// `t.*` over a join: the columns of the join side `rel`, or with `rel` empty the
     /// FROM table's, those of none of the join sides `rights`; less the hidden `drop`.
-    pub const StarOf = struct { rel: []const u8 = "", rights: []const []const u8 = &.{}, drop: []const []const u8 = &.{} };
+    /// A USING side's own key copy (`copies`) is listed in its place under its key's name.
+    pub const StarOf = struct { rel: []const u8 = "", rights: []const []const u8 = &.{}, drop: []const []const u8 = &.{}, copies: []const Rename = &.{} };
 };
 
 pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };
@@ -316,6 +319,9 @@ pub const Join = struct {
     /// a pair joins only where it holds, so an unmatched row still comes out. With
     /// no key it is the whole ON, of any join kind.
     residual: ?*Expr = null,
+    /// Columns written with the FROM table's alias (`l.x`), which that table, this
+    /// join's left input, must have.
+    own_cols: []const QualName = &.{},
 
     /// An ON with no `=` key, run as a nested-loop join.
     pub fn keyless(self: Join) bool {

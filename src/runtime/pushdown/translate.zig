@@ -10,6 +10,7 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 pub const bin = @import("../pushdown.zig").bin;
 const builtins = @import("../../exec/builtins.zig");
+const litAs = @import("../../exec/eval.zig").litAs;
 const callExpr = @import("testing_util.zig").callExpr;
 pub const fld = @import("../pushdown.zig").fld;
 const intLit = @import("testing_util.zig").intLit;
@@ -194,6 +195,7 @@ const Tx = struct {
                     return try self.fmt("({s} {s} {s})", .{ l orelse return null, if (b.op == .@"and") "AND" else "OR", r orelse return null });
                 },
                 .eq, .ne, .lt, .le, .gt, .ge => return self.compare(b.op, b.l, b.r, need),
+                .distinct, .not_distinct => return self.distinctPred(b.op, b.l, b.r, need),
                 else => return null,
             },
             .unary => |u| {
@@ -384,13 +386,65 @@ const Tx = struct {
         return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
     }
 
+    /// A quoted literal against a non-text operand, as sent: the number or bool it
+    /// reads as against a number or bool column, as the engine reads it, or null when
+    /// it does not read so plainly; quoted against anything else. Against a column of
+    /// a type not known, a number stays in the engine on the MySQL family, which
+    /// compares a decimal with a string as doubles.
+    fn typedLit(self: Tx, col: *const ast.Expr, lit: []const u8) Err!?[]const u8 {
+        const t = std.mem.trim(u8, lit, " \t\r\n");
+        const ck = blk: {
+            if (col.* != .field or col.field.parts.len != 1) break :blk null;
+            const i = self.o.schema.indexOf(col.field.parts[0]) orelse break :blk null;
+            break :blk self.o.schema.fields[i].ty.kind;
+        } orelse {
+            if (self.dialect.mysqlWire() and plainNumber(t)) return null;
+            return self.value(&.{ .str_lit = lit });
+        };
+        switch (ck) {
+            .int, .float, .decimal => {
+                if (!plainNumber(t) or (ck == .int and std.mem.indexOfScalar(u8, t, '.') != null)) return null;
+                return try self.arena.dupe(u8, t);
+            },
+            .bool => {
+                const b = (try litAs(self.arena, t, types.Type.init(.bool))) orelse return null;
+                if (self.dialect == .sqlserver) return try self.arena.dupe(u8, if (b.bool_lit) "1" else "0");
+                return try self.arena.dupe(u8, if (b.bool_lit) "TRUE" else "FALSE");
+            },
+            else => return self.value(&.{ .str_lit = lit }),
+        }
+    }
+
+    /// `IS [NOT] DISTINCT FROM` where the source has it: PostgreSQL as written, the
+    /// MySQL family as `<=>`; SQL Server before 2022 has neither, so it stays in the
+    /// engine there. Over text, or a type not known and met by no number, only the
+    /// side a folding collation errs toward is sent; against NULL it is exact.
+    fn distinctPred(self: Tx, op: ast.BinOp, l: *const ast.Expr, r: *const ast.Expr, need: Need) Err!?[]const u8 {
+        const lk = self.kind(l);
+        const rk = self.kind(r);
+        const numeric = (isLit(l) or isLit(r)) and lk != .text and rk != .text;
+        const exact_kind = (lk == .other and rk == .other) or numeric or l.* == .null_lit or r.* == .null_lit;
+        const settled = (op == .not_distinct and need == .superset) or (op == .distinct and need == .subset);
+        if (!exact_kind and !settled) return null;
+        const ls = (try self.value(l)) orelse return null;
+        const rs = (try self.value(r)) orelse return null;
+        return switch (self.dialect) {
+            .postgres => try self.fmt("({s} IS {s}DISTINCT FROM {s})", .{ ls, if (op == .not_distinct) "NOT " else "", rs }),
+            .mysql, .starrocks, .doris => if (op == .not_distinct)
+                try self.fmt("({s} <=> {s})", .{ ls, rs })
+            else
+                try self.fmt("(NOT ({s} <=> {s}))", .{ ls, rs }),
+            .sqlserver => null,
+        };
+    }
+
     /// `col op 'L'` over text. Under padding the shorter side compares as if
     /// space-filled, so ranges widen to a prefix test.
     fn textCompare(self: Tx, op: ast.BinOp, col: *const ast.Expr, lit: []const u8, need: Need) Err!?[]const u8 {
         const k = self.kind(col);
         if (k == .other) {
             const cs = (try self.value(col)) orelse return null;
-            const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
+            const ls = (try self.typedLit(col, lit)) orelse return null;
             return try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
         }
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
@@ -640,6 +694,54 @@ test "translateExpr: AND of comparisons, per-dialect quoting" {
     const e = try bin(a, .@"and", try bin(a, .ge, try fld(a, "a"), lit5), try bin(a, .lt, try fld(a, "c"), lit9));
     try testing.expectEqualStrings("((\"a\" >= 5) AND (\"c\" < 9))", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
     try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
+}
+
+test "translateExpr: a quoted literal against a number or bool column is sent as that type's literal" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sch = types.Schema{ .fields = &.{
+        .{ .name = "n", .ty = types.Type.init(.int) },
+        .{ .name = "d", .ty = types.Type.decimal(10, 2) },
+        .{ .name = "ok", .ty = types.Type.init(.bool) },
+    } };
+    const Case = struct { col: []const u8, op: ast.BinOp, lit: []const u8, d: Dialect, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .col = "d", .op = .lt, .lit = " 100000.25 ", .d = .postgres, .want = "(\"d\" < 100000.25)" },
+        .{ .col = "n", .op = .eq, .lit = "42", .d = .mysql, .want = "(`n` = 42)" },
+        .{ .col = "n", .op = .eq, .lit = "1.5", .d = .postgres, .want = null },
+        .{ .col = "d", .op = .eq, .lit = "1,5", .d = .postgres, .want = null },
+        .{ .col = "ok", .op = .eq, .lit = "yes", .d = .postgres, .want = "(\"ok\" = TRUE)" },
+        .{ .col = "ok", .op = .ne, .lit = "f", .d = .sqlserver, .want = "([ok] <> 0)" },
+    };
+    for (cases) |c| {
+        const lit = try a.create(ast.Expr);
+        lit.* = .{ .str_lit = c.lit };
+        const got = try translateExpr(a, try bin(a, c.op, try fld(a, c.col), lit), c.d, sch, true);
+        if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
+    }
+    const five = try a.create(ast.Expr);
+    five.* = .{ .str_lit = "5" };
+    const cast = try a.create(ast.Expr);
+    cast.* = .{ .cast = .{ .e = try intLit(a, 7), .ty = types.Type.decimal(10, 2) } };
+    const untyped = try bin(a, .lt, cast, five);
+    try testing.expect((try translateExpr(a, untyped, .mysql, .{ .fields = &.{} }, false)) == null);
+    try testing.expect(std.mem.endsWith(u8, (try translateExpr(a, untyped, .postgres, .{ .fields = &.{} }, false)).?, " < '5')"));
+}
+
+test "translateExpr: IS [NOT] DISTINCT FROM is native on postgres, `<=>` on the MySQL family, engine-side on sqlserver" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = try a.create(ast.Expr);
+    lit.* = .{ .int_lit = 5 };
+    const nd = try bin(a, .not_distinct, try fld(a, "a"), lit);
+    const d = try bin(a, .distinct, try fld(a, "a"), lit);
+    try testing.expectEqualStrings("(\"a\" IS NOT DISTINCT FROM 5)", (try translateExpr(a, nd, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(\"a\" IS DISTINCT FROM 5)", (try translateExpr(a, d, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(`a` <=> 5)", (try translateExpr(a, nd, .mysql, testSchema(), true)).?);
+    try testing.expectEqualStrings("(NOT (`a` <=> 5))", (try translateExpr(a, d, .starrocks, testSchema(), true)).?);
+    try testing.expect((try translateExpr(a, d, .sqlserver, testSchema(), true)) == null);
 }
 
 test "translateExpr: is not null" {

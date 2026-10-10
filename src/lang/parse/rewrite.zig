@@ -134,6 +134,8 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
                 .ge => ">=",
                 .@"and" => " and ",
                 .@"or" => " or ",
+                .distinct => " is distinct from ",
+                .not_distinct => " is not distinct from ",
             });
             try self.exprKey(b.r, buf);
             try buf.append(')');

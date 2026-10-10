@@ -109,6 +109,15 @@ fn evalBinary(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch, row: u
             if (l.isNull() or r.isNull()) return .null;
             return .{ .bool = false };
         },
+        .distinct, .not_distinct => {
+            const l = try evalRow(arena, b.l, batch, row);
+            const r = try evalRow(arena, b.r, batch, row);
+            const same = if (l.isNull() or r.isNull())
+                l.isNull() and r.isNull()
+            else
+                (compareValues(l, r) orelse return error.TypeMismatch) == .eq;
+            return .{ .bool = same == (b.op == .not_distinct) };
+        },
         else => {
             const l = try evalRow(arena, b.l, batch, row);
             const r = try evalRow(arena, b.r, batch, row);

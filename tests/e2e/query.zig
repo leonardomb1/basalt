@@ -1631,7 +1631,36 @@ test "join: `t.*` is that table's columns alone, by their own names unless taken
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,v\n1,2\n" });
     try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n1,x\n" });
-    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown field `b.v`");
+    try @import("harness.zig").expectRefusedAlike(alloc, &tmp, "SELECT b.v FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k;", "unknown column `b.v`");
+}
+
+test "join: under USING `t.k` and `t.*` are that side's own, the key in its place; `*` lists the merged key once, first" {
+    try runQualCases(&.{
+        .{ .q = "SELECT t.* FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "id,name,amt\n2,bob,20.25\n" },
+        .{ .q = "SELECT i.* FROM '$B/t.csv' t RIGHT JOIN '$B/items.csv' i USING (name) WHERE i.item = 'w'", .want = "name,item,q\neve,w,4\n" },
+        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.q IS NULL OR i.q > 3", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\n" },
+        .{ .q = "SELECT t.name AS tn, i.name AS iname, name FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE t.name IS NULL OR i.name IS NULL", .want = "tn,iname,name\ncid,,cid\n,eve,eve\n" },
+        .{ .q = "SELECT i.name, count(*) AS n FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.name IS NULL OR i.name = 'ana' GROUP BY i.name ORDER BY n", .want = "name,n\n,1\nana,2\n" },
+        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\ncid,3,,,\n" },
+        .{ .q = "SELECT * RENAME (id AS tid) FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "name,tid,amt,item,q\nbob,2,20.25,z,3\n" },
+        .{ .q = "SELECT name, item FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY t.name, item", .want = "name,item\nana,x\nana,y\nbob,z\ncid,\neve,w\n" },
+    });
+}
+
+test "join: a qualified column is that table's alone, the FROM table's and a later join's too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name\n1,ana\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "items.csv", .data = "name,item,q\nana,x,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "emp.csv", .data = "id,mgr\n1,2\n" });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT a.item FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name WHERE a.q > 0;", "unknown column `a.q`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name JOIN '$B/emp.csv' c ON c.id = a.q;", "unknown column `a.q`");
+    try refuse(alloc, &tmp, "SELECT count(*) FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name GROUP BY a.item;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name ORDER BY a.item;", "unknown column `a.item`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON c.id = a.id JOIN '$B/emp.csv' c ON c.id = a.id;", "unknown column `c.id`");
 }
 
 test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {
@@ -1641,4 +1670,66 @@ test "join: a second column of one name is named apart, hidden sort and DISTINCT
         .{ .q = "SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
         .{ .q = "SELECT DISTINCT ON (b.k) b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k WHERE a.k <> 2 ORDER BY b.k", .want = "s,s_r\nu,a\nz,c\n" },
     });
+}
+
+test "where: a quoted literal against a number or bool is read as one, exactly; one that does not read so is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in = "id,amt,f,ok\n1,99999.50,1.5,true\n2,100000.25,2.5,false\n3,,,\n";
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(amt AS DECIMAL(10,2)) < '100000'", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(amt AS DECIMAL(10,2)) <= ' 99999.505 '", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE '2' > id", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE id IN ('1', '3')", .want = "id\n1\n3\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE f >= '2.5'", .want = "id\n2\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(ok AS BOOL) = 'yes'", .want = "id\n1\n" },
+        .{ .q = "SELECT id, id = '2' AS two FROM '$IN' WHERE id < 3", .want = "id,two\n1,false\n2,true\n" },
+    };
+    for (cases) |c| {
+        const out = try runToString(alloc, &tmp, in, c.q);
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = in });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(amt AS DECIMAL(10,2)) = '1,5';", "`1,5` is not a valid decimal literal");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE id = '1.5';", "`1.5` is not a valid int literal");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(id AS STRING) = id;", "cannot compare");
+}
+
+test "where: IS [NOT] DISTINCT FROM compares with nulls as values, never null itself; NULL keys never match a join" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,b\n1,p\n3,q\n,r\n" });
+    const in = "a,k\nx,1\ny,2\nz,\n";
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT a FROM '$IN' WHERE k IS DISTINCT FROM 1", .want = "a\ny\nz\n" },
+        .{ .q = "SELECT a FROM '$IN' WHERE k IS NOT DISTINCT FROM NULL", .want = "a\nz\n" },
+        .{ .q = "SELECT a, k IS DISTINCT FROM 2 AS d, k = 2 AS e FROM '$IN'", .want = "a,d,e\nx,true,false\ny,false,true\nz,true,\n" },
+        .{ .q = "SELECT a FROM '$IN' WHERE NOT (k IS DISTINCT FROM '2')", .want = "a\ny\n" },
+        .{ .q = "SELECT l.a, r.b FROM '$IN' l LEFT JOIN '$B/r.csv' r ON l.k IS NOT DISTINCT FROM r.k", .want = "a,b\nx,p\ny,\nz,r\n" },
+        .{ .q = "SELECT l.a, r.b FROM '$IN' l LEFT JOIN '$B/r.csv' r ON l.k = r.k", .want = "a,b\nx,p\ny,\nz,\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l ANTI JOIN '$B/r.csv' r ON l.k = r.k", .want = "a\ny\nz\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv')", .want = "a\n" },
+        .{ .q = "SELECT l.a FROM '$IN' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 5)", .want = "a\nx\ny\nz\n" },
+    };
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const out = try runToString(alloc, &tmp, in, q);
+        defer alloc.free(out);
+        std.testing.expectEqualStrings(c.want, out) catch |e| {
+            std.debug.print("query: {s}\n", .{c.q});
+            return e;
+        };
+    }
 }
