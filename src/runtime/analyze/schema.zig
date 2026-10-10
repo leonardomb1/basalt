@@ -543,7 +543,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         ro.* = pair[1];
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
-        if (types.Type.unify(lt, rt) == null)
+        if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
             return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
     }
 
@@ -577,6 +577,10 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         .right_nullable = right_nullable,
         .left_nullable = left_nullable,
     };
+}
+
+fn isNumeric(k: types.TypeKind) bool {
+    return k == .int or k == .float or k == .decimal;
 }
 
 fn nameIn(names: []const []const u8, n: []const u8) bool {
@@ -748,6 +752,18 @@ test "joinPlan: pair orientation, ambiguity, per-pair comparability" {
     }, &diag);
     try std.testing.expectEqualSlices(usize, &.{0}, same.lks);
     try std.testing.expectEqualSlices(usize, &.{1}, same.rks);
+}
+
+test "joinPlan: a float key joins a decimal key, as an int one does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = types.Schema{ .fields = &.{.{ .name = "f", .ty = types.Type.init(.float) }} };
+    const right = types.Schema{ .fields = &.{.{ .name = "d", .ty = types.Type.decimal(4, 1) }} };
+    var diag = Diag{};
+    const p = try joinPlan(a, left, right, .{ .kind = .inner, .binding = "r", .left_keys = &.{.{ .parts = &.{"f"} }}, .right_keys = &.{.{ .parts = &.{"d"} }} }, &diag);
+    try std.testing.expectEqualSlices(usize, &.{0}, p.lks);
+    try std.testing.expectEqualSlices(usize, &.{0}, p.rks);
 }
 
 test "aggregatePlan: result types per function and group-key passthrough" {
