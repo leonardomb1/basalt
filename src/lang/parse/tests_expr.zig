@@ -226,6 +226,18 @@ test "sql: an empty quoted name is a lex error, not an empty column" {
     try testing.expectEqual(@as(u32, 8), diag.col);
 }
 
+test "sql: a stray non-ASCII character is named whole, a byte that is not UTF-8 as \\xNN" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 'ção', nõpe FROM 't.csv';", &diag));
+    try testing.expectEqualStrings("invalid token `õ`", diag.msg);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT n\xF5pe FROM 't.csv';", &diag));
+    try testing.expectEqualStrings("invalid token `\\xF5`", diag.msg);
+}
+
 test "parseTypeStr: params, aliases, junk" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
