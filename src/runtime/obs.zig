@@ -135,16 +135,18 @@ pub const Logger = struct {
 
     /// One finished `LOAD` of several, printed above the live progress line when
     /// `items` asked for it; a `load_complete` / `load_failed` event under JSON.
-    pub fn item(self: *Logger, it: Item) void {
-        if (self.quiet) return;
-        if (self.json and !self.enabled(.info)) return;
+    /// False when nothing was written, so a failure is reported another way.
+    pub fn item(self: *Logger, it: Item) bool {
+        if (self.quiet) return false;
+        if (self.json and !self.enabled(.info)) return false;
         self.mutex.lock();
         defer self.mutex.unlock();
         var lbuf: [1024]u8 = undefined;
         var w = std.Io.Writer.fixed(&lbuf);
-        if (self.json) it.renderJson(&w, self.run_id) catch return else it.renderText(&w) catch return;
+        if (self.json) it.renderJson(&w, self.run_id) catch return false else it.renderText(&w) catch return false;
         self.eraseProgress();
-        self.file.writeAll(w.buffered()) catch return;
+        self.file.writeAll(w.buffered()) catch return false;
+        return true;
     }
 
     /// Lines over the 16 KiB buffer are cut, not dropped.
@@ -506,6 +508,7 @@ pub const Summary = struct {
     target: []const u8 = "",
     rows_loaded: ?u64 = null,
     lone_load: bool = true,
+    partial: bool = false,
     pushdown: Pushdown = .{},
 
     pub const Pushdown = struct {
@@ -528,11 +531,14 @@ pub const Summary = struct {
     }
 
     /// `Loaded 20,000,000 rows into sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)`.
-    /// The run id is left out; both JSON renderings carry it.
+    /// The run id is left out; both JSON renderings carry it. A sentence whose only
+    /// count is zero rows shows a zero rate, not one over the rows a loop discovered.
     pub fn renderText(self: Summary, w: anytype) !void {
         const total = self.loads + self.loads_failed;
         const loaded = self.rows_loaded orelse self.rows_written;
+        var shown_rate = self.rate();
         if (total > 1 or self.loads_failed > 0) {
+            if (loaded == 0) shown_rate = 0;
             try w.writeAll("Loaded ");
             if (self.loads_failed > 0) try w.print("{d} of {d} targets, ", .{ self.loads, total }) else try w.print("{d} targets, ", .{self.loads});
             try writeThousands(w, loaded);
@@ -553,15 +559,18 @@ pub const Summary = struct {
         try w.writeAll(" in ");
         try writeDuration(w, self.elapsed_ms);
         try w.writeAll(" (");
-        try writeRate(w, self.rate());
+        try writeRate(w, shown_rate);
         try w.writeAll(" rows/s");
         if (self.threads > 1) try w.print(", {d} lanes", .{self.threads});
         try w.writeAll(")\n");
         if (self.loads_failed > 0) try w.print("{d} failed\n", .{self.loads_failed});
     }
 
+    /// `status` is `partial` once any load or `FOR EACH` item failed, as an HTTP
+    /// endpoint's reply says it.
     pub fn renderJson(self: Summary, w: anytype) !void {
-        try w.print("{{\"status\":\"ok\",\"run_id\":{d},", .{self.run_id});
+        const status = if (self.partial or self.loads_failed > 0) "partial" else "ok";
+        try w.print("{{\"status\":\"{s}\",\"run_id\":{d},", .{ status, self.run_id });
         try self.renderJsonFields(w);
     }
 
@@ -672,6 +681,20 @@ test "summary renderJson: one status-ok object with every metric field" {
         "{\"status\":\"ok\",\"run_id\":7,\"source\":\"csv\",\"sink\":\"starrocks\",\"rows_read\":10,\"rows_written\":8,\"elapsed_ms\":2000,\"rows_per_sec\":5,\"loads\":1,\"loads_failed\":0}\n",
         w.buffered(),
     );
+}
+
+test "summary: a failed load or item makes the status partial; zero rows loaded show a zero rate" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .loads = 1, .loads_failed = 1 }).renderJson(&w);
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"status\":\"partial\","));
+    w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .partial = true }).renderJson(&w);
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "{\"status\":\"partial\","));
+
+    w = std.Io.Writer.fixed(&buf);
+    try (Summary{ .run_id = 7, .rows_read = 2, .elapsed_ms = 1, .loads = 0, .loads_failed = 2, .rows_loaded = 0 }).renderText(&w);
+    try std.testing.expectEqualStrings("Loaded 0 of 2 targets, 0 rows in 1ms (0 rows/s)\n2 failed\n", w.buffered());
 }
 
 test "summary renderJson: a pushdown object only when a source was spared something" {

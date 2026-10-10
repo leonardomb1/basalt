@@ -202,18 +202,43 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             return if (transient) 75 else 1;
         },
     };
+    return reportFailedItems(eo, &sink);
+}
+
+/// The exit code for a run whose `FOR EACH` items failed under `ON ERROR CONTINUE`,
+/// after naming each failure not already shown and the count, in the log's format.
+fn reportFailedItems(eo: ErrOut, sink: *runtime.OutcomeSink) !u8 {
     const nfail = sink.failures();
-    if (nfail > 0) {
-        var all_retryable = true;
-        for (sink.list.items) |o| {
-            if (o.ok) continue;
-            if (!o.retryable) all_retryable = false;
-            if (o.shown) continue;
-            const tag = if (o.retryable) " (transient)" else "";
-            try stderr.print("{s}: item `{s}` failed{s}: {s}\n", .{ src.label, o.item, tag, o.err });
-        }
-        try stderr.print("{s}: {d}/{d} item(s) failed\n", .{ src.label, nfail, sink.list.items.len });
-        return if (all_retryable) 75 else 1;
+    if (nfail == 0) return 0;
+    var all_retryable = true;
+    var buf: [1024]u8 = undefined;
+    for (sink.list.items) |o| {
+        if (o.ok) continue;
+        if (!o.retryable) all_retryable = false;
+        if (o.shown) continue;
+        const msg = std.fmt.bufPrint(&buf, "item `{s}` failed: {s}", .{ o.item, o.err }) catch o.err;
+        try eo.report(.{ .msg = msg, .transient = o.retryable });
     }
-    return 0;
+    const msg = try std.fmt.bufPrint(&buf, "{d}/{d} item(s) failed", .{ nfail, sink.list.items.len });
+    try eo.report(.{ .msg = msg, .transient = all_retryable });
+    return if (all_retryable) 75 else 1;
+}
+
+test "reportFailedItems: under --log-format json every line is an NDJSON event" {
+    var sink = runtime.OutcomeSink.init(std.testing.allocator);
+    defer sink.deinit();
+    sink.record("ana", false, "unknown field `nope`", false);
+    sink.recordShown("bob", false, "shown", false, true);
+    sink.record("cid", true, "", false);
+    var out: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&out);
+    try std.testing.expectEqual(@as(u8, 1), try reportFailedItems(.{ .w = &w, .json = true, .label = "s.sql" }, &sink));
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, w.buffered(), "\n"), '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| : (n += 1) {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        parsed.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"2/3 item(s) failed\"") != null);
 }

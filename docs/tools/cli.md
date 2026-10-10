@@ -142,9 +142,10 @@ A single `LOAD` prints only the sentence — `Loaded 20,000,000 rows into
 sr.bronze.orders in 8.2s (2.4M rows/s, 12 lanes)`, or `Read 4,000,000 rows,
 loaded 7 into agg.csv in 1.9s` when the query reduces. The text carries no run
 id; under `--log-format json` the same facts are `load_complete` /
-`load_failed` events (level `info`) and a `run_complete` line, each with
-`run_id`, and `--format json` prints the summary object with `loads` and
-`loads_failed`. Parse those, never the sentence. A run of `SELECT`s writes no
+`load_failed` events (level `info`, one per `LOAD`, a lone one too) and a
+`run_complete` line, each with `run_id`, and `--format json` prints the summary
+object with `loads`, `loads_failed` and a `status` — `ok`, or `partial` once a
+load or a `FOR EACH` item failed. Parse those, never the sentence. A run of `SELECT`s writes no
 sentence — the printed rows are its feedback — but under `--log-format json` it
 too closes with a `run_complete` line on stderr (never on stdout, which holds
 the rows). Every `run_complete` carries a `pushdown` object when a source was

@@ -105,6 +105,9 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         load_err = e;
         return e;
     };
+    if (!is_load and !env.explain) if (env.max_rows) |cap| {
+        stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);
+    };
 }
 
 /// A derived table or CTE that aggregates a file or table is run first, in parallel,
