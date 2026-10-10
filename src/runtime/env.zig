@@ -388,9 +388,16 @@ pub const LoopRow = struct {
     cells: Row,
     outer: ?*const LoopRow = null,
     script: bool = false,
+    nulls: []const bool = &.{},
 
     pub fn typeAt(self: LoopRow, i: usize) ?types.Type {
         return if (i < self.types.len) self.types[i] else null;
+    }
+
+    /// A cell's value; a NULL PARAM, LET or CALL argument renders as "" but stays NULL here.
+    fn valueAt(self: LoopRow, arena: std.mem.Allocator, i: usize) Value {
+        if (i < self.nulls.len and self.nulls[i]) return .null;
+        return loopValue(arena, self.cells[i], self.typeAt(i));
     }
 
     pub fn appendScope(
@@ -399,9 +406,9 @@ pub const LoopRow = struct {
         names: *std.array_list.Managed([]const u8),
         vals: *std.array_list.Managed(Value),
     ) !void {
-        for (self.names, self.cells, 0..) |nm, cell, i| {
+        for (self.names, 0..) |nm, i| {
             try names.append(nm);
-            try vals.append(loopValue(arena, cell, self.typeAt(i)));
+            try vals.append(self.valueAt(arena, i));
         }
         if (self.outer) |o| try o.appendScope(arena, names, vals);
     }
@@ -413,17 +420,17 @@ pub const LoopRow = struct {
         vals: *std.array_list.Managed(Value),
     ) !void {
         if (self.script) return;
-        for (self.names, self.cells, 0..) |nm, cell, i| {
+        for (self.names, 0..) |nm, i| {
             try names.append(nm);
-            try vals.append(loopValue(arena, cell, self.typeAt(i)));
+            try vals.append(self.valueAt(arena, i));
         }
         if (self.outer) |o| try o.appendLoopVars(arena, names, vals);
     }
 
     pub fn loopVar(self: LoopRow, arena: std.mem.Allocator, name: []const u8) ?Value {
         if (self.script) return null;
-        for (self.names, self.cells, 0..) |nm, cell, i| {
-            if (std.mem.eql(u8, nm, name)) return loopValue(arena, cell, self.typeAt(i));
+        for (self.names, 0..) |nm, i| {
+            if (std.mem.eql(u8, nm, name)) return self.valueAt(arena, i);
         }
         return if (self.outer) |o| o.loopVar(arena, name) else null;
     }

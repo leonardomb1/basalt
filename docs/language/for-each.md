@@ -89,4 +89,5 @@ function's parameters), else from the script's `PARAM`s and `LET`s — so
 `'lit ${x}'` reads `PARAM x` even outside any loop. A bare `${name}` that
 nothing binds is left as written, so text that merely contains `${` passes
 through; write `$name` in an expression to have an unbound name refused at
-plan time.
+plan time. A `NULL` `PARAM` or `LET` splices as empty text, but stays `NULL`
+inside a `${ <expr> }` hole — `${coalesce(since, '2020-01-01')}` falls back.

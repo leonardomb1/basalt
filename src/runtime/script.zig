@@ -276,18 +276,37 @@ fn renderWrite(arena: std.mem.Allocator, w: ast.Write, lr: LoopRow) !ast.Write {
     };
 }
 
+/// A query parameter whose whole value is a NULL (`a = $p` with `$p` NULL) is left
+/// out, as `a = NULL` is.
 fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) ![]const ast.Hint {
     if (hints.len == 0) return hints;
-    const out = try arena.alloc(ast.Hint, hints.len);
-    for (hints, out) |h, *o| {
-        o.* = h;
+    var out = try std.array_list.Managed(ast.Hint).initCapacity(arena, hints.len);
+    for (hints) |h| {
+        if (h.value == .str and std.mem.startsWith(u8, h.key, "query:") and try holeIsNull(arena, h.value.str, lr)) continue;
+        var o = h;
         o.value = switch (h.value) {
             .str => |s| .{ .str = try interpAll(arena, s, lr) },
             .ident => |s| .{ .ident = try interpAll(arena, s, lr) },
             else => h.value,
         };
+        out.appendAssumeCapacity(o);
     }
-    return out;
+    return out.items;
+}
+
+/// Whether `s` is one `${...}` hole, bound, whose value is NULL.
+fn holeIsNull(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) !bool {
+    if (!std.mem.startsWith(u8, s, "${") or interpClose(s, 2) != s.len - 1) return false;
+    const inner = s[2 .. s.len - 1];
+    if (bareInterp(inner) and lr.lookup(inner) == null) return false;
+    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
+    const e = parser.parseExprStr(arena, inner, &diag) catch |err| return if (err == error.OutOfMemory) err else false;
+    if (interpUnsupported(e) != null) return false;
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var vals = std.array_list.Managed(Value).init(arena);
+    try lr.appendScope(arena, &names, &vals);
+    const v = eval.constEval(arena, e, names.items, vals.items) catch |err| return if (err == error.OutOfMemory) err else false;
+    return v.isNull();
 }
 
 pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow) anyerror!ast.Pipeline {
@@ -480,14 +499,16 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
     if (n == 0) return no_loop_vars;
     const names = try arena.alloc([]const u8, n);
     const cells = try arena.alloc([]const u8, n);
+    const nulls = try arena.alloc(bool, n);
     var i: usize = 0;
     var it = params.iterator();
     while (it.next()) |kv| {
         names[i] = kv.key_ptr.*;
         cells[i] = try eval.valueToString(arena, kv.value_ptr.*);
+        nulls[i] = kv.value_ptr.isNull();
         i += 1;
     }
-    return .{ .names = names, .cells = cells, .script = true };
+    return .{ .names = names, .cells = cells, .script = true, .nulls = nulls };
 }
 
 /// Interpolate `${...}` holes against script scope alone, for statements outside
@@ -527,18 +548,20 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     const pnames = try env.arena.alloc([]const u8, fd.params.len);
     const ptypes = try env.arena.alloc(?types.Type, fd.params.len);
     const cells = try env.arena.alloc([]const u8, fd.params.len);
+    const nulls = try env.arena.alloc(bool, fd.params.len);
     for (fd.params, c.args, 0..) |p, a, i| {
         pnames[i] = p.name;
         ptypes[i] = p.ty;
         const v = eval.constEval(env.arena, a, names.items, values.items) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, @errorName(e) }));
         cells[i] = try eval.valueToString(env.arena, v);
+        nulls[i] = v.isNull();
     }
 
     env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
     env.call_depth += 1;
     defer env.call_depth -= 1;
-    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
+    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .nulls = nulls, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
 }
 
 /// Render a `PRINT` argument with the helper that formats any cell, so a
@@ -793,4 +816,30 @@ test "PRINT renders literals, `||` over params, and a loop variable" {
     const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
     const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
     try std.testing.expectEqualStrings("company acme", try printText(a, row, lr, &params));
+}
+
+test "renderHints: a query parameter whose value is a NULL PARAM is left out, as a literal NULL is" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var params = std.StringHashMap(Value).init(a);
+    try params.put("p", .null);
+    try params.put("e", .{ .string = "" });
+    const scope = try buildScriptScope(a, &params);
+    const lr = LoopRow{ .names = &.{}, .cells = &.{}, .outer = &scope };
+    const pos: ast.Pos = .{ .line = 1, .col = 1 };
+    const hints = [_]ast.Hint{
+        .{ .key = "query:a", .value = .{ .str = "${p}" }, .pos = pos },
+        .{ .key = "query:b", .value = .{ .str = "${upper(p)}" }, .pos = pos },
+        .{ .key = "query:c", .value = .{ .str = "${e}" }, .pos = pos },
+        .{ .key = "query:d", .value = .{ .str = "${coalesce(p, 'x')}" }, .pos = pos },
+        .{ .key = "query:f", .value = .{ .str = "${nope}" }, .pos = pos },
+    };
+    const out = try renderHints(a, &hints, lr);
+    try std.testing.expectEqual(@as(usize, 3), out.len);
+    try std.testing.expectEqualStrings("query:c", out[0].key);
+    try std.testing.expectEqualStrings("", out[0].value.str);
+    try std.testing.expectEqualStrings("x", out[1].value.str);
+    try std.testing.expectEqualStrings("${nope}", out[2].value.str);
 }
