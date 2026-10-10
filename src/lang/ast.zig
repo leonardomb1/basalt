@@ -390,6 +390,7 @@ pub const WindowFunc = struct {
     out: []const u8,
     arg: ?QualName = null,
     offset: i64 = 1,
+    offset_expr: ?*Expr = null,
     default: ?*Expr = null,
     distinct: bool = false,
     ignore_nulls: bool = false,
@@ -488,6 +489,7 @@ pub const Window = struct {
     top_k: ?u64 = null,
     partition_by: []const QualName = &.{},
     order_by: []const SortKey = &.{},
+    key_label: ?[]const u8 = null,
 };
 
 pub const Pipeline = struct {

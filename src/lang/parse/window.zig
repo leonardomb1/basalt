@@ -8,12 +8,16 @@
 //! `Lower` turns the calls into stages: a projection computing every expression key
 //! or argument into a hidden `__wa<n>` column (one per distinct expression) and
 //! carrying the columns later items read, one window stage per distinct PARTITION
-//! BY / ORDER BY in order of first appearance, each sorting its own input, and the
-//! SELECT list's projection, which evaluates an expression around a window over its
-//! hidden column. A call that is a whole item names its column after the item, so
-//! `WHERE rn <= k` over a CTE still finds a lone ROW_NUMBER (`windowTopK`). Over a
-//! GROUP BY the windows run after the aggregate and HAVING, their aggregates lifted
-//! into the aggregate stage like any other (`SUM(SUM(x)) OVER ()`).
+//! BY / ORDER BY, each sorting its own input, and the SELECT list's projection, which
+//! evaluates an expression around a window over its hidden column. Every call writes
+//! its hidden column, renamed by that last projection, so an alias never shadows a
+//! column a window reads (`SUM(x) OVER (...) AS x`). Over a GROUP BY the windows run
+//! after the aggregate and HAVING, their aggregates lifted into the aggregate stage
+//! like any other (`SUM(SUM(x)) OVER ()`).
+//!
+//! Stages without ORDER BY run first, in order of appearance, so the first reads the
+//! input order; a later one that depends on that order (a value function, a ROWS
+//! frame) orders by a hidden ROW_NUMBER taken before any stage sorts.
 //!
 //! A call's `Spec` is its own keys and frame, or a named window (`base`) taken whole
 //! when `bare` (`OVER w`), else extended (`OVER (w ORDER BY t)`).
@@ -54,6 +58,7 @@ pub const WinCall = struct {
     func: ast.WinFn,
     arg: ?*ast.Expr = null,
     offset: i64 = 1,
+    offset_expr: ?*ast.Expr = null,
     default: ?*ast.Expr = null,
     distinct: bool = false,
     ignore_nulls: bool = false,
@@ -71,6 +76,15 @@ pub fn parseNullTreatment(self: *Parser) ?bool {
     _ = self.advance();
     _ = self.advance();
     return ignore;
+}
+
+/// A further `IGNORE NULLS` / `RESPECT NULLS` into `nulls`, refused when one was
+/// already given.
+pub fn moreNullTreatment(self: *Parser, nulls: *?bool) Error!void {
+    const pos = self.curPos();
+    const n = parseNullTreatment(self) orelse return;
+    if (nulls.* != null) return self.fail(pos, "IGNORE NULLS / RESPECT NULLS is given twice in one call", .{});
+    nulls.* = n;
 }
 
 /// `FILTER (WHERE c)` after a call, or null with nothing consumed.
@@ -144,6 +158,14 @@ fn wholeNumber(e: *const ast.Expr) ?i64 {
     return if (e.* == .int_lit) e.int_lit else null;
 }
 
+/// Whether `e` reads no column, so the planner can fold it (`1 + 1`, `$n`).
+fn constant(self: *Parser, e: *const ast.Expr) Error!bool {
+    var fields = std.array_list.Managed(ast.QualName).init(self.arena);
+    try self.collectFields(e, &fields);
+    for (fields.items) |q| if (!q.dollar) return false;
+    return true;
+}
+
 pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!void {
     const name = call.name;
     switch (call.func) {
@@ -154,9 +176,13 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                     return self.fail(call.pos, "`{s}()` takes no arguments", .{name}),
                 .ntile => {
                     if (args.len != 1) return self.fail(call.pos, "NTILE takes one argument, the number of buckets", .{});
-                    const n = wholeNumber(args[0]) orelse 0;
-                    if (n < 1) return self.fail(call.pos, "NTILE takes a positive whole number of buckets", .{});
-                    call.offset = n;
+                    if (wholeNumber(args[0]) == null and try constant(self, args[0])) {
+                        call.offset_expr = args[0];
+                    } else {
+                        const n = wholeNumber(args[0]) orelse 0;
+                        if (n < 1) return self.fail(call.pos, "NTILE takes a positive whole number of buckets", .{});
+                        call.offset = n;
+                    }
                 },
                 .lag, .lead => {
                     if (args.len < 1 or args.len > 3) return self.fail(call.pos, "`{s}` takes (column[, offset[, default]])", .{name});
@@ -165,9 +191,17 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                         const o = args[1];
                         if (o.* == .unary and o.unary.op == .neg and o.unary.e.* == .int_lit)
                             return self.fail(call.pos, "LAG/LEAD offset must not be negative — use the other function", .{});
-                        call.offset = wholeNumber(o) orelse return self.fail(call.pos, "LAG/LEAD offset must be an integer", .{});
+                        if (wholeNumber(o)) |n| {
+                            call.offset = n;
+                        } else if (try constant(self, o)) {
+                            call.offset_expr = o;
+                        } else return self.fail(call.pos, "LAG/LEAD offset must be a constant integer", .{});
                     }
-                    if (args.len == 3) call.default = args[2];
+                    if (args.len == 3) {
+                        if (!try constant(self, args[2]))
+                            return self.fail(call.pos, "LAG/LEAD default must be a constant — a literal, an expression of literals or a $param", .{});
+                        call.default = args[2];
+                    }
                 },
                 .first_value, .last_value => {
                     if (args.len != 1) return self.fail(call.pos, "`{s}` takes one argument", .{name});
@@ -176,9 +210,13 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                 .nth_value => {
                     if (args.len != 2) return self.fail(call.pos, "NTH_VALUE takes (column, n)", .{});
                     call.arg = args[0];
-                    const n = wholeNumber(args[1]) orelse 0;
-                    if (n < 1) return self.fail(call.pos, "NTH_VALUE's position must be a positive whole number", .{});
-                    call.offset = n;
+                    if (wholeNumber(args[1]) == null and try constant(self, args[1])) {
+                        call.offset_expr = args[1];
+                    } else {
+                        const n = wholeNumber(args[1]) orelse 0;
+                        if (n < 1) return self.fail(call.pos, "NTH_VALUE's position must be a positive whole number", .{});
+                        call.offset = n;
+                    }
                 },
             }
         },
@@ -331,7 +369,7 @@ pub fn parseBound(self: *Parser) Error!ast.FrameBound {
     }
     if (self.eatKw("preceding")) return .{ .preceding = off };
     if (self.eatKw("following")) return .{ .following = off };
-    return self.fail(self.curPos(), "expected PRECEDING or FOLLOWING after a frame offset", .{});
+    return self.fail(self.curPos(), "expected PRECEDING or FOLLOWING after the frame offset `{s}`, found `{s}` — an offset is plain digits, without an exponent", .{ off.text, self.toks[self.i].text });
 }
 
 /// `WINDOW w AS (...)[, ...]` after HAVING.
@@ -405,6 +443,29 @@ pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, agg
     if (bad) |n| return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{n});
 }
 
+/// `e` with each part that a computed grouping key spells (through the SELECT
+/// list's aliases: `upper(g)` grouped as `G2`) read from that key's column, the only
+/// form of it left past the aggregate.
+pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, map: []const Parser.ExprAlias) Error!*ast.Expr {
+    const Ctx = struct { p: *Parser, group: []const ast.QualName, map: []const Parser.ExprAlias };
+    const S = struct {
+        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+            switch (node.*) {
+                .field, .null_lit, .bool_lit, .int_lit, .float_lit, .str_lit, .lambda_var => return @constCast(node),
+                .call => |c| if (aggregates.lookup(c.name) != null) return @constCast(node),
+                else => {},
+            }
+            var buf = std.array_list.Managed(u8).init(cx.p.arena);
+            try cx.p.exprKey(node, &buf);
+            const name = Parser.resolveExprAlias(cx.map, buf.items);
+            for (cx.group) |k| if (k.parts.len == 1 and std.mem.eql(u8, k.parts[0], name))
+                return cx.p.mk(.{ .field = try cx.p.singleName(k.parts[0]) });
+            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+        }
+    };
+    return S.recur(.{ .p = self, .group = group, .map = map }, e);
+}
+
 /// Whether `e` reads the column `name`.
 pub fn refsName(e: *const ast.Expr, name: []const u8) bool {
     return switch (e.*) {
@@ -435,6 +496,17 @@ pub fn refsName(e: *const ast.Expr, name: []const u8) bool {
 /// Whether `e` reads any call's hidden column.
 pub fn refsWindow(e: *const ast.Expr, calls: []const WinCall) bool {
     for (calls) |c| if (refsName(e, c.hidden)) return true;
+    return false;
+}
+
+/// Whether functions over a window without ORDER BY read the rows' input order: a
+/// value function, or a ROWS frame narrower than the partition.
+fn inputOrdered(funcs: []const ast.WindowFunc) bool {
+    for (funcs) |f| {
+        if (f.func == .win) return true;
+        const fr = f.frame orelse continue;
+        if (fr.unit == .rows and !(fr.start == .unbounded_preceding and fr.end == .unbounded_following)) return true;
+    }
     return false;
 }
 
@@ -482,6 +554,13 @@ pub const Lower = struct {
         return self.p.qualOne(name);
     }
 
+    /// The expression a computed first ORDER BY key was written as, for messages.
+    fn label(self: *const Lower, ord: []const ast.SortKey) ?[]const u8 {
+        if (ord.len == 0) return null;
+        for (self.seen.items) |s| if (std.mem.eql(u8, s[1], ord[0].field.last())) return s[0];
+        return null;
+    }
+
     /// `e`, an item evaluated after the windows, with each column it reads carried
     /// through them; a qualified one (`b.amt`) is computed into a hidden column.
     pub fn carryExpr(self: *Lower, e: *ast.Expr) Error!*ast.Expr {
@@ -506,6 +585,7 @@ pub const Lower = struct {
     pub fn stages(self: *Lower, specs: []const Spec, pos: Pos) Error![]const ast.Stage {
         const Group = struct {
             key: []const u8,
+            label: ?[]const u8,
             part: []const ast.QualName,
             ord: []const ast.SortKey,
             funcs: std.array_list.Managed(ast.WindowFunc),
@@ -527,13 +607,13 @@ pub const Lower = struct {
                 try key.appendSlice(if (k.desc) " desc," else ",");
             }
             const arg: ?ast.QualName = if (c.arg) |a| try self.column(a) else null;
-            const out = c.out orelse c.hidden;
-            if (c.out == null) try self.hidden.append(c.hidden);
+            try self.hidden.append(c.hidden);
             const wf = ast.WindowFunc{
                 .func = c.func,
-                .out = out,
+                .out = c.hidden,
                 .arg = arg,
                 .offset = c.offset,
+                .offset_expr = c.offset_expr,
                 .default = c.default,
                 .distinct = c.distinct,
                 .ignore_nulls = c.ignore_nulls,
@@ -542,14 +622,39 @@ pub const Lower = struct {
             const g = for (groups.items) |*g| {
                 if (std.mem.eql(u8, g.key, key.items)) break g;
             } else blk: {
-                try groups.append(.{ .key = key.items, .part = part, .ord = ord, .funcs = std.array_list.Managed(ast.WindowFunc).init(self.p.arena) });
+                try groups.append(.{ .key = key.items, .label = self.label(ord), .part = part, .ord = ord, .funcs = std.array_list.Managed(ast.WindowFunc).init(self.p.arena) });
                 break :blk &groups.items[groups.items.len - 1];
             };
             try g.funcs.append(wf);
         }
-        const out = try self.p.arena.alloc(ast.Stage, groups.items.len);
-        for (groups.items, out) |*g, *st| st.* = .{
-            .node = .{ .window = .{ .funcs = try g.funcs.toOwnedSlice(), .partition_by = g.part, .order_by = g.ord } },
+        var plan = std.array_list.Managed(Group).init(self.p.arena);
+        for (groups.items) |g| if (g.ord.len == 0) try plan.append(g);
+        for (groups.items) |g| if (g.ord.len > 0) try plan.append(g);
+        var ordinal: ?ast.QualName = null;
+        for (plan.items[@min(1, plan.items.len)..]) |*g| {
+            if (g.ord.len > 0 or !inputOrdered(g.funcs.items)) continue;
+            if (ordinal == null) {
+                self.p.derived_n += 1;
+                const name = try std.fmt.allocPrint(self.p.arena, "__w{d}", .{self.p.derived_n});
+                try self.hidden.append(name);
+                ordinal = try self.p.qualOne(name);
+            }
+            const ord = try self.p.arena.alloc(ast.SortKey, 1);
+            ord[0] = .{ .field = ordinal.?, .desc = false };
+            g.ord = ord;
+            for (g.funcs.items) |*f| {
+                if (f.frame == null or f.frame.?.unit == .range) f.frame = .{ .unit = .rows, .start = .unbounded_preceding, .end = .unbounded_following };
+            }
+        }
+        const lead: usize = if (ordinal != null) 1 else 0;
+        const out = try self.p.arena.alloc(ast.Stage, lead + plan.items.len);
+        if (ordinal) |q| {
+            const f = try self.p.arena.alloc(ast.WindowFunc, 1);
+            f[0] = .{ .func = .{ .win = .row_number }, .out = q.last() };
+            out[0] = .{ .node = .{ .window = .{ .funcs = f } }, .hints = &.{}, .pos = pos };
+        }
+        for (plan.items, out[lead..]) |*g, *st| st.* = .{
+            .node = .{ .window = .{ .funcs = try g.funcs.toOwnedSlice(), .partition_by = g.part, .order_by = g.ord, .key_label = g.label } },
             .hints = &.{},
             .pos = pos,
         };

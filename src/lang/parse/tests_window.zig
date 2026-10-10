@@ -87,6 +87,7 @@ test "window frames: a start after its end, impossible bounds and bad offsets ar
         try expectRefused(a, src, c[1]);
     }
     try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY k, t RANGE 1 PRECEDING) AS s FROM 'in.csv';", "RANGE with an offset needs exactly one ORDER BY key");
+    try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY t ROWS 1e300 PRECEDING) AS s FROM 'in.csv';", "after the frame offset `1`, found `e300`");
     try expectRefused(a, "SELECT SUM(v) OVER (RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS s FROM 'in.csv';", "RANGE with an offset needs exactly one ORDER BY key");
     _ = try parseTest(a, "SELECT SUM(v) OVER (ORDER BY k, t RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM 'in.csv';");
     _ = try parseTest(a, "SELECT SUM(v) OVER (ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM 'in.csv';");
@@ -126,9 +127,30 @@ test "window functions: what each takes, and what a frame, ORDER BY or IGNORE NU
     try expectRefused(a, "SELECT UPPER(v) OVER () AS q FROM 'in.csv';", "`upper` is not a window function");
     try expectRefused(a, "SELECT SUM(LAG(v) OVER (ORDER BY t)) OVER () AS q FROM 'in.csv';", "window functions cannot be nested");
     try expectRefused(a, "SELECT SUM(ROW_NUMBER() OVER (ORDER BY t)) AS q FROM 'in.csv';", "an aggregate cannot take a window function's result");
+    try expectRefused(a, "SELECT LAG(v IGNORE NULLS) IGNORE NULLS OVER (ORDER BY t) AS q FROM 'in.csv';", "given twice");
+    try expectRefused(a, "SELECT LAG(v, 1, v) OVER (ORDER BY t) AS q FROM 'in.csv';", "LAG/LEAD default must be a constant");
+    try expectRefused(a, "SELECT LAG(v, t) OVER (ORDER BY t) AS q FROM 'in.csv';", "LAG/LEAD offset must be a constant integer");
 }
 
-test "window placement: in an expression it is lifted under a hidden name; WHERE, GROUP BY and HAVING refuse it" {
+test "window functions: IGNORE NULLS right after the first argument; constant counts and offsets fold later" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const w = try onlyWindow(a,
+        \\SELECT LEAD(v IGNORE NULLS, 2) OVER (ORDER BY t) AS a, NTH_VALUE(v RESPECT NULLS, 2) OVER (ORDER BY t) AS b,
+        \\       LAG(v IGNORE NULLS, 0, 7) OVER (ORDER BY t) AS c, NTILE(1 + 1) OVER (ORDER BY t) AS d
+        \\FROM 'in.csv';
+    );
+    try testing.expect(w.funcs[0].ignore_nulls);
+    try testing.expectEqual(@as(i64, 2), w.funcs[0].offset);
+    try testing.expect(!w.funcs[1].ignore_nulls);
+    try testing.expect(w.funcs[2].ignore_nulls);
+    try testing.expectEqual(@as(i64, 0), w.funcs[2].offset);
+    try testing.expect(w.funcs[2].default != null);
+    try testing.expect(w.funcs[3].offset_expr != null);
+}
+
+test "window placement: every call is lifted under a hidden name, renamed last; WHERE, GROUP BY and HAVING refuse it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -141,12 +163,13 @@ test "window placement: in an expression it is lifted under a hidden name; WHERE
     try testing.expectEqual(@as(usize, 1), ws.items.len);
     try testing.expectEqual(@as(usize, 2), ws.items[0].funcs.len);
     try testing.expect(std.mem.startsWith(u8, ws.items[0].funcs[0].out, "__w"));
-    try testing.expectEqualStrings("rn", ws.items[0].funcs[1].out);
+    try testing.expect(std.mem.startsWith(u8, ws.items[0].funcs[1].out, "__w"));
     const last = stages[stages.len - 2].node.select;
     try testing.expectEqual(@as(usize, 3), last.len);
     try testing.expectEqualStrings("d", last[1].computed.name);
     try testing.expect(last[1].computed.expr.* == .binary);
-    try testing.expectEqualStrings("rn", last[2].field.last());
+    try testing.expectEqualStrings("rn", last[2].computed.name);
+    try testing.expectEqualStrings(ws.items[0].funcs[1].out, last[2].computed.expr.field.last());
 
     const where = "a window function is only allowed in the SELECT list or ORDER BY";
     try expectRefused(a, "SELECT k FROM 'in.csv' WHERE ROW_NUMBER() OVER (ORDER BY t) = 1;", where);

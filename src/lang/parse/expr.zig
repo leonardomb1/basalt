@@ -409,22 +409,24 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 _ = self.advance();
                 var args = std.array_list.Managed(*ast.Expr).init(self.arena);
                 var call_distinct = false;
+                var nulls: ?bool = null;
                 if (!self.at(.rparen)) {
                     call_distinct = self.eatKw("distinct");
                     if (self.at(.star) and self.peekTag() == .rparen) {
                         _ = self.advance();
                     } else {
                         try args.append(try self.parseCallArg());
+                        nulls = self.parseNullTreatment();
                         while (self.eat(.comma)) try args.append(try self.parseCallArg());
                     }
                 }
-                var nulls = self.parseNullTreatment();
+                try self.moreNullTreatment(&nulls);
                 _ = try self.expect(.rparen);
                 const tpos: Pos = .{ .line = t.line, .col = t.col };
                 var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
                 if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
                     return self.fail(tpos, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
-                if (nulls == null) nulls = self.parseNullTreatment();
+                try self.moreNullTreatment(&nulls);
                 var call_args = try args.toOwnedSlice();
                 if (try self.parseFilterClause()) |c| {
                     const f = try self.applyFilter(lower, call_args, c, tpos);

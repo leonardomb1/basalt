@@ -346,15 +346,17 @@ const Case = struct { q: []const u8, want: []const u8 };
 
 const sales_csv = "id,k,t,v\n1,a,1,10\n2,a,2,\n3,a,2,30\n4,a,5,40\n5,b,1,5\n6,b,3,\n7,b,4,7\n";
 const days_csv = "day,amt\n2024-01-01,1\n2024-01-02,2\n2024-01-02,3\n2024-01-05,4\n2024-01-06,5\n";
+const floats_csv = "id,f\n1,1000000000.5\n2,0.001\n3,0.002\n4,0.003\n";
 
-/// Each case's query over `$B/s.csv` (`sales_csv`) and `$B/d.csv` (`days_csv`),
-/// loaded into a CSV and compared whole.
+/// Each case's query over `$B/s.csv` (`sales_csv`), `$B/d.csv` (`days_csv`) and
+/// `$B/f.csv` (`floats_csv`), loaded into a CSV and compared whole.
 fn expectCases(cases: []const Case) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = sales_csv });
     try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = days_csv });
+    try tmp.dir.writeFile(.{ .sub_path = "f.csv", .data = floats_csv });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     for (cases) |c| {
@@ -405,6 +407,13 @@ test "window functions: value functions, distribution, and every aggregate over 
     });
 }
 
+test "window float aggregates keep no rounding from rows that left; MEDIAN over a shrinking frame" {
+    try expectCases(&.{.{
+        .q = "SELECT id, VAR_POP(f) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS vp, SUM(f) OVER (ORDER BY id ROWS 1 PRECEDING) AS s, VAR_SAMP(f) OVER (ORDER BY id ROWS 1 PRECEDING) AS vs, MEDIAN(f) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS med FROM '$B/f.csv' ORDER BY id",
+        .want = "id,vp,s,vs,med\n1,0,1000000000.5,,0.0025\n2,0,1000000000.501,500000000498999940,0.002\n3,0,0.003,0.0000005,0.0025\n4,0,0.005,0.0000005,0.003\n",
+    }});
+}
+
 test "window IGNORE NULLS: LAG, LEAD, FIRST_VALUE and LAST_VALUE skip nulls, after the call or inside it" {
     try expectCases(&.{.{
         .q = "SELECT id, v, LAG(v) OVER (PARTITION BY k ORDER BY id) AS lag_r, LAG(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id) AS lag_i, LEAD(v IGNORE NULLS) OVER (PARTITION BY k ORDER BY id) AS lead_i, FIRST_VALUE(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id DESC) AS fv_i, LAST_VALUE(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY id) AS carried FROM '$B/s.csv' ORDER BY id",
@@ -450,6 +459,54 @@ test "windows in expressions, ORDER BY, expression keys and arguments, and over 
     });
 }
 
+test "a window aliased to a column a window reads yields the window, not the column" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id) AS v, COUNT(*) OVER (PARTITION BY k) AS k, LAG(t) OVER (ORDER BY id) AS t FROM '$B/s.csv' ORDER BY id",
+            .want = "id,v,k,t\n1,10,4,\n2,10,4,1\n3,40,4,2\n4,80,4,2\n5,85,3,5\n6,85,3,1\n7,92,3,3\n",
+        },
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id) AS k, MAX(v) OVER (PARTITION BY k) AS m FROM '$B/s.csv' ORDER BY id",
+            .want = "id,k,m\n1,10,40\n2,10,40\n3,40,40\n4,80,40\n5,85,7\n6,85,7\n7,92,7\n",
+        },
+        .{ .q = "SELECT *, SUM(v) OVER () AS v FROM '$B/s.csv' WHERE id < 3 ORDER BY id", .want = "id,k,t,v\n1,a,1,10\n2,a,2,10\n" },
+    });
+}
+
+test "a window without ORDER BY counts in input order beside windows that sort" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(
+        alloc,
+        &tmp,
+        "id,k\n1,2\n2,1\n3,2\n4,1\n",
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY k) AS rn, SUM(id) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, FIRST_VALUE(id) OVER (PARTITION BY k) AS f, LAST_VALUE(id) OVER () AS l, SUM(id) OVER (PARTITION BY k ROWS 1 PRECEDING) AS ps FROM '$IN' ORDER BY id",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,rn,s,f,l,ps\n1,3,1,1,4,1\n2,1,3,2,4,2\n3,4,5,1,4,4\n4,2,7,2,4,6\n", out);
+}
+
+test "a window over a computed GROUP BY key reads the key's column" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT upper(k) AS K2, COUNT(*) AS c, SUM(COUNT(*)) OVER (ORDER BY upper(k)) AS r FROM '$B/s.csv' GROUP BY upper(k) ORDER BY K2",
+            .want = "K2,c,r\nA,4,4\nB,3,7\n",
+        },
+        .{
+            .q = "SELECT upper(k) AS K2, SUM(v) AS s, SUM(SUM(v)) OVER (PARTITION BY upper(k)) AS p, LAG(lower(upper(k))) OVER (ORDER BY SUM(v)) AS prev FROM '$B/s.csv' GROUP BY 1 ORDER BY K2",
+            .want = "K2,s,p,prev\nA,80,80,b\nB,12,12,\n",
+        },
+    });
+}
+
+test "IGNORE NULLS inside a call with more arguments; constant NTILE, NTH_VALUE and LAG arguments" {
+    try expectCases(&.{.{
+        .q = "SELECT id, LEAD(v IGNORE NULLS, 1) OVER (PARTITION BY k ORDER BY id) AS ld, LAG(v IGNORE NULLS, 1, 0) OVER (PARTITION BY k ORDER BY id) AS lg, NTILE(1 + 1) OVER (ORDER BY id) AS nt, NTH_VALUE(v IGNORE NULLS, 3 - 1) OVER (PARTITION BY k ORDER BY id) AS nv, LAG(id, 4 / 2) OVER (ORDER BY id) AS l2 FROM '$B/s.csv' ORDER BY id",
+        .want = "id,ld,lg,nt,nv,l2\n1,30,0,1,,\n2,30,10,1,,\n3,40,10,1,30,1\n4,,30,1,30,2\n5,7,0,2,,3\n6,7,5,2,,4\n7,,5,2,7,5\n",
+    }});
+}
+
 test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -460,6 +517,8 @@ test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a w
     try expectRefusedAlike(alloc, &tmp, "SELECT BOOL_AND(v) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "`bool_and` needs a BOOL argument");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(nope * 2) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "unknown field `nope`");
     try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (PARTITION BY nope) AS s FROM '$B/s.csv';", "unknown field `nope`");
+    try expectRefusedAlike(alloc, &tmp, "SELECT SUM(v) OVER (ORDER BY upper(k) RANGE 1 PRECEDING) AS s FROM '$B/s.csv';", "ORDER BY key; `upper(k)` is string");
+    try expectRefusedAlike(alloc, &tmp, "SELECT NTILE(1 - 1) OVER (ORDER BY t) AS s FROM '$B/s.csv';", "NTILE takes a positive whole number of buckets");
 }
 
 /// A CSV large enough to split across lanes: an id, a group, and a value that is

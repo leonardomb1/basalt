@@ -186,7 +186,7 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
         if (ord.len != 1) return fail(diag, "RANGE with an offset needs exactly one ORDER BY key inside OVER (...), a number, date or timestamp", .{});
         const kt = in.fields[ord[0]].ty;
         key_kind = kt.kind;
-        conv = try rangeConv(arena, kt, oqs[0], wd.funcs, diag);
+        conv = try rangeConv(arena, kt, wd.key_label orelse lastPart(oqs[0]), wd.funcs, diag);
         break;
     };
     const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
@@ -223,8 +223,29 @@ pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, 
     const wp = try windowPlan(arena, in, wd, diag);
     for (wd.funcs) |f| {
         if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty, diag);
+        if (f.offset_expr) |e| if (!try exprHasDollar(arena, e)) {
+            _ = try windowOffset(arena, f, e, diag);
+        };
     }
     return wp.schema;
+}
+
+/// A constant NTILE count, NTH_VALUE position or LAG/LEAD offset, folded from `e`
+/// (its parameters already substituted) and checked as the literal would be.
+pub fn windowOffset(arena: std.mem.Allocator, f: ast.WindowFunc, e: *const ast.Expr, diag: *Diag) Error!i64 {
+    const lag = f.func == .win and (f.func.win == .lag or f.func.win == .lead);
+    const v = eval.constEval(arena, e, &.{}, &.{}) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return fail(diag, "{s}: {s}", .{ f.func.name(), @import("../env.zig").errLabel(err) });
+    };
+    const n: ?i64 = if (v == .int) v.int else null;
+    if (lag) {
+        if (n == null or n.? < 0) return fail(diag, "LAG/LEAD offset must be a non-negative integer", .{});
+    } else if (n == null or n.? < 1) {
+        if (f.func.win == .ntile) return fail(diag, "NTILE takes a positive whole number of buckets", .{});
+        return fail(diag, "NTH_VALUE's position must be a positive whole number", .{});
+    }
+    return n.?;
 }
 
 const us_per_day: i128 = 86_400_000_000;
@@ -271,7 +292,7 @@ fn scaledText(text: []const u8, scale: u8) i128 {
 /// float as itself, an int at the scale its offsets need, a decimal at its own or
 /// theirs, a date or timestamp in microseconds. A plain number over a date or
 /// timestamp is days; a TIME takes only an INTERVAL.
-fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: ast.QualName, funcs: []const ast.WindowFunc, diag: *Diag) Error!op.Window.RangeConv {
+fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: []const u8, funcs: []const ast.WindowFunc, diag: *Diag) Error!op.Window.RangeConv {
     var digits: u8 = 0;
     var interval = false;
     var plain = false;
@@ -285,11 +306,11 @@ fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: ast.QualName, funcs:
     if (kt.unknown) return .{};
     switch (kt.kind) {
         .int, .float, .decimal => if (interval)
-            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; `{s}` is {s}", .{ lastPart(key), try kt.name(arena) }),
+            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
         .time => if (plain)
-            return fail(diag, "a RANGE offset over the TIME key `{s}` is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{lastPart(key)}),
+            return fail(diag, "a RANGE offset over the TIME key `{s}` is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{key}),
         .date, .timestamp => {},
-        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `{s}` is {s}", .{ lastPart(key), try kt.name(arena) }),
+        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
     }
     return switch (kt.kind) {
         .float => .{ .float = true },

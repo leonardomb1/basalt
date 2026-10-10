@@ -11,11 +11,14 @@
 //! and a non-null row's offset never reaches it (UNBOUNDED FOLLOWING does).
 //!
 //! An aggregate slides over the frames: rows enter at the end edge and leave at the
-//! start edge, with a monotonic deque for MIN/MAX, Welford's update and its inverse
-//! for the variances, and per-value counts for COUNT(DISTINCT). MEDIAN, BIT_AND and
-//! BIT_OR cannot take a row back: a frame that only grows adds to them, any other is
-//! recomputed. A float sum over a sliding frame can drift by rounding. IGNORE NULLS
-//! reads through the positions of the non-null values and their prefix counts.
+//! start edge. Exact state takes a row back by subtraction (integer and decimal sums,
+//! counts, BIT_XOR, integer moments for the variances); MIN/MAX keep a monotonic
+//! deque; COUNT(DISTINCT) per-value counts. A float sum, the float variances, BIT_AND
+//! and BIT_OR merge partial results in two stacks (`TwoStack`), so a row that left
+//! leaves no rounding behind. MEDIAN keeps the frame's lower half in a max-heap and
+//! its upper half in a min-heap (`Halves`), a row that left dropped when it surfaces
+//! at a top. Every frame thus costs O(1) amortized per row, MEDIAN O(log n). IGNORE
+//! NULLS reads through the positions of the non-null values and their prefix counts.
 //!
 //! The default frame (`Frame{}`) is RANGE from the partition's start to the current
 //! row's peers. A RANGE offset (`Off.int` / `Off.float`) is in the order key's units
@@ -43,7 +46,6 @@ const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
 const materializeAll = @import("../op.zig").materializeAll;
-const selectNth = @import("aggregate.zig").selectNth;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -385,18 +387,171 @@ pub const Window = struct {
         }
     }
 
-    /// Whether the aggregate can take a row back out of its running state.
-    fn invertible(f: ast.AggFunc) bool {
-        return switch (f) {
-            .median, .bit_and, .bit_or => false,
-            else => true,
+    const Distinct = std.HashMap([]const Value, u32, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+
+    /// A sliding aggregate over a monoid by two stacks: values enter at the back and
+    /// leave from the front, whose entries hold suffix totals refilled from the back
+    /// when it runs dry. Nothing is ever subtracted, so a float total never keeps the
+    /// rounding of a row that left, at O(1) amortized per row.
+    fn TwoStack(comptime T: type, comptime identity: T, comptime combine: fn (T, T) T) type {
+        return struct {
+            back: std.ArrayList(T) = .empty,
+            back_agg: T = identity,
+            front: std.ArrayList(T) = .empty,
+
+            const Self = @This();
+
+            fn reset(s: *Self) void {
+                s.back.clearRetainingCapacity();
+                s.front.clearRetainingCapacity();
+                s.back_agg = identity;
+            }
+
+            fn push(s: *Self, a: std.mem.Allocator, x: T) !void {
+                try s.back.append(a, x);
+                s.back_agg = combine(s.back_agg, x);
+            }
+
+            fn pop(s: *Self, a: std.mem.Allocator) !void {
+                if (s.front.items.len == 0) {
+                    var acc = identity;
+                    var i = s.back.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        acc = combine(s.back.items[i], acc);
+                        try s.front.append(a, acc);
+                    }
+                    s.back.clearRetainingCapacity();
+                    s.back_agg = identity;
+                }
+                _ = s.front.pop();
+            }
+
+            fn get(s: *const Self) T {
+                const f = if (s.front.items.len > 0) s.front.items[s.front.items.len - 1] else identity;
+                return combine(f, s.back_agg);
+            }
         };
     }
 
-    const Distinct = std.HashMap([]const Value, u32, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
+    const Moments = struct {
+        n: f64 = 0,
+        mean: f64 = 0,
+        m2: f64 = 0,
+
+        /// Chan's pairwise merge of two groups' count, mean and squared deviations.
+        fn merge(a: Moments, b: Moments) Moments {
+            if (a.n == 0) return b;
+            if (b.n == 0) return a;
+            const n = a.n + b.n;
+            const d = b.mean - a.mean;
+            return .{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * a.n * b.n / n };
+        }
+    };
+
+    fn addF(a: f64, b: f64) f64 {
+        return a + b;
+    }
+
+    fn andI(a: i64, b: i64) i64 {
+        return a & b;
+    }
+
+    fn orI(a: i64, b: i64) i64 {
+        return a | b;
+    }
+
+    const Halves = struct {
+        lo: Heap,
+        hi: Heap,
+        nlo: usize = 0,
+        nhi: usize = 0,
+        gone: usize = 0,
+
+        const Item = struct { x: f64, p: usize };
+        const Heap = std.PriorityQueue(Item, bool, cmp);
+
+        /// Value order with NaN last, ties by position, so every row is distinct.
+        fn lt(a: Item, b: Item) bool {
+            const an = std.math.isNan(a.x);
+            const bn = std.math.isNan(b.x);
+            if (an != bn) return bn;
+            if (!an and a.x != b.x) return a.x < b.x;
+            return a.p < b.p;
+        }
+
+        fn cmp(max: bool, a: Item, b: Item) std.math.Order {
+            if (a.p == b.p) return .eq;
+            return if (if (max) lt(b, a) else lt(a, b)) .lt else .gt;
+        }
+
+        fn init(a: std.mem.Allocator) Halves {
+            return .{ .lo = Heap.init(a, true), .hi = Heap.init(a, false) };
+        }
+
+        fn reset(h: *Halves) void {
+            h.lo.clearRetainingCapacity();
+            h.hi.clearRetainingCapacity();
+            h.nlo = 0;
+            h.nhi = 0;
+            h.gone = 0;
+        }
+
+        fn prune(h: *Halves) void {
+            while (h.lo.peek()) |t| {
+                if (t.p >= h.gone) break;
+                _ = h.lo.remove();
+            }
+            while (h.hi.peek()) |t| {
+                if (t.p >= h.gone) break;
+                _ = h.hi.remove();
+            }
+        }
+
+        fn balance(h: *Halves) !void {
+            h.prune();
+            if (h.nlo > h.nhi + 1) {
+                try h.hi.add(h.lo.remove());
+                h.nlo -= 1;
+                h.nhi += 1;
+            } else if (h.nhi > h.nlo) {
+                try h.lo.add(h.hi.remove());
+                h.nhi -= 1;
+                h.nlo += 1;
+            }
+            h.prune();
+        }
+
+        fn add(h: *Halves, it: Item) !void {
+            const low = if (h.lo.peek()) |t| !lt(t, it) else false;
+            if (low) {
+                try h.lo.add(it);
+                h.nlo += 1;
+            } else {
+                try h.hi.add(it);
+                h.nhi += 1;
+            }
+            try h.balance();
+        }
+
+        /// Takes back the row `it`; rows leave in position order.
+        fn remove(h: *Halves, it: Item) !void {
+            h.gone = it.p + 1;
+            const low = if (h.lo.peek()) |t| !lt(t, it) else false;
+            if (low) h.nlo -= 1 else h.nhi -= 1;
+            try h.balance();
+        }
+
+        fn median(h: *Halves) ?f64 {
+            const l = h.lo.peek() orelse return null;
+            if (h.nlo > h.nhi) return l.x;
+            return (l.x + h.hi.peek().?.x) / 2;
+        }
+    };
 
     const Slide = struct {
         w: *Window,
+        a: std.mem.Allocator,
         f: Func,
         agg: ast.AggFunc,
         vals: []const Value,
@@ -405,10 +560,7 @@ pub const Window = struct {
         n: i64 = 0,
         t: i64 = 0,
         acc_i: i128 = 0,
-        acc_f: f64 = 0,
         seen_float: bool = false,
-        mean: f64 = 0,
-        m2: f64 = 0,
         s1: i128 = 0,
         s2: i128 = 0,
         inexact: i64 = 0,
@@ -416,16 +568,17 @@ pub const Window = struct {
         dq: std.array_list.Managed(usize),
         dq_head: usize = 0,
         seen: Distinct,
-        xs: std.array_list.Managed(f64),
+        fsum: TwoStack(f64, 0, addF) = .{},
+        mom: TwoStack(Moments, .{}, Moments.merge) = .{},
+        band: TwoStack(i64, -1, andI) = .{},
+        bor: TwoStack(i64, 0, orI) = .{},
+        med: Halves,
 
         fn reset(s: *Slide) void {
             s.n = 0;
             s.t = 0;
             s.acc_i = 0;
-            s.acc_f = 0;
             s.seen_float = false;
-            s.mean = 0;
-            s.m2 = 0;
             s.s1 = 0;
             s.s2 = 0;
             s.inexact = 0;
@@ -433,7 +586,11 @@ pub const Window = struct {
             s.dq.clearRetainingCapacity();
             s.dq_head = 0;
             s.seen.clearRetainingCapacity();
-            s.xs.clearRetainingCapacity();
+            s.fsum.reset();
+            s.mom.reset();
+            s.band.reset();
+            s.bor.reset();
+            s.med.reset();
         }
 
         fn add(s: *Slide, p: usize) !void {
@@ -461,11 +618,10 @@ pub const Window = struct {
                     } else switch (v) {
                         .int => |x| {
                             s.acc_i += x;
-                            s.acc_f += @floatFromInt(x);
                             s.n += 1;
                         },
                         else => if (asF64Opt(v)) |x| {
-                            s.acc_f += x;
+                            try s.fsum.push(s.a, x);
                             s.seen_float = true;
                             s.n += 1;
                         },
@@ -485,21 +641,19 @@ pub const Window = struct {
                     if (v.bool) s.t += 1;
                 },
                 .bit_and, .bit_or, .bit_xor => if (v == .int) {
-                    s.acc_i = if (s.n == 0) v.int else switch (s.agg) {
-                        .bit_and => s.acc_i & v.int,
-                        .bit_or => s.acc_i | v.int,
-                        else => s.acc_i ^ v.int,
-                    };
+                    switch (s.agg) {
+                        .bit_and => try s.band.push(s.a, v.int),
+                        .bit_or => try s.bor.push(s.a, v.int),
+                        else => s.acc_i ^= v.int,
+                    }
                     s.n += 1;
                 },
                 .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (asF64Opt(v)) |x| {
                     s.moments(v, false);
+                    try s.mom.push(s.a, .{ .n = 1, .mean = x });
                     s.n += 1;
-                    const delta = x - s.mean;
-                    s.mean += delta / @as(f64, @floatFromInt(s.n));
-                    s.m2 += delta * (x - s.mean);
                 },
-                .median => if (asF64Opt(v)) |x| try s.xs.append(x),
+                .median => if (asF64Opt(v)) |x| try s.med.add(.{ .x = x, .p = p }),
             }
         }
 
@@ -528,11 +682,10 @@ pub const Window = struct {
                     } else switch (v) {
                         .int => |x| {
                             s.acc_i -= x;
-                            s.acc_f -= @floatFromInt(x);
                             s.n -= 1;
                         },
-                        else => if (asF64Opt(v)) |x| {
-                            s.acc_f -= x;
+                        else => if (asF64Opt(v) != null) {
+                            try s.fsum.pop(s.a);
                             s.n -= 1;
                         },
                     }
@@ -544,30 +697,24 @@ pub const Window = struct {
                     s.n -= 1;
                     if (v.bool) s.t -= 1;
                 },
-                .bit_xor => if (v == .int) {
-                    s.acc_i ^= v.int;
-                    s.n -= 1;
-                },
-                .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (asF64Opt(v)) |x| {
-                    s.moments(v, true);
-                    if (s.n <= 1) {
-                        s.n = 0;
-                        s.mean = 0;
-                        s.m2 = 0;
-                        return;
+                .bit_and, .bit_or, .bit_xor => if (v == .int) {
+                    switch (s.agg) {
+                        .bit_and => try s.band.pop(s.a),
+                        .bit_or => try s.bor.pop(s.a),
+                        else => s.acc_i ^= v.int,
                     }
-                    const nf: f64 = @floatFromInt(s.n);
-                    const mean2 = (nf * s.mean - x) / (nf - 1);
-                    s.m2 -= (x - s.mean) * (x - mean2);
-                    if (s.m2 < 0) s.m2 = 0;
-                    s.mean = mean2;
                     s.n -= 1;
                 },
-                .bit_and, .bit_or, .median => unreachable,
+                .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (asF64Opt(v) != null) {
+                    s.moments(v, true);
+                    try s.mom.pop(s.a);
+                    s.n -= 1;
+                },
+                .median => if (asF64Opt(v)) |x| try s.med.remove(.{ .x = x, .p = p }),
             }
         }
 
-        /// Integer sums of x and x² beside Welford's state: over ints the variance is
+        /// Integer sums of x and x² beside the float moments: over ints the variance is
         /// then exact, so a frame of equal values reads 0 however many rows passed.
         fn moments(s: *Slide, v: Value, sub: bool) void {
             if (v != .int) {
@@ -598,31 +745,28 @@ pub const Window = struct {
                     return @as(f64, @floatFromInt(a - b)) / @as(f64, @floatFromInt(n));
                 } else |_| {} else |_| {}
             }
-            return s.m2;
+            return @max(0, s.mom.get().m2);
+        }
+
+        fn total(s: *const Slide) f64 {
+            return s.fsum.get() + @as(f64, @floatFromInt(s.acc_i));
         }
 
         fn result(s: *Slide) !Value {
             return switch (s.agg) {
                 .count => if (s.f.distinct) .{ .int = @intCast(s.seen.count()) } else .{ .int = s.n },
                 .count_if => .{ .int = s.n },
-                .sum => if (s.n == 0) .null else if (s.dec) |sc| (if (fitsPrecision(s.acc_i, 38)) .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else return decimalOverflow()) else if (s.seen_float or !s.out_int) .{ .float = s.acc_f } else try s.w.intSum(s.acc_i),
-                .avg => if (s.n == 0) .null else .{ .float = (if (s.seen_float) s.acc_f else @as(f64, @floatFromInt(s.acc_i))) / @as(f64, @floatFromInt(s.n)) },
+                .sum => if (s.n == 0) .null else if (s.dec) |sc| (if (fitsPrecision(s.acc_i, 38)) .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else return decimalOverflow()) else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
+                .avg => if (s.n == 0) .null else .{ .float = s.total() / @as(f64, @floatFromInt(s.n)) },
                 .min, .max => if (s.dq_head < s.dq.items.len) s.vals[s.dq.items[s.dq_head]] else .null,
                 .bool_and => if (s.n == 0) .null else .{ .bool = s.t == s.n },
                 .bool_or => if (s.n == 0) .null else .{ .bool = s.t > 0 },
-                .bit_and, .bit_or, .bit_xor => if (s.n == 0) .null else .{ .int = @intCast(s.acc_i) },
+                .bit_and => if (s.n == 0) .null else .{ .int = s.band.get() },
+                .bit_or => if (s.n == 0) .null else .{ .int = s.bor.get() },
+                .bit_xor => if (s.n == 0) .null else .{ .int = @intCast(s.acc_i) },
                 .var_samp, .stddev_samp => if (s.n < 2) .null else spread(s.agg, s.sqDev() / @as(f64, @floatFromInt(s.n - 1))),
                 .var_pop, .stddev_pop => if (s.n < 1) .null else spread(s.agg, s.sqDev() / @as(f64, @floatFromInt(s.n))),
-                .median => blk: {
-                    const xs = s.xs.items;
-                    if (xs.len == 0) break :blk .null;
-                    const mid = xs.len / 2;
-                    const hi = selectNth(xs, mid);
-                    if (xs.len % 2 == 1) break :blk .{ .float = hi };
-                    var lo = xs[0];
-                    for (xs[1..mid]) |x| lo = @max(lo, x);
-                    break :blk .{ .float = (lo + hi) / 2 };
-                },
+                .median => if (s.med.median()) |m| .{ .float = m } else .null,
             };
         }
     };
@@ -638,6 +782,7 @@ pub const Window = struct {
     fn aggregateOver(self: *Window, arena: std.mem.Allocator, f: Func, agg: ast.AggFunc, vals: []const Value, fs: []const usize, fe: []const usize, l: Layout, out_ty: types.Type, out: []Value) !void {
         var s = Slide{
             .w = self,
+            .a = arena,
             .f = f,
             .agg = agg,
             .vals = vals,
@@ -645,9 +790,8 @@ pub const Window = struct {
             .out_int = out_ty.kind == .int,
             .dq = std.array_list.Managed(usize).init(arena),
             .seen = Distinct.init(arena),
-            .xs = std.array_list.Managed(f64).init(arena),
+            .med = Halves.init(arena),
         };
-        const inv = invertible(agg);
         var k: usize = 0;
         const n = fs.len;
         while (k < n) {
@@ -656,22 +800,11 @@ pub const Window = struct {
             var lo = k;
             var hi = k;
             while (k < pe) : (k += 1) {
-                const st = fs[k];
-                const en = fe[k];
-                if (inv) {
-                    while (hi < en) : (hi += 1) try s.add(hi);
-                    while (lo < st) : (lo += 1) {
-                        if (lo < hi) try s.remove(lo);
-                    }
-                    if (hi < lo) hi = lo;
-                } else if (st == lo and en >= hi) {
-                    while (hi < en) : (hi += 1) try s.add(hi);
-                } else {
-                    s.reset();
-                    lo = st;
-                    hi = st;
-                    while (hi < en) : (hi += 1) try s.add(hi);
+                while (hi < fe[k]) : (hi += 1) try s.add(hi);
+                while (lo < fs[k]) : (lo += 1) {
+                    if (lo < hi) try s.remove(lo);
                 }
+                if (hi < lo) hi = lo;
                 out[k] = try s.result();
             }
         }

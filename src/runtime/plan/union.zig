@@ -228,18 +228,22 @@ pub fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: [
     if (bstages[wi].node != .window) return null;
     const wd = bstages[wi].node.window;
     if (wd.funcs.len != 1 or wd.funcs[0].func != .win or wd.funcs[0].func.win != .row_number) return null;
-    const rn = wd.funcs[0].out;
+    var rn = wd.funcs[0].out;
     for (bstages[wi + 1 ..]) |st| {
         if (st.node != .select) return null;
-        var kept = false;
+        var kept: ?[]const u8 = null;
         for (st.node.select) |it| switch (it) {
-            .star => kept = true,
+            .star => kept = rn,
             .field => |q| {
-                if (std.mem.eql(u8, q.last(), rn)) kept = true;
+                if (std.mem.eql(u8, q.last(), rn)) kept = rn;
+            },
+            .computed => |c| {
+                const e = c.expr;
+                if (e.* == .field and !e.field.dollar and e.field.parts.len == 1 and std.mem.eql(u8, e.field.parts[0], rn)) kept = c.name;
             },
             else => {},
         };
-        if (!kept) return null;
+        rn = kept orelse return null;
     }
     const k = rankBound(after[0].node.filter, rn) orelse return null;
     const out = try arena.dupe(ast.Stage, bstages);

@@ -33,8 +33,9 @@ FROM 'movimentos.csv';
   `ORDER BY` inside `OVER (...)` — it is what they number by — and take no frame;
   writing one is an error rather than being ignored.
 - `NTILE`'s bucket count and `NTH_VALUE`'s position are positive whole numbers;
-  `LAG`/`LEAD`'s offset a non-negative one. Their `default` is a constant — a
-  literal, a `$param` or an expression over them — cast to the column's type
+  `LAG`/`LEAD`'s offset a non-negative one — each a constant: a literal, a
+  `$param` or an expression over them (`NTILE($buckets)`, `LAG(amount, 2 * 7)`).
+  `LAG`/`LEAD`'s `default` is a constant too, cast to the column's type
   (`LAG(amount, 1, 0)`).
 - `DISTINCT` is accepted inside `COUNT` only.
 - The names are not reserved: a column called `rank` still reads as a column.
@@ -120,12 +121,15 @@ The frame is the slice of the partition an aggregate or a value function reads:
   FROM 'movimentos.csv';
   ```
 
-- Without `ORDER BY` a `ROWS` frame counts in input order, as the rows arrive.
+- Without `ORDER BY` a `ROWS` frame — and `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` —
+  counts in input order, as the rows arrive, whatever other windows of the query
+  sort by.
 
 ## IGNORE NULLS
 
 `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` and `NTH_VALUE` take `IGNORE NULLS` —
-after the call, as in the standard, or inside it — to look through null values.
+after the call, as in the standard, or inside it right after the first argument
+(`LEAD(x IGNORE NULLS, 2)`) — to look through null values; one of them, once.
 `RESPECT NULLS`, the default, is accepted too. Carrying the last known value
 forward:
 
@@ -202,7 +206,10 @@ FROM 'movimentos.csv'
 GROUP BY conta;
 ```
 
-A column a window reads there must be a grouping key or inside an aggregate.
+A column a window reads there must be a grouping key or inside an aggregate; a
+computed key is read as `GROUP BY` writes it (`OVER (ORDER BY upper(conta))` under
+`GROUP BY upper(conta)`, or under `GROUP BY 1` when the first item is that
+expression).
 
 ## Types
 
@@ -225,12 +232,13 @@ A window is a **breaker**: a row's value is not known until its whole partition 
 arrived, so memory is bounded by the input, as for `ORDER BY`, `DISTINCT` and
 `GROUP BY` (a window does not spill). Each stage sorts once, then resolves every
 row's frame by two forward-moving edges, so a frame of any size costs the same:
-an aggregate adds the rows entering and takes back the rows leaving — `MIN`/`MAX`
-through a monotonic queue, the variances by Welford's update and its inverse (exact
-over integers), `COUNT(DISTINCT)` by per-value counts. `MEDIAN`, `bit_and` and
-`bit_or` cannot take a row back: a frame that only grows adds to them, any other is
-recomputed. A float `SUM` or `AVG` over a sliding frame can differ from a fresh
-total in the last bits.
+an aggregate adds the rows entering and takes back the rows leaving — exactly for
+integer and decimal sums, counts and the variances over integers, `MIN`/`MAX`
+through a monotonic queue, `COUNT(DISTINCT)` by per-value counts. A float `SUM`,
+`AVG` or variance, `bit_and` and `bit_or` combine partial results kept in two
+stacks, never subtracting a row that left, so a sliding float total is as accurate
+as a fresh one. `MEDIAN` keeps the frame's two halves in two heaps, a logarithmic
+cost per row.
 
 `DISTINCT ON (...)` remains the cheaper way to keep one row per key — without an
 `ORDER BY` it streams, where `ROW_NUMBER() ... = 1` would not.
