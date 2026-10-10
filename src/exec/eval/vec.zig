@@ -10,6 +10,8 @@ const Value = @import("../value.zig").Value;
 const asDecimal = @import("row.zig").asDecimal;
 const ast = @import("../../lang/ast.zig");
 const castValue = @import("cast.zig").castValue;
+const parseFloatStrict = @import("cast.zig").parseFloatStrict;
+const parseIntStrict = @import("cast.zig").parseIntStrict;
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const decimalArithType = @import("row.zig").decimalArithType;
@@ -495,11 +497,13 @@ fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Ve
     }
 }
 
-/// Float to int guarding the i64 range and NaN/inf, which `@intFromFloat` treats
-/// as illegal behavior; out of range is CastFailed, as for a string.
+/// Float to int rounding half away from zero, as a decimal casts, guarding the
+/// i64 range and NaN/inf, which `@intFromFloat` treats as illegal behavior; out
+/// of range is CastFailed, as for a string.
 pub fn floatToInt(x: f64) error{CastFailed}!i64 {
-    if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
-    return @intFromFloat(x);
+    const r = @round(x);
+    if (!(r >= -9223372036854775808.0 and r < 9223372036854775808.0)) return error.CastFailed;
+    return @intFromFloat(r);
 }
 
 fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: usize) VecError!Vec {
@@ -525,7 +529,7 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
                         out[i] = 0;
                         continue;
                     }
-                    out[i] = std.fmt.parseInt(i64, trim(col.data.bytes.at(i)), 10) catch return error.CastFailed;
+                    out[i] = parseIntStrict(trim(col.data.bytes.at(i))) orelse return error.CastFailed;
                 },
                 else => return error.Unsupported,
             }
@@ -542,7 +546,7 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
                         out[i] = 0;
                         continue;
                     }
-                    out[i] = std.fmt.parseFloat(f64, trim(col.data.bytes.at(i))) catch return error.CastFailed;
+                    out[i] = parseFloatStrict(trim(col.data.bytes.at(i))) orelse return error.CastFailed;
                 },
                 else => return error.Unsupported,
             }

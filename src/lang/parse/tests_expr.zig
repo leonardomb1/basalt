@@ -231,6 +231,11 @@ test "parseTypeStr: params, aliases, junk" {
     defer arena.deinit();
     const a = arena.allocator();
     try testing.expect(parseTypeStr(a, "decimal(10,2)").?.scale == 2);
+    try testing.expect(parseTypeStr(a, "decimal(12)").?.precision == 12);
+    try testing.expect(parseTypeStr(a, "decimal(38,38)") != null);
+    try testing.expect(parseTypeStr(a, "decimal(39,0)") == null);
+    try testing.expect(parseTypeStr(a, "decimal(5,6)") == null);
+    try testing.expect(parseTypeStr(a, "decimal(0,0)") == null);
     try testing.expect(parseTypeStr(a, "varchar(20)").?.kind == .string);
     try testing.expect(parseTypeStr(a, "timestamp").?.kind == .timestamp);
     try testing.expect(parseTypeStr(a, "nope") == null);

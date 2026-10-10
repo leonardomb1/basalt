@@ -31,9 +31,14 @@ columns it has not seen.
 - `a ?? b` — null-coalesce (sugar for `COALESCE`).
 - `CAST(x AS INT)` / `CAST(x AS DECIMAL(18,2))` / `CAST(x AS DATE)` /
   `CAST(x AS TIMESTAMP)` — implicit widening is int→float/decimal only. Text
-  parses as `YYYY-MM-DD[ HH:MM:SS]`. Text to a number is **strict**: an optional
-  sign, digits and at most one `.`, and anything else fails rather than being
-  guessed at. That matters wherever money is written the Brazilian or European way
+  parses as `YYYY-MM-DD[ HH:MM:SS]`, and a day the month does not have
+  (`'2023-02-29'`, `'2024-04-31'`) fails rather than rolling into the next month.
+  Text to a number is **strict**: surrounding spaces aside, an optional sign,
+  digits and at most one `.` (an `INT` takes no `.`), and anything else — `1_000`,
+  `0x10`, `1 000` — fails rather than being guessed at. A `FLOAT` also reads an
+  exponent (`1.5e-05`, as spreadsheets write small numbers) and the words `nan`,
+  `inf` and `infinity`; the same rules decide whether a CSV column is sniffed as a
+  number. That matters wherever money is written the Brazilian or European way
   — `'1000,00'` is not a number basalt will read, rather than a guess that might
   be 100000.00. Strip the separator first: `CAST(replace(v, ',', '.') AS
   DECIMAL(18,2))`, or reach for `TRY_CAST` to turn unreadable values into nulls.
@@ -46,11 +51,23 @@ columns it has not seen.
   15 significant digits, as PostgreSQL converts `float8` to `numeric`: the
   double nearest `2.675` is `2.67499…`, and it still becomes `2.68`. A float too
   large for 38 digits fails the cast.
+- **`DECIMAL(p, s)` holds at most 38 digits**: `p` is 1 to 38, `s` at most `p`,
+  and `DECIMAL(p)` is `DECIMAL(p, 0)`. A cast whose value (after rounding to `s`)
+  has more than `p` digits fails — `CAST('1234.5' AS DECIMAL(4,1))` is an error,
+  and `TRY_CAST` gives null. `CAST(x AS INT)` of a float rounds half away from
+  zero, as of a decimal (`2.5` is `3`, `-2.7` is `-3`), and a value past the INT
+  range fails. Decimals compare exactly — `=`, `<`, `GROUP BY`, `DISTINCT`,
+  joins, `MIN`/`MAX` and sorting tell `1234567890.12345678` from
+  `1234567890.12345679` — and against an int exactly too; against a float
+  they compare as floats.
 - **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
   decimal and an int) answer a decimal at the wider operand's scale, `*` one at
   the summed scale — `CAST(1.1 AS DECIMAL(18,2)) + CAST(0.3 AS DECIMAL(18,2))` is
   `1.40`, not `1.4000000000000001`, so a `SUM` cast to `DECIMAL` stays exact
-  when this month's total is subtracted from last month's. `/` has no finite
+  when this month's total is subtracted from last month's. A product's scale
+  stops at 38, rounding half away from zero past it. A result (or a `SUM`) of
+  more than 38 digits fails with `decimal overflow: more than 38 digits` — cast
+  an operand to a smaller scale first. `/` has no finite
   scale and stays float, as does anything with a float operand (a literal like
   `0.3` is a float). `round(x, n)` on a decimal is exact too, and with a literal
   `n` answers `DECIMAL(p, n)`; `-x` stays a decimal, and `CAST(x AS INT)` rounds

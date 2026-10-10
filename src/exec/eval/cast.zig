@@ -18,19 +18,74 @@ const valueToString = @import("format.zig").valueToString;
 /// for `DECIMAL(p, s)` left the conversion undefined.
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
-    const d: Decimal = switch (v) {
+    const r = rescaleTo(asDecimalValue(v) orelse return error.CastFailed, ty.scale) orelse return error.CastFailed;
+    if (!fitsPrecision(r.unscaled, ty.precision)) return error.CastFailed;
+    return .{ .decimal = r };
+}
+
+/// The decimal a value reads as before it meets a target's scale and precision.
+pub fn asDecimalValue(v: Value) ?Decimal {
+    return switch (v) {
         .decimal => |x| x,
         .int => |x| .{ .unscaled = x, .scale = 0 },
         .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
-        .float => |x| floatToDecimal(x) orelse return error.CastFailed,
-        .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return error.CastFailed) {
+        .float => |x| floatToDecimal(x),
+        .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return null) {
             .decimal => |x| x,
             .int => |x| Decimal{ .unscaled = x, .scale = 0 },
-            else => return error.CastFailed,
+            else => null,
         },
-        else => return error.CastFailed,
+        else => null,
     };
-    return .{ .decimal = rescaleTo(d, ty.scale) orelse return error.CastFailed };
+}
+
+/// Whether `u` has at most `p` digits; precision 0, a driver's "unknown", is 38.
+pub fn fitsPrecision(u: i128, p: u8) bool {
+    const digits: u8 = if (p == 0 or p > max_digits) max_digits else p;
+    return @abs(u) < @as(u128, @intCast(powTen(digits)));
+}
+
+pub const max_digits = 38;
+
+/// Text as an INT: an optional sign and digits, nothing else (callers trim).
+/// `std.fmt.parseInt` alone also takes `_` separators, so `'1_000'` read as 1000.
+pub fn parseIntStrict(s: []const u8) ?i64 {
+    const body = if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s[1..] else s;
+    if (body.len == 0) return null;
+    for (body) |c| if (c < '0' or c > '9') return null;
+    return std.fmt.parseInt(i64, s, 10) catch null;
+}
+
+/// Text as a FLOAT: an optional sign, digits with at most one `.`, and an optional
+/// exponent (`1.5e-05`, as spreadsheets and pandas write small values), or the
+/// words `nan`, `inf` and `infinity`. No `_` or hex, which `std.fmt.parseFloat`
+/// alone accepts; callers trim.
+pub fn parseFloatStrict(s: []const u8) ?f64 {
+    var i: usize = 0;
+    if (i < s.len and (s[i] == '-' or s[i] == '+')) i += 1;
+    for ([_][]const u8{ "nan", "inf", "infinity" }) |word| {
+        if (std.ascii.eqlIgnoreCase(s[i..], word)) return std.fmt.parseFloat(f64, s) catch null;
+    }
+    var digits: usize = 0;
+    var dot = false;
+    while (i < s.len) : (i += 1) {
+        if (s[i] >= '0' and s[i] <= '9') {
+            digits += 1;
+        } else if (s[i] == '.' and !dot) {
+            dot = true;
+        } else break;
+    }
+    if (digits == 0) return null;
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '-' or s[i] == '+')) i += 1;
+        const start = i;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+        if (i == start) return null;
+    }
+    if (i != s.len) return null;
+    const x = std.fmt.parseFloat(f64, s) catch return null;
+    return if (std.math.isFinite(x)) x else null;
 }
 
 fn powTen(n: u8) i128 {
@@ -119,14 +174,14 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
             .float => |x| .{ .int = try floatToInt(x) },
             .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
             .bool => |x| .{ .int = if (x) 1 else 0 },
-            .string => |s| .{ .int = std.fmt.parseInt(i64, trim(s), 10) catch return error.CastFailed },
+            .string => |s| .{ .int = parseIntStrict(trim(s)) orelse return error.CastFailed },
             else => error.CastFailed,
         },
         .float => switch (v) {
             .float => v,
             .int => |x| .{ .float = @floatFromInt(x) },
             .decimal => |d| .{ .float = d.toF64() },
-            .string => |s| .{ .float = std.fmt.parseFloat(f64, trim(s)) catch return error.CastFailed },
+            .string => |s| .{ .float = parseFloatStrict(trim(s)) orelse return error.CastFailed },
             else => error.CastFailed,
         },
         .date => switch (v) {
@@ -202,7 +257,11 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
 
     try std.testing.expectEqual(@as(i64, 42), (try castValue(a, .{ .string = " 42 " }, .int)).int);
     try std.testing.expectEqual(@as(i64, 1), (try castValue(a, .{ .bool = true }, .int)).int);
-    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -3.9 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -4), (try castValue(a, .{ .float = -3.9 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 3), (try castValue(a, .{ .float = 2.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, -3), (try castValue(a, .{ .float = -2.5 }, .int)).int);
+    try std.testing.expectEqual(@as(i64, 2), (try castValue(a, .{ .float = 2.4 }, .int)).int);
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 9223372036854775807.0 }, .int));
     try std.testing.expectEqual(@as(f64, 2.5), (try castValue(a, .{ .string = "2.5" }, .float)).float);
     try std.testing.expect((try castValue(a, .{ .string = " TRUE " }, .bool)).bool);
     try std.testing.expect(!(try castValue(a, .{ .int = 0 }, .bool)).bool);
@@ -213,4 +272,33 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
+}
+
+test "text to a number is strict: sign, digits, one dot; a FLOAT also takes an exponent" {
+    for ([_][]const u8{ "1_000", "0x10", "1 000", "", "-", "1.5", "1e3", "inf", " 5" }) |s|
+        try std.testing.expect(parseIntStrict(s) == null);
+    try std.testing.expectEqual(@as(?i64, -42), parseIntStrict("-42"));
+    try std.testing.expectEqual(@as(?i64, 7), parseIntStrict("+7"));
+    for ([_][]const u8{ "1_000", "0x10", "0x1p3", "1 000", "", ".", "-", "1e", "1e+", "1.2.3", "1e3.5", "1e400", "nana" }) |s|
+        try std.testing.expect(parseFloatStrict(s) == null);
+    try std.testing.expectEqual(@as(?f64, 1000), parseFloatStrict("1e3"));
+    try std.testing.expectEqual(@as(?f64, 0.000015), parseFloatStrict("1.5e-05"));
+    try std.testing.expectEqual(@as(?f64, -0.5), parseFloatStrict("-.5"));
+    try std.testing.expectEqual(@as(?f64, 2), parseFloatStrict("2."));
+    try std.testing.expect(std.math.isNan(parseFloatStrict("NaN").?));
+    try std.testing.expect(std.math.isNegativeInf(parseFloatStrict("-Infinity").?));
+    try std.testing.expect(std.math.isPositiveInf(parseFloatStrict("inf").?));
+}
+
+test "a DECIMAL cast fails when the value does not fit its precision" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectError(error.CastFailed, castValueTyped(a, .{ .string = "1234.5" }, types.Type.decimal(4, 1)));
+    try std.testing.expectError(error.CastFailed, castValueTyped(a, .{ .int = 10 }, types.Type.decimal(38, 37)));
+    try std.testing.expectError(error.CastFailed, castValueTyped(a, .{ .string = "9.999" }, types.Type.decimal(3, 2)));
+    try std.testing.expectEqual(@as(i128, 999), (try castValueTyped(a, .{ .string = "9.99" }, types.Type.decimal(3, 2))).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 12345), (try castValueTyped(a, .{ .string = "123.45" }, types.Type.decimal(0, 2))).decimal.unscaled);
+    try std.testing.expect(fitsPrecision(std.math.pow(i128, 10, 38) - 1, 38));
+    try std.testing.expect(!fitsPrecision(std.math.pow(i128, 10, 38), 0));
 }

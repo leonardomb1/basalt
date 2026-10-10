@@ -1,6 +1,8 @@
 //! UTF-8 string helpers: character counts and offsets, substr, padding, reversal,
 //! case mapping, accent stripping and LIKE matching.
 
+const EvalError = @import("../eval.zig").EvalError;
+const failWith = @import("support.zig").failWith;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const pow10f = @import("../value.zig").pow10f;
 const std = @import("std");
@@ -64,7 +66,7 @@ pub fn roundHalfAway(x: f64, digits: i64) f64 {
 pub fn padChars(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u8, left: bool) ![]const u8 {
     if (n <= 0) return "";
     const want: usize = @intCast(n);
-    if (want > max_str_bytes) return error.CastFailed;
+    if (want > max_str_bytes) return padTooLarge(left);
     const have = charCount(s);
     if (have >= want) return arena.dupe(u8, s[0..charOffset(s, want)]);
     if (fill.len == 0) return arena.dupe(u8, s);
@@ -77,8 +79,12 @@ pub fn padChars(arena: std.mem.Allocator, s: []const u8, n: i64, fill: []const u
         try pad.appendSlice(fill[fi..][0..w]);
         fi += w;
     }
-    if (pad.items.len + s.len > max_str_bytes) return error.CastFailed;
+    if (pad.items.len + s.len > max_str_bytes) return padTooLarge(left);
     return std.mem.concat(arena, u8, if (left) &.{ pad.items, s } else &.{ s, pad.items });
+}
+
+fn padTooLarge(left: bool) EvalError {
+    return failWith(error.CastFailed, "{s}: the result would pass the {d}-byte string limit", .{ if (left) "lpad" else "rpad", max_str_bytes });
 }
 
 /// Postgres `left`/`right`: a negative `n` means all but the last/first |n|

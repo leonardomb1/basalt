@@ -57,7 +57,7 @@ pub const Decimal = struct {
     }
 };
 
-const pow10_i256 = blk: {
+pub const pow10_i256 = blk: {
     var t: [76]i256 = undefined;
     var r: i256 = 1;
     for (&t) |*e| {

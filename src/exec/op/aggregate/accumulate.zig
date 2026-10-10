@@ -41,7 +41,7 @@ pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !vo
             if (agg.ty.kind == .float)
                 dst.sum_f += src.sum_f
             else
-                dst.sum_i = std.math.add(i128, dst.sum_i, src.sum_i) catch return error.IntOverflow;
+                dst.sum_i = std.math.add(i128, dst.sum_i, src.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
             dst.n += src.n;
         },
         .avg => {
@@ -142,8 +142,9 @@ pub fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, 
 pub fn castArg(self: *Aggregate, arena: std.mem.Allocator, to: types.Type, v: Value) anyerror!Value {
     if (v.isNull()) return v;
     return eval.castValueTyped(arena, v, to) catch |err| {
-        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-        return err;
+        const e = if (err == error.CastFailed) eval.castFailure(arena, v, to) else err;
+        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(e)});
+        return e;
     };
 }
 
@@ -304,8 +305,8 @@ pub fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_ar
 pub fn addExact(sum: *align(8) i128, agg: Agg, v: Value) !void {
     if (agg.ty.kind == .decimal) {
         const d: Decimal = if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
-        const r = eval.rescaleTo(d, agg.ty.scale) orelse return error.CastFailed;
-        sum.* = std.math.add(i128, sum.*, r.unscaled) catch return error.CastFailed;
+        const r = eval.rescaleTo(d, agg.ty.scale) orelse return eval.decimalOverflow();
+        sum.* = std.math.add(i128, sum.*, r.unscaled) catch return eval.decimalOverflow();
     } else sum.* = std.math.add(i128, sum.*, v.int) catch return error.IntOverflow;
 }
 
@@ -433,7 +434,7 @@ pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
         .count => .{ .int = acc.n },
         .sum => if (acc.n == 0) .null else switch (agg.ty.kind) {
             .float => Value{ .float = acc.sum_f },
-            .decimal => Value{ .decimal = .{ .unscaled = acc.sum_i, .scale = agg.ty.scale } },
+            .decimal => if (eval.fitsPrecision(acc.sum_i, 38)) Value{ .decimal = .{ .unscaled = acc.sum_i, .scale = agg.ty.scale } } else return eval.decimalOverflow(),
             else => Value{ .int = std.math.cast(i64, acc.sum_i) orelse return error.IntOverflow },
         },
         .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },

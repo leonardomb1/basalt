@@ -5,6 +5,8 @@ const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Decimal = @import("../value.zig").Decimal;
+const asDecimalValue = @import("cast.zig").asDecimalValue;
+const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const evalRow = @import("row.zig").evalRow;
@@ -100,6 +102,10 @@ pub fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError
     return e;
 }
 
+pub fn decimalOverflow() error{IntOverflow} {
+    return @errorCast(failWith(error.IntOverflow, "decimal overflow: more than 38 digits", .{}));
+}
+
 /// A CAST failure naming the value and target, with the format a date or time is
 /// read in, since that is what a file in another convention trips over.
 pub fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
@@ -114,8 +120,11 @@ pub fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
         .time => "a TIME (HH:MM[:SS])",
         else => @tagName(ty.kind),
     };
-    if (ty.kind == .decimal)
+    if (ty.kind == .decimal) {
+        if (isNum(v) or asDecimalValue(v) != null)
+            return failWith(error.CastFailed, "CAST: '{s}' does not fit DECIMAL({d},{d})", .{ text, ty.precision, ty.scale });
         return failWith(error.CastFailed, "CAST: '{s}' is not a DECIMAL({d},{d})", .{ text, ty.precision, ty.scale });
+    }
     return failWith(error.CastFailed, "CAST: '{s}' is not {s}", .{ text, want });
 }
 
@@ -219,17 +228,18 @@ pub fn trim(s: []const u8) []const u8 {
 pub fn parseHexI64(s: []const u8) EvalError!i64 {
     var t = trim(s);
     if (t.len >= 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) t = t[2..];
-    if (t.len == 0) return error.CastFailed;
-    for (t) |ch| if (!std.ascii.isHex(ch)) return error.CastFailed;
-    const u = std.fmt.parseUnsigned(u64, t, 16) catch return error.CastFailed;
+    const bad = "from_hex: '{s}' is not up to 16 hex digits";
+    if (t.len == 0) return failWith(error.CastFailed, bad, .{clip(s)});
+    for (t) |ch| if (!std.ascii.isHex(ch)) return failWith(error.CastFailed, bad, .{clip(s)});
+    const u = std.fmt.parseUnsigned(u64, t, 16) catch return failWith(error.CastFailed, bad, .{clip(s)});
     return @bitCast(u);
 }
 
 pub fn toI64(v: Value) i64 {
     return switch (v) {
         .int => |x| x,
-        .float => |x| @intFromFloat(x),
-        .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " "), 10) catch 0,
+        .float => |x| std.math.lossyCast(i64, x),
+        .string => |s| parseIntStrict(std.mem.trim(u8, s, " ")) orelse 0,
         else => 0,
     };
 }
@@ -294,6 +304,33 @@ test "a failed CAST names its value and type, and TRY_CAST leaves no note" {
     try std.testing.expectEqualStrings("CAST: '1,5' is not a DECIMAL(10,2)", takeFailure(error.CastFailed).?);
     try std.testing.expect((try evalLit(a, "TRY_CAST('x' AS INT)")) == .null);
     try std.testing.expect(takeFailure(error.CastFailed) == null);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('1234.5' AS DECIMAL(4,1))"));
+    try std.testing.expectEqualStrings("CAST: '1234.5' does not fit DECIMAL(4,1)", takeFailure(error.CastFailed).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(2023, 2, 29)"));
+    try std.testing.expectEqualStrings("make_date: year 2023, month 2, day 29 is not a date", takeFailure(error.CastFailed).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "from_hex('')"));
+    try std.testing.expectEqualStrings("from_hex: '' is not up to 16 hex digits", takeFailure(error.CastFailed).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "repeat('ab', 1000000)"));
+    try std.testing.expectEqualStrings("repeat: the result would be 2000000 bytes, past the 1048576-byte string limit", takeFailure(error.CastFailed).?);
+    try std.testing.expectError(error.CastFailed, evalLit(a, "rpad('ab', 2000000, 'x')"));
+    try std.testing.expectEqualStrings("rpad: the result would pass the 1048576-byte string limit", takeFailure(error.CastFailed).?);
+}
+
+test "DECIMAL arithmetic past 38 digits is a decimal overflow; a product's scale stops at 38" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nines = "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0))";
+    try std.testing.expectError(error.IntOverflow, evalLit(a, nines ++ " + CAST(1 AS DECIMAL(38,0))"));
+    try std.testing.expectEqualStrings("decimal overflow: more than 38 digits", takeFailure(error.IntOverflow).?);
+    try std.testing.expectError(error.IntOverflow, evalLit(a, nines ++ " * 10"));
+    try std.testing.expectEqualStrings("decimal overflow: more than 38 digits", takeFailure(error.IntOverflow).?);
+    const tenth = "CAST('0.1' AS DECIMAL(38,10))";
+    const p = try evalLit(a, tenth ++ " * " ++ tenth ++ " * " ++ tenth ++ " * " ++ tenth);
+    try std.testing.expectEqual(@as(u8, 38), p.decimal.scale);
+    try std.testing.expectEqual(std.math.pow(i128, 10, 34), p.decimal.unscaled);
+    const one = "CAST('1' AS DECIMAL(38,10))";
+    try std.testing.expectError(error.IntOverflow, evalLit(a, one ++ " * " ++ one ++ " * " ++ one ++ " * " ++ one));
 }
 
 test "orderF64: a total order over NaN, so comparisons never hit unreachable" {

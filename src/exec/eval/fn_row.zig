@@ -704,7 +704,7 @@ pub const per_row = struct {
         if (n <= 0) return Value{ .string = "" };
         const s = try valueToString(arena, sv);
         const total = @as(u128, @intCast(n)) * @as(u128, s.len);
-        if (total > max_str_bytes) return error.CastFailed;
+        if (total > max_str_bytes) return failWith(error.CastFailed, "repeat: the result would be {d} bytes, past the {d}-byte string limit", .{ total, max_str_bytes });
         const out = try arena.alloc(u8, @intCast(total));
         var i: usize = 0;
         while (i < out.len) : (i += s.len) @memcpy(out[i..][0..s.len], s);
@@ -737,10 +737,11 @@ pub const per_row = struct {
         const y = toI64(yv);
         const m = toI64(mv);
         const d = toI64(dv);
-        if (m < 1 or m > 12) return error.CastFailed;
-        if (d < 1 or d > daysInMonth(y, @intCast(m))) return error.CastFailed;
+        const bad = "make_date: year {d}, month {d}, day {d} is not a date";
+        if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m)))
+            return failWith(error.CastFailed, bad, .{ y, m, d });
         const days = daysFromCivil(y, @intCast(m), @intCast(d));
-        return Value{ .date = std.math.cast(i32, days) orelse return error.CastFailed };
+        return Value{ .date = std.math.cast(i32, days) orelse return failWith(error.CastFailed, bad, .{ y, m, d }) };
     }
 
     pub fn epoch(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
