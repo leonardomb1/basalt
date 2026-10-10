@@ -251,7 +251,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     },
                     .field => |f| {
                         if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
-                        q = stripQual(f, &first.aliases);
+                        q = try distinctSortKey(self, stages.items, f, stripQual(f, &first.aliases), kpos);
                         was_qual = q.parts.len < f.parts.len;
                     },
                     else => {
@@ -378,6 +378,26 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
     if (first.final_names) |fin|
         try stages.append(.{ .node = .{ .select = fin }, .hints = &.{}, .pos = self.curPos() });
+}
+
+/// Under a plain DISTINCT a sort key must be a column the SELECT list outputs, as SQL
+/// requires: a key spelled as an item's column takes that item's name, and one a list
+/// without `*` lacks, or a USING side's copy, which no `*` keeps, is refused under the
+/// name the query wrote.
+fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualName, q: ast.QualName, at: Pos) Error!ast.QualName {
+    const n = stages.len;
+    if (n < 2 or stages[n - 1].node != .distinct or stages[n - 1].node.distinct.on != null or stages[n - 2].node != .select) return q;
+    const items = stages[n - 2].node.select;
+    switch (keyHome(items, q)) {
+        .as_is => return q,
+        .renamed => |nm| return self.singleName(nm),
+        .missing => {},
+    }
+    const listed = for (items) |it| {
+        if (it != .field and it != .computed) break false;
+    } else true;
+    if (!listed and !std.mem.startsWith(u8, q.last(), "__")) return q;
+    return self.fail(at, "for SELECT DISTINCT, ORDER BY `{s}` must appear in the select list", .{try std.mem.join(self.arena, ".", written.parts)});
 }
 
 /// Refuses an ORDER BY or GROUP BY on a name two SELECT items share, unless they are
@@ -1442,6 +1462,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (!lone_star) {
             if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on, on_stripped);
             try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+            if (distinct_on) |on| if (distinct_drop == null) {
+                const ks = try self.arena.alloc(ast.SortKey, on.len);
+                for (on, ks) |k, *sk| sk.* = .{ .field = k, .desc = false };
+                distinct_drop = try self.keepSortedCopies(&stages.items[stages.items.len - 1], ks);
+            };
         }
     }
 

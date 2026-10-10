@@ -625,7 +625,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
         if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
-            return fail(diag, "join keys `{s}` ({s}) and `{s}` ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ left.fields[pair[0]].name, @tagName(lt.kind), right.fields[pair[1]].name, @tagName(rt.kind) });
+            return fail(diag, "join keys {s} ({s}) and {s} ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ try keyLabel(arena, left.fields[pair[0]].name, lq.last()), @tagName(lt.kind), try keyLabel(arena, right.fields[pair[1]].name, lq.last()), @tagName(rt.kind) });
     }
 
     const emit_right = (j.kind != .semi and j.kind != .anti);
@@ -662,6 +662,14 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         .right_nullable = right_nullable,
         .left_nullable = left_nullable,
     };
+}
+
+/// A join key for a message: its column; a USING side's copy by the key's name
+/// (`using`); a key the parser computed from an ON expression as that.
+fn keyLabel(arena: std.mem.Allocator, name: []const u8, using: []const u8) Error![]const u8 {
+    if (std.mem.startsWith(u8, name, "__u")) return std.fmt.allocPrint(arena, "`{s}`", .{using});
+    if (std.mem.startsWith(u8, name, "__")) return "an ON expression";
+    return std.fmt.allocPrint(arena, "`{s}`", .{name});
 }
 
 fn isNumeric(k: types.TypeKind) bool {

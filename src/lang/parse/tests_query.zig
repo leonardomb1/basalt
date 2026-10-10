@@ -835,6 +835,9 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
         .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
         .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },
+        .{ .q = "SELECT DISTINCT g FROM 'x.csv' ORDER BY v;", .msg = "for SELECT DISTINCT, ORDER BY `v` must appear in the select list" },
+        .{ .q = "SELECT DISTINCT * FROM 'l.csv' l JOIN 'r.csv' r USING (k) ORDER BY r.k;", .msg = "for SELECT DISTINCT, ORDER BY `r.k` must appear in the select list" },
+        .{ .q = "SELECT l.k, COUNT(*) FROM 'l.csv' l JOIN 'r.csv' r USING (k) GROUP BY r.k;", .msg = "`l.k` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY" },
         .{ .q = "SELECT g FROM 'x.csv' ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
     };
     for (cases) |c| {

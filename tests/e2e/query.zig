@@ -1716,7 +1716,22 @@ test "join: under USING `t.k` and `t.*` are that side's own, the key in its plac
         .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\ncid,3,,,\n" },
         .{ .q = "SELECT * RENAME (id AS tid) FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "name,tid,amt,item,q\nbob,2,20.25,z,3\n" },
         .{ .q = "SELECT name, item FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY t.name, item", .want = "name,item\nana,x\nana,y\nbob,z\ncid,\neve,w\n" },
+        .{ .q = "SELECT DISTINCT ON (i.name) * FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) ORDER BY i.name, q DESC", .want = "name,id,amt,item,q\nana,1,10.5,y,2\nbob,2,20.25,z,3\n" },
+        .{ .q = "SELECT DISTINCT i.name FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC", .want = "name\nbob\nana\n" },
     });
+}
+
+test "join: a key or column the parser renamed is named in a message as the query wrote it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,w\n1,x\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,v\n1,10\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "k,v\na,10\n" });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/l.csv' l JOIN '$B/r.csv' r ON upper(l.w) = r.k;", "join keys an ON expression (string) and `k` (int) are not comparable");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/l.csv' l JOIN '$B/s.csv' s USING (k);", "join keys `k` (int) and `k` (string) are not comparable");
+    try refuse(alloc, &tmp, "SELECT count(*) FROM '$B/l.csv' GROUP BY upper(w) HAVING upper(w) > 1;", "cannot compare an expression (string) with 1 (int)");
 }
 
 test "join: a qualified column is that table's alone, the FROM table's and a later join's too" {

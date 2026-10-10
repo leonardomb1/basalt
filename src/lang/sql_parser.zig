@@ -551,6 +551,20 @@ pub const Parser = struct {
         const t = self.toks[self.i];
         return .{ .line = t.line, .col = t.col, .file = t.file };
     }
+    /// A column as the query wrote it, for a message: a hidden name the parser gave
+    /// it (a USING side's copy `__ul1` of `a.k`) read back from its span.
+    pub fn spelled(self: *Parser, q: ast.QualName) Error![]const u8 {
+        const sp = q.span orelse return q.last();
+        if (!std.mem.startsWith(u8, q.last(), "__")) return q.last();
+        var out = std.array_list.Managed(u8).init(self.arena);
+        for (self.toks) |t| {
+            const after_start = t.line > sp.start.line or (t.line == sp.start.line and t.col >= sp.start.col);
+            const before_end = t.line < sp.end.line or (t.line == sp.end.line and t.col < sp.end.col);
+            if (t.file == sp.start.file and after_start and before_end) try out.appendSlice(t.text);
+        }
+        return if (out.items.len > 0) out.items else q.last();
+    }
+
     pub fn spanFrom(self: *Parser, start: Pos) ast.Span {
         const t = self.toks[if (self.i > 0) self.i - 1 else 0];
         return .{ .start = start, .end = .{ .line = t.end_line, .col = t.end_col, .file = t.file } };

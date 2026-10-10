@@ -93,10 +93,11 @@ fn joinSpans(a: ?ast.Span, b: ?ast.Span) ?ast.Span {
     return a orelse b;
 }
 
-/// A comparison operand as the message names it: a column, a literal, else its kind.
+/// A comparison operand as the message names it: a column, a literal, else its kind
+/// (a column the parser named `__…` stands for an expression the query wrote).
 fn operandText(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}![]const u8 {
     return switch (e.*) {
-        .field => |q| try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
+        .field => |q| if (std.mem.startsWith(u8, lastPart(q), "__")) "an expression" else try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
         .str_lit => |v| try std.fmt.allocPrint(arena, "'{s}'", .{v}),
         .int_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
         .float_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
