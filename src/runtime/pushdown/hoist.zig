@@ -361,6 +361,7 @@ fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {
 /// drops it, or outputs two columns of that name (a reference to it is ambiguous).
 fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
     var named: usize = 0;
+    var all = false;
     for (items) |it| switch (it) {
         .field => |q| if (std.mem.eql(u8, q.last(), name)) {
             named += 1;
@@ -368,9 +369,13 @@ fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: 
         .computed => |c| if (std.mem.eql(u8, c.name, name)) {
             named += 1;
         },
+        .star => all = true,
+        .star_except => |names| all = all or for (names) |x| {
+            if (std.mem.eql(u8, x, name)) break false;
+        } else true,
         else => {},
     };
-    if (named > 1) return null;
+    if (named > 1 or (named == 1 and all)) return null;
     var star = false;
     for (items) |it| switch (it) {
         .star => star = true,

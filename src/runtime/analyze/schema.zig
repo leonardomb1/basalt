@@ -239,7 +239,7 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
         if (ord.len != 1) return fail(diag, "RANGE with an offset needs exactly one ORDER BY key inside OVER (...), a number, date or timestamp", .{});
         const kt = in.fields[ord[0]].ty;
         key_kind = kt.kind;
-        conv = try rangeConv(arena, kt, wd.key_label orelse lastPart(oqs[0]), wd.funcs, diag);
+        conv = try rangeConv(arena, kt, try keyText(arena, wd.key_label orelse lastPart(oqs[0])), wd.funcs, diag);
         break;
     };
     const fields = try arena.alloc(types.Schema.Field, in.fields.len + wd.funcs.len);
@@ -341,6 +341,13 @@ fn scaledText(text: []const u8, scale: u8) i128 {
     return v;
 }
 
+/// A window's ORDER BY key for a message: as written, or for one only the parser's
+/// hidden name spells, what it is.
+fn keyText(arena: std.mem.Allocator, key: []const u8) Error![]const u8 {
+    if (std.mem.indexOf(u8, key, "__") != null) return "the ORDER BY expression";
+    return std.fmt.allocPrint(arena, "`{s}`", .{key});
+}
+
 /// How a stage's single ORDER BY key reads as a number for its RANGE offsets: a
 /// float as itself, an int at the scale its offsets need, a decimal at its own or
 /// theirs, a date or timestamp in microseconds. A plain number over a date or
@@ -359,11 +366,11 @@ fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: []const u8, funcs: [
     if (kt.unknown) return .{};
     switch (kt.kind) {
         .int, .float, .decimal => if (interval)
-            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
+            return fail(diag, "an INTERVAL frame offset needs a date or timestamp ORDER BY key; {s} is {s}", .{ key, try kt.name(arena) }),
         .time => if (plain)
-            return fail(diag, "a RANGE offset over the TIME key `{s}` is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{key}),
+            return fail(diag, "a RANGE offset over the TIME key {s} is an INTERVAL, e.g. INTERVAL '5' MINUTE", .{key}),
         .date, .timestamp => {},
-        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; `{s}` is {s}", .{ key, try kt.name(arena) }),
+        else => return fail(diag, "RANGE with an offset needs a numeric, date or timestamp ORDER BY key; {s} is {s}", .{ key, try kt.name(arena) }),
     }
     return switch (kt.kind) {
         .float => .{ .float = true },
