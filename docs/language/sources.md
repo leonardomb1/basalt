@@ -165,5 +165,7 @@ WHERE downloads > 0;
 The rows are the array at `items` (or the response itself); a single object —
 a detail endpoint's answer — is one row. Columns are typed from the first
 object: numbers, booleans and strings as themselves, nested objects and arrays
-as JSON text, which `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
-apart.
+as JSON text. A later row's value is read into its column as `CAST` would read
+it, and one that cannot be — `"yes"` in a `BOOL` column, `1e300` in an `INT` —
+is `NULL` rather than a guess. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
+the nested JSON text apart.

@@ -131,6 +131,30 @@ test "for-each over a JSON array param iterates and binds fields by name" {
     try std.testing.expectEqualStrings("id,EMPRESA\n3,02\n", second);
 }
 
+test "FROM BODY reads DATE and DECIMAL columns as CAST does and rejects garbage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/f.csv' AS SELECT d, m FROM BODY (d DATE NOT NULL, m DECIMAL(10,2) NOT NULL);", .{base});
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .request_body = "{\"d\":\"2026-02-01\",\"m\":\"1.25\"}" }, &rdiag);
+    const out = try tmp.dir.readFileAlloc(alloc, "f.csv", 1 << 20);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("d,m\n2026-02-01,1.25\n", out);
+
+    var bdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .request_body = "{\"d\":\"garbage\",\"m\":\"1\"}" }, &bdiag));
+    try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "body row 0: column `d` cannot be read as date") != null);
+}
+
 test "for-each loop var used as an expression value binds per row" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
