@@ -546,7 +546,7 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     const ai = aggStageIndex(st);
     const agg = st[ai].node.aggregate;
     try testing.expectEqual(@as(usize, 1), agg.aggs.len);
-    try testing.expectEqualStrings("avg(v)", agg.aggs[0].name);
+    try testing.expectEqualStrings("#avg(v)", agg.aggs[0].name);
     try testing.expectEqual(ast.AggFunc.avg, agg.aggs[0].func);
 
     const sel = st[ai + 1].node.select;
@@ -554,7 +554,7 @@ test "sql: an aggregate inside a scalar expression lifts to the aggregate stage"
     try testing.expectEqualStrings("g", sel[0].field.last());
     try testing.expectEqualStrings("m", sel[1].computed.name);
     const arg0 = sel[1].computed.expr.call.args[0];
-    try testing.expectEqualStrings("avg(v)", arg0.field.last());
+    try testing.expectEqualStrings("#avg(v)", arg0.field.last());
 }
 
 test "sql: one aggregate mentioned twice becomes a single output column" {
@@ -580,7 +580,7 @@ test "sql: HAVING may name an aggregate the SELECT list omits" {
     const ai = aggStageIndex(st);
     const agg = st[ai].node.aggregate;
     try testing.expectEqual(@as(usize, 2), agg.aggs.len);
-    try testing.expectEqualStrings("count(*)", agg.aggs[1].name);
+    try testing.expectEqualStrings("#count(*)", agg.aggs[1].name);
 
     const sel = st[ai + 2].node.select;
     try testing.expectEqual(@as(usize, 2), sel.len);
@@ -701,4 +701,43 @@ test "sql: a select item's alias may omit AS, but not swallow the clause after i
     const items = bare.stmts[1].output.stages[1].node.select;
     try testing.expectEqualStrings("x", items[0].computed.name);
     try testing.expectEqualStrings("y", items[1].computed.name);
+}
+
+test "sql: an expression's name keeps its string literals, so distinct expressions never bind as one" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const prog = try parseTest(a, "SELECT upper('cat'), COUNT(*) FROM 'x.csv' GROUP BY upper(cat);");
+    const st = firstPipelineStages(prog);
+    const agg = st[aggStageIndex(st)].node.aggregate;
+    try testing.expectEqualStrings("#upper(cat)", agg.by[0].last());
+    const post = st[st.len - 2].node.select;
+    try testing.expectEqualStrings("upper('cat')", post[0].computed.name);
+
+    const having = try parseTest(a, "SELECT g, count_if(g = 'x') AS a FROM 'x.csv' GROUP BY g HAVING count_if(g = 'X') > 0;");
+    const hs = firstPipelineStages(having);
+    try testing.expectEqual(@as(usize, 2), hs[aggStageIndex(hs)].node.aggregate.aggs.len);
+}
+
+test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const cases = [_]struct { q: []const u8, msg: []const u8 }{
+        .{ .q = "SELECT g, COUNT(*) FROM 'x.csv' GROUP BY 2;", .msg = "GROUP BY position 2 names the aggregate `count(*)` — a position may only name a grouping key" },
+        .{ .q = "SELECT 1 AS a, 2 AS a;", .msg = "two SELECT items are named `a` — give one a different alias" },
+        .{ .q = "SELECT g, v AS g FROM 'x.csv';", .msg = "two SELECT items are named `g` — give one a different alias" },
+        .{ .q = "SELECT g FROM 'x.csv' GROUP BY g;", .msg = "GROUP BY without aggregate functions in SELECT or HAVING" },
+        .{ .q = "SELECT * FROM 'x.csv' ORDER BY 2;", .msg = "ORDER BY 2 needs a SELECT list without `*` — name the column instead" },
+        .{ .q = "SELECT g FROM 'x.csv' ORDER BY 3;", .msg = "ORDER BY position 3 is out of range" },
+        .{ .q = "SELECT g, SUM(v) FROM 'x.csv' GROUP BY g ORDER BY SUM(v) / COUNT(*);", .msg = "an aggregate in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it" },
+    };
+    for (cases) |c| {
+        var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        try testing.expectError(error.ParseFailed, parseSource(a, c.q, &diag));
+        try testing.expectEqualStrings(c.msg, diag.msg);
+    }
+    _ = try parseTest(a, "SELECT g FROM 'x.csv' GROUP BY g HAVING COUNT(*) > 1;");
 }
