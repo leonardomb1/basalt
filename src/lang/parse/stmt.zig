@@ -13,6 +13,8 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
 const nameApart = @import("../sql_parser.zig").nameApart;
 const keyHome = @import("../sql_parser.zig").keyHome;
+const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
+const providesName = @import("query.zig").providesName;
 const std = @import("std");
 
 /// A script that opens with EXPLAIN explains the whole script offline, without
@@ -325,13 +327,18 @@ pub fn parseNameSegment(self: *Parser) Error![]const u8 {
 /// `DISTINCT ON` keys are written against the input, as in Postgres: a key the list
 /// renamed is repointed at its output, one it does not project rides as a hidden
 /// column. Returns the projection that drops those again, or null.
-pub fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName) Error!?[]const ast.SelectItem {
+pub fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName, stripped: []const bool) Error!?[]const ast.SelectItem {
     for (items.items) |it| switch (it) {
         .field, .computed => {},
         else => return null,
     };
     const visible = items.items.len;
-    for (on) |*k| switch (keyHome(items.items[0..visible], k.*)) {
+    for (on, stripped) |*k, sq| if (sq and (ownsStrippedKey(items.items[0..visible], k.*) or providesName(items.items[0..visible], k.last()))) {
+        if (ownsStrippedKey(items.items[0..visible], k.*)) continue;
+        const b = try self.bindName(try self.mk(.{ .field = k.* }), &.{});
+        try items.append(.{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.* }) } });
+        k.* = try self.singleName(b.name);
+    } else switch (keyHome(items.items[0..visible], k.*)) {
         .as_is => {},
         .renamed => |nm| k.* = try self.singleName(nm),
         .missing => try items.append(.{ .field = k.* }),

@@ -309,6 +309,18 @@ pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
     return .missing;
 }
 
+/// Whether the SELECT list outputs the column of a key written with its table
+/// (`a.s`, stripped to `s`) under the key's own name: the same reference, first of
+/// its name. Otherwise `s` there may be another table's column, so the key rides
+/// along under a hidden name.
+pub fn ownsStrippedKey(items: []const ast.SelectItem, k: ast.QualName) bool {
+    for (items, 0..) |it, i| {
+        if (it != .field or !sameName(it.field, k)) continue;
+        return !nameTaken(items[0..i], k.last());
+    }
+    return false;
+}
+
 fn outName(it: ast.SelectItem) ?[]const u8 {
     return switch (it) {
         .field => |q| q.last(),

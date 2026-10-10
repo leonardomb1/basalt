@@ -1271,6 +1271,22 @@ test "join: `b.col` names the right side's column even when the join renamed it 
     }
 }
 
+test "a qualified ORDER BY or DISTINCT ON key sorts by that table's column, not a same-named one before it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "k,s\n1,b\n2,a\n3,c\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,s\n1,z\n2,y\n3,x\n" });
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/both.csv' AS SELECT b.s, a.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k ORDER BY a.s;
+        \\LOAD INTO '$B/right.csv' AS SELECT b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k ORDER BY a.s DESC;
+        \\LOAD INTO '$B/on.csv' AS SELECT DISTINCT ON (a.s) b.s FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k ORDER BY a.s;
+    , 1, &.{});
+    try expectFile(&tmp, "both.csv", "s,s_r\ny,a\nz,b\nx,c\n");
+    try expectFile(&tmp, "right.csv", "s\nx\nz\ny\n");
+    try expectFile(&tmp, "on.csv", "s\ny\nz\nx\n");
+}
+
 test "DISTINCT ON keys are input columns: renamed, unprojected, and beside an ORDER BY on another hidden column" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

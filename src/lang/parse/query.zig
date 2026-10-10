@@ -22,6 +22,7 @@ const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource
 const itemLabel = @import("../sql_parser.zig").itemLabel;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
 const nameApart = @import("../sql_parser.zig").nameApart;
+const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
@@ -205,9 +206,11 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         self.qual_sink = &order_quals;
         defer self.qual_sink = outer_quals;
         var keys = std.array_list.Managed(ast.SortKey).init(self.arena);
+        var stripped = std.array_list.Managed(bool).init(self.arena);
         var computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         while (true) {
             var q: ast.QualName = undefined;
+            var was_qual = false;
             if (self.isKw("identifier") and self.peekTag() == .lparen) {
                 q = try self.parseColRef();
             } else {
@@ -234,7 +237,10 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         q = stripQual(outs[@intCast(n - 1)], &first.aliases);
                     },
                     .str_lit => |s| q = try self.singleName(s),
-                    .field => |f| q = stripQual(f, &first.aliases),
+                    .field => |f| {
+                        q = stripQual(f, &first.aliases);
+                        was_qual = q.parts.len < f.parts.len;
+                    },
                     else => {
                         const b = try self.bindName(e, first.expr_aliases);
                         q = try self.singleName(b.name);
@@ -252,6 +258,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 desc = true;
             } else _ = self.eatKw("asc");
             try keys.append(.{ .field = q, .desc = desc });
+            try stripped.append(was_qual);
             if (!self.eat(.comma)) break;
         }
         try self.settleQuals(order_quals.items, &first.aliases, outer_quals);
@@ -273,7 +280,15 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             if (!wildcard) {
                 var extended = std.array_list.Managed(ast.SelectItem).init(self.arena);
                 try extended.appendSlice(proj);
-                for (sort_keys) |*k| {
+                for (sort_keys, stripped.items) |*k, sq| {
+                    if (sq and (ownsStrippedKey(proj, k.field) or providesName(proj, k.field.last()))) {
+                        if (ownsStrippedKey(proj, k.field)) continue;
+                        const b = try self.bindName(try self.mk(.{ .field = k.field }), &.{});
+                        const hidden: ast.SelectItem = .{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.field }) } };
+                        k.field = try self.singleName(b.name);
+                        if (!providesName(extended.items[proj.len..], b.name)) try extended.append(hidden);
+                        continue;
+                    }
                     if (k.field.parts.len != 1) {
                         switch (keyHome(proj, k.field)) {
                             .as_is => {},
@@ -934,9 +949,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var star_count: usize = 0;
     var post = std.array_list.Managed(ast.SelectItem).init(self.arena);
     var lifted = false;
-    if (distinct_on) |on| for (on) |*k| {
-        k.* = stripQual(k.*, &aliases);
-    };
+    var on_stripped: []bool = &.{};
+    if (distinct_on) |on| {
+        on_stripped = try self.arena.alloc(bool, on.len);
+        for (on, on_stripped) |*k, *st| {
+            const sq = stripQual(k.*, &aliases);
+            st.* = sq.parts.len < k.parts.len;
+            k.* = sq;
+        }
+    }
     var win_post = std.array_list.Managed(usize).init(self.arena);
     for (raw_items.items) |ri| {
         switch (ri) {
@@ -1135,7 +1156,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     } else if (win_calls.items.len == 0) {
         const lone_star = items.items.len == 1 and items.items[0] == .star;
         if (!lone_star) {
-            if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on);
+            if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on, on_stripped);
             try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
     }
@@ -1208,7 +1229,7 @@ fn keySide(q: ast.QualName, rname: []const u8) KeySide {
 
 /// Whether a projection already yields a column called `name`, so a window's
 /// reference to it need not be carried.
-fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
+pub fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
     for (items) |it| switch (it) {
         .star, .star_of => return true,
         .star_except => |ex| {
