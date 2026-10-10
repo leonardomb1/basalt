@@ -128,7 +128,7 @@ test "window functions: what each takes, and what a frame, ORDER BY or IGNORE NU
     try expectRefused(a, "SELECT SUM(ROW_NUMBER() OVER (ORDER BY t)) AS q FROM 'in.csv';", "an aggregate cannot take a window function's result");
 }
 
-test "window placement: in an expression it is lifted under a hidden name; WHERE, GROUP BY and HAVING refuse it" {
+test "window placement: every call is lifted under a hidden name, renamed last; WHERE, GROUP BY and HAVING refuse it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -141,12 +141,13 @@ test "window placement: in an expression it is lifted under a hidden name; WHERE
     try testing.expectEqual(@as(usize, 1), ws.items.len);
     try testing.expectEqual(@as(usize, 2), ws.items[0].funcs.len);
     try testing.expect(std.mem.startsWith(u8, ws.items[0].funcs[0].out, "__w"));
-    try testing.expectEqualStrings("rn", ws.items[0].funcs[1].out);
+    try testing.expect(std.mem.startsWith(u8, ws.items[0].funcs[1].out, "__w"));
     const last = stages[stages.len - 2].node.select;
     try testing.expectEqual(@as(usize, 3), last.len);
     try testing.expectEqualStrings("d", last[1].computed.name);
     try testing.expect(last[1].computed.expr.* == .binary);
-    try testing.expectEqualStrings("rn", last[2].field.last());
+    try testing.expectEqualStrings("rn", last[2].computed.name);
+    try testing.expectEqualStrings(ws.items[0].funcs[1].out, last[2].computed.expr.field.last());
 
     const where = "a window function is only allowed in the SELECT list or ORDER BY";
     try expectRefused(a, "SELECT k FROM 'in.csv' WHERE ROW_NUMBER() OVER (ORDER BY t) = 1;", where);

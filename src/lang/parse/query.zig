@@ -821,7 +821,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var win_post = std.array_list.Managed(usize).init(self.arena);
     for (raw_items.items) |ri| {
         switch (ri) {
-            .win => |wi| try post.append(.{ .field = try self.singleName(win_calls.items[wi].out.?) }),
+            .win => |wi| try post.append(.{ .computed = .{ .name = win_calls.items[wi].out.?, .expr = try self.mk(.{ .field = try self.singleName(win_calls.items[wi].hidden) }) } }),
             .qstar => |alias| {
                 if (!aliases.has(alias))
                     return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });

@@ -10,8 +10,8 @@
 //! carrying the columns later items read, one window stage per distinct PARTITION
 //! BY / ORDER BY in order of first appearance, each sorting its own input, and the
 //! SELECT list's projection, which evaluates an expression around a window over its
-//! hidden column. A call that is a whole item names its column after the item, so
-//! `WHERE rn <= k` over a CTE still finds a lone ROW_NUMBER (`windowTopK`). Over a
+//! hidden column. Every call writes its hidden column, renamed by the last projection,
+//! so an alias never shadows a column a window reads (`SUM(x) OVER (...) AS x`). Over a
 //! GROUP BY the windows run after the aggregate and HAVING, their aggregates lifted
 //! into the aggregate stage like any other (`SUM(SUM(x)) OVER ()`).
 //!
@@ -527,11 +527,10 @@ pub const Lower = struct {
                 try key.appendSlice(if (k.desc) " desc," else ",");
             }
             const arg: ?ast.QualName = if (c.arg) |a| try self.column(a) else null;
-            const out = c.out orelse c.hidden;
-            if (c.out == null) try self.hidden.append(c.hidden);
+            try self.hidden.append(c.hidden);
             const wf = ast.WindowFunc{
                 .func = c.func,
-                .out = out,
+                .out = c.hidden,
                 .arg = arg,
                 .offset = c.offset,
                 .default = c.default,

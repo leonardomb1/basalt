@@ -459,6 +459,20 @@ test "windows in expressions, ORDER BY, expression keys and arguments, and over 
     });
 }
 
+test "a window aliased to a column a window reads yields the window, not the column" {
+    try expectCases(&.{
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id) AS v, COUNT(*) OVER (PARTITION BY k) AS k, LAG(t) OVER (ORDER BY id) AS t FROM '$B/s.csv' ORDER BY id",
+            .want = "id,v,k,t\n1,10,4,\n2,10,4,1\n3,40,4,2\n4,80,4,2\n5,85,3,5\n6,85,3,1\n7,92,3,3\n",
+        },
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id) AS k, MAX(v) OVER (PARTITION BY k) AS m FROM '$B/s.csv' ORDER BY id",
+            .want = "id,k,m\n1,10,40\n2,10,40\n3,40,40\n4,80,40\n5,85,7\n6,85,7\n7,92,7\n",
+        },
+        .{ .q = "SELECT *, SUM(v) OVER () AS v FROM '$B/s.csv' WHERE id < 3 ORDER BY id", .want = "id,k,t,v\n1,a,1,10\n2,a,2,10\n" },
+    });
+}
+
 test "windows check like they run: a RANGE offset's key type, an INTERVAL's, a window's argument type" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
