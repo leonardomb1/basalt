@@ -301,6 +301,8 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 }
             }
         }
+        if (!extend_proj and visible == null and stages.items[stages.items.len - 1].node == .select)
+            hidden_drop = try self.keepSortedCopies(&stages.items[stages.items.len - 1], sort_keys);
         if (!extend_proj and computed.items.len > 0) {
             const tail = stages.items[stages.items.len - 1].node;
             if (visible != null or (tail == .distinct and tail.distinct.on != null))
@@ -979,6 +981,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post.append(all);
                 },
                 .star_rename, .star_of => {
+                    if (it == .star_rename and copy_names.len > 0) {
+                        const drop = try self.arena.alloc(ast.SelectItem, 1);
+                        drop[0] = .{ .star_except = copy_names };
+                        try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
+                    }
                     try items.append(it);
                     try post.append(it);
                 },

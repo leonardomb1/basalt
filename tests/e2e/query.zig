@@ -1612,6 +1612,9 @@ test "join: under USING `t.k` and `t.*` are that side's own, the key in its plac
         .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.q IS NULL OR i.q > 3", .want = "name,id,amt,item,q\ncid,3,,,\neve,,,w,4\n" },
         .{ .q = "SELECT t.name AS tn, i.name AS iname, name FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE t.name IS NULL OR i.name IS NULL", .want = "tn,iname,name\ncid,,cid\n,eve,eve\n" },
         .{ .q = "SELECT i.name, count(*) AS n FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) WHERE i.name IS NULL OR i.name = 'ana' GROUP BY i.name ORDER BY n", .want = "name,n\n,1\nana,2\n" },
+        .{ .q = "SELECT * FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY i.name DESC, q", .want = "name,id,amt,item,q\neve,,,w,4\nbob,2,20.25,z,3\nana,1,10.5,x,1\nana,1,10.5,y,2\ncid,3,,,\n" },
+        .{ .q = "SELECT * RENAME (id AS tid) FROM '$B/t.csv' t JOIN '$B/items.csv' i USING (name) WHERE i.item = 'z'", .want = "name,tid,amt,item,q\nbob,2,20.25,z,3\n" },
+        .{ .q = "SELECT name, item FROM '$B/t.csv' t FULL JOIN '$B/items.csv' i USING (name) ORDER BY t.name, item", .want = "name,item\nana,x\nana,y\nbob,z\ncid,\neve,w\n" },
     });
 }
 

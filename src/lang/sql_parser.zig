@@ -496,6 +496,28 @@ pub const Parser = struct {
         j.own_cols = try own.toOwnedSlice();
     }
 
+    /// A `*` that leaves out the USING key copies an ORDER BY sorts on (`a.k`) keeps
+    /// them through the sort; the select returned drops them after it.
+    pub fn keepSortedCopies(self: *Parser, st: *ast.Stage, keys: []const ast.SortKey) Error!?[]const ast.SelectItem {
+        var dropped = std.array_list.Managed([]const u8).init(self.arena);
+        const items = try self.arena.dupe(ast.SelectItem, st.node.select);
+        for (items) |*it| if (it.* == .star_except) {
+            var keep = std.array_list.Managed([]const u8).init(self.arena);
+            for (it.star_except) |n| {
+                const sorted = for (keys) |k| {
+                    if (k.field.parts.len == 1 and std.mem.eql(u8, k.field.parts[0], n) and std.mem.startsWith(u8, n, "__u")) break true;
+                } else false;
+                try (if (sorted) &dropped else &keep).append(n);
+            }
+            it.* = .{ .star_except = try keep.toOwnedSlice() };
+        };
+        if (dropped.items.len == 0) return null;
+        st.node.select = items;
+        const drop = try self.arena.alloc(ast.SelectItem, 1);
+        drop[0] = .{ .star_except = try dropped.toOwnedSlice() };
+        return drop;
+    }
+
     pub const PendingSemiJoin = struct {
         sentinel: *ast.Expr,
         lhs: *ast.Expr,
