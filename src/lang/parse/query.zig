@@ -651,7 +651,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                             .b = try self.stripExpr(c.binary.r, &aliases),
                             .left_name = ln,
                             .right_name = rn,
-                            .pos = .{ .line = opos.line, .col = opos.col },
+                            .pos = .{ .line = opos.line, .col = opos.col, .file = opos.file },
                         });
                         try key_cols.append(ln);
                         try key_cols.append(rn);

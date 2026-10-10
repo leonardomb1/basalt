@@ -29,8 +29,9 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         error.Usage, error.Unreadable => |le| return loadExit(le),
         else => return e,
     };
-    const eo = ErrOut{ .w = stderr, .json = wantsJsonLog(args), .label = src.label };
+    var eo = ErrOut{ .w = stderr, .json = wantsJsonLog(args), .label = src.label };
     const prog = (try parseSrcTo(arena.allocator(), src, eo)) orelse return 1;
+    eo.files = prog.files;
 
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();

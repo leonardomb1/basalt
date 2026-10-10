@@ -117,4 +117,5 @@ pub const Token = struct {
     col: u32,
     end_line: u32 = 0,
     end_col: u32 = 0,
+    file: u16 = 0,
 };

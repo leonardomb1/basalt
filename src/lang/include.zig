@@ -72,11 +72,15 @@ pub fn loadProgramOpts(
         .memo = std.StringHashMap(ast.Program).init(arena),
         .known_tables = opts.known_tables,
         .errors = opts.errors,
+        .files = std.array_list.Managed([]const u8).init(arena),
     };
     if (std.fs.cwd().realpathAlloc(arena, label)) |canon| {
         try ctx.stack.append(.{ .canon = canon, .shown = label });
     } else |_| {}
-    return load(&ctx, text, label, base_dir);
+    try ctx.files.append(label);
+    var prog = try load(&ctx, text, label, base_dir, 0);
+    if (ctx.files.items.len > 1) prog.files = ctx.files.items;
+    return prog;
 }
 
 const Frame = struct { canon: []const u8, shown: []const u8 };
@@ -92,6 +96,7 @@ const Ctx = struct {
     stmt_budget: usize = max_total_stmts,
     known_tables: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(parser.Diagnostic) = null,
+    files: std.array_list.Managed([]const u8),
 
     fn fail(self: *Ctx, label: []const u8, line: u32, col: u32, comptime fmt: []const u8, args: anytype) Error {
         const msg: []const u8 = std.fmt.allocPrint(self.arena, fmt, args) catch "include error";
@@ -100,7 +105,7 @@ const Ctx = struct {
     }
 };
 
-fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Error!ast.Program {
+fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8, file: u16) Error!ast.Program {
     var incs = std.array_list.Managed(Directive).init(ctx.arena);
     const body_at = try scanDirectives(ctx, text, label, &incs);
     const skipped: u32 = @intCast(std.mem.count(u8, text[0..body_at], "\n"));
@@ -132,7 +137,10 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
 
         try ctx.stack.append(.{ .canon = canon, .shown = resolved });
         ctx.depth += 1;
-        const sub = try load(ctx, src, resolved, std.fs.path.dirname(resolved) orelse ".");
+        const id = std.math.cast(u16, ctx.files.items.len) orelse
+            return ctx.fail(label, d.line, d.col, "more than {d} @include files", .{std.math.maxInt(u16)});
+        try ctx.files.append(resolved);
+        const sub = try load(ctx, src, resolved, std.fs.path.dirname(resolved) orelse ".", id);
         ctx.depth -= 1;
         _ = ctx.stack.pop();
         if (canonical) try ctx.memo.put(canon, sub);
@@ -161,6 +169,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8) Er
             .known_fns = known_fns.items,
             .known_tables = ctx.known_tables,
             .errors = if (ctx.depth == 0) ctx.errors else null,
+            .file = file,
         }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {

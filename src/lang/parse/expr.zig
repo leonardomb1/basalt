@@ -420,7 +420,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 }
                 var nulls = self.parseNullTreatment();
                 _ = try self.expect(.rparen);
-                const tpos: Pos = .{ .line = t.line, .col = t.col };
+                const tpos: Pos = .{ .line = t.line, .col = t.col, .file = t.file };
                 var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
                 if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
                     return self.fail(tpos, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
@@ -434,7 +434,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 if (self.isKw("over")) return self.parseWindowCall(lower, call_args, call_distinct, nulls, tpos);
                 if (nulls != null)
                     return self.fail(tpos, "IGNORE NULLS and RESPECT NULLS belong to a window function — `{s}(...)` needs OVER (...)", .{lower});
-                const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col }, .end = .{ .line = t.end_line, .col = t.end_col } };
+                const name_span = ast.Span{ .start = .{ .line = t.line, .col = t.col, .file = t.file }, .end = .{ .line = t.end_line, .col = t.end_col, .file = t.file } };
                 return self.mk(.{ .call = .{ .name = lower, .args = call_args, .distinct = call_distinct, .span = name_span } });
             }
             if (self.peekTag() != .dot) if (self.lambdaParam(t.text)) |name| {
@@ -550,6 +550,6 @@ pub fn parseSearch(self: *Parser) Error!*ast.Expr {
     args[0] = try self.mk(.{ .call = .{ .name = "search_cols", .args = try items.toOwnedSlice() } });
     args[1] = query;
     if (options) |o| args[2] = o;
-    const span = ast.Span{ .start = .{ .line = start.line, .col = start.col }, .end = .{ .line = start.end_line, .col = start.end_col } };
+    const span = ast.Span{ .start = .{ .line = start.line, .col = start.col, .file = start.file }, .end = .{ .line = start.end_line, .col = start.end_col, .file = start.file } };
     return self.mk(.{ .call = .{ .name = "search", .args = args, .span = span } });
 }

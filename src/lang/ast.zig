@@ -61,7 +61,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const token = @import("token.zig");
 
-pub const Pos = struct { line: u32, col: u32 };
+/// `file` indexes `Program.files`: 0 is the script itself, others an `@include`d file.
+pub const Pos = struct { line: u32, col: u32, file: u16 = 0 };
 
 pub const Span = struct { start: Pos, end: Pos };
 
@@ -640,7 +641,18 @@ pub const ExplainStmt = struct {
     pos: Pos,
 };
 
-pub const Program = struct { stmts: []const Stmt, explain: ExplainMode = .none };
+pub const Program = struct {
+    stmts: []const Stmt,
+    explain: ExplainMode = .none,
+    files: []const []const u8 = &.{},
+
+    /// The file a position lies in, or null for the script itself.
+    pub fn fileOf(self: Program, pos: ?Pos) ?[]const u8 {
+        const p = pos orelse return null;
+        if (p.file == 0 or p.file >= self.files.len) return null;
+        return self.files[p.file];
+    }
+};
 
 test "rebuildExpr identity copies every field — no silent drop" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

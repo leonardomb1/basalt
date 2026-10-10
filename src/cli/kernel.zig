@@ -735,7 +735,7 @@ fn runScript(
                     .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.failLabel(e),
                     .transient = rdiag.retryable or runtime.isTransient(e),
                 };
-                locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
+                locate(&ei, entry.text, entry.entry_at, entry.prog.fileOf(rdiag.pos) orelse "", rdiag.pos, rdiag.end);
                 return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared, .@"error" = ei });
             };
             try freezer.commit(decls);
@@ -812,7 +812,7 @@ fn runScript(
         .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.failLabel(e),
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
-    locate(&ei, entry.text, entry.entry_at, "", rdiag.pos, rdiag.end);
+    locate(&ei, entry.text, entry.entry_at, entry.prog.fileOf(rdiag.pos) orelse "", rdiag.pos, rdiag.end);
     return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads, .@"error" = ei });
 }
 

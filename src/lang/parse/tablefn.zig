@@ -55,8 +55,8 @@ pub fn checkTableBody(self: *Parser) Error!struct { toks: []const Token, check: 
     const toks = try self.arena.alloc(Token, body.len + 1);
     @memcpy(toks[0..body.len], body);
     const last = body[body.len - 1];
-    toks[body.len] = .{ .tag = .eof, .text = "", .line = last.line, .col = last.col };
-    const pos: Pos = .{ .line = body[0].line, .col = body[0].col };
+    toks[body.len] = .{ .tag = .eof, .text = "", .line = last.line, .col = last.col, .file = last.file };
+    const pos: Pos = .{ .line = body[0].line, .col = body[0].col, .file = body[0].file };
     return .{ .toks = toks, .check = .{ .bindings = try discard.toOwnedSlice(), .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos } } };
 }
 
