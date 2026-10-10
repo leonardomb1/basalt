@@ -56,6 +56,7 @@ pub const Wal = struct {
 
         const newest = try self.maxSegmentSeq();
         const loaded = self.loadedUpTo();
+        self.seq = loaded + 1;
         if (newest) |n| {
             if (n > loaded) {
                 self.seq = n;
@@ -65,8 +66,6 @@ pub const Wal = struct {
                 try f.seekFromEnd(0);
                 self.cur = f;
                 self.cur_size = (try f.stat()).size;
-            } else {
-                self.seq = n + 1;
             }
         }
         return self;
@@ -494,6 +493,31 @@ test "wal: reopen resumes the unfinished segment; loaded tail starts a new one" 
         defer w.close();
         try testing.expectEqual(@as(u64, 2), w.currentSeq());
     }
+}
+
+test "wal: reopen after every segment was purged numbers past the manifest" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(base);
+
+    {
+        var w = try Wal.open(gpa, base, "ev", 1 << 20);
+        defer w.close();
+        try w.append("{\"n\":1}");
+        try w.rotate();
+        try w.markLoaded(1);
+        _ = try w.purgeLoaded();
+    }
+    var w = try Wal.open(gpa, base, "ev", 1 << 20);
+    defer w.close();
+    try testing.expectEqual(@as(u64, 2), w.currentSeq());
+    try w.append("{\"n\":2}");
+    try w.rotate();
+    const pending = try w.pendingSegments(gpa);
+    defer gpa.free(pending);
+    try testing.expectEqualSlices(u64, &.{2}, pending);
 }
 
 test "wal: purgeOlderThan removes only LOADED segments past the window" {
