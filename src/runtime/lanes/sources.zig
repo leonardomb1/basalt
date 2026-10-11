@@ -228,3 +228,28 @@ pub const LaneSplit = union(enum) {
         };
     }
 };
+
+test "csvLanes: an explicit -j is kept, the default caps at one lane per MiB" {
+    try std.testing.expectEqual(@as(usize, 20), csvLanes(1000, .{ .threads = 20 }));
+    try std.testing.expectEqual(@as(usize, 1), csvLanes(1000, .{ .threads = 20, .lanes_auto = true }));
+    try std.testing.expectEqual(@as(usize, 7), csvLanes(6 << 20, .{ .threads = 20, .lanes_auto = true }));
+    try std.testing.expectEqual(@as(usize, 14), csvLanes(300 << 20, .{ .threads = 14, .lanes_auto = true }));
+    try std.testing.expectEqual(@as(usize, 1), csvLanes(0, .{ .threads = 0 }));
+}
+
+test "LaneSplit.lanes: parquet runs no more lanes than row groups" {
+    const schema = types.Schema{ .fields = &.{} };
+    const items = [_]PqItem{ .{ .file = 0, .rg = 0, .rg_end = 1 }, .{ .file = 0, .rg = 1, .rg_end = 2 }, .{ .file = 0, .rg = 2, .rg_end = 3 } };
+    var split = LaneSplit{ .parquet = .{
+        .files = &.{"x.parquet"},
+        .items = &items,
+        .project = null,
+        .bounds = &.{},
+        .src_schema = &schema,
+        .queue = .{ .nitems = items.len },
+    } };
+    try std.testing.expectEqual(@as(usize, 3), split.lanes(.{ .threads = 8 }));
+    try std.testing.expectEqual(@as(usize, 2), split.lanes(.{ .threads = 2 }));
+    split.parquet.max_lanes = 1;
+    try std.testing.expectEqual(@as(usize, 1), split.lanes(.{ .threads = 8 }));
+}
