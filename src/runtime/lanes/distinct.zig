@@ -209,7 +209,7 @@ fn runParallelDistinct(
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = split.lanes(opts.threads);
+    const nthreads = split.lanes(opts);
     const nitems = split.count(nthreads);
     var merge = DistinctMerge.init(arena, key_idx);
     var ctx = DistinctCtx{

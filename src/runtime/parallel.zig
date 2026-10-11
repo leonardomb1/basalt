@@ -116,6 +116,51 @@ pub const PipelinedSink = struct {
     }
 };
 
+/// The lane count when `-j` is not given: one per physical core the process may run
+/// on, since a second hyperthread adds little to lanes that stream memory (on a 6P+8E
+/// laptop, 20 lanes ran parquet aggregates and top-N 15-30% slower than 14). The
+/// logical count where the topology cannot be read.
+pub fn defaultLanes() usize {
+    const logical = std.Thread.getCpuCount() catch 1;
+    if (@import("builtin").os.tag != .linux) return logical;
+    const set = std.posix.sched_getaffinity(0) catch return logical;
+    var cores: usize = 0;
+    var path_buf: [96]u8 = undefined;
+    var list_buf: [256]u8 = undefined;
+    for (0..set.len * @bitSizeOf(usize)) |cpu| {
+        if (!cpuAllowed(set, cpu)) continue;
+        const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{cpu}) catch return logical;
+        const list = std.fs.cwd().readFile(path, &list_buf) catch return logical;
+        const first = firstAllowedSibling(std.mem.trim(u8, list, " \n"), set) orelse return logical;
+        if (first == cpu) cores += 1;
+    }
+    return std.math.clamp(cores, 1, logical);
+}
+
+fn cpuAllowed(set: std.posix.cpu_set_t, cpu: usize) bool {
+    const bits = @bitSizeOf(usize);
+    if (cpu / bits >= set.len) return false;
+    return (set[cpu / bits] >> @intCast(cpu % bits)) & 1 == 1;
+}
+
+/// The lowest CPU in a sysfs CPU list (`0-1`, `0,10`, `12`) that `set` allows, which
+/// stands for the whole core; null on a list that does not parse.
+fn firstAllowedSibling(list: []const u8, set: std.posix.cpu_set_t) ?usize {
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    var best: ?usize = null;
+    while (it.next()) |part| {
+        const dash = std.mem.indexOfScalar(u8, part, '-');
+        const lo = std.fmt.parseInt(usize, if (dash) |d| part[0..d] else part, 10) catch return null;
+        const hi = if (dash) |d| std.fmt.parseInt(usize, part[d + 1 ..], 10) catch return null else lo;
+        var c = lo;
+        while (c <= hi) : (c += 1) if (cpuAllowed(set, c)) {
+            if (best == null or c < best.?) best = c;
+            break;
+        };
+    }
+    return best;
+}
+
 /// Spawn up to `n` copies of `worker(ctx, lane_idx)`, join them, and return the
 /// lane count (>= 1). When no thread can be spawned the worker runs inline as lane 0.
 pub fn spawnJoin(alloc: std.mem.Allocator, n: usize, comptime worker: anytype, ctx: anytype) !usize {
@@ -551,4 +596,18 @@ test "run: per_lane sinks are opened by lanes and committed (closed) on success"
     try testing.expectEqual(@as(usize, 0), totals.aborted.load(.seq_cst));
     const opened = totals.opened.load(.seq_cst);
     try testing.expect(opened >= 1 and opened <= 2);
+}
+
+test "defaultLanes: one per physical core, within the logical count" {
+    const n = defaultLanes();
+    try testing.expect(n >= 1);
+    try testing.expect(n <= (std.Thread.getCpuCount() catch 1));
+
+    var set = std.mem.zeroes(std.posix.cpu_set_t);
+    set[0] = 0b1110;
+    try testing.expectEqual(@as(?usize, 1), firstAllowedSibling("0-1", set));
+    try testing.expectEqual(@as(?usize, 2), firstAllowedSibling("2,10", set));
+    try testing.expectEqual(@as(?usize, null), firstAllowedSibling("4-5", set));
+    try testing.expectEqual(@as(?usize, null), firstAllowedSibling("x", set));
+    try testing.expectEqual(@as(?usize, 3), firstAllowedSibling("3", set));
 }

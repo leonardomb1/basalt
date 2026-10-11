@@ -185,6 +185,7 @@ const Opts = struct {
     format: runtime.StdoutFormat = .arrow,
     max_rows: ?u64 = null,
     threads: usize = 1,
+    lanes_auto: bool = true,
     log: runtime.LogConfig = .{},
 };
 
@@ -194,7 +195,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const stderr = &err_file.interface;
     defer stderr.flush() catch {};
 
-    var opts = Opts{ .threads = std.Thread.getCpuCount() catch 1 };
+    var opts = Opts{ .threads = runtime.defaultLanes() };
     opts.log = .{ .level = .warn, .summary = .none };
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -213,6 +214,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             if (i >= args.len) return usageErr(stderr, "missing value after `--threads`");
             opts.threads = @max(1, std.fmt.parseInt(usize, args[i], 10) catch
                 return usageErr(stderr, "invalid --threads"));
+            opts.lanes_auto = false;
         } else if (std.mem.eql(u8, a, "--log-format")) {
             i += 1;
             if (i >= args.len) return usageErr(stderr, "missing value after `--log-format`");
@@ -779,6 +781,7 @@ fn runScript(
         _ = runtime.run(gpa, entry.prog, .{
             .params = params,
             .threads = opts.threads,
+            .lanes_auto = opts.lanes_auto,
             .log = opts.log,
             .explain = entry.prog.explain == .analyze,
             .stdout_format = format,

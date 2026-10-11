@@ -154,6 +154,7 @@ pub const RunOptions = struct {
     params: []const ParamArg = &.{},
     request_body: ?[]const u8 = null,
     threads: usize = 1,
+    lanes_auto: bool = false,
     log: LogConfig = .{},
     outcomes: ?*OutcomeSink = null,
     buffer_segment: ?u64 = null,

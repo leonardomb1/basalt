@@ -503,6 +503,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
 
 pub const runOutput = @import("run/output.zig").runOutput;
 pub const runExplain = @import("run/explain.zig").runExplain;
+pub const defaultLanes = @import("parallel.zig").defaultLanes;
 pub const printPlanArrow = @import("run/explain.zig").printPlanArrow;
 const resolveParams = @import("run/params.zig").resolveParams;
 const resolveLets = @import("run/params.zig").resolveLets;

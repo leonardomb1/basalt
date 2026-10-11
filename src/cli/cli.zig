@@ -253,7 +253,7 @@ fn usage(w: anytype) !void {
         \\                     byte-range chunks for a local CSV, and row-group morsels
         \\                     for a Parquet — over aggregate / distinct / top-N / join /
         \\                     map-only pipelines. `EXPLAIN` names which one a query gets.
-        \\                     (default: CPU count; a map pipeline keeps file order at
+        \\                     (default: one per physical core; a map pipeline keeps file order at
         \\                     any -j, except into a table, which has none. A float SUM is
         \\                     reproducible for a given -j but not across values of it —
         \\                     CAST to DECIMAL for a total that never varies.)

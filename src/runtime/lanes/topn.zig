@@ -203,7 +203,7 @@ fn runParallelTopN(
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = split.lanes(opts.threads);
+    const nthreads = split.lanes(opts);
     var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer kept_arena.deinit();
     var ctx = TopNCtx{

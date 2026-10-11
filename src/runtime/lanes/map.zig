@@ -324,7 +324,7 @@ fn runParallelMapImpl(
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
 
-    const nthreads = split.lanes(opts.threads);
+    const nthreads = split.lanes(opts);
     var ctx = MapCtx{
         .split = split,
         .map_stages = map_stages,

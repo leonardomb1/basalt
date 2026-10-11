@@ -271,6 +271,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             if (std.mem.eql(u8, h.key, "split")) try extra.append(h);
             if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) {
                 opts.threads = @intCast(h.value.int);
+                opts.lanes_auto = false;
                 env.sort_threads = opts.threads;
             }
         }

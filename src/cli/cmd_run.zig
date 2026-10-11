@@ -39,7 +39,8 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer params.deinit();
     var port: ?u16 = null;
     var host: []const u8 = http_server.default_host;
-    var threads: usize = std.Thread.getCpuCount() catch 1;
+    var threads: usize = runtime.defaultLanes();
+    var lanes_auto = true;
     var log = runtime.LogConfig{};
     var level_set = false;
     var stdout_format: runtime.StdoutFormat = .table;
@@ -62,6 +63,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 2;
             };
             if (threads == 0) threads = 1;
+            lanes_auto = false;
         } else if (std.mem.eql(u8, a, "--format")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             stdout_format = std.meta.stringToEnum(runtime.StdoutFormat, v) orelse {
@@ -183,7 +185,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
     const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .lanes_auto = lanes_auto, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)
                 try eo.report(.{ .msg = "aborted", .event = "aborted" })

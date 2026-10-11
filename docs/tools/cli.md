@@ -19,6 +19,19 @@ Options may come before or after the script path, and `-` (the script on
 stdin) may sit anywhere among them: `basalt run --format json job.sql` and
 `basalt run job.sql --format json` are the same run.
 
+## Parallelism
+
+`-j N` runs a query that can fan out on exactly `N` lanes — fewer only when
+the input has fewer pieces than that, as a Parquet file with three row groups
+has three. Without `-j`, `run`, `kernel` and `serve` use one lane per physical
+core the process may run on (`taskset` and container CPU sets count), not one
+per hardware thread: a second hyperthread adds little to a lane that streams
+memory, and on a 14-core, 20-thread laptop twenty lanes ran Parquet aggregates
+and top-N 15–30% slower than fourteen. Without `-j` a CSV also gets no more than
+one lane per MiB, so a small file is not spread over threads that cost more to
+start than the file takes to read. A float `SUM` is reproducible for a given
+lane count, so pass `-j` when two machines must agree to the last bit.
+
 ## Output formats
 
 `--format json` makes stdout machine-readable: a terminal `SELECT` emits one

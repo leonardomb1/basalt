@@ -21,6 +21,7 @@ const buildStage = @import("../plan.zig").buildStage;
 const buildTopN = @import("../plan.zig").buildTopN;
 const connect_mod = @import("../connect.zig");
 const csv = @import("../../format/csv.zig");
+const csvLanes = @import("sources.zig").csvLanes;
 const csvSplitFile = @import("sources.zig").csvSplitFile;
 const dispatchWorker = @import("../lanes.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
@@ -637,7 +638,7 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = split.lanes(opts.threads);
+    const nthreads = split.lanes(opts);
     const lanes = try env.gpa.alloc(PqLane, nthreads);
     defer env.gpa.free(lanes);
     for (lanes) |*l| {
@@ -804,7 +805,7 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
     env.src_name = "csv";
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = @max(@as(usize, 1), opts.threads);
+    const nthreads = csvLanes(mapped.body.len, opts);
     const slots = try allocAggSlots(env.gpa, nthreads);
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
