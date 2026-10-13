@@ -224,7 +224,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             return aw.sink();
         }
         if (wfmt == .parquet) {
-            const pw = pqwrite.Writer.open(env.arena, w.target, schema, .snappy, fmode) catch |e|
+            const pw = pqwrite.Writer.open(env.arena, w.target, schema, env.pq_codec, fmode) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return pw.sink();
         }

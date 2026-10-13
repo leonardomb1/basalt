@@ -1427,6 +1427,8 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LOAD INTO '$B/o.dat' WITH (format = 'parquet') APPEND AS SELECT 1 AS a;", "a parquet file's footer" },
         .{ "LOAD INTO '$B/o.csv' UPSERT ON (a) AS SELECT 1 AS a;", "`UPSERT` needs a table to merge into" },
         .{ "LOAD INTO '$B/o.csv' WITH (bogus = 1) AS SELECT 1 AS a;", "unknown `LOAD INTO` option `bogus`" },
+        .{ "LOAD INTO '$B/o.csv.gz' WITH (compression = 'gzip') AS SELECT 1 AS a;", "`compression` applies to a Parquet file target only" },
+        .{ "LOAD INTO '$B/o.parquet' WITH (compression = 'zstd') AS SELECT 1 AS a;", "unknown Parquet compression `zstd`" },
         .{ "PARAM n INT DEFAULT 'abc';\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "PARAM `n`: `abc` is not an integer" },
         .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
         .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
@@ -1438,6 +1440,24 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
+}
+
+test "a Parquet sink's `compression` picks gzip or no codec, and the file reads back whole" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for ([_][]const u8{ "'gzip'", "none", "'snappy'" }) |c| {
+        const script = try std.fmt.allocPrint(alloc,
+            \\LOAD INTO '{s}/p.parquet' WITH (compression = {s}) AS SELECT range AS id, 'n' || CAST(range % 7 AS VARCHAR) AS s FROM RANGE(5000);
+            \\LOAD INTO '{s}/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS t, COUNT(DISTINCT s) AS d FROM '{s}/p.parquet';
+        , .{ base, c, base, base });
+        defer alloc.free(script);
+        const got = try runScript(alloc, &tmp, script, &.{});
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings("n,t,d\n5000,12497500,7\n", got);
+    }
 }
 
 test "a JSON PARAM's paths bind from -p in a batch run, a missing key is an error, a string DEFAULT is the fallback" {

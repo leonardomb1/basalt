@@ -6,6 +6,7 @@ const Diag = @import("../analyze.zig").Diag;
 const Error = @import("../analyze.zig").Error;
 const arrowread = @import("../../format/arrowread.zig");
 const ast = @import("../../lang/ast.zig");
+const pqcodec = @import("../../format/codec.zig");
 const csv = @import("../../format/csv.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
@@ -71,6 +72,21 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
     inline for (.{ "xlsx", "excel" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .xlsx;
     return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx)", .{s});
+}
+
+/// A Parquet sink's page codec, `compression = 'snappy' | 'gzip' | 'none'`, snappy
+/// when unset. Any other target refuses the key: a CSV file takes its codec from
+/// a `.gz` suffix.
+pub fn parquetCodecFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!pqcodec.Codec {
+    const s = hintText(hints, "compression") orelse return .snappy;
+    const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
+    const fmt = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) else null;
+    if (fmt != .parquet)
+        return fail(diag, "`compression` applies to a Parquet file target only; a CSV file is gzipped by a `.gz` suffix", .{});
+    if (std.ascii.eqlIgnoreCase(s, "snappy")) return .snappy;
+    if (std.ascii.eqlIgnoreCase(s, "gzip")) return .gzip;
+    if (std.ascii.eqlIgnoreCase(s, "none")) return .uncompressed;
+    return fail(diag, "unknown Parquet compression `{s}` (snappy, gzip, none)", .{s});
 }
 
 /// Validated here so `check` turns away a malformed range before a run.

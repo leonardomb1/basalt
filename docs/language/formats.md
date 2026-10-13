@@ -39,6 +39,12 @@ store `DECIMAL` in the narrowest physical type its precision allows — INT32 to
 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY up to 38; past 38 digits (the engine's
 own ceiling) a value is refused rather than silently truncated.
 
+Pages are compressed with Snappy unless the sink says otherwise:
+`LOAD INTO 'orders.parquet' WITH (compression = 'gzip') AS ...` writes GZIP
+pages, smaller than Snappy's for somewhat more CPU (a fast DEFLATE level), and
+`compression = 'none'` leaves them uncompressed. `compression` is a Parquet
+sink's option only; any other target refuses it at plan time.
+
 ## Excel
 
 An Excel workbook — `.xlsx` or `.xlsm`, local, by URL or in object storage — reads
@@ -124,7 +130,9 @@ shape for this reader), nor is bzip2.
 
 `LOAD INTO 'orders.csv.gz'` writes gzip, at about `gzip -6`'s size, and `APPEND`
 adds a member to an existing one. Other codecs are refused at plan time: zstd
-output is not supported, and Parquet and Arrow compress their own pages. A `.zip`
+output is not supported, and Parquet and Arrow compress their own pages
+(`WITH (compression = ...)` picks Parquet's codec; a CSV file's comes from its
+suffix alone). A `.zip`
 is read only: `LOAD INTO 'x.zip'` and `LOAD INTO 'x.zip :: a.csv'` are refused
 at plan time too.
 
