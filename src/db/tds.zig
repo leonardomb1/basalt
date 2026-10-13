@@ -720,7 +720,7 @@ const PacketReader = struct {
     }
 
     fn readByte(self: *PacketReader) !u8 {
-        if (!try self.ensure()) return error.EndOfMessage;
+        if (self.pos >= self.buf.items.len and !try self.ensure()) return error.EndOfMessage;
         const b = self.buf.items[self.pos];
         self.pos += 1;
         return b;
@@ -737,6 +737,11 @@ const PacketReader = struct {
         }
     }
     fn readU16(self: *PacketReader) !u16 {
+        if (self.pos + 2 <= self.buf.items.len) {
+            const v = std.mem.readInt(u16, self.buf.items[self.pos..][0..2], .little);
+            self.pos += 2;
+            return v;
+        }
         var b: [2]u8 = undefined;
         try self.readBytes(&b);
         return @as(u16, b[0]) | (@as(u16, b[1]) << 8);
@@ -791,6 +796,8 @@ const TdsCursor = struct {
     cols: []ColumnDesc,
     schema: *types.Schema,
     done: bool,
+    cell: [0xFFFF]u8 = undefined,
+    nullbuf: [512]u8 = undefined,
 
     fn readHeader(self: *TdsCursor) !void {
         const ma = self.meta_arena.allocator();
@@ -908,6 +915,8 @@ const TdsCursor = struct {
         for (0..count) |k| {
             try self.reader.skip(6);
             var d = try self.parseTypeInfo();
+            d.plain_text = d.engine_type.kind == .string and !d.is_unicode and !d.is_guid and !d.is_binary and
+                (d.kind == .bytelen or d.kind == .ushortlen);
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
             d.name = try utf16ToUtf8(ma, nbytes);
@@ -1077,34 +1086,60 @@ const TdsCursor = struct {
         var nullbits: []const u8 = &.{};
         if (nbc) {
             const nbytes = (self.cols.len + 7) / 8;
-            nullbits = try self.reader.readSlice(arena, nbytes);
+            nullbits = if (nbytes <= self.nullbuf.len) blk: {
+                try self.reader.readBytes(self.nullbuf[0..nbytes]);
+                break :blk self.nullbuf[0..nbytes];
+            } else try self.reader.readSlice(arena, nbytes);
         }
         for (self.cols, 0..) |col, ci| {
             if (nbc and (nullbits[ci / 8] >> @intCast(ci % 8)) & 1 != 0) {
                 try builders[ci].append(.null);
                 continue;
             }
+            if (col.plain_text) {
+                try self.readPlainText(&builders[ci], col);
+                continue;
+            }
             try builders[ci].append(try self.readColumnValue(arena, col));
         }
     }
 
+    /// A varchar or char cell read from the packet straight into the column, then
+    /// re-encoded from the cell buffer only when it holds a byte above 0x7F.
+    fn readPlainText(self: *TdsCursor, b: *column.Builder, col: ColumnDesc) !void {
+        const len: usize = switch (col.kind) {
+            .bytelen => try self.reader.readByte(),
+            else => try self.reader.readU16(),
+        };
+        if ((col.kind == .bytelen and len == 0) or (col.kind == .ushortlen and len == 0xFFFF)) return b.append(.null);
+        const dst = try b.reserveBytes(len);
+        try self.reader.readBytes(dst);
+        if (isAscii(dst)) return b.commitBytes(len);
+        const raw = self.cell[0..len];
+        @memcpy(raw, dst);
+        const out = try b.reserveBytes(win1252Len(raw));
+        return b.commitBytes(win1252Encode(out, raw));
+    }
+
+    /// Fixed and length-prefixed cells, never longer than the cell buffer, are read
+    /// into it; `decodeValue` copies whatever it keeps.
+    fn readCell(self: *TdsCursor, len: usize) ![]u8 {
+        try self.reader.readBytes(self.cell[0..len]);
+        return self.cell[0..len];
+    }
+
     fn readColumnValue(self: *TdsCursor, arena: std.mem.Allocator, col: ColumnDesc) !Value {
         switch (col.kind) {
-            .fixed => {
-                const bytes = try self.reader.readSlice(arena, col.fixed_len);
-                return decodeValue(arena, col, bytes);
-            },
+            .fixed => return decodeValue(arena, col, try self.readCell(col.fixed_len)),
             .bytelen => {
                 const len: usize = try self.reader.readByte();
                 if (len == 0) return .null;
-                const bytes = try self.reader.readSlice(arena, len);
-                return decodeValue(arena, col, bytes);
+                return decodeValue(arena, col, try self.readCell(len));
             },
             .ushortlen => {
                 const len = try self.reader.readU16();
                 if (len == 0xFFFF) return .null;
-                const bytes = try self.reader.readSlice(arena, len);
-                return decodeValue(arena, col, bytes);
+                return decodeValue(arena, col, try self.readCell(len));
             },
             .plp => {
                 const bytes = (try self.reader.readPlp(arena)) orelse return .null;
@@ -1243,6 +1278,7 @@ const ColumnDesc = struct {
     is_guid: bool = false,
     is_binary: bool = false,
     is_money: bool = false,
+    plain_text: bool = false,
 };
 
 fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
@@ -1563,6 +1599,97 @@ test "win1252 fast path matches a per-byte encode over every byte and random run
         defer alloc.free(got);
         try std.testing.expectEqualSlices(u8, want.items, got);
         try std.testing.expectEqual(want.items.len == len, isAscii(buf[0..len]));
+    }
+}
+
+test "rows split across packets of every small size decode as each cell decoded alone" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const strT = types.Type.init(.string).asNullable();
+    var cols = [_]ColumnDesc{
+        .{ .tds_type = 0x38, .engine_type = types.Type.init(.int).asNullable(), .kind = .fixed, .fixed_len = 4 },
+        .{ .tds_type = 0xA7, .engine_type = strT, .kind = .ushortlen, .plain_text = true },
+        .{ .tds_type = 0x2F, .engine_type = strT, .kind = .bytelen, .plain_text = true },
+        .{ .tds_type = 0x6C, .engine_type = types.Type.decimal(14, 2).asNullable(), .kind = .bytelen, .scale = 2 },
+        .{ .tds_type = 0xE7, .engine_type = strT, .kind = .ushortlen, .is_unicode = true },
+        .{ .tds_type = 0x3E, .engine_type = types.Type.init(.float).asNullable(), .kind = .fixed, .fixed_len = 8 },
+    };
+    var prng = std.Random.DefaultPrng.init(0x7d5);
+    const rnd = prng.random();
+    const rows = 60;
+    var payload = std.array_list.Managed(u8).init(a);
+    const want = try a.alloc([cols.len]Value, rows);
+    for (want) |*row| {
+        const nbc = rnd.boolean();
+        try payload.append(if (nbc) 0xD2 else 0xD1);
+        var nulls: u8 = 0;
+        if (nbc) {
+            nulls = rnd.int(u8) & 0x3F;
+            try payload.append(nulls);
+        }
+        for (&cols, row, 0..) |col, *cell, ci| {
+            if (nulls >> @intCast(ci) & 1 != 0) {
+                cell.* = .null;
+                continue;
+            }
+            var raw: [64]u8 = undefined;
+            const len: usize = switch (col.kind) {
+                .fixed => col.fixed_len,
+                else => if (col.engine_type.kind == .decimal) 9 else rnd.uintAtMost(usize, 40) & if (col.is_unicode) ~@as(usize, 1) else ~@as(usize, 0),
+            };
+            for (raw[0..len]) |*b| b.* = if (rnd.uintLessThan(u8, 4) == 0) rnd.int(u8) else rnd.intRangeAtMost(u8, ' ', '~');
+            if (col.engine_type.kind == .decimal) {
+                raw[0] = rnd.uintAtMost(u8, 1);
+                raw[8] = 0;
+            }
+            if (col.is_unicode) for (0..len / 2) |k| {
+                raw[2 * k + 1] = 0;
+            };
+            const is_null = col.kind != .fixed and rnd.uintLessThan(u8, 8) == 0;
+            switch (col.kind) {
+                .fixed => {},
+                .bytelen => try payload.append(if (is_null) 0 else @intCast(len)),
+                else => {
+                    var l: [2]u8 = undefined;
+                    std.mem.writeInt(u16, &l, if (is_null) 0xFFFF else @intCast(len), .little);
+                    try payload.appendSlice(&l);
+                },
+            }
+            if (is_null or (col.kind == .bytelen and len == 0)) {
+                cell.* = .null;
+                continue;
+            }
+            try payload.appendSlice(raw[0..len]);
+            cell.* = try decodeValue(a, col, raw[0..len]);
+        }
+    }
+    for ([_]usize{ 1, 2, 3, 5, 7, 13, 64, 1 << 16 }) |chunk| {
+        var stream = std.array_list.Managed(u8).init(a);
+        var off: usize = 0;
+        while (off < payload.items.len) {
+            const n = @min(chunk, payload.items.len - off, 0xFFFF - 8);
+            const last = off + n == payload.items.len;
+            try stream.appendSlice(&.{ 0x04, if (last) STATUS_EOM else 0, @intCast((n + 8) >> 8), @intCast((n + 8) & 0xFF), 0, 0, 0, 0 });
+            try stream.appendSlice(payload.items[off..][0..n]);
+            off += n;
+        }
+        var src = std.Io.Reader.fixed(stream.items);
+        const cur = try gpa.create(TdsCursor);
+        defer gpa.destroy(cur);
+        cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &cols, .schema = undefined, .done = false };
+        defer cur.reader.deinit();
+        const batch = (try cur.fetchBatch(a)).?;
+        try std.testing.expectEqual(@as(usize, rows), batch.len);
+        for (want, 0..) |row, r| for (row, 0..) |w, ci| {
+            const got = batch.columns[ci].getValue(r);
+            try std.testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(got));
+            switch (w) {
+                .string => |s| try std.testing.expectEqualStrings(s, got.string),
+                else => try std.testing.expect(std.meta.eql(w, got)),
+            }
+        };
     }
 }
 

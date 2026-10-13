@@ -476,6 +476,21 @@ pub const Builder = struct {
         try l.ends.append(@intCast(l.values.items.len));
     }
 
+    /// Room for `n` more bytes of a bytes column's next value, which a producer
+    /// fills in place and then records with `commitBytes`.
+    pub fn reserveBytes(self: *Builder, n: usize) ![]u8 {
+        const l = &self.store.bytes.values;
+        try l.ensureUnusedCapacity(n);
+        return l.unusedCapacitySlice()[0..n];
+    }
+
+    pub fn commitBytes(self: *Builder, n: usize) !void {
+        try self.pushValid(true);
+        const l = &self.store.bytes;
+        l.values.items.len += n;
+        try l.ends.append(@intCast(l.values.items.len));
+    }
+
     pub fn append(self: *Builder, v: Value) !void {
         const ok = !v.isNull();
         try self.pushValid(ok);
