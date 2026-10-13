@@ -9,6 +9,7 @@ const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const dupeValue = @import("aggregate.zig").dupeValue;
 const keyOrder = @import("sort.zig").keyOrder;
+const rowOrder = @import("sort.zig").rowOrder;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Limit = @import("../op.zig").Limit;
@@ -208,11 +209,8 @@ pub const TopN = struct {
 };
 
 pub fn entryLess(a: TopN.Entry, b: TopN.Entry, keys: []const Sort.Key) bool {
-    for (keys) |k| {
-        const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
-        if (o != .eq) return o == .lt;
-    }
-    return entrySeq(a) < entrySeq(b);
+    const o = rowOrder(keys, a, b);
+    return if (o != .eq) o == .lt else entrySeq(a) < entrySeq(b);
 }
 
 fn entrySeq(e: TopN.Entry) u64 {
@@ -232,12 +230,8 @@ fn entryLessCtx(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) bool {
 /// `std.PriorityQueue` comparator ranking the worst row highest, so the min-heap API
 /// yields the eviction candidate. Of two equal rows the later is worse.
 fn entryWorstFirst(keys: []const Sort.Key, a: TopN.Entry, b: TopN.Entry) std.math.Order {
-    for (keys) |k| {
-        const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
-        if (o != .eq) return o.invert();
-    }
-    if (entrySeq(a) != entrySeq(b)) return std.math.order(entrySeq(b), entrySeq(a));
-    return .eq;
+    const o = rowOrder(keys, a, b);
+    return if (o != .eq) o.invert() else std.math.order(entrySeq(b), entrySeq(a));
 }
 
 pub fn dupeRowGpa(gpa: std.mem.Allocator, row: []const Value) ![]Value {

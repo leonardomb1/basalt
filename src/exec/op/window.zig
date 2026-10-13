@@ -47,6 +47,7 @@ const decimalOverflow = @import("../eval.zig").decimalOverflow;
 const wideSumDecimal = @import("../eval.zig").wideSumDecimal;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
+const rowOrder = @import("sort.zig").rowOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
 const Moments = @import("aggregate/accumulate.zig").Moments;
@@ -134,11 +135,7 @@ pub const Window = struct {
     const Parts = std.HashMap([]const Value, *Kept, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 
     fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
-        for (self.ord) |k| {
-            const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
-            if (o != .eq) return o == .lt;
-        }
-        return false;
+        return rowOrder(self.ord, a, b) == .lt;
     }
 
     /// ROW_NUMBER up to rank `k`: per partition, the best `k` rows so far, best first.

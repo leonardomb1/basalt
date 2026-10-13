@@ -535,26 +535,15 @@ pub const KeyArr = struct {
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| if (other.data == .ints) std.math.order(v[a], other.data.ints[c]) else return self.boxedAcross(a, other, c),
             .floats => |v| if (other.data == .floats) eval.orderF64(v[a], other.data.floats[c]) else return self.boxedAcross(a, other, c),
-            .decs => |v| if (other.data == .decs) (orderScaled(v[a], self.scale, other.data.decs[c], other.scale) orelse return self.boxedAcross(a, other, c)) else return self.boxedAcross(a, other, c),
+            .decs => |v| if (other.data == .decs) Decimal.order(.{ .unscaled = v[a], .scale = self.scale }, .{ .unscaled = other.data.decs[c], .scale = other.scale }) else return self.boxedAcross(a, other, c),
             .strs => |v| if (other.data == .strs) std.mem.order(u8, v[a], other.data.strs[c]) else return self.boxedAcross(a, other, c),
             .boxed => return self.boxedAcross(a, other, c),
         };
-        if (ord == .eq) return .eq;
-        return if (self.desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+        return if (self.desc) ord.invert() else ord;
     }
 
     fn boxedAcross(self: KeyArr, a: usize, other: KeyArr, c: usize) std.math.Order {
         return keyOrder(self.col.getValue(a), other.col.getValue(c), self.desc, self.nulls_first);
-    }
-
-    fn orderScaled(x: i128, sx: u8, y: i128, sy: u8) ?std.math.Order {
-        if (sx == sy) return std.math.order(x, y);
-        const hi = @max(sx, sy);
-        const fx = std.math.powi(i256, 10, hi - sx) catch return null;
-        const fy = std.math.powi(i256, 10, hi - sy) catch return null;
-        const wx = std.math.mul(i256, x, fx) catch return null;
-        const wy = std.math.mul(i256, y, fy) catch return null;
-        return std.math.order(wx, wy);
     }
 
     pub fn order(self: KeyArr, a: usize, c: usize) std.math.Order {
@@ -568,8 +557,7 @@ pub const KeyArr = struct {
             .strs => |v| std.mem.order(u8, v[a], v[c]),
             .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc, self.nulls_first),
         };
-        if (ord == .eq) return .eq;
-        return if (self.desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+        return if (self.desc) ord.invert() else ord;
     }
 };
 
@@ -888,8 +876,16 @@ pub fn keyOrder(va: Value, vb: Value, desc: bool, nulls_first: bool) std.math.Or
     const bn = vb.isNull();
     if (an or bn) return nullOrder(an, bn, nulls_first);
     const ord = eval.compareValues(va, vb) orelse return .eq;
-    if (ord == .eq) return .eq;
-    return if (desc) (if (ord == .lt) std.math.Order.gt else std.math.Order.lt) else ord;
+    return if (desc) ord.invert() else ord;
+}
+
+/// The order of two rows on `keys`, the first key that tells them apart deciding.
+pub fn rowOrder(keys: []const Sort.Key, a: []const Value, b: []const Value) std.math.Order {
+    for (keys) |k| {
+        const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
+        if (o != .eq) return o;
+    }
+    return .eq;
 }
 
 test "sort: nulls first or last in either direction" {
