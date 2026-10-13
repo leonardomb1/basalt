@@ -632,7 +632,8 @@ pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []
     const w = buf.writer();
 
     if (dialect == .sqlserver) {
-        try w.print("IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ qtable, qtable });
+        const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
+        try w.print("IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
     } else {
         try w.print("CREATE TABLE IF NOT EXISTS {s} (", .{qtable});
     }
@@ -640,7 +641,7 @@ pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try w.writeByte(',');
         const is_key = nameIn(keys, f.name);
-        const qn = try quoteIdent(arena, dialect, f.name);
+        const qn = try quoteName(arena, dialect, f.name);
         try w.print("{s} {s}", .{ qn, try dialect.ddlType(arena, f.ty, is_key) });
         if (is_key) {
             try w.writeAll(" NOT NULL");
@@ -679,7 +680,7 @@ fn starrocksTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types
     try w.print("CREATE TABLE IF NOT EXISTS {s} (\n", .{qtable});
     for (ordered.items, 0..) |f, i| {
         const is_key = is_pk and nameIn(keys, f.name);
-        const qn = try quoteIdent(arena, .starrocks, f.name);
+        const qn = try quoteName(arena, .starrocks, f.name);
         try w.print("  {s} {s}{s}", .{ qn, try Dialect.starrocks.ddlType(arena, f.ty, is_key), if (is_key) " NOT NULL" else "" });
         if (i + 1 < ordered.items.len) try w.writeByte(',');
         try w.writeByte('\n');
@@ -713,7 +714,7 @@ fn dorisTableSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Sch
     try w.print("CREATE TABLE IF NOT EXISTS {s} (\n", .{qtable});
     for (ordered.items, 0..) |f, i| {
         const is_key = nameIn(keys, f.name);
-        const qn = try quoteIdent(arena, .doris, f.name);
+        const qn = try quoteName(arena, .doris, f.name);
         try w.print("  {s} {s}{s}", .{ qn, try Dialect.doris.ddlType(arena, f.ty, is_key), if (is_key) " NOT NULL" else "" });
         if (i + 1 < ordered.items.len) try w.writeByte(',');
         try w.writeByte('\n');
@@ -773,7 +774,7 @@ fn buildMerge(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, sc
     try w.print("MERGE INTO {s} AS T USING (VALUES {s}) AS S ({s}) ON ", .{ qtable, values, cols });
     for (keys, 0..) |k, i| {
         if (i > 0) try w.writeAll(" AND ");
-        const qk = try quoteIdent(arena, dialect, k);
+        const qk = try quoteName(arena, dialect, k);
         try w.print("T.{s}=S.{s}", .{ qk, qk });
     }
     try w.writeAll(" WHEN MATCHED THEN UPDATE SET ");
@@ -781,7 +782,7 @@ fn buildMerge(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, sc
     try w.print(" WHEN NOT MATCHED THEN INSERT ({s}) VALUES (", .{cols});
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try w.writeByte(',');
-        try w.print("S.{s}", .{try quoteIdent(arena, dialect, f.name)});
+        try w.print("S.{s}", .{try quoteName(arena, dialect, f.name)});
     }
     try w.writeAll(");");
     return buf.toOwnedSlice();
@@ -793,7 +794,7 @@ fn writeUpdateSet(w: anytype, arena: std.mem.Allocator, dialect: Dialect, schema
         if (nameIn(keys, f.name)) continue;
         if (!first) try w.writeByte(',');
         first = false;
-        const qn = try quoteIdent(arena, dialect, f.name);
+        const qn = try quoteName(arena, dialect, f.name);
         try w.print("{s}={s}{s}", .{ qn, src_prefix, qn });
     }
 }
@@ -804,7 +805,7 @@ fn writeMysqlUpdate(w: anytype, arena: std.mem.Allocator, dialect: Dialect, sche
         if (nameIn(keys, f.name)) continue;
         if (!first) try w.writeByte(',');
         first = false;
-        const qn = try quoteIdent(arena, dialect, f.name);
+        const qn = try quoteName(arena, dialect, f.name);
         try w.print("{s}=VALUES({s})", .{ qn, qn });
     }
 }
@@ -813,7 +814,7 @@ pub fn colList(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema)
     var buf = std.array_list.Managed(u8).init(arena);
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try buf.append(',');
-        try writeQuoted(&buf, dialect, f.name);
+        try writeQuotedName(&buf, dialect, f.name);
     }
     return buf.toOwnedSlice();
 }
@@ -822,7 +823,7 @@ fn quoteNames(arena: std.mem.Allocator, dialect: Dialect, names: []const []const
     var buf = std.array_list.Managed(u8).init(arena);
     for (names, 0..) |n, i| {
         if (i > 0) try buf.append(',');
-        try writeQuoted(&buf, dialect, n);
+        try writeQuotedName(&buf, dialect, n);
     }
     return buf.toOwnedSlice();
 }
@@ -933,6 +934,14 @@ pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) 
     return buf.toOwnedSlice();
 }
 
+/// One identifier, dots and all, as a single quoted name: a column, or one part of
+/// a qualified table name.
+pub fn quoteName(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(arena);
+    try writeQuotedName(&buf, dialect, name);
+    return buf.toOwnedSlice();
+}
+
 /// `quoteIdent` straight into a list, so a sink on a general-purpose allocator does
 /// not leak one allocation per column (a 306-column load once leaked thousands).
 fn writeQuoted(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const u8) !void {
@@ -941,10 +950,19 @@ fn writeQuoted(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const
     while (it.next()) |part| {
         if (!first) try buf.append('.');
         first = false;
-        try buf.append(dialect.qOpen());
-        try buf.appendSlice(part);
-        try buf.append(dialect.qClose());
+        try writeQuotedName(buf, dialect, part);
     }
+}
+
+/// The dialect's quotes around `name`, a closing quote inside it doubled.
+fn writeQuotedName(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const u8) !void {
+    const close = dialect.qClose();
+    try buf.append(dialect.qOpen());
+    for (name) |c| {
+        if (c == close) try buf.append(close);
+        try buf.append(c);
+    }
+    try buf.append(close);
 }
 
 pub fn nameIn(names: []const []const u8, n: []const u8) bool {
@@ -1132,6 +1150,36 @@ test "quoteIdent quotes each dotted part per dialect" {
     try std.testing.expectEqualStrings("`db`.`t`", try quoteIdent(a, .mysql, "db.t"));
     try std.testing.expectEqualStrings("[dbo].[t]", try quoteIdent(a, .sqlserver, "dbo.t"));
     try std.testing.expectEqualStrings("`t`", try quoteIdent(a, .mysql, "t"));
+}
+
+test "quoteIdent and quoteName double the closing quote; quoteName keeps dots" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("\"a\"\"b\".\"t\"", try quoteIdent(a, .postgres, "a\"b.t"));
+    try std.testing.expectEqualStrings("`a``b`.`t`", try quoteIdent(a, .mysql, "a`b.t"));
+    try std.testing.expectEqualStrings("`a``b`", try quoteIdent(a, .starrocks, "a`b"));
+    try std.testing.expectEqualStrings("`a``b`", try quoteIdent(a, .doris, "a`b"));
+    try std.testing.expectEqualStrings("[a]]b].[t]", try quoteIdent(a, .sqlserver, "a]b.t"));
+    try std.testing.expectEqualStrings("[a[b]", try quoteIdent(a, .sqlserver, "a[b"));
+    try std.testing.expectEqualStrings("\"a.b\"", try quoteName(a, .postgres, "a.b"));
+    try std.testing.expectEqualStrings("[a.]]b]", try quoteName(a, .sqlserver, "a.]b"));
+}
+
+test "create table and insert quote odd column names whole" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "i]d", .ty = types.Type.init(.int) },
+        .{ .name = "x.y", .ty = types.Type.init(.string) },
+    } };
+    const qt = try quoteIdent(a, .sqlserver, "o'brien");
+    const ddl = try createTableSql(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"i]d"} } });
+    try std.testing.expect(std.mem.startsWith(u8, ddl, "IF OBJECT_ID(N'[o''brien]', N'U') IS NULL CREATE TABLE [o'brien] ("));
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "[i]]d] BIGINT NOT NULL,[x.y] NVARCHAR(4000) NULL, PRIMARY KEY ([i]]d])") != null);
+    const stmt = try buildStatement(a, .postgres, try quoteIdent(a, .postgres, "t"), schema, .append, &.{"(1,'a')"});
+    try std.testing.expectEqualStrings("INSERT INTO \"t\" (\"i]d\",\"x.y\") VALUES (1,'a')", stmt);
 }
 
 test "serializeValue: dialect-specific escaping, bools, bytes, null" {

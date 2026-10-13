@@ -153,8 +153,12 @@ pub fn genCreateTable(
     buckets: u32,
     replication_num: u32,
 ) ![]const u8 {
-    const qtable = try std.fmt.allocPrint(arena, "`{s}`.`{s}`", .{ db, table });
+    const qtable = try qualified(arena, flavor, db, table);
     return sql.createTableSqlWith(arena, flavor.dialect(), qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
+}
+
+fn qualified(arena: std.mem.Allocator, flavor: Flavor, db: []const u8, table: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}.{s}", .{ try sql.quoteName(arena, flavor.dialect(), db), try sql.quoteName(arena, flavor.dialect(), table) });
 }
 
 /// `<prefix>_<table>_<run_id>_<seq>`, with every byte outside `[-\w]` folded to `_`:
@@ -326,21 +330,18 @@ pub const StreamLoadSink = struct {
         }
         errdefer self.freeGzip();
         if (cfg.auto_create) {
+            var aa = std.heap.ArenaAllocator.init(gpa);
+            defer aa.deinit();
+            const a = aa.allocator();
             if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
                 if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
-                    const cdb = try std.fmt.allocPrint(gpa, "CREATE DATABASE IF NOT EXISTS `{s}`", .{cfg.database});
-                    defer gpa.free(cdb);
-                    try self.runDDL(cdb);
+                    try self.runDDL(try std.fmt.allocPrint(a, "CREATE DATABASE IF NOT EXISTS {s}", .{try sql.quoteName(a, cfg.flavor.dialect(), cfg.database)}));
                 }
-                const ddl = try genCreateTable(gpa, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num);
-                defer gpa.free(ddl);
-                try self.runDDL(ddl);
+                try self.runDDL(try genCreateTable(a, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num));
             }
 
             if (mode == .overwrite) {
-                const trunc = try std.fmt.allocPrint(gpa, "TRUNCATE TABLE `{s}`.`{s}`", .{ cfg.database, table });
-                defer gpa.free(trunc);
-                try self.runDDL(trunc);
+                try self.runDDL(try std.fmt.allocPrint(a, "TRUNCATE TABLE {s}", .{try qualified(a, cfg.flavor, cfg.database, table)}));
             }
         }
         self.setup_ns = (try std.time.Instant.now()).since(self.opened);
@@ -896,6 +897,24 @@ test "create table: append -> Duplicate Key" {
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`name` VARCHAR(65533)") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "DUPLICATE KEY(`id`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "BUCKETS 4") != null);
+}
+
+test "create table: a backtick in a database or column name is doubled" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "a`b", .ty = types.Type.init(.int) },
+        .{ .name = "c.d", .ty = types.Type.init(.string) },
+    } };
+    for ([_]Flavor{ .starrocks, .doris }) |f| {
+        const stmt = try genCreateTable(a, f, "w`h", "t", schema, .{ .upsert = .{ .keys = &.{"a`b"} } }, 4, 1);
+        try std.testing.expect(std.mem.indexOf(u8, stmt, "CREATE TABLE IF NOT EXISTS `w``h`.`t`") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stmt, "`a``b` BIGINT NOT NULL") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stmt, "`c.d` ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, stmt, "KEY(`a``b`)") != null);
+    }
+    try std.testing.expectEqualStrings("`a``b`,`c.d`", try columnList(a, schema));
 }
 
 test "create table: inferred upsert with unresolved (empty) keys errors" {

@@ -1201,7 +1201,7 @@ const BulkProto = struct {
         var cols = std.array_list.Managed(u8).init(arena);
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try cols.appendSlice(", ");
-            try cols.appendSlice(try sql.quoteIdent(arena, .sqlserver, f.name));
+            try cols.appendSlice(try sql.quoteName(arena, .sqlserver, f.name));
             try cols.appendSlice(" nvarchar(4000)");
         }
         return std.fmt.allocPrint(arena, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
