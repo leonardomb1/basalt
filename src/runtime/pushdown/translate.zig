@@ -32,6 +32,12 @@ pub const Need = enum {
     }
 };
 
+/// An equality a folding collation can only widen (`=` under superset) or narrow
+/// (`<>` under subset), so it is sent whatever the collation.
+fn foldSafe(op: ast.BinOp, need: Need) bool {
+    return (op == .eq and need == .superset) or (op == .ne and need == .subset);
+}
+
 pub const ColFacts = struct {
     text: bool,
     byte_order: bool = false,
@@ -215,13 +221,7 @@ const Tx = struct {
                 if (isLikeFn(c.name)) return self.likePred(c, need);
                 return self.value(e);
             },
-            .cond => |c| {
-                const cnd = (try self.pred(c.cond, .exact)) orelse return null;
-                const t = (try self.value(c.then)) orelse return null;
-                const f = (try self.value(c.els)) orelse return null;
-                return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
-            },
-            .match => |m| return self.match(m),
+            .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
             else => return self.value(e),
         }
     }
@@ -229,7 +229,7 @@ const Tx = struct {
     /// TRY_CAST and text-to-number casts of unprovable input stay engine-side.
     fn value(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
         switch (e.*) {
-            .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
+            .bool_lit => |b| return try self.boolLit(b),
             .int_lit => |v| return try self.fmt("{d}", .{v}),
             .float_lit => |v| return try self.fmt("{d}", .{v}),
             .dec_lit => |v| return try self.fmt("{f}", .{v}),
@@ -373,15 +373,10 @@ const Tx = struct {
         }
         const lf: ?ColFacts = if (lk == .text) lk.text.facts else null;
         const rf: ?ColFacts = if (rk == .text) rk.text.facts else null;
-        const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
-        if ((lf == null or rf == null) and !settled) self.want();
+        const eq_ok = foldSafe(op, need);
+        if ((lf == null or rf == null) and !eq_ok) self.want();
         const bytes = if (lf) |a| (if (rf) |b| a.byte_order and b.byte_order and !a.pads and !b.pads and !(lk == .text and lk.text.fn_) and !(rk == .text and rk.text.fn_) else false) else false;
-        const ok = bytes or switch (op) {
-            .eq => need == .superset,
-            .ne => need == .subset,
-            else => false,
-        };
-        if (!ok) return null;
+        if (!bytes and !eq_ok) return null;
         const ls = (try self.value(l)) orelse return null;
         const rs = (try self.value(r)) orelse return null;
         return try self.fmt("({s} {s} {s})", .{ ls, opSql(op), rs });
@@ -409,11 +404,16 @@ const Tx = struct {
             },
             .bool => {
                 const b = (try litAs(self.arena, t, types.Type.init(.bool))) orelse return null;
-                if (self.dialect == .sqlserver) return try self.arena.dupe(u8, if (b.bool_lit) "1" else "0");
-                return try self.arena.dupe(u8, if (b.bool_lit) "TRUE" else "FALSE");
+                return try self.boolLit(b.bool_lit);
             },
             else => return self.value(&.{ .str_lit = lit }),
         }
+    }
+
+    /// A bool as a value; SQL Server has no TRUE, and a predicate is no value there.
+    fn boolLit(self: Tx, b: bool) ![]const u8 {
+        if (self.dialect == .sqlserver) return self.arena.dupe(u8, if (b) "1" else "0");
+        return self.arena.dupe(u8, if (b) "TRUE" else "FALSE");
     }
 
     /// `IS [NOT] DISTINCT FROM` where the source has it: PostgreSQL as written, the
@@ -425,8 +425,7 @@ const Tx = struct {
         const rk = self.kind(r);
         const numeric = (isLit(l) or isLit(r)) and lk != .text and rk != .text;
         const exact_kind = (lk == .other and rk == .other) or numeric or l.* == .null_lit or r.* == .null_lit;
-        const settled = (op == .not_distinct and need == .superset) or (op == .distinct and need == .subset);
-        if (!exact_kind and !settled) return null;
+        if (!exact_kind and !foldSafe(if (op == .not_distinct) .eq else .ne, need)) return null;
         const ls = (try self.value(l)) orelse return null;
         const rs = (try self.value(r)) orelse return null;
         return switch (self.dialect) {
@@ -451,8 +450,8 @@ const Tx = struct {
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
         const f = known orelse ColFacts{ .text = true };
         const is_fn = k == .text and k.text.fn_;
-        const settled = (op == .eq and need == .superset) or (op == .ne and need == .subset);
-        if (known == null and !is_fn and !settled) self.want();
+        const eq_ok = foldSafe(op, need);
+        if (known == null and !is_fn and !eq_ok) self.want();
         const cs = (try self.value(col)) orelse return null;
         const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
         const plain = try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
@@ -460,11 +459,7 @@ const Tx = struct {
 
         if (is_fn) {
             if (!ascii) return null;
-            return switch (op) {
-                .eq => if (need == .superset) plain else null,
-                .ne => if (need == .subset) plain else null,
-                else => null,
-            };
+            return if (eq_ok) plain else null;
         }
         if (f.byte_order and !f.pads and ascii) return plain;
         switch (op) {
@@ -858,6 +853,9 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "status = 'a\\b'", .want = null, .d = .mysql },
         .{ .src = "now() > v", .want = null },
         .{ .src = "v + 1 > 2", .want = null },
+        .{ .src = "ok = TRUE", .want = "([ok] = 1)" },
+        .{ .src = "ok = FALSE", .want = "(`ok` = FALSE)", .d = .mysql },
+        .{ .src = "v > 1 OR TRUE", .want = "(([v] > 1) OR (1=1))" },
     };
     for (cases) |tc| {
         var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
