@@ -532,18 +532,10 @@ pub const CsvReader = struct {
             extra = try obj.getHeaders(arena);
         }
         const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
-        startHttp(hf, uri, extra) catch |e| switch (e) {
-            error.TlsInitializationFailed => {
-                const h = http_client.uriHost(uri) orelse return e;
-                if (!http_client.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
-                hf.client.next_https_rescan_certs = false;
-                try startHttp(hf, uri, extra);
-            },
-            else => return e,
-        };
+        var prng = objstore.jitterPrng();
+        var opening: HttpOpen = .{ .arena = arena, .hf = hf, .uri = uri, .extra = extra };
+        try objstore.retry(.{ .rand = prng.random() }, &opening, HttpOpen.attempt);
         errdefer hf.req.deinit();
-        const code = @intFromEnum(hf.response.head.status);
-        if (code != 200) return http_client.statusError(code);
         const ce = hf.response.head.content_encoding;
         if (ce == .compress) return error.UnsupportedCompressionMethod;
         const win = switch (ce) {
@@ -581,9 +573,39 @@ pub const CsvReader = struct {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 
+    /// One try at a GET's response head, retried by `objstore.retry` until a 200
+    /// arrives; a failed try drops its connection, so the next one dials afresh.
+    const HttpOpen = struct {
+        arena: std.mem.Allocator,
+        hf: *HttpFetch,
+        uri: std.Uri,
+        extra: []const std.http.Header,
+
+        fn attempt(self: *HttpOpen) !objstore.Verdict {
+            const hf = self.hf;
+            startHttp(hf, self.uri, self.extra) catch |e| switch (e) {
+                error.TlsInitializationFailed => {
+                    const h = http_client.uriHost(self.uri) orelse return e;
+                    if (!http_client.repairBundle(self.arena, &hf.client.ca_bundle, h, self.uri.port orelse 443)) return e;
+                    hf.client.next_https_rescan_certs = false;
+                    try startHttp(hf, self.uri, self.extra);
+                },
+                else => return e,
+            };
+            const code = @intFromEnum(hf.response.head.status);
+            if (code == 200) return .done;
+            if (hf.req.connection) |c| c.closing = true;
+            hf.req.deinit();
+            return .{ .failed = .{ .code = code, .err = http_client.statusError(code) } };
+        }
+    };
+
     fn startHttp(hf: *HttpFetch, uri: std.Uri, extra: []const std.http.Header) !void {
         hf.req = try hf.client.request(.GET, uri, .{ .extra_headers = extra });
-        errdefer hf.req.deinit();
+        errdefer {
+            if (hf.req.connection) |c| c.closing = true;
+            hf.req.deinit();
+        }
         try hf.req.sendBodiless();
         hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
@@ -1608,7 +1630,7 @@ test "CsvReader reads a list of http CSVs, each decoded per its Content-Encoding
     try std.testing.expectEqual(@as(usize, 6), rows);
 }
 
-test "CsvReader maps http status: 4xx permanent, 5xx transient" {
+test "CsvReader fails at once on a 4xx" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1623,16 +1645,27 @@ test "CsvReader maps http status: 4xx permanent, 5xx transient" {
         const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
         try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url, .{}));
     }
-    {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        var listener = try addr.listen(.{ .reuse_address = true });
-        defer listener.deinit();
-        const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "503 Service Unavailable", "busy" });
-        defer th.join();
-        defer releaseAccept(&listener);
-        const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
-        try std.testing.expectError(error.HttpServerBusy, CsvReader.open(a, url, .{}));
-    }
+}
+
+test "CsvReader retries a 503, a reset and a 502 before the 200" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = objstore.FakeServer.reply;
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        reply("503 Service Unavailable", "", ""),
+        null,
+        reply("502 Bad Gateway", "", ""),
+        reply("200 OK", "", "id,name\n1,a\n2,b\n"),
+    });
+    defer srv.stop();
+    const r = try CsvReader.open(a, try srv.url(a, "/data.csv"), .{});
+    defer r.close();
+    var rows: usize = 0;
+    while (try r.next(a)) |b| rows += b.len;
+    try std.testing.expectEqual(@as(usize, 2), rows);
+    try std.testing.expectEqual(@as(usize, 4), srv.requests());
 }
 
 pub fn parseSlice(a: std.mem.Allocator, schema: *const types.Schema, data: []const u8) !Batch {
