@@ -157,6 +157,25 @@ pub fn genCreateTable(
     return sql.createTableSqlWith(arena, flavor.dialect(), qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
 }
 
+/// The first name StarRocks cannot quote, if any: its parser collapses a doubled
+/// backtick to nothing, so `a``b` names the column `ab`.
+pub fn unquotableName(flavor: Flavor, db: []const u8, table: []const u8, schema: types.Schema) ?[]const u8 {
+    if (flavor != .starrocks) return null;
+    if (std.mem.indexOfScalar(u8, db, '`') != null) return db;
+    if (std.mem.indexOfScalar(u8, table, '`') != null) return table;
+    for (schema.fields) |f| if (std.mem.indexOfScalar(u8, f.name, '`') != null) return f.name;
+    return null;
+}
+
+test "unquotableName refuses a backtick on StarRocks only" {
+    const fields = [_]types.Schema.Field{ .{ .name = "id", .ty = types.Type.init(.int) }, .{ .name = "a`b", .ty = types.Type.init(.string) } };
+    const schema = types.Schema{ .fields = &fields };
+    try std.testing.expectEqualStrings("a`b", unquotableName(.starrocks, "db", "t", schema).?);
+    try std.testing.expectEqualStrings("t`x", unquotableName(.starrocks, "db", "t`x", .{ .fields = &.{} }).?);
+    try std.testing.expect(unquotableName(.doris, "db", "t", schema) == null);
+    try std.testing.expect(unquotableName(.starrocks, "db", "t", .{ .fields = fields[0..1] }) == null);
+}
+
 fn qualified(arena: std.mem.Allocator, flavor: Flavor, db: []const u8, table: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}.{s}", .{ try sql.quoteName(arena, flavor.dialect(), db), try sql.quoteName(arena, flavor.dialect(), table) });
 }

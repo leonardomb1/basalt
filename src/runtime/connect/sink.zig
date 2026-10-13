@@ -236,6 +236,8 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{w.connector}));
     if (streamload.Flavor.of(conn.connector)) |flavor| {
         const cfg = try resolveStreamLoadConfig(env, conn, flavor);
+        if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} cannot name a database, table or column `{s}`: it drops a backtick from a quoted name, so the rows would land under another name", .{ flavor.name(), name }));
         const s = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
             return srOpenErr(env, e, try std.fmt.allocPrint(env.arena, "{s} sink open failed", .{flavor.name()}));
         s.logger = env.log;
