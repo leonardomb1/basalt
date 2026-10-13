@@ -45,6 +45,7 @@ const regexpFind = @import("support.zig").regexpFind;
 const reverseChars = @import("strings.zig").reverseChars;
 const roundDecimal = @import("cast.zig").roundDecimal;
 const roundHalfAway = @import("strings.zig").roundHalfAway;
+const regexErr = @import("support.zig").regexErr;
 const roundOutScale = @import("cast.zig").roundOutScale;
 const std = @import("std");
 const strftimeFmt = @import("time.zig").strftimeFmt;
@@ -90,22 +91,14 @@ pub const per_row = struct {
             if (fv.isNull()) return .null;
             flags = regex.parseFlags(try valueToString(arena, fv)) orelse return error.CastFailed;
         }
-        const re = cachedRegexOpts(try valueToString(arena, pat), .{ .icase = flags.icase }) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadPattern => return error.CastFailed,
-            error.PatternTooComplex => return error.PatternTooComplex,
-        };
+        const re = cachedRegexOpts(try valueToString(arena, pat), .{ .icase = flags.icase }) catch |e| return regexErr(e);
         const replaceFn = if (flags.global) &regex.replaceAllRe else &regex.replaceFirstRe;
         const out = replaceFn(
             arena,
             re,
             try valueToString(arena, v),
             try valueToString(arena, rep),
-        ) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.BadPattern => return error.CastFailed,
-            error.PatternTooComplex => return error.PatternTooComplex,
-        };
+        ) catch |e| return regexErr(e);
         return .{ .string = out };
     }
 

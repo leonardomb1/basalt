@@ -148,18 +148,19 @@ pub fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row:
     if (v.isNull()) return null;
     const pat = try evalRow(arena, c.args[1], batch, row);
     if (pat.isNull()) return null;
-    const re = cachedRegex(try valueToString(arena, pat)) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadPattern => return error.CastFailed,
-        error.PatternTooComplex => return error.PatternTooComplex,
-    };
+    const re = cachedRegex(try valueToString(arena, pat)) catch |e| return regexErr(e);
     var m = RegexMatch{ .s = try valueToString(arena, v), .span = null, .caps = undefined };
-    m.span = re.find(m.s, 0, &m.caps) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadPattern => return error.CastFailed,
-        error.PatternTooComplex => return error.PatternTooComplex,
-    };
+    m.span = re.find(m.s, 0, &m.caps) catch |e| return regexErr(e);
     return m;
+}
+
+/// A regex failure as the evaluator raises it: a bad pattern is a CastFailed.
+pub fn regexErr(e: regex.Error) EvalError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadPattern => error.CastFailed,
+        error.PatternTooComplex => error.PatternTooComplex,
+    };
 }
 
 /// The entry is invalidated before compiling, so a failed compile never leaves the
