@@ -82,15 +82,7 @@ pub fn overBudget(self: *Aggregate, parts: anytype) bool {
 
 /// Writes the rows `dest` marks to their spill files, failing past the depth limit.
 pub fn spillRows(self: *Aggregate, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
-    const sp = self.spill.?;
-    if (self.spill_depth >= self.max_spill_depth) {
-        if (self.err) |ec| ec.set("GROUP BY still exceeds --op-memory after {d} levels of spilling; raise --op-memory", .{self.spill_depth});
-        return error.SpillTooDeep;
-    }
-    sp.parts.route(scratch, b, dest) catch |e| {
-        if (e == error.SpillCapExceeded) if (self.err) |ec| ec.set("GROUP BY spilled past --spill-cap; raise --spill-cap or --op-memory", .{});
-        return e;
-    };
+    return self.spill.?.parts.route(scratch, b, dest, "GROUP BY", self.spill_depth, self.max_spill_depth, self.err);
 }
 
 /// A row's spill file from the key hash the fold already computed.
@@ -101,8 +93,10 @@ pub fn destOf(self: *const Aggregate, h: u64) u8 {
 const Scan = @import("../../op.zig").Scan;
 const ErrCtx = @import("../../op.zig").ErrCtx;
 const Space = @import("../../space.zig").Space;
-const DirSpace = @import("../../space.zig").DirSpace;
+const TestDir = @import("../../spill.zig").TestDir;
 const TestSource = @import("../testing_util.zig").TestSource;
+const expectSameRows = @import("../testing_util.zig").expectSameRows;
+const lessStr = @import("../testing_util.zig").lessStr;
 const Value = @import("../../value.zig").Value;
 const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
@@ -227,10 +221,6 @@ const Opts = struct {
     err: ?*ErrCtx = null,
 };
 
-fn lessStr(_: void, x: []const u8, y: []const u8) bool {
-    return std.mem.lessThan(u8, x, y);
-}
-
 /// Every output row as one string, sorted, so runs compare as multisets.
 fn runAgg(a: std.mem.Allocator, input: []const Batch, by: []const usize, aggs: []const Aggregate.Agg, o: Opts) ![]const []const u8 {
     var ts = TestSource{ .schema_ = in_schema, .batches = input };
@@ -266,38 +256,6 @@ fn runAgg(a: std.mem.Allocator, input: []const Batch, by: []const usize, aggs: [
     return rows.items;
 }
 
-pub const TestDir = struct {
-    tmp: testing.TmpDir,
-    path: []const u8,
-    ds: DirSpace,
-
-    pub fn init(cap: u64) !*TestDir {
-        const self = try testing.allocator.create(TestDir);
-        self.tmp = testing.tmpDir(.{ .iterate = true });
-        self.path = try self.tmp.dir.realpathAlloc(testing.allocator, ".");
-        self.ds = .{ .dir = self.path, .cap = cap };
-        return self;
-    }
-
-    pub fn deinit(self: *TestDir) void {
-        testing.allocator.free(self.path);
-        self.tmp.cleanup();
-        testing.allocator.destroy(self);
-    }
-
-    pub fn files(self: *TestDir) !usize {
-        var it = self.tmp.dir.iterate();
-        var n: usize = 0;
-        while (try it.next()) |_| n += 1;
-        return n;
-    }
-};
-
-fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
-    try testing.expectEqual(want.len, got.len);
-    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
-}
-
 test "aggregate spill: every aggregate matches the in-memory result over every key shape" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -312,7 +270,7 @@ test "aggregate spill: every aggregate matches the in-memory result over every k
             const got = try runAgg(a, input, by, &every_agg, .{ .space = td.ds.space(), .spill_at = at });
             try expectSameRows(want, got);
             if (at == 1) try testing.expect(td.ds.seq.load(.monotonic) > 0);
-            try testing.expectEqual(@as(usize, 0), try td.files());
+            try testing.expectEqual(@as(usize, 0), try td.count());
         }
     }
 }
@@ -382,7 +340,7 @@ test "aggregate spill: past the disk cap fails with SpillCapExceeded" {
     var ec = ErrCtx{};
     try testing.expectError(error.SpillCapExceeded, runAgg(a, input, &.{ 1, 0 }, &every_agg, .{ .space = td.ds.space(), .spill_at = 1, .err = &ec }));
     try testing.expect(std.mem.indexOf(u8, ec.msg, "--spill-cap") != null);
-    try testing.expectEqual(@as(usize, 0), try td.files());
+    try testing.expectEqual(@as(usize, 0), try td.count());
 }
 
 test "aggregate spill: under the budget nothing is written" {

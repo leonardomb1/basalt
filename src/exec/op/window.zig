@@ -34,7 +34,6 @@ const KeyArr = @import("sort.zig").KeyArr;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
 const Stats = @import("../op.zig").Stats;
-const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
@@ -47,6 +46,7 @@ const decimalOverflow = @import("../eval.zig").decimalOverflow;
 const wideSumDecimal = @import("../eval.zig").wideSumDecimal;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
+const rowOrder = @import("sort.zig").rowOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
 const Moments = @import("aggregate/accumulate.zig").Moments;
@@ -60,11 +60,7 @@ const types = @import("../../lang/types.zig");
 /// the sum's scale, as the SUM aggregate does; a float total would read 0.1 + 0.2 as
 /// 0.30000000000000004.
 fn decStep(acc: *i256, v: Value, scale: u8, sub: bool) !void {
-    const d: Decimal = switch (v) {
-        .decimal => |x| x,
-        .int => |x| .{ .unscaled = x, .scale = 0 },
-        else => return error.TypeMismatch,
-    };
+    const d = eval.asDecimal(v) orelse return error.TypeMismatch;
     const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
     acc.* = (if (sub) std.math.sub(i256, acc.*, u) else std.math.add(i256, acc.*, u)) catch return decimalOverflow();
 }
@@ -134,11 +130,7 @@ pub const Window = struct {
     const Parts = std.HashMap([]const Value, *Kept, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 
     fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
-        for (self.ord) |k| {
-            const o = keyOrder(a[k.idx], b[k.idx], k.desc, k.nulls_first);
-            if (o != .eq) return o == .lt;
-        }
-        return false;
+        return rowOrder(self.ord, a, b) == .lt;
     }
 
     /// ROW_NUMBER up to rank `k`: per partition, the best `k` rows so far, best first.

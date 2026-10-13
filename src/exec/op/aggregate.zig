@@ -10,7 +10,6 @@
 //! passes `spill_at` (`aggregate/spill.zig`); without one, or on a lane, it never does.
 
 const Batch = @import("../batch.zig").Batch;
-const Decimal = @import("../value.zig").Decimal;
 const ErrCtx = @import("../op.zig").ErrCtx;
 const Op = @import("../op.zig").Op;
 const Stats = @import("../op.zig").Stats;
@@ -19,7 +18,6 @@ const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
-const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const simd = @import("../simd.zig");
 const std = @import("std");
@@ -91,16 +89,19 @@ pub const Aggregate = struct {
         try l.append(x);
     }
 
+    fn seenSet(alloc: std.mem.Allocator, acc: *Acc) !*DistinctSet() {
+        if (acc.seen) |set| return set;
+        const set = try alloc.create(DistinctSet());
+        set.* = DistinctSet().init(alloc);
+        acc.seen = set;
+        return set;
+    }
+
     /// Fold another lane's distinct values into `acc`, sizing the destination first:
     /// inserting a hash-ordered run into a smaller table built ever-longer probe runs
     /// (a global COUNT(DISTINCT) took 292s at -j 8, 8s at -j 1).
     pub fn mergeDistinct(alloc: std.mem.Allocator, acc: *Acc, src: *const DistinctSet()) !void {
-        const set = acc.seen orelse blk: {
-            const p = try alloc.create(DistinctSet());
-            p.* = DistinctSet().init(alloc);
-            acc.seen = p;
-            break :blk p;
-        };
+        const set = try seenSet(alloc, acc);
         try set.ensureTotalCapacity(std.math.cast(u32, set.count() + src.count()) orelse return error.OutOfMemory);
         var it = src.keyIterator();
         while (it.next()) |k| try noteDistinct(alloc, acc, k.*[0]);
@@ -109,12 +110,7 @@ pub const Aggregate = struct {
     /// Probes with a stack key and copies only on a miss. Copying first grew an arena
     /// per row: COUNT(DISTINCT) over 200M rows held ~7.6 GB for 200 values.
     pub fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
-        const set = acc.seen orelse blk: {
-            const p = try alloc.create(DistinctSet());
-            p.* = DistinctSet().init(alloc);
-            acc.seen = p;
-            break :blk p;
-        };
+        const set = try seenSet(alloc, acc);
         var probe = [_]Value{v};
         const gop = try set.getOrPut(probe[0..]);
         if (!gop.found_existing) {
@@ -146,7 +142,6 @@ pub const Aggregate = struct {
     pub const Direct = @import("aggregate/table.zig").Direct;
     pub const few_groups = @import("aggregate/table.zig").few_groups;
     pub const fixedHash = @import("aggregate/table.zig").fixedHash;
-    pub const fmix64 = @import("aggregate/table.zig").fmix64;
     pub const Fast = @import("aggregate/table.zig").Fast;
     pub const KeyKind = @import("aggregate/table.zig").KeyKind;
     pub const keyKindOf = @import("aggregate/table.zig").keyKindOf;

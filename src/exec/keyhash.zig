@@ -31,6 +31,17 @@ pub fn canonF64(x: f64) f64 {
     return if (x == 0) 0 else x;
 }
 
+/// murmur3's 64-bit finalizer.
+pub fn fmix64(x0: u64) u64 {
+    var x = x0;
+    x ^= x >> 33;
+    x *%= 0xff51afd7ed558ccd;
+    x ^= x >> 33;
+    x *%= 0xc4ceb9fe1a85ec53;
+    x ^= x >> 33;
+    return x;
+}
+
 const num_tag: u8 = 0xFF;
 
 pub fn hashNum(h: *std.hash.Wyhash, x: f64) void {

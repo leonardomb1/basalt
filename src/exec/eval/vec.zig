@@ -16,11 +16,12 @@ const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const decimalArithType = @import("row.zig").decimalArithType;
 const decimalOp = @import("row.zig").decimalOp;
-const decimalOverflow = @import("support.zig").decimalOverflow;
 const evalRow = @import("row.zig").evalRow;
 const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("cast.zig").rescaleTo;
+const addAtScale = @import("cast.zig").addAtScale;
+const pow10_i128 = @import("../value.zig").pow10_i128;
 const simd = @import("../simd.zig");
 const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
@@ -30,7 +31,6 @@ const orderF64 = @import("support.zig").orderF64;
 const parseIsoDate = @import("time.zig").parseIsoDate;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
 const std = @import("std");
-const toF64 = @import("support.zig").toF64;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
 const TypeCtx = @import("../eval.zig").TypeCtx;
@@ -756,8 +756,7 @@ const SumSink = struct {
     scale: u8,
 
     inline fn put(self: *SumSink, _: usize, d: Decimal) VecError!void {
-        const u = if (d.scale == self.scale) d.unscaled else (rescaleTo(d, self.scale) orelse return decimalOverflow()).unscaled;
-        self.sum = std.math.add(i256, self.sum, u) catch return decimalOverflow();
+        try addAtScale(&self.sum, d, self.scale);
     }
 };
 
@@ -802,8 +801,8 @@ fn decLanes(comptime op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap
                 const rs = sideScale(r);
                 const s: u16 = if (op == .mul) @as(u16, ls) + rs else @max(ls, rs);
                 if (s > max_digits or (op != .mul and (s - ls > 18 or s - rs > 18))) return false;
-                const fl: i128 = if (op == .mul) 1 else pow10(@intCast(s - ls));
-                const fr: i128 = if (op == .mul) 1 else pow10(@intCast(s - rs));
+                const fl: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - ls)];
+                const fr: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - rs)];
                 const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, fl) catch return false else 0;
                 const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, fr) catch return false else 0;
                 const lane = DecLane{ .l = l, .r = r, .a = laneSrc(l, ls, fl, lc), .b = laneSrc(r, rs, fr, rc), .s = @intCast(s) };
@@ -826,14 +825,10 @@ fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
     };
 }
 
-fn pow10(k: u8) i128 {
-    return std.math.powi(i128, 10, k) catch unreachable;
-}
-
 /// `narrow`: both sides fit i64, so a product is one widening multiply that
 /// cannot pass 38 digits.
 fn decLoop(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: DecLane, sink: anytype, valid: Bitmap, any: bool) VecError!void {
-    const limit: u128 = @intCast(pow10(max_digits));
+    const limit: u128 = @intCast(pow10_i128[max_digits]);
     const la = ln.a;
     const lb = ln.b;
     const s = ln.s;
@@ -891,9 +886,10 @@ fn cmpBound(op: ast.BinOp, flip: bool, d: Decimal, sc: u8, never: i128) ?struct 
     var fl: i128 = undefined;
     var exact = true;
     if (d.scale <= sc) {
-        fl = std.math.mul(i128, d.unscaled, pow10(sc - d.scale)) catch return null;
+        fl = std.math.mul(i128, d.unscaled, pow10_i128[sc - d.scale]) catch return null;
     } else {
-        const p = std.math.powi(i128, 10, d.scale - sc) catch return null;
+        if (d.scale - sc >= pow10_i128.len) return null;
+        const p = pow10_i128[d.scale - sc];
         fl = @divFloor(d.unscaled, p);
         exact = @mod(d.unscaled, p) == 0;
     }

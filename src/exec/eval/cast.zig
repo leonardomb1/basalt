@@ -9,6 +9,7 @@ const parseIsoDate = @import("time.zig").parseIsoDate;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
 const pow10_i128 = @import("../value.zig").pow10_i128;
+const pow10_i256 = @import("../value.zig").pow10_i256;
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
 const clip = @import("support.zig").clip;
@@ -43,7 +44,7 @@ pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
         .int => |x| .{ .unscaled = x, .scale = 0 },
         else => return error.CastFailed,
     };
-    if (d.scale > want and @rem(d.unscaled, powTen(d.scale - want)) != 0) {
+    if (d.scale > want and @rem(d.unscaled, pow10_i128[d.scale - want]) != 0) {
         if (want == 0)
             return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the sum is an INT, as no value sampled at plan time had any; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
         return failWith(error.CastFailed, "SUM: '{s}' has {d} decimal places, more than the {d} of the column's sampled values the sum is typed by; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale, want, d.scale });
@@ -76,7 +77,7 @@ pub fn asDecimalValue(v: Value) ?Decimal {
 /// Whether `u` has at most `p` digits; precision 0, a driver's "unknown", is 38.
 pub fn fitsPrecision(u: i128, p: u8) bool {
     const digits: u8 = if (p == 0 or p > max_digits) max_digits else p;
-    return @abs(u) < @as(u128, @intCast(powTen(digits)));
+    return @abs(u) < @as(u128, @intCast(pow10_i128[digits]));
 }
 
 pub const max_digits = 38;
@@ -130,10 +131,6 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
     return if (std.math.isFinite(x)) x else null;
 }
 
-fn powTen(n: u8) i128 {
-    return pow10_i128[n];
-}
-
 /// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
 /// float8 to numeric. Null for a non-finite value or one past 38 digits.
 pub fn floatToDecimal(x: f64) ?Decimal {
@@ -152,7 +149,7 @@ pub fn floatToDecimal(x: f64) ?Decimal {
     const shift = exp - 14;
     if (shift >= 0) {
         if (shift > 23) return null;
-        return .{ .unscaled = std.math.mul(i128, m, powTen(@intCast(shift))) catch return null, .scale = 0 };
+        return .{ .unscaled = std.math.mul(i128, m, pow10_i128[@intCast(shift)]) catch return null, .scale = 0 };
     }
     const sc = -shift;
     if (sc <= 38) return .{ .unscaled = m, .scale = @intCast(sc) };
@@ -176,23 +173,27 @@ pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
         if (drop > 38) return .{ .unscaled = 0, .scale = out_scale };
         var q = roundScaleDown(d.unscaled, @intCast(drop));
         if (digits < 0) {
-            q = std.math.mul(i128, q, powTen(@intCast(@min(-digits, 38)))) catch return null;
+            q = std.math.mul(i128, q, pow10_i128[@intCast(@min(-digits, 38))]) catch return null;
             r = .{ .unscaled = q, .scale = 0 };
         } else r = .{ .unscaled = q, .scale = @intCast(digits) };
     }
     return rescaleTo(r, out_scale);
 }
 
-/// `u / 10^drop`, rounded half away from zero.
-pub fn roundScaleDown(u: i128, drop: u32) i128 {
-    if (drop == 0) return u;
-    if (drop > 38) return 0;
-    const p = powTen(@intCast(drop));
+/// `u / 10^drop` for an i128 or i256 `u`, rounded half away from zero.
+pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
+    const table = if (@TypeOf(u) == i128) &pow10_i128 else &pow10_i256;
+    if (drop >= table.len) return 0;
+    const p = table[drop];
     const q = @divTrunc(u, p);
-    const r = @rem(u, p);
-    const twice = @abs(r) * 2;
-    if (twice >= @abs(p)) return if (u < 0) q - 1 else q + 1;
+    if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
     return q;
+}
+
+/// Adds `d` to a DECIMAL SUM's wide total, at the sum's `scale`.
+pub inline fn addAtScale(sum: *align(8) i256, d: Decimal, scale: u8) error{IntOverflow}!void {
+    const u = if (d.scale == scale) d.unscaled else (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
+    sum.* = std.math.add(i256, sum.*, u) catch return decimalOverflow();
 }
 
 /// Shifts a decimal to `want`, rounding half away from zero; null on overflow.

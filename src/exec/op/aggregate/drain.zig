@@ -72,6 +72,19 @@ pub fn partOf(h: u64) usize {
     return @intCast(h >> part_shift);
 }
 
+/// Row indices grouped by partition, rows of one partition in input order; `counts`
+/// holds a slot per partition plus one.
+fn radixOrder(order: []u32, hashes: []const u64, counts: []u32) void {
+    @memset(counts, 0);
+    for (hashes) |h| counts[(h >> part_shift) + 1] += 1;
+    for (1..counts.len) |ci| counts[ci] += counts[ci - 1];
+    for (hashes, 0..) |h, ri| {
+        const pi = h >> part_shift;
+        order[counts[pi]] = @intCast(ri);
+        counts[pi] += 1;
+    }
+}
+
 /// One partition's table and the store it indexes. A serial fold shares one store,
 /// so groups keep first-seen order; a lane's partitions each own theirs.
 pub fn FoldPart(comptime Store: type) type {
@@ -140,8 +153,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     defer scratch.deinit();
     const pull = scratch.allocator();
 
-    const nparts = fold_parts;
-    const counts = try self.state.alloc(u32, nparts + 1);
+    const counts = try self.state.alloc(u32, fold_parts + 1);
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(FixedStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
@@ -245,14 +257,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         if (groups < few_groups) {
             for (order, 0..) |*o, ri| o.* = @intCast(ri);
         } else {
-            @memset(counts, 0);
-            for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
-            for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
-            for (hashes[0..b.len], 0..) |h, ri| {
-                const pi = h >> part_shift;
-                order[counts[pi]] = @intCast(ri);
-                counts[pi] += 1;
-            }
+            radixOrder(order, hashes[0..b.len], counts);
         }
 
         var nspill: usize = 0;
@@ -376,8 +381,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         return one;
     }
 
-    const nparts = fold_parts;
-    const counts = try self.state.alloc(u32, nparts + 1);
+    const counts = try self.state.alloc(u32, fold_parts + 1);
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(GroupStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
@@ -403,15 +407,8 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
             c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
         }
 
-        @memset(counts, 0);
-        for (hashes[0..b.len]) |h| counts[(h >> part_shift) + 1] += 1;
-        for (1..nparts + 1) |ci| counts[ci] += counts[ci - 1];
         const order = try pull.alloc(u32, b.len);
-        for (hashes[0..b.len], 0..) |h, ri| {
-            const pi = h >> part_shift;
-            order[counts[pi]] = @intCast(ri);
-            counts[pi] += 1;
-        }
+        radixOrder(order, hashes[0..b.len], counts);
 
         for (order, 0..) |ri, oi| {
             if (oi + prefetch_ahead < order.len) {

@@ -5,6 +5,7 @@ const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Decimal = @import("../value.zig").Decimal;
+const asDecimal = @import("row.zig").asDecimal;
 const asDecimalValue = @import("cast.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
@@ -64,10 +65,6 @@ pub fn toF64(v: Value) f64 {
 /// The f64 a number hashes and meets a float as (`Decimal.keyF64`).
 pub fn keyF64(v: Value) f64 {
     return if (v == .decimal) v.decimal.keyF64() else toF64(v);
-}
-
-fn exactDecimal(v: Value) Decimal {
-    return if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
 }
 
 const RegexCache = struct {
@@ -151,18 +148,19 @@ pub fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row:
     if (v.isNull()) return null;
     const pat = try evalRow(arena, c.args[1], batch, row);
     if (pat.isNull()) return null;
-    const re = cachedRegex(try valueToString(arena, pat)) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadPattern => return error.CastFailed,
-        error.PatternTooComplex => return error.PatternTooComplex,
-    };
+    const re = cachedRegex(try valueToString(arena, pat)) catch |e| return regexErr(e);
     var m = RegexMatch{ .s = try valueToString(arena, v), .span = null, .caps = undefined };
-    m.span = re.find(m.s, 0, &m.caps) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadPattern => return error.CastFailed,
-        error.PatternTooComplex => return error.PatternTooComplex,
-    };
+    m.span = re.find(m.s, 0, &m.caps) catch |e| return regexErr(e);
     return m;
+}
+
+/// A regex failure as the evaluator raises it: a bad pattern is a CastFailed.
+pub fn regexErr(e: regex.Error) EvalError {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BadPattern => error.CastFailed,
+        error.PatternTooComplex => error.PatternTooComplex,
+    };
 }
 
 /// The entry is invalidated before compiling, so a failed compile never leaves the
@@ -199,7 +197,7 @@ pub fn orderF64(x: f64, y: f64) std.math.Order {
 pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (isNum(a) and isNum(b)) {
         if (a == .int and b == .int) return std.math.order(a.int, b.int);
-        if (a != .float and b != .float) return exactDecimal(a).order(exactDecimal(b));
+        if (a != .float and b != .float) return asDecimal(a).?.order(asDecimal(b).?);
         return orderF64(keyF64(a), keyF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);
@@ -239,7 +237,7 @@ pub fn toI64(v: Value) i64 {
     return switch (v) {
         .int => |x| x,
         .float => |x| std.math.lossyCast(i64, x),
-        .string => |s| parseIntStrict(std.mem.trim(u8, s, " ")) orelse 0,
+        .string => |s| parseIntStrict(trim(s)) orelse 0,
         else => 0,
     };
 }
@@ -441,4 +439,9 @@ test "compareValues: decimals order exactly against decimals and ints, at any sc
     try std.testing.expectEqual(std.math.Order.lt, compareValues(d(1, 200), d(1, 0)).?);
     try std.testing.expectEqual(std.math.Order.gt, compareValues(d(std.math.maxInt(i128), 0), d(-1, 100)).?);
     try std.testing.expectEqual(std.math.Order.lt, compareValues(d(-std.math.maxInt(i128), 0), d(1, 60)).?);
+}
+
+test "toI64 trims text as a CAST to INT does" {
+    try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = "\t7\n" }));
+    try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = " 7 " }));
 }

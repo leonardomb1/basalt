@@ -16,10 +16,12 @@
 //! run.
 
 const Batch = @import("../batch.zig").Batch;
+const ErrCtx = @import("../op.zig").ErrCtx;
 const Scan = @import("../op.zig").Scan;
 const Space = @import("../space.zig").Space;
 const column = @import("../column.zig");
 const driver = @import("../../connect/driver.zig");
+const keyhash = @import("../keyhash.zig");
 const spill = @import("../spill.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -31,13 +33,7 @@ pub const keep: u8 = 0xFF;
 /// The spill file a key's hash goes to at `depth`. Each depth salts the hash
 /// differently, so the keys of one file spread over all files of the next level.
 pub fn partOf(h: u64, depth: u8) u8 {
-    var x = h ^ (0x9E3779B97F4A7C15 *% (@as(u64, depth) + 1));
-    x ^= x >> 33;
-    x *%= 0xff51afd7ed558ccd;
-    x ^= x >> 33;
-    x *%= 0xc4ceb9fe1a85ec53;
-    x ^= x >> 33;
-    return @intCast(x >> 60);
+    return @intCast(keyhash.fmix64(h ^ (0x9E3779B97F4A7C15 *% (@as(u64, depth) + 1))) >> 60);
 }
 
 /// An allocator that counts the bytes it hands out, never what is freed: over an
@@ -87,8 +83,20 @@ pub const Parts = struct {
     tag: []const u8,
     writers: [fanout]?spill.Writer = @splat(null),
 
-    /// Appends each row `r` of `b` with `dest[r] != keep` to file `dest[r]`.
-    pub fn route(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
+    /// Appends each row `r` of `b` with `dest[r] != keep` to file `dest[r]`, for an
+    /// operator (`label` in its errors) spilling at `depth`; past `max_depth` it fails.
+    pub fn route(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8, comptime label: []const u8, depth: u8, max_depth: u8, err: ?*ErrCtx) !void {
+        if (depth >= max_depth) {
+            if (err) |ec| ec.set(label ++ " still exceeds --op-memory after {d} levels of spilling; raise --op-memory", .{depth});
+            return error.SpillTooDeep;
+        }
+        self.write(scratch, b, dest) catch |e| {
+            if (e == error.SpillCapExceeded) if (err) |ec| ec.set(label ++ " spilled past --spill-cap; raise --spill-cap or --op-memory", .{});
+            return e;
+        };
+    }
+
+    fn write(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
         const mask = try scratch.alloc(bool, b.len);
         for (0..fanout) |p| {
             var n: usize = 0;
