@@ -15,12 +15,13 @@
 //! LZO is effectively extinct in Parquet (parquet-mr dropped it). Both report
 //! `UnsupportedCodec` up front rather than failing obscurely mid-page.
 //!
-//! Writing is narrower than reading: only Snappy compresses. std ships no zstd or
-//! lz4 compressor, and its flate `Compress` is unfinished in 0.15.2 (`drain` ends in
-//! `@panic("TODO")`). Snappy is the dominant Parquet codec anyway, and a writer
-//! asked for anything else fails up front instead of emitting an unreadable file.
+//! Writing is narrower than reading: Snappy, and GZIP through the in-repo DEFLATE
+//! writer at its fast level. std ships no zstd or lz4 compressor, and its flate
+//! `Compress` is unfinished in 0.15.2 (`drain` ends in `@panic("TODO")`); a writer
+//! asked for another codec fails up front instead of emitting an unreadable file.
 
 const std = @import("std");
+const deflate = @import("deflate.zig");
 
 pub const Codec = enum(i32) {
     uncompressed = 0,
@@ -437,7 +438,7 @@ test "a real stream decoded with the wrong expected length is corruption" {
 
 pub fn canCompress(c: Codec) bool {
     return switch (c) {
-        .uncompressed, .snappy => true,
+        .uncompressed, .snappy, .gzip => true,
         else => false,
     };
 }
@@ -447,8 +448,20 @@ pub fn compress(arena: std.mem.Allocator, codec: Codec, src: []const u8) Error![
     return switch (codec) {
         .uncompressed => arena.dupe(u8, src),
         .snappy => snappyCompress(arena, src),
+        .gzip => gzipCompress(arena, src) catch Error.OutOfMemory,
         else => unreachable,
     };
+}
+
+/// One gzip member at the fast level; the encoder's own buffers are freed on
+/// return rather than left in the page arena.
+fn gzipCompress(arena: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const z = try deflate.Deflate.init(std.heap.page_allocator, &out.writer, .{ .level = .fast });
+    defer z.deinit(std.heap.page_allocator);
+    try z.interface.writeAll(src);
+    try z.finish();
+    return out.toOwnedSlice();
 }
 
 const snappy_hash_bits = 14;
@@ -563,15 +576,23 @@ test "snappy compressor output round-trips through our own decoder" {
     try t.expectEqualSlices(u8, big, try decompress(a, .snappy, comp, big.len));
 }
 
+test "gzip compressor output round-trips through the decoder" {
+    var ar = std.heap.ArenaAllocator.init(t.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "", "x", ref_payload }) |src| {
+        try t.expectEqualSlices(u8, src, try decompress(a, .gzip, try compress(a, .gzip, src), src.len));
+    }
+}
+
 test "compress refuses codecs without an encoder" {
     var ar = std.heap.ArenaAllocator.init(t.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try t.expect(supported(.gzip) and !canCompress(.gzip));
+    try t.expect(supported(.gzip) and canCompress(.gzip));
     try t.expect(supported(.zstd) and !canCompress(.zstd));
     try t.expect(supported(.lz4_raw) and !canCompress(.lz4_raw));
     try t.expectError(Error.UnsupportedCodec, compress(a, .zstd, "x"));
-    try t.expectError(Error.UnsupportedCodec, compress(a, .gzip, "x"));
 
     try t.expectEqualStrings("abc", try decompress(a, .uncompressed, try compress(a, .uncompressed, "abc"), 3));
 }

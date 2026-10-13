@@ -1161,7 +1161,11 @@ test "flba widths and big-endian two's complement match what readers expect" {
     try testing.expectEqual(@as(u8, 0x80), one[0]);
 }
 
-test "written files read back with the values and nulls intact" {
+test "written files read back with the values and nulls intact, snappy or gzip" {
+    for ([_]codec.Codec{ .snappy, .gzip }) |cc| try writeReadBack(cc);
+}
+
+fn writeReadBack(cc: codec.Codec) !void {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1178,7 +1182,7 @@ test "written files read back with the values and nulls intact" {
         .{ .name = "ok", .ty = types.Type.init(.bool).asNullable() },
     } };
 
-    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    var w = try Writer.open(a, path, schema, cc, .truncate);
     var ids = try column.Builder.initCapacity(a, schema.fields[0].ty, 3);
     var names = try column.Builder.initCapacity(a, schema.fields[1].ty, 3);
     var amts = try column.Builder.initCapacity(a, schema.fields[2].ty, 3);
