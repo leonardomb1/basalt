@@ -1295,8 +1295,7 @@ fn decodeMoney(bytes: []const u8) MalformedValue!Value {
 /// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.
 fn decodeTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
     if (bytes.len < 3 or bytes.len > 5) return error.MalformedTdsValue;
-    var tu: i64 = 0;
-    for (bytes, 0..) |b, k| tu |= @as(i64, b) << @intCast(k * 8);
+    const tu: i64 = @intCast(readULE(bytes));
     return @divTrunc(tu * 1_000_000, pow10(d.scale));
 }
 
@@ -1308,13 +1307,9 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
             const off_bytes: usize = if (d.tds_type == 0x2B) 2 else 0;
             if (bytes.len < 3 + off_bytes) return error.MalformedTdsValue;
             const tlen = bytes.len - 3 - off_bytes;
-            if (tlen < 3 or tlen > 5) return error.MalformedTdsValue;
-            var tu: i64 = 0;
-            for (bytes[0..tlen], 0..) |b, k| tu |= @as(i64, b) << @intCast(k * 8);
-            const days: i64 = @intCast(u24le(bytes[tlen .. tlen + 3]));
-            const days1970 = days - 719162;
-            const time_micros = @divTrunc(tu *| 1_000_000, pow10(d.scale));
-            return days1970 *| 86_400_000_000 +| time_micros;
+            const time_micros = try decodeTime(d, bytes[0..tlen]);
+            const days: i64 = @intCast(readULE(bytes[tlen .. tlen + 3]));
+            return (days - 719162) *| 86_400_000_000 +| time_micros;
         },
         else => switch (bytes.len) {
             8 => {
@@ -1339,10 +1334,6 @@ fn pow10(n: u8) i64 {
     var k: u8 = 0;
     while (k < @min(n, 18)) : (k += 1) r *= 10;
     return r;
-}
-
-fn u24le(b: []const u8) u32 {
-    return @as(u32, b[0]) | (@as(u32, b[1]) << 8) | (@as(u32, b[2]) << 16);
 }
 
 fn readULE(bytes: []const u8) u64 {
