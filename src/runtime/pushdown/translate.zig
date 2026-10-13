@@ -599,7 +599,7 @@ pub const pushable = [_]Pushable{
     .{ .name = "trim", .min_args = 1, .max_args = 1, .render = render.trim },
     .{ .name = "substr", .sql = "SUBSTRING", .min_args = 3, .max_args = 3, .render = render.plain },
     .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain },
-    .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.plain },
+    .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.concat },
     .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain },
     .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.none },
     .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.none },
@@ -640,6 +640,19 @@ const render = struct {
         _ = dialect;
         const joined = try std.mem.join(arena, ", ", args);
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
+    }
+
+    /// NULL when any argument is, as the engine's `concat`: the MySQL family's
+    /// CONCAT already is, PostgreSQL's and SQL Server's skip NULLs, so they get a CASE.
+    fn concat(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
+        const call = (try plain(arena, p, c, args, dialect)).?;
+        if (dialect.mysqlWire()) return call;
+        var nulls = std.array_list.Managed(u8).init(arena);
+        for (args, 0..) |a, i| {
+            if (i > 0) try nulls.appendSlice(" OR ");
+            try nulls.writer().print("{s} IS NULL", .{a});
+        }
+        return try std.fmt.allocPrint(arena, "CASE WHEN {s} THEN NULL ELSE {s} END", .{ nulls.items, call });
     }
 
     fn trim(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
@@ -712,6 +725,19 @@ test "translateExpr: loose date text against a column of unknown type stays in t
     iso.* = .{ .str_lit = "2024-01-05 05:00:00" };
     const e = try bin(a, .eq, try fld(a, "ts"), iso);
     try testing.expectEqualStrings("(\"ts\" = '2024-01-05 05:00:00')", (try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)).?);
+}
+
+test "translateExpr: concat stays NULL on a NULL argument in every dialect" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const z = try a.create(ast.Expr);
+    z.* = .{ .str_lit = "z" };
+    const c = try callExpr(a, "concat", &.{ try fld(a, "b"), z });
+    const e = try a.create(ast.Expr);
+    e.* = .{ .is_null = .{ .e = c, .negated = false } };
+    try testing.expectEqualStrings("(CASE WHEN \"b\" IS NULL OR 'z' IS NULL THEN NULL ELSE CONCAT(\"b\", 'z') END IS NULL)", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
+    try testing.expectEqualStrings("(CONCAT(`b`, 'z') IS NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 }
 
 test "translateExpr: AND of comparisons, per-dialect quoting" {
