@@ -7,28 +7,25 @@ const LaneSplit = @import("sources.zig").LaneSplit;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
-const WorkQueue = @import("../lanes.zig").WorkQueue;
-const aErr = @import("../plan.zig").aErr;
+const LaneMem = @import("../parallel.zig").LaneMem;
+const WorkQueue = @import("../parallel.zig").WorkQueue;
+const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildMapChain = @import("../plan.zig").buildMapChain;
 const column = @import("../../exec/column.zig");
-const csvSplitFile = @import("sources.zig").csvSplitFile;
-const dispatchWorker = @import("../lanes.zig").dispatchWorker;
+const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
 const laneRowSource = @import("sources.zig").laneRowSource;
 const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
-const openSink = @import("../connect.zig").openSink;
+const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
-const parquetSplit = @import("sources.zig").parquetSplit;
 const pqdecode = @import("../../format/parquet/read.zig");
-const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
-const tailSchema = @import("../plan.zig").tailSchema;
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 
@@ -138,25 +135,20 @@ const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
 /// Dedups per item rather than per lane, so the item index is a file position and the
 /// merge keeps the same row a serial run would.
 fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer batch_arena.deinit();
-
-    const src_schema = ctx.split.schema();
-    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), warena.allocator())) orelse return;
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
     defer inner.close();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, src_schema);
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = warena.allocator(), .gpa = wgpa.allocator(), .track_ords = true };
+    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.gpa.allocator(), .track_ords = true };
 
-    const probe = try warena.allocator().alloc(Value, ctx.key_idx.len);
-    while (try d.next(batch_arena.allocator())) |b| {
+    const probe = try mem.work.allocator().alloc(Value, ctx.key_idx.len);
+    while (try d.next(mem.batch.allocator())) |b| {
         try ctx.merge.absorb(i, b, d.ords, probe);
-        _ = batch_arena.reset(.retain_capacity);
+        _ = mem.batch.reset(.retain_capacity);
     }
 }
 
@@ -179,7 +171,7 @@ pub const ReaderSource = struct {
     pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };
 
-fn runParallelDistinct(
+pub fn runParallelDistinct(
     env: *Env,
     split: LaneSplit,
     prefix: []const ast.Stage,
@@ -232,23 +224,11 @@ fn runParallelDistinct(
 
     const merged = try merge.finish(row_schema);
 
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, try tailSchema(env, tail, row_schema.*));
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-    try writeTail(env, snk, merged, row_schema.*, tail, stats);
-    snk_open = false;
+    const snk = try openTailSink(env, w, tail, row_schema.*);
+    writeTail(env, snk, merged, row_schema.*, tail, stats) catch |e| {
+        snk.abort();
+        return e;
+    };
     try snk.close();
     return true;
-}
-
-pub fn runParallelParquetDistinct(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
-    return runParallelDistinct(env, split, prefix, dist, tail, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelCsvDistinct(env: *Env, rd: ast.Read, prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
-    defer mapped.close();
-    return runParallelDistinct(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, dist, tail, w, opts, stats, lanes_used);
 }

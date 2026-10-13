@@ -1,20 +1,19 @@
 //! `basalt run`: run a script once, or serve it on `--port` when it declares an endpoint.
 
 const ErrOut = @import("args.zig").ErrOut;
+const Flags = @import("args.zig").Flags;
 const analyze = @import("../runtime/analyze.zig");
 const http_server = @import("../server/http_server.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
-const obs = @import("../runtime/obs.zig");
-const parseLogFormat = @import("args.zig").parseLogFormat;
 const paramProblem = @import("args.zig").paramProblem;
 const parseSrcTo = @import("args.zig").parseSrcTo;
 const repeatedKey = @import("args.zig").repeatedKey;
 const runtime = @import("../runtime/run.zig");
 const sizeFlag = @import("args.zig").sizeFlag;
 const std = @import("std");
-const threadFlagValue = @import("args.zig").threadFlagValue;
+const sharedFlag = @import("args.zig").sharedFlag;
 const unknownOption = @import("args.zig").unknownOption;
 const wantsJsonLog = @import("args.zig").wantsJsonLog;
 
@@ -37,15 +36,9 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 
     var params = std.array_list.Managed(runtime.ParamArg).init(alloc);
     defer params.deinit();
-    var port: ?u16 = null;
-    var host: []const u8 = http_server.default_host;
-    var threads: ?usize = null;
-    var log = runtime.LogConfig{};
-    var level_set = false;
-    var stdout_format: runtime.StdoutFormat = .table;
+    var fl = Flags{};
     var explain = false;
     var no_progress = false;
-    var max_rows: ?u64 = null;
     var spill_dir: ?[]const u8 = null;
     var spill_cap: u64 = (runtime.RunOptions{}).spill_cap;
     var op_memory: usize = (runtime.RunOptions{}).op_memory;
@@ -56,24 +49,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             i += 1;
             continue;
         }
-        if (threadFlagValue(a, args, &i)) |tv| {
-            threads = @max(1, std.fmt.parseInt(usize, tv, 10) catch {
-                try stderr.print("error: invalid --threads `{s}`\n", .{tv});
-                return 2;
-            });
-        } else if (std.mem.eql(u8, a, "--format")) {
-            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            stdout_format = std.meta.stringToEnum(runtime.StdoutFormat, v) orelse {
-                try stderr.print("error: --format must be table|json|csv|tsv|arrow\n", .{});
-                return 2;
-            };
-        } else if (std.mem.eql(u8, a, "--max-rows")) {
-            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            max_rows = std.fmt.parseInt(u64, v, 10) catch {
-                try stderr.print("error: invalid --max-rows `{s}`\n", .{v});
-                return 2;
-            };
-        } else if (std.mem.eql(u8, a, "--spill-dir")) {
+        if (std.mem.eql(u8, a, "--spill-dir")) {
             const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
             if (v.len == 0) {
                 try stderr.print("error: --spill-dir needs a directory\n", .{});
@@ -94,21 +70,6 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             explain = true;
         } else if (std.mem.eql(u8, a, "--no-progress")) {
             no_progress = true;
-        } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
-            log.quiet = true;
-        } else if (std.mem.eql(u8, a, "--log-format")) {
-            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            log.format = parseLogFormat(v) orelse {
-                try stderr.print("error: --log-format must be auto|text|json\n", .{});
-                return 2;
-            };
-        } else if (std.mem.eql(u8, a, "--log-level")) {
-            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            log.level = obs.Level.parse(v) orelse {
-                try stderr.print("error: --log-level must be error|warn|info|debug\n", .{});
-                return 2;
-            };
-            level_set = true;
         } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--param")) {
             const kv = (try nextVal(args, &i, a, stderr)) orelse return 2;
             const eqp = std.mem.indexOfScalar(u8, kv, '=') orelse {
@@ -116,20 +77,10 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 2;
             };
             try params.append(.{ .key = kv[0..eqp], .val = kv[eqp + 1 ..] });
-        } else if (std.mem.eql(u8, a, "--host")) {
-            host = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            _ = std.net.Address.parseIp(host, 0) catch {
-                try stderr.print("error: invalid --host `{s}` (an IP address, such as 127.0.0.1)\n", .{host});
-                return 2;
-            };
-        } else if (std.mem.eql(u8, a, "--port")) {
-            const v = (try nextVal(args, &i, a, stderr)) orelse return 2;
-            port = std.fmt.parseInt(u16, v, 10) catch {
-                try stderr.print("error: invalid --port `{s}`\n", .{v});
-                return 2;
-            };
-        } else if (try unknownOption(a, "run", stderr)) return 2;
+        } else if ((try sharedFlag(args, &i, &fl, .{ .output = true, .listen = true }, stderr)) orelse return 2) {} else if (try unknownOption(a, "run", stderr)) return 2;
     }
+    var log = fl.log;
+    const stdout_format = fl.format orelse .table;
     const keys = try arena.allocator().alloc([]const u8, params.items.len);
     for (params.items, keys) |p, *k| k.* = p.key;
     if (repeatedKey(keys)) |k| {
@@ -142,11 +93,11 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     };
 
     if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
-        const serve_port = port orelse {
+        const serve_port = fl.port orelse {
             try stderr.print("error: {s} declares CREATE ENDPOINT: add `--port N` to serve it, or host its folder with `basalt serve <dir>`\n", .{src.label});
             return 2;
         };
-        http_server.serve(alloc, prog, host, serve_port, .{ .format = log.format, .level = if (level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
+        http_server.serve(alloc, prog, fl.host orelse http_server.default_host, serve_port, .{ .format = log.format, .level = if (fl.level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
             try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
             return 1;
         };
@@ -182,7 +133,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
     const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = fl.threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = fl.max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)
                 try eo.report(.{ .msg = "aborted", .event = "aborted" })

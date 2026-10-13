@@ -419,6 +419,22 @@ pub const LoopRow = struct {
         if (self.outer) |o| try o.appendScope(arena, names, vals);
     }
 
+    pub const Scope = struct { names: []const []const u8, values: []const Value };
+
+    /// What a constant expression may read here: the loop variables, innermost
+    /// first, then `params`.
+    pub fn scope(self: LoopRow, arena: std.mem.Allocator, params: *const std.StringHashMap(Value)) !Scope {
+        var names = std.array_list.Managed([]const u8).init(arena);
+        var values = std.array_list.Managed(Value).init(arena);
+        try self.appendLoopVars(arena, &names, &values);
+        var it = params.iterator();
+        while (it.next()) |kv| {
+            try names.append(kv.key_ptr.*);
+            try values.append(kv.value_ptr.*);
+        }
+        return .{ .names = names.items, .values = values.items };
+    }
+
     pub fn appendLoopVars(
         self: LoopRow,
         arena: std.mem.Allocator,
@@ -512,6 +528,19 @@ pub fn srOpenErr(env: *Env, e: anyerror, what: []const u8) error{PlanFailed} {
     else
         std.fmt.allocPrint(env.arena, "{s} ({s}) — {s}", .{ what, @errorName(e), env.diag.msg }) catch what;
     return planErr(env.diag, msg);
+}
+
+/// An analyze failure as a plan failure, keeping its position and span.
+pub fn aErr(env: *Env, ad: *const analyze.Diag, e: analyze.Error) anyerror {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AnalyzeFailed => blk: {
+            const err = planErr(env.diag, ad.msg);
+            env.diag.pos = ad.pos;
+            env.diag.end = ad.end;
+            break :blk err;
+        },
+    };
 }
 
 pub fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {

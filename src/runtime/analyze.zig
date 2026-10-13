@@ -42,7 +42,6 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const aggregates = @import("../lang/aggregates.zig");
 const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
@@ -50,13 +49,8 @@ const Dialect = @import("../db/sql.zig").Dialect;
 const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
-const pqwrite = @import("../format/parquet/write.zig");
-const arrowread = @import("../format/arrowread.zig");
-const azure = @import("../store/azure.zig");
 const s3 = @import("../store/s3.zig");
-const zipsrc = @import("../format/zipsrc.zig");
 const xlsx = @import("../format/xlsx.zig");
-const folder = @import("../connect/folder.zig");
 const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
 const keypush = @import("keypush.zig");
@@ -66,8 +60,6 @@ const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
-const analyzeCsv = @import("analyze/testing_util.zig").analyzeCsv;
-const expectAnalyzeErr = @import("analyze/testing_util.zig").expectAnalyzeErr;
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -189,20 +181,8 @@ fn roundedRows(diag: *Diag, what: []const u8, n: i128) Error!?u64 {
 
 /// The first `$name` in `e`, after substitution one nothing binds.
 fn firstDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!?ast.QualName {
-    const Find = struct {
-        arena: std.mem.Allocator,
-        found: *?ast.QualName,
-        fn recur(f: @This(), x: *const ast.Expr) Error!*ast.Expr {
-            if (x.* == .field) {
-                if (x.field.dollar and f.found.* == null) f.found.* = x.field;
-                return @constCast(x);
-            }
-            return ast.rebuildExpr(f.arena, x, f, recur);
-        }
-    };
-    var found: ?ast.QualName = null;
-    _ = try Find.recur(.{ .arena = arena, .found = &found }, e);
-    return found;
+    const refs = try dollarRefs(arena, e);
+    return if (refs.len > 0) refs[0] else null;
 }
 
 /// Every LIMIT and OFFSET written as an expression, evaluated against `params`, so
@@ -288,7 +268,6 @@ pub const fieldIndices = @import("analyze/schema.zig").fieldIndices;
 pub const Agg = @import("analyze/schema.zig").Agg;
 pub const AggregatePlan = @import("analyze/schema.zig").AggregatePlan;
 pub const aggregatePlan = @import("analyze/schema.zig").aggregatePlan;
-const aggResultType = @import("analyze/schema.zig").aggResultType;
 pub const windowFuncType = @import("analyze/schema.zig").windowFuncType;
 pub const windowSchema = @import("analyze/schema.zig").windowSchema;
 pub const windowPlan = @import("analyze/schema.zig").windowPlan;
@@ -382,7 +361,7 @@ fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, d
     return failPos(diag, t.pos, "{s}", .{try eval.valueToString(arena, m)});
 }
 
-fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+pub fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
     const e = fail(diag, fmt, args);
     diag.pos = pos;
     return e;
@@ -956,13 +935,13 @@ const Ctx = struct {
             .for_each => |fe| try self.checkBody(fe.body, outs),
             .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
             .func => |fd| if (!top)
-                try self.note(self.failAt(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
+                try self.note(self.failNear(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
             else if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
             .let_const => |l| if (!top)
-                try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}))
+                try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}))
             else
                 try self.checkQueryLet(l),
-            .param => |pd| if (!top) try self.note(self.failAt(pd.pos, "PARAM `{s}` must be declared at the top level of the script", .{pd.name})),
+            .param => |pd| if (!top) try self.note(self.failNear(pd.pos, "PARAM `{s}` must be declared at the top level of the script", .{pd.name})),
             .kind, .connection, .call, .throw, .print => {},
         };
     }
@@ -989,12 +968,12 @@ const Ctx = struct {
             .for_each => |fe| try self.checkBody(fe.body, outs),
             .match => |m| for (m.arms) |arm| try self.checkBody(arm.body, outs),
             .call, .throw, .print => {},
-            .let_const => |l| try self.note(self.failAt(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
-            .param, .kind, .connection, .func => try self.note(self.failAt(stmtPos(s).?, "{s}", .{body_stmt_rule})),
+            .let_const => |l| try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
+            .param, .kind, .connection, .func => try self.note(self.failNear(stmtPos(s).?, "{s}", .{body_stmt_rule})),
         };
     }
 
-    fn failAt(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+    fn failNear(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
         const e = fail(self.diag, fmt, args);
         self.diag.stamp(pos);
         return e;
@@ -1197,26 +1176,8 @@ const Ctx = struct {
     }
 
     fn unboundIn(self: *Ctx, e: *const ast.Expr) Error!void {
-        const Find = struct {
-            arena: std.mem.Allocator,
-            found: *?ast.QualName,
-            fn recur(f: @This(), x: *const ast.Expr) Error!*ast.Expr {
-                if (x.* == .field) {
-                    if (x.field.dollar and f.found.* == null) f.found.* = x.field;
-                    return @constCast(x);
-                }
-                return ast.rebuildExpr(f.arena, x, f, recur);
-            }
-        };
-        var found: ?ast.QualName = null;
-        _ = try Find.recur(.{ .arena = self.arena, .found = &found }, try substExpr(self.arena, e, self.params));
-        const q = found orelse return;
-        const err = fail(self.diag, "unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
-        if (q.span) |sp| {
-            self.diag.pos = sp.start;
-            self.diag.end = sp.end;
-        }
-        return err;
+        const q = (try firstDollar(self.arena, try substExpr(self.arena, e, self.params))) orelse return;
+        return failAt(self.diag, q.span, "unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
     }
 
     /// Output schema after a stage, type-checking along the way; null where the flow

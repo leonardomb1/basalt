@@ -11,8 +11,11 @@ const PqTopNCtx = @import("topn.zig").PqTopNCtx;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
-const WorkQueue = @import("../lanes.zig").WorkQueue;
-const aErr = @import("../plan.zig").aErr;
+const LaneMem = @import("../parallel.zig").LaneMem;
+const LaneSplit = @import("sources.zig").LaneSplit;
+const WorkQueue = @import("../parallel.zig").WorkQueue;
+const orderedWorker = @import("map.zig").orderedWorker;
+const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
@@ -21,9 +24,7 @@ const buildStage = @import("../plan.zig").buildStage;
 const buildTopN = @import("../plan.zig").buildTopN;
 const connect_mod = @import("../connect.zig");
 const csv = @import("../../format/csv.zig");
-const csvLanes = @import("sources.zig").csvLanes;
-const csvSplitFile = @import("sources.zig").csvSplitFile;
-const dispatchWorker = @import("../lanes.zig").dispatchWorker;
+const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const eval = @import("../../exec/eval.zig");
@@ -34,7 +35,6 @@ const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
 const openSqlQuery = @import("../connect.zig").openSqlQuery;
 const parallel = @import("../parallel.zig");
-const parquetSplit = @import("sources.zig").parquetSplit;
 const planSplit = @import("../connect.zig").planSplit;
 const pqTopNWorker = @import("topn.zig").pqTopNWorker;
 const pqdecode = @import("../../format/parquet/read.zig");
@@ -182,16 +182,58 @@ fn freeMergeParts(gpa: std.mem.Allocator, parts: []PqPart) void {
     gpa.free(parts);
 }
 
-fn groupEmitter(env: *Env, agg_in: *const types.Schema, by: []const usize, aggs: []const op.Aggregate.Agg, out_schema: *const types.Schema) op.Aggregate {
-    return .{
-        .child = undefined,
-        .in_schema = agg_in,
-        .by = by,
-        .aggs = aggs,
-        .out_schema = out_schema,
-        .state = env.arena,
-        .gpa = env.gpa,
-    };
+/// The aggregate every lane folds: its input and output schemas, keys and accumulators.
+const LaneAgg = struct {
+    strs: *op.Aggregate.StrTable,
+    in_schema: *const types.Schema,
+    out_schema: *const types.Schema,
+    by: []const usize,
+    aggs: []const op.Aggregate.Agg,
+
+    fn plan(env: *Env, in_schema: types.Schema, ag: ast.Aggregate, strs: *op.Aggregate.StrTable) !LaneAgg {
+        const arena = env.arena;
+        const agg_in = try schemaPtr(arena, in_schema);
+        var ad = analyze.Diag{};
+        const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+        const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
+        for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
+        return .{ .strs = strs, .in_schema = agg_in, .out_schema = try schemaPtr(arena, apl.schema), .by = apl.by, .aggs = aggs };
+    }
+
+    /// Fold `child` into private group tables, one per hash partition of `parts`.
+    fn fold(self: LaneAgg, child: op.Op, state: std.mem.Allocator, gpa: std.mem.Allocator, parts: *LaneParts) ![]const op.Aggregate.GroupSet {
+        var agg = op.Aggregate{
+            .strs = self.strs,
+            .child = child,
+            .in_schema = self.in_schema,
+            .by = self.by,
+            .aggs = self.aggs,
+            .out_schema = self.out_schema,
+            .err = null,
+            .state = state,
+            .gpa = gpa,
+            .part_state = &parts.allocs,
+            .table_gpa = parts.backing(),
+        };
+        return agg.drainParts();
+    }
+
+    fn emitter(self: LaneAgg, env: *Env) op.Aggregate {
+        return .{
+            .child = undefined,
+            .in_schema = self.in_schema,
+            .by = self.by,
+            .aggs = self.aggs,
+            .out_schema = self.out_schema,
+            .state = env.arena,
+            .gpa = env.gpa,
+        };
+    }
+};
+
+/// The sink for `w`, typed by what `tail` makes of `schema`.
+pub fn openTailSink(env: *Env, w: ast.Write, tail: []const ast.Stage, schema: types.Schema) !driver.Sink {
+    return openSink(env, try resolveUpsertKeys(env, w), try tailSchema(env, tail, schema));
 }
 
 /// Emit merged groups and write them through `tail`: a partition at a time across lanes
@@ -228,7 +270,7 @@ fn writeGroups(
         .params = env.params_expr,
         .errctx = env.errctx,
         .queue = .{ .nitems = sets.len },
-        .ord = &ord,
+        .ordered = &ord,
     };
     _ = try parallel.spawnJoin(env.arena, @min(threads, sets.len), groupWriteWorker, &ctx);
     if (ctx.queue.failure()) |e| return e;
@@ -242,65 +284,28 @@ const GroupWriteCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
-    ord: *OrderedOut,
+    ordered: ?*OrderedOut,
     rows_out: std.atomic.Value(u64) = .init(0),
 };
 
-fn groupWriteWorker(ctx: *GroupWriteCtx, _: usize) void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    while (true) {
-        if (ctx.queue.failed.load(.seq_cst)) return;
-        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-        if (i >= ctx.queue.nitems) break;
-        groupWriteUnit(ctx, i, warena.allocator()) catch |e| {
-            ctx.queue.fail(e);
-            ctx.ord.wake();
-            return;
-        };
-        _ = warena.reset(.retain_capacity);
-    }
-}
+const groupWriteWorker = orderedWorker(GroupWriteCtx, groupWriteUnit);
 
-fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, wa: std.mem.Allocator) !void {
-    const ord = ctx.ord;
-    ord.waitTurn(i, &ctx.queue.failed);
-    if (ctx.queue.failed.load(.seq_cst)) return;
-
-    const unit = try ord.takeUnit();
-    var handed = false;
-    defer if (!handed) OrderedOut.freeUnit(unit);
-    const ua = unit.arena.allocator();
-    const snk = ord.snk;
-    const enc: ?driver.UnitEncoder = if (snk.openUnit(ua)) |r| try r else null;
-    errdefer if (enc) |e| e.discard();
-
-    var em = ctx.emitter;
-    em.state = wa;
-    const out_schema = ctx.emitter.out_schema;
-    var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
-    var scan = op.Scan{ .src = ob.source() };
-    const chain = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.tail, &scan, out_schema);
-    var out: u64 = 0;
-    while (try chain.next(wa)) |b| {
-        if (b.len == 0) continue;
-        if (enc) |e| {
-            try e.write(wa, b);
-        } else try unit.parts.append(if (snk.canRender())
-            .{ .bytes = try snk.renderBatch(ua, b).? }
-        else
-            .{ .batch = try b.deepCopy(ua) });
-        out += b.len;
+fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem) !void {
+    const ord = ctx.ordered.?;
+    var f = (try ord.begin(i, &ctx.queue.failed)) orelse return;
+    {
+        errdefer f.drop();
+        const wa = mem.work.allocator();
+        var em = ctx.emitter;
+        em.state = wa;
+        const out_schema = ctx.emitter.out_schema;
+        var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
+        var scan = op.Scan{ .src = ob.source() };
+        const chain = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.tail, &scan, out_schema);
+        while (try chain.next(wa)) |b| try f.add(ord.snk, wa, b);
     }
-    if (enc) |e| {
-        try e.seal();
-        try unit.parts.append(.{ .encoded = e });
-    }
-    _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    handed = true;
-    try ord.deposit(i, unit);
+    _ = ctx.rows_out.fetchAdd(f.rows, .monotonic);
+    try ord.hand(i, f);
 }
 
 pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
@@ -332,16 +337,12 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
 }
 
 const AggCtx = struct {
-    strs: *op.Aggregate.StrTable,
+    agg: LaneAgg,
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
-    agg_in_schema: *const types.Schema,
-    out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
-    by: []const usize,
-    aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
     slots: []AggSlot,
     rows_read: *obs.RowCounter,
@@ -359,20 +360,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
     for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, child);
-    var agg = op.Aggregate{
-        .strs = ctx.strs,
-        .child = child,
-        .in_schema = ctx.agg_in_schema,
-        .by = ctx.by,
-        .aggs = ctx.aggs,
-        .out_schema = ctx.out_schema,
-        .err = null,
-        .state = wa,
-        .gpa = slot.gpa.allocator(),
-        .part_state = &slot.parts.allocs,
-        .table_gpa = slot.parts.backing(),
-    };
-    slot.sets = try agg.drainParts();
+    slot.sets = try ctx.agg.fold(child, wa, slot.gpa.allocator(), &slot.parts);
 }
 
 const PqLane = struct {
@@ -391,15 +379,11 @@ const pq_parts: usize = op.Aggregate.fold_parts;
 pub const pq_min_lanes: usize = 2;
 
 const PqAggCtx = struct {
-    strs: *op.Aggregate.StrTable,
+    agg: LaneAgg,
     morsels: PqMorsels,
-    agg_in_schema: *const types.Schema,
-    out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
-    by: []const usize,
-    aggs: []const op.Aggregate.Agg,
     lanes: []PqLane,
     rows_read: *obs.RowCounter,
     joins: []const LaneJoin = &.{},
@@ -511,20 +495,7 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(la, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.morsels.src_schema);
     for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, ctx.errctx, lj, child);
-    var agg = op.Aggregate{
-        .strs = ctx.strs,
-        .child = child,
-        .in_schema = ctx.agg_in_schema,
-        .by = ctx.by,
-        .aggs = ctx.aggs,
-        .out_schema = ctx.out_schema,
-        .err = null,
-        .state = la,
-        .gpa = ls.arena.child_allocator,
-        .part_state = &ls.parts.allocs,
-        .table_gpa = ls.parts.backing(),
-    };
-    ls.sets = try agg.drainParts();
+    ls.sets = try ctx.agg.fold(child, la, ls.arena.child_allocator, &ls.parts);
 }
 
 const PqMergeCtx = struct {
@@ -603,69 +574,115 @@ pub fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     };
 }
 
-/// Parallel aggregate over parquet, one morsel per row group, folded into private tables
-/// and merged by hash partition. False when too few row groups or lanes.
-pub fn runParallelParquetAgg(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelParquetAggImpl(env, rd, pipeline, prefix, ag, tail, null, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelParquetAggJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelParquetAggImpl(env, rd, pipeline, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
-}
-
-fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const arena = env.arena;
-    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
-    const morsels = split.parquet;
-    const ngroups = morsels.queue.nitems;
-    const src_schema = morsels.src_schema;
-    var agg_in_schema = try mapChainSchema(env, prefix, src_schema.*);
-
+/// Parallel aggregate over a split read, folded into private tables and merged by hash
+/// partition. False when a join in the span cannot run on lanes.
+pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    var agg_in_schema = try mapChainSchema(env, prefix, split.schema().*);
     var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
         const chain = (try resolveLaneJoins(env, js.join_span, agg_in_schema)) orelse return false;
         lane_joins = chain.joins;
         agg_in_schema = chain.out_schema;
     }
-    const agg_in = try schemaPtr(arena, agg_in_schema);
-
-    var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
-    const out_schema = try schemaPtr(arena, apl.schema);
+    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    defer strs.deinit();
+    const la = try LaneAgg.plan(env, agg_in_schema, ag, &strs);
 
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
 
+    var slots: []AggSlot = &.{};
+    defer freeAggSlots(env.gpa, slots);
+    var pq_lanes: []PqLane = &.{};
+    defer freePqLanes(env.gpa, pq_lanes);
+    const parts = try allocMergeParts(env.gpa);
+    defer freeMergeParts(env.gpa, parts);
+
     const nthreads = split.lanes(opts);
-    const lanes = try env.gpa.alloc(PqLane, nthreads);
-    defer env.gpa.free(lanes);
+    var sel: ?[]const []const u32 = null;
+    const sets, const write_threads = switch (split) {
+        .csv => |c| blk: {
+            slots = try allocAggSlots(env.gpa, nthreads);
+            var ctx = AggCtx{
+                .agg = la,
+                .mapped = c.mapped,
+                .csv_schema = c.schema,
+                .prefix = prefix,
+                .params = env.params_expr,
+                .errctx = env.errctx,
+                .queue = .{ .nitems = nthreads },
+                .slots = slots,
+                .rows_read = env.rows_read,
+                .joins = lane_joins,
+            };
+            const lanes = try parallel.spawnJoin(env.arena, nthreads, aggWorker, &ctx);
+            lanes_used.* = @max(lanes_used.*, lanes);
+            env.log.log(.debug, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
+            if (ctx.queue.failure()) |e| return e;
+            break :blk .{ try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts), opts.lanes() };
+        },
+        .parquet => |m| blk: {
+            pq_lanes = try allocPqLanes(env.gpa, nthreads);
+            sel = try foldParquet(env, la, m, prefix, lane_joins, tail, pq_lanes, parts, opts, lanes_used);
+            break :blk .{ try partSets(env.arena, parts), nthreads };
+        },
+    };
+
+    const snk = try openTailSink(env, w, tail, la.out_schema.*);
+    const t_emit0 = std.time.Instant.now() catch unreachable;
+    writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats) catch |e| {
+        snk.abort();
+        return e;
+    };
+    const t_emit1 = std.time.Instant.now() catch unreachable;
+    if (split == .parquet) {
+        var total: usize = 0;
+        for (sets) |st| total += st.len;
+        env.log.log(.debug, "pq agg tail: emit+write {d}ms ({d} groups)", .{ t_emit1.since(t_emit0) / 1_000_000, total });
+        if (opts.explain) {
+            std.debug.print(
+                \\  emit+write   {d:>8.1}ms {d:>12} rows
+                \\
+            , .{ @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total });
+        }
+    }
+    try snk.close();
+    return true;
+}
+
+fn allocPqLanes(gpa: std.mem.Allocator, n: usize) ![]PqLane {
+    const lanes = try gpa.alloc(PqLane, n);
     for (lanes) |*l| {
         l.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
-        l.parts.init(env.gpa);
+        l.parts.init(gpa);
     }
-    defer for (lanes) |*l| {
+    return lanes;
+}
+
+fn freePqLanes(gpa: std.mem.Allocator, lanes: []PqLane) void {
+    for (lanes) |*l| {
         for (l.sets) |*st| st.freeTable();
         l.parts.deinit();
         l.arena.deinit();
-    };
+    }
+    gpa.free(lanes);
+}
 
-    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
-    defer strs.deinit();
+/// Fold parquet morsels on `lanes`, one fixed slice of row groups each, and merge them
+/// into `parts`; returns each partition's top-N selection when the tail allows one.
+fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.Stage, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, opts: RunOptions, lanes_used: *usize) !?[]const []const u32 {
+    const arena = env.arena;
+    const ngroups = morsels.queue.nitems;
+    const nthreads = lanes.len;
     var ctx = PqAggCtx{
-        .strs = &strs,
+        .agg = la,
         .morsels = morsels,
-        .agg_in_schema = agg_in,
-        .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
         .errctx = env.errctx,
-        .by = apl.by,
-        .aggs = aggs,
         .lanes = lanes,
         .rows_read = env.rows_read,
-        .joins = lane_joins,
+        .joins = joins,
     };
 
     const t_fold0 = std.time.Instant.now() catch unreachable;
@@ -674,25 +691,17 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
     lanes_used.* = @max(lanes_used.*, used);
     if (ctx.morsels.queue.failure()) |e| return e;
 
-    const parts = try env.gpa.alloc(PqPart, pq_parts);
-    defer env.gpa.free(parts);
-    for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
-    defer for (parts) |*pp| {
-        if (pp.merge) |*m| m.deinit();
-        pp.arena.deinit();
-    };
-
     const t_mrg0 = std.time.Instant.now() catch unreachable;
-    if (apl.by.len == 0) {
+    if (la.by.len == 0) {
         const dst = &parts[0];
         for (lanes) |*l| {
             for (l.sets) |*st| {
-                if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, aggs);
+                if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, la.aggs);
                 for (0..st.len) |i| try dst.merge.?.add(st, i);
             }
         }
     } else {
-        var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = aggs, .queue = .{ .nitems = pq_parts } };
+        var mctx = PqMergeCtx{ .lanes = lanes, .parts = parts, .aggs = la.aggs, .queue = .{ .nitems = pq_parts } };
         _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
         if (mctx.queue.failure()) |e| return e;
     }
@@ -721,147 +730,38 @@ fn runParallelParquetAggImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stag
 
     env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, ngroups, used, pq_parts });
 
-    var sel: ?[]const []const u32 = null;
-    if (topNTail(tail)) |tn| {
-        var keys = std.array_list.Managed(op.Sort.Key).init(arena);
-        var ok = true;
-        for (tn.keys) |k| {
-            const idx = out_schema.resolve(k.field.parts) orelse {
-                ok = false;
-                break;
-            };
-            try keys.append(.{ .idx = idx, .desc = k.desc, .nulls_first = k.nulls_first });
-        }
-        if (ok) {
-            var tctx = PqTopNCtx{
-                .parts = parts,
-                .order = .{ .keys = keys.items, .by_len = apl.by.len, .aggs = aggs },
-                .n = tn.n,
-                .queue = .{ .nitems = pq_parts },
-                .sel = try arena.alloc([]const u32, pq_parts),
-            };
-            _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
-            if (tctx.queue.failure()) |e| return e;
-            var kept = std.array_list.Managed([]const u32).init(arena);
-            for (parts, tctx.sel) |*pp, sl| {
-                if (pp.merge != null) try kept.append(sl);
-            }
-            sel = kept.items;
-        }
+    const tn = topNTail(tail) orelse return null;
+    var keys = std.array_list.Managed(op.Sort.Key).init(arena);
+    for (tn.keys) |k| {
+        const idx = la.out_schema.resolve(k.field.parts) orelse return null;
+        try keys.append(.{ .idx = idx, .desc = k.desc, .nulls_first = k.nulls_first });
     }
-
-    const sets = try partSets(arena, parts);
-    var total: usize = 0;
-    for (sets) |st| total += st.len;
-
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-
-    const t_emit0 = std.time.Instant.now() catch unreachable;
-    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), sets, sel, tail, nthreads, stats);
-    const t_emit1 = std.time.Instant.now() catch unreachable;
-    env.log.log(.debug, "pq agg tail: emit+write {d}ms ({d} groups)", .{ t_emit1.since(t_emit0) / 1_000_000, total });
-    if (opts.explain) {
-        std.debug.print(
-            \\  emit+write   {d:>8.1}ms {d:>12} rows
-            \\
-        , .{ @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total });
-    }
-    snk_open = false;
-    try snk.close();
-    return true;
-}
-
-pub fn runParallelCsvAgg(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelCsvAggImpl(env, rd, prefix, ag, tail, null, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelCsvAggJoin(env: *Env, rd: ast.Read, js: AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelCsvAggImpl(env, rd, js.map_stages, js.ag, js.tail, js, w, opts, stats, lanes_used);
-}
-
-fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const arena = env.arena;
-    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
-    defer mapped.close();
-
-    var agg_in_schema = try mapChainSchema(env, prefix, mapped.schema);
-    var lane_joins: []const LaneJoin = &.{};
-    if (jshape) |js| {
-        const chain = (try resolveLaneJoins(env, js.join_span, agg_in_schema)) orelse return false;
-        lane_joins = chain.joins;
-        agg_in_schema = chain.out_schema;
-    }
-    const agg_in = try schemaPtr(arena, agg_in_schema);
-
-    var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
-    const out_schema = try schemaPtr(arena, apl.schema);
-
-    env.src_name = "csv";
-    env.sink_name = sinkLabel(env, w);
-
-    const nthreads = csvLanes(mapped.body.len, opts);
-    const slots = try allocAggSlots(env.gpa, nthreads);
-    defer freeAggSlots(env.gpa, slots);
-    const parts = try allocMergeParts(env.gpa);
-    defer freeMergeParts(env.gpa, parts);
-    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
-    defer strs.deinit();
-    var ctx = AggCtx{
-        .strs = &strs,
-        .mapped = mapped,
-        .csv_schema = &mapped.schema,
-        .agg_in_schema = agg_in,
-        .out_schema = out_schema,
-        .prefix = prefix,
-        .params = env.params_expr,
-        .errctx = env.errctx,
-        .by = apl.by,
-        .aggs = aggs,
-        .queue = .{ .nitems = nthreads },
-        .slots = slots,
-        .rows_read = env.rows_read,
-        .joins = lane_joins,
+    var tctx = PqTopNCtx{
+        .parts = parts,
+        .order = .{ .keys = keys.items, .by_len = la.by.len, .aggs = la.aggs },
+        .n = tn.n,
+        .queue = .{ .nitems = pq_parts },
+        .sel = try arena.alloc([]const u32, pq_parts),
     };
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, aggWorker, &ctx);
-    lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
-
-    if (ctx.queue.failure()) |e| return e;
-
-    const csets = try combineAggSlots(env, slots, aggs, opts.lanes(), parts);
-
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-
-    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.lanes(), stats);
-    snk_open = false;
-    try snk.close();
-    return true;
+    _ = try parallel.spawnJoin(arena, nthreads, pqTopNWorker, &tctx);
+    if (tctx.queue.failure()) |e| return e;
+    var kept = std.array_list.Managed([]const u32).init(arena);
+    for (parts, tctx.sel) |*pp, sl| {
+        if (pp.merge != null) try kept.append(sl);
+    }
+    return kept.items;
 }
 
 const SqlAggCtx = struct {
-    strs: *op.Aggregate.StrTable,
+    agg: LaneAgg,
     split: SplitCtx,
     predicates: []const []const u8,
     proj_select: ?[]const u8,
     where_extra: ?[]const u8,
     src_schema: *const types.Schema,
-    agg_in_schema: *const types.Schema,
-    out_schema: *const types.Schema,
     prefix: []const ast.Stage,
     params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
-    by: []const usize,
-    aggs: []const op.Aggregate.Agg,
     queue: WorkQueue,
     slots: []AggSlot,
     rows_read: *obs.RowCounter,
@@ -880,20 +780,7 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
-    var agg = op.Aggregate{
-        .strs = ctx.strs,
-        .child = child,
-        .in_schema = ctx.agg_in_schema,
-        .by = ctx.by,
-        .aggs = ctx.aggs,
-        .out_schema = ctx.out_schema,
-        .err = null,
-        .state = wa,
-        .gpa = slot.gpa.allocator(),
-        .part_state = &slot.parts.allocs,
-        .table_gpa = slot.parts.backing(),
-    };
-    slot.sets = try agg.drainParts();
+    slot.sets = try ctx.agg.fold(child, wa, slot.gpa.allocator(), &slot.parts);
 }
 
 /// Parallel SQL aggregate over key-range lanes, one connection and one `AggSlot` per
@@ -911,13 +798,9 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const pd = try pushdown.planAggWith(arena, desc.dialect, src_schema.*, prefix, ag, facts);
     const eff = if (pd.proj_schema) |ps| try schemaPtr(arena, ps) else src_schema;
 
-    const agg_in = try schemaPtr(arena, try mapChainSchema(env, prefix, eff.*));
-
-    var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-    const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-    for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
-    const out_schema = try schemaPtr(arena, apl.schema);
+    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    defer strs.deinit();
+    const la = try LaneAgg.plan(env, try mapChainSchema(env, prefix, eff.*), ag, &strs);
 
     const sp = (try planSplit(env, desc, stages[0], opts.lanes(), w)) orelse return false;
 
@@ -931,22 +814,16 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
     defer freeMergeParts(env.gpa, parts);
-    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
-    defer strs.deinit();
     var ctx = SqlAggCtx{
-        .strs = &strs,
+        .agg = la,
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
         .predicates = sp.predicates,
         .proj_select = pd.proj_select,
         .where_extra = pd.where_extra,
         .src_schema = eff,
-        .agg_in_schema = agg_in,
-        .out_schema = out_schema,
         .prefix = prefix,
         .params = env.params_expr,
         .errctx = env.errctx,
-        .by = apl.by,
-        .aggs = aggs,
         .queue = .{ .nitems = sp.predicates.len },
         .slots = slots,
         .rows_read = env.rows_read,
@@ -964,14 +841,13 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     if (ctx.queue.failure()) |e| return e;
 
-    const csets = try combineAggSlots(env, slots, aggs, opts.lanes(), parts);
+    const csets = try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts);
 
-    const snk = try openSink(env, w, out_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
-
-    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.lanes(), stats);
-    snk_open = false;
+    const snk = try openTailSink(env, w, tail, la.out_schema.*);
+    writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats) catch |e| {
+        snk.abort();
+        return e;
+    };
     try snk.close();
     return true;
 }

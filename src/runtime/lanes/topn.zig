@@ -7,23 +7,19 @@ const PqPart = @import("agg.zig").PqPart;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
-const WorkQueue = @import("../lanes.zig").WorkQueue;
-const aErr = @import("../plan.zig").aErr;
+const LaneMem = @import("../parallel.zig").LaneMem;
+const WorkQueue = @import("../parallel.zig").WorkQueue;
+const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildMapChain = @import("../plan.zig").buildMapChain;
-const csvSplitFile = @import("sources.zig").csvSplitFile;
-const dispatchWorker = @import("../lanes.zig").dispatchWorker;
-const driver = @import("../../connect/driver.zig");
-const eval = @import("../../exec/eval.zig");
+const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const laneRowSource = @import("sources.zig").laneRowSource;
 const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
-const openSink = @import("../connect.zig").openSink;
+const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
-const parquetSplit = @import("sources.zig").parquetSplit;
-const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
@@ -134,41 +130,27 @@ const TopNCtx = struct {
 const topnWorker = dispatchWorker(TopNCtx, topnWorkOne);
 
 fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer batch_arena.deinit();
-
-    const src_schema = ctx.split.schema();
-    var item_ptr: ?*const usize = null;
-    const inner: driver.Source = switch (ctx.split) {
-        .parquet => |*m| blk: {
-            const ms = try warena.allocator().create(MorselSource);
-            ms.* = .{ .m = m, .scratch = warena.allocator() };
-            item_ptr = &ms.cur_item;
-            break :blk .{ .ptr = ms, .vtable = &MorselSource.vtable };
-        },
-        .csv => (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), warena.allocator())) orelse return,
-    };
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
     defer inner.close();
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, src_schema);
+    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
     var tn = op.TopN{
         .child = child,
         .in_schema = ctx.row_schema,
         .keys = ctx.keys,
         .count = ctx.cap,
         .offset = 0,
-        .state = batch_arena.allocator(),
-        .gpa = wgpa.allocator(),
+        .state = mem.batch.allocator(),
+        .gpa = mem.gpa.allocator(),
         .seq_base = @as(u64, i) << 40,
-        .item = item_ptr,
+        .item = if (ctx.split == .parquet) &@as(*MorselSource, @ptrCast(@alignCast(inner.ptr))).cur_item else null,
     };
-    const local = (try tn.nextEntries(batch_arena.allocator())) orelse return;
+    const local = (try tn.nextEntries(mem.batch.allocator())) orelse return;
 
     ctx.mtx.lock();
     defer ctx.mtx.unlock();
@@ -179,7 +161,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     }
 }
 
-fn runParallelTopN(
+pub fn runParallelTopN(
     env: *Env,
     split: LaneSplit,
     prefix: []const ast.Stage,
@@ -235,8 +217,7 @@ fn runParallelTopN(
     const start = @min(lim.offset, ctx.kept.items.len);
     const end = @min(lim.offset +| lim.count, ctx.kept.items.len);
 
-    const wr = try resolveUpsertKeys(env, w);
-    const snk = try openSink(env, wr, row_schema.*);
+    const snk = try openTailSink(env, w, &.{}, row_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
     if (start < end) {
@@ -247,15 +228,4 @@ fn runParallelTopN(
     snk_open = false;
     try snk.close();
     return true;
-}
-
-pub fn runParallelParquetTopN(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const split = (try parquetSplit(env, rd, pipeline[1..], w, opts)) orelse return false;
-    return runParallelTopN(env, split, prefix, srt, lim, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelCsvTopN(env: *Env, rd: ast.Read, prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
-    defer mapped.close();
-    return runParallelTopN(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, prefix, srt, lim, w, opts, stats, lanes_used);
 }

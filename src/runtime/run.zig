@@ -47,14 +47,11 @@ const expand = @import("../lang/expand.zig");
 const ftp = @import("../store/ftp.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
-const Batch = @import("../exec/batch.zig").Batch;
 const csv = @import("../format/csv.zig");
 const column = @import("../exec/column.zig");
 const arrow = @import("../format/arrow.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
-const sql = @import("../db/sql.zig");
-const request = @import("../connect/request.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
@@ -66,8 +63,6 @@ pub const Diag = @import("env.zig").Diag;
 const Env = @import("env.zig").Env;
 pub const errLabel = @import("env.zig").errLabel;
 pub const failLabel = op.failLabel;
-const forHintIdent = @import("env.zig").forHintIdent;
-const hasFlagHint = @import("env.zig").hasFlagHint;
 pub const isTransient = @import("env.zig").isTransient;
 pub const ItemOutcome = @import("env.zig").ItemOutcome;
 pub const LogConfig = @import("env.zig").LogConfig;
@@ -77,12 +72,12 @@ const no_loop_vars = @import("env.zig").no_loop_vars;
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 pub const OutcomeSink = @import("env.zig").OutcomeSink;
 pub const ParamArg = @import("env.zig").ParamArg;
+const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
 pub const requestAbort = @import("env.zig").requestAbort;
 pub const requestReload = @import("env.zig").requestReload;
 pub const resetAbort = @import("env.zig").resetAbort;
 pub const RunOptions = @import("env.zig").RunOptions;
-const schemaPtr = @import("env.zig").schemaPtr;
 const setMsg = @import("env.zig").setMsg;
 pub const Stats = @import("env.zig").Stats;
 pub const StdoutFormat = @import("env.zig").StdoutFormat;
@@ -95,52 +90,14 @@ pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
 pub const takeReload = @import("env.zig").takeReload;
 
-const buildParallelSink = @import("connect.zig").buildParallelSink;
-const dupeSchema = @import("connect.zig").dupeSchema;
 const guardFileFormat = @import("connect.zig").guardFileFormat;
 const registerSftp = @import("connect.zig").registerSftp;
 const registerFtp = @import("connect.zig").registerFtp;
 const registerSmb = @import("connect.zig").registerSmb;
-const isLocalCsvRead = @import("connect.zig").isLocalCsvRead;
-const isLocalParquetRead = @import("connect.zig").isLocalParquetRead;
-const isFolderRead = @import("connect.zig").isFolderRead;
 const openSink = @import("connect.zig").openSink;
-const openSource = @import("connect.zig").openSource;
-const openSplitSource = @import("connect.zig").openSplitSource;
-const planSplit = @import("connect.zig").planSplit;
-const projectSqlRead = @import("connect.zig").projectSqlRead;
-const exceptColumns = @import("connect.zig").exceptColumns;
-const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
-const sinkLabel = @import("connect.zig").sinkLabel;
-const sqlConnInfo = @import("connect.zig").sqlConnInfo;
-const factsIfWanted = @import("connect.zig").factsIfWanted;
-const readReport = @import("connect.zig").readReport;
 const env_mod = @import("env.zig");
-const mem_connector = @import("connect.zig").mem_connector;
-const SplitCtx = @import("connect.zig").SplitCtx;
 
 const buildPipeline = @import("plan.zig").buildPipeline;
-const descendLeadingWhere = @import("plan.zig").descendLeadingWhere;
-const inlineHeadBindings = @import("plan.zig").inlineHeadBindings;
-const rebuildMapStages = @import("plan.zig").rebuildMapStages;
-const synthReconcile = @import("plan.zig").synthReconcile;
-const unionCanon = @import("plan.zig").unionCanon;
-const unionExceptNames = @import("plan.zig").unionExceptNames;
-const unionDownstreamMapOnly = @import("plan.zig").unionDownstreamMapOnly;
-const unionSpecs = @import("plan.zig").unionSpecs;
-
-const classifyAggPipeline = @import("lanes.zig").classifyAggPipeline;
-const classifyLaneShape = @import("lanes.zig").classifyLaneShape;
-const classifyMapJoinPipeline = @import("lanes.zig").classifyMapJoinPipeline;
-const classifyWholeAgg = @import("lanes.zig").classifyWholeAgg;
-const laneEligible = @import("lanes.zig").laneEligible;
-const projectedColumns = @import("plan.zig").projectedColumns;
-const runCsvLane = @import("lanes.zig").runCsvLane;
-const runParallelSqlAgg = @import("lanes.zig").runParallelSqlAgg;
-const runParallelSqlMapJoin = @import("lanes.zig").runParallelSqlMapJoin;
-const runParquetLane = @import("lanes.zig").runParquetLane;
-const wholeAggStages = @import("lanes.zig").wholeAggStages;
-const topNStages = @import("lanes.zig").topNStages;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
 const renderBound = @import("script.zig").renderBound;
@@ -414,14 +371,8 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
 
 /// No matching arm (and no `_`) is a no-op.
 fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-    const idx = (try matchArmIndex(env, m, names.items, values.items, "match")) orelse return;
+    const sc = try (LoopRow{ .names = &.{}, .cells = &.{} }).scope(env.arena, env.params);
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "match")) orelse return;
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
@@ -551,8 +502,8 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     const arena = env.arena;
     const stages = pipe.stages[0 .. pipe.stages.len - 1];
     var ddiag = analyze.Diag{};
-    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
-    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
+    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (stages[0].node == .read and stages[0].node.read.form == .path and std.mem.eql(u8, stages[0].node.read.connector, "csv"))
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
 
@@ -704,15 +655,8 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
 /// The loop variables are bound over same-named params. Untyped ones bind as strings;
 /// a `name:type` one binds the coerced value, so `port >= 1000` compares numerically.
 fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    try lr.appendLoopVars(env.arena, &names, &values);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-    const idx = (try matchArmIndex(env, m, names.items, values.items, "for/match")) orelse return;
+    const sc = try lr.scope(env.arena, env.params);
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "for/match")) orelse return;
     try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);
 }
 

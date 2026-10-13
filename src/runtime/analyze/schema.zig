@@ -2,6 +2,7 @@
 //! windows, explodes and joins, with the errors a mistyped stage gets at check time.
 
 const Diag = @import("../analyze.zig").Diag;
+const dollarRefs = @import("../analyze.zig").dollarRefs;
 const eval = @import("../../exec/eval.zig");
 const Error = @import("../analyze.zig").Error;
 const ParamMap = std.StringHashMap(*const ast.Expr);
@@ -9,6 +10,7 @@ const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const exprType = @import("../analyze.zig").exprType;
 const fail = @import("../analyze.zig").fail;
+const failPos = @import("../analyze.zig").failPos;
 const failAt = @import("../analyze.zig").failAt;
 const lastPart = @import("../analyze.zig").lastPart;
 const mk = @import("../analyze.zig").mk;
@@ -421,20 +423,7 @@ fn checkLagDefault(arena: std.mem.Allocator, d: *const ast.Expr, q: ast.QualName
 }
 
 fn exprHasDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!bool {
-    var found = false;
-    const Walk = struct {
-        arena: std.mem.Allocator,
-        found: *bool,
-        fn recur(w: @This(), x: *const ast.Expr) Error!*ast.Expr {
-            if (x.* == .field) {
-                if (x.field.dollar) w.found.* = true;
-                return @constCast(x);
-            }
-            return ast.rebuildExpr(w.arena, x, w, recur);
-        }
-    };
-    _ = try Walk.recur(.{ .arena = arena, .found = &found }, e);
-    return found;
+    return (try dollarRefs(arena, e)).len > 0;
 }
 
 pub const ExplodePlan = struct { idx: usize, schema: types.Schema };
@@ -588,12 +577,6 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
     out.deferred = &.{};
     out.residual = residual;
     return .{ .join = out, .left = try lfilt.toOwnedSlice(), .right = try rfilt.toOwnedSlice() };
-}
-
-fn failPos(diag: *Diag, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
-    const e = fail(diag, fmt, args);
-    diag.pos = pos;
-    return e;
 }
 
 fn qualOne(arena: std.mem.Allocator, name: []const u8) !ast.QualName {

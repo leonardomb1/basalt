@@ -72,6 +72,8 @@
 //! or not the rest of that script succeeds.
 
 const std = @import("std");
+const Flags = @import("args.zig").Flags;
+const sharedFlag = @import("args.zig").sharedFlag;
 const cli = @import("cli.zig");
 const include = @import("../lang/include.zig");
 const ast = @import("../lang/ast.zig");
@@ -194,38 +196,15 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     const stderr = &err_file.interface;
     defer stderr.flush() catch {};
 
-    var opts = Opts{};
-    opts.log = .{ .level = .warn, .summary = .none };
+    var fl = Flags{ .log = .{ .level = .warn, .summary = .none } };
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--format")) {
-            i += 1;
-            if (i >= args.len) return usageErr(stderr, "missing value after `--format`");
-            opts.format = std.meta.stringToEnum(runtime.StdoutFormat, args[i]) orelse
-                return usageErr(stderr, "--format must be table|json|csv|tsv|arrow");
-        } else if (std.mem.eql(u8, a, "--max-rows")) {
-            i += 1;
-            if (i >= args.len) return usageErr(stderr, "missing value after `--max-rows`");
-            opts.max_rows = std.fmt.parseInt(u64, args[i], 10) catch return usageErr(stderr, "invalid --max-rows");
-        } else if (std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--threads")) {
-            i += 1;
-            if (i >= args.len) return usageErr(stderr, "missing value after `--threads`");
-            opts.threads = @max(1, std.fmt.parseInt(usize, args[i], 10) catch
-                return usageErr(stderr, "invalid --threads"));
-        } else if (std.mem.eql(u8, a, "--log-format")) {
-            i += 1;
-            if (i >= args.len) return usageErr(stderr, "missing value after `--log-format`");
-            opts.log.format = cli.parseLogFormat(args[i]) orelse return usageErr(stderr, "--log-format must be auto|text|json");
-        } else if (std.mem.eql(u8, a, "--log-level")) {
-            i += 1;
-            if (i >= args.len) return usageErr(stderr, "missing value after `--log-level`");
-            opts.log.level = obs.Level.parse(args[i]) orelse return usageErr(stderr, "--log-level must be error|warn|info|debug");
-        } else {
-            try stderr.print("error: unknown option `{s}` for `kernel` — see `basalt help`\n", .{a});
+        if (!((try sharedFlag(args, &i, &fl, .{ .output = true }, stderr)) orelse return 2)) {
+            try stderr.print("error: unknown option `{s}` for `kernel` — see `basalt help`\n", .{args[i]});
             return 2;
         }
     }
+    const opts = Opts{ .format = fl.format orelse .arrow, .max_rows = fl.max_rows, .threads = fl.threads, .log = fl.log };
 
     const act = std.posix.Sigaction{ .handler = .{ .handler = onInterrupt }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);

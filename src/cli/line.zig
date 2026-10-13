@@ -42,7 +42,6 @@ pub const layoutRows = @import("line/layout.zig").layoutRows;
 pub const rowOf = @import("line/layout.zig").rowOf;
 const colsBetween = @import("line/layout.zig").colsBetween;
 pub const Buffer = @import("line/buffer.zig").Buffer;
-const testBuffer = @import("line/testing_util.zig").testBuffer;
 
 pub const Editor = struct {
     gpa: std.mem.Allocator,

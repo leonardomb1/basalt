@@ -33,57 +33,29 @@ const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const column = @import("../exec/column.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const folder = @import("../connect/folder.zig");
 const pqwrite = @import("../format/parquet/write.zig");
 const arrowread = @import("../format/arrowread.zig");
-const xlsx = @import("../format/xlsx.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const JsonWriter = @import("../connect/table.zig").JsonWriter;
 const arrow = @import("../format/arrow.zig");
 const ArrowWriter = arrow.ArrowWriter;
 const ArrowFileSink = arrow.FileSink;
-const TableWriter = @import("../connect/table.zig").TableWriter;
 const driver = @import("../connect/driver.zig");
-const streamload = @import("../db/streamload.zig");
 const registry = @import("../connect/registry.zig");
-const projectedColumns = @import("plan.zig").projectedColumns;
 const tds = @import("../db/tds.zig");
 const mysql = @import("../db/mysql.zig");
 const postgres = @import("../db/postgres.zig");
 const sql = @import("../db/sql.zig");
-const pushdown = @import("pushdown.zig");
-const Value = @import("../exec/value.zig").Value;
 const request = @import("../connect/request.zig");
 const http_client = @import("../net/http_client.zig");
-const aad = @import("../db/aad.zig");
 const split = @import("../connect/split.zig");
-const ssrp = @import("../db/ssrp.zig");
-const ntlm = @import("../net/ntlm.zig");
-const krb5 = @import("../net/krb5.zig");
-const BufferSource = @import("../connect/wal.zig").BufferSource;
-const azure = @import("../store/azure.zig");
-const s3 = @import("../store/s3.zig");
-const gen = @import("../connect/gen.zig");
-const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
-const obs = @import("obs.zig");
 
 pub const DbAuth = @import("env.zig").DbAuth;
 const DbConfig = @import("env.zig").DbConfig;
 const Env = @import("env.zig").Env;
-const env_mod = @import("env.zig");
-const eqlAny = @import("env.zig").eqlAny;
-const forHintName = @import("env.zig").forHintName;
-const pathFail = @import("env.zig").pathFail;
-const planErr = @import("env.zig").planErr;
-const planErrT = @import("env.zig").planErrT;
-const SqlDesc = @import("env.zig").SqlDesc;
 pub const SqlKind = @import("env.zig").SqlKind;
-const srOpenErr = @import("env.zig").srOpenErr;
 
 pub const DiscardSink = struct {
     fn writeBatch(_: *anyopaque, _: std.mem.Allocator, _: Batch) anyerror!void {}
@@ -178,7 +150,6 @@ pub const resolveFolderFmt = @import("connect/source.zig").resolveFolderFmt;
 pub const FolderRead = @import("connect/source.zig").FolderRead;
 pub const noteParquet = @import("connect/source.zig").noteParquet;
 const tdsConnect = @import("connect/dbconfig.zig").tdsConnect;
-const parseDbConfig = @import("connect/dbconfig.zig").parseDbConfig;
 pub const selectListFor = @import("connect/sql_read.zig").selectListFor;
 pub const projectSqlRead = @import("connect/sql_read.zig").projectSqlRead;
 pub const exceptColumns = @import("connect/sql_read.zig").exceptColumns;
@@ -285,18 +256,6 @@ pub fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const h
         } else try out.append(.{ .key = key, .value = val });
     }
     return out.toOwnedSlice();
-}
-
-fn cfgStr(arena: std.mem.Allocator, expr: *const ast.Expr) ?[]const u8 {
-    return switch (expr.*) {
-        .str_lit => |s| s,
-        .int_lit => |i| std.fmt.allocPrint(arena, "{d}", .{i}) catch null,
-        .call => |c| if ((std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit)
-            (std.process.getEnvVarOwned(arena, c.args[0].str_lit) catch null)
-        else
-            null,
-        else => null,
-    };
 }
 
 pub fn dupeSchema(arena: std.mem.Allocator, s: types.Schema) !types.Schema {

@@ -9,7 +9,7 @@ const arrow = @import("../../format/arrow.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../../exec/column.zig");
 const op = @import("../../exec/op.zig");
-const planErr = @import("../env.zig").planErr;
+const aErr = @import("../env.zig").aErr;
 const runDescribe = @import("../run.zig").runDescribe;
 const runOutput = @import("output.zig").runOutput;
 const std = @import("std");
@@ -31,10 +31,7 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     }
 
     var adiag = analyze.Diag{};
-    const plan = analyze.analyzeOne(env.arena, env.kind_name, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, adiag.msg)),
-    };
+    const plan = analyze.analyzeOne(env.arena, env.kind_name, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| return aErr(env, &adiag, err);
 
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();

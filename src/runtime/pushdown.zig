@@ -50,11 +50,12 @@ const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const split = @import("../connect/split.zig");
 pub const Dialect = @import("../db/sql.zig").Dialect;
-const builtins = @import("../exec/builtins.zig");
 const byList = @import("pushdown/testing_util.zig").byList;
 const expectWholeAggRefused = @import("pushdown/testing_util.zig").expectWholeAggRefused;
 const fieldItem = @import("pushdown/testing_util.zig").fieldItem;
 const geFilter = @import("pushdown/testing_util.zig").geFilter;
+const intLit = @import("pushdown/testing_util.zig").intLit;
+const projStage = @import("pushdown/testing_util.zig").projStage;
 const schema4 = @import("pushdown/testing_util.zig").schema4;
 const selectStage = @import("pushdown/testing_util.zig").selectStage;
 const testSchema = @import("pushdown/testing_util.zig").testSchema;
@@ -94,16 +95,20 @@ pub fn planAggWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
         plan.proj_schema = p.schema;
     }
 
-    var where = std.array_list.Managed(u8).init(arena);
-    for (prefix) |st| {
-        if (st.node != .filter) continue;
-        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts })) orelse continue;
-        if (where.items.len > 0) try where.appendSlice(" AND ");
-        try where.appendSlice(frag);
-    }
-    if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
-
+    plan.where_extra = try leadingWhere(arena, dialect, prefix, .{ .schema = src_schema, .check_fields = true, .facts = facts });
     return plan;
+}
+
+/// The filters ahead of any other stage that translate, ANDed. A filter past a `select`
+/// may name a column it computed, which the source holds under that name or not at all.
+fn leadingWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, opts: Opts) !?[]const u8 {
+    var parts = std.array_list.Managed([]const u8).init(arena);
+    for (stages) |st| {
+        if (st.node != .filter) break;
+        if (try translatePred(arena, st.node.filter, dialect, opts)) |frag| try parts.append(frag);
+    }
+    if (parts.items.len == 0) return null;
+    return try std.mem.join(arena, " AND ", parts.items);
 }
 
 pub const WholeAgg = struct {
@@ -251,20 +256,7 @@ pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Sch
 pub fn planMapWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8, facts: ?*const Facts) !MapPlan {
     var plan = MapPlan{};
 
-    var nf: usize = middle.len;
-    for (middle, 0..) |st, i| if (st.node != .filter) {
-        nf = i;
-        break;
-    };
-    const leading = middle[0..nf];
-
-    var where = std.array_list.Managed(u8).init(arena);
-    for (leading) |st| {
-        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts })) orelse continue;
-        if (where.items.len > 0) try where.appendSlice(" AND ");
-        try where.appendSlice(frag);
-    }
-    if (where.items.len > 0) plan.where_extra = try where.toOwnedSlice();
+    plan.where_extra = try leadingWhere(arena, dialect, middle, .{ .schema = src_schema, .check_fields = true, .facts = facts });
 
     var live = std.StringHashMap(void).init(arena);
     for (out_cols) |c| try live.put(c, {});
@@ -338,7 +330,6 @@ pub const Opts = @import("pushdown/translate.zig").Opts;
 pub const translatePred = @import("pushdown/translate.zig").translatePred;
 pub const wantsFacts = @import("pushdown/translate.zig").wantsFacts;
 pub const translateExpr = @import("pushdown/translate.zig").translateExpr;
-const pushable = @import("pushdown/translate.zig").pushable;
 pub const TopN = @import("pushdown/topn.zig").TopN;
 pub const classifyTopN = @import("pushdown/topn.zig").classifyTopN;
 pub const ExplainedTopN = @import("pushdown/topn.zig").ExplainedTopN;
@@ -346,7 +337,6 @@ pub const explainTopN = @import("pushdown/topn.zig").explainTopN;
 pub const planTopN = @import("pushdown/topn.zig").planTopN;
 pub const renderTopN = @import("pushdown/topn.zig").renderTopN;
 pub const collectQuals = @import("pushdown/hoist.zig").collectQuals;
-const mkExpr = @import("pushdown/hoist.zig").mkExpr;
 pub const hoistThroughJoins = @import("pushdown/hoist.zig").hoistThroughJoins;
 pub const hoistFilters = @import("pushdown/hoist.zig").hoistFilters;
 pub const pushIntoJoinSides = @import("pushdown/hoist.zig").pushIntoJoinSides;
@@ -358,15 +348,7 @@ pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
 
 pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, facts: ?*const Facts, wants: ?*bool) !?[]const u8 {
     if (stages.len < 2 or stages[0].node != .read) return null;
-    var parts = std.array_list.Managed([]const u8).init(arena);
-    for (stages[1..]) |st| {
-        if (st.node != .filter) break;
-        if (try translatePred(arena, st.node.filter, dialect, .{ .facts = facts, .wants_facts = wants })) |sql_frag| {
-            try parts.append(sql_frag);
-        }
-    }
-    if (parts.items.len == 0) return null;
-    return try std.mem.join(arena, " AND ", parts.items);
+    return leadingWhere(arena, dialect, stages[1..], .{ .facts = facts, .wants_facts = wants });
 }
 
 pub fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -642,6 +624,20 @@ test "planAgg: a select in the prefix disables projection (filter still pushed)"
     const plan = try planAgg(a, .postgres, testSchema(), &.{ filt, sel }, ag);
     try testing.expect(plan.proj_select == null);
     try testing.expectEqualStrings("(\"a\" >= 5)", plan.where_extra.?);
+}
+
+test "planAgg: a filter after a select stays engine-side, as it may name a computed column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const items = try a.alloc(ast.SelectItem, 1);
+    items[0] = .{ .computed = .{ .name = "c", .expr = try bin(a, .add, try fld(a, "a"), try intLit(a, 1)) } };
+    const by = try a.alloc(ast.QualName, 1);
+    by[0] = .{ .parts = &.{"c"} };
+    const ag = ast.Aggregate{ .aggs = &.{}, .by = by };
+
+    const plan = try planAgg(a, .postgres, testSchema(), &.{ projStage(items), try geFilter(a, "c", 5) }, ag);
+    try testing.expect(plan.where_extra == null);
 }
 
 test "serialWhere: contiguous filter prefix, partial translation, stops at non-filter" {

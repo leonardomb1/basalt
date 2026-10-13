@@ -1458,3 +1458,29 @@ test "a JSON PARAM's paths bind from -p in a batch run, a missing key is an erro
 
     try std.testing.expectError(error.PlanFailed, runScript(alloc, &tmp, script, &.{.{ .key = "job", .val = "{\"n\":5}" }}));
 }
+
+test "an EXPLAIN statement's analyze error keeps check's position" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "PRINT 'x';\nEXPLAIN SELECT id FROM '{s}/in.csv'\nWHERE nope > 1;", .{base});
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyze(parena.allocator(), prog, &adiag));
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = run(alloc, prog, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const out = try cap.end(alloc);
+    defer alloc.free(out);
+    try std.testing.expectError(error.PlanFailed, res);
+    try std.testing.expectEqualStrings(adiag.msg, rdiag.msg);
+    try std.testing.expectEqual(adiag.pos.?, rdiag.pos.?);
+}

@@ -24,6 +24,9 @@ const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
+const eval = @import("../exec/eval.zig");
+const sftp = @import("../store/sftp.zig");
+const smb = @import("../store/smb.zig");
 
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
 
@@ -192,20 +195,80 @@ const Shared = struct {
     stages: []const op.Stage,
     sink_mode: SinkMode,
     rows_read: *obs.RowCounter,
+    queue: WorkQueue,
 
     sink_mtx: std.Thread.Mutex = .{},
-    next_split: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     rows: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 };
 
-fn fail(sh: *Shared, e: anyerror) void {
-    sh.err_mtx.lock();
-    if (sh.first_err == null) sh.first_err = e;
-    sh.err_mtx.unlock();
-    sh.failed.store(true, .seq_cst);
+pub const WorkQueue = struct {
+    nitems: usize,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    err_mtx: std.Thread.Mutex = .{},
+    first_err: ?anyerror = null,
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    note_buf: [480]u8 = undefined,
+    note_len: usize = 0,
+
+    pub fn fail(q: *WorkQueue, e: anyerror) void {
+        q.err_mtx.lock();
+        if (q.first_err == null) {
+            q.first_err = e;
+            const name = @errorName(e);
+            if (eval.takeFailure(e)) |why| {
+                q.note_len = @min(why.len, q.note_buf.len);
+                @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
+            } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
+                q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
+            } else if (std.mem.startsWith(u8, name, "Smb") and smb.lastError().len > 0) {
+                q.note_len = (std.fmt.bufPrint(&q.note_buf, "smb: {s}: {s}", .{ name, smb.lastError() }) catch q.note_buf[0..0]).len;
+            }
+        }
+        q.err_mtx.unlock();
+        q.failed.store(true, .seq_cst);
+    }
+
+    pub fn failure(q: *WorkQueue) ?anyerror {
+        const e = q.first_err orelse return null;
+        return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
+    }
+};
+
+/// A lane's private allocators: a thread-unsafe gpa, a work arena for the chain it
+/// builds, and a batch arena reset between batches. Init in place; it must not move.
+pub const LaneMem = struct {
+    gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
+    work: std.heap.ArenaAllocator = undefined,
+    batch: std.heap.ArenaAllocator = undefined,
+
+    pub fn init(self: *LaneMem) void {
+        self.work = std.heap.ArenaAllocator.init(self.gpa.allocator());
+        self.batch = std.heap.ArenaAllocator.init(self.gpa.allocator());
+    }
+
+    pub fn deinit(self: *LaneMem) void {
+        self.batch.deinit();
+        self.work.deinit();
+        _ = self.gpa.deinit();
+    }
+};
+
+/// The worker loop shared by the parallel CSV/SQL paths: steal the next item off
+/// `ctx.queue`, run `workOne(ctx, i)`, and latch the first error, which stops the others.
+pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
+    return struct {
+        fn go(ctx: *Ctx, _: usize) void {
+            while (true) {
+                if (ctx.queue.failed.load(.seq_cst)) return;
+                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+                if (i >= ctx.queue.nitems) break;
+                workOne(ctx, i) catch |e| {
+                    ctx.queue.fail(e);
+                    return;
+                };
+            }
+        }
+    }.go;
 }
 
 fn lane(sh: *Shared, lane_idx: usize) void {
@@ -218,37 +281,37 @@ fn lane(sh: *Shared, lane_idx: usize) void {
 
     var own_sink: ?driver.Sink = null;
     defer if (own_sink) |s| {
-        if (sh.failed.load(.seq_cst)) {
+        if (sh.queue.failed.load(.seq_cst)) {
             s.abort();
         } else {
-            s.close() catch |e| fail(sh, e);
+            s.close() catch |e| sh.queue.fail(e);
         }
     };
 
     while (true) {
-        if (sh.failed.load(.seq_cst)) return;
-        const i = sh.next_split.fetchAdd(1, .seq_cst);
-        if (i >= sh.predicates.len) break;
+        if (sh.queue.failed.load(.seq_cst)) return;
+        const i = sh.queue.next.fetchAdd(1, .seq_cst);
+        if (i >= sh.queue.nitems) break;
 
         if (sh.sink_mode == .per_lane and own_sink == null) {
             const pl = sh.sink_mode.per_lane;
             own_sink = pl.open(pl.ctx, lane_alloc, lane_idx) catch |e| {
-                fail(sh, e);
+                sh.queue.fail(e);
                 return;
             };
         }
 
         const src = sh.open(sh.ctx, lane_alloc, sh.predicates[i]) catch |e| {
-            fail(sh, e);
+            sh.queue.fail(e);
             return;
         };
         defer src.close();
 
         while (true) {
-            if (sh.failed.load(.seq_cst)) return;
+            if (sh.queue.failed.load(.seq_cst)) return;
             _ = arena.reset(.retain_capacity);
             const maybe = src.next(a) catch |e| {
-                fail(sh, e);
+                sh.queue.fail(e);
                 return;
             };
             var b = maybe orelse break;
@@ -256,7 +319,7 @@ fn lane(sh: *Shared, lane_idx: usize) void {
             var ok = true;
             for (sh.stages) |st| {
                 b = st.apply(a, b) catch |e| {
-                    fail(sh, e);
+                    sh.queue.fail(e);
                     ok = false;
                     break;
                 };
@@ -265,7 +328,7 @@ fn lane(sh: *Shared, lane_idx: usize) void {
             if (b.len == 0) continue;
 
             writeLaneBatch(sh.sink_mode, &sh.sink_mtx, own_sink, a, b) catch |e| {
-                fail(sh, e);
+                sh.queue.fail(e);
                 return;
             };
             _ = sh.rows.fetchAdd(b.len, .seq_cst);
@@ -293,12 +356,13 @@ pub fn run(
         .stages = stages,
         .sink_mode = sink_mode,
         .rows_read = rows_read,
+        .queue = .{ .nitems = predicates.len },
     };
 
     const nlanes = @min(@max(@as(usize, 1), nthreads), predicates.len);
     _ = try spawnJoin(gpa, nlanes, lane, &sh);
 
-    if (sh.first_err) |e| return e;
+    if (sh.queue.failure()) |e| return e;
     return sh.rows.load(.seq_cst);
 }
 
@@ -323,7 +387,7 @@ const FakeSplitSource = struct {
     }
     fn vtNext(ptr: *anyopaque, _: std.mem.Allocator) anyerror!?Batch {
         const self: *FakeSplitSource = @ptrCast(@alignCast(ptr));
-        if (self.fail_read) return error.SplitReadFailed;
+        if (self.fail_read) return eval.explain(error.SplitReadFailed, "row 7: bad cast");
         if (self.remaining == 0) return null;
         const n = @min(self.remaining, 2);
         self.remaining -= n;
@@ -592,6 +656,7 @@ test "run: a lane's open or read failure is the run's error" {
         var snk = CountSink{};
         const preds = [_][]const u8{"fail-read"};
         try testing.expectError(error.SplitReadFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read));
+        try testing.expectEqualStrings("row 7: bad cast", eval.takeFailure(error.SplitReadFailed).?);
     }
 }
 

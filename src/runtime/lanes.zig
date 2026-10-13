@@ -59,56 +59,19 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const types = @import("../lang/types.zig");
-const op = @import("../exec/op.zig");
-const Batch = @import("../exec/batch.zig").Batch;
-const column = @import("../exec/column.zig");
-const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
-const pqdecode = @import("../format/parquet/read.zig");
-const folder = @import("../connect/folder.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const driver = @import("../connect/driver.zig");
 const sql = @import("../db/sql.zig");
-const wrapProjected = @import("../connect/split.zig").wrapProjected;
-const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
-const obs = @import("obs.zig");
-const Value = @import("../exec/value.zig").Value;
 
 const Env = @import("env.zig").Env;
-const planErr = @import("env.zig").planErr;
-const planErrT = @import("env.zig").planErrT;
 const RunOptions = @import("env.zig").RunOptions;
-const schemaPtr = @import("env.zig").schemaPtr;
 const Stats = @import("env.zig").Stats;
 
 const connect_mod = @import("connect.zig");
-const buildParallelSink = @import("connect.zig").buildParallelSink;
 const dupeSchema = @import("connect.zig").dupeSchema;
-const OneBatch = @import("connect.zig").OneBatch;
-const openSink = @import("connect.zig").openSink;
-const openSqlQuery = @import("connect.zig").openSqlQuery;
-const planSplit = @import("connect.zig").planSplit;
-const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
-const sinkLabel = @import("connect.zig").sinkLabel;
-const SplitCtx = @import("connect.zig").SplitCtx;
-const sqlDescForStage = @import("connect.zig").sqlDescForStage;
 
-const aErr = @import("plan.zig").aErr;
-const buildChainFrom = @import("plan.zig").buildChainFrom;
-const buildMapChain = @import("plan.zig").buildMapChain;
-const buildPipeline = @import("plan.zig").buildPipeline;
-const prepareJoinSide = @import("plan.zig").prepareJoinSide;
-const buildStage = @import("plan.zig").buildStage;
-const buildTopN = @import("plan.zig").buildTopN;
-const filterBounds = @import("plan.zig").filterBounds;
-const joinBuildCap = @import("plan.zig").joinBuildCap;
-const mapChainSchema = @import("plan.zig").mapChainSchema;
 const projectedColumns = @import("plan.zig").projectedColumns;
-const tailSchema = @import("plan.zig").tailSchema;
 
 const LaneShape = union(enum) {
     agg: AggShape,
@@ -139,34 +102,45 @@ pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
 }
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const rd = stages[0].node.read;
-    const pipe = stages[0 .. stages.len - 1];
-    return switch (shape) {
-        .agg => |x| runParallelParquetAgg(env, rd, pipe, x.prefix, x.ag, x.tail, w, opts, stats, lanes_used),
-        .agg_join => |x| runParallelParquetAggJoin(env, rd, pipe, x, w, opts, stats, lanes_used),
-        .distinct => |x| runParallelParquetDistinct(env, rd, pipe, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
-        .top_n => |x| runParallelParquetTopN(env, rd, pipe, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
-        .map => |x| runParallelParquetMap(env, rd, pipe, x, w, opts, stats, lanes_used),
-        .map_join => |x| runParallelParquetMapJoin(env, rd, pipe, x, w, opts, stats, lanes_used),
-    };
+    if (!shapeLaneSafe(shape)) return false;
+    const split = (try parquetSplit(env, stages[0].node.read, pushStages(stages, shape), w, opts)) orelse return false;
+    return runShape(env, split, shape, w, opts, stats, lanes_used);
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const pipe = stages[0 .. stages.len - 1];
-    const push = switch (shape) {
-        .map => |x| pipe[1..][0..x.len],
-        .map_join => |x| pipe[1..][0..x.prefix.len],
-        else => pipe[1..],
-    };
+    if (!shapeLaneSafe(shape)) return false;
     var rd = stages[0].node.read;
-    if (try projectedColumns(env, push)) |cols| rd.cols = cols;
+    if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
+    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
+    defer mapped.close();
+    return runShape(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, shape, w, opts, stats, lanes_used);
+}
+
+/// The stages a read may push down: a map path stops before its join, whose names are the join's.
+fn pushStages(stages: []const ast.Stage, shape: LaneShape) []const ast.Stage {
+    const middle = stages[1 .. stages.len - 1];
     return switch (shape) {
-        .agg => |x| runParallelCsvAgg(env, rd, x.prefix, x.ag, x.tail, w, opts, stats, lanes_used),
-        .agg_join => |x| runParallelCsvAggJoin(env, rd, x, w, opts, stats, lanes_used),
-        .distinct => |x| runParallelCsvDistinct(env, rd, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
-        .top_n => |x| runParallelCsvTopN(env, rd, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
-        .map => |x| runParallelCsvMap(env, rd, x, w, opts, stats, lanes_used),
-        .map_join => |x| runParallelCsvMapJoin(env, rd, x, w, opts, stats, lanes_used),
+        .map => |x| middle[0..x.len],
+        .map_join => |x| middle[0..x.prefix.len],
+        else => middle,
+    };
+}
+
+fn shapeLaneSafe(shape: LaneShape) bool {
+    return switch (shape) {
+        .map_join => |x| mapJoinKindLaneSafe(x.join.kind),
+        else => true,
+    };
+}
+
+fn runShape(env: *Env, split: LaneSplit, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return switch (shape) {
+        .agg => |x| runParallelAgg(env, split, x.prefix, x.ag, x.tail, null, w, opts, stats, lanes_used),
+        .agg_join => |x| runParallelAgg(env, split, x.map_stages, x.ag, x.tail, x, w, opts, stats, lanes_used),
+        .distinct => |x| runParallelDistinct(env, split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
+        .top_n => |x| runParallelTopN(env, split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
+        .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
+        .map_join => |x| runParallelMap(env, split, x.prefix, x, w, opts, stats, lanes_used),
     };
 }
 
@@ -271,82 +245,27 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     return out;
 }
 
-pub const WorkQueue = struct {
-    nitems: usize,
-    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    note_buf: [480]u8 = undefined,
-    note_len: usize = 0,
-
-    pub fn fail(q: *WorkQueue, e: anyerror) void {
-        q.err_mtx.lock();
-        if (q.first_err == null) {
-            q.first_err = e;
-            const name = @errorName(e);
-            if (eval.takeFailure(e)) |why| {
-                q.note_len = @min(why.len, q.note_buf.len);
-                @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
-            } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
-            } else if (std.mem.startsWith(u8, name, "Smb") and smb.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "smb: {s}: {s}", .{ name, smb.lastError() }) catch q.note_buf[0..0]).len;
-            }
-        }
-        q.err_mtx.unlock();
-        q.failed.store(true, .seq_cst);
-    }
-
-    pub fn failure(q: *WorkQueue) ?anyerror {
-        const e = q.first_err orelse return null;
-        return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
-    }
-};
-
-/// The worker loop shared by the parallel CSV/SQL paths: steal the next item off
-/// `ctx.queue`, run `workOne(ctx, i)`, and latch the first error, which stops the others.
-pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
-    return struct {
-        fn go(ctx: *Ctx, _: usize) void {
-            while (true) {
-                if (ctx.queue.failed.load(.seq_cst)) return;
-                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-                if (i >= ctx.queue.nitems) break;
-                workOne(ctx, i) catch |e| {
-                    ctx.queue.fail(e);
-                    return;
-                };
-            }
-        }
-    }.go;
-}
-
 pub const agg_combine_parallel_min = @import("lanes/agg.zig").agg_combine_parallel_min;
-const runParallelParquetMap = @import("lanes/map.zig").runParallelParquetMap;
-const runParallelParquetMapJoin = @import("lanes/map.zig").runParallelParquetMapJoin;
 const AggJoinShape = @import("lanes/agg.zig").AggJoinShape;
 const classifyAggJoinPipeline = @import("lanes/agg.zig").classifyAggJoinPipeline;
-const runParallelParquetAgg = @import("lanes/agg.zig").runParallelParquetAgg;
-const runParallelParquetAggJoin = @import("lanes/agg.zig").runParallelParquetAggJoin;
-const runParallelCsvAgg = @import("lanes/agg.zig").runParallelCsvAgg;
-const runParallelCsvAggJoin = @import("lanes/agg.zig").runParallelCsvAggJoin;
+const runParallelAgg = @import("lanes/agg.zig").runParallelAgg;
 pub const runParallelSqlAgg = @import("lanes/agg.zig").runParallelSqlAgg;
 const classifyMapPipeline = @import("lanes/map.zig").classifyMapPipeline;
 const MapJoinShape = @import("lanes/map.zig").MapJoinShape;
 pub const classifyMapJoinPipeline = @import("lanes/map.zig").classifyMapJoinPipeline;
 pub const joinKindLaneSafe = @import("lanes/map.zig").joinKindLaneSafe;
+const mapJoinKindLaneSafe = @import("lanes/map.zig").mapJoinKindLaneSafe;
 pub const runParallelSqlMapJoin = @import("lanes/map.zig").runParallelSqlMapJoin;
-const runParallelCsvMap = @import("lanes/map.zig").runParallelCsvMap;
-const runParallelCsvMapJoin = @import("lanes/map.zig").runParallelCsvMapJoin;
+const runParallelMap = @import("lanes/map.zig").runParallelMap;
 const TopNShape = @import("lanes/topn.zig").TopNShape;
 const classifyTopNPipeline = @import("lanes/topn.zig").classifyTopNPipeline;
-const runParallelParquetTopN = @import("lanes/topn.zig").runParallelParquetTopN;
-const runParallelCsvTopN = @import("lanes/topn.zig").runParallelCsvTopN;
+const runParallelTopN = @import("lanes/topn.zig").runParallelTopN;
 const DistinctShape = @import("lanes/distinct.zig").DistinctShape;
 const classifyDistinctPipeline = @import("lanes/distinct.zig").classifyDistinctPipeline;
-const runParallelParquetDistinct = @import("lanes/distinct.zig").runParallelParquetDistinct;
-const runParallelCsvDistinct = @import("lanes/distinct.zig").runParallelCsvDistinct;
+const runParallelDistinct = @import("lanes/distinct.zig").runParallelDistinct;
+const LaneSplit = @import("lanes/sources.zig").LaneSplit;
+const parquetSplit = @import("lanes/sources.zig").parquetSplit;
+const csvSplitFile = @import("lanes/sources.zig").csvSplitFile;
 
 test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

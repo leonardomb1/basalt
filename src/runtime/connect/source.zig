@@ -23,6 +23,7 @@ const guardFileFormat = @import("sink.zig").guardFileFormat;
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const http_client = @import("../../net/http_client.zig");
 const pathFail = @import("../env.zig").pathFail;
+const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
 const pqdecode = @import("../../format/parquet/read.zig");
@@ -121,8 +122,7 @@ pub fn openSourceProjected(
 pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?FolderRead {
     if (!folder.isFolder(path)) return null;
     var fdiag = analyze.Diag{};
-    const want = analyze.formatFromHints(hints, &fdiag) catch
-        return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
+    const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
     return resolveFolderFmt(env, path, want);
 }
 
@@ -195,7 +195,7 @@ fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source
 
 fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source {
     var odiag = analyze.Diag{};
-    const opts = analyze.xlsxOptions(hints, &odiag) catch return planErr(env.diag, odiag.msg);
+    const opts = analyze.xlsxOptions(hints, &odiag) catch |e| return aErr(env, &odiag, e);
     const r = xlsx.Reader.open(env.arena, env.gpa, path, opts) catch |e| {
         const why = switch (e) {
             error.XlsxSheetNotFound => blk: {
@@ -274,8 +274,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
         var fdiag = analyze.Diag{};
-        const want = analyze.formatFromHints(hints, &fdiag) catch
-            return planErr(env.diag, try env.arena.dupe(u8, fdiag.msg));
+        const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
         try guardFileFormat(env, rd.form.path, want, "read");
         const fr = try resolveFolder(env, rd.form.path, hints);
         env.folder_memo = null;
@@ -291,8 +290,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
         if (analyze.readFormat(rd.form.path, want) == .xlsx) return openXlsx(env, rd.form.path, hints);
         var ddiag = analyze.Diag{};
-        const d = analyze.dialectFromHints(hints, &ddiag) catch
-            return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+        const d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
         if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
         const opened = if (fr) |f| csv.CsvReader.openList(env.arena, f.files, d) else csv.CsvReader.open(env.arena, rd.form.path, d);

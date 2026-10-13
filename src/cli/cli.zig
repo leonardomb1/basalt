@@ -45,25 +45,13 @@
 //! fetches) and `wizard.zig` (`\connect`).
 
 const std = @import("std");
-const parser = @import("../lang/sql_parser.zig");
-const include = @import("../lang/include.zig");
-const Editor = @import("line.zig").Editor;
-const LineResult = @import("line.zig").Result;
-const view = @import("view.zig");
-const form = @import("form.zig");
-const hilite = @import("hilite.zig");
 const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
 const runtime = @import("../runtime/run.zig");
-const obs = @import("../runtime/obs.zig");
-const analyze = @import("../runtime/analyze.zig");
 const complete = @import("complete.zig");
-const http_server = @import("../server/http_server.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
-const Value = @import("../exec/value.zig").Value;
-const types = @import("../lang/types.zig");
 
 /// Asks the run to stop at its next boundary with one atomic store (async-signal-safe).
 /// A second signal exits 130 at once, so ^C ^C is not held hostage by a slow read.
@@ -143,7 +131,6 @@ fn unexpectedArg(args: [][:0]u8, stderr: *std.Io.Writer) !bool {
     return true;
 }
 
-const scriptArg = @import("args.zig").scriptArg;
 const unknownOption = @import("args.zig").unknownOption;
 pub const parseLogFormat = @import("args.zig").parseLogFormat;
 pub const CheckIssue = @import("cmd_check.zig").CheckIssue;
@@ -158,21 +145,14 @@ pub const writeOfferIn = @import("cmd_complete.zig").writeOfferIn;
 pub const writeOffer = @import("cmd_complete.zig").writeOffer;
 const cmdRun = @import("cmd_run.zig").cmdRun;
 const cmdServe = @import("cmd_serve.zig").cmdServe;
-const endsComplete = @import("entry.zig").endsComplete;
-const splitStatements = @import("entry.zig").splitStatements;
 pub const DeclKind = @import("entry.zig").DeclKind;
 pub const DeclId = @import("entry.zig").DeclId;
-const declOf = @import("entry.zig").declOf;
 pub const DeclStore = @import("entry.zig").DeclStore;
-const Session = @import("repl.zig").Session;
 pub const Catalog = @import("catalog.zig").Catalog;
 pub const Completer = @import("catalog.zig").Completer;
 pub const Offer = @import("catalog.zig").Offer;
-const csvCells = @import("catalog.zig").csvCells;
-const httpResources = @import("catalog.zig").httpResources;
 pub const suggestFor = @import("catalog.zig").suggestFor;
 const cmdRepl = @import("repl.zig").cmdRepl;
-const entryStatements = @import("repl.zig").entryStatements;
 pub const Pending = @import("prepare.zig").Pending;
 pub const Prepared = @import("prepare.zig").Prepared;
 pub const PrepareError = @import("prepare.zig").PrepareError;
@@ -181,10 +161,6 @@ pub const prepareEntry = @import("prepare.zig").prepareEntry;
 pub const LetFreezer = @import("prepare.zig").LetFreezer;
 pub const letLiteral = @import("prepare.zig").letLiteral;
 pub const appendDisplaySinks = @import("repl.zig").appendDisplaySinks;
-const isQuit = @import("repl.zig").isQuit;
-const isHelp = @import("repl.zig").isHelp;
-const threadFlagValue = @import("args.zig").threadFlagValue;
-const testArgv = @import("args.zig").testArgv;
 
 fn usage(w: anytype) !void {
     try w.writeAll(
