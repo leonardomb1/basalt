@@ -294,6 +294,16 @@ test "type flow catches a type error in an expression" {
     try std.testing.expectEqualStrings("`not` needs a bool operand", diag.msg);
 }
 
+test "an S3 target whose bucket a loop variable names is judged once rendered, not as its template" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parse(a, "FOR EACH ROW OF ('/tmp/b.csv') AS (b) LOAD INTO IDENTIFIER('s3://' || $b || '/o.csv') AS SELECT 1 AS a; END FOR;");
+    var diag = Diag{};
+    _ = try analyze(a, prog, &diag);
+    try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, "LOAD INTO 's3://Bad_Bucket/o.csv' AS SELECT 1 AS a;"), &diag));
+}
+
 test "analyze rejects unknown connection" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

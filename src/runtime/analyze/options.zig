@@ -40,7 +40,11 @@ pub fn unknownOptionMsg(arena: std.mem.Allocator, c: ast.Connection, key: []cons
 }
 
 pub fn portRangeMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} connection `port` is out of range", .{connector});
+    return rangeMsg(arena, connector, "port");
+}
+
+pub fn rangeMsg(arena: std.mem.Allocator, connector: []const u8, key: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} connection `{s}` is out of range", .{ connector, key });
 }
 
 pub fn needsHostMsg(arena: std.mem.Allocator, c: ast.Connection) Error![]const u8 {
@@ -188,6 +192,9 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
         const k = attr.key;
         if (containsKey(&stream_int_keys, k)) {
             if (intProblem(attr.value)) |why| return fail(diag, "{s}", .{why});
+            const v = intValue(attr.value).?;
+            const fits = if (std.mem.endsWith(u8, k, "port")) std.math.cast(u16, v) != null else std.math.cast(u32, v) != null;
+            if (!fits) return fail(diag, "{s}", .{try rangeMsg(arena, conn.connector, k)});
             continue;
         }
         if (std.mem.eql(u8, k, "auto_create")) {

@@ -351,12 +351,11 @@ pub const Plan = struct {
     outputs: []const Output,
 };
 
-/// The values a script statement's expression may read: names and values in step.
 pub const Scope = struct { names: []const []const u8, values: []const Value };
 
-/// What an expression folds to over `sc`, or the label of why it does not.
 pub const Folded = union(enum) { value: Value, failed: []const u8 };
 
+/// What an expression folds to over `sc`, or the label of why it does not.
 pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folded {
     const v = eval.constEval(arena, e, sc.names, sc.values) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -382,9 +381,9 @@ pub fn throwVerdict(arena: std.mem.Allocator, t: ast.Throw, sc: Scope) Error!?[]
     };
 }
 
-/// A `PRINT`'s text, rendered as any cell is, or why it cannot be.
 pub const Printed = union(enum) { text: []const u8, problem: []const u8 };
 
+/// A `PRINT`'s text, rendered as any cell is, or why it cannot be.
 pub fn printed(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Printed {
     return switch (try fold(arena, e, sc)) {
         .failed => |why| .{ .problem = try std.fmt.allocPrint(arena, "PRINT: {s}", .{why}) },
@@ -392,9 +391,9 @@ pub fn printed(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Pr
     };
 }
 
-/// A `CALL`'s arguments as the text cells its body's row binds, or why one cannot be.
 pub const CallArgs = union(enum) { cells: []const []const u8, problem: []const u8 };
 
+/// A `CALL`'s arguments as the text cells its body's row binds, or why one cannot be.
 pub fn callArgs(arena: std.mem.Allocator, c: ast.CallStmt, params: []const ast.FnParam, sc: Scope) Error!CallArgs {
     const cells = try arena.alloc([]const u8, params.len);
     for (params, c.args, cells) |p, a, *cell| switch (try fold(arena, a, sc)) {
@@ -404,10 +403,10 @@ pub fn callArgs(arena: std.mem.Allocator, c: ast.CallStmt, params: []const ast.F
     return .{ .cells = cells };
 }
 
-/// The statement `CASE` arm that runs (`_` matches), null for none, or why the CASE
-/// cannot be decided; `ctx` names it in the refusal.
 pub const ArmPick = union(enum) { arm: ?usize, problem: []const u8 };
 
+/// The statement `CASE` arm that runs (`_` matches), null for none, or why the CASE
+/// cannot be decided; `ctx` names it in the refusal.
 pub fn matchArm(arena: std.mem.Allocator, m: ast.StmtMatch, sc: Scope, ctx: []const u8) Error!ArmPick {
     var subj: ?Value = null;
     if (m.subject) |s| switch (try fold(arena, s, sc)) {
@@ -841,7 +840,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         }
     };
     for (program.stmts) |s| switch (s) {
-        .throw, .print, .call, .match => try checkScriptStmt(arena, s, program, &params_map, .{ .names = known_names.items, .values = known_values.items }, diag),
+        .throw => try checkScriptStmt(arena, s, program, &params_map, .{ .names = known_names.items, .values = known_values.items }, diag),
+        else => {},
+    };
+    for (program.stmts) |s| switch (s) {
+        .print, .call, .match => try checkScriptStmt(arena, s, program, &params_map, .{ .names = known_names.items, .values = known_values.items }, diag),
         else => {},
     };
     try bindBodyVars(arena, program.stmts, &params_map);
@@ -1593,7 +1596,7 @@ const Ctx = struct {
 /// What a file or stdout sink is refused for, shared by `check` and the run's
 /// planner so the two can never disagree about a target.
 pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!void {
-    if (s3.bucketNameError(w.target)) |why|
+    if (std.mem.indexOf(u8, w.target, "${") == null) if (s3.bucketNameError(w.target)) |why|
         return fail(diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
     if (ftp.isUrl(w.target))
         return fail(diag, "cannot write `{s}`: basalt reads from FTP but does not write to it; write to `sftp://` or a local file", .{w.target});
