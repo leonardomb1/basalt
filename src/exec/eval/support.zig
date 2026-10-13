@@ -236,7 +236,7 @@ pub fn toI64(v: Value) i64 {
     return switch (v) {
         .int => |x| x,
         .float => |x| std.math.lossyCast(i64, x),
-        .string => |s| parseIntStrict(std.mem.trim(u8, s, " ")) orelse 0,
+        .string => |s| parseIntStrict(trim(s)) orelse 0,
         else => 0,
     };
 }
@@ -438,4 +438,9 @@ test "compareValues: decimals order exactly against decimals and ints, at any sc
     try std.testing.expectEqual(std.math.Order.lt, compareValues(d(1, 200), d(1, 0)).?);
     try std.testing.expectEqual(std.math.Order.gt, compareValues(d(std.math.maxInt(i128), 0), d(-1, 100)).?);
     try std.testing.expectEqual(std.math.Order.lt, compareValues(d(-std.math.maxInt(i128), 0), d(1, 60)).?);
+}
+
+test "toI64 trims text as a CAST to INT does" {
+    try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = "\t7\n" }));
+    try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = " 7 " }));
 }
