@@ -114,10 +114,7 @@ pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const
             if (ck == ak or (ck.isNumeric() and ak.isNumeric())) return b.columns[ci];
         }
     }
-    const col = eval.evalColumn(arena, e, b, want) catch |err| {
-        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-        return err;
-    };
+    const col = eval.evalColumn(arena, e, b, want) catch |err| return inAggregate(self, err);
     if (col.ty.kind != .string) return col;
     const to = argCast(agg) orelse return col;
     if (to.kind == .string) return col;
@@ -128,10 +125,7 @@ pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const
 
 pub fn argValue(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batch, r: usize) anyerror!Value {
     const e = agg.arg orelse return .null;
-    const v = eval.evalRow(arena, e, b, r) catch |err| {
-        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-        return err;
-    };
+    const v = eval.evalRow(arena, e, b, r) catch |err| return inAggregate(self, err);
     if (v != .string) return v;
     const to = argCast(agg) orelse return v;
     if (to.kind == .string) return v;
@@ -143,10 +137,14 @@ pub fn castArg(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, to: types.T
     if (v.isNull()) return v;
     const exact = agg.func == .sum and v == .string and to.kind != .float;
     return (if (exact) eval.exactSumText(v.string, to) else eval.castValueTyped(arena, v, to)) catch |err| {
-        const e = if (err == error.CastFailed and !exact) eval.castFailure(arena, v, to) else err;
-        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(e)});
-        return e;
+        return inAggregate(self, if (err == error.CastFailed and !exact) eval.castFailure(arena, v, to) else err);
     };
+}
+
+/// `err`, its message noted as raised in an aggregate.
+fn inAggregate(self: *Aggregate, err: anyerror) anyerror {
+    if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
+    return err;
 }
 
 /// Vectorized reduce of one agg over one batch; null means fold row-wise. A null
@@ -156,16 +154,10 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
     if (foldsRowwise(agg.func)) return null;
     const e = agg.arg orelse return null;
     if (agg.func == .sum and agg.ty.kind == .decimal) {
-        const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-            return err;
-        };
+        const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| return inAggregate(self, err);
         if (fused) |f| return Partial{ .nvalid = f.nvalid, .sum_i = f.sum };
     }
-    const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| {
-        if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-        return err;
-    };
+    const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| return inAggregate(self, err);
     const n = b.len;
     if (col.ty.kind == .decimal) return switch (agg.func) {
         .count => Partial{ .nvalid = simd.popcountValid(col.validity.bits, n) },
@@ -273,10 +265,7 @@ pub fn emitGroup(self: *Aggregate, builders: []column.Builder, st: *const GroupS
     const nk = self.by.len;
     for (builders[0..nk], 0..) |*b, j| try b.append(st.keyValue(gi, j));
     for (self.aggs, builders[nk..], 0..) |agg, *b, j| {
-        try b.append(finalizeAcc(st.acc(gi, j), agg) catch |err| {
-            if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
-            return err;
-        });
+        try b.append(finalizeAcc(st.acc(gi, j), agg) catch |err| return inAggregate(self, err));
     }
 }
 
