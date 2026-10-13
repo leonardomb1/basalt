@@ -34,7 +34,7 @@ pub const Part = struct {
         };
         self.len = path.len + suffix.len;
         if (st) |s| {
-            file.chown(s.uid, s.gid) catch {};
+            file.chown(s.uid, s.gid) catch file.chown(null, s.gid) catch {};
             file.chmod(s.mode & 0o7777) catch |e| {
                 file.close();
                 self.discard();
