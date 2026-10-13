@@ -60,7 +60,7 @@ pub const Decimal = struct {
     }
 };
 
-const pow10_i128 = blk: {
+pub const pow10_i128 = blk: {
     var t: [39]i128 = undefined;
     var r: i128 = 1;
     for (&t) |*e| {

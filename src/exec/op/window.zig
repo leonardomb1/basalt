@@ -48,6 +48,8 @@ const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
+const Moments = @import("aggregate/accumulate.zig").Moments;
+const spread = @import("aggregate/accumulate.zig").spread;
 const materializeAll = @import("../op.zig").materializeAll;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
@@ -450,21 +452,6 @@ pub const Window = struct {
         };
     }
 
-    const Moments = struct {
-        n: f64 = 0,
-        mean: f64 = 0,
-        m2: f64 = 0,
-
-        /// Chan's pairwise merge of two groups' count, mean and squared deviations.
-        fn merge(a: Moments, b: Moments) Moments {
-            if (a.n == 0) return b;
-            if (b.n == 0) return a;
-            const n = a.n + b.n;
-            const d = b.mean - a.mean;
-            return .{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * a.n * b.n / n };
-        }
-    };
-
     fn addF(a: f64, b: f64) f64 {
         return a + b;
     }
@@ -786,13 +773,6 @@ pub const Window = struct {
             };
         }
     };
-
-    fn spread(func: ast.AggFunc, variance: f64) Value {
-        return .{ .float = switch (func) {
-            .stddev_samp, .stddev_pop => @sqrt(variance),
-            else => variance,
-        } };
-    }
 
     /// An aggregate over each row's frame, as the file header describes.
     fn aggregateOver(self: *Window, arena: std.mem.Allocator, f: Func, agg: ast.AggFunc, vals: []const Value, fs: []const usize, fe: []const usize, l: Layout, out_ty: types.Type, out: []Value) !void {

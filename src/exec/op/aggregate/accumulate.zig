@@ -508,22 +508,31 @@ pub fn noteMoment(acc: *Acc, x: f64) void {
     acc.ext = .{ .float = m2 + delta * (x - acc.sum_f) };
 }
 
-/// Chan et al.'s pairwise combination of two Welford states.
+/// A group's count, mean and sum of squared deviations.
+pub const Moments = struct {
+    n: f64 = 0,
+    mean: f64 = 0,
+    m2: f64 = 0,
+
+    /// Chan et al.'s pairwise merge of two groups' moments.
+    pub fn merge(a: Moments, b: Moments) Moments {
+        if (a.n == 0) return b;
+        if (b.n == 0) return a;
+        const n = a.n + b.n;
+        const d = b.mean - a.mean;
+        return .{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * a.n * b.n / n };
+    }
+};
+
+/// Two Welford states combined with `Moments.merge`.
 pub fn mergeMoments(dst: *Acc, src: Acc) void {
     if (src.n == 0) return;
-    if (dst.n == 0) {
-        dst.n = src.n;
-        dst.sum_f = src.sum_f;
-        dst.ext = .{ .float = sqDev(src) };
-        return;
-    }
-    const na: f64 = @floatFromInt(dst.n);
-    const nb: f64 = @floatFromInt(src.n);
-    const n = na + nb;
-    const delta = src.sum_f - dst.sum_f;
-    const m2 = sqDev(dst.*) + sqDev(src) + delta * delta * na * nb / n;
-    dst.ext = .{ .float = m2 };
-    dst.sum_f += delta * nb / n;
+    const m = Moments.merge(
+        .{ .n = @floatFromInt(dst.n), .mean = dst.sum_f, .m2 = sqDev(dst.*) },
+        .{ .n = @floatFromInt(src.n), .mean = src.sum_f, .m2 = sqDev(src) },
+    );
+    dst.ext = .{ .float = m.m2 };
+    dst.sum_f = m.mean;
     dst.n += src.n;
 }
 

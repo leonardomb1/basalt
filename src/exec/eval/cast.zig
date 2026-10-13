@@ -8,6 +8,7 @@ const floatToInt = @import("vec.zig").floatToInt;
 const parseIsoDate = @import("time.zig").parseIsoDate;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
+const pow10_i128 = @import("../value.zig").pow10_i128;
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
 const clip = @import("support.zig").clip;
@@ -124,16 +125,6 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
 fn powTen(n: u8) i128 {
     return pow10_i128[n];
 }
-
-const pow10_i128 = blk: {
-    var t: [39]i128 = undefined;
-    var r: i128 = 1;
-    for (&t) |*e| {
-        e.* = r;
-        r *%= 10;
-    }
-    break :blk t;
-};
 
 /// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
 /// float8 to numeric. Null for a non-finite value or one past 38 digits.
