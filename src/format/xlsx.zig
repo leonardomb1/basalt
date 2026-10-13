@@ -483,7 +483,7 @@ pub const Reader = struct {
 
     /// Rows the file left out between data rows are emitted empty, as are rows past the
     /// file's last up to `last_row`.
-    fn nextBatch(self: *Reader, arena: std.mem.Allocator) !?Batch {
+    pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
         if (self.done or self.last_row == 0) return null;
         if (self.part == null) {
             self.part = try openPart(self.arena, self.gpa, self.path, self.sheet_part);
@@ -542,20 +542,7 @@ pub const Reader = struct {
         };
     }
 
-    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *Reader = @ptrCast(@alignCast(ptr));
-        return self.schema;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *Reader = @ptrCast(@alignCast(ptr));
-        return self.nextBatch(arena);
-    }
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *Reader = @ptrCast(@alignCast(ptr));
-        self.close();
-    }
+    const vtable = driver.sourceVTable(Reader);
 };
 
 pub fn sheetNames(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8) ![]const []const u8 {
@@ -883,7 +870,7 @@ fn dumpFixture(arena: std.mem.Allocator, bytes: []const u8, opts: Options) ![]co
     const w = out.writer();
     for (r.schema.fields, 0..) |f, i| try w.print("{s}{s}:{s}", .{ if (i > 0) "," else "", f.name, @tagName(f.ty.kind) });
     try w.writeByte('\n');
-    while (try r.nextBatch(arena)) |b| {
+    while (try r.next(arena)) |b| {
         for (0..b.len) |row| {
             for (b.columns, 0..) |*c, i| {
                 if (i > 0) try w.writeByte('|');

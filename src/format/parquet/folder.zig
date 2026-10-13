@@ -85,42 +85,8 @@ pub const Folder = struct {
         return .{ .ptr = self, .vtable = &folder_vtable };
     }
 
-    const folder_vtable = driver.Source.VTable{
-        .schema = struct {
-            fn f(p: *anyopaque) types.Schema {
-                return @as(*Folder, @ptrCast(@alignCast(p))).schema;
-            }
-        }.f,
-        .next = struct {
-            fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-                return @as(*Folder, @ptrCast(@alignCast(p))).next(arena);
-            }
-        }.f,
-        .close = struct {
-            fn f(p: *anyopaque) void {
-                @as(*Folder, @ptrCast(@alignCast(p))).close();
-            }
-        }.f,
-    };
+    const folder_vtable = driver.sourceVTable(Folder);
 };
-
-pub const source_vtable = driver.Source.VTable{
-    .schema = srcSchema,
-    .next = srcNext,
-    .close = srcClose,
-};
-
-fn srcSchema(p: *anyopaque) types.Schema {
-    return @as(*Reader, @ptrCast(@alignCast(p))).schema;
-}
-
-fn srcNext(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    return @as(*Reader, @ptrCast(@alignCast(p))).next(arena);
-}
-
-fn srcClose(p: *anyopaque) void {
-    @as(*Reader, @ptrCast(@alignCast(p))).close();
-}
 
 /// Ends at the next chunk's start, or the footer. `total_compressed_size` is not
 /// used: writers disagree on whether it counts headers, which truncated chunks.

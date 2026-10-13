@@ -32,6 +32,7 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
+const objstore = @import("objstore.zig");
 const ntlm = @import("../net/ntlm.zig");
 const krb5 = @import("../net/krb5.zig");
 const spnego = @import("../net/spnego.zig");
@@ -1249,12 +1250,12 @@ pub const Upload = struct {
             .session = s,
             .handle = h,
             .path = t.path,
-            .interface = .{ .buffer = try arena.alloc(u8, 4 << 20), .vtable = &.{ .drain = drainFn } },
+            .interface = .{ .buffer = try arena.alloc(u8, 4 << 20), .vtable = &.{ .drain = objstore.drain(Upload) } },
         };
         return self;
     }
 
-    fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
+    pub fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
         if (bytes.len == 0) return 0;
         self.session.writeAt(self.handle, self.at, bytes) catch |e| {
             self.fail(e);
@@ -1262,16 +1263,6 @@ pub const Upload = struct {
         };
         self.at += bytes.len;
         return bytes.len;
-    }
-
-    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Upload = @fieldParentPtr("interface", w);
-        var total: usize = 0;
-        total += try self.put(w.buffered());
-        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
-        const last = data[data.len - 1];
-        for (0..splat) |_| total += try self.put(last);
-        return w.consume(total);
     }
 
     fn fail(self: *Upload, e: anyerror) void {
@@ -1312,8 +1303,8 @@ pub const Upload = struct {
     }
 };
 
-/// Regular files under `url`, recursively, skipping names starting `_` or `.`,
-/// as `smb://` URLs sorted by name.
+/// Regular files under `url`, recursively, skipping folders starting `_` or `.`,
+/// as `/`-separated paths relative to it, in server order.
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
     const t = try resolve(arena, url);
     const s = try checkout(t.cfg);
@@ -1343,15 +1334,7 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
         }
         if (names.items.len > 1_000_000) return error.FolderTooLarge;
     }
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-    const base = url[0 .. url.len - (if (std.mem.endsWith(u8, url, "/")) @as(usize, 1) else 0)];
-    const out = try arena.alloc([]const u8, names.items.len);
-    for (names.items, out) |n, *o| o.* = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, n });
-    return out;
+    return names.items;
 }
 
 fn winPath(arena: std.mem.Allocator, p: []const u8) ![]const u8 {

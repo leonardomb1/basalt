@@ -30,22 +30,10 @@
 
 const std = @import("std");
 const azure = @import("azure.zig");
+const http_client = @import("../net/http_client.zig");
 const s3 = @import("s3.zig");
-
-/// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
-/// Duplicated from `exec/eval.zig` so this module depends on nothing but std.
-pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
+const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 
 pub fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
     var open_buf: [64]u8 = undefined;
@@ -231,6 +219,22 @@ pub const Writer = struct {
         return self.vtable.last_error(self.ptr);
     }
 };
+
+/// Whether `path` is written whole on another host: SFTP, SMB or an object store,
+/// none of which can be appended to.
+pub fn isRemote(path: []const u8) bool {
+    return sftp.isUrl(path) or smb.isUrl(path) or isUrl(path);
+}
+
+/// The writer for a remote `path` (see `isRemote`), or null for a local one.
+pub fn openRemote(arena: std.mem.Allocator, path: []const u8, content_type: []const u8) !?Writer {
+    if (sftp.isUrl(path)) return writer(try sftp.Upload.open(arena, path));
+    if (smb.isUrl(path)) return writer(try smb.Upload.open(arena, path));
+    if (!isUrl(path)) return null;
+    const client = try arena.create(std.http.Client);
+    client.* = http_client.initClient(arena);
+    return try (try parse(arena, path)).openWriter(arena, client, content_type);
+}
 
 pub fn writer(w: anytype) Writer {
     const T = @TypeOf(w.*);
@@ -435,7 +439,8 @@ test "find and isPrefix dispatch on the scheme alone" {
     try std.testing.expect(find("s3://b/k.csv") == &s3.provider);
     try std.testing.expect(find("https://x/y.csv") == null);
     try std.testing.expect(find("/tmp/f.csv") == null);
-    try std.testing.expect(isPrefix("az://a/c/") and isPrefix("s3://b/dir/"));
+    try std.testing.expect(isPrefix("az://a/c/") and isPrefix("s3://b/dir/") and isPrefix("s3://b/"));
+    try std.testing.expect(!isPrefix("az://a/c/f.csv"));
     try std.testing.expect(!isPrefix("s3://b/f.csv") and !isPrefix("/tmp/dir/"));
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

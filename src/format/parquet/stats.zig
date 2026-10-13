@@ -204,48 +204,22 @@ fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]
 
 /// Null means unknown and the caller must keep the group. It once returned `.eq`
 /// for unknown pairs, which pruned every group of a DECIMAL or date-vs-string range.
-/// A date against an ISO string literal orders by parsing it (dialect §9).
+/// `eval.compareValues` first, so pruning agrees with the filter that re-checks
+/// rows; past it, the cross-kind pairs a statistic orders against. A text
+/// statistic against a date or time is unknown: text bounds are lexicographic, so
+/// `2024-01-05 23:00` can be the min of a group that also holds `2024-01-05T09:00`.
 pub fn cmp(a: Value, b: Value) ?std.math.Order {
-    if (numOrder(a, b)) |o| return o;
+    if ((a == .string or a == .bytes) and b != .string and b != .bytes) return null;
+    if (eval.compareValues(a, b)) |o| return o;
     return switch (a) {
-        .int => std.math.order(a.int, switch (b) {
-            .int => |x| x,
-            .float => |x| @as(i64, @intFromFloat(x)),
-            else => return null,
-        }),
-        .float => std.math.order(a.float, switch (b) {
-            .float => |x| x,
-            .int => |x| @as(f64, @floatFromInt(x)),
-            else => return null,
-        }),
-        .date => std.math.order(@as(i64, a.date), switch (b) {
-            .date => |x| @as(i64, x),
-            .int => |x| x,
-            .string => |x| eval.parseIsoDate(x) orelse return null,
-            else => return null,
-        }),
-        .time, .timestamp => blk: {
-            const av = if (a == .time) a.time else a.timestamp;
-            const bv = switch (b) {
-                .time => |x| x,
-                .timestamp => |x| x,
-                .int => |x| x,
-                .string => |x| if (a == .timestamp)
-                    eval.parseIsoTimestamp(x) orelse return null
-                else
-                    return null,
-                else => return null,
-            };
-            break :blk std.math.order(av, bv);
+        .date => |x| if (b == .int) std.math.order(@as(i64, x), b.int) else null,
+        .time, .timestamp => |x| switch (b) {
+            .time, .timestamp, .int => |y| std.math.order(x, y),
+            else => null,
         },
-        .string, .bytes => blk: {
-            const sa = if (a == .string) a.string else a.bytes;
-            const sb = switch (b) {
-                .string => |x| x,
-                .bytes => |x| x,
-                else => return null,
-            };
-            break :blk std.mem.order(u8, sa, sb);
+        .string, .bytes => |x| switch (b) {
+            .string, .bytes => |y| std.mem.order(u8, x, y),
+            else => null,
         },
         else => null,
     };
@@ -253,13 +227,6 @@ pub fn cmp(a: Value, b: Value) ?std.math.Order {
 
 fn isNumV(v: Value) bool {
     return v == .int or v == .float or v == .decimal;
-}
-
-/// Numeric ordering via `eval.compareValues`, used only when both sides are
-/// numeric, so pruning agrees with the filter that re-checks rows.
-fn numOrder(a: Value, b: Value) ?std.math.Order {
-    if (!isNumV(a) or !isNumV(b)) return null;
-    return eval.compareValues(a, b);
 }
 
 test "cmp: an unorderable pair is unknown, never a fabricated equality" {
@@ -271,6 +238,8 @@ test "cmp: an unorderable pair is unknown, never a fabricated equality" {
     try std.testing.expect(cmp(d, .{ .bool = true }) == null);
     try std.testing.expect(cmp(.{ .int = 5 }, .{ .string = "5" }) == null);
     try std.testing.expect(cmp(.{ .string = "a" }, .{ .int = 1 }) == null);
+    try std.testing.expect(cmp(.{ .string = "2024-01-05 23:00:00" }, .{ .timestamp = 0 }) == null);
+    try std.testing.expect(cmp(.{ .string = "2024-01-05" }, d) == null);
     try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .timestamp = 0 }, .{ .string = "1970-01-02" }).?);
 }
 

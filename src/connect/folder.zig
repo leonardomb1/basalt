@@ -19,10 +19,9 @@ pub fn isFolder(path: []const u8) bool {
 
 pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
-    if (sftp.isUrl(path)) {
-        for (try sftp.listPrefix(arena, path)) |u| if (!hidden(below(u, path))) try out.append(u);
-    } else if (smb.isUrl(path)) {
-        for (try smb.listPrefix(arena, path)) |u| if (!hidden(below(u, path))) try out.append(u);
+    if (sftp.isUrl(path) or smb.isUrl(path)) {
+        const names = if (sftp.isUrl(path)) try sftp.listPrefix(arena, path) else try smb.listPrefix(arena, path);
+        for (names) |n| if (!hidden(n)) try out.append(try std.mem.concat(arena, u8, &.{ path, n }));
     } else if (objstore.isUrl(path)) {
         var client = http_client.initClient(arena);
         defer client.deinit();

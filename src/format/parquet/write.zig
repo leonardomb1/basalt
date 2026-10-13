@@ -42,15 +42,14 @@
 
 const std = @import("std");
 const parquet = @import("footer.zig");
+const logical = @import("logical.zig");
+const pqdecode = @import("read.zig");
 const thrift = @import("thrift.zig");
 const codec = @import("../codec.zig");
 const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
-const http_client = @import("../../net/http_client.zig");
 const objstore = @import("../../store/objstore.zig");
 const Part = @import("../../store/part.zig").Part;
-const sftp = @import("../../store/sftp.zig");
-const smb = @import("../../store/smb.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
@@ -78,29 +77,23 @@ const Mapping = struct {
     optional: bool = true,
 };
 
-const conv_utf8 = 0;
-const conv_decimal = 5;
-const conv_date = 6;
-const conv_time_micros = 8;
-const conv_timestamp_micros = 10;
-
 fn mapType(t: types.Type) Error!Mapping {
     return switch (t.kind) {
         .bool => .{ .phys = .boolean },
         .int => .{ .phys = .int64 },
         .float => .{ .phys = .double },
-        .string => .{ .phys = .byte_array, .converted = conv_utf8 },
+        .string => .{ .phys = .byte_array, .converted = logical.conv_utf8 },
         .bytes => .{ .phys = .byte_array },
-        .date => .{ .phys = .int32, .converted = conv_date },
-        .time => .{ .phys = .int64, .converted = conv_time_micros },
-        .timestamp => .{ .phys = .int64, .converted = conv_timestamp_micros },
+        .date => .{ .phys = .int32, .converted = logical.conv_date },
+        .time => .{ .phys = .int64, .converted = logical.conv_time_micros },
+        .timestamp => .{ .phys = .int64, .converted = logical.conv_timestamp_micros },
         .decimal => blk: {
             const p: i32 = @max(1, @min(38, @as(i32, t.precision)));
             const s: i32 = @as(i32, t.scale);
             if (s > p) return Error.UnsupportedParquetDecimal;
-            if (p <= 9) break :blk .{ .phys = .int32, .converted = conv_decimal, .precision = p, .scale = s };
-            if (p <= 18) break :blk .{ .phys = .int64, .converted = conv_decimal, .precision = p, .scale = s };
-            break :blk .{ .phys = .fixed_len_byte_array, .converted = conv_decimal, .precision = p, .scale = s, .type_length = flbaLen(p) };
+            if (p <= 9) break :blk .{ .phys = .int32, .converted = logical.conv_decimal, .precision = p, .scale = s };
+            if (p <= 18) break :blk .{ .phys = .int64, .converted = logical.conv_decimal, .precision = p, .scale = s };
+            break :blk .{ .phys = .fixed_len_byte_array, .converted = logical.conv_decimal, .precision = p, .scale = s, .type_length = flbaLen(p) };
         },
         .array, .@"struct" => Error.UnsupportedParquetWrite,
     };
@@ -140,6 +133,7 @@ const ColBuf = struct {
     nulls: i64 = 0,
     min: ?Value = null,
     max: ?Value = null,
+    nan: bool = false,
     dict: std.StringHashMap(u32),
     dict_order: List([]const u8),
     /// A fixed-width column's dictionary: its PLAIN bytes (at most 16) as an integer
@@ -191,6 +185,7 @@ const ColBuf = struct {
         self.nulls = 0;
         self.min = null;
         self.max = null;
+        self.nan = false;
         self.dict.clearRetainingCapacity();
         self.dict_order.clearRetainingCapacity();
         self.fixed.clearRetainingCapacity();
@@ -253,9 +248,20 @@ const ColBuf = struct {
         return true;
     }
 
+    /// Decimals compare as numbers, not mantissas: per-value scales once ranked `0.5`
+    /// above `0.10`, wrote min > max, and readers pruned real rows. A NaN drops the
+    /// chunk's bounds, as the format leaves NaN out of min/max and a reader could
+    /// then prune the rows `x > 5` matches.
     fn observe(self: *ColBuf, arena: std.mem.Allocator, v: Value) !void {
-        if (self.min == null or order(v, self.min.?) == .lt) self.min = try own(arena, v);
-        if (self.max == null or order(v, self.max.?) == .gt) self.max = try own(arena, v);
+        if (self.nan) return;
+        if (v == .float and std.math.isNan(v.float)) {
+            self.nan = true;
+            self.min = null;
+            self.max = null;
+            return;
+        }
+        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try own(arena, v);
+        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try own(arena, v);
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -300,48 +306,6 @@ const ChunkMeta = struct {
     max: ?Value = null,
 };
 
-/// Ordering for min/max statistics. Decimals compare as numbers, not mantissas:
-/// per-value scales once ranked `0.5` above `0.10`, wrote min > max, and readers pruned real rows.
-fn order(a: Value, b: Value) std.math.Order {
-    return switch (a) {
-        .int => std.math.order(a.int, switch (b) {
-            .int => |x| x,
-            else => a.int,
-        }),
-        .float => std.math.order(a.float, switch (b) {
-            .float => |x| x,
-            else => a.float,
-        }),
-        .date => std.math.order(a.date, switch (b) {
-            .date => |x| x,
-            else => a.date,
-        }),
-        .time => std.math.order(a.time, switch (b) {
-            .time => |x| x,
-            else => a.time,
-        }),
-        .timestamp => std.math.order(a.timestamp, switch (b) {
-            .timestamp => |x| x,
-            else => a.timestamp,
-        }),
-        .decimal => eval.compareValues(a, b) orelse .eq,
-        .bool => std.math.order(@intFromBool(a.bool), switch (b) {
-            .bool => |x| @intFromBool(x),
-            else => @intFromBool(a.bool),
-        }),
-        .string, .bytes => blk: {
-            const sa = if (a == .string) a.string else a.bytes;
-            const sb = switch (b) {
-                .string => |x| x,
-                .bytes => |x| x,
-                else => sa,
-            };
-            break :blk std.mem.order(u8, sa, sb);
-        },
-        .null => .eq,
-    };
-}
-
 const RowGroupMeta = struct {
     chunks: []ChunkMeta,
     num_rows: i64,
@@ -384,9 +348,7 @@ pub const Writer = struct {
         };
     }
 
-    pub fn isPath(path: []const u8) bool {
-        return std.mem.endsWith(u8, path, ".parquet");
-    }
+    pub const isPath = pqdecode.Reader.isPath;
 
     /// `.append` is refused here as well as in the plan layer, so a caller that
     /// forgets the check fails loudly instead of truncating the file. An object
@@ -424,15 +386,8 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
         };
-        if (sftp.isUrl(path)) {
-            self.backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) };
-        } else if (smb.isUrl(path)) {
-            self.backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) };
-        } else if (objstore.isUrl(path)) {
-            const client = try arena.create(std.http.Client);
-            client.* = http_client.initClient(arena);
-            const obj = try objstore.parse(arena, path);
-            self.backend = .{ .object = try obj.openWriter(arena, client, parquet_content_type) };
+        if (try objstore.openRemote(arena, path, parquet_content_type)) |o| {
+            self.backend = .{ .object = o };
         } else {
             self.backend = .{ .file = try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
@@ -704,6 +659,12 @@ pub const Writer = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
+    pub fn openUnit(self: *Writer, arena: std.mem.Allocator) !driver.UnitEncoder {
+        const u = try arena.create(UnitEnc);
+        u.* = .{ .parent = self, .arena = arena, .held = List(Batch).init(arena) };
+        return .{ .ptr = u, .vtable = &UnitEnc.vtable };
+    }
+
     fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
         const cols = try arena.alloc(ColBuf, self.cols.len);
         for (cols, self.maps) |*c, m| {
@@ -830,62 +791,16 @@ fn writeStatistics(w: *thrift.Writer, arena: std.mem.Allocator, m: Mapping, c: C
 /// since the thrift binary field already has one.
 fn statBytes(arena: std.mem.Allocator, m: Mapping, v: Value) !?[]const u8 {
     switch (m.phys) {
-        .boolean => {
-            const b = try arena.alloc(u8, 1);
-            b[0] = if (v == .bool and v.bool) 1 else 0;
-            return b;
-        },
-        .int32 => {
-            const b = try arena.alloc(u8, 4);
-            const x: i32 = switch (v) {
-                .date => |d| d,
-                .int => |i| @intCast(i),
-                .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
-                else => 0,
-            };
-            std.mem.writeInt(i32, b[0..4], x, .little);
-            return b;
-        },
-        .int64 => {
-            const b = try arena.alloc(u8, 8);
-            const x: i64 = switch (v) {
-                .int => |i| i,
-                .time => |i| i,
-                .timestamp => |i| i,
-                .decimal => |d| try rescaleTo(i64, d, m.scale orelse 0),
-                else => 0,
-            };
-            std.mem.writeInt(i64, b[0..8], x, .little);
-            return b;
-        },
-        .fixed_len_byte_array => {
-            const len: usize = @intCast(m.type_length orelse return null);
-            const x: i128 = switch (v) {
-                .decimal => |d| try rescale(d, m.scale orelse 0),
-                .int => |i| i,
-                else => return null,
-            };
-            const b = try arena.alloc(u8, len);
-            try decimalBytes(b, x);
-            return b;
-        },
-        .double => {
-            const b = try arena.alloc(u8, 8);
-            const x: f64 = switch (v) {
-                .float => |f| f,
-                .int => |i| @floatFromInt(i),
-                else => 0,
-            };
-            std.mem.writeInt(u64, b[0..8], @bitCast(x), .little);
-            return b;
-        },
         .byte_array => return switch (v) {
             .string => |x| x,
             .bytes => |x| x,
             else => null,
         },
-        else => return null,
+        .fixed_len_byte_array => if (m.type_length == null or (v != .decimal and v != .int)) return null,
+        else => {},
     }
+    var buf: [16]u8 = undefined;
+    return try arena.dupe(u8, try plainFixed(&buf, m, v));
 }
 
 fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
@@ -915,17 +830,17 @@ fn writeLogicalType(w: *thrift.Writer, m: Mapping) !void {
     try w.fieldBegin(.@"struct", 10);
     try w.structBegin();
     switch (c) {
-        conv_utf8 => try emptyVariant(w, 1),
-        conv_decimal => {
+        logical.conv_utf8 => try emptyVariant(w, 1),
+        logical.conv_decimal => {
             try w.fieldBegin(.@"struct", 5);
             try w.structBegin();
             try w.writeI32(1, m.scale orelse 0);
             try w.writeI32(2, m.precision orelse 18);
             try w.structEnd();
         },
-        conv_date => try emptyVariant(w, 6),
-        conv_time_micros => try timeVariant(w, 7),
-        conv_timestamp_micros => try timeVariant(w, 8),
+        logical.conv_date => try emptyVariant(w, 6),
+        logical.conv_time_micros => try timeVariant(w, 7),
+        logical.conv_timestamp_micros => try timeVariant(w, 8),
         else => {},
     }
     try w.structEnd();
@@ -1055,51 +970,6 @@ fn packBits(comptime T: type, out: *List(u8), vals: []const T, width: u8) !void 
 fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
     switch (m.phys) {
         .boolean => try cb.pushBit(v == .bool and v.bool),
-        .int32 => {
-            const x: i32 = switch (v) {
-                .date => |d| d,
-                .int => |i| @intCast(i),
-                .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
-                else => 0,
-            };
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(i32, &b, x, .little);
-            try cb.values.appendSlice(&b);
-        },
-        .int64 => {
-            const x: i64 = switch (v) {
-                .int => |i| i,
-                .time => |i| i,
-                .timestamp => |i| i,
-                .decimal => |d| try rescaleTo(i64, d, m.scale orelse 0),
-                else => 0,
-            };
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(i64, &b, x, .little);
-            try cb.values.appendSlice(&b);
-        },
-        .fixed_len_byte_array => {
-            const len: usize = @intCast(m.type_length orelse return Error.UnsupportedParquetDecimal);
-            const x: i128 = switch (v) {
-                .decimal => |d| try rescale(d, m.scale orelse 0),
-                .int => |i| i,
-                else => 0,
-            };
-            var b: [16]u8 = undefined;
-            if (len > b.len) return Error.UnsupportedParquetDecimal;
-            try decimalBytes(b[0..len], x);
-            try cb.values.appendSlice(b[0..len]);
-        },
-        .double => {
-            const x: f64 = switch (v) {
-                .float => |f| f,
-                .int => |i| @floatFromInt(i),
-                else => 0,
-            };
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, @bitCast(x), .little);
-            try cb.values.appendSlice(&b);
-        },
         .byte_array => {
             const s: []const u8 = switch (v) {
                 .string => |x| x,
@@ -1111,23 +981,71 @@ fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
             try cb.values.appendSlice(&b);
             try cb.values.appendSlice(s);
         },
+        else => {
+            var buf: [16]u8 = undefined;
+            try cb.values.appendSlice(try plainFixed(&buf, m, v));
+        },
+    }
+}
+
+/// A fixed-width value PLAIN-encoded into `buf`: a boolean as one byte (the
+/// statistics form; pages bit-pack it), a decimal at the schema's scale.
+fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
+    switch (m.phys) {
+        .boolean => {
+            buf[0] = @intFromBool(v == .bool and v.bool);
+            return buf[0..1];
+        },
+        .int32 => {
+            const x: i32 = switch (v) {
+                .date => |d| d,
+                .int => |i| @intCast(i),
+                .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
+                else => 0,
+            };
+            std.mem.writeInt(i32, buf[0..4], x, .little);
+            return buf[0..4];
+        },
+        .int64 => {
+            const x: i64 = switch (v) {
+                .int => |i| i,
+                .time => |i| i,
+                .timestamp => |i| i,
+                .decimal => |d| try rescaleTo(i64, d, m.scale orelse 0),
+                else => 0,
+            };
+            std.mem.writeInt(i64, buf[0..8], x, .little);
+            return buf[0..8];
+        },
+        .fixed_len_byte_array => {
+            const len: usize = @intCast(m.type_length orelse return Error.UnsupportedParquetDecimal);
+            const x: i128 = switch (v) {
+                .decimal => |d| try rescaleTo(i128, d, m.scale orelse 0),
+                .int => |i| i,
+                else => 0,
+            };
+            if (len > buf.len) return Error.UnsupportedParquetDecimal;
+            try decimalBytes(buf[0..len], x);
+            return buf[0..len];
+        },
+        .double => {
+            const x: f64 = switch (v) {
+                .float => |f| f,
+                .int => |i| @floatFromInt(i),
+                else => 0,
+            };
+            std.mem.writeInt(u64, buf[0..8], @bitCast(x), .little);
+            return buf[0..8];
+        },
         else => return Error.UnsupportedParquetWrite,
     }
 }
 
-/// The unscaled integer restated to the schema's scale. Overflowing i128 is an
-/// error: clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
-fn rescale(d: Decimal, want: i32) Error!i128 {
-    var unscaled: i128 = d.unscaled;
-    var have: i32 = d.scale;
-    while (have < want) : (have += 1)
-        unscaled = std.math.mul(i128, unscaled, 10) catch return Error.UnsupportedParquetDecimal;
-    if (have > want) unscaled = eval.roundScaleDown(unscaled, @intCast(have - want));
-    return unscaled;
-}
-
+/// The unscaled integer restated to the schema's scale. Overflow is an error:
+/// clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
 fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
-    return std.math.cast(T, try rescale(d, want)) orelse Error.UnsupportedParquetDecimal;
+    const r = eval.rescaleTo(d, @intCast(want)) orelse return Error.UnsupportedParquetDecimal;
+    return std.math.cast(T, r.unscaled) orelse Error.UnsupportedParquetDecimal;
 }
 
 /// Big-endian two's complement in exactly `len` bytes (a FIXED_LEN_BYTE_ARRAY
@@ -1144,39 +1062,19 @@ fn decimalBytes(b: []u8, x: i128) Error!void {
     if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
 }
 
-const sink_vtable = driver.Sink.VTable{
-    .writeBatch = sinkWrite,
-    .close = sinkClose,
-    .abort = sinkAbort,
-    .openUnit = sinkOpenUnit,
-};
-fn sinkOpenUnit(p: *anyopaque, arena: std.mem.Allocator) anyerror!driver.UnitEncoder {
-    const u = try arena.create(UnitEnc);
-    u.* = .{ .parent = @ptrCast(@alignCast(p)), .arena = arena, .held = List(Batch).init(arena) };
-    return .{ .ptr = u, .vtable = &UnitEnc.vtable };
-}
-fn sinkWrite(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    return @as(*Writer, @ptrCast(@alignCast(p))).writeBatch(arena, b);
-}
-fn sinkClose(p: *anyopaque) anyerror!void {
-    return @as(*Writer, @ptrCast(@alignCast(p))).close();
-}
-fn sinkAbort(p: *anyopaque) void {
-    @as(*Writer, @ptrCast(@alignCast(p))).abort();
-}
+const sink_vtable = driver.sinkVTable(Writer);
 
 const testing = std.testing;
-const pqdecode = @import("read.zig");
 
 test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);
     try testing.expectEqual(parquet.PhysicalType.int64, (try mapType(types.Type.init(.int))).phys);
     try testing.expectEqual(parquet.PhysicalType.double, (try mapType(types.Type.init(.float))).phys);
     try testing.expectEqual(parquet.PhysicalType.byte_array, (try mapType(types.Type.init(.string))).phys);
-    try testing.expectEqual(@as(?i32, conv_utf8), (try mapType(types.Type.init(.string))).converted);
+    try testing.expectEqual(@as(?i32, logical.conv_utf8), (try mapType(types.Type.init(.string))).converted);
     try testing.expectEqual(parquet.PhysicalType.int32, (try mapType(types.Type.init(.date))).phys);
-    try testing.expectEqual(@as(?i32, conv_date), (try mapType(types.Type.init(.date))).converted);
-    try testing.expectEqual(@as(?i32, conv_timestamp_micros), (try mapType(types.Type.init(.timestamp))).converted);
+    try testing.expectEqual(@as(?i32, logical.conv_date), (try mapType(types.Type.init(.date))).converted);
+    try testing.expectEqual(@as(?i32, logical.conv_timestamp_micros), (try mapType(types.Type.init(.timestamp))).converted);
 
     try testing.expectError(Error.UnsupportedParquetWrite, mapType(types.Type.init(.array)));
 }
@@ -1196,14 +1094,14 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
 }
 
 test "decimal rescaling restates the unscaled value against the column scale" {
-    try testing.expectEqual(@as(i128, 1550), try rescale(.{ .unscaled = 155, .scale = 1 }, 2));
-    try testing.expectEqual(@as(i128, 155), try rescale(.{ .unscaled = 155, .scale = 2 }, 2));
-    try testing.expectEqual(@as(i128, 16), try rescale(.{ .unscaled = 155, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, -16), try rescale(.{ .unscaled = -155, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, 15), try rescale(.{ .unscaled = 154, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, -1235), try rescale(.{ .unscaled = -12345, .scale = 3 }, 2));
-    try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescale(.{ .unscaled = 125, .scale = 1 }, 18));
-    try testing.expectError(Error.UnsupportedParquetDecimal, rescale(.{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 30));
+    try testing.expectEqual(@as(i128, 1550), try rescaleTo(i128, .{ .unscaled = 155, .scale = 1 }, 2));
+    try testing.expectEqual(@as(i128, 155), try rescaleTo(i128, .{ .unscaled = 155, .scale = 2 }, 2));
+    try testing.expectEqual(@as(i128, 16), try rescaleTo(i128, .{ .unscaled = 155, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, -16), try rescaleTo(i128, .{ .unscaled = -155, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, 15), try rescaleTo(i128, .{ .unscaled = 154, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, -1235), try rescaleTo(i128, .{ .unscaled = -12345, .scale = 3 }, 2));
+    try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescaleTo(i128, .{ .unscaled = 125, .scale = 1 }, 18));
+    try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i128, .{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 30));
     try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i64, .{ .unscaled = 125, .scale = 1 }, 18));
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), try rescaleTo(i64, .{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 0));
 }
@@ -1371,6 +1269,32 @@ test "statistics record min, max and null count per row group" {
     try testing.expectEqual(@as(i64, 1), stats[1].nulls);
     try testing.expectEqualStrings("apple", stats[1].min);
     try testing.expectEqualStrings("zebra", stats[1].max);
+}
+
+test "a float chunk holding a NaN records no min or max" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "nan.parquet" });
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = types.Type.init(.float).asNullable() }} };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    var xs = try column.Builder.initCapacity(a, schema.fields[0].ty, 3);
+    try xs.append(.{ .float = 1.5 });
+    try xs.append(.{ .float = std.math.nan(f64) });
+    try xs.append(.{ .float = 0.5 });
+    var cols = [_]column.Column{try xs.finish()};
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 3 });
+    try w.close();
+
+    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 20);
+    const stats = try readStats(a, bytes, try parquet.parseFile(a, bytes));
+    try testing.expectEqualStrings("", stats[0].min);
+    try testing.expectEqualStrings("", stats[0].max);
 }
 
 const Stat = struct { nulls: i64, min: []const u8, max: []const u8 };

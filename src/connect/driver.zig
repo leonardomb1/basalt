@@ -227,11 +227,14 @@ pub const UnitEncoder = struct {
     }
 };
 
+/// `T.schema` may be a method or a field (a schema or a pointer to one).
 pub fn sourceVTable(comptime T: type) Source.VTable {
     return .{
         .schema = struct {
             fn f(p: *anyopaque) types.Schema {
-                return @as(*T, @ptrCast(@alignCast(p))).schema();
+                const self: *T = @ptrCast(@alignCast(p));
+                if (!@hasField(T, "schema")) return self.schema();
+                return if (@TypeOf(self.schema) == types.Schema) self.schema else self.schema.*;
             }
         }.f,
         .next = struct {
@@ -247,8 +250,25 @@ pub fn sourceVTable(comptime T: type) Source.VTable {
     };
 }
 
+/// The optional entries are filled when `T` declares `renderBatch` (with
+/// `writeRendered`) or `openUnit`.
 pub fn sinkVTable(comptime T: type) Sink.VTable {
     return .{
+        .renderBatch = if (@hasDecl(T, "renderBatch")) struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror![]const u8 {
+                return @as(*T, @ptrCast(@alignCast(p))).renderBatch(arena, b);
+            }
+        }.f else null,
+        .writeRendered = if (@hasDecl(T, "writeRendered")) struct {
+            fn f(p: *anyopaque, bytes: []const u8) anyerror!void {
+                return @as(*T, @ptrCast(@alignCast(p))).writeRendered(bytes);
+            }
+        }.f else null,
+        .openUnit = if (@hasDecl(T, "openUnit")) struct {
+            fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!UnitEncoder {
+                return @as(*T, @ptrCast(@alignCast(p))).openUnit(arena);
+            }
+        }.f else null,
         .writeBatch = struct {
             fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
                 return @as(*T, @ptrCast(@alignCast(p))).writeBatch(arena, b);
