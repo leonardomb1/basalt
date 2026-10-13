@@ -445,7 +445,7 @@ pub const CsvReader = struct {
 
         var sniff = try TypeSniffer.init(arena, fields.items.len, self.dialect.delim);
         var pending = std.array_list.Managed(Pending).init(arena);
-        while (pending.items.len < SAMPLE_ROWS) {
+        while (pending.items.len <= SAMPLE_ROWS) {
             const line = (try self.readLine()) orelse {
                 if (try self.advance()) continue;
                 self.stream_eof = true;
@@ -453,7 +453,7 @@ pub const CsvReader = struct {
             };
             if (line.len == 0) continue;
             const own = try arena.dupe(u8, line);
-            sniff.feed(own);
+            if (pending.items.len < SAMPLE_ROWS) sniff.feed(own);
             try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
         }
         sniff.whole = self.stream_eof;
@@ -718,13 +718,14 @@ pub const MappedCsv = struct {
         var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
         var fed: usize = 0;
         var pos: usize = 0;
-        while (fed < SAMPLE_ROWS and pos < body.len) {
+        while (pos < body.len) {
             const rec = scanRecord(body, pos, dialect.delim);
-            const line = rec.line;
+            if (rec.line.len > 0) {
+                if (fed == SAMPLE_ROWS) break;
+                sniff.feed(rec.line);
+                fed += 1;
+            }
             pos = rec.next;
-            if (line.len == 0) continue;
-            sniff.feed(line);
-            fed += 1;
         }
         sniff.whole = pos >= body.len;
         for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
@@ -954,11 +955,19 @@ const TypeSniffer = struct {
 fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
     switch (b.ty.kind) {
-        .int => try b.appendInt(parseIntFast(raw) orelse eval.parseIntStrict(raw) orelse return error.CsvTypeMismatch),
-        .float => try b.appendFloat(parseFloatFast(raw) orelse eval.parseFloatStrict(raw) orelse return error.CsvTypeMismatch),
+        .int => try b.appendInt(intCell(raw) orelse return error.CsvTypeMismatch),
+        .float => try b.appendFloat(floatCell(raw) orelse return error.CsvTypeMismatch),
         .date => try b.append(.{ .date = @intCast(eval.parseIsoDate(raw) orelse return error.CsvTypeMismatch) }),
         else => try b.appendStr(raw),
     }
+}
+
+fn intCell(raw: []const u8) ?i64 {
+    return parseIntFast(raw) orelse eval.parseIntStrict(raw);
+}
+
+fn floatCell(raw: []const u8) ?f64 {
+    return parseFloatFast(raw) orelse eval.parseFloatStrict(raw);
 }
 
 /// `[-]digits`, at most 18 of them so no i64 overflow: what a CSV cell needs of
@@ -1265,8 +1274,8 @@ fn nextField(line: []const u8, i: *usize, delim: u8) []const u8 {
 fn cellParses(kind: types.TypeKind, raw: []const u8) bool {
     if (raw.len == 0) return true;
     return switch (kind) {
-        .int => (std.fmt.parseInt(i64, raw, 10) catch null) != null,
-        .float => (std.fmt.parseFloat(f64, raw) catch null) != null,
+        .int => intCell(raw) != null,
+        .float => floatCell(raw) != null,
         .date => eval.parseIsoDate(raw) != null,
         else => true,
     };
@@ -1897,6 +1906,82 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
     }) |_| {}
     try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
     try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows"));
+}
+
+test "serial and mapped readers agree whether the sample read the whole file" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ base, "e.csv" });
+
+    for ([_]usize{ SAMPLE_ROWS - 1, SAMPLE_ROWS, SAMPLE_ROWS + 1 }) |rows| {
+        for ([_][]const u8{ "", "\n", "\n\n" }) |tail| {
+            var data = std.array_list.Managed(u8).init(a);
+            try data.appendSlice("id,e");
+            for (0..rows) |i| try data.writer().print("\n{d},", .{i + 1});
+            try data.appendSlice(tail);
+            try tmp.dir.writeFile(.{ .sub_path = "e.csv", .data = data.items });
+
+            const r = try CsvReader.open(a, path, .{});
+            defer r.close();
+            const m = try MappedCsv.open(a, path, .{});
+            defer m.close();
+            try std.testing.expectEqual(rows <= SAMPLE_ROWS, r.schema.fields[1].ty.unknown);
+            try std.testing.expectEqual(rows <= SAMPLE_ROWS, m.schema.fields[1].ty.unknown);
+            var n: usize = 0;
+            while (try r.next(a)) |b| n += b.len;
+            try std.testing.expectEqual(rows, n);
+        }
+    }
+}
+
+test "a cell past the sample that only lenient parsers accept is named with its file, line and column" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ base, "lax.csv" });
+
+    const cases = [_]struct { row: []const u8, want: []const u8 }{
+        .{ .row = "1_000,1.5\n", .want = "lax.csv` line 1026, column `i`: '1_000' is not an INT, the type sniffed from the first 1024 rows" },
+        .{ .row = "7,0x1p3\n", .want = "lax.csv` line 1026, column `f`: '0x1p3' is not a FLOAT, the type sniffed from the first 1024 rows" },
+        .{ .row = "7,1e400\n", .want = "lax.csv` line 1026, column `f`: '1e400' is not a FLOAT, the type sniffed from the first 1024 rows" },
+    };
+    for (cases) |c| {
+        var data = std.array_list.Managed(u8).init(a);
+        try data.appendSlice("i,f\n");
+        for (0..SAMPLE_ROWS) |i| try data.writer().print("{d},{d}.5\n", .{ i, i });
+        try data.appendSlice(c.row);
+        try tmp.dir.writeFile(.{ .sub_path = "lax.csv", .data = data.items });
+
+        const r = try CsvReader.open(a, path, .{});
+        defer r.close();
+        var err: ?anyerror = null;
+        while (r.next(a) catch |e| blk: {
+            err = e;
+            break :blk null;
+        }) |_| {}
+        try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+        try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want));
+
+        const m = try MappedCsv.open(a, path, .{});
+        defer m.close();
+        var sr = m.reader(0, 1, &m.schema);
+        err = null;
+        while (sr.next(a) catch |e| blk: {
+            err = e;
+            break :blk null;
+        }) |_| {}
+        try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
+        try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want));
+    }
 }
 
 fn readAllRows(a: std.mem.Allocator, path: []const u8) ![]const []const u8 {
