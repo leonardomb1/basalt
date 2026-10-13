@@ -255,6 +255,9 @@ fn appendDataPage(
         },
         .delta_binary_packed => {
             const vals = try decodeDeltaBinaryPacked(arena, body, present);
+            if (meta.ty == .int32) {
+                for (vals) |*v| v.* = @as(i32, @truncate(v.*));
+            }
             try emitInts(b, ty, defs, max_def, n, vals, tscale);
         },
         .delta_length_byte_array => {

@@ -236,7 +236,7 @@ pub fn decodeDeltaBinaryPacked(
             var br = BitReader{ .buf = src[pos..][0..bytes] };
             for (0..per_mini) |_| {
                 if (n >= want) break;
-                const raw: i64 = @intCast(try br.read(width));
+                const raw: i64 = @bitCast(try br.read(width));
                 value +%= min_delta +% raw;
                 out[n] = value;
                 n += 1;
@@ -339,7 +339,7 @@ fn decodeDeltaBinaryPackedTracking(
                 var br = BitReader{ .buf = src[pos..][0..bytes] };
                 for (0..per_mini) |_| {
                     if (n >= want) break;
-                    const raw: i64 = @intCast(try br.read(width));
+                    const raw: i64 = @bitCast(try br.read(width));
                     value +%= min_delta +% raw;
                     out[n] = value;
                     n += 1;
@@ -465,6 +465,16 @@ test "BitReader: wide values at non-zero bit offsets keep their top bits" {
     var short = BitReader{ .buf = all[0..8] };
     _ = try short.read(3);
     try std.testing.expectError(Error.CorruptParquetPage, short.read(64));
+}
+
+test "decodeDeltaBinaryPacked: a 64-bit miniblock delta wraps instead of trapping" {
+    var page: [5 + 1 + 1 + 128 * 8]u8 = @splat(0);
+    page[0..5].* = .{ 0x80, 0x01, 0x01, 0x02, 0x00 };
+    page[6] = 64;
+    @memset(page[7..15], 0xFF);
+    const got = try decodeDeltaBinaryPacked(std.testing.allocator, &page, 2);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualSlices(i64, &.{ 0, -1 }, got);
 }
 
 test "decodeDeltaBinaryPacked: a miniblock width above 64 is a corrupt page" {
