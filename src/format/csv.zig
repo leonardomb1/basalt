@@ -1248,7 +1248,7 @@ pub const CsvWriter = struct {
     write_buf: [LINE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
     owns_file: bool = true,
-    gz: ?*deflate.Gzip = null,
+    gz: ?*deflate.Deflate = null,
     part: Part = .{},
 
     const Backend = union(enum) {
@@ -1309,7 +1309,7 @@ pub const CsvWriter = struct {
 
         switch (splitCodec(path).codec) {
             .none => {},
-            .gzip => self.gz = try deflate.Gzip.init(std.heap.page_allocator, self.raw()),
+            .gzip => self.gz = try deflate.Deflate.init(std.heap.page_allocator, self.raw(), .{}),
             .zstd => return error.ZstdWriteUnsupported,
         }
 
@@ -2480,7 +2480,7 @@ test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an app
 
     var file: std.Io.Writer.Allocating = .init(a);
     for ([_][]const u8{ "id,name\n1,alpha\n", "2,beta\n" }) |part| {
-        const gz = try deflate.Gzip.init(std.testing.allocator, &file.writer);
+        const gz = try deflate.Deflate.init(std.testing.allocator, &file.writer, .{});
         defer gz.deinit(std.testing.allocator);
         try gz.interface.writeAll(part);
         try gz.finish();
