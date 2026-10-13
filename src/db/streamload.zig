@@ -6,8 +6,9 @@
 //! `upsert on k` -> Primary Key (keys reordered first + NOT NULL). What differs
 //! between the databases — DDL, a header's spelling — is the `Flavor`. Doris
 //! splits rows on newlines unless told `line_delimiter` (it ignores
-//! `row_delimiter`), and loads non-strict by default, turning a bad value into a
-//! silent NULL; both are set explicitly.
+//! `row_delimiter`). Both load non-strict by default, turning a value too long for
+//! its column or one that does not convert into a silent NULL, so every load sets
+//! `strict_mode` and such a row fails it.
 //!
 //! The body is fields separated by 0x01 and rows by 0x02, control bytes Stream
 //! Load does no quoting for; `\n` would let an embedded newline split a row.
@@ -86,10 +87,6 @@ pub const Flavor = enum {
             .starrocks => "partial_update",
             .doris => "partial_columns",
         };
-    }
-
-    fn strict(self: Flavor) bool {
-        return self == .doris;
     }
 
     /// The `format` header's value: StarRocks names a compressed CSV body by its
@@ -372,7 +369,7 @@ pub const StreamLoadSink = struct {
         try h.append(.{ .name = "columns", .value = self.columns });
         try h.append(.{ .name = "max_filter_ratio", .value = "0" });
         try h.append(.{ .name = "timeout", .value = std.fmt.comptimePrint("{d}", .{TIMEOUT_S}) });
-        if (self.cfg.flavor.strict()) try h.append(.{ .name = "strict_mode", .value = "true" });
+        try h.append(.{ .name = "strict_mode", .value = "true" });
         if (self.mode == .upsert and self.mode.upsert.partial != null) {
             try h.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
         }

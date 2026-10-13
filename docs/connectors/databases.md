@@ -30,7 +30,9 @@ spill directory (`--spill-dir`, counted against `--spill-cap`; on a RAM-backed
 `/tmp` that is memory, up to one `load_size` per lane), so a connection lost
 along the way — the server restarting, say — resends it under the same label
 instead of failing the load. A load the server refuses is not resent: the run
-fails with the server's message.
+fails with the server's message. Loads run in strict mode, so a value too long
+for its column, or one that does not convert to the column's type, fails the
+load instead of landing as NULL.
 
 `compression = 'gzip'` (the default is `'none'`) sends each transaction's body
 as one gzip stream, compressed on the fly at a fast level — about 2.5x smaller
@@ -48,9 +50,7 @@ key, so an `APPEND` or `REPLACE` target is a duplicate table with no sort key
 (`DISTRIBUTED BY RANDOM`), where StarRocks keys on the first column; an `UPSERT
 ON (k)` target is a `UNIQUE KEY` table with merge-on-write, its text keys
 `VARCHAR(65533)`, and `PARTIAL COLS` loads as Doris' `partial_columns`.
-Timestamps are `DATETIME(6)`, to keep microseconds. Loads run in Doris' strict
-mode, so a value that does not convert fails the load instead of landing as
-NULL.
+Timestamps are `DATETIME(6)`, to keep microseconds.
 
 ## SQL Server
 

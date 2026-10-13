@@ -526,6 +526,19 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
     report "starrocks-null-marker (run error)" bad
   fi
 
+  # StarRocks loads non-strict unless told, so a value too long for its VARCHAR
+  # column used to land as NULL. The load must fail and leave the table empty.
+  $B run -q -c "$SR_CONN SELECT * FROM sr.QUERY(\$\$DROP TABLE IF EXISTS it_strict\$\$);" >/dev/null 2>&1
+  $B run -q -c "$SR_CONN SELECT * FROM sr.QUERY(\$\$CREATE TABLE it_strict (id INT, s VARCHAR(5)) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES('replication_num' = '1')\$\$);" >/dev/null 2>&1
+  if $B run -q -c "$SR_CONN
+LOAD INTO sr.it_strict USING stream_load APPEND AS SELECT 1 AS id, 'abcdefgh' AS s;" >"$out/sr_strict.log" 2>&1; then
+    report "starrocks-strict (a too-long value loaded)" bad
+  elif [ "$($B run --format csv -q -c "$SR_CONN SELECT count(*) AS n FROM sr.it_strict;" 2>&1 | tail -1)" != 0 ]; then
+    report "starrocks-strict (rows landed)" bad
+  else
+    report "starrocks-strict" ok
+  fi
+
   # read back through a starrocks connection, so the starrocks dialect renders it
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
