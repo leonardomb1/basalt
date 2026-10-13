@@ -52,8 +52,8 @@ const deflate = @import("../format/deflate.zig");
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
-const RETRY_BUDGET_NS = (TIMEOUT_S + 120) * std.time.ns_per_s;
-const UNBEGUN_BUDGET_NS = 180 * std.time.ns_per_s;
+const RETRY_BUDGET_NS = 60 * std.time.ns_per_s;
+const UNBEGUN_BUDGET_NS = 30 * std.time.ns_per_s;
 const REPLAY_CHUNK = 1 << 20;
 
 pub const Flavor = enum {
