@@ -129,6 +129,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
 
+    try checkFirst(arena, raw_program, opts, diag);
+
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
     for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
@@ -298,6 +300,24 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         .none => {},
     }
     return stats;
+}
+
+/// The whole script through `check`'s analysis before anything runs, so a run
+/// refuses what `check` refuses, and a statement's static error stops the run
+/// before an earlier statement has written anything.
+fn checkFirst(arena: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !void {
+    const overrides = try arena.alloc(analyze.ParamOverride, opts.params.len);
+    for (opts.params, overrides) |kv, *o| o.* = .{ .name = kv.key, .value = kv.val };
+    var adiag = analyze.Diag{};
+    _ = analyze.analyzeOpts(arena, program, .{ .overrides = overrides, .declarations_only = opts.declarations_only }, &adiag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => {
+            const err = planErr(diag, adiag.msg);
+            diag.pos = adiag.pos;
+            diag.end = adiag.end;
+            return err;
+        },
+    };
 }
 
 fn runSummary(env: *const Env, run_id: u64, rows_written: u64, rows_read: u64, elapsed_ms: u64, lanes: usize, loads: *obs.LoadTally, scan: *driver.ScanTally, lone_load: bool) obs.Summary {

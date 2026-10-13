@@ -1306,7 +1306,7 @@ const Ctx = struct {
                     .range => "range",
                     .unit => "unit",
                 };
-                if (rd.form == .path and std.mem.eql(u8, connector, "csv")) {
+                if (rd.form == .path and std.mem.eql(u8, connector, "csv") and std.mem.indexOf(u8, rd.form.path, "${") == null) {
                     if (s3.bucketNameError(rd.form.path)) |why|
                         return fail(self.diag, "`{s}` is not a valid S3 source: {s}", .{ rd.form.path, why });
                     const fmt = try formatFromHints(lead.hints, self.diag);
