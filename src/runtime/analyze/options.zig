@@ -207,6 +207,29 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
     if (!database) return fail(diag, "{s}", .{try needsDatabaseMsg(arena, flavor.name())});
 }
 
+pub const bare_upsert_source_msg = "a bare `UPSERT` infers the primary key from the source, which needs a SQL table read — this query's source can't be introspected; name the key with `UPSERT ON (col)`";
+pub const bare_upsert_query_msg = "a bare `UPSERT` needs a table read (`FROM conn.schema.table`) to infer its key; a `QUERY(...)` has no single table to introspect — name the key with `UPSERT ON (col)`";
+
+/// A bare `UPSERT` (no `ON (...)`) takes its key from the table it reads, so one
+/// over a source that is no SQL table, and joins nothing that could be, is refused
+/// before it runs; the rest is decided once the source opens.
+pub fn checkBareUpsert(stages: []const ast.Stage, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
+    const w = stages[stages.len - 1].node.write;
+    if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return;
+    if (stages[0].node != .read) return;
+    const rd = stages[0].node.read;
+    const sql_read = if (connections.get(rd.connector)) |c|
+        (if (registry.Connector.parse(c.connector)) |k| k.sqlRead() != null else false)
+    else
+        false;
+    if (sql_read) {
+        if (rd.form == .query) return fail(diag, "{s}", .{bare_upsert_query_msg});
+        return;
+    }
+    for (stages) |st| if (st.node == .join) return;
+    return fail(diag, "{s}", .{bare_upsert_source_msg});
+}
+
 fn containsKey(keys: []const []const u8, k: []const u8) bool {
     for (keys) |x| if (std.mem.eql(u8, x, k)) return true;
     return false;

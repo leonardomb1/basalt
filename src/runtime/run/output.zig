@@ -247,6 +247,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     analyze.checkSinkForm(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (!is_file_sink) if (env.connections.get(last.write.connector)) |c|
         analyze.checkSinkConnection(arena, c, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    analyze.checkBareUpsert(stages, env.connections, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.sink_label_prefix = analyze.hintText(stages[stages.len - 1].hints, "label_prefix");
 
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);

@@ -264,6 +264,7 @@ pub const connectionProblem = @import("analyze/options.zig").connectionProblem;
 pub const sqlOptionProblem = @import("analyze/options.zig").sqlOptionProblem;
 pub const checkSinkConnection = @import("analyze/options.zig").checkSinkConnection;
 pub const unknownConnectionMsg = @import("analyze/options.zig").unknownConnectionMsg;
+pub const checkBareUpsert = @import("analyze/options.zig").checkBareUpsert;
 pub const Col = @import("analyze/schema.zig").Col;
 pub const selectCols = @import("analyze/schema.zig").selectCols;
 pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;
@@ -1257,6 +1258,10 @@ const Ctx = struct {
 
         const w = stages[stages.len - 1].node.write;
         const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return e;
+        };
+        checkBareUpsert(stages, self.connections, self.diag) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };

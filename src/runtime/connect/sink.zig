@@ -48,8 +48,8 @@ const xlsx = @import("../../format/xlsx.zig");
 /// source gets an error pointing at `upsert on <col>`.
 pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
-    const desc = env.sql_desc orelse return planErr(env.diag, "a bare `UPSERT` infers the primary key from the source, which needs a SQL table read — this query's source can't be introspected; name the key with `UPSERT ON (col)`");
-    const table = desc.table orelse return planErr(env.diag, "a bare `UPSERT` needs a table read (`FROM conn.schema.table`) to infer its key; a `QUERY(...)` has no single table to introspect — name the key with `UPSERT ON (col)`");
+    const desc = env.sql_desc orelse return planErr(env.diag, options.bare_upsert_source_msg);
+    const table = desc.table orelse return planErr(env.diag, options.bare_upsert_query_msg);
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|

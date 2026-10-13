@@ -1449,6 +1449,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'basic');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "`auth` is kerberos or ntlm, not `basic`" },
         .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'kerberos', user = 'me');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "Kerberos needs the `realm`" },
         .{ "SELECT * FROM nope.t;", "unknown connection `nope` in read" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd');\nLOAD INTO pg.t UPSERT AS SELECT * FROM '$B/a.csv';", "a bare `UPSERT` infers the primary key from the source" },
         .{ "PARAM n INT DEFAULT 1;\nTHROW 'boom' WHEN $n > 'x';\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW condition: type mismatch" },
         .{ "THROW 1 / 0 WHEN true;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW message: division by zero" },
         .{ "PARAM n INT DEFAULT 1;\nCASE WHEN $n = 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "match guard: type mismatch" },
