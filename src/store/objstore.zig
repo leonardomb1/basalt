@@ -30,7 +30,10 @@
 
 const std = @import("std");
 const azure = @import("azure.zig");
+const http_client = @import("../net/http_client.zig");
 const s3 = @import("s3.zig");
+const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
 
 pub fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
     var open_buf: [64]u8 = undefined;
@@ -216,6 +219,22 @@ pub const Writer = struct {
         return self.vtable.last_error(self.ptr);
     }
 };
+
+/// Whether `path` is written whole on another host: SFTP, SMB or an object store,
+/// none of which can be appended to.
+pub fn isRemote(path: []const u8) bool {
+    return sftp.isUrl(path) or smb.isUrl(path) or isUrl(path);
+}
+
+/// The writer for a remote `path` (see `isRemote`), or null for a local one.
+pub fn openRemote(arena: std.mem.Allocator, path: []const u8, content_type: []const u8) !?Writer {
+    if (sftp.isUrl(path)) return writer(try sftp.Upload.open(arena, path));
+    if (smb.isUrl(path)) return writer(try smb.Upload.open(arena, path));
+    if (!isUrl(path)) return null;
+    const client = try arena.create(std.http.Client);
+    client.* = http_client.initClient(arena);
+    return try (try parse(arena, path)).openWriter(arena, client, content_type);
+}
 
 pub fn writer(w: anytype) Writer {
     const T = @TypeOf(w.*);

@@ -338,8 +338,7 @@ pub const CsvReader = struct {
     }
 
     pub fn isUrl(path: []const u8) bool {
-        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or
-            objstore.isUrl(path) or sftp.isUrl(path) or smb.isUrl(path);
+        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or objstore.isRemote(path);
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
@@ -1315,18 +1314,9 @@ pub const CsvWriter = struct {
         const self = try arena.create(CsvWriter);
         var header = true;
         var newline = false;
-        if (sftp.isUrl(path)) {
-            if (mode == .append) return error.AppendNotSupported;
-            self.* = .{ .backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) } };
-        } else if (smb.isUrl(path)) {
-            if (mode == .append) return error.AppendNotSupported;
-            self.* = .{ .backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) } };
-        } else if (objstore.isUrl(path)) {
-            if (mode == .append) return error.AppendNotSupported;
-            const client = try arena.create(std.http.Client);
-            client.* = http_client.initClient(arena);
-            const obj = try objstore.parse(arena, path);
-            self.* = .{ .backend = .{ .object = try obj.openWriter(arena, client, "text/csv") } };
+        if (mode == .append and objstore.isRemote(path)) return error.AppendNotSupported;
+        if (try objstore.openRemote(arena, path, "text/csv")) |o| {
+            self.* = .{ .backend = .{ .object = o } };
         } else {
             self.* = .{ .backend = undefined };
             self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true }) else try self.part.create(path) };

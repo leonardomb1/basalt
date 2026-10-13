@@ -48,11 +48,8 @@ const thrift = @import("thrift.zig");
 const codec = @import("../codec.zig");
 const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
-const http_client = @import("../../net/http_client.zig");
 const objstore = @import("../../store/objstore.zig");
 const Part = @import("../../store/part.zig").Part;
-const sftp = @import("../../store/sftp.zig");
-const smb = @import("../../store/smb.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
@@ -389,15 +386,8 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
         };
-        if (sftp.isUrl(path)) {
-            self.backend = .{ .object = objstore.writer(try sftp.Upload.open(arena, path)) };
-        } else if (smb.isUrl(path)) {
-            self.backend = .{ .object = objstore.writer(try smb.Upload.open(arena, path)) };
-        } else if (objstore.isUrl(path)) {
-            const client = try arena.create(std.http.Client);
-            client.* = http_client.initClient(arena);
-            const obj = try objstore.parse(arena, path);
-            self.backend = .{ .object = try obj.openWriter(arena, client, parquet_content_type) };
+        if (try objstore.openRemote(arena, path, parquet_content_type)) |o| {
+            self.backend = .{ .object = o };
         } else {
             self.backend = .{ .file = try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
