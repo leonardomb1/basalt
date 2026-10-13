@@ -1225,6 +1225,8 @@ pub const Stream = struct {
 };
 
 pub const Upload = struct {
+    const upload_vtable = std.Io.Writer.VTable{ .drain = objstore.drain(Upload) };
+
     session: *Session,
     handle: Session.Handle,
     path: []const u8,
@@ -1250,7 +1252,7 @@ pub const Upload = struct {
             .session = s,
             .handle = h,
             .path = t.path,
-            .interface = .{ .buffer = try arena.alloc(u8, 4 << 20), .vtable = &.{ .drain = objstore.drain(Upload) } },
+            .interface = .{ .buffer = try arena.alloc(u8, 4 << 20), .vtable = &upload_vtable },
         };
         return self;
     }
