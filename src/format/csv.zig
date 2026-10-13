@@ -395,39 +395,7 @@ pub const CsvReader = struct {
             self.backend = .{ .smb = st };
             self.rdr = &st.interface;
         } else if (isUrl(first)) {
-            const hf = try arena.create(HttpFetch);
-            hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
-            errdefer hf.client.deinit();
-            var req_url = first;
-            var extra: []const std.http.Header = &.{};
-            if (objstore.isUrl(first)) {
-                const obj = try objstore.parse(arena, first);
-                req_url = obj.url;
-                extra = try obj.getHeaders(arena);
-            }
-            const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
-            startHttp(hf, uri, extra) catch |e| switch (e) {
-                error.TlsInitializationFailed => {
-                    const h = http_client.uriHost(uri) orelse return e;
-                    if (!http_client.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
-                    hf.client.next_https_rescan_certs = false;
-                    try startHttp(hf, uri, extra);
-                },
-                else => return e,
-            };
-            errdefer hf.req.deinit();
-            const code = @intFromEnum(hf.response.head.status);
-            if (code != 200) return http_client.statusError(code);
-            self.backend = .{ .http = hf };
-            const ce = hf.response.head.content_encoding;
-            if (ce == .compress) return error.UnsupportedCompressionMethod;
-            const win = switch (ce) {
-                .zstd => codecBuffer(.zstd),
-                .gzip, .deflate => codecBuffer(.gzip),
-                .compress, .identity => 0,
-            };
-            const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
-            self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
+            try self.openHttp(first);
         } else {
             self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(first, .{}), .fr = undefined } };
             self.backend.file.fr = self.backend.file.file.reader(&self.read_buf);
@@ -514,7 +482,11 @@ pub const CsvReader = struct {
         self.rest_urls = self.rest_urls[1..];
 
         switch (self.backend) {
-            .http => |hf| hf.req.deinit(),
+            .http => |hf| {
+                try self.openHttp(url);
+                hf.req.deinit();
+                hf.client.deinit();
+            },
             .sftp => |st| {
                 st.close();
                 const st2 = try sftp.Stream.open(self.arena, url);
@@ -541,23 +513,48 @@ pub const CsvReader = struct {
             },
             .member => {},
         }
-        const hf = try self.arena.create(HttpFetch);
-        hf.* = .{ .client = http_client.initClient(self.arena), .req = undefined, .response = undefined };
-        const obj = try objstore.parse(self.arena, url);
-        const extra = try obj.getHeaders(self.arena);
-        const uri = std.Uri.parse(obj.url) catch return error.InvalidUrl;
-        try startHttp(hf, uri, extra);
-        const code = @intFromEnum(hf.response.head.status);
-        if (code != 200) return http_client.statusError(code);
-        self.backend = .{ .http = hf };
-        const ce = hf.response.head.content_encoding;
-        if (ce == .compress) return error.UnsupportedCompressionMethod;
-        const win = ce.minBufferCapacity();
-        const dbuf: []u8 = if (win > 0) try self.arena.alloc(u8, win) else &.{};
-        self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
-
         try self.nextHeader(url);
         return true;
+    }
+
+    /// GETs `url`, signed when it names an object store, and reads its body decoded
+    /// per its Content-Encoding. A failed TLS handshake is retried once after
+    /// repairing the CA bundle for that host.
+    fn openHttp(self: *CsvReader, url: []const u8) !void {
+        const arena = self.arena;
+        const hf = try arena.create(HttpFetch);
+        hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
+        errdefer hf.client.deinit();
+        var req_url = url;
+        var extra: []const std.http.Header = &.{};
+        if (objstore.isUrl(url)) {
+            const obj = try objstore.parse(arena, url);
+            req_url = obj.url;
+            extra = try obj.getHeaders(arena);
+        }
+        const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
+        startHttp(hf, uri, extra) catch |e| switch (e) {
+            error.TlsInitializationFailed => {
+                const h = http_client.uriHost(uri) orelse return e;
+                if (!http_client.repairBundle(arena, &hf.client.ca_bundle, h, uri.port orelse 443)) return e;
+                hf.client.next_https_rescan_certs = false;
+                try startHttp(hf, uri, extra);
+            },
+            else => return e,
+        };
+        errdefer hf.req.deinit();
+        const code = @intFromEnum(hf.response.head.status);
+        if (code != 200) return http_client.statusError(code);
+        const ce = hf.response.head.content_encoding;
+        if (ce == .compress) return error.UnsupportedCompressionMethod;
+        const win = switch (ce) {
+            .zstd => codecBuffer(.zstd),
+            .gzip, .deflate => codecBuffer(.gzip),
+            .compress, .identity => 0,
+        };
+        const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
+        self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
+        self.backend = .{ .http = hf };
     }
 
     fn nextHeader(self: *CsvReader, url: []const u8) !void {
@@ -758,29 +755,11 @@ pub const MappedCsv = struct {
     /// Skipped when the file has no quote at all, so the common case costs one `memchr`.
     fn hasQuotedNewline(body: []const u8, delim: u8) bool {
         if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
-        var in_q = false;
-        var at_field = true;
-        var i: usize = 0;
-        while (i < body.len) : (i += 1) {
-            const c = body[i];
-            if (c == '"') {
-                if (in_q) {
-                    if (i + 1 < body.len and body[i + 1] == '"') {
-                        i += 1;
-                        continue;
-                    }
-                    in_q = false;
-                } else if (at_field) {
-                    in_q = true;
-                }
-                at_field = false;
-            } else if (c == '\n' and in_q) {
-                return true;
-            } else if (c == delim and !in_q) {
-                at_field = true;
-            } else if (c == '\n') {
-                at_field = true;
-            } else at_field = false;
+        var pos: usize = 0;
+        while (pos < body.len) {
+            const rec = scanRecord(body, pos, delim);
+            if (std.mem.indexOfScalar(u8, rec.line, '\n') != null) return true;
+            pos = rec.next;
         }
         return false;
     }
@@ -875,47 +854,27 @@ const TypeSniffer = struct {
     fn feed(self: *TypeSniffer, line: []const u8) void {
         var i: usize = 0;
         for (self.cols) |*c| {
-            if (i < line.len and line[i] == '"') {
+            if (i > line.len) break;
+            const quoted = i < line.len and line[i] == '"';
+            const raw = nextField(line, &i, self.delim);
+            if (quoted) {
                 c.seen = true;
                 c.all_int = false;
                 c.all_float = false;
                 c.all_date = false;
-                i += 1;
-                const start = i;
-                while (i < line.len) {
-                    if (line[i] == '"') {
-                        if (i + 1 < line.len and line[i + 1] == '"') {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                noteScale(c, line[start..@max(start, i -| 1)]);
-            } else {
-                const start = i;
-                while (i < line.len and line[i] != self.delim) i += 1;
-                const raw = line[start..i];
-                if (raw.len > 0) {
-                    c.seen = true;
-                    noteScale(c, raw);
-                    if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
-                    if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
-                        c.all_int = false;
-                        c.all_float = false;
-                    } else {
-                        if (c.all_int and eval.parseIntStrict(raw) == null) {
-                            c.all_int = false;
-                        }
-                        if (c.all_float and eval.parseFloatStrict(raw) == null) {
-                            c.all_float = false;
-                        }
-                    }
+                noteScale(c, raw);
+            } else if (raw.len > 0) {
+                c.seen = true;
+                noteScale(c, raw);
+                if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
+                if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
+                    c.all_int = false;
+                    c.all_float = false;
+                } else {
+                    if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
+                    if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
                 }
             }
-            if (i < line.len and line[i] == self.delim) i += 1;
         }
     }
 
@@ -1684,6 +1643,34 @@ test "CsvReader streams a CSV over http" {
     try std.testing.expect((try r.next(a)) == null);
 }
 
+test "CsvReader reads a list of http CSVs, each decoded per its Content-Encoding" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+    const gz = "200 OK\r\ncontent-encoding: gzip";
+    const th1 = try std.Thread.spawn(.{}, serveOnce, .{ &listener, gz, fx_gz });
+    defer th1.join();
+    defer releaseAccept(&listener);
+    const th2 = try std.Thread.spawn(.{}, serveOnce, .{ &listener, gz, fx_gz });
+    defer th2.join();
+    defer releaseAccept(&listener);
+
+    const port = listener.listen_address.getPort();
+    const urls = [_][]const u8{
+        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/a.csv", .{port}),
+        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/b.csv", .{port}),
+    };
+    const r = try CsvReader.openList(a, &urls, .{});
+    defer r.close();
+    var rows: usize = 0;
+    while (try r.next(a)) |b| rows += b.len;
+    try std.testing.expectEqual(@as(usize, 6), rows);
+}
+
 test "CsvReader maps http status: 4xx permanent, 5xx transient" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1856,6 +1843,16 @@ test "TypeSniffer: cells split on the dialect's delimiter, not always a comma" {
     try std.testing.expectEqual(types.TypeKind.float, s.resolve(1).kind);
     try std.testing.expectEqual(types.TypeKind.int, s.resolve(2).kind);
     try std.testing.expectEqual(types.TypeKind.string, s.resolve(3).kind);
+}
+
+test "TypeSniffer: text after a closing quote stays in its field, as the loader keeps it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var s = try TypeSniffer.init(ar.allocator(), 3, ',');
+    s.feed("\"x\"y,1,z");
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(0).kind);
+    try std.testing.expectEqual(types.TypeKind.int, s.resolve(1).kind);
+    try std.testing.expectEqual(types.TypeKind.string, s.resolve(2).kind);
 }
 
 test "serial and mapped readers infer the same schema; mismatch past the sample errors" {
@@ -2294,7 +2291,7 @@ test "csv: text after a closing quote stays in the field" {
     const b = (try r.next(a)).?;
     try std.testing.expectEqual(@as(usize, 1), b.len);
     try std.testing.expectEqualStrings("2 and more", b.columns[1].data.bytes.at(0));
-    try std.testing.expectEqualStrings("3", b.columns[2].data.bytes.at(0));
+    try std.testing.expectEqual(@as(i64, 3), b.columns[2].getValue(0).int);
 }
 
 test "csv writer: the delimiter carries to the header, rows and quoting" {
