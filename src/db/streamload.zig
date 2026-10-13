@@ -188,6 +188,11 @@ pub const StreamLoadSink = struct {
     client: std.http.Client,
     logger: ?*obs.Logger = null,
     errctx: ?*op.ErrCtx = null,
+    opened: std.time.Instant,
+    setup_ns: u64 = 0,
+    encode_ns: u64 = 0,
+    flush_ns: u64 = 0,
+    sent_bytes: u64 = 0,
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
         const self = try gpa.create(StreamLoadSink);
@@ -207,6 +212,7 @@ pub const StreamLoadSink = struct {
             .buffer = std.array_list.Managed(u8).init(gpa),
             .run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp()),
             .client = std.http.Client{ .allocator = gpa },
+            .opened = try std.time.Instant.now(),
         };
         errdefer self.buffer.deinit();
         errdefer self.client.deinit();
@@ -228,6 +234,7 @@ pub const StreamLoadSink = struct {
                 try self.runDDL(trunc);
             }
         }
+        self.setup_ns = (try std.time.Instant.now()).since(self.opened);
         return self;
     }
 
@@ -275,13 +282,23 @@ pub const StreamLoadSink = struct {
     }
 
     pub fn writeBatch(self: *StreamLoadSink, arena: std.mem.Allocator, batch: Batch) !void {
+        const t0 = try std.time.Instant.now();
         try appendBatchTsv(self.buffer.writer(), arena, batch);
+        self.encode_ns += (try std.time.Instant.now()).since(t0);
         if (self.buffer.items.len >= FLUSH_BYTES) try self.flush();
     }
 
+    /// At debug level, a closing line splits the sink's lifetime into body
+    /// encoding, time blocked in Stream Load, and the rest (reading upstream).
     pub fn close(self: *StreamLoadSink) !void {
         defer self.teardown();
         try self.flush();
+        if (self.logger) |lg| {
+            const life = (std.time.Instant.now() catch self.opened).since(self.opened);
+            lg.log(.debug, "stream load {s} closed: {d} loads, {d} bytes, life {d} ms, setup {d} ms, encode {d} ms, flush {d} ms", .{
+                self.table, self.seq, self.sent_bytes, life / std.time.ns_per_ms, self.setup_ns / std.time.ns_per_ms, self.encode_ns / std.time.ns_per_ms, self.flush_ns / std.time.ns_per_ms,
+            });
+        }
     }
 
     /// Drops the buffered body; loads already sent are committed and stay.
@@ -299,6 +316,8 @@ pub const StreamLoadSink = struct {
 
     fn flush(self: *StreamLoadSink) !void {
         if (self.buffer.items.len == 0) return;
+        const t0 = try std.time.Instant.now();
+        defer self.flush_ns += (std.time.Instant.now() catch t0).since(t0);
         self.seq += 1;
         var attempt: usize = 0;
         while (true) {
@@ -310,6 +329,7 @@ pub const StreamLoadSink = struct {
             };
             break;
         }
+        self.sent_bytes += self.buffer.items.len;
         self.buffer.clearRetainingCapacity();
     }
 
@@ -364,17 +384,49 @@ pub const StreamLoadSink = struct {
             }
             return error.StreamLoadFailed;
         }
+        if (self.logger) |lg| lg.log(.debug, "stream load {s} #{d}: {d} rows, {d} bytes, total {d} ms, begin {d}, plan {d}, read {d}, write {d}, commit+publish {d} ms", .{
+            self.table,                            self.seq,
+            jsonInt(body, "NumberLoadedRows"),     jsonInt(body, "LoadBytes"),
+            jsonInt(body, "LoadTimeMs"),           jsonInt(body, "BeginTxnTimeMs"),
+            jsonInt(body, "StreamLoadPlanTimeMs"), jsonInt(body, "ReadDataTimeMs"),
+            jsonInt(body, "WriteDataTimeMs"),      jsonInt(body, "CommitAndPublishTimeMs"),
+        });
     }
 };
 
-/// One string field of a flat JSON object, unescaped only as far as the server's
-/// own responses need; not a general JSON parser.
-fn jsonField(body: []const u8, name: []const u8) ?[]const u8 {
+/// Where the value of key `name` starts in a flat JSON object.
+fn jsonValueAt(body: []const u8, name: []const u8) ?usize {
     var needle_buf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{name}) catch return null;
     const at = std.mem.indexOf(u8, body, needle) orelse return null;
     var i = at + needle.len;
     while (i < body.len and (body[i] == ' ' or body[i] == ':')) i += 1;
+    return i;
+}
+
+/// One integer field of a flat JSON object, -1 when absent or not a number.
+fn jsonInt(body: []const u8, name: []const u8) i64 {
+    var i = jsonValueAt(body, name) orelse return -1;
+    const start = i;
+    while (i < body.len and (std.ascii.isDigit(body[i]) or (i == start and body[i] == '-'))) i += 1;
+    return std.fmt.parseInt(i64, body[start..i], 10) catch -1;
+}
+
+test "jsonInt reads the timing fields of a stream load response" {
+    const body =
+        \\{"NumberLoadedRows": 1200, "LoadBytes": 8388700, "CommitAndPublishTimeMs": 41, "Status": "Success"}
+    ;
+    try std.testing.expectEqual(@as(i64, 1200), jsonInt(body, "NumberLoadedRows"));
+    try std.testing.expectEqual(@as(i64, 8388700), jsonInt(body, "LoadBytes"));
+    try std.testing.expectEqual(@as(i64, 41), jsonInt(body, "CommitAndPublishTimeMs"));
+    try std.testing.expectEqual(@as(i64, -1), jsonInt(body, "Status"));
+    try std.testing.expectEqual(@as(i64, -1), jsonInt(body, "Absent"));
+}
+
+/// One string field of a flat JSON object, unescaped only as far as the server's
+/// own responses need; not a general JSON parser.
+fn jsonField(body: []const u8, name: []const u8) ?[]const u8 {
+    var i = jsonValueAt(body, name) orelse return null;
     if (i >= body.len or body[i] != '"') return null;
     i += 1;
     const start = i;
