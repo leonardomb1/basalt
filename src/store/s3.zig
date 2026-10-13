@@ -76,10 +76,6 @@ pub fn isUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "s3://");
 }
 
-pub fn isPrefix(url: []const u8) bool {
-    return isUrl(url) and std.mem.endsWith(u8, url, "/");
-}
-
 /// Why the bucket in this `s3://` URL cannot name a bucket, or null. Checked at plan
 /// time because the service answers a bare 400 (`s3://bt/x.csv` is too short); only
 /// the DNS rules AWS and MinIO share, the rest left to the service's own message.
@@ -315,43 +311,61 @@ pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const 
     );
 }
 
-pub fn getHeaders(arena: std.mem.Allocator, o: Obj, range: []const u8) ![]const std.http.Header {
-    return requestHeaders(arena, o, "GET", range);
-}
-
 /// Signed headers for any verb; `range` is `bytes=a-b` or empty for the whole
-/// object. Host is signed but not returned (see the module header).
+/// object.
 pub fn requestHeaders(
     arena: std.mem.Allocator,
     o: Obj,
     method: []const u8,
     range: []const u8,
 ) ![]const std.http.Header {
-    const creds = try credsFromEnv(arena);
-    const ts = try amzDate(arena, std.time.timestamp());
+    return signedHeaders(arena, try credsFromEnv(arena), .{
+        .method = method,
+        .host = o.host,
+        .region = o.region,
+        .uri_path = o.uri_path,
+        .range = range,
+    });
+}
 
+const Request = struct {
+    method: []const u8,
+    host: []const u8,
+    region: []const u8,
+    uri_path: []const u8,
+    query: []const []const u8 = &.{},
+    payload_hash: []const u8 = empty_payload_hash,
+    content_type: ?[]const u8 = null,
+    range: []const u8 = "",
+};
+
+/// Signs host, payload hash, date, session token and any range or content-type.
+/// Host and content-type are signed but not returned: the client sends both itself
+/// (see the module header).
+fn signedHeaders(arena: std.mem.Allocator, creds: Creds, r: Request) ![]const std.http.Header {
+    const ts = try amzDate(arena, std.time.timestamp());
     var sh = std.array_list.Managed(SignHeader).init(arena);
-    try sh.append(.{ .name = "host", .value = o.host });
-    if (range.len > 0) try sh.append(.{ .name = "range", .value = range });
-    try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+    if (r.content_type) |ct| try sh.append(.{ .name = "content-type", .value = ct });
+    try sh.append(.{ .name = "host", .value = r.host });
+    if (r.range.len > 0) try sh.append(.{ .name = "range", .value = r.range });
+    try sh.append(.{ .name = "x-amz-content-sha256", .value = r.payload_hash });
     try sh.append(.{ .name = "x-amz-date", .value = ts });
     if (creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
-
     const auth = try authHeader(arena, creds.access, creds.secret, .{
-        .method = method,
-        .uri_path = o.uri_path,
+        .method = r.method,
+        .uri_path = r.uri_path,
+        .query = r.query,
         .headers = sh.items,
-        .payload_hash = empty_payload_hash,
+        .payload_hash = r.payload_hash,
         .timestamp = ts,
-        .region = o.region,
+        .region = r.region,
     });
-
     var out = std.array_list.Managed(std.http.Header).init(arena);
     try out.append(.{ .name = "x-amz-date", .value = ts });
-    try out.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
+    try out.append(.{ .name = "x-amz-content-sha256", .value = r.payload_hash });
     if (creds.token) |t| try out.append(.{ .name = "x-amz-security-token", .value = t });
     try out.append(.{ .name = "Authorization", .value = auth });
-    if (range.len > 0) try out.append(.{ .name = "Range", .value = range });
+    if (r.range.len > 0) try out.append(.{ .name = "Range", .value = r.range });
     return out.toOwnedSlice();
 }
 
@@ -415,27 +429,13 @@ const ListPage = struct {
         try q.append("list-type=2");
         try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try uriEncode(c.arena, c.prefix, .encode_slash)}));
 
-        const ts = try amzDate(c.arena, std.time.timestamp());
-        var sh = std.array_list.Managed(SignHeader).init(c.arena);
-        try sh.append(.{ .name = "host", .value = c.host });
-        try sh.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
-        try sh.append(.{ .name = "x-amz-date", .value = ts });
-        if (c.creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
-        const auth = try authHeader(c.arena, c.creds.access, c.creds.secret, .{
+        const hdrs = try signedHeaders(c.arena, c.creds, .{
             .method = "GET",
+            .host = c.host,
+            .region = c.region,
             .uri_path = c.uri_path,
             .query = q.items,
-            .headers = sh.items,
-            .payload_hash = empty_payload_hash,
-            .timestamp = ts,
-            .region = c.region,
         });
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(c.arena);
-        try hdrs.append(.{ .name = "x-amz-date", .value = ts });
-        try hdrs.append(.{ .name = "x-amz-content-sha256", .value = empty_payload_hash });
-        if (c.creds.token) |t| try hdrs.append(.{ .name = "x-amz-security-token", .value = t });
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
 
         var url = std.array_list.Managed(u8).init(c.arena);
         try url.appendSlice(c.base_url);
@@ -448,7 +448,7 @@ const ListPage = struct {
         const res = try c.client.fetch(.{
             .method = .GET,
             .location = .{ .url = url.items },
-            .extra_headers = hdrs.items,
+            .extra_headers = hdrs,
             .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
         });
@@ -485,42 +485,6 @@ pub fn listPrefix(
 }
 
 pub const part_size = 8 * 1024 * 1024;
-
-/// Signs host, payload hash, date, session token and content-type for a write.
-/// Content-type is signed but not returned: it goes out via the client's own option.
-fn signedWriteHeaders(
-    arena: std.mem.Allocator,
-    creds: Creds,
-    method: []const u8,
-    o: Obj,
-    uri_path: []const u8,
-    query: []const []const u8,
-    payload_hash_hex: []const u8,
-    content_type: ?[]const u8,
-) ![]const std.http.Header {
-    const ts = try amzDate(arena, std.time.timestamp());
-    var sh = std.array_list.Managed(SignHeader).init(arena);
-    if (content_type) |ct| try sh.append(.{ .name = "content-type", .value = ct });
-    try sh.append(.{ .name = "host", .value = o.host });
-    try sh.append(.{ .name = "x-amz-content-sha256", .value = payload_hash_hex });
-    try sh.append(.{ .name = "x-amz-date", .value = ts });
-    if (creds.token) |t| try sh.append(.{ .name = "x-amz-security-token", .value = t });
-    const auth = try authHeader(arena, creds.access, creds.secret, .{
-        .method = method,
-        .uri_path = uri_path,
-        .query = query,
-        .headers = sh.items,
-        .payload_hash = payload_hash_hex,
-        .timestamp = ts,
-        .region = o.region,
-    });
-    var out = std.array_list.Managed(std.http.Header).init(arena);
-    try out.append(.{ .name = "x-amz-date", .value = ts });
-    try out.append(.{ .name = "x-amz-content-sha256", .value = payload_hash_hex });
-    if (creds.token) |t| try out.append(.{ .name = "x-amz-security-token", .value = t });
-    try out.append(.{ .name = "Authorization", .value = auth });
-    return out.toOwnedSlice();
-}
 
 fn completeBody(arena: std.mem.Allocator, etags: []const []const u8) ![]const u8 {
     var body = std.array_list.Managed(u8).init(arena);
@@ -599,7 +563,7 @@ pub const MultipartWriter = struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
                 const q = [_][]const u8{"uploads="};
-                const hdrs = try signedWriteHeaders(w.arena, w.creds, "POST", w.obj, w.obj.uri_path, &q, empty_payload_hash, w.content_type);
+                const hdrs = try w.signed("POST", w.obj.uri_path, &q, empty_payload_hash, w.content_type);
                 var aw = std.Io.Writer.Allocating.init(w.arena);
                 const res = try w.client.fetch(.{
                     .method = .POST,
@@ -643,7 +607,7 @@ pub const MultipartWriter = struct {
         try objstore.retry(self.policy(), ctx, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try signedWriteHeaders(w.arena, w.creds, "PUT", w.obj, w.obj.uri_path, c.q, c.ph, null);
+                const hdrs = try w.signed("PUT", w.obj.uri_path, c.q, c.ph, null);
                 const r = try w.putWithEtag(c.url, hdrs, c.bytes);
                 if (r.code == 200) {
                     if (r.etag.len == 0) {
@@ -692,7 +656,7 @@ pub const MultipartWriter = struct {
         try objstore.retry(self.policy(), ctx, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try signedWriteHeaders(w.arena, w.creds, "PUT", w.obj, w.obj.uri_path, &.{}, c.ph, w.content_type);
+                const hdrs = try w.signed("PUT", w.obj.uri_path, &.{}, c.ph, w.content_type);
                 var aw = std.Io.Writer.Allocating.init(w.arena);
                 const res = try w.client.fetch(.{
                     .method = .PUT,
@@ -741,7 +705,7 @@ pub const MultipartWriter = struct {
         try objstore.retry(self.policy(), ctx, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try signedWriteHeaders(w.arena, w.creds, "POST", w.obj, w.obj.uri_path, c.q, c.ph, null);
+                const hdrs = try w.signed("POST", w.obj.uri_path, c.q, c.ph, null);
                 var aw = std.Io.Writer.Allocating.init(w.arena);
                 const res = try w.client.fetch(.{
                     .method = .POST,
@@ -784,7 +748,7 @@ pub const MultipartWriter = struct {
                 .{self.obj.region},
             );
         const ph = try payloadHash(self.arena, body);
-        const hdrs = try signedWriteHeaders(self.arena, self.creds, "PUT", self.obj, self.obj.bucket_uri_path, &.{}, ph, null);
+        const hdrs = try self.signed("PUT", self.obj.bucket_uri_path, &.{}, ph, null);
         var aw = std.Io.Writer.Allocating.init(self.arena);
         const res = try self.client.fetch(.{
             .method = .PUT,
@@ -796,6 +760,18 @@ pub const MultipartWriter = struct {
         });
         const code = @intFromEnum(res.status);
         if (code != 200 and code != 409) return self.fail(code, aw.writer.buffered());
+    }
+
+    fn signed(self: *MultipartWriter, method: []const u8, uri_path: []const u8, query: []const []const u8, payload_hash: []const u8, content_type: ?[]const u8) ![]const std.http.Header {
+        return signedHeaders(self.arena, self.creds, .{
+            .method = method,
+            .host = self.obj.host,
+            .region = self.obj.region,
+            .uri_path = uri_path,
+            .query = query,
+            .payload_hash = payload_hash,
+            .content_type = content_type,
+        });
     }
 
     fn policy(self: *MultipartWriter) objstore.Policy {
@@ -949,11 +925,7 @@ test "parseUrl: virtual-host style for the real service" {
     }
 }
 
-test "prefix URLs are distinguished from object URLs and may have an empty prefix" {
-    try std.testing.expect(isPrefix("s3://b/dir/"));
-    try std.testing.expect(isPrefix("s3://b/"));
-    try std.testing.expect(!isPrefix("s3://b/f.csv"));
-
+test "prefix URLs may have an empty prefix" {
     const p = try parsePrefix("s3://lake/year=2026/");
     try std.testing.expectEqualStrings("lake", p.bucket);
     try std.testing.expectEqualStrings("year=2026/", p.prefix);

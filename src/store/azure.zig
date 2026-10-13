@@ -84,23 +84,29 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     const path = after_account[c_end + 1 ..];
     if (account.len == 0 or container.len == 0 or path.len == 0) return Error.AzureBadUrl;
 
-    const url_path = if (endpoint == null)
-        try std.fmt.allocPrint(arena, "/{s}/{s}", .{ container, path })
-    else
-        try std.fmt.allocPrint(arena, "/{s}/{s}/{s}", .{ account, container, path });
-
-    const full = if (endpoint) |ep|
-        try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), url_path })
-    else
-        try std.fmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, url_path });
-
+    const base = try containerBase(arena, account, container, endpoint);
+    const url_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base.path, path });
     return .{
         .account = account,
         .container = container,
         .path = path,
-        .url = full,
+        .url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base.url, path }),
         .canonical_resource = try canonicalResource(arena, account, url_path),
     };
+}
+
+/// The container's URL and URL path: `/<container>` against the real service,
+/// `/<account>/<container>` against a path-style `endpoint`.
+fn containerBase(arena: std.mem.Allocator, account: []const u8, container: []const u8, endpoint: ?[]const u8) !struct { url: []const u8, path: []const u8 } {
+    const path = if (endpoint == null)
+        try std.fmt.allocPrint(arena, "/{s}", .{container})
+    else
+        try std.fmt.allocPrint(arena, "/{s}/{s}", .{ account, container });
+    const url = if (endpoint) |ep|
+        try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), path })
+    else
+        try std.fmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, path });
+    return .{ .url = url, .path = path };
 }
 
 /// `/<account>` followed by the request URL's path. Against a path-style emulator
@@ -142,7 +148,7 @@ pub const MsHeader = struct { name: []const u8, value: []const u8 };
 pub const SignParams = struct {
     method: []const u8,
     canonical_resource: []const u8,
-    ms_headers: []const MsHeader,
+    ms_headers: []const MsHeader = &.{},
     content_length: usize = 0,
     content_type: []const u8 = "",
     range: []const u8 = "",
@@ -195,10 +201,6 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     return std.fmt.allocPrint(arena, "SharedKey {s}:{s}", .{ account, sig });
 }
 
-pub fn getHeaders(arena: std.mem.Allocator, b: Blob, range: []const u8) ![]const std.http.Header {
-    return requestHeaders(arena, b, "GET", range);
-}
-
 /// Signed headers for any verb; `range` is `bytes=a-b` or empty for the whole object.
 pub fn requestHeaders(
     arena: std.mem.Allocator,
@@ -206,24 +208,31 @@ pub fn requestHeaders(
     method: []const u8,
     range: []const u8,
 ) ![]const std.http.Header {
-    const key = try keyFromEnv(arena);
-    const date = try rfc1123(arena, std.time.timestamp());
-    const ms = [_]MsHeader{
-        .{ .name = "x-ms-date", .value = date },
-        .{ .name = "x-ms-version", .value = api_version },
-    };
-    const auth = try authHeader(arena, b.account, key, .{
+    return signedHeaders(arena, b.account, try keyFromEnv(arena), .{
         .method = method,
         .canonical_resource = b.canonical_resource,
-        .ms_headers = &ms,
         .range = range,
     });
+}
+
+/// Signs `p` with the date and version added to its `x-ms-*` headers, and returns
+/// every header to send.
+fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8, p: SignParams) ![]const std.http.Header {
+    const date = try rfc1123(arena, std.time.timestamp());
+    var ms = std.array_list.Managed(MsHeader).init(arena);
+    try ms.appendSlice(p.ms_headers);
+    try ms.append(.{ .name = "x-ms-date", .value = date });
+    try ms.append(.{ .name = "x-ms-version", .value = api_version });
+    var signed = p;
+    signed.ms_headers = ms.items;
+    const auth = try authHeader(arena, account, key, signed);
 
     var out = std.array_list.Managed(std.http.Header).init(arena);
     try out.append(.{ .name = "x-ms-date", .value = date });
     try out.append(.{ .name = "x-ms-version", .value = api_version });
+    for (p.ms_headers) |h| try out.append(.{ .name = h.name, .value = h.value });
     try out.append(.{ .name = "Authorization", .value = auth });
-    if (range.len > 0) try out.append(.{ .name = "Range", .value = range });
+    if (p.range.len > 0) try out.append(.{ .name = "Range", .value = p.range });
     return out.toOwnedSlice();
 }
 
@@ -303,15 +312,9 @@ pub const BlockBlobWriter = struct {
         const id_enc = try urlEncode(self.arena, id);
         const url = try std.fmt.allocPrint(self.arena, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
 
-        const date = try rfc1123(self.arena, std.time.timestamp());
-        const ms = [_]MsHeader{
-            .{ .name = "x-ms-date", .value = date },
-            .{ .name = "x-ms-version", .value = api_version },
-        };
-        const auth = try authHeader(self.arena, self.blob.account, self.key, .{
+        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
             .method = "PUT",
             .canonical_resource = self.blob.canonical_resource,
-            .ms_headers = &ms,
             .content_length = bytes.len,
             .query = &.{
                 try std.fmt.allocPrint(self.arena, "blockid:{s}", .{id}),
@@ -319,10 +322,10 @@ pub const BlockBlobWriter = struct {
             },
         });
 
-        self.send(url, date, auth, bytes, &.{}) catch |e| switch (e) {
+        self.send(url, hdrs, bytes) catch |e| switch (e) {
             Error.AzureContainerMissing => {
                 try self.createContainer();
-                try self.send(url, date, auth, bytes, &.{});
+                try self.send(url, hdrs, bytes);
             },
             else => return e,
         };
@@ -343,43 +346,22 @@ pub const BlockBlobWriter = struct {
         try body.appendSlice("</BlockList>");
 
         const url = try std.fmt.allocPrint(self.arena, "{s}?comp=blocklist", .{self.blob.url});
-        const date = try rfc1123(self.arena, std.time.timestamp());
-        const ms = [_]MsHeader{
-            .{ .name = "x-ms-blob-content-type", .value = self.content_type },
-            .{ .name = "x-ms-date", .value = date },
-            .{ .name = "x-ms-version", .value = api_version },
-        };
-        const auth = try authHeader(self.arena, self.blob.account, self.key, .{
+        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
             .method = "PUT",
             .canonical_resource = self.blob.canonical_resource,
-            .ms_headers = &ms,
+            .ms_headers = &.{.{ .name = "x-ms-blob-content-type", .value = self.content_type }},
             .content_length = body.items.len,
             .query = &.{"comp:blocklist"},
         });
-        try self.send(url, date, auth, body.items, &.{
-            .{ .name = "x-ms-blob-content-type", .value = self.content_type },
-        });
+        try self.send(url, hdrs, body.items);
     }
 
     const Send = struct { w: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8 };
 
     /// PUT with retry. `last_status` is cleared on success, since `stageBlock` retries a
     /// missing container and that first attempt's stale error must not be re-raised.
-    fn send(
-        self: *BlockBlobWriter,
-        url: []const u8,
-        date: []const u8,
-        auth: []const u8,
-        body: []const u8,
-        extra: []const std.http.Header,
-    ) !void {
-        var hdrs = std.array_list.Managed(std.http.Header).init(self.arena);
-        try hdrs.append(.{ .name = "x-ms-date", .value = date });
-        try hdrs.append(.{ .name = "x-ms-version", .value = api_version });
-        for (extra) |h| try hdrs.append(h);
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
-
-        try objstore.retry(self.policy(), Send{ .w = self, .url = url, .hdrs = hdrs.items, .body = body }, struct {
+    fn send(self: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8) !void {
+        try objstore.retry(self.policy(), Send{ .w = self, .url = url, .hdrs = hdrs, .body = body }, struct {
             fn attempt(c: Send) !objstore.Verdict {
                 var aw = std.Io.Writer.Allocating.init(c.w.arena);
                 const res = try c.w.client.fetch(.{
@@ -406,28 +388,17 @@ pub const BlockBlobWriter = struct {
         const url = try std.fmt.allocPrint(self.arena, "{s}?restype=container", .{base});
         const canon = self.blob.canonical_resource[0 .. self.blob.canonical_resource.len - self.blob.path.len - 1];
 
-        const date = try rfc1123(self.arena, std.time.timestamp());
-        const ms = [_]MsHeader{
-            .{ .name = "x-ms-date", .value = date },
-            .{ .name = "x-ms-version", .value = api_version },
-        };
-        const auth = try authHeader(self.arena, self.blob.account, self.key, .{
+        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
             .method = "PUT",
             .canonical_resource = canon,
-            .ms_headers = &ms,
             .query = &.{"restype:container"},
         });
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(self.arena);
-        try hdrs.append(.{ .name = "x-ms-date", .value = date });
-        try hdrs.append(.{ .name = "x-ms-version", .value = api_version });
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
 
         var aw = std.Io.Writer.Allocating.init(self.arena);
         const res = try self.client.fetch(.{
             .method = .PUT,
             .location = .{ .url = url },
-            .extra_headers = hdrs.items,
+            .extra_headers = hdrs,
             .payload = "",
             .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
@@ -596,34 +567,23 @@ const ListPage = struct {
         else
             try std.fmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try urlEncode(c.arena, c.prefix), try urlEncode(c.arena, marker) });
 
-        const date = try rfc1123(c.arena, std.time.timestamp());
-        const ms = [_]MsHeader{
-            .{ .name = "x-ms-date", .value = date },
-            .{ .name = "x-ms-version", .value = api_version },
-        };
         var q = std.array_list.Managed([]const u8).init(c.arena);
         try q.append("comp:list");
         if (marker.len > 0) try q.append(try std.fmt.allocPrint(c.arena, "marker:{s}", .{marker}));
         try q.append(try std.fmt.allocPrint(c.arena, "prefix:{s}", .{c.prefix}));
         try q.append("restype:container");
 
-        const auth = try authHeader(c.arena, c.account, c.key, .{
+        const hdrs = try signedHeaders(c.arena, c.account, c.key, .{
             .method = "GET",
             .canonical_resource = c.canon,
-            .ms_headers = &ms,
             .query = q.items,
         });
-
-        var hdrs = std.array_list.Managed(std.http.Header).init(c.arena);
-        try hdrs.append(.{ .name = "x-ms-date", .value = date });
-        try hdrs.append(.{ .name = "x-ms-version", .value = api_version });
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
 
         var aw = std.Io.Writer.Allocating.init(c.arena);
         const res = try c.client.fetch(.{
             .method = .GET,
             .location = .{ .url = url },
-            .extra_headers = hdrs.items,
+            .extra_headers = hdrs,
             .decompress_buffer = http_client.decompress_direct,
             .response_writer = &aw.writer,
         });
@@ -644,21 +604,14 @@ pub fn listPrefix(
     prefix: []const u8,
     endpoint: ?[]const u8,
 ) ![][]const u8 {
-    const url_path = if (endpoint == null)
-        try std.fmt.allocPrint(arena, "/{s}", .{container})
-    else
-        try std.fmt.allocPrint(arena, "/{s}/{s}", .{ account, container });
-    const base = if (endpoint) |ep|
-        try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), url_path })
-    else
-        try std.fmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, url_path });
+    const base = try containerBase(arena, account, container, endpoint);
     const ctx = ListPage{
         .arena = arena,
         .client = client,
         .account = account,
         .prefix = prefix,
-        .base = base,
-        .canon = try canonicalResource(arena, account, url_path),
+        .base = base.url,
+        .canon = try canonicalResource(arena, account, base.path),
         .key = try keyFromEnv(arena),
     };
     return objstore.listPages(arena, .{ .item_tag = "Name", .next_tag = "NextMarker" }, ctx, ListPage.page);
@@ -689,15 +642,7 @@ pub fn parsePrefix(url: []const u8) !struct { account: []const u8, container: []
     return .{ .account = account, .container = container, .prefix = after[c_end + 1 ..] };
 }
 
-pub fn isPrefix(url: []const u8) bool {
-    return isUrl(url) and std.mem.endsWith(u8, url, "/");
-}
-
-test "prefix URLs are distinguished from blob URLs and may have an empty prefix" {
-    try std.testing.expect(isPrefix("az://a/c/dir/"));
-    try std.testing.expect(isPrefix("az://a/c/"));
-    try std.testing.expect(!isPrefix("az://a/c/f.csv"));
-
+test "prefix URLs may have an empty prefix" {
     const p = try parsePrefix("az://acct/cont/year=2026/");
     try std.testing.expectEqualStrings("acct", p.account);
     try std.testing.expectEqualStrings("cont", p.container);

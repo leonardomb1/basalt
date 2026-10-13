@@ -435,7 +435,8 @@ test "find and isPrefix dispatch on the scheme alone" {
     try std.testing.expect(find("s3://b/k.csv") == &s3.provider);
     try std.testing.expect(find("https://x/y.csv") == null);
     try std.testing.expect(find("/tmp/f.csv") == null);
-    try std.testing.expect(isPrefix("az://a/c/") and isPrefix("s3://b/dir/"));
+    try std.testing.expect(isPrefix("az://a/c/") and isPrefix("s3://b/dir/") and isPrefix("s3://b/"));
+    try std.testing.expect(!isPrefix("az://a/c/f.csv"));
     try std.testing.expect(!isPrefix("s3://b/f.csv") and !isPrefix("/tmp/dir/"));
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
