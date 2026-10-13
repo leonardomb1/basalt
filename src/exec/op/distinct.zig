@@ -115,14 +115,7 @@ pub const Distinct = struct {
     }
 
     fn spillRows(self: *Distinct, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
-        if (self.spill_depth >= self.max_spill_depth) {
-            if (self.err) |ec| ec.set("DISTINCT still exceeds --op-memory after {d} levels of spilling; raise --op-memory", .{self.spill_depth});
-            return error.SpillTooDeep;
-        }
-        self.spill.?.parts.route(scratch, b, dest) catch |e| {
-            if (e == error.SpillCapExceeded) if (self.err) |ec| ec.set("DISTINCT spilled past --spill-cap; raise --spill-cap or --op-memory", .{});
-            return e;
-        };
+        return self.spill.?.parts.route(scratch, b, dest, "DISTINCT", self.spill_depth, self.max_spill_depth, self.err);
     }
 
     fn dedup(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {

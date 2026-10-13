@@ -82,15 +82,7 @@ pub fn overBudget(self: *Aggregate, parts: anytype) bool {
 
 /// Writes the rows `dest` marks to their spill files, failing past the depth limit.
 pub fn spillRows(self: *Aggregate, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
-    const sp = self.spill.?;
-    if (self.spill_depth >= self.max_spill_depth) {
-        if (self.err) |ec| ec.set("GROUP BY still exceeds --op-memory after {d} levels of spilling; raise --op-memory", .{self.spill_depth});
-        return error.SpillTooDeep;
-    }
-    sp.parts.route(scratch, b, dest) catch |e| {
-        if (e == error.SpillCapExceeded) if (self.err) |ec| ec.set("GROUP BY spilled past --spill-cap; raise --spill-cap or --op-memory", .{});
-        return e;
-    };
+    return self.spill.?.parts.route(scratch, b, dest, "GROUP BY", self.spill_depth, self.max_spill_depth, self.err);
 }
 
 /// A row's spill file from the key hash the fold already computed.

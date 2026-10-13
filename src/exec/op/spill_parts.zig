@@ -16,6 +16,7 @@
 //! run.
 
 const Batch = @import("../batch.zig").Batch;
+const ErrCtx = @import("../op.zig").ErrCtx;
 const Scan = @import("../op.zig").Scan;
 const Space = @import("../space.zig").Space;
 const column = @import("../column.zig");
@@ -87,8 +88,20 @@ pub const Parts = struct {
     tag: []const u8,
     writers: [fanout]?spill.Writer = @splat(null),
 
-    /// Appends each row `r` of `b` with `dest[r] != keep` to file `dest[r]`.
-    pub fn route(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
+    /// Appends each row `r` of `b` with `dest[r] != keep` to file `dest[r]`, for an
+    /// operator (`label` in its errors) spilling at `depth`; past `max_depth` it fails.
+    pub fn route(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8, comptime label: []const u8, depth: u8, max_depth: u8, err: ?*ErrCtx) !void {
+        if (depth >= max_depth) {
+            if (err) |ec| ec.set(label ++ " still exceeds --op-memory after {d} levels of spilling; raise --op-memory", .{depth});
+            return error.SpillTooDeep;
+        }
+        self.write(scratch, b, dest) catch |e| {
+            if (e == error.SpillCapExceeded) if (err) |ec| ec.set(label ++ " spilled past --spill-cap; raise --spill-cap or --op-memory", .{});
+            return e;
+        };
+    }
+
+    fn write(self: *Parts, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
         const mask = try scratch.alloc(bool, b.len);
         for (0..fanout) |p| {
             var n: usize = 0;
