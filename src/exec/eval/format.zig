@@ -62,29 +62,47 @@ pub fn writeTimestamp(w: anytype, micros: i64) !void {
     }
 }
 
+/// Digits are produced with 64-bit division whenever the magnitude fits, and the
+/// text is written in one call.
 pub fn writeDecimal(w: anytype, unscaled: i128, scale: u8) !void {
     const neg = unscaled < 0;
     var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
 
     var digits: [48]u8 = undefined;
     var n: usize = 0;
-    if (mag == 0) {
-        digits[0] = '0';
-        n = 1;
-    }
-    while (mag > 0) : (mag /= 10) {
-        digits[n] = @intCast('0' + mag % 10);
-        n += 1;
+    if (std.math.cast(u64, mag)) |small| {
+        var m = small;
+        while (true) {
+            digits[n] = @intCast('0' + m % 10);
+            n += 1;
+            m /= 10;
+            if (m == 0) break;
+        }
+    } else {
+        while (mag > 0) : (mag /= 10) {
+            digits[n] = @intCast('0' + mag % 10);
+            n += 1;
+        }
     }
     while (n <= scale) : (n += 1) digits[n] = '0';
 
-    if (neg) try w.writeByte('-');
+    var text: [digits.len + 2]u8 = undefined;
+    var t: usize = 0;
+    if (neg) {
+        text[0] = '-';
+        t = 1;
+    }
     var k: usize = n;
     while (k > 0) {
         k -= 1;
-        try w.writeByte(digits[k]);
-        if (scale > 0 and k == scale) try w.writeByte('.');
+        text[t] = digits[k];
+        t += 1;
+        if (scale > 0 and k == scale) {
+            text[t] = '.';
+            t += 1;
+        }
     }
+    try w.writeAll(text[0..t]);
 }
 
 pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
@@ -125,6 +143,51 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     var w = std.Io.Writer.fixed(&buf);
     writeTimestamp(&w, micros) catch unreachable;
     return arena.dupe(u8, w.buffered());
+}
+
+fn writeDecimalReference(w: anytype, unscaled: i128, scale: u8) !void {
+    const neg = unscaled < 0;
+    var mag: u128 = if (neg) @intCast(-unscaled) else @intCast(unscaled);
+    var digits: [48]u8 = undefined;
+    var n: usize = 0;
+    if (mag == 0) {
+        digits[0] = '0';
+        n = 1;
+    }
+    while (mag > 0) : (mag /= 10) {
+        digits[n] = @intCast('0' + mag % 10);
+        n += 1;
+    }
+    while (n <= scale) : (n += 1) digits[n] = '0';
+    if (neg) try w.writeByte('-');
+    var k: usize = n;
+    while (k > 0) {
+        k -= 1;
+        try w.writeByte(digits[k]);
+        if (scale > 0 and k == scale) try w.writeByte('.');
+    }
+}
+
+test "writeDecimal matches the digit-at-a-time 128-bit rendering" {
+    var prng = std.Random.DefaultPrng.init(0xdec);
+    const rnd = prng.random();
+    const edges = [_]i128{ 0, 1, -1, 9, 10, -10, std.math.maxInt(u64), -@as(i128, std.math.maxInt(u64)), @as(i128, std.math.maxInt(u64)) + 1, std.math.maxInt(i128), -std.math.maxInt(i128), std.math.maxInt(i64), std.math.minInt(i64) };
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    for (0..20000) |it| {
+        const u: i128 = if (it < edges.len * 8) edges[it % edges.len] else switch (it % 4) {
+            0 => rnd.int(i128) >> @intCast(rnd.uintLessThan(u8, 127)),
+            1 => rnd.int(i64),
+            2 => rnd.intRangeAtMost(i128, -100000, 100000),
+            else => rnd.int(i128) >> 1,
+        };
+        const scale: u8 = if (it < edges.len * 8) @intCast(it / edges.len * 5) else rnd.uintAtMost(u8, 38);
+        var wa = std.Io.Writer.fixed(&a);
+        var wb = std.Io.Writer.fixed(&b);
+        try writeDecimalReference(&wa, u, scale);
+        try writeDecimal(&wb, u, scale);
+        try std.testing.expectEqualStrings(wa.buffered(), wb.buffered());
+    }
 }
 
 test "dates and timestamps before year 0 print with a sign instead of trapping" {

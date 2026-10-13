@@ -39,6 +39,8 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
+const Column = @import("../exec/column.zig").Column;
+const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const mysql = @import("mysql.zig");
 const sql = @import("sql.zig");
@@ -158,34 +160,52 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 
 const NULL_MARKER = "\\N";
 
-pub fn appendBatchTsv(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-    var r: usize = 0;
-    while (r < batch.len) : (r += 1) {
+/// Appends each cell's text straight into `out`, with no per-value allocation.
+pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
+    for (0..batch.len) |r| {
         for (batch.columns, 0..) |*c, i| {
-            if (i > 0) try w.writeByte(0x01);
-            const v = c.getValue(r);
-            if (v.isNull()) {
-                try w.writeAll(NULL_MARKER);
-            } else {
-                const s = try sql.valueText(arena, v, .{ .bool_true = "true", .bool_false = "false" });
-                if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
-                try writeSanitized(w, s);
-            }
+            if (i > 0) try out.append(0x01);
+            try appendCell(out, c, r);
         }
-        try w.writeByte(0x02);
+        try out.append(0x02);
     }
 }
 
-fn writeSanitized(w: anytype, s: []const u8) !void {
-    var start: usize = 0;
-    for (s, 0..) |b, i| {
-        if (b == 0x01 or b == 0x02) {
-            try w.writeAll(s[start..i]);
-            try w.writeByte(' ');
-            start = i + 1;
-        }
+const CELL_BOUND = 512;
+
+/// The text `sql.valueText` gives the cell, with 0x01/0x02 in strings turned to
+/// spaces. Numbers and dates are rendered into a stack buffer: the widest, a
+/// float in plain notation, stays under `CELL_BOUND`.
+fn appendCell(out: *std.array_list.Managed(u8), c: *const Column, r: usize) !void {
+    if (!c.validity.get(r)) return out.appendSlice(NULL_MARKER);
+    var buf: [CELL_BOUND]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    switch (c.ty.kind) {
+        .string, .bytes => {
+            const s = c.data.bytes.at(r);
+            if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
+            return appendSanitized(out, s);
+        },
+        .bool => return out.appendSlice(if (c.data.b[r]) "true" else "false"),
+        .int => try w.print("{d}", .{c.data.i64[r]}),
+        .float => try w.print("{d}", .{c.data.f64[r]}),
+        .decimal => try eval.writeDecimal(&w, c.data.dec[r].unscaled, c.data.dec[r].scale),
+        .date => try eval.writeDate(&w, c.data.i32[r]),
+        .time => try eval.writeTime(&w, c.data.i64[r]),
+        .timestamp => try eval.writeTimestamp(&w, c.data.i64[r]),
+        .array, .@"struct" => return out.appendSlice(NULL_MARKER),
     }
-    try w.writeAll(s[start..]);
+    try out.appendSlice(w.buffered());
+}
+
+fn appendSanitized(out: *std.array_list.Managed(u8), s: []const u8) !void {
+    try out.ensureUnusedCapacity(s.len);
+    const dst = out.unusedCapacitySlice()[0..s.len];
+    @memcpy(dst, s);
+    for (dst) |*b| {
+        if (b.* == 0x01 or b.* == 0x02) b.* = ' ';
+    }
+    out.items.len += s.len;
 }
 
 pub const StreamLoadSink = struct {
@@ -352,10 +372,10 @@ pub const StreamLoadSink = struct {
     /// `load_size` or has been open half its timeout. A connection lost mid-stream
     /// only marks the transaction broken: later batches go to the spool alone and
     /// the commit replays it.
-    pub fn writeBatch(self: *StreamLoadSink, arena: std.mem.Allocator, batch: Batch) !void {
+    pub fn writeBatch(self: *StreamLoadSink, _: std.mem.Allocator, batch: Batch) !void {
         const t0 = try std.time.Instant.now();
         self.buffer.clearRetainingCapacity();
-        try appendBatchTsv(self.buffer.writer(), arena, batch);
+        try appendBatchTsv(&self.buffer, batch);
         self.encode_ns += (try std.time.Instant.now()).since(t0);
         const bytes = self.buffer.items;
         if (bytes.len == 0) return;
@@ -866,7 +886,7 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 3 };
 
     var out = std.array_list.Managed(u8).init(a);
-    try appendBatchTsv(out.writer(), a, batch);
+    try appendBatchTsv(&out, batch);
     try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x022\x01clean value\x02", out.items);
 }
 
@@ -885,7 +905,7 @@ test "a value that is literally the null marker is refused, not written as null"
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 1 };
 
     var out = std.array_list.Managed(u8).init(a);
-    try std.testing.expectError(error.StreamLoadNullMarkerInData, appendBatchTsv(out.writer(), a, batch));
+    try std.testing.expectError(error.StreamLoadNullMarkerInData, appendBatchTsv(&out, batch));
 
     var b1 = columnmod.Builder.init(a, str_ty);
     try b1.append(.{ .string = "a\\Nb" });
@@ -893,6 +913,89 @@ test "a value that is literally the null marker is refused, not written as null"
     cols2[0] = try b1.finish();
     const batch2 = Batch{ .schema = &schema, .columns = cols2, .len = 1 };
     out.clearRetainingCapacity();
-    try appendBatchTsv(out.writer(), a, batch2);
+    try appendBatchTsv(&out, batch2);
     try std.testing.expectEqualStrings("a\\Nb\x02", out.items);
+}
+
+fn appendBatchTsvReference(out: *std.array_list.Managed(u8), arena: std.mem.Allocator, batch: Batch) !void {
+    for (0..batch.len) |r| {
+        for (batch.columns, 0..) |*c, i| {
+            if (i > 0) try out.append(0x01);
+            const v = c.getValue(r);
+            if (v.isNull()) {
+                try out.appendSlice(NULL_MARKER);
+                continue;
+            }
+            const s = try sql.valueText(arena, v, .{ .bool_true = "true", .bool_false = "false" });
+            for (s) |b| try out.append(if (b == 0x01 or b == 0x02) ' ' else b);
+        }
+        try out.append(0x02);
+    }
+}
+
+test "stream-load body matches the per-value text path over random batches of every type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const columnmod = @import("../exec/column.zig");
+    const kinds = [_]types.Type{
+        types.Type.init(.int).asNullable(),
+        types.Type.init(.float).asNullable(),
+        types.Type.decimal(14, 2).asNullable(),
+        types.Type.decimal(38, 6).asNullable(),
+        types.Type.init(.date).asNullable(),
+        types.Type.init(.time).asNullable(),
+        types.Type.init(.timestamp).asNullable(),
+        types.Type.init(.bool).asNullable(),
+        types.Type.init(.string).asNullable(),
+        types.Type.init(.bytes).asNullable(),
+    };
+    const floats = [_]f64{ 0, -0.0, 1.5, -2.25, 1e-300, 5e-324, 1.7976931348623157e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 123456.789, 1e21, 0.1 };
+    const texts = [_][]const u8{ "", "plain", "a\x01b\x02c", "\x01\x02", "a\\Nb", "\\", "N", "  padded   ", "\xc3\xb3 utf8", "\\N " };
+    var prng = std.Random.DefaultPrng.init(0x57d);
+    const rnd = prng.random();
+    const rows = 300;
+    const cols = try a.alloc(columnmod.Column, kinds.len);
+    for (kinds, cols) |ty, *col| {
+        var b = columnmod.Builder.init(a, ty);
+        for (0..rows) |_| {
+            if (rnd.uintLessThan(u8, 6) == 0) {
+                try b.append(.null);
+                continue;
+            }
+            try b.append(switch (ty.kind) {
+                .int => .{ .int = switch (rnd.uintLessThan(u8, 3)) {
+                    0 => std.math.minInt(i64),
+                    1 => std.math.maxInt(i64),
+                    else => rnd.int(i32),
+                } },
+                .float => .{ .float = if (rnd.boolean()) floats[rnd.uintLessThan(usize, floats.len)] else (rnd.float(f64) - 0.5) * 1e6 },
+                .decimal => .{ .decimal = .{
+                    .unscaled = switch (rnd.uintLessThan(u8, 4)) {
+                        0 => rnd.int(i128) >> 6,
+                        1 => @as(i128, std.math.maxInt(u64)) * (if (rnd.boolean()) @as(i128, 1) else -1),
+                        2 => rnd.intRangeAtMost(i128, -999, 999),
+                        else => rnd.int(i64),
+                    },
+                    .scale = rnd.uintAtMost(u8, 12),
+                } },
+                .date => .{ .date = rnd.intRangeAtMost(i32, -800_000, 3_000_000) },
+                .time => .{ .time = rnd.intRangeAtMost(i64, 0, 86_400_000_000 - 1) },
+                .timestamp => .{ .timestamp = rnd.intRangeAtMost(i64, -100_000_000_000_000_000, 100_000_000_000_000_000) },
+                .bool => .{ .bool = rnd.boolean() },
+                .string => .{ .string = texts[rnd.uintLessThan(usize, texts.len)] },
+                else => .{ .bytes = texts[rnd.uintLessThan(usize, texts.len)] },
+            });
+        }
+        col.* = try b.finish();
+    }
+    const fields = try a.alloc(types.Schema.Field, kinds.len);
+    for (fields, kinds) |*f, ty| f.* = .{ .name = "c", .ty = ty };
+    var schema = types.Schema{ .fields = fields };
+    const batch = Batch{ .schema = &schema, .columns = cols, .len = rows };
+    var want = std.array_list.Managed(u8).init(a);
+    try appendBatchTsvReference(&want, a, batch);
+    var got = std.array_list.Managed(u8).init(a);
+    try appendBatchTsv(&got, batch);
+    try std.testing.expectEqualStrings(want.items, got.items);
 }
