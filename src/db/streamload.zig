@@ -160,51 +160,75 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 
 const NULL_MARKER = "\\N";
 
-/// Appends each cell's text straight into `out`, with no per-value allocation.
+/// Appends each cell's text straight into `out`: the batch's worst-case size is
+/// reserved once, so no cell allocates or checks capacity.
 pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
+    var bound: usize = batch.len;
+    for (batch.columns) |*c| {
+        bound += batch.len * (1 + cellBound(c.ty.kind));
+        if (c.data == .bytes) bound += c.data.bytes.values.len;
+    }
+    try out.ensureUnusedCapacity(bound);
     for (0..batch.len) |r| {
         for (batch.columns, 0..) |*c, i| {
-            if (i > 0) try out.append(0x01);
+            if (i > 0) out.appendAssumeCapacity(0x01);
             try appendCell(out, c, r);
         }
-        try out.append(0x02);
+        out.appendAssumeCapacity(0x02);
     }
 }
 
-const CELL_BOUND = 512;
+/// The longest text a non-null cell of the kind renders to, besides a string's
+/// own bytes; a float in plain notation is the widest, at 5e-324.
+fn cellBound(kind: types.TypeKind) usize {
+    return switch (kind) {
+        .string, .bytes, .array, .@"struct" => NULL_MARKER.len,
+        .bool => 5,
+        .int => 20,
+        .float => 340,
+        .decimal => 50,
+        .date => 24,
+        .time => 16,
+        .timestamp => 40,
+    };
+}
 
 /// The text `sql.valueText` gives the cell, with 0x01/0x02 in strings turned to
-/// spaces. Numbers and dates are rendered into a stack buffer: the widest, a
-/// float in plain notation, stays under `CELL_BOUND`.
+/// spaces, written into capacity `appendBatchTsv` reserved.
 fn appendCell(out: *std.array_list.Managed(u8), c: *const Column, r: usize) !void {
-    if (!c.validity.get(r)) return out.appendSlice(NULL_MARKER);
-    var buf: [CELL_BOUND]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
+    if (!c.validity.get(r)) return out.appendSliceAssumeCapacity(NULL_MARKER);
+    var w = std.Io.Writer.fixed(out.unusedCapacitySlice());
     switch (c.ty.kind) {
         .string, .bytes => {
             const s = c.data.bytes.at(r);
-            if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
+            if (s.len == NULL_MARKER.len and std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
             return appendSanitized(out, s);
         },
-        .bool => return out.appendSlice(if (c.data.b[r]) "true" else "false"),
+        .bool => return out.appendSliceAssumeCapacity(if (c.data.b[r]) "true" else "false"),
         .int => try w.print("{d}", .{c.data.i64[r]}),
         .float => try w.print("{d}", .{c.data.f64[r]}),
         .decimal => try eval.writeDecimal(&w, c.data.dec[r].unscaled, c.data.dec[r].scale),
         .date => try eval.writeDate(&w, c.data.i32[r]),
         .time => try eval.writeTime(&w, c.data.i64[r]),
         .timestamp => try eval.writeTimestamp(&w, c.data.i64[r]),
-        .array, .@"struct" => return out.appendSlice(NULL_MARKER),
+        .array, .@"struct" => return out.appendSliceAssumeCapacity(NULL_MARKER),
     }
-    try out.appendSlice(w.buffered());
+    out.items.len += w.end;
 }
 
-fn appendSanitized(out: *std.array_list.Managed(u8), s: []const u8) !void {
-    try out.ensureUnusedCapacity(s.len);
+/// Copies `s` with 0x01 and 0x02 replaced by spaces, sixteen bytes at a time.
+fn appendSanitized(out: *std.array_list.Managed(u8), s: []const u8) void {
+    const V = @Vector(16, u8);
+    const one: V = @splat(1);
+    const two: V = @splat(2);
+    const space: V = @splat(' ');
     const dst = out.unusedCapacitySlice()[0..s.len];
-    @memcpy(dst, s);
-    for (dst) |*b| {
-        if (b.* == 0x01 or b.* == 0x02) b.* = ' ';
+    var i: usize = 0;
+    while (i + 16 <= s.len) : (i += 16) {
+        const v: V = s[i..][0..16].*;
+        dst[i..][0..16].* = @select(u8, v -% one < two, space, v);
     }
+    for (s[i..], dst[i..]) |b, *d| d.* = if (b -% 1 < 2) ' ' else b;
     out.items.len += s.len;
 }
 
@@ -950,8 +974,8 @@ test "stream-load body matches the per-value text path over random batches of ev
         types.Type.init(.string).asNullable(),
         types.Type.init(.bytes).asNullable(),
     };
-    const floats = [_]f64{ 0, -0.0, 1.5, -2.25, 1e-300, 5e-324, 1.7976931348623157e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 123456.789, 1e21, 0.1 };
-    const texts = [_][]const u8{ "", "plain", "a\x01b\x02c", "\x01\x02", "a\\Nb", "\\", "N", "  padded   ", "\xc3\xb3 utf8", "\\N " };
+    const floats = [_]f64{ 0, -0.0, 1.5, -2.25, 1e-300, 5e-324, -5e-324, 1.7976931348623157e308, -1.7976931348623157e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 123456.789, 1e21, 0.1 };
+    const texts = [_][]const u8{ "", "plain", "a\x01b\x02c", "\x01\x02", "a\\Nb", "\\", "N", "  padded   ", "\xc3\xb3 utf8", "\\N ", "a long value\x01 that spans\x02 more than sixteen bytes\x01", "0123456789abcdef", "0123456789abcde\x02" };
     var prng = std.Random.DefaultPrng.init(0x57d);
     const rnd = prng.random();
     const rows = 300;
@@ -979,7 +1003,7 @@ test "stream-load body matches the per-value text path over random batches of ev
                     },
                     .scale = rnd.uintAtMost(u8, 12),
                 } },
-                .date => .{ .date = rnd.intRangeAtMost(i32, -800_000, 3_000_000) },
+                .date => .{ .date = if (rnd.uintLessThan(u8, 8) == 0) std.math.minInt(i32) + 1 else rnd.intRangeAtMost(i32, -800_000, 3_000_000) },
                 .time => .{ .time = rnd.intRangeAtMost(i64, 0, 86_400_000_000 - 1) },
                 .timestamp => .{ .timestamp = rnd.intRangeAtMost(i64, -100_000_000_000_000_000, 100_000_000_000_000_000) },
                 .bool => .{ .bool = rnd.boolean() },
