@@ -41,9 +41,9 @@ const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const keyset = @import("keyset.zig");
 const spill = @import("../spill.zig");
+const SpillDir = spill.TestDir;
 const spill_parts = @import("spill_parts.zig");
 const Space = @import("../space.zig").Space;
-const DirSpace = @import("../space.zig").DirSpace;
 const eval = @import("../eval.zig");
 const std = @import("std");
 const op_mod = @import("../op.zig");
@@ -51,6 +51,8 @@ const types = @import("../../lang/types.zig");
 const JoinRows = @import("testing_util.zig").JoinRows;
 const Scan = @import("../op.zig").Scan;
 const TestSource = @import("testing_util.zig").TestSource;
+const expectSameRows = @import("testing_util.zig").expectSameRows;
+const lessStr = @import("testing_util.zig").lessStr;
 const join_both_schema = @import("testing_util.zig").join_both_schema;
 const join_left_schema = @import("testing_util.zig").join_left_schema;
 const join_right_schema = @import("testing_util.zig").join_right_schema;
@@ -1497,26 +1499,6 @@ test "join: the build-size guard reports instead of exhausting memory" {
     try testing.expect(std.mem.indexOf(u8, ec.msg, "exceeds its cap") != null);
 }
 
-const SpillDir = struct {
-    tmp: testing.TmpDir,
-    path: []const u8,
-    ds: DirSpace,
-
-    fn init(a: std.mem.Allocator, cap: u64) !SpillDir {
-        var tmp = testing.tmpDir(.{ .iterate = true });
-        errdefer tmp.cleanup();
-        const path = try tmp.dir.realpathAlloc(a, ".");
-        return .{ .tmp = tmp, .path = path, .ds = .{ .dir = path, .cap = cap } };
-    }
-
-    fn files(self: *SpillDir) !usize {
-        var it = self.tmp.dir.iterate();
-        var n: usize = 0;
-        while (try it.next()) |_| n += 1;
-        return n;
-    }
-};
-
 const JoinSetup = struct {
     kind: ast.JoinKind,
     left: []const Batch,
@@ -1588,17 +1570,8 @@ fn runJoin(a: std.mem.Allocator, s: JoinSetup) !JoinOutcome {
             try rows.append(line.items);
         }
     }
-    std.mem.sort([]const u8, rows.items, {}, struct {
-        fn lt(_: void, x: []const u8, y: []const u8) bool {
-            return std.mem.lessThan(u8, x, y);
-        }
-    }.lt);
+    std.mem.sort([]const u8, rows.items, {}, lessStr);
     return .{ .rows = rows.items, .spilled = jn.grace != null, .deepest = if (jn.grace) |g| g.deepest else 0 };
-}
-
-fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
-    try testing.expectEqual(want.len, got.len);
-    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
 }
 
 /// `n` rows in batches of `per`: key `(i * mul) % mod`, null every `null_every`th
@@ -1626,8 +1599,8 @@ test "join spill: every kind, with and without a residual, gives the in-memory r
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
 
     const rv = try a.create(ast.Expr);
     rv.* = .{ .field = .{ .parts = &.{"rv"} } };
@@ -1658,7 +1631,7 @@ test "join spill: every kind, with and without a residual, gives the in-memory r
         const got = try runJoin(a, spilled);
         try testing.expect(got.spilled);
         try expectSameRows(want.rows, got.rows);
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     };
 }
 
@@ -1666,13 +1639,13 @@ test "join spill: a build side under the threshold stays in memory" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 50, 20, 1, 10, 7, "l");
     const right = try genBatches(a, &join_right_schema, 30, 10, 1, 10, 7, "r");
     const got = try runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 << 20 });
     try testing.expect(!got.spilled);
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 }
 
 const dec_right_schema = types.Schema{ .fields = &.{
@@ -1729,8 +1702,8 @@ test "join spill: decimal build keys and int probe keys that are equal land in t
         try testing.expect(used > 1);
     }
 
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 200, 64, 1, 40, 11, "l");
     var rights = std.array_list.Managed(Batch).init(a);
     for (0..3) |bi| {
@@ -1754,7 +1727,7 @@ test "join spill: decimal build keys and int probe keys that are equal land in t
         try testing.expect(got.deepest >= 1);
         try testing.expect(want.rows.len > 100);
         try expectSameRows(want.rows, got.rows);
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     }
 }
 
@@ -1762,8 +1735,8 @@ test "join spill: NOT IN never spills and still fails past the build cap" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
     const right = try genBatches(a, &join_right_schema, 40, 20, 1, 10, 1000, "r");
 
@@ -1776,15 +1749,15 @@ test "join spill: NOT IN never spills and still fails past the build cap" {
     defer op_mod.join_build_byte_cap = saved;
     try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .anti, .null_aware = true, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .err = &ec }));
     try testing.expect(std.mem.indexOf(u8, ec.msg, "a NOT IN build side never spills") != null);
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 }
 
 test "join spill: one key past the cap fails at once, naming the single key, and leaves no files" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
     const right = try genBatches(a, &join_right_schema, 400, 50, 0, 1, 1000, "r");
     for ([_]ast.JoinKind{ .inner, .right }) |kind| {
@@ -1794,7 +1767,7 @@ test "join spill: one key past the cap fails at once, naming the single key, and
         try testing.expect(std.mem.indexOf(u8, ec.msg, "a single join key holds 399 rows") != null);
         try testing.expect(std.mem.indexOf(u8, ec.msg, "--op-memory") != null);
         try testing.expectEqual(@as(u8, 0), deepest);
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     }
 
     var mixed = std.array_list.Managed(Batch).init(a);
@@ -1805,20 +1778,20 @@ test "join spill: one key past the cap fails at once, naming the single key, and
     try testing.expectError(error.JoinBuildTooLarge, runJoin(a, .{ .kind = .full, .left = left, .right = mixed.items, .space = sd.ds.space(), .spill_at = 1, .build_cap = 2048, .max_spill_depth = 8, .err = &ec, .deepest = &deepest }));
     try testing.expect(std.mem.indexOf(u8, ec.msg, "a single join key holds 399 rows") != null);
     try testing.expect(deepest < 4);
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 
     const fits = try runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 });
     try testing.expectEqual(@as(u8, 0), fits.deepest);
     try expectSameRows((try runJoin(a, .{ .kind = .inner, .left = left, .right = right })).rows, fits.rows);
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 }
 
 test "join spill: partitions past spill_at split again, two levels and more, for every kind" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
 
     const rv = try a.create(ast.Expr);
     rv.* = .{ .field = .{ .parts = &.{"rv"} } };
@@ -1843,7 +1816,7 @@ test "join spill: partitions past spill_at split again, two levels and more, for
             try testing.expect(got.spilled);
             try testing.expect(got.deepest >= if (at == 1) @as(u8, 2) else 1);
             try expectSameRows(want.rows, got.rows);
-            try testing.expectEqual(@as(usize, 0), try sd.files());
+            try testing.expectEqual(@as(usize, 0), try sd.count());
             try testing.expectEqual(@as(u64, 0), sd.ds.used.load(.monotonic));
         }
     };
@@ -1856,13 +1829,13 @@ test "join spill: the disk holds about one copy of the data while partitions spl
     const left = try genBatches(a, &join_left_schema, 3000, 256, 7, 2500, 31, "l");
     const right = try genBatches(a, &join_right_schema, 4000, 300, 3, 1500, 41, "r");
 
-    var flat = try SpillDir.init(a, 1 << 30);
-    defer flat.tmp.cleanup();
+    const flat = try SpillDir.init(1 << 30);
+    defer flat.deinit();
     const one = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = flat.ds.space(), .spill_at = 1, .max_spill_depth = 1 });
     try testing.expectEqual(@as(u8, 0), one.deepest);
 
-    var deep = try SpillDir.init(a, 1 << 30);
-    defer deep.tmp.cleanup();
+    const deep = try SpillDir.init(1 << 30);
+    defer deep.deinit();
     const got = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = deep.ds.space(), .spill_at = 1 });
     try testing.expect(got.deepest >= 2);
     try expectSameRows(one.rows, got.rows);
@@ -1874,8 +1847,8 @@ test "join spill: decimal build keys meet equal int probe keys at every depth" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 3000, 256, 1, 2200, 37, "l");
     var rights = std.array_list.Managed(Batch).init(a);
     var k: usize = 0;
@@ -1900,7 +1873,7 @@ test "join spill: decimal build keys meet equal int probe keys at every depth" {
         try testing.expect(got.deepest >= 2);
         try testing.expect(want.rows.len > 100);
         try expectSameRows(want.rows, got.rows);
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     }
 }
 
@@ -1908,8 +1881,8 @@ test "join spill: a partition still past the cap at the depth limit fails with S
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 1 << 30);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(1 << 30);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 500, 100, 1, 500, 1000, "l");
     const right = try genBatches(a, &join_right_schema, 2000, 200, 1, 500, 1000, "r");
     for ([_]u8{ 1, 2 }) |depth| {
@@ -1918,12 +1891,12 @@ test "join spill: a partition still past the cap at the depth limit fails with S
         try testing.expectError(error.SpillTooDeep, runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .build_cap = 1024, .max_spill_depth = depth, .err = &ec, .deepest = &deepest }));
         try testing.expect(std.mem.indexOf(u8, ec.msg, "levels of spilling") != null);
         try testing.expectEqual(depth - 1, deepest);
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     }
     const want = try runJoin(a, .{ .kind = .full, .left = left, .right = right });
     const got = try runJoin(a, .{ .kind = .full, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .build_cap = 1024 });
     try expectSameRows(want.rows, got.rows);
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 }
 
 test "join spill: the disk cap stopping a join mid-split leaves no files" {
@@ -1935,14 +1908,14 @@ test "join spill: the disk cap stopping a join mid-split leaves no files" {
     var deep_fail = false;
     var cap: u64 = 4096;
     while (cap < 1 << 20) : (cap += cap / 8) {
-        var sd = try SpillDir.init(a, cap);
-        defer sd.tmp.cleanup();
+        const sd = try SpillDir.init(cap);
+        defer sd.deinit();
         var deepest: u8 = 0;
         if (runJoin(a, .{ .kind = .right, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1, .deepest = &deepest })) |_| {} else |e| {
             try testing.expectEqual(error.SpillCapExceeded, e);
             if (deepest >= 1) deep_fail = true;
         }
-        try testing.expectEqual(@as(usize, 0), try sd.files());
+        try testing.expectEqual(@as(usize, 0), try sd.count());
     }
     try testing.expect(deep_fail);
 }
@@ -1951,10 +1924,10 @@ test "join spill: the disk cap stops a spilling join" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var sd = try SpillDir.init(a, 4096);
-    defer sd.tmp.cleanup();
+    const sd = try SpillDir.init(4096);
+    defer sd.deinit();
     const left = try genBatches(a, &join_left_schema, 40, 20, 1, 10, 7, "l");
     const right = try genBatches(a, &join_right_schema, 2000, 100, 1, 500, 1000, "r");
     try testing.expectError(error.SpillCapExceeded, runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 }));
-    try testing.expectEqual(@as(usize, 0), try sd.files());
+    try testing.expectEqual(@as(usize, 0), try sd.count());
 }

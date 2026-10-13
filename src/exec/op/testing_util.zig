@@ -31,6 +31,15 @@ pub const TestSource = struct {
     }
 };
 
+pub fn lessStr(_: void, x: []const u8, y: []const u8) bool {
+    return std.mem.lessThan(u8, x, y);
+}
+
+pub fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
+}
+
 pub fn intBatch(a: std.mem.Allocator, schema: *const types.Schema, vals: []const ?i64) !Batch {
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try column.intColumn(a, vals);

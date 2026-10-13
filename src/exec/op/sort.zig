@@ -22,8 +22,8 @@ const Batch = @import("../batch.zig").Batch;
 const Decimal = @import("../value.zig").Decimal;
 const Op = @import("../op.zig").Op;
 const Space = @import("../space.zig").Space;
-const DirSpace = @import("../space.zig").DirSpace;
 const spill = @import("../spill.zig");
+const SpillDir = spill.TestDir;
 const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
@@ -1023,35 +1023,6 @@ test "sortIdx: the radix words order rows exactly as the comparator does" {
         };
     }
 }
-
-const SpillDir = struct {
-    tmp: testing.TmpDir,
-    path: []const u8,
-    ds: DirSpace,
-
-    fn init(cap: u64) !*SpillDir {
-        const self = try testing.allocator.create(SpillDir);
-        errdefer testing.allocator.destroy(self);
-        self.tmp = testing.tmpDir(.{ .iterate = true });
-        errdefer self.tmp.cleanup();
-        self.path = try self.tmp.dir.realpathAlloc(testing.allocator, ".");
-        self.ds = .{ .dir = self.path, .cap = cap };
-        return self;
-    }
-
-    fn deinit(self: *SpillDir) void {
-        testing.allocator.free(self.path);
-        self.tmp.cleanup();
-        testing.allocator.destroy(self);
-    }
-
-    fn count(self: *SpillDir) !usize {
-        var it = self.tmp.dir.iterate();
-        var n: usize = 0;
-        while (try it.next()) |_| n += 1;
-        return n;
-    }
-};
 
 const mixed_schema = types.Schema{ .fields = &.{
     .{ .name = "i", .ty = types.Type.init(.int).asNullable() },

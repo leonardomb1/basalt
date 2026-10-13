@@ -22,6 +22,8 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
 const TestSource = @import("testing_util.zig").TestSource;
+const expectSameRows = @import("testing_util.zig").expectSameRows;
+const lessStr = @import("testing_util.zig").lessStr;
 const intBatch = @import("testing_util.zig").intBatch;
 const int_schema = @import("testing_util.zig").int_schema;
 const strBatch = @import("testing_util.zig").strBatch;
@@ -294,7 +296,7 @@ test "distinct dedups across batches, groups nulls as one key, deep-copies strin
     }
 }
 
-const SpillDir = @import("aggregate/spill.zig").TestDir;
+const SpillDir = @import("../spill.zig").TestDir;
 
 const spill_schema = types.Schema{ .fields = &.{
     .{ .name = "k", .ty = types.Type.init(.int).asNullable() },
@@ -323,10 +325,6 @@ fn spillInput(a: std.mem.Allocator, rows: usize, per: usize, groups: usize) ![]B
     return out;
 }
 
-fn lessStr(_: void, x: []const u8, y: []const u8) bool {
-    return std.mem.lessThan(u8, x, y);
-}
-
 /// Every output row as `k|s|v`, sorted.
 fn runSpillDistinct(a: std.mem.Allocator, input: []const Batch, keys: ?[]const usize, space: ?Space, spill_at: usize, err: ?*ErrCtx) ![]const []const u8 {
     var ts = TestSource{ .schema_ = spill_schema, .batches = input };
@@ -348,11 +346,6 @@ fn runSpillDistinct(a: std.mem.Allocator, input: []const Batch, keys: ?[]const u
     return rows.items;
 }
 
-fn expectSameRows(want: []const []const u8, got: []const []const u8) !void {
-    try testing.expectEqual(want.len, got.len);
-    for (want, got) |w, g| try testing.expectEqualStrings(w, g);
-}
-
 test "distinct spill: DISTINCT and DISTINCT ON keep the same rows, first per key, as in memory" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -366,7 +359,7 @@ test "distinct spill: DISTINCT and DISTINCT ON keep the same rows, first per key
             defer td.deinit();
             try expectSameRows(want, try runSpillDistinct(a, input, keys, td.ds.space(), at, null));
             if (at == 1 and want.len > 200) try testing.expect(td.ds.seq.load(.monotonic) > 0);
-            try testing.expectEqual(@as(usize, 0), try td.files());
+            try testing.expectEqual(@as(usize, 0), try td.count());
         }
     }
     const first = try runSpillDistinct(a, input, &.{0}, null, std.math.maxInt(usize), null);
@@ -395,5 +388,5 @@ test "distinct spill: past the disk cap fails with SpillCapExceeded" {
     var ec = ErrCtx{};
     try testing.expectError(error.SpillCapExceeded, runSpillDistinct(a, input, null, td.ds.space(), 1, &ec));
     try testing.expect(std.mem.indexOf(u8, ec.msg, "--spill-cap") != null);
-    try testing.expectEqual(@as(usize, 0), try td.files());
+    try testing.expectEqual(@as(usize, 0), try td.count());
 }

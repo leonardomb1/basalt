@@ -284,12 +284,12 @@ pub const Reader = struct {
 
 const testing = std.testing;
 
-const TestDir = struct {
+pub const TestDir = struct {
     tmp: testing.TmpDir,
     path: []const u8,
     ds: space_mod.DirSpace,
 
-    fn init(cap: u64) !*TestDir {
+    pub fn init(cap: u64) !*TestDir {
         const self = try testing.allocator.create(TestDir);
         errdefer testing.allocator.destroy(self);
         self.tmp = testing.tmpDir(.{ .iterate = true });
@@ -299,13 +299,13 @@ const TestDir = struct {
         return self;
     }
 
-    fn deinit(self: *TestDir) void {
+    pub fn deinit(self: *TestDir) void {
         testing.allocator.free(self.path);
         self.tmp.cleanup();
         testing.allocator.destroy(self);
     }
 
-    fn count(self: *TestDir) !usize {
+    pub fn count(self: *TestDir) !usize {
         var it = self.tmp.dir.iterate();
         var n: usize = 0;
         while (try it.next()) |_| n += 1;
