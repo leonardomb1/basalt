@@ -659,6 +659,12 @@ pub const Writer = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
+    pub fn openUnit(self: *Writer, arena: std.mem.Allocator) !driver.UnitEncoder {
+        const u = try arena.create(UnitEnc);
+        u.* = .{ .parent = self, .arena = arena, .held = List(Batch).init(arena) };
+        return .{ .ptr = u, .vtable = &UnitEnc.vtable };
+    }
+
     fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
         const cols = try arena.alloc(ColBuf, self.cols.len);
         for (cols, self.maps) |*c, m| {
@@ -1056,26 +1062,7 @@ fn decimalBytes(b: []u8, x: i128) Error!void {
     if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
 }
 
-const sink_vtable = driver.Sink.VTable{
-    .writeBatch = sinkWrite,
-    .close = sinkClose,
-    .abort = sinkAbort,
-    .openUnit = sinkOpenUnit,
-};
-fn sinkOpenUnit(p: *anyopaque, arena: std.mem.Allocator) anyerror!driver.UnitEncoder {
-    const u = try arena.create(UnitEnc);
-    u.* = .{ .parent = @ptrCast(@alignCast(p)), .arena = arena, .held = List(Batch).init(arena) };
-    return .{ .ptr = u, .vtable = &UnitEnc.vtable };
-}
-fn sinkWrite(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    return @as(*Writer, @ptrCast(@alignCast(p))).writeBatch(arena, b);
-}
-fn sinkClose(p: *anyopaque) anyerror!void {
-    return @as(*Writer, @ptrCast(@alignCast(p))).close();
-}
-fn sinkAbort(p: *anyopaque) void {
-    @as(*Writer, @ptrCast(@alignCast(p))).abort();
-}
+const sink_vtable = driver.sinkVTable(Writer);
 
 const testing = std.testing;
 

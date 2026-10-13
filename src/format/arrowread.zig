@@ -1071,21 +1071,7 @@ fn copyAs(comptime T: type, arena: std.mem.Allocator, src: []const u8, n: usize)
     return out;
 }
 
-const source_vtable = driver.Source.VTable{
-    .schema = srcSchema,
-    .next = srcNext,
-    .close = srcClose,
-};
-
-fn srcSchema(p: *anyopaque) types.Schema {
-    return @as(*Reader, @ptrCast(@alignCast(p))).schema;
-}
-fn srcNext(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    return @as(*Reader, @ptrCast(@alignCast(p))).next(arena);
-}
-fn srcClose(p: *anyopaque) void {
-    @as(*Reader, @ptrCast(@alignCast(p))).close();
-}
+const source_vtable = driver.sourceVTable(Reader);
 
 fn dump(a: std.mem.Allocator, bytes: []const u8, want: ?[]const []const u8) ![]const u8 {
     const r = try Reader.openBytes(a, bytes, want);

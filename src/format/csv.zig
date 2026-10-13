@@ -812,6 +812,8 @@ pub const CsvSliceReader = struct {
         return .{ .ptr = self, .vtable = &slice_vtable };
     }
 
+    pub fn close(_: *CsvSliceReader) void {}
+
     /// Counted only for an error message: a split file has no quoted newline, so its
     /// newlines are its line breaks.
     fn lineOf(self: *const CsvSliceReader, line: []const u8) u64 {
@@ -821,20 +823,7 @@ pub const CsvSliceReader = struct {
     }
 };
 
-const slice_vtable = driver.Source.VTable{
-    .schema = sliceSchema,
-    .next = sliceNext,
-    .close = sliceClose,
-};
-fn sliceSchema(ptr: *anyopaque) types.Schema {
-    const self: *CsvSliceReader = @ptrCast(@alignCast(ptr));
-    return self.schema.*;
-}
-fn sliceNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    const self: *CsvSliceReader = @ptrCast(@alignCast(ptr));
-    return self.next(arena);
-}
-fn sliceClose(_: *anyopaque) void {}
+const slice_vtable = driver.sourceVTable(CsvSliceReader);
 
 pub const SAMPLE_ROWS = 1024;
 
@@ -1251,23 +1240,7 @@ inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8,
     return appendCell(b, if (enc == .utf8) raw else try decodeField(arena, enc, raw), quoted);
 }
 
-const source_vtable = driver.Source.VTable{
-    .schema = srcSchema,
-    .next = srcNext,
-    .close = srcClose,
-};
-fn srcSchema(ptr: *anyopaque) types.Schema {
-    const self: *CsvReader = @ptrCast(@alignCast(ptr));
-    return self.schema;
-}
-fn srcNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-    const self: *CsvReader = @ptrCast(@alignCast(ptr));
-    return self.next(arena);
-}
-fn srcClose(ptr: *anyopaque) void {
-    const self: *CsvReader = @ptrCast(@alignCast(ptr));
-    self.close();
-}
+const source_vtable = driver.sourceVTable(CsvReader);
 
 pub const CsvWriter = struct {
     backend: Backend,
@@ -1522,33 +1495,7 @@ pub const CsvWriter = struct {
     }
 };
 
-const sink_vtable = driver.Sink.VTable{
-    .writeBatch = sinkWrite,
-    .close = sinkClose,
-    .abort = sinkAbort,
-    .renderBatch = sinkRender,
-    .writeRendered = sinkWriteRendered,
-};
-fn sinkRender(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror![]const u8 {
-    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
-    return self.renderBatch(arena, b);
-}
-fn sinkWriteRendered(ptr: *anyopaque, bytes: []const u8) anyerror!void {
-    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
-    return self.writeRendered(bytes);
-}
-fn sinkWrite(ptr: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
-    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
-    return self.writeBatch(arena, b);
-}
-fn sinkClose(ptr: *anyopaque) anyerror!void {
-    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
-    return self.close();
-}
-fn sinkAbort(ptr: *anyopaque) void {
-    const self: *CsvWriter = @ptrCast(@alignCast(ptr));
-    self.abort();
-}
+const sink_vtable = driver.sinkVTable(CsvWriter);
 
 /// Numbers and timestamps render with only digits and `+-.:eE `, so under an
 /// ordinary delimiter they skip the quote scan; a `.` or `-` delimiter cannot.
