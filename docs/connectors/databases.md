@@ -21,6 +21,17 @@ CREATE privilege; one that does lack a privilege it needs gets StarRocks' own
 message in the error (`starrocks refused 'CREATE TABLE …': Access denied; you
 need …`), not only in the log.
 
+A load streams its rows into one stream-load transaction until the body reaches
+`load_size` (default `'512MB'`; a size like `'64MB'` or a byte count) or has
+been open five minutes, then commits it and starts the next, so rows become
+visible a transaction at a time and a failed run leaves the open one
+uncommitted. Each transaction is also written to a spool file in the run's
+spill directory (`--spill-dir`, counted against `--spill-cap`; on a RAM-backed
+`/tmp` that is memory, up to one `load_size` per lane), so a connection lost
+along the way — the server restarting, say — resends it under the same label
+instead of failing the load. A load the server refuses is not resent: the run
+fails with the server's message.
+
 ## Doris
 
 A `doris` connection is the same in every respect — Doris is the project

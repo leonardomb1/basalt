@@ -259,7 +259,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
 }
 
 pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.Flavor) !streamload.Config {
-    var cfg = streamload.Config{ .flavor = flavor, .database = "", .errctx = env.errctx };
+    var cfg = streamload.Config{ .flavor = flavor, .database = "", .errctx = env.errctx, .space = env.space };
     for (conn.config) |attr| {
         const k = attr.key;
         if (eqlAny(k, &.{ "host", "fe_host" })) {
@@ -282,6 +282,10 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
             cfg.auto_create = try evalCfgBool(env, attr.value);
         } else if (std.mem.eql(u8, k, "label_prefix")) {
             cfg.label_prefix = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "load_size")) {
+            const txt = try evalCfgStr(env, attr.value);
+            cfg.load_size = env_mod.parseByteSize(txt) orelse 0;
+            if (cfg.load_size == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`load_size` must be a positive size like '512MB', not '{s}'", .{txt}));
         }
     }
     if (cfg.database.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} connection needs a `database`", .{flavor.name()}));

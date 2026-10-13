@@ -15,10 +15,16 @@
 //! escape in StarRocks CSV, so a value that is exactly `\N` is refused rather than
 //! silently loaded as NULL; loads run at max_filter_ratio=0, never partial.
 //!
-//! Each flush has a label, which makes it at-most-once within a run. Labels do not
-//! give cross-run idempotency (split ranges are reassigned to lanes
-//! non-deterministically); exactly-once across runs is owned by downstream dedup
-//! on a primary-key table, per the split.zig contract.
+//! The body streams with chunked transfer encoding: each batch is one chunk of a
+//! transaction that stays open until it reaches `load_size` (or half its timeout),
+//! so the server ingests while the lane reads on and its fixed per-transaction
+//! cost is paid rarely. Each transaction is teed to a spool file in the run's
+//! scratch space and truncated after its commit; a transient failure resends the
+//! spool under the same label, which keeps memory constant and the transaction
+//! at-most-once: the server's answer for a reused label tells committed from
+//! aborted. Labels do not give cross-run idempotency (split ranges are reassigned
+//! to lanes non-deterministically); exactly-once across runs is owned by
+//! downstream dedup on a primary-key table, per the split.zig contract.
 //!
 //! `logger` and `errctx` are set by the runtime after `open`, so a refused load or
 //! DDL carries the server's own message (e.g. the missing privilege) into the
@@ -26,8 +32,8 @@
 //! StarRocks checks the CREATE privilege before `IF NOT EXISTS` can no-op, so a
 //! role allowed only to load would otherwise be refused.
 //!
-//! The pure logic (type mapping, DDL, body, labels, auth) is unit-tested; the
-//! network paths need a live server.
+//! The pure logic (type mapping, DDL, body, labels, response outcomes) is
+//! unit-tested; the network paths need a live server.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -38,8 +44,12 @@ const mysql = @import("mysql.zig");
 const sql = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
+const Space = @import("../exec/space.zig").Space;
 
-const FLUSH_BYTES = 8 * 1024 * 1024;
+const TIMEOUT_S = 600;
+const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
+const RETRY_BUDGET_NS = (TIMEOUT_S + 120) * std.time.ns_per_s;
+const REPLAY_CHUNK = 1 << 20;
 
 pub const Flavor = enum {
     starrocks,
@@ -92,6 +102,8 @@ pub const Config = struct {
     auto_create: bool = true,
     label_prefix: []const u8 = "basalt",
     run_id: u64 = 0,
+    load_size: u64 = 512 << 20,
+    space: ?Space = null,
     errctx: ?*op.ErrCtx = null,
 };
 
@@ -188,11 +200,27 @@ pub const StreamLoadSink = struct {
     client: std.http.Client,
     logger: ?*obs.Logger = null,
     errctx: ?*op.ErrCtx = null,
+    url: []const u8 = "",
+    auth: []const u8 = "",
+    label: []const u8 = "",
+    headers: std.array_list.Managed(std.http.Header),
+    txn: ?Txn = null,
+    txn_bytes: u64 = 0,
+    txn_started: std.time.Instant,
+    broken: bool = false,
+    spool: ?Space.File = null,
     opened: std.time.Instant,
     setup_ns: u64 = 0,
     encode_ns: u64 = 0,
-    flush_ns: u64 = 0,
+    spool_ns: u64 = 0,
+    send_ns: u64 = 0,
+    wait_ns: u64 = 0,
     sent_bytes: u64 = 0,
+
+    const Txn = struct {
+        req: std.http.Client.Request,
+        body: std.http.BodyWriter,
+    };
 
     pub fn open(gpa: std.mem.Allocator, cfg: Config, table: []const u8, schema: types.Schema, mode: ast.WriteMode) !*StreamLoadSink {
         const self = try gpa.create(StreamLoadSink);
@@ -202,6 +230,7 @@ pub const StreamLoadSink = struct {
         var cfg_owned = cfg;
         cfg_owned.label_prefix = try gpa.dupe(u8, cfg.label_prefix);
         errdefer gpa.free(cfg_owned.label_prefix);
+        const now = try std.time.Instant.now();
         self.* = .{
             .gpa = gpa,
             .cfg = cfg_owned,
@@ -210,12 +239,16 @@ pub const StreamLoadSink = struct {
             .columns = columns,
             .mode = mode,
             .buffer = std.array_list.Managed(u8).init(gpa),
+            .headers = std.array_list.Managed(std.http.Header).init(gpa),
             .run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp()),
             .client = std.http.Client{ .allocator = gpa },
-            .opened = try std.time.Instant.now(),
+            .opened = now,
+            .txn_started = now,
         };
         errdefer self.buffer.deinit();
         errdefer self.client.deinit();
+        errdefer self.freeRequestParts();
+        try self.buildRequestParts();
         if (cfg.auto_create) {
             if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
                 if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
@@ -240,6 +273,36 @@ pub const StreamLoadSink = struct {
 
     pub fn sink(self: *StreamLoadSink) driver.Sink {
         return .{ .ptr = self, .vtable = &sink_vtable };
+    }
+
+    /// The URL and headers every transaction sends; the label is filled per transaction.
+    fn buildRequestParts(self: *StreamLoadSink) !void {
+        self.url = try std.fmt.allocPrint(self.gpa, "{s}/api/{s}/{s}/_stream_load", .{ self.cfg.load_url, self.db, self.table });
+        const cred = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ self.cfg.user, self.cfg.password });
+        defer self.gpa.free(cred);
+        const b64 = try self.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(cred.len));
+        defer self.gpa.free(b64);
+        self.auth = try std.fmt.allocPrint(self.gpa, "Basic {s}", .{std.base64.standard.Encoder.encode(b64, cred)});
+        const h = &self.headers;
+        try h.append(.{ .name = "Authorization", .value = self.auth });
+        try h.append(.{ .name = "label", .value = "" });
+        try h.append(.{ .name = "format", .value = "CSV" });
+        try h.append(.{ .name = "column_separator", .value = "\\x01" });
+        try h.append(.{ .name = self.cfg.flavor.rowDelimiterHeader(), .value = "\\x02" });
+        try h.append(.{ .name = "columns", .value = self.columns });
+        try h.append(.{ .name = "max_filter_ratio", .value = "0" });
+        try h.append(.{ .name = "timeout", .value = std.fmt.comptimePrint("{d}", .{TIMEOUT_S}) });
+        if (self.cfg.flavor.strict()) try h.append(.{ .name = "strict_mode", .value = "true" });
+        if (self.mode == .upsert and self.mode.upsert.partial != null) {
+            try h.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
+        }
+    }
+
+    fn freeRequestParts(self: *StreamLoadSink) void {
+        self.headers.deinit();
+        self.gpa.free(self.url);
+        self.gpa.free(self.auth);
+        self.gpa.free(self.label);
     }
 
     fn runDDL(self: *StreamLoadSink, stmt: []const u8) !void {
@@ -281,118 +344,263 @@ pub const StreamLoadSink = struct {
         };
     }
 
+    /// Encodes the batch once, tees it to the spool and streams it into the open
+    /// transaction as one chunk, then commits when the transaction reaches
+    /// `load_size` or has been open half its timeout. A connection lost mid-stream
+    /// only marks the transaction broken: later batches go to the spool alone and
+    /// the commit replays it.
     pub fn writeBatch(self: *StreamLoadSink, arena: std.mem.Allocator, batch: Batch) !void {
         const t0 = try std.time.Instant.now();
+        self.buffer.clearRetainingCapacity();
         try appendBatchTsv(self.buffer.writer(), arena, batch);
         self.encode_ns += (try std.time.Instant.now()).since(t0);
-        if (self.buffer.items.len >= FLUSH_BYTES) try self.flush();
+        const bytes = self.buffer.items;
+        if (bytes.len == 0) return;
+        if (self.txn_bytes == 0) {
+            self.seq += 1;
+            self.txn_started = try std.time.Instant.now();
+            self.gpa.free(self.label);
+            self.label = "";
+            self.label = try genLabel(self.gpa, self.cfg.label_prefix, self.table, self.run_id, self.seq);
+            self.headers.items[1].value = self.label;
+        }
+        try self.spoolWrite(bytes);
+        self.txn_bytes += bytes.len;
+        if (!self.broken) self.send(bytes) catch |e| try self.sendFailed(e);
+        const age = (try std.time.Instant.now()).since(self.txn_started);
+        if (self.txn_bytes >= self.cfg.load_size or age >= MAX_AGE_NS) try self.commit();
     }
 
     /// At debug level, a closing line splits the sink's lifetime into body
-    /// encoding, time blocked in Stream Load, and the rest (reading upstream).
+    /// encoding, spool writes, time blocked writing the body to the socket, time
+    /// waiting for the commit's answer, and the rest (reading upstream).
     pub fn close(self: *StreamLoadSink) !void {
         defer self.teardown();
-        try self.flush();
+        try self.commit();
         if (self.logger) |lg| {
             const life = (std.time.Instant.now() catch self.opened).since(self.opened);
-            lg.log(.debug, "stream load {s} closed: {d} loads, {d} bytes, life {d} ms, setup {d} ms, encode {d} ms, flush {d} ms", .{
-                self.table, self.seq, self.sent_bytes, life / std.time.ns_per_ms, self.setup_ns / std.time.ns_per_ms, self.encode_ns / std.time.ns_per_ms, self.flush_ns / std.time.ns_per_ms,
+            const ms = std.time.ns_per_ms;
+            lg.log(.debug, "stream load {s} closed: {d} loads, {d} bytes, life {d} ms, setup {d} ms, encode {d} ms, spool {d} ms, send {d} ms, wait {d} ms", .{
+                self.table, self.seq, self.sent_bytes, life / ms, self.setup_ns / ms, self.encode_ns / ms, self.spool_ns / ms, self.send_ns / ms, self.wait_ns / ms,
             });
         }
     }
 
-    /// Drops the buffered body; loads already sent are committed and stay.
+    /// Drops the open transaction without its terminating chunk, so the server
+    /// aborts it; transactions already committed stay.
     pub fn abort(self: *StreamLoadSink) void {
         self.teardown();
     }
 
     fn teardown(self: *StreamLoadSink) void {
+        self.dropTxn();
         self.client.deinit();
+        if (self.spool) |sp| {
+            sp.file.close();
+            std.fs.cwd().deleteFile(sp.path) catch {};
+            self.gpa.free(sp.path);
+            if (self.cfg.space) |space| space.release(self.txn_bytes);
+        }
         self.buffer.deinit();
+        self.freeRequestParts();
         self.gpa.free(self.columns);
         self.gpa.free(self.cfg.label_prefix);
         self.gpa.destroy(self);
     }
 
-    fn flush(self: *StreamLoadSink) !void {
-        if (self.buffer.items.len == 0) return;
+    fn spoolWrite(self: *StreamLoadSink, bytes: []const u8) !void {
+        const space = self.cfg.space orelse return;
         const t0 = try std.time.Instant.now();
-        defer self.flush_ns += (std.time.Instant.now() catch t0).since(t0);
-        self.seq += 1;
-        var attempt: usize = 0;
-        while (true) {
-            self.streamLoad() catch |e| {
-                attempt += 1;
-                if (attempt >= 3 or !driver.transientNet(e)) return e;
-                std.Thread.sleep(attempt * 500 * std.time.ns_per_ms);
-                continue;
-            };
-            break;
-        }
-        self.sent_bytes += self.buffer.items.len;
-        self.buffer.clearRetainingCapacity();
+        defer self.spool_ns += (std.time.Instant.now() catch t0).since(t0);
+        if (self.spool == null) self.spool = try space.create(self.gpa, "streamload");
+        try space.charge(bytes.len);
+        try self.spool.?.file.writeAll(bytes);
     }
 
-    fn streamLoad(self: *StreamLoadSink) !void {
-        const url = try std.fmt.allocPrint(self.gpa, "{s}/api/{s}/{s}/_stream_load", .{ self.cfg.load_url, self.db, self.table });
-        defer self.gpa.free(url);
-        const label = try genLabel(self.gpa, self.cfg.label_prefix, self.table, self.run_id, self.seq);
-        defer self.gpa.free(label);
+    fn spoolReset(self: *StreamLoadSink) !void {
+        const sp = self.spool orelse return;
+        try sp.file.setEndPos(0);
+        try sp.file.seekTo(0);
+        if (self.cfg.space) |space| space.release(self.txn_bytes);
+    }
 
-        const cred = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ self.cfg.user, self.cfg.password });
-        defer self.gpa.free(cred);
-        var enc: [512]u8 = undefined;
-        const b64 = std.base64.standard.Encoder.encode(&enc, cred);
-        const auth = try std.fmt.allocPrint(self.gpa, "Basic {s}", .{b64});
-        defer self.gpa.free(auth);
+    /// Opens the transaction's request: chunked, one connection of its own, with
+    /// send and receive timeouts so a server that stops reading cannot hang the lane.
+    fn begin(self: *StreamLoadSink) !void {
+        const uri = try std.Uri.parse(self.url);
+        self.txn = .{ .req = try self.client.request(.PUT, uri, .{
+            .redirect_behavior = .unhandled,
+            .keep_alive = false,
+            .headers = .{ .accept_encoding = .omit },
+            .extra_headers = self.headers.items,
+        }), .body = undefined };
+        errdefer self.dropTxn();
+        const t = &self.txn.?;
+        const fd = t.req.connection.?.stream_writer.getStream().handle;
+        driver.tuneSocket(fd);
+        const tv = std.posix.timeval{ .sec = TIMEOUT_S, .usec = 0 };
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        t.req.transfer_encoding = .chunked;
+        t.body = t.req.sendBodyUnflushed(&.{}) catch return self.writeErr();
+    }
 
-        var hdrs = std.array_list.Managed(std.http.Header).init(self.gpa);
-        defer hdrs.deinit();
-        try hdrs.append(.{ .name = "Authorization", .value = auth });
-        try hdrs.append(.{ .name = "label", .value = label });
-        try hdrs.append(.{ .name = "format", .value = "CSV" });
-        try hdrs.append(.{ .name = "column_separator", .value = "\\x01" });
-        try hdrs.append(.{ .name = self.cfg.flavor.rowDelimiterHeader(), .value = "\\x02" });
-        try hdrs.append(.{ .name = "columns", .value = self.columns });
-        try hdrs.append(.{ .name = "max_filter_ratio", .value = "0" });
-        if (self.cfg.flavor.strict()) try hdrs.append(.{ .name = "strict_mode", .value = "true" });
-        if (self.mode == .upsert and self.mode.upsert.partial != null) {
-            try hdrs.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
+    fn dropTxn(self: *StreamLoadSink) void {
+        if (self.txn) |*t| {
+            if (t.req.connection) |c| c.closing = true;
+            t.req.deinit();
+            self.txn = null;
         }
+    }
 
+    fn send(self: *StreamLoadSink, bytes: []const u8) !void {
+        const t0 = try std.time.Instant.now();
+        defer self.send_ns += (std.time.Instant.now() catch t0).since(t0);
+        if (self.txn == null) try self.begin();
+        const body = &self.txn.?.body;
+        body.writer.writeAll(bytes) catch return self.writeErr();
+        body.flush() catch return self.writeErr();
+    }
+
+    /// The socket error behind a failed body write.
+    fn writeErr(self: *StreamLoadSink) anyerror {
+        const t = self.txn orelse return error.WriteFailed;
+        const c = t.req.connection orelse return error.WriteFailed;
+        return c.stream_writer.err orelse error.WriteFailed;
+    }
+
+    /// A body write failed: when the server already answered (it closes the
+    /// socket on a refusal it can make early, like a reused label), that answer
+    /// decides; otherwise the transaction is replayed at commit.
+    fn sendFailed(self: *StreamLoadSink, e: anyerror) !void {
+        if (!transient(e)) {
+            self.dropTxn();
+            return e;
+        }
+        obs.logOr(self.logger, .warn, "stream load {s} #{d}: connection lost mid-body ({s}), replaying at commit", .{ self.table, self.seq, @errorName(e) });
+        if (self.txn != null and e != error.WouldBlock) {
+            const out = self.answer() catch Outcome.resend;
+            if (out == .fail) {
+                self.dropTxn();
+                return error.StreamLoadFailed;
+            }
+        }
+        self.dropTxn();
+        self.broken = true;
+        if (self.spool == null) return e;
+    }
+
+    /// Ends the open transaction and waits for its outcome. A transient failure
+    /// replays the spool under the same label, with backoff, until the server
+    /// gives an answer that settles it or the retry budget is spent.
+    fn commit(self: *StreamLoadSink) !void {
+        if (self.txn_bytes == 0) return;
+        const t0 = try std.time.Instant.now();
+        defer self.wait_ns += (std.time.Instant.now() catch t0).since(t0);
+        var delay: u64 = std.time.ns_per_s;
+        while (true) {
+            const out = self.attempt() catch |e| blk: {
+                if (!transient(e)) return e;
+                obs.logOr(self.logger, .warn, "stream load {s} #{d}: {s}, retrying", .{ self.table, self.seq, @errorName(e) });
+                break :blk Outcome.resend;
+            };
+            switch (out) {
+                .ok => break,
+                .fail => return error.StreamLoadFailed,
+                .resend, .wait => {
+                    self.broken = true;
+                    if (self.spool == null) return error.StreamLoadUnreplayable;
+                    if (driver.aborting()) return error.Aborted;
+                    if ((try std.time.Instant.now()).since(t0) + delay > RETRY_BUDGET_NS) {
+                        if (self.errctx) |ec| ec.set("stream load {s}: label {s} still unsettled after {d} s of retries", .{ self.table, self.label, RETRY_BUDGET_NS / std.time.ns_per_s });
+                        return error.StreamLoadRetriesExhausted;
+                    }
+                    std.Thread.sleep(delay);
+                    delay = @min(delay * 2, 10 * std.time.ns_per_s);
+                },
+            }
+        }
+        self.sent_bytes += self.txn_bytes;
+        try self.spoolReset();
+        self.txn_bytes = 0;
+        self.broken = false;
+    }
+
+    fn attempt(self: *StreamLoadSink) !Outcome {
+        defer self.dropTxn();
+        if (self.broken or self.txn == null) {
+            self.dropTxn();
+            try self.begin();
+            self.broken = false;
+            self.replay() catch |e| return self.answerAfter(e);
+        }
+        self.txn.?.body.end() catch return self.answerAfter(self.writeErr());
+        return self.answer();
+    }
+
+    /// The server's answer when a write failed; the write's error when there is none.
+    fn answerAfter(self: *StreamLoadSink, e: anyerror) !Outcome {
+        if (!transient(e) or e == error.WouldBlock) return e;
+        return self.answer() catch e;
+    }
+
+    fn replay(self: *StreamLoadSink) !void {
+        const sp = self.spool orelse return error.StreamLoadUnreplayable;
+        try sp.file.seekTo(0);
+        try self.buffer.resize(REPLAY_CHUNK);
+        defer self.buffer.clearRetainingCapacity();
+        const body = &self.txn.?.body;
+        var left = self.txn_bytes;
+        while (left > 0) {
+            const n = try sp.file.read(self.buffer.items[0..@min(left, REPLAY_CHUNK)]);
+            if (n == 0) return error.StreamLoadSpoolShort;
+            body.writer.writeAll(self.buffer.items[0..n]) catch return self.writeErr();
+            left -= n;
+        }
+    }
+
+    /// Reads the response to the open request and classifies it, logging the
+    /// server's timings on success and its reason on failure.
+    fn answer(self: *StreamLoadSink) !Outcome {
+        const req = &self.txn.?.req;
+        var res = req.receiveHead(&.{}) catch |e| return if (e == error.ReadFailed) (req.connection.?.getReadError() orelse e) else e;
         var body_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer body_aw.deinit();
-        const res = self.client.fetch(.{
-            .method = .PUT,
-            .location = .{ .url = url },
-            .extra_headers = hdrs.items,
-            .payload = self.buffer.items,
-            .response_writer = &body_aw.writer,
-        }) catch |e| {
-            obs.logOr(self.logger, .err, "stream load PUT failed ({s}): {s} ({d} bytes)", .{ @errorName(e), url, self.buffer.items.len });
-            return e;
+        var transfer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        _ = res.readerDecompressing(&transfer, &decompress, &.{}).streamRemaining(&body_aw.writer) catch |e| switch (e) {
+            error.ReadFailed => return res.bodyErr() orelse e,
+            else => return e,
         };
         const body = body_aw.writer.buffered();
-        if (!loadSucceeded(body)) {
-            obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ @intFromEnum(res.status), body });
-            if (self.errctx) |ec| {
-                const why = jsonField(body, "Message") orelse jsonField(body, "Status") orelse "no reason given";
-                if (jsonField(body, "ErrorURL")) |u|
-                    ec.set("stream load failed: {s} (rejected rows: {s})", .{ why, u })
-                else
-                    ec.set("stream load failed: {s}", .{why});
-            }
-            return error.StreamLoadFailed;
+        const out = classify(body);
+        switch (out) {
+            .ok => if (self.logger) |lg| lg.log(.debug, "stream load {s} #{d}: {d} rows, {d} bytes, total {d} ms, begin {d}, plan {d}, read {d}, write {d}, commit+publish {d} ms", .{
+                self.table,                            self.seq,
+                jsonInt(body, "NumberLoadedRows"),     jsonInt(body, "LoadBytes"),
+                jsonInt(body, "LoadTimeMs"),           jsonInt(body, "BeginTxnTimeMs"),
+                jsonInt(body, "StreamLoadPlanTimeMs"), jsonInt(body, "ReadDataTimeMs"),
+                jsonInt(body, "WriteDataTimeMs"),      jsonInt(body, "CommitAndPublishTimeMs"),
+            }),
+            .fail => {
+                obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ @intFromEnum(res.head.status), body });
+                if (self.errctx) |ec| {
+                    const why = jsonField(body, "Message") orelse jsonField(body, "Status") orelse "no reason given";
+                    if (jsonField(body, "ErrorURL")) |u|
+                        ec.set("stream load failed: {s} (rejected rows: {s})", .{ why, u })
+                    else
+                        ec.set("stream load failed: {s}", .{why});
+                }
+            },
+            .resend, .wait => obs.logOr(self.logger, .warn, "stream load {s} #{d} not settled (http {d}): {s}", .{ self.table, self.seq, @intFromEnum(res.head.status), body }),
         }
-        if (self.logger) |lg| lg.log(.debug, "stream load {s} #{d}: {d} rows, {d} bytes, total {d} ms, begin {d}, plan {d}, read {d}, write {d}, commit+publish {d} ms", .{
-            self.table,                            self.seq,
-            jsonInt(body, "NumberLoadedRows"),     jsonInt(body, "LoadBytes"),
-            jsonInt(body, "LoadTimeMs"),           jsonInt(body, "BeginTxnTimeMs"),
-            jsonInt(body, "StreamLoadPlanTimeMs"), jsonInt(body, "ReadDataTimeMs"),
-            jsonInt(body, "WriteDataTimeMs"),      jsonInt(body, "CommitAndPublishTimeMs"),
-        });
+        return out;
     }
 };
+
+fn transient(e: anyerror) bool {
+    return driver.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
+}
 
 /// Where the value of key `name` starts in a flat JSON object.
 fn jsonValueAt(body: []const u8, name: []const u8) ?usize {
@@ -449,17 +657,65 @@ test "jsonField pulls the reason out of a StarRocks failure body" {
     try std.testing.expect(jsonField("{\"Status\": 7}", "Status") == null);
 }
 
-fn loadSucceeded(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "Success") != null or
-        std.mem.indexOf(u8, body, "Publish Timeout") != null or
-        std.mem.indexOf(u8, body, "Label Already Exists") != null;
+const Outcome = enum { ok, fail, resend, wait };
+
+/// What a stream load response settles, from its `Status` (and, for a reused
+/// label, `ExistingJobStatus`): `ok` once the data is committed — a publish
+/// timeout included, which must never be resent — `fail` for a definite
+/// refusal, `wait` while the label's earlier transaction is still open,
+/// `resend` when it was aborted (a failed label may be reused) or the answer is
+/// not a stream load response at all, as from a server still starting.
+fn classify(body: []const u8) Outcome {
+    const status = jsonField(body, "Status") orelse return .resend;
+    if (eqlAnyIgnoreCase(status, &.{ "Success", "Publish Timeout" })) return .ok;
+    if (!std.ascii.eqlIgnoreCase(status, "Label Already Exists")) return .fail;
+    const existing = jsonField(body, "ExistingJobStatus") orelse return .wait;
+    if (eqlAnyIgnoreCase(existing, &.{ "FINISHED", "VISIBLE", "COMMITTED" })) return .ok;
+    if (eqlAnyIgnoreCase(existing, &.{ "CANCELLED", "ABORTED" })) return .resend;
+    return .wait;
 }
 
-test "loadSucceeded accepts success, publish timeout, and duplicate label" {
-    try std.testing.expect(loadSucceeded("{\"Status\": \"Success\"}"));
-    try std.testing.expect(loadSucceeded("{\"Status\": \"Publish Timeout\"}"));
-    try std.testing.expect(loadSucceeded("{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"FINISHED\"}"));
-    try std.testing.expect(!loadSucceeded("{\"Status\": \"Fail\", \"Message\": \"too many filtered rows\"}"));
+fn eqlAnyIgnoreCase(s: []const u8, options: []const []const u8) bool {
+    for (options) |o| if (std.ascii.eqlIgnoreCase(s, o)) return true;
+    return false;
+}
+
+test "classify settles on the parsed Status, not on words anywhere in the body" {
+    try std.testing.expectEqual(Outcome.ok, classify("{\"Status\": \"Success\", \"Message\": \"OK\"}"));
+    try std.testing.expectEqual(Outcome.ok, classify("{\"Status\": \"Publish Timeout\"}"));
+    try std.testing.expectEqual(Outcome.fail, classify("{\"Status\": \"Fail\", \"Message\": \"too many filtered rows\", \"ErrorURL\": \"http://x/Success\"}"));
+    try std.testing.expectEqual(Outcome.fail, classify("{\"Status\": \"Fail\", \"Message\": \"Label Already Exists elsewhere: Success\"}"));
+    try std.testing.expectEqual(Outcome.resend, classify(""));
+    try std.testing.expectEqual(Outcome.resend, classify("<html>503 Service Unavailable</html>"));
+}
+
+test "classify: a reused label is ok only once its earlier load committed" {
+    const cases = [_]struct { []const u8, Outcome }{
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"FINISHED\"}", .ok },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"VISIBLE\"}", .ok },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"COMMITTED\"}", .ok },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"RUNNING\"}", .wait },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"PREPARE\"}", .wait },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"PREPARED\"}", .wait },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"CANCELLED\"}", .resend },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"ABORTED\"}", .resend },
+        .{ "{\"Status\": \"Label Already Exists\"}", .wait },
+        .{ "{\"Status\": \"Label Already Exists\", \"ExistingJobStatus\": \"SOMETHING_NEW\"}", .wait },
+    };
+    for (cases) |c| try std.testing.expectEqual(c[1], classify(c[0]));
+}
+
+test "classify reads the pretty-printed StarRocks response" {
+    const body =
+        \\{
+        \\    "TxnId": -1,
+        \\    "Label": "probe_a1",
+        \\    "Status": "Label Already Exists",
+        \\    "ExistingJobStatus": "FINISHED",
+        \\    "Message": "Label [probe_a1] has already been used."
+        \\}
+    ;
+    try std.testing.expectEqual(Outcome.ok, classify(body));
 }
 
 const sink_vtable = driver.sinkVTable(StreamLoadSink);

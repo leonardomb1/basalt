@@ -149,7 +149,9 @@ report() { # $1 shape, $2 log prefix
         if ($i == "life") life += $(i+1)
         if ($i == "setup") su += $(i+1)
         if ($i == "encode") enc += $(i+1)
-        if ($i == "flush") fl += $(i+1)
+        if ($i == "spool") sp += $(i+1)
+        if ($i == "send") snd += $(i+1)
+        if ($i == "wait") wt += $(i+1)
       }
       sinks++
     }
@@ -157,10 +159,10 @@ report() { # $1 shape, $2 log prefix
       if (loads == 0) { print "   no stream loads logged"; exit }
       printf "   %d rows, %.1f MB body: %.0f rows/s, %.1f MB/s\n", rows, bytes / 1e6, rows / wall, bytes / 1e6 / wall
       printf "   %d stream loads over %d sinks, avg %.2f MB / %d rows each\n", loads, sinks, bytes / 1e6 / loads, rows / loads
-      printf "   lane time %.1fs: sink setup %.0f%%, read+decode %.0f%%, encode %.0f%%, blocked in stream load %.0f%%; setup avg %.0f ms/sink\n", \
-        life / 1e3, 100 * su / life, 100 * (life - su - enc - fl) / life, 100 * enc / life, 100 * fl / life, su / sinks
-      printf "   StarRocks per load (avg ms): total %.0f = begin %.0f + plan %.0f + read %.0f + write %.0f + commit/publish %.0f; client-side flush avg %.0f\n", \
-        tot / loads, beg / loads, pl / loads, rd / loads, wr / loads, cp / loads, fl / loads
+      printf "   lane time %.1fs: sink setup %.0f%%, read+decode %.0f%%, encode %.0f%%, spool %.0f%%, blocked sending %.0f%%, waiting on commit %.0f%%; setup avg %.0f ms/sink\n", \
+        life / 1e3, 100 * su / life, 100 * (life - su - enc - sp - snd - wt) / life, 100 * enc / life, 100 * sp / life, 100 * snd / life, 100 * wt / life, su / sinks
+      printf "   StarRocks per load (avg ms): total %.0f = begin %.0f + plan %.0f + read %.0f + write %.0f + commit/publish %.0f; client-side commit wait avg %.0f\n", \
+        tot / loads, beg / loads, pl / loads, rd / loads, wr / loads, cp / loads, wt / loads
     }' "$log"
 }
 
