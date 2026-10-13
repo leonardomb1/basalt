@@ -10,6 +10,7 @@ const LaneSplit = @import("sources.zig").LaneSplit;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
+const LaneMem = @import("../lanes.zig").LaneMem;
 const WorkQueue = @import("../lanes.zig").WorkQueue;
 const ast = @import("../../lang/ast.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
@@ -162,138 +163,153 @@ pub const OrderedOut = struct {
             freeUnit(u);
         }
     }
+
+    /// A unit being filled on a lane: unit-encoded, rendered, or copied batches.
+    pub const Fill = struct {
+        unit: *Unit,
+        enc: ?driver.UnitEncoder,
+        rows: u64 = 0,
+
+        pub fn add(f: *Fill, snk: driver.Sink, scratch: std.mem.Allocator, b: Batch) !void {
+            if (b.len == 0) return;
+            const ua = f.unit.arena.allocator();
+            if (f.enc) |e| {
+                try e.write(scratch, b);
+            } else try f.unit.parts.append(if (snk.canRender())
+                .{ .bytes = try snk.renderBatch(ua, b).? }
+            else
+                .{ .batch = try b.deepCopy(ua) });
+            f.rows += b.len;
+        }
+
+        pub fn drop(f: Fill) void {
+            if (f.enc) |e| e.discard();
+            freeUnit(f.unit);
+        }
+    };
+
+    /// Wait for unit `i`'s turn and take a unit to fill; null once the run has failed.
+    pub fn begin(self: *OrderedOut, i: usize, failed: *std.atomic.Value(bool)) !?Fill {
+        self.waitTurn(i, failed);
+        if (failed.load(.seq_cst)) return null;
+        const unit = try self.takeUnit();
+        errdefer freeUnit(unit);
+        const enc: ?driver.UnitEncoder = if (self.snk.openUnit(unit.arena.allocator())) |r| try r else null;
+        return .{ .unit = unit, .enc = enc };
+    }
+
+    /// Seal unit `i` and hand it over; from here it is the writer's, even on error.
+    pub fn hand(self: *OrderedOut, i: usize, f: Fill) !void {
+        if (f.enc) |e| {
+            errdefer f.drop();
+            try e.seal();
+            try f.unit.parts.append(.{ .encoded = e });
+        }
+        try self.deposit(i, f.unit);
+    }
 };
 
-const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
-
-/// One set of arenas for the lane's whole run, reset between units: per-unit arenas
-/// left every unit decoding and formatting into cold pages.
-fn orderedMapWorker(ctx: *MapCtx, _: usize) void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    var warena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wgpa.allocator());
-    defer batch_arena.deinit();
-    const ord = ctx.ordered.?;
-    while (true) {
-        if (ctx.queue.failed.load(.seq_cst)) return;
-        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-        if (i >= ctx.queue.nitems) break;
-        mapOrderedUnit(ctx, ord, i, &warena, &batch_arena) catch |e| {
-            ctx.queue.fail(e);
-            ord.wake();
-            return;
-        };
-        _ = warena.reset(.retain_capacity);
-        _ = batch_arena.reset(.retain_capacity);
-    }
+/// The worker loop of an ordered shape: one `LaneMem` for the lane's whole run, reset
+/// between units (per-unit arenas left every unit decoding into cold pages), and a
+/// failure wakes the lanes waiting on the window.
+pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usize) void {
+    return struct {
+        fn go(ctx: *Ctx, _: usize) void {
+            var mem: LaneMem = .{};
+            mem.init();
+            defer mem.deinit();
+            while (true) {
+                if (ctx.queue.failed.load(.seq_cst)) return;
+                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+                if (i >= ctx.queue.nitems) break;
+                unitFn(ctx, i, &mem) catch |e| {
+                    ctx.queue.fail(e);
+                    ctx.ordered.?.wake();
+                    return;
+                };
+                _ = mem.work.reset(.retain_capacity);
+                _ = mem.batch.reset(.retain_capacity);
+            }
+        }
+    }.go;
 }
 
+const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
+const orderedMapWorker = orderedWorker(MapCtx, mapOrderedUnit);
+
 fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    const wa = wgpa.allocator();
-    var warena = std.heap.ArenaAllocator.init(wa);
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wa);
-    defer batch_arena.deinit();
-
-    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
-        .shared => null,
-        .per_lane => |pl| try pl.open(pl.ctx, wa, i),
-    };
-    var own_sink_open = own_sink != null;
-    defer if (own_sink) |s| {
-        if (own_sink_open) s.abort();
-    };
-
-    const src_schema = ctx.split.schema();
-    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), warena.allocator())) orelse return;
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
     defer inner.close();
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.map_stages, &scan, src_schema);
-    const chain = if (ctx.join) |lj|
-        try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, lj, mapped_chain)
-    else
-        mapped_chain;
+    const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
+    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), i, chain, &mem.batch, &ctx.queue.failed);
+    _ = ctx.rows_out.fetchAdd(out, .monotonic);
+}
 
+fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
+    const mapped = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.map_stages, scan, ctx.split.schema());
+    return if (ctx.join) |lj| buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, mapped) else mapped;
+}
+
+/// Pour `chain` into the sink: the shared one, or a lane sink numbered `lane_idx`,
+/// opened at the first row and closed at the end. A set `failed` stops the pour and
+/// aborts that lane sink.
+fn pourLane(mode: parallel.SinkMode, mtx: *std.Thread.Mutex, gpa: std.mem.Allocator, lane_idx: usize, chain: op.Op, batch_arena: *std.heap.ArenaAllocator, failed: ?*std.atomic.Value(bool)) !u64 {
+    var own: ?driver.Sink = null;
+    errdefer if (own) |sk| sk.abort();
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
-        if (ctx.queue.failed.load(.seq_cst)) return;
+        if (failed) |f| if (f.load(.seq_cst)) {
+            if (own) |sk| sk.abort();
+            return out;
+        };
         if (b.len > 0) {
-            try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
+            if (own == null) switch (mode) {
+                .shared => {},
+                .per_lane => |pl| own = try pl.open(pl.ctx, gpa, lane_idx),
+            };
+            try parallel.writeLaneBatch(mode, mtx, own, batch_arena.allocator(), b);
             out += b.len;
         }
         _ = batch_arena.reset(.retain_capacity);
     }
-    _ = ctx.rows_out.fetchAdd(out, .monotonic);
-
-    if (own_sink) |s| {
-        own_sink_open = false;
-        try s.close();
+    if (own) |sk| {
+        own = null;
+        try sk.close();
     }
+    return out;
 }
 
 /// One positional unit of an ordered map, formatted (or unit-encoded) on the lane. A unit
 /// with no rows is still handed over: the writer waits on every position.
-fn mapOrderedUnit(ctx: *MapCtx, ord: *OrderedOut, i: usize, warena: *std.heap.ArenaAllocator, batch_arena: *std.heap.ArenaAllocator) !void {
-    errdefer {
-        ctx.split.abort();
-        ctx.queue.failed.store(true, .seq_cst);
-        ord.wake();
-    }
-    ord.waitTurn(i, &ctx.queue.failed);
-    if (ctx.queue.failed.load(.seq_cst)) return;
-
-    const unit = try ord.takeUnit();
-    var handed = false;
-    defer if (!handed) OrderedOut.freeUnit(unit);
-    const ua = unit.arena.allocator();
-    const snk = ord.snk;
-    const render = snk.canRender();
-    const enc: ?driver.UnitEncoder = if (snk.openUnit(ua)) |r| try r else null;
-    errdefer if (enc) |e| e.discard();
-
-    var out: u64 = 0;
-    if (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), warena.allocator())) |inner| {
-        defer inner.close();
-        var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
-        var scan = op.Scan{ .src = cs.source() };
-        const mapped_chain = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.map_stages, &scan, ctx.split.schema());
-        const chain = if (ctx.join) |lj|
-            try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, lj, mapped_chain)
-        else
-            mapped_chain;
-        while (try chain.next(batch_arena.allocator())) |b| {
-            if (ctx.queue.failed.load(.seq_cst)) {
-                if (enc) |e| e.discard();
-                return;
+fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem) !void {
+    errdefer ctx.split.abort();
+    const ord = ctx.ordered.?;
+    var f = (try ord.begin(i, &ctx.queue.failed)) orelse return;
+    {
+        errdefer f.drop();
+        if (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) |inner| {
+            defer inner.close();
+            var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
+            var scan = op.Scan{ .src = cs.source() };
+            const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
+            while (try chain.next(mem.batch.allocator())) |b| {
+                if (ctx.queue.failed.load(.seq_cst)) return f.drop();
+                try f.add(ord.snk, mem.batch.allocator(), b);
+                _ = mem.batch.reset(.retain_capacity);
             }
-            if (b.len > 0) {
-                if (enc) |e| {
-                    try e.write(batch_arena.allocator(), b);
-                } else try unit.parts.append(if (render)
-                    .{ .bytes = try snk.renderBatch(ua, b).? }
-                else
-                    .{ .batch = try b.deepCopy(ua) });
-                out += b.len;
-            }
-            _ = batch_arena.reset(.retain_capacity);
         }
     }
-    if (enc) |e| {
-        try e.seal();
-        try unit.parts.append(.{ .encoded = e });
-    }
-    _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    handed = true;
-    try ord.deposit(i, unit);
+    _ = ctx.rows_out.fetchAdd(f.rows, .monotonic);
+    try ord.hand(i, f);
 }
 
-fn runParallelMapImpl(
+pub fn runParallelMap(
     env: *Env,
     split_in: LaneSplit,
     map_stages: []const ast.Stage,
@@ -381,40 +397,28 @@ fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx
     var batch_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer batch_arena.deinit();
     const chain = (try buildLaneJoinDrain(state.allocator(), env.params_expr, env.errctx, lj)) orelse return 0;
-    var own: ?driver.Sink = null;
-    errdefer if (own) |sk| sk.abort();
-    var out: u64 = 0;
-    while (try chain.next(batch_arena.allocator())) |b| {
-        if (b.len > 0) {
-            if (own == null) switch (sink_mode) {
-                .shared => {},
-                .per_lane => |pl| own = try pl.open(pl.ctx, env.gpa, lane_idx),
-            };
-            try parallel.writeLaneBatch(sink_mode, mtx, own, batch_arena.allocator(), b);
-            out += b.len;
-        }
-        _ = batch_arena.reset(.retain_capacity);
-    }
-    if (own) |sk| {
-        own = null;
-        try sk.close();
-    }
-    return out;
+    return pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
 }
 
 /// The indexed right side's keys as row-group tests for the Parquet morsels of the
 /// left side, on the terms of the serial plan (`keypush.ParquetKeys`).
 fn laneParquetKeys(env: *Env, js: MapJoinShape, lane: LaneJoin, map_stages: []const ast.Stage) ![]const pqdecode.KeyBound {
     const arena = env.arena;
-    if (!keypush.leftMayNarrow(js.join) or keypush.disabled(js.join_hints)) return &.{};
-    const trace = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
-    const exprs = (try keyExprs(arena, trace, lane.left_key_names)) orelse return &.{};
+    const exprs = (try narrowingKeyExprs(arena, js, lane, map_stages)) orelse return &.{};
     const cols = try keypush.plainColumns(arena, exprs);
     for (cols) |c| {
         if (c != null) break;
     } else return &.{};
     const keys = try op.collectKeys(arena, &.{lane.index.build_batch}, lane.right_keys, op.default_push_cap);
     return keypush.keyBounds(arena, cols, keys);
+}
+
+/// The probe side's key expressions, traced back through `map_stages`, when the
+/// join's build keys may narrow its left side; null otherwise.
+fn narrowingKeyExprs(arena: std.mem.Allocator, js: MapJoinShape, lane: LaneJoin, map_stages: []const ast.Stage) !?[]const ?*ast.Expr {
+    if (!keypush.leftMayNarrow(js.join) or keypush.disabled(js.join_hints)) return null;
+    const trace = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
+    return keyExprs(arena, trace, lane.left_key_names);
 }
 
 /// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`
@@ -427,20 +431,6 @@ fn orderedUnits(split: LaneSplit, nthreads: usize) usize {
 }
 
 const ordered_chunk_bytes = 4 << 20;
-
-pub fn runParallelParquetMap(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelParquetMapImpl(env, rd, pipeline, map_stages, null, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelParquetMapJoin(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!mapJoinKindLaneSafe(shape.join.kind)) return false;
-    return runParallelParquetMapImpl(env, rd, pipeline, shape.prefix, shape, w, opts, stats, lanes_used);
-}
-
-fn runParallelParquetMapImpl(env: *Env, rd: ast.Read, pipeline: []const ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const split = (try parquetSplit(env, rd, pipeline[1..][0..map_stages.len], w, opts)) orelse return false;
-    return runParallelMapImpl(env, split, map_stages, jshape, w, opts, stats, lanes_used);
-}
 
 pub fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     const middle = stages[1 .. stages.len - 1];
@@ -540,41 +530,17 @@ fn sqlMapJoinLane(ctx: *SqlMapJoinCtx, lane_idx: usize) void {
 }
 
 fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
-    var wgpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = wgpa.deinit();
-    const wa = wgpa.allocator();
-    var warena = std.heap.ArenaAllocator.init(wa);
-    defer warena.deinit();
-    var batch_arena = std.heap.ArenaAllocator.init(wa);
-    defer batch_arena.deinit();
-
-    const own_sink: ?driver.Sink = switch (ctx.sink_mode) {
-        .shared => null,
-        .per_lane => |pl| try pl.open(pl.ctx, wa, lane_idx),
-    };
-    var own_sink_open = own_sink != null;
-    defer if (own_sink) |sk| {
-        if (own_sink_open) sk.abort();
-    };
-
-    var ss = SplitSource{ .ctx = ctx, .gpa = wa };
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    var ss = SplitSource{ .ctx = ctx, .gpa = mem.gpa.allocator() };
     defer SplitSource.closeFn(&ss);
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ss, .vtable = &SplitSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const probe = try buildMapChain(warena.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
-    const chain = try buildLaneJoinChain(warena.allocator(), ctx.params, ctx.errctx, ctx.join, probe);
-
-    var out: u64 = 0;
-    while (try chain.next(batch_arena.allocator())) |b| {
-        try parallel.writeLaneBatch(ctx.sink_mode, &ctx.sink_mtx, own_sink, batch_arena.allocator(), b);
-        out += b.len;
-        _ = batch_arena.reset(.retain_capacity);
-    }
+    const probe = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
+    const chain = try buildLaneJoinChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.join, probe);
+    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    if (own_sink) |sk| {
-        own_sink_open = false;
-        try sk.close();
-    }
 }
 
 /// Split-parallel SQL map+join. The serial plan's sources are closed before the shared
@@ -599,13 +565,10 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const lp = (try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema)) orelse return false;
 
     var where_extra: ?[]const u8 = null;
-    if (keypush.leftMayNarrow(shape.join) and !keypush.disabled(shape.join_hints)) {
-        const trace = try std.mem.concat(arena, ast.Stage, &.{ shape.prefix, lp.lane.probe_prep });
-        if (try keyExprs(arena, trace, lp.lane.left_key_names)) |exprs| {
-            const keys = try op.collectKeys(arena, &.{lp.lane.index.build_batch}, lp.lane.right_keys, op.default_push_cap);
-            where_extra = try keypush.render(arena, desc.dialect, src_schema.*, exprs, keys);
-            if (where_extra) |x| env.log.log(.debug, "key pushdown into {s} splits: WHERE {s}", .{ @tagName(desc.dialect), if (x.len > 400) x[0..400] else x });
-        }
+    if (try narrowingKeyExprs(arena, shape, lp.lane, shape.prefix)) |exprs| {
+        const keys = try op.collectKeys(arena, &.{lp.lane.index.build_batch}, lp.lane.right_keys, op.default_push_cap);
+        where_extra = try keypush.render(arena, desc.dialect, src_schema.*, exprs, keys);
+        if (where_extra) |x| env.log.log(.debug, "key pushdown into {s} splits: WHERE {s}", .{ @tagName(desc.dialect), if (x.len > 400) x[0..400] else x });
     }
 
     env.sink_name = sinkLabel(env, w);
@@ -640,21 +603,6 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         try sink_mode.shared.close();
     }
     return true;
-}
-
-pub fn runParallelCsvMap(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    return runParallelCsvMapImpl(env, rd, map_stages, null, w, opts, stats, lanes_used);
-}
-
-pub fn runParallelCsvMapJoin(env: *Env, rd: ast.Read, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!mapJoinKindLaneSafe(shape.join.kind)) return false;
-    return runParallelCsvMapImpl(env, rd, shape.prefix, shape, w, opts, stats, lanes_used);
-}
-
-fn runParallelCsvMapImpl(env: *Env, rd: ast.Read, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
-    defer mapped.close();
-    return runParallelMapImpl(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, map_stages, jshape, w, opts, stats, lanes_used);
 }
 
 test "join kinds allowed on the parallel probe path" {
