@@ -59,56 +59,19 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const types = @import("../lang/types.zig");
-const op = @import("../exec/op.zig");
-const Batch = @import("../exec/batch.zig").Batch;
-const column = @import("../exec/column.zig");
-const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
-const pqdecode = @import("../format/parquet/read.zig");
-const folder = @import("../connect/folder.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const driver = @import("../connect/driver.zig");
 const sql = @import("../db/sql.zig");
-const wrapProjected = @import("../connect/split.zig").wrapProjected;
-const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
-const obs = @import("obs.zig");
-const Value = @import("../exec/value.zig").Value;
 
 const Env = @import("env.zig").Env;
-const planErr = @import("env.zig").planErr;
-const planErrT = @import("env.zig").planErrT;
 const RunOptions = @import("env.zig").RunOptions;
-const schemaPtr = @import("env.zig").schemaPtr;
 const Stats = @import("env.zig").Stats;
 
 const connect_mod = @import("connect.zig");
-const buildParallelSink = @import("connect.zig").buildParallelSink;
 const dupeSchema = @import("connect.zig").dupeSchema;
-const OneBatch = @import("connect.zig").OneBatch;
-const openSink = @import("connect.zig").openSink;
-const openSqlQuery = @import("connect.zig").openSqlQuery;
-const planSplit = @import("connect.zig").planSplit;
-const resolveUpsertKeys = @import("connect.zig").resolveUpsertKeys;
-const sinkLabel = @import("connect.zig").sinkLabel;
-const SplitCtx = @import("connect.zig").SplitCtx;
-const sqlDescForStage = @import("connect.zig").sqlDescForStage;
 
-const aErr = @import("plan.zig").aErr;
-const buildChainFrom = @import("plan.zig").buildChainFrom;
-const buildMapChain = @import("plan.zig").buildMapChain;
-const buildPipeline = @import("plan.zig").buildPipeline;
-const prepareJoinSide = @import("plan.zig").prepareJoinSide;
-const buildStage = @import("plan.zig").buildStage;
-const buildTopN = @import("plan.zig").buildTopN;
-const filterBounds = @import("plan.zig").filterBounds;
-const joinBuildCap = @import("plan.zig").joinBuildCap;
-const mapChainSchema = @import("plan.zig").mapChainSchema;
 const projectedColumns = @import("plan.zig").projectedColumns;
-const tailSchema = @import("plan.zig").tailSchema;
 
 const LaneShape = union(enum) {
     agg: AggShape,
@@ -280,76 +243,6 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     };
     env.log.log(.debug, "top-N pushdown: {s} sent to {s}", .{ try t.describe(arena), @tagName(desc.kind) });
     return out;
-}
-
-pub const WorkQueue = struct {
-    nitems: usize,
-    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    err_mtx: std.Thread.Mutex = .{},
-    first_err: ?anyerror = null,
-    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    note_buf: [480]u8 = undefined,
-    note_len: usize = 0,
-
-    pub fn fail(q: *WorkQueue, e: anyerror) void {
-        q.err_mtx.lock();
-        if (q.first_err == null) {
-            q.first_err = e;
-            const name = @errorName(e);
-            if (eval.takeFailure(e)) |why| {
-                q.note_len = @min(why.len, q.note_buf.len);
-                @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
-            } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
-            } else if (std.mem.startsWith(u8, name, "Smb") and smb.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "smb: {s}: {s}", .{ name, smb.lastError() }) catch q.note_buf[0..0]).len;
-            }
-        }
-        q.err_mtx.unlock();
-        q.failed.store(true, .seq_cst);
-    }
-
-    pub fn failure(q: *WorkQueue) ?anyerror {
-        const e = q.first_err orelse return null;
-        return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
-    }
-};
-
-/// A lane's private allocators: a thread-unsafe gpa, a work arena for the chain it
-/// builds, and a batch arena reset between batches. Init in place; it must not move.
-pub const LaneMem = struct {
-    gpa: std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }) = .{},
-    work: std.heap.ArenaAllocator = undefined,
-    batch: std.heap.ArenaAllocator = undefined,
-
-    pub fn init(self: *LaneMem) void {
-        self.work = std.heap.ArenaAllocator.init(self.gpa.allocator());
-        self.batch = std.heap.ArenaAllocator.init(self.gpa.allocator());
-    }
-
-    pub fn deinit(self: *LaneMem) void {
-        self.batch.deinit();
-        self.work.deinit();
-        _ = self.gpa.deinit();
-    }
-};
-
-/// The worker loop shared by the parallel CSV/SQL paths: steal the next item off
-/// `ctx.queue`, run `workOne(ctx, i)`, and latch the first error, which stops the others.
-pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
-    return struct {
-        fn go(ctx: *Ctx, _: usize) void {
-            while (true) {
-                if (ctx.queue.failed.load(.seq_cst)) return;
-                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-                if (i >= ctx.queue.nitems) break;
-                workOne(ctx, i) catch |e| {
-                    ctx.queue.fail(e);
-                    return;
-                };
-            }
-        }
-    }.go;
 }
 
 pub const agg_combine_parallel_min = @import("lanes/agg.zig").agg_combine_parallel_min;
