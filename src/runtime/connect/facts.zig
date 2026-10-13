@@ -11,6 +11,8 @@ const resolveDbConfig = @import("dbconfig.zig").resolveDbConfig;
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const quoted = @import("../estimate.zig").quoted;
+const sqlStr = @import("../pushdown.zig").sqlStr;
 const types = @import("../../lang/types.zig");
 
 /// Per-column text and collation facts that decide which text comparisons may
@@ -88,13 +90,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
     const table = parts[parts.len - 1];
     switch (dialect) {
         .sqlserver => {
-            var obj = std.array_list.Managed(u8).init(arena);
-            for (parts, 0..) |p, i| {
-                if (i > 0) try obj.append('.');
-                try obj.append('[');
-                for (p) |ch| if (ch == ']') try obj.appendSlice("]]") else try obj.append(ch);
-                try obj.append(']');
-            }
+            const obj = try quoted(arena, parts, '[', ']');
             return std.fmt.allocPrint(arena,
                 \\SELECT c.name,
                 \\ CASE WHEN c.collation_name IS NULL THEN 0 ELSE 1 END,
@@ -103,16 +99,10 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ 1,
                 \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
-            , .{try sqlLit(arena, obj.items)});
+            , .{try sqlStr(arena, obj)});
         },
         .postgres => {
-            var obj = std.array_list.Managed(u8).init(arena);
-            for (parts, 0..) |p, i| {
-                if (i > 0) try obj.append('.');
-                try obj.append('"');
-                for (p) |ch| if (ch == '"') try obj.appendSlice("\"\"") else try obj.append(ch);
-                try obj.append('"');
-            }
+            const obj = try quoted(arena, parts, '"', '"');
             return std.fmt.allocPrint(arena,
                 \\SELECT a.attname,
                 \\ CASE WHEN t.typcategory = 'S' THEN 1 ELSE 0 END,
@@ -133,10 +123,10 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\        ELSE coalesce(to_jsonb(co) ->> 'collprovider', 'c') END AS prov,
                 \\   CASE WHEN co.collname = 'default' THEN d.datcollate ELSE to_jsonb(co) ->> 'collcollate' END AS locale) x
                 \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND d.datname = current_database()
-            , .{try sqlLit(arena, obj.items)});
+            , .{try sqlStr(arena, obj)});
         },
         .mysql => {
-            const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            const schema = if (parts.len >= 2) try sqlStr(arena, parts[parts.len - 2]) else "DATABASE()";
             return std.fmt.allocPrint(arena,
                 \\SELECT c.COLUMN_NAME,
                 \\ CASE WHEN c.COLLATION_NAME IS NULL THEN 0 ELSE 1 END,
@@ -145,10 +135,10 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END
                 \\FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = c.COLLATION_NAME
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
-            , .{ schema, try sqlLit(arena, table) });
+            , .{ schema, try sqlStr(arena, table) });
         },
         .starrocks, .doris => {
-            const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            const schema = if (parts.len >= 2) try sqlStr(arena, parts[parts.len - 2]) else "DATABASE()";
             return std.fmt.allocPrint(arena,
                 \\SELECT COLUMN_NAME,
                 \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'char', 'string') THEN 1 ELSE 0 END,
@@ -156,20 +146,9 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN LOWER(DATA_TYPE) = 'char' THEN 1 ELSE 0 END,
                 \\ 0
                 \\FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}
-            , .{ schema, try sqlLit(arena, table) });
+            , .{ schema, try sqlStr(arena, table) });
         },
     }
-}
-
-fn sqlLit(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    try out.append('\'');
-    for (s) |c| {
-        if (c == '\'') try out.append('\'');
-        try out.append(c);
-    }
-    try out.append('\'');
-    return out.toOwnedSlice();
 }
 
 pub fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {

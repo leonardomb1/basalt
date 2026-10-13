@@ -32,6 +32,7 @@ const resolveDbConfig = @import("connect/dbconfig.zig").resolveDbConfig;
 const sql = @import("../db/sql.zig");
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const std = @import("std");
+const sqlStr = @import("pushdown.zig").sqlStr;
 
 pub const Estimate = struct {
     rows: ?u64 = null,
@@ -193,20 +194,21 @@ pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const
     switch (dialect) {
         .postgres => {
             const obj = try quoted(arena, parts, '"', '"');
-            return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try sqlLit(arena, obj)});
+            return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try sqlStr(arena, obj)});
         },
         .sqlserver => {
             const obj = try quoted(arena, parts, '[', ']');
-            return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try sqlLit(arena, obj)});
+            return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try sqlStr(arena, obj)});
         },
         .mysql, .starrocks, .doris => {
-            const schema = if (parts.len >= 2) try sqlLit(arena, parts[parts.len - 2]) else "DATABASE()";
-            return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ schema, try sqlLit(arena, table) });
+            const schema = if (parts.len >= 2) try sqlStr(arena, parts[parts.len - 2]) else "DATABASE()";
+            return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ schema, try sqlStr(arena, table) });
         },
     }
 }
 
-fn quoted(arena: std.mem.Allocator, parts: []const []const u8, open: u8, close: u8) ![]const u8 {
+/// `parts` as one dotted name, each part between `open` and `close`, a `close` in it doubled.
+pub fn quoted(arena: std.mem.Allocator, parts: []const []const u8, open: u8, close: u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(arena);
     for (parts, 0..) |p, i| {
         if (i > 0) try out.append('.');
@@ -217,17 +219,6 @@ fn quoted(arena: std.mem.Allocator, parts: []const []const u8, open: u8, close: 
         }
         try out.append(close);
     }
-    return out.toOwnedSlice();
-}
-
-fn sqlLit(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    try out.append('\'');
-    for (s) |c| {
-        if (c == '\'') try out.append('\'');
-        try out.append(c);
-    }
-    try out.append('\'');
     return out.toOwnedSlice();
 }
 
