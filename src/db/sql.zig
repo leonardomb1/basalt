@@ -1019,7 +1019,7 @@ test "parseDecimalText rejects what it cannot read instead of inventing a number
 
 fn parseDateText(t: []const u8) i64 {
     if (t.len < 10) return 0;
-    return daysFromCivil(atoiN(t[0..4]), @intCast(atoiN(t[5..7])), @intCast(atoiN(t[8..10])));
+    return eval.daysFromCivil(atoiN(t[0..4]), @intCast(atoiN(t[5..7])), @intCast(atoiN(t[8..10])));
 }
 
 /// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
@@ -1046,17 +1046,6 @@ fn atoiN(s: []const u8) i64 {
         if (c >= '0' and c <= '9') v = v * 10 + (c - '0');
     }
     return v;
-}
-
-fn daysFromCivil(y0: i64, m: u32, d: u32) i64 {
-    const y = if (m <= 2) y0 - 1 else y0;
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const mi: i64 = @intCast(m);
-    const di: i64 = @intCast(d);
-    const doy = @divFloor(153 * (if (m > 2) mi - 3 else mi + 9) + 2, 5) + di - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146097 + doe - 719468;
 }
 
 test "create table + upsert SQL (postgres)" {

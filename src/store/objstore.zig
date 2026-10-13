@@ -32,21 +32,6 @@ const std = @import("std");
 const azure = @import("azure.zig");
 const s3 = @import("s3.zig");
 
-/// Civil date from a day count since the epoch (Howard Hinnant's algorithm).
-/// Duplicated from `exec/eval.zig` so this module depends on nothing but std.
-pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
-}
-
 pub fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
     var open_buf: [64]u8 = undefined;
     var close_buf: [64]u8 = undefined;

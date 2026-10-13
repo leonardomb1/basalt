@@ -41,6 +41,7 @@
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
+const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";
 pub const env_secret = "AWS_SECRET_ACCESS_KEY";
@@ -191,7 +192,7 @@ pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []cons
 pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs: u32 = @intCast(epoch_secs - days * 86400);
-    const c = objstore.civilFromDays(days);
+    const c = civilFromDays(days);
     return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });

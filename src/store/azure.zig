@@ -38,6 +38,7 @@
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
+const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
 pub const api_version = "2021-08-06";
 
@@ -128,7 +129,7 @@ pub fn keyFromEnv(arena: std.mem.Allocator) ![]const u8 {
 pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     const days = @divFloor(epoch_secs, 86400);
     const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
-    const c = objstore.civilFromDays(days);
+    const c = civilFromDays(days);
     const dow: usize = @intCast(@mod(days + 4, 7));
     const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
