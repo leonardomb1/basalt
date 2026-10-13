@@ -23,7 +23,8 @@ AS
   built this way must end in a literal extension, which picks the writer.
 - `.xlsx` is read but never written: a workbook target is a plan-time error.
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
-- `WITH (...)` on a `LOAD INTO` takes `delimiter` and `format` (a file) and
+- `WITH (...)` on a `LOAD INTO` takes `delimiter` and `format` (a file),
+  `compression` (a Parquet file: `snappy`, `gzip` or `none`) and
   `label_prefix` (StarRocks, Doris); any other key is a plan-time error rather
   than ignored.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`

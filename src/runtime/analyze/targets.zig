@@ -81,6 +81,8 @@ pub fn parquetCodecFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag)
     const s = hintText(hints, "compression") orelse return .snappy;
     const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
     const fmt = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) else null;
+    if (!file)
+        return fail(diag, "`compression` applies to a Parquet file target only; a starrocks or doris load is compressed by the connection's `compression` option", .{});
     if (fmt != .parquet)
         return fail(diag, "`compression` applies to a Parquet file target only; a CSV file is gzipped by a `.gz` suffix", .{});
     if (std.ascii.eqlIgnoreCase(s, "snappy")) return .snappy;
