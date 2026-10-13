@@ -6,8 +6,6 @@
 #
 #   batch:  docker run --rm -v "$PWD/pipelines:/scripts:ro" \
 #             -e SR_USER -e SR_PASS  IMAGE run /scripts/etl.sql
-#   serve:  docker run --rm -p 8080:8080 -v "$PWD/pipelines:/scripts:ro" \
-#             -e SR_USER -e SR_PASS  IMAGE serve /scripts
 #   stdin:  cat etl.sql | docker run --rm -i IMAGE run -
 
 # --- build: compile a static musl binary ----------------------------------
@@ -29,6 +27,5 @@ RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+
 # --- runtime: just the binary (ca-certs, nonroot, no shell) ---------------
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /src/zig-out/bin/basalt /usr/local/bin/basalt
-EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/basalt"]
 CMD ["help"]

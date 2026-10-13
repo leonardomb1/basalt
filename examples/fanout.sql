@@ -4,11 +4,9 @@
 --
 -- FOR EACH ROW OF over a JSON-param path; per-row dispatch via the CASE
 -- statement (guard form). ${...} interpolation in targets/keys/raw SQL is
--- unchanged from BSL.
+-- unchanged from BSL. Bind the job with -p job='{"tables":[...]}'.
 
-CREATE ENDPOINT '/fanout';
-
-PARAM job JSON FROM BODY;
+PARAM job JSON;
 
 CREATE CONNECTION crm TYPE sqlserver OPTIONS (
   host     = 'crm.internal',
