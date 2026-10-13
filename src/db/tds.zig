@@ -1397,25 +1397,58 @@ fn cp1252High(b: u8) u21 {
     };
 }
 
-fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var high = false;
-    for (bytes) |b| {
-        if (b >= 0x80) {
-            high = true;
-            break;
+const Utf8Seq = struct { len: u8, bytes: [3]u8 };
+
+const win1252_high: [128]Utf8Seq = blk: {
+    @setEvalBranchQuota(10_000);
+    var t: [128]Utf8Seq = undefined;
+    for (&t, 0..) |*e, k| {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp1252High(0x80 + k), &buf) catch unreachable;
+        e.* = .{ .len = n, .bytes = buf[0..3].* };
+    }
+    break :blk t;
+};
+
+/// Whether every byte is below 0x80, sixteen bytes at a time.
+fn isAscii(bytes: []const u8) bool {
+    const V = @Vector(16, u8);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 16 <= bytes.len) : (i += 16) acc |= @as(V, bytes[i..][0..16].*);
+    var tail: u8 = @reduce(.Or, acc);
+    for (bytes[i..]) |b| tail |= b;
+    return tail < 0x80;
+}
+
+/// Writes the UTF-8 form of Windows-1252 `src` into `dst`, which holds at least
+/// `win1252Len(src)` bytes, and returns that length.
+fn win1252Encode(dst: []u8, src: []const u8) usize {
+    var o: usize = 0;
+    for (src) |b| {
+        if (b < 0x80) {
+            dst[o] = b;
+            o += 1;
+        } else {
+            const e = win1252_high[b - 0x80];
+            @memcpy(dst[o..][0..e.len], e.bytes[0..e.len]);
+            o += e.len;
         }
     }
-    if (!high) return arena.dupe(u8, bytes);
+    return o;
+}
 
-    var out = std.array_list.Managed(u8).init(arena);
-    try out.ensureTotalCapacity(bytes.len + bytes.len / 2 + 4);
-    var tmp: [4]u8 = undefined;
-    for (bytes) |b| {
-        const cp: u21 = if (b < 0x80) b else cp1252High(b);
-        const n = std.unicode.utf8Encode(cp, &tmp) catch unreachable;
-        try out.appendSlice(tmp[0..n]);
-    }
-    return out.toOwnedSlice();
+fn win1252Len(src: []const u8) usize {
+    var n: usize = 0;
+    for (src) |b| n += if (b < 0x80) 1 else win1252_high[b - 0x80].len;
+    return n;
+}
+
+fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    if (isAscii(bytes)) return arena.dupe(u8, bytes);
+    const out = try arena.alloc(u8, win1252Len(bytes));
+    _ = win1252Encode(out, bytes);
+    return out;
 }
 
 fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
@@ -1494,6 +1527,43 @@ test "win1252 transcode to utf8" {
     const e = try win1252ToUtf8(alloc, &[_]u8{0x80});
     defer alloc.free(e);
     try std.testing.expectEqualStrings("€", e);
+}
+
+fn win1252Reference(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
+    var tmp: [4]u8 = undefined;
+    for (bytes) |b| {
+        const n = std.unicode.utf8Encode(if (b < 0x80) b else cp1252High(b), &tmp) catch unreachable;
+        try out.appendSlice(tmp[0..n]);
+    }
+}
+
+test "win1252 fast path matches a per-byte encode over every byte and random runs" {
+    const alloc = std.testing.allocator;
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*b, k| b.* = @intCast(k);
+    for (0..256) |k| {
+        want.clearRetainingCapacity();
+        try win1252Reference(&want, all[k .. k + 1]);
+        const got = try win1252ToUtf8(alloc, all[k .. k + 1]);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u8, want.items, got);
+    }
+    var prng = std.Random.DefaultPrng.init(0x1252);
+    const rnd = prng.random();
+    var buf: [80]u8 = undefined;
+    for (0..4000) |it| {
+        const len = rnd.uintLessThan(usize, buf.len + 1);
+        for (buf[0..len]) |*b| b.* = if (it % 3 == 0) rnd.int(u8) else rnd.uintLessThan(u8, 0x80);
+        if (it % 5 == 0 and len > 0) buf[rnd.uintLessThan(usize, len)] = 0x80 + rnd.uintLessThan(u8, 0x80);
+        want.clearRetainingCapacity();
+        try win1252Reference(&want, buf[0..len]);
+        const got = try win1252ToUtf8(alloc, buf[0..len]);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u8, want.items, got);
+        try std.testing.expectEqual(want.items.len == len, isAscii(buf[0..len]));
+    }
 }
 
 test "readIntLE sign-extends every TDS integer width" {
