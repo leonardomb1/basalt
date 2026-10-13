@@ -189,9 +189,12 @@ pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
 }
 
 /// An unsigned bound reads as its unsigned value; one only the deprecated signed-order
-/// `min`/`max` gave, or a UINT64 past 2^63-1, is unknown.
+/// `min`/`max` gave, or a UINT64 past 2^63-1, is unknown. An INT96 bound is unknown:
+/// the format leaves its order undefined, and writers that kept one compared the
+/// 12 bytes, nanoseconds first, not the instants.
 fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]const u8) ?Value {
     const b = raw orelse return null;
+    if (meta.ty == .int96) return null;
     const ty = basaltType(elem) catch return null;
     var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, b);
     const v = cur.next() catch return null;
@@ -260,6 +263,30 @@ test "unsigned statistics compare in unsigned order" {
     chunks[0].meta.?.stats.legacy = true;
     const beyond = [_]Bound{.{ .column = "u", .op = .gt, .value = .{ .int = 4_000_000_000 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &beyond));
+}
+
+test "INT96 statistics never prune: a byte-order max can sit below the group's latest instant" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "ts", .ty = .int96, .repetition = .optional },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "ts", .max_def = 1, .max_rep = 0 }};
+    const day: u32 = 2_460_315;
+    var early: [12]u8 = undefined;
+    var late: [12]u8 = undefined;
+    std.mem.writeInt(u64, early[0..8], 3_600_000_000_000, .little);
+    std.mem.writeInt(u32, early[8..12], day, .little);
+    std.mem.writeInt(u64, late[0..8], 0, .little);
+    std.mem.writeInt(u32, late[8..12], day + 1, .little);
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int96, .stats = .{ .min = &late, .max = &early } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 2 };
+    const noon: i64 = @import("encoding.zig").int96ToMicros(day, 12 * 3_600_000_000_000);
+    const ge = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .string = "2024-01-05T12:00:00" } }};
+    const ge_noon = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .timestamp = noon } }};
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &ge));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &ge_noon));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "ts", .desc = true, .full = true, .value = .{ .timestamp = noon } }));
+    try testing.expect(groupMayHoldKeys(&schema, &leaves, g, &.{.{ .column = "ts", .values = &.{.{ .timestamp = noon + 86_400_000_000 }} }}));
 }
 
 test "row groups are skipped only when statistics prove no row can match" {
