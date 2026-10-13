@@ -14,9 +14,9 @@
 //! comparator across two batches: same null placement, DESC, `orderF64` and byte order;
 //! decimals, scaled per batch, compare exactly at the larger scale. Input that never
 //! passes the limit is sorted in memory exactly as without a space. The disk cap is
-//! booked per byte written, merge passes included, and not given back on delete.
-//! A sort abandoned before its last batch keeps its mappings until the process ends;
-//! its files go with the run's scratch directory.
+//! booked per byte written, merge passes included, and given back as each file is
+//! deleted. A sort abandoned before its last batch (a LIMIT, an error downstream)
+//! frees its merge, files and mappings on `release`.
 
 const Batch = @import("../batch.zig").Batch;
 const Decimal = @import("../value.zig").Decimal;
@@ -73,6 +73,13 @@ pub const Sort = struct {
             return try self.sortBatch(arena, all);
         };
         return self.external(arena, space);
+    }
+
+    /// Drops a merge left unfinished by a consumer that stopped pulling: its files
+    /// are deleted, their disk charge given back and its memory freed.
+    pub fn release(self: *Sort) void {
+        self.dropMerge();
+        self.done = true;
     }
 
     fn dropMerge(self: *Sort) void {
@@ -154,7 +161,12 @@ pub const Sort = struct {
             var i: usize = 0;
             while (i < runs.items.len) : (i += fan_in) {
                 const group = runs.items[i..@min(runs.items.len, i + fan_in)];
-                runs.items[kept] = if (group.len == 1) group[0] else try self.mergeRuns(space, paths.allocator(), group);
+                runs.items[kept] = if (group.len == 1) group[0] else self.mergeRuns(space, paths.allocator(), group) catch |e| {
+                    deleteRuns(runs.items[0..kept]);
+                    deleteRuns(runs.items[i + group.len ..]);
+                    runs_owned = false;
+                    return e;
+                };
                 kept += 1;
             }
             runs.shrinkRetainingCapacity(kept);
@@ -1240,4 +1252,76 @@ test "sort spill: input under the limit is sorted in memory without touching the
     const keys = [_]Sort.Key{ .{ .idx = 3, .desc = false, .nulls_first = false }, .{ .idx = 2, .desc = true, .nulls_first = true } };
     try expectSameRows(try drainSorted(a, batches, &keys, .{}), try drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 1 << 30 }));
     try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
+}
+
+test "sort spill: a consumer that stops early leaves no file, charge or memory once the tree is released" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(17);
+    const batches = try mixedBatches(a, prng.random(), 30, 40);
+    const keys = [_]Sort.Key{.{ .idx = 1, .desc = false, .nulls_first = true }};
+    for ([_]usize{ 0, 1, 2, std.math.maxInt(usize) }) |pulls| {
+        const td = try SpillDir.init(std.math.maxInt(u64));
+        defer td.deinit();
+        var ts = TestSource{ .schema_ = mixed_schema, .batches = batches };
+        var scan = Scan{ .src = ts.src() };
+        var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &mixed_schema, .keys = &keys, .space = td.ds.space(), .spill_at = 200, .fan_in = 4, .batch_rows = 8, .gpa = testing.allocator };
+        var lim = @import("../op.zig").Limit{ .child = .{ .sort = &srt }, .remaining = std.math.maxInt(u64), .to_skip = 0 };
+        const top: Op = .{ .limit = &lim };
+        var n: usize = 0;
+        while (n < pulls) : (n += 1) {
+            if (try top.next(a) == null) break;
+        }
+        if (pulls == 1) try testing.expect(srt.merge != null and try td.count() > 0);
+        top.release();
+        top.release();
+        try testing.expectEqual(@as(usize, 0), try td.count());
+        try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
+        try testing.expect(try top.next(a) == null);
+    }
+}
+
+test "sort spill: a merge pass that fails gives back no more disk than it charged" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(23);
+    const batches = try mixedBatches(a, prng.random(), 24, 40);
+    const keys = [_]Sort.Key{.{ .idx = 1, .desc = false, .nulls_first = true }};
+    const Counting = struct {
+        inner: Space,
+        charged: u64 = 0,
+        released: u64 = 0,
+
+        fn space(self: *@This()) Space {
+            return .{ .ctx = self, .createFn = create, .chargeFn = charge, .releaseFn = release };
+        }
+        fn create(ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!Space.File {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.inner.create(arena, tag);
+        }
+        fn charge(ctx: *anyopaque, bytes: u64) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.inner.charge(bytes);
+            self.charged += bytes;
+        }
+        fn release(ctx: *anyopaque, bytes: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.inner.release(bytes);
+            self.released += bytes;
+        }
+    };
+    const probe = try SpillDir.init(std.math.maxInt(u64));
+    const peak = blk: {
+        defer probe.deinit();
+        _ = try drainSorted(a, batches, &keys, .{ .space = probe.ds.space(), .spill_at = 0, .fan_in = 1 << 20 });
+        break :blk probe.ds.peak.load(.monotonic);
+    };
+    const td = try SpillDir.init(peak + 1);
+    defer td.deinit();
+    var cs = Counting{ .inner = td.ds.space() };
+    try testing.expectError(error.SpillCapExceeded, drainSorted(a, batches, &keys, .{ .space = cs.space(), .spill_at = 0, .fan_in = 2 }));
+    try testing.expectEqual(cs.charged, cs.released);
+    try testing.expectEqual(@as(usize, 0), try td.count());
 }

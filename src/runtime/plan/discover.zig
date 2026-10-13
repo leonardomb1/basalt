@@ -76,6 +76,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
+    defer res.op.release();
     var rows = std.array_list.Managed(Row).init(env.arena);
     var da = std.heap.ArenaAllocator.init(env.gpa);
     defer da.deinit();

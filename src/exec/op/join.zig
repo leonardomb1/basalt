@@ -640,6 +640,13 @@ pub const Join = struct {
         return ix;
     }
 
+    /// Frees a spilled join left unfinished by a consumer that stopped pulling: the
+    /// partitions not yet joined are deleted, their disk charge given back, and the
+    /// current partition's index and mappings freed.
+    pub fn release(self: *Join) void {
+        if (self.grace) |g| g.deinit();
+    }
+
     /// Whether this join may spill: never a CROSS join, which has no key to split
     /// on, nor NOT IN, where one null key anywhere on the build side changes every
     /// probe row's answer.
@@ -728,6 +735,7 @@ pub const Join = struct {
     /// joins draining its unmatched build rows before the next one opens.
     fn nextGrace(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         const g = self.grace.?;
+        if (g.done) return null;
         errdefer g.deinit();
         if (!g.probed) try self.splitProbe(g);
         while (true) {
@@ -1626,6 +1634,47 @@ test "join spill: a build side under the threshold stays in memory" {
     const got = try runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 << 20 });
     try testing.expect(!got.spilled);
     try testing.expectEqual(@as(usize, 0), try sd.count());
+}
+
+test "join spill: a consumer that stops early leaves no file or charge once the tree is released" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const left = try genBatches(a, &join_left_schema, 300, 70, 1, 50, 17, "l");
+    const right = try genBatches(a, &join_right_schema, 200, 45, 7, 60, 23, "r");
+    for ([_]ast.JoinKind{ .inner, .full }) |kind| for ([_]usize{ 0, 1, 3, std.math.maxInt(usize) }) |pulls| {
+        const sd = try SpillDir.init(1 << 30);
+        defer sd.deinit();
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = left };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = right };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_both_schema,
+            .kind = kind,
+            .state = a,
+            .space = sd.ds.space(),
+            .spill_at = 1,
+        };
+        var lim = op_mod.Limit{ .child = .{ .join = &jn }, .remaining = std.math.maxInt(u64), .to_skip = 0 };
+        const top = Op{ .limit = &lim };
+        var n: usize = 0;
+        while (n < pulls) : (n += 1) {
+            if (try top.next(a) == null) break;
+        }
+        if (pulls == 1) try testing.expect(jn.grace != null and try sd.count() > 0);
+        top.release();
+        top.release();
+        try testing.expectEqual(@as(usize, 0), try sd.count());
+        try testing.expectEqual(@as(u64, 0), sd.ds.used.load(.monotonic));
+        if (jn.grace != null) try testing.expect(try top.next(a) == null);
+    };
 }
 
 const dec_right_schema = types.Schema{ .fields = &.{

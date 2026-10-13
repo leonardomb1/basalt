@@ -143,6 +143,7 @@ pub const Writer = struct {
         if (b.columns.len != self.schema.fields.len) return error.SpillSchemaMismatch;
         const total = batchLen(b);
         try self.space.charge(total);
+        errdefer self.space.release(total);
         const rows = b.len;
         try self.putU64(rows);
         try self.putU64(b.columns.len);
@@ -497,6 +498,31 @@ test "spill abort closes and deletes the file" {
     try testing.expectEqual(@as(usize, 0), try td.count());
     try testing.expectError(error.FileNotFound, std.fs.cwd().access(w.path, .{}));
     w.abort();
+}
+
+test "spill write that fails on disk gives its charge back once aborted" {
+    var td = try TestDir.init(1 << 30);
+    defer td.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ReadOnly = struct {
+        fn create(ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!Space.File {
+            const ds: *space_mod.DirSpace = @ptrCast(@alignCast(ctx));
+            const f = try ds.space().create(arena, tag);
+            f.file.close();
+            return .{ .file = try std.fs.cwd().openFile(f.path, .{}), .path = f.path };
+        }
+    };
+    var s = td.ds.space();
+    s.createFn = ReadOnly.create;
+    var w = try Writer.init(s, a, &all_schema, "ro");
+    const b = try allKindsBatch(a, 4000, 0);
+    try testing.expect(Writer.batchLen(b) > BUF_SIZE);
+    try testing.expect(std.meta.isError(w.write(b)));
+    w.abort();
+    try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
+    try testing.expectEqual(@as(usize, 0), try td.count());
 }
 
 test "spill reader rejects a file without the magic" {

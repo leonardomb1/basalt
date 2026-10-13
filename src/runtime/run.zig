@@ -409,6 +409,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 fn runScalarLet(env: *Env, l: ast.LetConst) !void {
     const what = try analyze.queryLetLabel(env.arena, l.name);
     const pipe = try buildPipeline(env, l.query.?.stages);
+    defer pipe.op.release();
     if (try analyze.queryLetColumnsProblem(env.arena, l.name, pipe.schema.fields.len)) |why| {
         const e = planErr(env.diag, why);
         env.diag.pos = l.pos;

@@ -205,6 +205,30 @@ pub const Op = union(enum) {
         }
     }
 
+    /// Frees what spilling operators in this tree still hold (files, their mappings,
+    /// their disk charge and memory) once the consumer is done pulling, whether the
+    /// tree ran to its end or not. Idempotent.
+    pub fn release(self: Op) void {
+        switch (self) {
+            .scan => {},
+            .sort => |s| {
+                s.release();
+                s.child.release();
+            },
+            .join => |j| {
+                j.release();
+                j.probe.release();
+                if (j.build) |b| b.release();
+            },
+            .nl_join => |j| {
+                j.probe.release();
+                if (j.build) |b| b.release();
+            },
+            .union_ => |u| for (u.children) |c| c.release(),
+            inline else => |o| o.child.release(),
+        }
+    }
+
     pub fn next(self: Op, arena: std.mem.Allocator) anyerror!?Batch {
         const st = self.stats();
         const t0 = std.time.Instant.now() catch {

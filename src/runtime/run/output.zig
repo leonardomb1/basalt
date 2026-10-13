@@ -312,6 +312,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.src_name = "";
     const src_base = env.sources.items.len;
     var res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+    defer res.op.release();
 
     const wr = try resolveUpsertKeys(env, last.write);
 

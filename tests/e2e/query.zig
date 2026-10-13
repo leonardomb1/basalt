@@ -1376,6 +1376,45 @@ test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to t
     try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 1024, .log = .{ .quiet = true } }, &rdiag));
 }
 
+test "spill: a LIMIT over a spilled sort or join gives its disk back before the next statement" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,k,s\n");
+    for (0..4000) |i| try in.print("{d},{d},s{d}\n", .{ i, (i * 7919) % 4001, i % 50 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    try tmp.dir.makeDir("spill");
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+
+    const cases = [_]struct { early: []const u8, full: []const u8 }{
+        .{ .early = "SELECT id FROM (SELECT id, k FROM '{0s}/in.csv' ORDER BY k) t WHERE id >= 0 LIMIT 1", .full = "SELECT count(*) AS n FROM (SELECT id FROM '{0s}/in.csv' ORDER BY k)" },
+        .{ .early = "SELECT a.id FROM '{0s}/in.csv' a JOIN '{0s}/in.csv' b ON a.k = b.k LIMIT 1", .full = "SELECT count(*) AS n FROM '{0s}/in.csv' a JOIN '{0s}/in.csv' b ON a.k = b.k" },
+    };
+    inline for (cases) |c| {
+        const early = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/early.csv' AS " ++ c.early ++ ";\n", .{base});
+        defer alloc.free(early);
+        const full = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/out.csv' AS " ++ c.full ++ ";\n", .{base});
+        defer alloc.free(full);
+        var cap: u64 = 1024;
+        while (true) : (cap *= 2) {
+            if (runScriptOpts(alloc, &tmp, full, .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir, .spill_cap = cap, .log = .{ .quiet = true } })) |out| {
+                alloc.free(out);
+                break;
+            } else |e| try std.testing.expectEqual(error.SpillCapExceeded, e);
+        }
+        const script = try std.mem.concat(alloc, u8, &.{ early, early, early, full });
+        defer alloc.free(script);
+        const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir, .spill_cap = cap, .log = .{ .quiet = true } });
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("n\n4000\n", out);
+    }
+}
+
 test "distinct: the single int-key path keeps first occurrences, null included once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
