@@ -100,6 +100,14 @@ fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     };
 }
 
+/// Date or timestamp text the engine reads its own way (`'2024-1-5'`, a `T`, a zone)
+/// but not plain ISO: against a column of unknown type it stays in the engine, as
+/// a source may read it differently, e.g. dropping the zone.
+fn looseTemporal(s: []const u8) bool {
+    if (eval.parseIsoDate(s) != null or eval.parseIsoTimestamp(s) != null) return false;
+    return eval.parseDateText(s) != null or eval.parseTimestampText(s) != null;
+}
+
 fn plainNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
@@ -396,6 +404,7 @@ const Tx = struct {
             break :blk self.o.schema.fields[i].ty.kind;
         } orelse {
             if (self.dialect.mysqlWire() and plainNumber(t)) return null;
+            if (looseTemporal(t)) return null;
             return self.value(&.{ .str_lit = lit });
         };
         switch (ck) {
@@ -456,6 +465,7 @@ const Tx = struct {
             const ls = (try self.typedLit(col, lit)) orelse return null;
             return try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
         }
+        if (k == .unknown and looseTemporal(std.mem.trim(u8, lit, " \t\r\n"))) return null;
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
         const f = known orelse ColFacts{ .text = true };
         const is_fn = k == .text and k.text.fn_;
@@ -686,6 +696,22 @@ test "translateExpr: equality with a string literal escapes quotes" {
     const e = try bin(a, .eq, try fld(a, "b"), lit);
     const sql = (try translateExpr(a, e, .mysql, testSchema(), true)).?;
     try testing.expectEqualStrings("(`b` = 'O''Brien')", sql);
+}
+
+test "translateExpr: loose date text against a column of unknown type stays in the engine" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "2024-01-05T05:00:00+05:00", "2024-1-5", "2024-01-05 05:00Z" }) |s| {
+        const lit = try a.create(ast.Expr);
+        lit.* = .{ .str_lit = s };
+        const e = try bin(a, .eq, try fld(a, "ts"), lit);
+        try testing.expect((try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)) == null);
+    }
+    const iso = try a.create(ast.Expr);
+    iso.* = .{ .str_lit = "2024-01-05 05:00:00" };
+    const e = try bin(a, .eq, try fld(a, "ts"), iso);
+    try testing.expectEqualStrings("(\"ts\" = '2024-01-05 05:00:00')", (try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)).?);
 }
 
 test "translateExpr: AND of comparisons, per-dialect quoting" {
