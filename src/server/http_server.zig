@@ -1,14 +1,17 @@
 //! HTTP trigger host for `@http` scripts. Each matching request runs the pipeline
 //! once: query-string values bind params, the request body feeds `read request`,
-//! and the response is a JSON run summary. A thread per connection keeps the health
-//! probes answering, but pipeline runs go one at a time; scale out with replicas
-//! behind a load balancer.
+//! and the response is a JSON run summary. A thread per connection (64 at most;
+//! past that a connection gets 503 + Retry-After) keeps the health probes
+//! answering, and request bodies are read before the run lock, but pipeline runs
+//! go one at a time; scale out with replicas behind a load balancer. A body read
+//! idle for 30s gets 408.
 //!
 //! Two entry points: `serve` hosts a single program; `serveDir` hosts every `@http`
 //! script in a directory, routing by each script's declared `@http(path=…)` and
-//! reloading on SIGHUP (the control plane writes scripts, then signals). The
-//! listener has a 1s accept timeout so the loop re-checks the shutdown and reload
-//! flags even when idle. `g_log` is the host's one logger, shared by every route
+//! reloading on SIGHUP (the control plane writes scripts, then signals). A reload
+//! thread loads the new table and swaps it in between runs, so the accept loop
+//! never waits on one. The listener has a 1s accept timeout so the loop re-checks
+//! the shutdown flag even when idle. `g_log` is the host's one logger, shared by every route
 //! and the flusher, so `--log-format json` covers loads, reloads and flush failures.
 //!
 //! `ACCEPT ... INTO BUFFER` endpoints validate a request against the declared
@@ -279,22 +282,26 @@ const Conns = struct {
     threads: usize,
     work: std.Thread.Mutex = .{},
     in_flight: std.atomic.Value(usize) = .init(0),
+    max_threads: usize = 64,
+    read_timeout_s: u32 = 30,
 
-    const max_threads = 64;
-
-    /// Past `max_threads`, or when a spawn fails, the connection is served inline.
+    /// Past `max_threads`, or when a spawn fails, the connection gets 503 with
+    /// Retry-After right away, so the accept thread never serves a request.
     fn dispatch(self: *Conns, conn: std.net.Server.Connection) void {
-        if (self.in_flight.fetchAdd(1, .acq_rel) < max_threads) {
+        if (self.in_flight.fetchAdd(1, .acq_rel) < self.max_threads) {
             if (std.Thread.spawn(.{}, serveConn, .{ self, conn })) |t| {
                 t.detach();
                 return;
             } else |_| {}
         }
-        serveConn(self, conn);
+        _ = self.in_flight.fetchSub(1, .acq_rel);
+        refuseBusy(conn.stream);
     }
 
     fn serveConn(self: *Conns, conn: std.net.Server.Connection) void {
         defer _ = self.in_flight.fetchSub(1, .acq_rel);
+        const tv = std.posix.timeval{ .sec = self.read_timeout_s, .usec = 0 };
+        std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
         var read_buf: [64 * 1024]u8 = undefined;
         handleConn(self, conn, &read_buf) catch {};
         conn.stream.close();
@@ -304,6 +311,19 @@ const Conns = struct {
         while (self.in_flight.load(.acquire) > 0) std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 };
+
+/// Answer 503 without reading the request, then drain what already arrived without
+/// waiting, so the close does not reset the connection before the client reads it.
+fn refuseBusy(stream: std.net.Stream) void {
+    const body = "{\"status\":\"error\",\"retryable\":true,\"error\":\"server busy\"}\n";
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\nretry-after: 5\r\ncontent-length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    _ = std.posix.send(stream.handle, msg, std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL) catch {};
+    std.posix.shutdown(stream.handle, .send) catch {};
+    var sink: [64 * 1024]u8 = undefined;
+    _ = std.posix.recv(stream.handle, &sink, std.posix.MSG.DONTWAIT) catch {};
+    stream.close();
+}
 
 const Registry = struct {
     gpa: std.mem.Allocator,
@@ -392,7 +412,7 @@ fn dirFingerprint(dir_path: []const u8) u64 {
 }
 
 /// With `watch` set, also reloads when the directory's contents change, checked
-/// at most every ~2s.
+/// at most every ~2s. Reloads run on their own thread so the accept loop never waits.
 pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
     var reg = try loadDir(gpa, dir_path);
@@ -402,10 +422,20 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
     banner(net_server.listen_address, reg.routes);
     if (watch) log(.info, "watching {s} for changes", .{dir_path});
     var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = runtime.defaultLanes() };
+    const reloader = try std.Thread.spawn(.{}, reloadLoop, .{ &conns, &reg, dir_path, watch, net_server.listen_address });
+    defer reloader.join();
     defer conns.drain();
+    while (!runtime.aborting()) {
+        const conn = net_server.accept() catch continue;
+        conns.dispatch(conn);
+    }
+}
+
+fn reloadLoop(conns: *Conns, reg: *Registry, dir_path: []const u8, watch: bool, address: std.net.Address) void {
     var fp: u64 = if (watch) dirFingerprint(dir_path) else 0;
     var last_check: i64 = 0;
     while (!runtime.aborting()) {
+        std.Thread.sleep(200 * std.time.ns_per_ms);
         var do_reload = runtime.takeReload();
         if (watch) {
             const now_ms = std.time.milliTimestamp();
@@ -418,21 +448,26 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
                 }
             }
         }
-        if (do_reload) {
-            if (loadDir(gpa, dir_path)) |new_reg| {
-                conns.work.lock();
-                reg.deinit();
-                reg = new_reg;
-                conns.routes = reg.routes;
-                conns.work.unlock();
-                if (watch) fp = dirFingerprint(dir_path);
-                log(.info, "reloaded {s}", .{dir_path});
-                banner(net_server.listen_address, reg.routes);
-            } else |e| log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
-        }
-        const conn = net_server.accept() catch continue;
-        conns.dispatch(conn);
+        if (do_reload and reloadOnce(conns, reg, dir_path)) banner(address, reg.routes);
     }
+}
+
+/// Load the directory off the lock, then swap the table once the current run, if
+/// any, finishes; requests read their route under the same lock. False when the
+/// load fails and the current routes stay.
+fn reloadOnce(conns: *Conns, reg: *Registry, dir_path: []const u8) bool {
+    const new_reg = loadDir(conns.gpa, dir_path) catch |e| {
+        log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
+        return false;
+    };
+    conns.work.lock();
+    var old = reg.*;
+    reg.* = new_reg;
+    conns.routes = reg.routes;
+    conns.work.unlock();
+    old.deinit();
+    log(.info, "reloaded {s}", .{dir_path});
+    return true;
 }
 
 fn findRoute(routes: []const Route, req_path: []const u8) ?Route {
@@ -442,6 +477,9 @@ fn findRoute(routes: []const Route, req_path: []const u8) ?Route {
     return null;
 }
 
+/// The body is read before the run lock, so a slow upload holds only its own
+/// thread. A request with neither Content-Length nor chunked encoding has an empty
+/// body (RFC 9112 §6.3), not one read until the client closes.
 fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !void {
     const gpa = conns.gpa;
     var send_buf: [16 * 1024]u8 = undefined;
@@ -463,23 +501,15 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
             return;
         }
 
-        conns.work.lock();
-        defer conns.work.unlock();
-        const route = findRoute(conns.routes, req_path) orelse {
-            try req.respond("{\"status\":\"error\",\"error\":\"not found\"}\n", .{ .status = .not_found, .keep_alive = false });
-            return;
-        };
-
         var req_arena = std.heap.ArenaAllocator.init(gpa);
         defer req_arena.deinit();
         const ra = req_arena.allocator();
+        const path = try ra.dupe(u8, req_path);
         var params = std.array_list.Managed(runtime.ParamArg).init(ra);
         try parseQuery(ra, &params, query);
-        dropForeignParams(&params, route.program);
         var hdrs = std.array_list.Managed(std.http.Header).init(ra);
         var hit = req.iterateHeaders();
         while (hit.next()) |h| try hdrs.append(.{ .name = try ra.dupe(u8, h.name), .value = try ra.dupe(u8, h.value) });
-        try bindHeaderParams(&params, route.program, hdrs.items);
 
         const too_large = "{\"status\":\"error\",\"retryable\":false,\"error\":\"request body over the 64 MiB limit\"}\n";
         const json_ct = std.http.Header{ .name = "content-type", .value = "application/json" };
@@ -487,6 +517,7 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
             try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
             return;
         }
+        if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = try req.readerExpectContinue(&body_buf);
         const body = reader.allocRemaining(gpa, .limited(max_body_bytes)) catch |e| switch (e) {
@@ -494,9 +525,23 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
                 try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
                 return;
             },
+            error.ReadFailed => {
+                if (creader.getError() orelse e != error.WouldBlock) return e;
+                try req.respond("{\"status\":\"error\",\"retryable\":true,\"error\":\"request body stalled\"}\n", .{ .status = .request_timeout, .keep_alive = false, .extra_headers = &.{json_ct} });
+                return;
+            },
             else => return e,
         };
         defer gpa.free(body);
+
+        conns.work.lock();
+        defer conns.work.unlock();
+        const route = findRoute(conns.routes, path) orelse {
+            try req.respond("{\"status\":\"error\",\"error\":\"not found\"}\n", .{ .status = .not_found, .keep_alive = false });
+            return;
+        };
+        dropForeignParams(&params, route.program);
+        try bindHeaderParams(&params, route.program, hdrs.items);
 
         if (route.buf) |bs| {
             var vmsg: []const u8 = "";
@@ -971,6 +1016,130 @@ test "health probes answer while a request holds the run lock" {
     var rbuf: [256]u8 = undefined;
     var r = s.reader(&rbuf);
     try std.testing.expectEqualStrings("HTTP/1.1 200 ", try r.interface().takeArray(13));
+}
+
+fn testConnect(srv: *std.net.Server, conns: *Conns, req: []const u8) !std.net.Stream {
+    const s = try std.net.tcpConnectToAddress(srv.listen_address);
+    errdefer s.close();
+    const tv = std.posix.timeval{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(s.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try s.writeAll(req);
+    conns.dispatch(try srv.accept());
+    return s;
+}
+
+fn expectStatus(s: std.net.Stream, comptime want: []const u8) !void {
+    var rbuf: [512]u8 = undefined;
+    var r = s.reader(&rbuf);
+    try std.testing.expectEqualStrings(want, try r.interface().takeArray(want.len));
+}
+
+test "a slow request body blocks neither health probes nor other endpoints; a stalled one gets 408" {
+    initLog(.{ .quiet = true });
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n7\n" });
+    var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const pa = try parser.parseSource(a, try std.fmt.allocPrint(a, "CREATE ENDPOINT '/a'; LOAD INTO '{s}/a.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base }), &d);
+    const pb = try parser.parseSource(a, try std.fmt.allocPrint(a, "CREATE ENDPOINT '/b'; LOAD INTO '{s}/b.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base }), &d);
+    const routes = [_]Route{
+        .{ .path = "/a", .program = pa, .label = "a" },
+        .{ .path = "/b", .program = pb, .label = "b" },
+    };
+
+    var srv = try listen("127.0.0.1", 0);
+    defer srv.deinit();
+    var conns = Conns{ .gpa = gpa, .routes = &routes, .threads = 1 };
+    defer conns.drain();
+
+    const slow = try testConnect(&srv, &conns, "POST /a HTTP/1.1\r\ncontent-length: 6\r\n\r\nabc");
+    defer slow.close();
+    {
+        const h = try testConnect(&srv, &conns, "GET /healthz HTTP/1.1\r\n\r\n");
+        defer h.close();
+        try expectStatus(h, "HTTP/1.1 200 ");
+    }
+    {
+        const b = try testConnect(&srv, &conns, "POST /b HTTP/1.1\r\n\r\n");
+        defer b.close();
+        try expectStatus(b, "HTTP/1.1 200 ");
+    }
+    try slow.writeAll("def");
+    try expectStatus(slow, "HTTP/1.1 200 ");
+
+    conns.drain();
+    conns.read_timeout_s = 1;
+    const stalled = try testConnect(&srv, &conns, "POST /a HTTP/1.1\r\ncontent-length: 6\r\n\r\nabc");
+    defer stalled.close();
+    try expectStatus(stalled, "HTTP/1.1 408 ");
+}
+
+fn testReload(conns: *Conns, reg: *Registry, dir: []const u8) void {
+    _ = reloadOnce(conns, reg, dir);
+}
+
+test "a reload waiting on a long run leaves new connections accepted and answered" {
+    initLog(.{ .quiet = true });
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const dir = try tmp.dir.realpathAlloc(ar.allocator(), ".");
+    try tmp.dir.writeFile(.{ .sub_path = "one.sql", .data = "CREATE ENDPOINT '/one'; LOAD INTO 'o.csv' AS SELECT 1 AS x;" });
+
+    var reg = try loadDir(gpa, dir);
+    defer reg.deinit();
+    var srv = try listen("127.0.0.1", 0);
+    defer srv.deinit();
+    var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = 1 };
+    defer conns.drain();
+
+    try tmp.dir.writeFile(.{ .sub_path = "two.sql", .data = "CREATE ENDPOINT '/two'; LOAD INTO 't.csv' AS SELECT 1 AS x;" });
+    conns.work.lock();
+    const reloader = try std.Thread.spawn(.{}, testReload, .{ &conns, &reg, dir });
+    var locked = true;
+    defer if (locked) {
+        conns.work.unlock();
+        reloader.join();
+    };
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+    {
+        const h = try testConnect(&srv, &conns, "GET /healthz HTTP/1.1\r\n\r\n");
+        defer h.close();
+        try expectStatus(h, "HTTP/1.1 200 ");
+    }
+    try std.testing.expectEqual(@as(usize, 1), conns.routes.len);
+    conns.work.unlock();
+    reloader.join();
+    locked = false;
+    try std.testing.expectEqual(@as(usize, 2), conns.routes.len);
+    try std.testing.expect(findRoute(conns.routes, "/two") != null);
+}
+
+test "past the connection cap a request gets 503 + Retry-After instead of an inline run" {
+    initLog(.{ .quiet = true });
+    var srv = try listen("127.0.0.1", 0);
+    defer srv.deinit();
+    var conns = Conns{ .gpa = std.testing.allocator, .routes = &.{}, .threads = 1, .max_threads = 1 };
+    defer conns.drain();
+
+    const busy = try testConnect(&srv, &conns, "GET /healthz HTTP/1.1\r\n");
+    defer busy.close();
+    const s = try testConnect(&srv, &conns, "GET /healthz HTTP/1.1\r\n\r\n");
+    defer s.close();
+    var rbuf: [512]u8 = undefined;
+    var r = s.reader(&rbuf);
+    const resp = try r.interface().allocRemaining(std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 503 "));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "retry-after: 5\r\n") != null);
+    try std.posix.shutdown(busy.handle, .send);
 }
 
 test "listen refuses a port another server already holds" {
