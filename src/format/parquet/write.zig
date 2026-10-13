@@ -135,6 +135,7 @@ const ColBuf = struct {
     nulls: i64 = 0,
     min: ?Value = null,
     max: ?Value = null,
+    nan: bool = false,
     dict: std.StringHashMap(u32),
     dict_order: List([]const u8),
     /// A fixed-width column's dictionary: its PLAIN bytes (at most 16) as an integer
@@ -186,6 +187,7 @@ const ColBuf = struct {
         self.nulls = 0;
         self.min = null;
         self.max = null;
+        self.nan = false;
         self.dict.clearRetainingCapacity();
         self.dict_order.clearRetainingCapacity();
         self.fixed.clearRetainingCapacity();
@@ -248,9 +250,20 @@ const ColBuf = struct {
         return true;
     }
 
+    /// Decimals compare as numbers, not mantissas: per-value scales once ranked `0.5`
+    /// above `0.10`, wrote min > max, and readers pruned real rows. A NaN drops the
+    /// chunk's bounds, as the format leaves NaN out of min/max and a reader could
+    /// then prune the rows `x > 5` matches.
     fn observe(self: *ColBuf, arena: std.mem.Allocator, v: Value) !void {
-        if (self.min == null or order(v, self.min.?) == .lt) self.min = try own(arena, v);
-        if (self.max == null or order(v, self.max.?) == .gt) self.max = try own(arena, v);
+        if (self.nan) return;
+        if (v == .float and std.math.isNan(v.float)) {
+            self.nan = true;
+            self.min = null;
+            self.max = null;
+            return;
+        }
+        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try own(arena, v);
+        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try own(arena, v);
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -294,48 +307,6 @@ const ChunkMeta = struct {
     min: ?Value = null,
     max: ?Value = null,
 };
-
-/// Ordering for min/max statistics. Decimals compare as numbers, not mantissas:
-/// per-value scales once ranked `0.5` above `0.10`, wrote min > max, and readers pruned real rows.
-fn order(a: Value, b: Value) std.math.Order {
-    return switch (a) {
-        .int => std.math.order(a.int, switch (b) {
-            .int => |x| x,
-            else => a.int,
-        }),
-        .float => std.math.order(a.float, switch (b) {
-            .float => |x| x,
-            else => a.float,
-        }),
-        .date => std.math.order(a.date, switch (b) {
-            .date => |x| x,
-            else => a.date,
-        }),
-        .time => std.math.order(a.time, switch (b) {
-            .time => |x| x,
-            else => a.time,
-        }),
-        .timestamp => std.math.order(a.timestamp, switch (b) {
-            .timestamp => |x| x,
-            else => a.timestamp,
-        }),
-        .decimal => eval.compareValues(a, b) orelse .eq,
-        .bool => std.math.order(@intFromBool(a.bool), switch (b) {
-            .bool => |x| @intFromBool(x),
-            else => @intFromBool(a.bool),
-        }),
-        .string, .bytes => blk: {
-            const sa = if (a == .string) a.string else a.bytes;
-            const sb = switch (b) {
-                .string => |x| x,
-                .bytes => |x| x,
-                else => sa,
-            };
-            break :blk std.mem.order(u8, sa, sb);
-        },
-        .null => .eq,
-    };
-}
 
 const RowGroupMeta = struct {
     chunks: []ChunkMeta,
@@ -1323,6 +1294,32 @@ test "statistics record min, max and null count per row group" {
     try testing.expectEqual(@as(i64, 1), stats[1].nulls);
     try testing.expectEqualStrings("apple", stats[1].min);
     try testing.expectEqualStrings("zebra", stats[1].max);
+}
+
+test "a float chunk holding a NaN records no min or max" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "nan.parquet" });
+
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = types.Type.init(.float).asNullable() }} };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    var xs = try column.Builder.initCapacity(a, schema.fields[0].ty, 3);
+    try xs.append(.{ .float = 1.5 });
+    try xs.append(.{ .float = std.math.nan(f64) });
+    try xs.append(.{ .float = 0.5 });
+    var cols = [_]column.Column{try xs.finish()};
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 3 });
+    try w.close();
+
+    const bytes = try std.fs.cwd().readFileAlloc(a, path, 1 << 20);
+    const stats = try readStats(a, bytes, try parquet.parseFile(a, bytes));
+    try testing.expectEqualStrings("", stats[0].min);
+    try testing.expectEqualStrings("", stats[0].max);
 }
 
 const Stat = struct { nulls: i64, min: []const u8, max: []const u8 };
