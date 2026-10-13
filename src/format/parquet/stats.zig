@@ -205,8 +205,11 @@ fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]
 /// Null means unknown and the caller must keep the group. It once returned `.eq`
 /// for unknown pairs, which pruned every group of a DECIMAL or date-vs-string range.
 /// `eval.compareValues` first, so pruning agrees with the filter that re-checks
-/// rows; past it, the cross-kind pairs a statistic orders against.
+/// rows; past it, the cross-kind pairs a statistic orders against. A text
+/// statistic against a date or time is unknown: text bounds are lexicographic, so
+/// `2024-01-05 23:00` can be the min of a group that also holds `2024-01-05T09:00`.
 pub fn cmp(a: Value, b: Value) ?std.math.Order {
+    if ((a == .string or a == .bytes) and b != .string and b != .bytes) return null;
     if (eval.compareValues(a, b)) |o| return o;
     return switch (a) {
         .date => |x| if (b == .int) std.math.order(@as(i64, x), b.int) else null,
@@ -235,6 +238,8 @@ test "cmp: an unorderable pair is unknown, never a fabricated equality" {
     try std.testing.expect(cmp(d, .{ .bool = true }) == null);
     try std.testing.expect(cmp(.{ .int = 5 }, .{ .string = "5" }) == null);
     try std.testing.expect(cmp(.{ .string = "a" }, .{ .int = 1 }) == null);
+    try std.testing.expect(cmp(.{ .string = "2024-01-05 23:00:00" }, .{ .timestamp = 0 }) == null);
+    try std.testing.expect(cmp(.{ .string = "2024-01-05" }, d) == null);
     try std.testing.expectEqual(std.math.Order.lt, cmp(.{ .timestamp = 0 }, .{ .string = "1970-01-02" }).?);
 }
 
