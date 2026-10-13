@@ -1041,21 +1041,42 @@ fn parseDateText(t: []const u8) i64 {
 }
 
 /// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
-/// second identical, collapsing distinct rows and unsettling ORDER BY.
+/// second identical, collapsing distinct rows and unsettling ORDER BY. A trailing
+/// offset (`-03`, `+05:45`, ` +00:00`), as a `timestamptz` prints in the session's
+/// zone, is folded into UTC, so a value reads the same whatever that zone is.
 fn parseDatetimeText(t: []const u8) i64 {
     const days = parseDateText(t);
     var secs: i64 = 0;
     if (t.len >= 19) secs = atoiN(t[11..13]) * 3600 + atoiN(t[14..16]) * 60 + atoiN(t[17..19]);
     var frac: i64 = 0;
+    var i: usize = @min(t.len, 19);
     if (t.len > 20 and t[19] == '.') {
-        var i: usize = 20;
+        i = 20;
         var scale: i64 = 100_000;
-        while (i < t.len and scale > 0 and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-            frac += @as(i64, t[i] - '0') * scale;
+        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
+            if (scale > 0) frac += @as(i64, t[i] - '0') * scale;
             scale = @divTrunc(scale, 10);
         }
     }
+    if (i < t.len and t[i] == ' ') i += 1;
+    if (t.len >= 19 and i + 3 <= t.len and (t[i] == '+' or t[i] == '-')) {
+        const sign: i64 = if (t[i] == '-') -1 else 1;
+        var off = atoiN(t[i + 1 .. i + 3]) * 3600;
+        var j = i + 3;
+        if (j < t.len and t[j] == ':') j += 1;
+        if (j + 2 <= t.len) off += atoiN(t[j .. j + 2]) * 60;
+        secs -= sign * off;
+    }
     return days * 86_400_000_000 + secs * 1_000_000 + frac;
+}
+
+test "parseDatetimeText folds a timestamptz offset into UTC" {
+    const base = parseDatetimeText("2024-01-05 05:00:00");
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 02:00:00-03"));
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 10:45:00+05:45"));
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 05:00:00 +00:00"));
+    try std.testing.expectEqual(base + 250_000, parseDatetimeText("2024-01-05 02:00:00.25-03"));
+    try std.testing.expectEqual(base + 123_456, parseDatetimeText("2024-01-05 05:00:00.1234567"));
 }
 
 fn atoiN(s: []const u8) i64 {

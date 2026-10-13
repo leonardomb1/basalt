@@ -11,7 +11,9 @@
 //! field count that disagreed with the RowDescription indexed `builders` out of
 //! bounds. A second statement's rows are never appended to the first's, since the
 //! schema is the first's. NUMERIC precision (up to 1000 in Postgres) is capped at
-//! 38, the ceiling of the engine's i128 decimal.
+//! 38, the ceiling of the engine's i128 decimal. Sessions start in `TimeZone=UTC`,
+//! the zone basalt's timestamps keep: a `timestamptz` reads, and a pushed timestamp
+//! literal compares, the same whatever the server's or database's zone is.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -105,6 +107,8 @@ pub const Conn = struct {
             try appendCStr(&body, "database");
             try appendCStr(&body, database);
         }
+        try appendCStr(&body, "TimeZone");
+        try appendCStr(&body, "UTC");
         try body.append(0);
 
         var hdr: [4]u8 = undefined;
