@@ -157,6 +157,30 @@ pub fn genCreateTable(
     return sql.createTableSqlWith(arena, flavor.dialect(), qtable, schema, mode, .{ .buckets = buckets, .replication_num = replication_num });
 }
 
+/// `<base>/api/<db>/<table>/_stream_load`, the names percent-encoded so a space,
+/// `/`, `?` or `#` in one stays part of it.
+fn loadUrl(gpa: std.mem.Allocator, base: []const u8, db: []const u8, table: []const u8) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{s}/api/", .{base});
+    try std.Uri.Component.percentEncode(w, db, isUnreserved);
+    try w.writeByte('/');
+    try std.Uri.Component.percentEncode(w, table, isUnreserved);
+    try w.writeAll("/_stream_load");
+    return aw.toOwnedSlice();
+}
+
+fn isUnreserved(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
+}
+
+test "loadUrl percent-encodes the database and table" {
+    const u = try loadUrl(std.testing.allocator, "http://be:8040", "my db", "a/b?c#d");
+    defer std.testing.allocator.free(u);
+    try std.testing.expectEqualStrings("http://be:8040/api/my%20db/a%2Fb%3Fc%23d/_stream_load", u);
+}
+
 /// The first name StarRocks cannot quote, if any: its parser collapses a doubled
 /// backtick to nothing, so `a``b` names the column `ab`.
 pub fn unquotableName(flavor: Flavor, db: []const u8, table: []const u8, schema: types.Schema) ?[]const u8 {
@@ -373,7 +397,7 @@ pub const StreamLoadSink = struct {
 
     /// The URL and headers every transaction sends; the label is filled per transaction.
     fn buildRequestParts(self: *StreamLoadSink) !void {
-        self.url = try std.fmt.allocPrint(self.gpa, "{s}/api/{s}/{s}/_stream_load", .{ self.cfg.load_url, self.db, self.table });
+        self.url = try loadUrl(self.gpa, self.cfg.load_url, self.db, self.table);
         const cred = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ self.cfg.user, self.cfg.password });
         defer self.gpa.free(cred);
         const b64 = try self.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(cred.len));
