@@ -726,6 +726,11 @@ const PacketReader = struct {
         return b;
     }
     fn readBytes(self: *PacketReader, dst: []u8) !void {
+        if (self.pos + dst.len <= self.buf.items.len) {
+            @memcpy(dst, self.buf.items[self.pos..][0..dst.len]);
+            self.pos += dst.len;
+            return;
+        }
         var off: usize = 0;
         while (off < dst.len) {
             if (!try self.ensure()) return error.EndOfMessage;
@@ -796,6 +801,7 @@ const TdsCursor = struct {
     cols: []ColumnDesc,
     schema: *types.Schema,
     done: bool,
+    full: bool = false,
     cell: [0xFFFF]u8 = undefined,
     nullbuf: [512]u8 = undefined,
 
@@ -832,12 +838,16 @@ const TdsCursor = struct {
 
     /// After the rowset the batch is run to its end, so a later statement executes and
     /// its error is seen; closing early would have SQL Server abandon it silently.
+    /// Once a batch fills, the next one's columns are sized for a full batch up front.
     fn fetchBatch(self: *TdsCursor, arena: std.mem.Allocator) !?Batch {
         if (self.done) return null;
         const ncol = self.cols.len;
         if (ncol == 0) return null;
         const builders = try arena.alloc(column.Builder, ncol);
-        for (self.cols, builders) |c, *b| b.* = column.Builder.init(arena, c.engine_type);
+        for (self.cols, builders) |c, *b| b.* = if (self.full)
+            try column.Builder.initCapacity(arena, c.engine_type, sql.STREAM_ROWS)
+        else
+            column.Builder.init(arena, c.engine_type);
 
         var n: usize = 0;
         while (n < sql.STREAM_ROWS) {
@@ -871,6 +881,7 @@ const TdsCursor = struct {
                 },
             }
         }
+        self.full = n == sql.STREAM_ROWS;
         if (n == 0) return null;
         const out = try arena.alloc(column.Column, ncol);
         for (builders, 0..) |*b, k| out[k] = try b.finish();
