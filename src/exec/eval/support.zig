@@ -237,9 +237,21 @@ pub fn toI64(v: Value) i64 {
     return switch (v) {
         .int => |x| x,
         .float => |x| std.math.lossyCast(i64, x),
+        .decimal => |d| blk: {
+            var q = d.unscaled;
+            var s = d.scale;
+            while (s > 0) : (s -= 1) q = @divTrunc(q, 10);
+            break :blk std.math.lossyCast(i64, q);
+        },
         .string => |s| parseIntStrict(trim(s)) orelse 0,
         else => 0,
     };
+}
+
+test "toI64 truncates a decimal as it does a float" {
+    try std.testing.expectEqual(@as(i64, 2024), toI64(.{ .decimal = .{ .unscaled = 20249, .scale = 1 } }));
+    try std.testing.expectEqual(@as(i64, -86400), toI64(.{ .decimal = .{ .unscaled = -864005, .scale = 1 } }));
+    try std.testing.expectEqual(@as(i64, 7), toI64(.{ .decimal = .{ .unscaled = 7, .scale = 0 } }));
 }
 
 test "formatDecimal pads sub-unit magnitudes, zero, and negatives" {

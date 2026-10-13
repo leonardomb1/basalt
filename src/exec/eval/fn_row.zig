@@ -767,7 +767,27 @@ pub const per_row = struct {
     pub fn toTimestamp(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
-        return Value{ .timestamp = try mulI64(toI64(v), 1_000_000) };
+        return Value{ .timestamp = try epochMicros(v) };
+    }
+
+    /// Seconds since the epoch as microseconds, a fraction kept to the microsecond
+    /// as PostgreSQL's `to_timestamp` keeps it.
+    fn epochMicros(v: Value) EvalError!i64 {
+        switch (v) {
+            .float => |x| {
+                const us = @round(x * 1_000_000);
+                if (!std.math.isFinite(us) or @abs(us) > 9.2e18) return error.IntOverflow;
+                return @intFromFloat(us);
+            },
+            .decimal => |d| {
+                var q: i128 = d.unscaled;
+                var s: u8 = d.scale;
+                while (s < 6) : (s += 1) q = std.math.mul(i128, q, 10) catch return error.IntOverflow;
+                while (s > 6) : (s -= 1) q = @divTrunc(q + (if (s == 7) @as(i128, if (q < 0) -5 else 5) else 0), 10);
+                return std.math.cast(i64, q) orelse error.IntOverflow;
+            },
+            else => return mulI64(toI64(v), 1_000_000),
+        }
     }
 
     pub fn strftime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
