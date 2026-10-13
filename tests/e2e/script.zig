@@ -1449,6 +1449,10 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'basic');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "`auth` is kerberos or ntlm, not `basic`" },
         .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'kerberos', user = 'me');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "Kerberos needs the `realm`" },
         .{ "SELECT * FROM nope.t;", "unknown connection `nope` in read" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LOAD INTO '$B/o.csv' WITH (bogus = 1) AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown `LOAD INTO` option `bogus`" },
+        .{ "CASE WHEN 1 = 0 THEN LOAD INTO '$B/o.xlsx' AS SELECT 1 AS a; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "does not write them" },
+        .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "only a starrocks or doris target" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' a JOIN '$B/a.csv' b ON a.x = b.x WITH (join_order = 'bad');", "join_order is 'auto' or 'written'" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

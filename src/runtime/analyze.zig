@@ -806,6 +806,46 @@ pub fn misplacedDecl(arena: std.mem.Allocator, stmts: []const ast.Stmt, where: e
 
 pub const stmtPos = ast.stmtPos;
 
+/// A join's `join_order` hint, which only names 'auto' or 'written'.
+pub fn checkJoinOrders(stages: []const ast.Stage, diag: *Diag) Error!void {
+    for (stages) |st| if (st.node == .join and joinorder.mode(st.hints) == .invalid) {
+        const e = fail(diag, "join_order is 'auto' or 'written'", .{});
+        diag.pos = st.pos;
+        return e;
+    };
+}
+
+/// The rules `analyzeOutput` applies that need no schema, a target's and its
+/// options' and a join's `join_order`, for every query in every body: a FOR EACH, a
+/// CASE arm, a statement function. The run asks this up front, so a query that never
+/// executes is refused as `check` refuses it.
+pub fn checkStaticQueries(arena: std.mem.Allocator, stmts: []const ast.Stmt, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
+    for (stmts) |s| switch (s) {
+        .output => |p| try checkStaticQuery(arena, p, connections, diag),
+        .explain => |e| try checkStaticQuery(arena, e.pipeline, connections, diag),
+        .for_each => |fe| try checkStaticQueries(arena, fe.body, connections, diag),
+        .match => |m| for (m.arms) |arm| try checkStaticQueries(arena, arm.body, connections, diag),
+        .func => |fd| if (fd.body == .stmts) try checkStaticQueries(arena, fd.body.stmts, connections, diag),
+        else => {},
+    };
+}
+
+fn checkStaticQuery(arena: std.mem.Allocator, p: ast.Pipeline, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
+    if (p.stages.len == 0) return;
+    try checkJoinOrders(p.stages, diag);
+    const last = p.stages[p.stages.len - 1];
+    if (last.node != .write) return;
+    errdefer diag.stamp(last.pos);
+    const w = last.node.write;
+    if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
+        try checkFileSink(w, last.hints, diag);
+        return checkSinkForm(w, last.hints, w.connector, diag);
+    }
+    const conn = connections.get(w.connector) orelse return;
+    try checkSinkForm(w, last.hints, conn.connector, diag);
+    try checkSinkConnection(arena, conn, diag);
+}
+
 /// One pipeline against declarations already in scope, for the executor's
 /// `EXPLAIN <query>;`, which holds these maps (params folded) and hands them over.
 pub fn analyzeOne(
@@ -998,6 +1038,7 @@ const Ctx = struct {
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`", .{});
         for (stages) |st| try checkStageLiterals(self.diag, st);
+        try checkJoinOrders(stages, self.diag);
 
         var source = self.resolveSource(stages[0]) catch |e| {
             self.diag.stamp(stages[0].pos);
@@ -1028,7 +1069,6 @@ const Ctx = struct {
             errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
             if (st.node == .join) si.key_pushdown = try self.keyPushNote(stages[0..si_at], st);
-            if (st.node == .join and joinorder.mode(st.hints) == .invalid) return fail(self.diag, "join_order is 'auto' or 'written'", .{});
             if (st.node == .join) si.join_order = joinorder.staticNote(st, stages[si_at + 1 ..]);
             if (si.breaker) {
                 has_breaker = true;

@@ -201,6 +201,15 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         diag.pos = m.pos;
         return e;
     }
+    var sdiag = analyze.Diag{};
+    analyze.checkStaticQueries(arena, program.stmts[1..], &connections, &sdiag) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.AnalyzeFailed => {
+            const err = planErr(diag, sdiag.msg);
+            diag.pos = sdiag.pos;
+            return err;
+        },
+    };
     if (runnable == 0 and !opts.declarations_only)
         return planErr(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`");
 
