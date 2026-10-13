@@ -21,6 +21,7 @@ const Scan = @import("../op.zig").Scan;
 const Space = @import("../space.zig").Space;
 const column = @import("../column.zig");
 const driver = @import("../../connect/driver.zig");
+const keyhash = @import("../keyhash.zig");
 const spill = @import("../spill.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -32,13 +33,7 @@ pub const keep: u8 = 0xFF;
 /// The spill file a key's hash goes to at `depth`. Each depth salts the hash
 /// differently, so the keys of one file spread over all files of the next level.
 pub fn partOf(h: u64, depth: u8) u8 {
-    var x = h ^ (0x9E3779B97F4A7C15 *% (@as(u64, depth) + 1));
-    x ^= x >> 33;
-    x *%= 0xff51afd7ed558ccd;
-    x ^= x >> 33;
-    x *%= 0xc4ceb9fe1a85ec53;
-    x ^= x >> 33;
-    return @intCast(x >> 60);
+    return @intCast(keyhash.fmix64(h ^ (0x9E3779B97F4A7C15 *% (@as(u64, depth) + 1))) >> 60);
 }
 
 /// An allocator that counts the bytes it hands out, never what is freed: over an

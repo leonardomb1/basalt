@@ -48,18 +48,8 @@ pub const few_groups = 1 << 12;
 /// of a 100-group GROUP BY.
 pub fn fixedHash(vals: []const i64, mask: u64) u64 {
     var h: u64 = 0x9E3779B97F4A7C15 ^ mask;
-    for (vals) |v| h = fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
+    for (vals) |v| h = keyhash.fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
     return h;
-}
-
-pub fn fmix64(x0: u64) u64 {
-    var x = x0;
-    x ^= x >> 33;
-    x *%= 0xff51afd7ed558ccd;
-    x ^= x >> 33;
-    x *%= 0xc4ceb9fe1a85ec53;
-    x ^= x >> 33;
-    return x;
 }
 
 pub const Fast = enum {

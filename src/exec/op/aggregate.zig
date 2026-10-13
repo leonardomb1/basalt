@@ -144,7 +144,6 @@ pub const Aggregate = struct {
     pub const Direct = @import("aggregate/table.zig").Direct;
     pub const few_groups = @import("aggregate/table.zig").few_groups;
     pub const fixedHash = @import("aggregate/table.zig").fixedHash;
-    pub const fmix64 = @import("aggregate/table.zig").fmix64;
     pub const Fast = @import("aggregate/table.zig").Fast;
     pub const KeyKind = @import("aggregate/table.zig").KeyKind;
     pub const keyKindOf = @import("aggregate/table.zig").keyKindOf;
