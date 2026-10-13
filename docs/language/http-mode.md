@@ -23,7 +23,19 @@ WHERE tipo IN ('leitura', 'alarme');
   way; without `--port`, `run` refuses an endpoint script instead of guessing
   a port. A port already in use is an error, not a second listener.
 - A request body is capped at 64 MiB (**413** past it) and the request head
-  at 64 KiB (**431**); a request that is not valid HTTP gets **400**.
+  at 64 KiB (**431**); a request that is not valid HTTP gets **400**. A body
+  that sends nothing for 30 seconds gets **408**; a request with neither
+  `Content-Length` nor chunked encoding has an empty body.
+- Each connection gets its own thread, up to 64; past that a new connection
+  is answered **503** + `Retry-After` at once, health probes included, so the
+  client retries rather than queueing. Bodies are read in parallel, but
+  pipeline runs go one at a time: a long run makes the next endpoint request
+  (buffered accepts included) wait for it once its body is in, but never
+  delays `/healthz` or another client's upload. For more throughput, run
+  replicas behind the load balancer.
+- A reload loads the new scripts on the side and swaps them in between runs:
+  a run in flight finishes on its old script, later requests see the new
+  ones, and the server keeps accepting connections throughout.
 - **`FROM BODY (schema)`** declares the request contract. The body (JSON array
   or single object) is validated row by row: a missing/null `NOT NULL` column
   or an unreadable value rejects the request with a message naming the row —
