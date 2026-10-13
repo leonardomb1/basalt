@@ -589,10 +589,7 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
         const query = if (q) |qi| target[qi + 1 ..] else "";
 
         if (std.mem.eql(u8, req_path, "/healthz") or std.mem.eql(u8, req_path, "/readyz")) {
-            try req.respond("{\"status\":\"ok\"}\n", .{ .status = .ok, .keep_alive = false, .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/json" },
-            } });
-            return;
+            return respondJson(&req, .ok, "{\"status\":\"ok\"}\n");
         }
 
         var req_arena = std.heap.ArenaAllocator.init(gpa);
@@ -605,24 +602,16 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
         var hit = req.iterateHeaders();
         while (hit.next()) |h| try hdrs.append(.{ .name = try ra.dupe(u8, h.name), .value = try ra.dupe(u8, h.value) });
 
-        const too_large = "{\"status\":\"error\",\"retryable\":false,\"error\":\"request body over the 64 MiB limit\"}\n";
-        const json_ct = std.http.Header{ .name = "content-type", .value = "application/json" };
-        if ((req.head.content_length orelse 0) > max_body_bytes) {
-            try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
-            return;
-        }
+        const too_large = "request body over the 64 MiB limit";
+        if ((req.head.content_length orelse 0) > max_body_bytes) return respondError(ra, &req, .payload_too_large, false, too_large);
         if (req.head.transfer_encoding == .none and req.head.content_length == null) req.head.content_length = 0;
         var body_buf: [64 * 1024]u8 = undefined;
         const reader = try req.readerExpectContinue(&body_buf);
         const body = reader.allocRemaining(gpa, .limited(max_body_bytes)) catch |e| switch (e) {
-            error.StreamTooLong => {
-                try req.respond(too_large, .{ .status = .payload_too_large, .keep_alive = false, .extra_headers = &.{json_ct} });
-                return;
-            },
+            error.StreamTooLong => return respondError(ra, &req, .payload_too_large, false, too_large),
             error.ReadFailed => {
                 if (creader.getError() orelse e != error.WouldBlock) return e;
-                try req.respond("{\"status\":\"error\",\"retryable\":true,\"error\":\"request body stalled\"}\n", .{ .status = .request_timeout, .keep_alive = false, .extra_headers = &.{json_ct} });
-                return;
+                return respondError(ra, &req, .request_timeout, true, "request body stalled");
             },
             else => return e,
         };
@@ -630,10 +619,7 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
 
         conns.work.lock();
         defer conns.work.unlock();
-        const route = findRoute(conns.routes, path) orelse {
-            try req.respond("{\"status\":\"error\",\"error\":\"not found\"}\n", .{ .status = .not_found, .keep_alive = false });
-            return;
-        };
+        const route = findRoute(conns.routes, path) orelse return respondError(ra, &req, .not_found, false, "not found");
         dropForeignParams(&params, route.program);
         try bindHeaderParams(&params, route.program, hdrs.items);
 
@@ -642,21 +628,10 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
             if (acceptIntoBuffer(bs, ra, body, &vmsg)) |rows| {
                 var ok_buf: [96]u8 = undefined;
                 const ok = std.fmt.bufPrint(&ok_buf, "{{\"status\":\"accepted\",\"rows\":{d}}}\n", .{rows}) catch unreachable;
-                try req.respond(ok, .{ .status = .ok, .keep_alive = false, .extra_headers = &.{json_ct} });
+                try respondJson(&req, .ok, ok);
             } else |e| switch (e) {
-                error.Backpressure => try req.respond("{\"status\":\"error\",\"retryable\":true,\"error\":\"buffer full\"}\n", .{
-                    .status = .service_unavailable,
-                    .keep_alive = false,
-                    .extra_headers = &.{ json_ct, .{ .name = "retry-after", .value = "5" } },
-                }),
-                error.BodySchemaViolation => {
-                    var out = std.array_list.Managed(u8).init(gpa);
-                    defer out.deinit();
-                    try out.appendSlice("{\"status\":\"error\",\"retryable\":false,\"error\":\"");
-                    try writeJsonStr(out.writer(), vmsg);
-                    try out.appendSlice("\"}\n");
-                    try req.respond(out.items, .{ .status = .unprocessable_entity, .keep_alive = false, .extra_headers = &.{json_ct} });
-                },
+                error.Backpressure => try respondError(ra, &req, .service_unavailable, true, "buffer full"),
+                error.BodySchemaViolation => try respondError(ra, &req, .unprocessable_entity, false, vmsg),
                 else => return e,
             }
             return;
@@ -671,7 +646,6 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
         defer out.deinit();
         const w = out.writer();
         var status: std.http.Status = .ok;
-        var retry_after = false;
 
         if (result) |stats| {
             const nfail = sink.failures();
@@ -696,7 +670,6 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
         } else |err| {
             const transient = diag.retryable or runtime.isTransient(err);
             status = if (transient) .service_unavailable else .unprocessable_entity;
-            retry_after = transient;
             try w.print("{{\"status\":\"error\",\"retryable\":{},", .{transient});
             if (diag.pos) |p| try w.print("\"line\":{d},\"col\":{d},", .{ p.line, p.col });
             try w.writeAll("\"error\":\"");
@@ -706,13 +679,23 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
             try w.writeAll("\"}\n");
         }
 
-        if (retry_after) {
-            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{ json_ct, .{ .name = "retry-after", .value = "5" } } });
-        } else {
-            try req.respond(out.items, .{ .status = status, .keep_alive = false, .extra_headers = &.{json_ct} });
-        }
-        return;
+        return respondJson(&req, status, out.items);
     }
+}
+
+/// A JSON answer that closes the connection; a 503 says when to retry.
+fn respondJson(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
+    const json_ct = std.http.Header{ .name = "content-type", .value = "application/json" };
+    const extra: []const std.http.Header = if (status == .service_unavailable) &.{ json_ct, .{ .name = "retry-after", .value = "5" } } else &.{json_ct};
+    try req.respond(body, .{ .status = status, .keep_alive = false, .extra_headers = extra });
+}
+
+fn respondError(arena: std.mem.Allocator, req: *std.http.Server.Request, status: std.http.Status, retryable: bool, msg: []const u8) !void {
+    var out = std.array_list.Managed(u8).init(arena);
+    try out.writer().print("{{\"status\":\"error\",\"retryable\":{},\"error\":\"", .{retryable});
+    try writeJsonStr(out.writer(), msg);
+    try out.appendSlice("\"}\n");
+    try respondJson(req, status, out.items);
 }
 
 fn writeJsonStr(w: anytype, s: []const u8) !void {
