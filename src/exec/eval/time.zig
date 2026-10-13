@@ -309,6 +309,118 @@ pub fn parseIsoTimestamp(s0: []const u8) ?i64 {
     return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
 }
 
+/// A quoted literal or CAST read as a date, as PostgreSQL reads one: one- or
+/// two-digit month and day, and a time part (`T` or space) that is dropped.
+pub fn parseDateText(s0: []const u8) ?i64 {
+    const s = trim(s0);
+    var p = TextParser{ .s = s };
+    const days = p.date() orelse return null;
+    if (p.i == s.len) return days;
+    if (s[p.i] != ' ' and s[p.i] != 'T') return null;
+    _ = parseTimestampText(s) orelse return null;
+    return days;
+}
+
+/// A quoted literal or CAST read as a timestamp, as PostgreSQL reads one: the
+/// date as `parseDateText`, `T` or space, `H:MM[:SS[.f]]`, and a zone (`Z`,
+/// `±HH`, `±HH:MM`, `±HHMM`) folded into UTC, the zone basalt's timestamps keep.
+pub fn parseTimestampText(s0: []const u8) ?i64 {
+    const s = trim(s0);
+    var p = TextParser{ .s = s };
+    const days = p.date() orelse return null;
+    if (p.i == s.len) return days * 86_400_000_000;
+    if (s[p.i] != ' ' and s[p.i] != 'T') return null;
+    p.i += 1;
+    const hh = p.num(1, 2) orelse return null;
+    if (!p.eat(':')) return null;
+    const mm = p.num(2, 2) orelse return null;
+    var ss: i64 = 0;
+    var frac: i64 = 0;
+    if (p.eat(':')) {
+        ss = p.num(2, 2) orelse return null;
+        if (p.eat('.')) {
+            var scale: i64 = 100_000;
+            const start = p.i;
+            while (p.i < s.len and std.ascii.isDigit(s[p.i])) : (p.i += 1) {
+                frac += @as(i64, s[p.i] - '0') * scale;
+                scale = @divTrunc(scale, 10);
+            }
+            if (p.i == start) return null;
+        }
+    }
+    if (hh > 23 or mm > 59 or ss > 59) return null;
+    var off_s: i64 = 0;
+    if (p.i < s.len) {
+        const c = s[p.i];
+        if (c == 'Z' or c == 'z') {
+            p.i += 1;
+        } else if (c == '+' or c == '-') {
+            p.i += 1;
+            const oh = p.num(2, 2) orelse return null;
+            _ = p.eat(':');
+            const om = if (p.i < s.len) p.num(2, 2) orelse return null else 0;
+            if (oh > 15 or om > 59) return null;
+            off_s = (oh * 3600 + om * 60) * @as(i64, if (c == '-') -1 else 1);
+        }
+    }
+    if (p.i != s.len) return null;
+    return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss - off_s) * 1_000_000 + frac;
+}
+
+const TextParser = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn date(p: *TextParser) ?i64 {
+        const y = p.num(4, 4) orelse return null;
+        if (!p.eat('-')) return null;
+        const m = p.num(1, 2) orelse return null;
+        if (!p.eat('-')) return null;
+        const d = p.num(1, 2) orelse return null;
+        if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
+        return daysFromCivil(y, @intCast(m), @intCast(d));
+    }
+
+    fn num(p: *TextParser, min: usize, max: usize) ?i64 {
+        const start = p.i;
+        while (p.i < p.s.len and p.i - start < max and std.ascii.isDigit(p.s[p.i])) p.i += 1;
+        if (p.i - start < min) return null;
+        return isoNum(p.s[start..p.i]);
+    }
+
+    fn eat(p: *TextParser, c: u8) bool {
+        if (p.i < p.s.len and p.s[p.i] == c) {
+            p.i += 1;
+            return true;
+        }
+        return false;
+    }
+};
+
+test "parseDateText and parseTimestampText read text as PostgreSQL does" {
+    const day = daysFromCivil(2024, 1, 5);
+    try std.testing.expectEqual(day, parseDateText("2024-01-05").?);
+    try std.testing.expectEqual(day, parseDateText("2024-1-5").?);
+    try std.testing.expectEqual(day, parseDateText("2024-01-05 12:00:00").?);
+    try std.testing.expectEqual(day, parseDateText("2024-01-05T00:00:00Z").?);
+    try std.testing.expect(parseDateText("01/05/2024") == null);
+    try std.testing.expect(parseDateText("2024-02-30") == null);
+    try std.testing.expect(parseDateText("2024-01-05 25:00") == null);
+
+    const noon = day * 86_400_000_000 + 12 * 3_600_000_000;
+    try std.testing.expectEqual(noon, parseTimestampText("2024-01-05 12:00:00").?);
+    try std.testing.expectEqual(noon, parseTimestampText("2024-1-5T12:00").?);
+    try std.testing.expectEqual(noon, parseTimestampText("2024-01-05 12:00:00Z").?);
+    try std.testing.expectEqual(noon, parseTimestampText("2024-01-05 17:00:00+05:00").?);
+    try std.testing.expectEqual(noon, parseTimestampText("2024-01-05 09:30-0230").?);
+    try std.testing.expectEqual(noon, parseTimestampText("2024-01-05 14:00+02").?);
+    try std.testing.expectEqual(noon + 250_000, parseTimestampText("2024-01-05 12:00:00.25").?);
+    try std.testing.expectEqual(day * 86_400_000_000, parseTimestampText("2024-01-05").?);
+    try std.testing.expect(parseTimestampText("2024-01-05 12") == null);
+    try std.testing.expect(parseTimestampText("2024-01-05 12:00:00.") == null);
+    try std.testing.expect(parseTimestampText("2024-01-05 12:00 UTC") == null);
+}
+
 pub fn civilFromDays(z0: i64) struct { y: i64, m: u32, d: u32 } {
     const z = z0 + 719468;
     const era = @divFloor(z, 146097);

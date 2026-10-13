@@ -5,9 +5,9 @@ const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const floatToInt = @import("vec.zig").floatToInt;
-const parseIsoDate = @import("time.zig").parseIsoDate;
+const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
-const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
+const parseTimestampText = @import("time.zig").parseTimestampText;
 const pow10_i128 = @import("../value.zig").pow10_i128;
 const pow10_i256 = @import("../value.zig").pow10_i256;
 const sql = @import("../../db/sql.zig");
@@ -229,13 +229,13 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         .date => switch (v) {
             .date => v,
             .timestamp => |x| .{ .date = @intCast(@divFloor(x, 86_400_000_000)) },
-            .string => |str| .{ .date = @intCast(parseIsoDate(str) orelse return error.CastFailed) },
+            .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
             else => error.CastFailed,
         },
         .timestamp => switch (v) {
             .timestamp => v,
             .date => |x| .{ .timestamp = @as(i64, x) * 86_400_000_000 },
-            .string => |str| .{ .timestamp = parseIsoTimestamp(str) orelse return error.CastFailed },
+            .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },
         .time => switch (v) {

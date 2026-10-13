@@ -11,6 +11,7 @@ const types = @import("../../lang/types.zig");
 pub const bin = @import("../pushdown.zig").bin;
 const builtins = @import("../../exec/builtins.zig");
 const litAs = @import("../../exec/eval.zig").litAs;
+const eval = @import("../../exec/eval.zig");
 const callExpr = @import("testing_util.zig").callExpr;
 pub const fld = @import("../pushdown.zig").fld;
 const intLit = @import("testing_util.zig").intLit;
@@ -405,6 +406,14 @@ const Tx = struct {
             .bool => {
                 const b = (try litAs(self.arena, t, types.Type.init(.bool))) orelse return null;
                 return try self.boolLit(b.bool_lit);
+            },
+            .date => {
+                const d = eval.parseDateText(t) orelse return null;
+                return self.value(&.{ .str_lit = try eval.formatDate(self.arena, d) });
+            },
+            .timestamp => {
+                const us = eval.parseTimestampText(t) orelse return null;
+                return self.value(&.{ .str_lit = try eval.formatTimestamp(self.arena, us) });
             },
             else => return self.value(&.{ .str_lit = lit }),
         }

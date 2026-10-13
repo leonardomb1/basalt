@@ -12,8 +12,8 @@ const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const evalRow = @import("row.zig").evalRow;
 const fmt_bound = @import("format.zig").fmt_bound;
-const parseIsoDate = @import("time.zig").parseIsoDate;
-const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
+const parseDateText = @import("time.zig").parseDateText;
+const parseTimestampText = @import("time.zig").parseTimestampText;
 const regex = @import("../regex.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -205,10 +205,10 @@ pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (a == .bool and b == .bool) return std.math.order(@intFromBool(a.bool), @intFromBool(b.bool));
     if (a == .timestamp and b == .timestamp) return std.math.order(a.timestamp, b.timestamp);
     if (a == .date and b == .date) return std.math.order(a.date, b.date);
-    if (a == .date and b == .string) return std.math.order(@as(i64, a.date), parseIsoDate(b.string) orelse return null);
-    if (a == .string and b == .date) return std.math.order(parseIsoDate(a.string) orelse return null, @as(i64, b.date));
-    if (a == .timestamp and b == .string) return std.math.order(a.timestamp, parseIsoTimestamp(b.string) orelse return null);
-    if (a == .string and b == .timestamp) return std.math.order(parseIsoTimestamp(a.string) orelse return null, b.timestamp);
+    if (a == .date and b == .string) return std.math.order(@as(i64, a.date), parseDateText(b.string) orelse return null);
+    if (a == .string and b == .date) return std.math.order(parseDateText(a.string) orelse return null, @as(i64, b.date));
+    if (a == .timestamp and b == .string) return std.math.order(a.timestamp, parseTimestampText(b.string) orelse return null);
+    if (a == .string and b == .timestamp) return std.math.order(parseTimestampText(a.string) orelse return null, b.timestamp);
     if (a == .time and b == .time) return std.math.order(a.time, b.time);
     return null;
 }

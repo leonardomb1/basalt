@@ -215,9 +215,9 @@ pub const TypeCtx = struct {
         if (e.* != .str_lit) return false;
         if (other.kind != .date and other.kind != .timestamp) return false;
         const ok = if (other.kind == .date)
-            parseIsoDate(e.str_lit) != null
+            parseDateText(e.str_lit) != null
         else
-            parseIsoTimestamp(e.str_lit) != null;
+            parseTimestampText(e.str_lit) != null;
         if (!ok) return self.err("`{s}` is not a valid {s} literal", .{ e.str_lit, @tagName(other.kind) });
         return true;
     }
@@ -390,6 +390,8 @@ pub const daysFromCivil = @import("eval/time.zig").daysFromCivil;
 pub const parseIsoDate = @import("eval/time.zig").parseIsoDate;
 pub const parseIsoTime = @import("eval/time.zig").parseIsoTime;
 pub const parseIsoTimestamp = @import("eval/time.zig").parseIsoTimestamp;
+pub const parseDateText = @import("eval/time.zig").parseDateText;
+pub const parseTimestampText = @import("eval/time.zig").parseTimestampText;
 pub const civilFromDays = @import("eval/time.zig").civilFromDays;
 pub const formatDecimal = @import("eval/support.zig").formatDecimal;
 const fieldIndex = @import("eval/support.zig").fieldIndex;

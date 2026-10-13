@@ -28,8 +28,8 @@ const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const max_digits = @import("cast.zig").max_digits;
 const orderF64 = @import("support.zig").orderF64;
-const parseIsoDate = @import("time.zig").parseIsoDate;
-const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
+const parseDateText = @import("time.zig").parseDateText;
+const parseTimestampText = @import("time.zig").parseTimestampText;
 const std = @import("std");
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
@@ -1112,8 +1112,8 @@ fn temporalNum(arena: std.mem.Allocator, v: Vec, want: types.TypeKind, n: usize)
             .timestamp => |t| return Num{ .iscalar = t },
             .string, .bytes => |str| {
                 const parsed = switch (want) {
-                    .date => parseIsoDate(str),
-                    .timestamp => parseIsoTimestamp(str),
+                    .date => parseDateText(str),
+                    .timestamp => parseTimestampText(str),
                     else => null,
                 } orelse return null;
                 return Num{ .iscalar = parsed };
