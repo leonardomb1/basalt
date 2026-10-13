@@ -204,7 +204,7 @@ pub const NLJoin = struct {
                     self.release();
                     return self.drain(arena, ix);
                 }
-                if (self.probe_mem == null) self.probe_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                if (self.probe_mem == null) self.probe_mem = std.heap.ArenaAllocator.init(self.state);
                 _ = self.probe_mem.?.reset(.retain_capacity);
                 const pa = self.probe_mem.?.allocator();
                 const lb = (try self.probe.next(pa)) orelse {
@@ -698,6 +698,34 @@ test "nljoin: an empty side gives every kind its unmatched rows or nothing" {
     };
     try testing.expectEqual(@as(usize, 2), (try runNL(a, .left, .less, &ls, &.{}, .{})).len);
     try testing.expectEqual(@as(usize, 1), (try runNL(a, .right, .less, &.{}, &rs, .{})).len);
+}
+
+test "nljoin: a join stopped early holds its probe batch in the plan arena, which frees it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ls = [_]LRow{ .{ .x = 1, .lv = "a" }, .{ .x = 2, .lv = "b" } };
+    const rs = [_]RRow{ .{ .lo = 0, .hi = 6, .rv = "c" }, .{ .lo = 0, .hi = 7, .rv = "d" } };
+    var lts = TestSource{ .schema_ = nl_left_schema, .batches = try leftBatches(a, &ls, 1000) };
+    var rts = TestSource{ .schema_ = nl_right_schema, .batches = try rightBatches(a, &rs, 1000) };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = NLJoin{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_schema = &nl_left_schema,
+        .right_schema = &nl_right_schema,
+        .out_schema = &nl_pair_schema,
+        .kind = .inner,
+        .cond = try condExpr(a, .all),
+        .pair_schema = &nl_pair_schema,
+        .state = a,
+        .chunk = 1,
+    };
+    try testing.expect((try jn.next(a)) != null);
+    const child = jn.probe_mem.?.child_allocator;
+    try testing.expectEqual(a.ptr, child.ptr);
+    try testing.expectEqual(a.vtable, child.vtable);
 }
 
 test "nljoin: a build side past its cap fails with JoinBuildTooLarge" {
