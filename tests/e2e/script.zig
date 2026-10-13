@@ -655,6 +655,28 @@ test "statement-level CASE dispatches on a resolved param (default arm otherwise
     try std.testing.expectEqualStrings("id,v\n1,10\n", big);
 }
 
+test "statement-level CASE: a NULL subject matches no arm, not WHEN NULL nor WHEN ''" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc, "PARAM e STRING DEFAULT NULL;\nCASE $e\n" ++
+        "  WHEN NULL THEN LOAD INTO '{0s}/out.csv' AS SELECT 'null' AS arm FROM '{0s}/in.csv';\n" ++
+        "  WHEN '' THEN LOAD INTO '{0s}/out.csv' AS SELECT 'empty' AS arm FROM '{0s}/in.csv';\n" ++
+        "  ELSE LOAD INTO '{0s}/out.csv' AS SELECT 'else' AS arm FROM '{0s}/in.csv';\nEND CASE;", .{base});
+    defer alloc.free(script);
+
+    const dflt = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(dflt);
+    try std.testing.expectEqualStrings("arm\nelse\n", dflt);
+    const empty = try runScript(alloc, &tmp, script, &[_]ParamArg{.{ .key = "e", .val = "" }});
+    defer alloc.free(empty);
+    try std.testing.expectEqualStrings("arm\nempty\n", empty);
+}
+
 test "for-each on_error=continue with an OutcomeSink: run succeeds, failure recorded" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

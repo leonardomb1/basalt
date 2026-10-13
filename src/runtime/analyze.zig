@@ -432,7 +432,10 @@ pub fn matchArm(arena: std.mem.Allocator, m: ast.StmtMatch, sc: Scope, ctx: []co
     return .{ .arm = null };
 }
 
+/// `subject = pattern` as a CASE arm judges it: NULL equals nothing, NULL included,
+/// as in a CASE expression.
 fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
+    if (a.isNull() or b.isNull()) return false;
     if (eval.compareValues(a, b)) |ord| return ord == .eq;
     const as = eval.valueToString(arena, a) catch return false;
     const bs = eval.valueToString(arena, b) catch return false;
