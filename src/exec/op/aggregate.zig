@@ -10,7 +10,6 @@
 //! passes `spill_at` (`aggregate/spill.zig`); without one, or on a lane, it never does.
 
 const Batch = @import("../batch.zig").Batch;
-const Decimal = @import("../value.zig").Decimal;
 const ErrCtx = @import("../op.zig").ErrCtx;
 const Op = @import("../op.zig").Op;
 const Stats = @import("../op.zig").Stats;
@@ -19,7 +18,6 @@ const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
-const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const simd = @import("../simd.zig");
 const std = @import("std");

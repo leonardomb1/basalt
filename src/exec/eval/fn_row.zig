@@ -9,7 +9,6 @@ const arith = @import("row.zig").arith;
 const addUnits = @import("time.zig").addUnits;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
-const cachedRegex = @import("support.zig").cachedRegex;
 const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const caseMap = @import("strings.zig").caseMap;
 const caseMapInto = @import("strings.zig").caseMapInto;

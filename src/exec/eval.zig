@@ -62,14 +62,11 @@
 
 const std = @import("std");
 const regex = @import("regex.zig");
-const sql = @import("../db/sql.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
-const Decimal = @import("value.zig").Decimal;
 pub const Value = @import("value.zig").Value;
 const json = @import("json.zig");
-const pow10f = @import("value.zig").pow10f;
 pub const Batch = @import("batch.zig").Batch;
 
 const Type = types.Type;
@@ -352,14 +349,10 @@ pub fn comparable(a: Type, b: Type) bool {
 
 pub const evalColumn = @import("eval/vec.zig").evalColumn;
 pub const decSum = @import("eval/vec.zig").decSum;
-const evalColumnRowwise = @import("eval/vec.zig").evalColumnRowwise;
 const evalVec = @import("eval/vec.zig").evalVec;
-const evalVecNode = @import("eval/vec.zig").evalVecNode;
 pub const constEval = @import("eval/vec.zig").constEval;
 pub const evalRow = @import("eval/row.zig").evalRow;
-const arith = @import("eval/row.zig").arith;
 const decimalArithType = @import("eval/row.zig").decimalArithType;
-pub const parseJson = @import("eval/row.zig").parseJson;
 pub const jsonPath = @import("eval/row.zig").jsonPath;
 pub const jsonToValue = @import("eval/row.zig").jsonToValue;
 pub const bindLambda = @import("eval/row.zig").bindLambda;
@@ -404,16 +397,8 @@ const lastPart = @import("eval/support.zig").lastPart;
 pub const toF64 = @import("eval/support.zig").toF64;
 pub const explain = @import("eval/support.zig").explain;
 pub const takeFailure = @import("eval/support.zig").takeFailure;
-const cachedRegex = @import("eval/support.zig").cachedRegex;
 pub const orderF64 = @import("eval/support.zig").orderF64;
 pub const compareValues = @import("eval/support.zig").compareValues;
-const charCount = @import("eval/strings.zig").charCount;
-const substrChars = @import("eval/strings.zig").substrChars;
-const padChars = @import("eval/strings.zig").padChars;
-const endSlice = @import("eval/strings.zig").endSlice;
-const reverseChars = @import("eval/strings.zig").reverseChars;
-const caseMapInto = @import("eval/strings.zig").caseMapInto;
-const likeMatch = @import("eval/strings.zig").likeMatch;
 
 const parser = @import("../lang/sql_parser.zig");
 

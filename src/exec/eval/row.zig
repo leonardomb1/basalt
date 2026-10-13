@@ -391,11 +391,6 @@ fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize
     return b.eval_fn(arena, c, batch, row);
 }
 
-pub fn parseJson(arena: std.mem.Allocator, text: []const u8) EvalError!std.json.Value {
-    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .duplicate_field_behavior = .use_last }) catch |e|
-        return if (e == error.OutOfMemory) error.OutOfMemory else error.InvalidJson;
-}
-
 /// Walks `path` (`a.b`, `a[0].b` or `a.0.b`, optionally led by `$.`) through `v`;
 /// null for a missing key, an index out of range, or a step onto a scalar.
 pub fn jsonPath(v: std.json.Value, path: []const u8) ?std.json.Value {
