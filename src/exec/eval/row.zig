@@ -18,6 +18,7 @@ const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const rescaleTo = @import("cast.zig").rescaleTo;
+const roundScaleDown = @import("cast.zig").roundScaleDown;
 const decimalOverflow = @import("support.zig").decimalOverflow;
 const fitsPrecision = @import("cast.zig").fitsPrecision;
 const max_digits = @import("cast.zig").max_digits;
@@ -299,7 +300,7 @@ pub fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, Div
             if (s <= max_digits) if (std.math.mul(i128, a.unscaled, b.unscaled)) |u| break :blk .{ .unscaled = u, .scale = @intCast(s) } else |_| {};
             const p = @as(i256, a.unscaled) * b.unscaled;
             const drop = s -| max_digits;
-            const q = if (drop == 0) p else roundDown256(p, drop);
+            const q = roundScaleDown(p, drop);
             break :blk .{ .unscaled = std.math.cast(i128, q) orelse return decimalOverflow(), .scale = @intCast(s - drop) };
         },
         .add, .sub => blk: {
@@ -321,14 +322,6 @@ pub fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, Div
     };
     if (!fitsPrecision(r.unscaled, max_digits)) return decimalOverflow();
     return r;
-}
-
-fn roundDown256(u: i256, drop: u16) i256 {
-    if (drop >= pow10_i256.len) return 0;
-    const p = pow10_i256[drop];
-    const q = @divTrunc(u, p);
-    if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
-    return q;
 }
 
 fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {

@@ -5,6 +5,7 @@ const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Decimal = @import("../value.zig").Decimal;
+const asDecimal = @import("row.zig").asDecimal;
 const asDecimalValue = @import("cast.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
@@ -64,10 +65,6 @@ pub fn toF64(v: Value) f64 {
 /// The f64 a number hashes and meets a float as (`Decimal.keyF64`).
 pub fn keyF64(v: Value) f64 {
     return if (v == .decimal) v.decimal.keyF64() else toF64(v);
-}
-
-fn exactDecimal(v: Value) Decimal {
-    return if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
 }
 
 const RegexCache = struct {
@@ -199,7 +196,7 @@ pub fn orderF64(x: f64, y: f64) std.math.Order {
 pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (isNum(a) and isNum(b)) {
         if (a == .int and b == .int) return std.math.order(a.int, b.int);
-        if (a != .float and b != .float) return exactDecimal(a).order(exactDecimal(b));
+        if (a != .float and b != .float) return asDecimal(a).?.order(asDecimal(b).?);
         return orderF64(keyF64(a), keyF64(b));
     }
     if (a == .string and b == .string) return std.mem.order(u8, a.string, b.string);

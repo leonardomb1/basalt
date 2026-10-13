@@ -5,7 +5,6 @@ const Aggregate = @import("../aggregate.zig").Aggregate;
 const Acc = Aggregate.Acc;
 const Agg = Aggregate.Agg;
 const Batch = @import("../../batch.zig").Batch;
-const Decimal = @import("../../value.zig").Decimal;
 const GroupSet = Aggregate.GroupSet;
 const Partial = Aggregate.Partial;
 const Value = @import("../../value.zig").Value;
@@ -199,8 +198,7 @@ fn sumDecimals(col: column.Column, scale: u8, n: usize) error{IntOverflow}!Parti
     var s: i256 = 0;
     for (col.data.dec[0..n], 0..) |d, i| {
         if (nvalid != n and !col.validity.get(i)) continue;
-        const u = if (d.scale == scale) d.unscaled else (eval.rescaleTo(d, scale) orelse return eval.decimalOverflow()).unscaled;
-        s = std.math.add(i256, s, u) catch return eval.decimalOverflow();
+        try eval.addAtScale(&s, d, scale);
     }
     return .{ .nvalid = nvalid, .sum_i = s };
 }
@@ -330,9 +328,7 @@ pub fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_ar
 /// Adding raw unscaled values multiplied the sum by 10^(declared - actual).
 pub fn addExact(sum: *align(8) i256, agg: Agg, v: Value) !void {
     if (agg.ty.kind == .decimal) {
-        const d: Decimal = if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
-        const r = eval.rescaleTo(d, agg.ty.scale) orelse return eval.decimalOverflow();
-        sum.* = std.math.add(i256, sum.*, r.unscaled) catch return eval.decimalOverflow();
+        try eval.addAtScale(sum, eval.asDecimal(v).?, agg.ty.scale);
     } else sum.* = std.math.add(i256, sum.*, v.int) catch return error.IntOverflow;
 }
 
