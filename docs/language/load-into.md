@@ -36,8 +36,14 @@ AS
   replaces it. A local file is written whole: the rows go to `x.csv.part`,
   renamed over `x.csv` once the write completes and deleted if it fails or is
   interrupted, so a reader never sees a torn file and a failed `LOAD` leaves the
-  previous one in place (a device or a symlink as the target is written in
-  place). Explicit `APPEND` accumulates for CSV only: the file is
+  previous one in place. The `.part` takes an existing file's permission bits
+  and, where the user may set them, its owner and group; ACLs and extended
+  attributes are not carried over. A target that is a device, a FIFO or a
+  symlink, has more than one hard link (so every name sees the new rows), or
+  sits in a directory where `x.csv.part` cannot be created is instead truncated
+  and written in place, keeping its inode, links and attributes but not the
+  guarantee: a reader may see it half written, and a failed `LOAD` leaves it
+  truncated. Explicit `APPEND` accumulates for CSV only: the file is
   opened without truncating and the header row is written only when it was
   absent or empty (a `.csv.gz` whose content is empty counts as empty). A file
   that already has a header must have this load's columns — the same names, in
