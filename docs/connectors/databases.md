@@ -22,7 +22,7 @@ message in the error (`starrocks refused 'CREATE TABLE …': Access denied; you
 need …`), not only in the log.
 
 A load streams its rows into one stream-load transaction until the body reaches
-`load_size` (default `'512MB'`; a size like `'64MB'` or a byte count) or has
+`load_size` (default `'128MB'`; a size like `'512MB'` or a byte count) or has
 been open five minutes, then commits it and starts the next, so rows become
 visible a transaction at a time and a failed run leaves the open one
 uncommitted. Each transaction is also written to a spool file in the run's

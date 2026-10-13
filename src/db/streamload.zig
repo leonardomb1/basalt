@@ -103,7 +103,7 @@ pub const Config = struct {
     auto_create: bool = true,
     label_prefix: []const u8 = "basalt",
     run_id: u64 = 0,
-    load_size: u64 = 512 << 20,
+    load_size: u64 = 128 << 20,
     space: ?Space = null,
     errctx: ?*op.ErrCtx = null,
 };

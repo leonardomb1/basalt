@@ -285,7 +285,7 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
         } else if (std.mem.eql(u8, k, "load_size")) {
             const txt = try evalCfgStr(env, attr.value);
             cfg.load_size = env_mod.parseByteSize(txt) orelse 0;
-            if (cfg.load_size == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`load_size` must be a positive size like '512MB', not '{s}'", .{txt}));
+            if (cfg.load_size == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`load_size` must be a positive size like '128MB', not '{s}'", .{txt}));
         }
     }
     if (cfg.database.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} connection needs a `database`", .{flavor.name()}));
