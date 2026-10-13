@@ -5,6 +5,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const Column = @import("column.zig").Column;
+const Decimal = @import("value.zig").Decimal;
 const intColumn = @import("column.zig").intColumn;
 const permute = @import("column.zig").permute;
 
@@ -26,6 +27,22 @@ pub const Batch = struct {
         const cols = try a.alloc(Column, self.columns.len);
         for (cols, self.columns) |*o, c| o.* = try permute(a, c, idx);
         return .{ .schema = self.schema, .columns = cols, .len = self.len };
+    }
+
+    /// The batch's heap, typed stores plus validity bitmaps: what holding it costs.
+    pub fn heapBytes(self: Batch) usize {
+        var n: usize = 0;
+        for (self.columns) |c| {
+            n += c.validity.bits.len + switch (c.data) {
+                .b => |s| s.len,
+                .i32 => |s| s.len * @sizeOf(i32),
+                .i64 => |s| s.len * @sizeOf(i64),
+                .f64 => |s| s.len * @sizeOf(f64),
+                .dec => |s| s.len * @sizeOf(Decimal),
+                .bytes => |b| b.values.len + b.offsets.len * @sizeOf(i32),
+            };
+        }
+        return n;
     }
 };
 

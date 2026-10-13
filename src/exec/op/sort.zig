@@ -125,7 +125,7 @@ pub const Sort = struct {
             if (b.len == 0) continue;
             try chunks.append(self.gpa, b);
             rows += b.len;
-            for (b.columns) |*col| bytes += columnBytes(col);
+            bytes += b.heapBytes();
             if (bytes <= self.spill_at) continue;
             const all = try concatChunks(held.allocator(), self.in_schema, chunks.items, rows);
             const s = try self.sorted(held.allocator(), all);
@@ -231,19 +231,6 @@ fn concatChunks(arena: std.mem.Allocator, schema: *const types.Schema, chunks: [
         out.* = try column.concat(arena, per, total);
     }
     return .{ .schema = schema, .columns = cols, .len = total };
-}
-
-/// A column's heap: typed store plus validity bitmap, the bytes a held batch costs.
-fn columnBytes(c: *const column.Column) usize {
-    const payload: usize = switch (c.data) {
-        .b => |s| s.len,
-        .i32 => |s| s.len * @sizeOf(i32),
-        .i64 => |s| s.len * @sizeOf(i64),
-        .f64 => |s| s.len * @sizeOf(f64),
-        .dec => |s| s.len * @sizeOf(Decimal),
-        .bytes => |b| b.values.len + b.offsets.len * @sizeOf(i32),
-    };
-    return payload + c.validity.bits.len;
 }
 
 /// A k-way merge of sorted sources: spilled runs in input order, then optionally the

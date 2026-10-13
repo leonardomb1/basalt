@@ -31,7 +31,6 @@
 //! with `JoinBuildTooLarge` past `build_cap`, as before.
 
 const Batch = @import("../batch.zig").Batch;
-const Decimal = @import("../value.zig").Decimal;
 const ErrCtx = @import("../op.zig").ErrCtx;
 const Op = @import("../op.zig").Op;
 const Stats = @import("../op.zig").Stats;
@@ -65,7 +64,7 @@ fn drainBuild(pull: std.mem.Allocator, child: Op, bytes_out: *usize, cap: usize)
     var chunks = std.array_list.Managed(Batch).init(pull);
     var bytes: usize = 0;
     while (try child.next(pull)) |b| {
-        bytes += batchBytes(b);
+        bytes += b.heapBytes();
         if (bytes > cap) return error.JoinBuildTooLarge;
         if (b.len == 0) continue;
         try chunks.append(b);
@@ -98,30 +97,11 @@ fn concatBatches(state: std.mem.Allocator, chunks: []const Batch, schema: *const
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-fn batchBytes(b: Batch) usize {
-    var n: usize = 0;
-    for (b.columns) |*col| n += columnBytes(col);
-    return n;
-}
-
 /// The bucket heads, chains and hashes `JoinIndex` adds over `rows` keyed rows.
 fn indexOverhead(rows: usize) usize {
     var slots: usize = 16;
     while (slots < rows * 2) slots *= 2;
     return slots * @sizeOf(u32) + rows * (@sizeOf(u32) + @sizeOf(u64));
-}
-
-/// A column's heap: typed store plus validity bitmap, close enough to bound a build side.
-fn columnBytes(c: *const column.Column) usize {
-    const payload: usize = switch (c.data) {
-        .b => |s| s.len,
-        .i32 => |s| s.len * @sizeOf(i32),
-        .i64 => |s| s.len * @sizeOf(i64),
-        .f64 => |s| s.len * @sizeOf(f64),
-        .dec => |s| s.len * @sizeOf(Decimal),
-        .bytes => |b| b.values.len + b.offsets.len * @sizeOf(i32),
-    };
-    return payload + c.validity.bits.len;
 }
 
 pub const KeyClass = enum { i64s, bytes, boxed };
@@ -629,7 +609,7 @@ pub const Join = struct {
             if (b.len == 0) continue;
             try held.append(try b.deepCopy(self.state));
             rows += b.len;
-            for (b.columns) |*col| bytes += columnBytes(col);
+            bytes += b.heapBytes();
         }
         self.replay = held.items;
         if (self.probe_ended)
@@ -686,7 +666,7 @@ pub const Join = struct {
         while (try build.next(pull.allocator())) |b| {
             if (b.len == 0) continue;
             try held.append(b);
-            bytes += batchBytes(b);
+            bytes += b.heapBytes();
             rows += b.len;
             if (bytes > self.spill_at) break;
         } else if (bytes + indexOverhead(rows) <= self.spill_at and rows < std.math.maxInt(u32)) {
@@ -908,7 +888,7 @@ pub const Join = struct {
         var bytes: usize = 0;
         while (try r.next(pa)) |b| {
             try held.append(b);
-            bytes += batchBytes(b);
+            bytes += b.heapBytes();
         }
         const cap = self.partCap();
         return JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, cap) catch |e| {
