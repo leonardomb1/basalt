@@ -400,6 +400,40 @@ fn checkMatchPatterns(arena: std.mem.Allocator, m: ast.StmtMatch, params: *const
 
 pub const ParamOverride = struct { name: []const u8, value: []const u8 };
 
+pub const param_default_msg = "param default must be a literal";
+
+/// A PARAM's DEFAULT as the value it stands for: a literal, or a negated number.
+pub fn paramDefaultValue(e: *const ast.Expr) ?Value {
+    return switch (e.*) {
+        .int_lit => |i| .{ .int = i },
+        .float_lit => |f| .{ .float = f },
+        .dec_lit => |d| .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } },
+        .str_lit => |s| .{ .string = s },
+        .bool_lit => |b| .{ .bool = b },
+        .null_lit => .null,
+        .unary => |u| if (u.op != .neg) null else switch (paramDefaultValue(u.e) orelse return null) {
+            .int => |i| if (i == std.math.minInt(i64)) null else .{ .int = -i },
+            .float => |f| .{ .float = -f },
+            .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+/// How a query LET is named in its errors; a desugared WHERE subquery is a
+/// "scalar subquery".
+pub fn queryLetLabel(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    if (std.mem.startsWith(u8, name, "__scalar")) return "scalar subquery";
+    return std.fmt.allocPrint(arena, "LET `{s}`", .{name});
+}
+
+/// A query LET binds one cell, so a result of other than one column is refused.
+pub fn queryLetColumnsProblem(arena: std.mem.Allocator, name: []const u8, ncols: usize) Error!?[]const u8 {
+    if (ncols == 1) return null;
+    return try std.fmt.allocPrint(arena, "{s}: must produce exactly one column, got {d}", .{ try queryLetLabel(arena, name), ncols });
+}
+
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
 /// The `$name`s an expression reads, in order, repeats included.
@@ -628,9 +662,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         if (text == null) if (p.default) |d| if (d.* == .str_lit) {
             text = d.str_lit;
         };
+        if (bound == null and !p.is_json) if (p.default) |d| if (paramDefaultValue(d) == null)
+            return fail(diag, "{s}", .{param_default_msg});
         if (text) |t| if (paramTextProblem(arena, p.ty, t)) |want|
             return fail(diag, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, t, want });
-        if (p.ty.kind == .int) if (p.default) |d| if (d.* == .dec_lit or d.* == .float_lit)
+        if (p.ty.kind == .int) if (p.default) |d| if (paramDefaultValue(d)) |raw| if (raw == .float or raw == .decimal)
             return fail(diag, "PARAM `{s}`: its DEFAULT is not an integer", .{p.name});
         const pe = bound orelse try typedParam(arena, p.ty, if (p.default) |d| d else try typedZero(arena, p.ty));
         try params_map.put(p.name, pe);
@@ -929,7 +965,8 @@ const Ctx = struct {
         const o = try self.attempt(self.analyzeOutput(.{ .stages = stages, .pos = q.pos })) orelse return;
         if (o.stages.len == 0) return;
         const schema = o.stages[o.stages.len - 1].out_schema orelse return;
-        if (schema.fields.len != 1) return;
+        if (try queryLetColumnsProblem(self.arena, l.name, schema.fields.len)) |why|
+            return self.note(self.failNear(l.pos, "{s}", .{why}));
         const lets = self.lets orelse return;
         const nul = try mk(self.arena, .null_lit);
         try lets.put(l.name, try mk(self.arena, .{ .cast = .{ .e = @constCast(nul), .ty = schema.fields[0].ty.asNullable() } }));

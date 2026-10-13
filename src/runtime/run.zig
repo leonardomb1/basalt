@@ -430,13 +430,13 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
 fn runScalarLet(env: *Env, l: ast.LetConst) !void {
-    const what: []const u8 = if (std.mem.startsWith(u8, l.name, "__scalar"))
-        "scalar subquery"
-    else
-        try std.fmt.allocPrint(env.arena, "LET `{s}`", .{l.name});
+    const what = try analyze.queryLetLabel(env.arena, l.name);
     const pipe = try buildPipeline(env, l.query.?.stages);
-    if (pipe.schema.fields.len != 1)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s}: must produce exactly one column, got {d}", .{ what, pipe.schema.fields.len }));
+    if (try analyze.queryLetColumnsProblem(env.arena, l.name, pipe.schema.fields.len)) |why| {
+        const e = planErr(env.diag, why);
+        env.diag.pos = l.pos;
+        return e;
+    }
 
     var scratch = std.heap.ArenaAllocator.init(env.gpa);
     defer scratch.deinit();
@@ -470,18 +470,6 @@ const resolveLets = @import("run/params.zig").resolveLets;
 pub fn unionBranchesAreReads(u: ast.Union) bool {
     for (u.branches) |b| if (b.pipeline != null) return false;
     return true;
-}
-
-pub fn constEvalDefault(expr: *const ast.Expr, diag: *Diag) !Value {
-    return switch (expr.*) {
-        .int_lit => |i| .{ .int = i },
-        .float_lit => |f| .{ .float = f },
-        .dec_lit => |d| .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } },
-        .str_lit => |s| .{ .string = s },
-        .bool_lit => |b| .{ .bool = b },
-        .null_lit => .null,
-        else => planErr(diag, "param default must be a literal"),
-    };
 }
 
 const describe_fields = [_]types.Schema.Field{

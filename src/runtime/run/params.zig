@@ -6,7 +6,6 @@ const ParamArg = @import("../env.zig").ParamArg;
 const Value = @import("../../exec/value.zig").Value;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
-const constEvalDefault = @import("../run.zig").constEvalDefault;
 const errLabel = @import("../env.zig").errLabel;
 const eval = @import("../../exec/eval.zig");
 const mkLit = @import("../env.zig").mkLit;
@@ -41,7 +40,7 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
         }
         if (v == null) {
             if (p.default) |d| {
-                const raw = try constEvalDefault(d, diag);
+                const raw = analyze.paramDefaultValue(d) orelse return planErr(diag, analyze.param_default_msg);
                 if (raw == .string and p.ty.kind != .string and p.ty.kind != .bytes) {
                     if (analyze.paramTextProblem(arena, p.ty, raw.string)) |want|
                         return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, raw.string, want }));
