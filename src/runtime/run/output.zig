@@ -42,6 +42,7 @@ const openSink = @import("../connect.zig").openSink;
 const openSource = @import("../connect.zig").openSource;
 const openSplitSource = @import("../connect.zig").openSplitSource;
 const parallel = @import("../parallel.zig");
+const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
@@ -228,14 +229,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
 
     var ddiag = analyze.Diag{};
-    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch
-        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-    env.csv_out = analyze.dialectFromHints(stages[stages.len - 1].hints, &ddiag) catch
-        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch
-        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-    env.fmt_out = analyze.formatFromHints(stages[stages.len - 1].hints, &ddiag) catch
-        return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
+    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.csv_out = analyze.dialectFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.fmt_out = analyze.formatFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (stages[0].node == .read and stages[0].node.read.form == .path and
         std.mem.eql(u8, stages[0].node.read.connector, "csv"))
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
@@ -243,19 +240,9 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         try guardFileFormat(env, last.write.target, env.fmt_out, "write");
     const is_file_sink = std.mem.eql(u8, last.write.connector, "csv") or std.mem.eql(u8, last.write.connector, "stdout");
     if (is_file_sink)
-        analyze.checkFileSink(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ddiag.msg)),
-        };
+        analyze.checkFileSink(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     const sink_connector = if (is_file_sink) last.write.connector else if (env.connections.get(last.write.connector)) |c| c.connector else last.write.connector;
-    analyze.checkSinkForm(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.AnalyzeFailed => {
-            const pe = planErr(env.diag, try env.arena.dupe(u8, ddiag.msg));
-            env.diag.pos = ddiag.pos;
-            return pe;
-        },
-    };
+    analyze.checkSinkForm(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.sink_label_prefix = analyze.hintText(stages[stages.len - 1].hints, "label_prefix");
 
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);

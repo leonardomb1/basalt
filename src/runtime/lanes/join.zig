@@ -2,7 +2,7 @@
 //! running its own probe over it.
 
 const Env = @import("../env.zig").Env;
-const aErr = @import("../plan.zig").aErr;
+const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildChainFrom = @import("../plan.zig").buildChainFrom;

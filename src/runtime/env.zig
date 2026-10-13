@@ -514,6 +514,19 @@ pub fn srOpenErr(env: *Env, e: anyerror, what: []const u8) error{PlanFailed} {
     return planErr(env.diag, msg);
 }
 
+/// An analyze failure as a plan failure, keeping its position and span.
+pub fn aErr(env: *Env, ad: *const analyze.Diag, e: analyze.Error) anyerror {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.AnalyzeFailed => blk: {
+            const err = planErr(env.diag, ad.msg);
+            env.diag.pos = ad.pos;
+            env.diag.end = ad.end;
+            break :blk err;
+        },
+    };
+}
+
 pub fn planErr(diag: *Diag, msg: []const u8) error{PlanFailed} {
     setMsg(diag, msg);
     return error.PlanFailed;

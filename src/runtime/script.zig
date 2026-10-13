@@ -40,6 +40,7 @@ const mk = @import("env.zig").mk;
 const mkLit = @import("env.zig").mkLit;
 const no_loop_vars = @import("env.zig").no_loop_vars;
 const OutcomeSink = @import("env.zig").OutcomeSink;
+const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
 const Row = @import("env.zig").Row;
 const RunOptions = @import("env.zig").RunOptions;
@@ -533,14 +534,7 @@ pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
 pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
     const r = try renderPipeline(env.arena, p, lr);
     var ad = analyze.Diag{};
-    const stages = analyze.bindLimits(env.arena, r.stages, env.params_expr, &ad) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.AnalyzeFailed => {
-            const pe = planErr(env.diag, try env.arena.dupe(u8, ad.msg));
-            env.diag.pos = ad.pos;
-            return pe;
-        },
-    };
+    const stages = analyze.bindLimits(env.arena, r.stages, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     return .{ .stages = stages, .pos = r.pos, .show = r.show };
 }
 

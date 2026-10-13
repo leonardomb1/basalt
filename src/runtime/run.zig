@@ -77,6 +77,7 @@ const no_loop_vars = @import("env.zig").no_loop_vars;
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 pub const OutcomeSink = @import("env.zig").OutcomeSink;
 pub const ParamArg = @import("env.zig").ParamArg;
+const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
 pub const requestAbort = @import("env.zig").requestAbort;
 pub const requestReload = @import("env.zig").requestReload;
@@ -551,8 +552,8 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     const arena = env.arena;
     const stages = pipe.stages[0 .. pipe.stages.len - 1];
     var ddiag = analyze.Diag{};
-    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
-    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch return planErr(env.diag, try arena.dupe(u8, ddiag.msg));
+    env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (stages[0].node == .read and stages[0].node.read.form == .path and std.mem.eql(u8, stages[0].node.read.connector, "csv"))
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
 

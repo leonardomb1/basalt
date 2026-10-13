@@ -52,6 +52,7 @@ const forHintName = @import("env.zig").forHintName;
 const mk = @import("env.zig").mk;
 const parseByteSize = @import("env.zig").parseByteSize;
 const PipeRes = @import("env.zig").PipeRes;
+const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
 const planErrT = @import("env.zig").planErrT;
 const Row = @import("env.zig").Row;
@@ -618,18 +619,6 @@ const buildUnion = @import("plan/union.zig").buildUnion;
 pub const discoverRows = @import("plan/discover.zig").discoverRows;
 pub const discoverRowsPipeline = @import("plan/discover.zig").discoverRowsPipeline;
 pub const discoverRowsJson = @import("plan/discover.zig").discoverRowsJson;
-
-pub fn aErr(env: *Env, ad: *analyze.Diag, e: analyze.Error) anyerror {
-    return switch (e) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.AnalyzeFailed => blk: {
-            const err = planErr(env.diag, ad.msg);
-            env.diag.pos = ad.pos;
-            env.diag.end = ad.end;
-            break :blk err;
-        },
-    };
-}
 
 pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     errdefer env.diag.stamp(stage.pos);

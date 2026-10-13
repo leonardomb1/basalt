@@ -27,6 +27,7 @@ const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openBulkOrInsert = @import("lane_sink.zig").openBulkOrInsert;
 const pathFail = @import("../env.zig").pathFail;
+const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
 const pqwrite = @import("../../format/parquet/write.zig");
@@ -177,10 +178,7 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
 pub fn uniqueTargetColumns(env: *Env, w: ast.Write, schema: types.Schema) !void {
     if (std.mem.eql(u8, w.connector, "stdout") or std.mem.eql(u8, w.connector, mem_connector)) return;
     var ad = analyze.Diag{};
-    analyze.uniqueColumns(schema, &ad) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.AnalyzeFailed => return planErr(env.diag, try env.arena.dupe(u8, ad.msg)),
-    };
+    analyze.uniqueColumns(schema, &ad) catch |e| return aErr(env, &ad, e);
 }
 
 fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driver.Sink {
