@@ -558,14 +558,18 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
 
     const pnames = try env.arena.alloc([]const u8, fd.params.len);
     const ptypes = try env.arena.alloc(?types.Type, fd.params.len);
-    const cells = try env.arena.alloc([]const u8, fd.params.len);
-    for (fd.params, c.args, 0..) |p, a, i| {
+    for (fd.params, 0..) |p, i| {
         pnames[i] = p.name;
         ptypes[i] = p.ty;
-        const v = eval.constEval(env.arena, a, sc.names, sc.values) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, @errorName(e) }));
-        cells[i] = try eval.valueToString(env.arena, v);
     }
+    const cells = switch (try analyze.callArgs(env.arena, c, fd.params, .{ .names = sc.names, .values = sc.values })) {
+        .cells => |cs| cs,
+        .problem => |why| {
+            const e = planErr(env.diag, why);
+            env.diag.pos = c.pos;
+            return e;
+        },
+    };
 
     env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
     env.call_depth += 1;
@@ -575,17 +579,22 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
 
 /// Render a `PRINT` argument with the helper that formats any cell, so a
 /// non-string renders as it would in a sink.
-pub fn printText(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow, params: *std.StringHashMap(Value)) ![]const u8 {
+pub fn printText(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow, params: *std.StringHashMap(Value)) !analyze.Printed {
     const sc = try lr.scope(arena, params);
-    return eval.valueToString(arena, try eval.constEval(arena, e, sc.names, sc.values));
+    return analyze.printed(arena, e, .{ .names = sc.names, .values = sc.values });
 }
 
 /// Logs at `info` on stderr through the run logger (level filter, JSON format,
 /// no lane interleaving); stdout stays reserved for data.
 pub fn runPrint(env: *Env, p: ast.Print, lr: LoopRow) anyerror!void {
-    const text = printText(env.arena, p.expr, lr, env.params) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "PRINT: {s}", .{@errorName(e)}));
-    env.log.script(text);
+    switch (try printText(env.arena, p.expr, lr, env.params)) {
+        .text => |text| env.log.script(text),
+        .problem => |why| {
+            const e = planErr(env.diag, why);
+            env.diag.pos = p.pos;
+            return e;
+        },
+    }
 }
 
 /// `THROW 'msg' [WHEN cond]`: only a `true` condition fires, an absent one always
@@ -593,18 +602,9 @@ pub fn runPrint(env: *Env, p: ast.Print, lr: LoopRow) anyerror!void {
 pub fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
     const sc = try outer.scope(env.arena, env.params);
     errdefer env.diag.stamp(t.pos);
-    if (t.when) |w| {
-        const c = eval.constEval(env.arena, w, sc.names, sc.values) catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition: {s}", .{@errorName(e)}));
-        if (c == .null) return;
-        if (c != .bool)
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))}));
-        if (!c.bool) return;
-    }
-    const m = eval.constEval(env.arena, t.message, sc.names, sc.values) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW message: {s}", .{@errorName(e)}));
+    const why = (try analyze.throwVerdict(env.arena, t, .{ .names = sc.names, .values = sc.values })) orelse return;
     env.diag.retryable = false;
-    return planErr(env.diag, try eval.valueToString(env.arena, m));
+    return planErr(env.diag, why);
 }
 
 /// The top-level THROWs that read only PARAMs and expression LETs, decided before
@@ -799,17 +799,17 @@ test "PRINT renders literals, `||` over params, and a loop variable" {
 
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const lit = try parser.parseExprStr(a, "'loading'", &pdiag);
-    try std.testing.expectEqualStrings("loading", try printText(a, lit, no_loop_vars, &params));
+    try std.testing.expectEqualStrings("loading", (try printText(a, lit, no_loop_vars, &params)).text);
 
     const cat = try parser.parseExprStr(a, "'since ' || $since", &pdiag);
-    try std.testing.expectEqualStrings("since 2024-01-01", try printText(a, cat, no_loop_vars, &params));
+    try std.testing.expectEqualStrings("since 2024-01-01", (try printText(a, cat, no_loop_vars, &params)).text);
 
     const num = try parser.parseExprStr(a, "$n", &pdiag);
-    try std.testing.expectEqualStrings("7", try printText(a, num, no_loop_vars, &params));
+    try std.testing.expectEqualStrings("7", (try printText(a, num, no_loop_vars, &params)).text);
 
     const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
     const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
-    try std.testing.expectEqualStrings("company acme", try printText(a, row, lr, &params));
+    try std.testing.expectEqualStrings("company acme", (try printText(a, row, lr, &params)).text);
 }
 
 test "renderHints: a query parameter whose value is a NULL PARAM is left out, as a literal NULL is" {

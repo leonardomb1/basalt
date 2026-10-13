@@ -350,20 +350,143 @@ pub const Plan = struct {
     outputs: []const Output,
 };
 
-/// Only a literal `true` fires (null is not a failure, as in SQL), and then the
-/// script's own message is the diagnostic, so `check` rejects exactly what a run would.
-fn checkThrow(arena: std.mem.Allocator, t: ast.Throw, params: *const ParamMap, diag: *Diag) Error!void {
-    if (t.when) |w| {
-        const c = eval.constEval(arena, try substExpr(arena, w, params), &.{}, &.{}) catch
-            return failPos(diag, t.pos, "THROW condition is not decidable at plan time", .{});
-        if (c == .null) return;
-        if (c != .bool)
-            return failPos(diag, t.pos, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
-        if (!c.bool) return;
+/// The values a script statement's expression may read: names and values in step.
+pub const Scope = struct { names: []const []const u8, values: []const Value };
+
+/// What an expression folds to over `sc`, or the label of why it does not.
+pub const Folded = union(enum) { value: Value, failed: []const u8 };
+
+pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folded {
+    const v = eval.constEval(arena, e, sc.names, sc.values) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return .{ .failed = env_mod.errLabel(err) };
+    };
+    return .{ .value = v };
+}
+
+/// A THROW's stop message over `sc`, or null when it does not fire: only a `true`
+/// condition fires (null is not a failure, as in SQL), an absent one always does.
+pub fn throwVerdict(arena: std.mem.Allocator, t: ast.Throw, sc: Scope) Error!?[]const u8 {
+    if (t.when) |w| switch (try fold(arena, w, sc)) {
+        .failed => |why| return try std.fmt.allocPrint(arena, "THROW condition: {s}", .{why}),
+        .value => |c| {
+            if (c == .null) return null;
+            if (c != .bool) return try std.fmt.allocPrint(arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
+            if (!c.bool) return null;
+        },
+    };
+    return switch (try fold(arena, t.message, sc)) {
+        .failed => |why| try std.fmt.allocPrint(arena, "THROW message: {s}", .{why}),
+        .value => |m| try eval.valueToString(arena, m),
+    };
+}
+
+/// A `PRINT`'s text, rendered as any cell is, or why it cannot be.
+pub const Printed = union(enum) { text: []const u8, problem: []const u8 };
+
+pub fn printed(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Printed {
+    return switch (try fold(arena, e, sc)) {
+        .failed => |why| .{ .problem = try std.fmt.allocPrint(arena, "PRINT: {s}", .{why}) },
+        .value => |v| .{ .text = try eval.valueToString(arena, v) },
+    };
+}
+
+/// A `CALL`'s arguments as the text cells its body's row binds, or why one cannot be.
+pub const CallArgs = union(enum) { cells: []const []const u8, problem: []const u8 };
+
+pub fn callArgs(arena: std.mem.Allocator, c: ast.CallStmt, params: []const ast.FnParam, sc: Scope) Error!CallArgs {
+    const cells = try arena.alloc([]const u8, params.len);
+    for (params, c.args, cells) |p, a, *cell| switch (try fold(arena, a, sc)) {
+        .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, why }) },
+        .value => |v| cell.* = try eval.valueToString(arena, v),
+    };
+    return .{ .cells = cells };
+}
+
+/// The statement `CASE` arm that runs (`_` matches), null for none, or why the CASE
+/// cannot be decided; `ctx` names it in the refusal.
+pub const ArmPick = union(enum) { arm: ?usize, problem: []const u8 };
+
+pub fn matchArm(arena: std.mem.Allocator, m: ast.StmtMatch, sc: Scope, ctx: []const u8) Error!ArmPick {
+    var subj: ?Value = null;
+    if (m.subject) |s| switch (try fold(arena, s, sc)) {
+        .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} subject: {s}", .{ ctx, why }) },
+        .value => |v| subj = v,
+    };
+    if (subj) |sv| for (m.arms) |arm| for (arm.pats) |p| if (try patternTypeProblem(arena, sv, p)) |why|
+        return .{ .problem = why };
+    for (m.arms, 0..) |arm, i| {
+        if (arm.is_default) return .{ .arm = i };
+        if (arm.guard) |g| {
+            switch (try fold(arena, g, sc)) {
+                .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} guard: {s}", .{ ctx, why }) },
+                .value => |gv| if (gv == .bool and gv.bool) return .{ .arm = i },
+            }
+            continue;
+        }
+        const sv = subj orelse continue;
+        for (arm.pats) |p| switch (try fold(arena, p, sc)) {
+            .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} pattern: {s}", .{ ctx, why }) },
+            .value => |pv| if (valuesEqualLoose(arena, sv, pv)) return .{ .arm = i },
+        };
     }
-    const m = eval.constEval(arena, try substExpr(arena, t.message, params), &.{}, &.{}) catch
-        return failPos(diag, t.pos, "THROW message is not decidable at plan time", .{});
-    return failPos(diag, t.pos, "{s}", .{try eval.valueToString(arena, m)});
+    return .{ .arm = null };
+}
+
+fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
+    if (eval.compareValues(a, b)) |ord| return ord == .eq;
+    const as = eval.valueToString(arena, a) catch return false;
+    const bs = eval.valueToString(arena, b) catch return false;
+    return std.mem.eql(u8, as, bs);
+}
+
+/// Every `$name` the expressions read is in `sc`: what the run decides from PARAMs
+/// and expression LETs alone, which `check` can decide too.
+fn foldsHere(arena: std.mem.Allocator, exprs: []const ?*const ast.Expr, sc: Scope) Error!bool {
+    for (exprs) |maybe| {
+        const e = maybe orelse continue;
+        for (try dollarRefs(arena, e)) |q| if (!containsName(sc.names, q.parts[0])) return false;
+    }
+    return true;
+}
+
+/// A top-level THROW, PRINT, CALL or CASE that reads only what is decided before
+/// anything runs, judged as the run judges it.
+fn checkScriptStmt(arena: std.mem.Allocator, s: ast.Stmt, program: ast.Program, params: *const ParamMap, sc: Scope, diag: *Diag) Error!void {
+    switch (s) {
+        .throw => |t| if (try foldsHere(arena, &.{ t.when, t.message }, sc)) if (try throwVerdict(arena, t, sc)) |why|
+            return failPos(diag, t.pos, "{s}", .{why}),
+        .print => |p| if (try foldsHere(arena, &.{p.expr}, sc)) switch (try printed(arena, p.expr, sc)) {
+            .problem => |why| return failPos(diag, p.pos, "{s}", .{why}),
+            .text => {},
+        },
+        .call => |c| {
+            const fd = for (program.stmts) |o| {
+                if (o == .func and std.mem.eql(u8, o.func.name, c.name)) break o.func;
+            } else return;
+            if (fd.body != .stmts or fd.params.len != c.args.len) return;
+            const args = try arena.alloc(?*const ast.Expr, c.args.len);
+            for (c.args, args) |a, *o| o.* = a;
+            if (try foldsHere(arena, args, sc)) switch (try callArgs(arena, c, fd.params, sc)) {
+                .problem => |why| return failPos(diag, c.pos, "{s}", .{why}),
+                .cells => {},
+            };
+        },
+        .match => |m| {
+            var exprs = std.array_list.Managed(?*const ast.Expr).init(arena);
+            try exprs.append(m.subject);
+            for (m.arms) |arm| {
+                for (arm.pats) |p| try exprs.append(p);
+                try exprs.append(arm.guard);
+            }
+            if (!try foldsHere(arena, exprs.items, sc)) return checkMatchPatterns(arena, m, params, diag);
+            switch (try matchArm(arena, m, sc, "match")) {
+                .problem => |why| return failPos(diag, m.pos, "{s}", .{why}),
+                .arm => {},
+            }
+        },
+        else => {},
+    }
 }
 
 pub fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
@@ -390,7 +513,8 @@ pub fn patternTypeProblem(arena: std.mem.Allocator, subj: Value, pat: *const ast
     return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(ty.kind) });
 }
 
-/// The run's `matchArmIndex` refusal, for a top-level `CASE` whose subject folds here.
+/// `matchArm`'s pattern refusal, for a top-level `CASE` whose subject folds here
+/// though not all of it does.
 fn checkMatchPatterns(arena: std.mem.Allocator, m: ast.StmtMatch, params: *const ParamMap, diag: *Diag) Error!void {
     const s = m.subject orelse return;
     const v = eval.constEval(arena, try substExpr(arena, s, params), &.{}, &.{}) catch return;
@@ -716,8 +840,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         }
     };
     for (program.stmts) |s| switch (s) {
-        .throw => |t| try checkThrow(arena, t, &params_map, diag),
-        .match => |m| try checkMatchPatterns(arena, m, &params_map, diag),
+        .throw, .print, .call, .match => try checkScriptStmt(arena, s, program, &params_map, .{ .names = known_names.items, .values = known_values.items }, diag),
         else => {},
     };
     try bindBodyVars(arena, program.stmts, &params_map);

@@ -341,40 +341,17 @@ fn runSummary(env: *const Env, run_id: u64, rows_written: u64, rows_read: u64, e
 
 /// Equality for plan-time `match`. A typed-vs-literal mismatch (a `port:int` subject
 /// vs a `"9030"` pattern) falls back to a textual compare instead of never matching.
-fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
-    if (eval.compareValues(a, b)) |ord| return ord == .eq;
-    const as = eval.valueToString(arena, a) catch return false;
-    const bs = eval.valueToString(arena, b) catch return false;
-    return std.mem.eql(u8, as, bs);
-}
-
 /// The index of the first `match` arm whose pattern or guard holds (`_` matches), or
 /// null. Shared by `runStmtMatch` and `runForMatch`; `ctx` prefixes eval errors.
 pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []const Value, ctx: []const u8) anyerror!?usize {
-    var subj: ?Value = null;
-    if (m.subject) |s| subj = eval.constEval(env.arena, s, ns, vs) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} subject: {s}", .{ ctx, @errorName(e) }));
-    if (subj) |sv| for (m.arms) |arm| for (arm.pats) |p| if (try analyze.patternTypeProblem(env.arena, sv, p)) |why| {
-        const e = planErr(env.diag, why);
-        env.diag.pos = m.pos;
-        return e;
+    return switch (try analyze.matchArm(env.arena, m, .{ .names = ns, .values = vs }, ctx)) {
+        .arm => |i| i,
+        .problem => |why| {
+            const e = planErr(env.diag, why);
+            env.diag.pos = m.pos;
+            return e;
+        },
     };
-    for (m.arms, 0..) |arm, i| {
-        if (arm.is_default) return i;
-        if (arm.guard) |g| {
-            const gv = eval.constEval(env.arena, g, ns, vs) catch |e|
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} guard: {s}", .{ ctx, @errorName(e) }));
-            if (gv == .bool and gv.bool) return i;
-            continue;
-        }
-        const sv = subj orelse continue;
-        for (arm.pats) |p| {
-            const pv = eval.constEval(env.arena, p, ns, vs) catch |e|
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} pattern: {s}", .{ ctx, @errorName(e) }));
-            if (valuesEqualLoose(env.arena, sv, pv)) return i;
-        }
-    }
-    return null;
 }
 
 /// No matching arm (and no `_`) is a no-op.
