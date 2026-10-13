@@ -578,12 +578,13 @@ pub const StreamLoadSink = struct {
     /// send and receive timeouts so a server that stops reading cannot hang the lane.
     fn begin(self: *StreamLoadSink) !void {
         const uri = try std.Uri.parse(self.url);
-        self.txn = .{ .req = try self.client.request(.PUT, uri, .{
+        const req = try self.client.request(.PUT, uri, .{
             .redirect_behavior = .unhandled,
             .keep_alive = false,
             .headers = .{ .accept_encoding = .omit },
             .extra_headers = self.headers.items,
-        }), .body = undefined };
+        });
+        self.txn = .{ .req = req, .body = undefined };
         errdefer self.dropTxn();
         const t = &self.txn.?;
         const fd = t.req.connection.?.stream_writer.getStream().handle;
