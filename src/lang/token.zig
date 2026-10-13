@@ -8,8 +8,6 @@
 //! `end_line`/`end_col` mark just past the token's last source byte, where an
 //! editor ends its underline; they are zero on a token made rather than lexed.
 
-const std = @import("std");
-
 pub const Tag = enum {
     ident,
     qident,

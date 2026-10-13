@@ -144,10 +144,9 @@ pub fn parseWindowCall(self: *Parser, name: []const u8, args: []const *ast.Expr,
         for (call.spec.partition) |e| if (refsName(e, prev.hidden)) return nested(self, pos);
         for (call.spec.order) |o| if (refsName(o.e, prev.hidden)) return nested(self, pos);
     }
-    self.derived_n += 1;
-    call.hidden = try std.fmt.allocPrint(self.arena, "__w{d}", .{self.derived_n});
+    call.hidden = try self.freshName("__w{d}");
     try sink.append(call);
-    return self.mk(.{ .field = try self.qualOne(call.hidden) });
+    return self.mk(.{ .field = try self.singleName(call.hidden) });
 }
 
 fn nested(self: *Parser, pos: Pos) Error {
@@ -159,11 +158,13 @@ fn wholeNumber(e: *const ast.Expr) ?i64 {
 }
 
 /// Whether `e` reads no column, so the planner can fold it (`1 + 1`, `$n`).
-fn constant(self: *Parser, e: *const ast.Expr) Error!bool {
-    var fields = std.array_list.Managed(ast.QualName).init(self.arena);
-    try self.collectFields(e, &fields);
-    for (fields.items) |q| if (!q.dollar) return false;
-    return true;
+fn constant(e: *const ast.Expr) bool {
+    const S = struct {
+        fn column(_: void, n: *const ast.Expr) ?bool {
+            return if (n.* == .field) !n.field.dollar else null;
+        }
+    };
+    return !ast.anyExpr(e, {}, S.column);
 }
 
 pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!void {
@@ -176,7 +177,7 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                     return self.fail(call.pos, "`{s}()` takes no arguments", .{name}),
                 .ntile => {
                     if (args.len != 1) return self.fail(call.pos, "NTILE takes one argument, the number of buckets", .{});
-                    if (wholeNumber(args[0]) == null and try constant(self, args[0])) {
+                    if (wholeNumber(args[0]) == null and constant(args[0])) {
                         call.offset_expr = args[0];
                     } else {
                         const n = wholeNumber(args[0]) orelse 0;
@@ -193,12 +194,12 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                             return self.fail(call.pos, "LAG/LEAD offset must not be negative — use the other function", .{});
                         if (wholeNumber(o)) |n| {
                             call.offset = n;
-                        } else if (try constant(self, o)) {
+                        } else if (constant(o)) {
                             call.offset_expr = o;
                         } else return self.fail(call.pos, "LAG/LEAD offset must be a constant integer", .{});
                     }
                     if (args.len == 3) {
-                        if (!try constant(self, args[2]))
+                        if (!constant(args[2]))
                             return self.fail(call.pos, "LAG/LEAD default must be a constant — a literal, an expression of literals or a $param", .{});
                         call.default = args[2];
                     }
@@ -210,7 +211,7 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
                 .nth_value => {
                     if (args.len != 2) return self.fail(call.pos, "NTH_VALUE takes (column, n)", .{});
                     call.arg = args[0];
-                    if (wholeNumber(args[1]) == null and try constant(self, args[1])) {
+                    if (wholeNumber(args[1]) == null and constant(args[1])) {
                         call.offset_expr = args[1];
                     } else {
                         const n = wholeNumber(args[1]) orelse 0;
@@ -347,15 +348,10 @@ pub fn parseBound(self: *Parser) Error!ast.FrameBound {
     if (self.isKw("interval")) {
         _ = self.advance();
         const s = std.mem.trim(u8, (try self.expect(.string)).text, " ");
-        if (std.mem.indexOfScalar(u8, s, ' ')) |sp| {
-            const word = std.mem.trim(u8, s[sp + 1 ..], " ");
-            off = .{ .text = s[0..sp], .unit = intervalUnit(word) orelse
-                return self.fail(bpos, "unknown INTERVAL unit `{s}` in a frame — DAY, HOUR, MINUTE or SECOND", .{word}) };
-        } else {
-            const word = try self.expectIdent();
-            off = .{ .text = s, .unit = intervalUnit(word) orelse
-                return self.fail(bpos, "unknown INTERVAL unit `{s}` in a frame — DAY, HOUR, MINUTE or SECOND", .{word}) };
-        }
+        const sp = std.mem.indexOfScalar(u8, s, ' ');
+        const word = if (sp) |k| std.mem.trim(u8, s[k + 1 ..], " ") else try self.expectIdent();
+        off = .{ .text = if (sp) |k| s[0..k] else s, .unit = intervalUnit(word) orelse
+            return self.fail(bpos, "unknown INTERVAL unit `{s}` in a frame — DAY, HOUR, MINUTE or SECOND", .{word}) };
         if (!validNumber(off.text)) return self.fail(bpos, "a frame's INTERVAL must be a non-negative number, not `{s}`", .{off.text});
     } else if (self.at(.int) or self.at(.float)) {
         off = .{ .text = self.advance().text };
@@ -470,29 +466,14 @@ pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, ma
 
 /// Whether `e` reads the column `name`.
 pub fn refsName(e: *const ast.Expr, name: []const u8) bool {
-    return switch (e.*) {
-        .field => |q| !q.dollar and q.parts.len == 1 and std.mem.eql(u8, q.parts[0], name),
-        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => false,
-        .unary => |u| refsName(u.e, name),
-        .binary => |b| refsName(b.l, name) or refsName(b.r, name),
-        .call => |c| for (c.args) |a| {
-            if (refsName(a, name)) break true;
-        } else false,
-        .cond => |c| refsName(c.cond, name) or refsName(c.then, name) or refsName(c.els, name),
-        .cast => |c| refsName(c.e, name),
-        .is_null => |n| refsName(n.e, name),
-        .let_in => |l| refsName(l.value, name) or refsName(l.body, name),
-        .lambda => |l| refsName(l.body, name),
-        .match => |m| blk: {
-            if (m.subject) |s| if (refsName(s, name)) break :blk true;
-            for (m.arms) |arm| {
-                for (arm.pats) |p| if (refsName(p, name)) break :blk true;
-                if (arm.guard) |g| if (refsName(g, name)) break :blk true;
-                if (refsName(arm.value, name)) break :blk true;
-            }
-            break :blk false;
-        },
+    const S = struct {
+        fn hit(n: []const u8, at: *const ast.Expr) ?bool {
+            if (at.* != .field) return null;
+            const q = at.field;
+            return !q.dollar and q.parts.len == 1 and std.mem.eql(u8, q.parts[0], n);
+        }
     };
+    return ast.anyExpr(e, name, S.hit);
 }
 
 /// Whether `e` reads any call's hidden column.
@@ -547,13 +528,12 @@ pub const Lower = struct {
         var buf = std.array_list.Managed(u8).init(self.p.arena);
         try self.p.exprKey(e, &buf);
         const key = buf.items;
-        for (self.seen.items) |s| if (std.mem.eql(u8, s[0], key)) return self.p.qualOne(s[1]);
-        self.p.derived_n += 1;
-        const name = try std.fmt.allocPrint(self.p.arena, "__wa{d}", .{self.p.derived_n});
+        for (self.seen.items) |s| if (std.mem.eql(u8, s[0], key)) return self.p.singleName(s[1]);
+        const name = try self.p.freshName("__wa{d}");
         try self.pre.append(.{ .computed = .{ .name = name, .expr = e } });
         try self.hidden.append(name);
         try self.seen.append(.{ key, name });
-        return self.p.qualOne(name);
+        return self.p.singleName(name);
     }
 
     /// The expression a computed first ORDER BY key was written as, for messages.
@@ -637,10 +617,9 @@ pub const Lower = struct {
         for (plan.items[@min(1, plan.items.len)..]) |*g| {
             if (g.ord.len > 0 or !inputOrdered(g.funcs.items)) continue;
             if (ordinal == null) {
-                self.p.derived_n += 1;
-                const name = try std.fmt.allocPrint(self.p.arena, "__w{d}", .{self.p.derived_n});
+                const name = try self.p.freshName("__w{d}");
                 try self.hidden.append(name);
-                ordinal = try self.p.qualOne(name);
+                ordinal = try self.p.singleName(name);
             }
             const ord = try self.p.arena.alloc(ast.SortKey, 1);
             ord[0] = .{ .field = ordinal.?, .desc = false, .nulls_first = false };

@@ -64,6 +64,22 @@ test "aggregate: two aggregates over different expressions stay separate" {
     try std.testing.expectEqualStrings("chk,m\n480,130\n", out);
 }
 
+test "aggregate: HAVING reads an aggregate inside CASE, and a constant CASE sits beside one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT g, COUNT(*) AS n FROM '$IN' GROUP BY g HAVING CASE SUM(x) WHEN 3 THEN true ELSE false END", .want = "g,n\na,2\n" },
+        .{ .q = "SELECT g FROM '$IN' GROUP BY g HAVING CASE WHEN SUM(x) > 4 THEN true ELSE false END", .want = "g\nb\n" },
+        .{ .q = "SELECT CASE WHEN 1 = 1 THEN 'k' END AS k, COUNT(*) AS n FROM '$IN'", .want = "k,n\nk,3\n" },
+    };
+    for (cases) |c| {
+        const out = try runToString(alloc, &tmp, "g,x\na,1\na,2\nb,5\n", c.q);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "aggregate: the same expression twice still shares one accumulator" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

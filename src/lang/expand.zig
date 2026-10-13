@@ -21,6 +21,7 @@
 const std = @import("std");
 const builtins = @import("../exec/builtins.zig");
 const eval = @import("../exec/eval.zig");
+const aggregates = @import("aggregates.zig");
 const parser = @import("sql_parser.zig");
 const ast = @import("ast.zig");
 const types = @import("types.zig");
@@ -71,7 +72,7 @@ pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
         at.* = s.func.pos;
-        if (builtins.lookup(s.func.name) != null or parser.isAggName(s.func.name)) {
+        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null) {
             msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
         }
@@ -406,47 +407,57 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
 /// Pad a short argument list from trailing `DEFAULT`s, expanded scope-free: a
 /// default may mention only literals and expression-form functions.
 fn fillDefaults(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
-    if (args.len == fd.params.len) return args;
-    fill: {
-        if (args.len > fd.params.len) break :fill;
-        for (fd.params[args.len..]) |p| if (p.default == null) break :fill;
-        const full = try cx.arena.alloc(*ast.Expr, fd.params.len);
-        @memcpy(full[0..args.len], args);
-        for (fd.params[args.len..], args.len..) |p, i| full[i] = try expandExpr(cx, p.default.?, null, 0);
-        return full;
+    if (try arityError(cx.arena, fd, args.len)) |m| {
+        cx.msg.* = m;
+        return error.ExpandFailed;
     }
+    if (args.len == fd.params.len) return args;
+    const full = try cx.arena.alloc(*ast.Expr, fd.params.len);
+    @memcpy(full[0..args.len], args);
+    for (fd.params[args.len..], args.len..) |p, i| full[i] = try expandExpr(cx, p.default.?, null, 0);
+    return full;
+}
+
+/// Why `fd` cannot take `n` arguments, or null. Defaults are trailing, so any count
+/// from the required ones up to all of them is fine.
+pub fn arityError(arena: std.mem.Allocator, fd: ast.FnDecl, n: usize) error{OutOfMemory}!?[]const u8 {
     var required: usize = 0;
     for (fd.params) |p| {
         if (p.default == null) required += 1;
     }
-    cx.msg.* = (if (required == fd.params.len)
-        std.fmt.allocPrint(cx.arena, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, args.len })
-    else
-        std.fmt.allocPrint(cx.arena, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, args.len })) catch "fn arity mismatch";
-    return error.ExpandFailed;
+    if (n >= required and n <= fd.params.len) return null;
+    if (required == fd.params.len)
+        return try std.fmt.allocPrint(arena, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, n });
+    return try std.fmt.allocPrint(arena, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, n });
 }
 
-/// Only a literal argument is decidable at expansion; anything else passes through
-/// to the type-checker. Ints widen to float/decimal; strings coerce to temporals and
-/// bytes, a temporal one read as a CAST reads it and passed on as that CAST.
 fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
     const out = try cx.arena.dupe(*ast.Expr, args);
-    for (fd.params, out, 1..) |p, *a, n| {
-        const ty = p.ty orelse continue;
-        const want = ty.kind;
-        const got = literalKind(a.*) orelse continue;
-        if (!acceptsLiteral(want, got)) {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, n, p.name, typeWord(want), typeWord(got) }) catch "fn argument type mismatch";
-            return error.ExpandFailed;
-        }
-        if (!isTemporalText(ty, a.*)) continue;
-        if (!temporalTextOk(cx.arena, ty, a.*.str_lit)) {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, n, p.name, typeWord(want), a.*.str_lit }) catch "fn argument type mismatch";
-            return error.ExpandFailed;
-        }
-        a.* = try mk(cx, .{ .cast = .{ .e = a.*, .ty = ty } });
-    }
+    for (out, 0..) |*a, i| if (try bindArg(cx.arena, fd, i, a)) |m| {
+        cx.msg.* = m;
+        return error.ExpandFailed;
+    };
     return out;
+}
+
+/// Checks argument `i` of a call to `fd`, returning why it does not fit, or null.
+/// Only a literal is decidable before the type-checker; anything else passes. Ints
+/// widen to float/decimal; strings coerce to temporals and bytes, a temporal one read
+/// as a CAST reads it and passed on as that CAST.
+pub fn bindArg(arena: std.mem.Allocator, fd: ast.FnDecl, i: usize, a: **ast.Expr) error{OutOfMemory}!?[]const u8 {
+    const p = fd.params[i];
+    const ty = p.ty orelse return null;
+    const want = ty.kind;
+    const got = literalKind(a.*) orelse return null;
+    if (!acceptsLiteral(want, got))
+        return try std.fmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i + 1, p.name, typeWord(want), typeWord(got) });
+    if (!isTemporalText(ty, a.*)) return null;
+    if (!temporalTextOk(arena, ty, a.*.str_lit))
+        return try std.fmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i + 1, p.name, typeWord(want), a.*.str_lit });
+    const cast = try arena.create(ast.Expr);
+    cast.* = .{ .cast = .{ .e = a.*, .ty = ty } };
+    a.* = cast;
+    return null;
 }
 
 /// A string literal passed for a DATE, TIME or TIMESTAMP parameter.

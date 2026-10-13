@@ -15,11 +15,11 @@ const Token = @import("../sql_parser.zig").Token;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const expand = @import("../expand.zig");
-const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource;
 const max_tvf_depth = @import("../sql_parser.zig").max_tvf_depth;
+const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 
-pub fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
+fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
     var i = self.table_fns.items.len;
     while (i > 0) {
         i -= 1;
@@ -62,7 +62,9 @@ pub fn checkTableBody(self: *Parser) Error!struct { toks: []const Token, check: 
 
 /// `f(args)` in FROM or JOIN: bind the arguments, re-parse the body, and lower it to a
 /// binding like a derived table, so a filter on the call still reaches the source.
-pub fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, join, lateral }) Error!TableCall {
+pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from, join, lateral }) Error!TableCall {
+    const fd = findTableFn(self, name) orelse
+        return self.fail(pos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ name, name });
     const lateral = place == .lateral;
     _ = try self.expect(.lparen);
     var args = std.array_list.Managed(*ast.Expr).init(self.arena);
@@ -72,16 +74,8 @@ pub fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, 
     }
     _ = try self.expect(.rparen);
 
-    var required: usize = 0;
-    for (fd.params) |p| {
-        if (p.default == null) required += 1;
-    }
     const n = args.items.len;
-    if (n < required or n > fd.params.len) {
-        if (required == fd.params.len)
-            return self.fail(pos, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, n });
-        return self.fail(pos, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, n });
-    }
+    if (try expand.arityError(self.arena, fd, n)) |m| return self.fail(pos, "{s}", .{m});
     for (fd.params[n..]) |p| try args.append(p.default.?);
     const names = try self.arena.alloc([]const u8, fd.params.len);
     var correlated = std.array_list.Managed(Correlated).init(self.arena);
@@ -99,13 +93,7 @@ pub fn callTableFn(self: *Parser, fd: ast.FnDecl, pos: Pos, place: enum { from, 
                 return self.fail(pos, "`{s}`: argument {d} (`{s}`) names a column — pass a row's value with `JOIN LATERAL {s}(...)`", .{ fd.name, i, p.name, fd.name });
             return self.fail(pos, "`{s}`: argument {d} (`{s}`) must be a constant — a literal, a `$param`, or an expression over them", .{ fd.name, i, p.name });
         }
-        const ty = p.ty orelse continue;
-        const want = ty.kind;
-        const got = expand.literalKind(a.*) orelse continue;
-        if (!expand.acceptsLiteral(want, got))
-            return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i, p.name, expand.typeWord(want), expand.typeWord(got) });
-        if (expand.isTemporalText(ty, a.*) and !expand.temporalTextOk(self.arena, ty, a.*.str_lit))
-            return self.fail(pos, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i, p.name, expand.typeWord(want), a.*.str_lit });
+        if (try expand.bindArg(self.arena, fd, i - 1, a)) |m| return self.fail(pos, "{s}", .{m});
     }
     if (self.tvf_depth >= max_tvf_depth)
         return self.fail(pos, "table function `{s}` nests more than {d} calls deep — does it reach itself?", .{ fd.name, max_tvf_depth });
@@ -168,7 +156,7 @@ pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array
             continue;
         }
         var parts = std.array_list.Managed(*ast.Expr).init(self.arena);
-        try splitConj(st.node.filter, &parts);
+        try splitAnd(st.node.filter, &parts);
         var keep = std.array_list.Managed(*ast.Expr).init(self.arena);
         for (parts.items) |cj| {
             if (eqOfMarker(cj, cor)) |m| {
@@ -255,24 +243,20 @@ pub fn parseDerivedTable(self: *Parser) Error!Derived {
     _ = self.eatKw("as");
     var alias: ?[]const u8 = null;
     var alias_pos = dpos;
-    if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
+    if (self.atAlias()) {
         alias = self.advance().text;
         alias_pos = self.prevPos();
     }
-    self.derived_n += 1;
-    const name = if (alias) |al|
-        try std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al })
-    else
-        try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
-
-    try self.let_names.append(name);
+    const name = try derivedName(self, alias);
     try self.pending_bindings.appendSlice(inner_bindings.items);
-    try self.pending_bindings.append(.{ .binding = .{
-        .name = name,
-        .pipeline = .{ .stages = try sub_stages.toOwnedSlice(), .pos = dpos },
-        .pos = dpos,
-    } });
+    try self.bindHidden(name, try sub_stages.toOwnedSlice(), dpos);
     return .{ .binding = name, .alias = alias, .alias_pos = alias_pos };
+}
+
+fn derivedName(self: *Parser, alias: ?[]const u8) Error![]const u8 {
+    self.derived_n += 1;
+    const al = alias orelse return std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
+    return std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al });
 }
 
 const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
@@ -298,19 +282,10 @@ pub fn parseJoinRead(self: *Parser) Error!Derived {
         }
     }
     const alias: ?[]const u8 = if (scratch.n > 0) scratch.names[0] else null;
-    self.derived_n += 1;
-    const name = if (alias) |al|
-        try std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al })
-    else
-        try std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
-    try self.let_names.append(name);
+    const name = try derivedName(self, alias);
     const stages = try self.arena.alloc(ast.Stage, 1);
     stages[0] = .{ .node = node, .hints = try hints.toOwnedSlice(), .pos = rpos };
-    try self.pending_bindings.append(.{ .binding = .{
-        .name = name,
-        .pipeline = .{ .stages = stages, .pos = rpos },
-        .pos = rpos,
-    } });
+    try self.bindHidden(name, stages, rpos);
     return .{ .binding = name, .alias = alias, .alias_pos = rpos, .join_hints = try join_hints.toOwnedSlice(), .own = scratch.implicit };
 }
 
@@ -337,7 +312,7 @@ pub fn firstOutName(self: *const Parser, stages: []const ast.Stage) ?[]const u8 
             .select => |items| {
                 if (items.len != 1) return null;
                 return switch (items[0]) {
-                    .field => |f| f.parts[f.parts.len - 1],
+                    .field => |f| f.last(),
                     .computed => |c| c.name,
                     else => null,
                 };
@@ -345,7 +320,7 @@ pub fn firstOutName(self: *const Parser, stages: []const ast.Stage) ?[]const u8 
             .aggregate => |ag| {
                 if (ag.by.len + ag.aggs.len != 1) return null;
                 if (ag.aggs.len == 1) return ag.aggs[0].name;
-                return ag.by[0].parts[ag.by[0].parts.len - 1];
+                return ag.by[0].last();
             },
             .union_ => |u| {
                 if (!u.positional or u.branches.len == 0) return null;
@@ -393,13 +368,6 @@ pub fn stageMentions(st: ast.Stage, cor: []const Correlated) ?[]const u8 {
     return null;
 }
 
-pub fn splitConj(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) Error!void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try splitConj(e.binary.l, out);
-        try splitConj(e.binary.r, out);
-    } else try out.append(e);
-}
-
 /// `col = $p` or `$p = col` for a `JOIN LATERAL` marker: which one, and `col`.
 pub fn eqOfMarker(e: *const ast.Expr, cor: []const Correlated) ?struct { cor: usize, col: ast.QualName } {
     if (e.* != .binary or e.binary.op != .eq) return null;
@@ -438,38 +406,12 @@ pub fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u
 /// Whether `e` contains `needle` by pointer, to reject an `IN (SELECT ...)` sentinel
 /// off the AND spine.
 pub fn containsExpr(e: *const ast.Expr, needle: *const ast.Expr) bool {
-    if (e == needle) return true;
-    return switch (e.*) {
-        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => false,
-        .lambda => |l| containsExpr(l.body, needle),
-        .unary => |u| containsExpr(u.e, needle),
-        .binary => |b| containsExpr(b.l, needle) or containsExpr(b.r, needle),
-        .is_null => |n| containsExpr(n.e, needle),
-        .cast => |c| containsExpr(c.e, needle),
-        .cond => |c| containsExpr(c.cond, needle) or containsExpr(c.then, needle) or containsExpr(c.els, needle),
-        .call => |c| blk: {
-            for (c.args) |a| {
-                if (containsExpr(a, needle)) break :blk true;
-            }
-            break :blk false;
-        },
-        .match => |m| blk: {
-            if (m.subject) |s| {
-                if (containsExpr(s, needle)) break :blk true;
-            }
-            for (m.arms) |arm| {
-                for (arm.pats) |p| {
-                    if (containsExpr(p, needle)) break :blk true;
-                }
-                if (arm.guard) |g| {
-                    if (containsExpr(g, needle)) break :blk true;
-                }
-                if (containsExpr(arm.value, needle)) break :blk true;
-            }
-            break :blk false;
-        },
-        .let_in => |li| containsExpr(li.value, needle) or containsExpr(li.body, needle),
+    const S = struct {
+        fn hit(n: *const ast.Expr, at: *const ast.Expr) ?bool {
+            return if (at == n) true else null;
+        }
     };
+    return ast.anyExpr(e, needle, S.hit);
 }
 
 pub fn isSentinel(self: *Parser, e: *const ast.Expr) bool {

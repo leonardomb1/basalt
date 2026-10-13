@@ -64,8 +64,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
-const aggregates = @import("aggregates.zig");
-const expand = @import("expand.zig");
+const quoteInto = @import("parse/rewrite.zig").quoteInto;
 const types = @import("types.zig");
 
 pub const Token = token.Token;
@@ -214,7 +213,8 @@ pub const AliasSet = struct {
         };
     }
 
-    fn strips(self: *const AliasSet, name: []const u8) bool {
+    /// Whether `name` is the FROM table's alias, which its own columns drop.
+    pub fn strips(self: *const AliasSet, name: []const u8) bool {
         for (self.names[0..self.n], self.kinds[0..self.n]) |a, k| {
             if (std.mem.eql(u8, a, name)) return k == .left;
         }
@@ -258,10 +258,7 @@ fn isKwIn(name: []const u8, kws: []const []const u8) bool {
 }
 
 pub fn isReservedAfterSource(name: []const u8) bool {
-    for (reserved_after_source) |k| {
-        if (eqlNoCase(name, k)) return true;
-    }
-    return false;
+    return isKwIn(name, &reserved_after_source);
 }
 
 /// Whether a computed path spells an extension after its last `${...}` hole: the
@@ -272,12 +269,6 @@ pub fn hasLiteralExt(tmpl: []const u8) bool {
     return dot + 1 < tail.len;
 }
 
-/// Whether `name` is an aggregate. Reserved: it parses as one before any user
-/// function is looked up.
-pub fn isAggName(name: []const u8) bool {
-    return aggregates.lookup(name) != null;
-}
-
 pub fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
     for (group) |k| {
         if (std.mem.eql(u8, k.last(), q.last())) return true;
@@ -285,34 +276,18 @@ pub fn isGroupKey(group: []const ast.QualName, q: ast.QualName) bool {
     return false;
 }
 
-/// The name the aggregate stage emits a `post` item under: a grouping key's own
-/// column name, a lifted aggregate's alias, or null for a star.
-fn postItemName(it: ast.SelectItem) ?[]const u8 {
-    return switch (it) {
-        .field => |q| q.last(),
-        .computed => |c| c.name,
-        .star, .star_except, .star_rename, .star_of => null,
-    };
-}
-
 /// Whether the SELECT list orders columns otherwise than the aggregate stage emits
 /// them (keys first) or emits a grouping key it never asked for, so the caller must add
 /// a projection.
 pub fn aggOrderDiffers(post: []const ast.SelectItem, group: []const ast.QualName, aggs: []const ast.AggItem) bool {
-    for (post) |it| if (postItemName(it) == null) return false;
+    for (post) |it| if (outName(it) == null) return false;
     if (post.len != group.len + aggs.len) return true;
     for (post, 0..) |it, i| {
-        const want = postItemName(it).?;
+        const want = outName(it).?;
         const natural = if (i < group.len) group[i].last() else aggs[i - group.len].name;
         if (!std.mem.eql(u8, want, natural)) return true;
     }
     return false;
-}
-
-fn sameName(a: ast.QualName, b: ast.QualName) bool {
-    if (a.parts.len != b.parts.len) return false;
-    for (a.parts, b.parts) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    return true;
 }
 
 const KeyHome = union(enum) { as_is, renamed: []const u8, missing };
@@ -321,7 +296,7 @@ const KeyHome = union(enum) { as_is, renamed: []const u8, missing };
 /// or nowhere. A qualified key (`b.amt`) matches only the same reference.
 pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
     for (items) |it| switch (it) {
-        .field => |f| if (sameName(f, k)) return .as_is,
+        .field => |f| if (ast.QualName.eql(f, k)) return .as_is,
         .computed => |c| if (k.parts.len == 1 and std.mem.eql(u8, c.name, k.last())) return .as_is,
         else => {},
     };
@@ -329,7 +304,7 @@ pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
         if (it == .field and std.mem.eql(u8, it.field.last(), k.last())) return .as_is;
     };
     for (items) |it| {
-        if (it == .computed and it.computed.expr.* == .field and sameName(it.computed.expr.field, k)) return .{ .renamed = it.computed.name };
+        if (it == .computed and it.computed.expr.* == .field and ast.QualName.eql(it.computed.expr.field, k)) return .{ .renamed = it.computed.name };
     }
     return .missing;
 }
@@ -340,17 +315,19 @@ pub fn keyHome(items: []const ast.SelectItem, k: ast.QualName) KeyHome {
 /// along under a hidden name.
 pub fn ownsStrippedKey(items: []const ast.SelectItem, k: ast.QualName) bool {
     for (items, 0..) |it, i| {
-        if (it != .field or !sameName(it.field, k)) continue;
+        if (it != .field or !ast.QualName.eql(it.field, k)) continue;
         return !nameTaken(items[0..i], k.last());
     }
     return false;
 }
 
-fn outName(it: ast.SelectItem) ?[]const u8 {
+/// The column a SELECT item outputs: a column's own name or an item's alias; null
+/// for a star.
+pub fn outName(it: ast.SelectItem) ?[]const u8 {
     return switch (it) {
         .field => |q| q.last(),
         .computed => |c| c.name,
-        else => null,
+        .star, .star_except, .star_rename, .star_of => null,
     };
 }
 
@@ -379,11 +356,7 @@ pub fn nameApart(arena: std.mem.Allocator, items: []ast.SelectItem) !void {
 pub fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]const ast.SelectItem {
     const outs = try arena.alloc(ast.SelectItem, items.len);
     for (items, outs) |it, *o| o.* = switch (it) {
-        .computed => |c| blk: {
-            const parts = try arena.alloc([]const u8, 1);
-            parts[0] = c.name;
-            break :blk .{ .field = .{ .parts = parts } };
-        },
+        .computed => |c| .{ .field = try ast.QualName.one(arena, c.name) },
         else => it,
     };
     return outs;
@@ -391,15 +364,7 @@ pub fn keepOutputs(arena: std.mem.Allocator, items: []const ast.SelectItem) ![]c
 
 /// What to call a SELECT item in a diagnostic.
 pub fn itemLabel(it: ast.SelectItem) []const u8 {
-    return switch (it) {
-        .star, .star_except, .star_rename, .star_of => "*",
-        .field => |q| q.last(),
-        .computed => |c| c.name,
-    };
-}
-
-pub fn aggFunc(name: []const u8) ?ast.AggFunc {
-    return aggregates.lookup(name);
+    return outName(it) orelse "*";
 }
 
 pub const TableFrame = struct {
@@ -528,9 +493,7 @@ pub const Parser = struct {
         };
         if (dropped.items.len == 0) return null;
         st.node.select = items;
-        const drop = try self.arena.alloc(ast.SelectItem, 1);
-        drop[0] = .{ .star_except = try dropped.toOwnedSlice() };
-        return drop;
+        return try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try dropped.toOwnedSlice() }});
     }
 
     pub const PendingSemiJoin = struct {
@@ -638,6 +601,11 @@ pub const Parser = struct {
         if (next.tag == .ident and !isReservedAfterSource(next.text)) _ = self.advance();
     }
 
+    /// Whether an alias follows: a name no clause after a source claims.
+    pub fn atAlias(self: *Parser) bool {
+        return self.at(.ident) and !isReservedAfterSource(self.cur().text);
+    }
+
     pub fn claimAlias(self: *Parser, aliases: *AliasSet, name: []const u8, pos: Pos, kind: AliasSet.Kind) Error!void {
         aliases.put(name, kind) catch |e| return switch (e) {
             error.AliasTaken => self.fail(pos, "`{s}` names two tables in this FROM; give one of them a different alias", .{name}),
@@ -659,7 +627,7 @@ pub const Parser = struct {
     pub fn itemAlias(self: *Parser) Error!?[]const u8 {
         if (self.eatKw("as")) return try self.expectColName();
         if (self.at(.qident)) return self.advance().text;
-        if (self.at(.ident) and !isReservedAfterSource(self.toks[self.i].text) and !isKwIn(self.toks[self.i].text, &.{ "into", "over", "filter", "window", "qualify", "fetch" }))
+        if (self.atAlias() and !isKwIn(self.cur().text, &.{ "into", "over", "filter", "window", "qualify", "fetch" }))
             return self.advance().text;
         return null;
     }
@@ -681,12 +649,7 @@ pub const Parser = struct {
         var buf = std.array_list.Managed(u8).init(self.arena);
         for (self.toks[start..end]) |t| {
             if (t.tag == .string) {
-                try buf.append('\'');
-                for (t.text) |c| {
-                    if (c == '\'') try buf.append('\'');
-                    try buf.append(c);
-                }
-                try buf.append('\'');
+                try quoteInto(&buf, t.text, '\'');
             } else for (t.text) |c| try buf.append(std.ascii.toLower(c));
         }
         return buf.toOwnedSlice();
@@ -708,6 +671,18 @@ pub const Parser = struct {
             }
         }
         return error.ParseFailed;
+    }
+
+    /// A hidden name no query writes: `fmt` with the parser's next number.
+    pub fn freshName(self: *Parser, comptime fmt: []const u8) Error![]const u8 {
+        self.derived_n += 1;
+        return std.fmt.allocPrint(self.arena, fmt, .{self.derived_n});
+    }
+
+    /// Binds `stages` under the hidden `name`, which the query then reads as a CTE.
+    pub fn bindHidden(self: *Parser, name: []const u8, stages: []const ast.Stage, pos: Pos) Error!void {
+        try self.let_names.append(name);
+        try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = stages, .pos = pos }, .pos = pos } });
     }
 
     pub fn mk(self: *Parser, e: ast.Expr) Error!*ast.Expr {
@@ -750,7 +725,6 @@ pub const Parser = struct {
     pub const parseCreate = @import("parse/stmt.zig").parseCreate;
     pub const parseAcceptBuffer = @import("parse/stmt.zig").parseAcceptBuffer;
     pub const parseNameSegment = @import("parse/stmt.zig").parseNameSegment;
-    pub const distinctOnOutputs = @import("parse/stmt.zig").distinctOnOutputs;
     pub const parseColRef = @import("parse/stmt.zig").parseColRef;
     pub const parseTargetSegment = @import("parse/stmt.zig").parseTargetSegment;
     pub const parseUnionClauses = @import("parse/stmt.zig").parseUnionClauses;
@@ -822,7 +796,6 @@ pub const Parser = struct {
     pub const parseSetOps = @import("parse/query.zig").parseSetOps;
     pub const setOpStages = @import("parse/query.zig").setOpStages;
     pub const appendUnion = @import("parse/query.zig").appendUnion;
-    pub const findTableFn = @import("parse/tablefn.zig").findTableFn;
     pub const cteName = @import("parse/tablefn.zig").cteName;
     pub const checkTableBody = @import("parse/tablefn.zig").checkTableBody;
     pub const LateralKey = struct { left: ast.QualName, right: []const u8 };
@@ -842,7 +815,6 @@ pub const Parser = struct {
     pub const firstOutName = @import("parse/tablefn.zig").firstOutName;
     pub const stageWord = @import("parse/tablefn.zig").stageWord;
     pub const stageMentions = @import("parse/tablefn.zig").stageMentions;
-    pub const splitConj = @import("parse/tablefn.zig").splitConj;
     pub const eqOfMarker = @import("parse/tablefn.zig").eqOfMarker;
     pub const outputNameOf = @import("parse/tablefn.zig").outputNameOf;
     pub const containsExpr = @import("parse/tablefn.zig").containsExpr;
@@ -883,14 +855,7 @@ pub const Parser = struct {
     pub const repointPostItem = @import("parse/rewrite.zig").repointPostItem;
     pub const constItemExpr = @import("parse/rewrite.zig").constItemExpr;
     pub const liftAggs = @import("parse/rewrite.zig").liftAggs;
-    pub const addHavingAggs = @import("parse/rewrite.zig").addHavingAggs;
     pub const singleName = @import("parse/rewrite.zig").singleName;
-    pub const havingRewrite = @import("parse/rewrite.zig").havingRewrite;
-    pub const sidesOf = @import("parse/rewrite.zig").sidesOf;
-    pub const hasBareField = @import("parse/rewrite.zig").hasBareField;
-    pub const hasQualField = @import("parse/rewrite.zig").hasQualField;
-    pub const qualOne = @import("parse/rewrite.zig").qualOne;
-    pub const namesOtherSide = @import("parse/rewrite.zig").namesOtherSide;
     pub const stripRightExpr = @import("parse/rewrite.zig").stripRightExpr;
     pub const stripExpr = @import("parse/rewrite.zig").stripExpr;
     pub const parseCallArg = @import("parse/expr.zig").parseCallArg;
@@ -957,22 +922,13 @@ pub fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
     return q;
 }
 
-/// Whether `name` is the FROM table's alias, which its own columns drop.
-pub fn stripsAlias(aliases: *const AliasSet, name: []const u8) bool {
-    return aliases.strips(name);
-}
-
 /// `t.x` as `x` where `t` is the FROM table; a USING key `t.k` as that table's own
 /// copy of it, not the merged `k`.
 pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
     if (q.dollar or q.parts.len < 2) return q;
     if (q.parts.len == 2) if (aliases.usingCopy(q.parts[0], q.parts[1])) |copy| return .{ .parts = copy, .span = q.span };
-    if (aliases.strips(q.parts[0]))
-        return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
-    return q;
+    return if (aliases.strips(q.parts[0])) stripPrefix(q, q.parts[0]) else q;
 }
-
-const testing = std.testing;
 
 test {
     _ = @import("parse/control.zig");

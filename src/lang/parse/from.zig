@@ -8,7 +8,6 @@ const Pos = @import("../sql_parser.zig").Pos;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
-const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource;
 const std = @import("std");
 const types = @import("../types.zig");
 
@@ -84,22 +83,13 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         const pos = self.curPos();
         const head = try self.expectIdent();
         if (self.at(.lparen)) {
-            const fd = self.findTableFn(head) orelse
-                return self.fail(pos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ head, head });
-            const bname = (try self.callTableFn(fd, pos, .from)).binding;
-            _ = self.eatKw("as");
-            if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
-                try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
-            } else try self.claimAlias(aliases, head, pos, .left);
+            const bname = (try self.callTableFn(head, pos, .from)).binding;
+            if (!try claimFromAlias(self, aliases)) try self.claimAlias(aliases, head, pos, .left);
             return .{ .ref = bname };
         }
         if (self.tvf) |f| if (f.cte(head)) |bname| {
-            node = .{ .ref = bname };
-            self.eatAliasAs();
-            if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
-                try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
-            } else aliases.implicit = head;
-            return node;
+            if (!try claimFromAlias(self, aliases)) aliases.implicit = head;
+            return .{ .ref = bname };
         };
         const http = if (self.connType(head)) |k| std.mem.eql(u8, k, "http") else false;
         if (self.at(.dot) and http) {
@@ -134,7 +124,7 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
                     try parts.append(try self.parseNameSegment());
                 }
                 node = .{ .read = .{ .connector = head, .form = .{ .table = .{ .parts = try parts.toOwnedSlice() } } } };
-                own = node.read.form.table.parts[node.read.form.table.parts.len - 1];
+                own = node.read.form.table.last();
             }
         } else if (self.isLet(head)) {
             node = .{ .ref = head };
@@ -143,11 +133,16 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
             return self.fail(pos, "unknown source `{s}`: not a CTE, connection, or path", .{head});
         }
     }
-    self.eatAliasAs();
-    if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
-        try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
-    } else aliases.implicit = own;
+    if (!try claimFromAlias(self, aliases)) aliases.implicit = own;
     return node;
+}
+
+/// `[AS] alias` after a FROM source, claimed for the FROM table; false when none follows.
+fn claimFromAlias(self: *Parser, aliases: *AliasSet) Error!bool {
+    self.eatAliasAs();
+    if (!self.atAlias()) return false;
+    try self.claimAlias(aliases, self.advance().text, self.prevPos(), .left);
+    return true;
 }
 
 /// A path's file name up to its first dot (`l` of `'dir/l.csv'`), the name SQL lets

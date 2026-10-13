@@ -78,6 +78,17 @@ pub const QualName = struct {
     pub fn last(self: QualName) []const u8 {
         return self.parts[self.parts.len - 1];
     }
+    pub fn one(arena: std.mem.Allocator, name: []const u8) error{OutOfMemory}!QualName {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = name;
+        return .{ .parts = parts };
+    }
+    /// Whether both name the same parts, as written.
+    pub fn eql(a: QualName, b: QualName) bool {
+        if (a.parts.len != b.parts.len) return false;
+        for (a.parts, b.parts) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+        return true;
+    }
 };
 
 /// `distinct` and `not_distinct` are `IS [NOT] DISTINCT FROM`: `<>` and `=` that treat
@@ -302,29 +313,40 @@ pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
 /// Whether `e` calls `search`, which reads whole rows: no column list proves what
 /// it needs, so a filter holding one is never moved across a select or a join.
 pub fn hasSearch(e: *const Expr) bool {
+    const S = struct {
+        fn hit(_: void, n: *const Expr) ?bool {
+            return if (n.* == .call and std.mem.eql(u8, n.call.name, "search")) true else null;
+        }
+    };
+    return anyExpr(e, {}, S.hit);
+}
+
+/// Whether `pred` holds of `e` or of an expression inside it: `pred` answers true
+/// (found), false (not here, nor below) or null (look inside). With `rebuildExpr`,
+/// the one place that enumerates `Expr`'s children.
+pub fn anyExpr(e: *const Expr, ctx: anytype, comptime pred: fn (@TypeOf(ctx), *const Expr) ?bool) bool {
+    if (pred(ctx, e)) |hit| return hit;
     return switch (e.*) {
         .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => false,
-        .unary => |u| hasSearch(u.e),
-        .binary => |b| hasSearch(b.l) or hasSearch(b.r),
-        .call => |c| blk: {
-            if (std.mem.eql(u8, c.name, "search")) break :blk true;
-            for (c.args) |a| if (hasSearch(a)) break :blk true;
-            break :blk false;
-        },
-        .cond => |c| hasSearch(c.cond) or hasSearch(c.then) or hasSearch(c.els),
+        .lambda => |l| anyExpr(l.body, ctx, pred),
+        .unary => |u| anyExpr(u.e, ctx, pred),
+        .binary => |b| anyExpr(b.l, ctx, pred) or anyExpr(b.r, ctx, pred),
+        .cond => |c| anyExpr(c.cond, ctx, pred) or anyExpr(c.then, ctx, pred) or anyExpr(c.els, ctx, pred),
+        .cast => |c| anyExpr(c.e, ctx, pred),
+        .is_null => |n| anyExpr(n.e, ctx, pred),
+        .let_in => |l| anyExpr(l.value, ctx, pred) or anyExpr(l.body, ctx, pred),
+        .call => |c| for (c.args) |a| {
+            if (anyExpr(a, ctx, pred)) break true;
+        } else false,
         .match => |m| blk: {
-            if (m.subject) |s| if (hasSearch(s)) break :blk true;
+            if (m.subject) |s| if (anyExpr(s, ctx, pred)) break :blk true;
             for (m.arms) |arm| {
-                for (arm.pats) |p| if (hasSearch(p)) break :blk true;
-                if (arm.guard) |g| if (hasSearch(g)) break :blk true;
-                if (hasSearch(arm.value)) break :blk true;
+                for (arm.pats) |p| if (anyExpr(p, ctx, pred)) break :blk true;
+                if (arm.guard) |g| if (anyExpr(g, ctx, pred)) break :blk true;
+                if (anyExpr(arm.value, ctx, pred)) break :blk true;
             }
             break :blk false;
         },
-        .cast => |c| hasSearch(c.e),
-        .is_null => |n| hasSearch(n.e),
-        .let_in => |l| hasSearch(l.value) or hasSearch(l.body),
-        .lambda => |l| hasSearch(l.body),
     };
 }
 

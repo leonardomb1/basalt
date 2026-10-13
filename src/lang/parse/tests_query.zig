@@ -170,6 +170,43 @@ test "sql: a table function call is checked where it is written" {
     try testing.expectEqualStrings("`bad`: a table function's body is a query — SELECT ... or WITH ...", diag.msg);
 }
 
+test "sql: a table function's DATE argument is read as a DATE, as a scalar function's is, and still spells a path" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE FUNCTION since(d DATE) RETURNS TABLE AS SELECT id FROM IDENTIFIER('o_' || $d || '.csv') WHERE day >= $d;
+        \\SELECT id FROM since('2026-01-02');
+    , &diag);
+    const b = prog.stmts[2].binding;
+    try testing.expectEqualStrings("o_2026-01-02.csv", b.pipeline.stages[0].node.read.form.path);
+    const r = b.pipeline.stages[1].node.filter.binary.r;
+    try testing.expect(r.* == .cast and r.cast.ty.kind == .date);
+}
+
+test "sql: HAVING lifts aggregates from any expression, and refuses nested ones; GROUP BY errors point at the key" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for ([_][]const u8{
+        "SELECT g FROM 'in.csv' GROUP BY g HAVING CASE WHEN sum(x) > 2 THEN true ELSE false END;",
+        "SELECT g FROM 'in.csv' GROUP BY g HAVING CASE sum(x) WHEN 3 THEN true ELSE false END;",
+    }) |q| {
+        const prog = try parseSource(a, q, &diag);
+        const st = prog.stmts[1].output.stages;
+        const ag = st[aggStageIndex(st)].node.aggregate;
+        try testing.expectEqual(@as(usize, 1), ag.aggs.len);
+        try testing.expectEqual(ast.AggFunc.sum, ag.aggs[0].func);
+    }
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g FROM 'in.csv' GROUP BY g HAVING sum(sum(x)) > 1;", &diag));
+    try testing.expectEqualStrings("aggregate functions cannot be nested", diag.msg);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT g, count(*) AS n FROM 'in.csv' GROUP BY 3;", &diag));
+    try testing.expectEqualStrings("GROUP BY position 3 is out of range", diag.msg);
+    try testing.expectEqual(@as(u32, 48), diag.col);
+}
+
 test "sql: JOIN LATERAL refuses a body the join could not apply per row" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

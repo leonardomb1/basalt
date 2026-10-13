@@ -10,11 +10,7 @@ const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
-const keepOutputs = @import("../sql_parser.zig").keepOutputs;
-const nameApart = @import("../sql_parser.zig").nameApart;
-const keyHome = @import("../sql_parser.zig").keyHome;
-const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
-const providesName = @import("query.zig").providesName;
+const quoteInto = @import("rewrite.zig").quoteInto;
 const std = @import("std");
 
 /// A script that opens with EXPLAIN explains the whole script offline, without
@@ -35,12 +31,7 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
     self.pending_semijoins = std.array_list.Managed(PendingSemiJoin).init(self.arena);
 
     var explain: ast.ExplainMode = .none;
-    if (self.isKw("explain")) {
-        _ = self.advance();
-        if (self.isKw("costs"))
-            return self.fail(self.curPos(), "EXPLAIN COSTS is not supported: basalt has no cost model", .{});
-        explain = if (self.eatKw("analyze")) .analyze else .plan;
-    }
+    if (self.eatKw("explain")) explain = try explainMode(self);
 
     var stmts = std.array_list.Managed(ast.Stmt).init(self.arena);
     while (!self.at(.eof)) {
@@ -190,14 +181,19 @@ pub fn connType(self: *Parser, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// What follows `EXPLAIN`: `ANALYZE`, or the plan alone.
+fn explainMode(self: *Parser) Error!ast.ExplainMode {
+    if (self.isKw("costs"))
+        return self.fail(self.curPos(), "EXPLAIN COSTS is not supported: basalt has no cost model", .{});
+    return if (self.eatKw("analyze")) .analyze else .plan;
+}
+
 /// `EXPLAIN [ANALYZE] <query>;` in statement position, explained against the
 /// declarations above it. A `WITH`'s CTEs stay ordinary bindings.
 pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     const pos = self.curPos();
     try self.expectKw("explain");
-    if (self.isKw("costs"))
-        return self.fail(self.curPos(), "EXPLAIN COSTS is not supported: basalt has no cost model", .{});
-    const mode: ast.ExplainMode = if (self.eatKw("analyze")) .analyze else .plan;
+    const mode = try explainMode(self);
 
     const base = out.items.len;
     if (self.isKw("load")) {
@@ -325,36 +321,8 @@ pub fn parseNameSegment(self: *Parser) Error![]const u8 {
     return self.expectIdent();
 }
 
-/// `DISTINCT ON` keys are written against the input, as in Postgres: a key the list
-/// renamed is repointed at its output, one it does not project rides as a hidden
-/// column. Returns the projection that drops those again, or null.
-pub fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName, stripped: []const bool) Error!?[]const ast.SelectItem {
-    for (items.items) |it| switch (it) {
-        .field, .computed => {},
-        else => return null,
-    };
-    const visible = items.items.len;
-    for (on, stripped) |*k, sq| if (sq and (ownsStrippedKey(items.items[0..visible], k.*) or providesName(items.items[0..visible], k.last()))) {
-        if (ownsStrippedKey(items.items[0..visible], k.*)) continue;
-        const b = try self.bindName(try self.mk(.{ .field = k.* }), &.{});
-        try items.append(.{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.* }) } });
-        k.* = try self.singleName(b.name);
-    } else switch (keyHome(items.items[0..visible], k.*)) {
-        .as_is => {},
-        .renamed => |nm| k.* = try self.singleName(nm),
-        .missing => try items.append(.{ .field = k.* }),
-    };
-    if (items.items.len == visible) return null;
-    nameApart(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
-    return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
-}
-
 pub fn parseColRef(self: *Parser) Error!ast.QualName {
-    if (self.isKw("identifier") and self.peekTag() == .lparen) {
-        const parts = try self.arena.alloc([]const u8, 1);
-        parts[0] = try self.parseNameSegment();
-        return .{ .parts = parts };
-    }
+    if (self.isKw("identifier") and self.peekTag() == .lparen) return self.singleName(try self.parseNameSegment());
     return self.parseQualNameTok();
 }
 
@@ -400,45 +368,39 @@ pub fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {
     return buf.toOwnedSlice();
 }
 
-pub fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
+pub fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e0: *const ast.Expr) Error!void {
+    const e = typedText(e0);
     switch (e.*) {
-        .str_lit => |s| try buf.appendSlice(s),
-        .int_lit => |v| try buf.writer().print("{d}", .{v}),
-        .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
-        .call => |c| {
-            if (std.mem.eql(u8, c.name, "concat")) {
-                for (c.args) |arg| try self.templatePart(buf, arg);
-                return;
-            }
-            try buf.appendSlice("${");
-            try self.unparse(buf, e);
-            try buf.append('}');
+        .str_lit => |s| return buf.appendSlice(s),
+        .int_lit => |v| return buf.writer().print("{d}", .{v}),
+        .bool_lit => |b| return buf.appendSlice(if (b) "true" else "false"),
+        .call => |c| if (std.mem.eql(u8, c.name, "concat")) {
+            for (c.args) |arg| try self.templatePart(buf, arg);
+            return;
         },
-        else => {
-            try buf.appendSlice("${");
-            try self.unparse(buf, e);
-            try buf.append('}');
-        },
+        else => {},
     }
+    try buf.appendSlice("${");
+    try self.unparse(buf, e);
+    try buf.append('}');
+}
+
+/// A string literal a typed parameter took as a CAST (a table function's DATE
+/// argument), read back as the text it was written as.
+fn typedText(e: *const ast.Expr) *const ast.Expr {
+    return if (e.* == .cast and e.cast.e.* == .str_lit) e.cast.e else e;
 }
 
 /// Print an expression back as `${ }` hole text; `$name` already parsed to a bare
 /// field, so it prints as `name`.
 pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
-    switch (e.*) {
+    switch (typedText(e).*) {
         .null_lit => try buf.appendSlice("null"),
         .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
         .int_lit => |v| try buf.writer().print("{d}", .{v}),
         .float_lit => |v| try buf.writer().print("{e}", .{v}),
         .dec_lit => |v| try buf.writer().print("{f}", .{v}),
-        .str_lit => |s| {
-            try buf.append('\'');
-            for (s) |ch| {
-                if (ch == '\'') try buf.append('\'');
-                try buf.append(ch);
-            }
-            try buf.append('\'');
-        },
+        .str_lit => |s| try quoteInto(buf, s, '\''),
         .field => |q| for (q.parts, 0..) |p, i| {
             if (i > 0) try buf.append('.');
             try buf.appendSlice(p);

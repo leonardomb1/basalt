@@ -6,13 +6,14 @@ const AliasSet = @import("../sql_parser.zig").AliasSet;
 const Error = @import("../sql_parser.zig").Error;
 const ExprAlias = Parser.ExprAlias;
 const Pos = @import("../sql_parser.zig").Pos;
-const aggFunc = @import("../sql_parser.zig").aggFunc;
+const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
+const binOpText = @import("../sql_parser.zig").binOpText;
+const outName = @import("../sql_parser.zig").outName;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
-const stripsAlias = @import("../sql_parser.zig").stripsAlias;
 
 /// The one shape a join key may take: the index is built on stored columns, so a
 /// computed key has to be computed first.
@@ -38,38 +39,15 @@ pub fn parseQualNameTok(self: *Parser) Error!ast.QualName {
 
 /// Every column an expression reads, so a pre-aggregation projection keeps the
 /// aggregates' inputs.
-pub fn collectFields(self: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
-    switch (e.*) {
-        .field => |q| out.append(q) catch return error.OutOfMemory,
-        .lambda => |l| try self.collectFields(l.body, out),
-        .lambda_var => {},
-        .unary => |u| try self.collectFields(u.e, out),
-        .binary => |b| {
-            try self.collectFields(b.l, out);
-            try self.collectFields(b.r, out);
-        },
-        .call => |c| for (c.args) |a| try self.collectFields(a, out),
-        .cond => |c| {
-            try self.collectFields(c.cond, out);
-            try self.collectFields(c.then, out);
-            try self.collectFields(c.els, out);
-        },
-        .cast => |c| try self.collectFields(c.e, out),
-        .is_null => |n| try self.collectFields(n.e, out),
-        .let_in => |l| {
-            try self.collectFields(l.value, out);
-            try self.collectFields(l.body, out);
-        },
-        .match => |m| {
-            if (m.subject) |subj| try self.collectFields(subj, out);
-            for (m.arms) |arm| {
-                for (arm.pats) |pat| try self.collectFields(pat, out);
-                if (arm.guard) |g| try self.collectFields(g, out);
-                try self.collectFields(arm.value, out);
-            }
-        },
-        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit => {},
-    }
+pub fn collectFields(_: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
+    const S = struct {
+        fn add(o: *std.array_list.Managed(ast.QualName), n: *const ast.Expr) ?bool {
+            if (n.* != .field) return null;
+            o.append(n.field) catch return true;
+            return false;
+        }
+    };
+    if (ast.anyExpr(e, out, S.add)) return error.OutOfMemory;
 }
 
 /// Render an expression as the key GROUP BY, ORDER BY, HAVING and lifted aggregates
@@ -119,28 +97,7 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
         .binary => |b| {
             try buf.append('(');
             try self.exprKey(b.l, buf);
-            try buf.appendSlice(switch (b.op) {
-                .add => "+",
-                .sub => "-",
-                .mul => "*",
-                .div => "/",
-                .mod => "%",
-                .bit_and => "&",
-                .bit_or => "|",
-                .bit_xor => "^",
-                .shl => "<<",
-                .shr => ">>",
-                .eq => "=",
-                .ne => "<>",
-                .lt => "<",
-                .le => "<=",
-                .gt => ">",
-                .ge => ">=",
-                .@"and" => " and ",
-                .@"or" => " or ",
-                .distinct => " is distinct from ",
-                .not_distinct => " is not distinct from ",
-            });
+            try buf.print(" {s} ", .{binOpText(b.op)});
             try self.exprKey(b.r, buf);
             try buf.append(')');
         },
@@ -212,7 +169,7 @@ fn plainName(s: []const u8) bool {
 }
 
 /// `s` between `q` quotes, an inner `q` doubled.
-fn quoteInto(buf: *std.array_list.Managed(u8), s: []const u8, q: u8) Error!void {
+pub fn quoteInto(buf: *std.array_list.Managed(u8), s: []const u8, q: u8) Error!void {
     try buf.append(q);
     for (s) |c| {
         if (c == q) try buf.append(q);
@@ -231,80 +188,51 @@ pub fn bindName(self: *Parser, e: *const ast.Expr, map: []const ExprAlias) Error
     try self.exprKey(e, &buf);
     for (map) |m| if (std.mem.eql(u8, m.synth, buf.items)) return .{ .name = m.out, .item = true };
     for (self.hidden_keys.items) |hk| if (std.mem.eql(u8, hk[0], buf.items)) return .{ .name = hk[1], .item = false };
-    self.derived_n += 1;
-    const name = try std.fmt.allocPrint(self.arena, "__a{d}", .{self.derived_n});
+    const name = try self.freshName("__a{d}");
     try self.hidden_keys.append(self.arena, .{ try buf.toOwnedSlice(), name });
     return .{ .name = name, .item = false };
 }
 
 /// Whether an aggregate call is buried inside an expression, as in `round(avg(x), 2)`.
 pub fn containsAgg(e: *const ast.Expr) bool {
-    return switch (e.*) {
-        .call => |c| aggFunc(c.name) != null or blk: {
-            for (c.args) |a| if (containsAgg(a)) break :blk true;
-            break :blk false;
-        },
-        .unary => |u| containsAgg(u.e),
-        .binary => |b| containsAgg(b.l) or containsAgg(b.r),
-        .cond => |c| containsAgg(c.cond) or containsAgg(c.then) or containsAgg(c.els),
-        .cast => |c| containsAgg(c.e),
-        .is_null => |n| containsAgg(n.e),
-        .let_in => |l| containsAgg(l.value) or containsAgg(l.body),
-        .match => |m| blk: {
-            if (m.subject) |s| if (containsAgg(s)) break :blk true;
-            for (m.arms) |arm| {
-                for (arm.pats) |p| if (containsAgg(p)) break :blk true;
-                if (arm.guard) |g| if (containsAgg(g)) break :blk true;
-                if (containsAgg(arm.value)) break :blk true;
-            }
-            break :blk false;
-        },
-        else => false,
+    const S = struct {
+        fn hit(_: void, n: *const ast.Expr) ?bool {
+            return if (n.* == .call and aggregates.lookup(n.call.name) != null) true else null;
+        }
     };
+    return ast.anyExpr(e, {}, S.hit);
 }
 
 /// Point the post-aggregate entry for `name` at `expr`, for an item lifted out of the
 /// pre-aggregate projection that has no column to read.
 pub fn repointPostItem(
-    self: *Parser,
+    _: *Parser,
     post: *std.array_list.Managed(ast.SelectItem),
     name: []const u8,
     expr: *ast.Expr,
 ) Error!void {
     for (post.items) |*p| {
-        const p_name = switch (p.*) {
-            .field => |q| q.last(),
-            .computed => |c| c.name,
-            else => continue,
-        };
-        if (!std.mem.eql(u8, p_name, name)) continue;
+        if (!std.mem.eql(u8, outName(p.*) orelse continue, name)) continue;
         p.* = .{ .computed = .{ .name = name, .expr = expr } };
         return;
     }
     try post.append(.{ .computed = .{ .name = name, .expr = expr } });
-    _ = self;
 }
 
 /// Whether a SELECT item is one value for the whole query (literals, `now()`-style
-/// calls, any `$name`), so it may sit beside aggregates. A bare column never is.
-pub fn constItemExpr(self: *Parser, e: *const ast.Expr) bool {
-    return switch (e.*) {
-        .int_lit, .float_lit, .dec_lit, .str_lit, .bool_lit, .null_lit => true,
-        .field => |q| q.dollar,
-        .lambda => |l| self.constItemExpr(l.body),
-        .lambda_var => true,
-        .unary => |u| self.constItemExpr(u.e),
-        .binary => |b| self.constItemExpr(b.l) and self.constItemExpr(b.r),
-        .cond => |c| self.constItemExpr(c.cond) and self.constItemExpr(c.then) and self.constItemExpr(c.els),
-        .cast => |c| self.constItemExpr(c.e),
-        .is_null => |n| self.constItemExpr(n.e),
-        .call => |c| {
-            if (aggFunc(c.name) != null) return false;
-            for (c.args) |a| if (!self.constItemExpr(a)) return false;
-            return true;
-        },
-        else => false,
+/// calls, any `$name`, a CASE over them), so it may sit beside aggregates. A bare
+/// column never is.
+pub fn constItemExpr(_: *Parser, e: *const ast.Expr) bool {
+    const S = struct {
+        fn varies(_: void, n: *const ast.Expr) ?bool {
+            return switch (n.*) {
+                .field => |q| !q.dollar,
+                .call => |c| if (aggregates.lookup(c.name) != null) true else null,
+                else => null,
+            };
+        }
     };
+    return !ast.anyExpr(e, {}, S.varies);
 }
 
 /// Lift the aggregate calls out of a scalar expression into columns of the aggregate
@@ -326,29 +254,20 @@ pub fn liftAggs(
     const S = struct {
         fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
             if (node.* == .call) {
-                if (aggFunc(node.call.name)) |f| {
+                if (aggregates.lookup(node.call.name)) |f| {
                     for (node.call.args) |a| {
                         if (containsAgg(a))
                             return cx.p.fail(cx.pos, "aggregate functions cannot be nested", .{});
                     }
                     const key = (try cx.p.bindName(node, cx.m)).name;
-
-                    var seen = false;
-                    for (cx.a.items) |it| {
-                        if (std.mem.eql(u8, it.name, key)) seen = true;
-                    }
+                    const seen = for (cx.a.items) |it| {
+                        if (std.mem.eql(u8, it.name, key)) break true;
+                    } else false;
                     if (!seen) {
                         const arg: ?*ast.Expr = if (node.call.args.len > 0) node.call.args[0] else null;
-                        cx.a.append(.{
-                            .name = key,
-                            .func = f,
-                            .arg = arg,
-                            .distinct = node.call.distinct,
-                        }) catch return error.OutOfMemory;
+                        try cx.a.append(.{ .name = key, .func = f, .arg = arg, .distinct = node.call.distinct });
                     }
-                    const parts = cx.p.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
-                    parts[0] = key;
-                    return cx.p.mk(.{ .field = .{ .parts = parts } });
+                    return cx.p.mk(.{ .field = try cx.p.singleName(key) });
                 }
             }
             return ast.rebuildExpr(cx.p.arena, node, cx, recur);
@@ -357,144 +276,32 @@ pub fn liftAggs(
     return S.recur(.{ .p = self, .a = aggs, .m = map, .pos = pos }, e);
 }
 
-/// Add aggregates that only HAVING names as output columns, dropped again by the
-/// post-aggregate projection. Returns whether any was added.
-pub fn addHavingAggs(
-    self: *Parser,
-    h: *const ast.Expr,
-    aggs: *std.array_list.Managed(ast.AggItem),
-    map: []const ExprAlias,
-) Error!bool {
-    switch (h.*) {
-        .call => |c| {
-            if (aggFunc(c.name)) |f| {
-                const want = (try self.bindName(h, map)).name;
-                for (aggs.items) |it| {
-                    if (std.mem.eql(u8, it.name, want)) return false;
-                }
-                const arg: ?*ast.Expr = if (c.args.len > 0) c.args[0] else null;
-                aggs.append(.{
-                    .name = want,
-                    .func = f,
-                    .arg = arg,
-                    .distinct = c.distinct,
-                }) catch return error.OutOfMemory;
-                return true;
-            }
-            var any = false;
-            for (c.args) |a| {
-                if (try self.addHavingAggs(a, aggs, map)) any = true;
-            }
-            return any;
-        },
-        .unary => |u| return self.addHavingAggs(u.e, aggs, map),
-        .binary => |b| {
-            const l = try self.addHavingAggs(b.l, aggs, map);
-            const r = try self.addHavingAggs(b.r, aggs, map);
-            return l or r;
-        },
-        .cond => |c| {
-            const a = try self.addHavingAggs(c.cond, aggs, map);
-            const b = try self.addHavingAggs(c.then, aggs, map);
-            const d = try self.addHavingAggs(c.els, aggs, map);
-            return a or b or d;
-        },
-        .cast => |c| return self.addHavingAggs(c.e, aggs, map),
-        .is_null => |n| return self.addHavingAggs(n.e, aggs, map),
-        else => return false,
-    }
-}
-
 pub fn singleName(self: *Parser, name: []const u8) Error!ast.QualName {
-    const parts = self.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
-    parts[0] = name;
-    return .{ .parts = parts };
-}
-
-/// Swap each aggregate call in HAVING for the column the aggregate stage already
-/// produced, making the clause an ordinary filter.
-pub fn havingRewrite(self: *Parser, e: *ast.Expr, map: []const ExprAlias) Error!*ast.Expr {
-    const Ctx = struct { p: *Parser, m: []const ExprAlias };
-    const S = struct {
-        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
-            if (node.* == .call and aggFunc(node.call.name) != null) {
-                const parts = cx.p.arena.alloc([]const u8, 1) catch return error.OutOfMemory;
-                parts[0] = (try cx.p.bindName(node, cx.m)).name;
-                return cx.p.mk(.{ .field = .{ .parts = parts } });
-            }
-            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
-        }
-    };
-    return S.recur(.{ .p = self, .m = map }, e);
+    return ast.QualName.one(self.arena, name);
 }
 
 /// Which sides `e` names: a column of the join's right side (`rname.col`), and any
 /// other, a left column or one written without its table.
-pub fn sidesOf(self: *Parser, e: *ast.Expr, rname: []const u8) Error!struct { right: bool, other: bool } {
-    const Ctx = struct { p: *Parser, rname: []const u8, right: *bool, other: *bool };
+pub fn sidesOf(e: *const ast.Expr, rname: []const u8) struct { right: bool, other: bool } {
     const S = struct {
-        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
-            if (node.* == .field) {
-                if (!node.field.dollar) {
-                    if (qualHasPrefix(node.field, cx.rname)) cx.right.* = true else cx.other.* = true;
-                }
-                return @constCast(node);
-            }
-            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+        fn right(r: []const u8, n: *const ast.Expr) ?bool {
+            return if (n.* == .field) !n.field.dollar and qualHasPrefix(n.field, r) else null;
+        }
+        fn other(r: []const u8, n: *const ast.Expr) ?bool {
+            return if (n.* == .field) !n.field.dollar and !qualHasPrefix(n.field, r) else null;
         }
     };
-    var right = false;
-    var other = false;
-    _ = try S.recur(.{ .p = self, .rname = rname, .right = &right, .other = &other }, e);
-    return .{ .right = right, .other = other };
+    return .{ .right = ast.anyExpr(e, rname, S.right), .other = ast.anyExpr(e, rname, S.other) };
 }
 
-/// Whether `e` names a column without its table.
-pub fn hasBareField(self: *Parser, e: *ast.Expr) Error!bool {
-    return hasFieldOf(self, e, false);
-}
-
-/// Whether `e` names a column with its table.
-pub fn hasQualField(self: *Parser, e: *ast.Expr) Error!bool {
-    return hasFieldOf(self, e, true);
-}
-
-fn hasFieldOf(self: *Parser, e: *ast.Expr, qualified: bool) Error!bool {
-    const Ctx = struct { p: *Parser, qualified: bool, found: *bool };
+/// Whether `e` names a column with its table (`qualified`), or without.
+pub fn hasFieldOf(e: *const ast.Expr, qualified: bool) bool {
     const S = struct {
-        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
-            if (node.* == .field) {
-                if (!node.field.dollar and (node.field.parts.len > 1) == cx.qualified) cx.found.* = true;
-                return @constCast(node);
-            }
-            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+        fn hit(q: bool, n: *const ast.Expr) ?bool {
+            return if (n.* == .field) !n.field.dollar and (n.field.parts.len > 1) == q else null;
         }
     };
-    var found = false;
-    _ = try S.recur(.{ .p = self, .qualified = qualified, .found = &found }, e);
-    return found;
-}
-
-pub fn qualOne(self: *Parser, name: []const u8) Error!ast.QualName {
-    const parts = try self.arena.alloc([]const u8, 1);
-    parts[0] = name;
-    return .{ .parts = parts };
-}
-
-pub fn namesOtherSide(self: *Parser, e: *ast.Expr, rname: []const u8) Error!bool {
-    const Ctx = struct { p: *Parser, rname: []const u8, other: *bool };
-    const S = struct {
-        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
-            if (node.* == .field) {
-                if (!node.field.dollar and !qualHasPrefix(node.field, cx.rname)) cx.other.* = true;
-                return @constCast(node);
-            }
-            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
-        }
-    };
-    var other = false;
-    _ = try S.recur(.{ .p = self, .rname = rname, .other = &other }, e);
-    return other;
+    return ast.anyExpr(e, qualified, S.hit);
 }
 
 /// `e` with the join's right name taken off its columns: `sra.x` is `x` to the right
@@ -538,10 +345,10 @@ fn stripSearchCols(p: *Parser, c: ast.Expr.Call, aliases: *const AliasSet) Error
         o.* = a;
         if (a.* != .str_lit) continue;
         const item = a.str_lit;
-        if (std.mem.startsWith(u8, item, "*@") and item.len > 2 and stripsAlias(aliases, item[2..])) {
+        if (std.mem.startsWith(u8, item, "*@") and item.len > 2 and aliases.strips(item[2..])) {
             o.* = try p.mk(.{ .str_lit = "*@" });
         } else if (std.mem.startsWith(u8, item, "=")) {
-            if (std.mem.indexOfScalar(u8, item, '.')) |dot| if (stripsAlias(aliases, item[1..dot])) {
+            if (std.mem.indexOfScalar(u8, item, '.')) |dot| if (aliases.strips(item[1..dot])) {
                 o.* = try p.mk(.{ .str_lit = try std.fmt.allocPrint(p.arena, "={s}", .{item[dot + 1 ..]}) });
             };
         }

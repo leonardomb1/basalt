@@ -11,14 +11,14 @@ const LateralKey = Parser.LateralKey;
 const Pos = @import("../sql_parser.zig").Pos;
 const SetOpTok = Parser.SetOpTok;
 const Window = @import("window.zig");
-const aggFunc = @import("../sql_parser.zig").aggFunc;
+const aggregates = @import("../aggregates.zig");
 const aggOrderDiffers = @import("../sql_parser.zig").aggOrderDiffers;
 const ast = @import("../ast.zig");
 const containsAgg = Parser.containsAgg;
+const hasFieldOf = @import("rewrite.zig").hasFieldOf;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const isGroupKey = @import("../sql_parser.zig").isGroupKey;
-const isReservedAfterSource = @import("../sql_parser.zig").isReservedAfterSource;
 const itemLabel = @import("../sql_parser.zig").itemLabel;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
 const nameApart = @import("../sql_parser.zig").nameApart;
@@ -26,11 +26,11 @@ const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
 const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
+const sidesOf = @import("rewrite.zig").sidesOf;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
-const stripsAlias = @import("../sql_parser.zig").stripsAlias;
 
 /// A computed file target (`IDENTIFIER(...)`) must spell its extension literally: it
 /// picks the writer and the legal dispositions at plan time, before any row is read.
@@ -309,27 +309,12 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 var extended = std.array_list.Managed(ast.SelectItem).init(self.arena);
                 try extended.appendSlice(proj);
                 for (sort_keys, stripped.items) |*k, sq| {
-                    if (sq and (ownsStrippedKey(proj, k.field) or providesName(proj, k.field.last()))) {
-                        if (ownsStrippedKey(proj, k.field)) continue;
-                        const b = try self.bindName(try self.mk(.{ .field = k.field }), &.{});
-                        const hidden: ast.SelectItem = .{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.field }) } };
-                        k.field = try self.singleName(b.name);
-                        if (!providesName(extended.items, b.name)) try extended.append(hidden);
-                        continue;
-                    }
+                    if (sq and try placeStrippedKey(self, &extended, proj.len, &k.field)) continue;
                     if (k.field.parts.len != 1) {
-                        switch (keyHome(proj, k.field)) {
-                            .as_is => {},
-                            .renamed => |nm| k.field = try self.singleName(nm),
-                            .missing => try extended.append(.{ .field = k.field }),
-                        }
+                        try placeKey(self, &extended, proj.len, &k.field);
                         continue;
                     }
-                    var have = false;
-                    for (have_names.items) |m| {
-                        if (std.mem.eql(u8, m, k.field.last())) have = true;
-                    }
-                    if (have) continue;
+                    if (nameListed(have_names.items, k.field.last())) continue;
                     try have_names.append(k.field.last());
                     const hidden = for (computed.items) |c| {
                         if (std.mem.eql(u8, c.computed.name, k.field.last())) break c;
@@ -360,9 +345,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 }
                 try stages.append(.{ .node = .{ .select = try ext.toOwnedSlice() }, .hints = &.{}, .pos = self.curPos() });
             }
-            const drop = try self.arena.alloc(ast.SelectItem, 1);
-            drop[0] = .{ .star_except = try names.toOwnedSlice() };
-            hidden_drop = drop;
+            hidden_drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try names.toOwnedSlice() }});
         }
         if (hidden_drop == null) hidden_drop = visible;
         const sort_stage: ast.Stage = .{ .node = .{ .sort = .{ .keys = sort_keys } }, .hints = &.{}, .pos = self.curPos() };
@@ -418,6 +401,46 @@ fn groupNameHome(self: *Parser, raw: anytype, n: []const u8, aliases: *const Ali
         return if (Window.refsName(e, n)) .input_under_alias else .alias;
     };
     return .input;
+}
+
+/// `DISTINCT ON` keys are written against the input, as in Postgres: a key the list
+/// renamed is repointed at its output, one it does not project rides as a hidden
+/// column. Returns the projection that drops those again, or null.
+fn distinctOnOutputs(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), on: []ast.QualName, stripped: []const bool) Error!?[]const ast.SelectItem {
+    for (items.items) |it| switch (it) {
+        .field, .computed => {},
+        else => return null,
+    };
+    const visible = items.items.len;
+    for (on, stripped) |*k, sq| {
+        if (!(sq and try placeStrippedKey(self, items, visible, k))) try placeKey(self, items, visible, k);
+    }
+    if (items.items.len == visible) return null;
+    nameApart(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
+    return keepOutputs(self.arena, items.items[0..visible]) catch return error.OutOfMemory;
+}
+
+/// A sort or `DISTINCT ON` key written with the FROM table (`a.s`, stripped to `s`)
+/// where the outputs `items[0..visible]` have a column of its name: that column when
+/// it is the key's own, else a hidden copy of the key. False when none has the name.
+fn placeStrippedKey(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), visible: usize, k: *ast.QualName) Error!bool {
+    const vis = items.items[0..visible];
+    if (ownsStrippedKey(vis, k.*)) return true;
+    if (!providesName(vis, k.last())) return false;
+    const b = try self.bindName(try self.mk(.{ .field = k.* }), &.{});
+    if (!providesName(items.items, b.name)) try items.append(.{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.* }) } });
+    k.* = try self.singleName(b.name);
+    return true;
+}
+
+/// A key read from the output that carries it, as itself or renamed, else carried
+/// beside the outputs `items[0..visible]`.
+fn placeKey(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), visible: usize, k: *ast.QualName) Error!void {
+    switch (keyHome(items.items[0..visible], k.*)) {
+        .as_is => {},
+        .renamed => |nm| k.* = try self.singleName(nm),
+        .missing => try items.append(.{ .field = k.* }),
+    }
 }
 
 fn nameListed(names: []const []const u8, n: []const u8) bool {
@@ -509,8 +532,7 @@ fn nameRepeats(
                 break;
             }
         } else try dups.append(.{ .name = name, .same = same });
-        self.derived_n += 1;
-        const hidden = try std.fmt.allocPrint(self.arena, "__d{d}", .{self.derived_n});
+        const hidden = try self.freshName("__d{d}");
         switch (ri.*) {
             .win => |wi| wins[wi].out = hidden,
             .item => |it| switch (it) {
@@ -900,14 +922,12 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             bpos = self.prevPos();
             const written = binding;
             self.eatAliasAs();
-            const has_alias = self.at(.lparen) or (self.at(.ident) and !isReservedAfterSource(self.cur().text));
+            const has_alias = self.at(.lparen) or self.atAlias();
             if (self.at(.lparen)) {
-                const fd = self.findTableFn(binding) orelse
-                    return self.fail(bpos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ binding, binding });
-                const call = try self.callTableFn(fd, bpos, if (lateral) .lateral else .join);
+                const call = try self.callTableFn(binding, bpos, if (lateral) .lateral else .join);
                 binding = call.binding;
                 lateral_keys = call.keys;
-                if (!(self.at(.ident) and !isReservedAfterSource(self.cur().text))) jalias = written;
+                if (!self.atAlias()) jalias = written;
             } else if (if (self.tvf) |f| f.cte(binding) else null) |bname| {
                 binding = bname;
                 if (!has_alias) jalias = written;
@@ -916,7 +936,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
         if (jalias) |ja| {
             try self.claimAlias(&aliases, ja, bpos, .right);
-        } else if (self.at(.ident) and !isReservedAfterSource(self.cur().text)) {
+        } else if (self.atAlias()) {
             jalias = self.advance().text;
             try self.claimAlias(&aliases, jalias.?, self.prevPos(), .right);
         } else if (own.len > 0 and !aliases.knows(own)) {
@@ -934,9 +954,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var using_sel: ?[]const ast.SelectItem = null;
         for (lateral_keys) |lk| {
             try left_keys.append(stripQual(lk.left, &aliases));
-            const rp = try self.arena.alloc([]const u8, 1);
-            rp[0] = lk.right;
-            try right_keys.append(.{ .parts = rp });
+            try right_keys.append(try self.singleName(lk.right));
             try pins.append(.{ .left = true, .right = true });
         }
         if (lateral and lateral_keys.len > 0 and kind == .cross) kind = .inner;
@@ -991,8 +1009,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     }
                 }
                 if (c.* == .binary and c.binary.op == .eq) {
-                    const sl = try self.sidesOf(c.binary.l, rname);
-                    const sr = try self.sidesOf(c.binary.r, rname);
+                    const sl = sidesOf(c.binary.l, rname);
+                    const sr = sidesOf(c.binary.r, rname);
                     const l_left = sl.other and !sl.right;
                     const r_left = sr.other and !sr.right;
                     const l_right = sl.right and !sl.other;
@@ -1004,45 +1022,41 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         if (le.* == .field) {
                             try left_keys.append(stripQual(le.field, &aliases));
                         } else {
-                            self.derived_n += 1;
-                            const k = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                            const k = try self.freshName("__jk{d}");
                             try left_computed.append(.{ .computed = .{ .name = k, .expr = try self.stripExpr(le, &aliases) } });
                             try key_cols.append(k);
-                            try left_keys.append(try self.qualOne(k));
+                            try left_keys.append(try self.singleName(k));
                         }
                         if (re.* == .field) {
                             try right_keys.append(stripPrefix(re.field, rname));
                         } else {
-                            self.derived_n += 1;
-                            const k = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                            const k = try self.freshName("__jk{d}");
                             try right_computed.append(.{ .computed = .{ .name = k, .expr = try self.stripRightExpr(re, rname) } });
                             try key_cols.append(k);
-                            try right_keys.append(try self.qualOne(k));
+                            try right_keys.append(try self.singleName(k));
                         }
                         continue;
                     }
                     if (!sl.right and !sr.right and sl.other and sr.other and
-                        (try self.hasBareField(c.binary.l) or try self.hasBareField(c.binary.r)))
+                        (hasFieldOf(c.binary.l, false) or hasFieldOf(c.binary.r, false)))
                     {
-                        self.derived_n += 1;
-                        const ln = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
-                        self.derived_n += 1;
-                        const rn = try std.fmt.allocPrint(self.arena, "__jk{d}", .{self.derived_n});
+                        const ln = try self.freshName("__jk{d}");
+                        const rn = try self.freshName("__jk{d}");
                         try deferred.append(.{
                             .a = try self.stripExpr(c.binary.l, &aliases),
                             .b = try self.stripExpr(c.binary.r, &aliases),
                             .left_name = ln,
                             .right_name = rn,
                             .pos = .{ .line = opos.line, .col = opos.col, .file = opos.file },
-                            .a_left = try self.hasQualField(c.binary.l),
-                            .b_left = try self.hasQualField(c.binary.r),
+                            .a_left = hasFieldOf(c.binary.l, true),
+                            .b_left = hasFieldOf(c.binary.r, true),
                         });
                         try key_cols.append(ln);
                         try key_cols.append(rn);
                         continue;
                     }
                 }
-                const right_only = !try self.namesOtherSide(c, rname);
+                const right_only = !sidesOf(c, rname).other;
                 if (right_only and (kind == .inner or kind == .left)) {
                     const e = try self.stripRightExpr(c, rname);
                     narrow = if (narrow) |n| try self.mk(.{ .binary = .{ .op = .@"and", .l = n, .r = e } }) else e;
@@ -1061,9 +1075,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 post_filters.clearRetainingCapacity();
             }
             if (narrow != null or right_computed.items.len > 0) {
-                self.derived_n += 1;
-                const name = try std.fmt.allocPrint(self.arena, "__derived{d}_on", .{self.derived_n});
-                try self.let_names.append(name);
+                const name = try self.freshName("__derived{d}_on");
                 var st = std.array_list.Managed(ast.Stage).init(self.arena);
                 try st.append(.{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos });
                 if (narrow) |n| try st.append(.{ .node = .{ .filter = n }, .hints = &.{}, .pos = jpos });
@@ -1071,7 +1083,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try right_computed.insert(0, .star);
                     try st.append(.{ .node = .{ .select = try right_computed.toOwnedSlice() }, .hints = &.{}, .pos = jpos });
                 }
-                try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = try st.toOwnedSlice(), .pos = jpos }, .pos = jpos } });
+                try self.bindHidden(name, try st.toOwnedSlice(), jpos);
                 if (jalias == null) jalias = binding;
                 binding = name;
             }
@@ -1123,12 +1135,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
         }
         for (self.pending_semijoins.items[sj_base..]) |sj| {
-            const lk = try self.arena.alloc(ast.QualName, 1);
-            lk[0] = stripQual(sj.lhs.field, &aliases);
-            const rk = try self.arena.alloc(ast.QualName, 1);
-            const rparts = try self.arena.alloc([]const u8, 1);
-            rparts[0] = sj.right_col;
-            rk[0] = .{ .parts = rparts };
+            const lk = try self.arena.dupe(ast.QualName, &.{stripQual(sj.lhs.field, &aliases)});
+            const rk = try self.arena.dupe(ast.QualName, &.{try self.singleName(sj.right_col)});
             try stages.append(.{
                 .node = .{ .join = .{
                     .kind = if (sj.negated) .anti else .semi,
@@ -1145,8 +1153,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         self.pending_semijoins.shrinkRetainingCapacity(sj_base);
     }
     if (key_cols.items.len > 0) {
-        const drop = try self.arena.alloc(ast.SelectItem, 1);
-        drop[0] = .{ .star_except = try key_cols.toOwnedSlice() };
+        const drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try key_cols.toOwnedSlice() }});
         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
     }
 
@@ -1211,23 +1218,24 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         try self.expectKw("by");
         var keys = std.array_list.Managed(ast.QualName).init(self.arena);
         while (true) {
+            const gpos = self.curPos();
             const ge = try self.parseExpr();
             var q: ast.QualName = undefined;
             if (ge.* == .int_lit) {
                 const n = ge.int_lit;
                 if (n < 1 or n > @as(i64, @intCast(raw_items.items.len)))
-                    return self.fail(pos, "GROUP BY position {d} is out of range", .{n});
+                    return self.fail(gpos, "GROUP BY position {d} is out of range", .{n});
                 const ri = raw_items.items[@intCast(n - 1)];
-                if (ri == .win) return self.fail(pos, "GROUP BY position {d} is a window function — group on it in an outer query", .{n});
-                if (ri != .item) return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n});
+                if (ri == .win) return self.fail(gpos, "GROUP BY position {d} is a window function — group on it in an outer query", .{n});
+                if (ri != .item) return self.fail(gpos, "GROUP BY position {d} refers to `*`", .{n});
                 q = switch (ri.item) {
                     .field => |f| stripQual(f, &aliases),
                     .computed => |c| blk: {
                         if (containsAgg(c.expr))
-                            return self.fail(pos, "GROUP BY position {d} names the aggregate `{s}` — a position may only name a grouping key", .{ n, c.name });
+                            return self.fail(gpos, "GROUP BY position {d} names the aggregate `{s}` — a position may only name a grouping key", .{ n, c.name });
                         break :blk try self.singleName(c.name);
                     },
-                    else => return self.fail(pos, "GROUP BY position {d} refers to `*`", .{n}),
+                    else => return self.fail(gpos, "GROUP BY position {d} refers to `*`", .{n}),
                 };
             } else if (ge.* == .field) {
                 if (ge.field.parts.len == 1) {
@@ -1235,12 +1243,12 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     switch (try groupNameHome(self, raw_items.items, n, &aliases)) {
                         .input => {},
                         .input_under_alias => try input_named.append(n),
-                        .alias => try unambiguous(self, dups.items, n, "GROUP BY", pos),
+                        .alias => try unambiguous(self, dups.items, n, "GROUP BY", gpos),
                     }
                 }
                 q = stripQual(ge.field, &aliases);
             } else {
-                if (containsAgg(ge)) return self.fail(pos, "GROUP BY cannot group on an aggregate", .{});
+                if (containsAgg(ge)) return self.fail(gpos, "GROUP BY cannot group on an aggregate", .{});
                 const b = try self.bindName(ge, expr_aliases.items);
                 if (!b.item and !providesName(group_hidden.items, b.name)) try group_hidden.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(ge, &aliases) } });
                 q = try self.singleName(b.name);
@@ -1312,7 +1320,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try post.append(.star);
                     star_count += 1;
                 } else {
-                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (stripsAlias(&aliases, alias)) "" else alias, .rights = rights, .drop = using_drop.items, .copies = using_copies.items } };
+                    const so: ast.SelectItem = .{ .star_of = .{ .rel = if (aliases.strips(alias)) "" else alias, .rights = rights, .drop = using_drop.items, .copies = using_copies.items } };
                     try items.append(if (win_calls.items.len > 0) .star else so);
                     try post.append(so);
                 }
@@ -1331,8 +1339,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 },
                 .star_rename, .star_of => {
                     if (it == .star_rename and copy_names.len > 0) {
-                        const drop = try self.arena.alloc(ast.SelectItem, 1);
-                        drop[0] = .{ .star_except = copy_names };
+                        const drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = copy_names }});
                         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
                     }
                     try items.append(it);
@@ -1351,7 +1358,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         continue;
                     }
                     if (stripped.* == .call) {
-                        if (aggFunc(stripped.call.name)) |f| {
+                        if (aggregates.lookup(stripped.call.name)) |f| {
                             const arg: ?*ast.Expr = if (stripped.call.args.len > 0) stripped.call.args[0] else null;
                             try aggs.append(.{ .name = c.name, .func = f, .arg = arg, .distinct = stripped.call.distinct });
                             try post.append(.{ .field = try self.singleName(c.name) });
@@ -1439,9 +1446,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
+    var having_filter: ?*ast.Expr = null;
     if (agg_mode) {
         if (having) |h| {
-            if (try self.addHavingAggs(try self.stripExpr(h, &aliases), &aggs, expr_aliases.items)) lifted = true;
+            const before = aggs.items.len;
+            const keyed = if (group.len > 0) try self.groupKeyRefs(h, group, expr_aliases.items) else h;
+            having_filter = try self.liftAggs(try self.stripExpr(keyed, &aliases), &aggs, expr_aliases.items, pos);
+            if (aggs.items.len > before) lifted = true;
         }
         if (aggs.items.len == 0 and win_calls.items.len == 0)
             return self.fail(pos, "GROUP BY without aggregate functions in SELECT or HAVING", .{});
@@ -1503,9 +1514,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             .hints = &.{},
             .pos = pos,
         });
-        if (having) |h| {
-            const keyed = if (group.len > 0) try self.groupKeyRefs(h, group, expr_aliases.items) else h;
-            const hf = try self.stripExpr(try self.havingRewrite(keyed, expr_aliases.items), &aliases);
+        if (having_filter) |hf| {
             try self.groupedOnly(hf, group, aggs_out, &.{}, pos);
             try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
         }
@@ -1520,7 +1529,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     } else if (win_calls.items.len == 0) {
         const lone_star = items.items.len == 1 and items.items[0] == .star;
         if (!lone_star) {
-            if (distinct_on) |on| distinct_drop = try self.distinctOnOutputs(&items, on, on_stripped);
+            if (distinct_on) |on| distinct_drop = try distinctOnOutputs(self, &items, on, on_stripped);
             try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             if (distinct_on) |on| if (distinct_drop == null) {
                 const ks = try self.arena.alloc(ast.SortKey, on.len);
@@ -1630,14 +1639,8 @@ pub fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
 /// A union arm that is not a bare source, lowered to a binding and read back: the
 /// union aligns arms by their schemas.
 pub fn unionBranchFromStages(self: *Parser, branch_stages: []const ast.Stage) Error!ast.UnionBranch {
-    self.derived_n += 1;
-    const name = try std.fmt.allocPrint(self.arena, "__union{d}", .{self.derived_n});
-    try self.let_names.append(name);
-    try self.pending_bindings.append(.{ .binding = .{
-        .name = name,
-        .pipeline = .{ .stages = branch_stages, .pos = self.curPos() },
-        .pos = self.curPos(),
-    } });
+    const name = try self.freshName("__union{d}");
+    try self.bindHidden(name, branch_stages, self.curPos());
     const ref = try self.arena.alloc(ast.Stage, 1);
     ref[0] = .{ .node = .{ .ref = name }, .hints = &.{}, .pos = self.curPos() };
     return .{
@@ -1803,19 +1806,18 @@ pub fn parseUsing(
     var keys = std.array_list.Managed(AliasSet.UsingKey).init(self.arena);
     while (true) {
         const k = try self.expectIdent();
-        self.derived_n += 1;
-        const rk = try std.fmt.allocPrint(self.arena, "__uk{d}", .{self.derived_n});
+        const rk = try self.freshName("__uk{d}");
         const lk = try std.fmt.allocPrint(self.arena, "__ul{d}", .{self.derived_n});
         try renames.append(.{ .from = k, .to = rk });
         try left_renames.append(.{ .from = k, .to = lk });
-        try left_keys.append(try self.qualOne(k));
-        try right_keys.append(try self.qualOne(rk));
-        try keys.append(.{ .key = k, .left = (try self.qualOne(lk)).parts, .right = (try self.qualOne(rk)).parts });
-        const left = try self.mk(.{ .field = try self.qualOne(k) });
+        try left_keys.append(try self.singleName(k));
+        try right_keys.append(try self.singleName(rk));
+        try keys.append(.{ .key = k, .left = (try self.singleName(lk)).parts, .right = (try self.singleName(rk)).parts });
+        const left = try self.mk(.{ .field = try self.singleName(k) });
         const value = if (kind == .right or kind == .full) blk: {
             const args = try self.arena.alloc(*ast.Expr, 2);
             args[0] = left;
-            args[1] = try self.mk(.{ .field = try self.qualOne(rk) });
+            args[1] = try self.mk(.{ .field = try self.singleName(rk) });
             break :blk try self.mk(.{ .call = .{ .name = "coalesce", .args = args } });
         } else left;
         try items.append(.{ .computed = .{ .name = k, .expr = value } });
@@ -1824,12 +1826,10 @@ pub fn parseUsing(
     _ = try self.expect(.rparen);
     try items.append(.{ .star_rename = try left_renames.toOwnedSlice() });
 
-    self.derived_n += 1;
-    const name = try std.fmt.allocPrint(self.arena, "__derived{d}_using", .{self.derived_n});
-    try self.let_names.append(name);
+    const name = try self.freshName("__derived{d}_using");
     const st = try self.arena.alloc(ast.Stage, 2);
     st[0] = .{ .node = .{ .ref = binding }, .hints = &.{}, .pos = jpos };
     st[1] = .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{.{ .star_rename = try renames.toOwnedSlice() }}) }, .hints = &.{}, .pos = jpos };
-    try self.pending_bindings.append(.{ .binding = .{ .name = name, .pipeline = .{ .stages = st, .pos = jpos }, .pos = jpos } });
+    try self.bindHidden(name, st, jpos);
     return .{ .binding = name, .select = try items.toOwnedSlice(), .keys = try keys.toOwnedSlice() };
 }

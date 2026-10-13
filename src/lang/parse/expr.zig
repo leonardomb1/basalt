@@ -207,8 +207,7 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
                 const pipe = try self.parseSubqueryPipeline();
                 const col = self.firstOutName(pipe.stages) orelse
                     return self.fail(inpos, "the subquery of IN must produce exactly one named column", .{});
-                self.derived_n += 1;
-                const bname = try std.fmt.allocPrint(self.arena, "__insq{d}", .{self.derived_n});
+                const bname = try self.freshName("__insq{d}");
                 try self.let_names.append(bname);
                 try self.pending_bindings.append(.{ .binding = .{
                     .name = bname,
@@ -366,13 +365,12 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                     return self.fail(spos, "a scalar subquery is only supported inside a query — bind it first with `LET x = (SELECT ...);`", .{});
                 _ = self.advance();
                 const pipe = try self.parseSubqueryPipeline();
-                self.derived_n += 1;
-                const name = try std.fmt.allocPrint(self.arena, "__scalar{d}", .{self.derived_n});
+                const name = try self.freshName("__scalar{d}");
                 try self.pending_bindings.append(.{ .let_const = .{ .name = name, .expr = null, .query = pipe, .pos = spos } });
                 try self.const_names.append(name);
-                const parts = try self.arena.alloc([]const u8, 1);
-                parts[0] = name;
-                return self.mk(.{ .field = .{ .parts = parts, .dollar = true } });
+                var q = try self.singleName(name);
+                q.dollar = true;
+                return self.mk(.{ .field = q });
             }
             _ = self.advance();
             const e = try self.parseExpr();
