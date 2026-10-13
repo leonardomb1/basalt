@@ -114,7 +114,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
 /// into memory, since built where it is read it ran on one thread. Returns the
 /// binding's name when materialized, for the caller to drop afterwards.
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
-    if (opts.threads < 2 or env.explain or stages[0].node != .ref) return null;
+    if (opts.lanes() < 2 or env.explain or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
     const b = env.bindings.get(name) orelse return null;
@@ -154,7 +154,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
         @memcpy(joined[b.stages.len..], stages[1..]);
         stages = joined;
     }
-    if (opts.threads < 2 or env.explain or stages.len < 3 or !laneEligible(stages, opts)) return null;
+    if (opts.lanes() < 2 or env.explain or stages.len < 3 or !laneEligible(stages, opts)) return null;
     const rd = stages[0].node.read;
     if (!isLocalCsvRead(rd) and !isLocalParquetRead(rd) and !isFolderRead(rd)) return null;
     var wi: usize = 1;
@@ -209,7 +209,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = stages_in;
-    env.sort_threads = opts.threads;
+    env.sort_threads = opts.lanes();
 
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {
@@ -271,8 +271,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             if (std.mem.eql(u8, h.key, "split")) try extra.append(h);
             if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) {
                 opts.threads = @intCast(h.value.int);
-                opts.lanes_auto = false;
-                env.sort_threads = opts.threads;
+                env.sort_threads = opts.lanes();
             }
         }
         if (extra.items.len > 0) {
@@ -287,7 +286,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     stages = try descendLeadingWhere(env, stages);
 
-    if (stages[0].node == .union_ and opts.threads > 1 and
+    if (stages[0].node == .union_ and opts.lanes() > 1 and
         !std.mem.eql(u8, last.write.connector, "csv") and
         unionBranchesAreReads(stages[0].node.union_) and
         unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
@@ -356,7 +355,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
     }
 
-    if (!whole_agg and !top_n and opts.threads > 1 and env.sql_desc != null) {
+    if (!whole_agg and !top_n and opts.lanes() > 1 and env.sql_desc != null) {
         if (stages[0].node == .read) {
             if (classifyAggPipeline(stages)) |shape| {
                 if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
@@ -369,7 +368,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             }
         }
         if (try op.linearize(arena, res.op)) |lin| {
-            if (try planSplit(env, env.sql_desc.?, stages[0], opts.threads, wr)) |sp| {
+            if (try planSplit(env, env.sql_desc.?, stages[0], opts.lanes(), wr)) |sp| {
                 const schema = try dupeSchema(arena, res.schema);
 
                 const middle = stages[1 .. stages.len - 1];
@@ -394,15 +393,15 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)) };
-                lanes_used.* = @max(lanes_used.*, @min(opts.threads, sp.predicates.len));
-                env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.threads, sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
+                lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
+                env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 if (try buildParallelSink(env, wr, schema)) |mode| {
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.threads, env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read);
                 } else {
                     const snk = try openSink(env, wr, schema);
                     var snk_open = true;
                     errdefer if (snk_open) snk.abort();
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.threads, env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read);
                     snk_open = false;
                     try snk.close();
                 }

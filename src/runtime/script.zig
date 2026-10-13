@@ -741,7 +741,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
         .parallel => {
             var wopts = opts;
             wopts.threads = 1;
-            const nworkers = @min(@max(opts.threads, @as(usize, 1)), rows.len);
+            const nworkers = @min(@max(opts.lanes(), @as(usize, 1)), rows.len);
             var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;

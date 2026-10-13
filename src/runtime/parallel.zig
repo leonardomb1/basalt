@@ -119,8 +119,18 @@ pub const PipelinedSink = struct {
 /// The lane count when `-j` is not given: one per physical core the process may run
 /// on, since a second hyperthread adds little to lanes that stream memory (on a 6P+8E
 /// laptop, 20 lanes ran parquet aggregates and top-N 15-30% slower than 14). The
-/// logical count where the topology cannot be read.
+/// logical count where the topology cannot be read. Read once per process.
 pub fn defaultLanes() usize {
+    const known = default_lanes.load(.monotonic);
+    if (known != 0) return known;
+    const n = physicalCores();
+    default_lanes.store(n, .monotonic);
+    return n;
+}
+
+var default_lanes = std.atomic.Value(usize).init(0);
+
+fn physicalCores() usize {
     const logical = std.Thread.getCpuCount() catch 1;
     if (@import("builtin").os.tag != .linux) return logical;
     const set = std.posix.sched_getaffinity(0) catch return logical;

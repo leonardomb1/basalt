@@ -591,7 +591,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
     const probe_schema = try mapChainSchema(env, shape.prefix, src_schema.*);
 
-    const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
+    const sp = (try planSplit(env, desc, stages[0], opts.lanes(), w)) orelse return false;
 
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
@@ -627,7 +627,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         .rows_read = env.rows_read,
     };
 
-    const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
+    const nlanes = @min(@max(@as(usize, 1), opts.lanes()), sp.predicates.len);
     const lanes = try parallel.spawnJoin(arena, nlanes, sqlMapJoinLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
