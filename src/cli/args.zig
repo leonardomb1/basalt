@@ -4,6 +4,7 @@
 const ast = @import("../lang/ast.zig");
 const include = @import("../lang/include.zig");
 const obs = @import("../runtime/obs.zig");
+const env = @import("../runtime/env.zig");
 const parseByteSize = @import("../runtime/env.zig").parseByteSize;
 const std = @import("std");
 
@@ -164,12 +165,38 @@ pub const ErrOut = struct {
     }
 };
 
+/// Whether `--log-format` asks for JSON, read before the flags are parsed: the last
+/// one wins, as in the parse.
 pub fn wantsJsonLog(args: [][:0]u8) bool {
+    var json = false;
     var i: usize = 2;
     while (i + 1 < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--log-format")) return std.mem.eql(u8, args[i + 1], "json");
+        if (std.mem.eql(u8, args[i], "--log-format")) json = parseLogFormat(args[i + 1]) == .json;
     }
-    return false;
+    return json;
+}
+
+test "sharedFlag: every command spells -j alike, and takes only its own groups" {
+    var w = std.Io.Writer.Discarding.init(&.{});
+    var argv = [_][:0]u8{ @constCast("basalt"), @constCast("kernel"), @constCast("-j8"), @constCast("--threads=3"), @constCast("--port"), @constCast("80") };
+    var f = Flags{};
+    var i: usize = 2;
+    try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
+    try std.testing.expectEqual(@as(?usize, 8), f.threads);
+    i = 3;
+    try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
+    try std.testing.expectEqual(@as(?usize, 3), f.threads);
+    i = 4;
+    try std.testing.expect(!(try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
+    try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .listen = true }, &w.writer)).?);
+    try std.testing.expectEqual(@as(?u16, 80), f.port);
+}
+
+test "wantsJsonLog: the last --log-format wins" {
+    var argv = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("--log-format"), @constCast("json"), @constCast("--log-format"), @constCast("text") };
+    try std.testing.expect(!wantsJsonLog(&argv));
+    argv[5] = @constCast("json");
+    try std.testing.expect(wantsJsonLog(&argv));
 }
 
 /// The AST slices into `src.text` and the included files' texts, so all must outlive
@@ -206,6 +233,80 @@ pub fn nextVal(args: [][:0]u8, i: *usize, flag: []const u8, stderr: *std.Io.Writ
 pub fn sizeFlag(v: []const u8, flag: []const u8, stderr: *std.Io.Writer) !?u64 {
     if (parseByteSize(v)) |n| return n;
     try stderr.print("error: invalid {s} `{s}` — a size such as 512MB, 8GB or 2GiB\n", .{ flag, v });
+    return null;
+}
+
+/// The flags several commands share, as parsed so far.
+pub const Flags = struct {
+    log: env.LogConfig = .{},
+    level_set: bool = false,
+    format: ?env.StdoutFormat = null,
+    max_rows: ?u64 = null,
+    threads: ?usize = null,
+    host: ?[]const u8 = null,
+    port: ?u16 = null,
+};
+
+/// Which of the shared flags a command takes: logging, output shape and lanes, and
+/// a listening address (`-p` for `--port` only where it is not `--param`).
+pub const FlagSet = struct { log: bool = true, output: bool = false, listen: bool = false, p_port: bool = false };
+
+/// Parse `args[i.*]` when it is one of `set`'s flags: true when it was, false when
+/// it is not one, null once a bad value has been reported (exit 2).
+pub fn sharedFlag(args: [][:0]u8, i: *usize, f: *Flags, comptime set: FlagSet, stderr: *std.Io.Writer) !?bool {
+    const a = args[i.*];
+    const eql = std.mem.eql;
+    if (set.log) {
+        if (eql(u8, a, "--quiet") or eql(u8, a, "-q")) {
+            f.log.quiet = true;
+            return true;
+        }
+        if (eql(u8, a, "--log-format")) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            f.log.format = parseLogFormat(v) orelse return badFlag(stderr, "--log-format must be auto|text|json", .{});
+            return true;
+        }
+        if (eql(u8, a, "--log-level")) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            f.log.level = obs.Level.parse(v) orelse return badFlag(stderr, "--log-level must be error|warn|info|debug", .{});
+            f.level_set = true;
+            return true;
+        }
+    }
+    if (set.output) {
+        if (threadFlagValue(a, args, i)) |tv| {
+            f.threads = @max(1, std.fmt.parseInt(usize, tv, 10) catch return badFlag(stderr, "invalid --threads `{s}`", .{tv}));
+            return true;
+        }
+        if (eql(u8, a, "--format")) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            f.format = std.meta.stringToEnum(env.StdoutFormat, v) orelse return badFlag(stderr, "--format must be table|json|csv|tsv|arrow", .{});
+            return true;
+        }
+        if (eql(u8, a, "--max-rows")) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            f.max_rows = std.fmt.parseInt(u64, v, 10) catch return badFlag(stderr, "invalid --max-rows `{s}`", .{v});
+            return true;
+        }
+    }
+    if (set.listen) {
+        if (eql(u8, a, "--host")) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            _ = std.net.Address.parseIp(v, 0) catch return badFlag(stderr, "invalid --host `{s}` (an IP address, such as 127.0.0.1)", .{v});
+            f.host = v;
+            return true;
+        }
+        if (eql(u8, a, "--port") or (set.p_port and eql(u8, a, "-p"))) {
+            const v = (try nextVal(args, i, a, stderr)) orelse return null;
+            f.port = std.fmt.parseInt(u16, v, 10) catch return badFlag(stderr, "invalid --port `{s}`", .{v});
+            return true;
+        }
+    }
+    return false;
+}
+
+fn badFlag(stderr: *std.Io.Writer, comptime fmt: []const u8, args: anytype) !?bool {
+    try stderr.print("error: " ++ fmt ++ "\n", args);
     return null;
 }
 
