@@ -844,7 +844,7 @@ fn serializeValue(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Alloc
         .null => try w.writeAll("NULL"),
         .bool => |b| try w.writeAll(if (dialect == .sqlserver) (if (b) "1" else "0") else (if (b) "TRUE" else "FALSE")),
         .int => |x| try w.print("{d}", .{x}),
-        .float => |x| try w.print("{d}", .{x}),
+        .float => |x| try floatLiteral(w, dialect, x),
         .decimal => |d| {
             const s = try eval.formatDecimal(scratch, d.unscaled, d.scale);
             defer scratch.free(s);
@@ -856,6 +856,31 @@ fn serializeValue(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Alloc
         .time => |t| try w.print("'{s}'", .{try eval.formatTime(scratch, t)}),
         .timestamp => |micros| try w.print("'{s}'", .{try eval.formatTimestamp(scratch, micros)}),
     }
+}
+
+/// A float as a literal the target keeps: `-0` as a float, not the integer 0, and
+/// NaN and the infinities as PostgreSQL spells them; elsewhere they have no value.
+fn floatLiteral(w: anytype, dialect: Dialect, x: f64) !void {
+    if (std.math.isNan(x) or std.math.isInf(x)) {
+        if (dialect != .postgres) return error.NonFiniteFloat;
+        const s = if (std.math.isNan(x)) "NaN" else if (x > 0) "Infinity" else "-Infinity";
+        return w.print("'{s}'::float8", .{s});
+    }
+    if (x == 0 and std.math.signbit(x)) {
+        return w.writeAll(if (dialect == .postgres) "'-0'::float8" else "-0e0");
+    }
+    try w.print("{d}", .{x});
+}
+
+test "floatLiteral keeps -0, NaN and the infinities on PostgreSQL" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try floatLiteral(&w, .postgres, std.math.nan(f64));
+    try floatLiteral(&w, .postgres, -std.math.inf(f64));
+    try floatLiteral(&w, .postgres, -0.0);
+    try floatLiteral(&w, .postgres, 1.5);
+    try std.testing.expectEqualStrings("'NaN'::float8'-Infinity'::float8'-0'::float81.5", w.buffered());
+    try std.testing.expectError(error.NonFiniteFloat, floatLiteral(&w, .sqlserver, std.math.inf(f64)));
 }
 
 fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
