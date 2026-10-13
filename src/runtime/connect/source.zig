@@ -310,7 +310,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         return reader.source();
     }
     const conn = env.connections.get(rd.connector) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{rd.connector}));
+        return planErr(env.diag, try @import("../analyze/options.zig").unknownConnectionMsg(env.arena, rd.connector, "read"));
     var rd_eff = rd;
     if (forHintName(hints, "where")) |wh| {
         if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {

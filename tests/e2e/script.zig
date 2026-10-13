@@ -1438,6 +1438,17 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
         .{ "PARAM n INT DEFAULT 5;\nCASE $n WHEN 5 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; WHEN 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 2 AS a; END CASE;", "CASE pattern 'x' is not int" },
         .{ "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', auth = 'ntlm', tls = 'off');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "requires an encrypted channel" },
+        .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', load_size = 'abc');\nLOAD INTO sr.t AS SELECT 1 AS a;", "`load_size` must be a positive size like '128MB', not 'abc'" },
+        .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', compression = 'lz4');\nLOAD INTO sr.t AS SELECT 1 AS a;", "`compression` must be 'none' or 'gzip', not 'lz4'" },
+        .{ "CREATE CONNECTION sr TYPE doris OPTIONS (host = '127.0.0.1', user = 'u', password = 'p');\nLOAD INTO sr.t AS SELECT 1 AS a;", "doris connection needs a `database`" },
+        .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', buckets = 'x');\nLOAD INTO sr.t AS SELECT 1 AS a;", "invalid integer config value" },
+        .{ "CREATE CONNECTION h TYPE http OPTIONS (url = 'http://127.0.0.1');\nLOAD INTO h.t AS SELECT 1 AS a;", "unsupported sink connector `http`" },
+        .{ "CREATE CONNECTION f TYPE ftp OPTIONS (host = 'h', bogus = 1);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "ftp connection `f`: unknown option `bogus`" },
+        .{ "CREATE CONNECTION f TYPE sftp OPTIONS (port = 22);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "sftp connection `f` needs a `host`" },
+        .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h', port = 99999);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "sftp connection `port` is out of range" },
+        .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'basic');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "`auth` is kerberos or ntlm, not `basic`" },
+        .{ "CREATE CONNECTION f TYPE smb OPTIONS (host = 'h', auth = 'kerberos', user = 'me');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "Kerberos needs the `realm`" },
+        .{ "SELECT * FROM nope.t;", "unknown connection `nope` in read" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

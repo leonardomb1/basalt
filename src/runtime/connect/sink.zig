@@ -10,6 +10,7 @@ const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const TableWriter = @import("../../connect/table.zig").TableWriter;
 const analyze = @import("../analyze.zig");
+const options = @import("../analyze/options.zig");
 const arrow = @import("../../format/arrow.zig");
 const arrowread = @import("../../format/arrowread.zig");
 const ast = @import("../../lang/ast.zig");
@@ -233,7 +234,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return writer.sink();
     }
     const conn = env.connections.get(w.connector) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown connection `{s}`", .{w.connector}));
+        return planErr(env.diag, try options.unknownConnectionMsg(env.arena, w.connector, "write"));
     if (streamload.Flavor.of(conn.connector)) |flavor| {
         const cfg = try resolveStreamLoadConfig(env, conn, flavor);
         if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
@@ -257,7 +258,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             },
         }
     }
-    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported sink connector `{s}`", .{conn.connector}));
+    return planErr(env.diag, try options.unsupportedSinkMsg(env.arena, conn.connector));
 }
 
 pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.Flavor) !streamload.Config {
@@ -287,14 +288,14 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
         } else if (std.mem.eql(u8, k, "load_size")) {
             const txt = try evalCfgStr(env, attr.value);
             cfg.load_size = env_mod.parseByteSize(txt) orelse 0;
-            if (cfg.load_size == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`load_size` must be a positive size like '128MB', not '{s}'", .{txt}));
+            if (cfg.load_size == 0) return planErr(env.diag, try options.loadSizeMsg(env.arena, txt));
         } else if (std.mem.eql(u8, k, "compression")) {
             const txt = try evalCfgStr(env, attr.value);
             cfg.compression = std.meta.stringToEnum(streamload.Compression, txt) orelse
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`compression` must be 'none' or 'gzip', not '{s}'", .{txt}));
+                return planErr(env.diag, try options.loadCompressionMsg(env.arena, txt));
         }
     }
-    if (cfg.database.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} connection needs a `database`", .{flavor.name()}));
+    if (cfg.database.len == 0) return planErr(env.diag, try options.needsDatabaseMsg(env.arena, flavor.name()));
     if (env.sink_label_prefix) |lp| cfg.label_prefix = lp;
     if (env.load_label_prefix) |lp| cfg.label_prefix = lp;
     if (env.load_run_id) |rid| cfg.run_id = rid;

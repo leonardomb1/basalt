@@ -4,6 +4,7 @@
 const Env = @import("../env.zig").Env;
 const ast = @import("../../lang/ast.zig");
 const ftp = @import("../../store/ftp.zig");
+const options = @import("../analyze/options.zig");
 const planErr = @import("../env.zig").planErr;
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
@@ -17,7 +18,7 @@ pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
     for (conn.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "sftp connection `port` is out of range");
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "sftp"));
             continue;
         }
         const v = optCfgStr(env, attr.value) catch |e| return e;
@@ -35,9 +36,9 @@ pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
             c.known_hosts = v;
         } else if (std.mem.eql(u8, k, "host_key")) {
             c.host_key = v;
-        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sftp connection `{s}`: unknown option `{s}` (host, port, user, password, key_file, key_passphrase, known_hosts, host_key)", .{ conn.name, k }));
+        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
     }
-    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "sftp connection `{s}` needs a `host`", .{conn.name}));
+    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     try sftp.register(conn.name, c);
 }
 
@@ -49,7 +50,7 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
     for (conn.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "smb connection `port` is out of range");
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "smb"));
             continue;
         }
         const v = optCfgStr(env, attr.value) catch |e| return e;
@@ -71,12 +72,13 @@ pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
             c.spn = v;
         } else if (std.mem.eql(u8, k, "auth")) {
             const a = v orelse "";
-            c.auth = if (std.ascii.eqlIgnoreCase(a, "kerberos")) .kerberos else if (std.ascii.eqlIgnoreCase(a, "ntlm")) .ntlm else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: `auth` is kerberos or ntlm, not `{s}`", .{ conn.name, a }));
-        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: unknown option `{s}` (host, port, user, password, domain, share, auth, realm, kdc, spn)", .{ conn.name, k }));
+            if (!options.smbAuthValid(a)) return planErr(env.diag, try options.smbAuthMsg(env.arena, conn.name, a));
+            c.auth = if (std.ascii.eqlIgnoreCase(a, "kerberos")) .kerberos else .ntlm;
+        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
     }
-    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}` needs a `host`", .{conn.name}));
+    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     if (c.auth == .kerberos and c.realm == null and std.mem.indexOfScalar(u8, c.user orelse "", '@') == null)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{conn.name}));
+        return planErr(env.diag, try options.smbRealmMsg(env.arena, conn.name));
     try smb.register(conn.name, c);
 }
 
@@ -88,7 +90,7 @@ pub fn registerFtp(env: *Env, conn: ast.Connection) !void {
     for (conn.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, "ftp connection `port` is out of range");
+            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "ftp"));
             continue;
         }
         const v = optCfgStr(env, attr.value) catch |e| return e;
@@ -98,9 +100,9 @@ pub fn registerFtp(env: *Env, conn: ast.Connection) !void {
             c.user = v;
         } else if (std.mem.eql(u8, k, "password")) {
             c.password = v;
-        } else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "ftp connection `{s}`: unknown option `{s}` (host, port, user, password)", .{ conn.name, k }));
+        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
     }
-    if (c.host.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "ftp connection `{s}` needs a `host`", .{conn.name}));
+    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     try ftp.register(conn.name, c);
 }
 
@@ -126,17 +128,17 @@ pub fn evalCfgStr(env: *Env, expr: *const ast.Expr) ![]const u8 {
                 return std.process.getEnvVarOwned(env.arena, name) catch
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "env var `{s}` is not set", .{name}));
             }
-            return planErr(env.diag, "config value must be a literal or env()/secret()");
+            return planErr(env.diag, options.literal_cfg_msg);
         },
-        else => return planErr(env.diag, "config value must be a literal or env()/secret()"),
+        else => return planErr(env.diag, options.literal_cfg_msg),
     }
 }
 
 pub fn evalCfgInt(env: *Env, expr: *const ast.Expr) !i64 {
     return switch (expr.*) {
         .int_lit => |i| i,
-        .str_lit => |s| std.fmt.parseInt(i64, s, 10) catch return planErr(env.diag, "invalid integer config value"),
-        else => planErr(env.diag, "config value must be an integer"),
+        .str_lit => |s| std.fmt.parseInt(i64, s, 10) catch return planErr(env.diag, options.int_cfg_msg),
+        else => planErr(env.diag, options.int_cfg_kind_msg),
     };
 }
 
@@ -144,6 +146,6 @@ pub fn evalCfgBool(env: *Env, expr: *const ast.Expr) !bool {
     return switch (expr.*) {
         .bool_lit => |b| b,
         .str_lit => |s| std.mem.eql(u8, s, "true"),
-        else => planErr(env.diag, "config value must be a bool"),
+        else => planErr(env.diag, options.bool_cfg_msg),
     };
 }

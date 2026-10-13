@@ -260,6 +260,10 @@ fn litFor(cx: CoerceCtx, text: []const u8, other: *const ast.Expr) Error!?*ast.E
     return p;
 }
 
+pub const connectionProblem = @import("analyze/options.zig").connectionProblem;
+pub const sqlOptionProblem = @import("analyze/options.zig").sqlOptionProblem;
+pub const checkSinkConnection = @import("analyze/options.zig").checkSinkConnection;
+pub const unknownConnectionMsg = @import("analyze/options.zig").unknownConnectionMsg;
 pub const Col = @import("analyze/schema.zig").Col;
 pub const selectCols = @import("analyze/schema.zig").selectCols;
 pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;
@@ -591,12 +595,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
     for (program.stmts[1..]) |s| if (s == .connection) {
-        if (!isConnectionType(s.connection.connector)) {
-            const e = fail(diag, "unknown connection type `{s}` (one of {s})", .{ s.connection.connector, connection_types });
-            diag.pos = s.connection.pos;
-            return e;
-        }
-        if (sqlOptionProblem(s.connection)) |why| {
+        if (try connectionProblem(arena, s.connection)) |why| {
             const e = fail(diag, "{s}", .{why});
             diag.pos = s.connection.pos;
             return e;
@@ -1090,7 +1089,7 @@ const Ctx = struct {
             .read => |rd| {
                 const conn: ?ast.Connection = self.connections.get(rd.connector);
                 if (!isBuiltinSource(rd.connector) and conn == null)
-                    return fail(self.diag, "unknown connection `{s}` in read", .{rd.connector});
+                    return fail(self.diag, "{s}", .{try unknownConnectionMsg(self.arena, rd.connector, "read")});
                 const connector = if (conn) |c| c.connector else rd.connector;
                 const detail = switch (rd.form) {
                     .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
@@ -1148,8 +1147,9 @@ const Ctx = struct {
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
-            return fail(self.diag, "unknown connection `{s}` in write", .{w.connector});
+            return fail(self.diag, "{s}", .{try unknownConnectionMsg(self.arena, w.connector, "write")});
         try checkSinkForm(w, hints, conn.connector, self.diag);
+        try checkSinkConnection(self.arena, conn, self.diag);
         return .{ .connector = conn.connector, .target = w.target, .mode = @tagName(w.mode) };
     }
 
@@ -1431,24 +1431,6 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
     return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
-}
-
-/// A SQL connection's literal `tls` and `auth`, judged as the run judges them at
-/// connect time; a value computed by an expression is left to the run.
-pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
-    const conn = registry.Connector.parse(c.connector) orelse return null;
-    if (conn.sqlRead() == null) return null;
-    var tls: ?[]const u8 = null;
-    var auth: ?[]const u8 = null;
-    for (c.config) |a| if (a.value.* == .str_lit) {
-        if (std.mem.eql(u8, a.key, "tls")) tls = a.value.str_lit;
-        if (std.mem.eql(u8, a.key, "auth")) auth = a.value.str_lit;
-    };
-    if (tls) |v| if (std.meta.stringToEnum(sql.TlsMode, v) == null) return env_mod.tls_values_msg;
-    if (auth) |v| if (std.meta.stringToEnum(env_mod.DbAuth, v) == null) return env_mod.auth_values_msg;
-    if (auth != null and tls != null and std.mem.eql(u8, auth.?, "ntlm") and std.mem.eql(u8, tls.?, "off"))
-        return env_mod.ntlm_needs_tls_msg;
-    return null;
 }
 
 fn containsName(names: []const []const u8, n: []const u8) bool {

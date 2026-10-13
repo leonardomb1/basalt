@@ -184,12 +184,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var runnable: usize = 0;
     for (program.stmts[1..]) |s| switch (s) {
         .connection => |c| {
-            if (!analyze.isConnectionType(c.connector)) {
-                const e = planErr(diag, try std.fmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types }));
-                diag.pos = c.pos;
-                return e;
-            }
-            if (analyze.sqlOptionProblem(c)) |why| {
+            if (try analyze.connectionProblem(arena, c)) |why| {
                 const e = planErr(diag, why);
                 diag.pos = c.pos;
                 return e;
