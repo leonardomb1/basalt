@@ -7,22 +7,13 @@
 //! standard one.
 
 const std = @import("std");
+const krb5 = @import("krb5.zig");
 
 const oid_spnego = [_]u8{ 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02 };
 pub const oid_ntlmssp = [_]u8{ 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a };
 
-fn derLen(out: *std.array_list.Managed(u8), n: usize) !void {
-    if (n < 0x80) return out.append(@intCast(n));
-    if (n < 0x100) return out.appendSlice(&[_]u8{ 0x81, @intCast(n) });
-    return out.appendSlice(&[_]u8{ 0x82, @intCast(n >> 8), @intCast(n & 0xff) });
-}
-
 fn derWrap(gpa: std.mem.Allocator, tag: u8, inner: []const u8) ![]u8 {
-    var out = std.array_list.Managed(u8).init(gpa);
-    try out.append(tag);
-    try derLen(&out, inner.len);
-    try out.appendSlice(inner);
-    return out.toOwnedSlice();
+    return krb5.derOf(gpa, tag, &.{inner});
 }
 
 pub const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
@@ -68,21 +59,7 @@ pub fn response(gpa: std.mem.Allocator, ntlm_authenticate: []const u8) ![]u8 {
     return derWrap(gpa, 0xa1, seq);
 }
 
-fn derAt(b: []const u8, at: usize) ?struct { tag: u8, body: []const u8, end: usize } {
-    if (at + 2 > b.len) return null;
-    var i = at + 1;
-    var n: usize = b[i];
-    i += 1;
-    if (n & 0x80 != 0) {
-        const k = n & 0x7f;
-        if (k == 0 or k > 3 or i + k > b.len) return null;
-        n = 0;
-        for (b[i..][0..k]) |c| n = (n << 8) | c;
-        i += k;
-    }
-    if (i + n > b.len) return null;
-    return .{ .tag = b[at], .body = b[i..][0..n], .end = i + n };
-}
+const derAt = krb5.El.at;
 
 /// The responseToken of a server's NegTokenResp: an NTLM CHALLENGE_MESSAGE or a
 /// Kerberos AP-REP.
@@ -167,4 +144,13 @@ test "spnego: a NegTokenInit offering NTLMSSP encodes byte for byte" {
         0x01,
     };
     try std.testing.expectEqualSlices(u8, &want, got);
+}
+
+test "spnego: a token past 64 KiB round-trips through a three-byte DER length" {
+    const big = try std.testing.allocator.alloc(u8, 70_000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0x5a);
+    const resp = try response(std.testing.allocator, big);
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualSlices(u8, big, token(resp).?);
 }

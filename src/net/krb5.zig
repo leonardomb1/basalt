@@ -314,7 +314,8 @@ fn derInt(gpa: std.mem.Allocator, v: i64) ![]u8 {
     return d.out.toOwnedSlice();
 }
 
-fn derOf(gpa: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
+/// A DER element of `tag` around the concatenated `parts`.
+pub fn derOf(gpa: std.mem.Allocator, tag: u8, parts: []const []const u8) ![]u8 {
     const body = try std.mem.concat(gpa, u8, parts);
     defer gpa.free(body);
     var d = Der.init(gpa);
@@ -429,13 +430,13 @@ fn parseTime(s: []const u8) i64 {
     return days * 86400 + n(s[8..10]) * 3600 + n(s[10..12]) * 60 + n(s[12..14]);
 }
 
-const El = struct {
+pub const El = struct {
     tag: u8,
     body: []const u8,
     end: usize,
     raw: []const u8,
 
-    fn at(b: []const u8, i: usize) ?El {
+    pub fn at(b: []const u8, i: usize) ?El {
         if (i + 2 > b.len) return null;
         var j = i + 1;
         var n: usize = b[j];
