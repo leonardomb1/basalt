@@ -21,6 +21,13 @@
 //! pipeline, one run per segment, labelled after it (prefix = segment stem,
 //! run_id = seq), so a replay produces identical labels and the sink dedups. A
 //! failed segment stops the drain, preserving order, and retries on the next tick.
+//!
+//! The first SIGTERM/SIGINT is a graceful stop (`runtime.shuttingDown`): accepts
+//! end, requests already in hand finish, and a flusher completes and marks the
+//! segment it is loading, then starts no other; the rest load on the next start.
+//! Draining everything at a stop would widen the window for a SIGKILL mid-load,
+//! the case that loads a segment twice into a sink without label dedup. A second
+//! signal aborts (`runtime.aborting`): the load in flight stops unmarked and replays.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -65,8 +72,10 @@ pub const BufState = struct {
     thread: ?std.Thread = null,
 
     /// With `drain`, the flusher first loads every pending segment and the open
-    /// one, as on exit; without, it stops after its in-flight segment and leaves
-    /// the open segment open, so a reload can hand this buffer on as it is.
+    /// one, as when a reload drops the buffer; without, it stops after its
+    /// in-flight segment and leaves the open segment open, so a reload can hand
+    /// this buffer on as it is. Once the process is shutting down no new segment
+    /// load starts either way: pending ones wait in the WAL for the next start.
     pub fn stopFlusher(self: *BufState, drain: bool) void {
         self.drain_on_stop = drain;
         self.stop.store(true, .seq_cst);
@@ -172,7 +181,7 @@ pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
     };
     defer gpa.free(pending);
     for (pending) |s| {
-        if (bs.stop.load(.seq_cst) and !bs.drain_on_stop) return;
+        if (runtime.shuttingDown() or (bs.stop.load(.seq_cst) and !bs.drain_on_stop)) return;
         var lbuf: [300]u8 = undefined;
         const label = bs.wal.labelFor(&lbuf, s);
         var diag: runtime.Diag = .{};
@@ -196,7 +205,7 @@ pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
 
 fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
     var last: i64 = std.time.milliTimestamp();
-    while (!bs.stop.load(.seq_cst)) {
+    while (!bs.stop.load(.seq_cst) and !runtime.shuttingDown()) {
         std.Thread.sleep(200 * std.time.ns_per_ms);
         const now = std.time.milliTimestamp();
         const due_time = now - last >= @as(i64, @intCast(bs.flush_secs * 1000));
@@ -210,7 +219,7 @@ fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
         };
         drainPending(gpa, bs);
     }
-    if (!bs.drain_on_stop) return;
+    if (!bs.drain_on_stop or runtime.shuttingDown()) return;
     bs.wal.rotateIfNonEmpty() catch {};
     drainPending(gpa, bs);
 }
@@ -294,7 +303,15 @@ fn banner(address: std.net.Address, routes: []const Route) void {
     }
 }
 
+fn logStopping() void {
+    if (runtime.aborting())
+        log(.info, "aborting: in-flight runs and segment loads stop now", .{})
+    else
+        log(.info, "stopping: finishing in-flight requests and the segment load in flight (signal again to abort)", .{});
+}
+
 pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, port: u16, log_cfg: runtime.LogConfig) !void {
+    runtime.enterServeMode();
     initLog(log_cfg);
     const bs = try initBufState(gpa, program);
     defer if (bs) |b| {
@@ -308,10 +325,11 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, por
     banner(net_server.listen_address, &routes);
     var conns = Conns{ .gpa = gpa, .routes = &routes, .threads = null };
     defer conns.drain();
-    while (!runtime.aborting()) {
+    while (!runtime.shuttingDown()) {
         const conn = net_server.accept() catch continue;
         conns.dispatch(conn);
     }
+    logStopping();
 }
 
 const Conns = struct {
@@ -496,6 +514,7 @@ fn dirFingerprint(dir_path: []const u8) u64 {
 /// With `watch` set, also reloads when the directory's contents change, checked
 /// at most every ~2s. Reloads run on their own thread so the accept loop never waits.
 pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
+    runtime.enterServeMode();
     initLog(log_cfg);
     var reg = try loadDir(gpa, dir_path, null);
     defer reg.deinit();
@@ -507,16 +526,17 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
     const reloader = try std.Thread.spawn(.{}, reloadLoop, .{ &conns, &reg, dir_path, watch, net_server.listen_address });
     defer reloader.join();
     defer conns.drain();
-    while (!runtime.aborting()) {
+    while (!runtime.shuttingDown()) {
         const conn = net_server.accept() catch continue;
         conns.dispatch(conn);
     }
+    logStopping();
 }
 
 fn reloadLoop(conns: *Conns, reg: *Registry, dir_path: []const u8, watch: bool, address: std.net.Address) void {
     var fp: u64 = if (watch) dirFingerprint(dir_path) else 0;
     var last_check: i64 = 0;
-    while (!runtime.aborting()) {
+    while (!runtime.shuttingDown()) {
         std.Thread.sleep(200 * std.time.ns_per_ms);
         var do_reload = runtime.takeReload();
         if (watch) {
@@ -539,7 +559,8 @@ fn reloadLoop(conns: *Conns, reg: *Registry, dir_path: []const u8, watch: bool, 
 /// load fails and the current routes stay. A buffer the new table keeps passes
 /// over open, so each segment has one flusher: its flusher pauses before the
 /// swap, the buffer takes the new script under the lock, and the flusher resumes
-/// after; a buffer the new table drops drains and closes with the old table.
+/// after; a buffer the new table drops drains and closes with the old table,
+/// unless a stop is pending, when it stops after its in-flight segment.
 fn reloadOnce(conns: *Conns, reg: *Registry, dir_path: []const u8) bool {
     const new_reg = loadDir(conns.gpa, dir_path, reg) catch |e| {
         log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
@@ -1313,6 +1334,47 @@ test "a restart resumes pending segments once; a buffer already open is refused"
     try startFlusher(gpa, bs);
     bs.stopFlusher(true);
     try expectEachIdOnce(a, tmp.dir, 5);
+}
+
+test "a graceful stop starts no further segment load; they wait for the next start" {
+    initLog(.{ .quiet = true });
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, try evScript(a, base, ""), &d);
+
+    var msg: []const u8 = "";
+    {
+        const bs = (try initBufState(gpa, prog)).?;
+        defer gpa.destroy(bs);
+        defer bs.wal.close();
+        _ = try acceptIntoBuffer(bs, a, "[{\"id\":0},{\"id\":1}]", &msg);
+        try bs.wal.rotate();
+        _ = try acceptIntoBuffer(bs, a, "{\"id\":2}", &msg);
+        try bs.wal.rotate();
+        runtime.enterServeMode();
+        defer runtime.resetShutdown();
+        try std.testing.expect(runtime.terminate());
+        try std.testing.expect(!runtime.aborting());
+        drainPending(gpa, bs);
+        try startFlusher(gpa, bs);
+        bs.stopFlusher(true);
+        try std.testing.expectEqual(@as(u64, 0), bs.wal.loadedUpTo());
+    }
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("out.csv", .{}));
+    const bs = (try initBufState(gpa, prog)).?;
+    defer {
+        bs.shutdown();
+        gpa.destroy(bs);
+    }
+    try bs.wal.rotateIfNonEmpty();
+    drainPending(gpa, bs);
+    try expectEachIdOnce(a, tmp.dir, 3);
 }
 
 test "past the connection cap a request gets 503 + Retry-After instead of an inline run" {

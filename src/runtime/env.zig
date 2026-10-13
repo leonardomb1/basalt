@@ -66,6 +66,35 @@ pub fn takeReload() bool {
     return g_reload.swap(false, .seq_cst);
 }
 
+var g_serving = std.atomic.Value(bool).init(false);
+var g_shutdown = std.atomic.Value(bool).init(false);
+
+/// Marks the process as a host, so a first SIGTERM stops it gracefully instead of aborting.
+pub fn enterServeMode() void {
+    g_serving.store(true, .seq_cst);
+}
+
+/// A graceful stop or an abort was asked for: a host takes no new work, and
+/// work already started runs to its end unless `aborting` is also set.
+pub fn shuttingDown() bool {
+    return g_shutdown.load(.seq_cst) or driver.aborting();
+}
+
+pub fn resetShutdown() void {
+    g_serving.store(false, .seq_cst);
+    g_shutdown.store(false, .seq_cst);
+}
+
+/// SIGTERM/SIGINT, with atomic stores only (async-signal-safe). A host's first
+/// signal is a graceful stop and its second an abort; a one-shot run's first is an
+/// abort. False once already aborting: the caller exits at once.
+pub fn terminate() bool {
+    if (driver.aborting()) return false;
+    if (g_serving.load(.seq_cst) and !g_shutdown.swap(true, .seq_cst)) return true;
+    driver.requestAbort();
+    return true;
+}
+
 /// Connection and network failures, worth a retry. An unknown host is not:
 /// it is usually a typo.
 pub fn isTransient(e: anyerror) bool {
@@ -681,4 +710,23 @@ pub fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, h.key, key) and h.value == .ident) return h.value.ident;
     }
     return null;
+}
+
+test "terminate: a host stops gracefully first and aborts on the second signal" {
+    defer {
+        resetShutdown();
+        driver.resetAbort();
+    }
+    try std.testing.expect(terminate());
+    try std.testing.expect(driver.aborting());
+    try std.testing.expect(!terminate());
+    driver.resetAbort();
+
+    enterServeMode();
+    try std.testing.expect(!shuttingDown());
+    try std.testing.expect(terminate());
+    try std.testing.expect(shuttingDown() and !driver.aborting());
+    try std.testing.expect(terminate());
+    try std.testing.expect(driver.aborting());
+    try std.testing.expect(!terminate());
 }

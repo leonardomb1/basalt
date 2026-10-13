@@ -97,9 +97,17 @@ FROM BUFFER 'eventos'
   flight, the new script takes over between runs, and accepts keep landing in
   the same segment throughout, so every acked row is loaded once. A buffer
   the new scripts drop has its pending rows loaded, then is closed.
+- Stopping: the first SIGTERM or SIGINT is a graceful stop. The server takes
+  no new connections, requests already in hand finish (an ack still means the
+  rows are synced to the WAL), and the flusher finishes and marks the segment
+  it is loading, then starts no other. A second signal is a hard stop: the
+  load in flight is aborted, unmarked.
 - Rows still pending at a stop stay in the WAL and are loaded once the next
-  start's flusher runs, picking up from the manifest. A stop or crash between
-  loading a segment and marking it loads that segment again; only a
-  label-deduplicating sink such as StarRocks absorbs that replay.
+  start's flusher runs, picking up from the manifest; a stop does not drain
+  the whole queue, as a long drain only widens the window for a kill mid-load.
+  A hard stop, a kill or a crash between loading a segment and marking it
+  loads that segment again; only a label-deduplicating sink such as StarRocks
+  absorbs that replay, so a sink without one (a CSV `APPEND`, say) is
+  at-least-once there.
 - Honest cost: `serve` becomes stateful (the WAL directory needs a persistent
   volume) and durability is the node's disk, not replicated.

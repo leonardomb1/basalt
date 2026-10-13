@@ -89,6 +89,10 @@ pub const LoadHook = @import("env.zig").LoadHook;
 pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
 pub const takeReload = @import("env.zig").takeReload;
+pub const enterServeMode = @import("env.zig").enterServeMode;
+pub const shuttingDown = @import("env.zig").shuttingDown;
+pub const resetShutdown = @import("env.zig").resetShutdown;
+pub const terminate = @import("env.zig").terminate;
 
 const guardFileFormat = @import("connect.zig").guardFileFormat;
 const registerSftp = @import("connect.zig").registerSftp;

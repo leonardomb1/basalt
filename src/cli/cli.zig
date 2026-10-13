@@ -8,7 +8,8 @@
 //! in a directory and reloads it on SIGHUP. A script comes from a file path or,
 //! with `-c/--command`, inline; `@include` resolves against its directory, or the
 //! cwd for an inline or stdin script. SIGTERM and SIGINT ask a run to stop at its
-//! next boundary, which is how the control plane cancels a job. `--log-format
+//! next boundary, which is how the control plane cancels a job; a server's first
+//! signal is a graceful stop and its second an abort. `--log-format
 //! json` is read before parsing, so a parse error has a runtime error's shape.
 //! Progress is a live line on a terminal, a `progress` event a second under a
 //! JSON log, and nothing on a pipe or under `-q`. A server's own lines are its
@@ -53,11 +54,11 @@ const complete = @import("complete.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
 
-/// Asks the run to stop at its next boundary with one atomic store (async-signal-safe).
-/// A second signal exits 130 at once, so ^C ^C is not held hostage by a slow read.
+/// A run stops at its next boundary; a host stops gracefully, then aborts on a
+/// second signal (`runtime.terminate`). Once aborting, a further signal exits 130
+/// at once, so ^C ^C is not held hostage by a slow read.
 fn onTerminate(_: i32) callconv(.c) void {
-    if (runtime.aborting()) std.posix.exit(130);
-    runtime.requestAbort();
+    if (!runtime.terminate()) std.posix.exit(130);
 }
 
 fn onReload(_: i32) callconv(.c) void {
