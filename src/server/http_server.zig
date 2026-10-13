@@ -61,40 +61,75 @@ pub const BufState = struct {
     max_bytes: u64 = 1 << 30,
     rows_since: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    drain_on_stop: bool = true,
     thread: ?std.Thread = null,
 
-    pub fn shutdown(self: *BufState) void {
+    /// With `drain`, the flusher first loads every pending segment and the open
+    /// one, as on exit; without, it stops after its in-flight segment and leaves
+    /// the open segment open, so a reload can hand this buffer on as it is.
+    pub fn stopFlusher(self: *BufState, drain: bool) void {
+        self.drain_on_stop = drain;
         self.stop.store(true, .seq_cst);
         if (self.thread) |t| t.join();
         self.thread = null;
+    }
+
+    pub fn shutdown(self: *BufState) void {
+        self.stopFlusher(true);
         self.wal.close();
+    }
+
+    /// Take the definition of a reloaded script; its flusher must be stopped
+    /// and no accept running.
+    fn adopt(self: *BufState, program: ast.Program) void {
+        const decl = bufferDecl(program).?;
+        self.decl = decl;
+        self.program = program;
+        self.max_bytes = decl.max_bytes;
+        self.wal.segment_bytes = decl.segment_bytes;
+        self.flush_secs = 5;
+        self.flush_rows = 50_000;
+        self.readHints();
+    }
+
+    fn readHints(self: *BufState) void {
+        for (self.program.stmts) |s| {
+            if (s != .output) continue;
+            for (s.output.stages) |st| {
+                if (st.node != .read or st.node.read.form != .buffer) continue;
+                for (st.hints) |h| {
+                    if (std.mem.eql(u8, h.key, "flush_secs") and h.value == .int)
+                        self.flush_secs = @intCast(@max(1, h.value.int));
+                    if (std.mem.eql(u8, h.key, "flush_rows") and h.value == .int)
+                        self.flush_rows = @intCast(@max(1, h.value.int));
+                }
+            }
+        }
     }
 };
 
-pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
+fn bufferDecl(program: ast.Program) ?ast.BufferDecl {
     if (program.stmts.len == 0 or program.stmts[0] != .kind) return null;
-    const decl = program.stmts[0].kind.buffer orelse return null;
+    return program.stmts[0].kind.buffer;
+}
+
+/// Fails with BufferLocked when the buffer is already open, here or in another process.
+pub fn initBufState(gpa: std.mem.Allocator, program: ast.Program) !?*BufState {
+    const decl = bufferDecl(program) orelse return null;
 
     const bs = try gpa.create(BufState);
     errdefer gpa.destroy(bs);
     bs.* = .{
-        .wal = try Wal.open(gpa, decl.dir, decl.name, decl.segment_bytes),
+        .wal = Wal.open(gpa, decl.dir, decl.name, decl.segment_bytes) catch |e| {
+            if (e == error.BufferLocked)
+                log(.err, "buffer `{s}` at {s} is already open by another basalt serve or script (one owner per WAL directory)", .{ decl.name, decl.dir });
+            return e;
+        },
         .decl = decl,
         .program = program,
         .max_bytes = decl.max_bytes,
     };
-    for (program.stmts) |s| {
-        if (s != .output) continue;
-        for (s.output.stages) |st| {
-            if (st.node != .read or st.node.read.form != .buffer) continue;
-            for (st.hints) |h| {
-                if (std.mem.eql(u8, h.key, "flush_secs") and h.value == .int)
-                    bs.flush_secs = @intCast(@max(1, h.value.int));
-                if (std.mem.eql(u8, h.key, "flush_rows") and h.value == .int)
-                    bs.flush_rows = @intCast(@max(1, h.value.int));
-            }
-        }
-    }
+    bs.readHints();
     return bs;
 }
 
@@ -137,6 +172,7 @@ pub fn drainPending(gpa: std.mem.Allocator, bs: *BufState) void {
     };
     defer gpa.free(pending);
     for (pending) |s| {
+        if (bs.stop.load(.seq_cst) and !bs.drain_on_stop) return;
         var lbuf: [300]u8 = undefined;
         const label = bs.wal.labelFor(&lbuf, s);
         var diag: runtime.Diag = .{};
@@ -174,11 +210,13 @@ fn flusherMain(gpa: std.mem.Allocator, bs: *BufState) void {
         };
         drainPending(gpa, bs);
     }
+    if (!bs.drain_on_stop) return;
     bs.wal.rotateIfNonEmpty() catch {};
     drainPending(gpa, bs);
 }
 
 pub fn startFlusher(gpa: std.mem.Allocator, bs: *BufState) !void {
+    bs.stop.store(false, .seq_cst);
     bs.thread = try std.Thread.spawn(.{}, flusherMain, .{ gpa, bs });
 }
 
@@ -328,7 +366,29 @@ fn refuseBusy(stream: std.net.Stream) void {
 const Registry = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    routes: []const Route,
+    routes: []Route,
+
+    fn owns(self: Registry, bs: *BufState) bool {
+        for (self.routes) |r| {
+            if (r.buf == bs) return true;
+        }
+        return false;
+    }
+
+    /// The open buffer named `decl`, matched by name and resolved directory.
+    fn findBuffer(self: Registry, decl: ast.BufferDecl) ?*BufState {
+        var want_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const want = std.fs.cwd().realpath(decl.dir, &want_buf) catch return null;
+        for (self.routes) |r| {
+            const b = r.buf orelse continue;
+            if (!std.mem.eql(u8, b.decl.name, decl.name)) continue;
+            var have_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const have = b.wal.dir.realpath(".", &have_buf) catch continue;
+            if (std.mem.eql(u8, have, want)) return b;
+        }
+        return null;
+    }
+
     fn deinit(self: *Registry) void {
         for (self.routes) |r| {
             if (r.buf) |b| {
@@ -342,11 +402,20 @@ const Registry = struct {
 
 /// Route table of every `CREATE ENDPOINT` `*.sql` script in `dir_path`. Other
 /// scripts and parse failures are logged and skipped, so one bad file spares the rest.
-fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
+/// On a reload (`prev` set) a buffer `prev` already has open is shared, not
+/// reopened, and its flusher left to `reloadOnce`; at startup a buffer another
+/// process holds is fatal.
+fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8, prev: ?*const Registry) !Registry {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     var routes = std.array_list.Managed(Route).init(a);
+    errdefer for (routes.items) |r| {
+        const b = r.buf orelse continue;
+        if (prev != null and prev.?.owns(b)) continue;
+        b.shutdown();
+        gpa.destroy(b);
+    };
 
     var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
@@ -378,7 +447,20 @@ fn loadDir(gpa: std.mem.Allocator, dir_path: []const u8) !Registry {
             }
         }
         if (dup) continue;
+        if (prev) |p| if (bufferDecl(prog)) |decl| if (p.findBuffer(decl)) |old| {
+            for (routes.items) |r| {
+                if (r.buf == old) {
+                    log(.warn, "skip {s}: buffer `{s}` already served by {s}", .{ entry.name, decl.name, r.label });
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try routes.append(.{ .path = path, .program = prog, .label = label, .doc = httpDoc(prog), .buf = old });
+            continue;
+        };
         const bs = initBufState(gpa, prog) catch |e| {
+            if (prev == null and e == error.BufferLocked) return e;
             log(.warn, "skip {s}: buffer setup failed: {s}", .{ entry.name, @errorName(e) });
             continue;
         };
@@ -415,7 +497,7 @@ fn dirFingerprint(dir_path: []const u8) u64 {
 /// at most every ~2s. Reloads run on their own thread so the accept loop never waits.
 pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, port: u16, watch: bool, log_cfg: runtime.LogConfig) !void {
     initLog(log_cfg);
-    var reg = try loadDir(gpa, dir_path);
+    var reg = try loadDir(gpa, dir_path, null);
     defer reg.deinit();
     var net_server = try listen(host, port);
     defer net_server.deinit();
@@ -454,17 +536,29 @@ fn reloadLoop(conns: *Conns, reg: *Registry, dir_path: []const u8, watch: bool, 
 
 /// Load the directory off the lock, then swap the table once the current run, if
 /// any, finishes; requests read their route under the same lock. False when the
-/// load fails and the current routes stay.
+/// load fails and the current routes stay. A buffer the new table keeps passes
+/// over open, so each segment has one flusher: its flusher pauses before the
+/// swap, the buffer takes the new script under the lock, and the flusher resumes
+/// after; a buffer the new table drops drains and closes with the old table.
 fn reloadOnce(conns: *Conns, reg: *Registry, dir_path: []const u8) bool {
-    const new_reg = loadDir(conns.gpa, dir_path) catch |e| {
+    const new_reg = loadDir(conns.gpa, dir_path, reg) catch |e| {
         log(.err, "reload failed (keeping current routes): {s}", .{@errorName(e)});
         return false;
     };
+    for (new_reg.routes) |r| if (r.buf) |b| if (reg.owns(b)) b.stopFlusher(false);
     conns.work.lock();
+    for (new_reg.routes) |r| if (r.buf) |b| if (reg.owns(b)) b.adopt(r.program);
     var old = reg.*;
     reg.* = new_reg;
     conns.routes = reg.routes;
     conns.work.unlock();
+    for (old.routes) |*r| {
+        const b = r.buf orelse continue;
+        if (!reg.owns(b)) continue;
+        r.buf = null;
+        startFlusher(conns.gpa, b) catch |e|
+            log(.err, "buffer {s}: flusher restart failed: {s}", .{ b.decl.name, @errorName(e) });
+    }
     old.deinit();
     log(.info, "reloaded {s}", .{dir_path});
     return true;
@@ -1093,7 +1187,7 @@ test "a reload waiting on a long run leaves new connections accepted and answere
     const dir = try tmp.dir.realpathAlloc(ar.allocator(), ".");
     try tmp.dir.writeFile(.{ .sub_path = "one.sql", .data = "CREATE ENDPOINT '/one'; LOAD INTO 'o.csv' AS SELECT 1 AS x;" });
 
-    var reg = try loadDir(gpa, dir);
+    var reg = try loadDir(gpa, dir, null);
     defer reg.deinit();
     var srv = try listen("127.0.0.1", 0);
     defer srv.deinit();
@@ -1120,6 +1214,122 @@ test "a reload waiting on a long run leaves new connections accepted and answere
     locked = false;
     try std.testing.expectEqual(@as(usize, 2), conns.routes.len);
     try std.testing.expect(findRoute(conns.routes, "/two") != null);
+}
+
+fn evScript(a: std.mem.Allocator, base: []const u8, flush: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\CREATE ENDPOINT '/ev'
+        \\  ACCEPT BODY (id INT NOT NULL)
+        \\  INTO BUFFER 'ev' AT '{s}/wal' SEGMENT 1 MB RETAIN UNTIL LOADED;
+        \\LOAD INTO '{s}/out.csv' APPEND AS
+        \\SELECT CAST(id AS INT) AS id FROM BUFFER 'ev' {s};
+    , .{ base, base, flush });
+}
+
+fn expectEachIdOnce(a: std.mem.Allocator, dir: std.fs.Dir, n: usize) !void {
+    const out = try dir.readFileAlloc(a, "out.csv", 1 << 20);
+    const seen = try a.alloc(u8, n);
+    @memset(seen, 0);
+    var it = std.mem.tokenizeScalar(u8, out, '\n');
+    try std.testing.expectEqualStrings("id", it.next().?);
+    while (it.next()) |line| seen[try std.fmt.parseInt(usize, line, 10)] += 1;
+    for (seen) |c| try std.testing.expectEqual(@as(u8, 1), c);
+}
+
+fn acceptLoop(conns: *Conns, n: usize, accepted: *std.atomic.Value(usize)) void {
+    for (0..n) |i| {
+        var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer ar.deinit();
+        const body = std.fmt.allocPrint(ar.allocator(), "{{\"id\":{d}}}", .{i}) catch return;
+        var msg: []const u8 = "";
+        conns.work.lock();
+        const bs = findRoute(conns.routes, "/ev").?.buf.?;
+        _ = acceptIntoBuffer(bs, ar.allocator(), body, &msg) catch {
+            conns.work.unlock();
+            return;
+        };
+        conns.work.unlock();
+        _ = accepted.fetchAdd(1, .seq_cst);
+        std.Thread.sleep(2 * std.time.ns_per_ms);
+    }
+}
+
+test "reloads hand an open buffer over: every accepted row is loaded exactly once" {
+    initLog(.{ .quiet = true });
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.makeDir("scripts");
+    const scripts = try std.fs.path.join(a, &.{ base, "scripts" });
+    var sdir = try tmp.dir.openDir("scripts", .{});
+    defer sdir.close();
+    try sdir.writeFile(.{ .sub_path = "ev.sql", .data = try evScript(a, base, "FLUSH EVERY 1 SECONDS OR 1 ROWS") });
+
+    var reg = try loadDir(gpa, scripts, null);
+    var reg_live = true;
+    defer if (reg_live) reg.deinit();
+    var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = 1 };
+
+    const n = 400;
+    var accepted = std.atomic.Value(usize).init(0);
+    const writer = try std.Thread.spawn(.{}, acceptLoop, .{ &conns, @as(usize, n), &accepted });
+    for (0..6) |i| {
+        std.Thread.sleep(150 * std.time.ns_per_ms);
+        if (i == 2) try sdir.writeFile(.{ .sub_path = "ev.sql", .data = try evScript(a, base, "FLUSH EVERY 1 SECONDS OR 3 ROWS") });
+        if (i == 4) try sdir.rename("ev.sql", "renamed.sql");
+        try std.testing.expect(reloadOnce(&conns, &reg, scripts));
+    }
+    writer.join();
+    try std.testing.expectEqual(@as(usize, n), accepted.load(.seq_cst));
+    try std.testing.expectEqual(@as(u64, 3), findRoute(conns.routes, "/ev").?.buf.?.flush_rows);
+    reg.deinit();
+    reg_live = false;
+    try expectEachIdOnce(a, tmp.dir, n);
+}
+
+test "a restart resumes pending segments once; a buffer already open is refused" {
+    initLog(.{ .quiet = true });
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.makeDir("scripts");
+    const scripts = try std.fs.path.join(a, &.{ base, "scripts" });
+    const text = try evScript(a, base, "");
+    try tmp.dir.writeFile(.{ .sub_path = "scripts/ev.sql", .data = text });
+    var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, text, &d);
+
+    var msg: []const u8 = "";
+    {
+        const bs = (try initBufState(gpa, prog)).?;
+        defer gpa.destroy(bs);
+        defer bs.wal.close();
+        try std.testing.expectError(error.BufferLocked, initBufState(gpa, prog));
+        try std.testing.expectError(error.BufferLocked, loadDir(gpa, scripts, null));
+        _ = try acceptIntoBuffer(bs, a, "[{\"id\":0},{\"id\":1}]", &msg);
+        try bs.wal.rotate();
+        drainPending(gpa, bs);
+        _ = try acceptIntoBuffer(bs, a, "{\"id\":2}", &msg);
+        try bs.wal.rotate();
+        _ = try acceptIntoBuffer(bs, a, "{\"id\":3}", &msg);
+    }
+    const bs = (try initBufState(gpa, prog)).?;
+    defer {
+        bs.shutdown();
+        gpa.destroy(bs);
+    }
+    _ = try acceptIntoBuffer(bs, a, "{\"id\":4}", &msg);
+    try startFlusher(gpa, bs);
+    bs.stopFlusher(true);
+    try expectEachIdOnce(a, tmp.dir, 5);
 }
 
 test "past the connection cap a request gets 503 + Retry-After instead of an inline run" {

@@ -87,5 +87,18 @@ FROM BUFFER 'eventos'
 - Without `AT`, segments go to `wal/` under the working directory.
 - **Batch replay**: `FROM BUFFER 'eventos' AT '<dir>'` in a plain batch script
   reads every retained segment — the queue is just another source.
+- One owner per buffer: `serve` holds a lock on `eventos.lock` in the WAL
+  directory while the buffer is open, so a second `basalt serve` (or a second
+  script) declaring the same buffer in the same directory is refused at
+  startup, naming it, instead of loading its segments twice. Run one process
+  per WAL directory; replicas each get their own.
+- A reload keeps a buffer the new scripts still declare (same name and
+  directory) open and hands it to them: its flusher finishes the segment in
+  flight, the new script takes over between runs, and accepts keep landing in
+  the same segment throughout, so every acked row is loaded once. A buffer
+  the new scripts drop is drained and closed, as on shutdown. A clean
+  stop (SIGTERM) drains what is pending; after a crash the next start resumes
+  from the manifest, and a segment loaded but not yet marked is loaded again —
+  only a label-deduplicating sink such as StarRocks absorbs that replay.
 - Honest cost: `serve` becomes stateful (the WAL directory needs a persistent
   volume) and durability is the node's disk, not replicated.

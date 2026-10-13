@@ -13,6 +13,10 @@
 //! effectively exactly-once without two-phase commit. Reopening a buffer whose
 //! newest segment is unloaded appends into it for the same reason.
 //!
+//! A `Wal` holds an exclusive flock on `eventos.lock` while open, so a buffer
+//! has one owner: a second opener, in this process or another, gets
+//! `error.BufferLocked` instead of draining the same segments twice.
+//!
 //! Threading: the accept loop (append, sync) and the flusher (rotation,
 //! `pendingSegments`, purge) share one `Wal` under its mutex. Segments below
 //! `currentSeq` are complete and immutable, so reading them needs no lock, and
@@ -35,6 +39,7 @@ pub const Wal = struct {
     seq: u64,
     cur: ?std.fs.File = null,
     cur_size: u64 = 0,
+    lock: std.fs.File,
     mu: std.Thread.Mutex = .{},
 
     pub fn open(gpa: std.mem.Allocator, dir_path: []const u8, name: []const u8, segment_bytes: u64) !Wal {
@@ -44,6 +49,13 @@ pub const Wal = struct {
         };
         var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
         errdefer dir.close();
+        var lock_buf: [256]u8 = undefined;
+        const lock_name = try std.fmt.bufPrint(&lock_buf, "{s}.lock", .{name});
+        const lock = dir.createFile(lock_name, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |e| switch (e) {
+            error.WouldBlock => return error.BufferLocked,
+            else => return e,
+        };
+        errdefer lock.close();
 
         var self = Wal{
             .gpa = gpa,
@@ -51,6 +63,7 @@ pub const Wal = struct {
             .name = try gpa.dupe(u8, name),
             .segment_bytes = segment_bytes,
             .seq = 1,
+            .lock = lock,
         };
         errdefer gpa.free(self.name);
 
@@ -73,6 +86,7 @@ pub const Wal = struct {
 
     pub fn close(self: *Wal) void {
         if (self.cur) |f| f.close();
+        self.lock.close();
         self.dir.close();
         self.gpa.free(self.name);
         self.* = undefined;
@@ -518,6 +532,22 @@ test "wal: reopen after every segment was purged numbers past the manifest" {
     const pending = try w.pendingSegments(gpa);
     defer gpa.free(pending);
     try testing.expectEqualSlices(u64, &.{2}, pending);
+}
+
+test "wal: a second open of the same buffer is refused until the first closes" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(base);
+
+    var w = try Wal.open(gpa, base, "ev", 1 << 20);
+    try testing.expectError(error.BufferLocked, Wal.open(gpa, base, "ev", 1 << 20));
+    var other = try Wal.open(gpa, base, "ev2", 1 << 20);
+    other.close();
+    w.close();
+    var again = try Wal.open(gpa, base, "ev", 1 << 20);
+    again.close();
 }
 
 test "wal: purgeOlderThan removes only LOADED segments past the window" {
