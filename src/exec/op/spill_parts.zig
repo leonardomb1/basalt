@@ -216,5 +216,11 @@ pub fn Replay(comptime T: type) type {
             }
             return null;
         }
+
+        /// Deletes the runs not yet replayed, for a consumer that stopped early.
+        pub fn release(self: *Self) void {
+            for (self.runs[self.idx..]) |run| spill.discard(run);
+            self.idx = self.runs.len;
+        }
     };
 }

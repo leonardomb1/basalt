@@ -24,6 +24,12 @@ pub const Spill = struct {
     replay: ?parts_mod.Replay(Aggregate) = null,
 };
 
+/// Drops the spill files a consumer that stopped early never read; safe twice.
+pub fn release(self: *Aggregate) void {
+    const sp = self.spill orelse return;
+    if (sp.replay) |*r| r.release() else sp.parts.abort();
+}
+
 /// `next` in spilling mode: the whole input folded (spilling what does not fit),
 /// the groups held in memory emitted, then each spill file aggregated in turn.
 pub fn spillNext(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {

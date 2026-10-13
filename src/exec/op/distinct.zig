@@ -86,6 +86,12 @@ pub const Distinct = struct {
         return sp.replay.?.next(self, self.gpa, arena);
     }
 
+    /// Drops the spill files a consumer that stopped early never read; safe twice.
+    pub fn release(self: *Distinct) void {
+        const sp = self.spill orelse return;
+        if (sp.replay) |*r| r.release() else sp.parts.abort();
+    }
+
     /// A fresh `Distinct` over one spill file, one level deeper, on `state`.
     pub fn replayChild(self: *Distinct, child: Op, state: std.mem.Allocator) Distinct {
         return .{

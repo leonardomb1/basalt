@@ -56,6 +56,7 @@ pub const Aggregate = struct {
     pub const Spill = @import("aggregate/spill.zig").Spill;
     pub const spillNext = @import("aggregate/spill.zig").spillNext;
     pub const replayChild = @import("aggregate/spill.zig").replayChild;
+    pub const release = @import("aggregate/spill.zig").release;
     pub const overBudget = @import("aggregate/spill.zig").overBudget;
     pub const spillRows = @import("aggregate/spill.zig").spillRows;
     pub const destOf = @import("aggregate/spill.zig").destOf;

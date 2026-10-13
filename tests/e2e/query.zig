@@ -1376,7 +1376,7 @@ test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to t
     try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 1024, .log = .{ .quiet = true } }, &rdiag));
 }
 
-test "spill: a LIMIT over a spilled sort or join gives its disk back before the next statement" {
+test "spill: a LIMIT over a spilled sort, join, GROUP BY or DISTINCT gives its disk back before the next statement" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1394,6 +1394,8 @@ test "spill: a LIMIT over a spilled sort or join gives its disk back before the 
     const cases = [_]struct { early: []const u8, full: []const u8 }{
         .{ .early = "SELECT id FROM (SELECT id, k FROM '{0s}/in.csv' ORDER BY k) t WHERE id >= 0 LIMIT 1", .full = "SELECT count(*) AS n FROM (SELECT id FROM '{0s}/in.csv' ORDER BY k)" },
         .{ .early = "SELECT a.id FROM '{0s}/in.csv' a JOIN '{0s}/in.csv' b ON a.k = b.k LIMIT 1", .full = "SELECT count(*) AS n FROM '{0s}/in.csv' a JOIN '{0s}/in.csv' b ON a.k = b.k" },
+        .{ .early = "SELECT id FROM (SELECT id, max(k) AS m FROM '{0s}/in.csv' GROUP BY id) t WHERE id >= 0 LIMIT 1", .full = "SELECT count(*) AS n FROM (SELECT id, max(k) AS m FROM '{0s}/in.csv' GROUP BY id)" },
+        .{ .early = "SELECT id FROM (SELECT DISTINCT id, k FROM '{0s}/in.csv') t WHERE id >= 0 LIMIT 1", .full = "SELECT count(*) AS n FROM (SELECT DISTINCT id, k FROM '{0s}/in.csv')" },
     };
     inline for (cases) |c| {
         const early = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/early.csv' AS " ++ c.early ++ ";\n", .{base});

@@ -225,6 +225,14 @@ pub const Op = union(enum) {
                 if (j.build) |b| b.release();
             },
             .union_ => |u| for (u.children) |c| c.release(),
+            .distinct => |d| {
+                d.release();
+                d.child.release();
+            },
+            .aggregate => |g| {
+                g.release();
+                g.child.release();
+            },
             inline else => |o| o.child.release(),
         }
     }
