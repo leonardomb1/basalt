@@ -36,7 +36,6 @@
 //! loop, the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
-const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
@@ -266,6 +265,7 @@ pub const BlockBlobWriter = struct {
     last_error: []const u8 = "",
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
+    sleep: objstore.Sleep = std.Thread.sleep,
 
     const vtable = std.Io.Writer.VTable{ .drain = objstore.drain(BlockBlobWriter) };
 
@@ -313,20 +313,18 @@ pub const BlockBlobWriter = struct {
         const id_enc = try urlEncode(self.arena, id);
         const url = try std.fmt.allocPrint(self.arena, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
 
-        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
-            .method = "PUT",
-            .canonical_resource = self.blob.canonical_resource,
+        const sign = Sign{
             .content_length = bytes.len,
             .query = &.{
                 try std.fmt.allocPrint(self.arena, "blockid:{s}", .{id}),
                 "comp:block",
             },
-        });
+        };
 
-        self.send(url, hdrs, bytes) catch |e| switch (e) {
+        self.send(url, sign, bytes) catch |e| switch (e) {
             Error.AzureContainerMissing => {
                 try self.createContainer();
-                try self.send(url, hdrs, bytes);
+                try self.send(url, sign, bytes);
             },
             else => return e,
         };
@@ -334,6 +332,8 @@ pub const BlockBlobWriter = struct {
     }
 
     /// Commits the staged blocks in order. Until this returns, the blob does not exist.
+    /// A replay after a lost answer is harmless: `Latest` resolves an id against the
+    /// committed list once the uncommitted one is gone, so the same list commits again.
     pub fn finish(self: *BlockBlobWriter) !void {
         try self.interface.flush();
 
@@ -347,38 +347,37 @@ pub const BlockBlobWriter = struct {
         try body.appendSlice("</BlockList>");
 
         const url = try std.fmt.allocPrint(self.arena, "{s}?comp=blocklist", .{self.blob.url});
-        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
-            .method = "PUT",
-            .canonical_resource = self.blob.canonical_resource,
+        const sign = Sign{
             .ms_headers = &.{.{ .name = "x-ms-blob-content-type", .value = self.content_type }},
             .content_length = body.items.len,
             .query = &.{"comp:blocklist"},
-        });
-        try self.send(url, hdrs, body.items);
+        };
+        try self.send(url, sign, body.items);
     }
 
-    const Send = struct { w: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8 };
+    const Sign = struct { ms_headers: []const MsHeader = &.{}, content_length: usize, query: []const []const u8 };
+    const Send = struct { w: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8 };
 
-    /// PUT with retry. `last_status` is cleared on success, since `stageBlock` retries a
-    /// missing container and that first attempt's stale error must not be re-raised.
-    fn send(self: *BlockBlobWriter, url: []const u8, hdrs: []const std.http.Header, body: []const u8) !void {
-        try objstore.retry(self.policy(), Send{ .w = self, .url = url, .hdrs = hdrs, .body = body }, struct {
+    /// PUT with retry, signed afresh per attempt. `last_status` is cleared on success,
+    /// since `stageBlock` retries a missing container and that first attempt's stale
+    /// error must not be re-raised.
+    fn send(self: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8) !void {
+        try objstore.retry(self.policy(), Send{ .w = self, .url = url, .sign = sign, .body = body }, struct {
             fn attempt(c: Send) !objstore.Verdict {
-                var aw = std.Io.Writer.Allocating.init(c.w.arena);
-                const res = try c.w.client.fetch(.{
-                    .method = .PUT,
-                    .location = .{ .url = c.url },
-                    .extra_headers = c.hdrs,
-                    .payload = c.body,
-                    .decompress_buffer = http_client.decompress_direct,
-                    .response_writer = &aw.writer,
+                const w = c.w;
+                const hdrs = try signedHeaders(w.arena, w.blob.account, w.key, .{
+                    .method = "PUT",
+                    .canonical_resource = w.blob.canonical_resource,
+                    .ms_headers = c.sign.ms_headers,
+                    .content_length = c.sign.content_length,
+                    .query = c.sign.query,
                 });
-                const code = @intFromEnum(res.status);
-                if (code == 201 or code == 200) {
-                    c.w.last_status = null;
+                const r = try objstore.exchange(w.arena, w.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.body });
+                if (r.code == 201 or r.code == 200) {
+                    w.last_status = null;
                     return .done;
                 }
-                return c.w.failed(code, aw.writer.buffered());
+                return w.failed(r);
             }
         }.attempt);
     }
@@ -395,21 +394,12 @@ pub const BlockBlobWriter = struct {
             .query = &.{"restype:container"},
         });
 
-        var aw = std.Io.Writer.Allocating.init(self.arena);
-        const res = try self.client.fetch(.{
-            .method = .PUT,
-            .location = .{ .url = url },
-            .extra_headers = hdrs,
-            .payload = "",
-            .decompress_buffer = http_client.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        if (code != 201 and code != 409) return self.fail(code, aw.writer.buffered());
+        const r = try objstore.exchange(self.arena, self.client, .{ .method = .PUT, .url = url, .headers = hdrs, .payload = "" });
+        if (r.code != 201 and r.code != 409) return self.fail(r.code, r.body);
     }
 
     fn policy(self: *BlockBlobWriter) objstore.Policy {
-        return .{ .rand = self.rand.random() };
+        return .{ .rand = self.rand.random(), .sleep = self.sleep };
     }
 
     fn fail(self: *BlockBlobWriter, code: u16, body: []const u8) Error {
@@ -418,8 +408,8 @@ pub const BlockBlobWriter = struct {
         return self.last_status.?;
     }
 
-    fn failed(self: *BlockBlobWriter, code: u16, body: []const u8) objstore.Verdict {
-        return .{ .failed = .{ .code = code, .err = self.fail(code, body) } };
+    fn failed(self: *BlockBlobWriter, r: objstore.Response) objstore.Verdict {
+        return r.failed(self.fail(r.code, r.body));
     }
 };
 
@@ -455,6 +445,50 @@ test "block ids are the same width at every block number" {
     try std.testing.expectEqual(b0.len, (try w.blockId(9)).len);
     try std.testing.expectEqual(b0.len, (try w.blockId(10)).len);
     try std.testing.expectEqual(b0.len, (try w.blockId(49_999)).len);
+}
+
+var test_slept_ms: u64 = 0;
+
+fn testSleep(ns: u64) void {
+    test_slept_ms += ns / std.time.ns_per_ms;
+}
+
+test "Put Block is re-put after a reset and waits out Retry-After; Put Block List is replayed after a 500" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = objstore.FakeServer.reply;
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        null,
+        reply("503 Server Busy", "Retry-After: 2\r\n", "<Error><Code>ServerBusy</Code></Error>"),
+        reply("201 Created", "", ""),
+        reply("500 Internal Server Error", "", ""),
+        reply("201 Created", "", ""),
+    });
+    defer srv.stop();
+    var w = BlockBlobWriter{
+        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
+        .arena = a,
+        .client = &client,
+        .blob = try parseUrl(a, "az://devstoreaccount1/c/f.csv", try srv.url(a, "")),
+        .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+        .block_ids = std.array_list.Managed([]const u8).init(a),
+        .content_type = "text/csv",
+        .rand = std.Random.DefaultPrng.init(0),
+        .sleep = testSleep,
+    };
+    test_slept_ms = 0;
+    try w.stageBlock("hello");
+    try std.testing.expectEqual(@as(usize, 1), w.block_ids.items.len);
+    try std.testing.expect(test_slept_ms >= 2000);
+    try std.testing.expectEqualStrings(srv.line(0), srv.line(2));
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 5), srv.requests());
+    try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
+    try std.testing.expectEqualStrings(srv.line(3), srv.line(4));
 }
 
 test "urlEncode escapes the base64 characters that are not URL-safe" {
@@ -561,6 +595,7 @@ const ListPage = struct {
     base: []const u8,
     canon: []const u8,
     key: []const u8,
+    sleep: objstore.Sleep = std.Thread.sleep,
 
     fn page(c: ListPage, marker: []const u8) ![]const u8 {
         const url = if (marker.len == 0)
@@ -574,23 +609,22 @@ const ListPage = struct {
         try q.append(try std.fmt.allocPrint(c.arena, "prefix:{s}", .{c.prefix}));
         try q.append("restype:container");
 
-        const hdrs = try signedHeaders(c.arena, c.account, c.key, .{
-            .method = "GET",
-            .canonical_resource = c.canon,
-            .query = q.items,
-        });
-
-        var aw = std.Io.Writer.Allocating.init(c.arena);
-        const res = try c.client.fetch(.{
-            .method = .GET,
-            .location = .{ .url = url },
-            .extra_headers = hdrs,
-            .decompress_buffer = http_client.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        const body = aw.writer.buffered();
-        if (code != 200) return statusToError(code, body);
+        var body: []const u8 = "";
+        var prng = objstore.jitterPrng();
+        const Ctx = struct { c: ListPage, q: []const []const u8, url: []const u8, out: *[]const u8 };
+        try objstore.retry(.{ .rand = prng.random(), .sleep = c.sleep }, Ctx{ .c = c, .q = q.items, .url = url, .out = &body }, struct {
+            fn attempt(x: Ctx) !objstore.Verdict {
+                const hdrs = try signedHeaders(x.c.arena, x.c.account, x.c.key, .{
+                    .method = "GET",
+                    .canonical_resource = x.c.canon,
+                    .query = x.q,
+                });
+                const r = try objstore.exchange(x.c.arena, x.c.client, .{ .method = .GET, .url = x.url, .headers = hdrs });
+                if (r.code != 200) return r.failed(statusToError(r.code, r.body));
+                x.out.* = r.body;
+                return .done;
+            }
+        }.attempt);
         return body;
     }
 };

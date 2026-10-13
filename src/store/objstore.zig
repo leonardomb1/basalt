@@ -10,13 +10,21 @@
 //! parameter names and encoding stay with each provider's page function because
 //! they are signed and the services canonicalise a query string differently.
 //!
-//! Retry: 429/500/503, five attempts, exponential backoff with jitter so parallel
-//! lanes throttled at the same instant do not retry in lockstep. Every request is
-//! idempotent (Put Block and UploadPart are keyed by block id / part number, the
-//! commit is a full replace, GET is a read), so retrying is always safe. A
-//! `Verdict.again` (the attempt fixed the cause itself, e.g. created the missing
-//! container) spends an attempt but no backoff. `Retry-After` is not honoured
-//! because `std.http.Client.fetch` does not surface response headers.
+//! Retry: a transport failure or a 408/429/500/502/503/504, at most five attempts
+//! and about 30 s of sleep, exponential backoff with jitter so parallel lanes
+//! throttled at the same instant do not retry in lockstep, stretched to any
+//! `Retry-After` the service sent. Any other 4xx fails at once, and so does a run
+//! that is aborting. Requests that go through it are safe to replay: GET, HEAD and
+//! listings read, Put Block and UploadPart are keyed by block id / part number,
+//! Put Block List is a full replace. Replaying CreateMultipartUpload after a lost
+//! answer starts a second upload and orphans the first, which, like any dropped
+//! writer's, is invisible and costs only storage. S3's CompleteMultipartUpload is
+//! not idempotent: a replay
+//! after a lost response may meet NoSuchUpload, which s3.zig resolves by checking
+//! the object it should have made. A `Verdict.again` (the attempt fixed the cause
+//! itself, e.g. created the missing container) spends an attempt but no backoff.
+//! `exchange` is the one request path, because `std.http.Client.fetch` does not
+//! surface the response headers (ETag, Retry-After) the retry and S3 need.
 //!
 //! The interface is a vtable rather than a comptime generic because the provider
 //! is chosen at run time from a URL string: a reader over `az://…` and one over
@@ -30,6 +38,7 @@
 
 const std = @import("std");
 const azure = @import("azure.zig");
+const driver = @import("../connect/driver.zig");
 const http_client = @import("../net/http_client.zig");
 const s3 = @import("s3.zig");
 const sftp = @import("sftp.zig");
@@ -77,14 +86,31 @@ pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const 
 }
 
 pub fn retriable(code: u16) bool {
-    return code == 429 or code == 500 or code == 503;
+    return switch (code) {
+        408, 429, 500, 502, 503, 504 => true,
+        else => false,
+    };
+}
+
+/// A request that died on the wire: the socket set every connector shares, plus a
+/// server that closed the connection instead of answering.
+pub fn transient(e: anyerror) bool {
+    return driver.transientNet(e) or e == error.HttpConnectionClosing;
 }
 
 pub const max_attempts = 5;
+pub const budget_ms: u64 = 30_000;
 
+/// 500 ms doubling per attempt up to 8 s, plus up to 50% jitter.
 pub fn backoffMs(attempt: usize, rand: std.Random) u64 {
-    const base = @as(u64, 200) << @intCast(@min(attempt, 5));
+    const base = @as(u64, 500) << @intCast(@min(attempt, 4));
     return base + rand.uintLessThan(u64, base / 2 + 1);
+}
+
+/// `Retry-After` in delta-seconds; the HTTP-date form is left to the backoff.
+pub fn retryAfterMs(value: []const u8) ?u64 {
+    const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
+    return std.math.mul(u64, secs, std.time.ms_per_s) catch budget_ms;
 }
 
 pub fn jitterPrng() std.Random.DefaultPrng {
@@ -94,28 +120,122 @@ pub fn jitterPrng() std.Random.DefaultPrng {
 pub const Verdict = union(enum) {
     done,
     again,
-    failed: struct { code: u16, err: anyerror },
+    failed: struct { code: u16, err: anyerror, retry_after_ms: ?u64 = null },
 };
+
+pub const Sleep = *const fn (ns: u64) void;
 
 pub const Policy = struct {
     rand: std.Random,
-    sleep: *const fn (ns: u64) void = std.Thread.sleep,
+    sleep: Sleep = std.Thread.sleep,
 };
 
-/// Runs `attemptFn(ctx)` until it reports `.done`, giving up after
-/// `max_attempts` or on the first non-transient status.
+/// Runs `attemptFn(ctx)` until it reports `.done`, giving up on the first failure
+/// that is not transient, after `max_attempts`, once `budget_ms` of sleep is spent,
+/// or as soon as the run is aborting.
 pub fn retry(policy: Policy, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
+    var slept: u64 = 0;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        switch (try attemptFn(ctx)) {
+        var wait = backoffMs(attempt, policy.rand);
+        const err = if (attemptFn(ctx)) |v| switch (v) {
             .done => return,
-            .again => {},
-            .failed => |f| {
-                if (!retriable(f.code) or attempt + 1 >= max_attempts) return f.err;
-                policy.sleep(backoffMs(attempt, policy.rand) * std.time.ns_per_ms);
+            .again => continue,
+            .failed => |f| blk: {
+                if (!retriable(f.code)) return f.err;
+                wait = @max(wait, f.retry_after_ms orelse 0);
+                break :blk f.err;
             },
-        }
+        } else |e| blk: {
+            if (!transient(e)) return e;
+            break :blk e;
+        };
+        if (attempt + 1 >= max_attempts or slept >= budget_ms or driver.aborting()) return err;
+        wait = @min(wait, budget_ms - slept);
+        if (!pause(policy.sleep, wait)) return err;
+        slept += wait;
     }
+}
+
+/// Sleeps `ms` in short slices; false as soon as the run starts aborting.
+fn pause(sleep: Sleep, ms: u64) bool {
+    var left = ms;
+    while (left > 0) {
+        const step: u64 = @min(left, 100);
+        sleep(step * std.time.ns_per_ms);
+        left -= step;
+        if (driver.aborting()) return false;
+    }
+    return true;
+}
+
+pub const Response = struct {
+    code: u16,
+    body: []const u8,
+    etag: []const u8 = "",
+    retry_after_ms: ?u64 = null,
+    content_length: ?u64 = null,
+
+    pub fn failed(self: Response, err: anyerror) Verdict {
+        return .{ .failed = .{ .code = self.code, .err = err, .retry_after_ms = self.retry_after_ms } };
+    }
+};
+
+pub const Call = struct {
+    method: std.http.Method,
+    url: []const u8,
+    headers: []const std.http.Header = &.{},
+    payload: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+};
+
+/// One request, its body read whole into `arena` and decoded per its
+/// Content-Encoding. A bodiless request follows up to three redirects, as
+/// `Client.fetch` does. Header values are copied out before the body is read,
+/// which invalidates the head's strings. A request that fails before its response
+/// head arrives would leave its connection pooled (std keeps a `.ready` one), so the
+/// replay would write into the dead socket; a failure always drops it.
+pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) !Response {
+    const uri = try std.Uri.parse(call.url);
+    const redirects: std.http.Client.Request.RedirectBehavior = if (call.payload == null) @enumFromInt(3) else .unhandled;
+    var req = try client.request(call.method, uri, .{
+        .redirect_behavior = redirects,
+        .extra_headers = call.headers,
+        .headers = .{ .content_type = if (call.content_type) |ct| .{ .override = ct } else .default },
+    });
+    defer req.deinit();
+    errdefer if (req.connection) |c| {
+        c.closing = true;
+    };
+    if (call.payload) |p| {
+        req.transfer_encoding = .{ .content_length = p.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(p);
+        try body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var resp = try req.receiveHead(if (call.payload == null) &redirect_buf else &.{});
+    var out = Response{ .code = @intFromEnum(resp.head.status), .body = "", .content_length = resp.head.content_length };
+    var it = resp.head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try arena.dupe(u8, h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) out.retry_after_ms = retryAfterMs(h.value);
+    }
+    if (resp.head.content_encoding == .compress) return error.UnsupportedCompressionMethod;
+    var aw = std.Io.Writer.Allocating.init(arena);
+    var transfer_buf: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = resp.readerDecompressing(&transfer_buf, &decompress, http_client.decompress_direct);
+    _ = reader.streamRemaining(&aw.writer) catch |e| switch (e) {
+        error.ReadFailed => return resp.bodyErr().?,
+        else => |x| return x,
+    };
+    out.body = aw.writer.buffered();
+    return out;
 }
 
 pub fn drain(comptime T: type) *const fn (*std.Io.Writer, []const []const u8, usize) std.Io.Writer.Error!usize {
@@ -342,12 +462,17 @@ test "collectTag reads every item from a listing page and nothing else" {
     try std.testing.expectEqual(@as(usize, 0), (try collectTag(a, "", "Key")).len);
 }
 
-test "retry policy: only transient statuses retry; backoff doubles from 200 ms with up to 50% jitter, capped at 6.4 s" {
-    try std.testing.expect(retriable(429) and retriable(500) and retriable(503));
-    try std.testing.expect(!retriable(403) and !retriable(404) and !retriable(201) and !retriable(200));
+test "retry policy: transport failures, 408, 429 and 5xx gateways retry; other 4xx do not" {
+    for ([_]u16{ 408, 429, 500, 502, 503, 504 }) |c| try std.testing.expect(retriable(c));
+    for ([_]u16{ 200, 201, 206, 400, 401, 403, 404, 409, 412, 501 }) |c| try std.testing.expect(!retriable(c));
+    try std.testing.expect(transient(error.ConnectionResetByPeer) and transient(error.HttpConnectionClosing));
+    try std.testing.expect(transient(error.ConnectionRefused) and transient(error.EndOfStream));
+    try std.testing.expect(!transient(error.S3AuthFailed) and !transient(error.OutOfMemory));
+}
 
+test "backoff doubles from 500 ms with up to 50% jitter, capped at 8 s; Retry-After reads delta-seconds" {
     for (0..5) |i| {
-        const base = @as(u64, 200) << @intCast(i);
+        const base = @as(u64, 500) << @intCast(i);
         var above_base = false;
         for (0..64) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
@@ -361,25 +486,44 @@ test "retry policy: only transient statuses retry; backoff doubles from 200 ms w
         for (0..64) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             const ms = backoffMs(attempt, prng.random());
-            try std.testing.expect(ms >= 6400 and ms <= 9600);
+            try std.testing.expect(ms >= 8000 and ms <= 12000);
         }
     }
+    try std.testing.expectEqual(@as(?u64, 7000), retryAfterMs("7"));
+    try std.testing.expectEqual(@as(?u64, 0), retryAfterMs(" 0 "));
+    try std.testing.expectEqual(@as(?u64, null), retryAfterMs("Wed, 21 Oct 2015 07:28:00 GMT"));
 }
 
 const Scripted = struct {
     codes: []const u16,
     calls: usize = 0,
+    retry_after_ms: ?u64 = null,
+
+    var slept_ms: u64 = 0;
+
+    /// 0 fixes the cause itself (`.again`), 1 is a reset connection, 2 a local
+    /// non-transient failure, 200 success, anything else that status.
     fn attempt(self: *Scripted) !Verdict {
         const code = self.codes[@min(self.calls, self.codes.len - 1)];
         self.calls += 1;
-        if (code == 0) return .again;
-        if (code == 200) return .done;
-        return .{ .failed = .{ .code = code, .err = error.Scripted } };
+        return switch (code) {
+            0 => .again,
+            1 => error.ConnectionResetByPeer,
+            2 => error.OutOfMemory,
+            200 => .done,
+            else => .{ .failed = .{ .code = code, .err = error.Scripted, .retry_after_ms = self.retry_after_ms } },
+        };
     }
-    fn noSleep(_: u64) void {}
+    fn noSleep(ns: u64) void {
+        slept_ms += ns / std.time.ns_per_ms;
+    }
+    fn abortingSleep(ns: u64) void {
+        noSleep(ns);
+        driver.requestAbort();
+    }
 };
 
-test "retry gives up after max_attempts and only ever retries transient statuses" {
+test "retry gives up after max_attempts and only ever retries transient failures" {
     var prng = std.Random.DefaultPrng.init(0);
     const policy = Policy{ .rand = prng.random(), .sleep = Scripted.noSleep };
 
@@ -387,17 +531,187 @@ test "retry gives up after max_attempts and only ever retries transient statuses
     try std.testing.expectError(error.Scripted, retry(policy, &throttled, Scripted.attempt));
     try std.testing.expectEqual(@as(usize, max_attempts), throttled.calls);
 
-    var flaky = Scripted{ .codes = &.{ 500, 429, 200 } };
-    try retry(policy, &flaky, Scripted.attempt);
-    try std.testing.expectEqual(@as(usize, 3), flaky.calls);
+    var flaky = Scripted{ .codes = &.{ 500, 429, 1, 502, 504, 200 } };
+    try std.testing.expectError(error.Scripted, retry(policy, &flaky, Scripted.attempt));
+    try std.testing.expectEqual(@as(usize, max_attempts), flaky.calls);
+
+    var recovers = Scripted{ .codes = &.{ 1, 408, 200 } };
+    try retry(policy, &recovers, Scripted.attempt);
+    try std.testing.expectEqual(@as(usize, 3), recovers.calls);
 
     var denied = Scripted{ .codes = &.{ 403, 200 } };
     try std.testing.expectError(error.Scripted, retry(policy, &denied, Scripted.attempt));
     try std.testing.expectEqual(@as(usize, 1), denied.calls);
 
+    var broken = Scripted{ .codes = &.{ 2, 200 } };
+    try std.testing.expectError(error.OutOfMemory, retry(policy, &broken, Scripted.attempt));
+    try std.testing.expectEqual(@as(usize, 1), broken.calls);
+
     var created = Scripted{ .codes = &.{ 0, 200 } };
     try retry(policy, &created, Scripted.attempt);
     try std.testing.expectEqual(@as(usize, 2), created.calls);
+}
+
+test "retry stretches the wait to Retry-After but never sleeps past the budget" {
+    var prng = std.Random.DefaultPrng.init(0);
+    const policy = Policy{ .rand = prng.random(), .sleep = Scripted.noSleep };
+
+    Scripted.slept_ms = 0;
+    var told = Scripted{ .codes = &.{ 503, 200 }, .retry_after_ms = 4000 };
+    try retry(policy, &told, Scripted.attempt);
+    try std.testing.expectEqual(@as(u64, 4000), Scripted.slept_ms);
+
+    Scripted.slept_ms = 0;
+    var greedy = Scripted{ .codes = &.{503}, .retry_after_ms = 3600 * 1000 };
+    try std.testing.expectError(error.Scripted, retry(policy, &greedy, Scripted.attempt));
+    try std.testing.expectEqual(budget_ms, Scripted.slept_ms);
+    try std.testing.expectEqual(@as(usize, 2), greedy.calls);
+
+    Scripted.slept_ms = 0;
+    var plain = Scripted{ .codes = &.{503} };
+    try std.testing.expectError(error.Scripted, retry(policy, &plain, Scripted.attempt));
+    try std.testing.expect(Scripted.slept_ms >= 500 + 1000 + 2000 + 4000 and Scripted.slept_ms <= budget_ms);
+}
+
+test "retry stops as soon as the run is aborting" {
+    defer driver.resetAbort();
+    var prng = std.Random.DefaultPrng.init(0);
+    const policy = Policy{ .rand = prng.random(), .sleep = Scripted.abortingSleep };
+
+    Scripted.slept_ms = 0;
+    var throttled = Scripted{ .codes = &.{503} };
+    try std.testing.expectError(error.Scripted, retry(policy, &throttled, Scripted.attempt));
+    try std.testing.expectEqual(@as(usize, 1), throttled.calls);
+    try std.testing.expect(Scripted.slept_ms <= 100);
+
+    var again = Scripted{ .codes = &.{503} };
+    try std.testing.expectError(error.Scripted, retry(policy, &again, Scripted.attempt));
+    try std.testing.expectEqual(@as(usize, 1), again.calls);
+}
+
+/// A scripted HTTP/1.1 server for request-path tests: each connection gets the next
+/// reply, `null` resetting it unanswered; past the script every request gets a 418.
+/// Request lines are recorded so a test can check what was replayed.
+pub const FakeServer = struct {
+    listener: std.net.Server,
+    replies: []const ?[]const u8,
+    thread: std.Thread = undefined,
+    stopping: std.atomic.Value(bool) = .init(false),
+    count: std.atomic.Value(usize) = .init(0),
+    lines: [16][128]u8 = undefined,
+    lens: [16]usize = .{0} ** 16,
+
+    pub fn start(self: *FakeServer, replies: []const ?[]const u8) !void {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true }), .replies = replies };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    pub fn url(self: *FakeServer, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ self.listener.listen_address.getPort(), path });
+    }
+
+    /// A whole response: `status` like "503 Slow Down", `extra` header lines each
+    /// ending in CRLF.
+    pub fn reply(comptime status: []const u8, comptime extra: []const u8, comptime body: []const u8) []const u8 {
+        return std.fmt.comptimePrint("HTTP/1.1 {s}\r\n{s}content-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ status, extra, body.len, body });
+    }
+
+    pub fn requests(self: *FakeServer) usize {
+        return self.count.load(.seq_cst);
+    }
+
+    pub fn line(self: *FakeServer, i: usize) []const u8 {
+        return self.lines[i][0..self.lens[i]];
+    }
+
+    pub fn stop(self: *FakeServer) void {
+        self.stopping.store(true, .seq_cst);
+        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
+        self.thread.join();
+        self.listener.deinit();
+    }
+
+    fn serve(self: *FakeServer) void {
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const conn = self.listener.accept() catch return;
+            defer conn.stream.close();
+            if (self.stopping.load(.seq_cst)) return;
+            self.record(conn.stream) catch continue;
+            const next: ?[]const u8 = if (i < self.replies.len) self.replies[i] else reply("418 Unscripted", "", "");
+            if (next) |text| {
+                conn.stream.writeAll(text) catch {};
+            } else {
+                const linger = extern struct { onoff: c_int, secs: c_int }{ .onoff = 1, .secs = 0 };
+                std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
+            }
+        }
+    }
+
+    fn record(self: *FakeServer, stream: std.net.Stream) !void {
+        var head: [8192]u8 = undefined;
+        var n: usize = 0;
+        const end = while (true) {
+            if (std.mem.indexOf(u8, head[0..n], "\r\n\r\n")) |at| break at + 4;
+            if (n == head.len) return error.HeadTooLarge;
+            const got = try stream.read(head[n..]);
+            if (got == 0) return error.EndOfStream;
+            n += got;
+        };
+        var left = bodyLength(head[0..end]) -| (n - end);
+        var sink: [4096]u8 = undefined;
+        while (left > 0) {
+            const got = try stream.read(sink[0..@min(sink.len, left)]);
+            if (got == 0) return error.EndOfStream;
+            left -= got;
+        }
+        const first = head[0 .. std.mem.indexOf(u8, head[0..end], "\r\n") orelse 0];
+        const k = self.count.fetchAdd(1, .seq_cst);
+        if (k < self.lines.len) {
+            const len = @min(first.len, self.lines[k].len);
+            @memcpy(self.lines[k][0..len], first[0..len]);
+            self.lens[k] = len;
+        }
+    }
+
+    fn bodyLength(head: []const u8) usize {
+        var it = std.mem.splitSequence(u8, head, "\r\n");
+        while (it.next()) |h| {
+            const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(h[0..colon], "content-length")) continue;
+            return std.fmt.parseInt(usize, std.mem.trim(u8, h[colon + 1 ..], " "), 10) catch 0;
+        }
+        return 0;
+    }
+};
+
+test "exchange surfaces ETag, Retry-After and the body, and a reset is a transient failure" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var srv: FakeServer = undefined;
+    try srv.start(&.{
+        null,
+        FakeServer.reply("503 Slow Down", "Retry-After: 3\r\n", ""),
+        FakeServer.reply("200 OK", "ETag: \"abc\"\r\n", "hello"),
+    });
+    defer srv.stop();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    const url = try srv.url(a, "/k");
+
+    if (exchange(a, &client, .{ .method = .GET, .url = url })) |_| {
+        return error.TestExpectedError;
+    } else |e| try std.testing.expect(transient(e));
+    const busy = try exchange(a, &client, .{ .method = .GET, .url = url });
+    try std.testing.expectEqual(@as(u16, 503), busy.code);
+    try std.testing.expectEqual(@as(?u64, 3000), busy.retry_after_ms);
+    const ok = try exchange(a, &client, .{ .method = .PUT, .url = url, .payload = "body!" });
+    try std.testing.expectEqual(@as(u16, 200), ok.code);
+    try std.testing.expectEqualStrings("\"abc\"", ok.etag);
+    try std.testing.expectEqualStrings("hello", ok.body);
+    try std.testing.expectEqualStrings("PUT /k HTTP/1.1", srv.line(2));
 }
 
 test "listPages follows the continuation marker and stops on the page without one" {

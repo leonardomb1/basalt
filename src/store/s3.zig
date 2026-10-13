@@ -39,7 +39,6 @@
 //! the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
-const http_client = @import("../net/http_client.zig");
 const objstore = @import("objstore.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
@@ -60,6 +59,7 @@ pub const Error = error{
     S3AuthFailed,
     S3Throttled,
     S3EmptyPrefix,
+    S3UploadMissing,
 };
 
 pub const Obj = struct {
@@ -380,6 +380,7 @@ pub fn statusToError(code: u16, body: []const u8) Error {
         if (std.mem.eql(u8, e.code, "InvalidAccessKeyId")) return Error.S3AuthFailed;
         if (std.mem.eql(u8, e.code, "ExpiredToken")) return Error.S3AuthFailed;
         if (std.mem.eql(u8, e.code, "SlowDown")) return Error.S3Throttled;
+        if (std.mem.eql(u8, e.code, "NoSuchUpload")) return Error.S3UploadMissing;
     }
     return switch (code) {
         401, 403 => Error.S3AuthFailed,
@@ -422,6 +423,7 @@ const ListPage = struct {
     base_url: []const u8,
     host: []const u8,
     uri_path: []const u8,
+    sleep: objstore.Sleep = std.Thread.sleep,
 
     fn page(c: ListPage, token: []const u8) ![]const u8 {
         var q = std.array_list.Managed([]const u8).init(c.arena);
@@ -430,14 +432,6 @@ const ListPage = struct {
         try q.append("list-type=2");
         try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try uriEncode(c.arena, c.prefix, .encode_slash)}));
 
-        const hdrs = try signedHeaders(c.arena, c.creds, .{
-            .method = "GET",
-            .host = c.host,
-            .region = c.region,
-            .uri_path = c.uri_path,
-            .query = q.items,
-        });
-
         var url = std.array_list.Managed(u8).init(c.arena);
         try url.appendSlice(c.base_url);
         for (q.items, 0..) |s, i| {
@@ -445,17 +439,24 @@ const ListPage = struct {
             try url.appendSlice(s);
         }
 
-        var aw = std.Io.Writer.Allocating.init(c.arena);
-        const res = try c.client.fetch(.{
-            .method = .GET,
-            .location = .{ .url = url.items },
-            .extra_headers = hdrs,
-            .decompress_buffer = http_client.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        const body = aw.writer.buffered();
-        if (code != 200) return statusToError(code, body);
+        var body: []const u8 = "";
+        var prng = objstore.jitterPrng();
+        const Ctx = struct { c: ListPage, q: []const []const u8, url: []const u8, out: *[]const u8 };
+        try objstore.retry(.{ .rand = prng.random(), .sleep = c.sleep }, Ctx{ .c = c, .q = q.items, .url = url.items, .out = &body }, struct {
+            fn attempt(x: Ctx) !objstore.Verdict {
+                const hdrs = try signedHeaders(x.c.arena, x.c.creds, .{
+                    .method = "GET",
+                    .host = x.c.host,
+                    .region = x.c.region,
+                    .uri_path = x.c.uri_path,
+                    .query = x.q,
+                });
+                const r = try objstore.exchange(x.c.arena, x.c.client, .{ .method = .GET, .url = x.url, .headers = hdrs });
+                if (r.code != 200) return r.failed(statusToError(r.code, r.body));
+                x.out.* = r.body;
+                return .done;
+            }
+        }.attempt);
         return body;
     }
 };
@@ -513,6 +514,9 @@ pub const MultipartWriter = struct {
     last_error: []const u8 = "",
     last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
+    sleep: objstore.Sleep = std.Thread.sleep,
+    total: u64 = 0,
+    completing: bool = false,
 
     const vtable = std.Io.Writer.VTable{ .drain = objstore.drain(MultipartWriter) };
 
@@ -565,32 +569,26 @@ pub const MultipartWriter = struct {
                 const w = c.w;
                 const q = [_][]const u8{"uploads="};
                 const hdrs = try w.signed("POST", w.obj.uri_path, &q, empty_payload_hash, w.content_type);
-                var aw = std.Io.Writer.Allocating.init(w.arena);
-                const res = try w.client.fetch(.{
+                const r = try objstore.exchange(w.arena, w.client, .{
                     .method = .POST,
-                    .location = .{ .url = c.url },
-                    .extra_headers = hdrs,
-                    .headers = .{ .content_type = .{ .override = w.content_type } },
+                    .url = c.url,
+                    .headers = hdrs,
                     .payload = "",
-                    .decompress_buffer = http_client.decompress_direct,
-                    .response_writer = &aw.writer,
+                    .content_type = w.content_type,
                 });
-                const code = @intFromEnum(res.status);
-                const body = aw.writer.buffered();
-                if (code == 200) {
-                    const id = objstore.extractTag(body, "UploadId") orelse return w.failed(code, body);
+                if (r.code == 200) {
+                    const id = objstore.extractTag(r.body, "UploadId") orelse return w.failed(r);
                     w.upload_id = try w.arena.dupe(u8, id);
                     w.upload_id_enc = try uriEncode(w.arena, w.upload_id.?, .encode_slash);
                     return .done;
                 }
-                if (try w.createBucketIfMissing(code, body)) return .again;
-                return w.failed(code, body);
+                if (try w.createBucketIfMissing(r.code, r.body)) return .again;
+                return w.failed(r);
             }
         }.attempt);
     }
 
-    /// UploadPart over the lower-level request API, because the ETag that
-    /// CompleteMultipartUpload needs is a response header `Client.fetch` does not surface.
+    /// UploadPart; its response's ETag is what CompleteMultipartUpload lists.
     fn uploadPart(self: *MultipartWriter, bytes: []const u8) !void {
         try self.ensureUpload();
         const q = [_][]const u8{
@@ -609,7 +607,7 @@ pub const MultipartWriter = struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
                 const hdrs = try w.signed("PUT", w.obj.uri_path, c.q, c.ph, null);
-                const r = try w.putWithEtag(c.url, hdrs, c.bytes);
+                const r = try objstore.exchange(w.arena, w.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.bytes });
                 if (r.code == 200) {
                     if (r.etag.len == 0) {
                         w.last_error = "UploadPart response carried no ETag";
@@ -617,38 +615,12 @@ pub const MultipartWriter = struct {
                         return .{ .failed = .{ .code = r.code, .err = w.last_status.? } };
                     }
                     try w.etags.append(r.etag);
+                    w.total += c.bytes.len;
                     return .done;
                 }
-                return w.failed(r.code, r.body);
+                return w.failed(r);
             }
         }.attempt);
-    }
-
-    const PutResult = struct { code: u16, etag: []const u8, body: []const u8 };
-
-    /// The ETag is copied out before the body is read, which invalidates the head's strings.
-    fn putWithEtag(self: *MultipartWriter, url: []const u8, hdrs: []const std.http.Header, bytes: []const u8) !PutResult {
-        const uri = std.Uri.parse(url) catch return Error.S3BadUrl;
-        var req = try self.client.request(.PUT, uri, .{ .extra_headers = hdrs });
-        defer req.deinit();
-        req.transfer_encoding = .{ .content_length = bytes.len };
-        var body = try req.sendBodyUnflushed(&.{});
-        try body.writer.writeAll(bytes);
-        try body.end();
-        try req.connection.?.flush();
-
-        var redirect_buf: [1024]u8 = undefined;
-        var resp = try req.receiveHead(&redirect_buf);
-        const code = @intFromEnum(resp.head.status);
-        var etag: []const u8 = "";
-        var it = resp.head.iterateHeaders();
-        while (it.next()) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "etag")) etag = try self.arena.dupe(u8, h.value);
-        }
-        var aw = std.Io.Writer.Allocating.init(self.arena);
-        var tbuf: [4096]u8 = undefined;
-        _ = resp.reader(&tbuf).streamRemaining(&aw.writer) catch {};
-        return .{ .code = code, .etag = etag, .body = aw.writer.buffered() };
     }
 
     fn singlePut(self: *MultipartWriter, bytes: []const u8) !void {
@@ -658,31 +630,28 @@ pub const MultipartWriter = struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
                 const hdrs = try w.signed("PUT", w.obj.uri_path, &.{}, c.ph, w.content_type);
-                var aw = std.Io.Writer.Allocating.init(w.arena);
-                const res = try w.client.fetch(.{
+                const r = try objstore.exchange(w.arena, w.client, .{
                     .method = .PUT,
-                    .location = .{ .url = w.obj.url },
-                    .extra_headers = hdrs,
-                    .headers = .{ .content_type = .{ .override = w.content_type } },
+                    .url = w.obj.url,
+                    .headers = hdrs,
                     .payload = c.bytes,
-                    .decompress_buffer = http_client.decompress_direct,
-                    .response_writer = &aw.writer,
+                    .content_type = w.content_type,
                 });
-                const code = @intFromEnum(res.status);
-                const body = aw.writer.buffered();
-                if (code == 200) {
+                if (r.code == 200) {
                     w.last_status = null;
                     return .done;
                 }
-                if (try w.createBucketIfMissing(code, body)) return .again;
-                return w.failed(code, body);
+                if (try w.createBucketIfMissing(r.code, r.body)) return .again;
+                return w.failed(r);
             }
         }.attempt);
     }
 
     /// Commits the object: a single PUT when the buffer never filled, else the final
     /// part and CompleteMultipartUpload. A 200 carrying `<Error>` is documented S3
-    /// behaviour under internal faults and is retried as a failure.
+    /// behaviour under internal faults and is retried as a failure. A replay whose
+    /// predecessor's answer was lost may meet NoSuchUpload because that one
+    /// completed; it counts as done when the object is there (`landed`).
     pub fn finish(self: *MultipartWriter) !void {
         try self.interface.flush();
         if (self.upload_id == null) return self.singlePut(self.part_buf[0..self.part_len]);
@@ -706,26 +675,30 @@ pub const MultipartWriter = struct {
         try objstore.retry(self.policy(), ctx, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
+                const replay = w.completing;
+                w.completing = true;
                 const hdrs = try w.signed("POST", w.obj.uri_path, c.q, c.ph, null);
-                var aw = std.Io.Writer.Allocating.init(w.arena);
-                const res = try w.client.fetch(.{
-                    .method = .POST,
-                    .location = .{ .url = c.url },
-                    .extra_headers = hdrs,
-                    .payload = c.body,
-                    .decompress_buffer = http_client.decompress_direct,
-                    .response_writer = &aw.writer,
-                });
-                var code = @intFromEnum(res.status);
-                const resp = aw.writer.buffered();
-                if (code == 200 and std.mem.indexOf(u8, resp, "<Error>") != null) code = 500;
-                if (code == 200) {
+                var r = try objstore.exchange(w.arena, w.client, .{ .method = .POST, .url = c.url, .headers = hdrs, .payload = c.body });
+                if (r.code == 200 and std.mem.indexOf(u8, r.body, "<Error>") != null) r.code = 500;
+                const gone = statusToError(r.code, r.body) == Error.S3UploadMissing;
+                if (r.code == 200 or (replay and gone and try w.landed())) {
                     w.last_status = null;
                     return .done;
                 }
-                return w.failed(code, resp);
+                return w.failed(r);
             }
         }.attempt);
+    }
+
+    /// Whether the object a lost CompleteMultipartUpload answer was about exists:
+    /// HEAD finds the multipart ETag these parts make, or the uploaded size when a
+    /// part ETag is not a plain MD5 (SSE-KMS, SSE-C).
+    fn landed(self: *MultipartWriter) !bool {
+        const hdrs = try self.signed("HEAD", self.obj.uri_path, &.{}, empty_payload_hash, null);
+        const r = try objstore.exchange(self.arena, self.client, .{ .method = .HEAD, .url = self.obj.url, .headers = hdrs });
+        if (r.code != 200) return false;
+        if (try multipartEtag(self.arena, self.etags.items)) |want| return std.ascii.eqlIgnoreCase(r.etag, want);
+        return r.content_length == self.total;
     }
 
     /// Creates the bucket on the first NoSuchBucket so the caller can retry. False
@@ -750,17 +723,8 @@ pub const MultipartWriter = struct {
             );
         const ph = try payloadHash(self.arena, body);
         const hdrs = try self.signed("PUT", self.obj.bucket_uri_path, &.{}, ph, null);
-        var aw = std.Io.Writer.Allocating.init(self.arena);
-        const res = try self.client.fetch(.{
-            .method = .PUT,
-            .location = .{ .url = self.obj.bucket_url },
-            .extra_headers = hdrs,
-            .payload = body,
-            .decompress_buffer = http_client.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        const code = @intFromEnum(res.status);
-        if (code != 200 and code != 409) return self.fail(code, aw.writer.buffered());
+        const r = try objstore.exchange(self.arena, self.client, .{ .method = .PUT, .url = self.obj.bucket_url, .headers = hdrs, .payload = body });
+        if (r.code != 200 and r.code != 409) return self.fail(r.code, r.body);
     }
 
     fn signed(self: *MultipartWriter, method: []const u8, uri_path: []const u8, query: []const []const u8, payload_hash: []const u8, content_type: ?[]const u8) ![]const std.http.Header {
@@ -776,7 +740,7 @@ pub const MultipartWriter = struct {
     }
 
     fn policy(self: *MultipartWriter) objstore.Policy {
-        return .{ .rand = self.rand.random() };
+        return .{ .rand = self.rand.random(), .sleep = self.sleep };
     }
 
     fn fail(self: *MultipartWriter, code: u16, body: []const u8) Error {
@@ -785,10 +749,26 @@ pub const MultipartWriter = struct {
         return self.last_status.?;
     }
 
-    fn failed(self: *MultipartWriter, code: u16, body: []const u8) objstore.Verdict {
-        return .{ .failed = .{ .code = code, .err = self.fail(code, body) } };
+    fn failed(self: *MultipartWriter, r: objstore.Response) objstore.Verdict {
+        return r.failed(self.fail(r.code, r.body));
     }
 };
+
+/// S3's ETag for a completed multipart upload: the MD5 of the parts' binary MD5s,
+/// then `-<part count>`, quoted. Null when a part ETag is not a plain MD5.
+pub fn multipartEtag(arena: std.mem.Allocator, etags: []const []const u8) !?[]const u8 {
+    var md5 = std.crypto.hash.Md5.init(.{});
+    for (etags) |e| {
+        const hex = std.mem.trim(u8, e, "\"");
+        if (hex.len != 32) return null;
+        var raw: [16]u8 = undefined;
+        _ = std.fmt.hexToBytes(&raw, hex) catch return null;
+        md5.update(&raw);
+    }
+    var d: [16]u8 = undefined;
+    md5.final(&d);
+    return try std.fmt.allocPrint(arena, "\"{s}-{d}\"", .{ &std.fmt.bytesToHex(d, .lower), etags.len });
+}
 
 test "amzDate matches the reference instant from the S3 signing docs" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -978,6 +958,146 @@ test "completeBody lists parts in staging order, 1-based" {
             "</CompleteMultipartUpload>",
         body,
     );
+}
+
+var test_slept_ms: u64 = 0;
+
+fn testSleep(ns: u64) void {
+    test_slept_ms += ns / std.time.ns_per_ms;
+}
+
+fn testWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *objstore.FakeServer) !MultipartWriter {
+    return .{
+        .interface = .{ .vtable = &MultipartWriter.vtable, .buffer = &.{} },
+        .arena = a,
+        .client = client,
+        .obj = try parseUrl(a, "s3://lake/out.csv", try srv.url(a, "")),
+        .creds = .{ .access = example_access, .secret = example_secret },
+        .content_type = "text/csv",
+        .part_buf = &.{},
+        .upload_id = "up1",
+        .upload_id_enc = "up1",
+        .etags = std.array_list.Managed([]const u8).init(a),
+        .rand = std.Random.DefaultPrng.init(0),
+        .sleep = testSleep,
+    };
+}
+
+const reply = objstore.FakeServer.reply;
+const reply_reset: ?[]const u8 = null;
+const reply_no_upload = reply("404 Not Found", "", "<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>");
+
+test "a listing page that meets SlowDown is fetched again" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        reply("503 Slow Down", "", "<Error><Code>SlowDown</Code></Error>"),
+        reply("200 OK", "", "<ListBucketResult><Contents><Key>p/a.csv</Key></Contents></ListBucketResult>"),
+    });
+    defer srv.stop();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+
+    const base = try bucketBase(a, "lake", default_region, try srv.url(a, ""));
+    const ctx = ListPage{
+        .arena = a,
+        .client = &client,
+        .creds = .{ .access = example_access, .secret = example_secret },
+        .region = default_region,
+        .prefix = "p/",
+        .base_url = base.url,
+        .host = base.host,
+        .uri_path = base.uri_path,
+        .sleep = testSleep,
+    };
+    const keys = try objstore.listPages(a, .{ .item_tag = "Key", .next_tag = "NextContinuationToken" }, ctx, ListPage.page);
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("p/a.csv", keys[0]);
+    try std.testing.expectEqual(@as(usize, 2), srv.requests());
+}
+
+test "an upload part is re-put under its part number after a reset and a 502; a 403 is not retried" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    {
+        var srv: objstore.FakeServer = undefined;
+        try srv.start(&.{
+            reply_reset,
+            reply("502 Bad Gateway", "", ""),
+            reply("200 OK", "ETag: \"e1\"\r\n", ""),
+        });
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        try w.uploadPart("hello");
+        try std.testing.expectEqual(@as(usize, 1), w.etags.items.len);
+        try std.testing.expectEqualStrings("\"e1\"", w.etags.items[0]);
+        try std.testing.expectEqual(@as(u64, 5), w.total);
+        try std.testing.expectEqual(@as(usize, 3), srv.requests());
+        try std.testing.expect(std.mem.indexOf(u8, srv.line(0), "partNumber=1&uploadId=up1") != null);
+        try std.testing.expectEqualStrings(srv.line(0), srv.line(2));
+    }
+    {
+        var srv: objstore.FakeServer = undefined;
+        try srv.start(&.{
+            reply("403 Forbidden", "", "<Error><Code>AccessDenied</Code></Error>"),
+        });
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        try std.testing.expectError(Error.S3AuthFailed, w.uploadPart("hello"));
+        try std.testing.expectEqual(@as(usize, 1), srv.requests());
+    }
+}
+
+test "a complete whose answer was lost counts as done only when the object it made is there" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    const part = "\"9dd4e461268c8034f5c8564e155c67a6\"";
+    const etag = (try multipartEtag(a, &.{part})).?;
+    const head_ok = try std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\nETag: {s}\r\ncontent-length: 1\r\nconnection: close\r\n\r\n", .{etag});
+    const head_other = "HTTP/1.1 200 OK\r\nETag: \"0123456789abcdef0123456789abcdef-1\"\r\ncontent-length: 1\r\nconnection: close\r\n\r\n";
+    const head_missing = reply("404 Not Found", "", "");
+
+    const Case = struct { replies: []const ?[]const u8, ok: bool, requests: usize };
+    const cases = [_]Case{
+        .{ .replies = &.{ reply_reset, reply_no_upload, head_ok }, .ok = true, .requests = 3 },
+        .{ .replies = &.{ reply_reset, reply_no_upload, head_missing }, .ok = false, .requests = 3 },
+        .{ .replies = &.{ reply_reset, reply_no_upload, head_other }, .ok = false, .requests = 3 },
+        .{ .replies = &.{reply_no_upload}, .ok = false, .requests = 1 },
+    };
+    for (cases) |c| {
+        var srv: objstore.FakeServer = undefined;
+        try srv.start(c.replies);
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        try w.etags.append(part);
+        if (c.ok) try w.finish() else try std.testing.expectError(Error.S3UploadMissing, w.finish());
+        try std.testing.expectEqual(c.requests, srv.requests());
+        try std.testing.expect(std.mem.startsWith(u8, srv.line(0), "POST /lake/out.csv?uploadId=up1 "));
+        if (c.requests == 3) try std.testing.expect(std.mem.startsWith(u8, srv.line(2), "HEAD /lake/out.csv "));
+    }
+}
+
+test "multipartEtag is the MD5 of the binary part MD5s plus the part count" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var raw: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(raw[0..16], "9dd4e461268c8034f5c8564e155c67a6");
+    _ = try std.fmt.hexToBytes(raw[16..], "d41d8cd98f00b204e9800998ecf8427e");
+    var d: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(&raw, &d, .{});
+    const want = try std.fmt.allocPrint(a, "\"{s}-2\"", .{&std.fmt.bytesToHex(d, .lower)});
+    const got = (try multipartEtag(a, &.{ "\"9dd4e461268c8034f5c8564e155c67a6\"", "\"D41D8CD98F00B204E9800998ECF8427E\"" })).?;
+    try std.testing.expectEqualStrings(want, got);
+    try std.testing.expect((try multipartEtag(a, &.{"\"kms-opaque-etag\""})) == null);
 }
 
 pub const provider = objstore.Provider{

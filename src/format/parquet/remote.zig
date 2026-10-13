@@ -90,6 +90,7 @@ pub const Remote = struct {
     total: u64,
     whole: ?[]const u8 = null,
     repaired: bool = false,
+    sleep: objstore.Sleep = std.Thread.sleep,
 
     /// Sizes the object by HEAD; without a length it fetches the whole object once.
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
@@ -105,7 +106,8 @@ pub const Remote = struct {
 
         if (self.contentLength(arena)) |n| {
             self.total = n;
-        } else |_| {
+        } else |e| {
+            if (objstore.transient(e)) return e;
             const body = try self.fetchWhole(arena);
             self.whole = body;
             self.total = body.len;
@@ -145,41 +147,51 @@ pub const Remote = struct {
         return res.body;
     }
 
-    const Resp = struct { code: u16, body: []const u8 };
-
-    /// A TLS retry gets its own buffer, so a failed attempt's partial response is
-    /// not prepended to the retry's body.
+    /// A failed TLS handshake is retried once after repairing the CA bundle.
     fn send(
         self: *Remote,
         arena: std.mem.Allocator,
         method: std.http.Method,
         range_hdr: []const u8,
-    ) !Resp {
-        const extra = try self.headers(arena, method, range_hdr);
-        return self.once(arena, method, extra) catch |e| switch (e) {
+    ) !objstore.Response {
+        return self.retrying(arena, method, range_hdr) catch |e| switch (e) {
             error.TlsInitializationFailed => {
                 if (!self.repair()) return e;
-                return self.once(arena, method, extra);
+                return self.retrying(arena, method, range_hdr);
             },
             else => e,
         };
     }
 
-    fn once(
+    /// Replays a transport failure or transient status under the object-store retry
+    /// policy, signing each attempt afresh; any other status is the caller's to read.
+    /// Each attempt has its own buffer, so a failed one's partial body is never
+    /// prepended to the next.
+    fn retrying(
         self: *Remote,
         arena: std.mem.Allocator,
         method: std.http.Method,
-        extra: []const std.http.Header,
-    ) !Resp {
-        var aw = std.Io.Writer.Allocating.init(arena);
-        const res = try self.client.fetch(.{
+        range_hdr: []const u8,
+    ) !objstore.Response {
+        var out: objstore.Response = undefined;
+        var prng = objstore.jitterPrng();
+        const Ctx = struct { r: *Remote, arena: std.mem.Allocator, method: std.http.Method, range_hdr: []const u8, out: *objstore.Response };
+        try objstore.retry(.{ .rand = prng.random(), .sleep = self.sleep }, Ctx{
+            .r = self,
+            .arena = arena,
             .method = method,
-            .location = .{ .url = self.url },
-            .extra_headers = extra,
-            .decompress_buffer = http_client.decompress_direct,
-            .response_writer = &aw.writer,
-        });
-        return .{ .code = @intFromEnum(res.status), .body = aw.writer.buffered() };
+            .range_hdr = range_hdr,
+            .out = &out,
+        }, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const extra = try c.r.headers(c.arena, c.method, c.range_hdr);
+                const resp = try objstore.exchange(c.arena, c.r.client, .{ .method = c.method, .url = c.r.url, .headers = extra });
+                c.out.* = resp;
+                if (objstore.retriable(resp.code)) return resp.failed(c.r.statusError(resp.code, resp.body));
+                return .done;
+            }
+        }.attempt);
+        return out;
     }
 
     pub fn headers(
@@ -197,15 +209,9 @@ pub const Remote = struct {
     }
 
     fn contentLength(self: *Remote, arena: std.mem.Allocator) !u64 {
-        const extra = try self.headers(arena, .HEAD, "");
-        const uri = std.Uri.parse(self.url) catch return error.InvalidUrl;
-        var req = try self.client.request(.HEAD, uri, .{ .extra_headers = extra });
-        defer req.deinit();
-        try req.sendBodiless();
-        var redirect_buf: [8 * 1024]u8 = undefined;
-        const resp = try req.receiveHead(&redirect_buf);
-        if (@intFromEnum(resp.head.status) != 200) return error.HeadUnsupported;
-        return resp.head.content_length orelse error.HeadUnsupported;
+        const r = try self.send(arena, .HEAD, "");
+        if (r.code != 200) return error.HeadUnsupported;
+        return r.content_length orelse error.HeadUnsupported;
     }
 
     pub fn statusError(self: *Remote, code: u16, body: []const u8) anyerror {
@@ -250,4 +256,29 @@ test "a remote whole-body read refuses to slice past the body it was given" {
     try testing.expectEqualStrings("234", try r.read(a, 2, 3));
     try testing.expectError(Error.CorruptParquetPage, r.read(a, 99992, 8));
     try testing.expectError(Error.CorruptParquetPage, r.read(a, 8, 5));
+}
+
+fn noSleep(_: u64) void {}
+
+test "a ranged read replays a 503, a reset and a 504 before the 206" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = objstore.FakeServer.reply;
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        reply("503 Service Unavailable", "", ""),
+        null,
+        reply("504 Gateway Timeout", "", ""),
+        reply("206 Partial Content", "content-range: bytes 2-5/100\r\n", "2345"),
+        reply("404 Not Found", "", ""),
+    });
+    defer srv.stop();
+    var client = std.http.Client{ .allocator = testing.allocator };
+    defer client.deinit();
+    var r = Remote{ .arena = a, .client = &client, .url = try srv.url(a, "/x.parquet"), .total = 100, .sleep = noSleep };
+    try testing.expectEqualStrings("2345", try r.read(a, 2, 4));
+    try testing.expectEqual(@as(usize, 4), srv.requests());
+    try testing.expectError(error.HttpNotFound, r.read(a, 2, 4));
+    try testing.expectEqual(@as(usize, 5), srv.requests());
 }
