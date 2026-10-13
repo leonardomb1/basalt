@@ -25,6 +25,7 @@
 //! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
+const objstore = @import("objstore.zig");
 const ssh = @import("../net/ssh.zig");
 
 pub const Error = error{
@@ -745,12 +746,12 @@ pub const Upload = struct {
             .handle = handle,
             .path = t.path,
             .part = part,
-            .interface = .{ .buffer = try arena.alloc(u8, 1 << 20), .vtable = &.{ .drain = drainFn } },
+            .interface = .{ .buffer = try arena.alloc(u8, 1 << 20), .vtable = &.{ .drain = objstore.drain(Upload) } },
         };
         return self;
     }
 
-    fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
+    pub fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
         if (bytes.len == 0) return 0;
         self.client.writeRange(self.handle, self.at, bytes) catch |e| {
             self.last_status = e;
@@ -759,16 +760,6 @@ pub const Upload = struct {
         };
         self.at += bytes.len;
         return bytes.len;
-    }
-
-    fn drainFn(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Upload = @fieldParentPtr("interface", w);
-        var total: usize = 0;
-        total += try self.put(w.buffered());
-        for (data[0 .. data.len - 1]) |d| total += try self.put(d);
-        const last = data[data.len - 1];
-        for (0..splat) |_| total += try self.put(last);
-        return w.consume(total);
     }
 
     pub fn finish(self: *Upload) !void {
