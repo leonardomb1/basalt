@@ -1417,6 +1417,15 @@ test "spill: a LIMIT over a spilled sort, join, GROUP BY or DISTINCT gives its d
     }
 }
 
+test "count: a float column past the int range is counted, not converted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const got = try runToString(alloc, &tmp, "k,f\n1,1e300\n2,\n3,-1e300\n", "SELECT COUNT(f) AS n, COUNT(*) AS a FROM '$IN'");
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("n,a\n2,3\n", got);
+}
+
 test "distinct: the single int-key path keeps first occurrences, null included once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

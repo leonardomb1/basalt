@@ -157,7 +157,9 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
         const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| return inAggregate(self, err);
         if (fused) |f| return Partial{ .nvalid = f.nvalid, .sum_i = f.sum };
     }
-    const col = eval.evalColumn(arena, e, b, agg.ty) catch |err| return inAggregate(self, err);
+    var want = agg.ty;
+    if (agg.func == .count) want.unknown = true;
+    const col = eval.evalColumn(arena, e, b, want) catch |err| return inAggregate(self, err);
     const n = b.len;
     if (col.ty.kind == .decimal) return switch (agg.func) {
         .count => Partial{ .nvalid = simd.popcountValid(col.validity.bits, n) },
