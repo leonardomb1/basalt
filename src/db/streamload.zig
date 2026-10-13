@@ -49,6 +49,7 @@ const Space = @import("../exec/space.zig").Space;
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
 const RETRY_BUDGET_NS = (TIMEOUT_S + 120) * std.time.ns_per_s;
+const UNBEGUN_BUDGET_NS = 180 * std.time.ns_per_s;
 const REPLAY_CHUNK = 1 << 20;
 
 pub const Flavor = enum {
@@ -216,6 +217,8 @@ pub const StreamLoadSink = struct {
     send_ns: u64 = 0,
     wait_ns: u64 = 0,
     sent_bytes: u64 = 0,
+    why: [256]u8 = undefined,
+    why_len: usize = 0,
 
     const Txn = struct {
         req: std.http.Client.Request,
@@ -507,7 +510,11 @@ pub const StreamLoadSink = struct {
             switch (out) {
                 .ok => break,
                 .fail => return error.StreamLoadFailed,
-                .resend, .wait => {
+                .resend, .wait, .unbegun => {
+                    if (out == .unbegun and (try std.time.Instant.now()).since(t0) + delay > UNBEGUN_BUDGET_NS) {
+                        if (self.errctx) |ec| ec.set("stream load failed: {s}", .{self.why[0..self.why_len]});
+                        return error.StreamLoadFailed;
+                    }
                     self.broken = true;
                     if (self.spool == null) return error.StreamLoadUnreplayable;
                     if (driver.aborting()) return error.Aborted;
@@ -592,7 +599,12 @@ pub const StreamLoadSink = struct {
                         ec.set("stream load failed: {s}", .{why});
                 }
             },
-            .resend, .wait => obs.logOr(self.logger, .warn, "stream load {s} #{d} not settled (http {d}): {s}", .{ self.table, self.seq, @intFromEnum(res.head.status), body }),
+            .resend, .wait, .unbegun => {
+                const why = jsonField(body, "Message") orelse "";
+                self.why_len = @min(why.len, self.why.len);
+                @memcpy(self.why[0..self.why_len], why[0..self.why_len]);
+                obs.logOr(self.logger, .warn, "stream load {s} #{d} not settled (http {d}): {s}", .{ self.table, self.seq, @intFromEnum(res.head.status), body });
+            },
         }
         return out;
     }
@@ -657,17 +669,22 @@ test "jsonField pulls the reason out of a StarRocks failure body" {
     try std.testing.expect(jsonField("{\"Status\": 7}", "Status") == null);
 }
 
-const Outcome = enum { ok, fail, resend, wait };
+const Outcome = enum { ok, fail, resend, wait, unbegun };
 
 /// What a stream load response settles, from its `Status` (and, for a reused
 /// label, `ExistingJobStatus`): `ok` once the data is committed — a publish
 /// timeout included, which must never be resent — `fail` for a definite
 /// refusal, `wait` while the label's earlier transaction is still open,
 /// `resend` when it was aborted (a failed label may be reused) or the answer is
-/// not a stream load response at all, as from a server still starting.
+/// not a stream load response at all, and `unbegun` for a failure before any
+/// transaction began (`TxnId` -1, no rows read), as from a BE that cannot reach
+/// its FE while restarting: resent for a while, then a failure.
 fn classify(body: []const u8) Outcome {
     const status = jsonField(body, "Status") orelse return .resend;
     if (eqlAnyIgnoreCase(status, &.{ "Success", "Publish Timeout" })) return .ok;
+    if (std.ascii.eqlIgnoreCase(status, "Fail")) {
+        return if (jsonValueAt(body, "TxnId") != null and jsonInt(body, "TxnId") == -1 and jsonInt(body, "NumberTotalRows") == 0) .unbegun else .fail;
+    }
     if (!std.ascii.eqlIgnoreCase(status, "Label Already Exists")) return .fail;
     const existing = jsonField(body, "ExistingJobStatus") orelse return .wait;
     if (eqlAnyIgnoreCase(existing, &.{ "FINISHED", "VISIBLE", "COMMITTED" })) return .ok;
@@ -685,6 +702,8 @@ test "classify settles on the parsed Status, not on words anywhere in the body" 
     try std.testing.expectEqual(Outcome.ok, classify("{\"Status\": \"Publish Timeout\"}"));
     try std.testing.expectEqual(Outcome.fail, classify("{\"Status\": \"Fail\", \"Message\": \"too many filtered rows\", \"ErrorURL\": \"http://x/Success\"}"));
     try std.testing.expectEqual(Outcome.fail, classify("{\"Status\": \"Fail\", \"Message\": \"Label Already Exists elsewhere: Success\"}"));
+    try std.testing.expectEqual(Outcome.unbegun, classify("{\"TxnId\": -1, \"Status\": \"Fail\", \"Message\": \"Couldn't open transport for :0\", \"NumberTotalRows\": 0}"));
+    try std.testing.expectEqual(Outcome.fail, classify("{\"TxnId\": 9, \"Status\": \"Fail\", \"Message\": \"too many filtered rows\", \"NumberTotalRows\": 3}"));
     try std.testing.expectEqual(Outcome.resend, classify(""));
     try std.testing.expectEqual(Outcome.resend, classify("<html>503 Service Unavailable</html>"));
 }
