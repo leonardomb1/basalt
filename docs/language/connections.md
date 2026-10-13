@@ -17,7 +17,7 @@ The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
   Windows authentication, `domain realm kdc spn` (below).
 - `starrocks` and `doris`: `fe_host`/`host`, `fe_port`/`port`, `user`
   `password`, a required `database`, and for loading `be_url` (also `load_url`)
-  `buckets replication_num auto_create label_prefix load_size`.
+  `buckets replication_num auto_create label_prefix load_size compression`.
 - `http`, `sftp`, `smb` and `ftp` have pages of their own: [HTTP APIs](../connectors/http.md),
   [SFTP](../connectors/sftp.md), [SMB file shares](../connectors/smb.md) and
   [FTP](../connectors/ftp.md); the

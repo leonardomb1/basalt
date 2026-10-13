@@ -47,6 +47,7 @@ const sql = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
 const Space = @import("../exec/space.zig").Space;
+const deflate = @import("../format/deflate.zig");
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
@@ -90,7 +91,26 @@ pub const Flavor = enum {
     fn strict(self: Flavor) bool {
         return self == .doris;
     }
+
+    /// The `format` header's value: StarRocks names a compressed CSV body by its
+    /// codec, Doris keeps `csv` and says `compress_type` (`formatExtra`).
+    fn format(self: Flavor, c: Compression) []const u8 {
+        return switch (c) {
+            .none => "CSV",
+            .gzip => switch (self) {
+                .starrocks => "gzip",
+                .doris => "csv",
+            },
+        };
+    }
+
+    fn formatExtra(self: Flavor, c: Compression) ?std.http.Header {
+        if (c == .gzip and self == .doris) return .{ .name = "compress_type", .value = "gz" };
+        return null;
+    }
 };
+
+pub const Compression = enum { none, gzip };
 
 pub const Config = struct {
     flavor: Flavor = .starrocks,
@@ -106,6 +126,7 @@ pub const Config = struct {
     label_prefix: []const u8 = "basalt",
     run_id: u64 = 0,
     load_size: u64 = 128 << 20,
+    compression: Compression = .none,
     space: ?Space = null,
     errctx: ?*op.ErrCtx = null,
 };
@@ -251,6 +272,10 @@ pub const StreamLoadSink = struct {
     headers: std.array_list.Managed(std.http.Header),
     txn: ?Txn = null,
     txn_bytes: u64 = 0,
+    body_bytes: u64 = 0,
+    z: ?*deflate.Deflate = null,
+    tee: std.Io.Writer = .failing,
+    tee_err: ?anyerror = null,
     txn_started: std.time.Instant,
     broken: bool = false,
     spool: ?Space.File = null,
@@ -296,6 +321,13 @@ pub const StreamLoadSink = struct {
         errdefer self.client.deinit();
         errdefer self.freeRequestParts();
         try self.buildRequestParts();
+        if (cfg.compression == .gzip) {
+            self.tee = .{ .buffer = try gpa.alloc(u8, 256 << 10), .vtable = &.{ .drain = teeDrain } };
+            errdefer gpa.free(self.tee.buffer);
+            self.z = try deflate.Deflate.init(gpa, &self.tee, .{ .level = .fast });
+            self.tee.end = 0;
+        }
+        errdefer self.freeGzip();
         if (cfg.auto_create) {
             if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
                 if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
@@ -333,7 +365,8 @@ pub const StreamLoadSink = struct {
         const h = &self.headers;
         try h.append(.{ .name = "Authorization", .value = self.auth });
         try h.append(.{ .name = "label", .value = "" });
-        try h.append(.{ .name = "format", .value = "CSV" });
+        try h.append(.{ .name = "format", .value = self.cfg.flavor.format(self.cfg.compression) });
+        if (self.cfg.flavor.formatExtra(self.cfg.compression)) |x| try h.append(x);
         try h.append(.{ .name = "column_separator", .value = "\\x01" });
         try h.append(.{ .name = self.cfg.flavor.rowDelimiterHeader(), .value = "\\x02" });
         try h.append(.{ .name = "columns", .value = self.columns });
@@ -342,6 +375,14 @@ pub const StreamLoadSink = struct {
         if (self.cfg.flavor.strict()) try h.append(.{ .name = "strict_mode", .value = "true" });
         if (self.mode == .upsert and self.mode.upsert.partial != null) {
             try h.append(.{ .name = self.cfg.flavor.partialHeader(), .value = "true" });
+        }
+    }
+
+    fn freeGzip(self: *StreamLoadSink) void {
+        if (self.z) |z| {
+            z.deinit(self.gpa);
+            self.gpa.free(self.tee.buffer);
+            self.z = null;
         }
     }
 
@@ -395,7 +436,9 @@ pub const StreamLoadSink = struct {
     /// transaction as one chunk, then commits when the transaction reaches
     /// `load_size` or has been open half its timeout. A connection lost mid-stream
     /// only marks the transaction broken: later batches go to the spool alone and
-    /// the commit replays it.
+    /// the commit replays it. With gzip the batch goes through the compressor,
+    /// whose output reaches the spool and the socket by `tee`; `load_size` still
+    /// counts the uncompressed body.
     pub fn writeBatch(self: *StreamLoadSink, _: std.mem.Allocator, batch: Batch) !void {
         const t0 = try std.time.Instant.now();
         self.buffer.clearRetainingCapacity();
@@ -410,10 +453,12 @@ pub const StreamLoadSink = struct {
             self.label = "";
             self.label = try genLabel(self.gpa, self.cfg.label_prefix, self.table, self.run_id, self.seq);
             self.headers.items[1].value = self.label;
+            if (self.z) |z| z.reset() catch return self.teeErr();
         }
-        try self.spoolWrite(bytes);
         self.txn_bytes += bytes.len;
-        if (!self.broken) self.send(bytes) catch |e| try self.sendFailed(e);
+        if (self.z) |z| {
+            z.interface.writeAll(bytes) catch return self.teeErr();
+        } else try self.push(bytes);
         const age = (try std.time.Instant.now()).since(self.txn_started);
         if (self.txn_bytes >= self.cfg.load_size or age >= MAX_AGE_NS) try self.commit();
     }
@@ -446,13 +491,54 @@ pub const StreamLoadSink = struct {
             sp.file.close();
             std.fs.cwd().deleteFile(sp.path) catch {};
             self.gpa.free(sp.path);
-            if (self.cfg.space) |space| space.release(self.txn_bytes);
+            if (self.cfg.space) |space| space.release(self.body_bytes);
         }
+        self.freeGzip();
         self.buffer.deinit();
         self.freeRequestParts();
         self.gpa.free(self.columns);
         self.gpa.free(self.cfg.label_prefix);
         self.gpa.destroy(self);
+    }
+
+    /// Body bytes as sent: to the spool, then into the open transaction unless
+    /// it is broken.
+    fn push(self: *StreamLoadSink, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.spoolWrite(bytes);
+        self.body_bytes += bytes.len;
+        if (!self.broken) self.send(bytes) catch |e| try self.sendFailed(e);
+    }
+
+    /// The compressor's output, pushed; `push`'s error is kept for `teeErr`,
+    /// since a writer can only fail with `WriteFailed`.
+    fn teeDrain(w: *std.Io.Writer, chunks: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *StreamLoadSink = @fieldParentPtr("tee", w);
+        self.teePush(w.buffered()) catch return error.WriteFailed;
+        _ = w.consumeAll();
+        var total: usize = 0;
+        for (chunks[0 .. chunks.len - 1]) |c| {
+            self.teePush(c) catch return error.WriteFailed;
+            total += c.len;
+        }
+        const last = chunks[chunks.len - 1];
+        for (0..splat) |_| {
+            self.teePush(last) catch return error.WriteFailed;
+            total += last.len;
+        }
+        return total;
+    }
+
+    fn teePush(self: *StreamLoadSink, bytes: []const u8) !void {
+        self.push(bytes) catch |e| {
+            self.tee_err = e;
+            return e;
+        };
+    }
+
+    fn teeErr(self: *StreamLoadSink) anyerror {
+        defer self.tee_err = null;
+        return self.tee_err orelse error.WriteFailed;
     }
 
     fn spoolWrite(self: *StreamLoadSink, bytes: []const u8) !void {
@@ -468,7 +554,7 @@ pub const StreamLoadSink = struct {
         const sp = self.spool orelse return;
         try sp.file.setEndPos(0);
         try sp.file.seekTo(0);
-        if (self.cfg.space) |space| space.release(self.txn_bytes);
+        if (self.cfg.space) |space| space.release(self.body_bytes);
     }
 
     /// Opens the transaction's request: chunked, one connection of its own, with
@@ -542,6 +628,10 @@ pub const StreamLoadSink = struct {
     /// gives an answer that settles it or the retry budget is spent.
     fn commit(self: *StreamLoadSink) !void {
         if (self.txn_bytes == 0) return;
+        if (self.z) |z| if (!z.done) {
+            z.finish() catch return self.teeErr();
+            self.tee.flush() catch return self.teeErr();
+        };
         const t0 = try std.time.Instant.now();
         defer self.wait_ns += (std.time.Instant.now() catch t0).since(t0);
         var delay: u64 = std.time.ns_per_s;
@@ -571,9 +661,10 @@ pub const StreamLoadSink = struct {
                 },
             }
         }
-        self.sent_bytes += self.txn_bytes;
+        self.sent_bytes += self.body_bytes;
         try self.spoolReset();
         self.txn_bytes = 0;
+        self.body_bytes = 0;
         self.broken = false;
     }
 
@@ -601,7 +692,7 @@ pub const StreamLoadSink = struct {
         try self.buffer.resize(REPLAY_CHUNK);
         defer self.buffer.clearRetainingCapacity();
         const body = &self.txn.?.body;
-        var left = self.txn_bytes;
+        var left = self.body_bytes;
         while (left > 0) {
             const n = try sp.file.read(self.buffer.items[0..@min(left, REPLAY_CHUNK)]);
             if (n == 0) return error.StreamLoadSpoolShort;
@@ -1022,4 +1113,16 @@ test "stream-load body matches the per-value text path over random batches of ev
     var got = std.array_list.Managed(u8).init(a);
     try appendBatchTsv(&got, batch);
     try std.testing.expectEqualStrings(want.items, got.items);
+}
+
+test "a gzip body is announced as each flavor spells it" {
+    try std.testing.expectEqualStrings("CSV", Flavor.starrocks.format(.none));
+    try std.testing.expectEqualStrings("CSV", Flavor.doris.format(.none));
+    try std.testing.expect(Flavor.starrocks.formatExtra(.none) == null and Flavor.doris.formatExtra(.none) == null);
+    try std.testing.expectEqualStrings("gzip", Flavor.starrocks.format(.gzip));
+    try std.testing.expect(Flavor.starrocks.formatExtra(.gzip) == null);
+    try std.testing.expectEqualStrings("csv", Flavor.doris.format(.gzip));
+    const x = Flavor.doris.formatExtra(.gzip).?;
+    try std.testing.expectEqualStrings("compress_type", x.name);
+    try std.testing.expectEqualStrings("gz", x.value);
 }

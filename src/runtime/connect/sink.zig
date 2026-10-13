@@ -286,6 +286,10 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
             const txt = try evalCfgStr(env, attr.value);
             cfg.load_size = env_mod.parseByteSize(txt) orelse 0;
             if (cfg.load_size == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`load_size` must be a positive size like '128MB', not '{s}'", .{txt}));
+        } else if (std.mem.eql(u8, k, "compression")) {
+            const txt = try evalCfgStr(env, attr.value);
+            cfg.compression = std.meta.stringToEnum(streamload.Compression, txt) orelse
+                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`compression` must be 'none' or 'gzip', not '{s}'", .{txt}));
         }
     }
     if (cfg.database.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} connection needs a `database`", .{flavor.name()}));

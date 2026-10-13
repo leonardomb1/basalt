@@ -32,6 +32,13 @@ along the way — the server restarting, say — resends it under the same label
 instead of failing the load. A load the server refuses is not resent: the run
 fails with the server's message.
 
+`compression = 'gzip'` (the default is `'none'`) sends each transaction's body
+as one gzip stream, compressed on the fly at a fast level — about 2.5x smaller
+on typical rows, at well over 100 MB/s per lane — for a link slower than the
+lane. `load_size` still counts the body before compression, so a transaction
+holds the same rows either way; the spool keeps the compressed bytes, and a
+resend replays them unchanged.
+
 ## Doris
 
 A `doris` connection is the same in every respect — Doris is the project
