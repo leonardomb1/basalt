@@ -815,8 +815,8 @@ pub const Upload = struct {
     }
 };
 
-/// The regular files under `url` (ending in `/`), subfolders included but not those
-/// starting `_` or `.`, sorted by name since a server lists in whatever order it keeps.
+/// The regular files under `url` (ending in `/`) as `/`-separated paths relative to
+/// it, subfolders included but not those starting `_` or `.`, in server order.
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
     const t = try resolve(arena, url);
     const c = checkout(t.cfg) catch |e| {
@@ -844,15 +844,7 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
         }
         if (names.items.len > 1_000_000) return error.FolderTooLarge;
     }
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
-    const base = url[0 .. url.len - (if (std.mem.endsWith(u8, url, "/")) @as(usize, 1) else 0)];
-    const out = try arena.alloc([]const u8, names.items.len);
-    for (names.items, out) |n, *o| o.* = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, n });
-    return out;
+    return names.items;
 }
 
 /// A file or directory error keeps the session usable; a transport error does not.
@@ -914,7 +906,7 @@ test "live: upload, list, read back whole, by range and streaming; an aborted up
     const names = try listPrefix(a, "sftp://probe/~/t/");
     try std.testing.expect(names.len >= 1);
     var found = false;
-    for (names) |n| found = found or std.mem.endsWith(u8, n, "/big.bin");
+    for (names) |n| found = found or std.mem.eql(u8, n, "big.bin");
     try std.testing.expect(found);
 
     const f = try File.open(a, "sftp://probe/~/t/big.bin");
