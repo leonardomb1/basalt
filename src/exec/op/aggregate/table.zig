@@ -70,12 +70,13 @@ pub const Fast = enum {
     sum_f_of_i64,
     generic,
 
-    pub fn of(slot: Slot, agg: Agg, col: ?column.Column, n: usize) Fast {
+    pub fn of(slot: Slot, col: ?column.Column, n: usize) Fast {
         const c = col orelse return if (slot == .count) .count_star else .generic;
         if (!c.validity.allSet(n)) return .generic;
         return switch (slot) {
             .count => .count_all_valid,
-            .sum_i => if (agg.ty.kind != .decimal and c.ty.kind == .int) .sum_i64 else .generic,
+            .sum_i => if (c.ty.kind == .int) .sum_i64 else .generic,
+            .sum_d => .generic,
             .sum_f => switch (c.ty.kind) {
                 .float => .sum_f64,
                 .int => .sum_f_of_i64,

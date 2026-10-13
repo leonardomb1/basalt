@@ -81,6 +81,14 @@ pub fn fitsPrecision(u: i128, p: u8) bool {
 
 pub const max_digits = 38;
 
+/// A DECIMAL SUM's wide total as a 38-digit decimal at `scale`, null past 38 digits.
+/// Sums add in i256 and only the total is range-checked, as PostgreSQL's NUMERIC
+/// sum is exact, so no batch split or row order can fail a sum that fits.
+pub fn wideSumDecimal(total: i256, scale: u8) ?Decimal {
+    const u = std.math.cast(i128, total) orelse return null;
+    return if (fitsPrecision(u, max_digits)) .{ .unscaled = u, .scale = scale } else null;
+}
+
 /// Text as an INT: an optional sign and digits, nothing else (callers trim).
 /// `std.fmt.parseInt` alone also takes `_` separators, so `'1_000'` read as 1000.
 pub fn parseIntStrict(s: []const u8) ?i64 {

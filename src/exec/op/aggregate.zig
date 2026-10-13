@@ -69,7 +69,7 @@ pub const Aggregate = struct {
 
     pub const Acc = struct {
         n: i64 = 0,
-        sum_i: i128 align(8) = 0,
+        sum_i: i256 align(8) = 0,
         sum_f: f64 = 0,
         ext: Value = .null,
         seen: ?*DistinctSet() = null,
@@ -480,7 +480,47 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     const big_aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = types.Type.decimal(38, 0) }};
     var over = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &big_schema, .by = &.{}, .aggs = &big_aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
     var acc = [_]Aggregate.Acc{.{}};
-    try testing.expectError(error.IntOverflow, over.foldVectorized(a, .{ .schema = &big_schema, .columns = big_cols, .len = 2 }, &acc));
+    try testing.expect(try over.foldVectorized(a, .{ .schema = &big_schema, .columns = big_cols, .len = 2 }, &acc));
+    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(acc[0], big_aggs[0]));
+}
+
+test "aggregate: a decimal sum checks 38 digits on the total, whatever the batches or row order" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const dty = types.Type.decimal(38, 0).asNullable();
+    const in_schema = types.Schema{ .fields = &.{ .{ .name = "k", .ty = types.Type.init(.int) }, .{ .name = "n", .ty = dty } } };
+    const big: i128 = 9 * (std.math.powi(i128, 10, 37) catch unreachable);
+    const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"n"} } };
+    const aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = dty }};
+    const out_schema = types.Schema{ .fields = &.{ .{ .name = "k", .ty = types.Type.init(.int) }, .{ .name = "s", .ty = dty } } };
+    const orders = [_][3]i128{ .{ -big, big, big }, .{ big, big, -big }, .{ big, -big, big } };
+    for (orders) |vals| for ([_][]const usize{ &.{}, &.{1}, &.{2}, &.{ 1, 2 } }) |cuts| for ([_][]const usize{ &.{}, &.{0} }) |by| {
+        var batches: [3]Batch = undefined;
+        var nb: usize = 0;
+        var lo: usize = 0;
+        for (0..cuts.len + 1) |ci| {
+            const hi = if (ci < cuts.len) cuts[ci] else vals.len;
+            var kb = column.Builder.init(a, types.Type.init(.int));
+            var db = column.Builder.init(a, dty);
+            for (vals[lo..hi]) |v| {
+                try kb.append(.{ .int = 1 });
+                try db.append(.{ .decimal = .{ .unscaled = v, .scale = 0 } });
+            }
+            const cols = try a.alloc(column.Column, 2);
+            cols[0] = try kb.finish();
+            cols[1] = try db.finish();
+            batches[nb] = .{ .schema = &in_schema, .columns = cols, .len = hi - lo };
+            nb += 1;
+            lo = hi;
+        }
+        var ts = TestSource{ .schema_ = in_schema, .batches = batches[0..nb] };
+        var scan = Scan{ .src = ts.src() };
+        var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &in_schema, .by = by, .aggs = &aggs, .out_schema = if (by.len == 0) &.{ .fields = out_schema.fields[1..] } else &out_schema, .state = a, .gpa = testing.allocator };
+        const out = (try agg.next(a)).?;
+        try testing.expectEqual(big, out.columns[by.len].getValue(0).decimal.unscaled);
+    };
 }
 
 test "aggregate: global vectorized reductions honor nulls; empty input edge cases" {

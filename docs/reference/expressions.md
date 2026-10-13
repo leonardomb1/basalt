@@ -90,8 +90,9 @@ columns it has not seen.
   the summed scale — `1.1 + 0.3` is `1.4`, not `1.4000000000000001`, so a `SUM`
   cast to `DECIMAL` stays exact when this month's total is subtracted from last
   month's. A product's scale stops at 38, rounding half away from zero past it.
-  A result (or a `SUM`) of more than 38 digits fails with `decimal overflow:
-  more than 38 digits` — cast an operand to a smaller scale first. Anything
+  A result (or a `SUM`'s final total) of more than 38 digits fails with
+  `decimal overflow: more than 38 digits` — cast an operand to a smaller scale
+  first. Anything
   with a float operand is a float. `round(x, n)` on a decimal is exact too, and
   with a literal `n` answers `DECIMAL(p, n)`; `-x`, `abs`, `floor`, `ceil`,
   `sign` and `mod` stay decimals, and `CAST(x AS INT)` rounds half away from

@@ -265,7 +265,7 @@ pub fn GroupMap() type {
 
 pub const Partial = struct {
     nvalid: usize,
-    sum_i: i128 = 0,
+    sum_i: i256 = 0,
     sum_f: f64 = 0,
     ext: ?Value = null,
 };

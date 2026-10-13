@@ -377,6 +377,7 @@ pub const parseFloatStrict = @import("eval/cast.zig").parseFloatStrict;
 pub const decimalOverflow = @import("eval/support.zig").decimalOverflow;
 pub const castFailure = @import("eval/support.zig").castFailure;
 pub const fitsPrecision = @import("eval/cast.zig").fitsPrecision;
+pub const wideSumDecimal = @import("eval/cast.zig").wideSumDecimal;
 pub const castValue = @import("eval/cast.zig").castValue;
 pub const writeValue = @import("eval/format.zig").writeValue;
 pub const writeDate = @import("eval/format.zig").writeDate;

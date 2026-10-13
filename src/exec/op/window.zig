@@ -43,7 +43,7 @@ const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const rescaleTo = @import("../eval.zig").rescaleTo;
 const decimalOverflow = @import("../eval.zig").decimalOverflow;
-const fitsPrecision = @import("../eval.zig").fitsPrecision;
+const wideSumDecimal = @import("../eval.zig").wideSumDecimal;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
@@ -58,14 +58,14 @@ const types = @import("../../lang/types.zig");
 /// Adds (or, leaving a frame, takes away) a value from a DECIMAL sum, exactly, at
 /// the sum's scale, as the SUM aggregate does; a float total would read 0.1 + 0.2 as
 /// 0.30000000000000004.
-fn decStep(acc: *i128, v: Value, scale: u8, sub: bool) !void {
+fn decStep(acc: *i256, v: Value, scale: u8, sub: bool) !void {
     const d: Decimal = switch (v) {
         .decimal => |x| x,
         .int => |x| .{ .unscaled = x, .scale = 0 },
         else => return error.TypeMismatch,
     };
     const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
-    acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return decimalOverflow();
+    acc.* = (if (sub) std.math.sub(i256, acc.*, u) else std.math.add(i256, acc.*, u)) catch return decimalOverflow();
 }
 
 /// A text argument of a numeric window aggregate read as the plain aggregate reads
@@ -218,7 +218,7 @@ pub const Window = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
     }
 
-    fn intSum(self: *Window, acc: i128) error{IntOverflow}!Value {
+    fn intSum(self: *Window, acc: i256) error{IntOverflow}!Value {
         const v = std.math.cast(i64, acc) orelse {
             if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(error.IntOverflow)});
             return error.IntOverflow;
@@ -562,7 +562,7 @@ pub const Window = struct {
         out_int: bool,
         n: i64 = 0,
         t: i64 = 0,
-        acc_i: i128 = 0,
+        acc_i: i256 = 0,
         seen_float: bool = false,
         s1: i128 = 0,
         s2: i128 = 0,
@@ -759,7 +759,7 @@ pub const Window = struct {
             return switch (s.agg) {
                 .count => if (s.f.distinct) .{ .int = @intCast(s.seen.count()) } else .{ .int = s.n },
                 .count_if => .{ .int = s.n },
-                .sum => if (s.n == 0) .null else if (s.dec) |sc| (if (fitsPrecision(s.acc_i, 38)) .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else return decimalOverflow()) else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
+                .sum => if (s.n == 0) .null else if (s.dec) |sc| .{ .decimal = wideSumDecimal(s.acc_i, sc) orelse return decimalOverflow() } else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
                 .avg => if (s.n == 0) .null else .{ .float = s.total() / @as(f64, @floatFromInt(s.n)) },
                 .min, .max => if (s.dq_head < s.dq.items.len) s.vals[s.dq.items[s.dq_head]] else .null,
                 .bool_and => if (s.n == 0) .null else .{ .bool = s.t == s.n },

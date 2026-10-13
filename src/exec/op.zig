@@ -54,7 +54,7 @@
 //! grow. A sliding float frame can drift by rounding; a segment tree is the exact
 //! upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER (`top_k`) keeps only each
 //! partition's best k rows. Window SUM skips non-numeric kinds like nulls, and sums
-//! in i128 with a range check, as it once wrapped.
+//! as the SUM aggregate does, range-checking only the frame's total.
 //!
 //! Aggregate is streaming hash aggregation, O(groups). Groups are typed records in
 //! blocks: `FixedStore` (raw i64 words plus a null mask) when every key is
@@ -74,9 +74,10 @@
 //! `Acc` fields are shared between aggregates: `n` counts rows, `sum_i`/`sum_f`
 //! hold sums, `ext` the extreme. Bitwise aggregates keep their bits in `sum_i`,
 //! with `n == 0` meaning none yet since zero is not AND's identity; variances keep
-//! Welford's mean in `sum_f` and squared deviations in `ext`, keeping `Acc` at 80
-//! bytes. Sums are exact i128, range-checked once in `finalizeAcc`, so the answer
-//! cannot depend on how rows split across batches and lanes (it once came out 5 at
+//! Welford's mean in `sum_f` and squared deviations in `ext`, keeping `Acc` one
+//! record. Sums are exact, i128 for ints and i256 for DECIMAL (whose addends reach
+//! 10^38), range-checked once in `finalizeAcc`, so the answer cannot depend on how
+//! rows split across batches and lanes or on their order (it once came out 5 at
 //! -j 1 and an overflow at -j 8). DECIMAL addends are normalized to the output
 //! scale. Variances merge with Chan's formula in fixed lane order, reproducible for
 //! a given `-j`, like a float SUM. Text arguments are cast before the accumulator

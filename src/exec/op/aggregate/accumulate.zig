@@ -41,7 +41,7 @@ pub fn mergeAcc(dst_alloc: std.mem.Allocator, dst: *Acc, src: Acc, agg: Agg) !vo
             if (agg.ty.kind == .float)
                 dst.sum_f += src.sum_f
             else
-                dst.sum_i = std.math.add(i128, dst.sum_i, src.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
+                dst.sum_i = std.math.add(i256, dst.sum_i, src.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
             dst.n += src.n;
         },
         .avg => {
@@ -196,11 +196,11 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
 /// A batch's DECIMAL SUM with `addExact`'s normalization, each value at `scale`.
 fn sumDecimals(col: column.Column, scale: u8, n: usize) error{IntOverflow}!Partial {
     const nvalid = simd.popcountValid(col.validity.bits, n);
-    var s: i128 = 0;
+    var s: i256 = 0;
     for (col.data.dec[0..n], 0..) |d, i| {
         if (nvalid != n and !col.validity.get(i)) continue;
         const u = if (d.scale == scale) d.unscaled else (eval.rescaleTo(d, scale) orelse return eval.decimalOverflow()).unscaled;
-        s = std.math.add(i128, s, u) catch return eval.decimalOverflow();
+        s = std.math.add(i256, s, u) catch return eval.decimalOverflow();
     }
     return .{ .nvalid = nvalid, .sum_i = s };
 }
@@ -223,7 +223,7 @@ pub fn mergePartial(acc: *Acc, agg: Agg, p: Partial) error{IntOverflow}!void {
             if (agg.ty.kind == .float)
                 acc.sum_f += p.sum_f
             else
-                acc.sum_i = std.math.add(i128, acc.sum_i, p.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
+                acc.sum_i = std.math.add(i256, acc.sum_i, p.sum_i) catch return if (agg.ty.kind == .decimal) eval.decimalOverflow() else error.IntOverflow;
             acc.n += @intCast(p.nvalid);
         },
         .avg => if (p.nvalid > 0) {
@@ -328,17 +328,18 @@ pub fn updateAcc(state: std.mem.Allocator, acc: *Acc, agg: Agg, v: Value, has_ar
 
 /// Add a non-null value to an int or DECIMAL SUM, normalized to the output scale.
 /// Adding raw unscaled values multiplied the sum by 10^(declared - actual).
-pub fn addExact(sum: *align(8) i128, agg: Agg, v: Value) !void {
+pub fn addExact(sum: *align(8) i256, agg: Agg, v: Value) !void {
     if (agg.ty.kind == .decimal) {
         const d: Decimal = if (v == .decimal) v.decimal else .{ .unscaled = v.int, .scale = 0 };
         const r = eval.rescaleTo(d, agg.ty.scale) orelse return eval.decimalOverflow();
-        sum.* = std.math.add(i128, sum.*, r.unscaled) catch return eval.decimalOverflow();
-    } else sum.* = std.math.add(i128, sum.*, v.int) catch return error.IntOverflow;
+        sum.* = std.math.add(i256, sum.*, r.unscaled) catch return eval.decimalOverflow();
+    } else sum.* = std.math.add(i256, sum.*, v.int) catch return error.IntOverflow;
 }
 
 pub const Slot = enum {
     count,
     sum_i,
+    sum_d,
     sum_f,
     full,
 
@@ -346,7 +347,11 @@ pub const Slot = enum {
         if (agg.distinct) return .full;
         return switch (agg.func) {
             .count => .count,
-            .sum => if (agg.ty.kind == .float) .sum_f else .sum_i,
+            .sum => switch (agg.ty.kind) {
+                .float => .sum_f,
+                .decimal => .sum_d,
+                else => .sum_i,
+            },
             .avg => .sum_f,
             else => .full,
         };
@@ -356,6 +361,7 @@ pub const Slot = enum {
         return switch (self) {
             .count => @sizeOf(i64),
             .sum_i => @sizeOf(SumI),
+            .sum_d => @sizeOf(SumD),
             .sum_f => @sizeOf(SumF),
             .full => @sizeOf(Acc),
         };
@@ -363,6 +369,8 @@ pub const Slot = enum {
 };
 
 pub const SumI = struct { n: i64, s: i128 align(8) };
+
+pub const SumD = struct { n: i64, s: i256 align(8) };
 
 pub const SumF = struct { n: i64, s: f64 };
 
@@ -394,6 +402,7 @@ pub const Layout = struct {
         for (self.slots, 0..) |sl, j| switch (sl) {
             .count => self.ptr(i64, tail, j).* = 0,
             .sum_i => self.ptr(SumI, tail, j).* = .{ .n = 0, .s = 0 },
+            .sum_d => self.ptr(SumD, tail, j).* = .{ .n = 0, .s = 0 },
             .sum_f => self.ptr(SumF, tail, j).* = .{ .n = 0, .s = 0 },
             .full => self.ptr(Acc, tail, j).* = .{},
         };
@@ -404,6 +413,10 @@ pub const Layout = struct {
             .count => .{ .n = self.ptr(i64, tail, j).* },
             .sum_i => blk: {
                 const x = self.ptr(SumI, tail, j).*;
+                break :blk .{ .n = x.n, .sum_i = x.s };
+            },
+            .sum_d => blk: {
+                const x = self.ptr(SumD, tail, j).*;
                 break :blk .{ .n = x.n, .sum_i = x.s };
             },
             .sum_f => blk: {
@@ -421,6 +434,11 @@ pub const Layout = struct {
             },
             .sum_i => if (!v.isNull()) {
                 const x = self.ptr(SumI, tail, j);
+                x.s = std.math.add(i128, x.s, v.int) catch return error.IntOverflow;
+                x.n += 1;
+            },
+            .sum_d => if (!v.isNull()) {
+                const x = self.ptr(SumD, tail, j);
                 try addExact(&x.s, agg, v);
                 x.n += 1;
             },
@@ -442,6 +460,12 @@ pub const Layout = struct {
                 d.s = std.math.add(i128, d.s, x.s) catch return error.IntOverflow;
                 d.n += x.n;
             },
+            .sum_d => {
+                const d = self.ptr(SumD, dst, j);
+                const x = self.ptr(SumD, src, j).*;
+                d.s = std.math.add(i256, d.s, x.s) catch return eval.decimalOverflow();
+                d.n += x.n;
+            },
             .sum_f => {
                 const d = self.ptr(SumF, dst, j);
                 const x = self.ptr(SumF, src, j).*;
@@ -460,7 +484,7 @@ pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
         .count => .{ .int = acc.n },
         .sum => if (acc.n == 0) .null else switch (agg.ty.kind) {
             .float => Value{ .float = acc.sum_f },
-            .decimal => if (eval.fitsPrecision(acc.sum_i, 38)) Value{ .decimal = .{ .unscaled = acc.sum_i, .scale = agg.ty.scale } } else return eval.decimalOverflow(),
+            .decimal => Value{ .decimal = eval.wideSumDecimal(acc.sum_i, agg.ty.scale) orelse return eval.decimalOverflow() },
             else => Value{ .int = std.math.cast(i64, acc.sum_i) orelse return error.IntOverflow },
         },
         .avg => if (acc.n == 0) .null else Value{ .float = acc.sum_f / @as(f64, @floatFromInt(acc.n)) },
@@ -485,7 +509,7 @@ pub fn finalizeAcc(acc: Acc, agg: Agg) error{IntOverflow}!Value {
     };
 }
 
-pub fn bitFold(func: ast.AggFunc, a: i128, b: i128) i128 {
+pub fn bitFold(func: ast.AggFunc, a: i256, b: i256) i256 {
     return switch (func) {
         .bit_and => a & b,
         .bit_or => a | b,

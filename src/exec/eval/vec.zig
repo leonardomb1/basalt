@@ -706,7 +706,7 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
     return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
 }
 
-pub const DecSum = struct { sum: i128, nvalid: usize };
+pub const DecSum = struct { sum: i256, nvalid: usize };
 
 /// `SUM(l op r)` over one batch as `addExact` adds it at `scale`, with no decimal
 /// column built between; null when `expr` is not a decimal operation.
@@ -724,11 +724,11 @@ fn decSumVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scal
         .add, .sub, .mul, .div, .mod => {},
         else => return null,
     }
+    if (numKind(expr, batch) != .decimal) return null;
     forgetFailure();
     const l = try evalVec(arena, b.l, batch);
     const r = try evalVec(arena, b.r, batch);
-    if (scalarNull(l) or scalarNull(r)) return null;
-    _ = decimalArithType(b.op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
+    if (scalarNull(l) or scalarNull(r)) return .{ .sum = 0, .nvalid = 0 };
     const bm = try bothValid(arena, l, r, batch.len);
     var sink = SumSink{ .scale = scale };
     try decApply(b.op, l, r, &sink, bm, !bm.allSet(batch.len));
@@ -752,12 +752,12 @@ const StoreSink = struct {
 };
 
 const SumSink = struct {
-    sum: i128 = 0,
+    sum: i256 = 0,
     scale: u8,
 
     inline fn put(self: *SumSink, _: usize, d: Decimal) VecError!void {
         const u = if (d.scale == self.scale) d.unscaled else (rescaleTo(d, self.scale) orelse return decimalOverflow()).unscaled;
-        self.sum = std.math.add(i128, self.sum, u) catch return decimalOverflow();
+        self.sum = std.math.add(i256, self.sum, u) catch return decimalOverflow();
     }
 };
 
@@ -974,6 +974,7 @@ fn numKind(e: *const ast.Expr, batch: Batch) ?types.TypeKind {
         .dec_lit => .decimal,
         .float_lit => .float,
         .field => |q| batch.columns[fieldIndex(batch.schema.*, q) orelse return null].ty.kind,
+        .unary => |u| if (u.op == .neg) numKind(u.e, batch) else null,
         .binary => |b| switch (b.op) {
             .add, .sub, .mul, .div, .mod => {
                 const lk = numKind(b.l, batch) orelse return null;
@@ -1714,6 +1715,23 @@ test "try_cast yields null exactly where cast raises" {
     try std.testing.expect(out.getValue(1).isNull());
 }
 
+test "decSum declines a non-decimal expression before evaluating it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
+    var xs = [_]?i64{ std.math.maxInt(i64), 2 };
+    var cols = [_]column.Column{try column.intColumn(a, &xs)};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for ([_][]const u8{ "x * 2", "x * 2.5e0", "x || 'a'" }) |src| {
+        try std.testing.expect((try decSum(a, try parser.parseExprStr(a, src, &diag), batch, 2)) == null);
+    }
+    const got = (try decSum(a, try parser.parseExprStr(a, "-1.25 - x", &diag), batch, 2)).?;
+    try std.testing.expectEqual(@as(usize, 2), got.nvalid);
+    try std.testing.expectEqual(@as(i256, -(@as(i256, std.math.maxInt(i64)) + 2) * 100 - 250), got.sum);
+}
+
 test "decimal arithmetic and comparisons on the vector lanes match the row path, values and errors" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1792,7 +1810,7 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
                 if (ty.kind == .decimal) try std.testing.expectError(first, decSum(a, e, batch, ty.scale));
                 continue;
             };
-            var sum: ?i128 = 0;
+            var sum: ?i256 = 0;
             var nvalid: usize = 0;
             for (0..n) |i| {
                 const want = try evalRow(a, e, batch, i);
@@ -1805,7 +1823,7 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
                         try std.testing.expectEqual(w.unscaled, have.decimal.unscaled);
                         try std.testing.expectEqual(w.scale, have.decimal.scale);
                         nvalid += 1;
-                        if (sum) |acc| sum = if (rescaleTo(w, ty.scale)) |x| std.math.add(i128, acc, x.unscaled) catch null else null;
+                        if (sum) |acc| sum = if (rescaleTo(w, ty.scale)) |x| acc + x.unscaled else null;
                     },
                     else => return error.TestUnexpectedResult,
                 }

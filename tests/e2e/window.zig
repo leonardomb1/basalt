@@ -561,3 +561,22 @@ test "windows after parallel stages: -j 4 writes what -j 1 does" {
         try std.testing.expectEqualStrings(serial, lanes);
     }
 }
+
+test "decimal SUM: 38 digits are checked on the total only, in aggregates and frames alike" {
+    const alloc = std.testing.allocator;
+    const in = "id,v\n1,90000000000000000000000000000000000000\n2,90000000000000000000000000000000000000\n3,-90000000000000000000000000000000000000\n";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT SUM(CAST(v AS DECIMAL(38,0))) AS s FROM '$IN'", .want = "s\n90000000000000000000000000000000000000\n" },
+        .{
+            .q = "SELECT id, SUM(CAST(v AS DECIMAL(38,0))) OVER () AS a, SUM(CAST(v AS DECIMAL(38,0))) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS b FROM '$IN' ORDER BY id",
+            .want = "id,a,b\n1,90000000000000000000000000000000000000,90000000000000000000000000000000000000\n2,90000000000000000000000000000000000000,0\n3,90000000000000000000000000000000000000,-90000000000000000000000000000000000000\n",
+        },
+    };
+    for (cases) |c| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const out = try runToString(alloc, &tmp, in, c.q);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
