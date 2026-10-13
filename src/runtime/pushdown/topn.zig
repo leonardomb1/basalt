@@ -174,7 +174,7 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
     var ob = std.array_list.Managed(u8).init(arena);
     for (t.keys, 0..) |k, i| {
         if (i > 0) try ob.appendSlice(", ");
-        const q = try split.quoteIdent(arena, dialect, k.col);
+        const q = try split.quoteName(arena, dialect, k.col);
         const dir = if (k.desc) " DESC" else "";
         const nf = k.nulls_first;
         switch (dialect) {

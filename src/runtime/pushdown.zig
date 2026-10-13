@@ -165,7 +165,7 @@ pub fn planWholeAggWhy(
         const out = plan_schema.fields[i];
         if (!std.mem.eql(u8, out.name, col)) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
         if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
-        const qc = try split.quoteIdent(arena, dialect, col);
+        const qc = try split.quoteName(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
         if (sel.items.len > 0) try sel.appendSlice(", ");
@@ -180,7 +180,7 @@ pub fn planWholeAggWhy(
             return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");
         try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
-            inner, cast_to, try split.quoteIdent(arena, dialect, out.name),
+            inner, cast_to, try split.quoteName(arena, dialect, out.name),
         }));
     }
 
@@ -213,7 +213,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
     const name = arg.field.parts[0];
     const idx = src_schema.indexOf(name) orelse return null;
     const src_kind = src_schema.fields[idx].ty.kind;
-    const col = try split.quoteIdent(arena, dialect, name);
+    const col = try split.quoteName(arena, dialect, name);
 
     switch (item.func) {
         .count => {
@@ -315,7 +315,7 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     for (src_schema.fields) |f| {
         if (!need.contains(f.name)) continue;
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try split.quoteIdent(arena, dialect, f.name));
+        try sel.appendSlice(try split.quoteName(arena, dialect, f.name));
         try fields.append(f);
     }
     if (fields.items.len > 0 and fields.items.len < src_schema.fields.len)

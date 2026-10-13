@@ -242,7 +242,7 @@ const Tx = struct {
             .field => |q| {
                 if (q.parts.len != 1) return null;
                 if (self.o.check_fields and !inSchema(self.o.schema, q.parts[0])) return null;
-                return try split.quoteIdent(self.arena, self.dialect, q.parts[0]);
+                return try split.quoteName(self.arena, self.dialect, q.parts[0]);
             },
             .cast => |c| {
                 if (c.safe) return null;

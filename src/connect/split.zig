@@ -212,7 +212,7 @@ fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
 const Bounds = struct { min: i64, max: i64 };
 
 fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteIdent(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -229,7 +229,7 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
 }
 
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
-    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteName(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max) - @as(i128, min) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -258,7 +258,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
 /// MIN/MAX of a date/timestamp key as days since 1970, or null when the cursor
 /// did not yield `.date` or `.timestamp` (e.g. a driver left it as text).
 fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteIdent(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -282,7 +282,7 @@ fn dayOf(v: Value) ?i64 {
 }
 
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
-    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteName(arena, dialect, col) catch col;
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -310,7 +310,7 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
 }
 
 fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
-    const qcol = sql.quoteIdent(arena, dialect, col) catch col;
+    const qcol = sql.quoteName(arena, dialect, col) catch col;
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
@@ -341,7 +341,7 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     });
 }
 
-pub const quoteIdent = sql.quoteIdent;
+pub const quoteName = sql.quoteName;
 
 fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     const out = try arena.alloc([]const u8, 1);

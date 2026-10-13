@@ -42,7 +42,7 @@ pub fn selectListFor(arena: std.mem.Allocator, dialect: sql.Dialect, cols: []con
     var out = std.array_list.Managed(u8).init(arena);
     for (cols, 0..) |c, i| {
         if (i > 0) try out.appendSlice(", ");
-        try out.appendSlice(try sql.quoteIdent(arena, dialect, c));
+        try out.appendSlice(try sql.quoteName(arena, dialect, c));
     }
     return out.toOwnedSlice();
 }
@@ -279,4 +279,12 @@ test "a projected SQL read asks for its columns, quoted per dialect; none means 
     try std.testing.expectEqualStrings("[E1_NUM], [E1_VALOR]", try selectListFor(a, .sqlserver, &.{ "E1_NUM", "E1_VALOR" }));
     try std.testing.expectEqualStrings("\"id\", \"amount\"", try selectListFor(a, .postgres, &.{ "id", "amount" }));
     try std.testing.expectEqualStrings("`id`", try selectListFor(a, .mysql, &.{"id"}));
+}
+
+test "a dotted or quote-bearing column name stays one quoted name in a read" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("\"a.b\"", try selectListFor(a, .postgres, &.{"a.b"}));
+    try std.testing.expectEqualStrings("[a.b], [x]]y]", try selectListFor(a, .sqlserver, &.{ "a.b", "x]y" }));
 }
