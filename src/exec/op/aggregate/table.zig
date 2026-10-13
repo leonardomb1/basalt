@@ -3,7 +3,6 @@
 //! `GroupTable.find` probes without inserting, for a table frozen by spilling.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
-const Agg = Aggregate.Agg;
 const Layout = Aggregate.Layout;
 const Slot = Aggregate.Slot;
 const Value = @import("../../value.zig").Value;
