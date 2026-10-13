@@ -415,14 +415,8 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
 
 /// No matching arm (and no `_`) is a no-op.
 fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-    const idx = (try matchArmIndex(env, m, names.items, values.items, "match")) orelse return;
+    const sc = try (LoopRow{ .names = &.{}, .cells = &.{} }).scope(env.arena, env.params);
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "match")) orelse return;
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
@@ -705,15 +699,8 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
 /// The loop variables are bound over same-named params. Untyped ones bind as strings;
 /// a `name:type` one binds the coerced value, so `port >= 1000` compares numerically.
 fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    try lr.appendLoopVars(env.arena, &names, &values);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-    const idx = (try matchArmIndex(env, m, names.items, values.items, "for/match")) orelse return;
+    const sc = try lr.scope(env.arena, env.params);
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "for/match")) orelse return;
     try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);
 }
 

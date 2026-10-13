@@ -419,6 +419,22 @@ pub const LoopRow = struct {
         if (self.outer) |o| try o.appendScope(arena, names, vals);
     }
 
+    pub const Scope = struct { names: []const []const u8, values: []const Value };
+
+    /// What a constant expression may read here: the loop variables, innermost
+    /// first, then `params`.
+    pub fn scope(self: LoopRow, arena: std.mem.Allocator, params: *const std.StringHashMap(Value)) !Scope {
+        var names = std.array_list.Managed([]const u8).init(arena);
+        var values = std.array_list.Managed(Value).init(arena);
+        try self.appendLoopVars(arena, &names, &values);
+        var it = params.iterator();
+        while (it.next()) |kv| {
+            try names.append(kv.key_ptr.*);
+            try values.append(kv.value_ptr.*);
+        }
+        return .{ .names = names.items, .values = values.items };
+    }
+
     pub fn appendLoopVars(
         self: LoopRow,
         arena: std.mem.Allocator,

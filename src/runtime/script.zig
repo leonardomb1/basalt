@@ -175,22 +175,30 @@ fn interpFail(arena: std.mem.Allocator, text: []const u8, why: []const u8) anyer
 /// Variables bind as strings unless the `for` header typed them (`port:int`), so
 /// `${if(port > 1000, ...)}` compares numerically. A failure is permanent.
 fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]const u8 {
+    return switch (try evalHole(arena, text, lr)) {
+        .value => |v| eval.valueToString(arena, v),
+        .fail => |why| interpFail(arena, text, why),
+    };
+}
+
+const Hole = union(enum) { value: Value, fail: []const u8 };
+
+/// A `${...}` hole's text parsed and evaluated against the scope, or why it cannot be.
+fn evalHole(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) !Hole {
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const e = parser.parseExprStr(arena, text, &diag) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return interpFail(arena, text, diag.msg);
+        return .{ .fail = diag.msg };
     };
-    if (interpUnsupported(e)) |why| {
-        return interpFail(arena, text, why);
-    }
+    if (interpUnsupported(e)) |why| return .{ .fail = why };
     var names = std.array_list.Managed([]const u8).init(arena);
     var vals = std.array_list.Managed(Value).init(arena);
     try lr.appendScope(arena, &names, &vals);
-    const result = eval.constEval(arena, e, names.items, vals.items) catch |err| {
+    const v = eval.constEval(arena, e, names.items, vals.items) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return interpFail(arena, text, op.errLabel(err));
+        return .{ .fail = op.errLabel(err) };
     };
-    return eval.valueToString(arena, result);
+    return .{ .value = v };
 }
 
 fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualName {
@@ -301,14 +309,10 @@ fn holeIsNull(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) !bool {
     if (!std.mem.startsWith(u8, s, "${") or interpClose(s, 2) != s.len - 1) return false;
     const inner = s[2 .. s.len - 1];
     if (bareInterp(inner) and lr.lookup(inner) == null) return false;
-    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const e = parser.parseExprStr(arena, inner, &diag) catch |err| return if (err == error.OutOfMemory) err else false;
-    if (interpUnsupported(e) != null) return false;
-    var names = std.array_list.Managed([]const u8).init(arena);
-    var vals = std.array_list.Managed(Value).init(arena);
-    try lr.appendScope(arena, &names, &vals);
-    const v = eval.constEval(arena, e, names.items, vals.items) catch |err| return if (err == error.OutOfMemory) err else false;
-    return v.isNull();
+    return switch (try evalHole(arena, inner, lr)) {
+        .value => |v| v.isNull(),
+        .fail => false,
+    };
 }
 
 pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow) anyerror!ast.Pipeline {
@@ -553,14 +557,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     if (env.call_depth >= max_call_depth)
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
 
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    try outer.appendLoopVars(env.arena, &names, &values);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
+    const sc = try outer.scope(env.arena, env.params);
 
     const pnames = try env.arena.alloc([]const u8, fd.params.len);
     const ptypes = try env.arena.alloc(?types.Type, fd.params.len);
@@ -568,7 +565,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     for (fd.params, c.args, 0..) |p, a, i| {
         pnames[i] = p.name;
         ptypes[i] = p.ty;
-        const v = eval.constEval(env.arena, a, names.items, values.items) catch |e|
+        const v = eval.constEval(env.arena, a, sc.names, sc.values) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, @errorName(e) }));
         cells[i] = try eval.valueToString(env.arena, v);
     }
@@ -582,15 +579,8 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
 /// Render a `PRINT` argument with the helper that formats any cell, so a
 /// non-string renders as it would in a sink.
 pub fn printText(arena: std.mem.Allocator, e: *const ast.Expr, lr: LoopRow, params: *std.StringHashMap(Value)) ![]const u8 {
-    var names = std.array_list.Managed([]const u8).init(arena);
-    var values = std.array_list.Managed(Value).init(arena);
-    try lr.appendLoopVars(arena, &names, &values);
-    var it = params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-    return eval.valueToString(arena, try eval.constEval(arena, e, names.items, values.items));
+    const sc = try lr.scope(arena, params);
+    return eval.valueToString(arena, try eval.constEval(arena, e, sc.names, sc.values));
 }
 
 /// Logs at `info` on stderr through the run logger (level filter, JSON format,
@@ -604,25 +594,17 @@ pub fn runPrint(env: *Env, p: ast.Print, lr: LoopRow) anyerror!void {
 /// `THROW 'msg' [WHEN cond]`: only a `true` condition fires, an absent one always
 /// does. A fired guard is permanent, so `retryable` is cleared.
 pub fn runThrow(env: *Env, t: ast.Throw, outer: LoopRow) anyerror!void {
-    var names = std.array_list.Managed([]const u8).init(env.arena);
-    var values = std.array_list.Managed(Value).init(env.arena);
-    try outer.appendLoopVars(env.arena, &names, &values);
-    var it = env.params.iterator();
-    while (it.next()) |kv| {
-        try names.append(kv.key_ptr.*);
-        try values.append(kv.value_ptr.*);
-    }
-
+    const sc = try outer.scope(env.arena, env.params);
     errdefer env.diag.stamp(t.pos);
     if (t.when) |w| {
-        const c = eval.constEval(env.arena, w, names.items, values.items) catch |e|
+        const c = eval.constEval(env.arena, w, sc.names, sc.values) catch |e|
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition: {s}", .{@errorName(e)}));
         if (c == .null) return;
         if (c != .bool)
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))}));
         if (!c.bool) return;
     }
-    const m = eval.constEval(env.arena, t.message, names.items, values.items) catch |e|
+    const m = eval.constEval(env.arena, t.message, sc.names, sc.values) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "THROW message: {s}", .{@errorName(e)}));
     env.diag.retryable = false;
     return planErr(env.diag, try eval.valueToString(env.arena, m));
