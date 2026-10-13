@@ -70,7 +70,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
         else => return null,
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
-    if (opts.threads < pq_min_lanes) return null;
+    if (opts.lanes() < pq_min_lanes) return null;
 
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
@@ -159,8 +159,12 @@ const min_lane_bytes = 1 << 20;
 /// since a lane costs more to start than a small file takes to parse (a 600 KB GROUP BY
 /// ran in 4 ms on one lane and 9 ms on twenty).
 pub fn csvLanes(bytes: usize, opts: RunOptions) usize {
-    const n = @max(@as(usize, 1), opts.threads);
-    return if (opts.lanes_auto) @min(n, bytes / min_lane_bytes + 1) else n;
+    return capCsvLanes(bytes, opts.lanes(), opts.threads == null);
+}
+
+fn capCsvLanes(bytes: usize, lanes: usize, auto: bool) usize {
+    const n = @max(@as(usize, 1), lanes);
+    return if (auto) @min(n, bytes / min_lane_bytes + 1) else n;
 }
 
 pub const LaneSplit = union(enum) {
@@ -179,7 +183,7 @@ pub const LaneSplit = union(enum) {
     pub fn lanes(self: *const LaneSplit, opts: RunOptions) usize {
         return switch (self.*) {
             .csv => |c| csvLanes(c.mapped.body.len, opts),
-            .parquet => |m| @max(1, @min(opts.threads, m.max_lanes, m.queue.nitems)),
+            .parquet => |m| @max(1, @min(opts.lanes(), m.max_lanes, m.queue.nitems)),
         };
     }
 
@@ -231,10 +235,12 @@ pub const LaneSplit = union(enum) {
 
 test "csvLanes: an explicit -j is kept, the default caps at one lane per MiB" {
     try std.testing.expectEqual(@as(usize, 20), csvLanes(1000, .{ .threads = 20 }));
-    try std.testing.expectEqual(@as(usize, 1), csvLanes(1000, .{ .threads = 20, .lanes_auto = true }));
-    try std.testing.expectEqual(@as(usize, 7), csvLanes(6 << 20, .{ .threads = 20, .lanes_auto = true }));
-    try std.testing.expectEqual(@as(usize, 14), csvLanes(300 << 20, .{ .threads = 14, .lanes_auto = true }));
+    try std.testing.expectEqual(@as(usize, 1), capCsvLanes(1000, 20, true));
+    try std.testing.expectEqual(@as(usize, 7), capCsvLanes(6 << 20, 20, true));
+    try std.testing.expectEqual(@as(usize, 14), capCsvLanes(300 << 20, 14, true));
     try std.testing.expectEqual(@as(usize, 1), csvLanes(0, .{ .threads = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), csvLanes(1000, .{ .threads = null }));
+    try std.testing.expectEqual(@min(@import("../parallel.zig").defaultLanes(), 7), csvLanes(6 << 20, .{ .threads = null }));
 }
 
 test "LaneSplit.lanes: parquet runs no more lanes than row groups" {

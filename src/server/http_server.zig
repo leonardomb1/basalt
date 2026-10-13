@@ -306,7 +306,7 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, por
     var net_server = try listen(host, port);
     defer net_server.deinit();
     banner(net_server.listen_address, &routes);
-    var conns = Conns{ .gpa = gpa, .routes = &routes, .threads = runtime.defaultLanes() };
+    var conns = Conns{ .gpa = gpa, .routes = &routes, .threads = null };
     defer conns.drain();
     while (!runtime.aborting()) {
         const conn = net_server.accept() catch continue;
@@ -317,7 +317,7 @@ pub fn serve(gpa: std.mem.Allocator, program: ast.Program, host: []const u8, por
 const Conns = struct {
     gpa: std.mem.Allocator,
     routes: []const Route,
-    threads: usize,
+    threads: ?usize,
     work: std.Thread.Mutex = .{},
     in_flight: std.atomic.Value(usize) = .init(0),
     max_threads: usize = 64,
@@ -503,7 +503,7 @@ pub fn serveDir(gpa: std.mem.Allocator, dir_path: []const u8, host: []const u8, 
     defer net_server.deinit();
     banner(net_server.listen_address, reg.routes);
     if (watch) log(.info, "watching {s} for changes", .{dir_path});
-    var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = runtime.defaultLanes() };
+    var conns = Conns{ .gpa = gpa, .routes = reg.routes, .threads = null };
     const reloader = try std.Thread.spawn(.{}, reloadLoop, .{ &conns, &reg, dir_path, watch, net_server.listen_address });
     defer reloader.join();
     defer conns.drain();
@@ -665,7 +665,7 @@ fn handleConn(conns: *Conns, conn: std.net.Server.Connection, read_buf: []u8) !v
         var diag: runtime.Diag = .{};
         var sink = runtime.OutcomeSink.init(gpa);
         defer sink.deinit();
-        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = conns.threads, .lanes_auto = true, .outcomes = &sink, .log = g_log_cfg }, &diag);
+        const result = runtime.run(gpa, route.program, .{ .params = params.items, .request_body = body, .threads = conns.threads, .outcomes = &sink, .log = g_log_cfg }, &diag);
 
         var out = std.array_list.Managed(u8).init(gpa);
         defer out.deinit();

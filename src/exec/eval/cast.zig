@@ -8,6 +8,7 @@ const floatToInt = @import("vec.zig").floatToInt;
 const parseIsoDate = @import("time.zig").parseIsoDate;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseIsoTimestamp = @import("time.zig").parseIsoTimestamp;
+const pow10_i128 = @import("../value.zig").pow10_i128;
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
 const clip = @import("support.zig").clip;
@@ -80,6 +81,14 @@ pub fn fitsPrecision(u: i128, p: u8) bool {
 
 pub const max_digits = 38;
 
+/// A DECIMAL SUM's wide total as a 38-digit decimal at `scale`, null past 38 digits.
+/// Sums add in i256 and only the total is range-checked, as PostgreSQL's NUMERIC
+/// sum is exact, so no batch split or row order can fail a sum that fits.
+pub fn wideSumDecimal(total: i256, scale: u8) ?Decimal {
+    const u = std.math.cast(i128, total) orelse return null;
+    return if (fitsPrecision(u, max_digits)) .{ .unscaled = u, .scale = scale } else null;
+}
+
 /// Text as an INT: an optional sign and digits, nothing else (callers trim).
 /// `std.fmt.parseInt` alone also takes `_` separators, so `'1_000'` read as 1000.
 pub fn parseIntStrict(s: []const u8) ?i64 {
@@ -124,16 +133,6 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
 fn powTen(n: u8) i128 {
     return pow10_i128[n];
 }
-
-const pow10_i128 = blk: {
-    var t: [39]i128 = undefined;
-    var r: i128 = 1;
-    for (&t) |*e| {
-        e.* = r;
-        r *%= 10;
-    }
-    break :blk t;
-};
 
 /// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
 /// float8 to numeric. Null for a non-finite value or one past 38 digits.

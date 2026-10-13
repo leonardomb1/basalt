@@ -835,14 +835,14 @@ fn runParallelCsvAggImpl(env: *Env, rd: ast.Read, prefix: []const ast.Stage, ag:
 
     if (ctx.queue.failure()) |e| return e;
 
-    const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const csets = try combineAggSlots(env, slots, aggs, opts.lanes(), parts);
 
     const wr = try resolveUpsertKeys(env, w);
     const snk = try openSink(env, wr, try tailSchema(env, tail, out_schema.*));
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.threads, stats);
+    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.lanes(), stats);
     snk_open = false;
     try snk.close();
     return true;
@@ -919,14 +919,14 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
     const out_schema = try schemaPtr(arena, apl.schema);
 
-    const sp = (try planSplit(env, desc, stages[0], opts.threads, w)) orelse return false;
+    const sp = (try planSplit(env, desc, stages[0], opts.lanes(), w)) orelse return false;
 
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
 
     env.sink_name = sinkLabel(env, w);
 
-    const nlanes = @min(@max(@as(usize, 1), opts.threads), sp.predicates.len);
+    const nlanes = @min(@max(@as(usize, 1), opts.lanes()), sp.predicates.len);
     const slots = try allocAggSlots(env.gpa, sp.predicates.len);
     defer freeAggSlots(env.gpa, slots);
     const parts = try allocMergeParts(env.gpa);
@@ -964,13 +964,13 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     if (ctx.queue.failure()) |e| return e;
 
-    const csets = try combineAggSlots(env, slots, aggs, opts.threads, parts);
+    const csets = try combineAggSlots(env, slots, aggs, opts.lanes(), parts);
 
     const snk = try openSink(env, w, out_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
 
-    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.threads, stats);
+    try writeGroups(env, snk, groupEmitter(env, agg_in, apl.by, aggs, out_schema), csets, null, tail, opts.lanes(), stats);
     snk_open = false;
     try snk.close();
     return true;

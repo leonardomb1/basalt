@@ -134,7 +134,7 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
 /// Preconditions every lane path shares. A hinted read is left to the paths that honour
 /// the hint: any hint used to keep a read serial while EXPLAIN called it morsel-parallel.
 pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
-    return opts.threads > 1 and stages.len >= 2 and
+    return opts.lanes() > 1 and stages.len >= 2 and
         stages[0].node == .read and analyze.laneHints(stages[0]);
 }
 

@@ -153,8 +153,8 @@ pub const OutcomeSink = struct {
 pub const RunOptions = struct {
     params: []const ParamArg = &.{},
     request_body: ?[]const u8 = null,
-    threads: usize = 1,
-    lanes_auto: bool = false,
+    /// The `-j` lane count; null picks it per input (`lanes`, `lanes/sources.csvLanes`).
+    threads: ?usize = 1,
     log: LogConfig = .{},
     outcomes: ?*OutcomeSink = null,
     buffer_segment: ?u64 = null,
@@ -175,6 +175,11 @@ pub const RunOptions = struct {
     spill_dir: ?[]const u8 = null,
     spill_cap: u64 = 8 << 30,
     op_memory: usize = 2 << 30,
+
+    /// The lanes a query may fan out on: the `-j` given, or one per physical core.
+    pub fn lanes(self: RunOptions) usize {
+        return self.threads orelse @import("parallel.zig").defaultLanes();
+    }
 };
 
 pub const FactsCache = struct {

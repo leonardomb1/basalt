@@ -234,7 +234,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         const fast = try pull.alloc(Fast, self.aggs.len);
         for (self.aggs, argcols, fast, layout.slots) |agg, *c, *f, sl| {
             c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
-            f.* = Fast.of(sl, agg, c.*, b.len);
+            f.* = Fast.of(sl, c.*, b.len);
         }
 
         var groups: usize = 0;

@@ -567,7 +567,8 @@ pub const Join = struct {
 
     /// CROSS: each probe batch, held in `cross_mem`, paired with every build row
     /// at most `cross_chunk` pairs per call, so no output batch grows with the
-    /// product of the sides.
+    /// product of the sides. `cross_mem` is backed by `state`, so a consumer that
+    /// stops pulling (a LIMIT, an error) leaves nothing behind the plan.
     fn nextCross(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
         const nb = ix.build_batch.len;
         while (true) {
@@ -577,7 +578,7 @@ pub const Join = struct {
                     self.cross_mem = null;
                     return null;
                 }
-                if (self.cross_mem == null) self.cross_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                if (self.cross_mem == null) self.cross_mem = std.heap.ArenaAllocator.init(self.state);
                 _ = self.cross_mem.?.reset(.retain_capacity);
                 const lb = (try self.nextProbe(self.cross_mem.?.allocator())) orelse {
                     self.probe_done = true;
@@ -1433,6 +1434,35 @@ test "join: cross emits bounded batches and keeps its build cap" {
         .build_cap = 8,
     };
     try testing.expectError(error.JoinBuildTooLarge, capped.next(a));
+}
+
+test "join: a cross join stopped early holds its probe batch in the plan arena, which frees it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, 3 }, &.{ "a", "b", "c" })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9 }, &.{ "x", "y", "z" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+        .cross_chunk = 4,
+    };
+    try testing.expectEqual(@as(usize, 4), (try jn.next(a)).?.len);
+    const child = jn.cross_mem.?.child_allocator;
+    try testing.expectEqual(a.ptr, child.ptr);
+    try testing.expectEqual(a.vtable, child.vtable);
 }
 
 test "join: the build-size guard reports instead of exhausting memory" {

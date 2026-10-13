@@ -18,7 +18,8 @@
 //! and BIT_OR merge partial results in two stacks (`TwoStack`), so a row that left
 //! leaves no rounding behind. MEDIAN keeps the frame's lower half in a max-heap and
 //! its upper half in a min-heap (`Halves`), a row that left dropped when it surfaces
-//! at a top. Every frame thus costs O(1) amortized per row, MEDIAN O(log n). IGNORE
+//! at a top, or when such rows outnumber a heap's live ones, so the heaps stay
+//! O(frame). Every frame thus costs O(1) amortized per row, MEDIAN O(log frame). IGNORE
 //! NULLS reads through the positions of the non-null values and their prefix counts.
 //!
 //! The default frame (`Frame{}`) is RANGE from the partition's start to the current
@@ -43,11 +44,13 @@ const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const rescaleTo = @import("../eval.zig").rescaleTo;
 const decimalOverflow = @import("../eval.zig").decimalOverflow;
-const fitsPrecision = @import("../eval.zig").fitsPrecision;
+const wideSumDecimal = @import("../eval.zig").wideSumDecimal;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
+const Moments = @import("aggregate/accumulate.zig").Moments;
+const spread = @import("aggregate/accumulate.zig").spread;
 const materializeAll = @import("../op.zig").materializeAll;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
@@ -56,14 +59,14 @@ const types = @import("../../lang/types.zig");
 /// Adds (or, leaving a frame, takes away) a value from a DECIMAL sum, exactly, at
 /// the sum's scale, as the SUM aggregate does; a float total would read 0.1 + 0.2 as
 /// 0.30000000000000004.
-fn decStep(acc: *i128, v: Value, scale: u8, sub: bool) !void {
+fn decStep(acc: *i256, v: Value, scale: u8, sub: bool) !void {
     const d: Decimal = switch (v) {
         .decimal => |x| x,
         .int => |x| .{ .unscaled = x, .scale = 0 },
         else => return error.TypeMismatch,
     };
     const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
-    acc.* = (if (sub) std.math.sub(i128, acc.*, u) else std.math.add(i128, acc.*, u)) catch return decimalOverflow();
+    acc.* = (if (sub) std.math.sub(i256, acc.*, u) else std.math.add(i256, acc.*, u)) catch return decimalOverflow();
 }
 
 /// A text argument of a numeric window aggregate read as the plain aggregate reads
@@ -216,7 +219,7 @@ pub const Window = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
     }
 
-    fn intSum(self: *Window, acc: i128) error{IntOverflow}!Value {
+    fn intSum(self: *Window, acc: i256) error{IntOverflow}!Value {
         const v = std.math.cast(i64, acc) orelse {
             if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(error.IntOverflow)});
             return error.IntOverflow;
@@ -450,21 +453,6 @@ pub const Window = struct {
         };
     }
 
-    const Moments = struct {
-        n: f64 = 0,
-        mean: f64 = 0,
-        m2: f64 = 0,
-
-        /// Chan's pairwise merge of two groups' count, mean and squared deviations.
-        fn merge(a: Moments, b: Moments) Moments {
-            if (a.n == 0) return b;
-            if (b.n == 0) return a;
-            const n = a.n + b.n;
-            const d = b.mean - a.mean;
-            return .{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * a.n * b.n / n };
-        }
-    };
-
     fn addF(a: f64, b: f64) f64 {
         return a + b;
     }
@@ -556,6 +544,27 @@ pub const Window = struct {
             const low = if (h.lo.peek()) |t| !lt(t, it) else false;
             if (low) h.nlo -= 1 else h.nhi -= 1;
             try h.balance();
+            compact(&h.lo, h.nlo, h.gone, true);
+            compact(&h.hi, h.nhi, h.gone, false);
+        }
+
+        /// Drops the departed rows buried below a heap's top once they outnumber
+        /// its `live` rows, so a heap holds O(frame) rows rather than O(partition)
+        /// (a monotone order never brings them to the top). A sorted array is a
+        /// valid heap; each row is dropped once, so the cost is amortized.
+        fn compact(heap: *Heap, live: usize, gone: usize, max: bool) void {
+            if (heap.count() <= 2 * live) return;
+            var k: usize = 0;
+            for (heap.items) |x| if (x.p >= gone) {
+                heap.items[k] = x;
+                k += 1;
+            };
+            heap.items.len = k;
+            std.mem.sort(Item, heap.items, max, heapLess);
+        }
+
+        fn heapLess(max: bool, a: Item, b: Item) bool {
+            return if (max) lt(b, a) else lt(a, b);
         }
 
         fn median(h: *Halves) ?f64 {
@@ -575,7 +584,7 @@ pub const Window = struct {
         out_int: bool,
         n: i64 = 0,
         t: i64 = 0,
-        acc_i: i128 = 0,
+        acc_i: i256 = 0,
         seen_float: bool = false,
         s1: i128 = 0,
         s2: i128 = 0,
@@ -772,7 +781,7 @@ pub const Window = struct {
             return switch (s.agg) {
                 .count => if (s.f.distinct) .{ .int = @intCast(s.seen.count()) } else .{ .int = s.n },
                 .count_if => .{ .int = s.n },
-                .sum => if (s.n == 0) .null else if (s.dec) |sc| (if (fitsPrecision(s.acc_i, 38)) .{ .decimal = .{ .unscaled = s.acc_i, .scale = sc } } else return decimalOverflow()) else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
+                .sum => if (s.n == 0) .null else if (s.dec) |sc| .{ .decimal = wideSumDecimal(s.acc_i, sc) orelse return decimalOverflow() } else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
                 .avg => if (s.n == 0) .null else .{ .float = s.total() / @as(f64, @floatFromInt(s.n)) },
                 .min, .max => if (s.dq_head < s.dq.items.len) s.vals[s.dq.items[s.dq_head]] else .null,
                 .bool_and => if (s.n == 0) .null else .{ .bool = s.t == s.n },
@@ -786,13 +795,6 @@ pub const Window = struct {
             };
         }
     };
-
-    fn spread(func: ast.AggFunc, variance: f64) Value {
-        return .{ .float = switch (func) {
-            .stddev_samp, .stddev_pop => @sqrt(variance),
-            else => variance,
-        } };
-    }
 
     /// An aggregate over each row's frame, as the file header describes.
     fn aggregateOver(self: *Window, arena: std.mem.Allocator, f: Func, agg: ast.AggFunc, vals: []const Value, fs: []const usize, fe: []const usize, l: Layout, out_ty: types.Type, out: []Value) !void {
@@ -1353,4 +1355,41 @@ test "window without ORDER BY: the default frame is the whole partition, a ROWS 
         at += 1;
     };
     try testing.expectEqual(@as(usize, 5), at);
+}
+
+test "window MEDIAN heaps stay within the frame and match a brute-force median, monotone or random" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const H = Window.Halves;
+    var prng = std.Random.DefaultPrng.init(0x3ed1a);
+    const rnd = prng.random();
+    const n = 20_000;
+    const xs = try a.alloc(f64, n);
+    const buf = try a.alloc(H.Item, 64);
+    for ([_]u8{ 0, 1, 2 }) |shape| for ([_]usize{ 1, 2, 7, 40 }) |w| {
+        for (xs, 0..) |*x, i| x.* = switch (shape) {
+            0 => @floatFromInt(i),
+            1 => -@as(f64, @floatFromInt(i)),
+            else => if (rnd.uintLessThan(u8, 20) == 0) std.math.nan(f64) else @floatFromInt(rnd.intRangeAtMost(i32, -50, 50)),
+        };
+        var h = H.init(a);
+        for (0..n) |i| {
+            try h.add(.{ .x = xs[i], .p = i });
+            if (i >= w) try h.remove(.{ .x = xs[i - w], .p = i - w });
+            const lo = i + 1 -| w;
+            const frame = buf[0 .. i + 1 - lo];
+            for (frame, lo..) |*f, p| f.* = .{ .x = xs[p], .p = p };
+            std.mem.sort(H.Item, frame, {}, struct {
+                fn less(_: void, l: H.Item, r: H.Item) bool {
+                    return H.lt(l, r);
+                }
+            }.less);
+            const mid = frame.len / 2;
+            const want = if (frame.len % 2 == 1) frame[mid].x else (frame[mid - 1].x + frame[mid].x) / 2;
+            const got = h.median().?;
+            try testing.expect((std.math.isNan(want) and std.math.isNan(got)) or want == got);
+            try testing.expect(h.lo.count() + h.hi.count() <= 2 * (h.nlo + h.nhi) + 2);
+        }
+    };
 }
