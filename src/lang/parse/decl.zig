@@ -309,26 +309,10 @@ pub fn parseParam(self: *Parser) Error!ast.Param {
     }
     var default: ?*ast.Expr = null;
     if (self.eatKw("default")) default = try self.parseExpr();
-    var source: ?ast.ParamSource = null;
-    var header_name: ?[]const u8 = null;
-    if (self.eatKw("from")) {
-        if (self.eatKw("query")) {
-            source = .query;
-        } else if (self.eatKw("body")) {
-            source = .body;
-        } else if (self.eatKw("header")) {
-            source = .header;
-            if (self.eat(.lparen)) {
-                header_name = (try self.expect(.string)).text;
-                _ = try self.expect(.rparen);
-            }
-        } else {
-            return self.fail(self.curPos(), "expected QUERY, BODY, or HEADER after FROM", .{});
-        }
-    }
-    if (is_json and source == null) source = .body;
+    if (self.isKw("from"))
+        return self.fail(self.curPos(), "`PARAM ... FROM`: " ++ ast.http_mode_discontinued ++ "; bind the param with `-p {s}=value`", .{name});
     _ = try self.expect(.semi);
-    return .{ .name = name, .ty = ty, .default = default, .source = source, .header_name = header_name, .pos = pos, .is_json = is_json };
+    return .{ .name = name, .ty = ty, .default = default, .pos = pos, .is_json = is_json };
 }
 
 pub fn parseTypeName(self: *Parser) Error!types.Type {

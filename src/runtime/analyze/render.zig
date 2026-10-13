@@ -21,11 +21,7 @@ const parse = @import("../analyze.zig").parse;
 /// A split or morsel fan-out prints as a candidate: only the source or file can settle it.
 pub fn render(plan: Plan, w: anytype) !void {
     for (plan.outputs) |o| {
-        if (std.mem.eql(u8, plan.kind, "batch")) {
-            try w.writeAll("plan\n");
-        } else {
-            try w.print("plan ({s})\n", .{plan.kind});
-        }
+        try w.writeAll("plan\n");
 
         var depth: usize = 1;
         try indent(w, depth);

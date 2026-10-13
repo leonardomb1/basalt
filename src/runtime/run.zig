@@ -8,8 +8,7 @@
 //! statements may reuse a CTE name and each sees its own (registering all up front
 //! once made the last win for both). A `for` body's bindings are scoped to the
 //! body and restored after each row. Sources are closed on every way out: they own
-//! sockets and gpa memory outside the plan arena, and a failed run under `serve`
-//! once leaked a socket per request. `EXPLAIN ANALYZE` runs serially: ten parallel
+//! sockets and gpa memory outside the plan arena. `EXPLAIN ANALYZE` runs serially: ten parallel
 //! paths would each need their own lane figures, and a plan must not depend on the
 //! pipeline's shape to print at all.
 //!
@@ -75,7 +74,6 @@ pub const ParamArg = @import("env.zig").ParamArg;
 const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
 pub const requestAbort = @import("env.zig").requestAbort;
-pub const requestReload = @import("env.zig").requestReload;
 pub const resetAbort = @import("env.zig").resetAbort;
 pub const RunOptions = @import("env.zig").RunOptions;
 const setMsg = @import("env.zig").setMsg;
@@ -88,10 +86,6 @@ pub const LoadDone = @import("env.zig").LoadDone;
 pub const LoadHook = @import("env.zig").LoadHook;
 pub const ResultInfo = arrow.ResultInfo;
 pub const SummaryMode = @import("env.zig").SummaryMode;
-pub const takeReload = @import("env.zig").takeReload;
-pub const enterServeMode = @import("env.zig").enterServeMode;
-pub const shuttingDown = @import("env.zig").shuttingDown;
-pub const resetShutdown = @import("env.zig").resetShutdown;
 pub const terminate = @import("env.zig").terminate;
 
 const guardFileFormat = @import("connect.zig").guardFileFormat;
@@ -139,7 +133,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
     for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
     var expand_at: ?ast.Pos = null;
-    const program = expand.expandProgramAt(arena, raw_program, opts.request_body, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
+    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ExpandFailed => {
             const err = planErr(diag, expand_msg);
@@ -165,11 +159,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s != .param or !s.param.is_json) continue;
         const name = s.param.name;
-        if (opts.request_body) |b| {
-            if (std.json.parseFromSliceLeaky(std.json.Value, arena, b, .{})) |jv| {
-                try json_params.put(name, jv);
-            } else |_| {}
-        }
         for (opts.params) |kv| {
             if (!std.mem.eql(u8, kv.key, name)) continue;
             if (std.json.parseFromSliceLeaky(std.json.Value, arena, kv.val, .{})) |jv| {
@@ -219,11 +208,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     var sources = std.array_list.Managed(driver.Source).init(arena);
     defer for (sources.items) |sc| sc.close();
-    var buffer_decl: ?ast.BufferDecl = null;
-    for (program.stmts) |s| {
-        if (s == .kind) buffer_decl = s.kind.buffer;
-    }
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = opts.request_body, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .buffer_decl = buffer_decl, .buffer_segment = opts.buffer_segment, .load_label_prefix = opts.load_label_prefix, .load_run_id = opts.load_run_id, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .kind_name = @tagName(program.stmts[0].kind.kind), .fns = &fns };
+    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .fns = &fns };
 
     var cit = connections.valueIterator();
     while (cit.next()) |c| {

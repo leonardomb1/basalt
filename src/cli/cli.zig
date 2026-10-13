@@ -1,19 +1,17 @@
 //! Command-line surface:
-//!   basalt run   <script>|-c <script> [-p k=v ...] [-j N] [--port N]
+//!   basalt run   <script>|-c <script> [-p k=v ...] [-j N]
 //!   basalt check <script>|-c <script>
 //!   basalt repl
 //!   basalt kernel
-//! `run` executes (HTTP mode on `--port` when the script declares an endpoint); `check`
-//! validates and plans without running; `serve <dir>` hosts every `@http` script
-//! in a directory and reloads it on SIGHUP. A script comes from a file path or,
-//! with `-c/--command`, inline; `@include` resolves against its directory, or the
-//! cwd for an inline or stdin script. SIGTERM and SIGINT ask a run to stop at its
-//! next boundary, which is how the control plane cancels a job; a server's first
-//! signal is a graceful stop and its second an abort. `--log-format
-//! json` is read before parsing, so a parse error has a runtime error's shape.
-//! Progress is a live line on a terminal, a `progress` event a second under a
-//! JSON log, and nothing on a pipe or under `-q`. A server's own lines are its
-//! output, so `serve` logs at `info` where a one-shot run logs at `warn`.
+//! `run` executes; `check` validates and plans without running. A script comes
+//! from a file path or, with `-c/--command`, inline; `@include` resolves against
+//! its directory, or the cwd for an inline or stdin script. SIGTERM and SIGINT ask
+//! a run to stop at its next boundary, which is how the control plane cancels a
+//! job; a second signal exits 130. `--log-format json` is read before parsing, so
+//! a parse error has a runtime error's shape. Progress is a live line on a
+//! terminal, a `progress` event a second under a JSON log, and nothing on a pipe
+//! or under `-q`. `serve` and `run --port`, the HTTP mode, are refused with
+//! `ast.http_mode_discontinued`.
 //!
 //! `repl` is an interactive loop that runs on `;` and prints results through a
 //! `write stdout` table sink. Declarations carry across entries in a `DeclStore`:
@@ -40,7 +38,7 @@
 //!
 //! This file keeps the signal handling, the dispatch and the usage text. Each
 //! command is its own file (`cmd_run.zig`, `cmd_check.zig`, `cmd_complete.zig`,
-//! `cmd_serve.zig`, `repl.zig`, `kernel.zig`), with what they share in
+//! `repl.zig`, `kernel.zig`), with what they share in
 //! `args.zig` (script and flags), `entry.zig` (statements and the session's
 //! declarations), `prepare.zig` (an entry made runnable), `catalog.zig` (what Tab
 //! fetches) and `wizard.zig` (`\connect`).
@@ -54,23 +52,16 @@ const complete = @import("complete.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
 
-/// A run stops at its next boundary; a host stops gracefully, then aborts on a
-/// second signal (`runtime.terminate`). Once aborting, a further signal exits 130
-/// at once, so ^C ^C is not held hostage by a slow read.
+/// The first signal asks the run to stop at its next boundary; once aborting, a
+/// further signal exits 130 at once, so ^C ^C is not held hostage by a slow read.
 fn onTerminate(_: i32) callconv(.c) void {
     if (!runtime.terminate()) std.posix.exit(130);
-}
-
-fn onReload(_: i32) callconv(.c) void {
-    runtime.requestReload();
 }
 
 fn installSignalHandlers() void {
     const term = std.posix.Sigaction{ .handler = .{ .handler = onTerminate }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(std.posix.SIG.TERM, &term, null);
     std.posix.sigaction(std.posix.SIG.INT, &term, null);
-    const hup = std.posix.Sigaction{ .handler = .{ .handler = onReload }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(std.posix.SIG.HUP, &hup, null);
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
@@ -94,7 +85,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     } else if (std.mem.eql(u8, verb, "run")) {
         std.process.exit(try cmdRun(alloc, args));
     } else if (std.mem.eql(u8, verb, "serve")) {
-        std.process.exit(try cmdServe(alloc, args));
+        try stderr.writeAll("error: `basalt serve`: " ++ ast.http_mode_discontinued ++ "; run each script with `basalt run`\n");
+        try stderr.flush();
+        std.process.exit(2);
     } else if (std.mem.eql(u8, verb, "complete")) {
         std.process.exit(try cmdComplete(alloc, args));
     } else if (std.mem.eql(u8, verb, "kernel")) {
@@ -145,7 +138,6 @@ pub const byteToUtf16 = @import("cmd_complete.zig").byteToUtf16;
 pub const writeOfferIn = @import("cmd_complete.zig").writeOfferIn;
 pub const writeOffer = @import("cmd_complete.zig").writeOffer;
 const cmdRun = @import("cmd_run.zig").cmdRun;
-const cmdServe = @import("cmd_serve.zig").cmdServe;
 pub const DeclKind = @import("entry.zig").DeclKind;
 pub const DeclId = @import("entry.zig").DeclId;
 pub const DeclStore = @import("entry.zig").DeclStore;
@@ -168,10 +160,8 @@ fn usage(w: anytype) !void {
         \\basalt — a SQL-driven data pipeline engine
         \\
         \\usage:
-        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N] [--port N] [--host IP]
-        \\               run a pipeline; --port N serves a CREATE ENDPOINT script
-        \\  basalt serve <dir> [--port N] [--host IP] [--watch] [--log-format FMT] [--log-level LVL]
-        \\               host every endpoint script in a dir (SIGHUP or -w reloads)
+        \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N]
+        \\               run a pipeline
         \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2]
         \\               parse and validate without running, reporting every problem;
         \\               `EXPLAIN` prints the plan; json: an array of diagnostics with
@@ -214,8 +204,7 @@ fn usage(w: anytype) !void {
         \\             default; each file is downloaded once per run and read
         \\             locally, a trailing / a folder with its subfolders
         \\  databases  postgres, mysql, sqlserver, starrocks, doris (CREATE CONNECTION ... TYPE ...)
-        \\  http       REST sources and sinks; `request` for an HTTP request body
-        \\  buffer     durable WAL buffer, replayed by a later run
+        \\  http       REST sources and sinks
         \\
         \\credentials:
         \\  a connection named `erp` reads ERP_USER / ERP_PASS from the environment;
@@ -242,8 +231,6 @@ fn usage(w: anytype) !void {
         \\                     directory of the run's own, removed when the run ends
         \\  --spill-cap SIZE   disk a run may spill to (default 8GB); past it the
         \\                     run fails cleanly
-        \\  --port N           listen port for HTTP mode
-        \\  --host IP          listen address for HTTP mode (default 0.0.0.0, every interface)
         \\  --format FMT       table|json|csv|tsv|arrow — what a SELECT writes to stdout.
         \\                     table: every row and column, for reading, closed by a
         \\                     `(N rows)` line. json: NDJSON rows (and a summary object
@@ -333,7 +320,6 @@ test {
     _ = @import("cmd_check.zig");
     _ = @import("cmd_complete.zig");
     _ = @import("cmd_run.zig");
-    _ = @import("cmd_serve.zig");
     _ = @import("entry.zig");
     _ = @import("prepare.zig");
     _ = @import("repl.zig");

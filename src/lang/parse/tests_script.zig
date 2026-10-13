@@ -105,8 +105,7 @@ test "sql: FOR EACH ROW OF json path with CASE dispatch" {
     const a = ar.allocator();
 
     const prog = try parseTest(a,
-        \\CREATE ENDPOINT '/fanout';
-        \\PARAM job JSON FROM BODY;
+        \\PARAM job JSON;
         \\CREATE CONNECTION crm TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
         \\FOR EACH ROW OF ($job.tables) AS (name, pk)
@@ -123,7 +122,6 @@ test "sql: FOR EACH ROW OF json path with CASE dispatch" {
         \\  END CASE
         \\END FOR;
     );
-    try testing.expect(prog.stmts[0].kind.kind == .http);
     try testing.expect(prog.stmts[1] == .param);
     try testing.expect(prog.stmts[1].param.is_json);
     const fe = prog.stmts[4].for_each;
@@ -240,41 +238,34 @@ test "sql: connection credential convention injects env calls" {
     try testing.expect(saw_user and saw_pass);
 }
 
-test "sql: ACCEPT INTO BUFFER declaration and FROM BUFFER source" {
+test "sql: every HTTP-mode form is refused with the one discontinuation message" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
-    const prog = try parseTest(a,
-        \\CREATE ENDPOINT '/eventos' DOC 'telemetria'
-        \\  ACCEPT BODY (device_id STRING NOT NULL, v INT)
-        \\  INTO BUFFER 'ev' AT '/var/lib/basalt/wal' SEGMENT 16 MB RETAIN 24 HOURS;
-        \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
-        \\LOAD INTO sr.eventos USING stream_load AS
-        \\SELECT device_id, CAST(v AS INT) AS v
-        \\FROM BUFFER 'ev' FLUSH EVERY 5 SECONDS OR 50000 ROWS
-        \\WHERE device_id IS NOT NULL;
-    );
-    const kd = prog.stmts[0].kind;
-    try testing.expect(kd.kind == .http);
-    const buf = kd.buffer.?;
-    try testing.expectEqualStrings("ev", buf.name);
-    try testing.expectEqualStrings("/var/lib/basalt/wal", buf.dir);
-    try testing.expectEqual(@as(u64, 16 << 20), buf.segment_bytes);
-    try testing.expectEqual(@as(u32, 24), buf.retain_hours.?);
-    try testing.expectEqual(@as(usize, 2), buf.schema.len);
-    try testing.expect(buf.schema[0].not_null);
+    const cases = [_][2][]const u8{
+        .{ "CREATE ENDPOINT '/x' DOC 'd';\nSELECT 1 AS x;", "`CREATE ENDPOINT`: " ++ ast.http_mode_discontinued ++ "; run the script with `basalt run`" },
+        .{ "ACCEPT BODY (a INT) INTO BUFFER 'ev';\nSELECT 1 AS x;", "`ACCEPT`: " ++ ast.http_mode_discontinued },
+        .{ "SELECT * FROM BUFFER 'ev' AT '/w';", "`FROM BUFFER`: " ++ ast.http_mode_discontinued },
+        .{ "SELECT a FROM BODY (a INT NOT NULL);", "`FROM BODY`: " ++ ast.http_mode_discontinued },
+        .{ "PARAM t STRING FROM HEADER('X-Tenant');\nSELECT 1 AS x;", "`PARAM ... FROM`: " ++ ast.http_mode_discontinued ++ "; bind the param with `-p t=value`" },
+    };
+    for (cases) |c| {
+        try testing.expectError(error.ParseFailed, parseSource(a, c[0], &diag));
+        try testing.expectEqualStrings(c[1], diag.msg);
+    }
 
-    const pl = prog.stmts[2].output;
-    const rd = pl.stages[0].node.read;
-    try testing.expectEqualStrings("buffer", rd.connector);
-    try testing.expectEqualStrings("ev", rd.form.buffer.name);
-    try testing.expectEqualStrings("", rd.form.buffer.dir);
-    try testing.expectEqualStrings("flush_secs", pl.stages[0].hints[0].key);
-    try testing.expectEqual(@as(i64, 5), pl.stages[0].hints[0].value.int);
-    try testing.expectEqualStrings("flush_rows", pl.stages[0].hints[1].key);
-    try testing.expectEqual(@as(i64, 50000), pl.stages[0].hints[1].value.int);
-    try testing.expect(pl.stages[1].node == .filter);
+    var errs = std.array_list.Managed(Diagnostic).init(a);
+    _ = try parseSourceOpts(a,
+        \\CREATE ENDPOINT '/x'
+        \\  ACCEPT BODY (a INT) INTO BUFFER 'ev';
+        \\SELECT a FROM BUFFER 'ev';
+        \\SELECT 1 AS x;
+    , &diag, .{ .errors = &errs });
+    try testing.expectEqual(@as(usize, 2), errs.items.len);
+    try testing.expectEqual(@as(u32, 1), errs.items[0].line);
+    try testing.expectEqual(@as(u32, 3), errs.items[1].line);
 }
 
 test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} templates" {

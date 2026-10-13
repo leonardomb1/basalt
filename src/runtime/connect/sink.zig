@@ -64,7 +64,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
-    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, write each run to its own path, or accumulate with `INTO BUFFER` and load the buffer once", .{ w.target, why }));
+    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, or write each run to its own path", .{ w.target, why }));
 }
 
 /// `run` does not analyze first; without this a `.zip` was parsed as CSV and
@@ -297,7 +297,5 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
     }
     if (cfg.database.len == 0) return planErr(env.diag, try options.needsDatabaseMsg(env.arena, flavor.name()));
     if (env.sink_label_prefix) |lp| cfg.label_prefix = lp;
-    if (env.load_label_prefix) |lp| cfg.label_prefix = lp;
-    if (env.load_run_id) |rid| cfg.run_id = rid;
     return cfg;
 }

@@ -65,6 +65,6 @@ FROM EACH TABLE OF (SELECT name, substr(name, 4, 2) FROM erp.sys.tables WHERE na
   ANCHOR SCHEMA erp.dbo.CT2010;
 ```
 
-JSON form (array of `{table, tag}` objects, e.g. from a request body):
+JSON form (array of `{table, tag}` objects, e.g. from a `JSON` param):
 `FROM EACH TABLE OF ($job.tables) IN erp AS (table_name, tag)` — element keys
 remappable via `WITH (table_field = ..., tag_field = ..., tag_substr = '4,2')`.

@@ -1,9 +1,8 @@
 //! End-to-end reads of each format: CSV dialects, zip members, Excel, parquet logical
-//! and nested types, WAL buffers, and the explode functions.
+//! and nested types, and the explode functions.
 
 const std = @import("std");
 const basalt = @import("basalt");
-const Wal = basalt.wal.Wal;
 const parser = basalt.sql_parser;
 const fixtures = basalt.fixtures;
 const Diag = basalt.env.Diag;
@@ -156,39 +155,6 @@ test "JSON_EACH explodes a JSON array; json_get walks keys and indexes" {
     );
     defer alloc.free(tags);
     try std.testing.expectEqualStrings("id,tag\n1,a\n1,1\n1,\n1,\"{\"\"k\"\":true}\"\n", tags);
-}
-
-test "FROM BUFFER replays WAL segments as a source (batch mode)" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const wal_dir = try std.fs.path.join(alloc, &.{ base, "wal" });
-    defer alloc.free(wal_dir);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
-
-    {
-        var w = try Wal.open(alloc, wal_dir, "ev", 1 << 20);
-        defer w.close();
-        try w.append("{\"device_id\":\"a\",\"v\":1}");
-        try w.append("{\"device_id\":\"b\",\"v\":2}");
-        try w.rotate();
-        try w.append("{\"device_id\":\"c\",\"v\":3}");
-        try w.sync();
-    }
-
-    const script = try std.fmt.allocPrint(
-        alloc,
-        "LOAD INTO '{s}' AS SELECT device_id, CAST(v AS INT) AS v FROM BUFFER 'ev' AT '{s}';",
-        .{ out_path, wal_dir },
-    );
-    defer alloc.free(script);
-
-    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("device_id,v\na,1\nb,2\nc,3\n", out);
 }
 
 test "an Excel workbook reads as a table: typed columns, a named sheet and range, and no writing one" {

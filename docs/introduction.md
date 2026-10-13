@@ -15,9 +15,8 @@ WHERE status = 'paid';
 ```
 
 The sources and sinks are files (CSV, Parquet, Arrow IPC, Excel), object
-storage, SFTP servers, Windows shares, SQL databases and HTTP APIs; the same
-script runs once from the command line, or as an HTTP endpoint under
-`basalt serve`.
+storage, SFTP servers, Windows shares, SQL databases and HTTP APIs; a script
+runs once from the command line.
 
 This book is the reference for the dialect, derived from the parser
 (`src/lang/sql_parser.zig`); it describes what the engine actually accepts.

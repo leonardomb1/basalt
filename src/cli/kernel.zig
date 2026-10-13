@@ -683,9 +683,6 @@ fn runScript(
     var pdiag: include.Diag = .{};
     var text: []const u8 = script;
     const entry = cli.prepareEntry(a, decls, script, &pdiag, &text) catch |e| switch (e) {
-        error.EndpointInSession => return reply(a, out, req.id, .{ .ok = false, .@"error" = .{
-            .msg = "CREATE ENDPOINT can't run in a session — put it in a script and use `basalt serve <dir>`",
-        } }),
         error.ParseFailed => {
             var ei = ErrorInfo{ .msg = pdiag.parse.msg };
             const pe = pdiag.parse;

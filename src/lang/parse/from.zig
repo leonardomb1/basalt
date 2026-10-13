@@ -9,9 +9,8 @@ const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const std = @import("std");
-const types = @import("../types.zig");
 
-/// A FROM source: a path, `IDENTIFIER(<expr>)`, BODY(schema), HTTP('url'), a CTE, or a
+/// A FROM source: a path, `IDENTIFIER(<expr>)`, HTTP('url'), a CTE, or a
 /// connection's table or QUERY. Registers the alias.
 pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
     var node: ast.Stage.Node = undefined;
@@ -33,10 +32,8 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         if (!hasLiteralExt(tmpl))
             return self.fail(pos, "dynamic path needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
         node = .{ .read = .{ .connector = "csv", .form = .{ .path = tmpl } } };
-    } else if (self.isKw("body")) {
-        _ = self.advance();
-        const schema = try self.parseBodySchema();
-        node = .{ .read = .{ .connector = "request", .form = .{ .request = schema } } };
+    } else if (self.isKw("body") and self.peekTag() == .lparen) {
+        return self.fail(self.curPos(), "`FROM BODY`: " ++ ast.http_mode_discontinued, .{});
     } else if (self.isKw("http") and self.peekTag() == .lparen) {
         _ = self.advance();
         _ = try self.expect(.lparen);
@@ -44,27 +41,7 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         _ = try self.expect(.rparen);
         node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
     } else if (self.isKw("buffer") and self.peekTag() == .string) {
-        _ = self.advance();
-        const name = self.advance().text;
-        var ref = ast.BufferRef{ .name = name };
-        if (self.eatKw("at")) ref.dir = (try self.expect(.string)).text;
-        if (self.eatKw("flush")) {
-            const fpos = self.curPos();
-            try self.expectKw("every");
-            const n = try self.expect(.int);
-            try self.expectKw("seconds");
-            const secs = std.fmt.parseInt(i64, n.text, 10) catch
-                return self.fail(fpos, "bad FLUSH EVERY seconds `{s}`", .{n.text});
-            try read_hints.append(.{ .key = "flush_secs", .value = .{ .int = secs }, .pos = fpos });
-            if (self.eatKw("or")) {
-                const r = try self.expect(.int);
-                try self.expectKw("rows");
-                const rows = std.fmt.parseInt(i64, r.text, 10) catch
-                    return self.fail(fpos, "bad FLUSH rows `{s}`", .{r.text});
-                try read_hints.append(.{ .key = "flush_rows", .value = .{ .int = rows }, .pos = fpos });
-            }
-        }
-        node = .{ .read = .{ .connector = "buffer", .form = .{ .buffer = ref } } };
+        return self.fail(self.curPos(), "`FROM BUFFER`: " ++ ast.http_mode_discontinued, .{});
     } else if (self.isKw("each")) {
         return self.parseEachTableOf(read_hints);
     } else if (self.isKw("range") and self.peekTag() == .lparen) {
@@ -291,27 +268,4 @@ pub fn parseRetry(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error
         _ = try self.expect(.rparen);
         try hints.append(.{ .key = "retry_statuses", .value = .{ .str = try codes.toOwnedSlice() }, .pos = pos });
     }
-}
-
-/// `BODY (col TYPE [NOT NULL], ...)`, enforced per row at bind time (a violation is
-/// the endpoint's 422).
-pub fn parseBodySchema(self: *Parser) Error![]const types.BodyCol {
-    _ = try self.expect(.lparen);
-    var cols = std.array_list.Managed(types.BodyCol).init(self.arena);
-    while (!self.at(.rparen)) {
-        const name = try self.expectIdent();
-        const ty = if (self.isKw("json")) blk: {
-            _ = self.advance();
-            break :blk types.Type.init(.string);
-        } else try self.parseTypeName();
-        var not_null = false;
-        if (self.eatKw("not")) {
-            try self.expectKw("null");
-            not_null = true;
-        }
-        try cols.append(.{ .name = name, .ty = ty, .not_null = not_null });
-        if (!self.eat(.comma)) break;
-    }
-    _ = try self.expect(.rparen);
-    return cols.toOwnedSlice();
 }

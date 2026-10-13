@@ -566,8 +566,7 @@ pub const Summary = struct {
         if (self.loads_failed > 0) try w.print("{d} failed\n", .{self.loads_failed});
     }
 
-    /// `status` is `partial` once any load or `FOR EACH` item failed, as an HTTP
-    /// endpoint's reply says it.
+    /// `status` is `partial` once any load or `FOR EACH` item failed.
     pub fn renderJson(self: Summary, w: anytype) !void {
         const status = if (self.partial or self.loads_failed > 0) "partial" else "ok";
         try w.print("{{\"status\":\"{s}\",\"run_id\":{d},", .{ status, self.run_id });

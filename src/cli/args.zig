@@ -63,7 +63,7 @@ pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, st
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-const valued_flags = [_][]const u8{ "-c", "--command", "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--port", "--host", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
+const valued_flags = [_][]const u8{ "-c", "--command", "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
 
 /// The first argument that is neither a flag nor a flag's value, `-` included, so the
 /// script may come before or after its flags.
@@ -178,7 +178,7 @@ pub fn wantsJsonLog(args: [][:0]u8) bool {
 
 test "sharedFlag: every command spells -j alike, and takes only its own groups" {
     var w = std.Io.Writer.Discarding.init(&.{});
-    var argv = [_][:0]u8{ @constCast("basalt"), @constCast("kernel"), @constCast("-j8"), @constCast("--threads=3"), @constCast("--port"), @constCast("80") };
+    var argv = [_][:0]u8{ @constCast("basalt"), @constCast("kernel"), @constCast("-j8"), @constCast("--threads=3"), @constCast("--log-level"), @constCast("info") };
     var f = Flags{};
     var i: usize = 2;
     try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
@@ -187,9 +187,9 @@ test "sharedFlag: every command spells -j alike, and takes only its own groups" 
     try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
     try std.testing.expectEqual(@as(?usize, 3), f.threads);
     i = 4;
-    try std.testing.expect(!(try sharedFlag(&argv, &i, &f, .{ .output = true }, &w.writer)).?);
-    try std.testing.expect((try sharedFlag(&argv, &i, &f, .{ .listen = true }, &w.writer)).?);
-    try std.testing.expectEqual(@as(?u16, 80), f.port);
+    try std.testing.expect(!(try sharedFlag(&argv, &i, &f, .{ .log = false, .output = true }, &w.writer)).?);
+    try std.testing.expect((try sharedFlag(&argv, &i, &f, .{}, &w.writer)).?);
+    try std.testing.expectEqual(obs.Level.info, f.log.level);
 }
 
 test "wantsJsonLog: the last --log-format wins" {
@@ -239,17 +239,13 @@ pub fn sizeFlag(v: []const u8, flag: []const u8, stderr: *std.Io.Writer) !?u64 {
 /// The flags several commands share, as parsed so far.
 pub const Flags = struct {
     log: env.LogConfig = .{},
-    level_set: bool = false,
     format: ?env.StdoutFormat = null,
     max_rows: ?u64 = null,
     threads: ?usize = null,
-    host: ?[]const u8 = null,
-    port: ?u16 = null,
 };
 
-/// Which of the shared flags a command takes: logging, output shape and lanes, and
-/// a listening address (`-p` for `--port` only where it is not `--param`).
-pub const FlagSet = struct { log: bool = true, output: bool = false, listen: bool = false, p_port: bool = false };
+/// Which of the shared flags a command takes: logging, and output shape and lanes.
+pub const FlagSet = struct { log: bool = true, output: bool = false };
 
 /// Parse `args[i.*]` when it is one of `set`'s flags: true when it was, false when
 /// it is not one, null once a bad value has been reported (exit 2).
@@ -269,7 +265,6 @@ pub fn sharedFlag(args: [][:0]u8, i: *usize, f: *Flags, comptime set: FlagSet, s
         if (eql(u8, a, "--log-level")) {
             const v = (try nextVal(args, i, a, stderr)) orelse return null;
             f.log.level = obs.Level.parse(v) orelse return badFlag(stderr, "--log-level must be error|warn|info|debug", .{});
-            f.level_set = true;
             return true;
         }
     }
@@ -286,19 +281,6 @@ pub fn sharedFlag(args: [][:0]u8, i: *usize, f: *Flags, comptime set: FlagSet, s
         if (eql(u8, a, "--max-rows")) {
             const v = (try nextVal(args, i, a, stderr)) orelse return null;
             f.max_rows = std.fmt.parseInt(u64, v, 10) catch return badFlag(stderr, "invalid --max-rows `{s}`", .{v});
-            return true;
-        }
-    }
-    if (set.listen) {
-        if (eql(u8, a, "--host")) {
-            const v = (try nextVal(args, i, a, stderr)) orelse return null;
-            _ = std.net.Address.parseIp(v, 0) catch return badFlag(stderr, "invalid --host `{s}` (an IP address, such as 127.0.0.1)", .{v});
-            f.host = v;
-            return true;
-        }
-        if (eql(u8, a, "--port") or (set.p_port and eql(u8, a, "-p"))) {
-            const v = (try nextVal(args, i, a, stderr)) orelse return null;
-            f.port = std.fmt.parseInt(u16, v, 10) catch return badFlag(stderr, "invalid --port `{s}`", .{v});
             return true;
         }
     }

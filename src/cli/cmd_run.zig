@@ -1,9 +1,9 @@
-//! `basalt run`: run a script once, or serve it on `--port` when it declares an endpoint.
+//! `basalt run`: run a script once.
 
 const ErrOut = @import("args.zig").ErrOut;
 const Flags = @import("args.zig").Flags;
 const analyze = @import("../runtime/analyze.zig");
-const http_server = @import("../server/http_server.zig");
+const ast = @import("../lang/ast.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
@@ -25,6 +25,14 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var stderr_file = std.fs.File.stderr().writerStreaming(&stderr_buf);
     const stderr = &stderr_file.interface;
     defer stderr.flush() catch {};
+
+    for (args[2..]) |a| {
+        const name = a[0 .. std.mem.indexOfScalar(u8, a, '=') orelse a.len];
+        if (std.mem.eql(u8, name, "--port") or std.mem.eql(u8, name, "--host")) {
+            try stderr.print("error: `run {s}`: " ++ ast.http_mode_discontinued ++ "; drop it to run the script once\n", .{name});
+            return 2;
+        }
+    }
 
     const src = loadSource(arena.allocator(), "run", args, stderr) catch |e| switch (e) {
         error.Usage, error.Unreadable => |le| return loadExit(le),
@@ -77,7 +85,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 return 2;
             };
             try params.append(.{ .key = kv[0..eqp], .val = kv[eqp + 1 ..] });
-        } else if ((try sharedFlag(args, &i, &fl, .{ .output = true, .listen = true }, stderr)) orelse return 2) {} else if (try unknownOption(a, "run", stderr)) return 2;
+        } else if ((try sharedFlag(args, &i, &fl, .{ .output = true }, stderr)) orelse return 2) {} else if (try unknownOption(a, "run", stderr)) return 2;
     }
     var log = fl.log;
     const stdout_format = fl.format orelse .table;
@@ -91,18 +99,6 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         try eo.report(.{ .msg = why });
         return 1;
     };
-
-    if (prog.stmts.len > 0 and prog.stmts[0] == .kind and prog.stmts[0].kind.kind == .http) {
-        const serve_port = fl.port orelse {
-            try stderr.print("error: {s} declares CREATE ENDPOINT: add `--port N` to serve it, or host its folder with `basalt serve <dir>`\n", .{src.label});
-            return 2;
-        };
-        http_server.serve(alloc, prog, fl.host orelse http_server.default_host, serve_port, .{ .format = log.format, .level = if (fl.level_set) log.level else .info, .quiet = log.quiet, .summary = .stderr }) catch |e| {
-            try stderr.print("{s}: serve error: {s}\n", .{ src.label, @errorName(e) });
-            return 1;
-        };
-        return 0;
-    }
 
     if (prog.explain == .plan) {
         var ebuf: [4096]u8 = undefined;
@@ -200,12 +196,11 @@ test "reportFailedItems: under --log-format json every line is an NDJSON event" 
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"2/3 item(s) failed\"") != null);
 }
 
-test "run refuses an endpoint script without --port instead of serving it" {
-    var argv = [_][:0]u8{
-        @constCast("basalt"),
-        @constCast("run"),
-        @constCast("-c"),
-        @constCast("CREATE ENDPOINT '/x'; SELECT 1 AS one;"),
-    };
-    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &argv));
+test "run refuses --port and --host, and an endpoint script fails to parse" {
+    var port = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("--port"), @constCast("8080"), @constCast("-c"), @constCast("SELECT 1 AS one;") };
+    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &port));
+    var host = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("-c"), @constCast("SELECT 1 AS one;"), @constCast("--host=127.0.0.1") };
+    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &host));
+    var endpoint = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("-c"), @constCast("CREATE ENDPOINT '/x'; SELECT 1 AS one;") };
+    try std.testing.expectEqual(@as(u8, 1), try cmdRun(std.testing.allocator, &endpoint));
 }

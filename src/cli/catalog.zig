@@ -248,7 +248,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         .connection => try conns.append(e.name),
         .function => try fns.append(e.name),
         .param, .let => try params.append(e.name),
-        .endpoint, .resource => {},
+        .resource => {},
     };
     try loopVarsAt(text, cursor, &params);
 

@@ -1,6 +1,6 @@
 //! A run's scratch space: the `Space` its blocking operators spill into. Each run
-//! owns one, so a run ending never removes another's files (the serve flusher and
-//! the notebook kernel can run while another run is going). Most runs never
+//! owns one, so a run ending never removes another's files (the notebook kernel
+//! can run while another run is going). Most runs never
 //! spill, so the directory, `<spill_dir>/basalt-spill-<random hex>` (`spill_dir`
 //! from `--spill-dir`, else `$TMPDIR`, else `/tmp`), is made on the first
 //! `create`; `deinit` removes it with everything in it. Files and the disk cap

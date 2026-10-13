@@ -212,15 +212,10 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
         .table => |q| .{ .table = try renderQual(arena, q, lr) },
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
-        .request => |d| .{ .request = d },
         .unit => .unit,
         .range => |r| .{ .range = .{
             .lo = try renderExpr(arena, r.lo, lr),
             .hi = try renderExpr(arena, r.hi, lr),
-        } },
-        .buffer => |b| .{ .buffer = .{
-            .name = try interpAll(arena, b.name, lr),
-            .dir = try interpAll(arena, b.dir, lr),
         } },
     }, .where = try interpAll(arena, rd.where, lr) };
 }

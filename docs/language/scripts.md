@@ -4,8 +4,7 @@ A script is a sequence of `;`-terminated statements:
 
 ```sql ignore
 @include 'lib.sql';               -- top of file only; C-style, relative to this file
-CREATE ENDPOINT '/x' DOC '...';   -- only for HTTP mode; absent = batch
-PARAM ...;                        -- request/CLI inputs
+PARAM ...;                        -- CLI inputs
 LET name = <expr>;                -- sealed plan-time constant
 THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
@@ -49,8 +48,7 @@ THROW 'since must be an ISO date' WHEN $since <> '' AND length($since) < 10;
 THROW 'unreachable branch';       -- unconditional, e.g. in a CASE arm
 ```
 
-- **Batch is the silent default.** A script with no `CREATE ENDPOINT` runs once
-  to completion ([exit codes](../tools/cli.md#exit-codes)).
+- A script runs once to completion ([exit codes](../tools/cli.md#exit-codes)).
 - Keywords are case-insensitive; identifiers keep their case.
 - Comments: `--` to end of line, `/* ... */` blocks.
 - Strings are `'...'` (double `''` for a literal quote), and only `'...'`.

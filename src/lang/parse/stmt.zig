@@ -54,9 +54,7 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
         if (!recovered) return self.fail(self.curPos(), "empty program: expected at least one statement", .{});
     }
 
-    const kind: ast.KindDecl = self.endpoint orelse
-        .{ .kind = .batch, .config = &.{}, .pos = .{ .line = 1, .col = 1 } };
-    try stmts.insert(0, .{ .kind = kind });
+    try stmts.insert(0, .{ .kind = .{ .pos = .{ .line = 1, .col = 1 } } });
     return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain };
 }
 
@@ -69,7 +67,7 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
     if (eqlNoCase(t.text, "for") or eqlNoCase(t.text, "case")) return true;
     if (!eqlNoCase(t.text, "create")) return false;
     for (self.toks[i + 1 .. @min(self.toks.len, i + 4)]) |n| {
-        if (n.tag == .ident and (eqlNoCase(n.text, "function") or eqlNoCase(n.text, "endpoint"))) return true;
+        if (n.tag == .ident and eqlNoCase(n.text, "function")) return true;
     }
     return false;
 }
@@ -78,6 +76,7 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
 /// query LET's own subqueries create.
 pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     if (self.isKw("create")) return self.parseCreate(out);
+    if (self.isKw("accept")) return self.fail(self.curPos(), "`ACCEPT`: " ++ ast.http_mode_discontinued, .{});
     if (self.isKw("param")) {
         const p = try self.parseParam();
         try self.const_names.append(p.name);
@@ -248,22 +247,8 @@ pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
         try self.expectKw("replace");
         break :blk true;
     } else false;
-    if (self.eatKw("endpoint")) {
-        const path = try self.expect(.string);
-        var attrs = std.array_list.Managed(ast.Attr).init(self.arena);
-        try attrs.append(.{ .key = "path", .value = try self.mk(.{ .str_lit = path.text }), .pos = pos });
-        if (self.eatKw("doc")) {
-            const doc = try self.expect(.string);
-            try attrs.append(.{ .key = "doc", .value = try self.mk(.{ .str_lit = doc.text }), .pos = pos });
-        }
-        var buffer: ?ast.BufferDecl = null;
-        if (self.eatKw("accept")) buffer = try self.parseAcceptBuffer(pos);
-        _ = try self.expect(.semi);
-        if (self.endpoint != null)
-            return self.fail(pos, "duplicate CREATE ENDPOINT", .{});
-        self.endpoint = .{ .kind = .http, .config = try attrs.toOwnedSlice(), .buffer = buffer, .pos = pos };
-        return;
-    }
+    if (self.isKw("endpoint"))
+        return self.fail(self.curPos(), "`CREATE ENDPOINT`: " ++ ast.http_mode_discontinued ++ "; run the script with `basalt run`", .{});
     if (self.eatKw("connection")) {
         const conn = try self.parseConnection(pos);
         try self.conn_names.append(conn.name);
@@ -274,38 +259,7 @@ pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
         return out.append(.{ .func = try self.parseFunction(pos, replace) });
     }
     if (self.eatKw("resource")) return self.parseResource(pos);
-    return self.fail(self.curPos(), "expected ENDPOINT, CONNECTION, RESOURCE, or FUNCTION after CREATE", .{});
-}
-
-/// `ACCEPT BODY (schema) INTO BUFFER 'name' [AT 'dir'] [SEGMENT n] [MAX n] [RETAIN ...]`
-/// after CREATE ENDPOINT. `MAX` is the on-disk backpressure limit (503 beyond it).
-pub fn parseAcceptBuffer(self: *Parser, pos: Pos) Error!ast.BufferDecl {
-    try self.expectKw("body");
-    const schema = try self.parseBodySchema();
-    try self.expectKw("into");
-    try self.expectKw("buffer");
-    const name = try self.expect(.string);
-    var decl = ast.BufferDecl{ .name = name.text, .dir = "wal", .schema = schema, .pos = pos };
-    while (true) {
-        if (self.eatKw("at")) {
-            decl.dir = (try self.expect(.string)).text;
-        } else if (self.eatKw("segment")) {
-            decl.segment_bytes = try self.parseByteSize();
-        } else if (self.eatKw("max")) {
-            decl.max_bytes = try self.parseByteSize();
-        } else if (self.eatKw("retain")) {
-            if (self.eatKw("until")) {
-                try self.expectKw("loaded");
-                decl.retain_hours = null;
-            } else {
-                const n = try self.expect(.int);
-                try self.expectKw("hours");
-                decl.retain_hours = std.fmt.parseInt(u32, n.text, 10) catch
-                    return self.fail(pos, "bad RETAIN hours `{s}`", .{n.text});
-            }
-        } else break;
-    }
-    return decl;
+    return self.fail(self.curPos(), "expected CONNECTION, RESOURCE, or FUNCTION after CREATE", .{});
 }
 
 /// One dotted name atom: an identifier, or `IDENTIFIER(<expr>)` lowered to a `${...}`
@@ -442,15 +396,4 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
         },
         else => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
     }
-}
-
-pub fn parseByteSize(self: *Parser) Error!u64 {
-    const n = try self.expect(.int);
-    const v = std.fmt.parseInt(u64, n.text, 10) catch
-        return self.fail(self.curPos(), "bad size `{s}`", .{n.text});
-    const unit = try self.expectIdent();
-    if (eqlNoCase(unit, "kb")) return v << 10;
-    if (eqlNoCase(unit, "mb")) return v << 20;
-    if (eqlNoCase(unit, "gb")) return v << 30;
-    return self.fail(self.curPos(), "expected KB, MB, or GB (got `{s}`)", .{unit});
 }

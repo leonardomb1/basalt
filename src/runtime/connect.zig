@@ -47,7 +47,6 @@ const tds = @import("../db/tds.zig");
 const mysql = @import("../db/mysql.zig");
 const postgres = @import("../db/postgres.zig");
 const sql = @import("../db/sql.zig");
-const request = @import("../connect/request.zig");
 const http_client = @import("../net/http_client.zig");
 const split = @import("../connect/split.zig");
 const analyze = @import("analyze.zig");
@@ -205,8 +204,7 @@ pub fn sourceLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) []const u8 
 }
 
 pub fn connectorType(env: *Env, name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "request") or
-        std.mem.eql(u8, name, "http") or std.mem.eql(u8, name, "buffer")) return name;
+    if (std.mem.eql(u8, name, "csv") or std.mem.eql(u8, name, "http")) return name;
     if (env.connections.get(name)) |c| return c.connector;
     return name;
 }

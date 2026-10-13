@@ -7,8 +7,8 @@ a REST response's nested object. These functions build and take them apart;
 
 ## Building a document
 
-`JSON_OBJECT(k1, v1, …)`, `JSON_ARRAY(v1, …)` — build a JSON document, for a
-request body or a nested column: numbers and booleans as themselves, text
+`JSON_OBJECT(k1, v1, …)`, `JSON_ARRAY(v1, …)` — build a JSON document, for an
+HTTP request body or a nested column: numbers and booleans as themselves, text
 as a JSON string, a null as `null` (the result itself is never null), and a
 NaN or infinity as `null` too, since JSON has neither. Text
 that is a JSON object or array — another `json_object`, or what `json_get`

@@ -19,7 +19,6 @@ test "sql: terminal select from csv becomes read+write stdout" {
     const prog = try parseTest(a, "SELECT id, amount FROM 'in.csv' WHERE status = 'paid' LIMIT 2;");
     try testing.expectEqual(@as(usize, 2), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqual(ast.Kind.batch, prog.stmts[0].kind.kind);
     const pl = prog.stmts[1].output;
     try testing.expectEqual(@as(usize, 5), pl.stages.len);
     try testing.expect(pl.stages[0].node == .read);

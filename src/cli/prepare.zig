@@ -24,7 +24,7 @@ pub const Prepared = struct {
     executable: usize,
 };
 
-pub const PrepareError = error{ ParseFailed, EndpointInSession, OutOfMemory };
+pub const PrepareError = error{ ParseFailed, OutOfMemory };
 
 /// A declaration the entry makes again is left out of the prelude, so no name is declared twice.
 fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const Pending, block: []const u8) !struct { text: []const u8, entry_at: usize } {
@@ -63,7 +63,6 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
             executable += 1;
             continue;
         };
-        if (id.kind == .endpoint) return error.EndpointInSession;
         try pending.append(.{ .id = id, .text = st });
     }
 

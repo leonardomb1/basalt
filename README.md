@@ -104,7 +104,6 @@ has the details.
 ```console
 $ basalt run pipeline.sql -p since=2026-01-01   # run once; -p binds a PARAM
 $ basalt check pipeline.sql                     # validate without connecting
-$ basalt serve ./endpoints                      # each script as an HTTP endpoint
 $ basalt repl                                   # an interactive session
 $ basalt kernel                                 # a session a notebook or editor drives
 ```

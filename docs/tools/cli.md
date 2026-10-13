@@ -1,8 +1,7 @@
 # Command line
 
 ```text
-basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE] [--port N] [--host IP]
-basalt serve    <dir> [--port N] [--host IP] [--watch]
+basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE]
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
 basalt repl
@@ -10,7 +9,7 @@ basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 basalt version
 ```
 
-`run` and `serve` take the log options `--log-level error|warn|info|debug`,
+`run` takes the log options `--log-level error|warn|info|debug`,
 `--log-format text|json|auto` and `-q`; `kernel` takes the first two.
 
 ## Options
@@ -23,7 +22,7 @@ stdin) may sit anywhere among them: `basalt run --format json job.sql` and
 
 `-j N` runs a query that can fan out on exactly `N` lanes — fewer only when
 the input has fewer pieces than that, as a Parquet file with three row groups
-has three. Without `-j`, `run`, `kernel` and `serve` use one lane per physical
+has three. Without `-j`, `run` and `kernel` use one lane per physical
 core the process may run on (`taskset` and container CPU sets count), not one
 per hardware thread: a second hyperthread adds little to a lane that streams
 memory, and on a 14-core, 20-thread laptop twenty lanes ran Parquet aggregates

@@ -15,10 +15,8 @@
 //! once defined shared `CREATE FUNCTION`s twice and made diamond-shaped trees
 //! exponential. Nothing is filtered: an included file may declare connections,
 //! params, functions or whole pipelines. The one structural fixup is the kind
-//! decl the parser puts at `stmts[0]` of every program (batch unless the script
-//! says `CREATE ENDPOINT`), which the runtime and the HTTP server read there: the
-//! merged program keeps exactly one, the includer's, unless only an included file
-//! declares an endpoint.
+//! decl the parser puts at `stmts[0]` of every program, which the runtime reads
+//! there: the merged program keeps exactly one.
 //!
 //! Cycles are detected on canonical absolute paths and nesting is capped at
 //! `max_depth` (with `max_total_stmts` as a backstop); both report the offending
@@ -183,9 +181,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base_dir: []const u8, fi
     var kind: ?ast.KindDecl = if (main) |m| leadKind(m) else null;
     var out = std.array_list.Managed(ast.Stmt).init(ctx.arena);
     for (subs.items) |sp| {
-        if (leadKind(sp)) |k| {
-            if (kind == null or (kind.?.kind != .http and k.kind == .http)) kind = k;
-        }
+        if (kind == null) kind = leadKind(sp);
         try out.appendSlice(stmtsOf(sp));
     }
     if (main) |m| try out.appendSlice(stmtsOf(m));
@@ -310,7 +306,6 @@ test "@include prepends a decls file to the including script" {
 
     try testing.expectEqual(@as(usize, 3), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqual(ast.Kind.batch, prog.stmts[0].kind.kind);
     try testing.expectEqualStrings("dbl", prog.stmts[1].func.name);
     try testing.expect(prog.stmts[2] == .output);
 }
@@ -373,29 +368,6 @@ test "@include: a table function declared in a library is called in the includer
     try testing.expect(prog.stmts[1].func.body == .table);
     try testing.expect(prog.stmts[2] == .binding);
     try testing.expect(prog.stmts[3] == .output);
-}
-
-test "@include keeps a leading CREATE ENDPOINT at stmts[0]" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "fns.sql", "CREATE FUNCTION dbl(x) AS x * 2;\n");
-
-    var diag: Diag = .{};
-    const prog = try loadProgram(a,
-        \\@include 'fns.sql';
-        \\CREATE ENDPOINT '/x';
-        \\SELECT dbl(id) AS y FROM 'in.csv';
-    , "main.sql", base, &diag);
-
-    try testing.expectEqual(@as(usize, 3), prog.stmts.len);
-    try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqual(ast.Kind.http, prog.stmts[0].kind.kind);
-    try testing.expect(prog.stmts[1] == .func);
-    try testing.expect(prog.stmts[2] == .output);
 }
 
 test "nested @include resolves relative to the including file" {

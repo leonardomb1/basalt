@@ -76,7 +76,6 @@ pub fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8) !void {
     for (try splitStatements(arena, text)) |st| {
         const id = declOf(st) orelse continue;
-        if (id.kind == .endpoint) continue;
         try decls.put(id, st);
     }
 }

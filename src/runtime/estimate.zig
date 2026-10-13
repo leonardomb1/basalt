@@ -356,7 +356,7 @@ test "estimate: a SQL table whose catalog cannot be asked is unknown, asked once
     const fns = std.StringHashMap(ast.FnDecl).init(a);
     var cache = env_mod.FactsCache.init(testing.allocator);
     defer cache.deinit();
-    var env = Env{ .arena = a, .gpa = testing.allocator, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = null, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns, .facts_cache = &cache };
+    var env = Env{ .arena = a, .gpa = testing.allocator, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns, .facts_cache = &cache };
 
     const rd = ast.Read{ .connector = "pg", .form = .{ .table = .{ .parts = &.{ "public", "t" } } } };
     try testing.expectEqual(@as(?u64, null), sqlRows(&env, rd));

@@ -1,16 +1,15 @@
 # Parameters and LET
 
 ```sql
-PARAM dias   INT DEFAULT 7;              -- batch: -p dias=3 | http: query string
+PARAM dias   INT DEFAULT 7;              -- -p dias=3
 PARAM desde  TIMESTAMP;                  -- no default = required
-PARAM job    JSON FROM BODY;             -- whole JSON body as a document
-PARAM tenant STRING FROM HEADER('X-Tenant');
+PARAM job    JSON;                       -- -p job='{"tables":[...]}', a document
 ```
 
 - Reference with `$`: `$dias`, `$desde`. JSON documents navigate by dotted
   path — `$job.tables`, `$job.source.host` — resolved to literals at plan time.
   A `JSON` param takes its document from `-p job='{"a":1}'` (or a kernel's
-  `params`), else the request body in HTTP mode, else a string `DEFAULT`; a
+  `params`), else a string `DEFAULT`; a
   path to a key the document lacks is an error naming the key. `check` with no
   value bound reads every path as `null`.
 - Safe navigation: `$job.filtro?.uf` — a missing intermediate resolves the
@@ -26,21 +25,13 @@ PARAM tenant STRING FROM HEADER('X-Tenant');
   `DECIMAL(38,0)`; `DECIMAL(p)` without a scale is refused. `-p` must name a
   `PARAM` the script declares, once: a misspelt name fails `run` and `check`
   rather than running on the default, and a name given twice is a malformed
-  command line. A kernel's `params` and an HTTP query string may carry names
-  a script does not declare; those are ignored.
-- Source defaults: scalars bind from the query string, `JSON` from the body. A
-  query-string value is decoded as a browser or a form encodes it: `%C3%A3` is
-  `ã`, `+` is a space and `%2B` a plus.
-  `FROM QUERY`, `FROM BODY` and `FROM HEADER('X-Name')` say so explicitly; a
-  bare `FROM HEADER` reads the header named like the param. In HTTP mode a
-  param binds only from its source, so a query string cannot override a
-  header or body param.
+  command line. A kernel's `params` may carry names a script does not
+  declare; those are ignored.
 
 **`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
 folded once at plan time (in declaration order; it may reference `$params` and
 earlier `$lets`) and referenced as `$name`. It can never be bound externally —
-`-p name=...` is an error, HTTP binding ignores it, and it is not part of an
-endpoint's parameter surface. A LET and a PARAM may not share a name. `LET
+`-p name=...` is an error. A LET and a PARAM may not share a name. `LET
 run_ts = now();` gives one consistent timestamp across every pipeline of a run.
 
 `LET name = (SELECT ...);` binds the single cell of a query instead, run when

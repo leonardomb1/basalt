@@ -19,9 +19,7 @@ the password is optional when a `key_file` logs in. The key is an OpenSSH
 Ed25519 key, passphrase-protected or not; an RSA key file is refused with that
 advice. Password and keyboard-interactive logins both work. Without a
 connection, `sftp://user@host/path` logs in with `~/.ssh/id_ed25519` or
-`SFTP_PASSWORD`. A connection name is process-wide: under `basalt serve` every
-script sees the latest `CREATE CONNECTION` of it, so give different servers
-different names.
+`SFTP_PASSWORD`.
 
 The server's host key is checked before anything is sent, against
 `known_hosts` (`~/.ssh/known_hosts` by default, hashed entries and `[host]:port`

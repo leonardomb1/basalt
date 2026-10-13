@@ -11,8 +11,8 @@
 //! `ExpandFailed` with a message.
 //!
 //! The same pass replaces `$p.a.b` refs to `json` params with literals of the
-//! resolved scalar, parsing the param's JSON once: a `-p` value, else the request
-//! body, else a string DEFAULT (a bare `p.a` is a column of a table aliased `p`).
+//! resolved scalar, parsing the param's JSON once: a `-p` value, else a string
+//! DEFAULT (a bare `p.a` is a column of a table aliased `p`).
 //! Offline, with none of them, such refs become `null`.
 //!
 //! Depth alone does not bound the work: `f(x) = g(x) + g(x)` doubles per level, so
@@ -55,20 +55,20 @@ const Subst = std.StringHashMap(*ast.Expr);
 /// A JSON PARAM's value given as text, by `-p name=...` or a kernel's `params`.
 pub const JsonArg = struct { name: []const u8, text: []const u8 };
 
-pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, msg: *[]const u8) Error!ast.Program {
-    return expandProgramWith(arena, program, body, &.{}, msg);
+pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8) Error!ast.Program {
+    return expandProgramWith(arena, program, &.{}, msg);
 }
 
-/// A JSON PARAM binds from its `args` text first, then the request body, then a string
-/// DEFAULT; with none of them (offline `check`) its paths read as null.
-pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
+/// A JSON PARAM binds from its `args` text first, then a string DEFAULT; with
+/// neither (offline `check`) its paths read as null.
+pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
     var at: ?ast.Pos = null;
-    return expandProgramAt(arena, program, body, args, msg, &at);
+    return expandProgramAt(arena, program, args, msg, &at);
 }
 
 /// `expandProgramWith`, with `at` set on failure to where the problem is: the failing
 /// call, else the statement or declaration holding it.
-pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]const u8, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
+pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
         at.* = s.func.pos;
@@ -90,15 +90,10 @@ pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]
         has_json = true;
     };
     if (has_json) {
-        var parsed: ?std.json.Value = null;
-        if (body) |b| parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, b, .{}) catch {
-            msg.* = "invalid JSON in request body";
-            return error.ExpandFailed;
-        };
         for (program.stmts) |s| if (s == .param and s.param.is_json) {
             at.* = s.param.pos;
-            var val = parsed;
-            if (val == null) if (s.param.default) |d| if (d.* == .str_lit) {
+            var val: ?std.json.Value = null;
+            if (s.param.default) |d| if (d.* == .str_lit) {
                 val = parseJsonArg(arena, s.param.name, d.str_lit, msg) catch |e| return e;
             };
             for (args) |arg| if (std.mem.eql(u8, arg.name, s.param.name)) {
@@ -121,8 +116,8 @@ pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, body: ?[]
 
 fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
     return switch (s) {
-        .kind => |k| .{ .kind = .{ .kind = k.kind, .config = try expandAttrs(cx, k.config), .buffer = k.buffer, .pos = k.pos } },
-        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .source = p.source, .header_name = p.header_name, .pos = p.pos, .is_json = p.is_json } },
+        .kind => s,
+        .param => |p| .{ .param = .{ .name = p.name, .ty = p.ty, .default = if (p.default) |d| try expandExpr(cx, d, null, 0) else null, .pos = p.pos, .is_json = p.is_json } },
         .connection => |c| blk: {
             var out = c;
             out.config = try expandAttrs(cx, c.config);
@@ -515,7 +510,7 @@ test "expansion preserves is_empty kind and match structure (via rebuildExpr)" {
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "SELECT CASE status WHEN 'a', 'b' THEN 'y' ELSE 'z' END AS g FROM 'x' WHERE status IS EMPTY;", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     const stages = out.stmts[1].output.stages;
     const f = stages[1].node.filter;
     try std.testing.expect(f.* == .is_null);
@@ -533,7 +528,7 @@ test "expandProgram inlines a user fn and drops its declaration" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION empresa(t) AS substr(t, 4, 2);\n" ++
         "SELECT empresa(id) AS e FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     try std.testing.expectEqual(@as(usize, 2), out.stmts.len);
     try std.testing.expect(out.stmts[1] == .output);
     const sel = out.stmts[1].output.stages[1].node.select;
@@ -553,20 +548,20 @@ test "expandProgram rejects recursion and arity mismatch" {
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const p1 = try parser.parseSource(a, "CREATE FUNCTION loopy(x) AS loopy(x);\nSELECT loopy(id) AS y FROM 'x';", &d1);
     var m1: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, null, &m1));
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, &m1));
     try std.testing.expect(std.mem.indexOf(u8, m1, "too deep") != null);
 
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const p2 = try parser.parseSource(a, "CREATE FUNCTION one(b) AS b;\nSELECT one(id, status) AS y FROM 'x';", &d2);
     var m2: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, null, &m2));
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, &m2));
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
 
     var at: ?ast.Pos = null;
-    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, null, &.{}, &m2, &at));
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, &.{}, &m2, &at));
     try std.testing.expectEqual(@as(u32, 2), at.?.line);
     try std.testing.expectEqual(@as(u32, 8), at.?.col);
-    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, null, &.{}, &m1, &at));
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, &.{}, &m1, &at));
     try std.testing.expectEqual(@as(u32, 1), at.?.line);
 }
 
@@ -591,7 +586,7 @@ fn expandErr(a: std.mem.Allocator, src: []const u8) ![]const u8 {
         return e;
     };
     var msg: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, prog, null, &msg));
+    try std.testing.expectError(error.ExpandFailed, expandProgram(a, prog, &msg));
     return msg;
 }
 
@@ -603,7 +598,7 @@ test "expandProgram: DEFAULT parameters fill missing trailing arguments" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION round_to(x, n INT DEFAULT 2) AS round(x, n);\n" ++
         "SELECT round_to(v) AS r, round_to(v, 4) AS r4 FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     const sel = outputSelect(out);
     try std.testing.expectEqualStrings("round", sel[0].computed.expr.call.name);
     try std.testing.expectEqual(@as(i64, 2), sel[0].computed.expr.call.args[1].int_lit);
@@ -623,13 +618,13 @@ test "expandProgram: a declared parameter type rejects a wrong-kind literal" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION margin(rev FLOAT, cost FLOAT) AS rev - cost;\n" ++
         "SELECT margin(7, amount) AS m FROM 'd';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .binary);
 
     const m2 = try expandErr(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-13-01') AS x FROM 'd';");
     try std.testing.expectEqualStrings("`f`: argument 1 (`a`) expects DATE, got `2026-13-01`", m2);
     const p2 = try parser.parseSource(a, "CREATE FUNCTION f(a DATE) AS a;\nSELECT f('2026-01-31') AS x FROM 'd';", &diag);
-    const o2 = try expandProgram(a, p2, null, &msg);
+    const o2 = try expandProgram(a, p2, &msg);
     const cast = outputSelect(o2)[0].computed.expr.cast;
     try std.testing.expectEqual(types.TypeKind.date, cast.ty.kind);
     try std.testing.expectEqualStrings("2026-01-31", cast.e.str_lit);
@@ -646,7 +641,7 @@ test "expandProgram: a table function is read with FROM, not called as a scalar 
     try std.testing.expectEqualStrings("`paid` is a table function — read it with FROM paid(...), not CALL", m2);
     var msg: []const u8 = "";
     var d: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try expandProgram(a, try parser.parseSource(a, decl ++ "SELECT * FROM paid();", &d), null, &msg);
+    const prog = try expandProgram(a, try parser.parseSource(a, decl ++ "SELECT * FROM paid();", &d), &msg);
     for (prog.stmts) |st| try std.testing.expect(st != .func);
 }
 
@@ -663,7 +658,7 @@ test "expandProgram: duplicate CREATE FUNCTION needs OR REPLACE" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION f(x) AS x + 1;\nCREATE OR REPLACE FUNCTION f(x) AS x + 2;\n" ++
         "SELECT f(id) AS v FROM 'd';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     try std.testing.expectEqual(@as(i64, 2), outputSelect(out)[0].computed.expr.binary.r.int_lit);
 }
 
@@ -677,7 +672,7 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
         "CREATE FUNCTION sync(name) AS\n  LOAD INTO 'out_${name}.csv' AS SELECT inc(id) AS id FROM 'in.csv';\nEND;\n" ++
         "CALL sync('a');", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
 
     var fns: usize = 0;
     var calls: usize = 0;
@@ -717,7 +712,7 @@ test "expandProgram inlines `let … in` away, a let binding used twice" {
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "SELECT LET d = id + 1 IN d * d AS v FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     const e = outputSelect(out)[0].computed.expr;
     try std.testing.expect(e.* == .binary);
     try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
@@ -734,15 +729,15 @@ fn outputSelect(prog: ast.Program) []const ast.SelectItem {
     return &.{};
 }
 
-test "expandProgram substitutes JSON-param path access from the body" {
+test "expandProgram substitutes JSON-param path access from a -p value" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const prog = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.source.host AS h, $job.n AS n FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, "{\"source\":{\"host\":\"203.0.113.9\"},\"n\":7}", &msg);
+    const out = try expandProgramWith(a, prog, &.{.{ .name = "job", .text = "{\"source\":{\"host\":\"203.0.113.9\"},\"n\":7}" }}, &msg);
     const sel = outputSelect(out);
     try std.testing.expect(sel[0].computed.expr.* == .str_lit);
     try std.testing.expectEqualStrings("203.0.113.9", sel[0].computed.expr.str_lit);
@@ -750,7 +745,7 @@ test "expandProgram substitutes JSON-param path access from the body" {
     try std.testing.expectEqual(@as(i64, 7), sel[1].computed.expr.int_lit);
 }
 
-test "a JSON param binds from a -p value before the body, and from a string DEFAULT" {
+test "a JSON param binds from a -p value, and from a string DEFAULT" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -758,17 +753,12 @@ test "a JSON param binds from a -p value before the body, and from a string DEFA
     const prog = try parser.parseSource(a, "PARAM job JSON;\nPARAM cfg JSON DEFAULT '{\"n\":9}';\n" ++
         "SELECT $job.a.b AS b, $cfg.n AS n FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgramWith(a, prog, null, &.{.{ .name = "job", .text = "{\"a\":{\"b\":\"cli\"}}" }}, &msg);
+    const out = try expandProgramWith(a, prog, &.{.{ .name = "job", .text = "{\"a\":{\"b\":\"cli\"}}" }}, &msg);
     const sel = outputSelect(out);
     try std.testing.expectEqualStrings("cli", sel[0].computed.expr.str_lit);
     try std.testing.expectEqual(@as(i64, 9), sel[1].computed.expr.int_lit);
 
-    const body = "{\"a\":{\"b\":\"body\"},\"n\":1}";
-    const both = try expandProgramWith(a, prog, body, &.{.{ .name = "job", .text = "{\"a\":{\"b\":\"cli\"}}" }}, &msg);
-    try std.testing.expectEqualStrings("cli", outputSelect(both)[0].computed.expr.str_lit);
-    try std.testing.expectEqual(@as(i64, 1), outputSelect(both)[1].computed.expr.int_lit);
-
-    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, prog, null, &.{.{ .name = "job", .text = "{bad" }}, &msg));
+    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, prog, &.{.{ .name = "job", .text = "{bad" }}, &msg));
     try std.testing.expect(std.mem.indexOf(u8, msg, "not valid JSON") != null);
 }
 
@@ -778,31 +768,31 @@ test "?. safe navigation: a missing intermediate resolves to null instead of err
     const a = ar.allocator();
 
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p1 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p1 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job?.source.host AS h FROM 'x';", &d1);
     var m1: []const u8 = "";
-    const o1 = try expandProgram(a, p1, "{\"other\":1}", &m1);
+    const o1 = try expandProgramWith(a, p1, &.{.{ .name = "job", .text = "{\"other\":1}" }}, &m1);
     try std.testing.expect(outputSelect(o1)[0].computed.expr.* == .null_lit);
 
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p2 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p2 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.source?.host AS h FROM 'x';", &d2);
     var m2: []const u8 = "";
-    const o2 = try expandProgram(a, p2, "{\"source\":{\"x\":1}}", &m2);
+    const o2 = try expandProgramWith(a, p2, &.{.{ .name = "job", .text = "{\"source\":{\"x\":1}}" }}, &m2);
     try std.testing.expect(outputSelect(o2)[0].computed.expr.* == .null_lit);
 
     var d4 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p4 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p4 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.filtro?.uf AS h FROM 'x';", &d4);
     var m4: []const u8 = "";
-    const o4 = try expandProgram(a, p4, "{\"a\":1}", &m4);
+    const o4 = try expandProgramWith(a, p4, &.{.{ .name = "job", .text = "{\"a\":1}" }}, &m4);
     try std.testing.expect(outputSelect(o4)[0].computed.expr.* == .null_lit);
 
     var d3 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p3 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p3 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.source.host AS h FROM 'x';", &d3);
     var m3: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p3, "{\"other\":1}", &m3));
+    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, p3, &.{.{ .name = "job", .text = "{\"other\":1}" }}, &m3));
     try std.testing.expect(std.mem.indexOf(u8, m3, "key `source` not found") != null);
 }
 
@@ -811,31 +801,31 @@ test "?. over a scalar intermediate resolves to null" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const prog = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.n?.x AS h FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, "{\"n\":7}", &msg);
+    const out = try expandProgramWith(a, prog, &.{.{ .name = "job", .text = "{\"n\":7}" }}, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);
 }
 
-test "json body errors: non-scalar leaf and invalid JSON" {
+test "json param errors: non-scalar leaf and invalid JSON" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
     var d1 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p1 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p1 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.source AS s FROM 'x';", &d1);
     var m1: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p1, "{\"source\":{\"h\":1}}", &m1));
+    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, p1, &.{.{ .name = "job", .text = "{\"source\":{\"h\":1}}" }}, &m1));
     try std.testing.expect(std.mem.indexOf(u8, m1, "scalar") != null);
 
     var d2 = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const p2 = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const p2 = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.n AS n FROM 'x';", &d2);
     var m2: []const u8 = "";
-    try std.testing.expectError(error.ExpandFailed, expandProgram(a, p2, "not json{", &m2));
-    try std.testing.expect(std.mem.indexOf(u8, m2, "invalid JSON") != null);
+    try std.testing.expectError(error.ExpandFailed, expandProgramWith(a, p2, &.{.{ .name = "job", .text = "not json{" }}, &m2));
+    try std.testing.expect(std.mem.indexOf(u8, m2, "not valid JSON") != null);
 }
 
 test "nested user fns inline through each other" {
@@ -846,7 +836,7 @@ test "nested user fns inline through each other" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION inc(x) AS x + 1;\nCREATE FUNCTION twice(y) AS inc(y) * 2;\n" ++
         "SELECT twice(id) AS v FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     const e = outputSelect(out)[0].computed.expr;
     try std.testing.expect(e.* == .binary);
     try std.testing.expectEqual(ast.BinOp.mul, e.binary.op);
@@ -866,7 +856,7 @@ test "a `let` shadowing a fn param is restored after the let body" {
     const prog = try parser.parseSource(a, "CREATE FUNCTION f(x) AS (LET x = 1 IN x) + x;\n" ++
         "SELECT f(id) AS v FROM 'd';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     const e = outputSelect(out)[0].computed.expr;
     try std.testing.expect(e.* == .binary);
     try std.testing.expectEqual(ast.BinOp.add, e.binary.op);
@@ -881,10 +871,10 @@ test "expandProgram leaves JSON paths null when unbound (offline check)" {
     defer ar.deinit();
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, "PARAM job JSON FROM BODY;\n" ++
+    const prog = try parser.parseSource(a, "PARAM job JSON;\n" ++
         "SELECT $job.source.host AS h FROM 'x';", &diag);
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     try std.testing.expect(outputSelect(out)[0].computed.expr.* == .null_lit);
 }
 
@@ -902,7 +892,7 @@ test "statement-level LET parses to a let_const stmt and its expression expands"
     try std.testing.expectEqualStrings("dbl", prog.stmts[2].let_const.expr.?.call.name);
 
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog, null, &msg);
+    const out = try expandProgram(a, prog, &msg);
     try std.testing.expect(out.stmts[1] == .let_const);
     const e = out.stmts[1].let_const.expr.?;
     try std.testing.expect(e.* == .binary);
@@ -916,7 +906,7 @@ test "json-form union: $param.path renders the branch array into discover_json" 
     const a = ar.allocator();
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a,
-        \\PARAM job JSON FROM BODY;
+        \\PARAM job JSON;
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
         \\LOAD INTO sr.UNIFIED USING stream_load AS
@@ -924,9 +914,9 @@ test "json-form union: $param.path renders the branch array into discover_json" 
     , &diag);
 
     var msg: []const u8 = "";
-    const out = try expandProgram(a, prog,
+    const out = try expandProgramWith(a, prog, &.{.{ .name = "job", .text = 
         \\{"tables":[{"table":"CT2010","tag":"01"},{"table":"CT2020","tag":"02"}]}
-    , &msg);
+    }}, &msg);
     var found = false;
     for (out.stmts) |s| {
         if (s != .output) continue;
@@ -940,7 +930,7 @@ test "json-form union: $param.path renders the branch array into discover_json" 
     try std.testing.expect(found);
 
     var msg2: []const u8 = "";
-    const off = try expandProgram(a, prog, null, &msg2);
+    const off = try expandProgram(a, prog, &msg2);
     for (off.stmts) |s| {
         if (s != .output) continue;
         try std.testing.expectEqualStrings("[]", s.output.stages[0].node.union_.discover_json);

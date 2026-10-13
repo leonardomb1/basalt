@@ -13,26 +13,24 @@ const std = @import("std");
 pub const Style = enum(u8) { plain, keyword, string, number, comment, param, punct, func };
 
 pub const keywords = [_][]const u8{
-    "accept",   "all",      "analyze",    "anchor",    "and",       "anti",      "append",     "as",         "asc",
-    "at",       "between",  "body",       "buffer",    "by",        "call",      "case",       "cols",       "connection",
-    "continue", "costs",    "create",     "cross",     "current",   "default",   "desc",       "distinct",   "doc",
-    "each",     "else",     "empty",      "end",       "endpoint",  "error",     "every",      "except",     "exclude",
-    "explain",  "flush",    "for",        "from",      "full",      "function",  "group",      "having",     "header",
-    "hours",    "http",     "identifier", "in",        "inner",     "into",      "is",         "jobs",       "join",
-    "json",     "left",     "let",        "like",      "limit",     "load",      "loaded",     "max",        "name",
-    "not",      "null",     "of",         "offset",    "on",        "options",   "or",         "order",      "outer",
-    "over",     "paginate", "parallel",   "param",     "partial",   "partition", "preceding",  "precision",  "print",
-    "pushdown", "query",    "range",      "rename",    "replace",   "retain",    "retry",      "right",      "row",
-    "rows",     "schema",   "seconds",    "segment",   "select",    "semi",      "sequential", "split",      "stop",
-    "table",    "then",     "throw",      "type",      "unbounded", "union",     "unnest",     "until",      "upsert",
-    "using",    "when",     "where",      "with",      "true",      "false",     "count",      "sum",        "avg",
-    "min",      "median",   "cast",       "try_cast",  "if",        "rank",      "dense_rank", "row_number", "lag",
-    "lead",     "string",   "int",        "float",     "decimal",   "bool",      "date",       "time",       "timestamp",
-    "resource", "get",      "post",       "json_each", "following", "filter",    "window",     "ignore",     "respect",
-    "nulls",    "interval",
+    "all",        "analyze",    "anchor",    "and",       "anti",       "append",    "as",        "asc",       "between",
+    "by",         "call",       "case",      "cols",      "connection", "continue",  "costs",     "create",    "cross",
+    "current",    "default",    "desc",      "distinct",  "each",       "else",      "empty",     "end",       "error",
+    "except",     "exclude",    "explain",   "for",       "from",       "full",      "function",  "group",     "having",
+    "http",       "identifier", "in",        "inner",     "into",       "is",        "jobs",      "join",      "json",
+    "left",       "let",        "like",      "limit",     "load",       "max",       "name",      "not",       "null",
+    "of",         "offset",     "on",        "options",   "or",         "order",     "outer",     "over",      "paginate",
+    "parallel",   "param",      "partial",   "partition", "preceding",  "precision", "print",     "pushdown",  "query",
+    "range",      "rename",     "replace",   "retry",     "right",      "row",       "rows",      "schema",    "select",
+    "semi",       "sequential", "split",     "stop",      "table",      "then",      "throw",     "type",      "unbounded",
+    "union",      "unnest",     "upsert",    "using",     "when",       "where",     "with",      "true",      "false",
+    "count",      "sum",        "avg",       "min",       "median",     "cast",      "try_cast",  "if",        "rank",
+    "dense_rank", "row_number", "lag",       "lead",      "string",     "int",       "float",     "decimal",   "bool",
+    "date",       "time",       "timestamp", "resource",  "get",        "post",      "json_each", "following", "filter",
+    "window",     "ignore",     "respect",   "nulls",     "interval",
     // type names
-    "varchar",    "char",      "nvarchar",  "text",      "bigint",     "smallint",   "tinyint",
-    "integer",  "double",   "real",       "numeric",   "boolean",   "datetime",
+      "varchar",   "char",      "nvarchar",  "text",
+    "bigint",     "smallint",   "tinyint",   "integer",   "double",     "real",      "numeric",   "boolean",   "datetime",
 };
 
 fn isKeyword(word: []const u8) bool {

@@ -136,7 +136,6 @@ pub fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session,
     defer f.close();
     var n: usize = 0;
     for (sess.decls.items.items) |e| {
-        if (e.kind == .endpoint) continue;
         try f.writeAll(e.text);
         try f.writeAll(";\n");
         n += 1;
@@ -506,11 +505,6 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
     var diag: include.Diag = .{};
     var text: []const u8 = block;
     const entry = prepareEntry(a, &sess.decls, block, &diag, &text) catch |e| switch (e) {
-        error.EndpointInSession => {
-            try msg.writeAll("error: CREATE ENDPOINT can't run in the REPL — put it in a script and use `basalt serve <dir>`\n");
-            try msg.flush();
-            return;
-        },
         error.ParseFailed => {
             if (diag.label.len > 0 and !std.mem.eql(u8, diag.label, "<repl>"))
                 try msg.print("error: {s}:{d}:{d}: {s}\n", .{ diag.label, diag.parse.line, diag.parse.col, diag.parse.msg })

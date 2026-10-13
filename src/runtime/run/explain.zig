@@ -31,7 +31,7 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     }
 
     var adiag = analyze.Diag{};
-    const plan = analyze.analyzeOne(env.arena, env.kind_name, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| return aErr(env, &adiag, err);
+    const plan = analyze.analyzeOne(env.arena, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| return aErr(env, &adiag, err);
 
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();

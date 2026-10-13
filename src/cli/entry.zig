@@ -123,7 +123,7 @@ pub fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const
     return out.toOwnedSlice();
 }
 
-pub const DeclKind = enum { connection, function, param, let, endpoint, resource };
+pub const DeclKind = enum { connection, function, param, let, resource };
 
 pub const DeclId = struct { kind: DeclKind, name: []const u8 };
 
@@ -162,7 +162,6 @@ pub fn declOf(stmt: []const u8) ?DeclId {
         if (!std.ascii.eqlIgnoreCase(w, "replace")) return null;
         w = nextWord(stmt, &i) orelse return null;
     }
-    if (std.ascii.eqlIgnoreCase(w, "endpoint")) return .{ .kind = .endpoint, .name = "" };
     if (std.ascii.eqlIgnoreCase(w, "resource")) {
         const q = nextWord(stmt, &i) orelse return null;
         const conn = identPrefix(q);
@@ -283,7 +282,7 @@ test "declOf names session declarations" {
     try std.testing.expectEqualStrings("f", declOf("CREATE FUNCTION f(a, b) AS a + b").?.name);
     try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
     try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
-    try std.testing.expectEqual(DeclKind.endpoint, declOf("CREATE ENDPOINT '/x'").?.kind);
+    try std.testing.expect(declOf("CREATE ENDPOINT '/x'") == null);
     try std.testing.expectEqual(DeclKind.resource, declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.kind);
     try std.testing.expectEqualStrings("rc.countries", declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.name);
     try std.testing.expect(declOf("CREATE RESOURCE countries AS GET('/all')") == null);

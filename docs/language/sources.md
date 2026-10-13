@@ -19,8 +19,6 @@ A query reads from one source, named after `FROM`, and joins may read more
 | REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param (`name = NULL`, or a value that is `NULL`, such as a `PARAM` defaulting to `NULL`, leaves it out), and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
 | REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` ([HTTP APIs](../connectors/http.md)) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
-| request body | `FROM BODY (col TYPE [NOT NULL], ...)` ([HTTP mode](http-mode.md)) |
-| durable buffer | `FROM BUFFER 'name'` ([HTTP mode](http-mode.md#durable-buffer-wal)) |
 | discovered union | `FROM EACH TABLE OF (...)` ([UNION ALL BY NAME](set-operations.md)) |
 | generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are int literals or params |
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |

@@ -56,8 +56,8 @@ AS
   indexes every row group or batch and is written last,
   so appending means rewriting the file), for `az://` / `s3://` (an object is
   replaced on write, never extended), and for `sftp://` / `smb://` (the file is
-  written beside the target and renamed over it) — use `REPLACE`, a per-run
-  path, or `INTO BUFFER` ([HTTP mode](http-mode.md#durable-buffer-wal)).
+  written beside the target and renamed over it) — use `REPLACE`, or a per-run
+  path.
 - `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
   lane count (otherwise the CLI `-j` applies).
 

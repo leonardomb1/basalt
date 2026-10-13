@@ -11,10 +11,6 @@
 //! then the script's PARAMs and LETs. Script scope is consulted only by `${...}`
 //! string interpolation, never when folding a bare name in an expression, where
 //! a bare name is a column and a same-named param must not displace it.
-//!
-//! The serve flusher pins `load_label_prefix` and `load_run_id` so a replayed
-//! buffer segment produces the same Stream Load labels, and the sink's dedup
-//! makes redelivery effectively-once.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -59,39 +55,10 @@ pub const aborting = driver.aborting;
 pub const errLabel = op.errLabel;
 pub const resetAbort = driver.resetAbort;
 
-var g_reload = std.atomic.Value(bool).init(false);
-pub fn requestReload() void {
-    g_reload.store(true, .seq_cst);
-}
-pub fn takeReload() bool {
-    return g_reload.swap(false, .seq_cst);
-}
-
-var g_serving = std.atomic.Value(bool).init(false);
-var g_shutdown = std.atomic.Value(bool).init(false);
-
-/// Marks the process as a host, so a first SIGTERM stops it gracefully instead of aborting.
-pub fn enterServeMode() void {
-    g_serving.store(true, .seq_cst);
-}
-
-/// A graceful stop or an abort was asked for: a host takes no new work, and
-/// work already started runs to its end unless `aborting` is also set.
-pub fn shuttingDown() bool {
-    return g_shutdown.load(.seq_cst) or driver.aborting();
-}
-
-pub fn resetShutdown() void {
-    g_serving.store(false, .seq_cst);
-    g_shutdown.store(false, .seq_cst);
-}
-
-/// SIGTERM/SIGINT, with atomic stores only (async-signal-safe). A host's first
-/// signal is a graceful stop and its second an abort; a one-shot run's first is an
-/// abort. False once already aborting: the caller exits at once.
+/// SIGTERM/SIGINT, with atomic stores only (async-signal-safe): the run stops at
+/// its next boundary. False once already aborting: the caller exits at once.
 pub fn terminate() bool {
     if (driver.aborting()) return false;
-    if (g_serving.load(.seq_cst) and !g_shutdown.swap(true, .seq_cst)) return true;
     driver.requestAbort();
     return true;
 }
@@ -182,16 +149,12 @@ pub const OutcomeSink = struct {
 
 pub const RunOptions = struct {
     params: []const ParamArg = &.{},
-    request_body: ?[]const u8 = null,
     /// The `-j` lane count; null picks it per input (`lanes`, `lanes/sources.csvLanes`).
     threads: ?usize = 1,
     log: LogConfig = .{},
     outcomes: ?*OutcomeSink = null,
-    buffer_segment: ?u64 = null,
     explain: bool = false,
     stdout_format: StdoutFormat = .table,
-    load_label_prefix: ?[]const u8 = null,
-    load_run_id: ?u64 = null,
     items: bool = false,
     progress: bool = false,
     line_base: u32 = 0,
@@ -288,7 +251,6 @@ pub const Env = struct {
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
     sources: *std.array_list.Managed(driver.Source),
-    request_body: ?[]const u8,
     diag: *Diag,
     log: *obs.Logger,
     progress: ?*obs.Progress = null,
@@ -309,11 +271,7 @@ pub const Env = struct {
     mem_sink: ?*MemSink = null,
     script_scope: LoopRow = no_loop_vars,
     call_depth: usize = 0,
-    buffer_decl: ?ast.BufferDecl = null,
-    buffer_segment: ?u64 = null,
-    load_label_prefix: ?[]const u8 = null,
     sink_label_prefix: ?[]const u8 = null,
-    load_run_id: ?u64 = null,
     sql_desc: ?SqlDesc = null,
     csv_in: csv.Dialect = .{},
     csv_out: csv.Dialect = .{},
@@ -331,7 +289,6 @@ pub const Env = struct {
     wrote_sink: bool = false,
     stdout_format: StdoutFormat = .table,
     explain: bool = false,
-    kind_name: []const u8 = "batch",
     result: arrow.ResultInfo = .{},
     results_printed: u32 = 0,
     line_base: u32 = 0,
@@ -714,20 +671,8 @@ pub fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
     return null;
 }
 
-test "terminate: a host stops gracefully first and aborts on the second signal" {
-    defer {
-        resetShutdown();
-        driver.resetAbort();
-    }
-    try std.testing.expect(terminate());
-    try std.testing.expect(driver.aborting());
-    try std.testing.expect(!terminate());
-    driver.resetAbort();
-
-    enterServeMode();
-    try std.testing.expect(!shuttingDown());
-    try std.testing.expect(terminate());
-    try std.testing.expect(shuttingDown() and !driver.aborting());
+test "terminate: the first signal aborts the run, a second exits" {
+    defer driver.resetAbort();
     try std.testing.expect(terminate());
     try std.testing.expect(driver.aborting());
     try std.testing.expect(!terminate());

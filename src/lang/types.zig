@@ -6,10 +6,9 @@
 //! `cast`. Nulls follow SQL three-valued logic, tracked as a per-type `nullable`
 //! flag; a bare `null` literal is `unknown` and unifies with anything.
 //!
-//! `BodyCol` (a declared `FROM BODY (...)` column) lives here so the connect layer
-//! does not need the AST. A `Field`'s `rel`/`base` are set on columns a join's
-//! right side contributed: the side's alias and the column's original name, which
-//! `name` no longer is once a collision renamed it `x_r`.
+//! A `Field`'s `rel`/`base` are set on columns a join's right side contributed:
+//! the side's alias and the column's original name, which `name` no longer is
+//! once a collision renamed it `x_r`.
 
 const std = @import("std");
 
@@ -118,8 +117,6 @@ pub const Type = struct {
         return null;
     }
 };
-
-pub const BodyCol = struct { name: []const u8, ty: Type, not_null: bool = false };
 
 pub const Schema = struct {
     fields: []const Field,

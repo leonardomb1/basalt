@@ -36,7 +36,6 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     var diag = Diag{};
     const plan = try analyze(a, prog, &diag);
 
-    try std.testing.expectEqualStrings("batch", plan.kind);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
     const o = plan.outputs[0];
     try std.testing.expectEqualStrings("csv", o.source.connector);

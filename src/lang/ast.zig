@@ -37,14 +37,11 @@
 //! position. A frame offset is kept as written, a non-negative number or an
 //! `INTERVAL`, for the plan to read in the order key's units. Without a frame it is
 //! the whole partition, or with `ORDER BY` everything up to the current row's peers.
-//! `FROM RANGE` bounds and `CALL` arguments resolve at plan time; an empty `FROM
-//! BUFFER` dir resolves from the `INTO BUFFER` declaration, whose endpoint acks
-//! after fsync and answers 503 past `MAX`.
+//! `FROM RANGE` bounds and `CALL` arguments resolve at plan time.
 //!
 //! Statements. A statement `LET` is folded once at plan time in declaration order
-//! and is sealed: never bound from outside, never part of an endpoint's parameter
-//! surface. Its query form takes one column of one row, and zero rows read as
-//! NULL. `PRINT` writes through the run logger to stderr, never stdout, which is
+//! and is sealed: never bound from outside. Its query form takes one column of one
+//! row, and zero rows read as NULL. `PRINT` writes through the run logger to stderr, never stdout, which is
 //! the data contract. A fired `THROW` aborts before a row is read and is never
 //! transient. A function body is an expression (inlined by `expand.zig`, recursion
 //! rejected), a statement block run by `CALL` with its parameters as loop
@@ -65,6 +62,9 @@ const token = @import("token.zig");
 pub const Pos = struct { line: u32, col: u32, file: u16 = 0 };
 
 pub const Span = struct { start: Pos, end: Pos };
+
+/// The one wording every removed HTTP-mode form reports, from the parser and the CLI alike.
+pub const http_mode_discontinued = "HTTP mode was discontinued after v0.10.3";
 
 pub const QualName = struct {
     parts: []const []const u8,
@@ -230,25 +230,11 @@ pub const ReadForm = union(enum) {
     table: QualName,
     query: []const u8,
     path: []const u8,
-    request: ?[]const types.BodyCol,
-    buffer: BufferRef,
     range: RangeSpec,
     unit,
 };
 
 pub const RangeSpec = struct { lo: *Expr, hi: *Expr };
-
-pub const BufferRef = struct { name: []const u8, dir: []const u8 = "" };
-
-pub const BufferDecl = struct {
-    name: []const u8,
-    dir: []const u8,
-    segment_bytes: u64 = 16 << 20,
-    retain_hours: ?u32 = null,
-    max_bytes: u64 = 1 << 30,
-    schema: []const types.BodyCol,
-    pos: Pos,
-};
 
 pub const SelectItem = union(enum) {
     star,
@@ -585,14 +571,10 @@ pub const Pipeline = struct {
     show: bool = false,
 };
 
-pub const ParamSource = enum { query, body, header };
-
 pub const Param = struct {
     name: []const u8,
     ty: types.Type,
     default: ?*Expr,
-    source: ?ParamSource,
-    header_name: ?[]const u8 = null,
     pos: Pos,
     is_json: bool = false,
 };
@@ -665,14 +647,8 @@ pub const ForEach = struct {
     pos: Pos,
 };
 
-pub const Kind = enum { batch, http };
-
-pub const KindDecl = struct {
-    kind: Kind,
-    config: []const Attr,
-    buffer: ?BufferDecl = null,
-    pos: Pos,
-};
+/// The program's lead statement: every program starts with one, so the body is `stmts[1..]`.
+pub const KindDecl = struct { pos: Pos };
 
 pub const StmtMatch = struct {
     subject: ?*Expr,

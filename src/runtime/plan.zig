@@ -995,7 +995,7 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     var rows = obs.RowCounter.init(0);
     var json = std.StringHashMap(std.json.Value).init(a);
     const fns = std.StringHashMap(ast.FnDecl).init(a);
-    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = null, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
 
     const side = [_]ast.Stage{.{ .node = .{ .ref = "c" }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } }};
     const out = try prepareJoinSide(&env, &side);
@@ -1040,7 +1040,7 @@ test "projectedColumns and rightNeeds: computed and deferred join keys narrow bo
     var rows = obs.RowCounter.init(0);
     var json = std.StringHashMap(std.json.Value).init(a);
     const fns = std.StringHashMap(ast.FnDecl).init(a);
-    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .request_body = null, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
 
     var outs = std.array_list.Managed([]const ast.Stage).init(a);
     for (prog.stmts) |st| if (st == .output) try outs.append(st.output.stages);

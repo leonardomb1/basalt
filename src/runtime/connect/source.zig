@@ -2,7 +2,6 @@
 //! reads, generated rows and constant sources, with the columns a query reads.
 
 const Batch = @import("../../exec/batch.zig").Batch;
-const BufferSource = @import("../../connect/wal.zig").BufferSource;
 const Env = @import("../env.zig").Env;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
@@ -30,7 +29,6 @@ const pqdecode = @import("../../format/parquet/read.zig");
 const queryParams = @import("../connect.zig").queryParams;
 const readReport = @import("../connect.zig").readReport;
 const readSql = @import("sql_read.zig").readSql;
-const request = @import("../../connect/request.zig");
 const resolveDbConfig = @import("dbconfig.zig").resolveDbConfig;
 const s3 = @import("../../store/s3.zig");
 const sql = @import("../../db/sql.zig");
@@ -223,36 +221,6 @@ fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sourc
 /// `openSourceAll`, a CSV converting only the columns `project` names. A union's
 /// branches already carry its `where` hint, so it is not folded in twice.
 fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
-    if (std.mem.eql(u8, rd.connector, "request")) {
-        const body = env.request_body orelse
-            return planErr(env.diag, "`FROM BODY` is only available to an endpoint script (`CREATE ENDPOINT`) served over HTTP");
-        const declared: ?[]const types.BodyCol = if (rd.form == .request) rd.form.request else null;
-        var reject: []const u8 = "";
-        const s = request.RequestSource.open(env.gpa, body, declared, env.arena, &reject) catch |e| {
-            if (e == error.BodySchemaViolation)
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "request body rejected: {s}", .{reject}));
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "could not parse request body as JSON: {s}", .{@errorName(e)}));
-        };
-        return s.source();
-    }
-    if (std.mem.eql(u8, rd.connector, "buffer")) {
-        const ref = rd.form.buffer;
-        var dir = ref.dir;
-        var declared: ?[]const types.BodyCol = null;
-        if (env.buffer_decl) |decl| {
-            if (std.mem.eql(u8, decl.name, ref.name)) {
-                if (dir.len == 0) dir = decl.dir;
-                declared = decl.schema;
-            }
-        }
-        if (dir.len == 0)
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}`: no INTO BUFFER declaration in this script — name its directory with AT '<dir>'", .{ref.name}));
-        const s = BufferSource.open(env.gpa, dir, ref.name, declared, env.buffer_segment) catch |e| switch (e) {
-            error.BufferEmpty => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}` at {s}: no segments to replay (and no declared schema)", .{ ref.name, dir })),
-            else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "buffer `{s}` at {s}: {s}", .{ ref.name, dir, @errorName(e) })),
-        };
-        return s.source();
-    }
     if (std.mem.eql(u8, rd.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
         var hopts = http_client.optsFromHints(hints);

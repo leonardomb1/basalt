@@ -2,7 +2,6 @@
 //! `ast.Program` the planner, analyzer, pushdown and executor share.
 //!
 //! Mapping highlights:
-//!   CREATE ENDPOINT '/x'            -> KindDecl http (absent -> batch)
 //!   PARAM x INT DEFAULT 7           -> Param (referenced as $x)
 //!   CREATE CONNECTION c TYPE t ...  -> Connection (+ credential convention:
 //!                                      user/password default to env(C_USER/C_PASS))
@@ -394,7 +393,6 @@ pub const Parser = struct {
     i: usize = 0,
     diag: *Diagnostic,
 
-    endpoint: ?ast.KindDecl = null,
     known_conns: []const ast.Connection = &.{},
     known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
@@ -723,7 +721,6 @@ pub const Parser = struct {
     pub const parseLetStmt = @import("parse/stmt.zig").parseLetStmt;
     pub const parsePrintStmt = @import("parse/stmt.zig").parsePrintStmt;
     pub const parseCreate = @import("parse/stmt.zig").parseCreate;
-    pub const parseAcceptBuffer = @import("parse/stmt.zig").parseAcceptBuffer;
     pub const parseNameSegment = @import("parse/stmt.zig").parseNameSegment;
     pub const parseColRef = @import("parse/stmt.zig").parseColRef;
     pub const parseTargetSegment = @import("parse/stmt.zig").parseTargetSegment;
@@ -731,7 +728,6 @@ pub const Parser = struct {
     pub const exprToTemplate = @import("parse/stmt.zig").exprToTemplate;
     pub const templatePart = @import("parse/stmt.zig").templatePart;
     pub const unparse = @import("parse/stmt.zig").unparse;
-    pub const parseByteSize = @import("parse/stmt.zig").parseByteSize;
     pub const parseConnection = @import("parse/decl.zig").parseConnection;
     pub const parseHttpClauses = @import("parse/decl.zig").parseHttpClauses;
     pub const parseHttpCall = @import("parse/decl.zig").parseHttpCall;
@@ -841,7 +837,6 @@ pub const Parser = struct {
     pub const parseEachTableOf = @import("parse/from.zig").parseEachTableOf;
     pub const parsePaginate = @import("parse/from.zig").parsePaginate;
     pub const parseRetry = @import("parse/from.zig").parseRetry;
-    pub const parseBodySchema = @import("parse/from.zig").parseBodySchema;
     pub const parseForEach = @import("parse/control.zig").parseForEach;
     pub const parseDollarPath = @import("parse/control.zig").parseDollarPath;
     pub const parseCaseStmt = @import("parse/control.zig").parseCaseStmt;

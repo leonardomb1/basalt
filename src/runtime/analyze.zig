@@ -347,7 +347,6 @@ pub const Output = struct {
 };
 
 pub const Plan = struct {
-    kind: []const u8,
     outputs: []const Output,
 };
 
@@ -731,7 +730,7 @@ pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Opt
     if (opts.issues) |list| if (p) |_| {} else |e| {
         if (e == error.OutOfMemory) return e;
         try list.append(.{ .msg = try arena.dupe(u8, diag.msg), .pos = diag.pos, .end = diag.end });
-        p = .{ .kind = "batch", .outputs = &.{} };
+        p = .{ .outputs = &.{} };
     };
     return p;
 }
@@ -742,13 +741,12 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     const json_args = try arena.alloc(expand.JsonArg, cli.len);
     for (cli, json_args) |o, *ja| ja.* = .{ .name = o.name, .text = o.value };
     var expand_at: ?ast.Pos = null;
-    const program = expand.expandProgramAt(arena, raw_program, null, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
+    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ExpandFailed => return failPos(diag, expand_at, "{s}", .{expand_msg}),
     };
     if (program.stmts.len == 0 or program.stmts[0] != .kind)
         return fail(diag, "internal error: the parsed program has no kind statement", .{});
-    const kind_name = @tagName(program.stmts[0].kind.kind);
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
     var connections = std.StringHashMap(ast.Connection).init(arena);
@@ -855,7 +853,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
     for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| try ctx.checkTableFn(s.func, tc);
 
-    return .{ .kind = kind_name, .outputs = try out_plans.toOwnedSlice() };
+    return .{ .outputs = try out_plans.toOwnedSlice() };
 }
 
 /// Does a stage name a column through `IDENTIFIER(<expr>)`, which the parser lowers to
@@ -1013,7 +1011,6 @@ fn checkStaticQuery(arena: std.mem.Allocator, p: ast.Pipeline, connections: *con
 /// `EXPLAIN <query>;`, which holds these maps (params folded) and hands them over.
 pub fn analyzeOne(
     arena: std.mem.Allocator,
-    kind_name: []const u8,
     pipe: ast.Pipeline,
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),
@@ -1023,7 +1020,7 @@ pub fn analyzeOne(
     var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag };
     const outs = try arena.alloc(Output, 1);
     outs[0] = try ctx.analyzeOutput(pipe);
-    return .{ .kind = kind_name, .outputs = outs };
+    return .{ .outputs = outs };
 }
 
 const Ctx = struct {
@@ -1303,8 +1300,6 @@ const Ctx = struct {
                     .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
                     .path => |p| p,
-                    .request => "request",
-                    .buffer => |b| try std.fmt.allocPrint(self.arena, "buffer {s}", .{b.name}),
                     .range => "range",
                     .unit => "unit",
                 };
@@ -1649,7 +1644,7 @@ fn containsName(names: []const []const u8, n: []const u8) bool {
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb, ftp";
 
 /// A `CREATE CONNECTION ... TYPE` that names a connector; the built-in sources
-/// (files, `range`, a request body) are never declared.
+/// (files, `range`) are never declared.
 pub fn isConnectionType(connector: []const u8) bool {
     const c = registry.Connector.parse(connector) orelse return false;
     return !c.isBuiltinSource() or c == .http;
