@@ -96,9 +96,10 @@ FROM BUFFER 'eventos'
   directory) open and hands it to them: its flusher finishes the segment in
   flight, the new script takes over between runs, and accepts keep landing in
   the same segment throughout, so every acked row is loaded once. A buffer
-  the new scripts drop is drained and closed, as on shutdown. A clean
-  stop (SIGTERM) drains what is pending; after a crash the next start resumes
-  from the manifest, and a segment loaded but not yet marked is loaded again —
-  only a label-deduplicating sink such as StarRocks absorbs that replay.
+  the new scripts drop has its pending rows loaded, then is closed.
+- Rows still pending at a stop stay in the WAL and are loaded once the next
+  start's flusher runs, picking up from the manifest. A stop or crash between
+  loading a segment and marking it loads that segment again; only a
+  label-deduplicating sink such as StarRocks absorbs that replay.
 - Honest cost: `serve` becomes stateful (the WAL directory needs a persistent
   volume) and durability is the node's disk, not replicated.
