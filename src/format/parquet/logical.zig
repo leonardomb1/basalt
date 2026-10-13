@@ -7,30 +7,18 @@ const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
-const conv_utf8 = 0;
-
-const conv_decimal = 5;
-
-const conv_date = 6;
-
+pub const conv_utf8 = 0;
+pub const conv_decimal = 5;
+pub const conv_date = 6;
 const conv_time_millis = 7;
-
-const conv_time_micros = 8;
-
+pub const conv_time_micros = 8;
 const conv_timestamp_millis = 9;
-
-const conv_timestamp_micros = 10;
-
+pub const conv_timestamp_micros = 10;
 const conv_uint8 = 11;
-
 const conv_uint16 = 12;
-
 const conv_uint32 = 13;
-
 const conv_uint64 = 14;
-
 const conv_json = 19;
-
 const conv_bson = 20;
 const logical = @import("testing_util.zig").logical;
 const testing = std.testing;
