@@ -14,9 +14,12 @@
 //!     which is why `finish` pads to the largest alignment seen;
 //!   * a table starts with a signed offset back to its vtable, and the vtable
 //!     lists each field's offset from the table start (0 = absent).
-//! `Table` decodes just enough to check what the builder produced.
+//! `Table` reads one back: the Arrow reader's untrusted input, and the tests'
+//! check of what the builder produced.
 
 const std = @import("std");
+
+pub const Error = error{CorruptArrow};
 
 pub const Builder = struct {
     alloc: std.mem.Allocator,
@@ -192,67 +195,74 @@ pub const Builder = struct {
     }
 };
 
+/// Every offset is checked before it is followed, so a corrupt buffer is
+/// `CorruptArrow`, never a trap.
 pub const Table = struct {
-    bytes: []const u8,
+    buf: []const u8,
     pos: usize,
 
-    pub fn root(bytes: []const u8) Table {
-        return .{ .bytes = bytes, .pos = rd(u32, bytes, 0) };
+    pub fn rd(comptime T: type, buf: []const u8, at: usize) Error!T {
+        if (at > buf.len or buf.len - at < @sizeOf(T)) return Error.CorruptArrow;
+        return std.mem.readInt(T, buf[at..][0..@sizeOf(T)], .little);
     }
 
-    fn rd(comptime T: type, bytes: []const u8, at: usize) T {
-        return std.mem.readInt(T, bytes[at..][0..@sizeOf(T)], .little);
+    pub fn root(buf: []const u8) Error!Table {
+        const p = try rd(u32, buf, 0);
+        if (p >= buf.len) return Error.CorruptArrow;
+        return .{ .buf = buf, .pos = p };
     }
 
-    fn fieldPos(self: Table, slot: usize) ?usize {
-        const vt = self.pos - @as(usize, @intCast(rd(i32, self.bytes, self.pos)));
-        const vsize = rd(u16, self.bytes, vt);
+    fn fieldPos(self: Table, slot: usize) Error!?usize {
+        const soff = try rd(i32, self.buf, self.pos);
+        const vt_i: i64 = @as(i64, @intCast(self.pos)) - soff;
+        if (vt_i < 0 or vt_i >= self.buf.len) return Error.CorruptArrow;
+        const vt: usize = @intCast(vt_i);
+        const vsize = try rd(u16, self.buf, vt);
         const fo = 4 + slot * 2;
-        if (fo >= vsize) return null;
-        const o = rd(u16, self.bytes, vt + fo);
+        if (fo + 2 > vsize) return null;
+        const o = try rd(u16, self.buf, vt + fo);
         if (o == 0) return null;
         return self.pos + o;
     }
 
-    pub fn int(self: Table, comptime T: type, slot: usize, default: T) T {
-        const p = self.fieldPos(slot) orelse return default;
-        return rd(T, self.bytes, p);
+    pub fn int(self: Table, comptime T: type, slot: usize, default: T) Error!T {
+        const p = (try self.fieldPos(slot)) orelse return default;
+        return rd(T, self.buf, p);
     }
 
-    fn target(self: Table, slot: usize) ?usize {
-        const p = self.fieldPos(slot) orelse return null;
-        return p + rd(u32, self.bytes, p);
+    fn target(self: Table, slot: usize) Error!?usize {
+        const p = (try self.fieldPos(slot)) orelse return null;
+        const t = p + try rd(u32, self.buf, p);
+        if (t >= self.buf.len) return Error.CorruptArrow;
+        return t;
     }
 
-    pub fn string(self: Table, slot: usize) ?[]const u8 {
-        const t = self.target(slot) orelse return null;
-        const len = rd(u32, self.bytes, t);
-        return self.bytes[t + 4 ..][0..len];
+    pub fn table(self: Table, slot: usize) Error!?Table {
+        const t = (try self.target(slot)) orelse return null;
+        return .{ .buf = self.buf, .pos = t };
     }
 
-    pub fn table(self: Table, slot: usize) ?Table {
-        const t = self.target(slot) orelse return null;
-        return .{ .bytes = self.bytes, .pos = t };
+    pub fn string(self: Table, slot: usize) Error!?[]const u8 {
+        const t = (try self.target(slot)) orelse return null;
+        const n = try rd(u32, self.buf, t);
+        if (n > self.buf.len - t - 4) return Error.CorruptArrow;
+        return self.buf[t + 4 ..][0..n];
     }
 
-    pub fn vector(self: Table, slot: usize) ?struct { len: usize, at: usize } {
-        const t = self.target(slot) orelse return null;
-        return .{ .len = rd(u32, self.bytes, t), .at = t + 4 };
+    pub const Vec = struct { len: usize, at: usize };
+
+    pub fn vector(self: Table, slot: usize, elem: usize) Error!?Vec {
+        const t = (try self.target(slot)) orelse return null;
+        const n = try rd(u32, self.buf, t);
+        if (n > (self.buf.len - t - 4) / elem) return Error.CorruptArrow;
+        return .{ .len = n, .at = t + 4 };
     }
 
-    pub fn tableAt(self: Table, vec_at: usize, i: usize) Table {
-        const p = vec_at + i * 4;
-        return .{ .bytes = self.bytes, .pos = p + rd(u32, self.bytes, p) };
-    }
-
-    pub fn stringAt(self: Table, vec_at: usize, i: usize) []const u8 {
-        const p = vec_at + i * 4;
-        const t = p + rd(u32, self.bytes, p);
-        return self.bytes[t + 4 ..][0..rd(u32, self.bytes, t)];
-    }
-
-    pub fn i64At(self: Table, at: usize) i64 {
-        return rd(i64, self.bytes, at);
+    pub fn tableAt(self: Table, v: Vec, i: usize) Error!Table {
+        const p = v.at + i * 4;
+        const t = p + try rd(u32, self.buf, p);
+        if (t >= self.buf.len) return Error.CorruptArrow;
+        return .{ .buf = self.buf, .pos = t };
     }
 };
 
@@ -266,10 +276,10 @@ test "table of scalars: absent fields read as defaults, present ones as written"
     const bytes = try b.finish(t);
     try std.testing.expectEqual(@as(usize, 0), bytes.len % 8);
 
-    const r = Table.root(bytes);
-    try std.testing.expectEqual(@as(i32, 7), r.int(i32, 0, 0));
-    try std.testing.expectEqual(@as(i16, 99), r.int(i16, 1, 99));
-    try std.testing.expectEqual(@as(i64, -5), r.int(i64, 2, 0));
+    const r = try Table.root(bytes);
+    try std.testing.expectEqual(@as(i32, 7), try r.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i16, 99), try r.int(i16, 1, 99));
+    try std.testing.expectEqual(@as(i64, -5), try r.int(i64, 2, 0));
 }
 
 test "strings, offset vectors, nested tables and struct vectors" {
@@ -289,18 +299,24 @@ test "strings, offset vectors, nested tables and struct vectors" {
     const t = try b.endTable();
     const bytes = try b.finish(t);
 
-    const r = Table.root(bytes);
-    const v = r.vector(0).?;
+    const r = try Table.root(bytes);
+    const v = (try r.vector(0, 4)).?;
     try std.testing.expectEqual(@as(usize, 2), v.len);
-    try std.testing.expectEqualStrings("id", r.stringAt(v.at, 0));
-    try std.testing.expectEqualStrings("valor", r.stringAt(v.at, 1));
-    try std.testing.expectEqual(@as(u8, 6), r.int(u8, 1, 0));
-    try std.testing.expectEqualStrings("valor", r.table(2).?.string(0).?);
-    const pv = r.vector(3).?;
+    try std.testing.expectEqualStrings("id", try stringAt(r, v, 0));
+    try std.testing.expectEqualStrings("valor", try stringAt(r, v, 1));
+    try std.testing.expectEqual(@as(u8, 6), try r.int(u8, 1, 0));
+    try std.testing.expectEqualStrings("valor", (try (try r.table(2)).?.string(0)).?);
+    const pv = (try r.vector(3, 16)).?;
     try std.testing.expectEqual(@as(usize, 2), pv.len);
     try std.testing.expectEqual(@as(usize, 0), pv.at % 8);
-    try std.testing.expectEqual(@as(i64, 4), r.i64At(pv.at + 16));
-    try std.testing.expectEqual(@as(i64, 1), r.i64At(pv.at + 24));
+    try std.testing.expectEqual(@as(i64, 4), try Table.rd(i64, r.buf, pv.at + 16));
+    try std.testing.expectEqual(@as(i64, 1), try Table.rd(i64, r.buf, pv.at + 24));
+}
+
+fn stringAt(r: Table, v: Table.Vec, i: usize) Error![]const u8 {
+    const p = v.at + i * 4;
+    const at = p + try Table.rd(u32, r.buf, p);
+    return r.buf[at + 4 ..][0..try Table.rd(u32, r.buf, at)];
 }
 
 test "growth keeps earlier bytes and offsets valid" {
@@ -321,10 +337,10 @@ test "growth keeps earlier bytes and offsets valid" {
     try b.addOffset(2, small);
     const t = try b.endTable();
     const bytes = try b.finish(t);
-    const r = Table.root(bytes);
-    try std.testing.expectEqualStrings(long, r.string(0).?);
-    const e = r.table(1).?;
-    try std.testing.expectEqual(@as(i32, 42), e.int(i32, 0, 0));
-    try std.testing.expectEqualStrings("ab", e.string(1).?);
-    try std.testing.expectEqualStrings("ab", r.string(2).?);
+    const r = try Table.root(bytes);
+    try std.testing.expectEqualStrings(long, (try r.string(0)).?);
+    const e = (try r.table(1)).?;
+    try std.testing.expectEqual(@as(i32, 42), try e.int(i32, 0, 0));
+    try std.testing.expectEqualStrings("ab", (try e.string(1)).?);
+    try std.testing.expectEqualStrings("ab", (try r.string(2)).?);
 }

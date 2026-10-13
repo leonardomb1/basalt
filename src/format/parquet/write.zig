@@ -43,6 +43,7 @@
 const std = @import("std");
 const parquet = @import("footer.zig");
 const logical = @import("logical.zig");
+const pqdecode = @import("read.zig");
 const thrift = @import("thrift.zig");
 const codec = @import("../codec.zig");
 const eval = @import("../../exec/eval.zig");
@@ -350,9 +351,7 @@ pub const Writer = struct {
         };
     }
 
-    pub fn isPath(path: []const u8) bool {
-        return std.mem.endsWith(u8, path, ".parquet");
-    }
+    pub const isPath = pqdecode.Reader.isPath;
 
     /// `.append` is refused here as well as in the plan layer, so a caller that
     /// forgets the check fails loudly instead of truncating the file. An object
@@ -1089,7 +1088,6 @@ fn sinkAbort(p: *anyopaque) void {
 }
 
 const testing = std.testing;
-const pqdecode = @import("read.zig");
 
 test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);

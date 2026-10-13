@@ -18,10 +18,9 @@
 //! (polars does) would otherwise be converted and held whole. Field names are
 //! duped, since the file is unmapped on close and a schema can outlive its reader.
 //!
-//! The file is untrusted. `flatbuf.Table` trusts its input (it only reads what
-//! this program wrote), so `Fb` checks every offset before following it, and a bad
-//! one is `CorruptArrow`, not a trap. A compressed buffer's declared length may be
-//! at most 1024 times its frame (plus 1 MiB), so a hostile length cannot become a
+//! The file is untrusted: `flatbuf.Table` checks every offset before following
+//! it, so a bad one is `CorruptArrow`, not a trap. A compressed buffer's declared
+//! length may be at most 1024 times its frame (plus 1 MiB), so a hostile length cannot become a
 //! huge allocation before a byte is decoded.
 //!
 //! Types map as the engine can hold them: every integer width to `int` (a
@@ -52,6 +51,7 @@ const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const codec = @import("codec.zig");
+const flatbuf = @import("flatbuf.zig");
 
 pub const Error = error{
     NotArrow,
@@ -69,74 +69,7 @@ pub fn isPath(path: []const u8) bool {
     return false;
 }
 
-const Fb = struct {
-    buf: []const u8,
-    pos: usize,
-
-    fn rd(comptime T: type, buf: []const u8, at: usize) Error!T {
-        if (at > buf.len or buf.len - at < @sizeOf(T)) return Error.CorruptArrow;
-        return std.mem.readInt(T, buf[at..][0..@sizeOf(T)], .little);
-    }
-
-    fn root(buf: []const u8) Error!Fb {
-        const p = try rd(u32, buf, 0);
-        if (p >= buf.len) return Error.CorruptArrow;
-        return .{ .buf = buf, .pos = p };
-    }
-
-    fn fieldPos(self: Fb, slot: usize) Error!?usize {
-        const soff = try rd(i32, self.buf, self.pos);
-        const vt_i: i64 = @as(i64, @intCast(self.pos)) - soff;
-        if (vt_i < 0 or vt_i >= self.buf.len) return Error.CorruptArrow;
-        const vt: usize = @intCast(vt_i);
-        const vsize = try rd(u16, self.buf, vt);
-        const fo = 4 + slot * 2;
-        if (fo + 2 > vsize) return null;
-        const o = try rd(u16, self.buf, vt + fo);
-        if (o == 0) return null;
-        return self.pos + o;
-    }
-
-    fn int(self: Fb, comptime T: type, slot: usize, default: T) Error!T {
-        const p = (try self.fieldPos(slot)) orelse return default;
-        return rd(T, self.buf, p);
-    }
-
-    fn target(self: Fb, slot: usize) Error!?usize {
-        const p = (try self.fieldPos(slot)) orelse return null;
-        const t = p + try rd(u32, self.buf, p);
-        if (t >= self.buf.len) return Error.CorruptArrow;
-        return t;
-    }
-
-    fn table(self: Fb, slot: usize) Error!?Fb {
-        const t = (try self.target(slot)) orelse return null;
-        return .{ .buf = self.buf, .pos = t };
-    }
-
-    fn string(self: Fb, slot: usize) Error!?[]const u8 {
-        const t = (try self.target(slot)) orelse return null;
-        const n = try rd(u32, self.buf, t);
-        if (n > self.buf.len - t - 4) return Error.CorruptArrow;
-        return self.buf[t + 4 ..][0..n];
-    }
-
-    const Vec = struct { len: usize, at: usize };
-
-    fn vector(self: Fb, slot: usize, elem: usize) Error!?Vec {
-        const t = (try self.target(slot)) orelse return null;
-        const n = try rd(u32, self.buf, t);
-        if (n > (self.buf.len - t - 4) / elem) return Error.CorruptArrow;
-        return .{ .len = n, .at = t + 4 };
-    }
-
-    fn tableAt(self: Fb, v: Vec, i: usize) Error!Fb {
-        const p = v.at + i * 4;
-        const t = p + try rd(u32, self.buf, p);
-        if (t >= self.buf.len) return Error.CorruptArrow;
-        return .{ .buf = self.buf, .pos = t };
-    }
-};
+const Fb = flatbuf.Table;
 
 const Kind = enum {
     null_,

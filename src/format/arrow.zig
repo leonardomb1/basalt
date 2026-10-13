@@ -373,13 +373,6 @@ pub const FileSink = struct {
     stream: bool,
     part: Part,
 
-    pub fn isPath(path: []const u8) bool {
-        inline for (.{ ".arrow", ".arrows", ".feather", ".ipc" }) |ext| {
-            if (std.ascii.endsWithIgnoreCase(path, ext)) return true;
-        }
-        return false;
-    }
-
     pub fn open(gpa: std.mem.Allocator, path: []const u8, schema: types.Schema) !*FileSink {
         if (std.mem.indexOf(u8, path, "://") != null) return error.ArrowRemoteSink;
         const stream = std.ascii.endsWithIgnoreCase(path, ".arrows");
@@ -509,12 +502,12 @@ pub const ArrowWriter = struct {
 
 const Frame = struct { meta: []const u8, body: []const u8, next: usize };
 
-fn readFrame(bytes: []const u8, at: usize) Frame {
+fn readFrame(bytes: []const u8, at: usize) !Frame {
     std.debug.assert(std.mem.readInt(u32, bytes[at..][0..4], .little) == continuation);
     const ml: usize = @intCast(std.mem.readInt(u32, bytes[at + 4 ..][0..4], .little));
     const meta = bytes[at + 8 ..][0..ml];
-    const msg = flatbuf.Table.root(meta);
-    const body_len: usize = @intCast(msg.int(i64, 3, 0));
+    const msg = try flatbuf.Table.root(meta);
+    const body_len: usize = @intCast(try msg.int(i64, 3, 0));
     const body_at = at + 8 + ml;
     return .{ .meta = meta, .body = bytes[body_at..][0..body_len], .next = body_at + body_len };
 }
@@ -558,13 +551,13 @@ test "stream: schema message declares every column's arrow type" {
     try sw.finish();
 
     const bytes = aw.written();
-    const f0 = readFrame(bytes, 0);
+    const f0 = try readFrame(bytes, 0);
     try std.testing.expectEqual(@as(usize, 0), f0.meta.len % 8);
-    const msg = flatbuf.Table.root(f0.meta);
-    try std.testing.expectEqual(@as(i16, version_v5), msg.int(i16, 0, 0));
-    try std.testing.expectEqual(@intFromEnum(Header.schema), msg.int(u8, 1, 0));
-    const schema = msg.table(2).?;
-    const fields = schema.vector(1).?;
+    const msg = try flatbuf.Table.root(f0.meta);
+    try std.testing.expectEqual(@as(i16, version_v5), try msg.int(i16, 0, 0));
+    try std.testing.expectEqual(@intFromEnum(Header.schema), try msg.int(u8, 1, 0));
+    const schema = (try msg.table(2)).?;
+    const fields = (try schema.vector(1, 4)).?;
     try std.testing.expectEqual(@as(usize, 8), fields.len);
 
     const want = [_]struct { name: []const u8, tag: TypeTag }{
@@ -574,21 +567,21 @@ test "stream: schema message declares every column's arrow type" {
         .{ .name = "x", .tag = .floating_point }, .{ .name = "hora", .tag = .time },
     };
     for (want, 0..) |w, i| {
-        const fld = schema.tableAt(fields.at, i);
-        try std.testing.expectEqualStrings(w.name, fld.string(0).?);
-        try std.testing.expect(fld.int(u8, 1, 0) == 1);
-        try std.testing.expectEqual(@intFromEnum(w.tag), fld.int(u8, 2, 0));
-        try std.testing.expectEqual(@as(usize, 0), fld.vector(5).?.len);
+        const fld = try schema.tableAt(fields, i);
+        try std.testing.expectEqualStrings(w.name, (try fld.string(0)).?);
+        try std.testing.expect(try fld.int(u8, 1, 0) == 1);
+        try std.testing.expectEqual(@intFromEnum(w.tag), try fld.int(u8, 2, 0));
+        try std.testing.expectEqual(@as(usize, 0), (try fld.vector(5, 4)).?.len);
     }
-    const int_t = schema.tableAt(fields.at, 0).table(3).?;
-    try std.testing.expectEqual(@as(i32, 64), int_t.int(i32, 0, 0));
-    try std.testing.expectEqual(@as(u8, 1), int_t.int(u8, 1, 0));
-    const dec_t = schema.tableAt(fields.at, 3).table(3).?;
-    try std.testing.expectEqual(@as(i32, 18), dec_t.int(i32, 0, 0));
-    try std.testing.expectEqual(@as(i32, 2), dec_t.int(i32, 1, 0));
-    const time_t = schema.tableAt(fields.at, 7).table(3).?;
-    try std.testing.expectEqual(@as(i16, 2), time_t.int(i16, 0, 0));
-    try std.testing.expectEqual(@as(i32, 64), time_t.int(i32, 1, 32));
+    const int_t = (try (try schema.tableAt(fields, 0)).table(3)).?;
+    try std.testing.expectEqual(@as(i32, 64), try int_t.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(u8, 1), try int_t.int(u8, 1, 0));
+    const dec_t = (try (try schema.tableAt(fields, 3)).table(3)).?;
+    try std.testing.expectEqual(@as(i32, 18), try dec_t.int(i32, 0, 0));
+    try std.testing.expectEqual(@as(i32, 2), try dec_t.int(i32, 1, 0));
+    const time_t = (try (try schema.tableAt(fields, 7)).table(3)).?;
+    try std.testing.expectEqual(@as(i16, 2), try time_t.int(i16, 0, 0));
+    try std.testing.expectEqual(@as(i32, 64), try time_t.int(i32, 1, 32));
 
     try std.testing.expectEqual(bytes.len, f0.next + 8);
     try std.testing.expectEqual(continuation, std.mem.readInt(u32, bytes[f0.next..][0..4], .little));
@@ -611,65 +604,65 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
     try sw.finish();
 
     const bytes = aw.written();
-    const f0 = readFrame(bytes, 0);
-    const f1 = readFrame(bytes, f0.next);
+    const f0 = try readFrame(bytes, 0);
+    const f1 = try readFrame(bytes, f0.next);
     try std.testing.expectEqual(bytes.len, f1.next + 8);
     try std.testing.expectEqual(@as(usize, 0), f1.body.len % 8);
 
-    const msg = flatbuf.Table.root(f1.meta);
-    try std.testing.expectEqual(@intFromEnum(Header.record_batch), msg.int(u8, 1, 0));
-    const rb = msg.table(2).?;
-    try std.testing.expectEqual(@as(i64, 3), rb.int(i64, 0, 0));
-    const nodes = rb.vector(1).?;
+    const msg = try flatbuf.Table.root(f1.meta);
+    try std.testing.expectEqual(@intFromEnum(Header.record_batch), try msg.int(u8, 1, 0));
+    const rb = (try msg.table(2)).?;
+    try std.testing.expectEqual(@as(i64, 3), try rb.int(i64, 0, 0));
+    const nodes = (try rb.vector(1, 16)).?;
     try std.testing.expectEqual(@as(usize, 8), nodes.len);
-    try std.testing.expectEqual(@as(i64, 3), rb.i64At(nodes.at));
-    try std.testing.expectEqual(@as(i64, 1), rb.i64At(nodes.at + 8));
-    try std.testing.expectEqual(@as(i64, 0), rb.i64At(nodes.at + 16 * 2 + 8));
-    const bufs = rb.vector(2).?;
+    try std.testing.expectEqual(@as(i64, 3), try flatbuf.Table.rd(i64, rb.buf, nodes.at));
+    try std.testing.expectEqual(@as(i64, 1), try flatbuf.Table.rd(i64, rb.buf, nodes.at + 8));
+    try std.testing.expectEqual(@as(i64, 0), try flatbuf.Table.rd(i64, rb.buf, nodes.at + 16 * 2 + 8));
+    const bufs = (try rb.vector(2, 16)).?;
     try std.testing.expectEqual(@as(usize, 6 * 2 + 3 + 2), bufs.len);
 
     const Buf = struct { off: usize, len: usize };
     const bufAt = struct {
-        fn f(t: flatbuf.Table, at: usize, i: usize) Buf {
-            return .{ .off = @intCast(t.i64At(at + i * 16)), .len = @intCast(t.i64At(at + i * 16 + 8)) };
+        fn f(t: flatbuf.Table, at: usize, i: usize) !Buf {
+            return .{ .off = @intCast(try flatbuf.Table.rd(i64, t.buf, at + i * 16)), .len = @intCast(try flatbuf.Table.rd(i64, t.buf, at + i * 16 + 8)) };
         }
     }.f;
     const body = f1.body;
 
-    const id_valid = bufAt(rb, bufs.at, 0);
+    const id_valid = try bufAt(rb, bufs.at, 0);
     try std.testing.expectEqual(@as(u8, 0b101), body[id_valid.off] & 0b111);
-    const id_data = bufAt(rb, bufs.at, 1);
+    const id_data = try bufAt(rb, bufs.at, 1);
     try std.testing.expectEqual(@as(usize, 24), id_data.len);
     try std.testing.expectEqual(@as(i64, 3), std.mem.readInt(i64, body[id_data.off + 16 ..][0..8], .little));
 
-    const nome_offs = bufAt(rb, bufs.at, 3);
-    const nome_data = bufAt(rb, bufs.at, 4);
+    const nome_offs = try bufAt(rb, bufs.at, 3);
+    const nome_data = try bufAt(rb, bufs.at, 4);
     try std.testing.expectEqual(@as(usize, 16), nome_offs.len);
     try std.testing.expectEqual(@as(i32, 6), std.mem.readInt(i32, body[nome_offs.off + 12 ..][0..4], .little));
     try std.testing.expectEqualStrings("anabob", body[nome_data.off..][0..nome_data.len]);
 
-    const ok_data = bufAt(rb, bufs.at, 6);
+    const ok_data = try bufAt(rb, bufs.at, 6);
     try std.testing.expectEqual(@as(u8, 0b101), body[ok_data.off]);
 
-    const valor_data = bufAt(rb, bufs.at, 8);
+    const valor_data = try bufAt(rb, bufs.at, 8);
     try std.testing.expectEqual(@as(usize, 48), valor_data.len);
     try std.testing.expectEqual(@as(i128, 1050), std.mem.readInt(i128, body[valor_data.off..][0..16], .little));
     try std.testing.expectEqual(@as(i128, 300), std.mem.readInt(i128, body[valor_data.off + 16 ..][0..16], .little));
     try std.testing.expectEqual(@as(i128, -1235), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
 
-    const dia_data = bufAt(rb, bufs.at, 10);
+    const dia_data = try bufAt(rb, bufs.at, 10);
     try std.testing.expectEqual(@as(usize, 12), dia_data.len);
     try std.testing.expectEqual(@as(i32, 20002), std.mem.readInt(i32, body[dia_data.off + 8 ..][0..4], .little));
 
-    const hora_data = bufAt(rb, bufs.at, 16);
+    const hora_data = try bufAt(rb, bufs.at, 16);
     try std.testing.expectEqual(@as(i64, 86_399_000_000), std.mem.readInt(i64, body[hora_data.off + 16 ..][0..8], .little));
 }
 
-fn metaOf(t: flatbuf.Table, slot: usize, key: []const u8) ?[]const u8 {
-    const v = t.vector(slot) orelse return null;
+fn metaOf(t: flatbuf.Table, slot: usize, key: []const u8) !?[]const u8 {
+    const v = (try t.vector(slot, 4)) orelse return null;
     for (0..v.len) |i| {
-        const kv = t.tableAt(v.at, i);
-        if (std.mem.eql(u8, kv.string(0).?, key)) return kv.string(1);
+        const kv = try t.tableAt(v, i);
+        if (std.mem.eql(u8, (try kv.string(0)).?, key)) return kv.string(1);
     }
     return null;
 }
@@ -693,21 +686,21 @@ test "stream: schema metadata says which result it is, a trailer batch carries t
     try sw.finish();
 
     const bytes = aw.written();
-    const f0 = readFrame(bytes, 0);
-    const sch = flatbuf.Table.root(f0.meta).table(2).?;
-    try std.testing.expectEqualStrings("2", metaOf(sch, 2, "basalt.statement").?);
-    try std.testing.expectEqualStrings("select", metaOf(sch, 2, "basalt.kind").?);
+    const f0 = try readFrame(bytes, 0);
+    const sch = (try (try flatbuf.Table.root(f0.meta)).table(2)).?;
+    try std.testing.expectEqualStrings("2", (try metaOf(sch, 2, "basalt.statement")).?);
+    try std.testing.expectEqualStrings("select", (try metaOf(sch, 2, "basalt.kind")).?);
 
-    const f1 = readFrame(bytes, f0.next);
-    const f2 = readFrame(bytes, f1.next);
-    const msg = flatbuf.Table.root(f2.meta);
-    try std.testing.expectEqual(@intFromEnum(Header.record_batch), msg.int(u8, 1, 0));
+    const f1 = try readFrame(bytes, f0.next);
+    const f2 = try readFrame(bytes, f1.next);
+    const msg = try flatbuf.Table.root(f2.meta);
+    try std.testing.expectEqual(@intFromEnum(Header.record_batch), try msg.int(u8, 1, 0));
     try std.testing.expectEqual(@as(usize, 0), f2.body.len);
-    try std.testing.expectEqualStrings("3", metaOf(msg, 4, "basalt.rows").?);
-    const rb = msg.table(2).?;
-    try std.testing.expectEqual(@as(i64, 0), rb.int(i64, 0, -1));
-    try std.testing.expectEqual(@as(usize, 8), rb.vector(1).?.len);
-    try std.testing.expectEqual(@as(usize, 7 * 2 + 3), rb.vector(2).?.len);
+    try std.testing.expectEqualStrings("3", (try metaOf(msg, 4, "basalt.rows")).?);
+    const rb = (try msg.table(2)).?;
+    try std.testing.expectEqual(@as(i64, 0), try rb.int(i64, 0, -1));
+    try std.testing.expectEqual(@as(usize, 8), (try rb.vector(1, 16)).?.len);
+    try std.testing.expectEqual(@as(usize, 7 * 2 + 3), (try rb.vector(2, 16)).?.len);
     try std.testing.expectEqual(bytes.len, f2.next + 8);
 }
 
