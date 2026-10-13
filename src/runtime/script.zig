@@ -16,16 +16,13 @@
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
-const expand = @import("../lang/expand.zig");
 const types = @import("../lang/types.zig");
 const obs = @import("obs.zig");
 const op = @import("../exec/op.zig");
 
-const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const parallel = @import("parallel.zig");
-const pushdown = @import("pushdown.zig");
 const analyze = @import("analyze.zig");
 const Value = @import("../exec/value.zig").Value;
 

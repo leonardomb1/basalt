@@ -174,10 +174,6 @@ pub fn wantsJsonLog(args: [][:0]u8) bool {
 
 /// The AST slices into `src.text` and the included files' texts, so all must outlive
 /// it. An error in an included file names that file's path and lines.
-fn parseSrc(arena: std.mem.Allocator, src: Source, stderr: *std.Io.Writer) !?ast.Program {
-    return parseSrcTo(arena, src, .{ .w = stderr, .json = false, .label = src.label });
-}
-
 pub fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     var diag: include.Diag = .{};
     return include.loadProgram(arena, src.text, src.label, src.dir, &diag) catch |e| switch (e) {

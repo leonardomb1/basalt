@@ -10,7 +10,6 @@ const ast = @import("../../lang/ast.zig");
 const column = @import("../../exec/column.zig");
 const op = @import("../../exec/op.zig");
 const aErr = @import("../env.zig").aErr;
-const planErr = @import("../env.zig").planErr;
 const runDescribe = @import("../run.zig").runDescribe;
 const runOutput = @import("output.zig").runOutput;
 const std = @import("std");

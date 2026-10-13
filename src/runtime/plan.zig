@@ -30,12 +30,10 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
-const Batch = @import("../exec/batch.zig").Batch;
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
-const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
 const keypush = @import("keypush.zig");
@@ -44,30 +42,21 @@ const obs = @import("obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
 
-const aborting = @import("env.zig").aborting;
 const Env = @import("env.zig").Env;
 const MemSource = @import("env.zig").MemSource;
-const forHintIdent = @import("env.zig").forHintIdent;
-const forHintName = @import("env.zig").forHintName;
-const mk = @import("env.zig").mk;
 const parseByteSize = @import("env.zig").parseByteSize;
 const PipeRes = @import("env.zig").PipeRes;
 const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
-const planErrT = @import("env.zig").planErrT;
-const Row = @import("env.zig").Row;
 const schemaPtr = @import("env.zig").schemaPtr;
 
 const ConstSource = @import("connect.zig").ConstSource;
-const dupeSchema = @import("connect.zig").dupeSchema;
 const OneBatch = @import("connect.zig").OneBatch;
-const openSource = @import("connect.zig").openSource;
 const openSourceProjected = @import("connect.zig").openSourceProjected;
 const projectSqlRead = @import("connect.zig").projectSqlRead;
 const projectJoinedSqlRead = @import("connect/sql_read.zig").projectJoinedSqlRead;
 const factsIfWanted = @import("connect.zig").factsIfWanted;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
-const exceptColumns = @import("connect.zig").exceptColumns;
 const sourceLabel = @import("connect.zig").sourceLabel;
 
 /// Rebuild a map-only `filter`/`select` chain against the projected source schema
