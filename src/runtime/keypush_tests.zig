@@ -57,7 +57,7 @@ fn itemQueries(a: std.mem.Allocator, srv: *FakePg) ![]const []const u8 {
     const all = try srv.received(testing.allocator);
     defer testing.allocator.free(all);
     var out = std.array_list.Managed([]const u8).init(a);
-    for (all) |q| if (std.mem.indexOf(u8, q, "public.items") != null) try out.append(try a.dupe(u8, q));
+    for (all) |q| if (std.mem.indexOf(u8, q, "\"public\".\"items\"") != null) try out.append(try a.dupe(u8, q));
     return out.toOwnedSlice();
 }
 
@@ -80,7 +80,7 @@ test "a SQL right side asks for the left side's keys after its WHERE 1 = 0 probe
     const r = try runPg(a, &tmp, srv.port(), "SELECT s.qty, c.name FROM '$B/s.csv' s JOIN pg.public.items c ON c.id = s.cr", 1);
     try testing.expect(r.err == null);
     try testing.expectEqualStrings("qty,name\n10,alpha\n30,gamma\n", r.out);
-    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM public.items WHERE \"id\" IN (1, 3)");
+    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM \"public\".\"items\" WHERE \"id\" IN (1, 3)");
 }
 
 test "a computed key narrows the right side's columns to those the key and the output read" {
@@ -97,7 +97,7 @@ test "a computed key narrows the right side's columns to those the key and the o
     try testing.expect(r.err == null);
     try testing.expectEqualStrings("cr,name\nA1,alpha\nC3,gamma\n", r.out);
     const qs = try itemQueries(a, srv);
-    try testing.expect(std.mem.startsWith(u8, qs[qs.len - 1], "SELECT \"code\", \"name\" FROM public.items WHERE "));
+    try testing.expect(std.mem.startsWith(u8, qs[qs.len - 1], "SELECT \"code\", \"name\" FROM \"public\".\"items\" WHERE "));
     try testing.expect(std.mem.endsWith(u8, qs[qs.len - 1], " IN ('A1', 'C3')"));
     try testing.expect(std.mem.endsWith(u8, qs[qs.len - 2], " WHERE 1 = 0"));
 
@@ -105,7 +105,7 @@ test "a computed key narrows the right side's columns to those the key and the o
     try testing.expect(u.err == null);
     try testing.expectEqualStrings("cr,name\nA1,alpha\nC3,gamma\n", u.out);
     const uq = try itemQueries(a, srv);
-    try testing.expect(std.mem.startsWith(u8, uq[uq.len - 1], "SELECT \"code\", \"name\" FROM public.items WHERE "));
+    try testing.expect(std.mem.startsWith(u8, uq[uq.len - 1], "SELECT \"code\", \"name\" FROM \"public\".\"items\" WHERE "));
 }
 
 test "a SQL left side asks for the indexed right side's keys" {
@@ -121,7 +121,7 @@ test "a SQL left side asks for the indexed right side's keys" {
     const r = try runPg(a, &tmp, srv.port(), "SELECT b.name, s.qty FROM pg.public.items b JOIN '$B/s.csv' s ON b.id = s.cr", 1);
     try testing.expect(r.err == null);
     try testing.expectEqualStrings("name,qty\nbeta,20\ngamma,30\n", r.out);
-    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM public.items WHERE \"id\" IN (2, 3)");
+    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM \"public\".\"items\" WHERE \"id\" IN (2, 3)");
 }
 
 test "key_pushdown = false sends the plain query, and an empty side sends WHERE 1 = 0" {
@@ -138,13 +138,13 @@ test "key_pushdown = false sends the plain query, and an empty side sends WHERE 
     try testing.expect(off.err == null);
     try testing.expectEqualStrings("qty,name\n10,alpha\n30,gamma\n", off.out);
     const qs = try itemQueries(a, srv);
-    try testing.expectEqualStrings("SELECT \"id\", \"name\" FROM public.items", qs[qs.len - 1]);
+    try testing.expectEqualStrings("SELECT \"id\", \"name\" FROM \"public\".\"items\"", qs[qs.len - 1]);
     for (qs) |q| try testing.expect(std.mem.indexOf(u8, q, " IN (") == null);
 
     const empty = try runPg(a, &tmp, srv.port(), "WITH s AS (SELECT * FROM '$B/s.csv' WHERE qty > 100) SELECT s.qty, c.name FROM s JOIN pg.public.items c ON c.id = s.cr", 1);
     try testing.expect(empty.err == null);
     try testing.expectEqualStrings("qty,name\n", empty.out);
-    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM public.items WHERE 1 = 0");
+    try expectLast(try itemQueries(a, srv), "SELECT \"id\", \"name\" FROM \"public\".\"items\" WHERE 1 = 0");
 }
 
 test "a failed late query is the server's words, permanent; a dropped connection is transient" {

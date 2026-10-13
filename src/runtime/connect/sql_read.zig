@@ -24,10 +24,23 @@ const std = @import("std");
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
         .query => |q| q,
-        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try qualStr(env.arena, t) }),
+        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try fromName(env, rd.connector, t) }),
         else => return planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
     };
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
+}
+
+/// Each part quoted for the source's dialect, as a write names the table, so a
+/// mixed-case or reserved name reads back what a LOAD created.
+fn fromName(env: *Env, connector: []const u8, t: ast.QualName) ![]const u8 {
+    const conn = env.connections.get(connector) orelse return qualStr(env.arena, t);
+    const info = sqlConnInfo(conn) orelse return qualStr(env.arena, t);
+    var out = std.array_list.Managed(u8).init(env.arena);
+    for (t.parts, 0..) |p, i| {
+        if (i > 0) try out.append('.');
+        try out.appendSlice(try sql.quoteName(env.arena, info.dialect, p));
+    }
+    return out.toOwnedSlice();
 }
 
 fn selectList(env: *Env, rd: ast.Read) ![]const u8 {
