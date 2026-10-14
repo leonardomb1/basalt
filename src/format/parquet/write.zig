@@ -39,6 +39,10 @@
 //!
 //! In a parallel run each ordered unit is encoded to row groups on the lane that
 //! read it (`UnitEnc`, `openEncoder`), and `appendEncoded` places them in order.
+//! An encoder's column buffers live in an arena of its own, handed back to the
+//! writer's pool when the unit is sealed, so a unit waiting its turn holds only its
+//! encoded bytes (on the unit's arena they kept about 25 MB a unit alive, two units
+//! a lane), and the next unit reuses those pages already faulted in.
 
 const std = @import("std");
 const parquet = @import("footer.zig");
@@ -320,6 +324,10 @@ pub const Writer = struct {
     arena: std.mem.Allocator,
     scratch: std.heap.ArenaAllocator,
     scratch_live: bool = true,
+    col_mem: ?*std.heap.ArenaAllocator = null,
+    owner: ?*Writer = null,
+    pool: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
+    pool_mu: std.Thread.Mutex = .{},
     backend: Backend,
     write_buf: [WRITE_BUF]u8 = undefined,
     fw: std.fs.File.Writer = undefined,
@@ -597,6 +605,16 @@ pub const Writer = struct {
         if (!self.scratch_live) return;
         self.scratch.deinit();
         self.scratch_live = false;
+        if (self.col_mem) |cm| {
+            self.owner.?.giveColMem(cm);
+            self.col_mem = null;
+        }
+        for (self.pool.items) |cm| {
+            cm.deinit();
+            std.heap.smp_allocator.destroy(cm);
+        }
+        self.pool.deinit(std.heap.smp_allocator);
+        self.pool = .empty;
     }
 
     pub fn abort(self: *Writer) void {
@@ -666,9 +684,11 @@ pub const Writer = struct {
     }
 
     fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
+        const col_mem = try self.takeColMem();
+        errdefer self.giveColMem(col_mem);
         const cols = try arena.alloc(ColBuf, self.cols.len);
         for (cols, self.maps) |*c, m| {
-            c.* = ColBuf.init(arena);
+            c.* = ColBuf.init(col_mem.allocator());
             c.dict_eligible = m.phys != .boolean;
             c.dict_ok = c.dict_eligible;
         }
@@ -685,8 +705,31 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
             .group_rows = unit_group_rows,
+            .col_mem = col_mem,
+            .owner = self,
         };
         return e;
+    }
+
+    /// A reset arena for an encoder's column buffers, one a lane released when it
+    /// sealed its unit if there is one, so its pages are already faulted in.
+    fn takeColMem(self: *Writer) !*std.heap.ArenaAllocator {
+        self.pool_mu.lock();
+        defer self.pool_mu.unlock();
+        if (self.pool.pop()) |cm| return cm;
+        const cm = try std.heap.smp_allocator.create(std.heap.ArenaAllocator);
+        cm.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        return cm;
+    }
+
+    fn giveColMem(self: *Writer, cm: *std.heap.ArenaAllocator) void {
+        _ = cm.reset(.retain_capacity);
+        self.pool_mu.lock();
+        defer self.pool_mu.unlock();
+        self.pool.append(std.heap.smp_allocator, cm) catch {
+            cm.deinit();
+            std.heap.smp_allocator.destroy(cm);
+        };
     }
 
     /// Place an encoder's row groups after everything written so far. Rows this
