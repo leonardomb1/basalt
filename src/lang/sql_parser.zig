@@ -25,7 +25,10 @@
 //! pointer, holds its place in the WHERE until it is lifted out, so it is accepted
 //! only as a top-level AND conjunct, and a WHERE lifts only the sentinels it
 //! registered itself. A scalar subquery becomes a query LET referenced as `$name`,
-//! a constant by plan time that can push down. BETWEEN becomes `>= AND <=`. Table
+//! a constant by plan time that can push down, and so does an uncorrelated
+//! `EXISTS`. A subquery in the SELECT list or WHERE that references the query
+//! around it is decorrelated into a semi, anti or LEFT join once that query's
+//! FROM is known (`parse/correlate.zig`). BETWEEN becomes `>= AND <=`. Table
 //! functions are expanded while parsing, so their declarations, including
 //! `@include`d ones, must be in hand.
 //!
@@ -54,9 +57,9 @@
 //!
 //! `Parser` keeps the token cursor, its state and small types here; its grammar
 //! is in parse/, one file per area (`stmt.zig`, `decl.zig`, `query.zig`,
-//! `tablefn.zig`, `window.zig`, `from.zig`, `control.zig`, `rewrite.zig`,
-//! `expr.zig`), each method aliased back into `Parser` so `self.parseExpr()` reads
-//! as before. The parser's tests are in `parse/tests_expr.zig`,
+//! `tablefn.zig`, `correlate.zig`, `window.zig`, `from.zig`, `control.zig`,
+//! `rewrite.zig`, `expr.zig`), each method aliased back into `Parser` so
+//! `self.parseExpr()` reads as before. The parser's tests are in `parse/tests_expr.zig`,
 //! `parse/tests_query.zig`, `parse/tests_script.zig` and `parse/tests_window.zig`.
 
 const std = @import("std");
@@ -441,12 +444,14 @@ pub const Parser = struct {
     query_depth: usize = 0,
     top_names: OutNames = .nested,
     key_aliases: ?*const AliasSet = null,
+    corr: ?*CorrScope = null,
+    query_where_end: ?usize = null,
     expr_nest: usize = 0,
     unary_nest: usize = 0,
 
-    /// A column written with a table (`t.x`) inside a query; `inner` once a nested
-    /// query that does not know `t` handed it out to the query around it.
-    pub const QualRef = struct { q: ast.QualName, pos: Pos, inner: bool = false };
+    /// A column written with a table (`t.x`) inside a query; `depth` counts the
+    /// nested queries that did not know `t` and handed it out to the query around.
+    pub const QualRef = struct { q: ast.QualName, pos: Pos, depth: u8 = 0 };
 
     /// Records a qualified column for the query being parsed to check against its
     /// tables once they are all known. JSON-param paths, lambda parameters, `?.`
@@ -460,20 +465,21 @@ pub const Parser = struct {
     }
 
     /// Settles a query's qualified columns once its FROM is known: a table of
-    /// its own is fine, unless the column came from a nested query, which makes
-    /// that one correlated; any other is handed out to `outer`, the query around
+    /// its own is fine, unless the column came from a nested query that was not
+    /// decorrelated (`parse/correlate.zig` takes those of a subquery in the SELECT
+    /// list or WHERE first); any other is handed out to `outer`, the query around
     /// this one, or with none an unknown table.
     pub fn settleQuals(self: *Parser, refs: []const QualRef, aliases: *const AliasSet, outer: ?*std.array_list.Managed(QualRef)) Error!void {
         for (refs) |r| {
             const t = r.q.parts[0];
             if (aliases.knows(t)) {
-                if (r.inner)
-                    return self.fail(r.pos, "`{s}.{s}` names `{s}` of the query around this subquery — a correlated subquery is not supported; write it as a JOIN (an equality with the outer query is an `IN (SELECT ...)` on that key)", .{ t, r.q.last(), t });
+                if (r.depth > 0)
+                    return self.fail(r.pos, "`{s}.{s}` names `{s}` of the query around this subquery — only a subquery in the SELECT list or WHERE may reference the query around it; a derived table or CTE in FROM or JOIN, and a subquery in ON, GROUP BY, HAVING, ORDER BY or LIMIT, cannot", .{ t, r.q.last(), t });
                 continue;
             }
             if (outer) |o| {
                 var up = r;
-                up.inner = true;
+                up.depth +|= 1;
                 try o.append(up);
                 continue;
             }
@@ -518,14 +524,35 @@ pub const Parser = struct {
         return try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try dropped.toOwnedSlice() }});
     }
 
+    /// An `IN (SELECT ...)` or `EXISTS (...)` held in the WHERE by its sentinel;
+    /// `corr` when the subquery was correlated, with the join it lowers to.
     pub const PendingSemiJoin = struct {
         sentinel: *ast.Expr,
-        lhs: *ast.Expr,
+        lhs: ?*ast.Expr,
         binding: []const u8,
-        right_col: []const u8,
+        right_col: []const u8 = "",
         negated: bool,
         pos: Pos,
+        what: []const u8 = "IN (SELECT ...)",
+        corr: ?Corr = null,
     };
+
+    /// A correlated subquery's join: the outer columns as written (stripped once
+    /// the outer FROM is known), the hidden right-side columns they meet, and the
+    /// rest of the correlation as a residual over both rows.
+    pub const Corr = struct {
+        outer_keys: []const ast.QualName,
+        right_keys: []const ast.QualName,
+        residual: ?*ast.Expr = null,
+        refs: []const QualRef,
+    };
+
+    /// A correlated scalar subquery, LEFT JOINed under `binding`; `hidden` are the
+    /// right-side columns the join adds, which no `*` shows.
+    pub const CorrScalar = struct { binding: []const u8, corr: Corr, hidden: []const []const u8, in_where: bool, pos: Pos };
+
+    /// The correlated scalar subqueries of the select core being parsed.
+    pub const CorrScope = struct { scalars: std.array_list.Managed(CorrScalar) };
 
     pub fn cur(self: *Parser) Token {
         return self.toks[self.i];
@@ -790,6 +817,7 @@ pub const Parser = struct {
         group: ?[]const ast.QualName = null,
         dups: []const DupName = &.{},
         final_names: ?[]const ast.SelectItem = null,
+        where_end: usize = 0,
     };
 
     /// A name two or more SELECT items share, and whether they are all the same
@@ -840,6 +868,11 @@ pub const Parser = struct {
     pub const containsExpr = @import("parse/tablefn.zig").containsExpr;
     pub const isSentinel = @import("parse/tablefn.zig").isSentinel;
     pub const liftSemiJoins = @import("parse/tablefn.zig").liftSemiJoins;
+    pub const captureSubquery = @import("parse/correlate.zig").captureSubquery;
+    pub const existsSubquery = @import("parse/correlate.zig").existsSubquery;
+    pub const correlatedIn = @import("parse/correlate.zig").correlatedIn;
+    pub const correlatedScalar = @import("parse/correlate.zig").correlatedScalar;
+    pub const checkCorrRefs = @import("parse/correlate.zig").checkCorrRefs;
     pub const WinCall = @import("parse/window.zig").WinCall;
     pub const NamedWindow = @import("parse/window.zig").NamedWindow;
     pub const parseNullTreatment = @import("parse/window.zig").parseNullTreatment;
@@ -951,6 +984,7 @@ pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
 
 test {
     _ = @import("parse/control.zig");
+    _ = @import("parse/correlate.zig");
     _ = @import("parse/decl.zig");
     _ = @import("parse/expr.zig");
     _ = @import("parse/from.zig");

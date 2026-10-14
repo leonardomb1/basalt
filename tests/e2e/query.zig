@@ -149,6 +149,52 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
     }
 }
 
+test "correlated subqueries: EXISTS, IN and scalar subqueries over the outer row, as PostgreSQL answers them, at one lane and four" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,tier\n1,alpha,north,1\n2,beta,south,2\n3,gamma,north,\n4,delta,,1\n5,eps,south,3\n,nokey,east,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = "oid,cust,amount,region,day\n10,1,100,north,1\n11,1,50,north,2\n12,2,75,south,3\n13,3,,north,4\n14,3,20,south,5\n15,,40,east,6\n16,9,10,west,7\n17,2,75,south,8\n18,4,5,,9\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT c.id, c.name FROM '$B/c.csv' c WHERE EXISTS (SELECT 1 FROM '$B/o.csv' o WHERE o.cust = c.id) ORDER BY c.id", .want = "id,name\n1,alpha\n2,beta\n3,gamma\n4,delta\n" },
+        .{ .q = "SELECT c.id, c.name FROM '$B/c.csv' c WHERE NOT EXISTS (SELECT 1 FROM '$B/o.csv' o WHERE o.cust = c.id) ORDER BY c.id", .want = "id,name\n5,eps\n,nokey\n" },
+        .{ .q = "SELECT c.id FROM '$B/c.csv' c WHERE EXISTS (SELECT 1 FROM '$B/o.csv' o WHERE o.cust = c.id AND o.day > c.id * 2) ORDER BY c.id", .want = "id\n2\n4\n" },
+        .{ .q = "SELECT c.id FROM '$B/c.csv' c WHERE NOT EXISTS (SELECT 1 FROM '$B/o.csv' o WHERE o.day <= c.tier) ORDER BY c.id", .want = "id\n3\n" },
+        .{ .q = "SELECT c.id FROM '$B/c.csv' c WHERE EXISTS (SELECT 1 FROM '$B/o.csv' WHERE amount > 90) AND NOT EXISTS (SELECT 1 FROM '$B/o.csv' WHERE amount > 900) ORDER BY c.id", .want = "id\n1\n2\n3\n4\n5\n\n" },
+        .{ .q = "SELECT c.id, c.tier FROM '$B/c.csv' c WHERE c.tier IN (SELECT o.cust FROM '$B/o.csv' o WHERE o.region = c.region) ORDER BY c.id", .want = "id,tier\n1,1\n2,2\n5,3\n" },
+        .{ .q = "SELECT c.id, c.tier FROM '$B/c.csv' c WHERE c.tier NOT IN (SELECT o.cust FROM '$B/o.csv' o WHERE o.region = c.region) ORDER BY c.id", .want = "id,tier\n4,1\n" },
+        .{ .q = "SELECT c.id, (SELECT count(*) FROM '$B/o.csv' o WHERE o.cust = c.id) AS n, (SELECT sum(o.amount) FROM '$B/o.csv' o WHERE o.cust = c.id) AS s, (SELECT coalesce(max(o.amount), 0) FROM '$B/o.csv' o WHERE o.cust = c.id) AS m FROM '$B/c.csv' c ORDER BY c.id", .want = "id,n,s,m\n1,2,150,100\n2,2,150,75\n3,2,20,20\n4,1,5,5\n5,0,,0\n,0,,0\n" },
+        .{ .q = "SELECT * FROM '$B/c.csv' c WHERE (SELECT count(*) FROM '$B/o.csv' o WHERE o.cust = c.id) = 0 ORDER BY id", .want = "id,name,region,tier\n5,eps,south,3\n,nokey,east,2\n" },
+        .{ .q = "SELECT c.id, (SELECT count(*) FROM '$B/o.csv' o WHERE o.cust = c.id AND o.region = c.region) AS n FROM '$B/c.csv' c ORDER BY c.id", .want = "id,n\n1,2\n2,2\n3,1\n4,0\n5,0\n,0\n" },
+        .{ .q = "SELECT c.id, (SELECT o.oid FROM '$B/o.csv' o WHERE o.cust = c.id AND o.day < 5 AND o.amount > 60) AS one FROM '$B/c.csv' c ORDER BY c.id", .want = "id,one\n1,10\n2,12\n3,\n4,\n5,\n,\n" },
+        .{ .q = "WITH big AS (SELECT * FROM '$B/o.csv' WHERE amount >= 20) SELECT c.id, (SELECT count(*) FROM big b WHERE b.cust = c.id) AS n FROM '$B/c.csv' c ORDER BY n DESC, c.id LIMIT 3", .want = "id,n\n1,2\n2,2\n3,1\n" },
+        .{ .q = "SELECT c.id, (SELECT count(*) FROM '$B/o.csv' o WHERE o.cust = c.id AND c.tier = 1) AS n FROM '$B/c.csv' c ORDER BY c.id", .want = "id,n\n1,2\n2,0\n3,0\n4,1\n5,0\n,0\n" },
+        .{ .q = "SELECT DISTINCT * FROM '$B/c.csv' c WHERE (SELECT coalesce(sum(o.amount), 0) FROM '$B/o.csv' o WHERE o.cust = c.id) < 100 ORDER BY id", .want = "id,name,region,tier\n3,gamma,north,\n4,delta,,1\n5,eps,south,3\n,nokey,east,2\n" },
+    };
+    for ([_]usize{ 1, 4 }) |threads| for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = threads });
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    };
+
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT c.id, (SELECT o.oid FROM '{s}/o.csv' o WHERE o.cust = c.id) AS one FROM '{s}/c.csv' c;", .{ base, base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.CastFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "more than one row returned by a subquery used as an expression") != null);
+}
+
 test "INTERSECT / EXCEPT: NULLs compare equal, results are deduplicated, INTERSECT binds tighter" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

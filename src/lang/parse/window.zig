@@ -414,7 +414,9 @@ pub fn checkCall(self: *Parser, call: WinCall, spec: Spec) Error!void {
 }
 
 /// Over a GROUP BY a window reads the aggregate's output: each column `e` names
-/// must be a grouping key, an aggregate already lifted, or another window's.
+/// must be a grouping key, an aggregate already lifted, or another window's. A
+/// column of a table this query lacks is left to `settleQuals`, as it belongs to
+/// the query around; a correlated subquery's value is refused as such.
 pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, aggs: []const ast.AggItem, calls: []const WinCall, pos: Pos) Error!void {
     const Ctx = struct { p: *Parser, group: []const ast.QualName, aggs: []const ast.AggItem, calls: []const WinCall, bad: *?ast.QualName };
     const S = struct {
@@ -426,6 +428,7 @@ pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, agg
                 for (cx.group) |k| if (std.mem.eql(u8, k.last(), n)) return @constCast(node);
                 for (cx.aggs) |a| if (std.mem.eql(u8, a.name, n)) return @constCast(node);
                 for (cx.calls) |c| if (std.mem.eql(u8, c.hidden, n)) return @constCast(node);
+                if (q.parts.len > 1) if (cx.p.key_aliases) |al| if (!al.knows(q.parts[0])) return @constCast(node);
                 if (cx.bad.* == null) cx.bad.* = q;
                 return @constCast(node);
             }
@@ -434,6 +437,8 @@ pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, agg
     };
     var bad: ?ast.QualName = null;
     _ = try S.recur(.{ .p = self, .group = group, .aggs = aggs, .calls = calls, .bad = &bad }, e);
+    if (bad) |q| if (std.mem.startsWith(u8, q.last(), "__sq"))
+        return self.fail(pos, "a correlated subquery in the SELECT list of a grouped query is not supported outside an aggregate — it is evaluated per input row; wrap it in an aggregate, or group in a derived table and correlate the query around it", .{});
     if (bad) |q| return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{try self.spelled(q)});
 }
 

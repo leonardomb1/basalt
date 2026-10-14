@@ -785,3 +785,27 @@ test "known tables: a name the session holds reads as a binding reference, FROM 
     };
     try testing.expectEqual(@as(usize, 2), refs);
 }
+
+test "sql: a refused correlated subquery fails its statement alone; the statements around it still decorrelate" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var errs = std.array_list.Managed(Diagnostic).init(a);
+    const prog = try parseSourceOpts(a,
+        \\SELECT a.k, (SELECT max(b.v) FROM 'r.csv' b WHERE b.d <= a.d) AS m FROM 'l.csv' a;
+        \\SELECT a.k FROM 'l.csv' a WHERE EXISTS (SELECT 1 FROM 'r.csv' b WHERE b.k = a.k);
+        \\SELECT a.k FROM 'l.csv' a WHERE a.k = 1 OR EXISTS (SELECT 1 FROM 'r.csv' b WHERE b.k = a.k);
+        \\SELECT a.k, (SELECT count(*) FROM 'r.csv' b WHERE b.k = a.k) AS n FROM 'l.csv' a;
+    , &diag, .{ .errors = &errs });
+    try testing.expectEqual(@as(usize, 2), errs.items.len);
+    try testing.expectEqual(@as(u32, 1), errs.items[0].line);
+    try testing.expectEqual(@as(u32, 3), errs.items[1].line);
+    var semi = false;
+    var left = false;
+    for (prog.stmts) |st| if (st == .output) for (st.output.stages) |sg| if (sg.node == .join) {
+        semi = semi or sg.node.join.kind == .semi;
+        left = left or sg.node.join.kind == .left;
+    };
+    try testing.expect(semi and left);
+}

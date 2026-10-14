@@ -16,6 +16,7 @@ const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
 const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
+const failWith = @import("support.zig").failWith;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const rescaleTo = @import("cast.zig").rescaleTo;
 const roundScaleDown = @import("cast.zig").roundScaleDown;
@@ -386,7 +387,14 @@ fn evalMatch(arena: std.mem.Allocator, m: ast.Match, batch: Batch, row: usize) E
     return .null;
 }
 
+/// A builtin by name; `__one_row(n, v)`, which a correlated scalar subquery
+/// reads its value through, fails when the subquery gave the row more than one.
 fn evalCall(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+    if (std.mem.eql(u8, c.name, "__one_row") and c.args.len == 2) {
+        const n = try evalRow(arena, c.args[0], batch, row);
+        if (n == .int and n.int > 1) return failWith(error.CastFailed, "more than one row returned by a subquery used as an expression", .{});
+        return evalRow(arena, c.args[1], batch, row);
+    }
     const b = lookupBuiltin(c.name) orelse return error.TypeMismatch;
     return b.eval_fn(arena, c, batch, row);
 }

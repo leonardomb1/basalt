@@ -759,9 +759,23 @@ test "sql: a qualifier must name a table of its query; one of the query around i
         .{ .src = "SELECT zz.k FROM 'l.csv' a WHERE zz.k > 2;", .want = "unknown table `zz`" },
         .{ .src = "SELECT a.k FROM 'l.csv' a ORDER BY zz.k;", .want = "unknown table `zz`" },
         .{ .src = "SELECT a.k FROM 'l.csv' a JOIN 'r.csv' b ON a.k = zz.k;", .want = "unknown table `zz`" },
-        .{ .src = "SELECT * FROM 'l.csv' a WHERE k IN (SELECT k FROM 'r.csv' b WHERE b.s = a.s);", .want = "`a.s` names `a` of the query around this subquery" },
-        .{ .src = "SELECT * FROM 'l.csv' a WHERE v > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);", .want = "correlated subquery is not supported" },
-        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a;", .want = "correlated subquery is not supported" },
+        .{ .src = "SELECT * FROM 'l.csv' a JOIN (SELECT * FROM 'r.csv' b WHERE b.s = a.s) d ON a.k = d.k;", .want = "`a.s` names `a` of the query around this subquery — only a subquery in the SELECT list or WHERE" },
+        .{ .src = "SELECT k FROM 'l.csv' a GROUP BY k HAVING count(*) > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.k);", .want = "`a.k` names `a` of the query around this subquery" },
+        .{ .src = "SELECT * FROM 'l.csv' a ORDER BY (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);", .want = "`a.s` names `a` of the query around this subquery" },
+        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.d <= a.d) AS m FROM 'l.csv' a;", .want = "the correlated condition `(d <= a.d)` is not an equality" },
+        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE a.k > 1) AS m FROM 'l.csv' a;", .want = "a correlated scalar subquery needs an equality `inner_column = outer_column`" },
+        .{ .src = "SELECT (SELECT b.k + a.k FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a;", .want = "`a.k` correlates the subquery in its SELECT list" },
+        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s HAVING count(*) > a.n) AS m FROM 'l.csv' a;", .want = "`a.n` correlates the subquery in its HAVING" },
+        .{ .src = "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s GROUP BY b.t) AS m FROM 'l.csv' a;", .want = "a correlated scalar subquery with GROUP BY is not supported" },
+        .{ .src = "SELECT (SELECT b.k FROM 'r.csv' b WHERE b.s = a.s LIMIT 1) AS m FROM 'l.csv' a;", .want = "a correlated scalar subquery with LIMIT or OFFSET is not supported" },
+        .{ .src = "SELECT a.s, (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a GROUP BY a.s;", .want = "a correlated subquery in the SELECT list of a grouped query" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE a.k = 1 OR EXISTS (SELECT 1 FROM 'r.csv' b WHERE b.s = a.s);", .want = "EXISTS is only supported as a top-level AND condition of WHERE" },
+        .{ .src = "SELECT EXISTS (SELECT 1 FROM 'r.csv' b WHERE b.s = a.s) AS e FROM 'l.csv' a;", .want = "a correlated EXISTS is only supported as a top-level AND condition of WHERE" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE EXISTS (SELECT count(*) FROM 'r.csv' b WHERE b.s = a.s);", .want = "a correlated EXISTS over an aggregate" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE EXISTS (SELECT b.k FROM 'r.csv' b WHERE b.s = a.s UNION SELECT 1);", .want = "cannot be a UNION, INTERSECT or EXCEPT" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE a.k IN (SELECT max(b.k) FROM 'r.csv' b WHERE b.s = a.s);", .want = "a correlated IN (SELECT ...) over an aggregate is not supported" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE EXISTS (SELECT 1 FROM 'r.csv' b WHERE EXISTS (SELECT 1 FROM 'r.csv' c WHERE c.s = a.s));", .want = "unknown table `a` in `a.s` — neither this subquery's FROM nor that of the query directly around it" },
+        .{ .src = "SELECT * FROM 'l.csv' a WHERE EXISTS (SELECT 1 FROM (SELECT * FROM 'r.csv' b WHERE b.s = a.s) d);", .want = "`a.s` reaches the query around this subquery from a derived table, CTE or subquery nested inside it" },
     };
     for (refused) |c| {
         try testing.expectError(error.ParseFailed, parseSource(a, c.src, &diag));
@@ -776,6 +790,11 @@ test "sql: a qualifier must name a table of its query; one of the query around i
         "SELECT a.k FROM 'l.csv' a WHERE a.k IN (SELECT b.k FROM 'r.csv' b WHERE b.s <> 'x');",
         "SELECT a.k, b.s FROM 'l.csv' a JOIN 'r.csv' b ON a.k = b.k ORDER BY b.s;",
         "SELECT a.k FROM 'l.csv' a PUSHDOWN(x.k > 1);",
+        "SELECT * FROM 'l.csv' a WHERE k IN (SELECT k FROM 'r.csv' b WHERE b.s = a.s);",
+        "SELECT * FROM 'l.csv' a WHERE v > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);",
+        "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a;",
+        "SELECT (SELECT count(*) FROM 'r.csv' b WHERE b.s = a.s AND a.k > 1) AS m FROM 'l.csv' a;",
+        "SELECT * FROM 'l.csv' a WHERE NOT EXISTS (SELECT 1 FROM 'r.csv' b WHERE b.s = a.s AND b.d <= a.d);",
     };
     for (accepted) |src| _ = try parseSource(a, src, &diag);
 }

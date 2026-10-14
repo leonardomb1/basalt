@@ -11,6 +11,7 @@ const LateralKey = Parser.LateralKey;
 const Pos = @import("../sql_parser.zig").Pos;
 const SetOpTok = Parser.SetOpTok;
 const Window = @import("window.zig");
+const Correlate = @import("correlate.zig");
 const aggregates = @import("../aggregates.zig");
 const aggOrderDiffers = @import("../sql_parser.zig").aggOrderDiffers;
 const ast = @import("../ast.zig");
@@ -173,6 +174,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     const outer_in_where = self.in_where;
     self.in_where = false;
     defer self.in_where = outer_in_where;
+    const outer_corr = self.corr;
+    self.corr = null;
+    defer self.corr = outer_corr;
     if (self.isKw("with") and !(self.peekTag() == .lparen)) {
         _ = self.advance();
         while (true) {
@@ -367,6 +371,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
     if (first.final_names) |fin|
         try stages.append(.{ .node = .{ .select = fin }, .hints = &.{}, .pos = self.curPos() });
+    self.query_where_end = if (set_op) null else first.where_end;
 }
 
 /// Under a plain DISTINCT a sort key must be a column the SELECT list outputs, as SQL
@@ -718,6 +723,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     const outer_keys = self.key_aliases;
     self.key_aliases = null;
     defer self.key_aliases = outer_keys;
+    var scope = Parser.CorrScope{ .scalars = .init(self.arena) };
+    const outer_corr = self.corr;
+    defer self.corr = outer_corr;
 
     var distinct = false;
     var distinct_on: ?[]ast.QualName = null;
@@ -750,6 +758,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     const outer_sink = self.win_sink;
     self.win_sink = &win_calls;
     defer self.win_sink = outer_sink;
+    self.corr = &scope;
     while (true) {
         if (self.eat(.star)) {
             if (self.eatKw("except") or self.eatKw("exclude")) {
@@ -816,6 +825,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     }
 
     self.win_sink = null;
+    self.corr = null;
 
     var aliases = AliasSet{};
     var read_hints = std.array_list.Managed(ast.Hint).init(self.arena);
@@ -1123,38 +1133,26 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (using_sel) |items| try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = jpos });
     }
 
-    if (self.eatKw("where")) {
-        const fpos = self.curPos();
+    var corr_hidden = std.array_list.Managed([]const u8).init(self.arena);
+    {
+        var fpos = pos;
+        var remaining: ?*ast.Expr = null;
         const sj_base = self.pending_semijoins.items.len;
-        self.in_where = true;
-        const raw = try self.parseExpr();
-        self.in_where = false;
-        const remaining = if (self.pending_semijoins.items.len > sj_base)
-            try self.liftSemiJoins(raw, fpos)
-        else
-            raw;
-        if (remaining) |r| {
-            const e = try self.stripExpr(r, &aliases);
-            try stages.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = fpos });
+        if (self.eatKw("where")) {
+            fpos = self.curPos();
+            self.in_where = true;
+            self.corr = &scope;
+            const raw = try self.parseExpr();
+            self.in_where = false;
+            self.corr = null;
+            remaining = if (self.pending_semijoins.items.len > sj_base)
+                try self.liftSemiJoins(raw, fpos)
+            else
+                raw;
         }
-        for (self.pending_semijoins.items[sj_base..]) |sj| {
-            const lk = try self.arena.dupe(ast.QualName, &.{stripQual(sj.lhs.field, &aliases)});
-            const rk = try self.arena.dupe(ast.QualName, &.{try self.singleName(sj.right_col)});
-            try stages.append(.{
-                .node = .{ .join = .{
-                    .kind = if (sj.negated) .anti else .semi,
-                    .binding = sj.binding,
-                    .left_keys = lk,
-                    .right_keys = rk,
-                    .pins = &.{.{ .left = true, .right = true }},
-                    .null_aware = sj.negated,
-                } },
-                .hints = &.{},
-                .pos = sj.pos,
-            });
-        }
-        self.pending_semijoins.shrinkRetainingCapacity(sj_base);
+        try Correlate.lowerWhere(self, &stages, &aliases, remaining, fpos, sj_base, scope.scalars.items, &corr_hidden);
     }
+    const where_end = stages.items.len + @intFromBool(key_cols.items.len > 0);
     if (key_cols.items.len > 0) {
         const drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try key_cols.toOwnedSlice() }});
         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
@@ -1305,6 +1303,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var using_copies = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
     var using_hidden = std.array_list.Managed([]const u8).init(self.arena);
     try aliases.usingCols(&using_drop, &using_copies, &using_hidden);
+    try using_hidden.appendSlice(corr_hidden.items);
     const copy_names = using_hidden.items;
     for (raw_items.items) |*ri| if (ri.* == .item and ri.item == .field) {
         const q = ri.item.field;
@@ -1606,6 +1605,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         .group = if (agg_mode and win_calls.items.len == 0) group else null,
         .dups = try dups.toOwnedSlice(),
         .final_names = final_names,
+        .where_end = where_end,
     };
 }
 

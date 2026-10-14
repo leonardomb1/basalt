@@ -437,7 +437,7 @@ pub fn liftSemiJoins(self: *Parser, e: *ast.Expr, pos: Pos) Error!?*ast.Expr {
     }
     for (self.pending_semijoins.items) |sj| {
         if (containsExpr(e, sj.sentinel))
-            return self.fail(sj.pos, "IN (SELECT ...) is only supported as a top-level AND condition of WHERE — not under OR, NOT or CASE", .{});
+            return self.fail(sj.pos, "{s} is only supported as a top-level AND condition of WHERE — not under OR, NOT or CASE", .{sj.what});
     }
     return e;
 }

@@ -639,6 +639,8 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         ro.* = pair[1];
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
+        if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)) and std.mem.startsWith(u8, right.fields[pair[1]].name, "__sq"))
+            return fail(diag, "a correlated subquery compares {s} ({s}) with a column of its own ({s}) — make them one type in the subquery's WHERE: `CAST(x AS string) = y`", .{ try keyLabel(arena, left.fields[pair[0]].name, lq.last()), @tagName(lt.kind), @tagName(rt.kind) });
         if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
             return fail(diag, "join keys {s} ({s}) and {s} ({s}) are not comparable — make them one type in the ON: `CAST(x AS string) = y`", .{ try keyLabel(arena, left.fields[pair[0]].name, lq.last()), @tagName(lt.kind), try keyLabel(arena, right.fields[pair[1]].name, lq.last()), @tagName(rt.kind) });
     }

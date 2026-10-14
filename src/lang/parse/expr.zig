@@ -204,7 +204,12 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
                     return self.fail(inpos, "IN (SELECT ...) is only supported in a WHERE clause", .{});
                 if (lhs.* != .field)
                     return self.fail(inpos, "the left side of IN (SELECT ...) must be a plain column", .{});
-                const pipe = try self.parseSubqueryPipeline();
+                const cap = try self.captureSubquery();
+                if (cap.refs.len > 0) {
+                    lhs = try self.correlatedIn(lhs, cap, negated, inpos);
+                    continue;
+                }
+                const pipe = cap.pipe;
                 const col = self.firstOutName(pipe.stages) orelse
                     return self.fail(inpos, "the subquery of IN must produce exactly one named column", .{});
                 const bname = try self.freshName("__insq{d}");
@@ -294,6 +299,12 @@ pub fn parseUnary(self: *Parser) Error!*ast.Expr {
         const e = try self.parseUnary();
         return self.mk(.{ .unary = .{ .op = .bit_not, .e = e } });
     }
+    if (self.isKw("not") and self.peekKw("exists") and self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .lparen) {
+        const pos = self.curPos();
+        _ = self.advance();
+        _ = self.advance();
+        return self.existsSubquery(true, pos);
+    }
     if (self.isKw("not") and !self.peekKw("like") and !self.peekKw("in")) {
         _ = self.advance();
         const e = try self.parseBin(25);
@@ -364,7 +375,9 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 if (self.query_depth == 0)
                     return self.fail(spos, "a scalar subquery is only supported inside a query — bind it first with `LET x = (SELECT ...);`", .{});
                 _ = self.advance();
-                const pipe = try self.parseSubqueryPipeline();
+                const cap = try self.captureSubquery();
+                if (cap.refs.len > 0) return self.correlatedScalar(cap, spos);
+                const pipe = cap.pipe;
                 const name = try self.freshName("__scalar{d}");
                 try self.pending_bindings.append(.{ .let_const = .{ .name = name, .expr = null, .query = pipe, .pos = spos } });
                 try self.const_names.append(name);
@@ -396,6 +409,12 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 return self.mk(.{ .bool_lit = false });
             }
             if (eqlNoCase(t.text, "case")) return self.parseCaseExpr();
+            if (eqlNoCase(t.text, "exists") and self.peekTag() == .lparen and self.i + 2 < self.toks.len and
+                self.toks[self.i + 2].tag == .ident and (eqlNoCase(self.toks[self.i + 2].text, "select") or eqlNoCase(self.toks[self.i + 2].text, "with")))
+            {
+                _ = self.advance();
+                return self.existsSubquery(false, .{ .line = t.line, .col = t.col, .file = t.file });
+            }
             if (eqlNoCase(t.text, "search") and self.peekTag() == .lparen) return self.parseSearch();
             if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
                 _ = self.advance();

@@ -1515,6 +1515,8 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE FUNCTION f(a) AS\n  PRINT $a;\nEND;\nCALL f(1, 2);", "`f` expects 1 argument(s), got 2" },
         .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  CALL nope($x);\nEND FOR;", "CALL: no function named `nope`" },
         .{ "LET x = 1;\nPARAM x INT DEFAULT 2;\nLOAD INTO '$B/o.csv' AS SELECT $x AS a;", "`x` is declared twice: LET and PARAM share one name space" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT p.x FROM '$B/a.csv' p WHERE EXISTS (SELECT 1 FROM '$B/a.csv' q WHERE CAST(q.x AS string) = p.x);", "a correlated subquery compares `x` (int) with a column of its own (string)" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT p.x, (SELECT count(*) FROM '$B/a.csv' q WHERE CAST(q.x AS string) = p.x) AS n FROM '$B/a.csv' p;", "a correlated subquery compares `x` (int) with a column of its own (string)" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

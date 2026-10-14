@@ -6,12 +6,15 @@
 //!
 //! Every scalar builtin is one `Builtin` entry (plan-time typing, row-wise
 //! evaluator, optional whole-batch kernel) found by `lookupBuiltin`; the table is
-//! re-exported by `exec/builtins.zig`. Check time catches what it can so a bad
-//! input fails `check`, not the run: a literal regex pattern or `strftime` format
-//! is compiled, and a string literal compared to a date/timestamp must be strict
-//! ISO, bending to the column's type (never the reverse, so `'01/07/2013'` is an
-//! error instead of a text comparison). A `$name` still present at typing time
-//! names nothing and is never read as a column.
+//! re-exported by `exec/builtins.zig`. One internal call stays out of the table,
+//! so neither Tab nor pushdown offers it: `__one_row(n, v)`, through which a
+//! correlated scalar subquery yields `v` and fails when its row got `n` > 1 rows.
+//! Check time catches what it can so a bad input fails `check`, not the run: a
+//! literal regex pattern or `strftime` format is compiled, and a string literal
+//! compared to a date/timestamp must be strict ISO, bending to the column's type
+//! (never the reverse, so `'01/07/2013'` is an error instead of a text
+//! comparison). A `$name` still present at typing time names nothing and is
+//! never read as a column.
 //!
 //! Two evaluators. `evalVec` works on whole typed column slices with no per-row
 //! `Value` boxing; a node it does not cover (bitwise ops, `try_cast`, most string
@@ -239,6 +242,10 @@ pub const TypeCtx = struct {
         self.span = c.span;
         inline for (.{ "count", "sum", "avg", "min", "max" }) |agg| {
             if (std.mem.eql(u8, name, agg)) return self.err("aggregate `{s}` is only valid inside `aggregate`", .{name});
+        }
+        if (std.mem.eql(u8, name, "__one_row") and c.args.len == 2) {
+            _ = try self.typeOf(c.args[0]);
+            return (try self.typeOf(c.args[1])).asNullable();
         }
         const b = lookupBuiltin(name) orelse return self.err("unknown function `{s}`", .{name});
         self.span = null;
