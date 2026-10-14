@@ -225,6 +225,7 @@ pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) 
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) out.retry_after_ms = retryAfterMs(h.value);
     }
+    if (call.method == .HEAD) return out;
     if (resp.head.content_encoding == .compress) return error.UnsupportedCompressionMethod;
     var aw = std.Io.Writer.Allocating.init(arena);
     var transfer_buf: [64]u8 = undefined;
