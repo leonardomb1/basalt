@@ -34,7 +34,6 @@ const planErrT = @import("../env.zig").planErrT;
 const pqwrite = @import("../../format/parquet/write.zig");
 const proberOpen = @import("sql_read.zig").proberOpen;
 const readReport = @import("../connect.zig").readReport;
-const redialFor = @import("lane_sink.zig").redialFor;
 const resolveDbConfig = @import("dbconfig.zig").resolveDbConfig;
 const split = @import("../../connect/split.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
@@ -251,7 +250,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
-                return openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, w.target, schema, w.mode, try redialFor(env.arena, info.kind, cfg)) catch |e| {
+                return openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, w.target, schema, w.mode, env.errctx) catch |e| {
                     defer c.close();
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
                 };

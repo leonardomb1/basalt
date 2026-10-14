@@ -84,6 +84,7 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     msg: std.array_list.Managed(u8),
     last_error: []const u8 = "",
+    txn_desc: [8]u8 = @splat(0),
     sspi_reply: []const u8 = "",
     tls: ?*sql.TlsState = null,
     shim: TlsShim = undefined,
@@ -265,7 +266,14 @@ pub const Conn = struct {
                     self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
                     return error.QueryFailed;
                 },
-                0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => {
+                0xE3 => {
+                    if (i + 2 > p.len) return error.TdsProtocol;
+                    const len = rdU16(p, i);
+                    if (i + 2 + len > p.len) return error.TdsProtocol;
+                    self.noteEnvChange(p[i + 2 .. i + 2 + len]);
+                    i += 2 + len;
+                },
+                0xAB, 0xA9, 0xA4, 0xA5 => {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     i += 2 + rdU16(p, i);
                 },
@@ -277,6 +285,18 @@ pub const Conn = struct {
                 },
                 else => break,
             }
+        }
+    }
+
+    /// The transaction descriptor a BEGIN TRANSACTION reports (ENVCHANGE type 8),
+    /// sent back in every later request's headers until a commit or rollback (9, 10)
+    /// clears it; a request with none while a transaction is open is refused.
+    fn noteEnvChange(self: *Conn, d: []const u8) void {
+        if (d.len < 2) return;
+        switch (d[0]) {
+            8 => if (d[1] == 8 and d.len >= 10) @memcpy(&self.txn_desc, d[2..10]),
+            9, 10 => self.txn_desc = @splat(0),
+            else => {},
         }
     }
 
@@ -547,6 +567,7 @@ pub const Conn = struct {
             0,    0,    1, 0,
             0,    0,
         });
+        @memcpy(payload.items[10..18], &self.txn_desc);
         const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, stmt);
         defer self.gpa.free(u16s);
         for (u16s) |u| {
