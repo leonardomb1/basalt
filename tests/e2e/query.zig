@@ -1417,6 +1417,25 @@ test "spill: a LIMIT over a spilled sort, join, GROUP BY or DISTINCT gives its d
     }
 }
 
+test "distinct into parquet on one lane: the writer thread and the operator do not share an arena" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,s\n");
+    for (0..200_000) |i| try in.print("{d},value_{d}_{d}\n", .{ i, i, (i * 7919) % 100_003 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/d.parquet' AS SELECT DISTINCT s FROM '{0s}/in.csv';\n" ++
+        "LOAD INTO '{0s}/out.csv' AS SELECT count(*) AS n FROM '{0s}/d.parquet';", .{base});
+    defer alloc.free(script);
+    const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = 1, .log = .{ .quiet = true } });
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("n\n200000\n", out);
+}
+
 test "count: a float column past the int range is counted, not converted" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
