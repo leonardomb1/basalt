@@ -151,7 +151,7 @@ def main(binary):
         not st["ok"] and e.get("line") == 3 and e.get("file") == "script" and "nope" in e.get("msg", ""),
         st,
     )
-    report("results before a failing statement are still delivered", rows(data) == [{"a": 1}], data)
+    report("a script with a static error runs none of its statements", rows(data) == [], data)
     _, st = k.run("SELECT range,\n       upper(nope) AS u\nFROM RANGE(3);")
     e = st.get("error") or {}
     report(
