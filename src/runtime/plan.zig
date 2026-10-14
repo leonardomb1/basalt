@@ -662,10 +662,10 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 const d = f.default orelse continue;
                 const q = f.arg orelse continue;
                 const ty = wp.schema.fields[schema.fields.len + i].ty;
-                const v = eval.constEval(arena, try analyze.substExpr(arena, d, env.params_expr), &.{}, &.{}) catch |e|
-                    return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{op.errLabel(e)}));
-                out.default = if (v.isNull()) .null else eval.castValueTyped(arena, v, ty) catch
-                    return planErr(env.diag, try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }));
+                out.default = switch (try analyze.lagDefault(arena, try analyze.substExpr(arena, d, env.params_expr), q, ty)) {
+                    .value => |v| v,
+                    .problem => |why| return planErr(env.diag, why),
+                };
             }
             const o = try arena.create(op.Window);
             o.* = .{

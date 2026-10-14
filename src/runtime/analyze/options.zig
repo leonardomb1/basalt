@@ -11,6 +11,8 @@ const ast = @import("../../lang/ast.zig");
 const env_mod = @import("../env.zig");
 const fail = @import("../analyze.zig").fail;
 const registry = @import("../../connect/registry.zig");
+const http_client = @import("../../net/http_client.zig");
+const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
 const streamload = @import("../../db/streamload.zig");
@@ -148,6 +150,7 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
         if (sqlOptionProblem(c)) |why| return why;
         return try sqlLiteralProblem(arena, c);
     }
+    if (conn == .http) return httpProblem(arena, c);
     const keys = fileKeys(c.connector) orelse return null;
     var host: ?[]const u8 = null;
     var host_known = false;
@@ -199,6 +202,28 @@ pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
     if (auth) |v| if (std.meta.stringToEnum(env_mod.DbAuth, v) == null) return env_mod.auth_values_msg;
     if (auth != null and tls != null and std.mem.eql(u8, auth.?, "ntlm") and std.mem.eql(u8, tls.?, "off"))
         return env_mod.ntlm_needs_tls_msg;
+    return null;
+}
+
+pub fn httpConnMsg(arena: std.mem.Allocator, name: []const u8, why: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(arena, "http connection `{s}`: {s}", .{ name, why });
+}
+
+/// An http connection whose options are all literals, judged by the run's own
+/// `connFromKvs`; one reading `env()` or `secret()` is left to the run.
+fn httpProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const u8 {
+    var auth: []const u8 = "";
+    for (c.config) |a| if (std.mem.eql(u8, a.key, "auth")) {
+        auth = (try literalText(arena, a.value)) orelse return null;
+    };
+    var kvs = std.array_list.Managed(http_client.KV).init(arena);
+    for (c.config) |a| if (httpAttrUsed(c, auth, a.key))
+        try kvs.append(.{ .key = a.key, .value = (try literalText(arena, a.value)) orelse return null });
+    var why: []const u8 = "";
+    _ = http_client.connFromKvs(arena, kvs.items, &why) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return try httpConnMsg(arena, c.name, why);
+    };
     return null;
 }
 

@@ -1465,7 +1465,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', compression = 'lz4');\nLOAD INTO sr.t AS SELECT 1 AS a;", "`compression` must be 'none' or 'gzip', not 'lz4'" },
         .{ "CREATE CONNECTION sr TYPE doris OPTIONS (host = '127.0.0.1', user = 'u', password = 'p');\nLOAD INTO sr.t AS SELECT 1 AS a;", "doris connection needs a `database`" },
         .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', buckets = 'x');\nLOAD INTO sr.t AS SELECT 1 AS a;", "invalid integer config value" },
-        .{ "CREATE CONNECTION h TYPE http OPTIONS (url = 'http://127.0.0.1');\nLOAD INTO h.t AS SELECT 1 AS a;", "unsupported sink connector `http`" },
+        .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1');\nLOAD INTO h.t AS SELECT 1 AS a;", "unsupported sink connector `http`" },
         .{ "CREATE CONNECTION f TYPE ftp OPTIONS (host = 'h', bogus = 1);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "ftp connection `f`: unknown option `bogus`" },
         .{ "CREATE CONNECTION f TYPE sftp OPTIONS (port = 22);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "sftp connection `f` needs a `host`" },
         .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h', port = 99999);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "sftp connection `port` is out of range" },
@@ -1506,6 +1506,9 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM range('a', 3);", "RANGE bounds must be integer literals" },
         .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h');\nLOAD INTO '$B/o.csv' AS SELECT * FROM f.t;", "unsupported source connector `sftp`" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' UNION ALL BY NAME SELECT * FROM '$B/a.csv' ANCHOR SCHEMA nope;", "union canon `nope` is not one of the source tables" },
+        .{ "CREATE CONNECTION h TYPE http OPTIONS (url = 'http://127.0.0.1');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: unknown attribute `url`" },
+        .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1', auth = 'bearer');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: auth 'bearer' needs a `token`" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT x, LAG(x, 1, 'no') OVER (ORDER BY x) AS l FROM '$B/a.csv';", "LAG/LEAD default does not fit `x`" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

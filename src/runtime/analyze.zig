@@ -279,6 +279,7 @@ pub const windowFuncType = @import("analyze/schema.zig").windowFuncType;
 pub const windowSchema = @import("analyze/schema.zig").windowSchema;
 pub const windowPlan = @import("analyze/schema.zig").windowPlan;
 pub const windowOffset = @import("analyze/schema.zig").windowOffset;
+pub const lagDefault = @import("analyze/schema.zig").lagDefault;
 pub const ExplodePlan = @import("analyze/schema.zig").ExplodePlan;
 pub const explodePlan = @import("analyze/schema.zig").explodePlan;
 pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;

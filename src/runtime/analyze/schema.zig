@@ -4,6 +4,7 @@
 const Diag = @import("../analyze.zig").Diag;
 const dollarRefs = @import("../analyze.zig").dollarRefs;
 const eval = @import("../../exec/eval.zig");
+const Value = @import("../../exec/value.zig").Value;
 const Error = @import("../analyze.zig").Error;
 const ParamMap = std.StringHashMap(*const ast.Expr);
 const aggregates = @import("../../lang/aggregates.zig");
@@ -413,13 +414,24 @@ fn opFrame(fr: ast.WinFrame, conv: op.Window.RangeConv, key_kind: types.TypeKind
 /// `$params` is left to the run, which knows their values.
 fn checkLagDefault(arena: std.mem.Allocator, d: *const ast.Expr, q: ast.QualName, ty: types.Type, diag: *Diag) Error!void {
     if (try exprHasDollar(arena, d)) return;
+    switch (try lagDefault(arena, d, q, ty)) {
+        .problem => |why| return fail(diag, "{s}", .{why}),
+        .value => {},
+    }
+}
+
+pub const LagDefault = union(enum) { value: Value, problem: []const u8 };
+
+/// A LAG/LEAD default, its params already literals, as a value of its column's type.
+pub fn lagDefault(arena: std.mem.Allocator, d: *const ast.Expr, q: ast.QualName, ty: types.Type) Error!LagDefault {
     const v = eval.constEval(arena, d, &.{}, &.{}) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
-        return fail(diag, "LAG/LEAD default: {s}", .{@import("../env.zig").errLabel(e)});
+        return .{ .problem = try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{@import("../env.zig").errLabel(e)}) };
     };
-    if (v.isNull()) return;
-    _ = eval.castValueTyped(arena, v, ty.asNullable()) catch
-        return fail(diag, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) });
+    if (v.isNull()) return .{ .value = .null };
+    const typed = eval.castValueTyped(arena, v, ty.asNullable()) catch
+        return .{ .problem = try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }) };
+    return .{ .value = typed };
 }
 
 fn exprHasDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!bool {

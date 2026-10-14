@@ -304,7 +304,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         }
         var errmsg: []const u8 = "";
         const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "http connection `{s}`: {s}", .{ rd.connector, errmsg }));
+            return planErr(env.diag, try options.httpConnMsg(env.arena, rd.connector, errmsg));
         const all = try std.mem.concat(env.arena, ast.Hint, &.{ conn.hints, hints });
         var hopts = http_client.optsFromHints(all);
         hopts.logger = env.log;
