@@ -326,6 +326,7 @@ pub const Writer = struct {
     scratch_live: bool = true,
     col_mem: ?*std.heap.ArenaAllocator = null,
     owner: ?*Writer = null,
+    own_mem: ?*std.heap.ArenaAllocator = null,
     pool: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
     pool_mu: std.Thread.Mutex = .{},
     backend: Backend,
@@ -362,7 +363,7 @@ pub const Writer = struct {
     /// forgets the check fails loudly instead of truncating the file. An object
     /// URL must never reach the filesystem: `az://` once became a local `az:` dir.
     pub fn open(
-        arena: std.mem.Allocator,
+        plan_arena: std.mem.Allocator,
         path: []const u8,
         schema: types.Schema,
         compression: codec.Codec,
@@ -370,6 +371,10 @@ pub const Writer = struct {
     ) !*Writer {
         if (mode == .append) return Error.AppendNotSupported;
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
+        const mem = try plan_arena.create(std.heap.ArenaAllocator);
+        mem.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer mem.deinit();
+        const arena = mem.allocator();
         const maps = try arena.alloc(Mapping, schema.fields.len);
         for (schema.fields, maps) |f, *m| {
             m.* = try mapType(f.ty);
@@ -383,7 +388,7 @@ pub const Writer = struct {
             c.dict_ok = c.dict_eligible;
         }
 
-        const self = try arena.create(Writer);
+        const self = try plan_arena.create(Writer);
         self.* = .{
             .arena = arena,
             .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -393,6 +398,7 @@ pub const Writer = struct {
             .compression = compression,
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
+            .own_mem = mem,
         };
         if (try objstore.openRemote(arena, path, parquet_content_type)) |o| {
             self.backend = .{ .object = o };
@@ -592,6 +598,14 @@ pub const Writer = struct {
             .object => |o| o.finish() catch |e| return self.specific(e),
             .memory => {},
         }
+        self.freeOwn();
+    }
+
+    fn freeOwn(self: *Writer) void {
+        if (self.own_mem) |m| {
+            m.deinit();
+            self.own_mem = null;
+        }
     }
 
     /// Once only: `abort` may follow a `close` that failed after freeing it.
@@ -621,6 +635,7 @@ pub const Writer = struct {
             .object => |o| o.abort(),
             .memory => {},
         }
+        self.freeOwn();
     }
 
     fn writeFileMetaData(self: *Writer, out: *List(u8)) !void {
