@@ -209,8 +209,8 @@ pub fn connVTable(comptime T: type) Conn.VTable {
     };
 }
 
-/// A load or commit the server refused: its own message into `errctx`, so the run
-/// reports why (a duplicate key, a check constraint) rather than `PgQueryFailed`.
+/// A load the server refused: its own message into `errctx`, so the run reports
+/// why (a duplicate key, a check constraint) rather than `PgQueryFailed`.
 fn refused(errctx: ?*op.ErrCtx, dialect: Dialect, msg: []const u8, e: anyerror) anyerror {
     if (errctx) |ec| if (msg.len > 0) ec.set("{s} refused the load: {s}", .{ @tagName(dialect), msg });
     return e;
@@ -422,24 +422,10 @@ fn freeSchema(gpa: std.mem.Allocator, schema: types.Schema) void {
     gpa.free(schema.fields);
 }
 
-/// A load runs in one transaction from the REPLACE's DELETE to the last row, so a
-/// failure anywhere leaves the table as it was: the DELETE once committed on its own
-/// and a failed load left the table empty. A broken connection cannot rejoin that
-/// transaction, so the load fails then rather than redialling.
-fn txnBegin(d: Dialect) []const u8 {
-    return switch (d) {
-        .sqlserver => "BEGIN TRANSACTION",
-        .mysql, .starrocks, .doris => "START TRANSACTION",
-        .postgres => "BEGIN",
-    };
-}
-
-fn txnCommit(d: Dialect) []const u8 {
-    return switch (d) {
-        .sqlserver => "COMMIT TRANSACTION",
-        else => "COMMIT",
-    };
-}
+pub const Redial = struct {
+    ctx: *const anyopaque,
+    dial: *const fn (*const anyopaque, std.mem.Allocator) anyerror!Conn,
+};
 
 pub const Sink = struct {
     gpa: std.mem.Allocator,
@@ -452,8 +438,10 @@ pub const Sink = struct {
     tuple_arena: std.heap.ArenaAllocator,
     flush_rows: usize,
     errctx: ?*op.ErrCtx = null,
+    redial: ?Redial = null,
+    conn_alive: bool = true,
 
-    pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*Sink {
+    pub fn open(gpa: std.mem.Allocator, conn: Conn, dialect: Dialect, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Sink {
         const self = try gpa.create(Sink);
         errdefer gpa.destroy(self);
         const owned = try ownedSchema(gpa, schema);
@@ -470,6 +458,7 @@ pub const Sink = struct {
             .rows = std.array_list.Managed([]const u8).init(gpa),
             .tuple_arena = std.heap.ArenaAllocator.init(gpa),
             .flush_rows = flushRowsFor(dialect),
+            .redial = redial,
         };
         errdefer self.rows.deinit();
         errdefer self.tuple_arena.deinit();
@@ -478,7 +467,6 @@ pub const Sink = struct {
         defer aa.deinit();
         const ddl = try createTableSql(aa.allocator(), dialect, self.table, schema, mode);
         try conn.exec(ddl);
-        try conn.exec(txnBegin(dialect));
         if (mode == .overwrite) {
             const del = try std.fmt.allocPrint(aa.allocator(), "DELETE FROM {s}", .{self.table});
             try conn.exec(del);
@@ -505,7 +493,16 @@ pub const Sink = struct {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const stmt = try buildStatement(aa.allocator(), self.dialect, self.table, self.schema, self.mode, self.rows.items);
-        self.conn.exec(stmt) catch |e| return refused(self.errctx, self.dialect, self.conn.lastError(), e);
+        self.conn.exec(stmt) catch |e| {
+            const rd = self.redial orelse return refused(self.errctx, self.dialect, self.conn.lastError(), e);
+            if (!driver.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
+            self.conn.close();
+            self.conn_alive = false;
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            self.conn = try rd.dial(rd.ctx, self.gpa);
+            self.conn_alive = true;
+            try self.conn.exec(stmt);
+        };
         self.rows.clearRetainingCapacity();
         _ = self.tuple_arena.reset(.retain_capacity);
     }
@@ -513,7 +510,6 @@ pub const Sink = struct {
     pub fn close(self: *Sink) !void {
         defer self.teardown();
         try self.flush();
-        self.conn.exec(txnCommit(self.dialect)) catch |e| return refused(self.errctx, self.dialect, self.conn.lastError(), e);
     }
 
     pub fn abort(self: *Sink) void {
@@ -521,7 +517,7 @@ pub const Sink = struct {
     }
 
     fn teardown(self: *Sink) void {
-        self.conn.close();
+        if (self.conn_alive) self.conn.close();
         self.rows.deinit();
         self.tuple_arena.deinit();
         freeSchema(self.gpa, self.schema);
@@ -544,11 +540,12 @@ pub fn BulkSink(comptime Proto: type) type {
         command: []const u8,
         seg_rows: u64 = 0,
         errctx: ?*op.ErrCtx = null,
+        redial: ?Redial = null,
 
         const Self = @This();
         const vtable = driver.sinkVTable(Self);
 
-        pub fn open(gpa: std.mem.Allocator, conn: *Proto.Connection, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode) !*Self {
+        pub fn open(gpa: std.mem.Allocator, conn: *Proto.Connection, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const owned = try ownedSchema(gpa, schema);
@@ -559,12 +556,11 @@ pub fn BulkSink(comptime Proto: type) type {
             const a = aa.allocator();
             const qtable = try quoteIdent(a, Proto.dialect, table_name);
             conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode)) catch |e| return onWire(e);
-            conn.exec(txnBegin(Proto.dialect)) catch |e| return onWire(e);
             if (mode == .overwrite) conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable})) catch |e| return onWire(e);
             const command = try gpa.dupe(u8, try Proto.command(a, qtable, schema));
             errdefer gpa.free(command);
 
-            self.* = .{ .gpa = gpa, .conn = conn, .schema = owned, .buffer = std.array_list.Managed(u8).init(gpa), .command = command };
+            self.* = .{ .gpa = gpa, .conn = conn, .schema = owned, .buffer = std.array_list.Managed(u8).init(gpa), .command = command, .redial = redial };
             errdefer self.buffer.deinit();
             try self.startSegment();
             return self;
@@ -587,14 +583,22 @@ pub fn BulkSink(comptime Proto: type) type {
             if (@hasDecl(Proto, "segmentHeader")) try Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema);
         }
 
-        /// Send the buffered segment and verify the row count. A segment holding only a
-        /// header is dropped without a round-trip.
+        /// Send the buffered segment and verify the row count, redialing once and
+        /// resending on a transient failure. A segment holding only a header is dropped
+        /// without a round-trip.
         fn commitSegment(self: *Self) !void {
             if (self.seg_rows == 0) {
                 self.buffer.clearRetainingCapacity();
                 return;
             }
-            self.sendSegment() catch |e| return refused(self.errctx, Proto.dialect, self.conn.last_error, e);
+            self.sendSegment() catch |e| {
+                const rd = self.redial orelse return refused(self.errctx, Proto.dialect, self.conn.last_error, e);
+                if (!driver.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.last_error, e);
+                const fresh = try rd.dial(rd.ctx, self.gpa);
+                self.conn.close();
+                self.conn = @ptrCast(@alignCast(fresh.ptr));
+                try self.sendSegment();
+            };
             self.buffer.clearRetainingCapacity();
             self.seg_rows = 0;
         }
@@ -611,7 +615,6 @@ pub fn BulkSink(comptime Proto: type) type {
         pub fn close(self: *Self) !void {
             defer self.teardown();
             try self.commitSegment();
-            self.conn.exec(txnCommit(Proto.dialect)) catch |e| return refused(self.errctx, Proto.dialect, self.conn.last_error, onWire(e));
         }
 
         /// Drop the buffer and close the socket mid-statement, so the server aborts the
@@ -1346,14 +1349,7 @@ const FakeBulk = struct {
         sends: usize = 0,
         closed: bool = false,
         last_len: usize = 0,
-        log: [8][]const u8 = undefined,
-        nlog: usize = 0,
-        fn exec(self: *Connection, sql_text: []const u8) !void {
-            if (self.nlog < self.log.len) {
-                self.log[self.nlog] = if (std.mem.startsWith(u8, sql_text, "CREATE")) "CREATE" else if (std.mem.startsWith(u8, sql_text, "DELETE")) "DELETE" else sql_text;
-                self.nlog += 1;
-            }
-        }
+        fn exec(_: *Connection, _: []const u8) !void {}
         fn close(self: *Connection) void {
             self.closed = true;
         }
@@ -1375,32 +1371,47 @@ const FakeBulk = struct {
         conn.last_len = segment.len;
         return rows;
     }
+    fn dial(ctx: *const anyopaque, _: std.mem.Allocator) anyerror!Conn {
+        const fresh: *Connection = @ptrCast(@alignCast(@constCast(ctx)));
+        return .{ .ptr = fresh, .vtable = &conn_vtable };
+    }
+    fn noCursor(_: *anyopaque, _: []const u8) anyerror!Cursor {
+        return error.Unsupported;
+    }
+    fn noExec(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn noClose(_: *anyopaque) void {}
+    const conn_vtable = Conn.VTable{ .queryCursor = noCursor, .exec = noExec, .close = noClose };
 };
 
-test "BulkSink: a REPLACE runs in one transaction, committed only after the last segment" {
+test "BulkSink: a transient send failure redials once and resends the intact segment" {
     const gpa = std.testing.allocator;
-    var c = FakeBulk.Connection{};
+    var first = FakeBulk.Connection{ .fail_once = true };
+    var second = FakeBulk.Connection{};
     const schema = types.Schema{ .fields = &.{} };
     const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 3 };
-    const s = try BulkSink(FakeBulk).open(gpa, &c, "t", schema, .overwrite);
+
+    const s = try BulkSink(FakeBulk).open(gpa, &first, "t", schema, .append, .{ .ctx = &second, .dial = FakeBulk.dial });
     try s.writeBatch(gpa, batch);
     try s.close();
-    try std.testing.expectEqual(@as(usize, 4), c.nlog);
-    for ([_][]const u8{ "CREATE", "BEGIN", "DELETE", "COMMIT" }, c.log[0..4]) |want, got| try std.testing.expectEqualStrings(want, got);
-    try std.testing.expectEqual(@as(usize, 1), c.sends);
-    try std.testing.expect(c.closed);
+
+    try std.testing.expectEqual(@as(usize, 1), first.sends);
+    try std.testing.expect(first.closed);
+    try std.testing.expectEqual(@as(usize, 1), second.sends);
+    try std.testing.expectEqual(@as(usize, 12), second.last_len);
+    try std.testing.expect(second.closed);
 }
 
-test "BulkSink: a failed segment ends the load uncommitted" {
+test "BulkSink: without a redial the transient failure is the caller's" {
     const gpa = std.testing.allocator;
-    var c = FakeBulk.Connection{ .fail_once = true };
+    var only = FakeBulk.Connection{ .fail_once = true };
     const schema = types.Schema{ .fields = &.{} };
     const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 1 };
-    const s = try BulkSink(FakeBulk).open(gpa, &c, "t", schema, .overwrite);
+
+    const s = try BulkSink(FakeBulk).open(gpa, &only, "t", schema, .append, null);
     try s.writeBatch(gpa, batch);
     try std.testing.expectError(error.ConnectionResetByPeer, s.close());
-    for (c.log[0..c.nlog]) |st| try std.testing.expect(!std.mem.eql(u8, st, "COMMIT"));
-    try std.testing.expect(c.closed);
+    try std.testing.expectEqual(@as(usize, 1), only.sends);
+    try std.testing.expect(only.closed);
 }
 
 test "DDL and CAST spell each kind the way each dialect declares it" {
