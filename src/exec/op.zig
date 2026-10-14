@@ -25,17 +25,18 @@
 //! reports each surviving row's input ordinal, so parallel lanes that dedup per
 //! chunk merge to the same row on every run.
 //!
-//! Sort lifts each key once into a typed `KeyArr`, then LSD-radix sorts the rows,
-//! stably, on order-preserving u64 words in 11-bit digits over only the range the
-//! keys use. Ints and floats are one word, decimals two (scaled to the widest scale
+//! Sort lifts each key once into a typed `KeyArr` and packs every row's
+//! order-preserving u64 words with its row number into one record, which an MSD
+//! byte radix orders, stably, skipping the bytes a bucket shares. Ints and floats are one word, decimals two (scaled to the widest scale
 //! present, since postgres NUMERIC carries a per-value scale and raw unscaled ints
 //! sorted 0.5 after 0.10), a string up to 31 bytes is its zero-padded bytes with
 //! the length in the last byte, and a longer one is a 24-byte prefix whose ties the
 //! comparator settles. Nulls sort first or last as each key says (by default as
 //! larger than every value: last ascending, first DESC), NaN sorts last and -0.0
 //! equals 0.0, as `eval.orderF64`. A comparator sort of 10M strings took 22s. The
-//! parallel sort splits rows into ranges on the first key's leading bits, one range
-//! per thread, and gives exactly the serial result.
+//! parallel sort splits rows into ranges on the first key's leading bits, a few
+//! per thread handed out as threads free up (`par`), and gives exactly the serial
+//! result.
 //!
 //! TopN fuses `sort | limit N [offset M]` into a bounded heap of M+N rows copied
 //! into `gpa`, up to `max_rows` (past it a radix sort is faster). Ties rank by input

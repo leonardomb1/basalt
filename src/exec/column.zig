@@ -21,6 +21,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
+const par = @import("par.zig");
 
 const Value = value.Value;
 
@@ -222,6 +223,57 @@ pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !C
     return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = data };
 }
 
+/// `concat` copying the chunks on up to `threads` threads, each chunk to its place;
+/// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
+pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: usize, threads: usize) !Column {
+    if (threads < 2 or chunks.len < 2 or total < 1 << 17) return concat(arena, chunks, total);
+    var bm = try Bitmap.initFull(arena, total);
+    const rows = try arena.alloc(usize, chunks.len);
+    const bytes = try arena.alloc(usize, chunks.len);
+    var off: usize = 0;
+    var span: usize = 0;
+    for (chunks, rows, bytes) |c, *r, *b| {
+        if (!c.validity.allSet(c.len)) {
+            for (0..c.len) |i| if (!c.validity.get(i)) bm.setValid(off + i, false);
+        }
+        r.* = off;
+        b.* = span;
+        off += c.len;
+        if (c.data == .bytes) span += @as(usize, @intCast(c.data.bytes.offsets[c.len])) - @as(usize, @intCast(c.data.bytes.offsets[0]));
+    }
+    const out: Column.Data = switch (chunks[0].data) {
+        .bytes => blk: {
+            const offsets = try arena.alloc(i32, total + 1);
+            offsets[0] = 0;
+            break :blk .{ .bytes = .{ .offsets = offsets, .values = try arena.alloc(u8, span) } };
+        },
+        inline else => |s, tag| @unionInit(Column.Data, @tagName(tag), try arena.alloc(@typeInfo(@TypeOf(s)).pointer.child, total)),
+    };
+    const Copy = struct {
+        chunks: []const Column,
+        rows: []const usize,
+        bytes: []const usize,
+        out: Column.Data,
+        fn f(x: *const @This(), i: usize) void {
+            const c = x.chunks[i];
+            const at = x.rows[i];
+            switch (c.data) {
+                .bytes => |b| {
+                    const o = x.out.bytes;
+                    const lo: usize = @intCast(b.offsets[0]);
+                    const hi: usize = @intCast(b.offsets[c.len]);
+                    const base = x.bytes[i];
+                    @memcpy(o.values[base..][0 .. hi - lo], b.values[lo..hi]);
+                    for (b.offsets[1 .. c.len + 1], o.offsets[at + 1 ..][0..c.len]) |src, *dst| dst.* = @intCast(base + @as(usize, @intCast(src)) - lo);
+                },
+                inline else => |s, tag| @memcpy(@field(x.out, @tagName(tag))[at..][0..c.len], s[0..c.len]),
+            }
+        }
+    };
+    par.each(threads, chunks.len, &Copy{ .chunks = chunks, .rows = rows, .bytes = bytes, .out = out }, Copy.f);
+    return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = out };
+}
+
 fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
     var span: usize = 0;
     for (chunks) |c| {
@@ -275,6 +327,75 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
         .bytes => |s| .{ .bytes = try s.take(arena, idx) },
     };
     return .{ .ty = c.ty, .len = idx.len, .validity = bm, .data = data };
+}
+
+/// `permute` on up to `threads` threads for a large `idx`, in chunks of rows: each
+/// gathers its own, a string column's chunks first summing their bytes so each knows
+/// where its values start.
+pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, threads: usize) !Column {
+    const n = idx.len;
+    const nc = par.chunks(n, 1 << 16);
+    if (threads < 2 or nc < 2) return permute(arena, c, idx);
+    var bm = try Bitmap.initFull(arena, n);
+    const starts = try arena.alloc(usize, nc);
+    const out: Column.Data = switch (c.data) {
+        .bytes => |b| blk: {
+            const Span = struct {
+                b: Bytes,
+                idx: []const usize,
+                starts: []usize,
+                fn f(x: *const @This(), i: usize) void {
+                    const r = par.bounds(x.idx.len, x.starts.len, i);
+                    x.starts[i] = x.b.spanOf(x.idx[r[0]..r[1]]);
+                }
+            };
+            par.each(threads, nc, &Span{ .b = b, .idx = idx, .starts = starts }, Span.f);
+            var total: usize = 0;
+            for (starts) |*st| {
+                const len = st.*;
+                st.* = total;
+                total += len;
+            }
+            const offsets = try arena.alloc(i32, n + 1);
+            offsets[0] = 0;
+            break :blk .{ .bytes = .{ .offsets = offsets, .values = try arena.alloc(u8, total) } };
+        },
+        inline else => |s, tag| @unionInit(Column.Data, @tagName(tag), try arena.alloc(@typeInfo(@TypeOf(s)).pointer.child, n)),
+    };
+    const Gather = struct {
+        c: Column,
+        idx: []const usize,
+        out: Column.Data,
+        bm: *Bitmap,
+        starts: []const usize,
+        nulls: bool,
+        fn f(x: *const @This(), i: usize) void {
+            const r = par.bounds(x.idx.len, x.starts.len, i);
+            const rows = x.idx[r[0]..r[1]];
+            if (x.nulls) {
+                for (rows, r[0]..) |row, at| if (!x.c.validity.get(row)) x.bm.setValid(at, false);
+            }
+            switch (x.c.data) {
+                .bytes => |b| {
+                    const o = x.out.bytes;
+                    var off = x.starts[i];
+                    for (rows, r[0]..) |row, w| {
+                        const v = b.at(row);
+                        @memcpy(o.values[off..][0..v.len], v);
+                        off += v.len;
+                        o.offsets[w + 1] = @intCast(off);
+                    }
+                },
+                inline else => |s, tag| {
+                    const o = @field(x.out, @tagName(tag));
+                    for (rows, r[0]..) |row, at| o[at] = s[row];
+                },
+            }
+        }
+    };
+    const g = Gather{ .c = c, .idx = idx, .out = out, .bm = &bm, .starts = starts, .nulls = !c.validity.allSet(c.len) };
+    par.each(threads, nc, &g, Gather.f);
+    return .{ .ty = c.ty, .len = n, .validity = bm, .data = out };
 }
 
 fn permuteSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, idx: []const usize) ![]T {

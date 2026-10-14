@@ -38,6 +38,7 @@ const Value = @import("../value.zig").Value;
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
+const par = @import("../par.zig");
 const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
@@ -226,34 +227,117 @@ pub const Window = struct {
         gend: []usize,
     };
 
-    fn layout(arena: std.mem.Allocator, idx: []const usize, parts: []const KeyArr, ords: []const KeyArr) !Layout {
-        const n = idx.len;
-        const l = Layout{
-            .pstart = try arena.alloc(usize, n),
-            .pend = try arena.alloc(usize, n),
-            .gstart = try arena.alloc(usize, n),
-            .gend = try arena.alloc(usize, n),
+    /// Each sorted row's partition and peer group as `[start, end)` positions, the keys
+    /// prepared over the sorted columns so neighbours compare in memory order. On up
+    /// to `threads` threads, in chunks: each marks where a partition or a peer group
+    /// begins, one pass carries every chunk's last and first boundary to its
+    /// neighbours, and each fills its starts forward and its ends backward.
+    fn layout(arena: std.mem.Allocator, n: usize, parts: []const KeyArr, ords: []const KeyArr, threads: usize) !Layout {
+        const nc = par.chunks(n, 1 << 16);
+        var lc = LayoutCtx{
+            .l = .{
+                .pstart = try arena.alloc(usize, n),
+                .pend = try arena.alloc(usize, n),
+                .gstart = try arena.alloc(usize, n),
+                .gend = try arena.alloc(usize, n),
+            },
+            .parts = parts,
+            .ords = ords,
+            .n = n,
+            .nc = nc,
+            .pnew = try arena.alloc(bool, n),
+            .gnew = try arena.alloc(bool, n),
+            .carry = try arena.alloc(LayoutCtx.Carry, nc),
         };
-        var i: usize = 0;
-        while (i < n) {
-            var j = i + 1;
-            while (j < n and sameOn(parts, idx[j - 1], idx[j])) j += 1;
-            var g = i;
-            while (g < j) {
-                var e = g + 1;
-                while (e < j and sameOn(ords, idx[e - 1], idx[e])) e += 1;
-                for (g..e) |k| {
-                    l.pstart[k] = i;
-                    l.pend[k] = j;
-                    l.gstart[k] = g;
-                    l.gend[k] = e;
+        par.each(threads, nc, &lc, LayoutCtx.mark);
+        var ps: usize = 0;
+        var gs: usize = 0;
+        for (lc.carry, 0..) |*c, i| {
+            const r = par.bounds(n, nc, i);
+            c.pstart = ps;
+            c.gstart = gs;
+            var k = r[1];
+            while (k > r[0]) {
+                k -= 1;
+                if (lc.pnew[k]) {
+                    ps = k;
+                    break;
                 }
-                g = e;
             }
-            i = j;
+            k = r[1];
+            while (k > r[0]) {
+                k -= 1;
+                if (lc.gnew[k]) {
+                    gs = k;
+                    break;
+                }
+            }
         }
-        return l;
+        var pe: usize = n;
+        var ge: usize = n;
+        var i = nc;
+        while (i > 0) {
+            i -= 1;
+            const r = par.bounds(n, nc, i);
+            lc.carry[i].pend = pe;
+            lc.carry[i].gend = ge;
+            for (r[0]..r[1]) |k| if (lc.pnew[k]) {
+                pe = k;
+                break;
+            };
+            for (r[0]..r[1]) |k| if (lc.gnew[k]) {
+                ge = k;
+                break;
+            };
+        }
+        par.each(threads, nc, &lc, LayoutCtx.fill);
+        return lc.l;
     }
+
+    const LayoutCtx = struct {
+        l: Layout,
+        parts: []const KeyArr,
+        ords: []const KeyArr,
+        n: usize,
+        nc: usize,
+        pnew: []bool,
+        gnew: []bool,
+        carry: []Carry,
+
+        const Carry = struct { pstart: usize = 0, gstart: usize = 0, pend: usize = 0, gend: usize = 0 };
+
+        fn mark(x: *LayoutCtx, c: usize) void {
+            const r = par.bounds(x.n, x.nc, c);
+            for (r[0]..r[1]) |k| {
+                const p = k == 0 or !sameOn(x.parts, k - 1, k);
+                x.pnew[k] = p;
+                x.gnew[k] = p or !sameOn(x.ords, k - 1, k);
+            }
+        }
+
+        fn fill(x: *LayoutCtx, c: usize) void {
+            const r = par.bounds(x.n, x.nc, c);
+            const cr = x.carry[c];
+            var ps = cr.pstart;
+            var gs = cr.gstart;
+            for (r[0]..r[1]) |k| {
+                if (x.pnew[k]) ps = k;
+                if (x.gnew[k]) gs = k;
+                x.l.pstart[k] = ps;
+                x.l.gstart[k] = gs;
+            }
+            var pe = cr.pend;
+            var ge = cr.gend;
+            var k = r[1];
+            while (k > r[0]) {
+                k -= 1;
+                x.l.pend[k] = pe;
+                x.l.gend[k] = ge;
+                if (x.pnew[k]) pe = k;
+                if (x.gnew[k]) ge = k;
+            }
+        }
+    };
 
     const RangeKeys = struct {
         float: bool,
@@ -831,12 +915,17 @@ pub const Window = struct {
         for (idx, 0..) |*x, i| x.* = i;
 
         const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
-        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepare(arena, all.columns[k.idx], k);
-        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepare(arena, all.columns[k.idx], k);
+        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepareThreads(arena, all.columns[k.idx], k, self.threads);
+        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepareThreads(arena, all.columns[k.idx], k, self.threads);
         try sortIdxThreads(arena, idx, arrs, self.threads);
-        const parts = arrs[0..self.part.len];
-        const ords = arrs[self.part.len..];
-        const l = try layout(arena, idx, parts, ords);
+
+        const ncols = all.columns.len;
+        const cols = try arena.alloc(column.Column, ncols + self.funcs.len);
+        for (all.columns, 0..) |*col, ci| cols[ci] = try column.permuteThreads(arena, col.*, idx, self.threads);
+        const sorted_keys = try arena.alloc(KeyArr, arrs.len);
+        for (self.part, 0..) |k, i| sorted_keys[i] = try KeyArr.prepareThreads(arena, cols[k.idx], k, self.threads);
+        for (self.ord, 0..) |k, i| sorted_keys[self.part.len + i] = try KeyArr.prepareThreads(arena, cols[k.idx], k, self.threads);
+        const l = try layout(arena, n, sorted_keys[0..self.part.len], sorted_keys[self.part.len..], self.threads);
 
         var rk: ?RangeKeys = null;
         for (self.funcs) |f| {
@@ -845,10 +934,6 @@ pub const Window = struct {
                 break;
             }
         }
-
-        const ncols = all.columns.len;
-        const cols = try arena.alloc(column.Column, ncols + self.funcs.len);
-        for (all.columns, 0..) |*col, ci| cols[ci] = try column.permute(arena, col.*, idx);
 
         for (self.funcs, 0..) |f, fi| {
             const out_ty = self.out_schema.fields[ncols + fi].ty;
@@ -1384,4 +1469,43 @@ test "window MEDIAN heaps stay within the frame and match a brute-force median, 
             try testing.expect(h.lo.count() + h.hi.count() <= 2 * (h.nlo + h.nhi) + 2);
         }
     };
+}
+
+test "layout across chunks and threads marks the same partitions and peer groups as a serial walk" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x1a7);
+    const rnd = prng.random();
+    const n = 300_000;
+    var pb = column.Builder.init(a, types.Type.init(.int).asNullable());
+    var ob = column.Builder.init(a, types.Type.init(.int).asNullable());
+    var p: i64 = 0;
+    var o: i64 = 0;
+    for (0..n) |_| {
+        if (rnd.uintLessThan(u32, 20_000) == 0) {
+            p += 1;
+            o = 0;
+        }
+        if (rnd.uintLessThan(u8, 3) == 0) o += 1;
+        try pb.append(if (@mod(p, 7) == 3) .null else Value{ .int = p });
+        try ob.append(Value{ .int = o });
+    }
+    const key = Sort.Key{ .idx = 0, .desc = false, .nulls_first = false };
+    const parts = [_]KeyArr{try KeyArr.prepare(a, try pb.finish(), key)};
+    const ords = [_]KeyArr{try KeyArr.prepare(a, try ob.finish(), key)};
+    const l = try Window.layout(a, n, &parts, &ords, 4);
+    var ps: usize = 0;
+    var gs: usize = 0;
+    for (0..n) |k| {
+        if (k > 0 and !Window.sameOn(&parts, k - 1, k)) ps = k;
+        if (k == ps or !Window.sameOn(&ords, k - 1, k)) gs = k;
+        try testing.expectEqual(ps, l.pstart[k]);
+        try testing.expectEqual(gs, l.gstart[k]);
+        try testing.expect(l.pend[k] > k and l.gend[k] > k and l.gend[k] <= l.pend[k]);
+        try testing.expect(l.pend[k] == n or !Window.sameOn(&parts, l.pend[k] - 1, l.pend[k]));
+        try testing.expect(l.gend[k] == n or l.gend[k] == l.pend[k] or !Window.sameOn(&ords, l.gend[k] - 1, l.gend[k]));
+        if (l.pend[k] - 1 > k) try testing.expectEqual(l.pstart[k], l.pstart[l.pend[k] - 1]);
+        if (l.gend[k] - 1 > k) try testing.expectEqual(l.gstart[k], l.gstart[l.gend[k] - 1]);
+    }
 }
