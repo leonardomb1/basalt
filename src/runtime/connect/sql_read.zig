@@ -234,7 +234,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
 
     var key: split.Key = undefined;
     if (hints.col) |col| {
-        key = .{ .col = col, .kind = hints.kind orelse .int };
+        key = .{ .col = col, .kind = hints.kind orelse .auto };
     } else if (desc.table) |table| {
         const info = (try split.introspectKey(env.arena, prober, desc.dialect, table)) orelse return null;
         if (!forced and info.est_rows < split.min_rows_to_split) return null;
@@ -258,7 +258,9 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
             pctx.base_sql = base;
         }
     }
-    return split.plan(env.arena, prober, desc.dialect, base, key, m);
+    const p = try split.plan(env.arena, prober, desc.dialect, base, key, m);
+    if (p == null) if (hints.col) |col| env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column is not an integer, date or timestamp with more than one value; reading on one lane", .{col});
+    return p;
 }
 
 pub fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {

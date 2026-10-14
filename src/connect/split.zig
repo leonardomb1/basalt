@@ -30,7 +30,9 @@ const Value = @import("../exec/value.zig").Value;
 const Conn = sql.Conn;
 const Dialect = sql.Dialect;
 
-pub const KeyKind = enum { int, uuid, date };
+/// `auto` is a `SPLIT BY (col)` that names no kind: one MIN/MAX probe tells an
+/// integer key from a date or timestamp one.
+pub const KeyKind = enum { int, uuid, date, auto };
 pub const Key = struct { col: []const u8, kind: KeyKind };
 pub const KeyInfo = struct { key: Key, est_rows: i64 };
 
@@ -192,7 +194,40 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
             if (preds.len <= 1) return null;
             return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
+        .auto => {
+            const lh = (try minMax(arena, prober, dialect, base, key.col)) orelse return null;
+            if (lh[0] == .int and lh[1] == .int) {
+                if (lh[1].int <= lh[0].int) return null;
+                const preds = try intRangePreds(arena, dialect, key.col, lh[0].int, lh[1].int, m);
+                if (preds.len <= 1) return null;
+                return Plan{ .key = .{ .col = key.col, .kind = .int }, .predicates = preds, .base_sql = base };
+            }
+            const lo = dayOf(lh[0]) orelse return null;
+            const hi = dayOf(lh[1]) orelse return null;
+            if (hi <= lo) return null;
+            const preds = try dateRangePreds(arena, dialect, key.col, lo, hi, m);
+            if (preds.len <= 1) return null;
+            return Plan{ .key = .{ .col = key.col, .kind = .date }, .predicates = preds, .base_sql = base };
+        },
     }
+}
+
+/// The key's MIN and MAX over `base`, as the driver types them; null when the
+/// probe fails or the table is empty.
+fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?[2]Value {
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
+    const conn = prober.open() catch return null;
+    var cur = conn.queryCursor(q) catch {
+        conn.close();
+        return null;
+    };
+    defer cur.close();
+    const b = (try cur.nextBatch(arena)) orelse return null;
+    if (b.len == 0) return null;
+    const lo = b.columns[0].getValue(0);
+    const hi = b.columns[1].getValue(0);
+    if (lo.isNull() or hi.isNull()) return null;
+    return .{ lo, hi };
 }
 
 /// A `LIMIT 1` probe so a forced uuid split does not fan out over an empty table.
