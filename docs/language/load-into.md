@@ -25,13 +25,24 @@ AS
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
   (a file), `compression` (a Parquet file: `snappy`, `gzip` or `none`) and
-  `label_prefix` (StarRocks, Doris); a key the target does not read, or any
+  `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
+  or SQL Server); a key the target does not read, or any
   other key, is a plan-time error rather than ignored.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
   (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —
   needs a table read on a SQL source that exposes it). An empty/unresolved
   upsert key is an error, never a silent no-op.
+- `REPLACE` into PostgreSQL, MySQL or SQL Server loads a staging table
+  (`_basalt_stage_<table>`, in the target's schema) from every lane, then in one
+  transaction clears the target and copies the staged rows in, and drops the
+  staging table. The target stays the same table — grants, views, foreign keys,
+  triggers and indexes stay — readers see the old rows until the commit, and a
+  failed load leaves the target as it was. `WITH (cutover = 'delete')` clears
+  with `DELETE` instead of the default `TRUNCATE`, for a login without the right
+  to truncate or a deferrable foreign key; MySQL always deletes, as its
+  `TRUNCATE` commits on its own. Running two REPLACEs into one target at once is
+  the caller's to prevent: they share the staging table.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
   a bare `LOAD INTO 'x.csv'`, like `REPLACE`, replaces the file, so a rerun
   replaces it. A local file is written whole: the rows go to `x.csv.part`,
