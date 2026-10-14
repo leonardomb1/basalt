@@ -415,7 +415,10 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 _ = self.advance();
                 return self.existsSubquery(false, .{ .line = t.line, .col = t.col, .file = t.file });
             }
-            if (eqlNoCase(t.text, "search") and self.peekTag() == .lparen) return self.parseSearch();
+            if (eqlNoCase(t.text, "search") and self.peekTag() == .lparen) {
+                if (self.col_uses) |u| u.opaqueUse(true);
+                return self.parseSearch();
+            }
             if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = self.advance();
@@ -433,13 +436,16 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 _ = self.advance();
                 _ = self.advance();
                 const e = try self.parseExpr();
+                if (e.* == .field and !e.field.dollar) if (self.col_uses) |u| try u.castUse(self.arena, e.field);
                 try self.expectKw("as");
                 const ty = try self.parseTypeName();
                 _ = try self.expect(.rparen);
                 return self.mk(.{ .cast = .{ .e = e, .ty = ty, .safe = safe } });
             }
-            if (eqlNoCase(t.text, "identifier") and self.peekTag() == .lparen)
+            if (eqlNoCase(t.text, "identifier") and self.peekTag() == .lparen) {
+                if (self.col_uses) |u| u.opaqueUse(true);
                 return self.mk(.{ .field = try self.parseColRef() });
+            }
             if (eqlNoCase(t.text, "if") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = self.advance();

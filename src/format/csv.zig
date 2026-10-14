@@ -152,7 +152,19 @@ fn codecBuffer(codec: Codec) usize {
 pub const Dialect = struct {
     delim: u8 = ',',
     encoding: Encoding = .utf8,
+    text: []const []const u8 = &.{},
 };
+
+/// Each sniffed field's type, a field the query reads only through `CAST` (`text`)
+/// left as its text for the cast to convert.
+fn settle(fields: []types.Schema.Field, sniff: *const TypeSniffer, d: Dialect) void {
+    for (fields, 0..) |*f, j| {
+        f.ty = sniff.resolve(j);
+        for (d.text) |t| if (std.mem.eql(u8, t, f.name)) {
+            f.ty = types.Type.init(.string).asNullable();
+        };
+    }
+}
 
 /// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
 /// latin-1 file are, so the ordinary field costs one scan and no allocation.
@@ -424,7 +436,7 @@ pub const CsvReader = struct {
             try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
         }
         sniff.whole = self.stream_eof;
-        for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
+        settle(fields.items, &sniff, self.dialect);
 
         self.pending = try pending.toOwnedSlice();
         self.schema = .{ .fields = try fields.toOwnedSlice() };
@@ -747,7 +759,7 @@ pub const MappedCsv = struct {
             pos = rec.next;
         }
         sniff.whole = pos >= body.len;
-        for (fields.items, 0..) |*f, j| f.ty = sniff.resolve(j);
+        settle(fields.items, &sniff, dialect);
 
         self.* = .{
             .data = data,
@@ -1218,7 +1230,7 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
             .date => "a DATE",
             else => @tagName(f.ty.kind),
         };
-        return explainf(e, "{s}, column `{s}`: '{s}' is not {s}, the type sniffed from the first {d} rows", .{ where, f.name, clip(raw), want, SAMPLE_ROWS });
+        return explainf(e, "{s}, column `{s}`: '{s}' is not {s}, the type sniffed from the first {d} rows — to read the column as written, use CAST({s} AS STRING) (or the type it holds) everywhere the query reads it", .{ where, f.name, clip(raw), want, SAMPLE_ROWS, f.name });
     }
     if (e == error.CsvRaggedRow)
         return explainf(e, "{s} has {d} fields, the header {d} — a row must have one field per column", .{ where, n, ncols });
@@ -1906,7 +1918,8 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
     }) |_| {}
     try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
     const why = eval.takeFailure(error.CsvTypeMismatch).?;
-    try std.testing.expect(std.mem.endsWith(u8, why, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows"));
+    try std.testing.expect(std.mem.indexOf(u8, why, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
+    try std.testing.expect(std.mem.endsWith(u8, why, "use CAST(id AS STRING) (or the type it holds) everywhere the query reads it"));
 
     const mb = try MappedCsv.open(a, bad_path, .{});
     defer mb.close();
@@ -1917,7 +1930,7 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
         break :blk null;
     }) |_| {}
     try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-    try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows"));
+    try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
 }
 
 test "serial and mapped readers agree whether the sample read the whole file" {
@@ -1981,7 +1994,7 @@ test "a cell past the sample that only lenient parsers accept is named with its 
             break :blk null;
         }) |_| {}
         try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-        try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want));
+        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want) != null);
 
         const m = try MappedCsv.open(a, path, .{});
         defer m.close();
@@ -1992,7 +2005,7 @@ test "a cell past the sample that only lenient parsers accept is named with its 
             break :blk null;
         }) |_| {}
         try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-        try std.testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want));
+        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want) != null);
     }
 }
 

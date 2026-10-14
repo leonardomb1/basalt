@@ -66,6 +66,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
+pub const ColUses = @import("parse/textcols.zig").ColUses;
 const quoteInto = @import("parse/rewrite.zig").quoteInto;
 const types = @import("types.zig");
 
@@ -442,6 +443,7 @@ pub const Parser = struct {
     in_where: bool = false,
     win_sink: ?*std.array_list.Managed(WinCall) = null,
     qual_sink: ?*std.array_list.Managed(QualRef) = null,
+    col_uses: ?*ColUses = null,
     query_depth: usize = 0,
     top_names: OutNames = .nested,
     key_aliases: ?*const AliasSet = null,
@@ -459,6 +461,7 @@ pub const Parser = struct {
     /// paths (refused when checked) and a table function's own markers are not
     /// columns of a table.
     pub fn noteQual(self: *Parser, q: ast.QualName, pos: Pos) Error!void {
+        if (self.col_uses) |u| if (!q.dollar and self.lambdaParam(q.parts[0]) == null) try u.bareUse(self.arena, q);
         const sink = self.qual_sink orelse return;
         if (q.dollar or q.safe.len > 0 or q.parts.len < 2 or q.parts[0].len == 0 or q.parts[0][0] == 0) return;
         if (self.lambdaParam(q.parts[0]) != null) return;
@@ -1000,6 +1003,7 @@ test {
     _ = @import("parse/rewrite.zig");
     _ = @import("parse/stmt.zig");
     _ = @import("parse/tablefn.zig");
+    _ = @import("parse/textcols.zig");
     _ = @import("parse/window.zig");
     _ = @import("parse/tests_expr.zig");
     _ = @import("parse/tests_query.zig");

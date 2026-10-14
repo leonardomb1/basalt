@@ -196,6 +196,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
             if (!self.eat(.comma)) break;
         }
     }
+    var uses = @import("textcols.zig").ColUses{ .parent = self.col_uses };
+    self.col_uses = &uses;
+    defer self.col_uses = uses.parent;
     defer if (self.pending_bindings.items.len > 0) {
         out.appendSlice(self.pending_bindings.items) catch {};
         self.pending_bindings.clearRetainingCapacity();
@@ -260,6 +263,8 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         q = try self.singleName(s);
                     },
                     .field => |f| {
+                        if (f.parts.len == 1 and first.out_keys != null and namesOutput(first.out_keys, f.parts[0]))
+                            if (self.col_uses) |u| u.outputUse(f);
                         if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
                         q = try distinctSortKey(self, stages.items, f, stripQual(f, &first.aliases), kpos);
                         was_qual = q.parts.len < f.parts.len;
@@ -373,6 +378,10 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     if (first.final_names) |fin|
         try stages.append(.{ .node = .{ .select = fin }, .hints = &.{}, .pos = self.curPos() });
     self.query_where_end = if (set_op) null else first.where_end;
+    if (stages.items.len > 0 and stages.items[0].node == .read) {
+        const rd = &stages.items[0].node.read;
+        if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) rd.text_cols = try uses.textCols(self.arena);
+    }
 }
 
 /// Under a plain DISTINCT a sort key must be a column the SELECT list outputs, as SQL
@@ -771,6 +780,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     defer self.win_sink = outer_sink;
     self.corr = &scope;
     while (true) {
+        if (self.at(.star) or (self.at(.ident) and self.peekTag() == .dot and self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star))
+            if (self.col_uses) |u| u.opaqueUse(false);
         if (self.eat(.star)) {
             if (self.eatKw("except") or self.eatKw("exclude")) {
                 _ = try self.expect(.lparen);
@@ -916,6 +927,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             } else {
                 field = try self.expectIdent();
             }
+            if (self.col_uses) |u| try u.bareUse(self.arena, try self.singleName(field));
             _ = try self.expect(.rparen);
             var as_name: ?[]const u8 = null;
             if (self.eatKw("as")) as_name = try self.expectIdent();
@@ -1820,6 +1832,7 @@ pub fn parseUsing(
     var keys = std.array_list.Managed(AliasSet.UsingKey).init(self.arena);
     while (true) {
         const k = try self.expectIdent();
+        if (self.col_uses) |u| try u.bareUse(self.arena, try self.singleName(k));
         const rk = try self.freshName("__uk{d}");
         const lk = try std.fmt.allocPrint(self.arena, "__ul{d}", .{self.derived_n});
         try renames.append(.{ .from = k, .to = rk });

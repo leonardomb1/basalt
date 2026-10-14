@@ -101,6 +101,45 @@ test "a shown result, CTE or derived table repeats a name as SQL does; a referen
     try std.testing.expectEqualStrings("LOAD INTO writes each column under its own name, and two columns are named `a` — alias one apart in the SELECT list", rdiag.msg);
 }
 
+test "a CSV column read only through CAST keeps its text past the sample, on one lane or many; a bare use still fails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    try buf.appendSlice("id,cep,v\n");
+    for (1..3000) |i| try buf.writer().print("{d},{d},{d}.5\n", .{ i, 10000000 + i, i });
+    try buf.appendSlice("3000,01310100,12345678901234567.12\n");
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = buf.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\SELECT CAST(cep AS STRING) AS cep, CAST(v AS DECIMAL(20,2)) AS v FROM '{s}/c.csv' WHERE id = 3000;
+        \\SELECT count(*) AS n FROM '{s}/c.csv' WHERE CAST(cep AS STRING) LIKE '0%';
+    , .{ base, base });
+    defer alloc.free(script);
+    for ([_]usize{ 1, 4 }) |lanes| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+        const res = run(alloc, prog, .{ .threads = lanes, .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const printed = try out.end(alloc);
+        defer alloc.free(printed);
+        _ = try res;
+        try std.testing.expectEqualStrings("cep,v\n01310100,12345678901234567.12\nn\n1\n", printed);
+    }
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const bare = try std.fmt.allocPrint(alloc, "SELECT CAST(cep AS STRING) AS c FROM '{s}/c.csv' WHERE cep > 0;", .{base});
+    defer alloc.free(bare);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.CsvTypeMismatch, run(alloc, try parser.parseSource(parena.allocator(), bare, &pdiag), .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+}
+
 test "a bare name both sides of a join have is ambiguous in that query, wherever it is read; qualified, merged by USING, or past the query it is not" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

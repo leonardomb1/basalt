@@ -21,6 +21,15 @@ work on it directly, and a parquet sink stores it as a date. A string function
 on it (`substr(day, 1, 7)`, `day LIKE '2026%'`) still sees the ISO text. A cell
 past the sample that does not parse as the inferred type is an error, never a
 silent coercion. Timestamps are not sniffed; `CAST(ts AS TIMESTAMP)` as before.
+
+A column the query reads only through `CAST` is not sniffed: the cast converts the
+cell as written. `SELECT CAST(cep AS STRING) AS cep FROM 'clientes.csv'` keeps
+`01310100` even where the first rows made `cep` look like an INT, and
+`CAST(valor AS DECIMAL(18,2))` parses the digits exactly instead of through a
+float. This holds when every use of the column in that query is a cast — a bare
+`cep` anywhere (a `WHERE cep > 0`, a `SELECT *`) reads the sniffed type again, and
+the error on a mismatched cell says so. It applies to the CSV a query reads in its
+own FROM, not to one joined to it or read through a CTE defined elsewhere.
 A column with no value at all — a header-only file, or one whose every cell is
 empty — is all NULL, and when the sample covered the whole file it is of unknown
 type, as SQL types a NULL: it compares and unifies with any type (`id NOT IN

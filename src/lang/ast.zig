@@ -224,6 +224,7 @@ pub const Read = struct {
     form: ReadForm,
     where: []const u8 = "",
     cols: []const []const u8 = &.{},
+    text_cols: []const []const u8 = &.{},
 };
 
 pub const ReadForm = union(enum) {

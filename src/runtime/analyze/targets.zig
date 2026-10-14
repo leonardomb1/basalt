@@ -309,7 +309,8 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
             return xr.schema;
         }
         var hdiag = Diag{};
-        const d = dialectFromHints(hints, &hdiag) catch return null;
+        var d = dialectFromHints(hints, &hdiag) catch return null;
+        d.text = rd.text_cols;
         const reader = csv.CsvReader.open(arena, rd.form.path, d) catch return null;
         const schema = reader.schema;
         reader.close();

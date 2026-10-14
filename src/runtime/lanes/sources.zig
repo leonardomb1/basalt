@@ -144,7 +144,9 @@ pub fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.Mapped
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
     if (analyze.readFormat(path, env.fmt_in) != .csv) return null;
 
-    const mapped = csv.MappedCsv.open(env.arena, path, env.csv_in) catch return null;
+    var d = env.csv_in;
+    d.text = rd.text_cols;
+    const mapped = csv.MappedCsv.open(env.arena, path, d) catch return null;
     if (mapped.quoted_newlines) {
         mapped.close();
         return null;

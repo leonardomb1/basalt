@@ -916,3 +916,33 @@ test "sql: GROUP BY, HAVING and ORDER BY refusals name the problem" {
     _ = try parseTest(a, "SELECT g FROM 'x.csv' GROUP BY g HAVING COUNT(*) > 1;");
     _ = try parseTest(a, "SELECT g, upper(g) AS g, COUNT(*) FROM 'x.csv' GROUP BY g;");
 }
+
+test "sql: a CSV column read only through CAST is read as text; any bare use, a star or a column the parser cannot name keeps it sniffed" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { src: []const u8, text: []const []const u8 };
+    const cases = [_]Case{
+        .{ .src = "SELECT CAST(cep AS STRING) AS cep, id FROM 'c.csv';", .text = &.{"cep"} },
+        .{ .src = "SELECT CAST(cep AS STRING) AS cep FROM 'c.csv' ORDER BY cep;", .text = &.{"cep"} },
+        .{ .src = "SELECT CAST(c.cep AS STRING) AS z, TRY_CAST(v AS DECIMAL(12,2)) AS v FROM 'c.csv' c;", .text = &.{ "cep", "v" } },
+        .{ .src = "SELECT CAST(cep AS STRING) AS z FROM 'c.csv' WHERE cep > 0;", .text = &.{} },
+        .{ .src = "SELECT CAST(cep AS STRING) AS z FROM 'c.csv' ORDER BY cep;", .text = &.{} },
+        .{ .src = "SELECT *, CAST(cep AS STRING) AS z FROM 'c.csv';", .text = &.{} },
+        .{ .src = "SELECT CAST(cep AS STRING) AS z, IDENTIFIER('id') FROM 'c.csv';", .text = &.{} },
+        .{ .src = "SELECT CAST(cep AS STRING) AS z FROM 'c.csv' c WHERE EXISTS (SELECT 1 FROM 'o.csv' o WHERE o.cep = c.cep);", .text = &.{} },
+        .{ .src = "SELECT CAST(cep AS STRING) AS z FROM 'c.parquet';", .text = &.{"cep"} },
+    };
+    for (cases) |c| {
+        const prog = try parseTest(a, c.src);
+        const st = firstPipelineStages(prog);
+        const got = st[0].node.read.text_cols;
+        if (c.text.len == 0) try testing.expectEqual(@as(usize, 0), got.len);
+        for (c.text) |w| {
+            const found = for (got) |g| {
+                if (std.mem.eql(u8, g, w)) break true;
+            } else false;
+            try testing.expect(found);
+        }
+    }
+}

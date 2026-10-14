@@ -138,7 +138,8 @@ fn renderQual(arena: std.mem.Allocator, q: ast.QualName, lr: LoopRow) !ast.QualN
 }
 
 fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
-    return .{ .connector = rd.connector, .form = switch (rd.form) {
+    var out = rd;
+    out.form = switch (rd.form) {
         .table => |q| .{ .table = try renderQual(arena, q, lr) },
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
@@ -147,7 +148,9 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
             .lo = try renderExpr(arena, r.lo, lr),
             .hi = try renderExpr(arena, r.hi, lr),
         } },
-    }, .where = try interpAll(arena, rd.where, lr) };
+    };
+    out.where = try interpAll(arena, rd.where, lr);
+    return out;
 }
 
 /// A nested `FOR EACH`'s source rendered with the enclosing row, so it can discover
