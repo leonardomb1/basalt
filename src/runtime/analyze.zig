@@ -761,7 +761,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         }
         try connections.put(s.connection.name, s.connection);
     };
-    if (!opts.declarations_only and countOutputs(program.stmts[1..]) == 0)
+    if (!opts.declarations_only and !hasRunnable(program.stmts[1..]))
         return fail(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`", .{});
 
     var params_map = ParamMap.init(arena);
@@ -850,7 +850,9 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     };
     try bindBodyVars(arena, program.stmts, &params_map);
 
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues };
+    var written = std.array_list.Managed([]const u8).init(arena);
+    try writtenFiles(arena, program.stmts[1..], &written);
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -920,20 +922,14 @@ pub fn isDynamicName(q: ast.QualName) bool {
     return std.mem.indexOf(u8, lastPart(q), "${") != null;
 }
 
-fn countOutputs(stmts: []const ast.Stmt) usize {
-    var n: usize = 0;
-    for (stmts) |s| n += switch (s) {
-        .output, .explain => 1,
-        .for_each => |fe| countOutputs(fe.body),
-        .match => |m| blk: {
-            var k: usize = 0;
-            for (m.arms) |arm| k += countOutputs(arm.body);
-            break :blk k;
-        },
-        .func => |fd| if (fd.body == .stmts) countOutputs(fd.body.stmts) else 0,
-        else => 0,
+/// Whether the top level does any work: a query, or a FOR EACH, CASE or CALL,
+/// which may only PRINT. One rule for `check` and `run`.
+pub fn hasRunnable(stmts: []const ast.Stmt) bool {
+    for (stmts) |s| switch (s) {
+        .output, .for_each, .match, .call, .explain => return true,
+        else => {},
     };
-    return n;
+    return false;
 }
 
 pub const Misplaced = struct { msg: []const u8, pos: ?ast.Pos };
@@ -994,6 +990,27 @@ pub fn checkStaticQueries(arena: std.mem.Allocator, stmts: []const ast.Stmt, con
     };
 }
 
+/// Every file the script writes, in any statement or body. A read of one is typed
+/// by the run, not from what is on disk now: a copy left by an earlier run may have
+/// other columns than the one this script writes before it reads.
+fn writtenFiles(arena: std.mem.Allocator, stmts: []const ast.Stmt, out: *std.array_list.Managed([]const u8)) Error!void {
+    for (stmts) |s| switch (s) {
+        .output => |p| try writtenFile(p, out),
+        .explain => |e| try writtenFile(e.pipeline, out),
+        .for_each => |fe| try writtenFiles(arena, fe.body, out),
+        .match => |m| for (m.arms) |arm| try writtenFiles(arena, arm.body, out),
+        .func => |fd| if (fd.body == .stmts) try writtenFiles(arena, fd.body.stmts, out),
+        else => {},
+    };
+}
+
+fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8)) Error!void {
+    if (p.stages.len == 0) return;
+    const last = p.stages[p.stages.len - 1];
+    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv")) return;
+    try out.append(last.node.write.target);
+}
+
 fn checkStaticQuery(arena: std.mem.Allocator, p: ast.Pipeline, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
     if (p.stages.len == 0) return;
     try checkJoinOrders(p.stages, diag);
@@ -1035,6 +1052,7 @@ const Ctx = struct {
     diag: *Diag,
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
+    written: []const []const u8 = &.{},
 
     /// A table function's body, typed where it is declared with each parameter a null
     /// of its declared type, so one nothing calls is checked too. A problem a call
@@ -1317,7 +1335,8 @@ const Ctx = struct {
                     if (readFormat(rd.form.path, fmt) == .xlsx) _ = try xlsxOptions(lead.hints, self.diag);
                     _ = try dialectFromHints(lead.hints, self.diag);
                 }
-                const schema = offlineSchema(self.arena, rd, lead.hints);
+                const rewritten = rd.form == .path and containsName(self.written, rd.form.path);
+                const schema = if (rewritten) null else offlineSchema(self.arena, rd, lead.hints);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {

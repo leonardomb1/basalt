@@ -655,6 +655,33 @@ test "statement-level CASE dispatches on a resolved param (default arm otherwise
     try std.testing.expectEqualStrings("id,v\n1,10\n", big);
 }
 
+test "a file the script rewrites is read with the columns it writes, not a stale copy's" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,status\n1,paid\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "staging.csv", .data = "old\n9\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/staging.csv' AS SELECT id, status FROM '{0s}/in.csv';\n" ++
+        "LOAD INTO '{0s}/out.csv' AS SELECT id, status FROM '{0s}/staging.csv';", .{base});
+    defer alloc.free(script);
+    const got = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("id,status\n1,paid\n", got);
+}
+
+test "a FOR EACH that only PRINTs is something to run" {
+    const alloc = std.testing.allocator;
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), "FOR EACH ROW OF (SELECT 1 AS a) AS (a) PRINT 'x'; END FOR;", &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag);
+}
+
 test "statement-level CASE: a NULL subject matches no arm, not WHEN NULL nor WHEN ''" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

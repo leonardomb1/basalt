@@ -192,8 +192,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         diag.pos = m.pos;
         return e;
     }
-    if (runnable == 0 and !opts.declarations_only)
-        return planErr(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`");
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
