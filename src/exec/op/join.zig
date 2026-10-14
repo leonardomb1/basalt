@@ -7,7 +7,7 @@
 //! split by key hash into `grace_parts` files, then the whole probe side (read-
 //! ahead replay included) the same way, and each partition is joined on its own —
 //! its build file indexed in a fresh arena, its probe file streamed through the
-//! usual `joinBatch`, its unmatched build rows drained for right and full joins —
+//! usual `probeStep`, its unmatched build rows drained for right and full joins —
 //! then freed and its files deleted. Peak memory is about one partition's index
 //! plus a probe batch, besides the up to `spill_at` bytes held when the switch
 //! happens. The partition is the key hash salted per depth (`spill_parts.partOf`;
@@ -26,7 +26,8 @@
 //! null-key probe row follows partition 0 down. Row order is not kept. NOT IN never spills (a null key
 //! anywhere on the build side changes every probe row's answer), nor CROSS: both
 //! keep the in-memory cap (the planner gives NOT IN the spill threshold as its
-//! cap). CROSS emits its pairs `cross_chunk` at a time. In grace mode `push_probe` is never applied, so a late
+//! cap). CROSS emits its pairs `cross_chunk` at a time, and every other kind its
+//! output `out_chunk` rows at a time, so a key that multiplies rows streams. In grace mode `push_probe` is never applied, so a late
 //! probe source opens without a key predicate. Without a `Space` the join fails
 //! with `JoinBuildTooLarge` past `build_cap`, as before.
 
@@ -524,6 +525,7 @@ pub const Join = struct {
     probe_mem: ?std.heap.ArenaAllocator = null,
     batch_mem: ?std.heap.ArenaAllocator = null,
     pair_mem: ?std.heap.ArenaAllocator = null,
+    pending: ?Pending = null,
 
     cross_mem: ?std.heap.ArenaAllocator = null,
     cross_batch: ?Batch = null,
@@ -540,13 +542,9 @@ pub const Join = struct {
             try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
         };
         if (self.kind == .cross) return self.nextCross(arena, ix);
-        while (!self.probe_done) {
-            if (try self.nextProbe(fresh(self.state, &self.probe_mem))) |lb| {
-                const out = try self.joinBatch(arena, ix, lb);
-                if (out.len > 0) return out;
-            } else {
-                self.probe_done = true;
-            }
+        if (!self.probe_done) {
+            if (try self.probeStep(arena, ix, ProbeSide{ .join = self })) |b| return b;
+            self.probe_done = true;
         }
         return self.drain(arena, ix);
     }
@@ -588,6 +586,14 @@ pub const Join = struct {
             return try self.gatherOut(arena, ix, lb, lidx, ridx, &.{}, n);
         }
     }
+
+    /// The in-memory probe side as `probeStep` reads it.
+    const ProbeSide = struct {
+        join: *Join,
+        fn next(ps: ProbeSide, arena: std.mem.Allocator) anyerror!?Batch {
+            return ps.join.nextProbe(arena);
+        }
+    };
 
     fn nextProbe(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.replay_pos < self.replay.len) {
@@ -649,6 +655,7 @@ pub const Join = struct {
     /// current partition's index and mappings freed.
     pub fn release(self: *Join) void {
         if (self.grace) |g| g.deinit();
+        self.pending = null;
         for ([_]*?std.heap.ArenaAllocator{ &self.probe_mem, &self.batch_mem, &self.pair_mem }) |m| {
             if (m.*) |*a| a.deinit();
             m.* = null;
@@ -749,10 +756,7 @@ pub const Join = struct {
         while (true) {
             if (g.index) |ix| {
                 if (!self.probe_done) {
-                    if (g.reader) |*r| while (try r.next(fresh(self.state, &self.probe_mem))) |pb| {
-                        const out = try self.joinBatch(arena, ix, pb);
-                        if (out.len > 0) return out;
-                    };
+                    if (g.reader) |*r| if (try self.probeStep(arena, ix, r)) |b| return b;
                     self.probe_done = true;
                 }
                 if (try self.drain(arena, ix)) |b| return b;
@@ -930,192 +934,229 @@ pub const Join = struct {
         return .{ .schema = self.out_schema, .columns = cols, .len = b.len };
     }
 
-    /// One probe batch to one output batch, gathered from index lists. Under NOT IN a
-    /// null on either side against a non-empty build is unknown and drops the row.
-    /// The probe batch (`probe_mem`) and the index lists (`batch_mem`) are reset per
-    /// batch and only the output goes to `out`: a semi or anti join may emit nothing
-    /// for a long stretch, and `next` keeps joining with the same `out`.
-    fn joinBatch(self: *Join, out: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
-        const arena = fresh(self.state, &self.batch_mem);
-        var lidx = std.array_list.Managed(usize).init(arena);
-        var ridx = std.array_list.Managed(usize).init(arena);
-        var rnull = std.array_list.Managed(bool).init(arena);
-        try lidx.ensureTotalCapacity(lb.len);
+    /// The probe batch being joined and where the join stands in it, kept across
+    /// calls so a key that multiplies rows comes out `out_chunk` rows at a time: the
+    /// row, whether its chain was looked up, the next build row of that chain and,
+    /// with a residual, the rows' matches, the semi/anti window and the pair buffer
+    /// (in `pair_mem`). The batch and these live in `probe_mem` until it is done.
+    const Pending = struct {
+        lb: Batch,
+        classes: []KeyClass,
+        hs: []u64,
+        nulls: []bool,
+        empty: bool,
+        r: usize = 0,
+        started: bool = false,
+        cur: ?usize = null,
+        hit: bool = false,
+        hits: []bool = &.{},
+        win: usize = first_win,
+        in_buf: usize = 0,
+        fin: usize = 0,
+        cl: std.ArrayListUnmanaged(usize) = .empty,
+        cr: std.ArrayListUnmanaged(usize) = .empty,
+    };
 
-        if (self.residual != null) return self.joinBatchResidual(out, arena, ix, lb);
-        const fill_right = (self.kind == .left or self.kind == .full);
-        const classes = try ix.classesFor(arena, lb, self.left_keys);
-        try ridx.ensureTotalCapacity(lb.len);
-        if (fill_right) try rnull.ensureTotalCapacity(lb.len);
+    const out_chunk = 1 << 16;
+    const pair_chunk = 1 << 16;
+    const first_win = 1024;
 
+    /// The next output of the probe side: up to `out_chunk` rows of the pending
+    /// batch, a new probe batch read (into `probe_mem`) when none is pending. Null at
+    /// the end of the probe side. Index lists live in `batch_mem`, reset per call, and
+    /// only the gathered output in `out`. Under NOT IN a null on either side against a
+    /// non-empty build is unknown and drops the row.
+    fn probeStep(self: *Join, out: std.mem.Allocator, ix: *JoinIndex, read: anytype) anyerror!?Batch {
+        while (true) {
+            if (self.pending == null) {
+                const pa = fresh(self.state, &self.probe_mem);
+                const lb = (try read.next(pa)) orelse return null;
+                if (lb.len == 0) continue;
+                self.pending = try self.startPending(pa, ix, lb);
+            }
+            const b = if (self.residual != null) try self.stepResidual(out, ix) else try self.stepPlain(out, ix);
+            if (b.len > 0) return b;
+        }
+    }
+
+    fn startPending(self: *Join, pa: std.mem.Allocator, ix: *JoinIndex, lb: Batch) !Pending {
         const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
-        const hs = try arena.alloc(u64, lb.len);
-        const nulls = try arena.alloc(bool, lb.len);
+        const classes = try ix.classesFor(pa, lb, self.left_keys);
+        const hs = try pa.alloc(u64, lb.len);
+        const nulls = try pa.alloc(bool, lb.len);
         for (hs, nulls, 0..) |*h, *nl, i| {
             nl.* = empty or anyNullKey(lb.columns, self.left_keys, i);
             h.* = if (nl.*) 0 else hashRowKeys(lb.columns, self.left_keys, classes, i);
         }
-        const ahead = 8;
+        var p = Pending{ .lb = lb, .classes = classes, .hs = hs, .nulls = nulls, .empty = empty };
+        if (self.residual != null) {
+            p.hits = try pa.alloc(bool, lb.len);
+            @memset(p.hits, false);
+        }
+        return p;
+    }
 
-        var r: usize = 0;
-        while (r < lb.len) : (r += 1) {
-            if (r + ahead < lb.len and !nulls[r + ahead]) ix.prefetch(hs[r + ahead]);
-            const first = if (nulls[r]) null else ix.findHashed(lb, self.left_keys, classes, r, hs[r]);
+    /// Row `r`'s chain looked up, the rows 8 ahead prefetched.
+    fn startRow(self: *Join, ix: *JoinIndex, p: *Pending) void {
+        const r = p.r;
+        const ahead = 8;
+        if (r + ahead < p.lb.len and !p.nulls[r + ahead]) ix.prefetch(p.hs[r + ahead]);
+        p.cur = if (p.nulls[r]) null else ix.findHashed(p.lb, self.left_keys, p.classes, r, p.hs[r]);
+        p.hit = p.cur != null;
+        p.started = true;
+        p.win = first_win;
+        p.in_buf = 0;
+    }
+
+    fn nextRow(self: *Join, p: *Pending) void {
+        _ = self;
+        p.r += 1;
+        p.started = false;
+    }
+
+    fn stepPlain(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
+        const p = &self.pending.?;
+        const arena = fresh(self.state, &self.batch_mem);
+        var lidx = std.array_list.Managed(usize).init(arena);
+        var ridx = std.array_list.Managed(usize).init(arena);
+        var rnull = std.array_list.Managed(bool).init(arena);
+        const fill_right = (self.kind == .left or self.kind == .full);
+        const lb = p.lb;
+        while (p.r < lb.len) {
+            if (!p.started) self.startRow(ix, p);
+            const r = p.r;
             switch (self.kind) {
-                .semi => {
-                    if (first != null) try lidx.append(r);
-                },
+                .semi => if (p.hit) try lidx.append(r),
                 .anti => {
-                    if (self.null_aware and !empty and (ix.has_null_key or nulls[r])) continue;
-                    if (first == null) try lidx.append(r);
+                    const unknown = self.null_aware and !p.empty and (ix.has_null_key or p.nulls[r]);
+                    if (!unknown and !p.hit) try lidx.append(r);
                 },
-                else => {
-                    if (first == null) {
-                        if (fill_right) {
-                            try lidx.append(r);
-                            try ridx.append(0);
-                            try rnull.append(true);
-                        }
-                        continue;
-                    }
-                    var cur = first;
-                    while (cur) |br| {
+                else => if (!p.hit) {
+                    if (fill_right) {
                         try lidx.append(r);
-                        try ridx.append(br);
-                        if (fill_right) try rnull.append(false);
-                        if (self.matched) |m| m[br] = true;
-                        if (self.shared_matched) |sm| markShared(sm, br);
-                        cur = ix.chainNext(br);
+                        try ridx.append(0);
+                        try rnull.append(true);
                     }
+                } else while (p.cur) |br| {
+                    if (lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+                    try lidx.append(r);
+                    try ridx.append(br);
+                    if (fill_right) try rnull.append(false);
+                    if (self.matched) |m| m[br] = true;
+                    if (self.shared_matched) |sm| markShared(sm, br);
+                    p.cur = ix.chainNext(br);
                 },
             }
+            self.nextRow(p);
         }
+        self.pending = null;
         return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
     }
 
-    /// `joinBatch` with a residual condition: key matches become candidate pairs,
-    /// evaluated in buffers of up to `pair_chunk` in `pair_mem`, so a key with many
-    /// build rows never holds a probe batch's every pair at once. Rows are finished in
-    /// order as their last pairs are evaluated: a row whose candidates all fail is
-    /// unmatched. A semi or anti join needs only a row's first match, so a row's chain
-    /// is cut at a window that starts at `first_win` and doubles, and walked no
-    /// further once it matched.
-    fn joinBatchResidual(self: *Join, out: std.mem.Allocator, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
-        const classes = try ix.classesFor(arena, lb, self.left_keys);
-        const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
-        const short = self.kind == .semi or self.kind == .anti;
-        var rs = Residual{
-            .join = self,
-            .ix = ix,
-            .lb = lb,
-            .hits = try arena.alloc(bool, lb.len),
+    /// The plain step with a residual condition: key matches become candidate pairs,
+    /// evaluated in buffers of up to `pair_chunk`, so a key with many build rows never
+    /// holds every pair at once. Rows are finished in order as their last pairs are
+    /// evaluated: a row whose candidates all fail is unmatched. A semi or anti join
+    /// needs only a row's first match, so a row's chain is cut at a window that starts
+    /// at `first_win` and doubles, and walked no further once it matched.
+    fn stepResidual(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
+        const p = &self.pending.?;
+        const arena = fresh(self.state, &self.batch_mem);
+        var o = Outs{
             .lidx = std.array_list.Managed(usize).init(arena),
             .ridx = std.array_list.Managed(usize).init(arena),
             .rnull = std.array_list.Managed(bool).init(arena),
         };
-        @memset(rs.hits, false);
-        try rs.begin();
-        for (0..lb.len) |r| {
-            if (empty or anyNullKey(lb.columns, self.left_keys, r)) continue;
-            var win: usize = first_win;
-            var in_buf: usize = 0;
-            var cur = ix.findHashed(lb, self.left_keys, classes, r, hashRowKeys(lb.columns, self.left_keys, classes, r));
-            while (cur) |br| {
-                if (rs.cl.items.len >= pair_chunk or (short and in_buf >= win)) {
-                    if (short and in_buf >= win) win *= 2;
-                    try rs.flush();
-                    in_buf = 0;
-                    if (short and rs.hits[r]) break;
+        const short = self.kind == .semi or self.kind == .anti;
+        const lb = p.lb;
+        if (p.cl.capacity == 0) try self.beginPairs(p);
+        while (p.r < lb.len) {
+            if (!p.started) self.startRow(ix, p);
+            const r = p.r;
+            while (p.cur) |br| {
+                if (p.cl.items.len >= pair_chunk or (short and p.in_buf >= p.win)) {
+                    if (short and p.in_buf >= p.win) p.win *= 2;
+                    try self.flushPairs(ix, p, &o);
+                    p.in_buf = 0;
+                    if (short and p.hits[r]) {
+                        p.cur = null;
+                        break;
+                    }
+                    if (o.lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len);
                 }
-                rs.cl.appendAssumeCapacity(r);
-                rs.cr.appendAssumeCapacity(br);
-                in_buf += 1;
-                cur = ix.chainNext(br);
+                p.cl.appendAssumeCapacity(r);
+                p.cr.appendAssumeCapacity(br);
+                p.in_buf += 1;
+                p.cur = ix.chainNext(br);
             }
+            self.nextRow(p);
         }
-        try rs.flush();
-        while (rs.fin < lb.len) : (rs.fin += 1) try rs.finish(rs.fin);
-        return self.gatherOut(out, ix, lb, rs.lidx.items, rs.ridx.items, rs.rnull.items, rs.lidx.items.len);
+        try self.flushPairs(ix, p, &o);
+        while (p.fin < lb.len) : (p.fin += 1) try self.finishRow(p, &o, p.fin);
+        self.pending = null;
+        return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len);
     }
 
-    const pair_chunk = 1 << 16;
-    const first_win = 1024;
-
-    const Residual = struct {
-        join: *Join,
-        ix: *JoinIndex,
-        lb: Batch,
-        hits: []bool,
+    const Outs = struct {
         lidx: std.array_list.Managed(usize),
         ridx: std.array_list.Managed(usize),
         rnull: std.array_list.Managed(bool),
-        cl: std.ArrayListUnmanaged(usize) = .empty,
-        cr: std.ArrayListUnmanaged(usize) = .empty,
-        fin: usize = 0,
-
-        fn pairArena(rs: *Residual) std.mem.Allocator {
-            return rs.join.pair_mem.?.allocator();
-        }
-
-        /// The buffered pairs evaluated, their matches recorded, and every row before
-        /// the buffer's last finished; the buffer then starts over in a reset arena.
-        fn flush(rs: *Residual) !void {
-            const j = rs.join;
-            const n = rs.cl.items.len;
-            if (n > 0) {
-                const pa = rs.pairArena();
-                const nl = rs.lb.columns.len;
-                const cols = try pa.alloc(column.Column, nl + rs.ix.build_batch.columns.len);
-                for (rs.lb.columns, 0..) |c, i| cols[i] = try takeCol(pa, c, rs.cl.items, &.{});
-                for (rs.ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(pa, c, rs.cr.items, &.{});
-                const pairs = Batch{ .schema = j.pair_schema.?, .columns = cols, .len = n };
-                const mask = eval.evalColumn(pa, j.residual.?, pairs, types.Type.init(.bool)) catch |e| {
-                    if (j.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
-                    return e;
-                };
-                const fill_right = (j.kind == .left or j.kind == .full);
-                for (rs.cl.items, rs.cr.items, 0..) |r, br, i| {
-                    while (rs.fin < r) : (rs.fin += 1) try rs.finish(rs.fin);
-                    if (!(mask.validity.get(i) and mask.data.b[i])) continue;
-                    rs.hits[r] = true;
-                    if (j.kind == .semi or j.kind == .anti) continue;
-                    try rs.lidx.append(r);
-                    try rs.ridx.append(br);
-                    if (fill_right) try rs.rnull.append(false);
-                    if (j.matched) |m| m[br] = true;
-                    if (j.shared_matched) |sm| markShared(sm, br);
-                }
-            }
-            try rs.begin();
-        }
-
-        /// An empty buffer of `pair_chunk` pairs in a reset `pair_mem`.
-        fn begin(rs: *Residual) !void {
-            const j = rs.join;
-            if (j.pair_mem == null) j.pair_mem = std.heap.ArenaAllocator.init(j.state);
-            _ = j.pair_mem.?.reset(.retain_capacity);
-            const pa = rs.pairArena();
-            rs.cl = .empty;
-            rs.cr = .empty;
-            try rs.cl.ensureTotalCapacity(pa, pair_chunk);
-            try rs.cr.ensureTotalCapacity(pa, pair_chunk);
-        }
-
-        /// Row `r`, its candidates all evaluated, as its join kind wants it.
-        fn finish(rs: *Residual, r: usize) !void {
-            const hit = rs.hits[r];
-            switch (rs.join.kind) {
-                .semi => if (hit) try rs.lidx.append(r),
-                .anti => if (!hit) try rs.lidx.append(r),
-                .left, .full => if (!hit) {
-                    try rs.lidx.append(r);
-                    try rs.ridx.append(0);
-                    try rs.rnull.append(true);
-                },
-                else => {},
-            }
-        }
     };
+
+    /// An empty buffer of `pair_chunk` pairs in a reset `pair_mem`.
+    fn beginPairs(self: *Join, p: *Pending) !void {
+        const pa = fresh(self.state, &self.pair_mem);
+        p.cl = .empty;
+        p.cr = .empty;
+        try p.cl.ensureTotalCapacity(pa, pair_chunk);
+        try p.cr.ensureTotalCapacity(pa, pair_chunk);
+    }
+
+    /// The buffered pairs evaluated, their matches recorded, and every row before
+    /// the buffer's last finished; the buffer then starts over.
+    fn flushPairs(self: *Join, ix: *JoinIndex, p: *Pending, o: *Outs) !void {
+        const n = p.cl.items.len;
+        if (n > 0) {
+            const pa = self.pair_mem.?.allocator();
+            const nl = p.lb.columns.len;
+            const cols = try pa.alloc(column.Column, nl + ix.build_batch.columns.len);
+            for (p.lb.columns, 0..) |c, i| cols[i] = try takeCol(pa, c, p.cl.items, &.{});
+            for (ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(pa, c, p.cr.items, &.{});
+            const pairs = Batch{ .schema = self.pair_schema.?, .columns = cols, .len = n };
+            const mask = eval.evalColumn(pa, self.residual.?, pairs, types.Type.init(.bool)) catch |e| {
+                if (self.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
+                return e;
+            };
+            const fill_right = (self.kind == .left or self.kind == .full);
+            for (p.cl.items, p.cr.items, 0..) |r, br, i| {
+                while (p.fin < r) : (p.fin += 1) try self.finishRow(p, o, p.fin);
+                if (!(mask.validity.get(i) and mask.data.b[i])) continue;
+                p.hits[r] = true;
+                if (self.kind == .semi or self.kind == .anti) continue;
+                try o.lidx.append(r);
+                try o.ridx.append(br);
+                if (fill_right) try o.rnull.append(false);
+                if (self.matched) |m| m[br] = true;
+                if (self.shared_matched) |sm| markShared(sm, br);
+            }
+        }
+        try self.beginPairs(p);
+    }
+
+    /// Row `r`, its candidates all evaluated, as the join kind wants it.
+    fn finishRow(self: *Join, p: *Pending, o: *Outs, r: usize) !void {
+        const hit = p.hits[r];
+        switch (self.kind) {
+            .semi => if (hit) try o.lidx.append(r),
+            .anti => if (!hit) try o.lidx.append(r),
+            .left, .full => if (!hit) {
+                try o.lidx.append(r);
+                try o.ridx.append(0);
+                try o.rnull.append(true);
+            },
+            else => {},
+        }
+    }
 
     /// right/full: after the probe ends, every unmatched build row with the left
     /// columns null, in chunks.
@@ -1363,6 +1404,69 @@ test "join: a residual over long key chains, past one pair buffer and the semi/a
         try testing.expectEqual(want.items.len, got.rvs.items.len);
         for (want.items, got.rvs.items) |w, g| try testing.expectEqualStrings(w.?, g.?);
     }
+}
+
+test "join: a key that multiplies rows comes out in bounded batches, in order, with or without a residual" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const residual = try a.create(ast.Expr);
+    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    var rk = std.array_list.Managed(?i64).init(a);
+    var rvs = std.array_list.Managed(?[]const u8).init(a);
+    for (0..70_000) |_| {
+        try rk.append(1);
+        try rvs.append("y");
+    }
+    for (0..10) |_| {
+        try rk.append(2);
+        try rvs.append("y");
+    }
+    const lk = [_]?i64{ 1, 2, 3, 1 };
+    const lv = [_]?[]const u8{ "p0", "p1", "p2", "p3" };
+    for ([_]ast.JoinKind{ .inner, .left, .right, .full }) |kind| for ([_]?*const ast.Expr{ null, residual }) |res| {
+        const lb = [_]Batch{try kvBatch(a, &join_left_schema, &lk, &lv)};
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, rk.items, rvs.items)};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = &join_both_schema,
+            .kind = kind,
+            .state = a,
+            .residual = res,
+            .pair_schema = if (res != null) &join_both_schema else null,
+        };
+        var got = std.array_list.Managed([]const u8).init(a);
+        var batches: usize = 0;
+        while (try jn.next(a)) |b| {
+            try testing.expect(b.len <= 2 * Join.out_chunk);
+            batches += 1;
+            for (0..b.len) |r| {
+                const v = b.columns[1].getValue(r);
+                if (!v.isNull()) try got.append(v.string);
+            }
+        }
+        try testing.expect(batches >= 3);
+        var want = std.array_list.Managed([]const u8).init(a);
+        for (0..70_000) |_| try want.append("p0");
+        for (0..10) |_| try want.append("p1");
+        if (kind == .left or kind == .full) try want.append("p2");
+        for (0..70_000) |_| try want.append("p3");
+        try testing.expectEqual(want.items.len, got.items.len);
+        for (want.items, got.items) |w, g| try testing.expectEqualStrings(w, g);
+    };
 }
 
 test "join: a residual ON condition decides which key matches count, per join kind" {
