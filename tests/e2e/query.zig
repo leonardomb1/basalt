@@ -1436,6 +1436,25 @@ test "distinct into parquet on one lane: the writer thread and the operator do n
     try std.testing.expectEqualStrings("n\n200000\n", out);
 }
 
+test "csv: a quote left open is an error, not every later line read as one field" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(error.PlanFailed, runToString(alloc, &tmp, "id,name\n1,\"open\n2,b\n3,c\n", "SELECT * FROM '$IN'"));
+}
+
+test "csv: a leading-zero code past the sample is a mismatch, not a silent int" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,code\n");
+    for (0..2000) |i| try in.print("{d},{d}\n", .{ i, 1000 + i });
+    try in.appendSlice("2000,01310100\n");
+    try std.testing.expectError(error.CsvTypeMismatch, runToString(alloc, &tmp, in.items, "SELECT * FROM '$IN'"));
+}
+
 test "count: a float column past the int range is counted, not converted" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

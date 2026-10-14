@@ -623,7 +623,8 @@ pub const CsvReader = struct {
         try self.join_buf.appendSlice(first);
         var quoted = true;
         while (quoted) {
-            const more = (try self.takePhysical()) orelse break;
+            const more = (try self.takePhysical()) orelse
+                return explainf(error.CsvUnterminatedQuote, "`{s}`: the quote opened on line {d} is never closed, so every line after it would read as one field", .{ self.path, self.rec_line });
             quoted = quotesOpen(more, self.dialect.delim, true);
             if (self.join_buf.items.len + more.len >= MAX_RECORD)
                 return explainf(error.CsvRecordTooLong, "`{s}`: the record from line {d} runs past {d} MiB without closing its quote — is a quote left open?", .{ self.path, self.rec_line, MAX_RECORD >> 20 });
@@ -877,7 +878,7 @@ const TypeSniffer = struct {
                 c.seen = true;
                 noteScale(c, raw);
                 if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
-                if (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null)) {
+                if (textLooking(raw)) {
                     c.all_int = false;
                     c.all_float = false;
                 } else {
@@ -931,11 +932,20 @@ fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
     }
 }
 
+/// A `+` or a leading zero (`007`, `-01`) marks a code, not a number: the sniffer
+/// types such a column text, and a later row holding one in a numeric column is a
+/// mismatch rather than `01310100` read silently as 1310100.
+fn textLooking(raw: []const u8) bool {
+    return raw.len > 0 and (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null));
+}
+
 fn intCell(raw: []const u8) ?i64 {
+    if (textLooking(raw)) return null;
     return parseIntFast(raw) orelse eval.parseIntStrict(raw);
 }
 
 fn floatCell(raw: []const u8) ?f64 {
+    if (textLooking(raw)) return null;
     return parseFloatFast(raw) orelse eval.parseFloatStrict(raw);
 }
 
