@@ -52,6 +52,8 @@ pub const flip_ratio = 4;
 
 pub const Mode = enum { auto, written, invalid };
 
+pub const invalid_msg = "join_order is 'auto' or 'written'";
+
 pub fn mode(hints: []const ast.Hint) Mode {
     for (hints) |h| {
         if (!std.mem.eql(u8, h.key, "join_order")) continue;
@@ -116,7 +118,7 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     errdefer env.diag.stamp(stages[si].pos);
     const st = stages[si];
     if (mode(st.hints) == .invalid)
-        return planErr(env.diag, "join_order is 'auto' or 'written'");
+        return planErr(env.diag, invalid_msg);
     if (take == null) {
         const end = chainEnd(stages, si);
         if (end - si >= 2 and orderFree(stages[end..]))

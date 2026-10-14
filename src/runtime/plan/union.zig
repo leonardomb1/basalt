@@ -18,7 +18,7 @@ const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSource = @import("../connect.zig").openSource;
 const planErr = @import("../env.zig").planErr;
-const readName = @import("../plan.zig").readName;
+const analyze = @import("../analyze.zig");
 const sourceLabel = @import("../connect.zig").sourceLabel;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -108,7 +108,7 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
         try specs.append(.{
             .read = rd,
             .tag = b.tag,
-            .name = if (b.pipeline != null) "query" else readName(b.read),
+            .name = analyze.unionBranchName(b),
             .pipeline = b.pipeline,
         });
     }
@@ -136,7 +136,9 @@ fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
 pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8, except: []const []const u8) !types.Schema {
     if (canon_opt) |c| if (!std.mem.eql(u8, c, "first")) {
         for (specs, schemas) |s, sch| if (std.mem.eql(u8, s.name, c)) return dropExcept(env.arena, sch, except);
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "union canon `{s}` is not one of the source tables", .{c}));
+        const names = try env.arena.alloc([]const u8, specs.len);
+        for (specs, names) |s, *n| n.* = s.name;
+        return planErr(env.diag, (try analyze.unionCanonProblem(env.arena, c, names)).?);
     };
     const canon = @constCast((try dropExcept(env.arena, schemas[0], except)).fields);
     for (schemas[1..]) |sch| {

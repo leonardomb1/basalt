@@ -1501,6 +1501,11 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PRINT 1;\nSELECT t.nope FROM '$B/a.csv' t;", "unknown field `nope`" },
         .{ "PRINT 1;\nSELECT IDENTIFIER('nope') FROM '$B/a.csv';", "unknown field `nope`" },
         .{ "PRINT 1;\nSELECT * FROM '$B/a.csv' p JOIN '$B/a.csv' q ON p.nope = q.x;", "unknown column `p.nope`" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' p JOIN '$B/a.csv' q ON p.x = q.x WITH (max_build = 'lots');", "bad max_build `lots`" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' p JOIN '$B/a.csv' q ON p.x = q.x WITH (max_build = 0);", "max_build must be positive" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM range('a', 3);", "RANGE bounds must be integer literals" },
+        .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h');\nLOAD INTO '$B/o.csv' AS SELECT * FROM f.t;", "unsupported source connector `sftp`" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' UNION ALL BY NAME SELECT * FROM '$B/a.csv' ANCHOR SCHEMA nope;", "union canon `nope` is not one of the source tables" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

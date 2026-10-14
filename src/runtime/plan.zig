@@ -44,7 +44,7 @@ const Value = @import("../exec/value.zig").Value;
 
 const Env = @import("env.zig").Env;
 const MemSource = @import("env.zig").MemSource;
-const parseByteSize = @import("env.zig").parseByteSize;
+const options = @import("analyze/options.zig");
 const PipeRes = @import("env.zig").PipeRes;
 const aErr = @import("env.zig").aErr;
 const planErr = @import("env.zig").planErr;
@@ -732,14 +732,10 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
 pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
     for (hints) |h| {
         if (!std.mem.eql(u8, h.key, "max_build")) continue;
-        const txt: []const u8 = switch (h.value) {
-            .str => |v| v,
-            .ident => |v| v,
-            .int => |v| return if (v > 0) @intCast(v) else planErr(env.diag, "max_build must be positive"),
-            .flag => "",
+        return switch (try options.maxBuild(env.arena, h)) {
+            .bytes => |cap| cap,
+            .problem => |why| planErr(env.diag, why),
         };
-        if (parseByteSize(txt)) |v| if (std.math.cast(usize, v)) |cap| return cap;
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}));
     }
     return op.join_build_byte_cap;
 }

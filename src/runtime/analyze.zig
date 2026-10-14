@@ -266,6 +266,7 @@ pub const sqlOptionProblem = @import("analyze/options.zig").sqlOptionProblem;
 pub const checkSinkConnection = @import("analyze/options.zig").checkSinkConnection;
 pub const unknownConnectionMsg = @import("analyze/options.zig").unknownConnectionMsg;
 pub const checkBareUpsert = @import("analyze/options.zig").checkBareUpsert;
+const options = @import("analyze/options.zig");
 pub const Col = @import("analyze/schema.zig").Col;
 pub const selectCols = @import("analyze/schema.zig").selectCols;
 pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;
@@ -565,6 +566,33 @@ pub fn queryLetColumnsProblem(arena: std.mem.Allocator, name: []const u8, ncols:
 pub fn loopColumnsProblem(arena: std.mem.Allocator, ncols: usize, nvars: usize) Error!?[]const u8 {
     if (ncols >= nvars) return null;
     return try std.fmt.allocPrint(arena, "for-each: the discovery query returns fewer columns than loop variables ({d} for {d})", .{ ncols, nvars });
+}
+
+/// The name `ANCHOR SCHEMA` matches a union branch by: a table's last name part,
+/// `query` for a subquery, nothing for a file.
+pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
+    if (b.pipeline != null) return "query";
+    return switch (b.read.form) {
+        .table => |q| q.last(),
+        else => "",
+    };
+}
+
+/// `ANCHOR SCHEMA name` must name one of the union's tables (`first` names the first).
+pub fn unionCanonProblem(arena: std.mem.Allocator, canon: []const u8, names: []const []const u8) Error!?[]const u8 {
+    if (std.mem.eql(u8, canon, "first") or containsName(names, canon)) return null;
+    return try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
+}
+
+pub const range_bound_msg = "RANGE bounds must be integer literals or integer params";
+
+/// A `range(lo, hi)` bound once its params are literals: an integer, or a negated one.
+pub fn rangeBoundValue(e: *const ast.Expr) ?i64 {
+    return switch (e.*) {
+        .int_lit => |v| v,
+        .unary => |u| if (u.op == .neg and u.e.* == .int_lit) -u.e.int_lit else null,
+        else => null,
+    };
 }
 
 pub fn notJsonParamMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
@@ -967,61 +995,24 @@ pub fn hasRunnable(stmts: []const ast.Stmt) bool {
     return false;
 }
 
-pub const Misplaced = struct { msg: []const u8, pos: ?ast.Pos };
-
-/// The first declaration standing where it may not, by `Ctx.checkStmts`'s rules: a
-/// CASE arm (`arm`) holds no LET, PARAM or function, a FOR EACH or statement-function
-/// body (`body`) only queries and script statements. The run asks this up front, so a
-/// body that never executes is refused as `check` refuses it.
-pub fn misplacedDecl(arena: std.mem.Allocator, stmts: []const ast.Stmt, where: enum { top, arm, body }) Error!?Misplaced {
-    for (stmts) |s| {
-        const inner: ?Misplaced = switch (s) {
-            .for_each => |fe| try misplacedDecl(arena, fe.body, .body),
-            .match => |m| for (m.arms) |arm| {
-                if (try misplacedDecl(arena, arm.body, if (where == .body) .body else .arm)) |x| break x;
-            } else null,
-            .func => |fd| switch (where) {
-                .top => if (fd.body == .stmts) try misplacedDecl(arena, fd.body.stmts, .body) else null,
-                .arm => .{ .pos = fd.pos, .msg = try std.fmt.allocPrint(arena, "function `{s}` must be declared at the top level of the script", .{fd.name}) },
-                .body => .{ .pos = fd.pos, .msg = body_stmt_rule },
-            },
-            .let_const => |l| if (where == .top) null else .{ .pos = l.pos, .msg = try std.fmt.allocPrint(arena, "LET `{s}` must be declared at the top level of the script", .{l.name}) },
-            .param => |pd| switch (where) {
-                .top => null,
-                .arm => .{ .pos = pd.pos, .msg = try std.fmt.allocPrint(arena, "PARAM `{s}` must be declared at the top level of the script", .{pd.name}) },
-                .body => .{ .pos = pd.pos, .msg = body_stmt_rule },
-            },
-            .kind, .connection => if (where == .body) .{ .pos = stmtPos(s), .msg = body_stmt_rule } else null,
-            else => null,
-        };
-        if (inner) |x| return x;
-    }
-    return null;
-}
-
 pub const stmtPos = ast.stmtPos;
 
-/// A join's `join_order` hint, which only names 'auto' or 'written'.
-pub fn checkJoinOrders(stages: []const ast.Stage, diag: *Diag) Error!void {
-    for (stages) |st| if (st.node == .join and joinorder.mode(st.hints) == .invalid) {
-        const e = fail(diag, "join_order is 'auto' or 'written'", .{});
-        diag.pos = st.pos;
-        return e;
-    };
-}
-
-/// The rules `analyzeOutput` applies that need no schema, a target's and its
-/// options' and a join's `join_order`, for every query in every body: a FOR EACH, a
-/// CASE arm, a statement function. The run asks this up front, so a query that never
-/// executes is refused as `check` refuses it.
-pub fn checkStaticQueries(arena: std.mem.Allocator, stmts: []const ast.Stmt, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
-    for (stmts) |s| switch (s) {
-        .output => |p| try checkStaticQuery(arena, p, connections, diag),
-        .explain => |e| try checkStaticQuery(arena, e.pipeline, connections, diag),
-        .for_each => |fe| try checkStaticQueries(arena, fe.body, connections, diag),
-        .match => |m| for (m.arms) |arm| try checkStaticQueries(arena, arm.body, connections, diag),
-        .func => |fd| if (fd.body == .stmts) try checkStaticQueries(arena, fd.body.stmts, connections, diag),
-        else => {},
+/// A join's `join_order` hint, which only names 'auto' or 'written', and its
+/// `max_build`, a size unless a loop row renders it.
+pub fn checkJoinHints(arena: std.mem.Allocator, stages: []const ast.Stage, diag: *Diag) Error!void {
+    for (stages) |st| if (st.node == .join) {
+        if (joinorder.mode(st.hints) == .invalid) return failPos(diag, st.pos, "{s}", .{joinorder.invalid_msg});
+        for (st.hints) |h| if (std.mem.eql(u8, h.key, "max_build")) {
+            const text: []const u8 = switch (h.value) {
+                .str, .ident => |v| v,
+                else => "",
+            };
+            if (std.mem.indexOf(u8, text, "${") != null) continue;
+            switch (try options.maxBuild(arena, h)) {
+                .problem => |why| return failPos(diag, h.pos, "{s}", .{why}),
+                .bytes => {},
+            }
+        };
     };
 }
 
@@ -1044,22 +1035,6 @@ fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8)) Error!
     const last = p.stages[p.stages.len - 1];
     if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv")) return;
     try out.append(last.node.write.target);
-}
-
-fn checkStaticQuery(arena: std.mem.Allocator, p: ast.Pipeline, connections: *const std.StringHashMap(ast.Connection), diag: *Diag) Error!void {
-    if (p.stages.len == 0) return;
-    try checkJoinOrders(p.stages, diag);
-    const last = p.stages[p.stages.len - 1];
-    if (last.node != .write) return;
-    errdefer diag.stamp(last.pos);
-    const w = last.node.write;
-    if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
-        try checkFileSink(w, last.hints, diag);
-        return checkSinkForm(w, last.hints, w.connector, diag);
-    }
-    const conn = connections.get(w.connector) orelse return;
-    try checkSinkForm(w, last.hints, conn.connector, diag);
-    try checkSinkConnection(arena, conn, diag);
 }
 
 /// One pipeline against declarations already in scope, for the executor's
@@ -1288,7 +1263,7 @@ const Ctx = struct {
             try checkStageLiterals(self.diag, st);
             try checkStageHoles(self.arena, st, self.diag);
         }
-        try checkJoinOrders(stages, self.diag);
+        try checkJoinHints(self.arena, stages, self.diag);
 
         var source = self.resolveSource(stages[0]) catch |e| {
             self.diag.stamp(stages[0].pos);
@@ -1387,12 +1362,18 @@ const Ctx = struct {
                 if (!isBuiltinSource(rd.connector) and conn == null)
                     return fail(self.diag, "{s}", .{try unknownConnectionMsg(self.arena, rd.connector, "read")});
                 const connector = if (conn) |c| c.connector else rd.connector;
+                if (conn != null and !isSqlSource(connector) and !std.mem.eql(u8, connector, "http"))
+                    return fail(self.diag, "{s}", .{try options.unsupportedSourceMsg(self.arena, connector)});
                 const detail = switch (rd.form) {
                     .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
                     .path => |p| p,
                     .range => "range",
                     .unit => "unit",
+                };
+                if (rd.form == .range) for ([_]*const ast.Expr{ rd.form.range.lo, rd.form.range.hi }) |b| {
+                    if ((try dollarRefs(self.arena, b)).len == 0 and rangeBoundValue(b) == null)
+                        return fail(self.diag, "{s}", .{range_bound_msg});
                 };
                 if (rd.form == .path and std.mem.eql(u8, connector, "csv") and std.mem.indexOf(u8, rd.form.path, "${") == null) {
                     if (s3.bucketNameError(rd.form.path)) |why|
@@ -1429,6 +1410,18 @@ const Ctx = struct {
                         .intersect => "intersect",
                         .except => "except",
                     }, un.branches.len });
+                const listed = un.discover_query.len == 0 and un.discover_pipeline == null and un.discover_json.len == 0;
+                if (listed) if (env_mod.forHintIdent(lead.hints, "canon")) |c| if (std.mem.indexOf(u8, c, "${") == null) {
+                    const names = try self.arena.alloc([]const u8, un.branches.len);
+                    for (un.branches, names) |b, *n| n.* = unionBranchName(b);
+                    const rendered = for (names) |n| {
+                        if (std.mem.indexOf(u8, n, "${") != null) break true;
+                    } else false;
+                    const at = for (lead.hints) |h| {
+                        if (std.mem.eql(u8, h.key, "canon")) break h.pos;
+                    } else lead.pos;
+                    if (!rendered) if (try unionCanonProblem(self.arena, c, names)) |why| return failPos(self.diag, at, "{s}", .{why});
+                };
                 return .{ .connector = "union", .detail = detail, .schema = null };
             },
             else => return fail(self.diag, "a pipeline must start with `read`, `union`, or a binding reference", .{}),
@@ -1680,6 +1673,9 @@ const Ctx = struct {
     }
 };
 
+pub const xlsx_write_fmt = "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`";
+pub const append_unsupported_fmt = "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, or write each run to its own path";
+
 /// What a file or stdout sink is refused for, shared by `check` and the run's
 /// planner so the two can never disagree about a target.
 pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!void {
@@ -1692,7 +1688,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
         if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
             return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
         if ((fmt orelse formatOfPath(w.target)) == .xlsx)
-            return fail(diag, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target});
+            return fail(diag, xlsx_write_fmt, .{w.target});
     }
     _ = try dialectFromHints(hints, diag);
     if (hintText(hints, "encoding") != null)
@@ -1702,7 +1698,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     if (w.mode == .append) {
         const fmt = if (std.mem.eql(u8, w.connector, "csv")) try formatFromHints(hints, diag) else null;
         if (appendUnsupported(w.target, fmt)) |why|
-            return fail(diag, "`APPEND` into `{s}` is not supported: {s}", .{ w.target, why });
+            return fail(diag, append_unsupported_fmt, .{ w.target, why });
     }
 }
 

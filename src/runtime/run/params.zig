@@ -13,21 +13,12 @@ const planErr = @import("../env.zig").planErr;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
-/// A LET named on the command line is an error, not ignored. A default takes the
-/// declared type: `PARAM d DATE DEFAULT '2026-01-01'` is a DATE.
+/// A default takes the declared type: `PARAM d DATE DEFAULT '2026-01-01'` is a DATE.
+/// `checkFirst` already refused a LET bound on the command line and a PARAM declared twice.
 pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []const ParamArg, params: *std.StringHashMap(Value), diag: *Diag) !void {
-    for (cli) |kv| {
-        for (program.stmts) |s| {
-            if (s != .let_const) continue;
-            if (std.mem.eql(u8, kv.key, s.let_const.name))
-                return planErr(diag, try std.fmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{kv.key}));
-        }
-    }
-    for (program.stmts, 0..) |s, i| {
+    for (program.stmts) |s| {
         if (s != .param) continue;
         const p = s.param;
-        for (program.stmts[0..i]) |prev| if (prev == .param and std.mem.eql(u8, prev.param.name, p.name))
-            return planErrAt(diag, try std.fmt.allocPrint(arena, "duplicate PARAM `{s}`", .{p.name}), p.pos);
         if (p.is_json) continue;
         var v: ?Value = null;
         for (cli) |kv| {
@@ -65,7 +56,8 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
 
 /// Fold every statement-level expression `LET` into a constant, in declaration order,
 /// with params and earlier LETs in scope, registered as a PARAM is. A LET is never
-/// bound from outside, so this is the only place its value is decided.
+/// bound from outside, so this is the only place its value is decided. `checkFirst`
+/// already refused a name declared twice and a LET reading what it may not.
 pub fn resolveLets(
     arena: std.mem.Allocator,
     program: ast.Program,
@@ -84,18 +76,6 @@ pub fn resolveLets(
     for (program.stmts) |s| {
         if (s != .let_const) continue;
         const l = s.let_const;
-        for (program.stmts) |p| {
-            if (p == .param and std.mem.eql(u8, p.param.name, l.name))
-                return planErrAt(diag, try std.fmt.allocPrint(arena, "`{s}` is declared twice: LET and PARAM share one name space", .{l.name}), l.pos);
-        }
-        if (params.contains(l.name))
-            return planErrAt(diag, try std.fmt.allocPrint(arena, "duplicate LET `{s}`", .{l.name}), l.pos);
-
-        if (try analyze.letRefProblem(arena, program, l)) |why| {
-            const e = planErrAt(diag, why.msg, if (why.span) |sp| sp.start else l.pos);
-            if (why.span) |sp| diag.end = sp.end;
-            return e;
-        }
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
             return planErrAt(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, errLabel(e) }), l.pos);

@@ -64,7 +64,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
-    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, or write each run to its own path", .{ w.target, why }));
+    return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
 }
 
 /// `run` does not analyze first; without this a `.zip` was parsed as CSV and
@@ -214,7 +214,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
         if ((env.fmt_out == null and xlsx.isPath(w.target)) or env.fmt_out == .xlsx)
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`", .{w.target}));
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.xlsx_write_fmt, .{w.target}));
         const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else if (arrowread.isPath(w.target)) analyze.FileFormat.arrow else analyze.FileFormat.csv);
         if (wfmt == .arrow) {
             const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {

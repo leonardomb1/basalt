@@ -229,7 +229,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
 
     var ddiag = analyze.Diag{};
-    analyze.checkJoinOrders(stages, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    analyze.checkJoinHints(env.arena, stages, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.csv_out = analyze.dialectFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);

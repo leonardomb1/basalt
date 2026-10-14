@@ -68,7 +68,6 @@ pub const LogConfig = @import("env.zig").LogConfig;
 const LoopRow = @import("env.zig").LoopRow;
 const mkLit = @import("env.zig").mkLit;
 const no_loop_vars = @import("env.zig").no_loop_vars;
-const body_stmt_rule = @import("env.zig").body_stmt_rule;
 pub const OutcomeSink = @import("env.zig").OutcomeSink;
 pub const ParamArg = @import("env.zig").ParamArg;
 const aErr = @import("env.zig").aErr;
@@ -180,24 +179,12 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     var runnable: usize = 0;
     for (program.stmts[1..]) |s| switch (s) {
-        .connection => |c| {
-            if (try analyze.connectionProblem(arena, c)) |why| {
-                const e = planErr(diag, why);
-                diag.pos = c.pos;
-                return e;
-            }
-            try connections.put(c.name, c);
-        },
+        .connection => |c| try connections.put(c.name, c),
         .func => |fd| try fns.put(fd.name, fd),
         .print, .binding => {},
         .output, .for_each, .match, .call, .explain => runnable += 1,
         .param, .kind, .let_const, .throw => {},
     };
-    if (try analyze.misplacedDecl(arena, program.stmts[1..], .top)) |m| {
-        const e = planErr(diag, m.msg);
-        diag.pos = m.pos;
-        return e;
-    }
 
     const run_id: u64 = @intCast(std.time.milliTimestamp());
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
@@ -252,15 +239,6 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     env.script_scope = try buildScriptScope(arena, &params);
     try runEarlyThrows(&env, program.stmts[1..]);
-    var sdiag = analyze.Diag{};
-    analyze.checkStaticQueries(arena, program.stmts[1..], &connections, &sdiag) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.AnalyzeFailed => {
-            const err = planErr(diag, sdiag.msg);
-            diag.pos = sdiag.pos;
-            return err;
-        },
-    };
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
@@ -370,6 +348,8 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
+/// A statement of a top-level CASE arm. `checkFirst` refused a LET, PARAM or function
+/// declared in one, so none reaches here.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     env.diag.pos = null;
     switch (s.*) {
@@ -393,22 +373,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             try registerSmb(env, c);
             try registerFtp(env, c);
         },
-        .let_const => |l| {
-            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name}));
-            env.diag.pos = l.pos;
-            return e;
-        },
-        .param => |pd| {
-            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "PARAM `{s}` must be declared at the top level of the script", .{pd.name}));
-            env.diag.pos = pd.pos;
-            return e;
-        },
-        .func => |fd| {
-            const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "function `{s}` must be declared at the top level of the script", .{fd.name}));
-            env.diag.pos = fd.pos;
-            return e;
-        },
-        .kind => {},
+        .let_const, .param, .func, .kind => unreachable,
     }
 }
 
@@ -611,6 +576,8 @@ pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptio
     for (body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
 }
 
+/// A FOR EACH, CALL or nested CASE body statement; `checkFirst` refused every
+/// declaration in a body.
 fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     switch (s.*) {
         .output => |p| {
@@ -627,11 +594,7 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
         .throw => |t| try runThrow(env, t, lr),
         .binding => |b| try env.bindings.put(b.name, try renderBound(env, b.pipeline, lr)),
         .for_each => |fe| try runForEach(env, try renderForSource(env.arena, fe, lr), opts, stats, lanes_used, batch_arena, runForBody, &lr),
-        .let_const => |l| {
-            env.diag.stamp(l.pos);
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "LET `{s}` must be declared at the top level of the script", .{l.name}));
-        },
-        .param, .kind, .connection, .func => return planErr(env.diag, body_stmt_rule),
+        .let_const, .param, .kind, .connection, .func => unreachable,
     }
 }
 

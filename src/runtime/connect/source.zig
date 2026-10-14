@@ -5,6 +5,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
+const options = @import("../analyze/options.zig");
 const arrowread = @import("../../format/arrowread.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
@@ -278,7 +279,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         return reader.source();
     }
     const conn = env.connections.get(rd.connector) orelse
-        return planErr(env.diag, try @import("../analyze/options.zig").unknownConnectionMsg(env.arena, rd.connector, "read"));
+        return planErr(env.diag, try options.unknownConnectionMsg(env.arena, rd.connector, "read"));
     var rd_eff = rd;
     if (forHintName(hints, "where")) |wh| {
         if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
@@ -330,7 +331,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             },
         }
     }
-    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unsupported source connector `{s}`", .{conn.connector}));
+    return planErr(env.diag, try options.unsupportedSourceMsg(env.arena, conn.connector));
 }
 
 /// A failed first fetch as a plan error naming the URL and status; a cancel stays
@@ -348,10 +349,5 @@ fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
 /// does not.
 fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
     const r = try analyze.substExpr(env.arena, e, env.params_expr);
-    switch (r.*) {
-        .int_lit => |v| return v,
-        .unary => |u| if (u.op == .neg and u.e.* == .int_lit) return -u.e.int_lit,
-        else => {},
-    }
-    return planErr(env.diag, "RANGE bounds must be integer literals or integer params");
+    return analyze.rangeBoundValue(r) orelse planErr(env.diag, analyze.range_bound_msg);
 }

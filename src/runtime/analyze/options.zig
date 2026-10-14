@@ -94,6 +94,10 @@ pub fn unsupportedSinkMsg(arena: std.mem.Allocator, connector: []const u8) Error
     return std.fmt.allocPrint(arena, "unsupported sink connector `{s}`", .{connector});
 }
 
+pub fn unsupportedSourceMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(arena, "unsupported source connector `{s}`", .{connector});
+}
+
 pub fn unknownConnectionMsg(arena: std.mem.Allocator, name: []const u8, where: []const u8) Error![]const u8 {
     return std.fmt.allocPrint(arena, "unknown connection `{s}` in {s}", .{ name, where });
 }
@@ -256,6 +260,20 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
             return fail(diag, "{s}", .{try loadCompressionMsg(arena, t)});
     }
     if (!database) return fail(diag, "{s}", .{try needsDatabaseMsg(arena, flavor.name())});
+}
+
+pub const BuildCap = union(enum) { bytes: usize, problem: []const u8 };
+
+/// A join's `max_build` as the run caps its build side: a positive byte count, or a
+/// size like '512MB'.
+pub fn maxBuild(arena: std.mem.Allocator, h: ast.Hint) Error!BuildCap {
+    const txt: []const u8 = switch (h.value) {
+        .str, .ident => |v| v,
+        .int => |v| return if (v > 0) .{ .bytes = @intCast(v) } else .{ .problem = "max_build must be positive" },
+        .flag => "",
+    };
+    if (env_mod.parseByteSize(txt)) |v| if (std.math.cast(usize, v)) |cap| return .{ .bytes = cap };
+    return .{ .problem = try std.fmt.allocPrint(arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}) };
 }
 
 pub const bare_upsert_source_msg = "a bare `UPSERT` infers the primary key from the source, which needs a SQL table read — this query's source can't be introspected; name the key with `UPSERT ON (col)`";
