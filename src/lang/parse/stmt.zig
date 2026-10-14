@@ -276,7 +276,12 @@ pub fn parseNameSegment(self: *Parser) Error![]const u8 {
 }
 
 pub fn parseColRef(self: *Parser) Error!ast.QualName {
-    if (self.isKw("identifier") and self.peekTag() == .lparen) return self.singleName(try self.parseNameSegment());
+    if (self.isKw("identifier") and self.peekTag() == .lparen) {
+        const start = self.curPos();
+        var q = try self.singleName(try self.parseNameSegment());
+        q.span = self.spanFrom(start);
+        return q;
+    }
     return self.parseQualNameTok();
 }
 

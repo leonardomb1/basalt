@@ -24,6 +24,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
+const holes = @import("analyze/holes.zig");
 const Value = @import("../exec/value.zig").Value;
 
 const aborting = @import("env.zig").aborting;
@@ -71,12 +72,12 @@ pub fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const 
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] == '$' and i + 1 < s.len and s[i + 1] == '{') {
-            const close = interpClose(s, i + 2) orelse {
+            const close = holes.close(s, i + 2) orelse {
                 try out.appendSlice(s[i..]);
                 break;
             };
             const inner = s[i + 2 .. close];
-            if (bareInterp(inner)) {
+            if (holes.bare(inner)) {
                 if (lr.lookup(inner)) |val| {
                     try out.appendSlice(val);
                 } else {
@@ -94,78 +95,9 @@ pub fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const 
     return out.toOwnedSlice();
 }
 
-/// The `}` closing a `${` opened before `start`: brace-balanced and quote-aware
-/// (`'...'` and `"..."`, both escaped by doubling).
-fn interpClose(s: []const u8, start: usize) ?usize {
-    var depth: usize = 1;
-    var k = start;
-    while (k < s.len) {
-        switch (s[k]) {
-            '\'', '"' => {
-                const q = s[k];
-                k += 1;
-                while (k < s.len) {
-                    if (s[k] == q) {
-                        if (k + 1 < s.len and s[k + 1] == q) {
-                            k += 2;
-                            continue;
-                        }
-                        k += 1;
-                        break;
-                    }
-                    k += 1;
-                }
-            },
-            '{' => {
-                depth += 1;
-                k += 1;
-            },
-            '}' => {
-                depth -= 1;
-                if (depth == 0) return k;
-                k += 1;
-            },
-            else => k += 1,
-        }
-    }
-    return null;
-}
-
-fn bareInterp(inner: []const u8) bool {
-    if (inner.len == 0 or !(std.ascii.isAlphabetic(inner[0]) or inner[0] == '_')) return false;
-    for (inner[1..]) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
-    return true;
-}
-
-fn interpUnsupported(e: *const ast.Expr) ?[]const u8 {
-    return switch (e.*) {
-        .let_in => "`let … in` is not supported inside ${...}; bind it in a select/fn instead",
-        .field => |q| if (q.safe.len > 0) "`?.` safe navigation is not supported inside ${...}" else null,
-        .unary => |u| interpUnsupported(u.e),
-        .binary => |b| interpUnsupported(b.l) orelse interpUnsupported(b.r),
-        .cond => |c| interpUnsupported(c.cond) orelse interpUnsupported(c.then) orelse interpUnsupported(c.els),
-        .cast => |c| interpUnsupported(c.e),
-        .is_null => |n| interpUnsupported(n.e),
-        .call => |c| {
-            for (c.args) |a| if (interpUnsupported(a)) |why| return why;
-            return null;
-        },
-        .match => |m| {
-            if (m.subject) |s| if (interpUnsupported(s)) |why| return why;
-            for (m.arms) |arm| {
-                for (arm.pats) |p| if (interpUnsupported(p)) |why| return why;
-                if (arm.guard) |g| if (interpUnsupported(g)) |why| return why;
-                if (interpUnsupported(arm.value)) |why| return why;
-            }
-            return null;
-        },
-        else => null,
-    };
-}
-
 /// `InterpFailed`, with why as the note its error message shows.
 fn interpFail(arena: std.mem.Allocator, text: []const u8, why: []const u8) anyerror {
-    const msg = std.fmt.allocPrint(arena, "`${{{s}}}`: {s}", .{ text, why }) catch return error.InterpFailed;
+    const msg = holes.failMsg(arena, text, why) catch return error.InterpFailed;
     return eval.explain(error.InterpFailed, msg);
 }
 
@@ -182,12 +114,10 @@ const Hole = union(enum) { value: Value, fail: []const u8 };
 
 /// A `${...}` hole's text parsed and evaluated against the scope, or why it cannot be.
 fn evalHole(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) !Hole {
-    var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
-    const e = parser.parseExprStr(arena, text, &diag) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .fail = diag.msg };
+    const e = switch (try holes.parse(arena, text)) {
+        .expr => |x| x,
+        .fail => |why| return .{ .fail = why },
     };
-    if (interpUnsupported(e)) |why| return .{ .fail = why };
     var names = std.array_list.Managed([]const u8).init(arena);
     var vals = std.array_list.Managed(Value).init(arena);
     try lr.appendScope(arena, &names, &vals);
@@ -299,9 +229,9 @@ fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) !
 
 /// Whether `s` is one `${...}` hole, bound, whose value is NULL.
 fn holeIsNull(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) !bool {
-    if (!std.mem.startsWith(u8, s, "${") or interpClose(s, 2) != s.len - 1) return false;
+    if (!std.mem.startsWith(u8, s, "${") or holes.close(s, 2) != s.len - 1) return false;
     const inner = s[2 .. s.len - 1];
-    if (bareInterp(inner) and lr.lookup(inner) == null) return false;
+    if (holes.bare(inner) and lr.lookup(inner) == null) return false;
     return switch (try evalHole(arena, inner, lr)) {
         .value => |v| v.isNull(),
         .fail => false,
@@ -310,38 +240,41 @@ fn holeIsNull(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) !bool {
 
 pub fn renderPipeline(arena: std.mem.Allocator, body: ast.Pipeline, lr: LoopRow) anyerror!ast.Pipeline {
     const stages = try arena.alloc(ast.Stage, body.stages.len);
-    for (body.stages, stages) |src, *dst| {
-        dst.* = src;
-        dst.hints = try renderHints(arena, src.hints, lr);
-        switch (src.node) {
-            .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, lr) },
-            .union_ => |u| dst.node = .{ .union_ = try renderUnion(arena, u, lr) },
-            .write => |w| dst.node = .{ .write = try renderWrite(arena, w, lr) },
-            .filter => |e| dst.node = .{ .filter = try renderExpr(arena, e, lr) },
-            .select => |items| dst.node = .{ .select = try renderSelect(arena, items, lr) },
-            .aggregate => |ag| {
-                const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
-                for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null, .distinct = a.distinct };
-                dst.node = .{ .aggregate = .{ .aggs = aggs, .by = try renderQuals(arena, ag.by, lr) } };
-            },
-            .distinct => |d| if (d.on) |on| {
-                dst.node = .{ .distinct = .{ .on = try renderQuals(arena, on, lr) } };
-            },
-            .sort => |st| {
-                const keys = try arena.alloc(ast.SortKey, st.keys.len);
-                for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc, .nulls_first = k.nulls_first };
-                dst.node = .{ .sort = .{ .keys = keys } };
-            },
-            .limit => |l| {
-                var r = l;
-                if (l.count_expr) |e| r.count_expr = try renderExpr(arena, e, lr);
-                if (l.offset_expr) |e| r.offset_expr = try renderExpr(arena, e, lr);
-                dst.node = .{ .limit = r };
-            },
-            else => {},
-        }
-    }
+    for (body.stages, stages) |src, *dst| dst.* = try renderStage(arena, src, lr);
     return .{ .stages = stages, .pos = body.pos, .show = body.show };
+}
+
+fn renderStage(arena: std.mem.Allocator, src: ast.Stage, lr: LoopRow) anyerror!ast.Stage {
+    var dst = src;
+    dst.hints = try renderHints(arena, src.hints, lr);
+    switch (src.node) {
+        .read => |rd| dst.node = .{ .read = try renderRead(arena, rd, lr) },
+        .union_ => |u| dst.node = .{ .union_ = try renderUnion(arena, u, lr) },
+        .write => |w| dst.node = .{ .write = try renderWrite(arena, w, lr) },
+        .filter => |e| dst.node = .{ .filter = try renderExpr(arena, e, lr) },
+        .select => |items| dst.node = .{ .select = try renderSelect(arena, items, lr) },
+        .aggregate => |ag| {
+            const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
+            for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null, .distinct = a.distinct };
+            dst.node = .{ .aggregate = .{ .aggs = aggs, .by = try renderQuals(arena, ag.by, lr) } };
+        },
+        .distinct => |d| if (d.on) |on| {
+            dst.node = .{ .distinct = .{ .on = try renderQuals(arena, on, lr) } };
+        },
+        .sort => |st| {
+            const keys = try arena.alloc(ast.SortKey, st.keys.len);
+            for (st.keys, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc, .nulls_first = k.nulls_first };
+            dst.node = .{ .sort = .{ .keys = keys } };
+        },
+        .limit => |l| {
+            var r = l;
+            if (l.count_expr) |e| r.count_expr = try renderExpr(arena, e, lr);
+            if (l.offset_expr) |e| r.offset_expr = try renderExpr(arena, e, lr);
+            dst.node = .{ .limit = r };
+        },
+        else => {},
+    }
+    return dst;
 }
 
 const RenderCtx = struct { arena: std.mem.Allocator, lr: LoopRow };
@@ -529,7 +462,14 @@ pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
 /// `renderPipeline`, then its LIMIT and OFFSET expressions evaluated against the
 /// script's PARAMs and LETs, before anything plans on their numbers.
 pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
-    const r = try renderPipeline(env.arena, p, lr);
+    const rendered = try env.arena.alloc(ast.Stage, p.stages.len);
+    for (p.stages, rendered) |src, *dst| dst.* = renderStage(env.arena, src, lr) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        const err = planErr(env.diag, op.failLabel(e));
+        env.diag.pos = src.pos;
+        return err;
+    };
+    const r = ast.Pipeline{ .stages = rendered, .pos = p.pos, .show = p.show };
     var ad = analyze.Diag{};
     const stages = analyze.bindLimits(env.arena, r.stages, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     return .{ .stages = stages, .pos = r.pos, .show = r.show };
@@ -537,18 +477,20 @@ pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
 
 /// `CALL f(a, b)`: a plan-time statement macro run as one sequential FOR EACH
 /// iteration over a hand-built row of its arguments. Depth is capped since a cycle would never end.
+/// The program was expanded first, which refused a CALL of an unknown, scalar or table
+/// function and filled its defaults, so the callee is a statement function taking every argument.
 pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn) anyerror!void {
-    const fd = env.fns.get(c.name) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL: no function named `{s}`", .{c.name}));
+    const fd = env.fns.get(c.name) orelse unreachable;
     const body = switch (fd.body) {
         .stmts => |b| b,
-        .expr => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name})),
-        .table => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` is a table function — read it with FROM {s}(...), not CALL", .{ c.name, c.name })),
+        .expr, .table => unreachable,
     };
-    if (c.args.len != fd.params.len)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`{s}` expects {d} argument(s), got {d}", .{ c.name, fd.params.len, c.args.len }));
-    if (env.call_depth >= max_call_depth)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
+    std.debug.assert(c.args.len == fd.params.len);
+    if (env.call_depth >= max_call_depth) {
+        const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
+        env.diag.pos = c.pos;
+        return e;
+    }
 
     const sc = try outer.scope(env.arena, env.params);
 

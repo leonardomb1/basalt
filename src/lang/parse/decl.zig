@@ -192,11 +192,11 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     var seen_default = false;
     for (params.items, 0..) |p, i| {
         for (params.items[0..i]) |q| if (std.mem.eql(u8, q.name, p.name))
-            return self.fail(pos, "`{s}`: parameter `{s}` is declared twice", .{ name, p.name });
+            return self.fail(p.pos orelse pos, "`{s}`: parameter `{s}` is declared twice", .{ name, p.name });
         if (p.default != null) {
             seen_default = true;
         } else if (seen_default) {
-            return self.fail(pos, "`{s}`: parameter `{s}` without DEFAULT follows one with DEFAULT", .{ name, p.name });
+            return self.fail(p.pos orelse pos, "`{s}`: parameter `{s}` without DEFAULT follows one with DEFAULT", .{ name, p.name });
         }
     }
     if (self.eatKw("returns")) {
@@ -261,13 +261,14 @@ pub fn atStmtCase(self: *Parser) bool {
 }
 
 pub fn parseFnParam(self: *Parser) Error!ast.FnParam {
+    const pos = self.curPos();
     const name = try self.expectIdent();
     var ty: ?types.Type = null;
     if (!self.at(.comma) and !self.at(.rparen) and !self.isKw("default"))
         ty = try self.parseTypeName();
     var default: ?*ast.Expr = null;
     if (self.eatKw("default")) default = try self.parseExpr();
-    return .{ .name = name, .ty = ty, .default = default };
+    return .{ .name = name, .ty = ty, .default = default, .pos = pos };
 }
 
 pub fn parseCallStmt(self: *Parser) Error!ast.CallStmt {

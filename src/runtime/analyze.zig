@@ -60,6 +60,7 @@ const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
+const holes = @import("analyze/holes.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -560,6 +561,16 @@ pub fn queryLetColumnsProblem(arena: std.mem.Allocator, name: []const u8, ncols:
     return try std.fmt.allocPrint(arena, "{s}: must produce exactly one column, got {d}", .{ try queryLetLabel(arena, name), ncols });
 }
 
+/// A FOR EACH binds one discovery column per loop variable, so a narrower result is refused.
+pub fn loopColumnsProblem(arena: std.mem.Allocator, ncols: usize, nvars: usize) Error!?[]const u8 {
+    if (ncols >= nvars) return null;
+    return try std.fmt.allocPrint(arena, "for-each: the discovery query returns fewer columns than loop variables ({d} for {d})", .{ ncols, nvars });
+}
+
+pub fn notJsonParamMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(arena, "for-each: `{s}` is not a JSON param", .{name});
+}
+
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
 /// not scalar keeps the declared default: `check` is offline.
 /// The `$name`s an expression reads, in order, repeats included.
@@ -717,6 +728,28 @@ fn checkStageLiterals(diag: *Diag, st: ast.Stage) Error!void {
     }
 }
 
+/// The `${...}` holes in a stage's paths, target, query text and option values, each
+/// of which the run renders: one whose text is no expression a hole may hold.
+fn checkStageHoles(arena: std.mem.Allocator, st: ast.Stage, diag: *Diag) Error!void {
+    var texts = std.array_list.Managed([]const u8).init(arena);
+    switch (st.node) {
+        .read => |rd| {
+            try texts.append(rd.where);
+            switch (rd.form) {
+                .path, .query => |s| try texts.append(s),
+                else => {},
+            }
+        },
+        .write => |w| try texts.append(w.target),
+        else => {},
+    }
+    for (st.hints) |h| switch (h.value) {
+        .str, .ident => |s| try texts.append(s),
+        else => {},
+    };
+    for (texts.items) |s| if (try holes.problem(arena, s)) |why| return failPos(diag, st.pos, "{s}", .{why});
+}
+
 pub const KnownTable = struct { name: []const u8, schema: ?types.Schema = null };
 
 pub const Issue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null };
@@ -852,7 +885,9 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
 
     var written = std.array_list.Managed([]const u8).init(arena);
     try writtenFiles(arena, program.stmts[1..], &written);
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items };
+    var json_params = std.array_list.Managed([]const u8).init(arena);
+    for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.append(s.param.name);
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -1053,6 +1088,7 @@ const Ctx = struct {
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
     written: []const []const u8 = &.{},
+    json_params: ?[]const []const u8 = null,
 
     /// A table function's body, typed where it is declared with each parameter a null
     /// of its declared type, so one nothing calls is checked too. A problem a call
@@ -1154,7 +1190,10 @@ const Ctx = struct {
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
-            .for_each => |fe| try self.checkBody(fe.body, outs),
+            .for_each => |fe| {
+                try self.checkLoopSource(fe);
+                try self.checkBody(fe.body, outs);
+            },
             .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
             .func => |fd| if (!top)
                 try self.note(self.failNear(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
@@ -1187,12 +1226,38 @@ const Ctx = struct {
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
-            .for_each => |fe| try self.checkBody(fe.body, outs),
+            .for_each => |fe| {
+                try self.checkLoopSource(fe);
+                try self.checkBody(fe.body, outs);
+            },
             .match => |m| for (m.arms) |arm| try self.checkBody(arm.body, outs),
             .call, .throw, .print => {},
             .let_const => |l| try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
             .param, .kind, .connection, .func => try self.note(self.failNear(stmtPos(s).?, "{s}", .{body_stmt_rule})),
         };
+    }
+
+    /// A FOR EACH's rows as the run discovers them: `$name` must be a JSON PARAM, and
+    /// a query whose columns are known must give each loop variable one.
+    fn checkLoopSource(self: *Ctx, fe: ast.ForEach) Error!void {
+        switch (fe.source) {
+            .json_path => |q| {
+                const declared = self.json_params orelse return;
+                if (!containsName(declared, q.parts[0]))
+                    return self.note(failAt(self.diag, q.span, "{s}", .{try notJsonParamMsg(self.arena, q.parts[0])}));
+            },
+            .pipeline => |p| {
+                if (p.stages.len == 0) return;
+                const stages = try self.arena.alloc(ast.Stage, p.stages.len + 1);
+                @memcpy(stages[0..p.stages.len], p.stages);
+                stages[p.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = p.pos };
+                const o = try self.attempt(self.analyzeOutput(.{ .stages = stages, .pos = p.pos })) orelse return;
+                const schema = (if (o.stages.len > 0) o.stages[o.stages.len - 1].out_schema else o.source.schema) orelse return;
+                if (try loopColumnsProblem(self.arena, schema.fields.len, fe.var_names.len)) |why|
+                    return self.note(failPos(self.diag, p.pos, "{s}", .{why}));
+            },
+            .read => {},
+        }
     }
 
     fn failNear(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
@@ -1219,7 +1284,10 @@ const Ctx = struct {
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`", .{});
-        for (stages) |st| try checkStageLiterals(self.diag, st);
+        for (stages) |st| {
+            try checkStageLiterals(self.diag, st);
+            try checkStageHoles(self.arena, st, self.diag);
+        }
         try checkJoinOrders(stages, self.diag);
 
         var source = self.resolveSource(stages[0]) catch |e| {
@@ -1739,6 +1807,7 @@ test {
     _ = @import("analyze/render.zig");
     _ = @import("analyze/schema.zig");
     _ = @import("analyze/targets.zig");
+    _ = @import("analyze/holes.zig");
     _ = @import("analyze/tests.zig");
     _ = @import("analyze/testing_util.zig");
 }

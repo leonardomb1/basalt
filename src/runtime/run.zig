@@ -161,12 +161,18 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     for (program.stmts) |s| {
         if (s != .param or !s.param.is_json) continue;
         const name = s.param.name;
-        for (opts.params) |kv| {
-            if (!std.mem.eql(u8, kv.key, name)) continue;
-            if (std.json.parseFromSliceLeaky(std.json.Value, arena, kv.val, .{})) |jv| {
-                try json_params.put(name, jv);
-            } else |_| return planErr(diag, try std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}));
-        }
+        var text: ?[]const u8 = if (s.param.default) |d| (if (d.* == .str_lit) d.str_lit else null) else null;
+        for (opts.params) |kv| if (std.mem.eql(u8, kv.key, name)) {
+            text = kv.val;
+        };
+        const t = text orelse {
+            const e = planErr(diag, try std.fmt.allocPrint(arena, "missing required param `{s}`", .{name}));
+            diag.pos = s.param.pos;
+            return e;
+        };
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{})) |jv| {
+            try json_params.put(name, jv);
+        } else |_| return planErr(diag, try std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}));
     }
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);

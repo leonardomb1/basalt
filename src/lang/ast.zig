@@ -606,6 +606,7 @@ pub const FnParam = struct {
     name: []const u8,
     ty: ?types.Type = null,
     default: ?*Expr = null,
+    pos: ?Pos = null,
 };
 
 pub const FnBody = union(enum) {

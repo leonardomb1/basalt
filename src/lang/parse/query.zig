@@ -20,6 +20,7 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const isGroupKey = @import("../sql_parser.zig").isGroupKey;
 const itemLabel = @import("../sql_parser.zig").itemLabel;
+const itemPos = @import("../sql_parser.zig").itemPos;
 const keepOutputs = @import("../sql_parser.zig").keepOutputs;
 const nameApart = @import("../sql_parser.zig").nameApart;
 const ownsStrippedKey = @import("../sql_parser.zig").ownsStrippedKey;
@@ -1492,7 +1493,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     continue;
                 },
             }
-            return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{itemLabel(it)});
+            return self.fail(itemPos(it) orelse pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{itemLabel(it)});
         }
         if (needs_pre) {
             var needed = std.array_list.Managed(ast.QualName).init(self.arena);

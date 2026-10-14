@@ -152,6 +152,10 @@ pub fn expectRefusedAlike(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tm
         std.debug.print("want `{s}` in `{s}`\n", .{ want, msg });
         return error.TestUnexpectedResult;
     };
+    if (!std.meta.eql(adiag.pos, rdiag.pos)) {
+        std.debug.print("check at {?}, run at {?}: {s}\n", .{ adiag.pos, rdiag.pos, script });
+        return error.TestUnexpectedResult;
+    }
 }
 
 pub fn expectFile(tmp: *std.testing.TmpDir, name: []const u8, want: []const u8) !void {

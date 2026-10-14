@@ -599,7 +599,7 @@ test "sql: a non-DEFAULT parameter may not follow a defaulted one" {
     try testing.expect(std.mem.indexOf(u8, diag.msg, "without DEFAULT") != null);
 }
 
-test "sql: a function may not name a parameter twice" {
+test "sql: a function may not name a parameter twice, nor a required one after a DEFAULT, each refused at the parameter" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -609,6 +609,13 @@ test "sql: a function may not name a parameter twice" {
         \\SELECT f(1, 2) AS v FROM 'x.csv';
     , &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "parameter `a` is declared twice") != null);
+    try testing.expectEqual(@as(usize, 22), diag.col);
+    try testing.expectError(error.ParseFailed, parseSource(a, "CREATE FUNCTION f(a DEFAULT 1, b) AS a;\nSELECT 1 AS v;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "without DEFAULT follows one with DEFAULT") != null);
+    try testing.expectEqual(@as(usize, 32), diag.col);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT a, b, COUNT(*) AS c FROM 'x.csv' GROUP BY a;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`b` is neither an aggregate nor a grouping key") != null);
+    try testing.expectEqual(@as(usize, 11), diag.col);
 }
 
 test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {

@@ -1495,6 +1495,12 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', bogus = 'x');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "postgres connection `pg`: unknown option `bogus`" },
         .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (database = 'd');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "postgres connection `pg` needs a `host`" },
         .{ "CREATE CONNECTION ms TYPE sqlserver OPTIONS (host = 'h', auth = 'kerberos', user = 'me', tls = 'require');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "`auth = 'kerberos'` needs the `realm`" },
+        .{ "PRINT 1;\nFOR EACH ROW OF (SELECT 1 AS a) AS (a, b)\n  PRINT $a;\nEND FOR;", "returns fewer columns than loop variables (1 for 2)" },
+        .{ "PRINT 1;\nFOR EACH ROW OF ($j) AS (x)\n  PRINT $x;\nEND FOR;", "for-each: `j` is not a JSON param" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv') AS (x)\n  LOAD INTO '$B/o_${x:lower}.csv' AS SELECT 1 AS a;\nEND FOR;", "`${x:lower}`: unexpected trailing input" },
+        .{ "PRINT 1;\nSELECT t.nope FROM '$B/a.csv' t;", "unknown field `nope`" },
+        .{ "PRINT 1;\nSELECT IDENTIFIER('nope') FROM '$B/a.csv';", "unknown field `nope`" },
+        .{ "PRINT 1;\nSELECT * FROM '$B/a.csv' p JOIN '$B/a.csv' q ON p.nope = q.x;", "unknown column `p.nope`" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }
@@ -1551,6 +1557,33 @@ test "a JSON PARAM's paths bind from -p in a batch run, a missing key is an erro
     try std.testing.expectEqualStrings("b,n\nx,14\n", got);
 
     try std.testing.expectError(error.PlanFailed, runScript(alloc, &tmp, script, &.{.{ .key = "job", .val = "{\"n\":5}" }}));
+}
+
+test "a FOR EACH over a JSON PARAM iterates its string DEFAULT, and a JSON PARAM given nothing is missing" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\PARAM rows JSON DEFAULT '[{{"x":"a"}},{{"x":"b"}}]';
+        \\FOR EACH ROW OF ($rows) AS (x)
+        \\  LOAD INTO '{s}/out_${{x}}.csv' AS SELECT '${{x}}' AS v;
+        \\END FOR;
+    , .{base});
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag);
+    try expectFile(&tmp, "out_b.csv", "v\nb\n");
+
+    const bare = try parser.parseSource(parena.allocator(), "PARAM rows JSON;\nFOR EACH ROW OF ($rows) AS (x)\n  PRINT $x;\nEND FOR;", &pdiag);
+    try std.testing.expectError(error.PlanFailed, run(alloc, bare, .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectEqualStrings("missing required param `rows`", rdiag.msg);
+    try std.testing.expectEqual(@as(u32, 1), rdiag.pos.?.line);
 }
 
 test "an EXPLAIN statement's analyze error keeps check's position" {

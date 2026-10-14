@@ -5,6 +5,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const Row = @import("../env.zig").Row;
 const aborting = @import("../env.zig").aborting;
+const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildPipeline = @import("../plan.zig").buildPipeline;
 const jsonToStr = @import("../plan.zig").jsonToStr;
@@ -17,8 +18,7 @@ const std = @import("std");
 /// every discovery form so all agree on coercion and the column-count error.
 fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, ncols: usize) !void {
     if (b.columns.len == 0) return;
-    if (b.columns.len < ncols)
-        return planErr(env.diag, "for-each: the discovery query returns fewer columns than loop variables");
+    if (try analyze.loopColumnsProblem(env.arena, b.columns.len, ncols)) |why| return planErr(env.diag, why);
     for (0..b.len) |r| {
         const row = try env.arena.alloc([]const u8, ncols);
         for (0..ncols) |j| {
@@ -93,8 +93,14 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
 /// like-named field of each element as text.
 pub fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []const u8) ![]const Row {
     const head = path.parts[0];
-    var cur = env.json_params.get(head) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: `{s}` is not a JSON param", .{head}));
+    var cur = env.json_params.get(head) orelse {
+        const e = planErr(env.diag, try analyze.notJsonParamMsg(env.arena, head));
+        if (path.span) |sp| {
+            env.diag.pos = sp.start;
+            env.diag.end = sp.end;
+        }
+        return e;
+    };
     for (path.parts[1..], 0..) |key, j| {
         const seg_safe = j < path.safe.len and path.safe[j];
         cur = switch (cur) {

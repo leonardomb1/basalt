@@ -366,6 +366,30 @@ pub fn itemLabel(it: ast.SelectItem) []const u8 {
     return outName(it) orelse "*";
 }
 
+/// Where a select item's text starts, as far as its first column reference shows it.
+pub fn itemPos(it: ast.SelectItem) ?Pos {
+    return switch (it) {
+        .field => |q| if (q.span) |s| s.start else null,
+        .computed => |c| exprPos(c.expr),
+        else => null,
+    };
+}
+
+fn exprPos(e: *const ast.Expr) ?Pos {
+    return switch (e.*) {
+        .field => |q| if (q.span) |s| s.start else null,
+        .unary => |u| exprPos(u.e),
+        .binary => |b| exprPos(b.l) orelse exprPos(b.r),
+        .cast => |c| exprPos(c.e),
+        .is_null => |n| exprPos(n.e),
+        .cond => |c| exprPos(c.cond) orelse exprPos(c.then) orelse exprPos(c.els),
+        .call => |c| for (c.args) |a| {
+            if (exprPos(a)) |p| break p;
+        } else null,
+        else => null,
+    };
+}
+
 pub const TableFrame = struct {
     names: []const []const u8,
     args: []const *ast.Expr,
@@ -913,7 +937,7 @@ pub fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
 }
 
 pub fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
-    if (qualHasPrefix(q, prefix)) return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{} };
+    if (qualHasPrefix(q, prefix)) return .{ .parts = q.parts[1..], .safe = if (q.safe.len > 0) q.safe[1..] else &.{}, .span = q.span };
     return q;
 }
 
