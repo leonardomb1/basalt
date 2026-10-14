@@ -142,6 +142,10 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             return if (diag.retryable) 75 else 1;
         },
         error.OutOfMemory => return e,
+        error.WriteFailed => if (stdoutClosed()) return 0 else {
+            try stderr.print("{s}: runtime error: {s}\n", .{ src.label, runtime.failLabel(e) });
+            return 1;
+        },
         else => {
             const transient = diag.retryable or runtime.isTransient(e);
             if (diag.msg.len > 0)
@@ -154,6 +158,14 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         },
     };
     return reportFailedItems(eo, &sink);
+}
+
+/// Whether stdout's reader has gone (`basalt run ... | head`): a write that failed
+/// for that is the reader's choice, ended quietly as `rg` and `grep` do, not an error.
+fn stdoutClosed() bool {
+    var fds = [_]std.posix.pollfd{.{ .fd = std.posix.STDOUT_FILENO, .events = std.posix.POLL.OUT, .revents = 0 }};
+    _ = std.posix.poll(&fds, 0) catch return false;
+    return fds[0].revents & std.posix.POLL.ERR != 0;
 }
 
 /// The exit code for a run whose `FOR EACH` items failed under `ON ERROR CONTINUE`,
