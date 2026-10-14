@@ -121,7 +121,7 @@ pub const Type = struct {
 pub const Schema = struct {
     fields: []const Field,
 
-    pub const Field = struct { name: []const u8, ty: Type, rel: []const u8 = "", base: []const u8 = "" };
+    pub const Field = struct { name: []const u8, ty: Type, rel: []const u8 = "", base: []const u8 = "", clash: bool = false };
 
     pub fn indexOf(self: Schema, name: []const u8) ?usize {
         for (self.fields, 0..) |f, i| {
@@ -140,6 +140,17 @@ pub const Schema = struct {
             if (std.mem.eql(u8, f.name, name)) n += 1;
         }
         return n > 1;
+    }
+
+    /// Whether one of the join sides `sides` brought a `name` the join renamed
+    /// `name_r` for a clash, so that `name` written bare beside those joins could
+    /// mean either table, as SQL reads it.
+    pub fn clashes(self: Schema, name: []const u8, sides: []const []const u8) bool {
+        for (self.fields) |f| {
+            if (!f.clash or !std.mem.eql(u8, f.base, name)) continue;
+            for (sides) |r| if (std.mem.eql(u8, f.rel, r)) return true;
+        }
+        return false;
     }
 
     /// The column a possibly qualified name refers to. `b.x`, where `b` is a join's

@@ -172,6 +172,7 @@ pub const AliasSet = struct {
     usings: [MAX_ALIASES][]const UsingKey = undefined,
     n: usize = 0,
     implicit: []const u8 = "",
+    sides: []const []const u8 = &.{},
 
     fn put(self: *AliasSet, name: []const u8, kind: Kind) error{ AliasTaken, TooManyAliases }!void {
         for (self.names[0..self.n]) |a| if (std.mem.eql(u8, a, name)) return error.AliasTaken;
@@ -660,6 +661,7 @@ pub const Parser = struct {
             error.AliasTaken => self.fail(pos, "`{s}` names two tables in this FROM; give one of them a different alias", .{name}),
             error.TooManyAliases => self.fail(pos, "more than {d} tables in one FROM", .{MAX_ALIASES}),
         };
+        if (kind != .left) aliases.sides = try aliases.rights(self.arena);
     }
 
     /// An identifier in either spelling. `isKw` stays bare-ident only: `"select"` is a
@@ -975,9 +977,15 @@ pub fn stripPrefix(q: ast.QualName, prefix: []const u8) ast.QualName {
 }
 
 /// `t.x` as `x` where `t` is the FROM table; a USING key `t.k` as that table's own
-/// copy of it, not the merged `k`.
+/// copy of it, not the merged `k`. A name written bare carries the FROM's join
+/// sides, against which `Schema.clashes` judges it.
 pub fn stripQual(q: ast.QualName, aliases: *const AliasSet) ast.QualName {
-    if (q.dollar or q.parts.len < 2) return q;
+    if (q.dollar) return q;
+    if (q.parts.len < 2) {
+        var out = q;
+        if (out.sides.len == 0) out.sides = aliases.sides;
+        return out;
+    }
     if (q.parts.len == 2) if (aliases.usingCopy(q.parts[0], q.parts[1])) |copy| return .{ .parts = copy, .span = q.span };
     return if (aliases.strips(q.parts[0])) stripPrefix(q, q.parts[0]) else q;
 }

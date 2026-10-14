@@ -318,14 +318,15 @@ pub fn stripRightExpr(self: *Parser, e: *ast.Expr, rname: []const u8) Error!*ast
     return S.recur(.{ .p = self, .rname = rname }, e);
 }
 
-/// Rewrite `alias.x` to `x` in an expression tree.
+/// Rewrite `alias.x` to `x` in an expression tree, a bare `x` stamped with the
+/// FROM's join sides (`stripQual`).
 pub fn stripExpr(self: *Parser, e: *ast.Expr, aliases: *const AliasSet) Error!*ast.Expr {
     const Ctx = struct { p: *Parser, aliases: *const AliasSet };
     const S = struct {
         fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
             if (node.* == .field) {
                 const q = stripQual(node.field, cx.aliases);
-                if (q.parts.ptr != node.field.parts.ptr)
+                if (q.parts.ptr != node.field.parts.ptr or q.sides.len != node.field.sides.len)
                     return cx.p.mk(.{ .field = q });
                 return @constCast(node);
             }

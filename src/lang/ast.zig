@@ -70,6 +70,7 @@ pub const QualName = struct {
     safe: []const bool = &.{},
     dollar: bool = false,
     span: ?Span = null,
+    sides: []const []const u8 = &.{},
 
     pub fn single(self: QualName) ?[]const u8 {
         return if (self.parts.len == 1) self.parts[0] else null;

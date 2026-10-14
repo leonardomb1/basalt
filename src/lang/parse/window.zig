@@ -503,7 +503,7 @@ pub const Lower = struct {
     calls: []WinCall,
     pre: std.array_list.Managed(ast.SelectItem),
     hidden: std.array_list.Managed([]const u8),
-    carries: std.array_list.Managed([]const u8),
+    carries: std.array_list.Managed(ast.QualName),
     seen: std.array_list.Managed([2][]const u8),
 
     pub fn init(p: *Parser, calls: []WinCall) Lower {
@@ -512,22 +512,28 @@ pub const Lower = struct {
             .calls = calls,
             .pre = std.array_list.Managed(ast.SelectItem).init(p.arena),
             .hidden = std.array_list.Managed([]const u8).init(p.arena),
-            .carries = std.array_list.Managed([]const u8).init(p.arena),
+            .carries = std.array_list.Managed(ast.QualName).init(p.arena),
             .seen = std.array_list.Managed([2][]const u8).init(p.arena),
         };
     }
 
-    fn carry(self: *Lower, name: []const u8) Error!void {
+    /// A bare column the windows pass through, kept as written so a name its join
+    /// sides stamp (`stripQual`) is still judged for a clash past the windows.
+    fn carry(self: *Lower, q: ast.QualName) Error!void {
+        const name = q.parts[0];
         for (self.calls) |c| if (std.mem.eql(u8, c.hidden, name)) return;
-        for (self.carries.items) |c| if (std.mem.eql(u8, c, name)) return;
-        try self.carries.append(name);
+        for (self.carries.items) |*c| if (std.mem.eql(u8, c.parts[0], name)) {
+            if (c.sides.len == 0) c.* = q;
+            return;
+        };
+        try self.carries.append(q);
     }
 
     /// The column a window reads for `e`: itself when a bare column, else a hidden
     /// one computing it, shared by every equal expression.
     pub fn column(self: *Lower, e: *ast.Expr) Error!ast.QualName {
         if (e.* == .field and !e.field.dollar and e.field.parts.len == 1) {
-            try self.carry(e.field.parts[0]);
+            try self.carry(e.field);
             return e.field;
         }
         var buf = std.array_list.Managed(u8).init(self.p.arena);
@@ -556,7 +562,7 @@ pub const Lower = struct {
                 if (node.* == .field) {
                     if (node.field.dollar) return @constCast(node);
                     if (node.field.parts.len == 1) {
-                        try l.carry(node.field.parts[0]);
+                        try l.carry(node.field);
                         return @constCast(node);
                     }
                     return l.p.mk(.{ .field = try l.column(@constCast(node)) });

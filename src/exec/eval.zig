@@ -128,7 +128,7 @@ pub const TypeCtx = struct {
                 self.span = q.span;
                 if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
-                if (q.parts.len == 1 and self.schema.ambiguous(q.parts[0])) return self.err("column reference `{s}` is ambiguous", .{q.parts[0]});
+                if (q.parts.len == 1 and (self.schema.ambiguous(q.parts[0]) or self.schema.clashes(q.parts[0], q.sides))) return self.err("column reference `{s}` is ambiguous", .{q.parts[0]});
                 const idx = fieldIndex(self.schema, q) orelse {
                     if (q.parts.len > 1) return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
                     return self.err("unknown field `{s}`", .{lastPart(q)});

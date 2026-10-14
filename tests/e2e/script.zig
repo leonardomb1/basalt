@@ -101,6 +101,49 @@ test "a shown result, CTE or derived table repeats a name as SQL does; a referen
     try std.testing.expectEqualStrings("LOAD INTO writes each column under its own name, and two columns are named `a` — alias one apart in the SELECT list", rdiag.msg);
 }
 
+test "a bare name both sides of a join have is ambiguous in that query, wherever it is read; qualified, merged by USING, or past the query it is not" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "id,v\n1,a\n2,b\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "id,v\n1,x\n3,y\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\SELECT l.v, r.v FROM '{s}/l.csv' l JOIN '{s}/r.csv' r ON l.id = r.id;
+        \\SELECT * FROM '{s}/l.csv' l JOIN '{s}/r.csv' r ON l.id = r.id ORDER BY v;
+        \\SELECT id, l.v FROM '{s}/l.csv' l JOIN '{s}/r.csv' r USING (id);
+        \\WITH j AS (SELECT * FROM '{s}/l.csv' l JOIN '{s}/r.csv' r ON l.id = r.id) SELECT v, v_r FROM j;
+    , .{ base, base, base, base, base, base, base, base });
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+    const res = run(alloc, prog, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const printed = try out.end(alloc);
+    defer alloc.free(printed);
+    _ = try res;
+    try std.testing.expectEqualStrings("v,v_r\na,x\n" ++ "id,v,id_r,v_r\n1,a,1,x\n" ++ "id,v\n1,a\n" ++ "v,v_r\na,x\n", printed);
+
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    const j = "FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.id = r.id";
+    const cases = [_][]const u8{
+        "SELECT v " ++ j ++ ";",
+        "SELECT l.id " ++ j ++ " WHERE v = 'a';",
+        "SELECT count(*) AS n " ++ j ++ " GROUP BY v;",
+        "SELECT l.id FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.id = r.id AND v = 'a';",
+        "SELECT l.id " ++ j ++ " ORDER BY v;",
+        "SELECT l.id, row_number() OVER (ORDER BY v) AS rn " ++ j ++ ";",
+        "SELECT v FROM '$B/l.csv' l LEFT JOIN '$B/r.csv' r ON l.id = r.id;",
+        "SELECT v FROM '$B/l.csv' l JOIN '$B/r.csv' r USING (id);",
+        "WITH c AS (SELECT v " ++ j ++ ") SELECT * FROM c;",
+    };
+    for (cases) |c| try refuse(alloc, &tmp, c, "column reference `v` is ambiguous");
+}
+
 test "EXPLAIN mid-script explains that query without running it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -51,8 +51,13 @@ own options (`max_build`, `join_order`, `key_pushdown`) may sit in a joined
 path's `WITH (...)` after the alias — `CROSS JOIN 'big.parquet' p WITH
 (max_build = '1GB')` — and apply to the join.
 Right-side columns that collide with a left name come back suffixed `_r`, and
-`_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows. A
-qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
+`_r2`, `_r3`, … if that name is taken too — that is the name `SELECT *` shows.
+In the joining query, a bare `amt` that both sides have is refused as
+ambiguous, as SQL refuses it (`SELECT`, `WHERE`, `GROUP BY`, `ON`, a window), never
+read as the left one; a `USING` key is the one merged column, and `ORDER BY amt`
+under `SELECT *` names the output column `amt`, the suffixed one being `amt_r`.
+Past the query — from a CTE or derived table over it — the output names are
+plain names. A qualified reference needs no suffix: with `FROM t a JOIN r b`, `b.amt` is the
 right side's `amt` everywhere in the query (`SELECT`, `WHERE`, `GROUP BY`,
 `ORDER BY`, a later join's `ON`), and `SELECT b.amt` calls its output `amt`
 unless `a.amt` is already in the list (then `amt_r`). `b.*` is the right side's

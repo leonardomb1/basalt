@@ -263,6 +263,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
                         q = try distinctSortKey(self, stages.items, f, stripQual(f, &first.aliases), kpos);
                         was_qual = q.parts.len < f.parts.len;
+                        if (f.parts.len == 1 and namesOutput(first.out_keys, f.parts[0])) q.sides = &.{};
                     },
                     else => {
                         const b = try self.bindName(e, first.expr_aliases);
@@ -378,6 +379,16 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
 /// requires: a key spelled as an item's column takes that item's name, and one a list
 /// without `*` lacks, or a USING side's copy, which no `*` keeps, is refused under the
 /// name the query wrote.
+/// Whether a bare ORDER BY `name` is an output column, which SQL reads first: every
+/// one under `*` (`out_keys` null), whose clashing names the join already set
+/// apart, else one the SELECT list names; only an input column past those can be
+/// ambiguous.
+fn namesOutput(out_keys: ?[]const ast.QualName, name: []const u8) bool {
+    const keys = out_keys orelse return true;
+    for (keys) |k| if (std.mem.eql(u8, k.last(), name)) return true;
+    return false;
+}
+
 fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualName, q: ast.QualName, at: Pos) Error!ast.QualName {
     const n = stages.len;
     if (n < 2 or stages[n - 1].node != .distinct or stages[n - 1].node.distinct.on != null or stages[n - 2].node != .select) return q;
@@ -1559,8 +1570,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 try stages.append(.{ .node = .{ .select = try low.pre.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
         } else {
-            for (low.carries.items) |name| {
-                if (!providesName(items.items, name)) try items.append(.{ .field = try self.singleName(name) });
+            for (low.carries.items) |q| {
+                if (!providesName(items.items, q.parts[0])) try items.append(.{ .field = q });
             }
             try items.appendSlice(low.pre.items);
             if (items.items.len > 0) {

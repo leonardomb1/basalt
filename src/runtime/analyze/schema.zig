@@ -29,6 +29,7 @@ pub const Col = struct {
     source: union(enum) { passthrough: usize, expr: *const ast.Expr },
     rel: []const u8 = "",
     base: []const u8 = "",
+    clash: bool = false,
 };
 
 fn colNamed(cols: []const Col, name: []const u8) bool {
@@ -56,10 +57,10 @@ fn freeName(arena: std.mem.Allocator, cols: []const Col, want: []const u8, joine
 pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast.SelectItem, params: *const ParamMap, diag: *Diag) Error![]Col {
     var cols = std.array_list.Managed(Col).init(arena);
     for (items) |item| switch (item) {
-        .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base }),
+        .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash }),
         .star_except => |names| for (in.fields, 0..) |f, idx| {
             if (nameIn(names, f.name)) continue;
-            try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
+            try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash });
         },
         .star_rename => |renames| {
             for (renames) |r| if (in.indexOf(r.from) == null) {
@@ -74,7 +75,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 for (in.fields[0..idx]) |g|
                     if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name) and !std.mem.eql(u8, f.name, g.name))
                         return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
-                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
+                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash and nm.ptr == f.name.ptr });
             }
         },
         .star_of => |so| for (in.fields, 0..) |f, idx| {
@@ -110,13 +111,13 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
 /// Refuses an unqualified name two columns of `in` share, as SQL does: a derived
 /// table, CTE or file may repeat a name, but a reference to it is ambiguous.
 pub fn single(in: types.Schema, q: ast.QualName, diag: *Diag) Error!void {
-    if (q.parts.len == 1 and in.ambiguous(q.parts[0]))
+    if (q.parts.len == 1 and (in.ambiguous(q.parts[0]) or in.clashes(q.parts[0], q.sides)))
         return failAt(diag, q.span, "column reference `{s}` is ambiguous", .{q.parts[0]});
 }
 
 pub fn schemaOfCols(arena: std.mem.Allocator, cols: []const Col) Error!types.Schema {
     const fields = try arena.alloc(types.Schema.Field, cols.len);
-    for (cols, fields) |c, *f| f.* = .{ .name = c.name, .ty = c.ty, .rel = c.rel, .base = c.base };
+    for (cols, fields) |c, *f| f.* = .{ .name = c.name, .ty = c.ty, .rel = c.rel, .base = c.base, .clash = c.clash };
     return .{ .fields = fields };
 }
 
@@ -653,7 +654,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     for (left.fields) |f| {
         const stale = std.mem.eql(u8, f.rel, rel);
-        try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = if (stale) "" else f.rel, .base = if (stale) "" else f.base });
+        try fields.append(.{ .name = f.name, .ty = if (left_nullable) f.ty.asNullable() else f.ty, .rel = if (stale) "" else f.rel, .base = if (stale) "" else f.base, .clash = f.clash and !stale });
     }
     if (emit_right) for (right.fields) |f| {
         var name = f.name;
@@ -669,6 +670,7 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
             .ty = if (right_nullable) f.ty.asNullable() else f.ty,
             .rel = if (j.alias.len != 0) j.alias else j.binding,
             .base = f.name,
+            .clash = n > 0,
         });
     };
     return .{
