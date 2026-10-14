@@ -68,7 +68,8 @@ source is asked to do are on [Pushdown](pushdown.md).
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
   `size`→`page_size`, `total`→`total_field`, `field`→`cursor_field`,
-  `start`→`start_page`, `max`→`max_pages`); unknown keys pass through. A
+  `start`→`start_page`, `max`→`max_pages`); any other key is a REST option's
+  own name. A
   cursor that is a full `http(s)://` URL is fetched as given; any other is
   URL-encoded into the cursor parameter.
 - **`RETRY n [ON (429, 503)]`** — retries + retryable statuses.
@@ -95,7 +96,9 @@ source is asked to do are on [Pushdown](pushdown.md).
 ## WITH options
 
 A read's `WITH (...)` takes `key = value` pairs and bare flags. `PAGINATE BY` and
-`RETRY` (above) are shorthands that set some of the REST ones.
+`RETRY` (above) are shorthands that set some of the REST ones. A key the source
+does not read — misspelled, or one of another kind of source — is a plan-time
+error rather than ignored.
 
 **Files**
 

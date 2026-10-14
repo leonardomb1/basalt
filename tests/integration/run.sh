@@ -228,7 +228,7 @@ collrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
   local decl=$2 pq="$out/coll_$1.parquet"
   printf 'n,code\n1,a\n2,B\n3,b\n4,000123\n5,000123   \n6,Z\n7,x[1]\n8,\n9,a\303\251\n10,  \n' >"$out/coll.csv"
   if ! brun run -c "$decl
-LOAD INTO $3 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(code AS STRING) AS code FROM '$out/coll.csv' WITH (null = '');" ||
+LOAD INTO $3 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(code AS STRING) AS code FROM '$out/coll.csv';" ||
      ! brun run -c "$decl
 LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
     report "$1-collation (setup error)" bad

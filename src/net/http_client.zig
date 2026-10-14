@@ -1,7 +1,7 @@
 //! The REST/JSON source. GETs a URL and yields one batch per page of JSON
 //! objects. Auth and pagination ride on the read's hints — its `PAGINATE`,
 //! `RETRY` and `WITH (...)` clauses — whose keys mirror the `Options` field names
-//! (unknown hints are ignored):
+//! (a key no REST read takes is refused at plan time):
 //!
 //!   SELECT * FROM HTTP('https://api.x/items')
 //!     PAGINATE BY cursor (field = 'next')
@@ -36,8 +36,8 @@
 //! Connection-level form: `CREATE CONNECTION itsm TYPE http OPTIONS (base_url =
 //! ...)` and `FROM itsm.GET('/path', k = v)`. The path resolves against the
 //! connection's `base_url` (spaces auto-encoded, so OData filters read naturally)
-//! and auth lives on the connection; unknown connection keys are an error,
-//! unlike hints:
+//! and auth lives on the connection; unknown connection keys are an error
+//! too:
 //!   auth = 'bearer'      token = env('TOK')                  -> Bearer <token>
 //!   auth = 'basic'       user = ..., password = ...          -> Basic <b64>
 //!   auth = 'header'      header_name/header_value            -> any API-key header

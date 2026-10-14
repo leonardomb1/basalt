@@ -1164,6 +1164,7 @@ const Ctx = struct {
             .binding => |b| {
                 try self.bindings.put(b.name, try self.limitsBound(b.pipeline));
                 try self.checkBindingLiterals(b.pipeline);
+                try self.checkLeadForm(b.pipeline);
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
@@ -1200,6 +1201,7 @@ const Ctx = struct {
                 try saved.append(.{ .name = b.name, .prev = self.bindings.get(b.name) });
                 try self.bindings.put(b.name, try self.limitsBound(b.pipeline));
                 try self.checkBindingLiterals(b.pipeline);
+                try self.checkLeadForm(b.pipeline);
             },
             .output => |p| if (try self.attempt(self.analyzeOutput(p))) |o| try outs.append(o),
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
@@ -1357,6 +1359,22 @@ const Ctx = struct {
         };
     }
 
+    /// Every binding's read, a UNION branch's among them, is checked where it is
+    /// declared, since a branch is never resolved as a pipeline's lead.
+    fn checkLeadForm(self: *Ctx, p: ast.Pipeline) !void {
+        if (p.stages.len == 0) return;
+        const lead = p.stages[0];
+        const connector = switch (lead.node) {
+            .read => |rd| if (self.connections.get(rd.connector)) |c| c.connector else rd.connector,
+            .union_ => "union",
+            else => "",
+        };
+        checkSourceForm(lead, connector, self.diag) catch |e| {
+            self.diag.stamp(lead.pos);
+            return e;
+        };
+    }
+
     fn resolveSource(self: *Ctx, lead: ast.Stage) !Source {
         switch (lead.node) {
             .read => |rd| {
@@ -1366,6 +1384,7 @@ const Ctx = struct {
                 const connector = if (conn) |c| c.connector else rd.connector;
                 if (conn != null and !isSqlSource(connector) and !std.mem.eql(u8, connector, "http"))
                     return fail(self.diag, "{s}", .{try options.unsupportedSourceMsg(self.arena, connector)});
+                try checkSourceForm(lead, connector, self.diag);
                 const detail = switch (rd.form) {
                     .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
@@ -1393,6 +1412,7 @@ const Ctx = struct {
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
+                try checkSourceForm(lead, "", self.diag);
                 const b = self.bindings.get(name) orelse {
                     if (self.knownTable(name)) |k|
                         return .{ .connector = "session", .detail = try std.fmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
@@ -1404,6 +1424,7 @@ const Ctx = struct {
                 return src;
             },
             .union_ => |un| {
+                try checkSourceForm(lead, "union", self.diag);
                 const detail = if (un.discover_query.len > 0 or un.discover_pipeline != null)
                     try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
@@ -1731,6 +1752,66 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
     return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
 }
+
+const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
+const csv_read_keys = [_][]const u8{ "format", "delimiter", "delim", "encoding" };
+const xlsx_read_keys = [_][]const u8{ "format", "sheet", "range", "header" };
+const rest_read_keys = [_][]const u8{
+    "items",          "method",        "body",         "body_type",   "header",    "bearer",
+    "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
+    "page_param",     "start_page",    "start_offset", "size_param",  "page_size", "cursor_param",
+    "cursor_field",   "total_field",   "max_pages",    "stop_short",  "prefetch",  "retries",
+    "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms",
+};
+const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr" };
+
+const ReadKind = struct { what: []const u8, keys: []const []const u8, takes: []const u8 };
+
+const csv_read = ReadKind{ .what = "a CSV read", .keys = &csv_read_keys, .takes = "format, delimiter, encoding" };
+const xlsx_read = ReadKind{ .what = "an Excel read", .keys = &xlsx_read_keys, .takes = "format, sheet, range, header" };
+const columnar_read = ReadKind{ .what = "a Parquet or Arrow read", .keys = &[_][]const u8{"format"}, .takes = "only format" };
+const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
+const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind" }, .takes = "split, splits, split_kind" };
+const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes = "table_field, tag_field, tag_substr" };
+const other_read = ReadKind{ .what = "this source", .keys = &.{}, .takes = "no options" };
+
+/// A read's `WITH` key that its kind of source does not read is refused rather
+/// than ignored, so a misspelled `delimeter` fails instead of reading commas.
+/// `connector` is the resolved source type: a file is `csv` whatever its format.
+pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Error!void {
+    const kind: ReadKind = switch (lead.node) {
+        .read => |rd| if (std.mem.eql(u8, connector, "csv")) blk: {
+            const fmt = (formatFromHints(lead.hints, diag) catch null) orelse
+                (if (rd.form == .path) formatOfPath(rd.form.path) else null);
+            break :blk if (fmt) |f| switch (f) {
+                .xlsx => xlsx_read,
+                .csv => csv_read,
+                else => columnar_read,
+            } else csv_read;
+        } else if (std.mem.eql(u8, connector, "http"))
+            rest_read
+        else if (isSqlSource(connector))
+            sql_read
+        else
+            other_read,
+        .union_ => union_read,
+        else => other_read,
+    };
+    for (lead.hints) |h| {
+        if (containsName(kind.keys, h.key) or containsName(&any_read_keys, h.key)) continue;
+        if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
+        const e = if (containsName(&join_hint_keys, h.key))
+            fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})
+        else if (containsName(&csv_read_keys, h.key) or containsName(&xlsx_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
+            fail(diag, "read option `{s}` does not apply to {s}, which takes {s}", .{ h.key, kind.what, kind.takes })
+        else
+            fail(diag, "unknown read option `{s}`: {s} takes {s}", .{ h.key, kind.what, kind.takes });
+        diag.pos = h.pos;
+        return e;
+    }
+}
+
+const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
 
 fn containsName(names: []const []const u8, n: []const u8) bool {
     for (names) |x| if (std.mem.eql(u8, x, n)) return true;
