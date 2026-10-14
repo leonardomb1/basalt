@@ -521,6 +521,10 @@ pub const Join = struct {
     replay: []const Batch = &.{},
     replay_pos: usize = 0,
 
+    probe_mem: ?std.heap.ArenaAllocator = null,
+    batch_mem: ?std.heap.ArenaAllocator = null,
+    pair_mem: ?std.heap.ArenaAllocator = null,
+
     cross_mem: ?std.heap.ArenaAllocator = null,
     cross_batch: ?Batch = null,
     cross_pos: usize = 0,
@@ -537,7 +541,7 @@ pub const Join = struct {
         };
         if (self.kind == .cross) return self.nextCross(arena, ix);
         while (!self.probe_done) {
-            if (try self.nextProbe(arena)) |lb| {
+            if (try self.nextProbe(fresh(self.state, &self.probe_mem))) |lb| {
                 const out = try self.joinBatch(arena, ix, lb);
                 if (out.len > 0) return out;
             } else {
@@ -645,6 +649,10 @@ pub const Join = struct {
     /// current partition's index and mappings freed.
     pub fn release(self: *Join) void {
         if (self.grace) |g| g.deinit();
+        for ([_]*?std.heap.ArenaAllocator{ &self.probe_mem, &self.batch_mem, &self.pair_mem }) |m| {
+            if (m.*) |*a| a.deinit();
+            m.* = null;
+        }
     }
 
     /// Whether this join may spill: never a CROSS join, which has no key to split
@@ -741,7 +749,7 @@ pub const Join = struct {
         while (true) {
             if (g.index) |ix| {
                 if (!self.probe_done) {
-                    if (g.reader) |*r| while (try r.next(arena)) |pb| {
+                    if (g.reader) |*r| while (try r.next(fresh(self.state, &self.probe_mem))) |pb| {
                         const out = try self.joinBatch(arena, ix, pb);
                         if (out.len > 0) return out;
                     };
@@ -924,13 +932,17 @@ pub const Join = struct {
 
     /// One probe batch to one output batch, gathered from index lists. Under NOT IN a
     /// null on either side against a non-empty build is unknown and drops the row.
-    fn joinBatch(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
+    /// The probe batch (`probe_mem`) and the index lists (`batch_mem`) are reset per
+    /// batch and only the output goes to `out`: a semi or anti join may emit nothing
+    /// for a long stretch, and `next` keeps joining with the same `out`.
+    fn joinBatch(self: *Join, out: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
+        const arena = fresh(self.state, &self.batch_mem);
         var lidx = std.array_list.Managed(usize).init(arena);
         var ridx = std.array_list.Managed(usize).init(arena);
         var rnull = std.array_list.Managed(bool).init(arena);
         try lidx.ensureTotalCapacity(lb.len);
 
-        if (self.residual != null) return self.joinBatchResidual(arena, ix, lb);
+        if (self.residual != null) return self.joinBatchResidual(out, arena, ix, lb);
         const fill_right = (self.kind == .left or self.kind == .full);
         const classes = try ix.classesFor(arena, lb, self.left_keys);
         try ridx.ensureTotalCapacity(lb.len);
@@ -978,70 +990,132 @@ pub const Join = struct {
                 },
             }
         }
-        return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+        return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
     }
 
-    /// `joinBatch` with a residual condition: every key match becomes a candidate
-    /// pair, the condition is evaluated over all of them at once, and only the
-    /// pairs it holds for match — a row whose candidates all fail is unmatched.
-    fn joinBatchResidual(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
+    /// `joinBatch` with a residual condition: key matches become candidate pairs,
+    /// evaluated in buffers of up to `pair_chunk` in `pair_mem`, so a key with many
+    /// build rows never holds a probe batch's every pair at once. Rows are finished in
+    /// order as their last pairs are evaluated: a row whose candidates all fail is
+    /// unmatched. A semi or anti join needs only a row's first match, so a row's chain
+    /// is cut at a window that starts at `first_win` and doubles, and walked no
+    /// further once it matched.
+    fn joinBatchResidual(self: *Join, out: std.mem.Allocator, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch) anyerror!Batch {
         const classes = try ix.classesFor(arena, lb, self.left_keys);
         const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
-        var cl = std.array_list.Managed(usize).init(arena);
-        var cr = std.array_list.Managed(usize).init(arena);
+        const short = self.kind == .semi or self.kind == .anti;
+        var rs = Residual{
+            .join = self,
+            .ix = ix,
+            .lb = lb,
+            .hits = try arena.alloc(bool, lb.len),
+            .lidx = std.array_list.Managed(usize).init(arena),
+            .ridx = std.array_list.Managed(usize).init(arena),
+            .rnull = std.array_list.Managed(bool).init(arena),
+        };
+        @memset(rs.hits, false);
+        try rs.begin();
         for (0..lb.len) |r| {
             if (empty or anyNullKey(lb.columns, self.left_keys, r)) continue;
+            var win: usize = first_win;
+            var in_buf: usize = 0;
             var cur = ix.findHashed(lb, self.left_keys, classes, r, hashRowKeys(lb.columns, self.left_keys, classes, r));
             while (cur) |br| {
-                try cl.append(r);
-                try cr.append(br);
+                if (rs.cl.items.len >= pair_chunk or (short and in_buf >= win)) {
+                    if (short and in_buf >= win) win *= 2;
+                    try rs.flush();
+                    in_buf = 0;
+                    if (short and rs.hits[r]) break;
+                }
+                rs.cl.appendAssumeCapacity(r);
+                rs.cr.appendAssumeCapacity(br);
+                in_buf += 1;
                 cur = ix.chainNext(br);
             }
         }
-
-        const pass = try arena.alloc(bool, cl.items.len);
-        if (cl.items.len > 0) {
-            const nl = lb.columns.len;
-            const cols = try arena.alloc(column.Column, nl + ix.build_batch.columns.len);
-            for (lb.columns, 0..) |c, i| cols[i] = try takeCol(arena, c, cl.items, &.{});
-            for (ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(arena, c, cr.items, &.{});
-            const pairs = Batch{ .schema = self.pair_schema.?, .columns = cols, .len = cl.items.len };
-            const mask = eval.evalColumn(arena, self.residual.?, pairs, types.Type.init(.bool)) catch |e| {
-                if (self.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
-                return e;
-            };
-            for (pass, 0..) |*p, i| p.* = mask.validity.get(i) and mask.data.b[i];
-        }
-
-        const fill_right = (self.kind == .left or self.kind == .full);
-        var lidx = std.array_list.Managed(usize).init(arena);
-        var ridx = std.array_list.Managed(usize).init(arena);
-        var rnull = std.array_list.Managed(bool).init(arena);
-        var p: usize = 0;
-        for (0..lb.len) |r| {
-            var hit = false;
-            while (p < cl.items.len and cl.items[p] == r) : (p += 1) {
-                if (!pass[p]) continue;
-                hit = true;
-                if (self.kind == .semi or self.kind == .anti) continue;
-                try lidx.append(r);
-                try ridx.append(cr.items[p]);
-                if (fill_right) try rnull.append(false);
-                if (self.matched) |m| m[cr.items[p]] = true;
-                if (self.shared_matched) |sm| markShared(sm, cr.items[p]);
-            }
-            switch (self.kind) {
-                .semi => if (hit) try lidx.append(r),
-                .anti => if (!hit) try lidx.append(r),
-                else => if (!hit and fill_right) {
-                    try lidx.append(r);
-                    try ridx.append(0);
-                    try rnull.append(true);
-                },
-            }
-        }
-        return self.gatherOut(arena, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+        try rs.flush();
+        while (rs.fin < lb.len) : (rs.fin += 1) try rs.finish(rs.fin);
+        return self.gatherOut(out, ix, lb, rs.lidx.items, rs.ridx.items, rs.rnull.items, rs.lidx.items.len);
     }
+
+    const pair_chunk = 1 << 16;
+    const first_win = 1024;
+
+    const Residual = struct {
+        join: *Join,
+        ix: *JoinIndex,
+        lb: Batch,
+        hits: []bool,
+        lidx: std.array_list.Managed(usize),
+        ridx: std.array_list.Managed(usize),
+        rnull: std.array_list.Managed(bool),
+        cl: std.ArrayListUnmanaged(usize) = .empty,
+        cr: std.ArrayListUnmanaged(usize) = .empty,
+        fin: usize = 0,
+
+        fn pairArena(rs: *Residual) std.mem.Allocator {
+            return rs.join.pair_mem.?.allocator();
+        }
+
+        /// The buffered pairs evaluated, their matches recorded, and every row before
+        /// the buffer's last finished; the buffer then starts over in a reset arena.
+        fn flush(rs: *Residual) !void {
+            const j = rs.join;
+            const n = rs.cl.items.len;
+            if (n > 0) {
+                const pa = rs.pairArena();
+                const nl = rs.lb.columns.len;
+                const cols = try pa.alloc(column.Column, nl + rs.ix.build_batch.columns.len);
+                for (rs.lb.columns, 0..) |c, i| cols[i] = try takeCol(pa, c, rs.cl.items, &.{});
+                for (rs.ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(pa, c, rs.cr.items, &.{});
+                const pairs = Batch{ .schema = j.pair_schema.?, .columns = cols, .len = n };
+                const mask = eval.evalColumn(pa, j.residual.?, pairs, types.Type.init(.bool)) catch |e| {
+                    if (j.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
+                    return e;
+                };
+                const fill_right = (j.kind == .left or j.kind == .full);
+                for (rs.cl.items, rs.cr.items, 0..) |r, br, i| {
+                    while (rs.fin < r) : (rs.fin += 1) try rs.finish(rs.fin);
+                    if (!(mask.validity.get(i) and mask.data.b[i])) continue;
+                    rs.hits[r] = true;
+                    if (j.kind == .semi or j.kind == .anti) continue;
+                    try rs.lidx.append(r);
+                    try rs.ridx.append(br);
+                    if (fill_right) try rs.rnull.append(false);
+                    if (j.matched) |m| m[br] = true;
+                    if (j.shared_matched) |sm| markShared(sm, br);
+                }
+            }
+            try rs.begin();
+        }
+
+        /// An empty buffer of `pair_chunk` pairs in a reset `pair_mem`.
+        fn begin(rs: *Residual) !void {
+            const j = rs.join;
+            if (j.pair_mem == null) j.pair_mem = std.heap.ArenaAllocator.init(j.state);
+            _ = j.pair_mem.?.reset(.retain_capacity);
+            const pa = rs.pairArena();
+            rs.cl = .empty;
+            rs.cr = .empty;
+            try rs.cl.ensureTotalCapacity(pa, pair_chunk);
+            try rs.cr.ensureTotalCapacity(pa, pair_chunk);
+        }
+
+        /// Row `r`, its candidates all evaluated, as its join kind wants it.
+        fn finish(rs: *Residual, r: usize) !void {
+            const hit = rs.hits[r];
+            switch (rs.join.kind) {
+                .semi => if (hit) try rs.lidx.append(r),
+                .anti => if (!hit) try rs.lidx.append(r),
+                .left, .full => if (!hit) {
+                    try rs.lidx.append(r);
+                    try rs.ridx.append(0);
+                    try rs.rnull.append(true);
+                },
+                else => {},
+            }
+        }
+    };
 
     /// right/full: after the probe ends, every unmatched build row with the left
     /// columns null, in chunks.
@@ -1089,6 +1163,13 @@ pub const Join = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 };
+
+/// `slot`'s arena, made over `state` on first use and reset for this use.
+fn fresh(state: std.mem.Allocator, slot: *?std.heap.ArenaAllocator) std.mem.Allocator {
+    if (slot.* == null) slot.* = std.heap.ArenaAllocator.init(state);
+    _ = slot.*.?.reset(.retain_capacity);
+    return slot.*.?.allocator();
+}
 
 /// Gather rows `idx` of `c`, then null out the `null_mask` positions (the outer-join
 /// fill). Only a source with no rows is built as an all-null column instead.
@@ -1202,6 +1283,85 @@ test "join: key pushdown sends one side's keys first and replays a read-ahead pr
         if (case.sent) try testing.expectEqual(@as(usize, 3), to_build.got.?[0].values.len);
         try testing.expectEqual(@as(usize, 1), to_probe.calls);
         try testing.expectEqual(@as(usize, 2), to_probe.got.?[0].values.len);
+    }
+}
+
+test "join: a residual over long key chains, past one pair buffer and the semi/anti window, keeps every kind's rows in order" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rv = try a.create(ast.Expr);
+    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
+    const x = try a.create(ast.Expr);
+    x.* = .{ .str_lit = "x" };
+    const residual = try a.create(ast.Expr);
+    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+
+    var rk = std.array_list.Managed(?i64).init(a);
+    var rvs = std.array_list.Managed(?[]const u8).init(a);
+    for (0..70_000) |i| {
+        try rk.append(1);
+        try rvs.append(if (i % 9000 == 8999) "y" else "x");
+    }
+    for (0..3000) |i| {
+        try rk.append(2);
+        try rvs.append(if (i == 2999) "y" else "x");
+    }
+    for (0..10) |_| {
+        try rk.append(4);
+        try rvs.append("x");
+    }
+    try rk.append(null);
+    try rvs.append("y");
+    var prng = std.Random.DefaultPrng.init(0x7e5);
+    const rnd = prng.random();
+    var lk = std.array_list.Managed(?i64).init(a);
+    var lv = std.array_list.Managed(?[]const u8).init(a);
+    const pool = [_]?i64{ 1, 2, 3, 4, null };
+    for (0..60) |i| {
+        try lk.append(pool[rnd.uintLessThan(usize, pool.len)]);
+        try lv.append(try std.fmt.allocPrint(a, "p{d}", .{i}));
+    }
+    var hits = [_]usize{0} ** 5;
+    for (rk.items, rvs.items) |k, v| {
+        if (k == null or std.mem.eql(u8, v.?, "x")) continue;
+        hits[@intCast(k.?)] += 1;
+    }
+    for ([_]ast.JoinKind{ .inner, .left, .semi, .anti }) |kind| {
+        var want = std.array_list.Managed(?[]const u8).init(a);
+        for (lk.items, lv.items) |k, v| {
+            const m: usize = if (k) |kk| hits[@intCast(kk)] else 0;
+            const n: usize = switch (kind) {
+                .inner => m,
+                .left => @max(m, 1),
+                .semi => @intFromBool(m > 0),
+                else => @intFromBool(m == 0),
+            };
+            for (0..n) |_| try want.append(v);
+        }
+        const lb = [_]Batch{ try kvBatch(a, &join_left_schema, lk.items[0..25], lv.items[0..25]), try kvBatch(a, &join_left_schema, lk.items[25..], lv.items[25..]) };
+        const rb = [_]Batch{try kvBatch(a, &join_right_schema, rk.items, rvs.items)};
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        const emit_right = kind != .semi and kind != .anti;
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = &.{0},
+            .right_keys = &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = if (emit_right) &join_both_schema else &join_left_schema,
+            .kind = kind,
+            .state = a,
+            .residual = residual,
+            .pair_schema = &join_both_schema,
+        };
+        const got = try JoinRows.collect(a, .{ .join = &jn }, 1);
+        try testing.expectEqual(want.items.len, got.rvs.items.len);
+        for (want.items, got.rvs.items) |w, g| try testing.expectEqualStrings(w.?, g.?);
     }
 }
 

@@ -169,7 +169,10 @@ const Cur = struct {
     pos: usize = 0,
     hit: bool = false,
     spans: ?[]Span = null,
+    win: usize = first_win,
 };
+
+const first_win = 1024;
 
 pub const NLJoin = struct {
     stats: Stats = .{},
@@ -192,6 +195,7 @@ pub const NLJoin = struct {
     matched: ?[]bool = null,
     sorted: ?Sorted = null,
     probe_mem: ?std.heap.ArenaAllocator = null,
+    pair_mem: ?std.heap.ArenaAllocator = null,
     cur: ?Cur = null,
     probe_done: bool = false,
     drain_pos: usize = 0,
@@ -223,6 +227,8 @@ pub const NLJoin = struct {
     fn release(self: *NLJoin) void {
         if (self.probe_mem) |*m| m.deinit();
         self.probe_mem = null;
+        if (self.pair_mem) |*m| m.deinit();
+        self.pair_mem = null;
     }
 
     fn ensureBuild(self: *NLJoin, arena: std.mem.Allocator) anyerror!*JoinIndex {
@@ -345,18 +351,34 @@ pub const NLJoin = struct {
 
     /// Pairs from where the current probe batch stands, up to `chunk` of them, the
     /// ON evaluated over them, and the output: the pairs it holds for, and each
-    /// probe row finished here that matched nothing, as its join kind wants it.
-    fn step(self: *NLJoin, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
+    /// probe row finished here that matched nothing, as its join kind wants it. A
+    /// semi or anti join needs only a row's first match, so it tries a row's pairs in
+    /// a window that starts at `first_win` and doubles while nothing matches, and a
+    /// row that matched skips the rest of its pairs. The
+    /// pairs live in `pair_mem`, reset every step, and only the output in `out`: a
+    /// semi or anti join's step often emits nothing, and `next` steps again with the
+    /// same `out`, so pairs kept there grew with the whole probe side.
+    fn step(self: *NLJoin, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
+        if (self.pair_mem == null) self.pair_mem = std.heap.ArenaAllocator.init(self.state);
+        _ = self.pair_mem.?.reset(.retain_capacity);
+        const arena = self.pair_mem.?.allocator();
         const c = &self.cur.?;
         const lb = c.batch;
         const nb = ix.build_batch.len;
         var cl = std.array_list.Managed(usize).init(arena);
         var cr = std.array_list.Managed(usize).init(arena);
         const start_row = c.row;
+        const short = self.kind == .semi or self.kind == .anti;
+        if (short and c.pos > 0 and c.hit) {
+            const sp: Span = if (c.spans) |s| s[c.row] else .{ .lo = 0, .hi = nb };
+            c.pos = sp.hi - sp.lo;
+        }
         while (c.row < lb.len and cl.items.len < self.chunk) {
             const sp: Span = if (c.spans) |s| s[c.row] else .{ .lo = 0, .hi = nb };
             const from = sp.lo + c.pos;
-            const take = @min(sp.hi -| from, self.chunk - cl.items.len);
+            var take = @min(sp.hi -| from, self.chunk - cl.items.len);
+            const cut = short and take > c.win;
+            if (cut) take = c.win;
             for (from..from + take) |i| {
                 try cl.append(c.row);
                 try cr.append(if (c.spans != null) self.sorted.?.order[i] else i);
@@ -365,6 +387,10 @@ pub const NLJoin = struct {
             if (from + take >= sp.hi) {
                 c.row += 1;
                 c.pos = 0;
+                c.win = first_win;
+            } else if (cut) {
+                c.win *= 2;
+                break;
             }
         }
 
@@ -412,7 +438,7 @@ pub const NLJoin = struct {
             hit = false;
         }
         c.hit = hit;
-        return self.gather(arena, ix, lb, lidx.items, ridx.items, rnull.items);
+        return self.gather(out, ix, lb, lidx.items, ridx.items, rnull.items);
     }
 
     /// right/full: once the probe side ends, every build row nothing matched, the
@@ -769,6 +795,35 @@ test "nljoin: the range path and the plain loop agree with a reference on random
             };
         };
     }
+}
+
+test "nljoin: semi and anti stop at a row's first match, past the first window and across chunks, as the reference says" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xa771);
+    const rnd = prng.random();
+    const tags = [_][]const u8{ "a", "b", "c", "d" };
+    const ls = try a.alloc(LRow, 40);
+    for (ls) |*l| l.* = .{
+        .x = if (rnd.uintLessThan(u8, 10) == 0) null else rnd.intRangeAtMost(i64, -5, 5000),
+        .lv = if (rnd.uintLessThan(u8, 8) == 0) null else tags[rnd.uintLessThan(usize, tags.len)],
+    };
+    const rs = try a.alloc(RRow, 5000);
+    for (rs, 0..) |*r, i| {
+        const lo: i64 = @intCast(5000 - i);
+        r.* = .{
+            .lo = if (rnd.uintLessThan(u8, 50) == 0) null else lo,
+            .hi = lo + rnd.intRangeAtMost(i64, 0, 3),
+            .rv = if (i < 4000) "z" else tags[rnd.uintLessThan(usize, tags.len)],
+        };
+    }
+    for ([_]Cond{ .less, .between, .or_eq, .above_hi }) |c| for ([_]ast.JoinKind{ .semi, .anti }) |kind| {
+        const want = try expected(a, kind, c, ls, rs);
+        for ([_]usize{ 1500, default_chunk }) |chunk| for ([_]bool{ false, true }) |rg| {
+            try expectRows(want, try runNL(a, kind, c, ls, rs, .{ .range = rg, .chunk = chunk, .per = 17 }));
+        };
+    };
 }
 
 test "nljoin: the range path pairs a probe row with only the intervals that can hold it" {
