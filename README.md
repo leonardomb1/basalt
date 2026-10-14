@@ -114,12 +114,12 @@ retrying, `1` a permanent one. See [Command line](https://leonardomb1.github.io/
 
 ## When not to use it
 
-- **Continuous replication.** basalt runs a script to completion (or once per
-  HTTP request); it does not follow a change log. Schedule it with cron, Airflow
-  or the like.
-- **Inputs larger than memory in a blocking step.** Pipelines stream, but a
-  `GROUP BY` holds its groups, a join its build side and a sort its input, with
-  no spill to disk.
+- **Continuous replication.** basalt runs a script to completion; it does not
+  follow a change log. Schedule it with cron, Airflow or the like.
+- **Inputs far larger than memory in a blocking step.** Pipelines stream, and a
+  sort, a join's build side, `DISTINCT` and a one-lane `GROUP BY` spill to disk
+  past `--op-memory`; but the per-lane tables of a parallel `GROUP BY` and
+  `count(DISTINCT)` stay in memory.
 - **Ad-hoc analytics over large local data.** A columnar database such as
   DuckDB is the better tool for that.
 
