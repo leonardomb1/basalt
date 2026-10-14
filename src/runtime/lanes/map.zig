@@ -337,6 +337,7 @@ pub fn runParallelMap(
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
+    errdefer parallel.abortLanes(sink_mode);
 
     const nthreads = split.lanes(opts);
     var ctx = MapCtx{
@@ -383,6 +384,7 @@ pub fn runParallelMap(
         shared_open = false;
         try sink_mode.shared.close();
     }
+    try parallel.finishLanes(sink_mode);
     return true;
 }
 
@@ -574,6 +576,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         .{ .shared = try openSink(env, w, lp.out_schema) };
     var shared_open = sink_mode == .shared;
     errdefer if (shared_open) sink_mode.shared.abort();
+    errdefer parallel.abortLanes(sink_mode);
 
     var ctx = SqlMapJoinCtx{
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
@@ -600,6 +603,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         shared_open = false;
         try sink_mode.shared.close();
     }
+    try parallel.finishLanes(sink_mode);
     return true;
 }
 

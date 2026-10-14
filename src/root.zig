@@ -18,6 +18,7 @@ pub const op = @import("exec/op.zig");
 pub const simd = @import("exec/simd.zig");
 pub const driver = @import("connect/driver.zig");
 pub const sql = @import("db/sql.zig");
+pub const replace = @import("db/replace.zig");
 pub const csv = @import("format/csv.zig");
 pub const table = @import("connect/table.zig");
 pub const streamload = @import("db/streamload.zig");

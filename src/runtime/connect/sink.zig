@@ -27,6 +27,9 @@ const mem_connector = @import("../connect.zig").mem_connector;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openBulkOrInsert = @import("lane_sink.zig").openBulkOrInsert;
+const ReplacePlan = @import("lane_sink.zig").ReplacePlan;
+const ReplaceSink = @import("lane_sink.zig").ReplaceSink;
+const sql = @import("../../db/sql.zig");
 const pathFail = @import("../env.zig").pathFail;
 const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
@@ -251,10 +254,34 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
-                return openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, w.target, schema, w.mode, try redialFor(env.arena, info.kind, cfg), env.errctx) catch |e| {
+                var target = w.target;
+                var mode = w.mode;
+                var plan: ?*ReplacePlan = null;
+                if (w.mode == .overwrite) {
+                    const qt = try sql.quoteIdent(env.arena, info.dialect, w.target);
+                    c.sqlConn().exec(try sql.createTableSql(env.arena, info.dialect, qt, schema, .append)) catch |e| {
+                        defer c.close();
+                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                    };
+                    const p = try env.arena.create(ReplacePlan);
+                    p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
+                    p.prepare() catch |e| {
+                        c.close();
+                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+                    };
+                    target = try p.stagingTarget(env.arena);
+                    mode = .append;
+                    plan = p;
+                }
+                const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx) catch |e| {
                     defer c.close();
+                    if (plan) |p| p.abort();
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
                 };
+                const p = plan orelse return inner;
+                const rs = try env.arena.create(ReplaceSink);
+                rs.* = .{ .inner = inner, .plan = p };
+                return rs.sink();
             },
         }
     }

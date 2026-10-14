@@ -20,6 +20,8 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
+const replace = @import("../../db/replace.zig");
+const Batch = @import("../../exec/batch.zig").Batch;
 const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
 
@@ -53,6 +55,96 @@ const SqlSinkSpec = struct {
     lane_mode: ast.WriteMode,
     redial: sql.Redial,
     errctx: ?*op.ErrCtx = null,
+    replace_plan: ?*ReplacePlan = null,
+};
+
+/// A REPLACE's staging and cutover (see `db/replace.zig`), each step on a short
+/// connection of its own, so the lanes keep theirs and their redials.
+pub const ReplacePlan = struct {
+    gpa: std.mem.Allocator,
+    kind: SqlKind,
+    cfg: DbConfig,
+    dialect: sql.Dialect,
+    target: []const u8,
+    schema: types.Schema,
+    how: replace.Cutover,
+    errctx: ?*op.ErrCtx,
+
+    pub fn stagingTarget(self: *const ReplacePlan, arena: std.mem.Allocator) ![]const u8 {
+        return replace.stagingName(arena, self.target);
+    }
+
+    pub fn prepare(self: *ReplacePlan) !void {
+        var aa = std.heap.ArenaAllocator.init(self.gpa);
+        defer aa.deinit();
+        try self.run(try replace.setupSql(aa.allocator(), self.dialect, self.target), "staging");
+    }
+
+    pub fn finish(self: *ReplacePlan) !void {
+        var aa = std.heap.ArenaAllocator.init(self.gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        self.run(try replace.cutoverSql(a, self.dialect, self.target, self.schema, self.how), "cutover") catch |e| {
+            self.abort();
+            return e;
+        };
+        self.run(&.{try replace.dropSql(a, self.dialect, self.target)}, "staging cleanup") catch {};
+    }
+
+    pub fn abort(self: *ReplacePlan) void {
+        var aa = std.heap.ArenaAllocator.init(self.gpa);
+        defer aa.deinit();
+        const drop = replace.dropSql(aa.allocator(), self.dialect, self.target) catch return;
+        self.run(&.{drop}, "staging cleanup") catch {};
+    }
+
+    fn run(self: *ReplacePlan, stmts: []const []const u8, step: []const u8) !void {
+        const conn = try connectSql(self.gpa, self.kind, self.cfg);
+        defer conn.close();
+        replace.execAll(conn, stmts) catch |e| {
+            if (self.errctx) |ec| if (conn.lastError().len > 0) ec.set("{s} refused the REPLACE {s}: {s}", .{ @tagName(self.dialect), step, conn.lastError() });
+            return e;
+        };
+    }
+};
+
+fn finishLaneReplace(ctx: *anyopaque) anyerror!void {
+    const spec: *SqlSinkSpec = @ptrCast(@alignCast(ctx));
+    if (spec.replace_plan) |p| try p.finish();
+}
+
+fn abortLaneReplace(ctx: *anyopaque) void {
+    const spec: *SqlSinkSpec = @ptrCast(@alignCast(ctx));
+    if (spec.replace_plan) |p| p.abort();
+}
+
+/// The serial REPLACE: one sink loading the staging table, cut over on close.
+pub const ReplaceSink = struct {
+    inner: driver.Sink,
+    plan: *ReplacePlan,
+
+    pub fn writeBatch(self: *ReplaceSink, arena: std.mem.Allocator, b: Batch) !void {
+        return self.inner.writeBatch(arena, b);
+    }
+
+    pub fn close(self: *ReplaceSink) !void {
+        self.inner.close() catch |e| {
+            self.plan.abort();
+            return e;
+        };
+        try self.plan.finish();
+    }
+
+    pub fn abort(self: *ReplaceSink) void {
+        self.inner.abort();
+        self.plan.abort();
+    }
+
+    const vtable = driver.sinkVTable(ReplaceSink);
+
+    pub fn sink(self: *ReplaceSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
 };
 
 const DialSpec = struct { kind: SqlKind, cfg: DbConfig };
@@ -100,7 +192,7 @@ pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parall
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
     if (try buildSqlSinkSpec(env, w, schema)) |spec|
-        return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec } };
+        return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec, .finish = finishLaneReplace, .abort = abortLaneReplace } };
     return null;
 }
 
@@ -113,7 +205,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
 
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
-    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, w.mode, null) catch |e|
+    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
@@ -129,6 +221,14 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         .redial = try redialFor(env.arena, kind, cfg),
         .errctx = env.errctx,
     };
+    if (w.mode == .overwrite) {
+        const plan = try env.arena.create(ReplacePlan);
+        plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
+        plan.prepare() catch |e|
+            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+        spec.target = try plan.stagingTarget(env.arena);
+        spec.replace_plan = plan;
+    }
     return spec;
 }
 

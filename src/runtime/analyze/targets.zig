@@ -14,6 +14,7 @@ const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
 const std = @import("std");
+const replace = @import("../../db/replace.zig");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx.zig");
 const zipsrc = @import("../../format/zipsrc.zig");
@@ -89,6 +90,25 @@ pub fn parquetCodecFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag)
     if (std.ascii.eqlIgnoreCase(s, "gzip")) return .gzip;
     if (std.ascii.eqlIgnoreCase(s, "none")) return .uncompressed;
     return fail(diag, "unknown Parquet compression `{s}` (snappy, gzip, none)", .{s});
+}
+
+/// How a REPLACE into a database table clears the target at its cutover,
+/// `cutover = 'truncate' | 'delete'`, truncate when unset (see `db/replace.zig`).
+/// The key's target kind is judged by `checkSinkForm`; its mode and value here.
+pub fn cutoverFromHints(w: ast.Write, hints: []const ast.Hint) Error!?replace.Cutover {
+    const s = hintText(hints, "cutover") orelse return null;
+    if (w.mode != .overwrite) return error.AnalyzeFailed;
+    if (std.ascii.eqlIgnoreCase(s, "truncate")) return .truncate;
+    if (std.ascii.eqlIgnoreCase(s, "delete")) return .delete;
+    return error.AnalyzeFailed;
+}
+
+pub fn cutoverProblem(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!replace.Cutover {
+    const s = hintText(hints, "cutover") orelse return .truncate;
+    if (w.mode != .overwrite)
+        return fail(diag, "`cutover` applies to a REPLACE only: it says how the target is cleared once the new rows are staged", .{});
+    return (cutoverFromHints(w, hints) catch null) orelse
+        fail(diag, "unknown `cutover = '{s}'` (truncate, delete)", .{s});
 }
 
 /// Validated here so `check` turns away a malformed range before a run.

@@ -299,6 +299,7 @@ pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
+pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
 const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
@@ -1705,7 +1706,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
 
 const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression" };
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
-const table_sink_keys = [_][]const u8{"compression"};
+const table_sink_keys = [_][]const u8{ "compression", "cutover" };
 
 /// `USING` names a load path, and only StarRocks and Doris have one to name; a
 /// `WITH` key the target's kind does not read is refused rather than ignored.
@@ -1724,6 +1725,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         return e;
     }
     _ = try parquetCodecFromHints(w, hints, diag);
+    _ = try cutoverProblem(w, hints, diag);
     const form = w.form orelse return;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });

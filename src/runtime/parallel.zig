@@ -32,10 +32,25 @@ pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred
 
 pub const OpenSinkFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink;
 
+/// `finish` runs once every lane's sink has closed, `abort` once a lane failed: a
+/// staged REPLACE cuts over to its target, or drops its staging table, there.
 pub const SinkMode = union(enum) {
     shared: driver.Sink,
-    per_lane: struct { open: OpenSinkFn, ctx: *anyopaque },
+    per_lane: struct {
+        open: OpenSinkFn,
+        ctx: *anyopaque,
+        finish: ?*const fn (*anyopaque) anyerror!void = null,
+        abort: ?*const fn (*anyopaque) void = null,
+    },
 };
+
+pub fn finishLanes(mode: SinkMode) !void {
+    if (mode == .per_lane) if (mode.per_lane.finish) |f| try f(mode.per_lane.ctx);
+}
+
+pub fn abortLanes(mode: SinkMode) void {
+    if (mode == .per_lane) if (mode.per_lane.abort) |f| f(mode.per_lane.ctx);
+}
 
 /// Formats outside the lock and holds `mtx` only for the append: locking the whole
 /// write made 6M rows of parquet to CSV slower at -j 16 (835ms) than at -j 1 (752ms).

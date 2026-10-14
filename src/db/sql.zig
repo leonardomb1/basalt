@@ -467,10 +467,6 @@ pub const Sink = struct {
         defer aa.deinit();
         const ddl = try createTableSql(aa.allocator(), dialect, self.table, schema, mode);
         try conn.exec(ddl);
-        if (mode == .overwrite) {
-            const del = try std.fmt.allocPrint(aa.allocator(), "DELETE FROM {s}", .{self.table});
-            try conn.exec(del);
-        }
         return self;
     }
 
@@ -556,7 +552,6 @@ pub fn BulkSink(comptime Proto: type) type {
             const a = aa.allocator();
             const qtable = try quoteIdent(a, Proto.dialect, table_name);
             conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode)) catch |e| return onWire(e);
-            if (mode == .overwrite) conn.exec(try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qtable})) catch |e| return onWire(e);
             const command = try gpa.dupe(u8, try Proto.command(a, qtable, schema));
             errdefer gpa.free(command);
 
