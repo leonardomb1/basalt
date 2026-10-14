@@ -12,6 +12,7 @@ const evalCfgInt = @import("register.zig").evalCfgInt;
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const krb5 = @import("../../net/krb5.zig");
 const ntlm = @import("../../net/ntlm.zig");
+const options = @import("../analyze/options.zig");
 const planErr = @import("../env.zig").planErr;
 const sql = @import("../../db/sql.zig");
 const ssrp = @import("../../db/ssrp.zig");
@@ -142,9 +143,9 @@ const EnvCfg = struct {
 
 pub fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
     const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env });
-    if (cfg.host.len == 0) return planErr(env.diag, "connection needs a `host`");
+    if (cfg.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     if (cfg.auth == .kerberos and cfg.realm.len == 0 and std.mem.indexOfScalar(u8, cfg.user, '@') == null)
-        return planErr(env.diag, "connection `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`");
+        return planErr(env.diag, try options.sqlRealmMsg(env.arena, conn.name));
     if (cfg.auth == .ntlm and cfg.tls == .off) return planErr(env.diag, env_mod.ntlm_needs_tls_msg);
     return cfg;
 }

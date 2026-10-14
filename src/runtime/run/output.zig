@@ -259,10 +259,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     if (stages[0].node == .read or stages[0].node == .union_) {
         var extra = std.array_list.Managed(ast.Hint).init(arena);
-        for (stages[stages.len - 1].hints) |h| {
-            if (std.mem.eql(u8, h.key, "split")) try extra.append(h);
-            if (std.mem.eql(u8, h.key, "jobs") and h.value == .int and h.value.int > 0) {
-                opts.threads = @intCast(h.value.int);
+        if (last.write.split) |sp| {
+            try extra.append(.{ .key = "split", .value = .{ .ident = sp.col }, .pos = sp.pos });
+            if (sp.jobs) |n| {
+                opts.threads = n;
                 env.sort_threads = opts.lanes();
             }
         }

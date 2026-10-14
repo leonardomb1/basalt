@@ -27,6 +27,10 @@ pub const int_cfg_kind_msg = "config value must be an integer";
 pub const bool_cfg_msg = "config value must be a bool";
 pub const literal_cfg_msg = "config value must be a literal or env()/secret()";
 
+const sql_keys = [_][]const u8{ "host", "port", "database", "user", "password", "tls" };
+const sqlserver_keys = sql_keys ++ [_][]const u8{ "auth", "domain", "realm", "kdc", "spn", "client_id", "resource", "token" };
+const stream_keys = sql_keys ++ [_][]const u8{ "fe_host", "fe_port", "be_url", "load_url", "buckets", "replication_num", "auto_create", "label_prefix", "load_size", "compression" };
+
 fn fileKeys(connector: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, connector, "sftp")) return &sftp_keys;
     if (std.mem.eql(u8, connector, "smb")) return &smb_keys;
@@ -34,8 +38,19 @@ fn fileKeys(connector: []const u8) ?[]const []const u8 {
     return null;
 }
 
+/// The options a connector reads: a file connection's, or a database's as
+/// `parseDbConfig` and `resolveStreamLoadConfig` read them.
+fn connectionKeys(connector: []const u8) ?[]const []const u8 {
+    if (fileKeys(connector)) |keys| return keys;
+    const conn = registry.Connector.parse(connector) orelse return null;
+    if (conn.sqlRead() == null) return null;
+    if (conn.streamLoad()) return &stream_keys;
+    if (std.mem.eql(u8, connector, "sqlserver")) return &sqlserver_keys;
+    return &sql_keys;
+}
+
 pub fn unknownOptionMsg(arena: std.mem.Allocator, c: ast.Connection, key: []const u8) Error![]const u8 {
-    const keys = fileKeys(c.connector) orelse &.{};
+    const keys = connectionKeys(c.connector) orelse &.{};
     return std.fmt.allocPrint(arena, "{s} connection `{s}`: unknown option `{s}` ({s})", .{ c.connector, c.name, key, try std.mem.join(arena, ", ", keys) });
 }
 
@@ -123,7 +138,12 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
     if (!analyze.isConnectionType(c.connector))
         return try std.fmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types });
     const conn = registry.Connector.parse(c.connector).?;
-    if (conn.sqlRead() != null) return sqlOptionProblem(c);
+    if (conn.sqlRead() != null) {
+        for (c.config) |attr| if (!containsKey(connectionKeys(c.connector).?, attr.key))
+            return try unknownOptionMsg(arena, c, attr.key);
+        if (sqlOptionProblem(c)) |why| return why;
+        return try sqlLiteralProblem(arena, c);
+    }
     const keys = fileKeys(c.connector) orelse return null;
     var host: ?[]const u8 = null;
     var host_known = false;
@@ -176,6 +196,30 @@ pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
     if (auth != null and tls != null and std.mem.eql(u8, auth.?, "ntlm") and std.mem.eql(u8, tls.?, "off"))
         return env_mod.ntlm_needs_tls_msg;
     return null;
+}
+
+/// A database connection's `host` and Kerberos `realm` as `resolveDbConfig` demands
+/// them: no host option at all, or Kerberos with neither a realm nor `me@REALM`.
+fn sqlLiteralProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const u8 {
+    var host = false;
+    var kerberos = false;
+    var realm = false;
+    var plain_user = false;
+    for (c.config) |a| {
+        if (std.mem.eql(u8, a.key, "host") or std.mem.eql(u8, a.key, "fe_host"))
+            host = a.value.* != .str_lit or a.value.str_lit.len > 0;
+        if (std.mem.eql(u8, a.key, "realm")) realm = true;
+        if (a.value.* != .str_lit) continue;
+        if (std.mem.eql(u8, a.key, "auth")) kerberos = std.mem.eql(u8, a.value.str_lit, "kerberos");
+        if (std.mem.eql(u8, a.key, "user")) plain_user = std.mem.indexOfScalar(u8, a.value.str_lit, '@') == null;
+    }
+    if (!host) return try needsHostMsg(arena, c);
+    if (kerberos and !realm and plain_user) return try sqlRealmMsg(arena, c.name);
+    return null;
+}
+
+pub fn sqlRealmMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
+    return std.fmt.allocPrint(arena, "connection `{s}`: `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{name});
 }
 
 /// What a `LOAD INTO conn.table` is refused for by the connection it names, before

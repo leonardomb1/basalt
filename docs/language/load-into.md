@@ -23,10 +23,10 @@ AS
   built this way must end in a literal extension, which picks the writer.
 - `.xlsx` is read but never written: a workbook target is a plan-time error.
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
-- `WITH (...)` on a `LOAD INTO` takes `delimiter` and `format` (a file),
-  `compression` (a Parquet file: `snappy`, `gzip` or `none`) and
-  `label_prefix` (StarRocks, Doris); any other key is a plan-time error rather
-  than ignored.
+- `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
+  (a file), `compression` (a Parquet file: `snappy`, `gzip` or `none`) and
+  `label_prefix` (StarRocks, Doris); a key the target does not read, or any
+  other key, is a plan-time error rather than ignored.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
   (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —
@@ -58,8 +58,10 @@ AS
   replaced on write, never extended), and for `sftp://` / `smb://` (the file is
   written beside the target and renamed over it) — use `REPLACE`, or a per-run
   path.
-- `SPLIT BY (col)` parallelizes the load by key ranges; `JOBS n` fixes the
-  lane count (otherwise the CLI `-j` applies).
+- `SPLIT BY (col)` parallelizes a load from a SQL table (or a `UNION` of
+  them) by ranges of `col`; `JOBS n` fixes the lane count (otherwise the CLI
+  `-j` applies). A file source fans out on its own, so `SPLIT BY` over one is
+  a plan-time error, as is `JOBS 0`.
 
 **stdout is not syntax**: a terminal `SELECT ...;` statement prints the result
 as an aligned table — `basalt run -c "SELECT * FROM 'x.csv'"` works as a

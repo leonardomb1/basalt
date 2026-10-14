@@ -275,6 +275,7 @@ fn renderWrite(arena: std.mem.Allocator, w: ast.Write, lr: LoopRow) !ast.Write {
         .form = if (w.form) |f| try interpAll(arena, f, lr) else null,
         .target = try interpAll(arena, w.target, lr),
         .mode = try renderMode(arena, w.mode, lr),
+        .split = if (w.split) |sp| .{ .col = try interpAll(arena, sp.col, lr), .jobs = sp.jobs, .pos = sp.pos } else null,
     };
 }
 

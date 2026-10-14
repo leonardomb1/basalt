@@ -94,15 +94,17 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
         } else if (self.eatKw("split")) {
             try self.expectKw("by");
             _ = try self.expect(.lparen);
-            const col = try self.expectColName();
+            const cpos = self.curPos();
+            var sp = ast.SplitBy{ .col = try self.expectColName(), .pos = cpos };
             _ = try self.expect(.rparen);
-            try whints.append(.{ .key = "split", .value = .{ .ident = col }, .pos = pos });
             if (self.eatKw("jobs")) {
+                const jpos = self.curPos();
                 const n = try self.expect(.int);
-                const v = std.fmt.parseInt(i64, n.text, 10) catch
-                    return self.fail(pos, "bad JOBS count `{s}`", .{n.text});
-                try whints.append(.{ .key = "jobs", .value = .{ .int = v }, .pos = pos });
+                const v = std.fmt.parseInt(usize, n.text, 10) catch 0;
+                if (v == 0) return self.fail(jpos, "`JOBS` takes a positive lane count, not `{s}`", .{n.text});
+                sp.jobs = v;
             }
+            write.split = sp;
         } else if (self.isKw("with") and self.peekTag() == .lparen) {
             _ = self.advance();
             try self.parseWithHints(&whints);

@@ -393,6 +393,14 @@ pub const Write = struct {
     form: ?[]const u8,
     target: []const u8,
     mode: WriteMode,
+    split: ?SplitBy = null,
+};
+
+/// `SPLIT BY (col) [JOBS n]`: a clause of its own, so a `WITH` key cannot spell it.
+pub const SplitBy = struct {
+    col: []const u8,
+    jobs: ?usize = null,
+    pos: Pos,
 };
 
 pub const WriteMode = union(enum) {

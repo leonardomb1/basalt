@@ -565,6 +565,21 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`ANCHOR` applies to `UNION ALL BY NAME`") != null);
 }
 
+test "sql: SPLIT BY is a clause of its own, and JOBS takes a positive count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "LOAD INTO 'o.csv' SPLIT BY (id) JOBS 4 AS SELECT * FROM 'a.csv';");
+    const last = prog.stmts[1].output.stages[prog.stmts[1].output.stages.len - 1];
+    try testing.expectEqualStrings("id", last.node.write.split.?.col);
+    try testing.expectEqual(@as(?usize, 4), last.node.write.split.?.jobs);
+    try testing.expectEqual(@as(usize, 0), last.hints.len);
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "LOAD INTO 'o.csv' SPLIT BY (id) JOBS 0 AS SELECT * FROM 'a.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "`JOBS` takes a positive lane count") != null);
+    try testing.expectEqual(@as(usize, 38), diag.col);
+}
+
 test "sql: UNION ALL BY NAME with tag literal and anchor" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -594,7 +609,7 @@ test "sql: UNION ALL BY NAME with tag literal and anchor" {
     try testing.expectEqualStrings("CT2010", pl.stages[0].hints[1].value.ident);
     const w = pl.stages[1].node.write;
     try testing.expectEqual(@as(usize, 2), w.mode.upsert.keys.len);
-    try testing.expectEqualStrings("split", pl.stages[1].hints[0].key);
+    try testing.expectEqualStrings("R_E_C_N_O_", w.split.?.col);
 }
 
 test "sql: a computed GROUP BY key keeps the columns a CASE inside an aggregate reads" {

@@ -1486,6 +1486,15 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CASE WHEN 1 = 0 THEN LOAD INTO '$B/o.xlsx' AS SELECT 1 AS a; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "does not write them" },
         .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "only a starrocks or doris target" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' a JOIN '$B/a.csv' b ON a.x = b.x WITH (join_order = 'bad');", "join_order is 'auto' or 'written'" },
+        .{ "LOAD INTO '$B/o.csv' WITH (jobs = 2) AS SELECT * FROM '$B/a.csv';", "unknown `LOAD INTO` option `jobs`" },
+        .{ "LOAD INTO '$B/o.csv' WITH (split = 'x') AS SELECT * FROM '$B/a.csv';", "unknown `LOAD INTO` option `split`" },
+        .{ "LOAD INTO '$B/o.csv' WITH (label_prefix = 'x') AS SELECT * FROM '$B/a.csv';", "option `label_prefix` does not apply to a file target" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', database = 'd');\nLOAD INTO pg.t WITH (delimiter = ';') AS SELECT * FROM '$B/a.csv';", "option `delimiter` does not apply to a postgres target" },
+        .{ "LOAD INTO '$B/o.csv' SPLIT BY (x) AS SELECT * FROM '$B/a.csv';", "`SPLIT BY` cuts a SQL table read into key ranges" },
+        .{ "LOAD INTO '$B/o.csv' SPLIT BY (nope) JOBS 2 AS WITH b AS (SELECT * FROM '$B/a.csv') SELECT * FROM b;", "`SPLIT BY` cuts a SQL table read into key ranges" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', bogus = 'x');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "postgres connection `pg`: unknown option `bogus`" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (database = 'd');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "postgres connection `pg` needs a `host`" },
+        .{ "CREATE CONNECTION ms TYPE sqlserver OPTIONS (host = 'h', auth = 'kerberos', user = 'me', tls = 'require');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "`auth = 'kerberos'` needs the `realm`" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

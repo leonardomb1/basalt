@@ -1286,6 +1286,8 @@ const Ctx = struct {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };
+        if (w.split) |sp| if (!isSqlSource(source.connector) and !std.mem.eql(u8, source.connector, "union"))
+            return failPos(self.diag, sp.pos, "`SPLIT BY` cuts a SQL table read into key ranges; this load reads {s}, which fans out across lanes on its own (`-j`)", .{source.detail});
         if (cur) |c| if (!std.mem.eql(u8, w.connector, "stdout")) uniqueColumns(c, self.diag) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
@@ -1636,23 +1638,28 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     }
 }
 
-const sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "label_prefix", "split", "splits", "split_kind", "jobs" };
+const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression" };
+const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
+const table_sink_keys = [_][]const u8{"compression"};
 
 /// `USING` names a load path, and only StarRocks and Doris have one to name; a
-/// `WITH` key no sink reads is refused rather than ignored.
+/// `WITH` key the target's kind does not read is refused rather than ignored.
 pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u8, diag: *Diag) Error!void {
+    const file = std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdout");
+    const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
+    const keys: []const []const u8 = if (file) &file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
     for (hints) |h| {
-        for (sink_keys) |k| {
-            if (std.mem.eql(u8, h.key, k)) break;
-        } else {
-            const e = fail(diag, "unknown `LOAD INTO` option `{s}` (a sink takes `delimiter`, `format`, for a Parquet file `compression` and, for starrocks or doris, `label_prefix`)", .{h.key});
-            diag.pos = h.pos;
-            return e;
-        }
+        if (containsName(keys, h.key)) continue;
+        const known = containsName(&file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key);
+        const e = if (known)
+            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format` and, for Parquet, `compression`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
+        else
+            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format` and, for Parquet, `compression`; a starrocks or doris table `label_prefix`)", .{h.key});
+        diag.pos = h.pos;
+        return e;
     }
     _ = try parquetCodecFromHints(w, hints, diag);
     const form = w.form orelse return;
-    const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
     return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
