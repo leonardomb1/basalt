@@ -427,6 +427,12 @@ fn bulkDict(
         },
         .int => {
             for (dict) |v| if (v != .int) return false;
+            if (defs == null or defs.?.len == idx.len) {
+                const out = b.reserveSlots(i64, idx.len) catch return false;
+                for (out, idx) |*o, ix| o.* = dict[ix].int;
+                b.commitSlots(i64, idx.len) catch return false;
+                return true;
+            }
             const vals = try arena.alloc(i64, idx.len);
             for (vals, idx) |*o, ix| o.* = dict[ix].int;
             if (defs) |d| {
@@ -436,11 +442,35 @@ fn bulkDict(
         },
         .float => {
             for (dict) |v| if (v != .float) return false;
+            if (defs == null or defs.?.len == idx.len) {
+                const out = b.reserveSlots(f64, idx.len) catch return false;
+                for (out, idx) |*o, ix| o.* = dict[ix].float;
+                b.commitSlots(f64, idx.len) catch return false;
+                return true;
+            }
             const vals = try arena.alloc(f64, idx.len);
             for (vals, idx) |*o, ix| o.* = dict[ix].float;
             if (defs) |d| {
                 b.appendBulkScattered(f64, vals, d, max_def) catch return false;
             } else b.appendBulk(f64, vals) catch return false;
+            return true;
+        },
+        .decimal => {
+            const typed = try arena.alloc(Decimal, dict.len);
+            for (typed, dict) |*o, v| {
+                const dv = coerce(ty, v, tscale);
+                if (dv != .decimal) return false;
+                o.* = dv.decimal;
+            }
+            if (defs == null or defs.?.len == idx.len) {
+                const out = b.reserveSlots(Decimal, idx.len) catch return false;
+                for (out, idx) |*o, ix| o.* = typed[ix];
+                b.commitSlots(Decimal, idx.len) catch return false;
+                return true;
+            }
+            const vals = try arena.alloc(Decimal, idx.len);
+            for (vals, idx) |*o, ix| o.* = typed[ix];
+            b.appendBulkScattered(Decimal, vals, defs.?, max_def) catch return false;
             return true;
         },
         .date => {

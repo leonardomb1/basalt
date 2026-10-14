@@ -402,18 +402,47 @@ pub const Builder = struct {
         try self.pushValidRun(vals.len);
     }
 
+    /// Room for `n` more values of a fixed-width store, written in place and then
+    /// counted, all valid, by `commitSlots`; skips the copy a temporary would cost.
+    pub fn reserveSlots(self: *Builder, comptime T: type, n: usize) ![]T {
+        switch (self.store) {
+            inline .b, .i32, .i64, .f64, .dec => |*l| {
+                if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
+                try l.ensureUnusedCapacity(n);
+                return l.unusedCapacitySlice()[0..n];
+            },
+            .bytes => return error.BulkTypeMismatch,
+        }
+    }
+
+    pub fn commitSlots(self: *Builder, comptime T: type, n: usize) !void {
+        switch (self.store) {
+            inline .b, .i32, .i64, .f64, .dec => |*l| {
+                if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
+                l.items.len += n;
+            },
+            .bytes => return error.BulkTypeMismatch,
+        }
+        try self.pushValidRun(n);
+    }
+
     pub fn appendBytesScattered(self: *Builder, vals: []const []const u8, defs: ?[]const u32, max_def: u32) !void {
         if (self.store != .bytes) return error.BulkTypeMismatch;
         const l = &self.store.bytes;
-        const d = defs orelse {
+        const all_present = if (defs) |d| d.len == vals.len else true;
+        if (all_present) {
+            var total: usize = 0;
+            for (vals) |s| total += s.len;
+            try l.values.ensureUnusedCapacity(total);
             try l.ends.ensureUnusedCapacity(vals.len);
             for (vals) |s| {
-                try l.values.appendSlice(s);
+                l.values.appendSliceAssumeCapacity(s);
                 l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
             }
             try self.pushValidRun(vals.len);
             return;
-        };
+        }
+        const d = defs.?;
         try l.ends.ensureUnusedCapacity(d.len);
         var j: usize = 0;
         for (d) |lvl| {
@@ -437,6 +466,7 @@ pub const Builder = struct {
         defs: []const u32,
         max_def: u32,
     ) !void {
+        if (defs.len == vals.len) return self.appendBulk(T, vals);
         switch (self.store) {
             inline .b, .i32, .i64, .f64, .dec => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
