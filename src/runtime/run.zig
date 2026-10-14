@@ -165,9 +165,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
             text = kv.val;
         };
         const t = text orelse {
-            const e = planErr(diag, try std.fmt.allocPrint(arena, "missing required param `{s}`", .{name}));
-            diag.pos = s.param.pos;
-            return e;
+            try json_params.put(name, .null);
+            continue;
         };
         if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{})) |jv| {
             try json_params.put(name, jv);

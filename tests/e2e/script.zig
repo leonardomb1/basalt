@@ -1509,8 +1509,28 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION h TYPE http OPTIONS (url = 'http://127.0.0.1');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: unknown attribute `url`" },
         .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1', auth = 'bearer');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: auth 'bearer' needs a `token`" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT x, LAG(x, 1, 'no') OVER (ORDER BY x) AS l FROM '$B/a.csv';", "LAG/LEAD default does not fit `x`" },
+        .{ "PRINT 1;\nCALL nope(1);", "CALL: no function named `nope`" },
+        .{ "CREATE FUNCTION f(a) AS a + 1;\nCALL f(1);", "`f` is a scalar function" },
+        .{ "CREATE FUNCTION f(a) RETURNS TABLE AS SELECT $a AS x;\nCALL f(1);", "`f` is a table function" },
+        .{ "CREATE FUNCTION f(a) AS\n  PRINT $a;\nEND;\nCALL f(1, 2);", "`f` expects 1 argument(s), got 2" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  CALL nope($x);\nEND FOR;", "CALL: no function named `nope`" },
+        .{ "LET x = 1;\nPARAM x INT DEFAULT 2;\nLOAD INTO '$B/o.csv' AS SELECT $x AS a;", "`x` is declared twice: LET and PARAM share one name space" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
+}
+
+test "check and run refuse alike a LET bound on the command line" {
+    const alloc = std.testing.allocator;
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), "LET x = 1;\nSELECT $x AS a;", &pdiag);
+    var adiag = analyze.Diag{};
+    try std.testing.expectError(error.AnalyzeFailed, analyze.analyzeWith(parena.allocator(), prog, &.{.{ .name = "x", .value = "2" }}, &adiag));
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .params = &.{.{ .key = "x", .val = "2" }}, .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectEqualStrings(adiag.msg, rdiag.msg);
+    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "is a LET, not a PARAM") != null);
 }
 
 test "a PARAM DEFAULT may be a negative number" {
@@ -1567,7 +1587,7 @@ test "a JSON PARAM's paths bind from -p in a batch run, a missing key is an erro
     try std.testing.expectError(error.PlanFailed, runScript(alloc, &tmp, script, &.{.{ .key = "job", .val = "{\"n\":5}" }}));
 }
 
-test "a FOR EACH over a JSON PARAM iterates its string DEFAULT, and a JSON PARAM given nothing is missing" {
+test "a FOR EACH over a JSON PARAM iterates its string DEFAULT; one given nothing is missing unless read with ?." {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1591,7 +1611,10 @@ test "a FOR EACH over a JSON PARAM iterates its string DEFAULT, and a JSON PARAM
     const bare = try parser.parseSource(parena.allocator(), "PARAM rows JSON;\nFOR EACH ROW OF ($rows) AS (x)\n  PRINT $x;\nEND FOR;", &pdiag);
     try std.testing.expectError(error.PlanFailed, run(alloc, bare, .{ .log = .{ .quiet = true } }, &rdiag));
     try std.testing.expectEqualStrings("missing required param `rows`", rdiag.msg);
-    try std.testing.expectEqual(@as(u32, 1), rdiag.pos.?.line);
+    try std.testing.expectEqual(@as(u32, 2), rdiag.pos.?.line);
+
+    const optional = try parser.parseSource(parena.allocator(), "PARAM rows JSON;\nFOR EACH ROW OF ($rows?.items) AS (x)\n  PRINT $x;\nEND FOR;\nPRINT 'done';", &pdiag);
+    _ = try run(alloc, optional, .{ .log = .{ .quiet = true } }, &rdiag);
 }
 
 test "an EXPLAIN statement's analyze error keeps check's position" {

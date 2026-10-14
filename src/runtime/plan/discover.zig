@@ -101,6 +101,12 @@ pub fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []cons
         }
         return e;
     };
+    if (cur == .null) {
+        if (path.safe.len > 0 and path.safe[0]) return &.{};
+        const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "missing required param `{s}`", .{head}));
+        if (path.span) |sp| env.diag.pos = sp.start;
+        return e;
+    }
     for (path.parts[1..], 0..) |key, j| {
         const seg_safe = j < path.safe.len and path.safe[j];
         cur = switch (cur) {
