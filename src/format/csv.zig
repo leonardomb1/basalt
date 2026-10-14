@@ -192,7 +192,7 @@ fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]typ
 }
 
 fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
-    if (enc == .utf8) return s;
+    if (enc == .utf8) return utf8Repair(arena, s);
     var high = false;
     for (s) |c| if (c >= 0x80) {
         high = true;
@@ -1259,7 +1259,42 @@ inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?
 }
 
 inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8, quoted: bool, enc: Encoding) !void {
-    return appendCell(b, if (enc == .utf8) raw else try decodeField(arena, enc, raw), quoted);
+    if (enc != .utf8) return appendCell(b, try decodeField(arena, enc, raw), quoted);
+    return appendCell(b, if (b.ty.kind == .string) try utf8Repair(arena, raw) else raw, quoted);
+}
+
+/// `s` when it is valid UTF-8, else a copy with each invalid byte as U+FFFD, as
+/// pyarrow reads one: a text value basalt holds is always UTF-8, so a Parquet or
+/// JSON file written from a mislabelled CSV stays readable everywhere.
+fn utf8Repair(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(s)) return s;
+    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len + 8);
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+        if (n > 0 and i + n <= s.len) {
+            if (std.unicode.utf8Decode(s[i .. i + n])) |_| {
+                try out.appendSlice(s[i .. i + n]);
+                i += n;
+                continue;
+            } else |_| {}
+        }
+        try out.appendSlice("\u{FFFD}");
+        i += 1;
+    }
+    return out.items;
+}
+
+test "utf8Repair keeps valid text and replaces each invalid byte" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ok = "café ção";
+    try std.testing.expect((try utf8Repair(a, ok)).ptr == ok.ptr);
+    try std.testing.expectEqualStrings("caf\u{FFFD}", try utf8Repair(a, "caf\xe9"));
+    try std.testing.expectEqualStrings("\u{FFFD}(", try utf8Repair(a, "\xc3\x28"));
+    try std.testing.expectEqualStrings("\u{FFFD}x", try utf8Repair(a, "\xffx"));
+    try std.testing.expectEqualStrings("a\u{FFFD}\u{FFFD}", try utf8Repair(a, "a\xe2\x82"));
 }
 
 const source_vtable = driver.sourceVTable(CsvReader);
@@ -2199,7 +2234,7 @@ test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {
 
     const ascii = "2020-10-27";
     try std.testing.expect((try decodeField(a, .latin1, ascii)).ptr == ascii.ptr);
-    try std.testing.expect((try decodeField(a, .utf8, "\xC7\xC3")).len == 2);
+    try std.testing.expectEqualStrings("\u{FFFD}\u{FFFD}", try decodeField(a, .utf8, "\xC7\xC3"));
 
     try std.testing.expectEqualStrings("LIQUIDAÇÃO", try decodeField(a, .latin1, "LIQUIDA\xC7\xC3O"));
     try std.testing.expectEqualStrings("“hi”", try decodeField(a, .cp1252, "\x93hi\x94"));
