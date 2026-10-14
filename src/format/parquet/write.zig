@@ -418,33 +418,27 @@ pub const Writer = struct {
         };
     }
 
+    /// Column at a time: the batch is cut at row-group boundaries, then each column
+    /// encodes its rows of that piece in slices of `slice_rows`, after each of which a
+    /// PLAIN column past `page_target_bytes` seals a page.
     pub fn writeBatch(self: *Writer, arena: std.mem.Allocator, batch: Batch) !void {
         _ = arena;
         const sa = self.scratch.allocator();
-        for (0..batch.len) |r| {
+        var start: usize = 0;
+        while (start < batch.len) {
+            const end = start + @min(batch.len - start, self.group_rows - self.rows);
             for (batch.columns, self.cols, self.maps) |col, *cb, m| {
-                const v = col.getValue(r);
-                try cb.defs.append(if (v == .null) 0 else 1);
-                if (v == .null) {
-                    cb.nulls += 1;
-                    continue;
+                var lo = start;
+                while (lo < end) {
+                    const hi = @min(end, lo + slice_rows);
+                    try encodeSlice(cb, sa, m, col, lo, hi);
+                    if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa, m.optional);
+                    lo = hi;
                 }
-                try cb.observe(sa, v);
-                const before = cb.values.items.len;
-                try encodePlain(cb, m, v);
-                if (cb.dict_ok) switch (v) {
-                    .string, .bytes => |x| _ = try cb.dictPut(sa, x),
-                    // A fixed-width value's key is its PLAIN encoding, just written,
-                    // which is also its dictionary entry.
-                    else => try cb.dictPutFixed(cb.values.items[before..]),
-                };
             }
-            for (self.cols, self.maps) |*cb, m| {
-                if (cb.dict_ok) continue;
-                if (cb.values.items.len >= page_target_bytes) try cb.sealPage(sa, m.optional);
-            }
-            self.rows += 1;
-            self.total_rows += 1;
+            self.rows += end - start;
+            self.total_rows += @intCast(end - start);
+            start = end;
             if (self.rows >= self.group_rows) try self.flushRowGroup();
         }
     }
@@ -1008,6 +1002,123 @@ fn packBits(comptime T: type, out: *List(u8), vals: []const T, width: u8) !void 
         }
     }
     if (bit_n > 0) try out.append(@intCast(bit_buf & 0xFF));
+}
+
+const slice_rows = 1024;
+
+/// Rows `lo..hi` of one column into its chunk. Storage that is its Parquet type
+/// already (64-bit ints, times and timestamps, doubles, dates, text) takes a typed
+/// loop that keeps min and max natively and observes them once per slice, where
+/// `observe` per value spent most of a write comparing tagged values; the rest
+/// goes value by value.
+fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, lo: usize, hi: usize) !void {
+    const k = col.ty.kind;
+    switch (col.data) {
+        .i64 => |d| if (m.phys == .int64 and (k == .int or k == .time or k == .timestamp))
+            return encodeFixedSlice(i64, cb, sa, col, d, lo, hi),
+        .f64 => |d| if (m.phys == .double and k == .float)
+            return encodeFixedSlice(f64, cb, sa, col, d, lo, hi),
+        .i32 => |d| if (m.phys == .int32 and k == .date)
+            return encodeFixedSlice(i32, cb, sa, col, d, lo, hi),
+        .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
+            return encodeBytesSlice(cb, sa, col, lo, hi),
+        else => {},
+    }
+    for (lo..hi) |r| try encodeValue(cb, sa, m, col.getValue(r));
+}
+
+fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
+    try cb.defs.append(if (v == .null) 0 else 1);
+    if (v == .null) {
+        cb.nulls += 1;
+        return;
+    }
+    try cb.observe(sa, v);
+    const before = cb.values.items.len;
+    try encodePlain(cb, m, v);
+    if (cb.dict_ok) switch (v) {
+        .string, .bytes => |x| _ = try cb.dictPut(sa, x),
+        else => try cb.dictPutFixed(cb.values.items[before..]),
+    };
+}
+
+fn typedValue(kind: types.TypeKind, x: anytype) Value {
+    return switch (@TypeOf(x)) {
+        f64 => .{ .float = x },
+        i32 => .{ .date = x },
+        else => switch (kind) {
+            .time => .{ .time = x },
+            .timestamp => .{ .timestamp = x },
+            else => .{ .int = x },
+        },
+    };
+}
+
+fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, col: column.Column, data: []const T, lo: usize, hi: usize) !void {
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    try cb.defs.ensureUnusedCapacity(hi - lo);
+    try cb.values.ensureUnusedCapacity((hi - lo) * @sizeOf(T));
+    var mn: T = undefined;
+    var mx: T = undefined;
+    var any = false;
+    var nan = false;
+    for (lo..hi) |r| {
+        if (!col.validity.get(r)) {
+            cb.defs.appendAssumeCapacity(0);
+            cb.nulls += 1;
+            continue;
+        }
+        cb.defs.appendAssumeCapacity(1);
+        const x = data[r];
+        var le: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(U, &le, @bitCast(x), .little);
+        cb.values.appendSliceAssumeCapacity(&le);
+        if (cb.dict_ok) try cb.dictPutFixed(&le);
+        if (T == f64 and std.math.isNan(x)) {
+            nan = true;
+            continue;
+        }
+        if (!any) {
+            mn = x;
+            mx = x;
+            any = true;
+        } else {
+            if (x < mn) mn = x;
+            if (x > mx) mx = x;
+        }
+    }
+    if (nan) try cb.observe(sa, .{ .float = std.math.nan(f64) });
+    if (any) {
+        try cb.observe(sa, typedValue(col.ty.kind, mn));
+        try cb.observe(sa, typedValue(col.ty.kind, mx));
+    }
+}
+
+fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, col: column.Column, lo: usize, hi: usize) !void {
+    const b = col.data.bytes;
+    try cb.defs.ensureUnusedCapacity(hi - lo);
+    var mn: ?[]const u8 = null;
+    var mx: ?[]const u8 = null;
+    for (lo..hi) |r| {
+        if (!col.validity.get(r)) {
+            cb.defs.appendAssumeCapacity(0);
+            cb.nulls += 1;
+            continue;
+        }
+        cb.defs.appendAssumeCapacity(1);
+        const s = b.at(r);
+        var len4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len4, @intCast(s.len), .little);
+        try cb.values.ensureUnusedCapacity(4 + s.len);
+        cb.values.appendSliceAssumeCapacity(&len4);
+        cb.values.appendSliceAssumeCapacity(s);
+        if (cb.dict_ok) _ = try cb.dictPut(sa, s);
+        if (mn == null or std.mem.order(u8, s, mn.?) == .lt) mn = s;
+        if (mx == null or std.mem.order(u8, s, mx.?) == .gt) mx = s;
+    }
+    const text = col.ty.kind == .string;
+    if (mn) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
+    if (mx) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
 }
 
 fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
