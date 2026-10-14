@@ -1022,6 +1022,8 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
             return encodeFixedSlice(i32, cb, sa, col, d, lo, hi),
         .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
             return encodeBytesSlice(cb, sa, col, lo, hi),
+        .dec => |d| if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
+            return encodeDecimalSlice(cb, sa, m, col, d, lo, hi),
         else => {},
     }
     for (lo..hi) |r| try encodeValue(cb, sa, m, col.getValue(r));
@@ -1091,6 +1093,64 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, col: c
     if (any) {
         try cb.observe(sa, typedValue(col.ty.kind, mn));
         try cb.observe(sa, typedValue(col.ty.kind, mx));
+    }
+}
+
+/// Each value rescaled to the column's scale as `plainFixed` does, so min and max
+/// compare the integers that are written.
+fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, data: []const Decimal, lo: usize, hi: usize) !void {
+    const scale = m.scale orelse 0;
+    const width: usize = switch (m.phys) {
+        .int32 => 4,
+        .int64 => 8,
+        else => @intCast(m.type_length orelse return Error.UnsupportedParquetDecimal),
+    };
+    if (width > 16) return Error.UnsupportedParquetDecimal;
+    try cb.defs.ensureUnusedCapacity(hi - lo);
+    try cb.values.ensureUnusedCapacity((hi - lo) * width);
+    var mn: i128 = 0;
+    var mx: i128 = 0;
+    var any = false;
+    for (lo..hi) |r| {
+        if (!col.validity.get(r)) {
+            cb.defs.appendAssumeCapacity(0);
+            cb.nulls += 1;
+            continue;
+        }
+        cb.defs.appendAssumeCapacity(1);
+        var buf: [16]u8 = undefined;
+        const out = buf[0..width];
+        const x: i128 = switch (m.phys) {
+            .int32 => blk: {
+                const v = try rescaleTo(i32, data[r], scale);
+                std.mem.writeInt(i32, out[0..4], v, .little);
+                break :blk v;
+            },
+            .int64 => blk: {
+                const v = try rescaleTo(i64, data[r], scale);
+                std.mem.writeInt(i64, out[0..8], v, .little);
+                break :blk v;
+            },
+            else => blk: {
+                const v = try rescaleTo(i128, data[r], scale);
+                try decimalBytes(out, v);
+                break :blk v;
+            },
+        };
+        cb.values.appendSliceAssumeCapacity(out);
+        if (cb.dict_ok) try cb.dictPutFixed(out);
+        if (!any) {
+            mn = x;
+            mx = x;
+            any = true;
+        } else {
+            if (x < mn) mn = x;
+            if (x > mx) mx = x;
+        }
+    }
+    if (any) {
+        try cb.observe(sa, .{ .decimal = .{ .unscaled = mn, .scale = @intCast(scale) } });
+        try cb.observe(sa, .{ .decimal = .{ .unscaled = mx, .scale = @intCast(scale) } });
     }
 }
 
