@@ -58,19 +58,6 @@ pub const part_shift = keytable.part_shift;
 
 pub const partOf = keytable.partOf;
 
-/// Row indices grouped by partition, rows of one partition in input order; `counts`
-/// holds a slot per partition plus one.
-fn radixOrder(order: []u32, hashes: []const u64, counts: []u32) void {
-    @memset(counts, 0);
-    for (hashes) |h| counts[(h >> part_shift) + 1] += 1;
-    for (1..counts.len) |ci| counts[ci] += counts[ci - 1];
-    for (hashes, 0..) |h, ri| {
-        const pi = h >> part_shift;
-        order[counts[pi]] = @intCast(ri);
-        counts[pi] += 1;
-    }
-}
-
 /// One partition's table and the store it indexes. A serial fold shares one store,
 /// so groups keep first-seen order; a lane's partitions each own theirs.
 pub fn FoldPart(comptime Store: type) type {
@@ -198,7 +185,6 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     defer scratch.deinit();
     const pull = scratch.allocator();
 
-    const counts = try self.state.alloc(u32, fold_parts + 1);
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(FixedStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
@@ -227,51 +213,56 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         if (self.part_state == null) groups = parts[0].store.len else for (parts) |*pp| {
             groups += pp.store.len;
         }
-        const order = try pull.alloc(u32, b.len);
-        if (groups < few_groups) {
-            for (order, 0..) |*o, ri| o.* = @intCast(ri);
-        } else {
-            radixOrder(order, hashes[0..b.len], counts);
-        }
+        const live = try pull.alloc(u32, b.len);
+        var m: usize = 0;
+        for (tails, 0..) |t, r| if (t == null) {
+            live[m] = @intCast(r);
+            m += 1;
+        };
+        const by_part = groups >= few_groups;
+        const pof = try pull.alloc(u8, m);
+        for (pof, live[0..m]) |*p, r| p.* = if (by_part) @intCast(hashes[r] >> part_shift) else 0;
+        const runs = try keytable.Runs(i64).init(pull, if (by_part) fold_parts else 1, e.nk, pof, live[0..m], hashes, e.keys, e.masks);
 
         var nspill: usize = 0;
-        for (order, 0..) |ri, oi| {
-            if (tails[ri] != null) continue;
-            if (oi + prefetch_ahead < order.len) {
-                const pr = order[oi + prefetch_ahead];
-                parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
+        for (0..m) |d| {
+            if (d + prefetch_ahead < m) {
+                const ph = runs.hashes[d + prefetch_ahead];
+                parts[ph >> part_shift].table.prefetch(ph);
             }
-            const key = e.key(ri);
-            if (direct) |*d| if (d.find(key)) |hit| {
+            const ri = runs.rows[d];
+            const h = runs.hashes[d];
+            const key = Aggregate.FixedKey{ .vals = runs.key(d), .mask = runs.mask(d) };
+            if (direct) |*dr| if (dr.find(key)) |hit| {
                 tails[ri] = hit.tail;
                 pidx[ri] = hit.part;
                 continue;
             };
-            const pi = hashes[ri] >> part_shift;
+            const pi = h >> part_shift;
             const part = &parts[pi];
             if (frozen) {
-                const slot = if (dest[ri] == spill_parts.keep) part.table.find(hashes[ri], key, part.store) else null;
+                const slot = if (dest[ri] == spill_parts.keep) part.table.find(h, key, part.store) else null;
                 if (slot) |sl| {
                     tails[ri] = part.store.at(sl).tail;
                     pidx[ri] = @intCast(pi);
                 } else {
-                    dest[ri] = self.destOf(hashes[ri]);
+                    dest[ri] = self.destOf(h);
                     nspill += 1;
                 }
                 continue;
             }
             const at: u32 = @intCast(part.store.len);
-            const f = try part.table.getOrPut(hashes[ri], key, part.store, at);
+            const f = try part.table.getOrPut(h, key, part.store, at);
             const rec = if (f.found) part.store.at(f.slot) else blk: {
-                const nr = try part.store.push(hashes[ri]);
-                @memcpy(nr.keys, key.vals);
+                const nr = try part.store.push(h);
+                for (nr.keys, key.vals) |*o, v| o.* = v;
                 nr.mask.* = key.mask;
                 layout.setOrd(nr.tail, at);
                 break :blk nr;
             };
             tails[ri] = rec.tail;
             pidx[ri] = @intCast(pi);
-            if (direct) |*d| d.note(key, rec.tail, @intCast(pi));
+            if (direct) |*dr| dr.note(key, rec.tail, @intCast(pi));
         }
 
         if (nspill > 0) try self.spillRows(pull, b, dest);
@@ -319,7 +310,6 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         return one;
     }
 
-    const counts = try self.state.alloc(u32, fold_parts + 1);
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(GroupStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
@@ -346,30 +336,32 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         const pidx = try pull.alloc(u8, b.len);
         @memset(tails, null);
 
-        const order = try pull.alloc(u32, b.len);
-        radixOrder(order, hashes[0..b.len], counts);
+        const pof = try pull.alloc(u8, b.len);
+        for (pof, hashes) |*p, h| p.* = @intCast(h >> part_shift);
+        const runs = try keytable.Runs(Value).init(pull, fold_parts, nk, pof, &.{}, hashes, probes, &.{});
 
-        for (order, 0..) |ri, oi| {
-            if (oi + prefetch_ahead < order.len) {
-                const pr = order[oi + prefetch_ahead];
-                parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
+        for (0..b.len) |d| {
+            if (d + prefetch_ahead < b.len) {
+                const ph = runs.hashes[d + prefetch_ahead];
+                parts[ph >> part_shift].table.prefetch(ph);
             }
-            r = ri;
-            const probe = probes[r * nk ..][0..nk];
-            const pi = hashes[r] >> part_shift;
+            r = runs.rows[d];
+            const h = runs.hashes[d];
+            const probe = runs.key(d);
+            const pi = h >> part_shift;
             const part = &parts[pi];
             const rec = if (frozen) blk: {
-                const sl = part.table.find(hashes[r], probe, part.store) orelse {
-                    dest[r] = self.destOf(hashes[r]);
+                const sl = part.table.find(h, probe, part.store) orelse {
+                    dest[r] = self.destOf(h);
                     nspill += 1;
                     continue;
                 };
                 break :blk part.store.at(sl);
             } else blk: {
                 const at: u32 = @intCast(part.store.len);
-                const f = try part.table.getOrPut(hashes[r], probe, part.store, at);
+                const f = try part.table.getOrPut(h, probe, part.store, at);
                 if (f.found) break :blk part.store.at(f.slot);
-                const nr = try part.store.push(hashes[r]);
+                const nr = try part.store.push(h);
                 for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, keyhash.canonValue(v));
                 layout.setOrd(nr.tail, at);
                 break :blk nr;

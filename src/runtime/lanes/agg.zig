@@ -531,6 +531,11 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
         break :blk m;
     };
     dst.merge.?.own = true;
+    var total: usize = 0;
+    for (srcs) |*ls| {
+        if (ls.sets.len > p) total += ls.sets[p].len;
+    }
+    try dst.merge.?.reserve(total);
     for (srcs, 0..) |*ls, i| {
         if (i == bi or ls.sets.len <= p) continue;
         const st = &ls.sets[p];

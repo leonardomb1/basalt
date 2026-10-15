@@ -114,6 +114,58 @@ pub inline fn partOf(h: u64) usize {
     return @intCast(h >> part_shift);
 }
 
+/// A batch's items laid out by radix partition, input order within one: partition
+/// `p` holds `starts[p]` to `starts[p + 1]`, each item's row, hash, key words and null
+/// mask copied there, so a walk over a partition reads all of them in order, not
+/// through an index of row numbers. Item `i` is row `rows_in[i]` (row `i` when
+/// `rows_in` is empty), in partition `pof[i]`; the hashes, keys and masks given are
+/// by row, `nk` key words a row, and no masks means no NULL.
+pub fn Runs(comptime K: type) type {
+    return struct {
+        starts: []u32,
+        rows: []u32,
+        hashes: []u64,
+        keys: []K,
+        masks: []u64,
+        nk: usize,
+
+        pub fn init(a: std.mem.Allocator, nparts: usize, nk: usize, pof: []const u8, rows_in: []const u32, hashes_in: []const u64, keys_in: []const K, masks_in: []const u64) !@This() {
+            const m = pof.len;
+            const self = @This(){
+                .starts = try a.alloc(u32, nparts + 1),
+                .rows = try a.alloc(u32, m),
+                .hashes = try a.alloc(u64, m),
+                .keys = try a.alloc(K, m * nk),
+                .masks = try a.alloc(u64, if (masks_in.len == 0) 0 else m),
+                .nk = nk,
+            };
+            @memset(self.starts, 0);
+            for (pof) |p| self.starts[p + 1] += 1;
+            for (1..self.starts.len) |ci| self.starts[ci] += self.starts[ci - 1];
+            var at: [parts]u32 = undefined;
+            @memcpy(at[0..nparts], self.starts[0..nparts]);
+            for (pof, 0..) |p, i| {
+                const d = at[p];
+                at[p] += 1;
+                const r = if (rows_in.len == 0) i else rows_in[i];
+                self.rows[d] = @intCast(r);
+                self.hashes[d] = hashes_in[r];
+                for (0..nk) |w| self.keys[d * nk + w] = keys_in[r * nk + w];
+                if (self.masks.len > 0) self.masks[d] = masks_in[r];
+            }
+            return self;
+        }
+
+        pub inline fn mask(self: @This(), d: usize) u64 {
+            return if (self.masks.len == 0) 0 else self.masks[d];
+        }
+
+        pub inline fn key(self: @This(), d: usize) []const K {
+            return self.keys[d * self.nk ..][0..self.nk];
+        }
+    };
+}
+
 /// Each word through murmur3's 64-bit finalizer. Wyhash's streaming form was a fifth
 /// of a 100-group GROUP BY.
 pub fn fixedHash(vals: []const i64, mask: u64) u64 {
@@ -283,13 +335,26 @@ pub const GroupTable = struct {
         return self.rehash(self.entries.len * growth, store);
     }
 
-    /// Rebuild at `cap` from this table's own entries, taking each hash from its
-    /// record, the records read a few entries ahead, and free the outgrown entries
-    /// (an arena kept every outgrown table).
+    /// Rebuild at `cap`, each hash taken from its record, and free the outgrown
+    /// entries (an arena kept every outgrown table). A table holding every record of
+    /// its store reads the records in order; one sharing its store walks its entries,
+    /// reading records a few entries ahead.
     fn rehash(self: *GroupTable, cap: usize, store: anytype) !void {
         const ne = try self.alloc.alloc(u32, cap);
         @memset(ne, 0);
         const nmask = cap - 1;
+        if (self.len == store.len) {
+            for (0..store.len) |idx| {
+                const h = store.hashAt(idx);
+                var i = h & nmask;
+                while (ne[i] != 0) i = (i + 1) & nmask;
+                ne[i] = pack(h, idx);
+            }
+            self.alloc.free(self.entries);
+            self.entries = ne;
+            self.mask = nmask;
+            return;
+        }
         for (self.entries, 0..) |e, ei| {
             if (ei + prefetch_ahead < self.entries.len) {
                 const ahead = self.entries[ei + prefetch_ahead];

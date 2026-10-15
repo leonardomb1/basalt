@@ -175,43 +175,20 @@ pub const Pairs = struct {
                 m += 1;
             }
         }
-        const starts = try scratch.alloc(u32, self.parts.len + 1);
-        const sh = try scratch.alloc(u64, m);
         if (self.kind != null) {
-            const sk = try scratch.alloc(i64, m * nk);
-            scatter(i64, nk, pof[0..m], hashes, keys, sh, sk, starts);
+            const runs = try keytable.Runs(i64).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, keys, &.{});
             for (self.parts, 0..) |*part, p| {
-                const lo = starts[p];
-                const hi = starts[p + 1];
-                for (lo..hi) |d| {
-                    if (d + keytable.prefetch_ahead < hi) part.table.prefetch(sh[d + keytable.prefetch_ahead]);
-                    try put(part, sh[d], sk[d * nk ..][0..nk]);
+                const hi = runs.starts[p + 1];
+                for (runs.starts[p]..hi) |d| {
+                    if (d + keytable.prefetch_ahead < hi) part.table.prefetch(runs.hashes[d + keytable.prefetch_ahead]);
+                    try put(part, runs.hashes[d], runs.key(d));
                 }
             }
         } else {
-            const sk = try scratch.alloc(Value, m * nk);
-            scatter(Value, nk, pof[0..m], hashes, probes, sh, sk, starts);
+            const runs = try keytable.Runs(Value).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, probes, &.{});
             for (self.parts, 0..) |*part, p| {
-                for (starts[p]..starts[p + 1]) |d| try putBoxed(part, sh[d], sk[d * nk ..][0..nk]);
+                for (runs.starts[p]..runs.starts[p + 1]) |d| try putBoxed(part, runs.hashes[d], runs.key(d));
             }
-        }
-    }
-
-    /// Rows `i` of `hashes` and `keys` (`nk` a row) moved to `sh` and `sk` grouped by
-    /// partition `pof[i]`, in input order within one; partition `p` runs from
-    /// `starts[p]` to `starts[p + 1]`. Walking them in place, not through an index of
-    /// row numbers, reads both in order.
-    fn scatter(comptime K: type, nk: usize, pof: []const u8, hashes: []const u64, keys: []const K, sh: []u64, sk: []K, starts: []u32) void {
-        @memset(starts, 0);
-        for (pof) |p| starts[p + 1] += 1;
-        for (1..starts.len) |ci| starts[ci] += starts[ci - 1];
-        var at: [keytable.parts]u32 = undefined;
-        @memcpy(at[0 .. starts.len - 1], starts[0 .. starts.len - 1]);
-        for (pof, 0..) |p, i| {
-            const d = at[p];
-            at[p] += 1;
-            sh[d] = hashes[i];
-            for (0..nk) |w| sk[d * nk + w] = keys[i * nk + w];
         }
     }
 
