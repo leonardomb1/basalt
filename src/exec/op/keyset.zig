@@ -7,6 +7,7 @@
 const Batch = @import("../batch.zig").Batch;
 const Value = @import("../value.zig").Value;
 const eval = @import("../eval.zig");
+const keyhash = @import("../keyhash.zig");
 const std = @import("std");
 
 /// One key column's values. `overflow` means `values` stopped at the cap and only
@@ -26,11 +27,12 @@ pub const KeyPush = struct {
     apply: *const fn (ctx: *anyopaque, keys: []const KeyValues) anyerror!void,
 };
 
-/// The distinct non-null values of each column in `cols` across `batches`.
+/// The distinct non-null values of each column in `cols` across `batches`, distinct
+/// as `keyhash.valueEq` tells them.
 pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const usize, cap: usize) ![]KeyValues {
     const out = try arena.alloc(KeyValues, cols.len);
     for (cols, out) |ci, *kv| {
-        var seen = std.StringHashMap(void).init(arena);
+        var seen = std.HashMap(Value, void, keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage).init(arena);
         var vals = std.array_list.Managed(Value).init(arena);
         var overflow = false;
         var lo: ?Value = null;
@@ -43,14 +45,14 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
                 if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = try own(arena, v);
                 if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = try own(arena, v);
                 if (overflow) continue;
-                const k = try identity(arena, v);
-                const gop = try seen.getOrPut(k);
-                if (gop.found_existing) continue;
+                if (seen.contains(v)) continue;
                 if (vals.items.len == cap) {
                     overflow = true;
                     continue;
                 }
-                try vals.append(try own(arena, v));
+                const o = try own(arena, v);
+                try seen.put(o, {});
+                try vals.append(o);
             }
         }
         kv.* = .{ .values = try vals.toOwnedSlice(), .overflow = overflow, .min = lo, .max = hi };
@@ -65,12 +67,6 @@ fn own(arena: std.mem.Allocator, v: Value) !Value {
         .bytes => |s| .{ .bytes = try arena.dupe(u8, s) },
         else => v,
     };
-}
-
-/// Equal values have equal identities and values of different kinds never share
-/// one, so `1` and `'1'` stay apart.
-fn identity(arena: std.mem.Allocator, v: Value) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}:{s}", .{ @tagName(v), try eval.valueToString(arena, v) });
 }
 
 test "collect: distinct non-null values per key, min and max past the cap" {
@@ -91,4 +87,31 @@ test "collect: distinct non-null values per key, min and max past the cap" {
     const none = try collect(a, &.{}, &.{0}, 3);
     try testing.expectEqual(@as(usize, 0), none[0].values.len);
     try testing.expect(!none[0].overflow);
+}
+
+test "collect: values equal under keyhash count once, whatever their scale or zero sign" {
+    const testing = std.testing;
+    const types = @import("../../lang/types.zig");
+    const column = @import("../column.zig");
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "d", .ty = types.Type.decimal(10, 2) },
+        .{ .name = "f", .ty = types.Type.init(.float) },
+    } };
+    var dec = column.Builder.init(a, schema.fields[0].ty);
+    try dec.append(.{ .decimal = .{ .unscaled = 10, .scale = 1 } });
+    try dec.append(.{ .decimal = .{ .unscaled = 100, .scale = 2 } });
+    var flt = column.Builder.init(a, schema.fields[1].ty);
+    try flt.append(.{ .float = -0.0 });
+    try flt.append(.{ .float = 0.0 });
+    const cols = try a.alloc(column.Column, 2);
+    cols[0] = try dec.finish();
+    cols[1] = try flt.finish();
+    const keys = try collect(a, &.{.{ .schema = &schema, .columns = cols, .len = 2 }}, &.{ 0, 1 }, 1);
+    for (keys) |k| {
+        try testing.expectEqual(@as(usize, 1), k.values.len);
+        try testing.expect(!k.overflow);
+    }
 }

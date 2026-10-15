@@ -8,7 +8,6 @@ const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const keyhash = @import("../../keyhash.zig");
 const std = @import("std");
-const types = @import("../../../lang/types.zig");
 
 pub const prefetch_ahead = 8;
 
@@ -48,19 +47,6 @@ pub fn fixedHash(vals: []const i64, mask: u64) u64 {
     var h: u64 = 0x9E3779B97F4A7C15 ^ mask;
     for (vals) |v| h = keyhash.fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
     return h;
-}
-
-pub const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
-
-pub fn keyKindOf(kind: types.TypeKind) ?KeyKind {
-    return switch (kind) {
-        .int, .time, .timestamp => .i64k,
-        .date => .i32k,
-        .bool => .boolk,
-        .float => .f64k,
-        .string => .strk,
-        else => null,
-    };
 }
 
 pub const RecBlocks = struct {

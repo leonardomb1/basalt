@@ -276,6 +276,31 @@ test "DISTINCT ON with ORDER BY keeps the first row per key in ORDER BY order" {
     }
 }
 
+test "GROUP BY on any key path and DISTINCT print one key for -0.0 and 0.0" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "z.csv", .data = "f,d\n-0.0,1\n0.0,1\nnan,2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const t = "(SELECT CAST(f AS FLOAT) AS g, CAST(d AS DECIMAL(5,1)) AS x FROM '$B/z.csv') t";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT g, count(*) AS n FROM " ++ t ++ " GROUP BY g ORDER BY g", .want = "g,n\n0,2\nnan,1\n" },
+        .{ .q = "SELECT g, x, count(*) AS n FROM " ++ t ++ " GROUP BY g, x ORDER BY g", .want = "g,x,n\n0,1.0,2\nnan,2.0,1\n" },
+        .{ .q = "SELECT DISTINCT g FROM " ++ t ++ " ORDER BY g", .want = "g\n0\nnan\n" },
+        .{ .q = "SELECT DISTINCT ON (g) g, x FROM " ++ t ++ " ORDER BY g", .want = "g,x\n0,1.0\nnan,2.0\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
 test "several IN (SELECT ...) conditions, each subquery with its own WHERE" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

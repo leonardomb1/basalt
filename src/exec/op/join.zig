@@ -108,11 +108,12 @@ fn indexOverhead(rows: usize) usize {
 pub const KeyClass = enum { i64s, bytes, boxed };
 
 /// How a key position compares. Same kind required: `int` and `timestamp` share the
-/// i64 store but are never equal.
+/// i64 store but are never equal. `.i64s` is the kinds `keyhash.keyKindOf` keys by
+/// their raw i64.
 fn classOf(a: column.Column, b: column.Column) KeyClass {
     if (a.ty.kind != b.ty.kind) return .boxed;
     return switch (a.data) {
-        .i64 => if (std.meta.activeTag(b.data) == .i64) .i64s else .boxed,
+        .i64 => if (keyhash.keyKindOf(a.ty.kind) == .i64k and std.meta.activeTag(b.data) == .i64) .i64s else .boxed,
         .bytes => if (std.meta.activeTag(b.data) == .bytes) .bytes else .boxed,
         else => .boxed,
     };

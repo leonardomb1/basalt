@@ -208,7 +208,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                     keys[r * nk + j] = @intFromBool(col.data.b[r]);
                 },
                 .f64k => for (0..b.len) |r| {
-                    keys[r * nk + j] = @bitCast(keyhash.canonF64(col.data.f64[r]));
+                    keys[r * nk + j] = keyhash.floatWord(col.data.f64[r]);
                 },
                 .strk => {
                     const table = try self.strTable();
@@ -399,7 +399,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 const f = try part.table.getOrPut(hashes[r], probe, part.store, at);
                 if (f.found) break :blk part.store.at(f.slot);
                 const nr = try part.store.push(hashes[r]);
-                for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, v);
+                for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, keyhash.canonValue(v));
                 break :blk nr;
             };
             tails[r] = rec.tail;

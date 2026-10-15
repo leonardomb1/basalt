@@ -23,12 +23,40 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
 const eval = @import("eval.zig");
+const types = @import("../lang/types.zig");
 
 /// The canonical bit pattern for a float key: -0.0 becomes 0.0 and every NaN one NaN,
 /// matching `valueEq`, which compares floats numerically.
 pub fn canonF64(x: f64) f64 {
     if (std.math.isNan(x)) return std.math.nan(f64);
     return if (x == 0) 0 else x;
+}
+
+/// The value a group or distinct row keeps for its key: a float canonical, so which
+/// of `0.0` and `-0.0` (or which NaN) a key prints never depends on row order,
+/// thread count or which key path ran.
+pub fn canonValue(v: Value) Value {
+    return if (v == .float) .{ .float = canonF64(v.float) } else v;
+}
+
+/// How a typed key path stores one column's key as a 64-bit word whose equality is
+/// `valueEq`'s within that kind; null for a kind it boxes.
+pub const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
+
+pub fn keyKindOf(kind: types.TypeKind) ?KeyKind {
+    return switch (kind) {
+        .int, .time, .timestamp => .i64k,
+        .date => .i32k,
+        .bool => .boolk,
+        .float => .f64k,
+        .string => .strk,
+        else => null,
+    };
+}
+
+/// A float key's word: its canonical bits, so equal floats share one word.
+pub inline fn floatWord(x: f64) i64 {
+    return @bitCast(canonF64(x));
 }
 
 /// murmur3's 64-bit finalizer.
@@ -202,6 +230,13 @@ test "hashValue: -0.0 and NaN hash by value, matching valueEq" {
 
     try testing.expect(!valueEq(nan_a, zero));
     try testing.expect(hashOne(nan_a) != hashOne(zero));
+}
+
+test "canonValue and floatWord: equal floats keep one value and one word" {
+    try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(canonValue(.{ .float = -0.0 }).float)));
+    try testing.expectEqual(floatWord(0.0), floatWord(-0.0));
+    try testing.expectEqual(floatWord(std.math.nan(f64)), floatWord(-std.math.nan(f64)));
+    try testing.expectEqual(@as(i64, -3), canonValue(.{ .int = -3 }).int);
 }
 
 test "hashValue: numerically equal values hash alike ACROSS int/float/decimal" {

@@ -212,30 +212,32 @@ pub const Distinct = struct {
                 };
                 self.ords = ords;
             }
-            return try gatherDeep(arena, b, keep, kept);
+            return try gatherDeep(arena, b, keep, kept, key_idx);
         }
         return null;
     }
 };
 
-/// The raw 64-bit words of an int-family column, or null for a kind whose bits
-/// are not its identity (floats have two zeros).
+/// The 64-bit key words of a column `keyhash.keyKindOf` stores as its raw i64s, or
+/// null for a kind whose words need building.
 fn fixedWord(col: column.Column) ?[]const u64 {
-    return switch (col.ty.kind) {
-        .int, .time, .timestamp => @ptrCast(col.data.i64),
-        else => null,
-    };
+    return if (keyhash.keyKindOf(col.ty.kind) == .i64k) @ptrCast(col.data.i64) else null;
 }
 
 /// Deep-copy the `keep`-marked rows of `b` into `arena`, duping string payloads
 /// (unlike `column.gather`), for a source batch whose scratch is about to be freed.
-fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) anyerror!Batch {
+/// A float key column's values are `keyhash.canonF64`, as GROUP BY keeps its keys.
+fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, key_idx: []const usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
     for (b.columns, b.schema.fields, 0..) |*col, f, ci| {
         var bd = column.Builder.init(arena, f.ty);
         var r: usize = 0;
         while (r < b.len) : (r += 1) if (keep[r]) try bd.append(col.getValue(r));
         outcols[ci] = try bd.finish();
+        if (f.ty.kind == .float and std.mem.indexOfScalar(usize, key_idx, ci) != null)
+            for (outcols[ci].data.f64[0..kept]) |*x| {
+                x.* = keyhash.canonF64(x.*);
+            };
     }
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
