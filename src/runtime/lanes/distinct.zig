@@ -77,9 +77,17 @@ const Piece = struct {
 
 /// A work item's first rows, which live until the merge has gathered them.
 const Item = struct {
-    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
-    cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
+    arena: std.heap.ArenaAllocator,
     pieces: std.ArrayListUnmanaged(Piece) = .empty,
+};
+
+/// What a lane keeps across the items it takes: its string ids, so a string costs the
+/// shared table's lock once a lane rather than once an item, and its working memory,
+/// reused rather than mapped afresh for every item.
+const Lane = struct {
+    arena: std.heap.ArenaAllocator,
+    cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
+    mem: LaneMem = .{},
 };
 
 const DistinctCtx = struct {
@@ -93,17 +101,29 @@ const DistinctCtx = struct {
     strs: *?*keytable.StrTable,
     queue: WorkQueue,
     items: []Item,
+    lanes: []Lane,
     rows_read: *obs.RowCounter,
 };
 
-const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
+/// A lane: work items taken from the queue until none are left, with the lane's own
+/// string cache.
+fn distinctWorker(ctx: *DistinctCtx, lane_idx: usize) void {
+    const lane = &ctx.lanes[lane_idx];
+    const in = keytable.Interner{ .table = ctx.strs, .cache = &lane.cache, .alloc = lane.arena.allocator() };
+    lane.mem.init();
+    defer lane.mem.deinit();
+    while (!ctx.queue.failed.load(.seq_cst)) {
+        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+        if (i >= ctx.queue.nitems) return;
+        _ = lane.mem.work.reset(.retain_capacity);
+        _ = lane.mem.batch.reset(.retain_capacity);
+        distinctWorkOne(ctx, &lane.mem, in, i) catch |e| return ctx.queue.fail(e);
+    }
+}
 
 /// Dedups per item rather than per lane, so the item index is a file position and the
 /// merge keeps the row a serial run would; then keys the item's first rows for it.
-fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
+fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: usize) !void {
     const item = &ctx.items[i];
     const ia = item.arena.allocator();
     const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
@@ -111,10 +131,9 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.gpa.allocator(), .track_ords = true };
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .shared_strs = in };
     defer d.release();
 
-    const in = keytable.Interner{ .table = ctx.strs, .cache = &item.cache, .alloc = ia };
     const enc: ?keytable.Encoder = if (ctx.keys.kinds) |k| try keytable.Encoder.init(ia, ctx.keys.idx, k) else null;
     while (try d.next(ia)) |b| {
         const hashes = try ia.alloc(u64, b.len);
@@ -147,6 +166,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
 }
 
 const MergeCtx = struct {
+    gpa: std.mem.Allocator,
     keys: Keys,
     items: []Item,
     queue: WorkQueue,
@@ -156,7 +176,7 @@ const mergeWorker = dispatchWorker(MergeCtx, mergeOne);
 
 /// Partition `p` across every item in input order: a key's first row is kept.
 fn mergeOne(ctx: *MergeCtx, p: usize) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var table = try keytable.GroupTable.init(a, 16);
@@ -269,8 +289,11 @@ pub fn runParallelDistinct(
     const nthreads = split.lanes(opts);
     const nitems = split.count(nthreads);
     const items = try arena.alloc(Item, nitems);
-    for (items) |*it| it.* = .{};
+    for (items) |*it| it.* = .{ .arena = .init(env.gpa) };
     defer for (items) |*it| it.arena.deinit();
+    const lane_state = try arena.alloc(Lane, @max(nthreads, 1));
+    for (lane_state) |*l| l.* = .{ .arena = .init(env.gpa) };
+    defer for (lane_state) |*l| l.arena.deinit();
     var strs_table = keytable.StrTable.init(std.heap.page_allocator);
     defer strs_table.deinit();
     var strs: ?*keytable.StrTable = &strs_table;
@@ -285,6 +308,7 @@ pub fn runParallelDistinct(
         .strs = &strs,
         .queue = .{ .nitems = nitems },
         .items = items,
+        .lanes = lane_state,
         .rows_read = env.rows_read,
     };
 
@@ -293,7 +317,7 @@ pub fn runParallelDistinct(
     env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
-    var mctx = MergeCtx{ .keys = ctx.keys, .items = items, .queue = .{ .nitems = keytable.parts } };
+    var mctx = MergeCtx{ .gpa = env.gpa, .keys = ctx.keys, .items = items, .queue = .{ .nitems = keytable.parts } };
     _ = try parallel.spawnJoin(arena, nthreads, mergeWorker, &mctx);
     if (mctx.queue.failure()) |e| return e;
     const merged = try gatherKept(arena, row_schema, items);

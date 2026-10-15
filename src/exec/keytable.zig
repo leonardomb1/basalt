@@ -76,6 +76,12 @@ pub const Direct = struct {
         return self.recs[self.slot(key.vals[0], key.mask) orelse return null];
     }
 
+    /// `key`'s record and partition, when the array holds it.
+    pub inline fn find(self: *const Direct, key: FixedKey) ?struct { tail: [*]u8, part: u8 } {
+        const i = self.slot(key.vals[0], key.mask) orelse return null;
+        return .{ .tail = self.recs[i] orelse return null, .part = self.parts[i] };
+    }
+
     /// The record and partition of each row whose key the array holds.
     pub fn hits(self: *Direct, e: Encoded, tails: []?[*]u8, pidx: []u8) void {
         self.prime(e);

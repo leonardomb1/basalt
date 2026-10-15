@@ -40,6 +40,8 @@ pub const Distinct = struct {
     seen: ?Seen = null,
     strs: ?*keytable.StrTable = null,
     str_cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
+    shared_strs: ?keytable.Interner = null,
+    scratch: ?std.heap.ArenaAllocator = null,
     track_ords: bool = false,
     ords: []const u64 = &.{},
     seen_rows: u64 = 0,
@@ -109,11 +111,14 @@ pub const Distinct = struct {
         return if (self.track_ords) self.state else self.gpa;
     }
 
+    /// String ids through `shared_strs` when a lane shares its own, else a private table.
     fn interner(self: *Distinct) keytable.Interner {
-        return .{ .table = &self.strs, .cache = &self.str_cache, .alloc = self.state };
+        return self.shared_strs orelse .{ .table = &self.strs, .cache = &self.str_cache, .alloc = self.state };
     }
 
     fn freeSeen(self: *Distinct) void {
+        if (self.scratch) |*a| a.deinit();
+        self.scratch = null;
         const s = &(self.seen orelse return);
         s.table.deinit();
         if (s.direct) |d| d.deinit(self.tableAlloc());
@@ -187,16 +192,17 @@ pub const Distinct = struct {
     fn dedup(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
         const seen = try self.seenSet();
         errdefer self.freeSeen();
-        var scratch = std.heap.ArenaAllocator.init(self.gpa);
-        defer scratch.deinit();
+        if (self.scratch == null) self.scratch = .init(self.gpa);
+        const scratch = &self.scratch.?;
         const pull = scratch.allocator();
 
-        while (try self.child.next(pull)) |b| {
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            const b = (try self.child.next(pull)) orelse break;
             const keep = try pull.alloc(bool, b.len);
             const frozen = self.overBudget();
             const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
             @memset(dest, spill_parts.keep);
-            const hashes = try pull.alloc(u64, b.len);
             var nspill: usize = 0;
             var kept: usize = 0;
             switch (seen.store) {
@@ -205,22 +211,30 @@ pub const Distinct = struct {
                     @memset(keep, false);
                     const rows = if (seen.direct) |*d| try d.misses(e, pull) else null;
                     const n = if (rows) |rs| rs.len else b.len;
-                    for (0..n) |i| hashes[i] = e.hash(if (rows) |rs| rs[i] else i);
+                    const hashes: []u64 = if (rows == null) try pull.alloc(u64, n) else &.{};
+                    for (hashes, 0..) |*h, i| h.* = e.hash(i);
                     for (0..n) |i| {
                         const r = if (rows) |rs| rs[i] else i;
-                        if (i + keytable.prefetch_ahead < n) seen.table.prefetch(hashes[i + keytable.prefetch_ahead]);
                         const key = e.key(r);
+                        var h: u64 = undefined;
+                        if (seen.direct) |*d| {
+                            if (d.lookup(key) != null) continue;
+                            h = e.hash(r);
+                        } else {
+                            h = hashes[i];
+                            if (i + keytable.prefetch_ahead < n) seen.table.prefetch(hashes[i + keytable.prefetch_ahead]);
+                        }
                         if (frozen) {
-                            const known = !(e.absent.len > 0 and e.absent[r]) and seen.table.find(hashes[i], key, st) != null;
+                            const known = !(e.absent.len > 0 and e.absent[r]) and seen.table.find(h, key, st) != null;
                             if (!known) {
-                                dest[r] = spill_parts.partOf(hashes[i], self.spill_depth);
+                                dest[r] = spill_parts.partOf(h, self.spill_depth);
                                 nspill += 1;
                             }
                             continue;
                         }
-                        const f = try seen.table.getOrPut(hashes[i], key, st, @intCast(st.len));
+                        const f = try seen.table.getOrPut(h, key, st, @intCast(st.len));
                         if (f.found) continue;
-                        const nr = try st.push(hashes[i]);
+                        const nr = try st.push(h);
                         @memcpy(nr.keys, key.vals);
                         nr.mask.* = key.mask;
                         if (seen.direct) |*d| d.note(key, nr.tail, 0);
@@ -230,6 +244,7 @@ pub const Distinct = struct {
                 },
                 .boxed => |st| {
                     const nk = seen.key_idx.len;
+                    const hashes = try pull.alloc(u64, b.len);
                     const probes = try pull.alloc(Value, b.len * nk);
                     for (0..b.len) |r| {
                         const probe = probes[r * nk ..][0..nk];

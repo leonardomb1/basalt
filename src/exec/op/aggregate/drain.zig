@@ -198,6 +198,11 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
             }
             const key = e.key(ri);
+            if (direct) |*d| if (d.find(key)) |hit| {
+                tails[ri] = hit.tail;
+                pidx[ri] = hit.part;
+                continue;
+            };
             const pi = hashes[ri] >> part_shift;
             const part = &parts[pi];
             if (frozen) {
