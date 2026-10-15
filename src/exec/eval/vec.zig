@@ -1130,7 +1130,7 @@ inline fn numF(x: Num, i: usize) f64 {
     };
 }
 
-inline fn numAt(comptime T: type, x: Num, i: usize) T {
+pub inline fn numAt(comptime T: type, x: Num, i: usize) T {
     return if (T == i64) numI(x, i) else numF(x, i);
 }
 

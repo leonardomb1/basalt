@@ -31,6 +31,8 @@ const column = @import("../column.zig");
 const evalRow = @import("row.zig").evalRow;
 const evalVec = @import("vec.zig").evalVec;
 const mkCol = @import("vec.zig").mkCol;
+const numAt = @import("vec.zig").numAt;
+const numValid = @import("vec.zig").numValid;
 const std = @import("std");
 const strAt = @import("vec.zig").strAt;
 const toF64 = @import("support.zig").toF64;
@@ -148,14 +150,6 @@ fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!
     return x;
 }
 
-inline fn numAt(comptime a: Arg, x: Num, i: usize) ?a.Base() {
-    return switch (x) {
-        .icol => |c| if (c.v.get(i)) (if (a == .num) @as(f64, @floatFromInt(c.d[i])) else c.d[i]) else null,
-        .fcol => |c| if (c.v.get(i)) (if (a == .num) c.d[i] else unreachable) else null,
-        .iscalar => |s| if (a == .num) @as(f64, @floatFromInt(s)) else s,
-        .fscalar => |s| if (a == .num) s else unreachable,
-    };
-}
 
 fn isBytes(v: Vec) bool {
     return switch (v) {
@@ -262,7 +256,7 @@ pub fn Scalar(comptime F: type) type {
 
         inline fn at(comptime a: Arg, op: anytype, i: usize) ?a.Base() {
             if (comptime a.text()) return strAt(op, i);
-            return numAt(a, op, i);
+            return if (numValid(op, i)) numAt(a.Base(), op, i) else null;
         }
     };
 }
