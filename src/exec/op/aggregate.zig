@@ -97,7 +97,6 @@ pub const Aggregate = struct {
     pub const GroupStore = @import("aggregate/table.zig").GroupStore;
     pub const argCast = @import("aggregate/accumulate.zig").argCast;
     pub const argColumn = @import("aggregate/accumulate.zig").argColumn;
-    pub const castArg = @import("aggregate/accumulate.zig").castArg;
     pub const emitSets = @import("aggregate/accumulate.zig").emitSets;
     pub const emitGroup = @import("aggregate/accumulate.zig").emitGroup;
     pub const Layout = @import("aggregate/kernel.zig").Layout;

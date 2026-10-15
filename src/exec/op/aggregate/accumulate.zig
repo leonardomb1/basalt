@@ -13,6 +13,7 @@ const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const failLabel = @import("../../op.zig").failLabel;
 const funcs = @import("funcs.zig");
+const read = @import("read.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
@@ -40,15 +41,8 @@ pub fn foldSingle(self: *Aggregate, arena: std.mem.Allocator, b: Batch, layout: 
     }
 }
 
-/// What a text argument is cast to before it reaches the accumulator, or null for
-/// COUNT, MIN and MAX. Parallel CSV lanes carry raw text, so the cast happens here.
 pub fn argCast(agg: Agg) ?types.Type {
-    return switch (aggregates.spec(agg.func).arg) {
-        .star_or_any, .any => null,
-        .numeric => agg.ty.asNullable(),
-        .int => types.Type.init(.int).asNullable(),
-        .bool => types.Type.init(.bool).asNullable(),
-    };
+    return read.castTo(agg.func, agg.ty);
 }
 
 /// One agg's argument across a batch, a text column cast per `argCast`. A stored
@@ -66,21 +60,7 @@ pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const
         }
     }
     const col = eval.evalColumn(arena, e, b, want) catch |err| return inAggregate(self, err);
-    if (col.ty.kind != .string) return col;
-    const to = argCast(agg) orelse return col;
-    if (to.kind == .string) return col;
-    var out = try column.Builder.initCapacity(arena, to, b.len);
-    for (0..b.len) |r| try out.append(try self.castArg(arena, agg, to, col.getValue(r)));
-    return out.finish();
-}
-
-/// A text `SUM` into an INT or DECIMAL adds exactly or fails; it never rounds.
-pub fn castArg(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, to: types.Type, v: Value) anyerror!Value {
-    if (v.isNull()) return v;
-    const exact = agg.func == .sum and v == .string and to.kind != .float;
-    return (if (exact) eval.exactSumText(v.string, to) else eval.castValueTyped(arena, v, to)) catch |err| {
-        return inAggregate(self, if (err == error.CastFailed and !exact) eval.castFailure(arena, v, to) else err);
-    };
+    return read.castText(arena, agg.func, agg.ty, col) catch |err| inAggregate(self, err);
 }
 
 /// `err`, its message noted as raised in an aggregate.

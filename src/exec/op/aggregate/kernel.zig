@@ -16,6 +16,7 @@ const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const funcs = @import("funcs.zig");
+const read = @import("read.zig");
 const simd = @import("../../simd.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -49,81 +50,6 @@ pub const Kernel = struct {
     own_always: bool,
 };
 
-/// The physical type a column of `kind` holds, or null for one read only as values.
-fn Phys(comptime kind: types.TypeKind) ?type {
-    return switch (kind) {
-        .int, .time, .timestamp => i64,
-        .date => i32,
-        .float => f64,
-        .decimal => Decimal,
-        .bool => bool,
-        .string, .bytes => []const u8,
-        .array, .@"struct" => null,
-    };
-}
-
-inline fn get(comptime S: type, c: column.Column, i: usize) S {
-    return switch (S) {
-        i64 => c.data.i64[i],
-        i32 => c.data.i32[i],
-        f64 => c.data.f64[i],
-        Decimal => c.data.dec[i],
-        bool => c.data.b[i],
-        []const u8 => c.data.bytes.at(i),
-        else => unreachable,
-    };
-}
-
-fn slice(comptime S: type, c: column.Column, n: usize) []const S {
-    return switch (S) {
-        i64 => c.data.i64[0..n],
-        f64 => c.data.f64[0..n],
-        Decimal => c.data.dec[0..n],
-        else => unreachable,
-    };
-}
-
-/// Whether a value of physical type `S` converts to `In` without a cast.
-fn converts(comptime S: type, comptime In: type) bool {
-    if (S == In) return true;
-    return (In == f64 and (S == i64 or S == Decimal)) or (In == Decimal and S == i64);
-}
-
-inline fn conv(comptime S: type, comptime In: type, x: S) In {
-    if (S == In) return x;
-    return switch (In) {
-        f64 => if (S == i64) @floatFromInt(x) else x.toF64(),
-        Decimal => .{ .unscaled = x, .scale = 0 },
-        else => unreachable,
-    };
-}
-
-/// `v` as an `In`, through a cast to the type the op reads when it is not one already.
-fn fromValue(comptime In: type, v: Value, cx: Ctx) !In {
-    if (In == Value) return v;
-    switch (In) {
-        i64 => switch (v) {
-            .int, .time, .timestamp => |x| return x,
-            else => {},
-        },
-        i32 => if (v == .date) return v.date,
-        f64 => switch (v) {
-            .float, .int, .decimal => return eval.toF64(v),
-            else => {},
-        },
-        Decimal => if (eval.asDecimal(v)) |d| return d,
-        bool => if (v == .bool) return v.bool,
-        []const u8 => switch (v) {
-            .string, .bytes => |s| return s,
-            else => {},
-        },
-        else => unreachable,
-    }
-    const c = try eval.castValueTyped(cx.scratch, v, cx.ty);
-    if (c.isNull()) return error.CastFailed;
-    return fromValue(In, c, cx);
-}
-
 fn hasAddAll(comptime Op: type) bool {
     return @hasDecl(Op, "addAll") and @TypeOf(Op.addAll) != void;
 }
@@ -143,7 +69,7 @@ pub fn make(comptime Op: type) Kernel {
         fn add(p: [*]u8, v: Value, cx: Ctx) anyerror!void {
             if (v.isNull()) return;
             if (Op.In == void) return Op.add(st(p), {}, cx);
-            try Op.add(st(p), try fromValue(Op.In, v, cx), cx);
+            try Op.add(st(p), try read.fromValue(Op.In, v, cx), cx);
         }
 
         fn fold(p: [*]u8, col: ?column.Column, n: usize, cx: Ctx) anyerror!void {
@@ -151,51 +77,31 @@ pub fn make(comptime Op: type) Kernel {
             if (Op.In == void) return Op.addN(s, if (col) |c| simd.popcountValid(c.validity.bits, n) else n);
             const c = col.?;
             const all = c.validity.allSet(n);
-            if (Op.In != Value) switch (c.ty.kind) {
-                inline else => |kind| if (comptime Phys(kind)) |S| if (comptime converts(S, Op.In)) {
-                    if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, slice(S, c, n), cx);
-                    for (0..n) |i| {
-                        if (!all and !c.validity.get(i)) continue;
-                        try Op.add(s, conv(S, Op.In, get(S, c, i)), cx);
-                    }
-                    return;
+            switch (c.ty.kind) {
+                inline else => |kind| {
+                    if (comptime read.Phys(kind)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, read.slice(S, c, n), cx);
+                    if (all) {
+                        for (0..n) |i| if (try read.atValid(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
+                    } else for (0..n) |i| if (try read.at(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
                 },
-            };
-            for (0..n) |i| {
-                const v = c.getValue(i);
-                if (v.isNull()) continue;
-                try Op.add(s, try fromValue(Op.In, v, cx), cx);
             }
         }
 
         fn foldRows(tails: []const ?[*]u8, off: usize, col: ?column.Column, rows: Rows) anyerror!void {
             const needs_alloc = @hasDecl(Op, "needs_alloc") and Op.needs_alloc;
-            if (Op.In == void) {
-                const c = col orelse {
-                    for (tails) |t| if (t) |tp| try Op.add(st(tp + off), {}, rows.cx);
-                    return;
-                };
-                for (tails, 0..) |t, r| if (t) |tp| if (c.validity.get(r)) try Op.add(st(tp + off), {}, rows.cx);
+            const c = col orelse {
+                if (Op.In != void) unreachable;
+                for (tails) |t| if (t) |tp| try Op.add(st(tp + off), {}, rows.cx);
                 return;
-            }
-            const c = col.?;
-            const all = c.validity.allSet(tails.len);
-            if (Op.In != Value) switch (c.ty.kind) {
-                inline else => |kind| if (comptime Phys(kind)) |S| if (comptime converts(S, Op.In)) {
-                    for (tails, 0..) |t, r| {
-                        const tp = t orelse continue;
-                        if (!all and !c.validity.get(r)) continue;
-                        try Op.add(st(tp + off), conv(S, Op.In, get(S, c, r)), if (needs_alloc) rows.at(r) else rows.cx);
-                    }
-                    return;
-                },
             };
-            for (tails, 0..) |t, r| {
-                const tp = t orelse continue;
-                const v = c.getValue(r);
-                if (v.isNull()) continue;
-                const cx = rows.at(r);
-                try Op.add(st(tp + off), try fromValue(Op.In, v, cx), cx);
+            const all = c.validity.allSet(tails.len);
+            switch (c.ty.kind) {
+                inline else => |kind| for (tails, 0..) |t, r| {
+                    const tp = t orelse continue;
+                    const cx = if (needs_alloc) rows.at(r) else rows.cx;
+                    const x = (if (all) try read.atValid(Op.In, kind, c, r, cx) else try read.at(Op.In, kind, c, r, cx)) orelse continue;
+                    try Op.add(st(tp + off), x, cx);
+                },
             }
         }
 
@@ -209,6 +115,7 @@ pub fn make(comptime Op: type) Kernel {
             return Op.own(st(p), cx);
         }
     };
+    comptime std.debug.assert(@alignOf(Op.State) <= 8);
     return .{
         .size = std.mem.alignForward(usize, @sizeOf(Op.State), 8),
         .init = K.init,
@@ -231,7 +138,7 @@ fn kernelOf(comptime Op: type) *const Kernel {
 
 fn extreme(comptime want: std.math.Order, kind: types.TypeKind) *const Kernel {
     return switch (kind) {
-        inline else => |k| if (comptime Phys(k)) |T| kernelOf(funcs.Extreme(T, want)) else kernelOf(funcs.ExtremeValue(want)),
+        inline else => |k| if (comptime read.Phys(k)) |T| kernelOf(funcs.Extreme(T, want)) else kernelOf(funcs.ExtremeValue(want)),
     };
 }
 
@@ -261,10 +168,10 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         .bit_and => .{ .k = kernelOf(funcs.Bits(.@"and")), .ty = types.Type.init(.int) },
         .bit_or => .{ .k = kernelOf(funcs.Bits(.@"or")), .ty = types.Type.init(.int) },
         .bit_xor => .{ .k = kernelOf(funcs.Bits(.xor)), .ty = types.Type.init(.int) },
-        .var_samp => .{ .k = kernelOf(funcs.Spread(.var_samp)), .ty = float },
-        .var_pop => .{ .k = kernelOf(funcs.Spread(.var_pop)), .ty = float },
-        .stddev_samp => .{ .k = kernelOf(funcs.Spread(.stddev_samp)), .ty = float },
-        .stddev_pop => .{ .k = kernelOf(funcs.Spread(.stddev_pop)), .ty = float },
+        .var_samp => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.var_samp, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.var_samp, false)), .ty = float },
+        .var_pop => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.var_pop, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.var_pop, false)), .ty = float },
+        .stddev_samp => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_samp, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_samp, false)), .ty = float },
+        .stddev_pop => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_pop, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_pop, false)), .ty = float },
     };
 }
 

@@ -248,13 +248,35 @@ pub const AvgDecimal = struct {
     }
 };
 
-fn order(comptime T: type, a: T, b: T) std.math.Order {
+/// The order MIN and MAX keep, GROUP BY and window alike: NaN above every number,
+/// decimals exactly across scales, text by bytes, and across kinds `compareValues`'s.
+pub fn order(comptime T: type, a: T, b: T) std.math.Order {
     return switch (T) {
+        Value => eval.compareValues(a, b) orelse .eq,
         f64 => eval.orderF64(a, b),
         Decimal => a.order(b),
         bool => std.math.order(@intFromBool(a), @intFromBool(b)),
         []const u8 => std.mem.order(u8, a, b),
         else => std.math.order(a, b),
+    };
+}
+
+/// A physical value as the declared type `out` tags it: a TIMESTAMP and an INT
+/// share i64, a BYTES and a STRING their bytes.
+pub fn toValue(comptime T: type, x: T, out: types.Type) Value {
+    return switch (T) {
+        Value => x,
+        i64 => switch (out.kind) {
+            .time => .{ .time = x },
+            .timestamp => .{ .timestamp = x },
+            else => .{ .int = x },
+        },
+        i32 => .{ .date = x },
+        f64 => .{ .float = x },
+        Decimal => .{ .decimal = x },
+        bool => .{ .bool = x },
+        []const u8 => if (out.kind == .bytes) .{ .bytes = x } else .{ .string = x },
+        else => unreachable,
     };
 }
 
@@ -277,20 +299,7 @@ pub fn Extreme(comptime T: type, comptime want: std.math.Order) type {
             if (T == []const u8 and s.has) s.v = try cx.alloc.dupe(u8, s.v);
         }
         pub fn finish(s: *const State, cx: Ctx) !Value {
-            if (!s.has) return .null;
-            return switch (T) {
-                i64 => switch (cx.out.kind) {
-                    .time => .{ .time = s.v },
-                    .timestamp => .{ .timestamp = s.v },
-                    else => .{ .int = s.v },
-                },
-                i32 => .{ .date = s.v },
-                f64 => .{ .float = s.v },
-                Decimal => .{ .decimal = s.v },
-                bool => .{ .bool = s.v },
-                []const u8 => if (cx.out.kind == .bytes) .{ .bytes = s.v } else .{ .string = s.v },
-                else => unreachable,
-            };
+            return if (s.has) toValue(T, s.v, cx.out) else .null;
         }
         pub const addAll = if (T == f64) addAllF else {};
         fn addAllF(s: *State, xs: []const f64, cx: Ctx) !void {
@@ -306,7 +315,7 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
         pub const needs_alloc = true;
         pub const State = struct { v: Value = .null };
         pub fn add(s: *State, x: Value, cx: Ctx) !void {
-            if (!s.v.isNull() and (eval.compareValues(x, s.v) orelse .eq) != want) return;
+            if (!s.v.isNull() and order(Value, x, s.v) != want) return;
             s.v = try dupeValue(cx.alloc, x);
         }
         pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
@@ -433,19 +442,74 @@ pub const Moments = struct {
     }
 };
 
-pub fn spread(func: ast.AggFunc, variance: f64) Value {
+/// A variance or standard deviation (`func`) of `n` values with squared deviations
+/// `m2`: NULL below two values for the sample statistics and below one for the
+/// population ones. A negative `m2` is rounding and reads 0; a NaN stays NaN.
+pub fn spreadOf(func: ast.AggFunc, n: i64, m2: f64) Value {
+    const samp = func == .var_samp or func == .stddev_samp;
+    if (n < @as(i64, if (samp) 2 else 1)) return .null;
+    const variance = (if (m2 < 0) 0 else m2) / @as(f64, @floatFromInt(if (samp) n - 1 else n));
     return .{ .float = switch (func) {
         .stddev_samp, .stddev_pop => @sqrt(variance),
         else => variance,
     } };
 }
 
-/// VAR_SAMP, VAR_POP, STDDEV_SAMP or STDDEV_POP by Welford's update.
-pub fn Spread(comptime func: ast.AggFunc) type {
+/// Exact sums of x and x² over INT values, so a variance over ints is exact (a run
+/// of equal values reads 0 however many rows passed) until they leave i128, when
+/// the float moments stand in.
+pub const IntSquares = struct {
+    s1: i128 align(8) = 0,
+    s2: i128 align(8) = 0,
+    overflow: bool = false,
+
+    pub fn add(q: *IntSquares, v: i64, sub: bool) void {
+        const x: i128 = v;
+        const sq = std.math.mul(i128, x, x) catch {
+            q.overflow = true;
+            return;
+        };
+        q.s1 = std.math.add(i128, q.s1, if (sub) -x else x) catch blk: {
+            q.overflow = true;
+            break :blk q.s1;
+        };
+        q.s2 = std.math.add(i128, q.s2, if (sub) -sq else sq) catch blk: {
+            q.overflow = true;
+            break :blk q.s2;
+        };
+    }
+
+    pub fn merge(d: *IntSquares, s: IntSquares) void {
+        d.overflow = d.overflow or s.overflow;
+        d.s1 = std.math.add(i128, d.s1, s.s1) catch blk: {
+            d.overflow = true;
+            break :blk d.s1;
+        };
+        d.s2 = std.math.add(i128, d.s2, s.s2) catch blk: {
+            d.overflow = true;
+            break :blk d.s2;
+        };
+    }
+
+    /// The squared deviations of `n` values, or null once the sums overflowed.
+    pub fn m2(q: IntSquares, n: i64) ?f64 {
+        if (q.overflow or n <= 0) return null;
+        const nn: i128 = n;
+        const a = std.math.mul(i128, nn, q.s2) catch return null;
+        const b = std.math.mul(i128, q.s1, q.s1) catch return null;
+        return @as(f64, @floatFromInt(a - b)) / @as(f64, @floatFromInt(nn));
+    }
+};
+
+/// VAR_SAMP, VAR_POP, STDDEV_SAMP or STDDEV_POP by Welford's update, and over ints
+/// (`exact`) by `IntSquares` while they hold.
+pub fn Spread(comptime func: ast.AggFunc, comptime exact: bool) type {
     return struct {
-        pub const In = f64;
-        pub const State = struct { n: i64 = 0, mean: f64 = 0, m2: f64 = 0 };
-        pub fn add(s: *State, x: f64, _: Ctx) !void {
+        pub const In = if (exact) i64 else f64;
+        pub const State = struct { n: i64 = 0, mean: f64 = 0, m2: f64 = 0, sq: if (exact) IntSquares else void = if (exact) .{} else {} };
+        pub fn add(s: *State, v: In, _: Ctx) !void {
+            const x: f64 = if (exact) @floatFromInt(v) else v;
+            if (exact) s.sq.add(v, false);
             s.n += 1;
             const delta = x - s.mean;
             s.mean += delta / @as(f64, @floatFromInt(s.n));
@@ -460,12 +524,11 @@ pub fn Spread(comptime func: ast.AggFunc) type {
             d.mean = m.mean;
             d.m2 = m.m2;
             d.n += s.n;
+            if (exact) d.sq.merge(s.sq);
         }
         pub fn finish(s: *const State, _: Ctx) !Value {
-            const samp = func == .var_samp or func == .stddev_samp;
-            if (s.n < @as(i64, if (samp) 2 else 1)) return .null;
-            const n: f64 = @floatFromInt(if (samp) s.n - 1 else s.n);
-            return spread(func, s.m2 / n);
+            const m2 = if (exact) (s.sq.m2(s.n) orelse s.m2) else s.m2;
+            return spreadOf(func, s.n, m2);
         }
     };
 }

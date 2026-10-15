@@ -51,52 +51,14 @@ const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const rowOrder = @import("sort.zig").rowOrder;
 const keyhash = @import("../keyhash.zig");
-const lessV = @import("aggregate.zig").lessV;
 const aggFuncs = @import("aggregate/funcs.zig");
+const read = @import("aggregate/read.zig");
 const Ctx = aggFuncs.Ctx;
 const Moments = aggFuncs.Moments;
 const materializeAll = @import("../op.zig").materializeAll;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
-
-/// A text argument of a numeric window aggregate read as the plain aggregate reads
-/// it, every row up front: exactly for a SUM into an INT or DECIMAL (the sum's
-/// type), else as a FLOAT.
-fn numericArg(arena: std.mem.Allocator, agg: ast.AggFunc, out_ty: types.Type, c: column.Column) !column.Column {
-    if (c.ty.kind != .string or aggregates.spec(agg).arg != .numeric) return c;
-    const exact = agg == .sum and out_ty.kind != .float;
-    const to = if (!exact) types.Type.init(.float) else if (out_ty.kind == .decimal) out_ty else types.Type.init(.int);
-    var bd = try column.Builder.initCapacity(arena, to.asNullable(), c.len);
-    for (0..c.len) |p| {
-        const v = c.getValue(p);
-        if (v != .string) {
-            try bd.append(v);
-        } else if (exact) {
-            try bd.append(try eval.exactSumText(v.string, out_ty));
-        } else {
-            try bd.append(eval.castValueTyped(arena, v, to) catch |e| return if (e == error.CastFailed) eval.castFailure(arena, v, to) else e);
-        }
-    }
-    return bd.finish();
-}
-
-fn decF64(d: Decimal) f64 {
-    var scale: f64 = 1;
-    var i: u8 = 0;
-    while (i < d.scale) : (i += 1) scale *= 10;
-    return @as(f64, @floatFromInt(d.unscaled)) / scale;
-}
-
-fn asF64Opt(v: Value) ?f64 {
-    return switch (v) {
-        .int => |x| @floatFromInt(x),
-        .float => |x| x,
-        .decimal => |d| decF64(d),
-        .bool => |b| if (b) 1 else 0,
-        else => null,
-    };
-}
 
 pub const Window = struct {
     stats: Stats = .{},
@@ -359,7 +321,7 @@ pub const Window = struct {
             rk.null_at[p] = v.isNull();
             if (v.isNull()) continue;
             if (conv.float) {
-                const x = asF64Opt(v) orelse 0;
+                const x = eval.toF64(v);
                 rk.floats[p] = if (k.desc) -x else x;
             } else {
                 const x: i128 = switch (v) {
@@ -717,30 +679,29 @@ pub const Window = struct {
     }
 
     /// MIN (`want` .lt) or MAX by a monotonic deque of the values that can still win,
-    /// in `lessV` order, a later equal value displacing an earlier one.
-    fn Deque(comptime want: std.math.Order) type {
+    /// in `aggregate/funcs.zig`'s `order`, a later equal value displacing an earlier one.
+    fn Deque(comptime T: type, comptime want: std.math.Order) type {
         return struct {
-            pub const In = Value;
-            const Item = struct { v: Value, p: usize };
+            pub const In = T;
+            const Item = struct { v: T, p: usize };
             pub const State = struct { q: std.ArrayList(Item) = .empty, head: usize = 0 };
             pub fn reset(s: *State) void {
                 s.q.clearRetainingCapacity();
                 s.head = 0;
             }
-            pub fn add(s: *State, x: Value, p: usize, cx: Ctx) !void {
+            pub fn add(s: *State, x: T, p: usize, cx: Ctx) !void {
                 while (s.q.items.len > s.head) {
-                    const back = s.q.items[s.q.items.len - 1].v;
-                    const beaten = if (want == .gt) !lessV(x, back) else !lessV(back, x);
-                    if (!beaten) break;
+                    const o = aggFuncs.order(T, x, s.q.items[s.q.items.len - 1].v);
+                    if (o != .eq and o != want) break;
                     s.q.items.len -= 1;
                 }
                 try s.q.append(cx.alloc, .{ .v = x, .p = p });
             }
-            pub fn remove(s: *State, _: Value, p: usize, _: Ctx) !void {
+            pub fn remove(s: *State, _: T, p: usize, _: Ctx) !void {
                 if (s.head < s.q.items.len and s.q.items[s.head].p == p) s.head += 1;
             }
-            pub fn finish(s: *const State, _: Ctx) !Value {
-                return if (s.head < s.q.items.len) s.q.items[s.head].v else .null;
+            pub fn finish(s: *const State, cx: Ctx) !Value {
+                return if (s.head < s.q.items.len) aggFuncs.toValue(T, s.q.items[s.head].v, cx.out) else .null;
             }
         };
     }
@@ -769,16 +730,13 @@ pub const Window = struct {
     }
 
     /// A variance (`func`) from the frame's moments in two stacks; over ints (`exact`)
-    /// also from integer sums of x and x², so a frame of equal values reads exactly 0
-    /// however many rows passed, the moments standing in once those sums overflow.
+    /// from `IntSquares` while they hold, as the GROUP BY aggregate has it.
     fn Spread(comptime func: ast.AggFunc, comptime exact: bool) type {
         return struct {
             pub const In = if (exact) i64 else f64;
             pub const State = struct {
                 n: i64 = 0,
-                s1: i128 = 0,
-                s2: i128 = 0,
-                overflow: bool = false,
+                sq: aggFuncs.IntSquares = .{},
                 mom: TwoStack(Moments, .{}, Moments.merge) = .{},
             };
             pub fn reset(s: *State) void {
@@ -786,43 +744,18 @@ pub const Window = struct {
                 s.* = .{ .mom = s.mom };
             }
             pub fn add(s: *State, x: In, cx: Ctx) !void {
-                if (exact) sums(s, x, false);
+                if (exact) s.sq.add(x, false);
                 try s.mom.push(cx.alloc, .{ .n = 1, .mean = if (exact) @floatFromInt(x) else x });
                 s.n += 1;
             }
             pub fn remove(s: *State, x: In, cx: Ctx) !void {
-                if (exact) sums(s, x, true);
+                if (exact) s.sq.add(x, true);
                 try s.mom.pop(cx.alloc);
                 s.n -= 1;
             }
-            fn sums(s: *State, v: i64, sub: bool) void {
-                const x: i128 = v;
-                const sq = std.math.mul(i128, x, x) catch {
-                    s.overflow = true;
-                    return;
-                };
-                s.s1 = std.math.add(i128, s.s1, if (sub) -x else x) catch blk: {
-                    s.overflow = true;
-                    break :blk s.s1;
-                };
-                s.s2 = std.math.add(i128, s.s2, if (sub) -sq else sq) catch blk: {
-                    s.overflow = true;
-                    break :blk s.s2;
-                };
-            }
-            fn sqDev(s: *const State) f64 {
-                if (exact and !s.overflow and s.n > 0) {
-                    const n: i128 = s.n;
-                    if (std.math.mul(i128, n, s.s2)) |a| if (std.math.mul(i128, s.s1, s.s1)) |b| {
-                        return @as(f64, @floatFromInt(a - b)) / @as(f64, @floatFromInt(n));
-                    } else |_| {} else |_| {}
-                }
-                return @max(0, s.mom.get().m2);
-            }
             pub fn finish(s: *const State, _: Ctx) !Value {
-                const samp = func == .var_samp or func == .stddev_samp;
-                if (s.n < @as(i64, if (samp) 2 else 1)) return .null;
-                return aggFuncs.spread(func, sqDev(s) / @as(f64, @floatFromInt(if (samp) s.n - 1 else s.n)));
+                const m2 = (if (exact) s.sq.m2(s.n) else null) orelse s.mom.get().m2;
+                return aggFuncs.spreadOf(func, s.n, m2);
             }
         };
     }
@@ -845,42 +778,6 @@ pub const Window = struct {
         }
     };
 
-    /// The kind `In` reads a column of `kind` as: itself when it takes it, `.string`
-    /// standing for every other scalar (present for `void` and `Value`, skipped
-    /// otherwise), `.array` for a kind that reads as NULL.
-    fn reads(comptime In: type, comptime kind: types.TypeKind) types.TypeKind {
-        if (kind == .array or kind == .@"struct") return .array;
-        const takes = switch (In) {
-            bool => kind == .bool,
-            i64 => kind == .int,
-            f64 => kind == .int or kind == .float or kind == .decimal or kind == .bool,
-            Decimal => kind == .int or kind == .decimal,
-            else => false,
-        };
-        return if (takes) kind else .string;
-    }
-
-    /// Sorted row `p` as `In`, or null for a NULL or a value the aggregate skips, as
-    /// a numeric one skips a non-number; an exact DECIMAL sum rejects one.
-    inline fn read(comptime In: type, comptime kind: types.TypeKind, c: column.Column, p: usize) !?In {
-        if (kind == .array or !c.validity.get(p)) return null;
-        return switch (In) {
-            Value => c.getValue(p),
-            void => {},
-            else => switch (kind) {
-                .int => switch (In) {
-                    f64 => @floatFromInt(c.data.i64[p]),
-                    Decimal => .{ .unscaled = c.data.i64[p], .scale = 0 },
-                    else => c.data.i64[p],
-                },
-                .float => c.data.f64[p],
-                .decimal => if (In == f64) decF64(c.data.dec[p]) else c.data.dec[p],
-                .bool => if (In == f64) @as(f64, if (c.data.b[p]) 1 else 0) else c.data.b[p],
-                else => if (In == Decimal) error.TypeMismatch else null,
-            },
-        };
-    }
-
     const Run = *const fn (?column.Column, Frames, Layout, Ctx, *column.Builder) anyerror!void;
 
     /// The one loop every window aggregate runs, generated per aggregate `A` (a
@@ -889,7 +786,9 @@ pub const Window = struct {
     /// frame's end edge and leave at its start edge, as the file header describes.
     fn Slider(comptime A: type, comptime kind: types.TypeKind) type {
         return struct {
-            fn run(col: ?column.Column, fr: Frames, l: Layout, cx: Ctx, bd: *column.Builder) anyerror!void {
+            fn run(col: ?column.Column, fr: Frames, l: Layout, given: Ctx, bd: *column.Builder) anyerror!void {
+                var cx = given;
+                cx.ty = read.inType(A.In, cx.out);
                 var s: A.State = if (@hasDecl(A, "init")) A.init(cx) else .{};
                 const n = fr.fs.len;
                 var k: usize = 0;
@@ -900,10 +799,10 @@ pub const Window = struct {
                     var hi = k;
                     while (k < pe) : (k += 1) {
                         while (hi < fr.fe[k]) : (hi += 1) {
-                            if (try at(col, hi)) |x| try step(A.add, &s, x, hi, cx);
+                            if (try at(col, hi, cx)) |x| try step(A.add, &s, x, hi, cx);
                         }
                         while (lo < fr.fs[k]) : (lo += 1) {
-                            if (lo < hi) if (try at(col, lo)) |x| try step(A.remove, &s, x, lo, cx);
+                            if (lo < hi) if (try at(col, lo, cx)) |x| try step(A.remove, &s, x, lo, cx);
                         }
                         if (hi < lo) hi = lo;
                         try bd.append(try A.finish(&s, cx));
@@ -911,12 +810,12 @@ pub const Window = struct {
                 }
             }
 
-            inline fn at(col: ?column.Column, p: usize) !?A.In {
+            inline fn at(col: ?column.Column, p: usize, cx: Ctx) !?A.In {
                 if (A.In == void) {
                     const c = col orelse return {};
-                    return read(void, kind, c, p);
+                    return read.at(void, kind, c, p, cx);
                 }
-                return read(A.In, kind, col.?, p);
+                return read.at(A.In, kind, col.?, p, cx);
             }
 
             inline fn step(comptime f: anytype, s: *A.State, x: A.In, p: usize, cx: Ctx) !void {
@@ -928,7 +827,7 @@ pub const Window = struct {
 
     fn runOf(comptime A: type, kind: types.TypeKind) Run {
         return switch (kind) {
-            inline else => |k| Slider(A, comptime reads(A.In, k)).run,
+            inline else => |k| Slider(A, k).run,
         };
     }
 
@@ -940,8 +839,9 @@ pub const Window = struct {
             .count_if => runOf(aggFuncs.CountIf, kind),
             .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runOf(SumInt, kind) else runOf(FloatSum(false), kind),
             .avg => if (kind == .int) runOf(aggFuncs.AvgInt, kind) else runOf(FloatSum(true), kind),
-            .min => runOf(Deque(.lt), kind),
-            .max => runOf(Deque(.gt), kind),
+            inline .min, .max => |m| switch (kind) {
+                inline else => |k| runOf(Deque(read.Phys(k) orelse Value, if (m == .min) .lt else .gt), k),
+            },
             .median => runOf(Median, kind),
             .bool_and => runOf(aggFuncs.BoolFold(true), kind),
             .bool_or => runOf(aggFuncs.BoolFold(false), kind),
@@ -1094,7 +994,7 @@ pub const Window = struct {
                 },
                 .agg => |agg| {
                     const fr = try frames(arena, l, f.frame, rk);
-                    const col: ?column.Column = if (arg) |x| try numericArg(arena, agg, out_ty, x) else null;
+                    const col: ?column.Column = if (arg) |x| try read.castText(arena, agg, out_ty, x) else null;
                     const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = arena, .scratch = arena };
                     slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, &bd) catch |e| {
                         if (e == error.IntOverflow and agg == .sum and out_ty.kind == .int) if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(e)});

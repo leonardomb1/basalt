@@ -64,6 +64,26 @@ test "window: a column only named inside OVER survives the projection" {
     try std.testing.expectEqualStrings("s\n10\n", sub);
 }
 
+test "window and GROUP BY variances agree: exact over ints, NaN kept, on one lane or several" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in = "g,x,f\n1,1000000007,1.5\n1,1000000007,nan\n1,1000000007,2\n2,4,0.5\n2,6,2.5\n";
+    const want = "g,a,b,c\n1,0,nan,0\n2,1,2,1.4142135623730951\n";
+    const qs = [_][]const u8{
+        "SELECT g, var_pop(x) AS a, var_samp(f) AS b, stddev_samp(x) AS c FROM '$IN' GROUP BY g ORDER BY g",
+        "SELECT DISTINCT g, var_pop(x) OVER (PARTITION BY g) AS a, var_samp(f) OVER (PARTITION BY g) AS b, stddev_samp(x) OVER (PARTITION BY g) AS c FROM '$IN' ORDER BY g",
+    };
+    for (qs) |q| {
+        const one = try runToString(alloc, &tmp, in, q);
+        defer alloc.free(one);
+        try std.testing.expectEqualStrings(want, one);
+        const lanes = try runCsvThreaded(alloc, &tmp, in, q, 4);
+        defer alloc.free(lanes);
+        try std.testing.expectEqualStrings(want, lanes);
+    }
+}
+
 test "window: row_number, rank and dense_rank number within a partition" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
