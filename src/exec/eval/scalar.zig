@@ -16,6 +16,7 @@
 
 const Batch = @import("../batch.zig").Batch;
 const Bitmap = @import("vec.zig").Bitmap;
+const Filled = @import("vec.zig").Filled;
 const EvalError = @import("../eval.zig").EvalError;
 const Num = @import("vec.zig").Num;
 const Str = @import("vec.zig").Str;
@@ -207,8 +208,6 @@ pub fn Scalar(comptime F: type) type {
         fn vecFixed(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
             const n = batch.len;
             var out = try Out(Payload(F)).init(arena, n);
-            var bm = try Bitmap.initFull(arena, n);
-            var any = false;
             var cx = Cx{ .arena = arena, .buf = out.buf() };
             var ops: OperandTuple(F) = undefined;
             inline for (comptime argsOf(F), 0..) |a, i| {
@@ -227,8 +226,7 @@ pub fn Scalar(comptime F: type) type {
                 inline for (comptime argsOf(F), 0..) |a, k| {
                     if (ops[k]) |op| {
                         t[k] = at(a, op, i) orelse {
-                            try out.none(i, cx.mark, &bm);
-                            any = true;
+                            try out.none(i, cx.mark);
                             continue :rows;
                         };
                     } else if (comptime a.optional()) {
@@ -237,21 +235,16 @@ pub fn Scalar(comptime F: type) type {
                 }
                 const r = @call(.auto, F.apply, .{cx} ++ t) catch |e| return unsupported(e);
                 if (@typeInfo(Result(F)) == .optional) {
-                    if (r) |x| try out.put(i, cx.mark, x) else {
-                        try out.none(i, cx.mark, &bm);
-                        any = true;
-                    }
+                    if (r) |x| try out.put(i, cx.mark, x) else try out.none(i, cx.mark);
                 } else try out.put(i, cx.mark, r);
             }
-            return out.finish(n, bm, any);
+            return out.finish();
         }
 
         fn vecMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
             const n = batch.len;
             if (c.args.len == 0) return error.Unsupported;
             var out = try Out(Payload(F)).init(arena, n);
-            var bm = try Bitmap.initFull(arena, n);
-            var any = false;
             var cx = Cx{ .arena = arena, .buf = out.buf() };
             const ops = try arena.alloc(Str, c.args.len);
             for (c.args, ops) |e, *o| o.* = asStr(try evalVec(arena, e, batch)) orelse return error.Unsupported;
@@ -259,13 +252,12 @@ pub fn Scalar(comptime F: type) type {
             rows: for (0..n) |i| {
                 cx.mark = out.begin();
                 for (ops, parts) |o, *p| p.* = strAt(o, i) orelse {
-                    try out.none(i, cx.mark, &bm);
-                    any = true;
+                    try out.none(i, cx.mark);
                     continue :rows;
                 };
                 try out.put(i, cx.mark, F.apply(cx, parts) catch |e| return unsupported(e));
             }
-            return out.finish(n, bm, any);
+            return out.finish();
         }
 
         inline fn at(comptime a: Arg, op: anytype, i: usize) ?a.Base() {
@@ -291,8 +283,10 @@ fn Out(comptime P: type) type {
     return switch (P) {
         []const u8 => struct {
             app: column.BytesAppender,
+            bm: Bitmap,
+            any: bool = false,
             fn init(arena: std.mem.Allocator, n: usize) !@This() {
-                return .{ .app = try column.BytesAppender.init(arena, n) };
+                return .{ .app = try column.BytesAppender.init(arena, n), .bm = try Bitmap.initFull(arena, n) };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
                 return &o.app.values;
@@ -314,20 +308,21 @@ fn Out(comptime P: type) type {
                 }
                 try o.app.endRow();
             }
-            fn none(o: *@This(), i: usize, mark: usize, bm: *Bitmap) !void {
+            fn none(o: *@This(), i: usize, mark: usize) !void {
                 o.app.values.shrinkRetainingCapacity(mark);
                 try o.app.pushNull();
-                bm.setValid(i, false);
+                o.bm.setValid(i, false);
+                o.any = true;
             }
-            fn finish(o: *@This(), n: usize, bm: Bitmap, any: bool) !Vec {
-                return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try o.app.finish() });
+            fn finish(o: *@This()) !Vec {
+                return mkCol(Type.init(.string).withNull(o.any), o.bm.len, o.bm, .{ .bytes = try o.app.finish() });
             }
         },
         else => struct {
-            d: []P,
+            f: Filled(P),
             scratch: std.array_list.Managed(u8),
             fn init(arena: std.mem.Allocator, n: usize) !@This() {
-                return .{ .d = try arena.alloc(P, n), .scratch = .init(arena) };
+                return .{ .f = try .init(arena, n), .scratch = .init(arena) };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
                 return &o.scratch;
@@ -337,19 +332,18 @@ fn Out(comptime P: type) type {
                 return 0;
             }
             fn put(o: *@This(), i: usize, _: usize, x: P) !void {
-                o.d[i] = x;
+                o.f.d[i] = x;
             }
-            fn none(o: *@This(), i: usize, _: usize, bm: *Bitmap) !void {
-                o.d[i] = std.mem.zeroes(P);
-                bm.setValid(i, false);
+            fn none(o: *@This(), i: usize, _: usize) !void {
+                o.f.setNull(i);
             }
-            fn finish(o: *@This(), n: usize, bm: Bitmap, any: bool) !Vec {
-                return switch (P) {
-                    i64 => mkCol(Type.init(.int).withNull(any), n, bm, .{ .i64 = o.d }),
-                    f64 => mkCol(Type.init(.float).withNull(any), n, bm, .{ .f64 = o.d }),
-                    bool => mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = o.d }),
+            fn finish(o: *@This()) !Vec {
+                return o.f.finish(Type.init(switch (P) {
+                    i64 => .int,
+                    f64 => .float,
+                    bool => .bool,
                     else => @compileError("unsupported scalar result"),
-                };
+                }));
             }
         },
     };

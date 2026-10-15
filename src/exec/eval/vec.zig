@@ -365,19 +365,11 @@ fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator,
         for (0..n) |i| out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
         return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
     }
-    var bm = try Bitmap.initFull(arena, n);
-    var any: bool = false;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (!numValid(l, i) or !numValid(r, i)) {
-            out[i] = if (Out == bool) false else 0;
-            bm.setValid(i, false);
-            any = true;
-            continue;
-        }
-        out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
+    var f = Filled(Out){ .d = out, .bm = try Bitmap.initFull(arena, n) };
+    for (0..n) |i| {
+        if (!numValid(l, i) or !numValid(r, i)) f.setNull(i) else out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
     }
-    return mkCol(ty.withNull(any), n, bm, outData(Out, out));
+    return f.finish(ty);
 }
 
 fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
@@ -416,34 +408,25 @@ fn dictCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize)
     const d = col.dict.?;
     const per = try arena.alloc(bool, d.values.len);
     for (d.values, per) |v, *o| o.* = cmpResult(op, if (flip) std.mem.order(u8, lit, v) else std.mem.order(u8, v, lit));
-    const out = try arena.alloc(bool, n);
-    for (out, d.codes[0..n]) |*o, c| o.* = per[c];
-    if (col.validity.allSet(n)) return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
-    var bm = try Bitmap.initFull(arena, n);
-    for (0..n) |i| if (!col.validity.get(i)) {
-        out[i] = false;
-        bm.setValid(i, false);
-    };
-    return mkCol(Type.init(.bool).withNull(true), n, bm, .{ .b = out });
+    var f = try Filled(bool).masked(arena, n, try copyBits(arena, col.validity, n));
+    for (f.d, d.codes[0..n]) |*o, c| o.* = per[c];
+    return f.finish(Type.init(.bool));
 }
 
 fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) VecError!Vec {
-    const out = try arena.alloc(bool, n);
-    var bm = try Bitmap.initFull(arena, n);
-    var any: bool = false;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const ls = strAt(l, i);
-        const rs = strAt(r, i);
-        if (ls == null or rs == null) {
-            out[i] = false;
-            bm.setValid(i, false);
-            any = true;
+    var f = try Filled(bool).init(arena, n);
+    for (0..n) |i| {
+        const ls = strAt(l, i) orelse {
+            f.setNull(i);
             continue;
-        }
-        out[i] = cmpResult(op, std.mem.order(u8, ls.?, rs.?));
+        };
+        const rs = strAt(r, i) orelse {
+            f.setNull(i);
+            continue;
+        };
+        f.d[i] = cmpResult(op, std.mem.order(u8, ls, rs));
     }
-    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    return f.finish(Type.init(.bool));
 }
 
 /// Evaluates a subexpression the row evaluator might never need (an untaken
@@ -541,8 +524,8 @@ fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: 
         .int => {
             const out = try arena.alloc(i64, n);
             switch (src) {
-                .float => for (col.data.f64, 0..) |x, i| {
-                    out[i] = try floatToInt(x);
+                .float => for (col.data.f64[0..n], 0..) |x, i| {
+                    out[i] = if (col.validity.get(i)) try floatToInt(x) else 0;
                 },
                 .bool => for (col.data.b, 0..) |x, i| {
                     out[i] = if (x) 1 else 0;
@@ -695,15 +678,10 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
 /// not its case, and the float kernels take over.
 fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
-    const out = try arena.alloc(Decimal, n);
-    const bm = try bothValid(arena, l, r, n);
-    const any = !bm.allSet(n);
-    if (any) for (out, 0..) |*o, i| if (!bm.get(i)) {
-        o.* = .{ .unscaled = 0, .scale = ty.scale };
-    };
-    var sink = StoreSink{ .out = out };
-    try decApply(op, l, r, &sink, bm, any);
-    return mkCol(ty.withNull(any), n, bm, .{ .dec = out });
+    var f = try Filled(Decimal).masked(arena, n, try bothValid(arena, l, r, n));
+    var sink = StoreSink{ .out = f.d };
+    try decApply(op, l, r, &sink, f.bm, f.any);
+    return f.finish(ty);
 }
 
 pub const DecSum = struct { sum: i256, nvalid: usize };
@@ -946,10 +924,9 @@ fn decOpCmpVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecEr
     const d = asDecimal(lit) orelse return null;
     const sc: u16 = if (a.op == .mul) @as(u16, sideScale(l)) + sideScale(r) else @max(sideScale(l), sideScale(r));
     const pick = if (sc <= max_digits) cmpBound(b.op, flip, d, @intCast(sc), std.math.minInt(i128)) else null;
-    const bm = try bothValid(arena, l, r, n);
-    const any = !bm.allSet(n);
+    var f = try Filled(bool).masked(arena, n, try bothValid(arena, l, r, n));
     var sink = CmpSink{
-        .out = try arena.alloc(bool, n),
+        .out = f.d,
         .op = b.op,
         .flip = flip,
         .lit = d,
@@ -957,9 +934,8 @@ fn decOpCmpVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecEr
         .fast_op = if (pick) |p| p.op else b.op,
         .bound = if (pick) |p| p.bound else 0,
     };
-    if (any) @memset(sink.out, false);
-    try decApply(a.op, l, r, &sink, bm, any);
-    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = sink.out });
+    try decApply(a.op, l, r, &sink, f.bm, f.any);
+    return f.finish(Type.init(.bool));
 }
 
 /// The numeric kind an arithmetic tree evaluates to, read off the batch without
@@ -1016,9 +992,9 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     const d = asDecimal(lit.scalar) orelse return null;
     const c = col.col;
     const pick = cmpBound(op, flip, d, c.ty.scale, std.math.minInt(i128)) orelse return null;
-    const out = try arena.alloc(bool, n);
+    var f = try Filled(bool).masked(arena, n, try copyBits(arena, c.validity, n));
     switch (pick.op) {
-        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec[0..n], out) |x, *o| {
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec[0..n], f.d) |x, *o| {
             o.* = if (x.scale == c.ty.scale)
                 cmpResult(cop, std.math.order(x.unscaled, pick.bound))
             else
@@ -1026,12 +1002,7 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
         },
         else => unreachable,
     }
-    const bm = Bitmap{ .bits = try arena.dupe(u8, c.validity.bits[0 .. (n + 7) / 8]), .len = n };
-    const any = !bm.allSet(n);
-    if (any) for (out, 0..) |*o, i| if (!bm.get(i)) {
-        o.* = false;
-    };
-    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    return f.finish(Type.init(.bool));
 }
 
 /// Exact comparison when one side is a decimal and the other a decimal or an int;
@@ -1040,19 +1011,11 @@ fn decCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) 
     const lt = vecType(l) orelse return null;
     const rt = vecType(r) orelse return null;
     if (lt.kind != .decimal and rt.kind != .decimal) return null;
-    const out = try arena.alloc(bool, n);
-    var bm = try Bitmap.initFull(arena, n);
-    var any = false;
+    var f = try Filled(bool).init(arena, n);
     for (0..n) |i| {
-        if (!vecValid(l, i) or !vecValid(r, i)) {
-            out[i] = false;
-            bm.setValid(i, false);
-            any = true;
-            continue;
-        }
-        out[i] = cmpResult(op, decAt(l, i).order(decAt(r, i)));
+        if (!vecValid(l, i) or !vecValid(r, i)) f.setNull(i) else f.d[i] = cmpResult(op, decAt(l, i).order(decAt(r, i)));
     }
-    return mkCol(Type.init(.bool).withNull(any), n, bm, .{ .b = out });
+    return f.finish(Type.init(.bool));
 }
 
 fn vecType(v: Vec) ?Type {
@@ -1224,6 +1187,54 @@ inline fn boolVal(x: BoolOp, i: usize) bool {
 
 pub fn mkCol(ty: Type, n: usize, validity: Bitmap, data: Column.Data) Vec {
     return .{ .col = .{ .ty = ty, .len = n, .validity = validity, .data = data } };
+}
+
+fn copyBits(arena: std.mem.Allocator, v: Bitmap, n: usize) VecError!Bitmap {
+    return .{ .bits = try arena.dupe(u8, v.bits[0 .. (n + 7) / 8]), .len = n };
+}
+
+/// The column a kernel fills: its values, its validity, and whether any row is
+/// null. Rows are marked null one by one (`setNull`), or a validity worked out first
+/// is adopted (`masked`) and its null rows zeroed at `finish`; either way a null
+/// slot holds zero, since some consumers read a slot before its validity.
+pub fn Filled(comptime T: type) type {
+    return struct {
+        d: []T,
+        bm: Bitmap,
+        any: bool = false,
+        zero_masked: bool = false,
+
+        const zero: T = if (T == Decimal) .{ .unscaled = 0, .scale = 0 } else std.mem.zeroes(T);
+
+        pub fn init(arena: std.mem.Allocator, n: usize) VecError!@This() {
+            return .{ .d = try arena.alloc(T, n), .bm = try Bitmap.initFull(arena, n) };
+        }
+
+        pub fn masked(arena: std.mem.Allocator, n: usize, bm: Bitmap) VecError!@This() {
+            const any = !bm.allSet(n);
+            return .{ .d = try arena.alloc(T, n), .bm = bm, .any = any, .zero_masked = any };
+        }
+
+        pub fn setNull(self: *@This(), i: usize) void {
+            self.d[i] = zero;
+            self.bm.setValid(i, false);
+            self.any = true;
+        }
+
+        pub fn finish(self: *@This(), ty: Type) Vec {
+            if (self.zero_masked) for (self.d, 0..) |*o, i| if (!self.bm.get(i)) {
+                o.* = if (T == Decimal) .{ .unscaled = 0, .scale = ty.scale } else zero;
+            };
+            const data: Column.Data = switch (T) {
+                bool => .{ .b = self.d },
+                i64 => .{ .i64 = self.d },
+                f64 => .{ .f64 = self.d },
+                Decimal => .{ .dec = self.d },
+                else => @compileError("no column of this type"),
+            };
+            return mkCol(ty.withNull(self.any), self.d.len, self.bm, data);
+        }
+    };
 }
 
 fn realize(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Column {
