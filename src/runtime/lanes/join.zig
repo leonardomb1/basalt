@@ -17,6 +17,16 @@ const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const Batch = @import("../../exec/batch.zig").Batch;
+const LaneMem = @import("../parallel.zig").LaneMem;
+const LaneSplit = @import("sources.zig").LaneSplit;
+const WorkQueue = @import("../parallel.zig").WorkQueue;
+const buildMapChain = @import("../plan.zig").buildMapChain;
+const dispatchWorker = @import("../parallel.zig").dispatchWorker;
+const laneRowSource = @import("sources.zig").laneRowSource;
+const obs = @import("../obs.zig");
+const parallel = @import("../parallel.zig");
+const parquetSplit = @import("sources.zig").parquetSplit;
 
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
@@ -74,6 +84,74 @@ pub const LaneJoin = struct {
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 
+/// The build side's Parquet split when it is a local Parquet read followed only by
+/// filters and projections, so the lanes read it as they read a probe side; else null
+/// and the build side reads serially.
+fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
+    if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
+    for (rstages[1..]) |st| switch (st.node) {
+        .filter, .select => {},
+        else => return null,
+    };
+    const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
+    return parquetSplit(env, rstages[0].node.read, rstages, w, .{ .threads = env.sort_threads });
+}
+
+/// One item of a parallel build read: the rows it kept, in its own arena until the
+/// index has copied them.
+const BuildPart = struct {
+    arena: std.heap.ArenaAllocator,
+    batches: std.ArrayListUnmanaged(Batch) = .empty,
+};
+
+const BuildCtx = struct {
+    split: *LaneSplit,
+    stages: []const ast.Stage,
+    params: *std.StringHashMap(*const ast.Expr),
+    errctx: ?*op.ErrCtx,
+    queue: WorkQueue,
+    parts: []BuildPart,
+    bytes: std.atomic.Value(usize) = .init(0),
+    cap: usize,
+    rows_read: *obs.RowCounter,
+};
+
+const buildWorker = dispatchWorker(BuildCtx, buildWorkOne);
+
+fn buildWorkOne(ctx: *BuildCtx, i: usize) !void {
+    const part = &ctx.parts[i];
+    const a = part.arena.allocator();
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
+    defer inner.close();
+    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
+    var scan = op.Scan{ .src = cs.source() };
+    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, ctx.split.schema());
+    while (try child.next(a)) |b| {
+        if (b.len == 0) continue;
+        try part.batches.append(a, b);
+        if (ctx.bytes.fetchAdd(b.heapBytes(), .monotonic) + b.heapBytes() > ctx.cap) return error.JoinBuildTooLarge;
+    }
+}
+
+/// The build side read by the lanes, its items' rows concatenated in file order (the
+/// order a serial read gives) and indexed.
+fn indexInParallel(env: *Env, split: *LaneSplit, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, cap: usize) !*op.JoinIndex {
+    const arena = env.arena;
+    const nitems = split.count(env.sort_threads);
+    const parts = try arena.alloc(BuildPart, nitems);
+    for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
+    defer for (parts) |*p| p.arena.deinit();
+    var ctx = BuildCtx{ .split = split, .stages = stages, .params = env.params_expr, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read };
+    _ = try parallel.spawnJoin(arena, env.sort_threads, buildWorker, &ctx);
+    if (ctx.queue.failure()) |e| return e;
+    var chunks = std.array_list.Managed(Batch).init(arena);
+    for (parts) |*p| try chunks.appendSlice(p.batches.items);
+    return op.JoinIndex.fromBatches(arena, chunks.items, right_schema, right_keys, ctx.bytes.load(.monotonic), cap, env.sort_threads);
+}
+
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
 /// (the pulls are scratch) and prevalidate the suffix. Returns the lane recipe and the
 /// sink's output schema, or null when the build side is past the spill threshold of
@@ -85,7 +163,14 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const binding = env.bindings.get(j.binding) orelse
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const src_base = env.sources.items.len;
-    const build = try buildPipeline(env, try prepareJoinSide(env, try j.rightStages(arena, binding.stages)));
+    const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+    var split = try buildSplit(env, rstages);
+    const build: struct { op: op.Op = undefined, schema: types.Schema } = if (split) |*sp|
+        .{ .schema = try mapChainSchema(env, rstages[1..], sp.schema().*) }
+    else blk: {
+        const pr = try buildPipeline(env, rstages);
+        break :blk .{ .op = pr.op, .schema = pr.schema };
+    };
 
     var ad = analyze.Diag{};
     const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
@@ -106,9 +191,12 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
 
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
-    const build_op = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
     const cap = try laneJoinCap(env, j, join_hints);
-    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, cap, env.sort_threads) catch |e| {
+    const built = if (split) |*sp|
+        indexInParallel(env, sp, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, cap)
+    else
+        op.JoinIndex.create(arena, build_arena.allocator(), try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema), right_schema, right_keys, cap, env.sort_threads);
+    const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
         if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) {
             if (e == error.JoinBuildTooLarge) env.errctx.set("{s}", .{op.failLabel(e)});
