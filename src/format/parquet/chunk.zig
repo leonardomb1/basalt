@@ -153,11 +153,15 @@ fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) Error!void {
 }
 
 /// A dictionary decoded once into a typed column; a byte dictionary also keeps its
-/// values as slices, which pages gather from and the column notes as its codes.
+/// values as slices, which pages gather from and the column notes as its codes,
+/// with an `id` no other dictionary in the process shares (an address can be reused).
 const Dict = struct {
     col: column.Column,
     entries: []const []const u8,
+    id: u64,
 };
+
+var dict_ids = std.atomic.Value(u64).init(1);
 
 /// The dictionary page is PLAIN, so it goes through the same kernel as a data page.
 fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement, cast: Cast) Error!Dict {
@@ -173,7 +177,7 @@ fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMeta
         },
         else => &.{},
     };
-    return .{ .col = col, .entries = entries };
+    return .{ .col = col, .entries = entries, .id = dict_ids.fetchAdd(1, .monotonic) };
 }
 
 /// v1 length-prefixes each level section; v2 keeps them unprefixed with lengths
@@ -527,7 +531,7 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
             const vals = try rows.arena.alloc([]const u8, idx.len);
             for (vals, idx) |*o, ix| o.* = d.entries[ix];
             try rows.bytes(cast, vals);
-            try rows.b.noteDict(@intFromPtr(d.entries.ptr), d.entries, idx, rows.defs, rows.max_def);
+            try rows.b.noteDict(d.id, d.entries, idx, rows.defs, rows.max_def);
         },
         inline else => |vals| {
             const T = std.meta.Elem(@TypeOf(vals));

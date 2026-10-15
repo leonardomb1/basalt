@@ -14,17 +14,20 @@ const std = @import("std");
 
 pub const prefetch_ahead = 8;
 
+/// A direct array for one small-range integer key: a key `base + i` finds its record
+/// at `recs[i]` with no hashing. `base` is the smallest key of the first batch, so a
+/// range starting anywhere sits wholly inside.
 pub const Direct = struct {
     recs: []?[*]u8,
     parts: []u8,
+    base: ?i64 = null,
 
     pub const len = 1 << 14;
 
     pub fn init(gpa: std.mem.Allocator) !Direct {
         const recs = try gpa.alloc(?[*]u8, len);
         @memset(recs, null);
-        const parts = try gpa.alloc(u8, len);
-        return .{ .recs = recs, .parts = parts };
+        return .{ .recs = recs, .parts = try gpa.alloc(u8, len) };
     }
 
     pub fn deinit(self: Direct, gpa: std.mem.Allocator) void {
@@ -32,17 +35,75 @@ pub const Direct = struct {
         gpa.free(self.parts);
     }
 
-    /// The smallest non-null key, so a range starting at 0 or 1 sits wholly inside.
-    pub fn baseFor(keys: []const i64, masks: []const u64) i64 {
+    /// Whether `keys` (one word a row, of kinds this array serves) can use one.
+    pub fn serves(kinds: []const keyhash.KeyKind) bool {
+        return kinds.len == 1 and kinds[0] != .f64k and kinds[0] != .boolk;
+    }
+
+    fn slot(self: *const Direct, k: i64, m: u64) ?usize {
+        if (m != 0) return null;
+        const off = k -% self.base.?;
+        return if (off < 0 or off >= len) null else @intCast(off);
+    }
+
+    /// Sets `base` from the first batch seen.
+    pub fn prime(self: *Direct, e: Encoded) void {
+        if (self.base != null) return;
         var lo: i64 = std.math.maxInt(i64);
-        for (keys, masks) |k, m| if (m == 0 and k < lo) {
+        for (e.keys, 0..) |k, r| if (e.mask(r) == 0 and k < lo) {
             lo = k;
         };
-        return if (lo == std.math.maxInt(i64)) 0 else lo;
+        self.base = if (lo == std.math.maxInt(i64)) 0 else lo;
+    }
+
+    /// The rows whose key the array does not hold, in order, after one tight pass.
+    pub fn misses(self: *Direct, e: Encoded, a: std.mem.Allocator) ![]u32 {
+        self.prime(e);
+        const out = try a.alloc(u32, e.keys.len);
+        const base = self.base.?;
+        var n: usize = 0;
+        for (e.keys, 0..) |k, r| {
+            const off = k -% base;
+            const held = e.mask(r) == 0 and off >= 0 and off < len and self.recs[@intCast(off)] != null;
+            out[n] = @intCast(r);
+            n += @intFromBool(!held);
+        }
+        return out[0..n];
+    }
+
+    /// `key`'s record, when the array holds it.
+    pub inline fn lookup(self: *const Direct, key: FixedKey) ?[*]u8 {
+        return self.recs[self.slot(key.vals[0], key.mask) orelse return null];
+    }
+
+    /// The record and partition of each row whose key the array holds.
+    pub fn hits(self: *Direct, e: Encoded, tails: []?[*]u8, pidx: []u8) void {
+        self.prime(e);
+        for (e.keys, tails, pidx, 0..) |k, *t, *pi, r| {
+            const i = self.slot(k, e.mask(r)) orelse continue;
+            t.* = self.recs[i] orelse continue;
+            pi.* = self.parts[i];
+        }
+    }
+
+    /// Notes `key`'s record, when its key falls in the array's range.
+    pub fn note(self: *Direct, key: FixedKey, tail: [*]u8, part: u8) void {
+        const i = self.slot(key.vals[0], key.mask) orelse return;
+        self.recs[i] = tail;
+        self.parts[i] = part;
     }
 };
 
 pub const few_groups = 1 << 12;
+
+/// The radix partitions every parallel build and merge splits keys into, by the top
+/// bits of the key hash (a table's bucket takes the bottom bits, its salt bits 32-37).
+pub const parts = 64;
+pub const part_shift = 58;
+
+pub inline fn partOf(h: u64) usize {
+    return @intCast(h >> part_shift);
+}
 
 /// Each word through murmur3's 64-bit finalizer. Wyhash's streaming form was a fifth
 /// of a 100-group GROUP BY.
@@ -360,10 +421,11 @@ pub const Interner = struct {
     }
 };
 
-/// A batch's keys as `Encoder` writes them: `nk` words a row (`keys`), the words a row
-/// hashes by (`hkeys`, a string's hash where `keys` holds its id; `keys` itself when
-/// no key is a string), a null mask a row, and `absent` for a row whose string a
-/// frozen table cannot hold.
+/// A batch's keys as `Encoder` writes them: `nk` words a row (`keys`, the column
+/// itself for one INT-like key), the words a row hashes by (`hkeys`, a string's hash
+/// where `keys` holds its id; `keys` itself when no key is a string), a null mask a
+/// row (none when no key is NULL), and `absent` for a row whose string a frozen table
+/// cannot hold.
 pub const Encoded = struct {
     nk: usize,
     keys: []i64,
@@ -371,37 +433,66 @@ pub const Encoded = struct {
     masks: []u64,
     absent: []bool,
 
+    pub inline fn mask(self: Encoded, r: usize) u64 {
+        return if (self.masks.len == 0) 0 else self.masks[r];
+    }
+
     pub fn key(self: Encoded, r: usize) FixedKey {
-        return .{ .vals = self.keys[r * self.nk ..][0..self.nk], .mask = self.masks[r] };
+        return .{ .vals = self.keys[r * self.nk ..][0..self.nk], .mask = self.mask(r) };
     }
 
     pub fn hash(self: Encoded, r: usize) u64 {
-        return fixedHash(self.hkeys[r * self.nk ..][0..self.nk], self.masks[r]);
+        return fixedHash(self.hkeys[r * self.nk ..][0..self.nk], self.mask(r));
     }
 };
 
 /// Key columns (`cols`, each of `kinds`, from `keyhash.keyKindOf`) encoded a column at
 /// a time: ints, dates and booleans as their value, floats by `keyhash.floatWord`,
-/// strings by their interned id. A NULL is word 0 with its bit set in the mask.
+/// strings by their interned id. A NULL is word 0 with its bit set in the mask. A
+/// dictionary column's ids are kept per column while its dictionary stays the same,
+/// as batches of one chunk share theirs.
 pub const Encoder = struct {
     cols: []const usize,
     kinds: []const keyhash.KeyKind,
     has_str: bool,
+    memo: []DictMemo,
 
-    pub fn init(cols: []const usize, kinds: []const keyhash.KeyKind) Encoder {
+    const DictMemo = struct { id: u64 = 0, ents: []StrId = &.{} };
+
+    pub fn init(a: std.mem.Allocator, cols: []const usize, kinds: []const keyhash.KeyKind) !Encoder {
         var has_str = false;
         for (kinds) |k| has_str = has_str or k == .strk;
-        return .{ .cols = cols, .kinds = kinds, .has_str = has_str };
+        const memo = try a.alloc(DictMemo, cols.len);
+        @memset(memo, .{});
+        return .{ .cols = cols, .kinds = kinds, .has_str = has_str, .memo = memo };
+    }
+
+    /// `d`'s values as ids, from the memo while the dictionary is the one last seen (by
+    /// its id; one without an id is never remembered). Frozen, nothing is interned and
+    /// nothing remembered.
+    fn dictIds(self: Encoder, a: std.mem.Allocator, j: usize, d: *const column.Column.Dict, in: Interner, frozen: bool) ![]const StrId {
+        const m = &self.memo[j];
+        if (!frozen and d.id != 0 and m.id == d.id) return m.ents;
+        const ents = try (if (frozen) a else in.alloc).alloc(StrId, d.values.len);
+        for (ents, d.values) |*x, v| x.* = if (frozen) in.lookup(v) else try in.id(v);
+        if (!frozen and d.id != 0) m.* = .{ .id = d.id, .ents = ents };
+        return ents;
     }
 
     pub fn encode(self: Encoder, a: std.mem.Allocator, columns: []const column.Column, n: usize, in: Interner, frozen: bool) !Encoded {
         const nk = self.cols.len;
+        var nulls = false;
+        for (self.cols) |ci| nulls = nulls or !columns[ci].validity.allSet(n);
+        if (nk == 1 and self.kinds[0] == .i64k and !nulls) {
+            const raw = @constCast(columns[self.cols[0]].data.i64[0..n]);
+            return .{ .nk = 1, .keys = raw, .hkeys = raw, .masks = &.{}, .absent = &.{} };
+        }
         const keys = try a.alloc(i64, n * nk);
         var e = Encoded{
             .nk = nk,
             .keys = keys,
             .hkeys = if (self.has_str) try a.alloc(i64, n * nk) else keys,
-            .masks = try a.alloc(u64, n),
+            .masks = if (nulls) try a.alloc(u64, n) else &.{},
             .absent = if (frozen and self.has_str) try a.alloc(bool, n) else &.{},
         };
         @memset(e.masks, 0);
@@ -422,8 +513,7 @@ pub const Encoder = struct {
                     keys[r * nk + j] = keyhash.floatWord(col.data.f64[r]);
                 },
                 .strk => if (col.dict) |d| {
-                    const ents = try a.alloc(StrId, d.values.len);
-                    for (ents, d.values) |*x, v| x.* = if (frozen) in.lookup(v) else try in.id(v);
+                    const ents = try self.dictIds(a, j, d, in, frozen);
                     for (0..n) |r| {
                         if (!col.validity.get(r)) continue;
                         self.putStr(&e, r, j, ents[d.codes[r]]);

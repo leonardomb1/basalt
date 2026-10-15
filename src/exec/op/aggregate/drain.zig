@@ -21,7 +21,8 @@ const dupeValue = @import("../aggregate.zig").dupeValue;
 const few_groups = Aggregate.few_groups;
 const keyKindOf = Aggregate.keyKindOf;
 const keyhash = @import("../../keyhash.zig");
-const Encoder = @import("../../keytable.zig").Encoder;
+const keytable = @import("../../keytable.zig");
+const Encoder = keytable.Encoder;
 const prefetch_ahead = Aggregate.prefetch_ahead;
 const spill_parts = @import("../spill_parts.zig");
 const std = @import("std");
@@ -50,13 +51,11 @@ pub fn drainParts(self: *Aggregate) anyerror![]GroupSet {
     return self.drainImpl();
 }
 
-pub const fold_parts = 64;
+pub const fold_parts = keytable.parts;
 
-pub const part_shift = 58;
+pub const part_shift = keytable.part_shift;
 
-pub fn partOf(h: u64) usize {
-    return @intCast(h >> part_shift);
-}
+pub const partOf = keytable.partOf;
 
 /// Row indices grouped by partition, rows of one partition in input order; `counts`
 /// holds a slot per partition plus one.
@@ -161,18 +160,13 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(FixedStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
-    const nk = self.by.len;
-
-    const direct: ?Direct = if (nk == 1 and kinds[0] != .f64k and kinds[0] != .boolk) try Direct.init(self.gpa) else null;
+    var direct: ?Direct = if (Direct.serves(kinds)) try Direct.init(self.gpa) else null;
     defer if (direct) |d| d.deinit(self.gpa);
-    var direct_base: ?i64 = null;
-    const enc = Encoder.init(self.by, kinds);
+    const enc = try Encoder.init(self.state, self.by, kinds);
 
     while (try self.child.next(pull)) |b| {
         const frozen = self.overBudget(parts);
         const e = try enc.encode(pull, b.columns, b.len, self.interner(), frozen);
-        const keys = e.keys;
-        const masks = e.masks;
         const hashes = try pull.alloc(u64, b.len);
         const tails = try pull.alloc(?[*]u8, b.len);
         const pidx = try pull.alloc(u8, b.len);
@@ -182,17 +176,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         for (e.absent, 0..) |x, r| if (x) {
             dest[r] = 0;
         };
-        if (direct) |d| {
-            if (direct_base == null) direct_base = Direct.baseFor(keys, masks);
-            const base = direct_base.?;
-            for (keys, masks, tails, pidx) |k, m, *t, *pi| {
-                if (m != 0) continue;
-                const off = k -% base;
-                if (off < 0 or off >= Direct.len) continue;
-                t.* = d.recs[@intCast(off)] orelse continue;
-                pi.* = d.parts[@intCast(off)];
-            }
-        }
+        if (direct) |*d| d.hits(e, tails, pidx);
         for (hashes, tails, 0..) |*h, t, r| h.* = if (t != null) 0 else e.hash(r);
 
         var groups: usize = 0;
@@ -237,13 +221,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
             };
             tails[ri] = rec.tail;
             pidx[ri] = @intCast(pi);
-            if (direct) |d| if (key.mask == 0) {
-                const off = key.vals[0] -% direct_base.?;
-                if (off >= 0 and off < Direct.len) {
-                    d.recs[@intCast(off)] = rec.tail;
-                    d.parts[@intCast(off)] = @intCast(pi);
-                }
-            };
+            if (direct) |*d| d.note(key, rec.tail, @intCast(pi));
         }
 
         if (nspill > 0) try self.spillRows(pull, b, dest);

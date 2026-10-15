@@ -18,6 +18,7 @@ const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const dupeValue = @import("aggregate.zig").dupeValue;
 const keyhash = @import("../keyhash.zig");
+const keytable = @import("../keytable.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
@@ -37,11 +38,11 @@ pub const Distinct = struct {
     state: std.mem.Allocator,
     gpa: std.mem.Allocator,
     seen: ?Seen = null,
+    strs: ?*keytable.StrTable = null,
+    str_cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
     track_ords: bool = false,
     ords: []const u64 = &.{},
     seen_rows: u64 = 0,
-    seen_words: ?SeenWords = null,
-    seen_null: bool = false,
     err: ?*ErrCtx = null,
     space: ?Space = null,
     spill_at: usize = std.math.maxInt(usize),
@@ -57,10 +58,67 @@ pub const Distinct = struct {
         replay: ?spill_parts.Replay(Distinct) = null,
     };
 
-    const null_hash: u64 = 0x2545F4914F6CDD1D;
+    const FixedStore = keytable.FixedStore(keytable.NoPayload);
+    const BoxedStore = keytable.GroupStore(keytable.NoPayload);
+    const no_payload = keytable.NoPayload{};
 
-    const Seen = std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-    const SeenWords = std.AutoHashMap(u64, void);
+    /// The keys seen so far: one shared `GroupTable` over fixed-width encoded keys, or
+    /// over boxed ones when a key's kind has no fixed encoding.
+    const Seen = struct {
+        key_idx: []const usize,
+        enc: ?keytable.Encoder,
+        direct: ?keytable.Direct,
+        table: keytable.GroupTable,
+        store: union(enum) { fixed: *FixedStore, boxed: *BoxedStore },
+
+        fn len(self: *const Seen) usize {
+            return self.table.len;
+        }
+    };
+
+    fn seenSet(self: *Distinct) !*Seen {
+        if (self.seen) |*s| return s;
+        const key_idx = self.keys orelse blk: {
+            const all = try self.state.alloc(usize, self.in_schema.fields.len);
+            for (all, 0..) |*x, i| x.* = i;
+            break :blk all;
+        };
+        const kinds = try self.state.alloc(keyhash.KeyKind, key_idx.len);
+        var fixed = true;
+        for (key_idx, kinds) |ci, *k| k.* = keyhash.keyKindOf(self.in_schema.fields[ci].ty.kind) orelse blk: {
+            fixed = false;
+            break :blk .i64k;
+        };
+        self.seen = .{
+            .key_idx = key_idx,
+            .enc = if (fixed) try keytable.Encoder.init(self.state, key_idx, kinds) else null,
+            .direct = if (fixed and keytable.Direct.serves(kinds)) try keytable.Direct.init(self.tableAlloc()) else null,
+            .table = try keytable.GroupTable.init(self.tableAlloc(), 16),
+            .store = if (fixed)
+                .{ .fixed = try newIn(self.state, FixedStore.init(self.state, key_idx.len, &no_payload)) }
+            else
+                .{ .boxed = try newIn(self.state, BoxedStore.init(self.state, key_idx.len, &no_payload)) },
+        };
+        return &self.seen.?;
+    }
+
+    /// Where the table lives: the general allocator, so an outgrown table is freed,
+    /// except on a lane, whose short-lived arena spares many threads mapping and
+    /// unmapping tables at once.
+    fn tableAlloc(self: *Distinct) std.mem.Allocator {
+        return if (self.track_ords) self.state else self.gpa;
+    }
+
+    fn interner(self: *Distinct) keytable.Interner {
+        return .{ .table = &self.strs, .cache = &self.str_cache, .alloc = self.state };
+    }
+
+    fn freeSeen(self: *Distinct) void {
+        const s = &(self.seen orelse return);
+        s.table.deinit();
+        if (s.direct) |d| d.deinit(self.tableAlloc());
+        s.direct = null;
+    }
 
     pub fn next(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.space == null or self.track_ords) return self.dedup(arena);
@@ -88,6 +146,7 @@ pub const Distinct = struct {
 
     /// Drops the spill files a consumer that stopped early never read; safe twice.
     pub fn release(self: *Distinct) void {
+        self.freeSeen();
         const sp = self.spill orelse return;
         if (sp.replay) |*r| r.release() else sp.parts.abort();
     }
@@ -113,10 +172,8 @@ pub const Distinct = struct {
     fn overBudget(self: *Distinct) bool {
         const sp = self.spill orelse return false;
         if (sp.frozen) return true;
-        var keys: usize = @intFromBool(self.seen_null);
-        if (self.seen) |m| keys += m.count();
-        if (self.seen_words) |m| keys += m.count();
-        if (keys > 0 and sp.meter.bytes > self.spill_at) sp.frozen = true;
+        const seen = &(self.seen orelse return false);
+        if (seen.len() > 0 and sp.meter.bytes + seen.table.entries.len * @sizeOf(u32) > self.spill_at) sp.frozen = true;
         return sp.frozen;
     }
 
@@ -124,76 +181,79 @@ pub const Distinct = struct {
         return self.spill.?.parts.route(scratch, b, dest, "DISTINCT", self.spill_depth, self.max_spill_depth, self.err);
     }
 
+    /// The next batch of first rows: each row's key looked up in `seen` in input
+    /// order, inserted when new. Once frozen, a row whose key is held is dropped and one
+    /// whose key is not goes to the spill file of its key hash.
     fn dedup(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
-        if (self.seen == null) self.seen = Seen.init(self.state);
-        const seen = &self.seen.?;
-
+        const seen = try self.seenSet();
+        errdefer self.freeSeen();
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const pull = scratch.allocator();
 
         while (try self.child.next(pull)) |b| {
-            var key_idx: []const usize = undefined;
-            if (self.keys) |k| {
-                key_idx = k;
-            } else {
-                const idxs = try pull.alloc(usize, b.columns.len);
-                for (idxs, 0..) |*x, i| x.* = i;
-                key_idx = idxs;
-            }
-
             const keep = try pull.alloc(bool, b.len);
-            const probe = try pull.alloc(Value, key_idx.len);
             const frozen = self.overBudget();
             const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
             @memset(dest, spill_parts.keep);
+            const hashes = try pull.alloc(u64, b.len);
             var nspill: usize = 0;
             var kept: usize = 0;
-            var r: usize = 0;
-            if (key_idx.len == 1 and fixedWord(b.columns[key_idx[0]]) != null) {
-                if (self.seen_words == null) self.seen_words = SeenWords.init(self.state);
-                const words = &self.seen_words.?;
-                const col = b.columns[key_idx[0]];
-                while (r < b.len) : (r += 1) {
-                    if (frozen) {
-                        const valid = col.validity.get(r);
-                        const known = if (valid) words.contains(fixedWord(col).?[r]) else self.seen_null;
-                        keep[r] = false;
-                        if (!known) {
-                            dest[r] = spill_parts.partOf(if (valid) fixedWord(col).?[r] else null_hash, self.spill_depth);
-                            nspill += 1;
+            switch (seen.store) {
+                .fixed => |st| {
+                    const e = try seen.enc.?.encode(pull, b.columns, b.len, self.interner(), frozen);
+                    @memset(keep, false);
+                    const rows = if (seen.direct) |*d| try d.misses(e, pull) else null;
+                    const n = if (rows) |rs| rs.len else b.len;
+                    for (0..n) |i| hashes[i] = e.hash(if (rows) |rs| rs[i] else i);
+                    for (0..n) |i| {
+                        const r = if (rows) |rs| rs[i] else i;
+                        if (i + keytable.prefetch_ahead < n) seen.table.prefetch(hashes[i + keytable.prefetch_ahead]);
+                        const key = e.key(r);
+                        if (frozen) {
+                            const known = !(e.absent.len > 0 and e.absent[r]) and seen.table.find(hashes[i], key, st) != null;
+                            if (!known) {
+                                dest[r] = spill_parts.partOf(hashes[i], self.spill_depth);
+                                nspill += 1;
+                            }
+                            continue;
                         }
-                        continue;
+                        const f = try seen.table.getOrPut(hashes[i], key, st, @intCast(st.len));
+                        if (f.found) continue;
+                        const nr = try st.push(hashes[i]);
+                        @memcpy(nr.keys, key.vals);
+                        nr.mask.* = key.mask;
+                        if (seen.direct) |*d| d.note(key, nr.tail, 0);
+                        keep[r] = true;
+                        kept += 1;
                     }
-                    if (!col.validity.get(r)) {
-                        keep[r] = !self.seen_null;
-                        self.seen_null = true;
-                    } else {
-                        const gop = try words.getOrPut(fixedWord(col).?[r]);
-                        keep[r] = !gop.found_existing;
+                },
+                .boxed => |st| {
+                    const nk = seen.key_idx.len;
+                    const probes = try pull.alloc(Value, b.len * nk);
+                    for (0..b.len) |r| {
+                        const probe = probes[r * nk ..][0..nk];
+                        for (seen.key_idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
+                        hashes[r] = keyhash.MultiKeyCtx.hash(.{}, probe);
                     }
-                    if (keep[r]) kept += 1;
-                }
-            } else while (r < b.len) : (r += 1) {
-                for (key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-                if (frozen) {
-                    keep[r] = false;
-                    if (!seen.contains(probe)) {
-                        dest[r] = spill_parts.partOf(keyhash.MultiKeyCtx.hash(.{}, probe), self.spill_depth);
-                        nspill += 1;
+                    for (0..b.len) |r| {
+                        const probe: []const Value = probes[r * nk ..][0..nk];
+                        if (frozen) {
+                            keep[r] = false;
+                            if (seen.table.find(hashes[r], probe, st) == null) {
+                                dest[r] = spill_parts.partOf(hashes[r], self.spill_depth);
+                                nspill += 1;
+                            }
+                            continue;
+                        }
+                        const f = try seen.table.getOrPut(hashes[r], probe, st, @intCast(st.len));
+                        keep[r] = !f.found;
+                        if (f.found) continue;
+                        const nr = try st.push(hashes[r]);
+                        for (nr.keys, probe) |*o, v| o.* = try dupeValue(self.state, v);
+                        kept += 1;
                     }
-                    continue;
-                }
-                const gop = try seen.getOrPut(probe);
-                if (gop.found_existing) {
-                    keep[r] = false;
-                } else {
-                    const kv = try self.state.alloc(Value, key_idx.len);
-                    for (key_idx, 0..) |ci, j| kv[j] = try dupeValue(self.state, b.columns[ci].getValue(r));
-                    gop.key_ptr.* = kv;
-                    keep[r] = true;
-                    kept += 1;
-                }
+                },
             }
             if (nspill > 0) try self.spillRows(pull, b, dest);
             const base = self.seen_rows;
@@ -205,37 +265,34 @@ pub const Distinct = struct {
             if (self.track_ords) {
                 const ords = try arena.alloc(u64, kept);
                 var oi: usize = 0;
-                r = 0;
-                while (r < b.len) : (r += 1) if (keep[r]) {
+                for (keep, 0..) |k, r| if (k) {
                     ords[oi] = base + r;
                     oi += 1;
                 };
                 self.ords = ords;
             }
-            return try gatherDeep(arena, b, keep, kept, key_idx);
+            return try gatherKept(arena, b, keep, kept, seen.key_idx);
         }
+        self.freeSeen();
         return null;
     }
 };
 
-/// The 64-bit key words of a column `keyhash.keyKindOf` stores as its raw i64s, or
-/// null for a kind whose words need building.
-fn fixedWord(col: column.Column) ?[]const u64 {
-    return if (keyhash.keyKindOf(col.ty.kind) == .i64k) @ptrCast(col.data.i64) else null;
+fn newIn(a: std.mem.Allocator, v: anytype) !*@TypeOf(v) {
+    const p = try a.create(@TypeOf(v));
+    p.* = v;
+    return p;
 }
 
-/// Deep-copy the `keep`-marked rows of `b` into `arena`, duping string payloads
-/// (unlike `column.gather`), for a source batch whose scratch is about to be freed.
-/// A float key column's values are `keyhash.canonF64`, as GROUP BY keeps its keys.
-fn gatherDeep(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, key_idx: []const usize) anyerror!Batch {
+/// The `keep`-marked rows of `b` copied into `arena`, string bytes included, for a
+/// source batch whose scratch is about to be freed. A float key column's values are
+/// `keyhash.canonF64`, as GROUP BY keeps its keys.
+fn gatherKept(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, key_idx: []const usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, b.schema.fields, 0..) |*col, f, ci| {
-        var bd = column.Builder.init(arena, f.ty);
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) if (keep[r]) try bd.append(col.getValue(r));
-        outcols[ci] = try bd.finish();
-        if (f.ty.kind == .float and std.mem.indexOfScalar(usize, key_idx, ci) != null)
-            for (outcols[ci].data.f64[0..kept]) |*x| {
+    for (b.columns, outcols, 0..) |col, *o, ci| {
+        o.* = try column.gather(arena, col, keep, kept);
+        if (col.ty.kind == .float and std.mem.indexOfScalar(usize, key_idx, ci) != null)
+            for (o.data.f64[0..kept]) |*x| {
                 x.* = keyhash.canonF64(x.*);
             };
     }

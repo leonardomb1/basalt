@@ -449,7 +449,9 @@ pub const Column = struct {
     data: Data,
     dict: ?*const Dict = null,
 
-    pub const Dict = struct { values: []const []const u8, codes: []const u32 };
+    /// A column's values as codes into `values`; `id`, when not 0, names the
+    /// dictionary for the process, so a consumer may remember what it made of it.
+    pub const Dict = struct { values: []const []const u8, codes: []const u32, id: u64 = 0 };
 
     pub const Data = union(enum) {
         b: []bool,
@@ -755,14 +757,15 @@ pub const Builder = struct {
         var dict: ?*const Column.Dict = null;
         if (self.dict_vals) |vals| if (self.dict_codes.items.len == n) {
             const d = try self.arena.create(Column.Dict);
-            d.* = .{ .values = vals, .codes = self.dict_codes.items };
+            d.* = .{ .values = vals, .codes = self.dict_codes.items, .id = self.dict_src.? };
             dict = d;
         };
         return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict };
     }
 
-    /// Records the dictionary the rows just appended came from (`codes` for present
-    /// rows, a null taking 0). Rows appended otherwise leave the count short and `finish` attaches none.
+    /// Records the dictionary the rows just appended came from (`src`, its process-wide
+    /// id; `codes` for present rows, a null taking 0). Rows appended otherwise leave the
+    /// count short and `finish` attaches none.
     pub fn noteDict(self: *Builder, src: usize, vals: []const []const u8, codes: []const u32, defs: ?[]const u32, max_def: u32) !void {
         if (self.dict_src) |prev| if (prev != src) {
             self.dict_vals = null;

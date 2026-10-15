@@ -1,5 +1,6 @@
-//! DISTINCT lanes: each lane keeps the first row per key it saw, merged by file order
-//! so the first row overall wins.
+//! DISTINCT lanes: each work item keeps the first row per key it saw; the items' rows
+//! are then merged a hash partition at a time on the shared key table, walking items
+//! in file order so the first row overall wins, and gathered back in file order.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
@@ -14,6 +15,8 @@ const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildMapChain = @import("../plan.zig").buildMapChain;
 const column = @import("../../exec/column.zig");
+const keyhash = @import("../../exec/keyhash.zig");
+const keytable = @import("../../exec/keytable.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
 const laneRowSource = @import("sources.zig").laneRowSource;
@@ -47,74 +50,36 @@ pub fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     return .{ .prefix = middle[0..d], .dist = middle[d].node.distinct, .tail = middle[d + 1 ..] };
 }
 
-const DistinctRow = struct {
-    chunk: usize,
-    ord: u64,
-    vals: []Value,
+/// The key columns of the DISTINCT and how they are keyed: encoded fixed-width words
+/// when every key has a fixed encoding, else boxed values.
+const Keys = struct {
+    idx: []const usize,
+    kinds: ?[]const keyhash.KeyKind,
 
-    fn before(_: void, a: DistinctRow, b: DistinctRow) bool {
-        if (a.chunk != b.chunk) return a.chunk < b.chunk;
-        return a.ord < b.ord;
+    fn of(a: std.mem.Allocator, schema: *const types.Schema, idx: []const usize) !Keys {
+        const kinds = try a.alloc(keyhash.KeyKind, idx.len);
+        for (idx, kinds) |ci, *k| k.* = keyhash.keyKindOf(schema.fields[ci].ty.kind) orelse return .{ .idx = idx, .kinds = null };
+        return .{ .idx = idx, .kinds = kinds };
     }
 };
 
-const DistinctMerge = struct {
-    seen: op.Aggregate.GroupMap(),
-    rows: std.array_list.Managed(DistinctRow),
-    key_idx: []const usize,
-    arena: std.mem.Allocator,
-    mtx: std.Thread.Mutex = .{},
+/// One batch of an item's first rows, keyed for the merge: each row's hash, its
+/// encoded key (fixed-width keys), the rows bucketed by hash partition in input order
+/// (`order` from `starts[p]` to `starts[p + 1]`), and which rows the merge keeps.
+const Piece = struct {
+    batch: Batch,
+    enc: ?keytable.Encoded,
+    hashes: []u64,
+    starts: []u32,
+    order: []u32,
+    keep: []bool,
+};
 
-    pub fn init(arena: std.mem.Allocator, key_idx: []const usize) DistinctMerge {
-        return .{
-            .seen = op.Aggregate.GroupMap().init(arena),
-            .rows = std.array_list.Managed(DistinctRow).init(arena),
-            .key_idx = key_idx,
-            .arena = arena,
-        };
-    }
-
-    fn dupeRow(self: *DistinctMerge, b: Batch, r: usize) ![]Value {
-        const vals = try self.arena.alloc(Value, b.columns.len);
-        for (b.columns, vals) |*col, *v| v.* = try op.dupeValue(self.arena, col.getValue(r));
-        return vals;
-    }
-
-    fn absorb(self: *DistinctMerge, chunk: usize, b: Batch, ords: []const u64, probe: []Value) !void {
-        self.mtx.lock();
-        defer self.mtx.unlock();
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            for (self.key_idx, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-            const gop = try self.seen.getOrPut(probe);
-            if (gop.found_existing) {
-                const slot = &self.rows.items[gop.value_ptr.*];
-                const cand = DistinctRow{ .chunk = chunk, .ord = ords[r], .vals = &.{} };
-                if (!DistinctRow.before({}, cand, slot.*)) continue;
-                slot.chunk = chunk;
-                slot.ord = ords[r];
-                slot.vals = try self.dupeRow(b, r);
-                continue;
-            }
-            const kv = try self.arena.alloc(Value, self.key_idx.len);
-            for (self.key_idx, 0..) |ci, j| kv[j] = try op.dupeValue(self.arena, b.columns[ci].getValue(r));
-            gop.key_ptr.* = kv;
-            gop.value_ptr.* = self.rows.items.len;
-            try self.rows.append(.{ .chunk = chunk, .ord = ords[r], .vals = try self.dupeRow(b, r) });
-        }
-    }
-
-    /// Input order, then one batch: sorting here makes `-j 8` agree with `-j 1` byte for byte.
-    fn finish(self: *DistinctMerge, row_schema: *const types.Schema) !Batch {
-        std.mem.sort(DistinctRow, self.rows.items, {}, DistinctRow.before);
-        const cols = try self.arena.alloc(column.Column, row_schema.fields.len);
-        for (row_schema.fields, cols, 0..) |f, *c, ci| {
-            var bd = column.Builder.init(self.arena, f.ty);
-            for (self.rows.items) |row| try bd.append(row.vals[ci]);
-            c.* = try bd.finish();
-        }
-        return .{ .schema = row_schema, .columns = cols, .len = self.rows.items.len };
-    }
+/// A work item's first rows, which live until the merge has gathered them.
+const Item = struct {
+    arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
+    pieces: std.ArrayListUnmanaged(Piece) = .empty,
 };
 
 const DistinctCtx = struct {
@@ -124,32 +89,132 @@ const DistinctCtx = struct {
     params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
     local_keys: ?[]const usize,
-    key_idx: []const usize,
+    keys: Keys,
+    strs: *?*keytable.StrTable,
     queue: WorkQueue,
-    merge: *DistinctMerge,
+    items: []Item,
     rows_read: *obs.RowCounter,
 };
 
 const distinctWorker = dispatchWorker(DistinctCtx, distinctWorkOne);
 
 /// Dedups per item rather than per lane, so the item index is a file position and the
-/// merge keeps the same row a serial run would.
+/// merge keeps the row a serial run would; then keys the item's first rows for it.
 fn distinctWorkOne(ctx: *DistinctCtx, i: usize) !void {
     var mem: LaneMem = .{};
     mem.init();
     defer mem.deinit();
+    const item = &ctx.items[i];
+    const ia = item.arena.allocator();
     const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
     defer inner.close();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
     var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.gpa.allocator(), .track_ords = true };
+    defer d.release();
 
-    const probe = try mem.work.allocator().alloc(Value, ctx.key_idx.len);
-    while (try d.next(mem.batch.allocator())) |b| {
-        try ctx.merge.absorb(i, b, d.ords, probe);
-        _ = mem.batch.reset(.retain_capacity);
+    const in = keytable.Interner{ .table = ctx.strs, .cache = &item.cache, .alloc = ia };
+    const enc: ?keytable.Encoder = if (ctx.keys.kinds) |k| try keytable.Encoder.init(ia, ctx.keys.idx, k) else null;
+    while (try d.next(ia)) |b| {
+        const hashes = try ia.alloc(u64, b.len);
+        var e: ?keytable.Encoded = null;
+        if (enc) |en| {
+            e = try en.encode(ia, b.columns, b.len, in, false);
+            for (hashes, 0..) |*h, r| h.* = e.?.hash(r);
+        } else {
+            const probe = try ia.alloc(Value, ctx.keys.idx.len);
+            for (hashes, 0..) |*h, r| {
+                for (ctx.keys.idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
+                h.* = keyhash.MultiKeyCtx.hash(.{}, probe);
+            }
+        }
+        const starts = try ia.alloc(u32, keytable.parts + 1);
+        @memset(starts, 0);
+        for (hashes) |h| starts[keytable.partOf(h) + 1] += 1;
+        for (1..starts.len) |p| starts[p] += starts[p - 1];
+        const order = try ia.alloc(u32, b.len);
+        const fill = try ia.dupe(u32, starts[0..keytable.parts]);
+        for (hashes, 0..) |h, r| {
+            const p = keytable.partOf(h);
+            order[fill[p]] = @intCast(r);
+            fill[p] += 1;
+        }
+        const keep = try ia.alloc(bool, b.len);
+        @memset(keep, false);
+        try item.pieces.append(ia, .{ .batch = b, .enc = e, .hashes = hashes, .starts = starts, .order = order, .keep = keep });
     }
+}
+
+const MergeCtx = struct {
+    keys: Keys,
+    items: []Item,
+    queue: WorkQueue,
+};
+
+const mergeWorker = dispatchWorker(MergeCtx, mergeOne);
+
+/// Partition `p` across every item in input order: a key's first row is kept.
+fn mergeOne(ctx: *MergeCtx, p: usize) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var table = try keytable.GroupTable.init(a, 16);
+    const nk = ctx.keys.idx.len;
+    if (ctx.keys.kinds != null) {
+        var st = keytable.FixedStore(keytable.NoPayload).init(a, nk, &no_payload);
+        for (ctx.items) |*item| for (item.pieces.items) |pc| for (pc.order[pc.starts[p]..pc.starts[p + 1]]) |r| {
+            const key = pc.enc.?.key(r);
+            const f = try table.getOrPut(pc.hashes[r], key, &st, @intCast(st.len));
+            if (f.found) continue;
+            const nr = try st.push(pc.hashes[r]);
+            @memcpy(nr.keys, key.vals);
+            nr.mask.* = key.mask;
+            pc.keep[r] = true;
+        };
+    } else {
+        var st = keytable.GroupStore(keytable.NoPayload).init(a, nk, &no_payload);
+        const probe = try a.alloc(Value, nk);
+        for (ctx.items) |*item| for (item.pieces.items) |pc| for (pc.order[pc.starts[p]..pc.starts[p + 1]]) |r| {
+            for (ctx.keys.idx, probe) |ci, *v| v.* = pc.batch.columns[ci].getValue(r);
+            const f = try table.getOrPut(pc.hashes[r], @as([]const Value, probe), &st, @intCast(st.len));
+            if (f.found) continue;
+            const nr = try st.push(pc.hashes[r]);
+            @memcpy(nr.keys, probe);
+            pc.keep[r] = true;
+        };
+    }
+}
+
+const no_payload = keytable.NoPayload{};
+
+/// Every item's kept rows, in input order, as one batch.
+fn gatherKept(arena: std.mem.Allocator, row_schema: *const types.Schema, items: []const Item) !Batch {
+    var parts_ = std.array_list.Managed(Batch).init(arena);
+    var total: usize = 0;
+    for (items) |*item| for (item.pieces.items) |pc| {
+        var kept: usize = 0;
+        for (pc.keep) |k| kept += @intFromBool(k);
+        if (kept == 0) continue;
+        const cols = try arena.alloc(column.Column, pc.batch.columns.len);
+        for (pc.batch.columns, cols) |c, *o| o.* = try column.gather(arena, c, pc.keep, kept);
+        try parts_.append(.{ .schema = row_schema, .columns = cols, .len = kept });
+        total += kept;
+    };
+    const cols = try arena.alloc(column.Column, row_schema.fields.len);
+    if (parts_.items.len == 0) {
+        for (row_schema.fields, cols) |f, *c| {
+            var bd = column.Builder.init(arena, f.ty);
+            c.* = try bd.finish();
+        }
+        return .{ .schema = row_schema, .columns = cols, .len = 0 };
+    }
+    const per = try arena.alloc(column.Column, parts_.items.len);
+    for (cols, 0..) |*c, ci| {
+        for (parts_.items, per) |pb, *o| o.* = pb.columns[ci];
+        c.* = try column.concat(arena, per, total);
+    }
+    return .{ .schema = row_schema, .columns = cols, .len = total };
 }
 
 pub const ReaderSource = struct {
@@ -203,7 +268,12 @@ pub fn runParallelDistinct(
 
     const nthreads = split.lanes(opts);
     const nitems = split.count(nthreads);
-    var merge = DistinctMerge.init(arena, key_idx);
+    const items = try arena.alloc(Item, nitems);
+    for (items) |*it| it.* = .{};
+    defer for (items) |*it| it.arena.deinit();
+    var strs_table = keytable.StrTable.init(std.heap.page_allocator);
+    defer strs_table.deinit();
+    var strs: ?*keytable.StrTable = &strs_table;
     var ctx = DistinctCtx{
         .split = split,
         .row_schema = row_schema,
@@ -211,9 +281,10 @@ pub fn runParallelDistinct(
         .params = env.params_expr,
         .errctx = env.errctx,
         .local_keys = local_keys,
-        .key_idx = key_idx,
+        .keys = try Keys.of(arena, row_schema, key_idx),
+        .strs = &strs,
         .queue = .{ .nitems = nitems },
-        .merge = &merge,
+        .items = items,
         .rows_read = env.rows_read,
     };
 
@@ -222,7 +293,10 @@ pub fn runParallelDistinct(
     env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
-    const merged = try merge.finish(row_schema);
+    var mctx = MergeCtx{ .keys = ctx.keys, .items = items, .queue = .{ .nitems = keytable.parts } };
+    _ = try parallel.spawnJoin(arena, nthreads, mergeWorker, &mctx);
+    if (mctx.queue.failure()) |e| return e;
+    const merged = try gatherKept(arena, row_schema, items);
 
     const snk = try openTailSink(env, w, tail, row_schema.*);
     writeTail(env, snk, merged, row_schema.*, tail, stats) catch |e| {
