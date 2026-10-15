@@ -51,8 +51,8 @@
 //! the error code it explains and dropped when evaluation restarts, so an error
 //! swallowed by TRY_CAST or a fallback never lends its note to a later one.
 //!
-//! Rendering: `writeValue` writes text straight into a sink with no allocation
-//! and is byte-identical to `valueToString`; years before 0 print with a sign.
+//! Rendering: `valueToString` spells a value as text; years before 0 print with
+//! a sign.
 //! Dates are day counts and timestamps microseconds since 1970-01-01.
 //!
 //! The evaluator's parts are in eval/: `vec.zig` and `row.zig` are the two
@@ -381,7 +381,6 @@ pub const castFailure = @import("eval/support.zig").castFailure;
 pub const fitsPrecision = @import("eval/cast.zig").fitsPrecision;
 pub const wideSumDecimal = @import("eval/cast.zig").wideSumDecimal;
 pub const castValue = @import("eval/cast.zig").castValue;
-pub const writeValue = @import("eval/format.zig").writeValue;
 pub const writeDate = @import("eval/format.zig").writeDate;
 pub const writeTime = @import("eval/format.zig").writeTime;
 pub const writeTimestamp = @import("eval/format.zig").writeTimestamp;

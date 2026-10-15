@@ -1292,43 +1292,6 @@ const BulkProto = struct {
 
 pub const BulkSink = sql.BulkSink(BulkProto);
 
-fn appendBatchReference(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-    var r: usize = 0;
-    while (r < batch.len) : (r += 1) {
-        try w.writeByte(0xD1);
-        for (batch.columns) |*col| {
-            const v = col.getValue(r);
-            if (v.isNull()) {
-                try writeU16(w, 0xFFFF);
-                continue;
-            }
-            const u16s = try std.unicode.utf8ToUtf16LeAlloc(arena, try celltext.referenceText(arena, v, "1", "0"));
-            var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
-            if (blen < u16s.len * 2 and blen >= 2) {
-                const last = u16s[blen / 2 - 1];
-                if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
-            }
-            try writeU16(w, @intCast(blen));
-            var k: usize = 0;
-            while (k * 2 < blen) : (k += 1) {
-                try w.writeByte(@intCast(u16s[k] & 0xff));
-                try w.writeByte(@intCast(u16s[k] >> 8));
-            }
-        }
-    }
-}
-
-fn expectBulkRowsSame(a: std.mem.Allocator, batch: Batch) !void {
-    var want = std.array_list.Managed(u8).init(a);
-    var got = std.array_list.Managed(u8).init(a);
-    const ref = appendBatchReference(want.writer(), a, batch);
-    const new = BulkProto.appendBatch(got.writer(), a, batch);
-    if (ref) |_| {
-        try new;
-        try std.testing.expectEqualSlices(u8, want.items, got.items);
-    } else |e| try std.testing.expectError(e, new);
-}
-
 fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, texts: []const []const u8) !Batch {
     const ty = types.Type.init(kind).asNullable();
     var b = column.Builder.init(a, ty);
@@ -1340,14 +1303,39 @@ fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, texts: []const []const 
     return .{ .schema = schema, .columns = cols, .len = texts.len };
 }
 
-test "INSERT BULK rows match the per-value path over random batches of every type" {
+inline fn wide(comptime s: []const u8) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    return comptime std.mem.sliceAsBytes(std.unicode.utf8ToUtf16LeStringLiteral(s));
+}
+
+test "INSERT BULK rows of every kind" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try expectBulkRowsSame(a, try celltext.testBatch(a, 0x7d5, 400));
+    const batches = try celltext.goldenBatches(a);
+    const got = try a.alloc([]const u8, batches.len);
+    for (batches, got) |batch, *g| {
+        var w = std.Io.Writer.Allocating.init(a);
+        try BulkProto.appendBatch(&w.writer, a, batch);
+        g.* = w.written();
+    }
+    const tiny = celltext.golden_tiny;
+    try celltext.expectGolden(&.{
+        "\xd1\x02\x00" ++ wide("1") ++ "\xd1\x02\x00" ++ wide("0") ++ "\xd1\xff\xff",
+        "\xd1\x02\x00" ++ wide("0") ++ "\xd1\x04\x00" ++ wide("-1") ++ "\xd1\x28\x00" ++ wide("-9223372036854775808") ++ "\xd1\x26\x00" ++ wide("9223372036854775807") ++ "\xd1\xff\xff",
+        "\xd1\x06\x00" ++ wide("0.1") ++ "\xd1\x02\x00" ++ wide("0") ++ "\xd1\x04\x00" ++ wide("-0") ++ "\xd1\x8c\x02" ++ wide(tiny) ++ "\xd1\x2c\x00" ++ wide("1000000000000000000000") ++ "\xd1\x0a\x00" ++ wide("-2.25") ++ "\xd1\x06\x00" ++ wide("nan") ++ "\xd1\x06\x00" ++ wide("inf") ++ "\xd1\x08\x00" ++ wide("-inf") ++ "\xd1\xff\xff",
+        "\xd1\x0c\x00" ++ wide("123.45") ++ "\xd1\x0e\x00" ++ wide("-0.0007") ++ "\xd1\x02\x00" ++ wide("5") ++ "\xd1\x0e\x00" ++ wide("0.12345") ++ "\xd1\x2c\x00" ++ wide("-18446744073709.551615") ++ "\xd1\x08\x00" ++ wide("0.00") ++ "\xd1\xff\xff",
+        "\xd1\x00\x00\xd1\x0a\x00" ++ wide("plain") ++ "\xd1\x10\x00" ++ wide("tab\there") ++ "\xd1\x14\x00" ++ wide("line\nbreak") ++ "\xd1\x0e\x00" ++ wide("cr\rlf\r\n") ++ "\xd1\x10\x00" ++ wide("say \"hi\"") ++ "\xd1\x0e\x00" ++ wide("O'Brien") ++ "\xd1\x16\x00" ++ wide("back\\slash\\") ++ "\xd1\x08\x00" ++ wide("a\\Nb") ++ "\xd1\x06\x00" ++ wide("\\N ") ++ "\xd1\x08\x00" ++ wide("NULL") ++ "\xd1\x0a\x00" ++ wide("a\x01b\x02c") ++ "\xd1\x1a\x00" ++ wide("a,b;c:d.e-1 0") ++ "\xd1\x08\x00" ++ wide("\xc3\xb3 \xf0\x9f\x98\x80") ++ "\xd1\x08\x00" ++ wide("\x00nul") ++ "\xd1\x2e\x00" ++ wide("sixteen bytes and more\x01") ++ "\xd1\xff\xff",
+        "\xd1\x00\x00\xd1\x0a\x00" ++ wide("plain") ++ "\xd1\x10\x00" ++ wide("\x01\x02 \\ \t\n\"") ++ "\xd1\x02\x00" ++ wide("\xc3\xb3") ++ "\xd1\xff\xff",
+        "\xd1\x14\x00" ++ wide("1970-01-01") ++ "\xd1\x14\x00" ++ wide("2024-01-01") ++ "\xd1\x14\x00" ++ wide("0000-01-01") ++ "\xd1\x1c\x00" ++ wide("-5877641-06-24") ++ "\xd1\xff\xff",
+        "\xd1\x10\x00" ++ wide("00:00:00") ++ "\xd1\x1e\x00" ++ wide("01:02:03.000001") ++ "\xd1\x1e\x00" ++ wide("23:59:59.999999") ++ "\xd1\xff\xff",
+        "\xd1\x26\x00" ++ wide("1970-01-01 00:00:00") ++ "\xd1\x34\x00" ++ wide("2024-01-01 00:00:00.123456") ++ "\xd1\x34\x00" ++ wide("1969-12-31 23:59:59.999999") ++ "\xd1\x26\x00" ++ wide("0001-01-01 00:00:00") ++ "\xd1\xff\xff",
+        "\xd1\xff\xff\xd1\xff\xff",
+        "\xd1\x02\x00" ++ wide("1") ++ "\x06\x00" ++ wide("a b") ++ "\x08\x00" ++ wide("2.50") ++ "\xd1\xff\xff\xff\xff\xff\xff\xd1\x04\x00" ++ wide("-2") ++ "\x00\x00\x08\x00" ++ wide("-0.1"),
+    }, got);
 }
 
-test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8 as before" {
+test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1359,11 +1347,23 @@ test "INSERT BULK cuts a long cell before a split surrogate pair and refuses inv
         for (0..3) |k| @memcpy(s[lead + k * emoji.len ..][0..emoji.len], emoji);
         t.* = s;
     }
-    try expectBulkRowsSame(a, try textBatch(a, .string, &texts));
     var got = std.array_list.Managed(u8).init(a);
-    try BulkProto.appendBatch(got.writer(), a, try textBatch(a, .string, texts[2..3]));
-    try std.testing.expectEqual(@as(usize, 1 + 2 + 7998), got.items.len);
-    try expectBulkRowsSame(a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" }));
+    try BulkProto.appendBatch(got.writer(), a, try textBatch(a, .string, &texts));
+    const kept = [_]struct { usize, []const u8 }{
+        .{ 7998, "x\x00=\xd8\x00\xde" },
+        .{ 8000, "x\x00=\xd8\x00\xde" },
+        .{ 7998, "x\x00x\x00" },
+        .{ 8000, "x\x00x\x00" },
+    };
+    var off: usize = 0;
+    for (kept) |k| {
+        try std.testing.expectEqual(@as(u8, 0xD1), got.items[off]);
+        try std.testing.expectEqual(k[0], std.mem.readInt(u16, got.items[off + 1 ..][0..2], .little));
+        off += 3 + k[0];
+        try std.testing.expectEqualSlices(u8, k[1], got.items[off - k[1].len .. off]);
+    }
+    try std.testing.expectEqual(got.items.len, off);
+    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" })));
     try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"})));
 }
 
@@ -1676,27 +1676,17 @@ test "win1252 transcode to utf8" {
     try std.testing.expectEqualStrings("€", e);
 }
 
-fn win1252Reference(out: *std.array_list.Managed(u8), bytes: []const u8) !void {
-    var tmp: [4]u8 = undefined;
-    for (bytes) |b| {
-        const n = std.unicode.utf8Encode(if (b < 0x80) b else cp1252High(b), &tmp) catch unreachable;
-        try out.appendSlice(tmp[0..n]);
-    }
-}
-
-test "win1252 fast path matches a per-byte encode over every byte and random runs" {
+test "win1252 decodes every byte" {
     const alloc = std.testing.allocator;
-    var want = std.array_list.Managed(u8).init(alloc);
-    defer want.deinit();
     var all: [256]u8 = undefined;
     for (&all, 0..) |*b, k| b.* = @intCast(k);
-    for (0..256) |k| {
-        want.clearRetainingCapacity();
-        try win1252Reference(&want, all[k .. k + 1]);
-        const got = try win1252ToUtf8(alloc, all[k .. k + 1]);
-        defer alloc.free(got);
-        try std.testing.expectEqualSlices(u8, want.items, got);
-    }
+    const got = try win1252ToUtf8(alloc, &all);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f\xe2\x82\xac\xc2\x81\xe2\x80\x9a\xc6\x92\xe2\x80\x9e\xe2\x80\xa6\xe2\x80\xa0\xe2\x80\xa1\xcb\x86\xe2\x80\xb0\xc5\xa0\xe2\x80\xb9\xc5\x92\xc2\x8d\xc5\xbd\xc2\x8f\xc2\x90\xe2\x80\x98\xe2\x80\x99\xe2\x80\x9c\xe2\x80\x9d\xe2\x80\xa2\xe2\x80\x93\xe2\x80\x94\xcb\x9c\xe2\x84\xa2\xc5\xa1\xe2\x80\xba\xc5\x93\xc2\x9d\xc5\xbe\xc5\xb8\xc2\xa0\xc2\xa1\xc2\xa2\xc2\xa3\xc2\xa4\xc2\xa5\xc2\xa6\xc2\xa7\xc2\xa8\xc2\xa9\xc2\xaa\xc2\xab\xc2\xac\xc2\xad\xc2\xae\xc2\xaf\xc2\xb0\xc2\xb1\xc2\xb2\xc2\xb3\xc2\xb4\xc2\xb5\xc2\xb6\xc2\xb7\xc2\xb8\xc2\xb9\xc2\xba\xc2\xbb\xc2\xbc\xc2\xbd\xc2\xbe\xc2\xbf\xc3\x80\xc3\x81\xc3\x82\xc3\x83\xc3\x84\xc3\x85\xc3\x86\xc3\x87\xc3\x88\xc3\x89\xc3\x8a\xc3\x8b\xc3\x8c\xc3\x8d\xc3\x8e\xc3\x8f\xc3\x90\xc3\x91\xc3\x92\xc3\x93\xc3\x94\xc3\x95\xc3\x96\xc3\x97\xc3\x98\xc3\x99\xc3\x9a\xc3\x9b\xc3\x9c\xc3\x9d\xc3\x9e\xc3\x9f\xc3\xa0\xc3\xa1\xc3\xa2\xc3\xa3\xc3\xa4\xc3\xa5\xc3\xa6\xc3\xa7\xc3\xa8\xc3\xa9\xc3\xaa\xc3\xab\xc3\xac\xc3\xad\xc3\xae\xc3\xaf\xc3\xb0\xc3\xb1\xc3\xb2\xc3\xb3\xc3\xb4\xc3\xb5\xc3\xb6\xc3\xb7\xc3\xb8\xc3\xb9\xc3\xba\xc3\xbb\xc3\xbc\xc3\xbd\xc3\xbe\xc3\xbf", got);
+}
+
+test "win1252 text decodes as its pieces decode, split anywhere" {
+    const alloc = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x1252);
     const rnd = prng.random();
     var buf: [80]u8 = undefined;
@@ -1704,12 +1694,16 @@ test "win1252 fast path matches a per-byte encode over every byte and random run
         const len = rnd.uintLessThan(usize, buf.len + 1);
         for (buf[0..len]) |*b| b.* = if (it % 3 == 0) rnd.int(u8) else rnd.uintLessThan(u8, 0x80);
         if (it % 5 == 0 and len > 0) buf[rnd.uintLessThan(usize, len)] = 0x80 + rnd.uintLessThan(u8, 0x80);
-        want.clearRetainingCapacity();
-        try win1252Reference(&want, buf[0..len]);
-        const got = try win1252ToUtf8(alloc, buf[0..len]);
-        defer alloc.free(got);
-        try std.testing.expectEqualSlices(u8, want.items, got);
-        try std.testing.expectEqual(want.items.len == len, isAscii(buf[0..len]));
+        const cut = rnd.uintAtMost(usize, len);
+        const whole = try win1252ToUtf8(alloc, buf[0..len]);
+        defer alloc.free(whole);
+        const head = try win1252ToUtf8(alloc, buf[0..cut]);
+        defer alloc.free(head);
+        const tail = try win1252ToUtf8(alloc, buf[cut..len]);
+        defer alloc.free(tail);
+        try std.testing.expectEqualSlices(u8, head, whole[0..head.len]);
+        try std.testing.expectEqualSlices(u8, tail, whole[head.len..]);
+        try std.testing.expectEqual(whole.len == len, isAscii(buf[0..len]));
     }
 }
 

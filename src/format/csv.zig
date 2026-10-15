@@ -2536,40 +2536,126 @@ test "csv writer: renderBatch produces exactly what writeBatch writes" {
     try std.testing.expect(ws.sink().canRender());
 }
 
-fn renderRowsReference(w: *std.Io.Writer, arena: std.mem.Allocator, batch: Batch, d: u8) !void {
-    const quote_scalars = scalarCanNeedQuote(d);
-    var r: usize = 0;
-    while (r < batch.len) : (r += 1) {
-        for (batch.columns, 0..) |*col, i| {
-            if (i > 0) try w.writeByte(d);
-            switch (col.ty.kind) {
-                .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
-                else => {
-                    if (!col.validity.get(r)) continue;
-                    const v = col.getValue(r);
-                    if (quote_scalars) {
-                        try writeField(w, try eval.valueToString(arena, v), d);
-                    } else {
-                        try eval.writeValue(w, v);
-                    }
-                },
-            }
-        }
-        try w.writeByte('\n');
-    }
+fn goldenCsv(a: std.mem.Allocator, d: u8) ![]const []const u8 {
+    const batches = try celltext.goldenBatches(a);
+    const out = try a.alloc([]const u8, batches.len);
+    var w = CsvWriter{ .backend = .{ .file = std.fs.File.stdout() }, .owns_file = false, .dialect = .{ .delim = d } };
+    for (batches, out) |batch, *o| o.* = try w.renderBatch(a, batch);
+    return out;
 }
 
-test "csv writer: rows match the per-value path over random batches of every type, for every kind of delimiter" {
+test "csv writer: rows of every kind, for every kind of delimiter" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const batch = try celltext.testBatch(a, 0xc5f, 500);
-    for ([_]u8{ ',', ';', '\t', '|', ':', '.', '-', 'e', '0', ' ' }) |d| {
-        var want = std.Io.Writer.Allocating.init(a);
-        try renderRowsReference(&want.writer, a, batch, d);
-        var w = CsvWriter{ .backend = .{ .file = std.fs.File.stdout() }, .owns_file = false, .dialect = .{ .delim = d } };
-        try std.testing.expectEqualStrings(want.writer.buffered(), try w.renderBatch(a, batch));
-    }
+    const tiny = celltext.golden_tiny;
+    const want = [_]struct { u8, [11][]const u8 }{
+        .{ ',', .{
+            "true\nfalse\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
+            "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
+            "\n\n",
+            "1,a b,2.50\n,,\n-2,\"\",-0.1\n",
+        } },
+        .{ '\t', .{
+            "true\nfalse\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
+            "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
+            "\n\n",
+            "1\ta b\t2.50\n\t\t\n-2\t\"\"\t-0.1\n",
+        } },
+        .{ '.', .{
+            "true\nfalse\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "\"0.1\"\n0\n-0\n\"" ++ tiny ++ "\"\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n-inf\n\n",
+            "\"123.45\"\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "00:00:00\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
+            "1970-01-01 00:00:00\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n0001-01-01 00:00:00\n\n",
+            "\"\"\n\n",
+            "1.a b.\"2.50\"\n..\n-2.\"\".\"-0.1\"\n",
+        } },
+        .{ '-', .{
+            "true\nfalse\n\n",
+            "0\n\"-1\"\n\"-9223372036854775808\"\n9223372036854775807\n\n",
+            "0.1\n0\n\"-0\"\n" ++ tiny ++ "\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n\"-inf\"\n\n",
+            "123.45\n\"-0.0007\"\n5\n0.12345\n\"-18446744073709.551615\"\n0.00\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
+            "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
+            "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",
+            "\"\"\n\n",
+            "1-a b-2.50\n--\n\"-2\"-\"\"-\"-0.1\"\n",
+        } },
+        .{ ':', .{
+            "true\nfalse\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "\"00:00:00\"\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
+            "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",
+            "\"\"\n\n",
+            "1:a b:2.50\n::\n-2:\"\":-0.1\n",
+        } },
+        .{ 'e', .{
+            "\"true\"\n\"false\"\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
+            "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
+            "\"\"\n\n",
+            "1ea be2.50\nee\n-2e\"\"e-0.1\n",
+        } },
+        .{ '0', .{
+            "true\nfalse\n\n",
+            "\"0\"\n-1\n\"-9223372036854775808\"\n\"9223372036854775807\"\n\n",
+            "\"0.1\"\n\"0\"\n\"-0\"\n\"" ++ tiny ++ "\"\n\"1000000000000000000000\"\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
+            "\"00:00:00\"\n\"01:02:03.000001\"\n23:59:59.999999\n\n",
+            "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n1969-12-31 23:59:59.999999\n\"0001-01-01 00:00:00\"\n\n",
+            "\"\"\n\n",
+            "10a b0\"2.50\"\n00\n-20\"\"0\"-0.1\"\n",
+        } },
+        .{ ' ', .{
+            "true\nfalse\n\n",
+            "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
+            "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
+            "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\"\xc3\xb3 \xf0\x9f\x98\x80\"\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
+            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
+            "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
+            "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",
+            "\"\"\n\n",
+            "1 \"a b\" 2.50\n  \n-2 \"\" -0.1\n",
+        } },
+    };
+    for (want) |x| try celltext.expectGolden(&x[1], try goldenCsv(a, x[0]));
 }
 
 test "scalarCanNeedQuote: only a delimiter a number could contain forces the scan" {

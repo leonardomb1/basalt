@@ -1270,86 +1270,102 @@ test "INSERT literals: dialect-specific escaping, bools, bytes, null" {
     try std.testing.expectEqualStrings("'1970-01-01'", try literalOf(a, .postgres, .date, .{ .date = 0 }));
 }
 
-fn serializeRowReference(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usize) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(gpa);
-    try buf.append('(');
-    for (batch.columns, 0..) |*c, i| {
-        if (i > 0) try buf.append(',');
-        try serializeValueReference(buf.writer(), dialect, c.getValue(row), gpa);
-    }
-    try buf.append(')');
-    return buf.toOwnedSlice();
-}
-
-fn serializeValueReference(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Allocator) !void {
-    switch (v) {
-        .null => try w.writeAll("NULL"),
-        .bool => |b| try w.writeAll(if (dialect == .sqlserver) (if (b) "1" else "0") else (if (b) "TRUE" else "FALSE")),
-        .int => |x| try w.print("{d}", .{x}),
-        .float => |x| try floatLiteral(w, dialect, x),
-        .decimal => |d| {
-            const s = try eval.formatDecimal(scratch, d.unscaled, d.scale);
-            defer scratch.free(s);
-            try w.writeAll(s);
-        },
-        .string => |s| try quoteString(w, dialect, s),
-        .bytes => |s| try hexLiteral(w, dialect, s),
-        .date => |days| try w.print("'{s}'", .{try eval.formatDate(scratch, days)}),
-        .time => |t| try w.print("'{s}'", .{try eval.formatTime(scratch, t)}),
-        .timestamp => |micros| try w.print("'{s}'", .{try eval.formatTimestamp(scratch, micros)}),
-    }
-}
-
-test "INSERT literals match the per-value path over random batches of every type, in every dialect" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const batch = try celltext.testBatch(a, 0x5e1, 400);
-    const dialects = std.enums.values(Dialect);
-    var failed: usize = 0;
-    for (dialects) |d| {
+fn goldenLiterals(a: std.mem.Allocator, d: Dialect) ![]const []const u8 {
+    const batches = try celltext.goldenBatches(a);
+    const out = try a.alloc([]const u8, batches.len);
+    for (batches, out) |batch, *o| {
+        var w = std.Io.Writer.Allocating.init(a);
         for (0..batch.len) |r| {
-            const want = serializeRowReference(a, d, batch, r);
-            const got = serializeRow(a, d, batch, r);
-            if (want) |ws| try std.testing.expectEqualStrings(ws, try got) else |e| {
-                try std.testing.expectError(e, got);
-                failed += 1;
-            }
+            if (r > 0) try w.writer.writeByte(' ');
+            if (serializeRow(a, d, batch, r)) |row| try w.writer.writeAll(row) else |e| try w.writer.writeAll(@errorName(e));
         }
+        o.* = w.written();
     }
-    try std.testing.expect(failed > 0 and failed < batch.len * dialects.len);
+    return out;
 }
 
-fn appendBulkTextReference(w: anytype, arena: std.mem.Allocator, batch: Batch, fmt: BulkFormat) !void {
-    for (0..batch.len) |r| {
-        for (batch.columns, 0..) |*col, i| {
-            if (i > 0) try w.writeByte('\t');
-            const v = col.getValue(r);
-            if (v.isNull()) {
-                try w.writeAll("\\N");
-            } else {
-                try bulkEscaped(w, try celltext.referenceText(arena, v, fmt.bool_true, fmt.bool_false));
-            }
-        }
-        try w.writeByte('\n');
-    }
-}
-
-test "COPY and LOAD DATA text match the per-value path over random batches of every type" {
+test "INSERT literals of every kind, in every dialect" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const batch = try celltext.testBatch(a, 0xc0b1, 500);
-    var want = std.array_list.Managed(u8).init(a);
-    var got = std.array_list.Managed(u8).init(a);
-    try appendBulkTextReference(want.writer(), a, batch, .{});
-    try appendBulkText(got.writer(), batch, .{});
-    try std.testing.expectEqualStrings(want.items, got.items);
-    want.clearRetainingCapacity();
-    got.clearRetainingCapacity();
-    try appendBulkTextReference(want.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" });
-    try appendBulkText(got.writer(), batch, .{ .bool_true = "1", .bool_false = "0" });
-    try std.testing.expectEqualStrings(want.items, got.items);
+    const tiny = celltext.golden_tiny;
+    const words = "(TRUE) (FALSE) (NULL)";
+    const ints = "(0) (-1) (-9223372036854775808) (9223372036854775807) (NULL)";
+    const floats = "(0.1) (0) (-0e0) (" ++ tiny ++ ") (1000000000000000000000) (-2.25) NonFiniteFloat NonFiniteFloat NonFiniteFloat (NULL)";
+    const decimals = "(123.45) (-0.0007) (5) (0.12345) (-18446744073709.551615) (0.00) (NULL)";
+    const strings = "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\slash\\') ('a\\Nb') ('\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)";
+    const hex = "(0x) (0x706c61696e) (0x0102205c20090a22) (0xc3b3) (NULL)";
+    const dates = "('1970-01-01') ('2024-01-01') ('0000-01-01') ('-5877641-06-24') (NULL)";
+    const times = "('00:00:00') ('01:02:03.000001') ('23:59:59.999999') (NULL)";
+    const stamps = "('1970-01-01 00:00:00') ('2024-01-01 00:00:00.123456') ('1969-12-31 23:59:59.999999') ('0001-01-01 00:00:00') (NULL)";
+    const nested = "(NULL) (NULL)";
+    const rows = "(1,'a b',2.50) (NULL,NULL,NULL) (-2,'',-0.1)";
+    const want = [_]struct { Dialect, [11][]const u8 }{
+        .{ .postgres, .{
+            words,
+            ints,
+            "(0.1) (0) ('-0'::float8) (" ++ tiny ++ ") (1000000000000000000000) (-2.25) ('NaN'::float8) ('Infinity'::float8) ('-Infinity'::float8) (NULL)",
+            decimals,
+            strings,
+            "('\\x') ('\\x706c61696e') ('\\x0102205c20090a22') ('\\xc3b3') (NULL)",
+            dates,
+            times,
+            stamps,
+            nested,
+            rows,
+        } },
+        .{ .mysql, .{
+            words,
+            ints,
+            floats,
+            decimals,
+            "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\\\slash\\\\') ('a\\\\Nb') ('\\\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)",
+            hex,
+            dates,
+            times,
+            stamps,
+            nested,
+            rows,
+        } },
+        .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
+        .{ .starrocks, .{ words, ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
+        .{ .doris, .{ words, ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
+    };
+    try std.testing.expectEqual(std.enums.values(Dialect).len, want.len);
+    for (want) |x| try celltext.expectGolden(&x[1], try goldenLiterals(a, x[0]));
+}
+
+fn goldenBulkText(a: std.mem.Allocator, comptime fmt: BulkFormat) ![]const []const u8 {
+    const batches = try celltext.goldenBatches(a);
+    const out = try a.alloc([]const u8, batches.len);
+    for (batches, out) |batch, *o| {
+        var w = std.Io.Writer.Allocating.init(a);
+        try appendBulkText(&w.writer, batch, fmt);
+        o.* = w.written();
+    }
+    return out;
+}
+
+test "COPY and LOAD DATA text of every kind" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var want = [_][]const u8{
+        "t\nf\n\\N\n",
+        "0\n-1\n-9223372036854775808\n9223372036854775807\n\\N\n",
+        "0.1\n0\n-0\n" ++ celltext.golden_tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\\N\n",
+        "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\\N\n",
+        "\nplain\ntab\\there\nline\\nbreak\ncr\\rlf\\r\\n\nsay \"hi\"\nO'Brien\nback\\\\slash\\\\\na\\\\Nb\n\\\\N \nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\\N\n",
+        "\nplain\n\x01\x02 \\\\ \\t\\n\"\n\xc3\xb3\n\\N\n",
+        "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\\N\n",
+        "00:00:00\n01:02:03.000001\n23:59:59.999999\n\\N\n",
+        "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\\N\n",
+        "\\N\n\\N\n",
+        "1\ta b\t2.50\n\\N\t\\N\t\\N\n-2\t\t-0.1\n",
+    };
+    try celltext.expectGolden(&want, try goldenBulkText(a, .{}));
+    want[0] = "1\n0\n\\N\n";
+    try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bool_true = "1", .bool_false = "0" }));
 }
 
 test "coerceText parses bools, dates, timestamps, and decimals" {

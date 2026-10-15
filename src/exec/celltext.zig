@@ -96,87 +96,79 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     }
 }
 
-/// Tests' reference spelling of a value, as the sinks built it before `write`.
-pub fn referenceText(arena: std.mem.Allocator, v: Value, bool_true: []const u8, bool_false: []const u8) ![]const u8 {
-    return switch (v) {
-        .null => "",
-        .bool => |b| if (b) bool_true else bool_false,
-        .date => |days| try format.formatDate(arena, days),
-        .time => |t| try format.formatTime(arena, t),
-        .timestamp => |micros| try format.formatTimestamp(arena, micros),
-        else => try format.valueToString(arena, v),
-    };
+/// Tests' fixture: a one-column batch of `kind` over the values sinks spell
+/// differently, its last row null; decimals carry scales other than the column's.
+pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
+    const nested = kind == .array or kind == .@"struct";
+    const ty = if (kind == .decimal) types.Type.decimal(14, 2).asNullable() else types.Type.init(kind).asNullable();
+    var b = column.Builder.init(arena, if (nested) types.Type.init(.string).asNullable() else ty);
+    switch (kind) {
+        .bool => for ([_]bool{ true, false }) |x| try b.append(.{ .bool = x }),
+        .int => for ([_]i64{ 0, -1, std.math.minInt(i64), std.math.maxInt(i64) }) |x| try b.append(.{ .int = x }),
+        .float => for ([_]f64{ 0.1, 0, -0.0, 5e-324, 1e21, -2.25, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |x| try b.append(.{ .float = x }),
+        .decimal => for ([_]struct { i128, u8 }{ .{ 12345, 2 }, .{ -7, 4 }, .{ 5, 0 }, .{ 12345, 5 }, .{ -@as(i128, std.math.maxInt(u64)), 6 }, .{ 0, 2 } }) |x| try b.append(.{ .decimal = .{ .unscaled = x[0], .scale = x[1] } }),
+        .string => for (golden_texts) |x| try b.append(.{ .string = x }),
+        .bytes => for ([_][]const u8{ "", "plain", "\x01\x02 \\ \t\n\"", "\xc3\xb3" }) |x| try b.append(.{ .bytes = x }),
+        .date => for ([_]i32{ 0, 19723, -719528, std.math.minInt(i32) + 1 }) |x| try b.append(.{ .date = x }),
+        .time => for ([_]i64{ 0, 3_723_000_001, 86_399_999_999 }) |x| try b.append(.{ .time = x }),
+        .timestamp => for ([_]i64{ 0, 1_704_067_200_123_456, -1, -62_135_596_800_000_000 }) |x| try b.append(.{ .timestamp = x }),
+        .array, .@"struct" => try b.append(.{ .string = "x" }),
+    }
+    try b.append(.null);
+    const cols = try arena.alloc(Column, 1);
+    cols[0] = try b.finish();
+    if (nested) cols[0].ty = ty;
+    const schema = try arena.create(types.Schema);
+    schema.* = .{ .fields = try arena.dupe(types.Schema.Field, &.{.{ .name = "c", .ty = ty }}) };
+    return .{ .schema = schema, .columns = cols, .len = cols[0].len };
 }
 
-/// Strings a test batch draws from: escapes, quotes, delimiters, the stream-load
+/// Strings `goldenColumn` holds: escapes, quotes, delimiters, the stream-load
 /// separators, non-ASCII and text longer than a SIMD lane.
-pub const test_texts = [_][]const u8{
-    "",                       "plain",               "a\x01b\x02c", "\x01\x02",
-    "a\\Nb",                  "\\",                  "N",           "  padded   ",
-    "\xc3\xb3 utf8",          "\\N ",                "NULL",        "a long value\x01 that spans\x02 more than sixteen bytes\x01",
-    "0123456789abcdef",       "0123456789abcde\x02", "tab\there",   "line\nbreak",
-    "cr\rlf\r\n",             "say \"hi\"",          "O'Brien",     "a,b;c:d.e",
-    "\xf0\x9f\x98\x80 emoji", "back\\slash\\",       "\x00nul",
+pub const golden_texts = [_][]const u8{
+    "",                           "plain",       "tab\there",     "line\nbreak",               "cr\rlf\r\n",
+    "say \"hi\"",                 "O'Brien",     "back\\slash\\", "a\\Nb",                     "\\N ",
+    "NULL",                       "a\x01b\x02c", "a,b;c:d.e-1 0", "\xc3\xb3 \xf0\x9f\x98\x80", "\x00nul",
+    "sixteen bytes and more\x01",
 };
 
-/// A batch of `rows` random rows over every scalar kind and a nested column, about
-/// a sixth of each column null; decimals carry scales other than their column's.
-pub fn testBatch(arena: std.mem.Allocator, seed: u64, rows: usize) !Batch {
-    const kinds = [_]types.Type{
-        types.Type.init(.int).asNullable(),
-        types.Type.init(.float).asNullable(),
-        types.Type.decimal(14, 2).asNullable(),
-        types.Type.decimal(38, 6).asNullable(),
-        types.Type.init(.date).asNullable(),
-        types.Type.init(.time).asNullable(),
-        types.Type.init(.timestamp).asNullable(),
-        types.Type.init(.bool).asNullable(),
-        types.Type.init(.string).asNullable(),
-        types.Type.init(.bytes).asNullable(),
-        types.Type.init(.array).asNullable(),
+/// The plain spelling of 5e-324, which `goldenColumn` holds among its floats.
+pub const golden_tiny = "0." ++ "0" ** 323 ++ "5";
+
+/// Tests' fixture: three rows of an int, a string and a decimal, the middle row
+/// null, to pin separators and row ends.
+pub fn goldenRows(arena: std.mem.Allocator) !Batch {
+    const tys = [_]types.Type{ types.Type.init(.int).asNullable(), types.Type.init(.string).asNullable(), types.Type.decimal(10, 2).asNullable() };
+    const rows = [_][3]Value{
+        .{ .{ .int = 1 }, .{ .string = "a b" }, .{ .decimal = .{ .unscaled = 250, .scale = 2 } } },
+        .{ .null, .null, .null },
+        .{ .{ .int = -2 }, .{ .string = "" }, .{ .decimal = .{ .unscaled = -1, .scale = 1 } } },
     };
-    const floats = [_]f64{ 0, -0.0, 1.5, -2.25, 1e-300, 5e-324, -5e-324, 1.7976931348623157e308, -1.7976931348623157e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 123456.789, 1e21, 0.1 };
-    var prng = std.Random.DefaultPrng.init(seed);
-    const rnd = prng.random();
-    const cols = try arena.alloc(Column, kinds.len);
-    for (kinds, cols) |ty, *col| {
-        const nested = ty.kind == .array;
-        var b = column.Builder.init(arena, if (nested) types.Type.init(.string).asNullable() else ty);
-        for (0..rows) |_| {
-            if (rnd.uintLessThan(u8, 6) == 0) {
-                try b.append(.null);
-                continue;
-            }
-            try b.append(switch (ty.kind) {
-                .int => .{ .int = switch (rnd.uintLessThan(u8, 3)) {
-                    0 => std.math.minInt(i64),
-                    1 => std.math.maxInt(i64),
-                    else => rnd.int(i32),
-                } },
-                .float => .{ .float = if (rnd.boolean()) floats[rnd.uintLessThan(usize, floats.len)] else (rnd.float(f64) - 0.5) * 1e6 },
-                .decimal => .{ .decimal = .{
-                    .unscaled = switch (rnd.uintLessThan(u8, 4)) {
-                        0 => rnd.int(i128) >> 6,
-                        1 => @as(i128, std.math.maxInt(u64)) * (if (rnd.boolean()) @as(i128, 1) else -1),
-                        2 => rnd.intRangeAtMost(i128, -999, 999),
-                        else => rnd.int(i64),
-                    },
-                    .scale = rnd.uintAtMost(u8, 12),
-                } },
-                .date => .{ .date = if (rnd.uintLessThan(u8, 8) == 0) std.math.minInt(i32) + 1 else rnd.intRangeAtMost(i32, -800_000, 3_000_000) },
-                .time => .{ .time = rnd.intRangeAtMost(i64, 0, 86_400_000_000 - 1) },
-                .timestamp => .{ .timestamp = rnd.intRangeAtMost(i64, -100_000_000_000_000_000, 100_000_000_000_000_000) },
-                .bool => .{ .bool = rnd.boolean() },
-                .bytes => .{ .bytes = test_texts[rnd.uintLessThan(usize, test_texts.len)] },
-                else => .{ .string = test_texts[rnd.uintLessThan(usize, test_texts.len)] },
-            });
-        }
+    const cols = try arena.alloc(Column, tys.len);
+    for (tys, cols, 0..) |ty, *col, c| {
+        var b = column.Builder.init(arena, ty);
+        for (rows) |row| try b.append(row[c]);
         col.* = try b.finish();
-        if (nested) col.ty = ty;
     }
-    const fields = try arena.alloc(types.Schema.Field, kinds.len);
-    for (fields, kinds) |*f, ty| f.* = .{ .name = "c", .ty = ty };
+    const fields = try arena.alloc(types.Schema.Field, tys.len);
+    for (fields, tys, [_][]const u8{ "i", "s", "d" }) |*f, ty, n| f.* = .{ .name = n, .ty = ty };
     const schema = try arena.create(types.Schema);
     schema.* = .{ .fields = fields };
-    return .{ .schema = schema, .columns = cols, .len = rows };
+    return .{ .schema = schema, .columns = cols, .len = rows.len };
+}
+
+/// Tests' fixture: `goldenColumn` of every kind, in the order the golden tests list
+/// them, then `goldenRows`.
+pub fn goldenBatches(arena: std.mem.Allocator) ![]const Batch {
+    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp, .array };
+    const out = try arena.alloc(Batch, kinds.len + 1);
+    for (kinds, out[0..kinds.len]) |k, *b| b.* = try goldenColumn(arena, k);
+    out[kinds.len] = try goldenRows(arena);
+    return out;
+}
+
+/// Tests' check of one rendering per `goldenBatches` batch against its golden bytes.
+pub fn expectGolden(want: []const []const u8, got: []const []const u8) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
 }

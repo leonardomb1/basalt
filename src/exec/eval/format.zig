@@ -6,20 +6,6 @@ const formatDecimal = @import("support.zig").formatDecimal;
 const std = @import("std");
 const evalLit = @import("testing_util.zig").evalLit;
 
-pub fn writeValue(w: anytype, v: Value) !void {
-    switch (v) {
-        .null => {},
-        .string, .bytes => |x| try w.writeAll(x),
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .int => |x| try w.print("{d}", .{x}),
-        .float => |x| try w.print("{d}", .{x}),
-        .decimal => |d| try writeDecimal(w, d.unscaled, d.scale),
-        .date => |x| try writeDate(w, x),
-        .time => |x| try writeTime(w, x),
-        .timestamp => |x| try writeTimestamp(w, x),
-    }
-}
-
 pub fn writeDate(w: anytype, days: i64) !void {
     const c = civilFromDays(days);
     try writeYear(w, c.y);
@@ -263,62 +249,6 @@ test "json_reduce: folds, typed accumulators, positions, shadowing" {
     try std.testing.expectEqualStrings("[10,21]", (try evalLit(a, "json_transform('[10,20]', (x, i) -> x + i)")).string);
 
     try std.testing.expect((try evalLit(a, "json_any('[[1,2],[3]]', x -> json_reduce(x, 0, (acc, x) -> acc + x) = 3)")).bool);
-}
-
-test "writeValue renders exactly what valueToString does, for every kind" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const cases = [_]Value{
-        .null,
-        .{ .bool = true },
-        .{ .bool = false },
-        .{ .int = 0 },
-        .{ .int = -1 },
-        .{ .int = std.math.maxInt(i64) },
-        .{ .int = std.math.minInt(i64) },
-        .{ .float = 0 },
-        .{ .float = -0.0 },
-        .{ .float = 0.1 },
-        .{ .float = 1.0 / 3.0 },
-        .{ .float = -2.5e-8 },
-        .{ .float = 1.7976931348623157e308 },
-        .{ .float = 5e-324 },
-        .{ .float = std.math.inf(f64) },
-        .{ .float = -std.math.inf(f64) },
-        .{ .float = std.math.nan(f64) },
-        .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
-        .{ .decimal = .{ .unscaled = 1700, .scale = 2 } },
-        .{ .decimal = .{ .unscaled = -1700, .scale = 2 } },
-        .{ .decimal = .{ .unscaled = 5, .scale = 6 } },
-        .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 0 } },
-        .{ .decimal = .{ .unscaled = std.math.minInt(i128) + 1, .scale = 10 } },
-        .{ .string = "" },
-        .{ .string = "plain" },
-        .{ .bytes = "raw" },
-        .{ .date = 0 },
-        .{ .date = 20000 },
-        .{ .date = 2932896 },
-        .{ .time = 0 },
-        .{ .time = 1 },
-        .{ .time = 86_400_000_000 - 1 },
-        .{ .timestamp = 0 },
-        .{ .timestamp = -1 },
-        .{ .timestamp = 1_754_000_000_000_000 },
-        .{ .timestamp = 1_754_000_000_123_456 },
-    };
-
-    for (cases) |v| {
-        var buf: [512]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        try writeValue(&w, v);
-        const want = try valueToString(a, v);
-        std.testing.expectEqualStrings(want, w.buffered()) catch |e| {
-            std.debug.print("mismatch on {s}\n", .{@tagName(v)});
-            return e;
-        };
-    }
 }
 
 test "formatTime suppresses an all-zero fraction, like formatTimestamp" {

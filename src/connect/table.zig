@@ -19,9 +19,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const eval = @import("../exec/eval.zig");
 const celltext = @import("../exec/celltext.zig");
-const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
 
 pub const Grid = struct {
@@ -633,64 +631,57 @@ test "renderFitted: types row, right-aligned numbers, NULL, cut cells, elided ro
     try std.testing.expectEqualStrings("  1  ana      a value that is much longer than forty …    10.5", it.next().?);
 }
 
-fn writeJsonValueReference(out: *std.Io.Writer, arena: std.mem.Allocator, v: Value) !void {
-    switch (v) {
-        .null => try out.writeAll("null"),
-        .bool => |b| try out.writeAll(if (b) "true" else "false"),
-        .int => |i| try out.print("{d}", .{i}),
-        .float => |f| if (std.math.isFinite(f)) try out.print("{d}", .{f}) else try out.writeAll("null"),
-        .bytes => |b| {
-            const enc = std.base64.standard.Encoder;
-            const dst = try arena.alloc(u8, enc.calcSize(b.len));
-            try out.writeByte('"');
-            try out.writeAll(enc.encode(dst, b));
-            try out.writeByte('"');
-        },
-        else => {
-            const s = try eval.valueToString(arena, v);
-            try out.writeByte('"');
-            try writeEscapedW(out, s);
-            try out.writeByte('"');
-        },
-    }
-}
-
-test "table and JSON cells match the per-value path over random batches of every type" {
+test "table cells and JSON rows of every kind" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const batch = try celltext.testBatch(a, 0x7ab1e, 400);
-
-    const tw = try TableWriter.open(std.testing.allocator, batch.schema.*);
-    defer tw.deinit();
-    try tw.writeBatch(a, batch);
-    var i: usize = 0;
-    for (0..batch.len) |r| {
-        for (batch.columns) |*col| {
-            const v = col.getValue(r);
-            const got = tw.cells.items[i];
-            i += 1;
-            if (v.isNull()) {
-                try std.testing.expect(got == null);
-            } else try std.testing.expectEqualStrings(try eval.valueToString(a, v), got.?);
+    const batches = try celltext.goldenBatches(a);
+    const cells = try a.alloc([]const u8, batches.len);
+    const json = try a.alloc([]const u8, batches.len);
+    for (batches, cells, json) |batch, *c, *j| {
+        const tw = try TableWriter.open(std.testing.allocator, batch.schema.*);
+        defer tw.deinit();
+        try tw.writeBatch(a, batch);
+        var w = std.Io.Writer.Allocating.init(a);
+        for (tw.cells.items, 0..) |cell, i| {
+            if (i > 0) try w.writer.writeByte(' ');
+            if (cell) |s| try w.writer.print("[{s}]", .{s}) else try w.writer.writeAll("null");
         }
-    }
+        c.* = w.written();
 
-    const keys = try a.alloc([]const u8, batch.columns.len);
-    for (keys, 0..) |*k, c| k.* = try std.fmt.allocPrint(a, "\"c{d}\":", .{c});
-    var want = std.Io.Writer.Allocating.init(a);
-    for (0..batch.len) |r| {
-        try want.writer.writeByte('{');
-        for (batch.columns, 0..) |*col, c| {
-            if (c > 0) try want.writer.writeByte(',');
-            try want.writer.writeAll(keys[c]);
-            try writeJsonValueReference(&want.writer, a, col.getValue(r));
-        }
-        try want.writer.writeAll("}\n");
+        const keys = try a.alloc([]const u8, batch.columns.len);
+        for (keys, batch.schema.fields) |*k, f| k.* = try std.fmt.allocPrint(a, "\"{s}\":", .{f.name});
+        var jw = std.Io.Writer.Allocating.init(a);
+        try JsonWriter.writeRows(&jw.writer, keys, batch);
+        j.* = jw.written();
     }
-    var got = std.Io.Writer.Allocating.init(a);
-    try JsonWriter.writeRows(&got.writer, keys, batch);
-    try std.testing.expectEqualStrings(want.writer.buffered(), got.writer.buffered());
+    const tiny = celltext.golden_tiny;
+    try celltext.expectGolden(&.{
+        "[true] [false] null",
+        "[0] [-1] [-9223372036854775808] [9223372036854775807] null",
+        "[0.1] [0] [-0] [" ++ tiny ++ "] [1000000000000000000000] [-2.25] [nan] [inf] [-inf] null",
+        "[123.45] [-0.0007] [5] [0.12345] [-18446744073709.551615] [0.00] null",
+        "[] [plain] [tab\there] [line\nbreak] [cr\rlf\r\n] [say \"hi\"] [O'Brien] [back\\slash\\] [a\\Nb] [\\N ] [NULL] [a\x01b\x02c] [a,b;c:d.e-1 0] [\xc3\xb3 \xf0\x9f\x98\x80] [\x00nul] [sixteen bytes and more\x01] null",
+        "[] [plain] [\x01\x02 \\ \t\n\"] [\xc3\xb3] null",
+        "[1970-01-01] [2024-01-01] [0000-01-01] [-5877641-06-24] null",
+        "[00:00:00] [01:02:03.000001] [23:59:59.999999] null",
+        "[1970-01-01 00:00:00] [2024-01-01 00:00:00.123456] [1969-12-31 23:59:59.999999] [0001-01-01 00:00:00] null",
+        "null null",
+        "[1] [a b] [2.50] null null null [-2] [] [-0.1]",
+    }, cells);
+    try celltext.expectGolden(&.{
+        "{\"c\":true}\n{\"c\":false}\n{\"c\":null}\n",
+        "{\"c\":0}\n{\"c\":-1}\n{\"c\":-9223372036854775808}\n{\"c\":9223372036854775807}\n{\"c\":null}\n",
+        "{\"c\":0.1}\n{\"c\":0}\n{\"c\":-0}\n{\"c\":" ++ tiny ++ "}\n{\"c\":1000000000000000000000}\n{\"c\":-2.25}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n",
+        "{\"c\":\"123.45\"}\n{\"c\":\"-0.0007\"}\n{\"c\":\"5\"}\n{\"c\":\"0.12345\"}\n{\"c\":\"-18446744073709.551615\"}\n{\"c\":\"0.00\"}\n{\"c\":null}\n",
+        "{\"c\":\"\"}\n{\"c\":\"plain\"}\n{\"c\":\"tab\\there\"}\n{\"c\":\"line\\nbreak\"}\n{\"c\":\"cr\\rlf\\r\\n\"}\n{\"c\":\"say \\\"hi\\\"\"}\n{\"c\":\"O'Brien\"}\n{\"c\":\"back\\\\slash\\\\\"}\n{\"c\":\"a\\\\Nb\"}\n{\"c\":\"\\\\N \"}\n{\"c\":\"NULL\"}\n{\"c\":\"a\\u0001b\\u0002c\"}\n{\"c\":\"a,b;c:d.e-1 0\"}\n{\"c\":\"\xc3\xb3 \xf0\x9f\x98\x80\"}\n{\"c\":\"\\u0000nul\"}\n{\"c\":\"sixteen bytes and more\\u0001\"}\n{\"c\":null}\n",
+        "{\"c\":\"\"}\n{\"c\":\"cGxhaW4=\"}\n{\"c\":\"AQIgXCAJCiI=\"}\n{\"c\":\"w7M=\"}\n{\"c\":null}\n",
+        "{\"c\":\"1970-01-01\"}\n{\"c\":\"2024-01-01\"}\n{\"c\":\"0000-01-01\"}\n{\"c\":\"-5877641-06-24\"}\n{\"c\":null}\n",
+        "{\"c\":\"00:00:00\"}\n{\"c\":\"01:02:03.000001\"}\n{\"c\":\"23:59:59.999999\"}\n{\"c\":null}\n",
+        "{\"c\":\"1970-01-01 00:00:00\"}\n{\"c\":\"2024-01-01 00:00:00.123456\"}\n{\"c\":\"1969-12-31 23:59:59.999999\"}\n{\"c\":\"0001-01-01 00:00:00\"}\n{\"c\":null}\n",
+        "{\"c\":null}\n{\"c\":null}\n",
+        "{\"i\":1,\"s\":\"a b\",\"d\":\"2.50\"}\n{\"i\":null,\"s\":null,\"d\":null}\n{\"i\":-2,\"s\":\"\",\"d\":\"-0.1\"}\n",
+    }, json);
 }
 
 test "renderPlain spells a null NULL, so it is never read as an empty string" {

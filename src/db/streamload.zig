@@ -1087,32 +1087,31 @@ test "a value that is literally the null marker is refused, not written as null"
     try std.testing.expectEqualStrings("a\\Nb\x02", out.items);
 }
 
-fn appendBatchTsvReference(out: *std.array_list.Managed(u8), arena: std.mem.Allocator, batch: Batch) !void {
-    for (0..batch.len) |r| {
-        for (batch.columns, 0..) |*c, i| {
-            if (i > 0) try out.append(0x01);
-            const v = c.getValue(r);
-            if (v.isNull()) {
-                try out.appendSlice(NULL_MARKER);
-                continue;
-            }
-            const s = try celltext.referenceText(arena, v, "true", "false");
-            for (s) |b| try out.append(if (b == 0x01 or b == 0x02) ' ' else b);
-        }
-        try out.append(0x02);
-    }
-}
-
-test "stream-load body matches the per-value text path over random batches of every type" {
+test "stream-load body of every kind" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const batch = try celltext.testBatch(a, 0x57d, 300);
-    var want = std.array_list.Managed(u8).init(a);
-    try appendBatchTsvReference(&want, a, batch);
-    var got = std.array_list.Managed(u8).init(a);
-    try appendBatchTsv(&got, batch);
-    try std.testing.expectEqualStrings(want.items, got.items);
+    const batches = try celltext.goldenBatches(a);
+    const got = try a.alloc([]const u8, batches.len);
+    for (batches, got) |batch, *g| {
+        var out = std.array_list.Managed(u8).init(a);
+        try appendBatchTsv(&out, batch);
+        g.* = out.items;
+    }
+    const tiny = celltext.golden_tiny;
+    try celltext.expectGolden(&.{
+        "true\x02false\x02\\N\x02",
+        "0\x02-1\x02-9223372036854775808\x029223372036854775807\x02\\N\x02",
+        "0.1\x020\x02-0\x02" ++ tiny ++ "\x021000000000000000000000\x02-2.25\x02nan\x02inf\x02-inf\x02\\N\x02",
+        "123.45\x02-0.0007\x025\x020.12345\x02-18446744073709.551615\x020.00\x02\\N\x02",
+        "\x02plain\x02tab\there\x02line\nbreak\x02cr\rlf\r\n\x02say \"hi\"\x02O'Brien\x02back\\slash\\\x02a\\Nb\x02\\N \x02NULL\x02a b c\x02a,b;c:d.e-1 0\x02\xc3\xb3 \xf0\x9f\x98\x80\x02\x00nul\x02sixteen bytes and more \x02\\N\x02",
+        "\x02plain\x02   \\ \t\n\"\x02\xc3\xb3\x02\\N\x02",
+        "1970-01-01\x022024-01-01\x020000-01-01\x02-5877641-06-24\x02\\N\x02",
+        "00:00:00\x0201:02:03.000001\x0223:59:59.999999\x02\\N\x02",
+        "1970-01-01 00:00:00\x022024-01-01 00:00:00.123456\x021969-12-31 23:59:59.999999\x020001-01-01 00:00:00\x02\\N\x02",
+        "\\N\x02\\N\x02",
+        "1\x01a b\x012.50\x02\\N\x01\\N\x01\\N\x02-2\x01\x01-0.1\x02",
+    }, got);
 }
 
 test "a gzip body is announced as each flavor spells it" {
