@@ -21,6 +21,9 @@
 //! at a top, or when such rows outnumber a heap's live ones, so the heaps stay
 //! O(frame). Every frame thus costs O(1) amortized per row, MEDIAN O(log frame). IGNORE
 //! NULLS reads through the positions of the non-null values and their prefix counts.
+//! Each aggregate is a state with `add`, `remove` and `finish` (the invertible ones
+//! are `aggregate/funcs.zig`'s own), and `Slider` generates the one loop that slides
+//! it, per aggregate and argument kind, reading the sorted column as typed values.
 //!
 //! The default frame (`Frame{}`) is RANGE from the partition's start to the current
 //! row's peers. A RANGE offset (`Off.int` / `Off.float`) is in the order key's units
@@ -34,6 +37,7 @@ const KeyArr = @import("sort.zig").KeyArr;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
 const Stats = @import("../op.zig").Stats;
+const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
@@ -43,48 +47,52 @@ const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const rescaleTo = @import("../eval.zig").rescaleTo;
-const decimalOverflow = @import("../eval.zig").decimalOverflow;
-const wideSumDecimal = @import("../eval.zig").wideSumDecimal;
 const freeRowGpa = @import("topn.zig").freeRowGpa;
 const keyOrder = @import("sort.zig").keyOrder;
 const rowOrder = @import("sort.zig").rowOrder;
 const keyhash = @import("../keyhash.zig");
 const lessV = @import("aggregate.zig").lessV;
-const Moments = @import("aggregate/funcs.zig").Moments;
-const spread = @import("aggregate/funcs.zig").spread;
+const aggFuncs = @import("aggregate/funcs.zig");
+const Ctx = aggFuncs.Ctx;
+const Moments = aggFuncs.Moments;
 const materializeAll = @import("../op.zig").materializeAll;
 const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
-/// Adds (or, leaving a frame, takes away) a value from a DECIMAL sum, exactly, at
-/// the sum's scale, as the SUM aggregate does; a float total would read 0.1 + 0.2 as
-/// 0.30000000000000004.
-fn decStep(acc: *i256, v: Value, scale: u8, sub: bool) !void {
-    const d = eval.asDecimal(v) orelse return error.TypeMismatch;
-    const u = (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
-    acc.* = (if (sub) std.math.sub(i256, acc.*, u) else std.math.add(i256, acc.*, u)) catch return decimalOverflow();
+/// A text argument of a numeric window aggregate read as the plain aggregate reads
+/// it, every row up front: exactly for a SUM into an INT or DECIMAL (the sum's
+/// type), else as a FLOAT.
+fn numericArg(arena: std.mem.Allocator, agg: ast.AggFunc, out_ty: types.Type, c: column.Column) !column.Column {
+    if (c.ty.kind != .string or aggregates.spec(agg).arg != .numeric) return c;
+    const exact = agg == .sum and out_ty.kind != .float;
+    const to = if (!exact) types.Type.init(.float) else if (out_ty.kind == .decimal) out_ty else types.Type.init(.int);
+    var bd = try column.Builder.initCapacity(arena, to.asNullable(), c.len);
+    for (0..c.len) |p| {
+        const v = c.getValue(p);
+        if (v != .string) {
+            try bd.append(v);
+        } else if (exact) {
+            try bd.append(try eval.exactSumText(v.string, out_ty));
+        } else {
+            try bd.append(eval.castValueTyped(arena, v, to) catch |e| return if (e == error.CastFailed) eval.castFailure(arena, v, to) else e);
+        }
+    }
+    return bd.finish();
 }
 
-/// A text argument of a numeric window aggregate read as the plain aggregate reads
-/// it: exactly for a SUM into an INT or DECIMAL, else as a FLOAT.
-fn numericArg(arena: std.mem.Allocator, f: ast.WinFn, out_ty: types.Type, v: Value) !Value {
-    if (v != .string or f != .agg or aggregates.spec(f.agg).arg != .numeric) return v;
-    if (f.agg == .sum and out_ty.kind != .float) return eval.exactSumText(v.string, out_ty);
-    const to = types.Type.init(.float);
-    return eval.castValueTyped(arena, v, to) catch |e| if (e == error.CastFailed) eval.castFailure(arena, v, to) else e;
+fn decF64(d: Decimal) f64 {
+    var scale: f64 = 1;
+    var i: u8 = 0;
+    while (i < d.scale) : (i += 1) scale *= 10;
+    return @as(f64, @floatFromInt(d.unscaled)) / scale;
 }
 
 fn asF64Opt(v: Value) ?f64 {
     return switch (v) {
         .int => |x| @floatFromInt(x),
         .float => |x| x,
-        .decimal => |d| blk: {
-            var scale: f64 = 1;
-            var i: u8 = 0;
-            while (i < d.scale) : (i += 1) scale *= 10;
-            break :blk @as(f64, @floatFromInt(d.unscaled)) / scale;
-        },
+        .decimal => |d| decF64(d),
         .bool => |b| if (b) 1 else 0,
         else => null,
     };
@@ -210,14 +218,6 @@ pub const Window = struct {
         const cols = try arena.alloc(column.Column, builders.len);
         for (builders, cols) |*bd, *c| c.* = try bd.finish();
         return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
-    }
-
-    fn intSum(self: *Window, acc: i256) error{IntOverflow}!Value {
-        const v = std.math.cast(i64, acc) orelse {
-            if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(error.IntOverflow)});
-            return error.IntOverflow;
-        };
-        return .{ .int = v };
     }
 
     pub const Layout = struct {
@@ -482,8 +482,6 @@ pub const Window = struct {
         }
     }
 
-    const Distinct = std.HashMap([]const Value, u32, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-
     /// A sliding aggregate over a monoid by two stacks: values enter at the back and
     /// leave from the front, whose entries hold suffix totals refilled from the back
     /// when it runs dry. Nothing is ever subtracted, so a float total never keeps the
@@ -643,265 +641,315 @@ pub const Window = struct {
             return if (max) lt(b, a) else lt(a, b);
         }
 
-        fn median(h: *Halves) ?f64 {
-            const l = h.lo.peek() orelse return null;
+        fn median(h: *const Halves) ?f64 {
+            if (h.lo.items.len == 0) return null;
+            const l = h.lo.items[0];
             if (h.nlo > h.nhi) return l.x;
-            return (l.x + h.hi.peek().?.x) / 2;
+            return (l.x + h.hi.items[0].x) / 2;
         }
     };
 
-    const Slide = struct {
-        w: *Window,
-        a: std.mem.Allocator,
-        f: Func,
-        agg: ast.AggFunc,
-        vals: []const Value,
-        dec: ?u8,
-        out_int: bool,
-        n: i64 = 0,
-        t: i64 = 0,
-        acc_i: i256 = 0,
-        seen_float: bool = false,
-        s1: i128 = 0,
-        s2: i128 = 0,
-        inexact: i64 = 0,
-        overflow: bool = false,
-        dq: std.array_list.Managed(usize),
-        dq_head: usize = 0,
-        seen: Distinct,
-        fsum: TwoStack(f64, 0, addF) = .{},
-        mom: TwoStack(Moments, .{}, Moments.merge) = .{},
-        band: TwoStack(i64, -1, andI) = .{},
-        bor: TwoStack(i64, 0, orI) = .{},
-        med: Halves,
-
-        fn reset(s: *Slide) void {
-            s.n = 0;
-            s.t = 0;
-            s.acc_i = 0;
-            s.seen_float = false;
-            s.s1 = 0;
-            s.s2 = 0;
-            s.inexact = 0;
-            s.overflow = false;
-            s.dq.clearRetainingCapacity();
-            s.dq_head = 0;
+    /// COUNT(DISTINCT x): each value's count in the frame, the key copied on its first
+    /// entry and dropped when its count reaches zero.
+    const CountDistinct = struct {
+        pub const In = Value;
+        pub const State = struct { seen: std.HashMapUnmanaged([]const Value, u32, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage) = .empty };
+        pub fn reset(s: *State) void {
             s.seen.clearRetainingCapacity();
-            s.fsum.reset();
-            s.mom.reset();
-            s.band.reset();
-            s.bor.reset();
-            s.med.reset();
         }
-
-        fn add(s: *Slide, p: usize) !void {
-            if (s.f.arg == null) {
-                s.n += 1;
-                return;
+        pub fn add(s: *State, x: Value, cx: Ctx) !void {
+            var probe = [_]Value{x};
+            const gop = try s.seen.getOrPut(cx.alloc, &probe);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try cx.alloc.dupe(Value, &probe);
+                gop.value_ptr.* = 0;
             }
-            const v = s.vals[p];
-            if (v.isNull()) return;
-            switch (s.agg) {
-                .count => if (s.f.distinct) {
-                    const gop = try s.seen.getOrPut(s.vals[p .. p + 1]);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* += 1;
-                } else {
-                    s.n += 1;
-                },
-                .count_if => if (v == .bool and v.bool) {
-                    s.n += 1;
-                },
-                .sum, .avg => {
-                    if (s.dec) |sc| {
-                        try decStep(&s.acc_i, v, sc, false);
-                        s.n += 1;
-                    } else switch (v) {
-                        .int => |x| {
-                            s.acc_i += x;
-                            s.n += 1;
-                        },
-                        else => if (asF64Opt(v)) |x| {
-                            try s.fsum.push(s.a, x);
-                            s.seen_float = true;
-                            s.n += 1;
-                        },
-                    }
-                },
-                .min, .max => {
-                    while (s.dq.items.len > s.dq_head) {
-                        const back = s.vals[s.dq.items[s.dq.items.len - 1]];
-                        const beaten = if (s.agg == .max) !lessV(v, back) else !lessV(back, v);
-                        if (!beaten) break;
-                        s.dq.items.len -= 1;
-                    }
-                    try s.dq.append(p);
-                },
-                .bool_and, .bool_or => if (v == .bool) {
-                    s.n += 1;
-                    if (v.bool) s.t += 1;
-                },
-                .bit_and, .bit_or, .bit_xor => if (v == .int) {
-                    switch (s.agg) {
-                        .bit_and => try s.band.push(s.a, v.int),
-                        .bit_or => try s.bor.push(s.a, v.int),
-                        else => s.acc_i ^= v.int,
-                    }
-                    s.n += 1;
-                },
-                .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (asF64Opt(v)) |x| {
-                    s.moments(v, false);
-                    try s.mom.push(s.a, .{ .n = 1, .mean = x });
-                    s.n += 1;
-                },
-                .median => if (asF64Opt(v)) |x| try s.med.add(.{ .x = x, .p = p }),
-            }
+            gop.value_ptr.* += 1;
         }
-
-        fn remove(s: *Slide, p: usize) !void {
-            if (s.f.arg == null) {
-                s.n -= 1;
-                return;
-            }
-            const v = s.vals[p];
-            if (v.isNull()) return;
-            switch (s.agg) {
-                .count => if (s.f.distinct) {
-                    const e = s.seen.getEntry(s.vals[p .. p + 1]) orelse return;
-                    e.value_ptr.* -= 1;
-                    if (e.value_ptr.* == 0) _ = s.seen.remove(s.vals[p .. p + 1]);
-                } else {
-                    s.n -= 1;
-                },
-                .count_if => if (v == .bool and v.bool) {
-                    s.n -= 1;
-                },
-                .sum, .avg => {
-                    if (s.dec) |sc| {
-                        try decStep(&s.acc_i, v, sc, true);
-                        s.n -= 1;
-                    } else switch (v) {
-                        .int => |x| {
-                            s.acc_i -= x;
-                            s.n -= 1;
-                        },
-                        else => if (asF64Opt(v) != null) {
-                            try s.fsum.pop(s.a);
-                            s.n -= 1;
-                        },
-                    }
-                },
-                .min, .max => if (s.dq_head < s.dq.items.len and s.dq.items[s.dq_head] == p) {
-                    s.dq_head += 1;
-                },
-                .bool_and, .bool_or => if (v == .bool) {
-                    s.n -= 1;
-                    if (v.bool) s.t -= 1;
-                },
-                .bit_and, .bit_or, .bit_xor => if (v == .int) {
-                    switch (s.agg) {
-                        .bit_and => try s.band.pop(s.a),
-                        .bit_or => try s.bor.pop(s.a),
-                        else => s.acc_i ^= v.int,
-                    }
-                    s.n -= 1;
-                },
-                .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (asF64Opt(v) != null) {
-                    s.moments(v, true);
-                    try s.mom.pop(s.a);
-                    s.n -= 1;
-                },
-                .median => if (asF64Opt(v)) |x| try s.med.remove(.{ .x = x, .p = p }),
-            }
+        pub fn remove(s: *State, x: Value, _: Ctx) !void {
+            var probe = [_]Value{x};
+            const e = s.seen.getEntry(&probe) orelse return;
+            e.value_ptr.* -= 1;
+            if (e.value_ptr.* == 0) s.seen.removeByPtr(e.key_ptr);
         }
-
-        /// Integer sums of x and x² beside the float moments: over ints the variance is
-        /// then exact, so a frame of equal values reads 0 however many rows passed.
-        fn moments(s: *Slide, v: Value, sub: bool) void {
-            if (v != .int) {
-                s.inexact += if (sub) -1 else 1;
-                return;
-            }
-            const x: i128 = v.int;
-            const sq = std.math.mul(i128, x, x) catch {
-                s.overflow = true;
-                return;
-            };
-            const d1 = if (sub) -x else x;
-            const d2 = if (sub) -sq else sq;
-            s.s1 = std.math.add(i128, s.s1, d1) catch blk: {
-                s.overflow = true;
-                break :blk s.s1;
-            };
-            s.s2 = std.math.add(i128, s.s2, d2) catch blk: {
-                s.overflow = true;
-                break :blk s.s2;
-            };
-        }
-
-        fn sqDev(s: *const Slide) f64 {
-            if (s.inexact == 0 and !s.overflow and s.n > 0) {
-                const n: i128 = s.n;
-                if (std.math.mul(i128, n, s.s2)) |a| if (std.math.mul(i128, s.s1, s.s1)) |b| {
-                    return @as(f64, @floatFromInt(a - b)) / @as(f64, @floatFromInt(n));
-                } else |_| {} else |_| {}
-            }
-            return @max(0, s.mom.get().m2);
-        }
-
-        fn total(s: *const Slide) f64 {
-            return s.fsum.get() + @as(f64, @floatFromInt(s.acc_i));
-        }
-
-        fn result(s: *Slide) !Value {
-            return switch (s.agg) {
-                .count => if (s.f.distinct) .{ .int = @intCast(s.seen.count()) } else .{ .int = s.n },
-                .count_if => .{ .int = s.n },
-                .sum => if (s.n == 0) .null else if (s.dec) |sc| .{ .decimal = wideSumDecimal(s.acc_i, sc) orelse return decimalOverflow() } else if (s.seen_float or !s.out_int) .{ .float = s.total() } else try s.w.intSum(s.acc_i),
-                .avg => if (s.n == 0) .null else .{ .float = s.total() / @as(f64, @floatFromInt(s.n)) },
-                .min, .max => if (s.dq_head < s.dq.items.len) s.vals[s.dq.items[s.dq_head]] else .null,
-                .bool_and => if (s.n == 0) .null else .{ .bool = s.t == s.n },
-                .bool_or => if (s.n == 0) .null else .{ .bool = s.t > 0 },
-                .bit_and => if (s.n == 0) .null else .{ .int = s.band.get() },
-                .bit_or => if (s.n == 0) .null else .{ .int = s.bor.get() },
-                .bit_xor => if (s.n == 0) .null else .{ .int = @intCast(s.acc_i) },
-                .var_samp, .stddev_samp => if (s.n < 2) .null else spread(s.agg, s.sqDev() / @as(f64, @floatFromInt(s.n - 1))),
-                .var_pop, .stddev_pop => if (s.n < 1) .null else spread(s.agg, s.sqDev() / @as(f64, @floatFromInt(s.n))),
-                .median => if (s.med.median()) |m| .{ .float = m } else .null,
-            };
+        pub fn finish(s: *const State, _: Ctx) !Value {
+            return .{ .int = @intCast(s.seen.count()) };
         }
     };
 
-    /// An aggregate over each row's frame, as the file header describes.
-    fn aggregateOver(self: *Window, arena: std.mem.Allocator, f: Func, agg: ast.AggFunc, vals: []const Value, fs: []const usize, fe: []const usize, l: Layout, out_ty: types.Type, out: []Value) !void {
-        var s = Slide{
-            .w = self,
-            .a = arena,
-            .f = f,
-            .agg = agg,
-            .vals = vals,
-            .dec = if (agg == .sum and out_ty.kind == .decimal) out_ty.scale else null,
-            .out_int = out_ty.kind == .int,
-            .dq = std.array_list.Managed(usize).init(arena),
-            .seen = Distinct.init(arena),
-            .med = Halves.init(arena),
-        };
-        var k: usize = 0;
-        const n = fs.len;
-        while (k < n) {
-            const pe = l.pend[k];
-            s.reset();
-            var lo = k;
-            var hi = k;
-            while (k < pe) : (k += 1) {
-                while (hi < fe[k]) : (hi += 1) try s.add(hi);
-                while (lo < fs[k]) : (lo += 1) {
-                    if (lo < hi) try s.remove(lo);
-                }
-                if (hi < lo) hi = lo;
-                out[k] = try s.result();
-            }
+    /// SUM over ints exactly; the frame total alone is range-checked, as an INT unless
+    /// the sum is typed otherwise.
+    const SumInt = struct {
+        pub const In = i64;
+        pub const State = aggFuncs.SumInt.State;
+        pub const add = aggFuncs.SumInt.add;
+        pub const remove = aggFuncs.SumInt.remove;
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            if (s.n > 0 and cx.out.kind != .int) return .{ .float = @floatFromInt(s.s) };
+            return aggFuncs.SumInt.finish(s, cx);
         }
+    };
+
+    /// SUM (or AVG) of floats in two stacks, so a row that left leaves no rounding
+    /// behind. The total adds zero, as the exact integer part once did, so -0 reads 0.
+    fn FloatSum(comptime avg: bool) type {
+        return struct {
+            pub const In = f64;
+            pub const State = struct { n: i64 = 0, t: TwoStack(f64, 0, addF) = .{} };
+            pub fn reset(s: *State) void {
+                s.n = 0;
+                s.t.reset();
+            }
+            pub fn add(s: *State, x: f64, cx: Ctx) !void {
+                try s.t.push(cx.alloc, x);
+                s.n += 1;
+            }
+            pub fn remove(s: *State, _: f64, cx: Ctx) !void {
+                try s.t.pop(cx.alloc);
+                s.n -= 1;
+            }
+            pub fn finish(s: *const State, _: Ctx) !Value {
+                if (s.n == 0) return .null;
+                const t = s.t.get() + @as(f64, 0);
+                return .{ .float = if (avg) t / @as(f64, @floatFromInt(s.n)) else t };
+            }
+        };
+    }
+
+    /// MIN (`want` .lt) or MAX by a monotonic deque of the values that can still win,
+    /// in `lessV` order, a later equal value displacing an earlier one.
+    fn Deque(comptime want: std.math.Order) type {
+        return struct {
+            pub const In = Value;
+            const Item = struct { v: Value, p: usize };
+            pub const State = struct { q: std.ArrayList(Item) = .empty, head: usize = 0 };
+            pub fn reset(s: *State) void {
+                s.q.clearRetainingCapacity();
+                s.head = 0;
+            }
+            pub fn add(s: *State, x: Value, p: usize, cx: Ctx) !void {
+                while (s.q.items.len > s.head) {
+                    const back = s.q.items[s.q.items.len - 1].v;
+                    const beaten = if (want == .gt) !lessV(x, back) else !lessV(back, x);
+                    if (!beaten) break;
+                    s.q.items.len -= 1;
+                }
+                try s.q.append(cx.alloc, .{ .v = x, .p = p });
+            }
+            pub fn remove(s: *State, _: Value, p: usize, _: Ctx) !void {
+                if (s.head < s.q.items.len and s.q.items[s.head].p == p) s.head += 1;
+            }
+            pub fn finish(s: *const State, _: Ctx) !Value {
+                return if (s.head < s.q.items.len) s.q.items[s.head].v else .null;
+            }
+        };
+    }
+
+    /// BIT_AND or BIT_OR, which no subtraction undoes, in two stacks.
+    fn BitStack(comptime op: aggFuncs.BitOp) type {
+        return struct {
+            pub const In = i64;
+            pub const State = struct { n: i64 = 0, t: if (op == .@"and") TwoStack(i64, -1, andI) else TwoStack(i64, 0, orI) = .{} };
+            pub fn reset(s: *State) void {
+                s.n = 0;
+                s.t.reset();
+            }
+            pub fn add(s: *State, x: i64, cx: Ctx) !void {
+                try s.t.push(cx.alloc, x);
+                s.n += 1;
+            }
+            pub fn remove(s: *State, _: i64, cx: Ctx) !void {
+                try s.t.pop(cx.alloc);
+                s.n -= 1;
+            }
+            pub fn finish(s: *const State, _: Ctx) !Value {
+                return if (s.n == 0) .null else .{ .int = s.t.get() };
+            }
+        };
+    }
+
+    /// A variance (`func`) from the frame's moments in two stacks; over ints (`exact`)
+    /// also from integer sums of x and x², so a frame of equal values reads exactly 0
+    /// however many rows passed, the moments standing in once those sums overflow.
+    fn Spread(comptime func: ast.AggFunc, comptime exact: bool) type {
+        return struct {
+            pub const In = if (exact) i64 else f64;
+            pub const State = struct {
+                n: i64 = 0,
+                s1: i128 = 0,
+                s2: i128 = 0,
+                overflow: bool = false,
+                mom: TwoStack(Moments, .{}, Moments.merge) = .{},
+            };
+            pub fn reset(s: *State) void {
+                s.mom.reset();
+                s.* = .{ .mom = s.mom };
+            }
+            pub fn add(s: *State, x: In, cx: Ctx) !void {
+                if (exact) sums(s, x, false);
+                try s.mom.push(cx.alloc, .{ .n = 1, .mean = if (exact) @floatFromInt(x) else x });
+                s.n += 1;
+            }
+            pub fn remove(s: *State, x: In, cx: Ctx) !void {
+                if (exact) sums(s, x, true);
+                try s.mom.pop(cx.alloc);
+                s.n -= 1;
+            }
+            fn sums(s: *State, v: i64, sub: bool) void {
+                const x: i128 = v;
+                const sq = std.math.mul(i128, x, x) catch {
+                    s.overflow = true;
+                    return;
+                };
+                s.s1 = std.math.add(i128, s.s1, if (sub) -x else x) catch blk: {
+                    s.overflow = true;
+                    break :blk s.s1;
+                };
+                s.s2 = std.math.add(i128, s.s2, if (sub) -sq else sq) catch blk: {
+                    s.overflow = true;
+                    break :blk s.s2;
+                };
+            }
+            fn sqDev(s: *const State) f64 {
+                if (exact and !s.overflow and s.n > 0) {
+                    const n: i128 = s.n;
+                    if (std.math.mul(i128, n, s.s2)) |a| if (std.math.mul(i128, s.s1, s.s1)) |b| {
+                        return @as(f64, @floatFromInt(a - b)) / @as(f64, @floatFromInt(n));
+                    } else |_| {} else |_| {}
+                }
+                return @max(0, s.mom.get().m2);
+            }
+            pub fn finish(s: *const State, _: Ctx) !Value {
+                const samp = func == .var_samp or func == .stddev_samp;
+                if (s.n < @as(i64, if (samp) 2 else 1)) return .null;
+                return aggFuncs.spread(func, sqDev(s) / @as(f64, @floatFromInt(if (samp) s.n - 1 else s.n)));
+            }
+        };
+    }
+
+    const Median = struct {
+        pub const In = f64;
+        pub const State = Halves;
+        pub fn init(cx: Ctx) State {
+            return Halves.init(cx.alloc);
+        }
+        pub const reset = Halves.reset;
+        pub fn add(s: *State, x: f64, p: usize, _: Ctx) !void {
+            try s.add(.{ .x = x, .p = p });
+        }
+        pub fn remove(s: *State, x: f64, p: usize, _: Ctx) !void {
+            try s.remove(.{ .x = x, .p = p });
+        }
+        pub fn finish(s: *const State, _: Ctx) !Value {
+            return if (s.median()) |m| .{ .float = m } else .null;
+        }
+    };
+
+    /// The kind `In` reads a column of `kind` as: itself when it takes it, `.string`
+    /// standing for every other scalar (present for `void` and `Value`, skipped
+    /// otherwise), `.array` for a kind that reads as NULL.
+    fn reads(comptime In: type, comptime kind: types.TypeKind) types.TypeKind {
+        if (kind == .array or kind == .@"struct") return .array;
+        const takes = switch (In) {
+            bool => kind == .bool,
+            i64 => kind == .int,
+            f64 => kind == .int or kind == .float or kind == .decimal or kind == .bool,
+            Decimal => kind == .int or kind == .decimal,
+            else => false,
+        };
+        return if (takes) kind else .string;
+    }
+
+    /// Sorted row `p` as `In`, or null for a NULL or a value the aggregate skips, as
+    /// a numeric one skips a non-number; an exact DECIMAL sum rejects one.
+    inline fn read(comptime In: type, comptime kind: types.TypeKind, c: column.Column, p: usize) !?In {
+        if (kind == .array or !c.validity.get(p)) return null;
+        return switch (In) {
+            Value => c.getValue(p),
+            void => {},
+            else => switch (kind) {
+                .int => switch (In) {
+                    f64 => @floatFromInt(c.data.i64[p]),
+                    Decimal => .{ .unscaled = c.data.i64[p], .scale = 0 },
+                    else => c.data.i64[p],
+                },
+                .float => c.data.f64[p],
+                .decimal => if (In == f64) decF64(c.data.dec[p]) else c.data.dec[p],
+                .bool => if (In == f64) @as(f64, if (c.data.b[p]) 1 else 0) else c.data.b[p],
+                else => if (In == Decimal) error.TypeMismatch else null,
+            },
+        };
+    }
+
+    const Run = *const fn (?column.Column, Frames, Layout, Ctx, *column.Builder) anyerror!void;
+
+    /// The one loop every window aggregate runs, generated per aggregate `A` (a
+    /// `State` with `add`, `remove` and `finish`, each optionally taking the row's
+    /// position) and the kind its argument reads as: per partition, rows enter at the
+    /// frame's end edge and leave at its start edge, as the file header describes.
+    fn Slider(comptime A: type, comptime kind: types.TypeKind) type {
+        return struct {
+            fn run(col: ?column.Column, fr: Frames, l: Layout, cx: Ctx, bd: *column.Builder) anyerror!void {
+                var s: A.State = if (@hasDecl(A, "init")) A.init(cx) else .{};
+                const n = fr.fs.len;
+                var k: usize = 0;
+                while (k < n) {
+                    const pe = l.pend[k];
+                    if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
+                    var lo = k;
+                    var hi = k;
+                    while (k < pe) : (k += 1) {
+                        while (hi < fr.fe[k]) : (hi += 1) {
+                            if (try at(col, hi)) |x| try step(A.add, &s, x, hi, cx);
+                        }
+                        while (lo < fr.fs[k]) : (lo += 1) {
+                            if (lo < hi) if (try at(col, lo)) |x| try step(A.remove, &s, x, lo, cx);
+                        }
+                        if (hi < lo) hi = lo;
+                        try bd.append(try A.finish(&s, cx));
+                    }
+                }
+            }
+
+            inline fn at(col: ?column.Column, p: usize) !?A.In {
+                if (A.In == void) {
+                    const c = col orelse return {};
+                    return read(void, kind, c, p);
+                }
+                return read(A.In, kind, col.?, p);
+            }
+
+            inline fn step(comptime f: anytype, s: *A.State, x: A.In, p: usize, cx: Ctx) !void {
+                if (@typeInfo(@TypeOf(f)).@"fn".params.len == 4) return f(s, x, p, cx);
+                return f(s, x, cx);
+            }
+        };
+    }
+
+    fn runOf(comptime A: type, kind: types.TypeKind) Run {
+        return switch (kind) {
+            inline else => |k| Slider(A, comptime reads(A.In, k)).run,
+        };
+    }
+
+    /// The sliding aggregate for `f` over an argument column of `kind`, chosen once.
+    fn slider(f: Func, agg: ast.AggFunc, kind: types.TypeKind, out: types.Type) Run {
+        if (f.arg == null) return runOf(aggFuncs.Count, .int);
+        return switch (agg) {
+            .count => if (f.distinct) runOf(CountDistinct, kind) else runOf(aggFuncs.Count, kind),
+            .count_if => runOf(aggFuncs.CountIf, kind),
+            .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runOf(SumInt, kind) else runOf(FloatSum(false), kind),
+            .avg => if (kind == .int) runOf(aggFuncs.AvgInt, kind) else runOf(FloatSum(true), kind),
+            .min => runOf(Deque(.lt), kind),
+            .max => runOf(Deque(.gt), kind),
+            .median => runOf(Median, kind),
+            .bool_and => runOf(aggFuncs.BoolFold(true), kind),
+            .bool_or => runOf(aggFuncs.BoolFold(false), kind),
+            .bit_and => runOf(BitStack(.@"and"), kind),
+            .bit_or => runOf(BitStack(.@"or"), kind),
+            .bit_xor => runOf(aggFuncs.Bits(.xor), kind),
+            inline .var_samp, .var_pop, .stddev_samp, .stddev_pop => |g| if (kind == .int) runOf(Spread(g, true), kind) else runOf(Spread(g, false), kind),
+        };
     }
 
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
@@ -938,11 +986,7 @@ pub const Window = struct {
         for (self.funcs, 0..) |f, fi| {
             const out_ty = self.out_schema.fields[ncols + fi].ty;
             var bd = try column.Builder.initCapacity(arena, out_ty, n);
-            const vals: []Value = if (f.arg) |ai| blk: {
-                const vs = try arena.alloc(Value, n);
-                for (idx, vs) |row, *v| v.* = try numericArg(arena, f.func, out_ty, all.columns[ai].getValue(row));
-                break :blk vs;
-            } else &.{};
+            const arg: ?column.Column = if (f.arg) |ai| cols[ai] else null;
             switch (f.func) {
                 .win => |kind| switch (kind) {
                     .row_number, .rank, .dense_rank, .percent_rank => {
@@ -986,19 +1030,20 @@ pub const Window = struct {
                         try bd.appendInt(bucket);
                     },
                     .lag, .lead, .first_value, .last_value, .nth_value => {
+                        const vc = arg.?;
                         var cnt: []usize = &.{};
                         var nnpos: []usize = &.{};
                         if (f.ignore_nulls) {
                             cnt = try arena.alloc(usize, n + 1);
                             var c: usize = 0;
-                            for (vals, 0..) |v, p| {
+                            for (0..n) |p| {
                                 cnt[p] = c;
-                                if (!v.isNull()) c += 1;
+                                if (!vc.getValue(p).isNull()) c += 1;
                             }
                             cnt[n] = c;
                             nnpos = try arena.alloc(usize, c);
                             c = 0;
-                            for (vals, 0..) |v, p| if (!v.isNull()) {
+                            for (0..n) |p| if (!vc.getValue(p).isNull()) {
                                 nnpos[c] = p;
                                 c += 1;
                             };
@@ -1011,18 +1056,18 @@ pub const Window = struct {
                             const v: Value = switch (kind) {
                                 .lag, .lead => blk: {
                                     if (f.ignore_nulls) {
-                                        if (f.offset == 0) break :blk vals[k];
+                                        if (f.offset == 0) break :blk vc.getValue(k);
                                         const j: i64 = if (kind == .lag)
                                             @as(i64, @intCast(cnt[k])) - f.offset
                                         else
                                             @as(i64, @intCast(cnt[k + 1])) + f.offset - 1;
                                         if (j < @as(i64, @intCast(cnt[ps])) or j >= @as(i64, @intCast(cnt[pe]))) break :blk f.default;
-                                        break :blk vals[nnpos[@intCast(j)]];
+                                        break :blk vc.getValue(nnpos[@intCast(j)]);
                                     }
                                     const dir: i64 = if (kind == .lag) -f.offset else f.offset;
                                     const target = @as(i64, @intCast(k)) + dir;
                                     if (target < @as(i64, @intCast(ps)) or target >= @as(i64, @intCast(pe))) break :blk f.default;
-                                    break :blk vals[@intCast(target)];
+                                    break :blk vc.getValue(@intCast(target));
                                 },
                                 else => blk: {
                                     const s = fr.?.fs[k];
@@ -1031,15 +1076,15 @@ pub const Window = struct {
                                         const a = cnt[s];
                                         const b = cnt[e];
                                         break :blk switch (kind) {
-                                            .first_value => if (a < b) vals[nnpos[a]] else .null,
-                                            .last_value => if (a < b) vals[nnpos[b - 1]] else .null,
-                                            else => if (a + @as(usize, @intCast(f.offset)) - 1 < b) vals[nnpos[a + @as(usize, @intCast(f.offset)) - 1]] else .null,
+                                            .first_value => if (a < b) vc.getValue(nnpos[a]) else .null,
+                                            .last_value => if (a < b) vc.getValue(nnpos[b - 1]) else .null,
+                                            else => if (a + @as(usize, @intCast(f.offset)) - 1 < b) vc.getValue(nnpos[a + @as(usize, @intCast(f.offset)) - 1]) else .null,
                                         };
                                     }
                                     break :blk switch (kind) {
-                                        .first_value => if (s < e) vals[s] else .null,
-                                        .last_value => if (s < e) vals[e - 1] else .null,
-                                        else => if (s + @as(usize, @intCast(f.offset)) - 1 < e) vals[s + @as(usize, @intCast(f.offset)) - 1] else .null,
+                                        .first_value => if (s < e) vc.getValue(s) else .null,
+                                        .last_value => if (s < e) vc.getValue(e - 1) else .null,
+                                        else => if (s + @as(usize, @intCast(f.offset)) - 1 < e) vc.getValue(s + @as(usize, @intCast(f.offset)) - 1) else .null,
                                     };
                                 },
                             };
@@ -1049,9 +1094,12 @@ pub const Window = struct {
                 },
                 .agg => |agg| {
                     const fr = try frames(arena, l, f.frame, rk);
-                    const out = try arena.alloc(Value, n);
-                    try self.aggregateOver(arena, f, agg, vals, fr.fs, fr.fe, l, out_ty, out);
-                    for (out) |v| try bd.append(v);
+                    const col: ?column.Column = if (arg) |x| try numericArg(arena, agg, out_ty, x) else null;
+                    const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = arena, .scratch = arena };
+                    slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, &bd) catch |e| {
+                        if (e == error.IntOverflow and agg == .sum and out_ty.kind == .int) if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(e)});
+                        return e;
+                    };
                 },
             }
             cols[ncols + fi] = try bd.finish();

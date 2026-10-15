@@ -10,7 +10,8 @@
 //! `addAll` (a slice with no nulls, where a vector loop beats one at a time),
 //! `needs_alloc` (the state allocates per value), `own` and `own_always` (rebuild
 //! even when the merge does not own its source: a DISTINCT set belongs to the
-//! producer's allocator).
+//! producer's allocator), and `remove` (the exact inverse of `add`, which a window
+//! frame slides with when a value leaves it).
 //!
 //! Sums are exact, i128 for ints and i256 for DECIMAL (whose addends reach 10^38),
 //! range-checked once in `finish`, so the answer cannot depend on how rows split
@@ -49,6 +50,9 @@ pub const Count = struct {
     pub fn addN(s: *State, k: usize) void {
         s.n += @intCast(k);
     }
+    pub fn remove(s: *State, _: void, _: Ctx) !void {
+        s.n -= 1;
+    }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.n += s.n;
     }
@@ -62,6 +66,9 @@ pub const CountIf = struct {
     pub const State = struct { n: i64 = 0 };
     pub fn add(s: *State, x: bool, _: Ctx) !void {
         s.n += @intFromBool(x);
+    }
+    pub fn remove(s: *State, x: bool, _: Ctx) !void {
+        s.n -= @intFromBool(x);
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.n += s.n;
@@ -125,6 +132,10 @@ pub const SumInt = struct {
         s.s += x;
         s.n += 1;
     }
+    pub fn remove(s: *State, x: i64, _: Ctx) !void {
+        s.s -= x;
+        s.n -= 1;
+    }
     pub fn addAll(s: *State, xs: []const i64, _: Ctx) !void {
         var t: i128 = 0;
         for (xs) |x| t += x;
@@ -147,6 +158,11 @@ pub const SumDecimal = struct {
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
         try eval.addAtScale(&s.s, x, cx.out.scale);
         s.n += 1;
+    }
+    pub fn remove(s: *State, x: Decimal, cx: Ctx) !void {
+        const u = (eval.rescaleTo(x, cx.out.scale) orelse return eval.decimalOverflow()).unscaled;
+        s.s = std.math.sub(i256, s.s, u) catch return eval.decimalOverflow();
+        s.n -= 1;
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.s = std.math.add(i256, d.s, s.s) catch return eval.decimalOverflow();
@@ -183,6 +199,7 @@ pub const AvgInt = struct {
     pub const State = SumInt.State;
     pub const add = SumInt.add;
     pub const addAll = SumInt.addAll;
+    pub const remove = SumInt.remove;
     pub const merge = SumInt.merge;
     pub fn finish(s: *const State, _: Ctx) !Value {
         if (s.n == 0) return .null;
@@ -352,6 +369,10 @@ pub fn BoolFold(comptime all: bool) type {
             s.n += 1;
             s.t += @intFromBool(x);
         }
+        pub fn remove(s: *State, x: bool, _: Ctx) !void {
+            s.n -= 1;
+            s.t -= @intFromBool(x);
+        }
         pub fn merge(d: *State, s: *const State, _: Ctx) !void {
             d.n += s.n;
             d.t += s.t;
@@ -379,6 +400,11 @@ pub fn Bits(comptime op: BitOp) type {
         pub fn add(s: *State, x: i64, _: Ctx) !void {
             s.v = if (s.n == 0) x else fold(s.v, x);
             s.n += 1;
+        }
+        pub const remove = if (op == .xor) removeXor else {};
+        fn removeXor(s: *State, x: i64, _: Ctx) !void {
+            s.v ^= x;
+            s.n -= 1;
         }
         pub fn merge(d: *State, s: *const State, _: Ctx) !void {
             if (s.n == 0) return;
