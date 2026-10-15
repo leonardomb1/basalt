@@ -163,15 +163,6 @@ pub const per_row = struct {
         return .{ .string = out.written() };
     }
 
-    pub fn toBase64(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const data = try valueToString(arena, v);
-        const enc = std.base64.standard.Encoder;
-        const out = try arena.alloc(u8, enc.calcSize(data.len));
-        return .{ .string = enc.encode(out, data) };
-    }
-
     pub fn fromBase64(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -181,35 +172,6 @@ pub const per_row = struct {
         const out = try arena.alloc(u8, dec.calcSizeForSlice(text) catch return failWith(error.CastFailed, bad, .{clip(text)}));
         dec.decode(out, text) catch return failWith(error.CastFailed, bad, .{clip(text)});
         return .{ .bytes = out };
-    }
-
-    /// RFC 3986 percent-encoding: all but letters, digits and `-._~` become `%XX`.
-    /// Decoding leaves `+` alone and passes a stray `%` through, as DuckDB does.
-    pub fn urlCode(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const str = try valueToString(arena, v);
-        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
-        if (eq(c.name, "url_encode")) {
-            for (str) |b| {
-                if (std.ascii.isAlphanumeric(b) or b == '-' or b == '.' or b == '_' or b == '~') {
-                    try out.append(b);
-                } else try out.writer().print("%{X:0>2}", .{b});
-            }
-        } else {
-            var i: usize = 0;
-            while (i < str.len) : (i += 1) {
-                if (str[i] == '%' and i + 2 < str.len) {
-                    if (std.fmt.parseInt(u8, str[i + 1 .. i + 3], 16)) |b| {
-                        try out.append(b);
-                        i += 2;
-                        continue;
-                    } else |_| {}
-                }
-                try out.append(str[i]);
-            }
-        }
-        return .{ .string = out.items };
     }
 
     /// Postgres' `concat_ws`: nulls are skipped, where `concat` is null when any
@@ -247,105 +209,6 @@ pub const per_row = struct {
             if (!v.isNull()) return v;
         }
         return .null;
-    }
-
-    pub fn upperLower(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        var out = std.array_list.Managed(u8).init(arena);
-        try caseMapInto(&out, try valueToString(arena, v), eq(c.name, "upper"));
-        return .{ .string = out.items };
-    }
-
-    /// `length` counts characters, `strlen` bytes (DuckDB's split); a BYTES value
-    /// is bytes either way.
-    pub fn strlen(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const s = try valueToString(arena, v);
-        return .{ .int = @intCast(if (eq(c.name, "length") and v != .bytes) charCount(s) else s.len) };
-    }
-
-    pub fn bitCount(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        if (v != .int) return error.TypeMismatch;
-        return .{ .int = @intCast(@popCount(v.int)) };
-    }
-
-    pub fn toHex(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        if (v != .int) return error.TypeMismatch;
-        return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{@as(u64, @bitCast(v.int))}) };
-    }
-
-    pub fn fromHex(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        return .{ .int = try parseHexI64(try valueToString(arena, v)) };
-    }
-
-    pub fn concat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        var buf = std.array_list.Managed(u8).init(arena);
-        for (c.args) |a| {
-            const v = try evalRow(arena, a, batch, row);
-            if (v.isNull()) return .null;
-            try buf.appendSlice(try valueToString(arena, v));
-        }
-        return .{ .string = try buf.toOwnedSlice() };
-    }
-
-    pub fn affix(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const name = c.name;
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        const pv = try evalRow(arena, c.args[1], batch, row);
-        if (sv.isNull() or pv.isNull()) return .null;
-        const s = try valueToString(arena, sv);
-        const p = try valueToString(arena, pv);
-        const r = if (eq(name, "starts_with")) std.mem.startsWith(u8, s, p) else if (eq(name, "ends_with")) std.mem.endsWith(u8, s, p) else (std.mem.indexOf(u8, s, p) != null);
-        return .{ .bool = r };
-    }
-
-    pub fn like(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        const pv = try evalRow(arena, c.args[1], batch, row);
-        if (sv.isNull() or pv.isNull()) return .null;
-        return .{ .bool = likeMatch(try valueToString(arena, sv), try valueToString(arena, pv)) };
-    }
-
-    pub fn trimSpace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        return .{ .string = try arena.dupe(u8, trim(try valueToString(arena, v))) };
-    }
-
-    pub fn substr(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        const startv = try evalRow(arena, c.args[1], batch, row);
-        if (startv.isNull()) return .null;
-        var len_opt: ?i64 = null;
-        if (c.args.len > 2) {
-            const lv = try evalRow(arena, c.args[2], batch, row);
-            if (lv.isNull()) return .null;
-            len_opt = toI64(lv);
-        }
-        return .{ .string = try substrChars(arena, try valueToString(arena, sv), toI64(startv), len_opt) };
-    }
-
-    pub fn replace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        const fv = try evalRow(arena, c.args[1], batch, row);
-        const tv = try evalRow(arena, c.args[2], batch, row);
-        if (sv.isNull() or fv.isNull() or tv.isNull()) return .null;
-        const s = try valueToString(arena, sv);
-        const from = try valueToString(arena, fv);
-        const to = try valueToString(arena, tv);
-        if (from.len == 0) return .{ .string = try arena.dupe(u8, s) };
-        const out = try arena.alloc(u8, std.mem.replacementSize(u8, s, from, to));
-        _ = std.mem.replace(u8, s, from, to, out);
-        return .{ .string = out };
     }
 
     pub fn abs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -408,21 +271,6 @@ pub const per_row = struct {
         return arith(.mod, a, b);
     }
 
-    pub fn power(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const a = try evalRow(arena, c.args[0], batch, row);
-        const b = try evalRow(arena, c.args[1], batch, row);
-        if (a.isNull() or b.isNull()) return .null;
-        return Value{ .float = std.math.pow(f64, toF64(a), toF64(b)) };
-    }
-
-    pub fn sqrt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const x = toF64(v);
-        if (x < 0) return .null;
-        return Value{ .float = @sqrt(x) };
-    }
-
     pub fn sign(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
@@ -461,50 +309,6 @@ pub const per_row = struct {
             if (if (want_gt) ord == .lt else ord == .gt) best = v;
         }
         return best;
-    }
-
-    pub fn pad(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return .null;
-        var fill: []const u8 = " ";
-        if (c.args.len > 2) {
-            const fv = try evalRow(arena, c.args[2], batch, row);
-            if (fv.isNull()) return .null;
-            fill = try valueToString(arena, fv);
-        }
-        const s = try valueToString(arena, sv);
-        return Value{ .string = try padChars(arena, s, toI64(nv), fill, eq(c.name, "lpad")) };
-    }
-
-    pub fn leftRight(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return .null;
-        const s = try valueToString(arena, sv);
-        return Value{ .string = try arena.dupe(u8, endSlice(s, toI64(nv), eq(c.name, "left"))) };
-    }
-
-    pub fn splitPart(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        const dv = try evalRow(arena, c.args[1], batch, row);
-        const nv = try evalRow(arena, c.args[2], batch, row);
-        if (sv.isNull() or dv.isNull() or nv.isNull()) return .null;
-        const delim = try valueToString(arena, dv);
-        const s = try valueToString(arena, sv);
-        var want = toI64(nv);
-        if (delim.len == 0) return Value{ .string = if (want == 1 or want == -1) try arena.dupe(u8, s) else "" };
-        if (want < 0) want += @as(i64, @intCast(std.mem.count(u8, s, delim))) + 2;
-        if (want < 1) return Value{ .string = "" };
-        var it = std.mem.splitSequence(u8, s, delim);
-        var k: i64 = 0;
-        while (it.next()) |part| {
-            k += 1;
-            if (k == want) return Value{ .string = try arena.dupe(u8, part) };
-        }
-        return Value{ .string = "" };
     }
 
     /// The JSON array functions: the body is bound once to slots each element then
@@ -697,39 +501,6 @@ pub const per_row = struct {
         };
     }
 
-    pub fn strpos(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        const pv = try evalRow(arena, c.args[1], batch, row);
-        if (sv.isNull() or pv.isNull()) return .null;
-        const s = try valueToString(arena, sv);
-        const sub = try valueToString(arena, pv);
-        if (sub.len == 0) return Value{ .int = 1 };
-        const at = std.mem.indexOf(u8, s, sub) orelse return Value{ .int = 0 };
-        return Value{ .int = @as(i64, @intCast(charCount(s[0..at]))) + 1 };
-    }
-
-    pub fn repeat(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        const nv = try evalRow(arena, c.args[1], batch, row);
-        if (nv.isNull()) return .null;
-        const n = toI64(nv);
-        if (n <= 0) return Value{ .string = "" };
-        const s = try valueToString(arena, sv);
-        const total = @as(u128, @intCast(n)) * @as(u128, s.len);
-        if (total > max_str_bytes) return failWith(error.CastFailed, "repeat: the result would be {d} bytes, past the {d}-byte string limit", .{ total, max_str_bytes });
-        const out = try arena.alloc(u8, @intCast(total));
-        var i: usize = 0;
-        while (i < out.len) : (i += s.len) @memcpy(out[i..][0..s.len], s);
-        return Value{ .string = out };
-    }
-
-    pub fn reverse(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        return Value{ .string = try reverseChars(arena, try valueToString(arena, sv)) };
-    }
-
     pub fn dateAddDiff(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         if (c.args[0].* != .str_lit) return error.TypeMismatch;
         const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
@@ -811,101 +582,5 @@ pub const per_row = struct {
             return failWith(error.CastFailed, "strptime: '{s}' is not a date in '{s}' (try_strptime gives null)", .{ clip(text), clip(fmt) });
         };
         return .{ .timestamp = us };
-    }
-
-    pub fn unaccent(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const str = try valueToString(arena, v);
-        if (isAscii(str)) return .{ .string = str };
-        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
-        var i: usize = 0;
-        while (i < str.len) {
-            const w = charWidth(str, i);
-            const base = if (w == 1) null else unaccentCp(std.unicode.utf8Decode(str[i..][0..w]) catch unreachable);
-            try out.appendSlice(base orelse str[i..][0..w]);
-            i += w;
-        }
-        return .{ .string = out.items };
-    }
-
-    /// Postgres' `translate`, by characters: each character of `from` becomes the one
-    /// at the same place in `to`, or is deleted when `to` is shorter.
-    pub fn translate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        var args: [3][]const u8 = undefined;
-        for (&args, c.args) |*o, e| {
-            const v = try evalRow(arena, e, batch, row);
-            if (v.isNull()) return .null;
-            o.* = try valueToString(arena, v);
-        }
-        const str, const from, const to = args;
-        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
-        var i: usize = 0;
-        while (i < str.len) {
-            const w = charWidth(str, i);
-            const ch = str[i..][0..w];
-            i += w;
-            var at: usize = 0;
-            var k: usize = 0;
-            const hit = while (k < from.len) {
-                const fw = charWidth(from, k);
-                if (std.mem.eql(u8, from[k..][0..fw], ch)) break at;
-                k += fw;
-                at += 1;
-            } else null;
-            const idx = hit orelse {
-                try out.appendSlice(ch);
-                continue;
-            };
-            const off = charOffset(to, idx);
-            if (off < to.len) try out.appendSlice(to[off..][0..charWidth(to, off)]);
-        }
-        return .{ .string = out.items };
-    }
-
-    pub fn initcap(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const str = try valueToString(arena, v);
-        var out = try std.array_list.Managed(u8).initCapacity(arena, str.len);
-        var in_word = false;
-        var i: usize = 0;
-        while (i < str.len) {
-            const w = charWidth(str, i);
-            const ch = str[i..][0..w];
-            i += w;
-            const cp: u21 = if (w == 1) ch[0] else std.unicode.utf8Decode(ch) catch unreachable;
-            const word = isWordChar(cp, w);
-            if (!word) {
-                try out.appendSlice(ch);
-            } else {
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(caseMap(cp, !in_word), &buf) catch unreachable;
-                try out.appendSlice(buf[0..n]);
-            }
-            in_word = word;
-        }
-        return .{ .string = out.items };
-    }
-
-    pub fn ascii(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const str = try valueToString(arena, v);
-        if (str.len == 0) return .{ .int = 0 };
-        const w = charWidth(str, 0);
-        return .{ .int = if (w == 1) str[0] else std.unicode.utf8Decode(str[0..w]) catch unreachable };
-    }
-
-    pub fn chr(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        if (v != .int) return error.TypeMismatch;
-        const bad = "chr: {d} is not a character";
-        const cp = std.math.cast(u21, v.int) orelse return failWith(error.CastFailed, bad, .{v.int});
-        var buf: [4]u8 = undefined;
-        if (cp == 0) return failWith(error.CastFailed, bad, .{v.int});
-        const n = std.unicode.utf8Encode(cp, &buf) catch return failWith(error.CastFailed, bad, .{v.int});
-        return .{ .string = try arena.dupe(u8, buf[0..n]) };
     }
 };

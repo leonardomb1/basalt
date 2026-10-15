@@ -1,5 +1,7 @@
 //! The built-in scalar function table: each name with its typing rule, its row form
-//! and, where one exists, its vector kernel (fn_typing, fn_row, fn_vec).
+//! and, where one exists, its vector kernel. A function written once as math
+//! (`fn_scalar.zig`) gets both forms from `scalar.zig`; the rest have a row form in
+//! `fn_row.zig` and, a few, a hand-written kernel in `fn_vec.zig`.
 
 const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
@@ -15,6 +17,11 @@ const per_row = @import("fn_row.zig").per_row;
 const std = @import("std");
 const typing = @import("fn_typing.zig").typing;
 const vectorized = @import("fn_vec.zig").vectorized;
+const f = @import("fn_scalar.zig");
+
+fn S(comptime F: type) type {
+    return @import("scalar.zig").Scalar(F);
+}
 
 pub const max_str_bytes = 1 << 20;
 
@@ -37,42 +44,42 @@ pub const builtins = [_]Builtin{
     .{ .name = "concat_ws", .type_fn = typing.concatWs, .eval_fn = per_row.concatWs },
     .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
     .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
-    .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = per_row.upperLower, .vec_fn = vectorized.upperLower },
-    .{ .name = "lower", .type_fn = typing.unaryString, .eval_fn = per_row.upperLower, .vec_fn = vectorized.upperLower },
-    .{ .name = "length", .type_fn = typing.strlen, .eval_fn = per_row.strlen, .vec_fn = vectorized.strlen },
-    .{ .name = "strlen", .type_fn = typing.strlen, .eval_fn = per_row.strlen, .vec_fn = vectorized.strlen },
-    .{ .name = "bit_count", .type_fn = typing.bitCountToHex, .eval_fn = per_row.bitCount },
-    .{ .name = "to_hex", .type_fn = typing.bitCountToHex, .eval_fn = per_row.toHex },
-    .{ .name = "from_hex", .type_fn = typing.fromHex, .eval_fn = per_row.fromHex },
-    .{ .name = "concat", .type_fn = typing.concat, .eval_fn = per_row.concat, .vec_fn = vectorized.concat },
+    .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = S(f.CaseMap(true)).eval, .vec_fn = S(f.CaseMap(true)).vec },
+    .{ .name = "lower", .type_fn = typing.unaryString, .eval_fn = S(f.CaseMap(false)).eval, .vec_fn = S(f.CaseMap(false)).vec },
+    .{ .name = "length", .type_fn = typing.strlen, .eval_fn = S(f.Length(true)).eval, .vec_fn = S(f.Length(true)).vec },
+    .{ .name = "strlen", .type_fn = typing.strlen, .eval_fn = S(f.Length(false)).eval, .vec_fn = S(f.Length(false)).vec },
+    .{ .name = "bit_count", .type_fn = typing.bitCountToHex, .eval_fn = S(f.BitCount).eval, .vec_fn = S(f.BitCount).vec },
+    .{ .name = "to_hex", .type_fn = typing.bitCountToHex, .eval_fn = S(f.ToHex).eval, .vec_fn = S(f.ToHex).vec },
+    .{ .name = "from_hex", .type_fn = typing.fromHex, .eval_fn = S(f.FromHex).eval, .vec_fn = S(f.FromHex).vec },
+    .{ .name = "concat", .type_fn = typing.concat, .eval_fn = S(f.Concat).eval, .vec_fn = S(f.Concat).vec },
     .{ .name = "coalesce", .type_fn = typing.coalesce, .eval_fn = per_row.coalesce, .vec_fn = vectorized.coalesce },
-    .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
-    .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
-    .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = per_row.affix, .vec_fn = vectorized.strPredicate },
+    .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.starts_with)).eval, .vec_fn = S(f.Match(.starts_with)).vec },
+    .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
+    .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },
     .{ .name = "search", .type_fn = fn_search.typeSearch, .eval_fn = fn_search.rowSearch, .vec_fn = fn_search.vecSearch },
-    .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = per_row.like, .vec_fn = vectorized.strPredicate },
-    .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = per_row.trimSpace, .vec_fn = vectorized.trimSpace },
-    .{ .name = "substr", .type_fn = typing.substr, .eval_fn = per_row.substr, .vec_fn = vectorized.substr },
-    .{ .name = "replace", .type_fn = typing.replace, .eval_fn = per_row.replace, .vec_fn = vectorized.replace },
+    .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.like)).eval, .vec_fn = S(f.Match(.like)).vec },
+    .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = S(f.Trim).eval, .vec_fn = S(f.Trim).vec },
+    .{ .name = "substr", .type_fn = typing.substr, .eval_fn = S(f.Substr).eval, .vec_fn = S(f.Substr).vec },
+    .{ .name = "replace", .type_fn = typing.replace, .eval_fn = S(f.Replace).eval, .vec_fn = S(f.Replace).vec },
     .{ .name = "abs", .type_fn = typing.abs, .eval_fn = per_row.abs },
     .{ .name = "floor", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
     .{ .name = "ceil", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
     .{ .name = "round", .type_fn = typing.round, .eval_fn = per_row.round },
     .{ .name = "mod", .type_fn = typing.mod, .eval_fn = per_row.mod },
-    .{ .name = "power", .type_fn = typing.power, .eval_fn = per_row.power },
-    .{ .name = "sqrt", .type_fn = typing.sqrt, .eval_fn = per_row.sqrt },
+    .{ .name = "power", .type_fn = typing.power, .eval_fn = S(f.Power).eval, .vec_fn = S(f.Power).vec },
+    .{ .name = "sqrt", .type_fn = typing.sqrt, .eval_fn = S(f.Sqrt).eval, .vec_fn = S(f.Sqrt).vec },
     .{ .name = "sign", .type_fn = typing.sign, .eval_fn = per_row.sign },
     .{ .name = "nullif", .type_fn = typing.nullif, .eval_fn = per_row.nullif },
     .{ .name = "greatest", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
     .{ .name = "least", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
-    .{ .name = "lpad", .type_fn = typing.pad, .eval_fn = per_row.pad },
-    .{ .name = "rpad", .type_fn = typing.pad, .eval_fn = per_row.pad },
-    .{ .name = "left", .type_fn = typing.leftRight, .eval_fn = per_row.leftRight },
-    .{ .name = "right", .type_fn = typing.leftRight, .eval_fn = per_row.leftRight },
-    .{ .name = "split_part", .type_fn = typing.splitPart, .eval_fn = per_row.splitPart },
-    .{ .name = "strpos", .type_fn = typing.strpos, .eval_fn = per_row.strpos },
-    .{ .name = "repeat", .type_fn = typing.repeat, .eval_fn = per_row.repeat },
-    .{ .name = "reverse", .type_fn = typing.reverse, .eval_fn = per_row.reverse },
+    .{ .name = "lpad", .type_fn = typing.pad, .eval_fn = S(f.Pad(true)).eval, .vec_fn = S(f.Pad(true)).vec },
+    .{ .name = "rpad", .type_fn = typing.pad, .eval_fn = S(f.Pad(false)).eval, .vec_fn = S(f.Pad(false)).vec },
+    .{ .name = "left", .type_fn = typing.leftRight, .eval_fn = S(f.End(true)).eval, .vec_fn = S(f.End(true)).vec },
+    .{ .name = "right", .type_fn = typing.leftRight, .eval_fn = S(f.End(false)).eval, .vec_fn = S(f.End(false)).vec },
+    .{ .name = "split_part", .type_fn = typing.splitPart, .eval_fn = S(f.SplitPart).eval, .vec_fn = S(f.SplitPart).vec },
+    .{ .name = "strpos", .type_fn = typing.strpos, .eval_fn = S(f.Strpos).eval, .vec_fn = S(f.Strpos).vec },
+    .{ .name = "repeat", .type_fn = typing.repeat, .eval_fn = S(f.Repeat).eval, .vec_fn = S(f.Repeat).vec },
+    .{ .name = "reverse", .type_fn = typing.reverse, .eval_fn = S(f.Reverse).eval, .vec_fn = S(f.Reverse).vec },
     .{ .name = "date_add", .type_fn = typing.dateAdd, .eval_fn = per_row.dateAddDiff },
     .{ .name = "date_diff", .type_fn = typing.dateDiff, .eval_fn = per_row.dateAddDiff },
     .{ .name = "make_date", .type_fn = typing.makeDate, .eval_fn = per_row.makeDate },
@@ -81,12 +88,12 @@ pub const builtins = [_]Builtin{
     .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
     .{ .name = "strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
     .{ .name = "try_strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
-    .{ .name = "unaccent", .type_fn = typing.unaryString, .eval_fn = per_row.unaccent },
-    .{ .name = "strip_accents", .type_fn = typing.unaryString, .eval_fn = per_row.unaccent },
-    .{ .name = "translate", .type_fn = typing.translate, .eval_fn = per_row.translate },
-    .{ .name = "initcap", .type_fn = typing.unaryString, .eval_fn = per_row.initcap },
-    .{ .name = "ascii", .type_fn = typing.strlen, .eval_fn = per_row.ascii },
-    .{ .name = "chr", .type_fn = typing.chr, .eval_fn = per_row.chr },
+    .{ .name = "unaccent", .type_fn = typing.unaryString, .eval_fn = S(f.Unaccent).eval, .vec_fn = S(f.Unaccent).vec },
+    .{ .name = "strip_accents", .type_fn = typing.unaryString, .eval_fn = S(f.Unaccent).eval, .vec_fn = S(f.Unaccent).vec },
+    .{ .name = "translate", .type_fn = typing.translate, .eval_fn = S(f.Translate).eval, .vec_fn = S(f.Translate).vec },
+    .{ .name = "initcap", .type_fn = typing.unaryString, .eval_fn = S(f.Initcap).eval, .vec_fn = S(f.Initcap).vec },
+    .{ .name = "ascii", .type_fn = typing.strlen, .eval_fn = S(f.Ascii).eval, .vec_fn = S(f.Ascii).vec },
+    .{ .name = "chr", .type_fn = typing.chr, .eval_fn = S(f.Chr).eval, .vec_fn = S(f.Chr).vec },
     .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = per_row.jsonGet },
     .{ .name = "json_filter", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
@@ -100,10 +107,10 @@ pub const builtins = [_]Builtin{
     .{ .name = "json_concat", .type_fn = typing.jsonConcat, .eval_fn = per_row.jsonConcat },
     .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
     .{ .name = "json_array", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonArray },
-    .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = per_row.toBase64 },
+    .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = S(f.ToBase64).eval, .vec_fn = S(f.ToBase64).vec },
     .{ .name = "from_base64", .type_fn = typing.fromBase64, .eval_fn = per_row.fromBase64 },
-    .{ .name = "url_encode", .type_fn = typing.unaryString, .eval_fn = per_row.urlCode },
-    .{ .name = "url_decode", .type_fn = typing.unaryString, .eval_fn = per_row.urlCode },
+    .{ .name = "url_encode", .type_fn = typing.unaryString, .eval_fn = S(f.UrlCode(true)).eval, .vec_fn = S(f.UrlCode(true)).vec },
+    .{ .name = "url_decode", .type_fn = typing.unaryString, .eval_fn = S(f.UrlCode(false)).eval, .vec_fn = S(f.UrlCode(false)).vec },
 };
 
 pub fn lookupBuiltin(name: []const u8) ?*const Builtin {
