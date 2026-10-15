@@ -94,7 +94,7 @@ fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
         else => return null,
     };
     const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
-    return parquetSplit(env, rstages[0].node.read, rstages, w, .{ .threads = env.sort_threads });
+    return parquetSplit(env, rstages[0].node.read, rstages[1..], w, .{ .threads = env.sort_threads });
 }
 
 /// One item of a parallel build read: the rows it kept, in its own arena until the
