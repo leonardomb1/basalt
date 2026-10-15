@@ -28,6 +28,10 @@ pub fn foldSingle(self: *Aggregate, arena: std.mem.Allocator, b: Batch, layout: 
             try layout.kernels[j].fold(p, null, b.len, cx);
             continue;
         };
+        if (agg.distinct) {
+            try self.pairsOf(j).add(arena, try self.argColumn(arena, agg, e, b), b.len, null, self.interner());
+            continue;
+        }
         if (agg.func == .sum and agg.ty.kind == .decimal) {
             const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| return inAggregate(self, err);
             if (fused) |f| {

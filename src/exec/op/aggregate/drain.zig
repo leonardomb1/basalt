@@ -14,6 +14,7 @@ const GroupStore = Aggregate.GroupStore;
 const GroupTable = Aggregate.GroupTable;
 const KeyKind = Aggregate.KeyKind;
 const Layout = Aggregate.Layout;
+const Pairs = @import("pairs.zig").Pairs;
 const Rows = @import("kernel.zig").Rows;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
@@ -113,15 +114,52 @@ pub fn foldSets(self: *Aggregate, comptime tag: std.meta.Tag(GroupSet.Store), pa
     const kinds = try self.keyKinds();
     const own = self.part_state != null;
     const out = try self.state.alloc(GroupSet, if (own) fold_parts else 1);
-    for (out, parts[0..out.len]) |*o, *p| o.* = .{
+    for (out, parts[0..out.len], 0..) |*o, *p, pi| o.* = .{
         .store = @unionInit(GroupSet.Store, @tagName(tag), p.store),
         .len = p.store.len,
         .key_kinds = kinds,
         .table = if (own) &p.table else null,
         .strs = self.strs,
+        .pairs = if (own) self.pairs else &.{},
+        .part = @intCast(pi),
     };
     if (!own) for (parts) |*p| p.table.deinit();
+    if (!own) try applyPairs(self, .{ .groups = &out[0] }, layoutOf(parts));
     return out;
+}
+
+fn layoutOf(parts: anytype) *const Layout {
+    return parts[0].store.payload;
+}
+
+/// One `Pairs` per DISTINCT aggregate, partitioned as the fold's groups are.
+fn initPairs(self: *Aggregate, grouped: bool) !void {
+    var n: usize = 0;
+    for (self.aggs) |a| n += @intFromBool(a.distinct);
+    if (n == 0) return;
+    const pairs = try self.state.alloc(Pairs, n);
+    const allocs: []const std.mem.Allocator = self.part_state orelse &.{self.state};
+    var i: usize = 0;
+    for (self.aggs, 0..) |a, j| {
+        if (!a.distinct) continue;
+        pairs[i] = try Pairs.init(self.state, j, a.arg_ty, grouped, fold_parts, allocs, self.table_gpa orelse self.gpa);
+        i += 1;
+    }
+    self.pairs = pairs;
+}
+
+/// A serial fold's pairs into its states, partition by partition, their indexes
+/// then freed; a lane's stay with its sets for the merge.
+fn applyPairs(self: *Aggregate, into: Pairs.Into, layout: *const Layout) !void {
+    for (self.pairs) |*pp| {
+        for (0..pp.parts.len) |p| try pp.apply(p, into, layout, self.state, self.strs);
+        pp.deinit();
+    }
+}
+
+pub fn pairsOf(self: *Aggregate, j: usize) *Pairs {
+    for (self.pairs) |*pp| if (pp.j == j) return pp;
+    unreachable;
 }
 
 pub fn keyKinds(self: *Aggregate) ![]types.TypeKind {
@@ -141,6 +179,10 @@ fn foldRows(self: *Aggregate, pull: std.mem.Allocator, b: Batch, layout: *const 
     };
     for (self.aggs, 0..) |agg, j| {
         const col = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+        if (agg.distinct) {
+            try self.pairsOf(j).add(pull, col.?, b.len, .{ .tails = tails, .pidx = pidx, .layout = layout }, self.interner());
+            continue;
+        }
         var cx = layout.ctx(j, self.state);
         cx.scratch = pull;
         const rows = Rows{ .cx = cx, .allocs = if (per_part) &allocs else &.{}, .pidx = pidx };
@@ -160,6 +202,8 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(FixedStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
+    try initPairs(self, true);
+    errdefer for (self.pairs) |*pp| pp.deinit();
     var direct: ?Direct = if (Direct.serves(kinds)) try Direct.init(self.gpa) else null;
     defer if (direct) |d| d.deinit(self.gpa);
     const enc = try Encoder.init(self.state, self.by, kinds);
@@ -222,6 +266,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 const nr = try part.store.push(hashes[ri]);
                 @memcpy(nr.keys, key.vals);
                 nr.mask.* = key.mask;
+                layout.setOrd(nr.tail, at);
                 break :blk nr;
             };
             tails[ri] = rec.tail;
@@ -262,12 +307,15 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
         const tail = try self.state.alignedAlloc(u8, .of(Value), @max(layout.size, 1));
         layout.clear(tail.ptr);
+        try initPairs(self, false);
+        errdefer for (self.pairs) |*pp| pp.deinit();
         while (try self.child.next(pull)) |b| {
             if (b.len != 0) try self.foldSingle(pull, b, layout, tail.ptr);
             _ = scratch.reset(.retain_capacity);
         }
         const one = try self.state.alloc(GroupSet, 1);
-        one[0] = .{ .store = .{ .single = try newIn(self.state, GroupSet.Single{ .layout = layout, .tail = tail.ptr }) }, .len = 1, .key_kinds = &.{} };
+        one[0] = .{ .store = .{ .single = try newIn(self.state, GroupSet.Single{ .layout = layout, .tail = tail.ptr }) }, .len = 1, .key_kinds = &.{}, .strs = self.strs };
+        if (self.part_state == null) try applyPairs(self, .{ .one = tail.ptr }, layout) else one[0].pairs = self.pairs;
         return one;
     }
 
@@ -275,6 +323,8 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
     const parts = try self.foldParts(GroupStore, layout);
     errdefer for (parts) |*p| p.table.deinit();
+    try initPairs(self, true);
+    errdefer for (self.pairs) |*pp| pp.deinit();
     const hctx = keyhash.MultiKeyCtx{};
     while (try self.child.next(pull)) |b| {
         const frozen = self.overBudget(parts);
@@ -321,6 +371,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 if (f.found) break :blk part.store.at(f.slot);
                 const nr = try part.store.push(hashes[r]);
                 for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, keyhash.canonValue(v));
+                layout.setOrd(nr.tail, at);
                 break :blk nr;
             };
             tails[r] = rec.tail;

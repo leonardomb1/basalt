@@ -8,10 +8,10 @@
 //! `In` is the value the state takes: `void` when only presence counts, `Value` when
 //! no physical type fits. Optional hooks: `addN` (k values at once, for `void`),
 //! `addAll` (a slice with no nulls, where a vector loop beats one at a time),
-//! `needs_alloc` (the state allocates per value), `own` and `own_always` (rebuild
-//! even when the merge does not own its source: a DISTINCT set belongs to the
-//! producer's allocator), and `remove` (the exact inverse of `add`, which a window
-//! frame slides with when a value leaves it).
+//! `needs_alloc` (the state allocates per value), `own` (rebuild in the group's
+//! allocator when a merge frees its source), and `remove` (the exact inverse of
+//! `add`, which a window frame slides with when a value leaves it). A DISTINCT
+//! aggregate is its plain math behind `pairs.zig`'s filter.
 //!
 //! Sums are exact, i128 for ints and i256 for DECIMAL (whose addends reach 10^38),
 //! range-checked once in `finish`, so the answer cannot depend on how rows split
@@ -26,7 +26,6 @@ const Value = @import("../../value.zig").Value;
 const Decimal = @import("../../value.zig").Decimal;
 const ast = @import("../../../lang/ast.zig");
 const eval = @import("../../eval.zig");
-const keyhash = @import("../../keyhash.zig");
 const simd = @import("../../simd.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -75,53 +74,6 @@ pub const CountIf = struct {
     }
     pub fn finish(s: *const State, _: Ctx) !Value {
         return .{ .int = s.n };
-    }
-};
-
-pub fn DistinctSet() type {
-    return std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-}
-
-/// COUNT(DISTINCT x). Probes with a stack key and copies only on a miss: copying
-/// first grew an arena per row (200M rows held ~7.6 GB for 200 values).
-pub const CountDistinct = struct {
-    pub const In = Value;
-    pub const needs_alloc = true;
-    pub const own_always = true;
-    pub const State = struct { set: ?*DistinctSet() = null };
-
-    fn setOf(s: *State, alloc: std.mem.Allocator) !*DistinctSet() {
-        if (s.set) |set| return set;
-        const set = try alloc.create(DistinctSet());
-        set.* = DistinctSet().init(alloc);
-        s.set = set;
-        return set;
-    }
-    pub fn add(s: *State, v: Value, cx: Ctx) !void {
-        const set = try setOf(s, cx.alloc);
-        var probe = [_]Value{v};
-        const gop = try set.getOrPut(probe[0..]);
-        if (gop.found_existing) return;
-        const key = try cx.alloc.alloc(Value, 1);
-        key[0] = try dupeValue(cx.alloc, v);
-        gop.key_ptr.* = key;
-    }
-    /// Sizes the destination first: inserting a hash-ordered run into a smaller table
-    /// built ever-longer probe runs (a global COUNT(DISTINCT) took 292s at -j 8).
-    pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
-        const src = s.set orelse return;
-        const set = try setOf(d, cx.alloc);
-        try set.ensureTotalCapacity(std.math.cast(u32, set.count() + src.count()) orelse return error.OutOfMemory);
-        var it = src.keyIterator();
-        while (it.next()) |k| try add(d, k.*[0], cx);
-    }
-    pub fn own(s: *State, cx: Ctx) !void {
-        const src = s.*;
-        s.* = .{};
-        try merge(s, &src, cx);
-    }
-    pub fn finish(s: *const State, _: Ctx) !Value {
-        return .{ .int = if (s.set) |set| set.count() else 0 };
     }
 };
 

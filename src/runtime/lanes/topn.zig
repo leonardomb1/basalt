@@ -84,7 +84,7 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
         ctx.sel[p] = &.{};
         return;
     };
-    const set = m.result();
+    const set = try m.result();
     const idx = try pp.arena.allocator().alloc(u32, set.len);
     for (idx, 0..) |*x, i| x.* = @intCast(i);
     if (set.len > ctx.n) {

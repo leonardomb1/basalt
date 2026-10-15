@@ -127,12 +127,16 @@ fn combineAggSlots(
         var m: ?op.Aggregate.GroupMerge = null;
         for (slots) |*s| {
             for (s.sets) |*st| {
-                if (m == null) m = try op.Aggregate.GroupMerge.init(env.arena, st, aggs);
-                for (0..st.len) |i| try m.?.add(st, i);
+                if (m == null) {
+                    m = try op.Aggregate.GroupMerge.init(env.arena, st, aggs);
+                    m.?.threads = threads;
+                }
+                try m.?.addSet(st);
             }
         }
+        defer if (m) |*mm| mm.deinit();
         const one = try env.arena.alloc(op.Aggregate.GroupSet, if (m == null) 0 else 1);
-        if (m) |*mm| one[0] = mm.result();
+        if (m) |*mm| one[0] = try mm.result();
         return one;
     }
 
@@ -148,7 +152,7 @@ fn combineAggSlots(
 fn partSets(a: std.mem.Allocator, parts: []PqPart) ![]const op.Aggregate.GroupSet {
     var sets = std.array_list.Managed(op.Aggregate.GroupSet).init(a);
     for (parts) |*pp| {
-        if (pp.merge) |*m| try sets.append(m.result());
+        if (pp.merge) |*m| try sets.append(try m.result());
     }
     return sets.items;
 }
@@ -521,19 +525,20 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
     }
     const bi = big orelse return;
     const into = &srcs[bi].sets[p];
-    dst.merge = op.Aggregate.GroupMerge.adopt(into, aggs) orelse blk: {
+    dst.merge = (try op.Aggregate.GroupMerge.adopt(into, aggs)) orelse blk: {
         var m = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), into, aggs);
-        for (0..into.len) |gi| try m.add(into, gi);
+        try m.addSet(into);
         break :blk m;
     };
     dst.merge.?.own = true;
     for (srcs, 0..) |*ls, i| {
         if (i == bi or ls.sets.len <= p) continue;
         const st = &ls.sets[p];
-        for (0..st.len) |gi| try dst.merge.?.add(st, gi);
+        try dst.merge.?.addSet(st);
         st.freeTable();
         ls.parts.free(p);
     }
+    try dst.merge.?.settle();
     dst.merge.?.deinit();
 }
 
@@ -696,8 +701,11 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.S
         const dst = &parts[0];
         for (lanes) |*l| {
             for (l.sets) |*st| {
-                if (dst.merge == null) dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, la.aggs);
-                for (0..st.len) |i| try dst.merge.?.add(st, i);
+                if (dst.merge == null) {
+                    dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, la.aggs);
+                    dst.merge.?.threads = nthreads;
+                }
+                try dst.merge.?.addSet(st);
             }
         }
     } else {

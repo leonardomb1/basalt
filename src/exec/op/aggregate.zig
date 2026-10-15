@@ -55,6 +55,7 @@ pub const Aggregate = struct {
     max_spill_depth: u8 = spill_parts.default_max_depth,
     spill_depth: u8 = 0,
     spill: ?*Spill = null,
+    pairs: []Pairs = &.{},
 
     pub const Spill = @import("aggregate/spill.zig").Spill;
     pub const spillNext = @import("aggregate/spill.zig").spillNext;
@@ -63,6 +64,8 @@ pub const Aggregate = struct {
     pub const overBudget = @import("aggregate/spill.zig").overBudget;
     pub const spillRows = @import("aggregate/spill.zig").spillRows;
     pub const destOf = @import("aggregate/spill.zig").destOf;
+    pub const Pairs = @import("aggregate/pairs.zig").Pairs;
+    pub const pairsOf = @import("aggregate/drain.zig").pairsOf;
     pub const StrId = keytable.StrId;
     pub const StrTable = keytable.StrTable;
 
@@ -118,6 +121,7 @@ test {
     _ = @import("aggregate/spill.zig");
     _ = @import("aggregate/funcs.zig");
     _ = @import("aggregate/kernel.zig");
+    _ = @import("aggregate/pairs.zig");
     _ = @import("spill_parts.zig");
 }
 

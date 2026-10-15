@@ -8,7 +8,9 @@
 //! no group (one sent to a spill file).
 //!
 //! `Layout` places each aggregate's state after a group's keys, so a COUNT pays
-//! eight bytes and a SUM its own, and carries the per-aggregate `Ctx`.
+//! eight bytes and a SUM its own, and carries the per-aggregate `Ctx`. With a
+//! DISTINCT aggregate a group's record starts with its ordinal in its store, which
+//! names the group in the aggregate's pairs (`pairs.zig`).
 
 const Agg = @import("../aggregate.zig").Aggregate.Agg;
 const Decimal = @import("../../value.zig").Decimal;
@@ -47,7 +49,6 @@ pub const Kernel = struct {
     merge: *const fn ([*]u8, [*]const u8, Ctx) anyerror!void,
     finish: *const fn ([*]const u8, Ctx) anyerror!Value,
     own: ?*const fn ([*]u8, Ctx) anyerror!void,
-    own_always: bool,
 };
 
 fn hasAddAll(comptime Op: type) bool {
@@ -125,7 +126,6 @@ pub fn make(comptime Op: type) Kernel {
         .merge = K.merge,
         .finish = K.finish,
         .own = if (@hasDecl(Op, "own")) K.own else null,
-        .own_always = @hasDecl(Op, "own_always") and Op.own_always,
     };
 }
 
@@ -148,7 +148,7 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
     const arg = agg.arg_ty orelse agg.ty;
     const float = types.Type.init(.float);
     return switch (agg.func) {
-        .count => .{ .k = if (agg.distinct) kernelOf(funcs.CountDistinct) else kernelOf(funcs.Count), .ty = agg.ty },
+        .count => .{ .k = kernelOf(funcs.Count), .ty = agg.ty },
         .sum => switch (agg.ty.kind) {
             .decimal => .{ .k = kernelOf(funcs.SumDecimal), .ty = agg.ty },
             .float => .{ .k = kernelOf(funcs.SumFloat), .ty = agg.ty },
@@ -180,12 +180,15 @@ pub const Layout = struct {
     ctxs: []const Ctx,
     offs: []const usize,
     size: usize,
+    ord: bool,
 
     pub fn init(a: std.mem.Allocator, aggs: []const Agg) !Layout {
         const kernels = try a.alloc(*const Kernel, aggs.len);
         const ctxs = try a.alloc(Ctx, aggs.len);
         const offs = try a.alloc(usize, aggs.len);
-        var at: usize = 0;
+        var ord = false;
+        for (aggs) |agg| ord = ord or agg.distinct;
+        var at: usize = if (ord) @sizeOf(u64) else 0;
         for (aggs, kernels, ctxs, offs) |agg, *k, *cx, *o| {
             const kf = kernelFor(agg);
             k.* = kf.k;
@@ -193,7 +196,15 @@ pub const Layout = struct {
             o.* = at;
             at += kf.k.size;
         }
-        return .{ .kernels = kernels, .ctxs = ctxs, .offs = offs, .size = at };
+        return .{ .kernels = kernels, .ctxs = ctxs, .offs = offs, .size = at, .ord = ord };
+    }
+
+    pub fn setOrd(self: Layout, tail: [*]u8, i: usize) void {
+        if (self.ord) @as(*u64, @ptrCast(@alignCast(tail))).* = i;
+    }
+
+    pub fn ordOf(_: Layout, tail: [*]const u8) usize {
+        return @intCast(@as(*const u64, @ptrCast(@alignCast(tail))).*);
     }
 
     pub fn clear(self: Layout, tail: [*]u8) void {

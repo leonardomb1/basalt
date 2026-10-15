@@ -100,6 +100,27 @@ test "parallel parquet aggregate: an ungrouped agg (threads>1) matches serial" {
     try std.testing.expectEqualStrings(serial, par);
 }
 
+test "parallel parquet aggregate: COUNT(DISTINCT) counts a value once across lanes, global and grouped" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "SELECT COUNT(DISTINCT id % 37) AS a, COUNT(DISTINCT f) AS b, COUNT(DISTINCT CAST(id % 11 AS TEXT)) AS c FROM '$IN'", "a,b,c\n37,5000,11\n" },
+        .{ "SELECT id % 5 AS k, COUNT(DISTINCT id % 37) AS a, COUNT(DISTINCT CAST(id % 11 AS TEXT)) AS c FROM '$IN' GROUP BY id % 5 ORDER BY k", "k,a,c\n0,37,11\n1,37,11\n2,37,11\n3,37,11\n4,37,11\n" },
+    };
+    for (cases) |c| {
+        const q = c[0];
+        var t1 = std.testing.tmpDir(.{});
+        defer t1.cleanup();
+        const serial = try runParquetThreaded(alloc, &t1, q, 1);
+        defer alloc.free(serial);
+        var t4 = std.testing.tmpDir(.{});
+        defer t4.cleanup();
+        const par = try runParquetThreaded(alloc, &t4, q, 4);
+        defer alloc.free(par);
+        try std.testing.expectEqualStrings(c[1], serial);
+        try std.testing.expectEqualStrings(serial, par);
+    }
+}
+
 test "parallel parquet aggregate: an ungrouped agg under a filter (threads>1)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

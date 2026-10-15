@@ -82,6 +82,7 @@ pub fn overBudget(self: *Aggregate, parts: anytype) bool {
         bytes += p.table.entries.len * @sizeOf(u32);
         groups += p.table.len;
     }
+    for (self.pairs) |*pp| bytes += pp.tableBytes();
     if (groups > 0 and bytes > self.spill_at) sp.frozen = true;
     return sp.frozen;
 }

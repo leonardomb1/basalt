@@ -213,6 +213,21 @@ pub fn FixedStore(comptime P: type) type {
 
 pub const FixedKey = struct { vals: []const i64, mask: u64 };
 
+/// The value a fixed-width key word of a column of `kind` stands for, a string's
+/// through the table that interned it.
+pub fn wordValue(kind: types.TypeKind, raw: i64, strs: ?*const StrTable) Value {
+    return switch (kind) {
+        .int => .{ .int = raw },
+        .time => .{ .time = raw },
+        .timestamp => .{ .timestamp = raw },
+        .date => .{ .date = @intCast(raw) },
+        .bool => .{ .bool = raw != 0 },
+        .float => .{ .float = @bitCast(raw) },
+        .string => .{ .string = strs.?.at(@intCast(raw)) },
+        else => unreachable,
+    };
+}
+
 pub const GroupTable = struct {
     const salt_bits = 6;
     const idx_bits = 32 - salt_bits;
@@ -257,14 +272,29 @@ pub const GroupTable = struct {
         self.entries = &.{};
     }
 
-    /// Rebuild from this table's own entries, taking each hash from its record, and
-    /// free the outgrown entries (an arena kept every outgrown table).
+    /// Room for `n` keys in all, so a merge that knows how many it brings rehashes once.
+    pub fn reserve(self: *GroupTable, n: usize, store: anytype) !void {
+        var cap = self.entries.len;
+        while ((n + 1) * 10 >= cap * 7) cap *= growth;
+        if (cap != self.entries.len) try self.rehash(cap, store);
+    }
+
     fn grow(self: *GroupTable, store: anytype) !void {
-        const cap = self.entries.len * growth;
+        return self.rehash(self.entries.len * growth, store);
+    }
+
+    /// Rebuild at `cap` from this table's own entries, taking each hash from its
+    /// record, the records read a few entries ahead, and free the outgrown entries
+    /// (an arena kept every outgrown table).
+    fn rehash(self: *GroupTable, cap: usize, store: anytype) !void {
         const ne = try self.alloc.alloc(u32, cap);
         @memset(ne, 0);
         const nmask = cap - 1;
-        for (self.entries) |e| {
+        for (self.entries, 0..) |e, ei| {
+            if (ei + prefetch_ahead < self.entries.len) {
+                const ahead = self.entries[ei + prefetch_ahead];
+                if (ahead != 0) @prefetch(store.recs.base((ahead & max_groups) - 1), .{ .rw = .read, .locality = 3 });
+            }
             if (e == 0) continue;
             const h = store.hashAt((e & max_groups) - 1);
             var i = h & nmask;
