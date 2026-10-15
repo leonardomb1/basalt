@@ -22,8 +22,10 @@ const LaneMem = @import("../parallel.zig").LaneMem;
 const LaneSplit = @import("sources.zig").LaneSplit;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const buildMapChain = @import("../plan.zig").buildMapChain;
-const dispatchWorker = @import("../parallel.zig").dispatchWorker;
-const laneRowSource = @import("sources.zig").laneRowSource;
+const HeldFile = @import("agg.zig").HeldFile;
+const driver = @import("../../connect/driver.zig");
+const openItem = @import("agg.zig").openItem;
+const pqdecode = @import("../../format/parquet/read.zig");
 const obs = @import("../obs.zig");
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
@@ -97,8 +99,8 @@ fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
     return parquetSplit(env, rstages[0].node.read, rstages[1..], w, .{ .threads = env.sort_threads });
 }
 
-/// One item of a parallel build read: the rows it kept, in its own arena until the
-/// index has copied them.
+/// One item of a parallel build read: the rows it kept, copied out of the read's
+/// per-batch scratch into the item's own arena until the index has copied them.
 const BuildPart = struct {
     arena: std.heap.ArenaAllocator,
     batches: std.ArrayListUnmanaged(Batch) = .empty,
@@ -116,23 +118,58 @@ const BuildCtx = struct {
     rows_read: *obs.RowCounter,
 };
 
-const buildWorker = dispatchWorker(BuildCtx, buildWorkOne);
+/// One row group of the build file, read from the lane's open reader.
+const ItemSource = struct {
+    r: *pqdecode.Reader,
+    schema_: *const types.Schema,
 
-fn buildWorkOne(ctx: *BuildCtx, i: usize) !void {
-    const part = &ctx.parts[i];
-    const a = part.arena.allocator();
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *ItemSource = @ptrCast(@alignCast(ptr));
+        return self.schema_.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+        const self: *ItemSource = @ptrCast(@alignCast(ptr));
+        return self.r.next(arena);
+    }
+    fn closeFn(_: *anyopaque) void {}
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
+
+/// A lane: items taken from the queue in turn, each row group read through the lane's
+/// one open reader (reopening a file per row group re-parses its footer), its kept
+/// rows filed under the item's index so the index sees them in file order.
+fn buildLane(ctx: *BuildCtx, _: usize) void {
+    buildLaneRun(ctx) catch |e| ctx.queue.fail(e);
+}
+
+fn buildLaneRun(ctx: *BuildCtx) !void {
+    const m = &ctx.split.parquet;
     var mem: LaneMem = .{};
     mem.init();
     defer mem.deinit();
-    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
-    defer inner.close();
-    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, ctx.split.schema());
-    while (try child.next(a)) |b| {
-        if (b.len == 0) continue;
-        try part.batches.append(a, b);
-        if (ctx.bytes.fetchAdd(b.heapBytes(), .monotonic) + b.heapBytes() > ctx.cap) return error.JoinBuildTooLarge;
+    var keep = std.heap.ArenaAllocator.init(mem.gpa.allocator());
+    defer keep.deinit();
+    var held: ?HeldFile = null;
+    defer if (held) |h| h.r.close();
+    while (!ctx.queue.failed.load(.seq_cst)) {
+        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
+        if (i >= ctx.queue.nitems) return;
+        _ = mem.work.reset(.retain_capacity);
+        const r = (try openItem(m, keep.allocator(), &held, i)) orelse continue;
+        var item = ItemSource{ .r = r, .schema_ = m.src_schema };
+        var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ItemSource.vtable }, .count = ctx.rows_read };
+        var scan = op.Scan{ .src = cs.source() };
+        const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, m.src_schema);
+        const part = &ctx.parts[i];
+        const a = part.arena.allocator();
+        while (true) {
+            _ = mem.batch.reset(.retain_capacity);
+            const b = (try child.next(mem.batch.allocator())) orelse break;
+            if (b.len == 0) continue;
+            const kept = try b.deepCopy(a);
+            try part.batches.append(a, kept);
+            if (ctx.bytes.fetchAdd(kept.heapBytes(), .monotonic) + kept.heapBytes() > ctx.cap) return error.JoinBuildTooLarge;
+        }
     }
 }
 
@@ -145,7 +182,7 @@ fn indexInParallel(env: *Env, split: *LaneSplit, stages: []const ast.Stage, righ
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();
     var ctx = BuildCtx{ .split = split, .stages = stages, .params = env.params_expr, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read };
-    _ = try parallel.spawnJoin(arena, env.sort_threads, buildWorker, &ctx);
+    _ = try parallel.spawnJoin(arena, env.sort_threads, buildLane, &ctx);
     if (ctx.queue.failure()) |e| return e;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);
