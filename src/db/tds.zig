@@ -44,6 +44,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
+const celltext = @import("../exec/celltext.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const driver = @import("../connect/driver.zig");
@@ -1247,18 +1248,21 @@ const BulkProto = struct {
         }
     }
 
+    /// Each cell's text is transcoded through one UTF-16 buffer, grown to the
+    /// longest cell of the batch.
     pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-        const fmt = sql.BulkFormat{ .bool_true = "1", .bool_false = "0" };
-        var r: usize = 0;
-        while (r < batch.len) : (r += 1) {
+        var units = std.array_list.Managed(u16).init(arena);
+        var buf: [celltext.scalar_bound]u8 = undefined;
+        for (0..batch.len) |r| {
             try w.writeByte(0xD1);
             for (batch.columns) |*col| {
-                const v = col.getValue(r);
-                if (v.isNull()) {
+                if (celltext.isNull(col, r)) {
                     try writeU16(w, 0xFFFF);
                     continue;
                 }
-                const u16s = try std.unicode.utf8ToUtf16LeAlloc(arena, try sql.valueText(arena, v, fmt));
+                const s = celltext.text(col, r, &buf, sql.BulkText(.{ .bool_true = "1", .bool_false = "0" }){});
+                try units.resize(s.len);
+                const u16s = units.items[0..try std.unicode.utf8ToUtf16Le(units.items, s)];
                 var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
                 if (blen < u16s.len * 2 and blen >= 2) {
                     const last = u16s[blen / 2 - 1];
@@ -1287,6 +1291,81 @@ const BulkProto = struct {
 };
 
 pub const BulkSink = sql.BulkSink(BulkProto);
+
+fn appendBatchReference(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
+    var r: usize = 0;
+    while (r < batch.len) : (r += 1) {
+        try w.writeByte(0xD1);
+        for (batch.columns) |*col| {
+            const v = col.getValue(r);
+            if (v.isNull()) {
+                try writeU16(w, 0xFFFF);
+                continue;
+            }
+            const u16s = try std.unicode.utf8ToUtf16LeAlloc(arena, try celltext.referenceText(arena, v, "1", "0"));
+            var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
+            if (blen < u16s.len * 2 and blen >= 2) {
+                const last = u16s[blen / 2 - 1];
+                if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
+            }
+            try writeU16(w, @intCast(blen));
+            var k: usize = 0;
+            while (k * 2 < blen) : (k += 1) {
+                try w.writeByte(@intCast(u16s[k] & 0xff));
+                try w.writeByte(@intCast(u16s[k] >> 8));
+            }
+        }
+    }
+}
+
+fn expectBulkRowsSame(a: std.mem.Allocator, batch: Batch) !void {
+    var want = std.array_list.Managed(u8).init(a);
+    var got = std.array_list.Managed(u8).init(a);
+    const ref = appendBatchReference(want.writer(), a, batch);
+    const new = BulkProto.appendBatch(got.writer(), a, batch);
+    if (ref) |_| {
+        try new;
+        try std.testing.expectEqualSlices(u8, want.items, got.items);
+    } else |e| try std.testing.expectError(e, new);
+}
+
+fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, texts: []const []const u8) !Batch {
+    const ty = types.Type.init(kind).asNullable();
+    var b = column.Builder.init(a, ty);
+    for (texts) |t| try b.append(if (kind == .bytes) .{ .bytes = t } else .{ .string = t });
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try b.finish();
+    const schema = try a.create(types.Schema);
+    schema.* = .{ .fields = try a.dupe(types.Schema.Field, &.{.{ .name = "c", .ty = ty }}) };
+    return .{ .schema = schema, .columns = cols, .len = texts.len };
+}
+
+test "INSERT BULK rows match the per-value path over random batches of every type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try expectBulkRowsSame(a, try celltext.testBatch(a, 0x7d5, 400));
+}
+
+test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8 as before" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const emoji = "\xf0\x9f\x98\x80";
+    var texts: [4][]const u8 = undefined;
+    for (&texts, 3997..) |*t, lead| {
+        const s = try a.alloc(u8, lead + emoji.len * 3);
+        @memset(s[0..lead], 'x');
+        for (0..3) |k| @memcpy(s[lead + k * emoji.len ..][0..emoji.len], emoji);
+        t.* = s;
+    }
+    try expectBulkRowsSame(a, try textBatch(a, .string, &texts));
+    var got = std.array_list.Managed(u8).init(a);
+    try BulkProto.appendBatch(got.writer(), a, try textBatch(a, .string, texts[2..3]));
+    try std.testing.expectEqual(@as(usize, 1 + 2 + 7998), got.items.len);
+    try expectBulkRowsSame(a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" }));
+    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"})));
+}
 
 fn writeU16(w: anytype, v: u16) !void {
     try w.writeByte(@intCast(v & 0xff));

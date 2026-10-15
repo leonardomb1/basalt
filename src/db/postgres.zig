@@ -638,8 +638,8 @@ const CopyProto = struct {
         return std.fmt.allocPrint(arena, "COPY {s} ({s}) FROM STDIN", .{ qtable, try sql.colList(arena, .postgres, schema) });
     }
 
-    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-        try sql.appendBulkText(w, arena, batch, .{});
+    pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {
+        try sql.appendBulkText(w, batch, .{});
     }
 
     pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {

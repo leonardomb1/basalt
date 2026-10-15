@@ -39,6 +39,7 @@ const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
+const celltext = @import("../exec/celltext.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const ast = @import("../lang/ast.zig");
@@ -849,29 +850,34 @@ fn serializeRow(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usi
     try buf.append('(');
     for (batch.columns, 0..) |*c, i| {
         if (i > 0) try buf.append(',');
-        try serializeValue(buf.writer(), dialect, c.getValue(row), gpa);
+        switch (dialect) {
+            inline else => |d| try celltext.write(buf.writer(), c, row, Literal(d){}),
+        }
     }
     try buf.append(')');
     return buf.toOwnedSlice();
 }
 
-fn serializeValue(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Allocator) !void {
-    switch (v) {
-        .null => try w.writeAll("NULL"),
-        .bool => |b| try w.writeAll(if (dialect == .sqlserver) (if (b) "1" else "0") else (if (b) "TRUE" else "FALSE")),
-        .int => |x| try w.print("{d}", .{x}),
-        .float => |x| try floatLiteral(w, dialect, x),
-        .decimal => |d| {
-            const s = try eval.formatDecimal(scratch, d.unscaled, d.scale);
-            defer scratch.free(s);
-            try w.writeAll(s);
-        },
-        .string => |s| try quoteString(w, dialect, s),
-        .bytes => |s| try hexLiteral(w, dialect, s),
-        .date => |days| try w.print("'{s}'", .{try eval.formatDate(scratch, days)}),
-        .time => |t| try w.print("'{s}'", .{try eval.formatTime(scratch, t)}),
-        .timestamp => |micros| try w.print("'{s}'", .{try eval.formatTimestamp(scratch, micros)}),
-    }
+/// The `celltext.write` policy for a cell as a literal in an INSERT's VALUES.
+fn Literal(comptime dialect: Dialect) type {
+    return struct {
+        pub const null_text = "NULL";
+        pub const bool_true = if (dialect == .sqlserver) "1" else "TRUE";
+        pub const bool_false = if (dialect == .sqlserver) "0" else "FALSE";
+        pub const quote_temporal = "'";
+
+        pub fn string(_: @This(), w: anytype, s: []const u8) !void {
+            return quoteString(w, dialect, s);
+        }
+
+        pub fn bytes(_: @This(), w: anytype, s: []const u8) !void {
+            return hexLiteral(w, dialect, s);
+        }
+
+        pub fn float(_: @This(), w: anytype, x: f64) !void {
+            return floatLiteral(w, dialect, x);
+        }
+    };
 }
 
 /// A float as a literal the target keeps: `-0` as a float, not the integer 0, and
@@ -929,34 +935,28 @@ pub const BulkFormat = struct {
     bool_false: []const u8 = "f",
 };
 
-pub fn appendBulkText(w: anytype, arena: std.mem.Allocator, batch: Batch, fmt: BulkFormat) !void {
-    var r: usize = 0;
-    while (r < batch.len) : (r += 1) {
+/// The `celltext.write` policy for COPY and LOAD DATA text: `\N` for null, and a
+/// string's backslash, tab, newline and carriage return escaped.
+pub fn BulkText(comptime fmt: BulkFormat) type {
+    return struct {
+        pub const null_text = "\\N";
+        pub const bool_true = fmt.bool_true;
+        pub const bool_false = fmt.bool_false;
+
+        pub fn string(_: @This(), w: anytype, s: []const u8) !void {
+            return bulkEscaped(w, s);
+        }
+    };
+}
+
+pub fn appendBulkText(w: anytype, batch: Batch, comptime fmt: BulkFormat) !void {
+    for (0..batch.len) |r| {
         for (batch.columns, 0..) |*col, i| {
             if (i > 0) try w.writeByte('\t');
-            try bulkValue(w, arena, col.getValue(r), fmt);
+            try celltext.write(w, col, r, BulkText(fmt){});
         }
         try w.writeByte('\n');
     }
-}
-
-fn bulkValue(w: anytype, arena: std.mem.Allocator, v: Value, fmt: BulkFormat) !void {
-    if (v.isNull()) {
-        try w.writeAll("\\N");
-    } else {
-        try bulkEscaped(w, try valueText(arena, v, fmt));
-    }
-}
-
-pub fn valueText(arena: std.mem.Allocator, v: Value, fmt: BulkFormat) ![]const u8 {
-    return switch (v) {
-        .null => "",
-        .bool => |b| if (b) fmt.bool_true else fmt.bool_false,
-        .date => |days| try eval.formatDate(arena, days),
-        .time => |t| try eval.formatTime(arena, t),
-        .timestamp => |micros| try eval.formatTimestamp(arena, micros),
-        else => try eval.valueToString(arena, v),
-    };
 }
 
 fn bulkEscaped(w: anytype, s: []const u8) !void {
@@ -1244,42 +1244,112 @@ test "create table and insert quote odd column names whole" {
     try std.testing.expectEqualStrings("INSERT INTO \"t\" (\"i]d\",\"x.y\") VALUES (1,'a')", stmt);
 }
 
-test "serializeValue: dialect-specific escaping, bools, bytes, null" {
+fn literalOf(a: std.mem.Allocator, dialect: Dialect, kind: types.TypeKind, v: Value) ![]const u8 {
+    const ty = types.Type.init(kind).asNullable();
+    var b = column.Builder.init(a, ty);
+    try b.append(v);
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try b.finish();
+    var schema = types.Schema{ .fields = &.{.{ .name = "c", .ty = ty }} };
+    const row = try serializeRow(a, dialect, .{ .schema = &schema, .columns = cols, .len = 1 }, 0);
+    return row[1 .. row.len - 1];
+}
+
+test "INSERT literals: dialect-specific escaping, bools, bytes, null" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var buf = std.array_list.Managed(u8).init(a);
+    try std.testing.expectEqualStrings("'c:\\\\tmp'", try literalOf(a, .mysql, .string, .{ .string = "c:\\tmp" }));
+    try std.testing.expectEqualStrings("'c:\\tmp'", try literalOf(a, .postgres, .string, .{ .string = "c:\\tmp" }));
+    try std.testing.expectEqualStrings("1", try literalOf(a, .sqlserver, .bool, .{ .bool = true }));
+    try std.testing.expectEqualStrings("FALSE", try literalOf(a, .postgres, .bool, .{ .bool = false }));
+    try std.testing.expectEqualStrings("'\\x01ab'", try literalOf(a, .postgres, .bytes, .{ .bytes = "\x01\xab" }));
+    try std.testing.expectEqualStrings("0x01ab", try literalOf(a, .mysql, .bytes, .{ .bytes = "\x01\xab" }));
+    try std.testing.expectEqualStrings("NULL", try literalOf(a, .postgres, .int, .null));
+    try std.testing.expectEqualStrings("'O''Brien'", try literalOf(a, .postgres, .string, .{ .string = "O'Brien" }));
+    try std.testing.expectEqualStrings("'1970-01-01'", try literalOf(a, .postgres, .date, .{ .date = 0 }));
+}
 
-    try serializeValue(buf.writer(), .mysql, .{ .string = "c:\\tmp" }, a);
-    try std.testing.expectEqualStrings("'c:\\\\tmp'", buf.items);
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .string = "c:\\tmp" }, a);
-    try std.testing.expectEqualStrings("'c:\\tmp'", buf.items);
+fn serializeRowReference(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usize) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(gpa);
+    try buf.append('(');
+    for (batch.columns, 0..) |*c, i| {
+        if (i > 0) try buf.append(',');
+        try serializeValueReference(buf.writer(), dialect, c.getValue(row), gpa);
+    }
+    try buf.append(')');
+    return buf.toOwnedSlice();
+}
 
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .sqlserver, .{ .bool = true }, a);
-    try std.testing.expectEqualStrings("1", buf.items);
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .bool = false }, a);
-    try std.testing.expectEqualStrings("FALSE", buf.items);
+fn serializeValueReference(w: anytype, dialect: Dialect, v: Value, scratch: std.mem.Allocator) !void {
+    switch (v) {
+        .null => try w.writeAll("NULL"),
+        .bool => |b| try w.writeAll(if (dialect == .sqlserver) (if (b) "1" else "0") else (if (b) "TRUE" else "FALSE")),
+        .int => |x| try w.print("{d}", .{x}),
+        .float => |x| try floatLiteral(w, dialect, x),
+        .decimal => |d| {
+            const s = try eval.formatDecimal(scratch, d.unscaled, d.scale);
+            defer scratch.free(s);
+            try w.writeAll(s);
+        },
+        .string => |s| try quoteString(w, dialect, s),
+        .bytes => |s| try hexLiteral(w, dialect, s),
+        .date => |days| try w.print("'{s}'", .{try eval.formatDate(scratch, days)}),
+        .time => |t| try w.print("'{s}'", .{try eval.formatTime(scratch, t)}),
+        .timestamp => |micros| try w.print("'{s}'", .{try eval.formatTimestamp(scratch, micros)}),
+    }
+}
 
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .bytes = "\x01\xab" }, a);
-    try std.testing.expectEqualStrings("'\\x01ab'", buf.items);
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .mysql, .{ .bytes = "\x01\xab" }, a);
-    try std.testing.expectEqualStrings("0x01ab", buf.items);
+test "INSERT literals match the per-value path over random batches of every type, in every dialect" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try celltext.testBatch(a, 0x5e1, 400);
+    const dialects = std.enums.values(Dialect);
+    var failed: usize = 0;
+    for (dialects) |d| {
+        for (0..batch.len) |r| {
+            const want = serializeRowReference(a, d, batch, r);
+            const got = serializeRow(a, d, batch, r);
+            if (want) |ws| try std.testing.expectEqualStrings(ws, try got) else |e| {
+                try std.testing.expectError(e, got);
+                failed += 1;
+            }
+        }
+    }
+    try std.testing.expect(failed > 0 and failed < batch.len * dialects.len);
+}
 
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .null, a);
-    try std.testing.expectEqualStrings("NULL", buf.items);
+fn appendBulkTextReference(w: anytype, arena: std.mem.Allocator, batch: Batch, fmt: BulkFormat) !void {
+    for (0..batch.len) |r| {
+        for (batch.columns, 0..) |*col, i| {
+            if (i > 0) try w.writeByte('\t');
+            const v = col.getValue(r);
+            if (v.isNull()) {
+                try w.writeAll("\\N");
+            } else {
+                try bulkEscaped(w, try celltext.referenceText(arena, v, fmt.bool_true, fmt.bool_false));
+            }
+        }
+        try w.writeByte('\n');
+    }
+}
 
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .string = "O'Brien" }, a);
-    try std.testing.expectEqualStrings("'O''Brien'", buf.items);
-    buf.clearRetainingCapacity();
-    try serializeValue(buf.writer(), .postgres, .{ .date = 0 }, a);
-    try std.testing.expectEqualStrings("'1970-01-01'", buf.items);
+test "COPY and LOAD DATA text match the per-value path over random batches of every type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try celltext.testBatch(a, 0xc0b1, 500);
+    var want = std.array_list.Managed(u8).init(a);
+    var got = std.array_list.Managed(u8).init(a);
+    try appendBulkTextReference(want.writer(), a, batch, .{});
+    try appendBulkText(got.writer(), batch, .{});
+    try std.testing.expectEqualStrings(want.items, got.items);
+    want.clearRetainingCapacity();
+    got.clearRetainingCapacity();
+    try appendBulkTextReference(want.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" });
+    try appendBulkText(got.writer(), batch, .{ .bool_true = "1", .bool_false = "0" });
+    try std.testing.expectEqualStrings(want.items, got.items);
 }
 
 test "coerceText parses bools, dates, timestamps, and decimals" {
@@ -1329,11 +1399,11 @@ test "bulk text format: tab/newline/backslash escaping and \\N nulls" {
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 2 };
 
     var out = std.array_list.Managed(u8).init(a);
-    try appendBulkText(out.writer(), a, batch, .{});
+    try appendBulkText(out.writer(), batch, .{});
     try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\tt\n\\N\tf\n", out.items);
 
     out.clearRetainingCapacity();
-    try appendBulkText(out.writer(), a, batch, .{ .bool_true = "1", .bool_false = "0" });
+    try appendBulkText(out.writer(), batch, .{ .bool_true = "1", .bool_false = "0" });
     try std.testing.expectEqualStrings("a\\tb\\nc\\\\d\t1\n\\N\t0\n", out.items);
 }
 

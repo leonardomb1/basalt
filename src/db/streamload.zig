@@ -41,7 +41,7 @@ const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Column = @import("../exec/column.zig").Column;
-const eval = @import("../exec/eval.zig");
+const celltext = @import("../exec/celltext.zig");
 const driver = @import("../connect/driver.zig");
 const mysql = @import("mysql.zig");
 const sql = @import("sql.zig");
@@ -258,43 +258,38 @@ fn cellBound(kind: types.TypeKind) usize {
     };
 }
 
-/// The text `sql.valueText` gives the cell, with 0x01/0x02 in strings turned to
-/// spaces, written into capacity `appendBatchTsv` reserved.
+/// The cell written into capacity `appendBatchTsv` reserved.
 fn appendCell(out: *std.array_list.Managed(u8), c: *const Column, r: usize) !void {
-    if (!c.validity.get(r)) return out.appendSliceAssumeCapacity(NULL_MARKER);
     var w = std.Io.Writer.fixed(out.unusedCapacitySlice());
-    switch (c.ty.kind) {
-        .string, .bytes => {
-            const s = c.data.bytes.at(r);
-            if (s.len == NULL_MARKER.len and std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
-            return appendSanitized(out, s);
-        },
-        .bool => return out.appendSliceAssumeCapacity(if (c.data.b[r]) "true" else "false"),
-        .int => try w.print("{d}", .{c.data.i64[r]}),
-        .float => try w.print("{d}", .{c.data.f64[r]}),
-        .decimal => try eval.writeDecimal(&w, c.data.dec[r].unscaled, c.data.dec[r].scale),
-        .date => try eval.writeDate(&w, c.data.i32[r]),
-        .time => try eval.writeTime(&w, c.data.i64[r]),
-        .timestamp => try eval.writeTimestamp(&w, c.data.i64[r]),
-        .array, .@"struct" => return out.appendSliceAssumeCapacity(NULL_MARKER),
-    }
+    try celltext.write(&w, c, r, TsvText{});
     out.items.len += w.end;
 }
 
-/// Copies `s` with 0x01 and 0x02 replaced by spaces, sixteen bytes at a time.
-fn appendSanitized(out: *std.array_list.Managed(u8), s: []const u8) void {
+/// The `celltext.write` policy for a stream-load body: `\N` is null, so a string may
+/// not be exactly that, and 0x01/0x02, the separators, become spaces in one.
+const TsvText = struct {
+    pub const null_text = NULL_MARKER;
+    pub const bool_true = "true";
+    pub const bool_false = "false";
+
+    pub fn string(_: TsvText, w: *std.Io.Writer, s: []const u8) !void {
+        if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
+        sanitize(try w.writableSlice(s.len), s);
+    }
+};
+
+/// Copies `s` into `dst` with 0x01 and 0x02 replaced by spaces, sixteen bytes at a time.
+fn sanitize(dst: []u8, s: []const u8) void {
     const V = @Vector(16, u8);
     const one: V = @splat(1);
     const two: V = @splat(2);
     const space: V = @splat(' ');
-    const dst = out.unusedCapacitySlice()[0..s.len];
     var i: usize = 0;
     while (i + 16 <= s.len) : (i += 16) {
         const v: V = s[i..][0..16].*;
         dst[i..][0..16].* = @select(u8, v -% one < two, space, v);
     }
     for (s[i..], dst[i..]) |b, *d| d.* = if (b -% 1 < 2) ' ' else b;
-    out.items.len += s.len;
 }
 
 pub const StreamLoadSink = struct {
@@ -1101,7 +1096,7 @@ fn appendBatchTsvReference(out: *std.array_list.Managed(u8), arena: std.mem.Allo
                 try out.appendSlice(NULL_MARKER);
                 continue;
             }
-            const s = try sql.valueText(arena, v, .{ .bool_true = "true", .bool_false = "false" });
+            const s = try celltext.referenceText(arena, v, "true", "false");
             for (s) |b| try out.append(if (b == 0x01 or b == 0x02) ' ' else b);
         }
         try out.append(0x02);
@@ -1112,62 +1107,7 @@ test "stream-load body matches the per-value text path over random batches of ev
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const columnmod = @import("../exec/column.zig");
-    const kinds = [_]types.Type{
-        types.Type.init(.int).asNullable(),
-        types.Type.init(.float).asNullable(),
-        types.Type.decimal(14, 2).asNullable(),
-        types.Type.decimal(38, 6).asNullable(),
-        types.Type.init(.date).asNullable(),
-        types.Type.init(.time).asNullable(),
-        types.Type.init(.timestamp).asNullable(),
-        types.Type.init(.bool).asNullable(),
-        types.Type.init(.string).asNullable(),
-        types.Type.init(.bytes).asNullable(),
-    };
-    const floats = [_]f64{ 0, -0.0, 1.5, -2.25, 1e-300, 5e-324, -5e-324, 1.7976931348623157e308, -1.7976931348623157e308, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 123456.789, 1e21, 0.1 };
-    const texts = [_][]const u8{ "", "plain", "a\x01b\x02c", "\x01\x02", "a\\Nb", "\\", "N", "  padded   ", "\xc3\xb3 utf8", "\\N ", "a long value\x01 that spans\x02 more than sixteen bytes\x01", "0123456789abcdef", "0123456789abcde\x02" };
-    var prng = std.Random.DefaultPrng.init(0x57d);
-    const rnd = prng.random();
-    const rows = 300;
-    const cols = try a.alloc(columnmod.Column, kinds.len);
-    for (kinds, cols) |ty, *col| {
-        var b = columnmod.Builder.init(a, ty);
-        for (0..rows) |_| {
-            if (rnd.uintLessThan(u8, 6) == 0) {
-                try b.append(.null);
-                continue;
-            }
-            try b.append(switch (ty.kind) {
-                .int => .{ .int = switch (rnd.uintLessThan(u8, 3)) {
-                    0 => std.math.minInt(i64),
-                    1 => std.math.maxInt(i64),
-                    else => rnd.int(i32),
-                } },
-                .float => .{ .float = if (rnd.boolean()) floats[rnd.uintLessThan(usize, floats.len)] else (rnd.float(f64) - 0.5) * 1e6 },
-                .decimal => .{ .decimal = .{
-                    .unscaled = switch (rnd.uintLessThan(u8, 4)) {
-                        0 => rnd.int(i128) >> 6,
-                        1 => @as(i128, std.math.maxInt(u64)) * (if (rnd.boolean()) @as(i128, 1) else -1),
-                        2 => rnd.intRangeAtMost(i128, -999, 999),
-                        else => rnd.int(i64),
-                    },
-                    .scale = rnd.uintAtMost(u8, 12),
-                } },
-                .date => .{ .date = if (rnd.uintLessThan(u8, 8) == 0) std.math.minInt(i32) + 1 else rnd.intRangeAtMost(i32, -800_000, 3_000_000) },
-                .time => .{ .time = rnd.intRangeAtMost(i64, 0, 86_400_000_000 - 1) },
-                .timestamp => .{ .timestamp = rnd.intRangeAtMost(i64, -100_000_000_000_000_000, 100_000_000_000_000_000) },
-                .bool => .{ .bool = rnd.boolean() },
-                .string => .{ .string = texts[rnd.uintLessThan(usize, texts.len)] },
-                else => .{ .bytes = texts[rnd.uintLessThan(usize, texts.len)] },
-            });
-        }
-        col.* = try b.finish();
-    }
-    const fields = try a.alloc(types.Schema.Field, kinds.len);
-    for (fields, kinds) |*f, ty| f.* = .{ .name = "c", .ty = ty };
-    var schema = types.Schema{ .fields = fields };
-    const batch = Batch{ .schema = &schema, .columns = cols, .len = rows };
+    const batch = try celltext.testBatch(a, 0x57d, 300);
     var want = std.array_list.Managed(u8).init(a);
     try appendBatchTsvReference(&want, a, batch);
     var got = std.array_list.Managed(u8).init(a);

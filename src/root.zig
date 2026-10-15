@@ -10,6 +10,7 @@ pub const include = @import("lang/include.zig");
 pub const expand = @import("lang/expand.zig");
 pub const value = @import("exec/value.zig");
 pub const column = @import("exec/column.zig");
+pub const celltext = @import("exec/celltext.zig");
 pub const batch = @import("exec/batch.zig");
 pub const eval = @import("exec/eval.zig");
 pub const json = @import("exec/json.zig");

@@ -20,6 +20,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
+const celltext = @import("../exec/celltext.zig");
 const Value = @import("../exec/value.zig").Value;
 const driver = @import("driver.zig");
 
@@ -97,13 +98,13 @@ pub const TableWriter = struct {
         return self;
     }
 
-    pub fn writeBatch(self: *TableWriter, arena: std.mem.Allocator, batch: Batch) !void {
+    pub fn writeBatch(self: *TableWriter, _: std.mem.Allocator, batch: Batch) !void {
+        var buf: [celltext.scalar_bound]u8 = undefined;
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             const overflow = self.tty and self.nrows >= keep_max;
             for (batch.columns, 0..) |*col, c| {
-                const v = col.getValue(r);
-                const s: ?[]const u8 = if (v.isNull()) null else try self.gpa.dupe(u8, try eval.valueToString(arena, v));
+                const s: ?[]const u8 = if (celltext.isNull(col, r)) null else try self.gpa.dupe(u8, celltext.text(col, r, &buf, celltext.Plain{}));
                 if (!overflow) {
                     try self.cells.append(s);
                 } else if (self.tail.items.len < tail_rows * self.ncols) {
@@ -490,41 +491,48 @@ pub const JsonWriter = struct {
         return self;
     }
 
-    pub fn writeBatch(self: *JsonWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        const out = &self.fw.interface;
-        var r: usize = 0;
-        while (r < batch.len) : (r += 1) {
+    pub fn writeBatch(self: *JsonWriter, _: std.mem.Allocator, batch: Batch) !void {
+        return writeRows(&self.fw.interface, self.keys, batch);
+    }
+
+    fn writeRows(out: *std.Io.Writer, keys: []const []const u8, batch: Batch) !void {
+        for (0..batch.len) |r| {
             try out.writeByte('{');
             for (batch.columns, 0..) |*col, c| {
                 if (c > 0) try out.writeByte(',');
-                try out.writeAll(self.keys[c]);
-                try writeJsonValue(out, arena, col.getValue(r));
+                try out.writeAll(keys[c]);
+                try celltext.write(out, col, r, JsonText{});
             }
             try out.writeAll("}\n");
         }
     }
 
-    fn writeJsonValue(out: *std.Io.Writer, arena: std.mem.Allocator, v: Value) !void {
-        switch (v) {
-            .null => try out.writeAll("null"),
-            .bool => |b| try out.writeAll(if (b) "true" else "false"),
-            .int => |i| try out.print("{d}", .{i}),
-            .float => |f| if (std.math.isFinite(f)) try out.print("{d}", .{f}) else try out.writeAll("null"),
-            .bytes => |b| {
-                const enc = std.base64.standard.Encoder;
-                const dst = try arena.alloc(u8, enc.calcSize(b.len));
-                try out.writeByte('"');
-                try out.writeAll(enc.encode(dst, b));
-                try out.writeByte('"');
-            },
-            else => {
-                const s = try eval.valueToString(arena, v);
-                try out.writeByte('"');
-                try writeEscapedW(out, s);
-                try out.writeByte('"');
-            },
+    /// The `celltext.write` policy for JSON: decimals and temporals ride as strings,
+    /// non-finite floats as null and bytes as base64.
+    const JsonText = struct {
+        pub const null_text = "null";
+        pub const bool_true = "true";
+        pub const bool_false = "false";
+        pub const quote_decimal = "\"";
+        pub const quote_temporal = "\"";
+
+        pub fn string(_: JsonText, out: *std.Io.Writer, s: []const u8) !void {
+            try out.writeByte('"');
+            try writeEscapedW(out, s);
+            try out.writeByte('"');
         }
-    }
+
+        pub fn bytes(_: JsonText, out: *std.Io.Writer, s: []const u8) !void {
+            try out.writeByte('"');
+            try std.base64.standard.Encoder.encodeWriter(out, s);
+            try out.writeByte('"');
+        }
+
+        pub fn float(_: JsonText, out: *std.Io.Writer, x: f64) !void {
+            if (std.math.isFinite(x)) return out.print("{d}", .{x});
+            return out.writeAll("null");
+        }
+    };
 
     pub fn close(self: *JsonWriter) !void {
         try self.fw.interface.flush();
@@ -623,6 +631,66 @@ test "renderFitted: types row, right-aligned numbers, NULL, cut cells, elided ro
     _ = it.next();
     _ = it.next();
     try std.testing.expectEqualStrings("  1  ana      a value that is much longer than forty …    10.5", it.next().?);
+}
+
+fn writeJsonValueReference(out: *std.Io.Writer, arena: std.mem.Allocator, v: Value) !void {
+    switch (v) {
+        .null => try out.writeAll("null"),
+        .bool => |b| try out.writeAll(if (b) "true" else "false"),
+        .int => |i| try out.print("{d}", .{i}),
+        .float => |f| if (std.math.isFinite(f)) try out.print("{d}", .{f}) else try out.writeAll("null"),
+        .bytes => |b| {
+            const enc = std.base64.standard.Encoder;
+            const dst = try arena.alloc(u8, enc.calcSize(b.len));
+            try out.writeByte('"');
+            try out.writeAll(enc.encode(dst, b));
+            try out.writeByte('"');
+        },
+        else => {
+            const s = try eval.valueToString(arena, v);
+            try out.writeByte('"');
+            try writeEscapedW(out, s);
+            try out.writeByte('"');
+        },
+    }
+}
+
+test "table and JSON cells match the per-value path over random batches of every type" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try celltext.testBatch(a, 0x7ab1e, 400);
+
+    const tw = try TableWriter.open(std.testing.allocator, batch.schema.*);
+    defer tw.deinit();
+    try tw.writeBatch(a, batch);
+    var i: usize = 0;
+    for (0..batch.len) |r| {
+        for (batch.columns) |*col| {
+            const v = col.getValue(r);
+            const got = tw.cells.items[i];
+            i += 1;
+            if (v.isNull()) {
+                try std.testing.expect(got == null);
+            } else try std.testing.expectEqualStrings(try eval.valueToString(a, v), got.?);
+        }
+    }
+
+    const keys = try a.alloc([]const u8, batch.columns.len);
+    for (keys, 0..) |*k, c| k.* = try std.fmt.allocPrint(a, "\"c{d}\":", .{c});
+    var want = std.Io.Writer.Allocating.init(a);
+    for (0..batch.len) |r| {
+        try want.writer.writeByte('{');
+        for (batch.columns, 0..) |*col, c| {
+            if (c > 0) try want.writer.writeByte(',');
+            try want.writer.writeAll(keys[c]);
+            try writeJsonValueReference(&want.writer, a, col.getValue(r));
+        }
+        try want.writer.writeAll("}\n");
+    }
+    var got = std.Io.Writer.Allocating.init(a);
+    try JsonWriter.writeRows(&got.writer, keys, batch);
+    try std.testing.expectEqualStrings(want.writer.buffered(), got.writer.buffered());
 }
 
 test "renderPlain spells a null NULL, so it is never read as an empty string" {

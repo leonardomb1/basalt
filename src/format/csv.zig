@@ -49,6 +49,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
+const celltext = @import("../exec/celltext.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
@@ -1488,40 +1489,22 @@ pub const CsvWriter = struct {
         self.writeRows(arena, batch) catch |e| return self.specific(e);
     }
 
-    fn writeRows(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        return self.renderRows(self.out(), arena, batch);
+    fn writeRows(self: *CsvWriter, _: std.mem.Allocator, batch: Batch) !void {
+        return self.renderRows(self.out(), batch);
     }
 
     /// Split from `writeRows` so a parallel lane renders into its own buffer and holds
     /// the shared sink's lock only for the append (`driver.Sink.VTable.renderBatch`).
-    fn renderRows(self: *CsvWriter, w: *std.Io.Writer, arena: std.mem.Allocator, batch: Batch) !void {
+    fn renderRows(self: *CsvWriter, w: *std.Io.Writer, batch: Batch) !void {
         const d = self.dialect.delim;
-        const quote_scalars = scalarCanNeedQuote(d);
-        var r: usize = 0;
-        while (r < batch.len) : (r += 1) {
-            for (batch.columns, 0..) |*col, i| {
-                if (i > 0) try w.writeByte(d);
-                switch (col.ty.kind) {
-                    .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
-                    else => {
-                        if (!col.validity.get(r)) continue;
-                        const v = col.getValue(r);
-                        if (quote_scalars) {
-                            try writeField(w, try eval.valueToString(arena, v), d);
-                        } else {
-                            try eval.writeValue(w, v);
-                        }
-                    },
-                }
-            }
-            try w.writeByte('\n');
-        }
+        if (scalarCanNeedQuote(d)) return renderCells(w, batch, CsvText(true){ .delim = d });
+        return renderCells(w, batch, CsvText(false){ .delim = d });
     }
 
     pub fn renderBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(arena);
         try aw.ensureUnusedCapacity(batch.len * 64 + 64);
-        self.renderRows(&aw.writer, arena, batch) catch |e| return self.specific(e);
+        self.renderRows(&aw.writer, batch) catch |e| return self.specific(e);
         return aw.writer.buffered();
     }
 
@@ -1578,6 +1561,34 @@ const sink_vtable = driver.sinkVTable(CsvWriter);
 
 /// Numbers and timestamps render with only digits and `+-.:eE `, so under an
 /// ordinary delimiter they skip the quote scan; a `.` or `-` delimiter cannot.
+fn renderCells(w: *std.Io.Writer, batch: Batch, p: anytype) !void {
+    for (0..batch.len) |r| {
+        for (batch.columns, 0..) |*col, i| {
+            if (i > 0) try w.writeByte(p.delim);
+            try celltext.write(w, col, r, p);
+        }
+        try w.writeByte('\n');
+    }
+}
+
+/// The `celltext.write` policy for CSV: null is empty and a field is quoted as
+/// `writeField` decides; with a delimiter a number, date or boolean can hold,
+/// every field's text goes through that decision.
+fn CsvText(comptime quote_scalars: bool) type {
+    return struct {
+        delim: u8,
+
+        pub const null_text = "";
+        pub const bool_true = "true";
+        pub const bool_false = "false";
+        pub const escape_scalars = quote_scalars;
+
+        pub fn string(self: @This(), w: *std.Io.Writer, s: []const u8) !void {
+            return writeField(w, s, self.delim);
+        }
+    };
+}
+
 fn scalarCanNeedQuote(delim: u8) bool {
     return switch (delim) {
         '0'...'9', '+', '-', '.', ':', 'e', 'E', ' ', '"', '\n', '\r' => true,
@@ -2523,6 +2534,42 @@ test "csv writer: renderBatch produces exactly what writeBatch writes" {
     try std.testing.expectEqualStrings("1,2.5,ok\n-7,,\n0,-0.125,\"has,comma\"\n", bytes);
 
     try std.testing.expect(ws.sink().canRender());
+}
+
+fn renderRowsReference(w: *std.Io.Writer, arena: std.mem.Allocator, batch: Batch, d: u8) !void {
+    const quote_scalars = scalarCanNeedQuote(d);
+    var r: usize = 0;
+    while (r < batch.len) : (r += 1) {
+        for (batch.columns, 0..) |*col, i| {
+            if (i > 0) try w.writeByte(d);
+            switch (col.ty.kind) {
+                .string, .bytes => if (col.validity.get(r)) try writeField(w, col.data.bytes.at(r), d),
+                else => {
+                    if (!col.validity.get(r)) continue;
+                    const v = col.getValue(r);
+                    if (quote_scalars) {
+                        try writeField(w, try eval.valueToString(arena, v), d);
+                    } else {
+                        try eval.writeValue(w, v);
+                    }
+                },
+            }
+        }
+        try w.writeByte('\n');
+    }
+}
+
+test "csv writer: rows match the per-value path over random batches of every type, for every kind of delimiter" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try celltext.testBatch(a, 0xc5f, 500);
+    for ([_]u8{ ',', ';', '\t', '|', ':', '.', '-', 'e', '0', ' ' }) |d| {
+        var want = std.Io.Writer.Allocating.init(a);
+        try renderRowsReference(&want.writer, a, batch, d);
+        var w = CsvWriter{ .backend = .{ .file = std.fs.File.stdout() }, .owns_file = false, .dialect = .{ .delim = d } };
+        try std.testing.expectEqualStrings(want.writer.buffered(), try w.renderBatch(a, batch));
+    }
 }
 
 test "scalarCanNeedQuote: only a delimiter a number could contain forces the scan" {

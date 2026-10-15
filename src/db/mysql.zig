@@ -495,8 +495,8 @@ const LoadDataProto = struct {
         return std.fmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
     }
 
-    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-        try sql.appendBulkText(w, arena, batch, .{ .bool_true = "1", .bool_false = "0" });
+    pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {
+        try sql.appendBulkText(w, batch, .{ .bool_true = "1", .bool_false = "0" });
     }
 
     pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {
