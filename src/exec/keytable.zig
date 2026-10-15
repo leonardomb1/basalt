@@ -150,7 +150,7 @@ pub const RecBlocks = struct {
         return @as(usize, 1) << @intCast(first_shift + @max(b, 1) - 1);
     }
 
-    fn base(self: RecBlocks, i: usize) [*]u8 {
+    pub fn base(self: RecBlocks, i: usize) [*]u8 {
         const l = locate(i);
         return self.blocks.items[l.b].ptr + l.off * self.rec_size;
     }
@@ -240,6 +240,14 @@ pub const GroupTable = struct {
 
     pub fn prefetch(self: *const GroupTable, h: u64) void {
         @prefetch(&self.entries[h & self.mask], .{ .rw = .read, .locality = 3 });
+    }
+
+    /// Prefetches the record `h`'s first slot points to, when its salt matches: a
+    /// second stage behind `prefetch`, once the slot itself is likely in cache.
+    pub fn prefetchRecord(self: *const GroupTable, h: u64, store: anytype) void {
+        const e = self.entries[h & self.mask];
+        if (e == 0 or (e >> idx_bits) != saltOf(h)) return;
+        @prefetch(store.recs.base((e & max_groups) - 1), .{ .rw = .read, .locality = 3 });
     }
 
     /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt` is left

@@ -542,6 +542,7 @@ pub const JoinIndex = struct {
             var i = rows_.len;
             while (i > 0) {
                 i -= 1;
+                if (i >= keytable.prefetch_ahead) pt.table.prefetch(b.hashes[rows_[i - keytable.prefetch_ahead]]);
                 const r = rows_[i];
                 const h = b.hashes[r];
                 if (b.enc) |e| {
@@ -624,6 +625,11 @@ pub const JoinIndex = struct {
 
     pub fn prefetch(self: *const JoinIndex, h: u64) void {
         self.partOfHash(h).table.prefetch(h);
+    }
+
+    pub fn prefetchRecord(self: *const JoinIndex, h: u64) void {
+        const pt = self.partOfHash(h);
+        if (self.fixed) pt.table.prefetchRecord(h, pt.fixed) else pt.table.prefetchRecord(h, pt.boxed);
     }
 
     /// The first build row whose keys equal probe row `r`'s, or null; walk the rest
@@ -1180,11 +1186,12 @@ pub const Join = struct {
         return p;
     }
 
-    /// Row `r`'s chain looked up, the rows 8 ahead prefetched.
+    /// Row `r`'s chain looked up: the slot of the row 16 ahead prefetched, and the
+    /// record of the row 8 ahead.
     fn startRow(_: *Join, ix: *JoinIndex, p: *Pending) void {
         const r = p.r;
-        const ahead = 8;
-        if (r + ahead < p.lb.len and !p.probe.miss[r + ahead]) ix.prefetch(p.probe.hashes[r + ahead]);
+        if (r + 16 < p.lb.len and !p.probe.miss[r + 16]) ix.prefetch(p.probe.hashes[r + 16]);
+        if (r + 8 < p.lb.len and !p.probe.miss[r + 8]) ix.prefetchRecord(p.probe.hashes[r + 8]);
         p.cur = ix.first(p.probe, r);
         p.hit = p.cur != null;
         p.started = true;
