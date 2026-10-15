@@ -585,37 +585,23 @@ fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Ve
 fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column) VecError!Vec {
     const n = take.len;
     var bm = try Bitmap.initFull(arena, n);
-    const data: Column.Data = switch (t.data) {
-        .b => |ts| blk: {
-            const o = try arena.alloc(bool, n);
-            mergePick(bool, o, &bm, take, ts, e.data.b, t.validity, e.validity);
-            break :blk .{ .b = o };
-        },
-        .i32 => |ts| blk: {
-            const o = try arena.alloc(i32, n);
-            mergePick(i32, o, &bm, take, ts, e.data.i32, t.validity, e.validity);
-            break :blk .{ .i32 = o };
-        },
-        .i64 => |ts| blk: {
-            const o = try arena.alloc(i64, n);
-            mergePick(i64, o, &bm, take, ts, e.data.i64, t.validity, e.validity);
-            break :blk .{ .i64 = o };
-        },
-        .f64 => |ts| blk: {
-            const o = try arena.alloc(f64, n);
-            mergePick(f64, o, &bm, take, ts, e.data.f64, t.validity, e.validity);
-            break :blk .{ .f64 = o };
-        },
-        .dec => |ts| blk: {
-            const o = try arena.alloc(Decimal, n);
-            mergePick(Decimal, o, &bm, take, ts, e.data.dec, t.validity, e.validity);
-            break :blk .{ .dec = o };
-        },
-        .bytes => |ts| blk: {
-            break :blk .{ .bytes = try mergeBytes(arena, &bm, take, ts, e.data.bytes, t.validity, e.validity) };
-        },
+    const Op = struct {
+        arena: std.mem.Allocator,
+        take: []const bool,
+        t: Column,
+        e: Column,
+        bm: *Bitmap,
+        pub fn fixed(o: @This(), comptime tag: column.Tag) ![]column.Elem(tag) {
+            const out = try o.arena.alloc(column.Elem(tag), o.take.len);
+            mergePick(column.Elem(tag), out, o.bm, o.take, @field(o.t.data, @tagName(tag)), @field(o.e.data, @tagName(tag)), o.t.validity, o.e.validity);
+            return out;
+        }
+        pub fn bytes(o: @This()) !column.Bytes {
+            return mergeBytes(o.arena, o.bm, o.take, o.t.data.bytes, o.e.data.bytes, o.t.validity, o.e.validity);
+        }
     };
-    return .{ .col = .{ .ty = t.ty.withNull(true), .len = n, .validity = bm, .data = data } };
+    const data = try column.mapTag(t.data, Op{ .arena = arena, .take = take, .t = t, .e = e, .bm = &bm });
+    return .{ .col = Column.derived(t.ty.withNull(true), n, bm, data) };
 }
 
 fn mergeBytes(arena: std.mem.Allocator, bm: *Bitmap, take: []const bool, ts: column.Bytes, es: column.Bytes, tv: Bitmap, ev: Bitmap) !column.Bytes {

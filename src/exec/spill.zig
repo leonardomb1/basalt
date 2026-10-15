@@ -29,7 +29,7 @@ const Space = space_mod.Space;
 const Batch = @import("batch.zig").Batch;
 const Column = column.Column;
 const Bitmap = column.Bitmap;
-const Tag = std.meta.Tag(Column.Data);
+const Tag = column.Tag;
 
 const ALIGN = 16;
 const MAGIC = "BSPILL\x00\x01";
@@ -45,12 +45,8 @@ fn pad(n: u64) u64 {
 
 fn elemSize(tag: Tag) u64 {
     return switch (tag) {
-        .b => @sizeOf(bool),
-        .i32 => @sizeOf(i32),
-        .i64 => @sizeOf(i64),
-        .f64 => @sizeOf(f64),
-        .dec => @sizeOf(value.Decimal),
         .bytes => @sizeOf(i32),
+        inline else => |t| @sizeOf(column.Elem(t)),
     };
 }
 
@@ -256,17 +252,19 @@ pub const Reader = struct {
         const cols = try arena.alloc(Column, fields.len);
         for (cols, fields, tags, vlens) |*c, f, t, vlen| {
             const bits = try self.take((rows + 7) / 8);
-            const data: Column.Data = switch (t) {
-                .b => .{ .b = try self.takeSlice(bool, rows) },
-                .i32 => .{ .i32 = try self.takeSlice(i32, rows) },
-                .i64 => .{ .i64 = try self.takeSlice(i64, rows) },
-                .f64 => .{ .f64 = try self.takeSlice(f64, rows) },
-                .dec => .{ .dec = try self.takeSlice(value.Decimal, rows) },
-                .bytes => .{ .bytes = .{
-                    .offsets = try self.takeSlice(i32, rows + 1),
-                    .values = try self.take(vlen),
-                } },
+            const Op = struct {
+                r: *Reader,
+                rows: u64,
+                vlen: u64,
+                pub fn fixed(o: @This(), comptime tag: Tag) ![]column.Elem(tag) {
+                    return o.r.takeSlice(column.Elem(tag), o.rows);
+                }
+                pub fn bytes(o: @This()) !column.Bytes {
+                    const offsets = try o.r.takeSlice(i32, o.rows + 1);
+                    return .{ .offsets = offsets, .values = try o.r.take(o.vlen) };
+                }
             };
+            const data = try column.mapTag(t, Op{ .r = self, .rows = rows, .vlen = vlen });
             c.* = .{
                 .ty = f.ty,
                 .len = @intCast(rows),

@@ -50,13 +50,11 @@ pub fn castValue(arena: std.mem.Allocator, func: ast.AggFunc, to: types.Type, v:
 /// The physical type a column of `kind` holds, or null for one read only as values.
 pub fn Phys(comptime kind: types.TypeKind) ?type {
     return switch (kind) {
-        .int, .time, .timestamp => i64,
-        .date => i32,
-        .float => f64,
-        .decimal => Decimal,
-        .bool => bool,
-        .string, .bytes => []const u8,
         .array, .@"struct" => null,
+        else => switch (column.storageOf(kind)) {
+            .bytes => []const u8,
+            inline else => |t| column.Elem(t),
+        },
     };
 }
 

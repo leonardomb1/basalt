@@ -186,69 +186,73 @@ fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept:
 
 pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usize) !Column {
     const bm = try gatherValidity(arena, c.validity, keep, kept);
-    const data: Column.Data = switch (c.data) {
-        .b => |s| .{ .b = try gatherSlice(bool, arena, s, keep, kept) },
-        .i32 => |s| .{ .i32 = try gatherSlice(i32, arena, s, keep, kept) },
-        .i64 => |s| .{ .i64 = try gatherSlice(i64, arena, s, keep, kept) },
-        .f64 => |s| .{ .f64 = try gatherSlice(f64, arena, s, keep, kept) },
-        .dec => |s| .{ .dec = try gatherSlice(value.Decimal, arena, s, keep, kept) },
-        .bytes => |s| .{ .bytes = try s.take(arena, try keptIndices(arena, keep, kept)) },
+    const Op = struct {
+        arena: std.mem.Allocator,
+        c: Column,
+        keep: []const bool,
+        kept: usize,
+        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            return gatherSlice(Elem(t), o.arena, @field(o.c.data, @tagName(t)), o.keep, o.kept);
+        }
+        fn bytes(o: @This()) !Bytes {
+            return o.c.data.bytes.take(o.arena, try keptIndices(o.arena, o.keep, o.kept));
+        }
     };
-    return .{ .ty = c.ty, .len = kept, .validity = bm, .data = data };
+    return Column.derived(c.ty, kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .keep = keep, .kept = kept }));
+}
+
+/// The validity of `chunks` laid end to end.
+fn concatValidity(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bitmap {
+    var bm = try Bitmap.initFull(arena, total);
+    var off: usize = 0;
+    for (chunks) |c| {
+        if (!c.validity.allSet(c.len)) {
+            for (0..c.len) |i| if (!c.validity.get(i)) bm.setValid(off + i, false);
+        }
+        off += c.len;
+    }
+    return bm;
 }
 
 pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Column {
     std.debug.assert(chunks.len > 0);
-    var bm = try Bitmap.initFull(arena, total);
-    {
-        var off: usize = 0;
-        for (chunks) |c| {
-            if (!c.validity.allSet(c.len)) {
-                var i: usize = 0;
-                while (i < c.len) : (i += 1) {
-                    if (!c.validity.get(i)) bm.setValid(off + i, false);
-                }
+    const bm = try concatValidity(arena, chunks, total);
+    const Op = struct {
+        arena: std.mem.Allocator,
+        chunks: []const Column,
+        total: usize,
+        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            const out = try o.arena.alloc(Elem(t), o.total);
+            var off: usize = 0;
+            for (o.chunks) |c| {
+                @memcpy(out[off..][0..c.len], @field(c.data, @tagName(t))[0..c.len]);
+                off += c.len;
             }
-            off += c.len;
+            return out;
         }
-    }
-    const data: Column.Data = switch (chunks[0].data) {
-        .b => .{ .b = try concatSlices("b", bool, arena, chunks, total) },
-        .i32 => .{ .i32 = try concatSlices("i32", i32, arena, chunks, total) },
-        .i64 => .{ .i64 = try concatSlices("i64", i64, arena, chunks, total) },
-        .f64 => .{ .f64 = try concatSlices("f64", f64, arena, chunks, total) },
-        .dec => .{ .dec = try concatSlices("dec", value.Decimal, arena, chunks, total) },
-        .bytes => .{ .bytes = try concatBytes(arena, chunks, total) },
+        fn bytes(o: @This()) !Bytes {
+            return concatBytes(o.arena, o.chunks, o.total);
+        }
     };
-    return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = data };
+    return Column.derived(chunks[0].ty, total, bm, try mapTag(chunks[0].data, Op{ .arena = arena, .chunks = chunks, .total = total }));
 }
 
 /// `concat` copying the chunks on up to `threads` threads, each chunk to its place;
 /// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
 pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: usize, threads: usize) !Column {
     if (threads < 2 or chunks.len < 2 or total < 1 << 17) return concat(arena, chunks, total);
-    var bm = try Bitmap.initFull(arena, total);
+    const bm = try concatValidity(arena, chunks, total);
     const rows = try arena.alloc(usize, chunks.len);
     const bytes = try arena.alloc(usize, chunks.len);
     var off: usize = 0;
     var span: usize = 0;
     for (chunks, rows, bytes) |c, *r, *b| {
-        if (!c.validity.allSet(c.len)) {
-            for (0..c.len) |i| if (!c.validity.get(i)) bm.setValid(off + i, false);
-        }
         r.* = off;
         b.* = span;
         off += c.len;
         if (c.data == .bytes) span += @as(usize, @intCast(c.data.bytes.offsets[c.len])) - @as(usize, @intCast(c.data.bytes.offsets[0]));
     }
-    const out: Column.Data = switch (chunks[0].data) {
-        .bytes => blk: {
-            const offsets = try arena.alloc(i32, total + 1);
-            offsets[0] = 0;
-            break :blk .{ .bytes = .{ .offsets = offsets, .values = try arena.alloc(u8, span) } };
-        },
-        inline else => |s, tag| @unionInit(Column.Data, @tagName(tag), try arena.alloc(@typeInfo(@TypeOf(s)).pointer.child, total)),
-    };
+    const out = try allocData(arena, chunks[0].data, total, span);
     const Copy = struct {
         chunks: []const Column,
         rows: []const usize,
@@ -271,7 +275,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
         }
     };
     par.each(threads, chunks.len, &Copy{ .chunks = chunks, .rows = rows, .bytes = bytes, .out = out }, Copy.f);
-    return .{ .ty = chunks[0].ty, .len = total, .validity = bm, .data = out };
+    return Column.derived(chunks[0].ty, total, bm, out);
 }
 
 fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
@@ -301,16 +305,6 @@ fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !
     return .{ .offsets = offsets, .values = values };
 }
 
-fn concatSlices(comptime tag: []const u8, comptime T: type, arena: std.mem.Allocator, chunks: []const Column, total: usize) ![]T {
-    const out = try arena.alloc(T, total);
-    var off: usize = 0;
-    for (chunks) |c| {
-        @memcpy(out[off..][0..c.len], @field(c.data, tag)[0..c.len]);
-        off += c.len;
-    }
-    return out;
-}
-
 pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column {
     var bm = try Bitmap.initFull(arena, idx.len);
     if (!c.validity.allSet(c.len)) {
@@ -318,15 +312,21 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
             if (!c.validity.get(r)) bm.setValid(i, false);
         }
     }
-    const data: Column.Data = switch (c.data) {
-        .b => |s| .{ .b = try permuteSlice(bool, arena, s, idx) },
-        .i32 => |s| .{ .i32 = try permuteSlice(i32, arena, s, idx) },
-        .i64 => |s| .{ .i64 = try permuteSlice(i64, arena, s, idx) },
-        .f64 => |s| .{ .f64 = try permuteSlice(f64, arena, s, idx) },
-        .dec => |s| .{ .dec = try permuteSlice(value.Decimal, arena, s, idx) },
-        .bytes => |s| .{ .bytes = try s.take(arena, idx) },
+    const Op = struct {
+        arena: std.mem.Allocator,
+        c: Column,
+        idx: []const usize,
+        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            const src = @field(o.c.data, @tagName(t));
+            const out = try o.arena.alloc(Elem(t), o.idx.len);
+            for (o.idx, 0..) |r, i| out[i] = src[r];
+            return out;
+        }
+        fn bytes(o: @This()) !Bytes {
+            return o.c.data.bytes.take(o.arena, o.idx);
+        }
     };
-    return .{ .ty = c.ty, .len = idx.len, .validity = bm, .data = data };
+    return Column.derived(c.ty, idx.len, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .idx = idx }));
 }
 
 /// `permute` on up to `threads` threads for a large `idx`, in chunks of rows: each
@@ -338,30 +338,25 @@ pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, t
     if (threads < 2 or nc < 2) return permute(arena, c, idx);
     var bm = try Bitmap.initFull(arena, n);
     const starts = try arena.alloc(usize, nc);
-    const out: Column.Data = switch (c.data) {
-        .bytes => |b| blk: {
-            const Span = struct {
-                b: Bytes,
-                idx: []const usize,
-                starts: []usize,
-                fn f(x: *const @This(), i: usize) void {
-                    const r = par.bounds(x.idx.len, x.starts.len, i);
-                    x.starts[i] = x.b.spanOf(x.idx[r[0]..r[1]]);
-                }
-            };
-            par.each(threads, nc, &Span{ .b = b, .idx = idx, .starts = starts }, Span.f);
-            var total: usize = 0;
-            for (starts) |*st| {
-                const len = st.*;
-                st.* = total;
-                total += len;
+    var span: usize = 0;
+    if (c.data == .bytes) {
+        const Span = struct {
+            b: Bytes,
+            idx: []const usize,
+            starts: []usize,
+            fn f(x: *const @This(), i: usize) void {
+                const r = par.bounds(x.idx.len, x.starts.len, i);
+                x.starts[i] = x.b.spanOf(x.idx[r[0]..r[1]]);
             }
-            const offsets = try arena.alloc(i32, n + 1);
-            offsets[0] = 0;
-            break :blk .{ .bytes = .{ .offsets = offsets, .values = try arena.alloc(u8, total) } };
-        },
-        inline else => |s, tag| @unionInit(Column.Data, @tagName(tag), try arena.alloc(@typeInfo(@TypeOf(s)).pointer.child, n)),
-    };
+        };
+        par.each(threads, nc, &Span{ .b = c.data.bytes, .idx = idx, .starts = starts }, Span.f);
+        for (starts) |*st| {
+            const len = st.*;
+            st.* = span;
+            span += len;
+        }
+    }
+    const out = try allocData(arena, c.data, n, span);
     const Gather = struct {
         c: Column,
         idx: []const usize,
@@ -395,13 +390,56 @@ pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, t
     };
     const g = Gather{ .c = c, .idx = idx, .out = out, .bm = &bm, .starts = starts, .nulls = !c.validity.allSet(c.len) };
     par.each(threads, nc, &g, Gather.f);
-    return .{ .ty = c.ty, .len = n, .validity = bm, .data = out };
+    return Column.derived(c.ty, n, bm, out);
 }
 
-fn permuteSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, idx: []const usize) ![]T {
-    const out = try arena.alloc(T, idx.len);
-    for (idx, 0..) |r, i| out[i] = src[r];
-    return out;
+pub const Tag = std.meta.Tag(Column.Data);
+
+/// The storage a column of `kind` holds: the one kind-to-storage mapping, which
+/// `Builder`, `Column.getValue` and the aggregate kernels derive theirs from.
+pub fn storageOf(kind: types.TypeKind) Tag {
+    return switch (kind) {
+        .bool => .b,
+        .date => .i32,
+        .int, .time, .timestamp => .i64,
+        .float => .f64,
+        .decimal => .dec,
+        .string, .bytes, .array, .@"struct" => .bytes,
+    };
+}
+
+/// The element type of a fixed-width storage.
+pub fn Elem(comptime t: Tag) type {
+    return std.meta.Elem(@FieldType(Column.Data, @tagName(t)));
+}
+
+/// A `Data` of storage `tag`, from `op.fixed(t)` for a fixed-width one and
+/// `op.bytes()` for bytes: the per-storage dispatch every column copy, merge and
+/// spill read goes through, so none can miss a storage.
+pub fn mapTag(tag: Tag, op: anytype) !Column.Data {
+    return switch (tag) {
+        .bytes => .{ .bytes = try op.bytes() },
+        inline else => |t| @unionInit(Column.Data, @tagName(t), try op.fixed(t)),
+    };
+}
+
+/// Unfilled buffers for `n` rows of storage `tag`; a bytes one gets `span` value
+/// bytes and `n + 1` offsets, the first set to 0.
+pub fn allocData(arena: std.mem.Allocator, tag: Tag, n: usize, span: usize) !Column.Data {
+    const Op = struct {
+        arena: std.mem.Allocator,
+        n: usize,
+        span: usize,
+        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            return o.arena.alloc(Elem(t), o.n);
+        }
+        fn bytes(o: @This()) !Bytes {
+            const offsets = try o.arena.alloc(i32, o.n + 1);
+            offsets[0] = 0;
+            return .{ .offsets = offsets, .values = try o.arena.alloc(u8, o.span) };
+        }
+    };
+    return mapTag(tag, Op{ .arena = arena, .n = n, .span = span });
 }
 
 pub const Column = struct {
@@ -425,17 +463,18 @@ pub const Column = struct {
     pub fn getValue(self: Column, i: usize) Value {
         if (!self.validity.get(i)) return .null;
         return switch (self.ty.kind) {
-            .bool => .{ .bool = self.data.b[i] },
-            .int => .{ .int = self.data.i64[i] },
-            .float => .{ .float = self.data.f64[i] },
-            .decimal => .{ .decimal = self.data.dec[i] },
-            .string => .{ .string = self.data.bytes.at(i) },
-            .bytes => .{ .bytes = self.data.bytes.at(i) },
-            .date => .{ .date = self.data.i32[i] },
-            .time => .{ .time = self.data.i64[i] },
-            .timestamp => .{ .timestamp = self.data.i64[i] },
             .array, .@"struct" => .null,
+            inline else => |k| blk: {
+                const t = comptime storageOf(k);
+                break :blk @unionInit(Value, @tagName(k), if (t == .bytes) self.data.bytes.at(i) else @field(self.data, @tagName(t))[i]);
+            },
         };
+    }
+
+    /// A column built from other columns' rows: it owns its buffers, so it carries
+    /// no dictionary, whatever its sources had.
+    pub fn derived(ty: types.Type, len: usize, validity: Bitmap, data: Data) Column {
+        return .{ .ty = ty, .len = len, .validity = validity, .data = data, .dict = null };
     }
 };
 
@@ -454,7 +493,7 @@ pub const Builder = struct {
         ends: std.array_list.Managed(i32),
     };
 
-    pub const Store = union(enum) {
+    pub const Store = union(Tag) {
         b: std.array_list.Managed(bool),
         i32: std.array_list.Managed(i32),
         i64: std.array_list.Managed(i64),
@@ -468,13 +507,9 @@ pub const Builder = struct {
             .values = std.array_list.Managed(u8).init(arena),
             .ends = std.array_list.Managed(i32).init(arena),
         } };
-        const store: Store = switch (ty.kind) {
-            .bool => .{ .b = std.array_list.Managed(bool).init(arena) },
-            .date => .{ .i32 = std.array_list.Managed(i32).init(arena) },
-            .int, .time, .timestamp => .{ .i64 = std.array_list.Managed(i64).init(arena) },
-            .float => .{ .f64 = std.array_list.Managed(f64).init(arena) },
-            .decimal => .{ .dec = std.array_list.Managed(value.Decimal).init(arena) },
-            .string, .bytes, .array, .@"struct" => bytes_store,
+        const store: Store = switch (storageOf(ty.kind)) {
+            .bytes => bytes_store,
+            inline else => |t| @unionInit(Store, @tagName(t), std.array_list.Managed(Elem(t)).init(arena)),
         };
         return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store };
     }
@@ -514,7 +549,7 @@ pub const Builder = struct {
 
     pub fn appendBulk(self: *Builder, comptime T: type, vals: []const T) !void {
         switch (self.store) {
-            inline .b, .i32, .i64, .f64, .dec => |*l| {
+            inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 try l.appendSlice(vals);
             },
@@ -527,7 +562,7 @@ pub const Builder = struct {
     /// counted, all valid, by `commitSlots`; skips the copy a temporary would cost.
     pub fn reserveSlots(self: *Builder, comptime T: type, n: usize) ![]T {
         switch (self.store) {
-            inline .b, .i32, .i64, .f64, .dec => |*l| {
+            inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 try l.ensureUnusedCapacity(n);
                 return l.unusedCapacitySlice()[0..n];
@@ -538,7 +573,7 @@ pub const Builder = struct {
 
     pub fn commitSlots(self: *Builder, comptime T: type, n: usize) !void {
         switch (self.store) {
-            inline .b, .i32, .i64, .f64, .dec => |*l| {
+            inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 l.items.len += n;
             },
@@ -589,7 +624,7 @@ pub const Builder = struct {
     ) !void {
         if (defs.len == vals.len) return self.appendBulk(T, vals);
         switch (self.store) {
-            inline .b, .i32, .i64, .f64, .dec => |*l| {
+            inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 try l.ensureUnusedCapacity(defs.len);
                 try self.bits.ensureTotalCapacity((self.rows + defs.len + 7) / 8);
@@ -709,17 +744,13 @@ pub const Builder = struct {
         const n = self.rows;
         const bm = Bitmap{ .bits = try self.bits.toOwnedSlice(), .len = n };
         const data: Column.Data = switch (self.store) {
-            .b => |*l| .{ .b = try l.toOwnedSlice() },
-            .i32 => |*l| .{ .i32 = try l.toOwnedSlice() },
-            .i64 => |*l| .{ .i64 = try l.toOwnedSlice() },
-            .f64 => |*l| .{ .f64 = try l.toOwnedSlice() },
-            .dec => |*l| .{ .dec = try l.toOwnedSlice() },
             .bytes => |*l| blk: {
                 const offsets = try self.arena.alloc(i32, n + 1);
                 offsets[0] = 0;
                 @memcpy(offsets[1..], l.ends.items);
                 break :blk .{ .bytes = .{ .offsets = offsets, .values = try l.values.toOwnedSlice() } };
             },
+            inline else => |*l, t| @unionInit(Column.Data, @tagName(t), try l.toOwnedSlice()),
         };
         var dict: ?*const Column.Dict = null;
         if (self.dict_vals) |vals| if (self.dict_codes.items.len == n) {
