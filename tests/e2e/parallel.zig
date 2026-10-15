@@ -299,6 +299,30 @@ test "parallel CSV distinct (threads>1): dedups across chunks" {
     try std.testing.expectEqualStrings("g\na\nb\nc\n", out);
 }
 
+test "parallel CSV distinct: the first row per key by file position, in file order, as one lane gives" {
+    const alloc = std.testing.allocator;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,k,s,f\n");
+    for (0..6000) |i| try input.writer().print("{d},{d},k{d},{s}\n", .{ i, (i * 7919) % 613, (i * 31) % 97, if (i % 5 == 0) "-0.0" else if (i % 5 == 1) "0.0" else "1.5" });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{
+        "SELECT DISTINCT ON (k) k, id FROM '$IN'",
+        "SELECT DISTINCT ON (s, k) s, k, id FROM '$IN'",
+        "SELECT DISTINCT s, f FROM '$IN'",
+    }) |q| {
+        const one = try runCsvThreaded(alloc, &tmp, input.items, q, 1);
+        defer alloc.free(one);
+        const four = try runCsvThreaded(alloc, &tmp, input.items, q, 4);
+        defer alloc.free(four);
+        try std.testing.expectEqualStrings(one, four);
+    }
+    const first = try runCsvThreaded(alloc, &tmp, input.items, "SELECT DISTINCT ON (k) k, id FROM '$IN' WHERE k = 0", 4);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("k,id\n0,0\n", first);
+}
+
 test "parallel CSV Top-N: sort | limit (threads>1)" {
     const alloc = std.testing.allocator;
     const input = "id,v\n1,10\n2,40\n3,20\n4,50\n5,30\n";
