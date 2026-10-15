@@ -4,17 +4,15 @@
 
 const Error = @import("read.zig").Error;
 const Leaf = @import("schema.zig").Leaf;
-const PlainCursor = @import("encoding.zig").PlainCursor;
+const plainValue = @import("chunk.zig").plainValue;
 const Reader = @import("read.zig").Reader;
 const Threshold = @import("../../exec/value.zig").Threshold;
 const Value = @import("../../exec/value.zig").Value;
 const basaltType = @import("logical.zig").basaltType;
-const coerce = @import("logical.zig").coerce;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
-const temporalScale = @import("logical.zig").temporalScale;
 const unsignedBits = @import("logical.zig").unsignedBits;
 const asUnsigned = @import("logical.zig").asUnsigned;
 const types = @import("../../lang/types.zig");
@@ -195,14 +193,12 @@ pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
 fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]const u8) ?Value {
     const b = raw orelse return null;
     if (meta.ty == .int96) return null;
-    const ty = basaltType(elem) catch return null;
-    var cur = PlainCursor.init(meta.ty, elem.type_length orelse 0, b);
-    const v = cur.next() catch return null;
-    if (ty.kind == .int and v == .int) if (unsignedBits(elem)) |bits| {
+    const v = plainValue(elem, meta.ty, b) catch return null;
+    if (v == .int) if (unsignedBits(elem)) |bits| {
         if (meta.stats.legacy) return null;
         return .{ .int = asUnsigned(bits, v.int) orelse return null };
     };
-    return coerce(ty, v, temporalScale(elem));
+    return v;
 }
 
 /// Null means unknown and the caller must keep the group. It once returned `.eq`

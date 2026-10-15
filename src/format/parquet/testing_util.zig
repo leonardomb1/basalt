@@ -2,8 +2,8 @@
 
 pub const fx = @embedFile("../testdata/zstd.parquet");
 const Entries = @import("chunk.zig").Entries;
-const PlainCursor = @import("encoding.zig").PlainCursor;
 const Reader = @import("read.zig").Reader;
+const plainValue = @import("chunk.zig").plainValue;
 const Value = @import("../../exec/value.zig").Value;
 const decodeByteStreamSplit = @import("encoding.zig").decodeByteStreamSplit;
 const decodeDeltaBinaryPacked = @import("encoding.zig").decodeDeltaBinaryPacked;
@@ -42,11 +42,7 @@ pub fn fuzzKernels(_: void, input: []const u8) anyerror!void {
     _ = decodeByteStreamSplit(a, src, @max(1, @as(usize, width6 % 17)), count) catch {};
 
     inline for (.{ .boolean, .int32, .int64, .int96, .float, .double, .byte_array, .fixed_len_byte_array }) |pt| {
-        var cur = PlainCursor.init(pt, @intCast(width6), src);
-        var n: usize = 0;
-        while (n < count) : (n += 1) {
-            _ = cur.next() catch break;
-        }
+        _ = plainValue(.{ .ty = pt, .type_length = width6, .converted_type = input[1] & 0x1F }, pt, src) catch {};
     }
 }
 

@@ -1,8 +1,7 @@
-//! Parquet's page value encodings: the RLE/bit-packed hybrid, PLAIN, the three
-//! DELTA forms and BYTE_STREAM_SPLIT.
+//! Parquet's page value encodings: the RLE/bit-packed hybrid, the three DELTA
+//! forms and BYTE_STREAM_SPLIT. PLAIN values are read in place by chunk.zig's kernel.
 
 const Error = @import("read.zig").Error;
-const Value = @import("../../exec/value.zig").Value;
 const parquet = @import("footer.zig");
 const std = @import("std");
 const testing = std.testing;
@@ -121,71 +120,6 @@ fn readVarint(src: []const u8, pos: *usize) Error!u64 {
         shift = std.math.add(u6, shift, 7) catch return Error.CorruptParquetPage;
     }
 }
-
-pub const PlainCursor = struct {
-    src: []const u8,
-    pos: usize = 0,
-    ty: parquet.PhysicalType,
-    type_length: usize = 0,
-    bits: BitReader = .{ .buf = &.{} },
-
-    pub fn init(ty: parquet.PhysicalType, type_length: i32, src: []const u8) PlainCursor {
-        return .{
-            .src = src,
-            .ty = ty,
-            .type_length = if (type_length > 0) @intCast(type_length) else 0,
-            .bits = .{ .buf = src },
-        };
-    }
-
-    pub fn next(self: *PlainCursor) Error!Value {
-        switch (self.ty) {
-            .boolean => return .{ .bool = (try self.bits.read(1)) != 0 },
-            .int32 => return .{ .int = try self.readInt(i32) },
-            .int64 => return .{ .int = try self.readInt(i64) },
-            .float => {
-                const raw = try self.takeInt(u32);
-                return .{ .float = @floatCast(@as(f32, @bitCast(raw))) };
-            },
-            .double => {
-                const raw = try self.takeInt(u64);
-                return .{ .float = @bitCast(raw) };
-            },
-            .byte_array => {
-                const n: usize = @intCast(try self.takeInt(u32));
-                const b = try self.take(n);
-                return .{ .bytes = b };
-            },
-            .fixed_len_byte_array => {
-                if (self.type_length == 0) return Error.CorruptParquetPage;
-                return .{ .bytes = try self.take(self.type_length) };
-            },
-            .int96 => {
-                const b = try self.take(12);
-                const nanos = std.mem.readInt(u64, b[0..8], .little);
-                const jday = std.mem.readInt(u32, b[8..12], .little);
-                return .{ .timestamp = int96ToMicros(jday, nanos) };
-            },
-            else => return Error.UnsupportedParquetEncoding,
-        }
-    }
-
-    fn take(self: *PlainCursor, n: usize) Error![]const u8 {
-        if (self.pos + n > self.src.len) return Error.CorruptParquetPage;
-        defer self.pos += n;
-        return self.src[self.pos..][0..n];
-    }
-
-    fn takeInt(self: *PlainCursor, comptime T: type) Error!T {
-        const n = @sizeOf(T);
-        const b = try self.take(n);
-        return std.mem.readInt(T, b[0..n], .little);
-    }
-
-    fn readInt(self: *PlainCursor, comptime T: type) Error!i64 {
-        return @intCast(try self.takeInt(T));
-    }
-};
 
 /// INT96: Julian day (2440588 is 1970-01-01) plus nanoseconds of day. Saturates,
 /// since a u32 Julian day of micros overflows i64 on a corrupt file.

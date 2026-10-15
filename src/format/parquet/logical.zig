@@ -1,8 +1,7 @@
 //! Parquet's logical and converted types onto basalt types: temporal units, decimals,
-//! JSON, and the value coercions they need.
+//! JSON, and the unit, sign and decimal rules the page kernel converts values by.
 
 const Error = @import("read.zig").Error;
-const Value = @import("../../exec/value.zig").Value;
 const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -164,43 +163,11 @@ fn decimalOf(e: parquet.SchemaElement) types.Type {
     return types.Type.decimal(p, s);
 }
 
-fn decimalValue(t: types.Type, v: Value) Value {
-    return switch (v) {
-        .int => |x| .{ .decimal = .{ .unscaled = x, .scale = t.scale } },
-        .bytes => |b| .{ .decimal = .{ .unscaled = unscaledOf(b), .scale = t.scale } },
-        else => v,
-    };
-}
-
 /// A byte-array decimal's big-endian two's-complement unscaled value.
 pub fn unscaledOf(b: []const u8) i128 {
     var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
     for (b) |byte| acc = (acc << 8) | byte;
     return acc;
-}
-
-pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
-    if (v == .null) return v;
-    return switch (t.kind) {
-        .string => switch (v) {
-            .bytes => |b| .{ .string = b },
-            else => v,
-        },
-        .date => switch (v) {
-            .int => |x| .{ .date = @intCast(x) },
-            else => v,
-        },
-        .time => switch (v) {
-            .int => |x| .{ .time = scale.apply(x) },
-            else => v,
-        },
-        .timestamp => switch (v) {
-            .int => |x| .{ .timestamp = scale.apply(x) },
-            else => v,
-        },
-        .decimal => decimalValue(t, v),
-        else => v,
-    };
 }
 
 test "physical plus converted type maps onto a basalt type" {
@@ -238,14 +205,12 @@ test "temporal scale converts millisecond columns and leaves micros alone" {
     try testing.expectEqual(TemporalScale.identity, temporalScale(.{ .converted_type = 10 }));
     try testing.expectEqual(TemporalScale.identity, temporalScale(.{}));
 
-    const ts = types.Type.init(.timestamp);
-    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), coerce(ts, .{ .int = 1_583_298_367_123 }, .{ .mul = 1000 }).timestamp);
-    try testing.expectEqual(@as(i64, 1_583_298_367_123), coerce(ts, .{ .int = 1_583_298_367_123 }, .identity).timestamp);
+    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), (TemporalScale{ .mul = 1000 }).apply(1_583_298_367_123));
+    try testing.expectEqual(@as(i64, 1_583_298_367_123), TemporalScale.identity.apply(1_583_298_367_123));
 }
 
 test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
     const want: i64 = 1_767_268_800_000_000;
-    const ts = types.Type.init(.timestamp);
     inline for (.{
         .{ parquet.TimeUnit.millis, want / 1000 },
         .{ parquet.TimeUnit.micros, want },
@@ -253,7 +218,7 @@ test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
     }) |c| {
         const e = logical(.int64, .{ .timestamp = .{ .unit = c[0] } });
         try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(e)).kind);
-        try testing.expectEqual(want, coerce(ts, .{ .int = c[1] }, temporalScale(e)).timestamp);
+        try testing.expectEqual(want, temporalScale(e).apply(c[1]));
     }
     const utc = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .nanos } });
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(utc)).kind);
@@ -269,17 +234,16 @@ test "nanoseconds floor to micros, including before 1970" {
 }
 
 test "a LogicalType-only TIME reads as time in millis and micros" {
-    const tm = types.Type.init(.time);
     const want: i64 = 3_720_000_000;
     const ms = logical(.int32, .{ .time = .{ .unit = .millis } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(ms)).kind);
-    try testing.expectEqual(want, coerce(tm, .{ .int = want / 1000 }, temporalScale(ms)).time);
+    try testing.expectEqual(want, temporalScale(ms).apply(want / 1000));
     const us = logical(.int64, .{ .time = .{ .unit = .micros } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(us)).kind);
-    try testing.expectEqual(want, coerce(tm, .{ .int = want }, temporalScale(us)).time);
+    try testing.expectEqual(want, temporalScale(us).apply(want));
     const ns = logical(.int64, .{ .time = .{ .unit = .nanos } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(ns)).kind);
-    try testing.expectEqual(want, coerce(tm, .{ .int = want * 1000 }, temporalScale(ns)).time);
+    try testing.expectEqual(want, temporalScale(ns).apply(want * 1000));
 }
 
 test "LogicalType DATE, DECIMAL, STRING and INTEGER map without a ConvertedType" {

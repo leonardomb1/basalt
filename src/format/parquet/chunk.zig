@@ -1,9 +1,11 @@
 //! A column chunk's pages decoded into a column: dictionary and data pages (v1 and v2),
 //! levels, and one typed kernel every encoding feeds. An encoding decodes a page's
 //! present values into a source, a `Cast` function turns each physical value into
-//! the column's store type, and `push` lays them out around the null rows.
+//! the column's store type, and `Rows` lays them out around the null rows; a
+//! statistic's value goes through the same kernel into `One`.
 
 const Decimal = @import("../../exec/value.zig").Decimal;
+const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
 const Levels = @import("nested.zig").Levels;
 const ListShape = @import("schema.zig").ListShape;
@@ -40,7 +42,7 @@ pub fn readColumnChunk(
     rows: usize,
     max_def: u32,
     base_offset: u64,
-) (Error || parquet.Error || @import("../codec.zig").Error)!column.Column {
+) ReadError!column.Column {
     return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset);
 }
 
@@ -56,11 +58,46 @@ pub fn readColumnChunkLevels(
     max_rep: u32,
     list: ?ListShape,
     base_offset: u64,
-) (Error || parquet.Error || @import("../codec.zig").Error)!column.Column {
-    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tscale = temporalScale(elem) };
+) ReadError!column.Column {
+    const d = try readPages(arena, file_bytes, meta, elem, if (list == null) rows else null, max_def, max_rep, base_offset);
+    const shape = list orelse return d.vals;
+    return assembleLists(arena, d.vals, d.levels.?.reps.items, d.levels.?.defs.items, max_def, shape, rows);
+}
 
-    const entries = if (list != null) std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage else rows;
-    var levels: ?Levels = if (list != null) .{
+pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };
+
+pub fn readEntries(
+    arena: std.mem.Allocator,
+    file_bytes: []const u8,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
+    max_def: u32,
+    max_rep: u32,
+    base_offset: u64,
+) ReadError!Entries {
+    const d = try readPages(arena, file_bytes, meta, elem, null, max_def, max_rep, base_offset);
+    const lv = d.levels.?;
+    if (d.vals.len != lv.reps.items.len or d.vals.len != lv.defs.items.len) return Error.CorruptParquetPage;
+    return .{ .vals = d.vals, .reps = lv.reps.items, .defs = lv.defs.items };
+}
+
+const ReadError = Error || parquet.Error || @import("../codec.zig").Error;
+
+/// Every read of a chunk walks its pages here: `rows` values, or with `rows` null
+/// the chunk's `num_values` entries along with their levels.
+fn readPages(
+    arena: std.mem.Allocator,
+    file_bytes: []const u8,
+    meta: parquet.ColumnMetaData,
+    elem: parquet.SchemaElement,
+    rows: ?usize,
+    max_def: u32,
+    max_rep: u32,
+    base_offset: u64,
+) ReadError!struct { vals: column.Column, levels: ?Levels } {
+    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tscale = temporalScale(elem) };
+    const entries = rows orelse std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
+    var levels: ?Levels = if (rows == null) .{
         .reps = std.array_list.Managed(u32).init(arena),
         .defs = std.array_list.Managed(u32).init(arena),
     } else null;
@@ -86,10 +123,9 @@ pub fn readColumnChunkLevels(
             else => return Error.CorruptParquetPage,
         }
     }
-    const col = try b.finish();
-    try readUnsigned(elem, col);
-    if (list) |shape| return assembleLists(arena, col, levels.?.reps.items, levels.?.defs.items, max_def, shape, rows);
-    return col;
+    const vals = try b.finish();
+    try readUnsigned(elem, vals);
+    return .{ .vals = vals, .levels = levels };
 }
 
 fn readPageOf(arena: std.mem.Allocator, file_bytes: []const u8, offset: usize, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement) !parquet.Page {
@@ -116,48 +152,6 @@ fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) Error!void {
     }
 }
 
-pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };
-
-pub fn readEntries(
-    arena: std.mem.Allocator,
-    file_bytes: []const u8,
-    meta: parquet.ColumnMetaData,
-    elem: parquet.SchemaElement,
-    max_def: u32,
-    max_rep: u32,
-    base_offset: u64,
-) (Error || parquet.Error || @import("../codec.zig").Error)!Entries {
-    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tscale = temporalScale(elem) };
-    const entries = std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
-    var levels = Levels{
-        .reps = std.array_list.Managed(u32).init(arena),
-        .defs = std.array_list.Managed(u32).init(arena),
-    };
-    var b = try column.Builder.initCapacity(arena, cast.ty, entries);
-    var dict: ?Dict = null;
-    const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
-    if (at < base_offset) return Error.CorruptParquetPage;
-    var offset: usize = std.math.cast(usize, at - base_offset) orelse return Error.CorruptParquetPage;
-    var produced: usize = 0;
-    while (produced < entries) {
-        if (offset >= file_bytes.len) return Error.CorruptParquetPage;
-        const pg = try readPageOf(arena, file_bytes, offset, meta, elem);
-        offset = pg.next_offset;
-        switch (pg.header.ty) {
-            .dictionary_page => dict = try readDict(arena, pg, meta, elem, cast),
-            .data_page, .data_page_v2 => {
-                produced += try appendDataPage(arena, &b, pg, meta, elem, cast, max_def, dict, max_rep, &levels);
-            },
-            .index_page => {},
-            else => return Error.CorruptParquetPage,
-        }
-    }
-    const vals = try b.finish();
-    try readUnsigned(elem, vals);
-    if (vals.len != levels.reps.items.len or vals.len != levels.defs.items.len) return Error.CorruptParquetPage;
-    return .{ .vals = vals, .reps = levels.reps.items, .defs = levels.defs.items };
-}
-
 /// A dictionary decoded once into a typed column; a byte dictionary also keeps its
 /// values as slices, which pages gather from and the column notes as its codes.
 const Dict = struct {
@@ -169,7 +163,7 @@ const Dict = struct {
 fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement, cast: Cast) Error!Dict {
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
     var db = try column.Builder.initCapacity(arena, cast.ty, n);
-    try pushPlain(arena, &db, cast, meta.ty, elem.type_length orelse 0, pg.data, n, null, 0);
+    try pushPlain(arena, Rows{ .arena = arena, .b = &db, .defs = null, .max_def = 0 }, cast, meta.ty, elem.type_length orelse 0, pg.data, n);
     const col = try db.finish();
     const entries: []const []const u8 = switch (col.data) {
         .bytes => |bs| blk: {
@@ -183,7 +177,7 @@ fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMeta
 }
 
 /// v1 length-prefixes each level section; v2 keeps them unprefixed with lengths
-/// in the header. Every encoding hands `push` only the present values; the
+/// in the header. Every encoding hands the kernel only the present values; the
 /// definition levels place them and mark the rest null.
 fn appendDataPage(
     arena: std.mem.Allocator,
@@ -242,9 +236,10 @@ fn appendDataPage(
         }
     }
 
+    const rows: Rows = .{ .arena = arena, .b = b, .defs = defs, .max_def = max_def };
     const type_length = elem.type_length orelse 0;
     switch (pg.header.encoding) {
-        .plain => try pushPlain(arena, b, cast, meta.ty, type_length, body, present, defs, max_def),
+        .plain => try pushPlain(arena, rows, cast, meta.ty, type_length, body, present),
         .byte_stream_split => {
             const width: usize = switch (meta.ty) {
                 .float => 4,
@@ -255,20 +250,20 @@ fn appendDataPage(
                 else => return Error.UnsupportedParquetEncoding,
             };
             const flat = try decodeByteStreamSplit(arena, body, width, present);
-            try pushPlain(arena, b, cast, meta.ty, type_length, flat, present, defs, max_def);
+            try pushPlain(arena, rows, cast, meta.ty, type_length, flat, present);
         },
         .delta_binary_packed => {
             const vals = try decodeDeltaBinaryPacked(arena, body, present);
             if (meta.ty == .int32) {
                 for (vals) |*v| v.* = @as(i32, @truncate(v.*));
             }
-            try pushInts(arena, b, cast, Items(i64){ .items = vals }, present, defs, max_def);
+            try pushInts(rows, cast, Items(i64){ .items = vals }, present);
         },
-        .delta_length_byte_array => try pushBytes(arena, b, cast, try decodeDeltaLengthByteArray(arena, body, present), defs, max_def),
-        .delta_byte_array => try pushBytes(arena, b, cast, try decodeDeltaByteArray(arena, body, present), defs, max_def),
+        .delta_length_byte_array => try pushBytes(rows, cast, try decodeDeltaLengthByteArray(arena, body, present)),
+        .delta_byte_array => try pushBytes(rows, cast, try decodeDeltaByteArray(arena, body, present)),
         .rle => {
             const bits = try decodeRleHybrid(arena, body[@min(4, body.len)..], 1, present);
-            try pushInts(arena, b, cast, Items(u32){ .items = bits }, present, defs, max_def);
+            try pushInts(rows, cast, Items(u32){ .items = bits }, present);
         },
         .plain_dictionary, .rle_dictionary => {
             const d = dict orelse return Error.CorruptParquetPage;
@@ -276,7 +271,7 @@ fn appendDataPage(
             if (body[0] > 32) return Error.CorruptParquetPage;
             const width: u6 = @intCast(body[0]);
             const idx = try decodeRleHybrid(arena, body[1..], width, present);
-            try pushDict(arena, b, cast, d, idx, defs, max_def);
+            try pushDict(rows, cast, d, idx);
         },
         else => return Error.UnsupportedParquetEncoding,
     }
@@ -314,28 +309,64 @@ const Cast = struct {
     }
 };
 
-/// The kernel every page runs: the `n` present values of `src`, each through
-/// `conv`, land at the rows whose definition level is `max_def` and the rest read
-/// null. A page with no nulls is written straight into the store.
-fn push(
+/// The kernel's destination for a page: the `n` present values of `src`, each
+/// through `conv`, land at the rows whose definition level is `max_def` and the
+/// rest read null. A page with no nulls is written straight into the store.
+const Rows = struct {
     arena: std.mem.Allocator,
     b: *column.Builder,
-    comptime T: type,
-    cast: Cast,
-    comptime conv: anytype,
-    src: anytype,
-    n: usize,
     defs: ?[]const u32,
     max_def: u32,
-) Error!void {
-    const dense = if (defs) |d| d.len == n else true;
-    const out = if (dense) b.reserveSlots(T, n) catch |e| return landed(e) else try arena.alloc(T, n);
-    for (out, 0..) |*o, i| o.* = conv(cast, src.get(i));
-    if (dense) {
-        b.commitSlots(T, n) catch |e| return landed(e);
-    } else {
-        b.appendBulkScattered(T, out, defs.?, max_def) catch |e| return landed(e);
+
+    fn put(s: Rows, comptime T: type, cast: Cast, comptime conv: anytype, src: anytype, n: usize) Error!void {
+        const dense = if (s.defs) |d| d.len == n else true;
+        const out = if (dense) s.b.reserveSlots(T, n) catch |e| return landed(e) else try s.arena.alloc(T, n);
+        for (out, 0..) |*o, i| o.* = conv(cast, src.get(i));
+        if (dense) {
+            s.b.commitSlots(T, n) catch |e| return landed(e);
+        } else {
+            s.b.appendBulkScattered(T, out, s.defs.?, s.max_def) catch |e| return landed(e);
+        }
     }
+
+    fn bytes(s: Rows, _: Cast, vals: []const []const u8) Error!void {
+        s.b.appendBytesScattered(vals, s.defs, s.max_def) catch |e| return landed(e);
+    }
+};
+
+/// The kernel's destination for a statistic: its one value, read back as a
+/// one-row column of the same store would give it.
+const One = struct {
+    out: *Value,
+
+    fn put(s: One, comptime T: type, cast: Cast, comptime conv: anytype, src: anytype, _: usize) Error!void {
+        var x = [1]T{conv(cast, src.get(0))};
+        var valid = [1]u8{1};
+        const row: column.Column = .{ .ty = cast.ty, .len = 1, .validity = .{ .bits = &valid, .len = 1 }, .data = storeOf(T, &x) };
+        s.out.* = row.getValue(0);
+    }
+
+    fn bytes(s: One, cast: Cast, vals: []const []const u8) Error!void {
+        s.out.* = if (cast.ty.kind == .string) .{ .string = vals[0] } else .{ .bytes = vals[0] };
+    }
+
+    fn storeOf(comptime T: type, x: []T) column.Column.Data {
+        inline for (std.meta.fields(column.Column.Data)) |f| {
+            if (f.type == []T) return @unionInit(column.Column.Data, f.name, x);
+        }
+        unreachable;
+    }
+};
+
+/// A statistic's raw min or max as the column's pages would read it: the first
+/// PLAIN value of `raw` through the page kernel, so pruning and scans agree.
+pub fn plainValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: []const u8) Error!Value {
+    const cast: Cast = .{ .ty = try basaltType(elem), .tscale = temporalScale(elem) };
+    var slot: [1][]const u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&slot));
+    var v: Value = .null;
+    try pushPlain(fba.allocator(), One{ .out = &v }, cast, phys, elem.type_length orelse 0, raw, 1);
+    return v;
 }
 
 fn landed(e: anytype) Error {
@@ -346,63 +377,61 @@ fn landed(e: anytype) Error {
 }
 
 /// Physical ints, and booleans as 0 or 1, into whichever store the column's kind has.
-fn pushInts(arena: std.mem.Allocator, b: *column.Builder, cast: Cast, src: anytype, n: usize, defs: ?[]const u32, max_def: u32) Error!void {
+fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
     return switch (cast.ty.kind) {
-        .int => push(arena, b, i64, cast, Cast.same, src, n, defs, max_def),
+        .int => sink.put(i64, cast, Cast.same, src, n),
         .time, .timestamp => if (cast.tscale.isIdentity())
-            push(arena, b, i64, cast, Cast.same, src, n, defs, max_def)
+            sink.put(i64, cast, Cast.same, src, n)
         else
-            push(arena, b, i64, cast, Cast.scaled, src, n, defs, max_def),
-        .date => push(arena, b, i32, cast, Cast.date, src, n, defs, max_def),
-        .decimal => push(arena, b, Decimal, cast, Cast.decimal, src, n, defs, max_def),
-        .bool => push(arena, b, bool, cast, Cast.truthy, src, n, defs, max_def),
+            sink.put(i64, cast, Cast.scaled, src, n),
+        .date => sink.put(i32, cast, Cast.date, src, n),
+        .decimal => sink.put(Decimal, cast, Cast.decimal, src, n),
+        .bool => sink.put(bool, cast, Cast.truthy, src, n),
         else => Error.UnsupportedParquetEncoding,
     };
 }
 
-fn pushFloats(arena: std.mem.Allocator, b: *column.Builder, cast: Cast, src: anytype, n: usize, defs: ?[]const u32, max_def: u32) Error!void {
+fn pushFloats(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
     if (cast.ty.kind != .float) return Error.UnsupportedParquetEncoding;
-    return push(arena, b, f64, cast, Cast.same, src, n, defs, max_def);
+    return sink.put(f64, cast, Cast.same, src, n);
 }
 
 /// Text and binary columns take the slices as they are; a decimal reads each as
 /// a big-endian unscaled value.
-fn pushBytes(arena: std.mem.Allocator, b: *column.Builder, cast: Cast, vals: []const []const u8, defs: ?[]const u32, max_def: u32) Error!void {
+fn pushBytes(sink: anytype, cast: Cast, vals: []const []const u8) Error!void {
     switch (cast.ty.kind) {
-        .string, .bytes => b.appendBytesScattered(vals, defs, max_def) catch |e| return landed(e),
-        .decimal => try push(arena, b, Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len, defs, max_def),
+        .string, .bytes => try sink.bytes(cast, vals),
+        .decimal => try sink.put(Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len),
         else => return Error.UnsupportedParquetEncoding,
     }
 }
 
-/// PLAIN values (a data or dictionary page's, or byte-stream-split ones once
-/// interleaved back), fixed-width ones read in place.
+/// PLAIN values (a data or dictionary page's, byte-stream-split ones once
+/// interleaved back, or a statistic's), fixed-width ones read in place.
 fn pushPlain(
     arena: std.mem.Allocator,
-    b: *column.Builder,
+    sink: anytype,
     cast: Cast,
     phys: parquet.PhysicalType,
     type_length: i32,
     body: []const u8,
     n: usize,
-    defs: ?[]const u32,
-    max_def: u32,
 ) Error!void {
     switch (phys) {
         .boolean => {
             if (body.len < (n + 7) / 8) return Error.CorruptParquetPage;
-            try pushInts(arena, b, cast, Bits{ .body = body }, n, defs, max_def);
+            try pushInts(sink, cast, Bits{ .body = body }, n);
         },
-        .int32 => try pushInts(arena, b, cast, try plain(i32, body, n), n, defs, max_def),
-        .int64 => try pushInts(arena, b, cast, try plain(i64, body, n), n, defs, max_def),
-        .float => try pushFloats(arena, b, cast, try plain(f32, body, n), n, defs, max_def),
-        .double => try pushFloats(arena, b, cast, try plain(f64, body, n), n, defs, max_def),
+        .int32 => try pushInts(sink, cast, try plain(i32, body, n), n),
+        .int64 => try pushInts(sink, cast, try plain(i64, body, n), n),
+        .float => try pushFloats(sink, cast, try plain(f32, body, n), n),
+        .double => try pushFloats(sink, cast, try plain(f64, body, n), n),
         .int96 => {
             if (body.len < n * 12) return Error.CorruptParquetPage;
-            try push(arena, b, i64, cast, Cast.same, Int96{ .body = body }, n, defs, max_def);
+            try sink.put(i64, cast, Cast.same, Int96{ .body = body }, n);
         },
-        .byte_array => try pushBytes(arena, b, cast, try plainByteArrays(arena, body, n), defs, max_def),
-        .fixed_len_byte_array => try pushBytes(arena, b, cast, try fixedByteArrays(arena, body, type_length, n), defs, max_def),
+        .byte_array => try pushBytes(sink, cast, try plainByteArrays(arena, body, n)),
+        .fixed_len_byte_array => try pushBytes(sink, cast, try fixedByteArrays(arena, body, type_length, n)),
         else => return Error.UnsupportedParquetEncoding,
     }
 }
@@ -491,26 +520,18 @@ fn fixedByteArrays(arena: std.mem.Allocator, body: []const u8, type_length: i32,
 }
 
 /// Indices are bounds-checked once, then gathered through the typed dictionary.
-fn pushDict(
-    arena: std.mem.Allocator,
-    b: *column.Builder,
-    cast: Cast,
-    d: Dict,
-    idx: []const u32,
-    defs: ?[]const u32,
-    max_def: u32,
-) Error!void {
+fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
     for (idx) |ix| if (ix >= d.col.len) return Error.CorruptParquetPage;
     switch (d.col.data) {
         .bytes => {
-            const vals = try arena.alloc([]const u8, idx.len);
+            const vals = try rows.arena.alloc([]const u8, idx.len);
             for (vals, idx) |*o, ix| o.* = d.entries[ix];
-            b.appendBytesScattered(vals, defs, max_def) catch |e| return landed(e);
-            try b.noteDict(@intFromPtr(d.entries.ptr), d.entries, idx, defs, max_def);
+            try rows.bytes(cast, vals);
+            try rows.b.noteDict(@intFromPtr(d.entries.ptr), d.entries, idx, rows.defs, rows.max_def);
         },
         inline else => |vals| {
             const T = std.meta.Elem(@TypeOf(vals));
-            try push(arena, b, T, cast, Cast.same, Gather(T){ .vals = vals, .idx = idx }, idx.len, defs, max_def);
+            try rows.put(T, cast, Cast.same, Gather(T){ .vals = vals, .idx = idx }, idx.len);
         },
     }
 }
