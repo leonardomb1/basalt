@@ -150,7 +150,6 @@ fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!
     return x;
 }
 
-
 fn isBytes(v: Vec) bool {
     return switch (v) {
         .col => |c| c.ty.kind == .bytes,
