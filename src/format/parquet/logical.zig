@@ -167,13 +167,16 @@ fn decimalOf(e: parquet.SchemaElement) types.Type {
 fn decimalValue(t: types.Type, v: Value) Value {
     return switch (v) {
         .int => |x| .{ .decimal = .{ .unscaled = x, .scale = t.scale } },
-        .bytes => |b| blk: {
-            var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
-            for (b) |byte| acc = (acc << 8) | byte;
-            break :blk .{ .decimal = .{ .unscaled = acc, .scale = t.scale } };
-        },
+        .bytes => |b| .{ .decimal = .{ .unscaled = unscaledOf(b), .scale = t.scale } },
         else => v,
     };
+}
+
+/// A byte-array decimal's big-endian two's-complement unscaled value.
+pub fn unscaledOf(b: []const u8) i128 {
+    var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
+    for (b) |byte| acc = (acc << 8) | byte;
+    return acc;
 }
 
 pub fn coerce(t: types.Type, v: Value, scale: TemporalScale) Value {
