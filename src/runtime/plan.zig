@@ -884,6 +884,7 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         .state = arena,
         .err = env.errctx,
         .build_cap = try hashJoinCap(env, j, hints),
+        .threads = env.sort_threads,
         .space = env.space,
         .spill_at = try joinSpillAt(env, hints),
     };

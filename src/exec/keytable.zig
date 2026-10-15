@@ -7,9 +7,12 @@
 //! integer keys. `GroupTable.find` probes without inserting, for a table frozen by
 //! spilling.
 
+const Decimal = @import("value.zig").Decimal;
 const Value = @import("value.zig").Value;
+const pow10_i128 = @import("value.zig").pow10_i128;
 const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
+const types = @import("../lang/types.zig");
 const std = @import("std");
 
 pub const prefetch_ahead = 8;
@@ -457,11 +460,18 @@ pub const Encoded = struct {
 /// strings by their interned id. A NULL is word 0 with its bit set in the mask. A
 /// dictionary column's ids are kept per column while its dictionary stays the same,
 /// as batches of one chunk share theirs.
+///
+/// With `want` (the column kinds another side's words stand for, as a join's probe
+/// has its build's), a column of another kind is read into those words where
+/// `keyhash.valueEq` lets its values equal them: an integral FLOAT or DECIMAL as an
+/// INT, an INT or DECIMAL as its canonical FLOAT, BYTES as text. A value that cannot
+/// equal any key there is `absent`.
 pub const Encoder = struct {
     cols: []const usize,
     kinds: []const keyhash.KeyKind,
     has_str: bool,
     memo: []DictMemo,
+    want: ?[]const types.TypeKind = null,
 
     const DictMemo = struct { id: u64 = 0, ents: []StrId = &.{} };
 
@@ -485,11 +495,17 @@ pub const Encoder = struct {
         return ents;
     }
 
+    /// Whether column `j` arrives as the kind its words stand for.
+    fn native(self: Encoder, j: usize, kind: types.TypeKind) bool {
+        const w = self.want orelse return true;
+        return kind == w[j] or (w[j] == .string and kind == .bytes);
+    }
+
     pub fn encode(self: Encoder, a: std.mem.Allocator, columns: []const column.Column, n: usize, in: Interner, frozen: bool) !Encoded {
         const nk = self.cols.len;
         var nulls = false;
         for (self.cols) |ci| nulls = nulls or !columns[ci].validity.allSet(n);
-        if (nk == 1 and self.kinds[0] == .i64k and !nulls) {
+        if (nk == 1 and self.kinds[0] == .i64k and !nulls and self.native(0, columns[self.cols[0]].ty.kind)) {
             const raw = @constCast(columns[self.cols[0]].data.i64[0..n]);
             return .{ .nk = 1, .keys = raw, .hkeys = raw, .masks = &.{}, .absent = &.{} };
         }
@@ -499,13 +515,15 @@ pub const Encoder = struct {
             .keys = keys,
             .hkeys = if (self.has_str) try a.alloc(i64, n * nk) else keys,
             .masks = if (nulls) try a.alloc(u64, n) else &.{},
-            .absent = if (frozen and self.has_str) try a.alloc(bool, n) else &.{},
+            .absent = if (frozen and (self.has_str or self.want != null)) try a.alloc(bool, n) else &.{},
         };
         @memset(e.masks, 0);
         @memset(e.absent, false);
         for (self.cols, self.kinds, 0..) |ci, kk, j| {
             const col = columns[ci];
-            switch (kk) {
+            if (!self.native(j, col.ty.kind)) {
+                cross(&e, j, kk, col, n);
+            } else switch (kk) {
                 .i64k => for (0..n) |r| {
                     keys[r * nk + j] = col.data.i64[r];
                 },
@@ -541,6 +559,40 @@ pub const Encoder = struct {
             };
         }
         return e;
+    }
+
+    /// Column `j` of another kind than its words: numbers converted where they can be
+    /// equal, every other row absent.
+    fn cross(e: *Encoded, j: usize, kk: keyhash.KeyKind, col: column.Column, n: usize) void {
+        for (0..n) |r| {
+            if (!col.validity.get(r)) continue;
+            const w: ?i64 = switch (kk) {
+                .i64k => switch (col.ty.kind) {
+                    .float => intOf(col.data.f64[r]),
+                    .decimal => intOfDec(col.data.dec[r]),
+                    else => null,
+                },
+                .f64k => switch (col.ty.kind) {
+                    .int => keyhash.floatWord(@floatFromInt(col.data.i64[r])),
+                    .decimal => keyhash.floatWord(col.data.dec[r].keyF64()),
+                    else => null,
+                },
+                else => null,
+            };
+            if (w) |x| e.keys[r * e.nk + j] = x else e.absent[r] = true;
+        }
+    }
+
+    fn intOfDec(d: Decimal) ?i64 {
+        if (d.scale >= pow10_i128.len) return if (d.unscaled == 0) 0 else null;
+        const p = pow10_i128[d.scale];
+        if (@rem(d.unscaled, p) != 0) return null;
+        return std.math.cast(i64, @divExact(d.unscaled, p));
+    }
+
+    fn intOf(x: f64) ?i64 {
+        if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0) or @trunc(x) != x) return null;
+        return @intFromFloat(x);
     }
 
     fn putStr(_: Encoder, e: *Encoded, r: usize, j: usize, x: StrId) void {

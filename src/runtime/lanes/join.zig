@@ -108,7 +108,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     defer build_arena.deinit();
     const build_op = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
     const cap = try laneJoinCap(env, j, join_hints);
-    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, cap) catch |e| {
+    const index = op.JoinIndex.create(arena, build_arena.allocator(), build_op, right_schema, right_keys, cap, env.sort_threads) catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
         if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) {
             if (e == error.JoinBuildTooLarge) env.errctx.set("{s}", .{op.failLabel(e)});
@@ -255,7 +255,7 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
         .{ .kind = .full, .residual = not_x, .lane_rows = 5, .drained = &.{ "x", "w", "m" } },
     };
     for (cases) |case| {
-        const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize));
+        const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize), 1);
         const words = try a.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
         @memset(words, std.atomic.Value(u64).init(0));
         const lj = LaneJoin{
@@ -302,7 +302,7 @@ test "lane joins: only right and full joins get a drain" {
     const a = ar.allocator();
     var params = std.StringHashMap(*const ast.Expr).init(a);
     const build = try op_testing.kvBatch(a, &op_testing.join_right_schema, &.{1}, &.{"x"});
-    const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize));
+    const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize), 1);
     const lj = LaneJoin{
         .index = index,
         .left_keys = &.{0},

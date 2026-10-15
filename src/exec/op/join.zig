@@ -40,6 +40,9 @@ const column = @import("../column.zig");
 const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
 const keyset = @import("keyset.zig");
+const par = @import("../par.zig");
+const keytable = @import("../keytable.zig");
+const Value = @import("../value.zig").Value;
 const spill = @import("../spill.zig");
 const SpillDir = spill.TestDir;
 const spill_parts = @import("spill_parts.zig");
@@ -98,11 +101,12 @@ fn concatBatches(state: std.mem.Allocator, chunks: []const Batch, schema: *const
     return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
-/// The bucket heads, chains and hashes `JoinIndex` adds over `rows` keyed rows.
-fn indexOverhead(rows: usize) usize {
+/// What `JoinIndex` adds over `rows` keyed rows of `nk` keys: the table's slots, a
+/// record per key (hash, words, mask, first row) and a chain link per row.
+fn indexOverhead(rows: usize, nk: usize) usize {
     var slots: usize = 16;
-    while (slots < rows * 2) slots *= 2;
-    return slots * @sizeOf(u32) + rows * (@sizeOf(u32) + @sizeOf(u64));
+    while (slots * 7 < (rows + 1) * 10) slots *= 2;
+    return slots * @sizeOf(u32) + rows * (3 * @sizeOf(u64) + nk * @sizeOf(i64) + @sizeOf(u32));
 }
 
 pub const KeyClass = enum { i64s, bytes, boxed };
@@ -325,16 +329,60 @@ const Grace = struct {
     }
 };
 
+/// The record payload of a key: the first build row holding it, the rest chained
+/// through `JoinIndex.next` in build order.
+const Head = struct {
+    size: usize = @sizeOf(u64),
+
+    pub fn clear(_: *const Head, tail: [*]u8) void {
+        @as(*u64, @ptrCast(@alignCast(tail))).* = 0;
+    }
+
+    fn of(tail: [*]u8) *u64 {
+        return @ptrCast(@alignCast(tail));
+    }
+};
+
+const head_payload = Head{};
+
+/// A probe batch keyed for `JoinIndex.first`: each row's hash, its key in the build's
+/// words (or boxed), and `miss`, a row that cannot match (a NULL key, or a value no
+/// build key can equal).
+pub const Probe = struct {
+    hashes: []u64,
+    miss: []bool,
+    enc: ?keytable.Encoded = null,
+    boxed: []const Value = &.{},
+};
+
+/// The build side materialized and its keys in the shared key table: fixed-width
+/// words when every build key has a fixed encoding, boxed values otherwise. A key's
+/// record holds its first build row; `next` chains the rest in build order. A large
+/// build is split into `keytable.parts` partitions by the key hash's top bits, each
+/// filled on its own thread. Read-only once built, so the lanes probe one index.
 pub const JoinIndex = struct {
     build_batch: Batch,
     keys: []const usize,
-    heads: []const u32,
-    next: []const u32,
-    hashes: []const u64,
-    mask: u64,
+    next: []const u32 = &.{},
     has_null_key: bool = false,
+    parts: []Part = &.{},
+    fixed: bool = true,
+    kinds: []const keyhash.KeyKind = &.{},
+    want: []const types.TypeKind = &.{},
+    strs: ?*keytable.StrTable = null,
+    str_cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
 
-    /// Drain `build` into `pull`, materialize it in `state` and index `right_keys`.
+    const Part = struct {
+        table: keytable.GroupTable,
+        fixed: *keytable.FixedStore(Head),
+        boxed: *keytable.GroupStore(Head),
+    };
+
+    /// A build at least this large is partitioned and filled in parallel.
+    const parallel_min = 1 << 16;
+
+    /// Drain `build` into `pull`, materialize it in `state` and index `right_keys` on up
+    /// to `threads` threads.
     pub fn create(
         state: std.mem.Allocator,
         pull: std.mem.Allocator,
@@ -342,15 +390,16 @@ pub const JoinIndex = struct {
         right_schema: *const types.Schema,
         right_keys: []const usize,
         cap: usize,
+        threads: usize,
     ) anyerror!*JoinIndex {
         var bytes: usize = 0;
         const chunks = try drainBuild(pull, build, &bytes, cap);
-        return fromBatches(state, chunks, right_schema, right_keys, bytes, cap);
+        return fromBatches(state, chunks, right_schema, right_keys, bytes, cap, threads);
     }
 
     /// Index `chunks` (holding `bytes`), copied into `state`; checked against `cap`
-    /// before anything is copied. Rows are inserted in reverse so prepending leaves
-    /// duplicate chains in build order.
+    /// before anything is copied. Each partition takes its rows in reverse, so
+    /// prepending leaves duplicate chains in build order.
     pub fn fromBatches(
         state: std.mem.Allocator,
         chunks: []const Batch,
@@ -358,111 +407,243 @@ pub const JoinIndex = struct {
         right_keys: []const usize,
         bytes: usize,
         cap: usize,
+        threads: usize,
     ) anyerror!*JoinIndex {
         var n: usize = 0;
         for (chunks) |b| n += b.len;
         if (n >= std.math.maxInt(u32)) return error.JoinBuildTooLarge;
-        if (bytes + (if (right_keys.len > 0) indexOverhead(n) else 0) > cap) return error.JoinBuildTooLarge;
+        if (bytes + (if (right_keys.len > 0) indexOverhead(n, right_keys.len) else 0) > cap) return error.JoinBuildTooLarge;
         const batch = try concatBatches(state, chunks, right_schema, n);
 
         const self = try state.create(JoinIndex);
-        self.* = .{
-            .build_batch = batch,
-            .keys = right_keys,
-            .heads = &.{},
-            .next = &.{},
-            .hashes = &.{},
-            .mask = 0,
-        };
+        self.* = .{ .build_batch = batch, .keys = right_keys };
         if (right_keys.len == 0) return self;
 
-        var cap_slots: usize = 16;
-        while (cap_slots < n * 2) cap_slots *= 2;
-
-        const heads = try state.alloc(u32, cap_slots);
-        @memset(heads, 0);
-        const chain = try state.alloc(u32, n);
-        const hashes = try state.alloc(u64, n);
-        self.heads = heads;
-        self.next = chain;
-        self.hashes = hashes;
-        self.mask = cap_slots - 1;
-
-        const classes = try state.alloc(KeyClass, right_keys.len);
-        for (right_keys, classes) |k, *c| c.* = classOf(batch.columns[k], batch.columns[k]);
-
-        @memset(chain, 0);
-        var ri: usize = n;
-        while (ri > 0) {
-            ri -= 1;
-            const r = ri;
-            if (anyNullKey(batch.columns, right_keys, r)) {
-                self.has_null_key = true;
-                continue;
-            }
-            const h = hashRowKeys(batch.columns, right_keys, classes, r);
-            hashes[r] = h;
-            var slot = h & self.mask;
-            while (heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
-                const hr: usize = heads[slot] - 1;
-                if (hashes[hr] == h and self.rowsEq(classes, hr, r)) break;
-            }
-            chain[r] = heads[slot];
-            heads[slot] = @intCast(r + 1);
+        const want = try state.alloc(types.TypeKind, right_keys.len);
+        const kinds = try state.alloc(keyhash.KeyKind, right_keys.len);
+        for (right_keys, want, kinds) |k, *w, *kk| {
+            w.* = right_schema.fields[k].ty.kind;
+            kk.* = keyhash.keyKindOf(w.*) orelse blk: {
+                self.fixed = false;
+                break :blk .i64k;
+            };
         }
+        self.want = want;
+        self.kinds = kinds;
+        const chain = try state.alloc(u32, n);
+        @memset(chain, 0);
+        self.next = chain;
+
+        var b = Build{ .ix = self, .n = n, .hashes = try state.alloc(u64, n), .nulls = try state.alloc(bool, n) };
+        if (self.fixed) {
+            const enc = try keytable.Encoder.init(state, right_keys, kinds);
+            b.enc = try enc.encode(state, batch.columns, n, self.interner(state), false);
+        }
+        const nparts: usize = if (n >= parallel_min and threads > 1) keytable.parts else 1;
+        b.nc = par.chunks(n, 1 << 15);
+        if (!self.fixed) b.vals = try state.alloc(Value, (b.nc + keytable.parts) * right_keys.len);
+        b.counts = try state.alloc(u32, b.nc * nparts);
+        @memset(b.counts, 0);
+        b.nparts = nparts;
+        par.each(threads, b.nc, &b, Build.hashChunk);
+        b.starts = try state.alloc(u32, nparts + 1);
+        b.offs = try state.alloc(u32, b.nc * nparts);
+        var at: u32 = 0;
+        for (0..nparts) |p| {
+            b.starts[p] = at;
+            for (0..b.nc) |c| {
+                b.offs[c * nparts + p] = at;
+                at += b.counts[c * nparts + p];
+            }
+        }
+        b.starts[nparts] = at;
+        b.order = try state.alloc(u32, at);
+        par.each(threads, b.nc, &b, Build.scatterChunk);
+
+        var tsa = std.heap.ThreadSafeAllocator{ .child_allocator = state };
+        b.alloc = tsa.allocator();
+        self.parts = try state.alloc(Part, nparts);
+        par.each(threads, nparts, &b, Build.fillPart);
+        if (b.failed) return error.OutOfMemory;
+        for (b.nulls) |nl| if (nl) {
+            self.has_null_key = true;
+            break;
+        };
         return self;
+    }
+
+    /// The parallel build's shared state: each row's hash and partition order, filled
+    /// a chunk at a time, then each partition's table a partition at a time.
+    const Build = struct {
+        ix: *JoinIndex,
+        n: usize,
+        hashes: []u64,
+        nulls: []bool,
+        enc: ?keytable.Encoded = null,
+        nc: usize = 0,
+        nparts: usize = 1,
+        counts: []u32 = &.{},
+        offs: []u32 = &.{},
+        starts: []u32 = &.{},
+        order: []u32 = &.{},
+        alloc: std.mem.Allocator = undefined,
+        failed: bool = false,
+        vals: []Value = &.{},
+
+        fn part(b: *const Build, h: u64) usize {
+            return if (b.nparts == 1) 0 else keytable.partOf(h);
+        }
+
+        fn hashChunk(b: *Build, c: usize) void {
+            const r0, const r1 = par.bounds(b.n, b.nc, c);
+            const cols = b.ix.build_batch.columns;
+            const nk = b.ix.keys.len;
+            for (r0..r1) |r| {
+                b.nulls[r] = anyNullKey(cols, b.ix.keys, r);
+                if (b.nulls[r]) continue;
+                b.hashes[r] = if (b.enc) |e| e.hash(r) else blk: {
+                    const v = b.vals[c * nk ..][0..nk];
+                    for (b.ix.keys, v) |k, *x| x.* = cols[k].getValue(r);
+                    break :blk keyhash.MultiKeyCtx.hash(.{}, v);
+                };
+                b.counts[c * b.nparts + b.part(b.hashes[r])] += 1;
+            }
+        }
+
+        fn scatterChunk(b: *Build, c: usize) void {
+            const r0, const r1 = par.bounds(b.n, b.nc, c);
+            const offs = b.offs[c * b.nparts ..][0..b.nparts];
+            for (r0..r1) |r| {
+                if (b.nulls[r]) continue;
+                const p = b.part(b.hashes[r]);
+                b.order[offs[p]] = @intCast(r);
+                offs[p] += 1;
+            }
+        }
+
+        fn fillPart(b: *Build, p: usize) void {
+            b.fill(p) catch {
+                b.failed = true;
+            };
+        }
+
+        fn fill(b: *Build, p: usize) !void {
+            const ix = b.ix;
+            const rows_ = b.order[b.starts[p]..b.starts[p + 1]];
+            var slots: usize = 16;
+            while (slots * 7 < (rows_.len + 1) * 10) slots *= 2;
+            const pt = &ix.parts[p];
+            pt.table = try keytable.GroupTable.init(b.alloc, slots);
+            pt.fixed = try b.alloc.create(keytable.FixedStore(Head));
+            pt.fixed.* = .init(b.alloc, ix.keys.len, &head_payload);
+            pt.boxed = try b.alloc.create(keytable.GroupStore(Head));
+            pt.boxed.* = .init(b.alloc, ix.keys.len, &head_payload);
+            const nk = ix.keys.len;
+            var i = rows_.len;
+            while (i > 0) {
+                i -= 1;
+                const r = rows_[i];
+                const h = b.hashes[r];
+                if (b.enc) |e| {
+                    const key = e.key(r);
+                    const f = try pt.table.getOrPut(h, key, pt.fixed, @intCast(pt.fixed.len));
+                    const rec = if (f.found) pt.fixed.at(f.slot) else blk: {
+                        const nr = try pt.fixed.push(h);
+                        @memcpy(nr.keys, key.vals);
+                        nr.mask.* = key.mask;
+                        break :blk nr;
+                    };
+                    ix.link(Head.of(rec.tail), f.found, r);
+                } else {
+                    const v = b.vals[(b.nc + p) * nk ..][0..nk];
+                    for (ix.keys, v) |k, *x| x.* = ix.build_batch.columns[k].getValue(r);
+                    const f = try pt.table.getOrPut(h, @as([]const Value, v), pt.boxed, @intCast(pt.boxed.len));
+                    const rec = if (f.found) pt.boxed.at(f.slot) else blk: {
+                        const nr = try pt.boxed.push(h);
+                        @memcpy(nr.keys, v);
+                        break :blk nr;
+                    };
+                    ix.link(Head.of(rec.tail), f.found, r);
+                }
+            }
+        }
+    };
+
+    /// Prepends build row `r` to its key's chain.
+    fn link(self: *JoinIndex, head: *u64, found: bool, r: usize) void {
+        if (found) @constCast(self.next)[r] = @intCast(head.* + 1);
+        head.* = r;
+    }
+
+    fn interner(self: *JoinIndex, a: std.mem.Allocator) keytable.Interner {
+        return .{ .table = &self.strs, .cache = &self.str_cache, .alloc = a };
+    }
+
+    fn partOfHash(self: *const JoinIndex, h: u64) *const Part {
+        return &self.parts[if (self.parts.len == 1) 0 else keytable.partOf(h)];
     }
 
     pub fn rows(self: *const JoinIndex) usize {
         return self.build_batch.len;
     }
 
-    fn rowsEq(self: *const JoinIndex, classes: []const KeyClass, a_row: usize, b_row: usize) bool {
-        for (self.keys, classes) |k, cls| {
-            const c = &self.build_batch.columns[k];
-            if (!cellEq(cls, c, a_row, c, b_row)) return false;
-        }
-        return true;
+    /// The encoder a probing join keys its batches with, the build's key words its
+    /// target; in `a`, as one index of a grace join is freed before the next.
+    pub fn probeEncoder(self: *const JoinIndex, a: std.mem.Allocator, probe_keys: []const usize) !?keytable.Encoder {
+        if (!self.fixed or self.keys.len == 0) return null;
+        var enc = try keytable.Encoder.init(a, probe_keys, try a.dupe(keyhash.KeyKind, self.kinds));
+        enc.want = try a.dupe(types.TypeKind, self.want);
+        return enc;
     }
 
-    fn probeEq(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, prow: usize, brow: usize) bool {
-        for (self.keys, probe_keys, classes) |bk, pk, cls| {
-            if (!cellEq(cls, &self.build_batch.columns[bk], brow, &probe.columns[pk], prow)) return false;
+    /// `lb`'s keys hashed and encoded as the build's, column at a time.
+    pub fn probe(self: *const JoinIndex, a: std.mem.Allocator, lb: Batch, probe_keys: []const usize, enc: ?keytable.Encoder) !Probe {
+        const miss = try a.alloc(bool, lb.len);
+        const hashes = try a.alloc(u64, lb.len);
+        const empty = self.keys.len == 0 or self.build_batch.len == 0;
+        for (miss, 0..) |*m, r| m.* = empty or anyNullKey(lb.columns, probe_keys, r);
+        if (empty) return .{ .hashes = hashes, .miss = miss };
+        if (enc) |en| {
+            const in = keytable.Interner{ .table = @constCast(&self.strs), .cache = @constCast(&self.str_cache), .alloc = a };
+            const e = try en.encode(a, lb.columns, lb.len, in, true);
+            for (hashes, miss, 0..) |*h, *m, r| {
+                if (e.absent.len > 0 and e.absent[r]) m.* = true;
+                h.* = if (m.*) 0 else e.hash(r);
+            }
+            return .{ .hashes = hashes, .miss = miss, .enc = e };
         }
-        return true;
-    }
-
-    /// First build row whose keys equal probe row `row`'s, or null; walk the rest with
-    /// `chainNext`. `classes` comes from `classesFor`.
-    pub fn find(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize) ?usize {
-        if (self.keys.len == 0 or self.build_batch.len == 0) return null;
-        if (anyNullKey(probe.columns, probe_keys, row)) return null;
-        return self.findHashed(probe, probe_keys, classes, row, hashRowKeys(probe.columns, probe_keys, classes, row));
+        const nk = probe_keys.len;
+        const vals = try a.alloc(Value, lb.len * nk);
+        for (hashes, miss, 0..) |*h, m, r| {
+            const v = vals[r * nk ..][0..nk];
+            for (probe_keys, v) |k, *x| x.* = lb.columns[k].getValue(r);
+            h.* = if (m) 0 else keyhash.MultiKeyCtx.hash(.{}, v);
+        }
+        return .{ .hashes = hashes, .miss = miss, .boxed = vals };
     }
 
     pub fn prefetch(self: *const JoinIndex, h: u64) void {
-        @prefetch(&self.heads[h & self.mask], .{ .rw = .read, .locality = 3 });
+        self.partOfHash(h).table.prefetch(h);
     }
 
-    pub fn findHashed(self: *const JoinIndex, probe: Batch, probe_keys: []const usize, classes: []const KeyClass, row: usize, h: u64) ?usize {
-        var slot = h & self.mask;
-        while (self.heads[slot] != 0) : (slot = (slot + 1) & self.mask) {
-            const hr: usize = self.heads[slot] - 1;
-            if (self.hashes[hr] == h and self.probeEq(probe, probe_keys, classes, row, hr)) return hr;
+    /// The first build row whose keys equal probe row `r`'s, or null; walk the rest
+    /// with `chainNext`.
+    pub fn first(self: *const JoinIndex, p: Probe, r: usize) ?usize {
+        if (p.miss[r]) return null;
+        const h = p.hashes[r];
+        const pt = self.partOfHash(h);
+        if (self.fixed) {
+            const slot = pt.table.find(h, p.enc.?.key(r), pt.fixed) orelse return null;
+            return @intCast(Head.of(pt.fixed.at(slot).tail).*);
         }
-        return null;
+        const nk = self.keys.len;
+        const slot = pt.table.find(h, @as([]const Value, p.boxed[r * nk ..][0..nk]), pt.boxed) orelse return null;
+        return @intCast(Head.of(pt.boxed.at(slot).tail).*);
     }
 
     pub fn chainNext(self: *const JoinIndex, row: usize) ?usize {
         const nx = self.next[row];
         return if (nx == 0) null else nx - 1;
-    }
-
-    pub fn classesFor(self: *const JoinIndex, arena: std.mem.Allocator, probe: Batch, probe_keys: []const usize) ![]KeyClass {
-        const classes = try arena.alloc(KeyClass, probe_keys.len);
-        for (self.keys, probe_keys, classes) |bk, pk, *c|
-            c.* = classOf(probe.columns[pk], self.build_batch.columns[bk]);
-        return classes;
     }
 };
 
@@ -479,6 +660,9 @@ pub const Join = struct {
     index: ?*JoinIndex = null,
     left_keys: []const usize,
     right_keys: []const usize,
+    probe_enc: ?keytable.Encoder = null,
+    probe_keyed: bool = false,
+    threads: usize = 1,
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
     out_schema: *const types.Schema,
@@ -680,7 +864,7 @@ pub const Join = struct {
     fn buildIndex(self: *Join, arena: std.mem.Allocator) anyerror!?*JoinIndex {
         const build = self.build orelse return error.JoinHasNoBuildSide;
         const cap = self.build_cap orelse op_mod.join_build_byte_cap;
-        if (!self.mayGrace()) return try JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, cap);
+        if (!self.mayGrace()) return try JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, cap, self.threads);
         var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer pull.deinit();
         var held = std.array_list.Managed(Batch).init(pull.allocator());
@@ -692,8 +876,8 @@ pub const Join = struct {
             bytes += b.heapBytes();
             rows += b.len;
             if (bytes > self.spill_at) break;
-        } else if (bytes + indexOverhead(rows) <= self.spill_at and rows < std.math.maxInt(u32)) {
-            return try JoinIndex.fromBatches(self.state, held.items, self.right_schema, self.right_keys, bytes, std.math.maxInt(usize));
+        } else if (bytes + indexOverhead(rows, self.right_keys.len) <= self.spill_at and rows < std.math.maxInt(u32)) {
+            return try JoinIndex.fromBatches(self.state, held.items, self.right_schema, self.right_keys, bytes, std.math.maxInt(usize), self.threads);
         }
         try self.startGrace(&pull, held.items, build);
         return null;
@@ -814,7 +998,7 @@ pub const Join = struct {
         var fit: Fit = .fits;
         const rows: usize = @intCast(build.rows);
         const bytes: usize = @intCast(build.bytes);
-        if (bytes + indexOverhead(rows) > self.spill_at) {
+        if (bytes + indexOverhead(rows, self.right_keys.len) > self.spill_at) {
             if (try self.oneKey(g, build)) {
                 fit = .one_key;
             } else if (g.cur.depth + 1 >= self.max_spill_depth) {
@@ -902,7 +1086,7 @@ pub const Join = struct {
     /// `run`'s rows indexed in `pa`, under `partCap`; past it the error says why no
     /// split could help.
     fn indexPart(self: *Join, pa: std.mem.Allocator, run_opt: ?spill.Run, fit: Fit) anyerror!*JoinIndex {
-        const run = run_opt orelse return JoinIndex.fromBatches(pa, &.{}, self.right_schema, self.right_keys, 0, std.math.maxInt(usize));
+        const run = run_opt orelse return JoinIndex.fromBatches(pa, &.{}, self.right_schema, self.right_keys, 0, std.math.maxInt(usize), self.threads);
         var r = try spill.Reader.open(run);
         defer r.close();
         var held = std.array_list.Managed(Batch).init(pa);
@@ -912,7 +1096,7 @@ pub const Join = struct {
             bytes += b.heapBytes();
         }
         const cap = self.partCap();
-        return JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, cap) catch |e| {
+        return JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, cap, self.threads) catch |e| {
             if (e != error.JoinBuildTooLarge) return e;
             const ec = self.err orelse return if (fit == .too_deep) error.SpillTooDeep else e;
             switch (fit) {
@@ -942,8 +1126,7 @@ pub const Join = struct {
     /// (in `pair_mem`). The batch and these live in `probe_mem` until it is done.
     const Pending = struct {
         lb: Batch,
-        classes: []KeyClass,
-        hs: []u64,
+        probe: Probe,
         nulls: []bool,
         empty: bool,
         r: usize = 0,
@@ -982,14 +1165,14 @@ pub const Join = struct {
 
     fn startPending(self: *Join, pa: std.mem.Allocator, ix: *JoinIndex, lb: Batch) !Pending {
         const empty = ix.keys.len == 0 or ix.build_batch.len == 0;
-        const classes = try ix.classesFor(pa, lb, self.left_keys);
-        const hs = try pa.alloc(u64, lb.len);
-        const nulls = try pa.alloc(bool, lb.len);
-        for (hs, nulls, 0..) |*h, *nl, i| {
-            nl.* = empty or anyNullKey(lb.columns, self.left_keys, i);
-            h.* = if (nl.*) 0 else hashRowKeys(lb.columns, self.left_keys, classes, i);
+        if (!self.probe_keyed) {
+            self.probe_enc = try ix.probeEncoder(self.state, self.left_keys);
+            self.probe_keyed = true;
         }
-        var p = Pending{ .lb = lb, .classes = classes, .hs = hs, .nulls = nulls, .empty = empty };
+        const nulls = try pa.alloc(bool, lb.len);
+        for (nulls, 0..) |*nl, i| nl.* = empty or anyNullKey(lb.columns, self.left_keys, i);
+        const pr = try ix.probe(pa, lb, self.left_keys, self.probe_enc);
+        var p = Pending{ .lb = lb, .probe = pr, .nulls = nulls, .empty = empty };
         if (self.residual != null) {
             p.hits = try pa.alloc(bool, lb.len);
             @memset(p.hits, false);
@@ -998,11 +1181,11 @@ pub const Join = struct {
     }
 
     /// Row `r`'s chain looked up, the rows 8 ahead prefetched.
-    fn startRow(self: *Join, ix: *JoinIndex, p: *Pending) void {
+    fn startRow(_: *Join, ix: *JoinIndex, p: *Pending) void {
         const r = p.r;
         const ahead = 8;
-        if (r + ahead < p.lb.len and !p.nulls[r + ahead]) ix.prefetch(p.hs[r + ahead]);
-        p.cur = if (p.nulls[r]) null else ix.findHashed(p.lb, self.left_keys, p.classes, r, p.hs[r]);
+        if (r + ahead < p.lb.len and !p.probe.miss[r + ahead]) ix.prefetch(p.probe.hashes[r + ahead]);
+        p.cur = ix.first(p.probe, r);
         p.hit = p.cur != null;
         p.started = true;
         p.win = first_win;

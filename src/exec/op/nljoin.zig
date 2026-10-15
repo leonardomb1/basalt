@@ -234,7 +234,7 @@ pub const NLJoin = struct {
     fn ensureBuild(self: *NLJoin, arena: std.mem.Allocator) anyerror!*JoinIndex {
         if (self.index) |ix| return ix;
         const build = self.build orelse return error.JoinHasNoBuildSide;
-        const ix = JoinIndex.create(self.state, arena, build, self.right_schema, &.{}, self.build_cap orelse op_mod.join_build_byte_cap) catch |e| {
+        const ix = JoinIndex.create(self.state, arena, build, self.right_schema, &.{}, self.build_cap orelse op_mod.join_build_byte_cap, 1) catch |e| {
             if (self.err) |ec| ec.set("{s}", .{failLabel(e)});
             return e;
         };
