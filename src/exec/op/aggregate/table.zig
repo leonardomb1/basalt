@@ -4,9 +4,7 @@
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
 const Layout = Aggregate.Layout;
-const Slot = Aggregate.Slot;
 const Value = @import("../../value.zig").Value;
-const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const keyhash = @import("../../keyhash.zig");
 const std = @import("std");
@@ -51,50 +49,6 @@ pub fn fixedHash(vals: []const i64, mask: u64) u64 {
     for (vals) |v| h = keyhash.fmix64(h ^ (@as(u64, @bitCast(v)) *% 0xC2B2AE3D27D4EB4F));
     return h;
 }
-
-pub const Fast = enum {
-    count_star,
-    count_all_valid,
-    sum_i64,
-    sum_f64,
-    sum_f_of_i64,
-    sum_f_of_dec,
-    sum_dec,
-    min_i64,
-    max_i64,
-    min_dec,
-    max_dec,
-    generic,
-
-    pub fn of(slot: Slot, func: ast.AggFunc, col: ?column.Column, n: usize) Fast {
-        const c = col orelse return if (slot == .count) .count_star else .generic;
-        if (!c.validity.allSet(n)) return .generic;
-        return switch (slot) {
-            .count => .count_all_valid,
-            .sum_i => if (c.ty.kind == .int) .sum_i64 else .generic,
-            .sum_d => if (c.ty.kind == .decimal) .sum_dec else .generic,
-            .sum_f => switch (c.ty.kind) {
-                .float => .sum_f64,
-                .int => .sum_f_of_i64,
-                .decimal => .sum_f_of_dec,
-                else => .generic,
-            },
-            .full => switch (func) {
-                .min => switch (c.ty.kind) {
-                    .int => .min_i64,
-                    .decimal => .min_dec,
-                    else => .generic,
-                },
-                .max => switch (c.ty.kind) {
-                    .int => .max_i64,
-                    .decimal => .max_dec,
-                    else => .generic,
-                },
-                else => .generic,
-            },
-        };
-    }
-};
 
 pub const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
 

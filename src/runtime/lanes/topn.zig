@@ -46,9 +46,9 @@ pub fn topNTail(tail: []const ast.Stage) ?TopNTail {
 
 /// The output value a sort key refers to: group keys first, then the aggregates. A sum
 /// out of range only orders here; it fails the query when emitted.
-fn groupSortValue(set: *const op.Aggregate.GroupSet, gi: usize, col: usize, by_len: usize, aggs: []const op.Aggregate.Agg) Value {
+fn groupSortValue(set: *const op.Aggregate.GroupSet, gi: usize, col: usize, by_len: usize) Value {
     if (col < by_len) return set.keyValue(gi, col);
-    return op.Aggregate.finalizeAcc(set.acc(gi, col - by_len), aggs[col - by_len]) catch .null;
+    return set.finish(gi, col - by_len) catch .null;
 }
 
 const GroupOrder = struct {
@@ -59,8 +59,8 @@ const GroupOrder = struct {
 
     fn less(self: GroupOrder, a: u32, b: u32) bool {
         for (self.keys) |k| {
-            const av = groupSortValue(self.set, a, k.idx, self.by_len, self.aggs);
-            const bv = groupSortValue(self.set, b, k.idx, self.by_len, self.aggs);
+            const av = groupSortValue(self.set, a, k.idx, self.by_len);
+            const bv = groupSortValue(self.set, b, k.idx, self.by_len);
             const o = op.keyOrder(av, bv, k.desc, k.nulls_first);
             if (o != .eq) return o == .lt;
         }

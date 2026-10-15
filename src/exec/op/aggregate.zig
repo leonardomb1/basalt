@@ -1,10 +1,11 @@
 //! `GROUP BY` and global aggregates: grouped hash tables, per-lane partials and
-//! their merge, and the vectorized reductions of the global path.
+//! their merge.
 //!
 //! `Aggregate` keeps its fields and core types here; its group tables are in
 //! `aggregate/table.zig`, a lane's group sets and their merge in `groups.zig`, the
-//! input loop in `drain.zig`, and the accumulators in `accumulate.zig`, each aliased
-//! back into the struct.
+//! input loop in `drain.zig`, arguments and output in `accumulate.zig`, each
+//! aliased back into the struct. Every aggregate is its math in `funcs.zig` run by
+//! the loops `kernel.zig` generates for it.
 //!
 //! With a `space`, a grouped serial aggregate spills to disk once what it holds
 //! passes `spill_at` (`aggregate/spill.zig`); without one, or on a lane, it never does.
@@ -25,6 +26,7 @@ const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
 const Space = @import("../space.zig").Space;
 const spill_parts = @import("spill_parts.zig");
+const kernel = @import("aggregate/kernel.zig");
 const TestSource = @import("testing_util.zig").TestSource;
 const intBatch = @import("testing_util.zig").intBatch;
 const int_schema = @import("testing_util.zig").int_schema;
@@ -64,68 +66,11 @@ pub const Aggregate = struct {
     pub const StrTable = @import("aggregate/groups.zig").StrTable;
     pub const strId = @import("aggregate/groups.zig").strId;
     pub const strTable = @import("aggregate/groups.zig").strTable;
-    pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false };
-
-    pub const Acc = struct {
-        n: i64 = 0,
-        sum_i: i256 align(8) = 0,
-        sum_f: f64 = 0,
-        ext: Value = .null,
-        seen: ?*DistinctSet() = null,
-        vals: ?*std.array_list.Managed(f64) = null,
-    };
-
-    /// A type-returning fn for the same reason as `GroupMap`.
-    pub fn DistinctSet() type {
-        return std.HashMap([]const Value, void, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-    }
-
-    pub fn noteMedian(alloc: std.mem.Allocator, acc: *Acc, x: f64) !void {
-        const l = acc.vals orelse blk: {
-            const p = try alloc.create(std.array_list.Managed(f64));
-            p.* = std.array_list.Managed(f64).init(alloc);
-            acc.vals = p;
-            break :blk p;
-        };
-        try l.append(x);
-    }
-
-    fn seenSet(alloc: std.mem.Allocator, acc: *Acc) !*DistinctSet() {
-        if (acc.seen) |set| return set;
-        const set = try alloc.create(DistinctSet());
-        set.* = DistinctSet().init(alloc);
-        acc.seen = set;
-        return set;
-    }
-
-    /// Fold another lane's distinct values into `acc`, sizing the destination first:
-    /// inserting a hash-ordered run into a smaller table built ever-longer probe runs
-    /// (a global COUNT(DISTINCT) took 292s at -j 8, 8s at -j 1).
-    pub fn mergeDistinct(alloc: std.mem.Allocator, acc: *Acc, src: *const DistinctSet()) !void {
-        const set = try seenSet(alloc, acc);
-        try set.ensureTotalCapacity(std.math.cast(u32, set.count() + src.count()) orelse return error.OutOfMemory);
-        var it = src.keyIterator();
-        while (it.next()) |k| try noteDistinct(alloc, acc, k.*[0]);
-    }
-
-    /// Probes with a stack key and copies only on a miss. Copying first grew an arena
-    /// per row: COUNT(DISTINCT) over 200M rows held ~7.6 GB for 200 values.
-    pub fn noteDistinct(alloc: std.mem.Allocator, acc: *Acc, v: Value) !void {
-        const set = try seenSet(alloc, acc);
-        var probe = [_]Value{v};
-        const gop = try set.getOrPut(probe[0..]);
-        if (!gop.found_existing) {
-            const key = try alloc.alloc(Value, 1);
-            key[0] = try dupeValue(alloc, v);
-            gop.key_ptr.* = key;
-        }
-        acc.n = @intCast(set.count());
-    }
+    pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false, arg_ty: ?types.Type = null };
 
     pub const GroupSet = @import("aggregate/groups.zig").GroupSet;
     pub const GroupMerge = @import("aggregate/groups.zig").GroupMerge;
     pub const GroupMap = @import("aggregate/groups.zig").GroupMap;
-    pub const Partial = @import("aggregate/groups.zig").Partial;
     pub const next = @import("aggregate/drain.zig").next;
     pub const drainSet = @import("aggregate/drain.zig").drainSet;
     pub const drainParts = @import("aggregate/drain.zig").drainParts;
@@ -143,7 +88,6 @@ pub const Aggregate = struct {
     pub const Direct = @import("aggregate/table.zig").Direct;
     pub const few_groups = @import("aggregate/table.zig").few_groups;
     pub const fixedHash = @import("aggregate/table.zig").fixedHash;
-    pub const Fast = @import("aggregate/table.zig").Fast;
     pub const KeyKind = @import("aggregate/table.zig").KeyKind;
     pub const keyKindOf = @import("aggregate/table.zig").keyKindOf;
     pub const RecBlocks = @import("aggregate/table.zig").RecBlocks;
@@ -151,139 +95,26 @@ pub const Aggregate = struct {
     pub const FixedKey = @import("aggregate/table.zig").FixedKey;
     pub const GroupTable = @import("aggregate/table.zig").GroupTable;
     pub const GroupStore = @import("aggregate/table.zig").GroupStore;
-    pub const mergeAcc = @import("aggregate/accumulate.zig").mergeAcc;
-    pub const foldVectorized = @import("aggregate/accumulate.zig").foldVectorized;
-    pub const foldRowwise = @import("aggregate/accumulate.zig").foldRowwise;
     pub const argCast = @import("aggregate/accumulate.zig").argCast;
     pub const argColumn = @import("aggregate/accumulate.zig").argColumn;
-    pub const argValue = @import("aggregate/accumulate.zig").argValue;
     pub const castArg = @import("aggregate/accumulate.zig").castArg;
-    pub const reduceBatch = @import("aggregate/accumulate.zig").reduceBatch;
-    pub const foldsRowwise = @import("aggregate/accumulate.zig").foldsRowwise;
-    pub const mergePartial = @import("aggregate/accumulate.zig").mergePartial;
     pub const emitSets = @import("aggregate/accumulate.zig").emitSets;
     pub const emitGroup = @import("aggregate/accumulate.zig").emitGroup;
-    pub const updateAcc = @import("aggregate/accumulate.zig").updateAcc;
-    pub const addExact = @import("aggregate/accumulate.zig").addExact;
-    pub const Slot = @import("aggregate/accumulate.zig").Slot;
-    pub const SumI = @import("aggregate/accumulate.zig").SumI;
-    pub const SumD = @import("aggregate/accumulate.zig").SumD;
-    pub const SumF = @import("aggregate/accumulate.zig").SumF;
-    pub const Layout = @import("aggregate/accumulate.zig").Layout;
-    pub const finalizeAcc = @import("aggregate/accumulate.zig").finalizeAcc;
-    pub const bitFold = @import("aggregate/accumulate.zig").bitFold;
-    pub const sqDev = @import("aggregate/accumulate.zig").sqDev;
-    pub const noteMoment = @import("aggregate/accumulate.zig").noteMoment;
-    pub const mergeMoments = @import("aggregate/accumulate.zig").mergeMoments;
-    pub const spread = @import("aggregate/accumulate.zig").spread;
+    pub const Layout = @import("aggregate/kernel.zig").Layout;
+    pub const foldSingle = @import("aggregate/accumulate.zig").foldSingle;
 };
 
 pub fn lessV(a: Value, b: Value) bool {
     return (eval.compareValues(a, b) orelse .eq) == .lt;
 }
 
-/// Quickselect: `xs[k]` becomes the k-th smallest, smaller before, larger after.
-/// Median-of-three pivot, Hoare partition; expected O(n). NaN orders above every
-/// number, as `eval.orderF64` has it, so the NaNs are moved to the end first.
-pub fn selectNth(xs_all: []f64, k: usize) f64 {
-    var m: usize = 0;
-    for (xs_all) |x| {
-        if (std.math.isNan(x)) continue;
-        xs_all[m] = x;
-        m += 1;
-    }
-    @memset(xs_all[m..], std.math.nan(f64));
-    if (k >= m) return std.math.nan(f64);
-    const xs = xs_all[0..m];
-    var lo: usize = 0;
-    var hi: usize = xs.len - 1;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (xs[mid] < xs[lo]) std.mem.swap(f64, &xs[mid], &xs[lo]);
-        if (xs[hi] < xs[lo]) std.mem.swap(f64, &xs[hi], &xs[lo]);
-        if (xs[hi] < xs[mid]) std.mem.swap(f64, &xs[hi], &xs[mid]);
-        const p = xs[mid];
-        var i = lo;
-        var j = hi;
-        while (i <= j) {
-            while (xs[i] < p) i += 1;
-            while (p < xs[j]) j -= 1;
-            if (i <= j) {
-                std.mem.swap(f64, &xs[i], &xs[j]);
-                i += 1;
-                if (j == 0) break;
-                j -= 1;
-            }
-        }
-        if (k <= j) {
-            hi = j;
-        } else if (k >= i) {
-            lo = i;
-        } else {
-            return xs[k];
-        }
-    }
-    return xs[k];
-}
-
-pub fn dupeValue(state: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try state.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try state.dupe(u8, s) },
-        else => v,
-    };
-}
-
-/// Sum an i64 column exactly in i128, branch-free, range-checked in `finalizeAcc`.
-/// This was `+%`, which returned a plausible wrong total.
-pub fn sumIntCol(d: []const i64) i128 {
-    var s: i128 = 0;
-    for (d) |x| s += x;
-    return s;
-}
-
-pub fn validSumI(col: column.Column, n: usize) i128 {
-    var s: i128 = 0;
-    for (col.data.i64[0..n], 0..) |x, i| {
-        if (col.validity.get(i)) s += x;
-    }
-    return s;
-}
-
-pub fn validSumF(col: column.Column, n: usize) f64 {
-    var s: f64 = 0;
-    for (col.data.f64[0..n], 0..) |x, i| {
-        if (col.validity.get(i)) s += x;
-    }
-    return s;
-}
-
-/// MIN/MAX over an int or float column: SIMD when all valid (a null lane's 0 would
-/// corrupt the extreme), else a scalar skip.
-pub fn reduceExtreme(col: column.Column, func: ast.AggFunc, n: usize) Value {
-    const is_min = func == .min;
-    if (col.ty.kind == .float) {
-        const d = col.data.f64[0..n];
-        if (col.validity.allSet(n)) {
-            return .{ .float = if (is_min) simd.minF(d) else simd.maxF(d) };
-        }
-        var m: ?f64 = null;
-        for (d, 0..) |x, i| {
-            if (!col.validity.get(i)) continue;
-            m = if (m) |cur| (if (is_min) @min(cur, x) else @max(cur, x)) else x;
-        }
-        return if (m) |x| Value{ .float = x } else .null;
-    }
-    var m: ?i64 = null;
-    for (col.data.i64[0..n], 0..) |x, i| {
-        if (!col.validity.get(i)) continue;
-        m = if (m) |cur| (if (is_min) @min(cur, x) else @max(cur, x)) else x;
-    }
-    return if (m) |x| Value{ .int = x } else .null;
-}
+pub const selectNth = @import("aggregate/funcs.zig").selectNth;
+pub const dupeValue = @import("aggregate/funcs.zig").dupeValue;
 
 test {
     _ = @import("aggregate/spill.zig");
+    _ = @import("aggregate/funcs.zig");
+    _ = @import("aggregate/kernel.zig");
     _ = @import("spill_parts.zig");
 }
 
@@ -380,54 +211,79 @@ test "aggregate: sum/avg coerce raw string cells (parallel CSV lane shape); garb
     }
 }
 
+/// One aggregate's state outside an operator, for testing its math through its kernel.
+const Probe = struct {
+    k: *const kernel.Kernel,
+    cx: kernel.Ctx,
+    buf: [64]u8 align(16) = undefined,
+
+    fn init(agg: Aggregate.Agg) Probe {
+        const kf = kernel.kernelFor(agg);
+        var p = Probe{ .k = kf.k, .cx = .{ .out = agg.ty, .ty = kf.ty, .alloc = testing.allocator, .scratch = testing.allocator } };
+        p.k.init(&p.buf);
+        return p;
+    }
+    fn add(p: *Probe, v: Value) !void {
+        try p.k.add(&p.buf, v, p.cx);
+    }
+    fn merge(p: *Probe, o: *const Probe) !void {
+        try p.k.merge(&p.buf, &o.buf, p.cx);
+    }
+    fn finish(p: *const Probe) !Value {
+        return p.k.finish(&p.buf, p.cx);
+    }
+};
+
 test "aggregate: variance folded in two halves and merged matches one fold, and holds up far from zero" {
     const A = Aggregate;
     const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
     const xs = [_]f64{ 2, 4, 4, 4, 5, 5, 7, 9, 1.5, 12.25 };
     inline for (.{ ast.AggFunc.var_samp, .var_pop, .stddev_samp, .stddev_pop }) |func| {
         const agg = A.Agg{ .func = func, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
-        var whole = A.Acc{};
-        for (xs) |x| try A.updateAcc(testing.allocator, &whole, agg, .{ .float = x }, true);
+        var whole = Probe.init(agg);
+        for (xs) |x| try whole.add(.{ .float = x });
         for (0..xs.len + 1) |cut| {
-            var lo = A.Acc{};
-            var hi = A.Acc{};
-            for (xs[0..cut]) |x| try A.updateAcc(testing.allocator, &lo, agg, .{ .float = x }, true);
-            for (xs[cut..]) |x| try A.updateAcc(testing.allocator, &hi, agg, .{ .float = x }, true);
-            try A.mergeAcc(testing.allocator, &lo, hi, agg);
-            try testing.expectApproxEqAbs((try A.finalizeAcc(whole, agg)).float, (try A.finalizeAcc(lo, agg)).float, 1e-9);
+            var lo = Probe.init(agg);
+            var hi = Probe.init(agg);
+            for (xs[0..cut]) |x| try lo.add(.{ .float = x });
+            for (xs[cut..]) |x| try hi.add(.{ .float = x });
+            try lo.merge(&hi);
+            try testing.expectApproxEqAbs((try whole.finish()).float, (try lo.finish()).float, 1e-9);
         }
     }
     const pop = A.Agg{ .func = .var_pop, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
     const samp = A.Agg{ .func = .var_samp, .arg = &fx, .ty = types.Type.init(.float).asNullable() };
-    var p = A.Acc{};
-    var q = A.Acc{};
+    var p = Probe.init(pop);
+    var q = Probe.init(samp);
     for (xs[0..8]) |x| {
-        try A.updateAcc(testing.allocator, &p, pop, .{ .float = x + 1e9 }, true);
-        try A.updateAcc(testing.allocator, &q, samp, .{ .int = @intFromFloat(x) }, true);
+        try p.add(.{ .float = x + 1e9 });
+        try q.add(.{ .int = @intFromFloat(x) });
     }
-    try testing.expectApproxEqAbs(@as(f64, 4), (try A.finalizeAcc(p, pop)).float, 1e-6);
-    try testing.expectApproxEqAbs(@as(f64, 32.0 / 7.0), (try A.finalizeAcc(q, samp)).float, 1e-12);
-    var one = A.Acc{};
-    try A.updateAcc(testing.allocator, &one, samp, .{ .float = 3 }, true);
-    try testing.expect((try A.finalizeAcc(one, samp)) == .null);
-    try testing.expectEqual(@as(f64, 0), (try A.finalizeAcc(one, pop)).float);
-    try testing.expect((try A.finalizeAcc(.{}, pop)) == .null);
+    try testing.expectApproxEqAbs(@as(f64, 4), (try p.finish()).float, 1e-6);
+    try testing.expectApproxEqAbs(@as(f64, 32.0 / 7.0), (try q.finish()).float, 1e-12);
+    var one = Probe.init(samp);
+    try one.add(.{ .float = 3 });
+    try testing.expect((try one.finish()) == .null);
+    var one_pop = Probe.init(pop);
+    try one_pop.add(.{ .float = 3 });
+    try testing.expectEqual(@as(f64, 0), (try one_pop.finish()).float);
+    try testing.expect((try Probe.init(pop).finish()) == .null);
 }
 
 test "aggregate: bit_and starts from its first value, not zero, through a merge too" {
     const A = Aggregate;
     const fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
     const agg = A.Agg{ .func = .bit_and, .arg = &fx, .ty = types.Type.init(.int).asNullable() };
-    var empty = A.Acc{};
-    var some = A.Acc{};
-    for ([_]i64{ 0b1110, 0b0111, -1 }) |x| try A.updateAcc(testing.allocator, &some, agg, .{ .int = x }, true);
-    try A.updateAcc(testing.allocator, &some, agg, .null, true);
-    try A.mergeAcc(testing.allocator, &empty, some, agg);
-    try testing.expectEqual(@as(i64, 0b0110), (try A.finalizeAcc(empty, agg)).int);
-    var neg = A.Acc{};
-    try A.updateAcc(testing.allocator, &neg, agg, .{ .int = std.math.minInt(i64) }, true);
-    try testing.expectEqual(@as(i64, std.math.minInt(i64)), (try A.finalizeAcc(neg, agg)).int);
-    try testing.expect((try A.finalizeAcc(.{}, agg)) == .null);
+    var empty = Probe.init(agg);
+    var some = Probe.init(agg);
+    for ([_]i64{ 0b1110, 0b0111, -1 }) |x| try some.add(.{ .int = x });
+    try some.add(.null);
+    try empty.merge(&some);
+    try testing.expectEqual(@as(i64, 0b0110), (try empty.finish()).int);
+    var neg = Probe.init(agg);
+    try neg.add(.{ .int = std.math.minInt(i64) });
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), (try neg.finish()).int);
+    try testing.expect((try Probe.init(agg).finish()) == .null);
 }
 
 test "aggregate: a decimal sum normalizes each value's own scale" {
@@ -460,25 +316,16 @@ test "aggregate: a decimal sum normalizes each value's own scale" {
     try testing.expectEqual(@as(u8, 6), d.scale);
     try testing.expectEqual(@as(i128, 3_001_002), d.unscaled);
 
-    var rows = [_]Aggregate.Acc{.{}};
-    try agg.foldRowwise(a, batches[0], &rows);
-    var vecs = [_]Aggregate.Acc{.{}};
-    try testing.expect(try agg.foldVectorized(a, batches[0], &vecs));
-    try testing.expectEqual(rows[0].sum_i, vecs[0].sum_i);
-    try testing.expectEqual(rows[0].n, vecs[0].n);
-
     const top: i128 = std.math.powi(i128, 10, 38) catch unreachable;
     var big = column.Builder.init(a, types.Type.decimal(38, 0));
     try big.append(.{ .decimal = .{ .unscaled = top - 1, .scale = 0 } });
     try big.append(.{ .decimal = .{ .unscaled = top - 1, .scale = 0 } });
     const big_cols = try a.alloc(column.Column, 1);
     big_cols[0] = try big.finish();
-    const big_schema = types.Schema{ .fields = &.{.{ .name = "n", .ty = types.Type.decimal(38, 0) }} };
     const big_aggs = [_]Aggregate.Agg{.{ .func = .sum, .arg = &fx, .ty = types.Type.decimal(38, 0) }};
-    var over = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &big_schema, .by = &.{}, .aggs = &big_aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
-    var acc = [_]Aggregate.Acc{.{}};
-    try testing.expect(try over.foldVectorized(a, .{ .schema = &big_schema, .columns = big_cols, .len = 2 }, &acc));
-    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(acc[0], big_aggs[0]));
+    var over = Probe.init(big_aggs[0]);
+    try over.k.fold(&over.buf, big_cols[0], 2, over.cx);
+    try testing.expectError(error.IntOverflow, over.finish());
 }
 
 test "aggregate: a decimal sum checks 38 digits on the total, whatever the batches or row order" {
@@ -601,14 +448,24 @@ test "aggregate: global vectorized reductions honor nulls; empty input edge case
 test "integer SUM: exact across batches, an error only when the total leaves i64" {
     const big: i64 = 6148914691236517205;
     const agg = Aggregate.Agg{ .func = .sum, .arg = null, .ty = types.Type.init(.int) };
-    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 3, .sum_i = sumIntCol(&[_]i64{ big, big, big }) }, agg));
-    try testing.expectError(error.IntOverflow, Aggregate.finalizeAcc(.{ .n = 2, .sum_i = sumIntCol(&[_]i64{ std.math.minInt(i64), -1 }) }, agg));
-    try testing.expectEqual(@as(i128, 6), sumIntCol(&[_]i64{ 1, 2, 3 }));
-
     const max = std.math.maxInt(i64);
-    var acc = Aggregate.Acc{ .n = 5 };
-    for ([_][]const i64{ &.{ max, max }, &.{ -max, -max }, &.{5} }) |part| acc.sum_i += sumIntCol(part);
-    try testing.expectEqual(Value{ .int = 5 }, try Aggregate.finalizeAcc(acc, agg));
+    const cases = [_]struct { parts: []const []const i64, want: ?i64 }{
+        .{ .parts = &.{&.{ big, big, big }}, .want = null },
+        .{ .parts = &.{&.{ std.math.minInt(i64), -1 }}, .want = null },
+        .{ .parts = &.{&.{ 1, 2, 3 }}, .want = 6 },
+        .{ .parts = &.{ &.{ max, max }, &.{ -max, -max }, &.{5} }, .want = 5 },
+    };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    for (cases) |c| {
+        var p = Probe.init(agg);
+        for (c.parts) |part| {
+            var b = column.Builder.init(ar.allocator(), types.Type.init(.int));
+            for (part) |x| try b.append(.{ .int = x });
+            try p.k.fold(&p.buf, try b.finish(), part.len, p.cx);
+        }
+        if (c.want) |w| try testing.expectEqual(Value{ .int = w }, try p.finish()) else try testing.expectError(error.IntOverflow, p.finish());
+    }
 }
 
 test "aggregate: selectNth orders NaN above every number" {

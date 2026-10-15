@@ -60,9 +60,8 @@
 //! Aggregate is streaming hash aggregation, O(groups). Groups are typed records in
 //! blocks: `FixedStore` (raw i64 words plus a null mask) when every key is
 //! fixed-width, `GroupStore` (boxed values) otherwise. Keys are followed by each
-//! aggregate's `Slot` as laid out by `Layout`, so a SUM pays its own bytes rather
-//! than an 80-byte `Acc`, and the hash leads the record, so a table grows without
-//! rehashing. `GroupTable` slots are one u32 (hash salt plus index), sixteen to a
+//! aggregate's state as laid out by `Layout`, so a COUNT pays eight bytes and a SUM
+//! its own, and the hash leads the record, so a table grows without rehashing. `GroupTable` slots are one u32 (hash salt plus index), sixteen to a
 //! cache line, since at high cardinality the lines a probe touches are the cost;
 //! a batch is hashed first and probed `prefetch_ahead` rows behind a prefetch.
 //! Groups split over `fold_parts` radix partitions by the hash's top bits (the
@@ -72,17 +71,17 @@
 //! order does not follow thread timing. Parallel lanes fold partial `GroupSet`s that
 //! `GroupMerge` combines by their raw accumulators; `emitSets` finalizes once.
 //!
-//! `Acc` fields are shared between aggregates: `n` counts rows, `sum_i`/`sum_f`
-//! hold sums, `ext` the extreme. Bitwise aggregates keep their bits in `sum_i`,
-//! with `n == 0` meaning none yet since zero is not AND's identity; variances keep
-//! Welford's mean in `sum_f` and squared deviations in `ext`, keeping `Acc` one
-//! record. Sums are exact, i128 for ints and i256 for DECIMAL (whose addends reach
-//! 10^38), range-checked once in `finalizeAcc`, so the answer cannot depend on how
-//! rows split across batches and lanes or on their order (it once came out 5 at
-//! -j 1 and an overflow at -j 8). DECIMAL addends are normalized to the output
-//! scale. Variances merge with Chan's formula in fixed lane order, reproducible for
-//! a given `-j`, like a float SUM. Text arguments are cast before the accumulator
-//! (`argCast`); without it SUM panicked on a text cell and AVG returned 0.
+//! Each aggregate is its math alone (`aggregate/funcs.zig`: a state and its add,
+//! merge and finish), and `aggregate/kernel.zig` generates every loop around it —
+//! a batch with no nulls, one with, a batch's rows into their groups, a lane's
+//! states into another's — once per physical type, chosen per aggregate at plan
+//! time. Sums are exact, i128 for ints and i256 for DECIMAL, range-checked once at
+//! the end, so the answer cannot depend on how rows split across batches and lanes
+//! or on their order (it once came out 5 at -j 1 and an overflow at -j 8). DECIMAL
+//! addends are normalized to the output scale. Variances merge with Chan's formula
+//! in fixed lane order, reproducible for a given `-j`, like a float SUM. Text
+//! arguments are cast before the state (`argCast`); without it SUM panicked on a
+//! text cell and AVG returned 0.
 //!
 //! Join is a hash join: the build (right) side is drained into a `JoinIndex` and
 //! the probe (left) side streams through it. The index is three flat arrays (bucket

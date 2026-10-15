@@ -6,10 +6,8 @@
 //! find, and send the rest to `spillRows`, picked by the hash they already have.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
-const Acc = Aggregate.Acc;
 const Batch = @import("../../batch.zig").Batch;
 const Direct = Aggregate.Direct;
-const Fast = Aggregate.Fast;
 const FixedKey = Aggregate.FixedKey;
 const FixedStore = Aggregate.FixedStore;
 const GroupSet = Aggregate.GroupSet;
@@ -17,14 +15,11 @@ const GroupStore = Aggregate.GroupStore;
 const GroupTable = Aggregate.GroupTable;
 const KeyKind = Aggregate.KeyKind;
 const Layout = Aggregate.Layout;
+const Rows = @import("kernel.zig").Rows;
 const StrId = Aggregate.StrId;
-const SumD = Aggregate.SumD;
-const SumF = Aggregate.SumF;
-const SumI = Aggregate.SumI;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const dupeValue = @import("../aggregate.zig").dupeValue;
-const eval = @import("../../eval.zig");
 const few_groups = Aggregate.few_groups;
 const fixedHash = Aggregate.fixedHash;
 const keyKindOf = Aggregate.keyKindOf;
@@ -147,6 +142,24 @@ pub fn keyKinds(self: *Aggregate) ![]types.TypeKind {
     return kinds;
 }
 
+/// Each aggregate's argument over a batch whose rows know their group record
+/// (`tails`, null for a row sent to a spill file) and partition (`pidx`), folded
+/// one aggregate at a time by its kernel.
+fn foldRows(self: *Aggregate, pull: std.mem.Allocator, b: Batch, layout: *const Layout, tails: []const ?[*]u8, parts: anytype, pidx: []const u8) !void {
+    var allocs: [fold_parts]std.mem.Allocator = undefined;
+    const per_part = self.part_state != null;
+    if (per_part) for (parts, 0..) |*p, i| {
+        allocs[i] = p.alloc;
+    };
+    for (self.aggs, 0..) |agg, j| {
+        const col = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+        var cx = layout.ctx(j, self.state);
+        cx.scratch = pull;
+        const rows = Rows{ .cx = cx, .allocs = if (per_part) &allocs else &.{}, .pidx = pidx };
+        try layout.kernels[j].foldRows(tails, layout.offs[j], col, rows);
+    }
+}
+
 /// Fold with raw fixed-width keys. Floats group by number, not bits, as everywhere
 /// else (-0.0 split from 0.0 before). Below `few_groups` rows go in arrival order;
 /// past it a batch is walked a partition at a time so probes share a table.
@@ -244,13 +257,6 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         var r: usize = 0;
         while (r < b.len) : (r += 1) hashes[r] = if (tails[r] != null) 0 else fixedHash(hkeys[r * nk ..][0..nk], masks[r]);
 
-        const argcols = try pull.alloc(?column.Column, self.aggs.len);
-        const fast = try pull.alloc(Fast, self.aggs.len);
-        for (self.aggs, argcols, fast, layout.slots) |agg, *c, *f, sl| {
-            c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
-            f.* = Fast.of(sl, agg.func, c.*, b.len);
-        }
-
         var groups: usize = 0;
         if (self.part_state == null) groups = parts[0].store.len else for (parts) |*pp| {
             groups += pp.store.len;
@@ -302,87 +308,13 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
             };
         }
 
-        if (nspill > 0) {
-            try self.spillRows(pull, b, dest);
-            for (tails[0..b.len], pidx[0..b.len], 0..) |t, pi, ri| {
-                const tail = t orelse continue;
-                for (self.aggs, 0..) |agg, j| {
-                    const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                    try layout.update(parts[pi].alloc, tail, j, agg, v);
-                }
-            }
-        } else if (counts_only) {
+        if (nspill > 0) try self.spillRows(pull, b, dest);
+        if (counts_only) {
             for (tails[0..b.len]) |t| {
-                const cs: [*]i64 = @ptrCast(@alignCast(t.?));
+                const cs: [*]i64 = @ptrCast(@alignCast(t orelse continue));
                 for (cs[0..self.aggs.len]) |*c| c.* += 1;
             }
-        } else for (self.aggs, fast, 0..) |agg, fk, j| switch (fk) {
-            .count_star, .count_all_valid => for (tails[0..b.len]) |t| {
-                layout.ptr(i64, t.?, j).* += 1;
-            },
-            .sum_i64 => {
-                const col = argcols[j].?.data.i64;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const x = layout.ptr(SumI, t.?, j);
-                    x.s += v;
-                    x.n += 1;
-                }
-            },
-            .sum_f64 => {
-                const col = argcols[j].?.data.f64;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const x = layout.ptr(SumF, t.?, j);
-                    x.s += v;
-                    x.n += 1;
-                }
-            },
-            .sum_f_of_i64 => {
-                const col = argcols[j].?.data.i64;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const x = layout.ptr(SumF, t.?, j);
-                    x.s += @floatFromInt(v);
-                    x.n += 1;
-                }
-            },
-            .sum_f_of_dec => {
-                const col = argcols[j].?.data.dec;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const x = layout.ptr(SumF, t.?, j);
-                    x.s += v.toF64();
-                    x.n += 1;
-                }
-            },
-            .sum_dec => {
-                const col = argcols[j].?.data.dec;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const x = layout.ptr(SumD, t.?, j);
-                    try eval.addAtScale(&x.s, v, agg.ty.scale);
-                    x.n += 1;
-                }
-            },
-            .min_i64, .max_i64 => {
-                const col = argcols[j].?.data.i64;
-                const want: std.math.Order = if (fk == .min_i64) .lt else .gt;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const a = layout.ptr(Acc, t.?, j);
-                    const o = if (a.ext == .int) std.math.order(v, a.ext.int) else if (a.ext.isNull()) want else eval.compareValues(.{ .int = v }, a.ext) orelse .eq;
-                    if (o == want) a.ext = .{ .int = v };
-                }
-            },
-            .min_dec, .max_dec => {
-                const col = argcols[j].?.data.dec;
-                const want: std.math.Order = if (fk == .min_dec) .lt else .gt;
-                for (tails[0..b.len], col[0..b.len]) |t, v| {
-                    const a = layout.ptr(Acc, t.?, j);
-                    const o = if (a.ext == .decimal) v.order(a.ext.decimal) else if (a.ext.isNull()) want else eval.compareValues(.{ .decimal = v }, a.ext) orelse .eq;
-                    if (o == want) a.ext = .{ .decimal = v };
-                }
-            },
-            .generic => for (tails[0..b.len], pidx[0..b.len], 0..) |t, pi, ri| {
-                const v = if (argcols[j]) |col| col.getValue(ri) else Value.null;
-                try layout.update(parts[pi].alloc, t.?, j, agg, v);
-            },
-        };
+        } else try foldRows(self, pull, b, layout, tails[0..b.len], parts, pidx[0..b.len]);
         _ = scratch.reset(.retain_capacity);
     }
     return self.foldSets(.fixed, parts);
@@ -406,14 +338,15 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     }
 
     if (self.by.len == 0) {
-        const accs = try self.state.alloc(Acc, self.aggs.len);
-        for (accs) |*a| a.* = .{};
+        const layout = try newIn(self.state, try Layout.init(self.state, self.aggs));
+        const tail = try self.state.alignedAlloc(u8, .of(Value), @max(layout.size, 1));
+        layout.clear(tail.ptr);
         while (try self.child.next(pull)) |b| {
-            if (b.len != 0 and !(try self.foldVectorized(pull, b, accs))) try self.foldRowwise(pull, b, accs);
+            if (b.len != 0) try self.foldSingle(pull, b, layout, tail.ptr);
             _ = scratch.reset(.retain_capacity);
         }
         const one = try self.state.alloc(GroupSet, 1);
-        one[0] = .{ .store = .{ .single = accs }, .len = 1, .key_kinds = &.{} };
+        one[0] = .{ .store = .{ .single = try newIn(self.state, GroupSet.Single{ .layout = layout, .tail = tail.ptr }) }, .len = 1, .key_kinds = &.{} };
         return one;
     }
 
@@ -438,10 +371,9 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
             hashes[r] = hctx.hash(probe);
         }
 
-        const argcols = try pull.alloc(?column.Column, self.aggs.len);
-        for (self.aggs, argcols) |agg, *c| {
-            c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
-        }
+        const tails = try pull.alloc(?[*]u8, b.len);
+        const pidx = try pull.alloc(u8, b.len);
+        @memset(tails, null);
 
         const order = try pull.alloc(u32, b.len);
         radixOrder(order, hashes[0..b.len], counts);
@@ -453,7 +385,8 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
             }
             r = ri;
             const probe = probes[r * nk ..][0..nk];
-            const part = &parts[hashes[r] >> part_shift];
+            const pi = hashes[r] >> part_shift;
+            const part = &parts[pi];
             const rec = if (frozen) blk: {
                 const sl = part.table.find(hashes[r], probe, part.store) orelse {
                     dest[r] = self.destOf(hashes[r]);
@@ -469,12 +402,11 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, v);
                 break :blk nr;
             };
-            for (self.aggs, 0..) |agg, j| {
-                const v = if (argcols[j]) |col| col.getValue(r) else Value.null;
-                try layout.update(part.alloc, rec.tail, j, agg, v);
-            }
+            tails[r] = rec.tail;
+            pidx[r] = @intCast(pi);
         }
         if (nspill > 0) try self.spillRows(pull, b, dest);
+        try foldRows(self, pull, b, layout, tails, parts, pidx);
         _ = scratch.reset(.retain_capacity);
     }
     return self.foldSets(.boxed, parts);

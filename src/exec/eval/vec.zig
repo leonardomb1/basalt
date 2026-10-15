@@ -708,7 +708,7 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
 
 pub const DecSum = struct { sum: i256, nvalid: usize };
 
-/// `SUM(l op r)` over one batch as `addExact` adds it at `scale`, with no decimal
+/// `SUM(l op r)` over one batch as `SumDecimal.add` adds it at `scale`, with no decimal
 /// column built between; null when `expr` is not a decimal operation.
 pub fn decSum(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scale: u8) EvalError!?DecSum {
     return decSumVec(arena, expr, batch, scale) catch |e| switch (e) {

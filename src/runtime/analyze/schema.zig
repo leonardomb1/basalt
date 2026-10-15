@@ -138,7 +138,7 @@ pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const a
     return idxs;
 }
 
-pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, name: []const u8, distinct: bool = false };
+pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, name: []const u8, distinct: bool = false, arg_ty: ?types.Type = null };
 
 pub const AggregatePlan = struct { by: []usize, aggs: []Agg, schema: types.Schema };
 
@@ -155,8 +155,9 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
     for (ag.aggs, 0..) |item, i| {
         const sub: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
         const ty = try aggResultType(arena, item.func, sub, in, diag);
+        const arg_ty: ?types.Type = if (sub) |a| try exprType(arena, in, a, diag) else null;
         const arg: ?*const ast.Expr = if (sub) |a| try coerceLits(arena, in, a) else null;
-        aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct };
+        aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct, .arg_ty = arg_ty };
         try fields.append(.{ .name = item.name, .ty = ty });
     }
     return .{ .by = by, .aggs = aggs, .schema = .{ .fields = try fields.toOwnedSlice() } };

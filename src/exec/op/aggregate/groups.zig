@@ -2,7 +2,6 @@
 //! merge of several lanes' sets into one.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
-const Acc = Aggregate.Acc;
 const Agg = Aggregate.Agg;
 const FixedKey = Aggregate.FixedKey;
 const FixedStore = Aggregate.FixedStore;
@@ -12,8 +11,6 @@ const Layout = Aggregate.Layout;
 const Value = @import("../../value.zig").Value;
 const dupeValue = @import("../aggregate.zig").dupeValue;
 const keyhash = @import("../../keyhash.zig");
-const mergeAcc = Aggregate.mergeAcc;
-const mergeDistinct = Aggregate.mergeDistinct;
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
@@ -83,8 +80,28 @@ pub const GroupSet = struct {
     pub const Store = union(enum) {
         fixed: *FixedStore,
         boxed: *GroupStore,
-        single: []Acc,
+        single: *Single,
     };
+
+    /// The global aggregate's one record.
+    pub const Single = struct { layout: *const Layout, tail: [*]u8 };
+
+    fn layoutOf(self: *const GroupSet) *const Layout {
+        return switch (self.store) {
+            .fixed => |st| st.layout,
+            .boxed => |st| st.layout,
+            .single => |st| st.layout,
+        };
+    }
+
+    /// Group `i`'s state record.
+    pub fn tail(self: *const GroupSet, i: usize) [*]u8 {
+        return switch (self.store) {
+            .fixed => |st| st.at(i).tail,
+            .boxed => |st| st.at(i).tail,
+            .single => |st| st.tail,
+        };
+    }
 
     pub fn keyValue(self: *const GroupSet, i: usize, j: usize) Value {
         switch (self.store) {
@@ -108,12 +125,9 @@ pub const GroupSet = struct {
         }
     }
 
-    pub fn acc(self: *const GroupSet, i: usize, j: usize) Acc {
-        return switch (self.store) {
-            .fixed => |st| st.layout.acc(st.at(i).tail, j),
-            .boxed => |st| st.layout.acc(st.at(i).tail, j),
-            .single => |accs| accs[j],
-        };
+    /// Aggregate `j`'s result for group `i`.
+    pub fn finish(self: *const GroupSet, i: usize, j: usize) !Value {
+        return self.layoutOf().finish(self.tail(i), j);
     }
 };
 
@@ -168,10 +182,12 @@ pub const GroupMerge = struct {
                 n.* = GroupStore.init(alloc, st.nkeys, st.layout);
                 break :blk .{ .boxed = n };
             },
-            .single => blk: {
-                const accs = try alloc.alloc(Acc, aggs.len);
-                @memset(accs, .{});
-                break :blk .{ .single = accs };
+            .single => |st| blk: {
+                const n = try alloc.create(GroupSet.Single);
+                const t = try alloc.alignedAlloc(u8, .of(Value), @max(st.layout.size, 1));
+                st.layout.clear(t.ptr);
+                n.* = .{ .layout = st.layout, .tail = t.ptr };
+                break :blk .{ .single = n };
             },
         };
         return .{
@@ -185,7 +201,7 @@ pub const GroupMerge = struct {
 
     pub fn add(self: *GroupMerge, src: *const GroupSet, i: usize) !void {
         switch (self.set.store) {
-            .single => |dst| for (dst, self.aggs, 0..) |*d, agg, j| try mergeAcc(self.alloc, d, src.acc(i, j), agg),
+            .single => |dst| for (0..self.aggs.len) |j| try dst.layout.merge(self.alloc, dst.tail, src.tail(i), j),
             .fixed => |dst| {
                 const sr = src.store.fixed.at(i);
                 const h = src.store.fixed.hashAt(i);
@@ -196,7 +212,7 @@ pub const GroupMerge = struct {
                     try self.adoptTail(dst.layout, nr.tail, sr.tail);
                     return;
                 };
-                for (self.aggs, 0..) |agg, j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j, agg);
+                for (0..self.aggs.len) |j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j);
             },
             .boxed => |dst| {
                 const sr = src.store.boxed.at(i);
@@ -209,7 +225,7 @@ pub const GroupMerge = struct {
                     try self.adoptTail(dst.layout, nr.tail, sr.tail);
                     return;
                 };
-                for (self.aggs, 0..) |agg, j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j, agg);
+                for (0..self.aggs.len) |j| try dst.layout.merge(self.alloc, rec.tail, sr.tail, j);
             },
         }
     }
@@ -228,24 +244,9 @@ pub const GroupMerge = struct {
     fn adoptTail(self: *GroupMerge, layout: *const Layout, dst: [*]u8, src: [*]u8) !void {
         @memcpy(dst[0..layout.size], src[0..layout.size]);
         if (!self.any_distinct and !self.own) return;
-        for (self.aggs, layout.slots, 0..) |agg, sl, j| {
-            if (sl != .full) continue;
-            const d = layout.ptr(Acc, dst, j);
-            if (agg.distinct) {
-                d.seen = null;
-                d.n = 0;
-                if (layout.ptr(Acc, src, j).seen) |ss| try mergeDistinct(self.alloc, d, ss);
-            } else if (self.own) switch (agg.func) {
-                .min, .max => d.ext = try dupeValue(self.alloc, d.ext),
-                .median => if (d.vals) |sv| {
-                    d.vals = null;
-                    const l = try self.alloc.create(std.array_list.Managed(f64));
-                    l.* = try .initCapacity(self.alloc, sv.items.len);
-                    l.appendSliceAssumeCapacity(sv.items);
-                    d.vals = l;
-                },
-                else => {},
-            };
+        for (layout.kernels, layout.offs, 0..) |k, off, j| {
+            const own = k.own orelse continue;
+            if (k.own_always or self.own) try own(dst + off, layout.ctx(j, self.alloc));
         }
     }
 
@@ -262,10 +263,3 @@ pub const GroupMerge = struct {
 pub fn GroupMap() type {
     return std.HashMap([]const Value, usize, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
 }
-
-pub const Partial = struct {
-    nvalid: usize,
-    sum_i: i256 = 0,
-    sum_f: f64 = 0,
-    ext: ?Value = null,
-};

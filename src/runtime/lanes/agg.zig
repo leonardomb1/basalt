@@ -196,7 +196,7 @@ const LaneAgg = struct {
         var ad = analyze.Diag{};
         const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
         const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-        for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct };
+        for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
         return .{ .strs = strs, .in_schema = agg_in, .out_schema = try schemaPtr(arena, apl.schema), .by = apl.by, .aggs = aggs };
     }
 
