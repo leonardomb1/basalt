@@ -114,7 +114,8 @@ pub fn hashOne(v: Value) u64 {
 }
 
 /// Grouping equality: two nulls are equal; otherwise string and bytes compare by
-/// bytes and the rest via `compareValues`.
+/// bytes and the rest via `compareValues`. Text never equals another kind, in
+/// either order, since the two hash apart.
 pub fn valueEq(a: Value, b: Value) bool {
     const an = a.isNull();
     const bn = b.isNull();
@@ -124,7 +125,10 @@ pub fn valueEq(a: Value, b: Value) bool {
             .string, .bytes => |t| std.mem.eql(u8, s, t),
             else => false,
         },
-        else => (eval.compareValues(a, b) orelse return false) == .eq,
+        else => switch (b) {
+            .string, .bytes => false,
+            else => (eval.compareValues(a, b) orelse return false) == .eq,
+        },
     };
 }
 
@@ -269,4 +273,12 @@ test "decimals compare exactly, and equal ones hash alike at any scale and size"
     const huge_short = Value{ .decimal = .{ .unscaled = 9999999999999999999999999999999999999, .scale = 29 } };
     try testing.expect(valueEq(huge, huge_short));
     try testing.expectEqual(hashOne(huge), hashOne(huge_short));
+}
+
+test "valueEq is symmetric: text never equals a date, whichever side it is on" {
+    const d = Value{ .date = 19000 };
+    const t = Value{ .string = "2022-01-08" };
+    try std.testing.expect(!valueEq(d, t));
+    try std.testing.expect(!valueEq(t, d));
+    try std.testing.expect(valueEq(.{ .int = 1 }, .{ .float = 1.0 }) == valueEq(.{ .float = 1.0 }, .{ .int = 1 }));
 }
