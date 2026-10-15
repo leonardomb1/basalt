@@ -8,7 +8,6 @@
 const Aggregate = @import("../aggregate.zig").Aggregate;
 const Batch = @import("../../batch.zig").Batch;
 const Direct = Aggregate.Direct;
-const FixedKey = Aggregate.FixedKey;
 const FixedStore = Aggregate.FixedStore;
 const GroupSet = Aggregate.GroupSet;
 const GroupStore = Aggregate.GroupStore;
@@ -16,27 +15,17 @@ const GroupTable = Aggregate.GroupTable;
 const KeyKind = Aggregate.KeyKind;
 const Layout = Aggregate.Layout;
 const Rows = @import("kernel.zig").Rows;
-const StrId = Aggregate.StrId;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const dupeValue = @import("../aggregate.zig").dupeValue;
 const few_groups = Aggregate.few_groups;
-const fixedHash = Aggregate.fixedHash;
 const keyKindOf = Aggregate.keyKindOf;
 const keyhash = @import("../../keyhash.zig");
+const Encoder = @import("../../keytable.zig").Encoder;
 const prefetch_ahead = Aggregate.prefetch_ahead;
 const spill_parts = @import("../spill_parts.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
-
-const absent_id = std.math.maxInt(u32);
-
-/// A string's interned id without interning it: `absent_id` when this aggregate has
-/// never seen it, which no group key can then hold. The hash is `strId`'s.
-fn internedId(self: *Aggregate, s: []const u8) StrId {
-    if (self.str_cache.get(s)) |e| return e;
-    return .{ .id = absent_id, .h = std.hash.Wyhash.hash(0x5bd1e995, s) };
-}
 
 pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
     if (self.space != null and self.by.len != 0 and self.part_state == null) return self.spillNext(arena);
@@ -175,73 +164,24 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     const nk = self.by.len;
 
     const direct: ?Direct = if (nk == 1 and kinds[0] != .f64k and kinds[0] != .boolk) try Direct.init(self.gpa) else null;
-    var has_str = false;
-    for (kinds) |k| if (k == .strk) {
-        has_str = true;
-    };
     defer if (direct) |d| d.deinit(self.gpa);
     var direct_base: ?i64 = null;
+    const enc = Encoder.init(self.by, kinds);
 
     while (try self.child.next(pull)) |b| {
         const frozen = self.overBudget(parts);
-        const keys = try pull.alloc(i64, b.len * nk);
-        const hkeys = if (has_str) try pull.alloc(i64, b.len * nk) else keys;
-        const masks = try pull.alloc(u64, b.len);
+        const e = try enc.encode(pull, b.columns, b.len, self.interner(), frozen);
+        const keys = e.keys;
+        const masks = e.masks;
         const hashes = try pull.alloc(u64, b.len);
         const tails = try pull.alloc(?[*]u8, b.len);
         const pidx = try pull.alloc(u8, b.len);
         const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
-        @memset(masks, 0);
         @memset(tails, null);
         @memset(dest, spill_parts.keep);
-
-        for (self.by, kinds, 0..) |ci, kk, j| {
-            const col = b.columns[ci];
-            switch (kk) {
-                .i64k => for (0..b.len) |r| {
-                    keys[r * nk + j] = col.data.i64[r];
-                },
-                .i32k => for (0..b.len) |r| {
-                    keys[r * nk + j] = col.data.i32[r];
-                },
-                .boolk => for (0..b.len) |r| {
-                    keys[r * nk + j] = @intFromBool(col.data.b[r]);
-                },
-                .f64k => for (0..b.len) |r| {
-                    keys[r * nk + j] = keyhash.floatWord(col.data.f64[r]);
-                },
-                .strk => {
-                    const table = try self.strTable();
-                    if (col.dict) |d| {
-                        const ents = try pull.alloc(StrId, d.values.len);
-                        for (ents, d.values) |*e, v| e.* = if (frozen) internedId(self, v) else try self.strId(table, v);
-                        for (0..b.len) |r| {
-                            if (!col.validity.get(r)) continue;
-                            const e = ents[d.codes[r]];
-                            keys[r * nk + j] = e.id;
-                            hkeys[r * nk + j] = @bitCast(e.h);
-                            if (frozen and e.id == absent_id) dest[r] = 0;
-                        }
-                    } else for (0..b.len) |r| {
-                        if (!col.validity.get(r)) continue;
-                        const s = col.data.bytes.at(r);
-                        const e = if (frozen) internedId(self, s) else try self.strId(table, s);
-                        keys[r * nk + j] = e.id;
-                        hkeys[r * nk + j] = @bitCast(e.h);
-                        if (frozen and e.id == absent_id) dest[r] = 0;
-                    }
-                },
-            }
-            if (!col.validity.allSet(b.len)) for (0..b.len) |r| {
-                if (col.validity.get(r)) continue;
-                masks[r] |= @as(u64, 1) << @intCast(j);
-                keys[r * nk + j] = 0;
-                if (has_str) hkeys[r * nk + j] = 0;
-            };
-            if (has_str and kk != .strk) for (0..b.len) |r| {
-                hkeys[r * nk + j] = keys[r * nk + j];
-            };
-        }
+        for (e.absent, 0..) |x, r| if (x) {
+            dest[r] = 0;
+        };
         if (direct) |d| {
             if (direct_base == null) direct_base = Direct.baseFor(keys, masks);
             const base = direct_base.?;
@@ -249,13 +189,11 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 if (m != 0) continue;
                 const off = k -% base;
                 if (off < 0 or off >= Direct.len) continue;
-                const e = d.recs[@intCast(off)] orelse continue;
-                t.* = e;
+                t.* = d.recs[@intCast(off)] orelse continue;
                 pi.* = d.parts[@intCast(off)];
             }
         }
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) hashes[r] = if (tails[r] != null) 0 else fixedHash(hkeys[r * nk ..][0..nk], masks[r]);
+        for (hashes, tails, 0..) |*h, t, r| h.* = if (t != null) 0 else e.hash(r);
 
         var groups: usize = 0;
         if (self.part_state == null) groups = parts[0].store.len else for (parts) |*pp| {
@@ -275,7 +213,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 const pr = order[oi + prefetch_ahead];
                 parts[hashes[pr] >> part_shift].table.prefetch(hashes[pr]);
             }
-            const key = FixedKey{ .vals = keys[ri * nk ..][0..nk], .mask = masks[ri] };
+            const key = e.key(ri);
             const pi = hashes[ri] >> part_shift;
             const part = &parts[pi];
             if (frozen) {

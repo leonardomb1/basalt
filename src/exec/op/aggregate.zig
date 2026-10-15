@@ -2,7 +2,7 @@
 //! their merge.
 //!
 //! `Aggregate` keeps its fields and core types here; its group tables are in
-//! `aggregate/table.zig`, a lane's group sets and their merge in `groups.zig`, the
+//! `../keytable.zig`, a lane's group sets and their merge in `groups.zig`, the
 //! input loop in `drain.zig`, arguments and output in `accumulate.zig`, each
 //! aliased back into the struct. Every aggregate is its math in `funcs.zig` run by
 //! the loops `kernel.zig` generates for it.
@@ -20,6 +20,7 @@ const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
 const keyhash = @import("../keyhash.zig");
+const keytable = @import("../keytable.zig");
 const simd = @import("../simd.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -62,10 +63,13 @@ pub const Aggregate = struct {
     pub const overBudget = @import("aggregate/spill.zig").overBudget;
     pub const spillRows = @import("aggregate/spill.zig").spillRows;
     pub const destOf = @import("aggregate/spill.zig").destOf;
-    pub const StrId = @import("aggregate/groups.zig").StrId;
-    pub const StrTable = @import("aggregate/groups.zig").StrTable;
-    pub const strId = @import("aggregate/groups.zig").strId;
-    pub const strTable = @import("aggregate/groups.zig").strTable;
+    pub const StrId = keytable.StrId;
+    pub const StrTable = keytable.StrTable;
+
+    /// String keys' ids, through the table the lanes share.
+    pub fn interner(self: *Aggregate) keytable.Interner {
+        return .{ .table = &self.strs, .cache = &self.str_cache, .alloc = self.state };
+    }
     pub const Agg = struct { func: ast.AggFunc, arg: ?*const ast.Expr, ty: types.Type, distinct: bool = false, arg_ty: ?types.Type = null };
 
     pub const GroupSet = @import("aggregate/groups.zig").GroupSet;
@@ -84,17 +88,17 @@ pub const Aggregate = struct {
     pub const keyKinds = @import("aggregate/drain.zig").keyKinds;
     pub const drainFixed = @import("aggregate/drain.zig").drainFixed;
     pub const drainImpl = @import("aggregate/drain.zig").drainImpl;
-    pub const prefetch_ahead = @import("aggregate/table.zig").prefetch_ahead;
-    pub const Direct = @import("aggregate/table.zig").Direct;
-    pub const few_groups = @import("aggregate/table.zig").few_groups;
-    pub const fixedHash = @import("aggregate/table.zig").fixedHash;
+    pub const prefetch_ahead = keytable.prefetch_ahead;
+    pub const Direct = keytable.Direct;
+    pub const few_groups = keytable.few_groups;
+    pub const fixedHash = keytable.fixedHash;
     pub const KeyKind = @import("../keyhash.zig").KeyKind;
     pub const keyKindOf = @import("../keyhash.zig").keyKindOf;
-    pub const RecBlocks = @import("aggregate/table.zig").RecBlocks;
-    pub const FixedStore = @import("aggregate/table.zig").FixedStore;
-    pub const FixedKey = @import("aggregate/table.zig").FixedKey;
-    pub const GroupTable = @import("aggregate/table.zig").GroupTable;
-    pub const GroupStore = @import("aggregate/table.zig").GroupStore;
+    pub const RecBlocks = keytable.RecBlocks;
+    pub const FixedStore = keytable.FixedStore(Layout);
+    pub const FixedKey = keytable.FixedKey;
+    pub const GroupTable = keytable.GroupTable;
+    pub const GroupStore = keytable.GroupStore(Layout);
     pub const argCast = @import("aggregate/accumulate.zig").argCast;
     pub const argColumn = @import("aggregate/accumulate.zig").argColumn;
     pub const emitSets = @import("aggregate/accumulate.zig").emitSets;
