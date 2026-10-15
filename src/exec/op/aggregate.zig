@@ -167,6 +167,7 @@ pub const Aggregate = struct {
     pub const addExact = @import("aggregate/accumulate.zig").addExact;
     pub const Slot = @import("aggregate/accumulate.zig").Slot;
     pub const SumI = @import("aggregate/accumulate.zig").SumI;
+    pub const SumD = @import("aggregate/accumulate.zig").SumD;
     pub const SumF = @import("aggregate/accumulate.zig").SumF;
     pub const Layout = @import("aggregate/accumulate.zig").Layout;
     pub const finalizeAcc = @import("aggregate/accumulate.zig").finalizeAcc;

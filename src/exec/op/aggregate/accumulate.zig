@@ -5,6 +5,7 @@ const Aggregate = @import("../aggregate.zig").Aggregate;
 const Acc = Aggregate.Acc;
 const Agg = Aggregate.Agg;
 const Batch = @import("../../batch.zig").Batch;
+const Decimal = @import("../../value.zig").Decimal;
 const GroupSet = Aggregate.GroupSet;
 const Partial = Aggregate.Partial;
 const Value = @import("../../value.zig").Value;
@@ -159,11 +160,13 @@ pub fn reduceBatch(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, b: Batc
     }
     var want = agg.ty;
     if (agg.func == .count) want.unknown = true;
-    const col = eval.evalColumn(arena, e, b, want) catch |err| return inAggregate(self, err);
+    const col = if (agg.func == .avg) try self.argColumn(arena, agg, e, b) else eval.evalColumn(arena, e, b, want) catch |err| return inAggregate(self, err);
     const n = b.len;
     if (col.ty.kind == .decimal) return switch (agg.func) {
         .count => Partial{ .nvalid = simd.popcountValid(col.validity.bits, n) },
         .sum => if (agg.ty.kind == .decimal) try sumDecimals(col, agg.ty.scale, n) else null,
+        .avg => avgDecimals(col, n),
+        .min, .max => Partial{ .nvalid = simd.popcountValid(col.validity.bits, n), .ext = extremeDecimal(col, agg.func, n) },
         else => null,
     };
     if (col.ty.kind != .int and col.ty.kind != .float) return null;
@@ -195,6 +198,43 @@ fn sumDecimals(col: column.Column, scale: u8, n: usize) error{IntOverflow}!Parti
         try eval.addAtScale(&s, d, scale);
     }
     return .{ .nvalid = nvalid, .sum_i = s };
+}
+
+/// A batch's DECIMAL AVG partial: the values summed exactly while they share a
+/// scale, then once as a float, so the mean is as close as the f64 result allows.
+fn avgDecimals(col: column.Column, n: usize) Partial {
+    const nvalid = simd.popcountValid(col.validity.bits, n);
+    var p = Partial{ .nvalid = nvalid };
+    var s: i256 = 0;
+    var scale: ?u8 = null;
+    for (col.data.dec[0..n], 0..) |d, i| {
+        if (nvalid != n and !col.validity.get(i)) continue;
+        const at = scale orelse d.scale;
+        if (d.scale != at) {
+            p.sum_f += d.toF64();
+            continue;
+        }
+        scale = at;
+        s += d.unscaled;
+    }
+    if (scale) |sc| p.sum_f += @as(f64, @floatFromInt(s)) / std.math.pow(f64, 10, @floatFromInt(sc));
+    return p;
+}
+
+/// A batch's DECIMAL MIN or MAX in exact order, or null when every value is null.
+fn extremeDecimal(col: column.Column, func: ast.AggFunc, n: usize) ?Value {
+    const all = col.validity.allSet(n);
+    var best: ?Decimal = null;
+    for (col.data.dec[0..n], 0..) |d, i| {
+        if (!all and !col.validity.get(i)) continue;
+        const cur = best orelse {
+            best = d;
+            continue;
+        };
+        const o = d.order(cur);
+        if (if (func == .min) o == .lt else o == .gt) best = d;
+    }
+    return if (best) |d| Value{ .decimal = d } else null;
 }
 
 /// Whether `reduceBatch` leaves an aggregate to the row-wise fold, decided before

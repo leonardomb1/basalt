@@ -276,6 +276,30 @@ test "csv aggregate: min/max on inferred numeric columns compare numerically, no
     try std.testing.expectEqualStrings("mn,mx,s\n2,10,21\n", got);
 }
 
+test "DECIMAL MIN/MAX/AVG and INT MIN/MAX: exact order across scales, nulls skipped, grouped or not, on one lane or several" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in = "g,v,n\na,1.25,4\na,-3.5,-2\na,,\nb,10,7\nb,2.125,9\nc,,\n";
+    const d = "CASE WHEN v > 5 THEN CAST(v AS DECIMAL(12,1)) ELSE CAST(v AS DECIMAL(12,3)) END";
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{
+            .q = "SELECT g, MIN(d) AS mn, MAX(d) AS mx, AVG(d) AS av, MIN(n) AS ni, MAX(n) AS nx FROM (SELECT g, n, " ++ d ++ " AS d FROM '$IN') x GROUP BY g ORDER BY g",
+            .want = "g,mn,mx,av,ni,nx\na,-3.500,1.250,-1.125,-2,4\nb,2.125,10.0,6.0625,7,9\nc,,,,,\n",
+        },
+        .{ .q = "SELECT MIN(d) AS mn, MAX(d) AS mx, AVG(d) AS av FROM (SELECT " ++ d ++ " AS d FROM '$IN') x", .want = "mn,mx,av\n-3.500,10.0,2.46875\n" },
+        .{ .q = "SELECT MIN(d) AS mn, AVG(d) AS av FROM (SELECT CAST(v AS DECIMAL(12,3)) AS d FROM '$IN' WHERE v IS NULL) x", .want = "mn,av\n,\n" },
+    };
+    for (cases) |c| {
+        const one = try runToString(alloc, &tmp, in, c.q);
+        defer alloc.free(one);
+        try std.testing.expectEqualStrings(c.want, one);
+        const lanes = try runCsvThreaded(alloc, &tmp, in, c.q, 4);
+        defer alloc.free(lanes);
+        try std.testing.expectEqualStrings(c.want, lanes);
+    }
+}
+
 test "MEDIAN: odd count takes the middle, even count the mean of the two, nulls ignored, empty is null" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

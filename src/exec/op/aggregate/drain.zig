@@ -18,11 +18,13 @@ const GroupTable = Aggregate.GroupTable;
 const KeyKind = Aggregate.KeyKind;
 const Layout = Aggregate.Layout;
 const StrId = Aggregate.StrId;
+const SumD = Aggregate.SumD;
 const SumF = Aggregate.SumF;
 const SumI = Aggregate.SumI;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const dupeValue = @import("../aggregate.zig").dupeValue;
+const eval = @import("../../eval.zig");
 const few_groups = Aggregate.few_groups;
 const fixedHash = Aggregate.fixedHash;
 const keyKindOf = Aggregate.keyKindOf;
@@ -246,7 +248,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         const fast = try pull.alloc(Fast, self.aggs.len);
         for (self.aggs, argcols, fast, layout.slots) |agg, *c, *f, sl| {
             c.* = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
-            f.* = Fast.of(sl, c.*, b.len);
+            f.* = Fast.of(sl, agg.func, c.*, b.len);
         }
 
         var groups: usize = 0;
@@ -340,6 +342,40 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                     const x = layout.ptr(SumF, t.?, j);
                     x.s += @floatFromInt(v);
                     x.n += 1;
+                }
+            },
+            .sum_f_of_dec => {
+                const col = argcols[j].?.data.dec;
+                for (tails[0..b.len], col[0..b.len]) |t, v| {
+                    const x = layout.ptr(SumF, t.?, j);
+                    x.s += v.toF64();
+                    x.n += 1;
+                }
+            },
+            .sum_dec => {
+                const col = argcols[j].?.data.dec;
+                for (tails[0..b.len], col[0..b.len]) |t, v| {
+                    const x = layout.ptr(SumD, t.?, j);
+                    try eval.addAtScale(&x.s, v, agg.ty.scale);
+                    x.n += 1;
+                }
+            },
+            .min_i64, .max_i64 => {
+                const col = argcols[j].?.data.i64;
+                const want: std.math.Order = if (fk == .min_i64) .lt else .gt;
+                for (tails[0..b.len], col[0..b.len]) |t, v| {
+                    const a = layout.ptr(Acc, t.?, j);
+                    const o = if (a.ext == .int) std.math.order(v, a.ext.int) else if (a.ext.isNull()) want else eval.compareValues(.{ .int = v }, a.ext) orelse .eq;
+                    if (o == want) a.ext = .{ .int = v };
+                }
+            },
+            .min_dec, .max_dec => {
+                const col = argcols[j].?.data.dec;
+                const want: std.math.Order = if (fk == .min_dec) .lt else .gt;
+                for (tails[0..b.len], col[0..b.len]) |t, v| {
+                    const a = layout.ptr(Acc, t.?, j);
+                    const o = if (a.ext == .decimal) v.order(a.ext.decimal) else if (a.ext.isNull()) want else eval.compareValues(.{ .decimal = v }, a.ext) orelse .eq;
+                    if (o == want) a.ext = .{ .decimal = v };
                 }
             },
             .generic => for (tails[0..b.len], pidx[0..b.len], 0..) |t, pi, ri| {
