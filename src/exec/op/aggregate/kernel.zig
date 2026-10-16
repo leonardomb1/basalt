@@ -48,6 +48,7 @@ pub const Kernel = struct {
     foldRows: *const fn ([]const ?[*]u8, usize, ?column.Column, Rows) anyerror!void,
     merge: *const fn ([*]u8, [*]const u8, Ctx) anyerror!void,
     finish: *const fn ([*]const u8, Ctx) anyerror!Value,
+    finishAll: *const fn ([]const [*]const u8, usize, Ctx, *column.Builder) anyerror!void,
     own: ?*const fn ([*]u8, Ctx) anyerror!void,
 };
 
@@ -112,6 +113,9 @@ pub fn make(comptime Op: type) Kernel {
         fn finish(p: [*]const u8, cx: Ctx) anyerror!Value {
             return Op.finish(cst(p), cx);
         }
+        fn finishAll(tails: []const [*]const u8, off: usize, cx: Ctx, out: *column.Builder) anyerror!void {
+            for (tails) |t| try out.append(try Op.finish(cst(t + off), cx));
+        }
         fn own(p: [*]u8, cx: Ctx) anyerror!void {
             return Op.own(st(p), cx);
         }
@@ -125,6 +129,7 @@ pub fn make(comptime Op: type) Kernel {
         .foldRows = K.foldRows,
         .merge = K.merge,
         .finish = K.finish,
+        .finishAll = K.finishAll,
         .own = if (@hasDecl(Op, "own")) K.own else null,
     };
 }
@@ -224,5 +229,10 @@ pub const Layout = struct {
 
     pub fn finish(self: Layout, tail: [*]const u8, j: usize) !Value {
         return self.kernels[j].finish(tail + self.offs[j], self.ctxs[j]);
+    }
+
+    /// Aggregate `j`'s result for every record of `tails`, in order, into `out`.
+    pub fn finishAll(self: Layout, tails: []const [*]const u8, j: usize, out: *column.Builder) !void {
+        return self.kernels[j].finishAll(tails, self.offs[j], self.ctxs[j], out);
     }
 };

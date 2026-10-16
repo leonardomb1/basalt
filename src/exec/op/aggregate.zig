@@ -105,7 +105,6 @@ pub const Aggregate = struct {
     pub const argCast = @import("aggregate/accumulate.zig").argCast;
     pub const argColumn = @import("aggregate/accumulate.zig").argColumn;
     pub const emitSets = @import("aggregate/accumulate.zig").emitSets;
-    pub const emitGroup = @import("aggregate/accumulate.zig").emitGroup;
     pub const Layout = @import("aggregate/kernel.zig").Layout;
     pub const foldSingle = @import("aggregate/accumulate.zig").foldSingle;
 };
