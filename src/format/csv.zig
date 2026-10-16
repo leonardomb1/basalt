@@ -722,6 +722,7 @@ pub const MappedCsv = struct {
     file: std.fs.File,
     path: []const u8 = "",
     quoted_newlines: bool = false,
+    quote_free: bool = false,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
 
@@ -769,14 +770,19 @@ pub const MappedCsv = struct {
             .file = file,
             .path = try arena.dupe(u8, path),
             .dialect = dialect,
-            .quoted_newlines = hasQuotedNewline(body, dialect.delim),
         };
+        const quotes = scanQuotes(body, dialect.delim);
+        self.quoted_newlines = quotes == .quoted_newlines;
+        self.quote_free = quotes == .none;
         return self;
     }
 
-    /// A reader of the i-th of `n` chunks, its failures naming this file and line.
+    /// A reader of the i-th of `n` chunks, its failures naming this file and line. In a
+    /// quote-free file it releases the pages it has read as it goes; in one with quotes,
+    /// whose pages the open-time scan already mapped, releasing them cost a third of
+    /// the read, so they stay.
     pub fn reader(self: *const MappedCsv, i: usize, n: usize, schema: *const types.Schema) CsvSliceReader {
-        return .{ .data = self.chunk(i, n), .schema = schema, .dialect = self.dialect, .slot = self.slot, .path = self.path, .whole = self.data };
+        return .{ .data = self.chunk(i, n), .schema = schema, .dialect = self.dialect, .slot = self.slot, .path = self.path, .whole = self.data, .release = self.quote_free };
     }
 
     /// The i-th of `n` newline-aligned chunks of the body; a line belongs to the
@@ -787,17 +793,29 @@ pub const MappedCsv = struct {
         return self.body[lo..hi];
     }
 
-    /// Skipped when the file has no quote at all, so the common case costs one `memchr`.
-    fn hasQuotedNewline(body: []const u8, delim: u8) bool {
-        if (std.mem.indexOfScalar(u8, body, '"') == null) return false;
+    /// Whether the body has a quote, and then whether a quoted field holds a newline.
+    /// A quote-free file costs one `memchr`, which releases the pages behind it as it
+    /// goes, so checking it never holds all of it resident; a file with quotes is
+    /// walked record by record.
+    fn scanQuotes(body: []const u8, delim: u8) enum { none, quotes, quoted_newlines } {
+        var at: usize = 0;
+        const quoted = while (at < body.len) {
+            const end = @min(body.len, at + scan_window);
+            if (std.mem.indexOfScalar(u8, body[at..end], '"') != null) break true;
+            release(body[at..end]);
+            at = end;
+        } else false;
+        if (!quoted) return .none;
         var pos: usize = 0;
         while (pos < body.len) {
             const rec = scanRecord(body, pos, delim);
-            if (std.mem.indexOfScalar(u8, rec.line, '\n') != null) return true;
+            if (std.mem.indexOfScalar(u8, rec.line, '\n') != null) return .quoted_newlines;
             pos = rec.next;
         }
-        return false;
+        return .quotes;
     }
+
+    const scan_window = 4 << 20;
 
     fn lineStart(self: *const MappedCsv, raw: usize) usize {
         if (raw == 0) return 0;
@@ -813,9 +831,26 @@ pub const MappedCsv = struct {
     }
 };
 
+/// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
+/// process, so what was read once stops counting as resident; touched again, they
+/// fault back in from the file (anonymous memory would come back zeroed).
+fn release(bytes: []const u8) void {
+    const page = std.heap.page_size_min;
+    const lo = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
+    const hi = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
+    if (hi <= lo) return;
+    const at: [*]align(page) u8 = @ptrFromInt(lo);
+    std.posix.madvise(at, hi - lo, std.posix.MADV.DONTNEED) catch {};
+}
+
+/// A chunk of a mapped file, read a batch at a time; with `release`, every
+/// `release_every` bytes the pages already read are released, so a lane holds a few
+/// MiB of its chunk resident, not all of it.
 pub const CsvSliceReader = struct {
     data: []const u8,
     pos: usize = 0,
+    release: bool = false,
+    released: usize = 0,
     schema: *const types.Schema,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
@@ -841,8 +876,14 @@ pub const CsvSliceReader = struct {
         if (rows == 0) return null;
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
+        if (self.release and self.pos - self.released >= release_every) {
+            release(self.data[self.released..self.pos]);
+            self.released = self.pos;
+        }
         return Batch{ .schema = self.schema, .columns = cols, .len = rows };
     }
+
+    const release_every = 4 << 20;
 
     pub fn source(self: *CsvSliceReader) driver.Source {
         return .{ .ptr = self, .vtable = &slice_vtable };
@@ -2680,7 +2721,7 @@ test "scanRecord: a newline inside a quoted field stays in the value" {
     try std.testing.expectEqualStrings("x,y", scanRecord("x,y", 0, ',').line);
 }
 
-test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" {
+test "quotesOpen / scanQuotes drive the continuation and split decisions" {
     try std.testing.expect(quotesOpen("1,\"line A", ',', false));
     try std.testing.expect(!quotesOpen("1,\"line A\"", ',', false));
     try std.testing.expect(!quotesOpen("plain,row", ',', false));
@@ -2690,9 +2731,9 @@ test "quotesOpen / hasQuotedNewline drive the continuation and split decisions" 
     try std.testing.expect(quotesOpen("end\",\"again", ',', true));
     try std.testing.expect(quotesOpen("a \"\"quoted\"\" word", ',', true));
 
-    try std.testing.expect(MappedCsv.hasQuotedNewline("1,\"a\nb\"\n", ','));
-    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,\"a b\"\n2,c\n", ','));
-    try std.testing.expect(!MappedCsv.hasQuotedNewline("1,a\n2,b\n", ','));
+    try std.testing.expect(MappedCsv.scanQuotes("1,\"a\nb\"\n", ',') == .quoted_newlines);
+    try std.testing.expect(MappedCsv.scanQuotes("1,\"a b\"\n2,c\n", ',') == .quotes);
+    try std.testing.expect(MappedCsv.scanQuotes("1,a\n2,b\n", ',') == .none);
 }
 
 test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an append write it" {
