@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const http_client = @import("../../net/http_client.zig");
+const xmlescape = @import("../../format/xml/escape.zig");
 
 threadlocal var why_buf: [700]u8 = undefined;
 threadlocal var why_len: usize = 0;
@@ -103,9 +104,9 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     defer gpa.free(mid);
     const uid = try uuidHex(gpa);
     defer gpa.free(uid);
-    const u_esc = try xmlEscape(gpa, username);
+    const u_esc = try xmlescape.attrAlloc(gpa, username);
     defer gpa.free(u_esc);
-    const p_esc = try xmlEscape(gpa, password);
+    const p_esc = try xmlescape.attrAlloc(gpa, password);
     defer gpa.free(p_esc);
 
     const envelope = try std.fmt.allocPrint(gpa,
@@ -233,19 +234,6 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
 
 const appendForm = http_client.appendForm;
 const formEncode = http_client.formEncode;
-
-fn xmlEscape(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(gpa);
-    for (s) |c| switch (c) {
-        '&' => try out.appendSlice("&amp;"),
-        '<' => try out.appendSlice("&lt;"),
-        '>' => try out.appendSlice("&gt;"),
-        '"' => try out.appendSlice("&quot;"),
-        '\'' => try out.appendSlice("&apos;"),
-        else => try out.append(c),
-    };
-    return out.toOwnedSlice();
-}
 
 fn iso8601(gpa: std.mem.Allocator, secs: i64) ![]const u8 {
     const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };

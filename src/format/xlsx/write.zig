@@ -37,6 +37,7 @@ const Output = @import("../output.zig").Output;
 const zipwrite = @import("../compress/zipwrite.zig");
 const read = @import("read.zig");
 const xml = @import("../xml/token.zig");
+const escape = @import("../xml/escape.zig");
 
 pub const max_cols = 16384;
 pub const max_rows = 1048576;
@@ -105,7 +106,7 @@ pub const Writer = struct {
         try self.zip.addStored("_rels/.rels", root_rels);
         var wb = std.Io.Writer.Allocating.init(arena);
         try wb.writer.writeAll(workbook_head);
-        try escapeAttr(&wb.writer, sheet_name);
+        try escape.text(&wb.writer, sheet_name, .{ .attr = true });
         try wb.writer.writeAll(workbook_tail);
         try self.zip.addStored("xl/workbook.xml", wb.written());
         try self.zip.addStored("xl/_rels/workbook.xml.rels", workbook_rels);
@@ -215,12 +216,7 @@ pub const Writer = struct {
         if (s.len > max_cell_chars and charsOf(s, valid) > max_cell_chars) return tooLong(self.row, "");
         const preserve = s.len > 0 and (isSpace(s[0]) or isSpace(s[s.len - 1]));
         try w.writeAll(if (preserve) " t=\"inlineStr\"><is><t xml:space=\"preserve\">" else " t=\"inlineStr\"><is><t>");
-        if (valid) {
-            try escapeText(w, s);
-        } else {
-            var runs = celltext.Utf8Runs{ .s = s };
-            while (runs.next()) |t| try escapeText(w, t);
-        }
+        try escape.text(w, s, .{ .ooxml = true });
         try w.writeAll("</t></is></c>");
     }
 
@@ -279,49 +275,6 @@ fn exactInDouble(unscaled: i128) bool {
     var m: u128 = @abs(unscaled);
     while (m != 0 and m % 10 == 0) m /= 10;
     return m < 1_000_000_000_000_000;
-}
-
-/// Valid UTF-8 as element text.
-fn escapeText(w: *std.Io.Writer, s: []const u8) !void {
-    var from: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        var hex: ?u16 = null;
-        const rep: []const u8 = switch (c) {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '_' => if (xml.ooxmlEscape(s[i..]) != null) "_x005F_" else continue,
-            '\t', '\n' => continue,
-            0...0x08, 0x0B, 0x0C, 0x0D...0x1F => blk: {
-                hex = c;
-                break :blk "";
-            },
-            0xEF => if (i + 2 < s.len and s[i + 1] == 0xBF and (s[i + 2] == 0xBE or s[i + 2] == 0xBF)) blk: {
-                hex = if (s[i + 2] == 0xBE) 0xFFFE else 0xFFFF;
-                break :blk "";
-            } else continue,
-            else => continue,
-        };
-        try w.writeAll(s[from..i]);
-        if (hex) |h| {
-            try w.print("_x{X:0>4}_", .{h});
-            if (h > 0xFF) i += 2;
-        } else try w.writeAll(rep);
-        from = i + 1;
-    }
-    try w.writeAll(s[from..]);
-}
-
-fn escapeAttr(w: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        else => try w.writeByte(c),
-    };
 }
 
 const xml_decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
@@ -390,7 +343,7 @@ test "sheet names Excel refuses" {
 test "text escapes: markup, controls, CR, noncharacters and literal escapes" {
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    try escapeText(&aw.writer, "a<b>&c\r\n\t\x00_x0041_ _x12_ \u{FFFE}\u{FFFF}é");
+    try escape.text(&aw.writer, "a<b>&c\r\n\t\x00_x0041_ _x12_ \u{FFFE}\u{FFFF}é", .{ .ooxml = true });
     try std.testing.expectEqualStrings("a&lt;b&gt;&amp;c_x000D_\n\t_x0000__x005F_x0041_ _x12_ _xFFFE__xFFFF_é", aw.written());
 }
 

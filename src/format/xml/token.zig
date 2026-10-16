@@ -90,12 +90,9 @@ pub const Tokenizer = struct {
         try self.buf.ensureUnusedCapacity(64 << 10);
         const dst = self.buf.unusedCapacitySlice();
         const n = self.r.readSliceShort(dst) catch return error.ReadFailed;
-        if (n == 0) {
-            self.eof = true;
-            return false;
-        }
         self.buf.items.len += n;
-        return true;
+        if (n < dst.len) self.eof = true;
+        return n > 0;
     }
 
     /// The next token, or null at the end of the document. Trailing text is read after

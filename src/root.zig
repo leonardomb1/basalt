@@ -42,6 +42,7 @@ pub const pqdecode = @import("format/parquet/read.zig");
 pub const arrowread = @import("format/arrow/read.zig");
 pub const xlsx = @import("format/xlsx/read.zig");
 pub const xml = @import("format/xml/token.zig");
+pub const xmlescape = @import("format/xml/escape.zig");
 pub const xlsxwrite = @import("format/xlsx/write.zig");
 pub const ssh = @import("net/ssh.zig");
 pub const sftp = @import("store/sftp.zig");
