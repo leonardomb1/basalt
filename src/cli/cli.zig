@@ -179,14 +179,15 @@ fn usage(w: anytype) !void {
         \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,
         \\             .ipc, .arrows; local), Excel (.xlsx, read and written;
         \\             WITH (sheet = 'Name'), reads also range = 'B3:F200',
-        \\             header = false) and JSON (.json, .ndjson, .jsonl;
+        \\             header = false), JSON (.json, .ndjson, .jsonl;
         \\             WITH (items = 'data.rows') on a read, WITH (array = true)
-        \\             on a write for one array, not NDJSON) — the
-        \\             extension picks the format; another needs WITH (format =
-        \\             'csv'|'parquet'|'arrow'|'json'|'ndjson').
+        \\             on a write for one array, not NDJSON) and XML (.xml; WITH
+        \\             (row = 'Item') on a read, (root = .., row = ..) on a write)
+        \\             — the extension picks the format; another needs WITH (format
+        \\             = 'csv'|'parquet'|'arrow'|'json'|'ndjson'|'xml').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
-        \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON WITH (format = 'ndjson'),
+        \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),
         \\             piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;
         \\             'archive.zip :: inner.csv' reads one member (`::` optional

@@ -6,6 +6,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const DiscardSink = @import("../connect.zig").DiscardSink;
 const Env = @import("../env.zig").Env;
 const jsonwrite = @import("../../format/json/write.zig");
+const xmlwrite = @import("../../format/xml/write.zig");
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const TableWriter = @import("../../connect/table.zig").TableWriter;
@@ -222,6 +223,11 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, env.json_shape) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return jw.sink();
+        }
+        if (wfmt == .xml) {
+            const xw = xmlwrite.Writer.open(env.arena, w.target, schema, env.xml_names) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output XML `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+            return xw.sink();
         }
         if (wfmt == .xlsx) {
             const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, env.xlsx_sheet) catch |e| switch (e) {

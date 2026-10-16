@@ -304,6 +304,7 @@ pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
 pub const xmlOptions = @import("analyze/targets.zig").xmlOptions;
 pub const jsonShapeFromHints = @import("analyze/targets.zig").jsonShapeFromHints;
+pub const xmlNamesFromHints = @import("analyze/targets.zig").xmlNamesFromHints;
 pub const json_array_append_fmt = @import("analyze/targets.zig").json_array_append_fmt;
 pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 pub const xlsxSheetFromHints = @import("analyze/targets.zig").xlsxSheetFromHints;
@@ -1732,7 +1733,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     }
 }
 
-const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "array" };
+const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "array", "root", "row" };
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
 const table_sink_keys = [_][]const u8{ "compression", "cutover" };
 const xlsx_sink_keys = [_][]const u8{ "format", "sheet" };
@@ -1756,14 +1757,15 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         }
         const known = containsName(&file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key);
         const e = if (known)
-            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format`, for Parquet `compression` and for JSON `array`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
+            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format`, for Parquet `compression`, for JSON `array`, for XML `root` and `row`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
         else
-            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format`, for Parquet `compression` and for JSON `array`; a starrocks or doris table `label_prefix`)", .{h.key});
+            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format`, for Parquet `compression`, for JSON `array`, for XML `root` and `row`; a starrocks or doris table `label_prefix`)", .{h.key});
         diag.pos = h.pos;
         return e;
     }
     _ = try parquetCodecFromHints(w, hints, diag);
     _ = try jsonShapeFromHints(w, hints, diag);
+    _ = try xmlNamesFromHints(w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
     _ = try xlsxSheetFromHints(hints, diag);
     const form = w.form orelse return;

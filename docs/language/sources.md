@@ -8,9 +8,10 @@ A query reads from one source, named after `FROM`, and joins may read more
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` ([dynamic names](for-each.md#dynamic-names--var-identifier-)) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx' \| 'json' \| 'ndjson')` names one |
+| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx' \| 'json' \| 'ndjson' \| 'xml')` names one |
 | file — JSON or NDJSON | `FROM 'events.ndjson'` (also `.jsonl`) / `FROM 'rows.json'`; see [JSON and NDJSON](#json-and-ndjson) |
-| standard input | `FROM STDIN` — CSV, or `WITH (format = 'json' \| 'ndjson')`; see [Standard input](#standard-input) |
+| file — XML | `FROM 'orders.xml'`, `WITH (row = 'Order')` naming the row element; see [XML](formats.md#xml) |
+| standard input | `FROM STDIN` — CSV, or `WITH (format = 'json' \| 'ndjson' \| 'xml')`; see [Standard input](#standard-input) |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` / `.ndjson.gz` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | folder | `FROM 'sales/'` — a trailing `/`, local or remote, reads every Parquet file under it (subfolders too, as Spark's `year=2026/` layout) as one table, or every `.csv`/`.tsv`/`.txt` when it holds CSVs; see below |
@@ -77,9 +78,9 @@ JSON is in [File formats](formats.md#json).
 
 ## Standard input
 
-`FROM STDIN` reads the process's stdin as a CSV, or as JSON or NDJSON with
-`WITH (format = 'json' | 'ndjson')`, taking a CSV's `delimiter` and `encoding`
-or JSON's `items`:
+`FROM STDIN` reads the process's stdin as a CSV, or as JSON, NDJSON or XML with
+`WITH (format = 'json' | 'ndjson' | 'xml')`, taking a CSV's `delimiter` and
+`encoding`, JSON's `items` or XML's `row`:
 
 ```sh
 curl -s https://api.example.org/export.ndjson | basalt run -c "

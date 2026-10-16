@@ -11,6 +11,7 @@ const csv = @import("../../format/csv.zig");
 const json = @import("../../format/json/read.zig");
 const jsonwrite = @import("../../format/json/write.zig");
 const xmlread = @import("../../format/xml/read.zig");
+const xmlwrite = @import("../../format/xml/write.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
@@ -166,6 +167,22 @@ pub fn jsonShapeFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Er
     return if (array) .array else .ndjson;
 }
 
+/// An XML sink's root and row element names, `rows` and `row` when unset. Any other
+/// target refuses the keys.
+pub fn xmlNamesFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!xmlwrite.Names {
+    var n = xmlwrite.Names{};
+    const root = hintText(hints, "root");
+    const row = hintText(hints, "row");
+    if (root == null and row == null) return n;
+    const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
+    const fmt = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) else null;
+    if (fmt != .xml)
+        return fail(diag, "`root` and `row` apply to an XML file target only: they name its root and row elements", .{});
+    if (root) |r| n.root = if (r.len > 0) r else return fail(diag, "`root` names an element, so it cannot be empty", .{});
+    if (row) |r| n.row = if (r.len > 0) r else return fail(diag, "`row` names an element, so it cannot be empty", .{});
+    return n;
+}
+
 pub const json_array_append_fmt = "`APPEND` into `{s}` is not supported: a JSON array closes on its last byte, so appending means rewriting the file. Write NDJSON (no `array`) to append, or use `REPLACE`";
 
 /// An Excel sink's worksheet name, `Sheet1` when unset; validated here so `check`
@@ -226,8 +243,8 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (codec == .none) return null;
     const fmt = explicit orelse formatOfPath(path) orelse .csv;
     if (fmt == .xlsx) return "an Excel workbook is a zip archive already, so it is written without a `.gz`/`.zst` suffix";
-    if (fmt != .csv and fmt != .json) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
-    if (codec == .zstd) return "basalt compresses CSV and JSON output as gzip; name it `.gz`, as zstd output is not supported";
+    if (fmt != .csv and fmt != .json and fmt != .xml) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
+    if (codec == .zstd) return "basalt compresses CSV, JSON and XML output as gzip; name it `.gz`, as zstd output is not supported";
     return null;
 }
 

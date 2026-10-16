@@ -984,6 +984,16 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
     report "s3-json-write (run error)" bad
   fi
 
+  # XML out to objects and back over HTTP, plain and gzipped: the tokenizer must stop
+  # at the body's end rather than read past it
+  if brun run -c "LOAD INTO 's3://basalt-it/xml/a.xml' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/xml/b.xml.gz' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO '$out/s3_xml.csv' AS SELECT id, name, val FROM 's3://basalt-it/xml/' ORDER BY id;"; then
+    check s3-xml-write "$out/s3_xml.csv" tests/integration/expected.csv
+  else
+    report "s3-xml-write (run error)" bad
+  fi
+
   # an Excel workbook out to an object and back, through the same upload path
   if brun run -c "LOAD INTO 's3://basalt-it/xl/seed.xlsx' WITH (sheet = 'Seed') AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "LOAD INTO '$out/s3_xlsx.csv' AS SELECT id, name, val FROM 's3://basalt-it/xl/seed.xlsx' WITH (sheet = 'Seed') ORDER BY id;"; then

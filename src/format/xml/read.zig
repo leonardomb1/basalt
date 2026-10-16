@@ -74,6 +74,7 @@ pub const Reader = struct {
     schema: types.Schema = .{ .fields = &.{} },
     index: std.StringHashMapUnmanaged(usize) = .empty,
     arrays: std.StringHashMapUnmanaged(void) = .empty,
+    names: std.StringHashMapUnmanaged([]const u8) = .empty,
     depth: usize = 0,
     held: []const []const Cell = &.{},
     held_at: usize = 0,
@@ -319,7 +320,7 @@ pub const Reader = struct {
     /// The rest of an element just opened, children and text, up to its close.
     fn readBody(self: *Reader, arena: std.mem.Allocator, name: []const u8, attrs: []const Attr, nil: bool) anyerror!*Node {
         var children = std.array_list.Managed(*const Node).init(arena);
-        var text = std.array_list.Managed(u8).init(arena);
+        var text = Text{};
         while (try self.tz.next()) |t| switch (t) {
             .open => |c| {
                 const cname = try self.nameOf(arena, c.name);
@@ -331,13 +332,45 @@ pub const Reader = struct {
                     try children.append(leaf);
                 } else try children.append(try self.readBody(arena, cname, cattrs, cnil));
             },
-            .text => |raw| try self.appendText(arena, &text, raw, true),
-            .cdata => |raw| try self.appendText(arena, &text, raw, false),
+            .text => |raw| try text.add(self, arena, raw, true),
+            .cdata => |raw| try text.add(self, arena, raw, false),
             .close => break,
         } else return error.BadXml;
         const node = try arena.create(Node);
-        node.* = .{ .name = name, .attrs = attrs, .text = text.items, .children = children.items, .nil = nil };
+        node.* = .{ .name = name, .attrs = attrs, .text = text.get(), .children = children.items, .nil = nil };
         return node;
+    }
+
+    /// An element's text, kept as one exact copy when it comes in one piece, as a
+    /// leaf's does, and joined only when it comes in several.
+    const Text = struct {
+        one: []const u8 = "",
+        many: ?std.array_list.Managed(u8) = null,
+
+        fn add(t: *Text, r: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool) !void {
+            if (t.many) |*m| return r.appendText(arena, m, raw, entities);
+            if (t.one.len == 0) {
+                t.one = try r.textOf(arena, raw, entities);
+                return;
+            }
+            var m = std.array_list.Managed(u8).init(arena);
+            try m.appendSlice(t.one);
+            try r.appendText(arena, &m, raw, entities);
+            t.many = m;
+        }
+
+        fn get(t: *const Text) []const u8 {
+            return if (t.many) |m| m.items else t.one;
+        }
+    };
+
+    /// `raw` decoded as `appendText` does, copied once when nothing needs decoding.
+    fn textOf(self: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool) ![]const u8 {
+        if (self.enc == .utf8 and (!entities or std.mem.indexOfScalar(u8, raw, '&') == null) and std.unicode.utf8ValidateSlice(raw))
+            return arena.dupe(u8, raw);
+        var m = std.array_list.Managed(u8).init(arena);
+        try self.appendText(arena, &m, raw, entities);
+        return m.items;
     }
 
     /// `raw` decoded from the document's encoding and, unless CDATA, its entities.
@@ -353,10 +386,19 @@ pub const Reader = struct {
         }
     }
 
+    /// A name decoded once and kept, as the same few names recur on every row; past
+    /// `max_names` distinct ones, a document of unique names is decoded per use.
     fn nameOf(self: *Reader, arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
-        const s = if (self.enc == .utf8) raw else try csv.decodeField(arena, self.enc, raw);
-        return arena.dupe(u8, try escape.decodeName(arena, s));
+        if (self.names.get(raw)) |n| return n;
+        const keep = self.names.count() < max_names;
+        const a = if (keep) self.arena else arena;
+        const s = if (self.enc == .utf8) raw else try csv.decodeField(a, self.enc, raw);
+        const name = try a.dupe(u8, try escape.decodeName(a, s));
+        if (keep) try self.names.put(self.arena, try self.arena.dupe(u8, raw), name);
+        return name;
     }
+
+    const max_names = 4096;
 
     /// A tag's attributes, decoded, but for namespace declarations and `xsi:` ones.
     fn attrsOf(self: *Reader, arena: std.mem.Allocator, o: token.Tag) ![]const Attr {
@@ -364,9 +406,7 @@ pub const Reader = struct {
         var it = o.iterator();
         while (it.next()) |a| {
             if (std.mem.eql(u8, a.name, "xmlns") or std.mem.startsWith(u8, a.name, "xmlns:") or std.mem.startsWith(u8, a.name, "xsi:")) continue;
-            var v = std.array_list.Managed(u8).init(arena);
-            try self.appendText(arena, &v, a.value, true);
-            try out.append(.{ .name = try self.nameOf(arena, token.localName(a.name)), .value = v.items });
+            try out.append(.{ .name = try self.nameOf(arena, token.localName(a.name)), .value = try self.textOf(arena, a.value, true) });
         }
         return out.items;
     }

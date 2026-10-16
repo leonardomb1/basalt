@@ -68,6 +68,53 @@ an object store, SFTP or SMB as a CSV does. `APPEND` adds rows to an NDJSON file
 (a newline first if its last line has none); an array is refused, as it closes
 on its last byte.
 
+## XML
+
+`FROM 'orders.xml'` reads a row from each child of the document's root, or from
+each element `WITH (row = 'Order')` names, wherever it sits. A row's columns are
+its attributes and its child elements:
+
+```xml
+<orders>
+  <order id="1"><customer>Ana</customer><total currency="BRL">10.50</total>
+    <items><item sku="A">2</item><item sku="B">1</item></items></order>
+</orders>
+```
+
+reads as `id`, `customer`, `total`, `total@currency` and `items`. A child holding
+only text is a column of it, and its attributes are `child@attr` columns. A child
+holding elements is JSON text that `json_get` and `JSON_EACH` take apart, with
+`@attr` keys and `#text` for text beside elements; a name that repeats within an
+element is an array, and is an array in every row if it repeats anywhere in the
+first 1,024. Here `json_get(items, 'item')` is `[{"@sku":"A","#text":"2"}, …]`,
+and `WITH (row = 'item')` reads the items themselves as rows. An attribute of the
+row named like one of its children is `@attr`. Text directly inside the row,
+beside its children, is a column named for the row.
+
+Columns come from the first 1,024 rows, in the order first met; a name first met
+later is dropped, as a JSON key is. Values are typed as a CSV's cells are (INT,
+FLOAT, DATE, else text, a leading zero keeping a code text), and a later value
+its typed column cannot read is an error naming the row, not a NULL; read the
+column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
+is the empty string in a text column and NULL in a typed one; an absent element
+or `xsi:nil="true"` is NULL. Namespace prefixes are dropped, and names encoded as
+SQL Server's `FOR XML` writes them (`Valor_x0020_Total`) are decoded. The
+declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252; `WITH (encoding =
+'latin1')` overrides a wrong declaration), UTF-16 is refused, and invalid UTF-8 is
+repaired. An XML file streams, row by row, on one lane; a folder of `.xml` files
+reads as one table, and `.xml.gz`, objects, SFTP and SMB work as for CSV.
+
+`LOAD INTO 'orders.xml'` writes one `<row>` a line inside a `<rows>` root, a
+column an element, as `FOR XML PATH` does; `WITH (root = 'Pedidos', row =
+'Pedido')` renames them. A NULL is an element left out, so `<a></a>` stays the
+empty string, and a name an element cannot hold is encoded (`Valor Total` as
+`Valor_x0020_Total`), so the file reads back as written. Numbers are written as
+SQL shows them, a NaN or infinite float as `NaN`, `INF`, `-INF`, dates and times
+ISO text and bytes base64; a character XML 1.0 cannot carry (a control other
+than tab, LF and CR) is U+FFFD. A `.gz` name gzips the file, and it goes to an
+object store, SFTP or SMB as a CSV does; `APPEND` is refused, as the root closes
+on the last line.
+
 ## Excel
 
 An Excel workbook — `.xlsx` or `.xlsm`, local, by URL or in object storage — reads

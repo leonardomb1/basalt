@@ -103,6 +103,7 @@ pub fn appendUnsupported(target: []const u8, explicit: ?FileFormat) ?[]const u8 
     if (parquet) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
     if (arrow) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
     if (if (explicit) |f| f == .xlsx else xlsx.isPath(target)) return "an Excel workbook is a zip archive whose directory is written last, so appending means rewriting the file";
+    if ((explicit orelse targets.formatOfPath(target)) == .xml) return "an XML file's root element closes on its last line, so appending means rewriting the file";
     return null;
 }
 
@@ -114,6 +115,7 @@ pub fn sinkKind(node: anytype) []const u8 {
         if (arrowread.isPath(path)) return "arrow";
         if (xlsx.isPath(path)) return "xlsx";
         if (targets.formatOfPath(path) == .json) return "json";
+        if (targets.formatOfPath(path) == .xml) return "xml";
     }
     return node.connector;
 }
