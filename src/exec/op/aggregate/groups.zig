@@ -79,6 +79,12 @@ pub const GroupSet = struct {
     }
 };
 
+fn capFor(n: usize) usize {
+    var cap: usize = 256;
+    while ((n + 1) * 10 >= cap * 7) cap *= 2;
+    return cap;
+}
+
 pub const GroupMerge = struct {
     alloc: std.mem.Allocator,
     aggs: []const Agg,
@@ -90,32 +96,6 @@ pub const GroupMerge = struct {
     globals: std.ArrayListUnmanaged(*const GroupSet) = .empty,
     remap: std.ArrayListUnmanaged(u32) = .empty,
     settled: bool = false,
-
-    /// Merge into `set` itself, its store and index, and its pairs, instead of copying
-    /// them. The indexes move here (`deinit` frees them); null for a set without one
-    /// of its own.
-    pub fn adopt(set: *const GroupSet, aggs: []const Agg) !?GroupMerge {
-        const table = set.table orelse return null;
-        const alloc = switch (set.store) {
-            .fixed => |st| st.recs.alloc,
-            .boxed => |st| st.recs.alloc,
-            .single => return null,
-        };
-        const pairs = try alloc.alloc(Pairs, set.pairs.len);
-        for (pairs, set.pairs) |*d, *s| {
-            d.* = s.*;
-            d.parts = try alloc.dupe(Pairs.Part, s.parts[set.part..][0..1]);
-            s.parts[set.part].table.entries = &.{};
-        }
-        defer table.entries = &.{};
-        return .{
-            .alloc = alloc,
-            .aggs = aggs,
-            .set = set.*,
-            .table = table.*,
-            .pairs = pairs,
-        };
-    }
 
     /// Free the indexes and lists; safe to repeat, as a lane partition's merge is
     /// freed once merged and again with the partitions.
@@ -129,6 +109,11 @@ pub const GroupMerge = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
+        return initFor(alloc, like, aggs, 0);
+    }
+
+    /// As `init`, the index sized at once for `expect` groups.
+    pub fn initFor(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg, expect: usize) !GroupMerge {
         const store: GroupSet.Store = switch (like.store) {
             .fixed => |st| blk: {
                 const n = try alloc.create(FixedStore);
@@ -154,7 +139,7 @@ pub const GroupMerge = struct {
             .alloc = alloc,
             .aggs = aggs,
             .set = .{ .store = store, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds, .strs = like.strs },
-            .table = try GroupTable.init(alloc, 256),
+            .table = try GroupTable.init(alloc, capFor(expect)),
             .pairs = pairs,
         };
     }

@@ -366,8 +366,20 @@ pub const GroupTable = struct {
         @prefetch(store.recs.base((e & max_groups) - 1), .{ .rw = .read, .locality = 3 });
     }
 
-    /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt` is left
-    /// empty and its owner's cleanup still runs.
+    /// Whether one more key would make the table grow.
+    pub inline fn full(self: *const GroupTable) bool {
+        return (self.len + 1) * 10 >= self.entries.len * 7;
+    }
+
+    /// Forget every key, keeping the records and the entries' memory, for a bounded
+    /// table whose keys may then be met again as new records.
+    pub fn clear(self: *GroupTable) void {
+        @memset(self.entries, 0);
+        self.len = 0;
+    }
+
+    /// Free the entries. Safe to repeat: a lane's sets and a merge each free theirs
+    /// once merged and again at cleanup.
     pub fn deinit(self: *GroupTable) void {
         if (stats and self.entries.len != 0) for (&totals, &self.counts) |*t, *c| {
             _ = t.fetchAdd(c.load(.monotonic), .monotonic);
@@ -434,7 +446,7 @@ pub const GroupTable = struct {
         new_slot: u32,
     ) !Found {
         if (new_slot >= max_groups) return error.TooManyGroups;
-        if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(store);
+        if (self.full()) try self.grow(store);
         tally(&self.counts, .lookups, 1);
         const want = saltOf(h) << idx_bits;
         var i = h & self.mask;

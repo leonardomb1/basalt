@@ -59,14 +59,24 @@ pub const part_shift = keytable.part_shift;
 pub const partOf = keytable.partOf;
 
 /// One partition's table and the store it indexes. A serial fold shares one store,
-/// so groups keep first-seen order; a lane's partitions each own theirs.
+/// so groups keep first-seen order; a lane's partitions each own theirs, and a
+/// lane's table is `bounded`: at `lane_table` entries it is cleared, not grown, and
+/// a key met again becomes a second record the merge combines. A lane then probes a
+/// table that stays cached instead of one of all its groups.
 pub fn FoldPart(comptime Store: type) type {
     return struct {
         table: GroupTable,
         store: *Store,
         alloc: std.mem.Allocator,
+        bounded: bool = false,
+
+        pub inline fn room(self: *@This()) void {
+            if (self.bounded and self.table.full()) self.table.clear();
+        }
     };
 }
+
+pub const lane_table = 1 << 10;
 
 /// The tables live in a real allocator, not the arena, so a growing table frees
 /// what it outgrew.
@@ -77,7 +87,7 @@ pub fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) 
     errdefer for (parts[0..made]) |*p| p.table.deinit();
     if (self.part_state) |ps| {
         for (parts, ps) |*p, a| {
-            p.* = .{ .table = try GroupTable.init(tg, 16), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a };
+            p.* = .{ .table = try GroupTable.init(tg, lane_table), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a, .bounded = true };
             made += 1;
         }
     } else {
@@ -252,6 +262,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 continue;
             }
             const at: u32 = @intCast(part.store.len);
+            part.room();
             const f = try part.table.getOrPut(h, key, part.store, at);
             const rec = if (f.found) part.store.at(f.slot) else blk: {
                 const nr = try part.store.push(h);
@@ -361,6 +372,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 break :blk part.store.at(sl);
             } else blk: {
                 const at: u32 = @intCast(part.store.len);
+                part.room();
                 const f = try part.table.getOrPut(h, probe, part.store, at);
                 if (f.found) break :blk part.store.at(f.slot);
                 const nr = try part.store.push(h);

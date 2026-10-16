@@ -521,31 +521,30 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
     return mergeRadixPart(&ctx.parts[p], ctx.lanes, ctx.aggs, p);
 }
 
-/// Merge radix partition `p` of `srcs` (parquet lanes or CSV/SQL slots) into `dst`. The
-/// largest source is merged into in place, the rest walked in index order and freed.
+/// Merge radix partition `p` of `srcs` (parquet lanes or CSV/SQL slots) into `dst`:
+/// one table built from every source in index order, each freed once merged. A lane
+/// may hold a group in several records (its table is bounded), so no source's store
+/// is adopted as the result.
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
-    var big: ?usize = null;
-    for (srcs, 0..) |*ls, i| {
-        if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
-        if (big == null or ls.sets[p].len > srcs[big.?].sets[p].len) big = i;
+    var total: usize = 0;
+    for (srcs) |*ls| {
+        if (ls.sets.len > p) total += ls.sets[p].len;
     }
-    const bi = big orelse return;
-    const into = &srcs[bi].sets[p];
-    dst.merge = (try op.Aggregate.GroupMerge.adopt(into, aggs)) orelse blk: {
-        var m = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), into, aggs);
-        try m.addSet(into);
-        break :blk m;
-    };
-    dst.merge.?.own = true;
-    for (srcs, 0..) |*ls, i| {
-        if (i == bi or ls.sets.len <= p) continue;
+    for (srcs) |*ls| {
+        if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
         const st = &ls.sets[p];
+        if (dst.merge == null) {
+            dst.merge = try op.Aggregate.GroupMerge.initFor(dst.arena.allocator(), st, aggs, total);
+            dst.merge.?.own = true;
+        }
         try dst.merge.?.addSet(st);
         st.freeTable();
         ls.parts.free(p);
     }
-    try dst.merge.?.settle();
-    dst.merge.?.deinit();
+    if (dst.merge) |*m| {
+        try m.settle();
+        m.deinit();
+    }
 }
 
 pub const AggJoinShape = struct {
