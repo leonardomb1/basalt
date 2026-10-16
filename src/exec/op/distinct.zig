@@ -1,6 +1,8 @@
 //! `DISTINCT` and `DISTINCT ON`: the first row per key, in input order. A
 //! `partial` one (a lane's work item, whose rows a merge dedups again) keeps its keys
 //! in a bounded table (`GroupTable.initBounded`) and may pass a key's later row on.
+//! Its one table is not split into partitions the way an aggregate's lane tables
+//! are, so it starts at `lane_min` entries and may grow to `lane_max` while it folds.
 //!
 //! With a `space` (and no `track_ords`, which only the lanes set) it spills past
 //! `spill_at` by the scheme in `spill_parts.zig`: once frozen, a row whose key was
@@ -21,7 +23,8 @@ const column = @import("../column.zig");
 const dupeValue = @import("aggregate.zig").dupeValue;
 const keyhash = @import("../keyhash.zig");
 const keytable = @import("../keytable.zig");
-const lane_table = @import("aggregate/drain.zig").lane_table;
+const lane_min = 1 << 14;
+const lane_max = 1 << 18;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
@@ -99,7 +102,7 @@ pub const Distinct = struct {
             .key_idx = key_idx,
             .enc = if (fixed) try keytable.Encoder.init(self.state, key_idx, kinds) else null,
             .direct = if (fixed and keytable.Direct.serves(kinds)) try keytable.Direct.init(self.tableAlloc()) else null,
-            .table = if (self.partial) try keytable.GroupTable.initBounded(self.tableAlloc(), lane_table) else try keytable.GroupTable.init(self.tableAlloc(), 16),
+            .table = if (self.partial) try keytable.GroupTable.initBounded(self.tableAlloc(), lane_min, lane_max) else try keytable.GroupTable.init(self.tableAlloc(), 16),
             .store = if (fixed)
                 .{ .fixed = try newIn(self.state, FixedStore.init(self.state, key_idx.len, &no_payload)) }
             else

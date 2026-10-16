@@ -72,7 +72,7 @@ pub const Pairs = struct {
         errdefer for (parts[0..made]) |*p| p.table.deinit();
         for (parts, 0..) |*p, i| {
             const al = allocs[if (allocs.len == 1) 0 else i];
-            const table = if (bounded) try GroupTable.initBounded(table_alloc, lane_table) else try GroupTable.init(table_alloc, GroupTable.capFor(expect));
+            const table = if (bounded) try GroupTable.initBounded(table_alloc, lane_table, lane_table) else try GroupTable.init(table_alloc, GroupTable.capFor(expect));
             p.* = .{ .table = table, .store = try newStore(al, kind, grouped), .alloc = al };
             made += 1;
         }

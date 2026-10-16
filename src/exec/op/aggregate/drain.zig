@@ -81,7 +81,7 @@ pub fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) 
     errdefer for (parts[0..made]) |*p| p.table.deinit();
     if (self.part_state) |ps| {
         for (parts, ps) |*p, a| {
-            p.* = .{ .table = try GroupTable.initBounded(tg, lane_table), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a };
+            p.* = .{ .table = try GroupTable.initBounded(tg, lane_table, lane_table), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a };
             made += 1;
         }
     } else {

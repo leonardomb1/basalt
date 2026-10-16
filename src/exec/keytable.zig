@@ -342,20 +342,26 @@ pub const GroupTable = struct {
     alloc: std.mem.Allocator,
     counts: Counters = [_]std.atomic.Value(u64){.init(0)} ** ncounts,
     bounded: bool = false,
+    max: usize = 0,
+    from: usize = 0,
     probes: u32 = 0,
     skip: u32 = 0,
 
     const skip_keys = 1 << 16;
     const thin_pct = 95;
 
-    /// A table that never grows past `cap` entries, for a lane's partial fold whose
-    /// records a merge combines: full, it forgets its keys and starts again, so a key
-    /// met again becomes a second record. When a cycle reduced its keys by less than
-    /// 5% (DuckDB's `MaybeSkipLookups`), the next `skip_keys` keys are taken as new
-    /// without probing, then probing resumes and the cycle is judged again.
-    pub fn initBounded(alloc: std.mem.Allocator, cap: usize) !GroupTable {
+    /// A table of `cap` entries that never grows past `max`, for a lane's partial fold
+    /// whose records a merge combines. Full, it judges the keys taken since it last
+    /// grew or cleared: below `max` and not thin, it grows, so a key set larger than
+    /// `cap` but repeated is still folded in the lane; otherwise it forgets its keys
+    /// and starts again, so a key met again becomes a second record. When the keys it
+    /// judged were reduced by less than 5% (DuckDB's `MaybeSkipLookups`), the next
+    /// `skip_keys` keys are taken as new without probing, then probing resumes and the
+    /// cycle is judged again.
+    pub fn initBounded(alloc: std.mem.Allocator, cap: usize, max: usize) !GroupTable {
         var t = try init(alloc, cap);
         t.bounded = true;
+        t.max = @max(cap, max);
         return t;
     }
 
@@ -404,6 +410,7 @@ pub const GroupTable = struct {
         tally(&self.counts, .clears, 1);
         @memset(self.entries, 0);
         self.len = 0;
+        self.from = 0;
         self.probes = 0;
     }
 
@@ -482,8 +489,15 @@ pub const GroupTable = struct {
                 return .{ .slot = new_slot, .found = false };
             }
             if (self.full()) {
-                if (self.len * 100 >= @as(usize, self.probes) * thin_pct) self.skip = skip_keys;
-                self.clear();
+                const thin = (self.len - self.from) * 100 >= @as(usize, self.probes) * thin_pct;
+                if (!thin and self.entries.len < self.max) {
+                    try self.grow(store);
+                    self.from = self.len;
+                    self.probes = 0;
+                } else {
+                    if (thin) self.skip = skip_keys;
+                    self.clear();
+                }
             }
             self.probes += 1;
         } else if (self.full()) try self.grow(store);
@@ -821,14 +835,14 @@ test "a bounded table clears when full, then skips probing while its cycles bare
         }
     };
 
-    var few = try GroupTable.initBounded(std.testing.allocator, 16);
+    var few = try GroupTable.initBounded(std.testing.allocator, 16, 16);
     defer few.deinit();
     var st_few = FixedStore(NoPayload).init(a, 1, &payload);
     for (0..400) |i| _ = try Put.put(&few, &st_few, @intCast(i % 5));
     try std.testing.expectEqual(@as(usize, 5), st_few.len);
     try std.testing.expectEqual(@as(u32, 0), few.skip);
 
-    var twice = try GroupTable.initBounded(std.testing.allocator, 16);
+    var twice = try GroupTable.initBounded(std.testing.allocator, 16, 16);
     defer twice.deinit();
     var st_twice = FixedStore(NoPayload).init(a, 1, &payload);
     for (0..24) |i| _ = try Put.put(&twice, &st_twice, @intCast(i / 2));
@@ -836,7 +850,7 @@ test "a bounded table clears when full, then skips probing while its cycles bare
     try std.testing.expect(!try Put.put(&twice, &st_twice, 0));
     try std.testing.expectEqual(@as(usize, 14), st_twice.len);
 
-    var thin = try GroupTable.initBounded(std.testing.allocator, 16);
+    var thin = try GroupTable.initBounded(std.testing.allocator, 16, 16);
     defer thin.deinit();
     var st_thin = FixedStore(NoPayload).init(a, 1, &payload);
     for (0..12) |k| try std.testing.expect(!try Put.put(&thin, &st_thin, @intCast(k)));
@@ -844,4 +858,40 @@ test "a bounded table clears when full, then skips probing while its cycles bare
     try std.testing.expect(!try Put.put(&thin, &st_thin, 11));
     try std.testing.expectEqual(@as(usize, 13), st_thin.len);
     try std.testing.expectEqual(@as(usize, 1), thin.len);
+}
+
+test "a bounded table grows toward its max while its keys repeat, then clears" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const payload = NoPayload{};
+    const Put = struct {
+        fn put(tb: *GroupTable, s: *FixedStore(NoPayload), k: i64) !void {
+            const key = FixedKey{ .vals = &.{k}, .mask = 0 };
+            const h = fixedHash(key.vals, 0);
+            const f = try tb.getOrPut(h, key, s, @intCast(s.len));
+            if (!f.found) {
+                const nr = try s.push(h);
+                nr.keys[0] = k;
+                nr.mask.* = 0;
+            }
+        }
+    };
+
+    var roomy = try GroupTable.initBounded(std.testing.allocator, 16, 64);
+    defer roomy.deinit();
+    var st_roomy = FixedStore(NoPayload).init(a, 1, &payload);
+    for (0..80) |i| try Put.put(&roomy, &st_roomy, @intCast(i / 2));
+    try std.testing.expectEqual(@as(usize, 64), roomy.entries.len);
+    try std.testing.expectEqual(@as(usize, 40), st_roomy.len);
+    try std.testing.expectEqual(@as(usize, 40), roomy.len);
+
+    var capped = try GroupTable.initBounded(std.testing.allocator, 16, 32);
+    defer capped.deinit();
+    var st_capped = FixedStore(NoPayload).init(a, 1, &payload);
+    for (0..80) |i| try Put.put(&capped, &st_capped, @intCast(i / 2));
+    try std.testing.expectEqual(@as(usize, 32), capped.entries.len);
+    try std.testing.expect(st_capped.len > 40);
+    try std.testing.expect(capped.len < 40);
+    try std.testing.expectEqual(@as(u32, 0), capped.skip);
 }
