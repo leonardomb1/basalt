@@ -244,9 +244,12 @@ fn openXml(env: *Env, path: []const u8, files: []const []const u8, hints: []cons
 }
 
 fn xmlOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
+    const told = eval.takeFailure(e);
+    if (told) |t| if (std.mem.startsWith(u8, t, path) and std.mem.startsWith(u8, t[path.len..], ": "))
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read XML `{s}`: {s}", .{ path, t[path.len + 2 ..] }));
     const why = switch (e) {
-        error.BadXml, error.XmlTokenTooLong => "it is not well-formed XML in its first rows",
-        error.XmlUnsupportedEncoding, error.TextTypeMismatch => eval.takeFailure(e) orelse @errorName(e),
+        error.BadXml, error.XmlTokenTooLong => told orelse "it is not well-formed XML in its first rows",
+        error.XmlUnsupportedEncoding, error.TextTypeMismatch => told orelse @errorName(e),
         else => try pathFail(env.arena, path, e),
     };
     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read XML `{s}` ({s})", .{ path, why }));

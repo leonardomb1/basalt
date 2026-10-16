@@ -43,6 +43,7 @@ pub const Options = struct {
     batch_rows: usize = 2048,
     schema: ?types.Schema = null,
     text: []const []const u8 = &.{},
+    source_name: []const u8 = "",
 };
 
 const Kind = enum { elem, attr, child_attr };
@@ -76,6 +77,10 @@ pub const Reader = struct {
     arrays: std.StringHashMapUnmanaged(void) = .empty,
     names: std.StringHashMapUnmanaged([]const u8) = .empty,
     depth: usize = 0,
+    rooted: bool = false,
+    row_bytes: usize = 0,
+    row_elems: usize = 0,
+    row_name: []const u8 = "",
     held: []const []const Cell = &.{},
     held_at: usize = 0,
     rows_seen: u64 = 0,
@@ -274,25 +279,41 @@ pub const Reader = struct {
     }
 
     fn mismatch(self: *Reader, name: []const u8, v: []const u8, kind: types.TypeKind, what: []const u8) anyerror {
-        return eval.explain(error.TextTypeMismatch, std.fmt.allocPrint(self.arena, "XML row {d}: `{s}` holds {s} (`{s}`) that is not {s}, as its first rows typed it; read it with `CAST({s} AS VARCHAR)` to keep it as text", .{ self.rows_seen, name, what, eval.clip(v), @tagName(kind), name }) catch "XML row holds a value its column cannot read");
+        return eval.explain(error.TextTypeMismatch, std.fmt.allocPrint(self.arena, "{s}{s}XML row {d}: `{s}` holds {s} (`{s}`) that is not {s}, as its first rows typed it; read it with `CAST({s} AS VARCHAR)` to keep it as text", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, name, what, eval.clip(v), @tagName(kind), name }) catch "XML row holds a value its column cannot read");
     }
 
-    /// The next row's cells, the document read up to it.
+    /// The next row's cells, the document read up to it. A document that ends before
+    /// its root closes, holds no element, or has text outside its root is not XML
+    /// read whole, so it is an error rather than fewer rows.
     fn nextRow(self: *Reader, arena: std.mem.Allocator) !?[]const Cell {
         while (try self.tz.next()) |t| switch (t) {
+            .text => |raw| if (self.depth == 0 and !blank(raw))
+                return self.malformed("it holds text outside its root element; is it XML?"),
             .open => |o| {
+                if (self.depth == 0 and self.rooted and self.opts.row == null)
+                    return self.malformed("it has a second root element");
+                self.rooted = true;
                 const name = try self.nameOf(arena, o.name);
                 const is_row = if (self.opts.row) |r| std.mem.eql(u8, name, r) else self.depth == 1;
                 if (is_row) {
                     self.rows_seen += 1;
+                    self.row_bytes = 0;
+                    self.row_elems = 0;
+                    self.row_name = name;
                     return try self.readRow(arena, o, name);
                 }
                 if (!o.self_closing) self.depth += 1;
             },
             .close => self.depth -|= 1,
-            else => {},
+            .cdata => {},
         };
+        if (!self.rooted) return self.malformed("it holds no XML element");
+        if (self.depth > 0) return self.malformed("it ends before its root element closes; is it cut short?");
         return null;
+    }
+
+    fn malformed(self: *Reader, why: []const u8) anyerror {
+        return eval.explain(error.BadXml, std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", why }) catch why);
     }
 
     fn readRow(self: *Reader, arena: std.mem.Allocator, o: token.Tag, name: []const u8) ![]const Cell {
@@ -321,21 +342,31 @@ pub const Reader = struct {
     fn readBody(self: *Reader, arena: std.mem.Allocator, name: []const u8, attrs: []const Attr, nil: bool) anyerror!*Node {
         var children = std.array_list.Managed(*const Node).init(arena);
         var text = Text{};
-        while (try self.tz.next()) |t| switch (t) {
-            .open => |c| {
-                const cname = try self.nameOf(arena, c.name);
-                const cattrs = try self.attrsOf(arena, c);
-                const cnil = isNil(c);
-                if (c.self_closing) {
-                    const leaf = try arena.create(Node);
-                    leaf.* = .{ .name = cname, .attrs = cattrs, .text = "", .children = &.{}, .nil = cnil };
-                    try children.append(leaf);
-                } else try children.append(try self.readBody(arena, cname, cattrs, cnil));
-            },
-            .text => |raw| try text.add(self, arena, raw, true),
-            .cdata => |raw| try text.add(self, arena, raw, false),
-            .close => break,
-        } else return error.BadXml;
+        while (try self.tz.next()) |t| {
+            self.row_bytes += switch (t) {
+                .open => |c| c.name.len + c.attrs.len,
+                .close => |c| c.len,
+                .text, .cdata => |raw| raw.len,
+            };
+            if (t == .open) self.row_elems += 1;
+            if (self.row_bytes > max_row_bytes or self.row_elems > max_row_elems)
+                return self.malformed(std.fmt.allocPrint(self.arena, "row {d}, a `{s}` element, passes {d} MB or {d} elements, so it is not one row of many; name the repeating element with `WITH (row = '...')`", .{ self.rows_seen, self.row_name, max_row_bytes >> 20, max_row_elems }) catch "a row passes the size of one row");
+            switch (t) {
+                .open => |c| {
+                    const cname = try self.nameOf(arena, c.name);
+                    const cattrs = try self.attrsOf(arena, c);
+                    const cnil = isNil(c);
+                    if (c.self_closing) {
+                        const leaf = try arena.create(Node);
+                        leaf.* = .{ .name = cname, .attrs = cattrs, .text = "", .children = &.{}, .nil = cnil };
+                        try children.append(leaf);
+                    } else try children.append(try self.readBody(arena, cname, cattrs, cnil));
+                },
+                .text => |raw| try text.add(self, arena, raw, true),
+                .cdata => |raw| try text.add(self, arena, raw, false),
+                .close => break,
+            }
+        } else return self.malformed("it ends inside a row; is it cut short?");
         const node = try arena.create(Node);
         node.* = .{ .name = name, .attrs = attrs, .text = text.get(), .children = children.items, .nil = nil };
         return node;
@@ -399,6 +430,8 @@ pub const Reader = struct {
     }
 
     const max_names = 4096;
+    const max_row_bytes = 64 << 20;
+    const max_row_elems = 100_000;
 
     /// A tag's attributes, decoded, but for namespace declarations and `xsi:` ones.
     fn attrsOf(self: *Reader, arena: std.mem.Allocator, o: token.Tag) ![]const Attr {
@@ -569,4 +602,16 @@ test "a value past the sample its typed column cannot read is an error; UTF-16 i
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>abc</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>2</n><n>3</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.XmlUnsupportedEncoding, readAll(a, "\xff\xfe<\x00r\x00>\x00", .{}));
+}
+
+test "a document cut short, with no element or text outside its root, is an error, not fewer rows" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(error.BadXml, readAll(a, "<r><x><n>1</n></x><x><n>2</n></x>", .{}));
+    try testing.expectError(error.BadXml, readAll(a, "<r><x><n>1</n></x><x><n>2", .{}));
+    try testing.expectError(error.BadXml, readAll(a, "{\"a\":1}\n{\"a\":2}\n", .{}));
+    try testing.expectError(error.BadXml, readAll(a, "", .{}));
+    try testing.expectError(error.BadXml, readAll(a, "<r><x/></r><r><x/></r>", .{}));
+    try testing.expectEqual(@as(usize, 0), (try readAll(a, "<r/>", .{})).rows.len);
 }

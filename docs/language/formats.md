@@ -102,7 +102,13 @@ SQL Server's `FOR XML` writes them (`Valor_x0020_Total`) are decoded. The
 declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252; `WITH (encoding =
 'latin1')` overrides a wrong declaration), UTF-16 is refused, and invalid UTF-8 is
 repaired. An XML file streams, row by row, on one lane; a folder of `.xml` files
-reads as one table, and `.xml.gz`, objects, SFTP and SMB work as for CSV.
+reads as one table, and `.xml.gz`, objects, SFTP and SMB work as for CSV. A
+document that ends before its root closes, holds no element or has text outside
+its root is an error, never a shorter table, and so is one row past 64 MB or
+100,000 elements, as when the root's child is a wrapper and `row` should name the
+element inside it. An attribute named like a child element is told apart only if
+both appear in the first 1,024 rows; met first later, it reads into the child's
+column where the child is absent.
 
 `LOAD INTO 'orders.xml'` writes one `<row>` a line inside a `<rows>` root, a
 column an element, as `FOR XML PATH` does; `WITH (root = 'Pedidos', row =

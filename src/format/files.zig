@@ -4,7 +4,8 @@
 //! of none after the stream.
 //!
 //! `R` opens with `R.open(arena, gpa, reader, opts)` on an `O` whose `schema`
-//! field, when set, fixes the columns, and has `schema`, `next` and `close`.
+//! field, when set, fixes the columns, and has `schema`, `next` and `close`; an `O`
+//! with a `source_name` field is told which file it reads, for its messages.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -26,7 +27,9 @@ pub fn Files(comptime R: type, comptime O: type) type {
         pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: O) !*Self {
             const s = try Stream.open(arena, files[0]);
             errdefer s.close();
-            return on(arena, gpa, s, files[1..], opts);
+            var o = opts;
+            if (@hasField(O, "source_name")) o.source_name = files[0];
+            return on(arena, gpa, s, files[1..], o);
         }
 
         pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *Stream, rest: []const []const u8, opts: O) !*Self {
@@ -42,6 +45,7 @@ pub fn Files(comptime R: type, comptime O: type) type {
                 if (self.rest.len == 0) return null;
                 self.reader.close();
                 try self.stream.reopen(self.rest[0]);
+                if (@hasField(O, "source_name")) self.opts.source_name = self.rest[0];
                 self.rest = self.rest[1..];
                 self.reader = try R.open(self.arena, self.gpa, self.stream.reader, self.opts);
             }
