@@ -17,7 +17,7 @@ bucket, a share or a table.
 [Functions](https://leonardomb1.github.io/basalt/reference/functions.html) ·
 [Connectors](https://leonardomb1.github.io/basalt/connectors/databases.html)
 
-The first four examples run as written, against public data; paste one into
+The first five examples run as written, against public data; paste one into
 `basalt run -c "..."` or a `.sql` file.
 
 A CSV on the web, summarized into a local Parquet file:
@@ -75,6 +75,31 @@ FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.pa
 GROUP BY payment_type ORDER BY trips DESC;
 ```
 
+Sources federate: each side of a join can come from anywhere. Taxi trips from
+that Parquet file, joined to the zone names in a CSV at another URL:
+
+```sql
+SELECT z.Borough AS borough, count(*) AS trips, round(avg(t.total_amount), 2) AS avg_fare
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet' t
+JOIN 'https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv' z
+  ON t.PULocationID = z.LocationID
+GROUP BY z.Borough ORDER BY trips DESC;
+```
+
+```console
+borough        trips    avg_fare
+-------------  -------  --------
+Manhattan      2646948  22.38
+Queens         273128   68.25
+Brooklyn       25258    32.81
+Unknown        10360    29.36
+Bronx          6905     35.7
+N/A            1658     93.43
+EWR            295      104.2
+Staten Island  72       55.09
+(8 rows)
+```
+
 A script is parsed, type-checked and planned before a row is read, so a typo
 fails at once, not an hour into a load; `basalt check` finds it without running
 anything wherever the columns are known offline, as for a local file:
@@ -84,16 +109,18 @@ $ basalt run -c "SELECT Pclass, Survivd FROM 'https://raw.githubusercontent.com/
 <command>:1:16: error: unknown field `Survivd`
 ```
 
-The same shape moves a database table into a lake, with the `WHERE` run by the
-database:
+The same shape joins two databases on the way into a lake, each `WHERE` run by
+the database it filters:
 
 ```sql
 CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'sql.internal', database = 'erp');
+CREATE CONNECTION sales TYPE postgres OPTIONS (host = 'pg.internal', database = 'sales');
 
-LOAD INTO 's3://lake/bronze/orders.parquet' AS
-SELECT id, customer, amount, placed_at
-FROM erp.dbo.orders
-WHERE status = 'paid';
+LOAD INTO 's3://lake/silver/paid_orders.parquet' AS
+SELECT o.id, o.amount, o.placed_at, c.segment, c.region
+FROM erp.dbo.orders o
+JOIN sales.public.customers c ON c.id = o.customer_id
+WHERE o.status = 'paid';
 ```
 
 ## Install
@@ -129,7 +156,7 @@ zig build -Doptimize=ReleaseFast
 | **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos) | ✓ | ✓ |
 | **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
 | **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
-| **Standard input** — `FROM STDIN`, as CSV, JSON, NDJSON or XML | ✓ | |
+| **Standard input and output** — `FROM STDIN` reads CSV, JSON, NDJSON or XML; a final `SELECT` prints a table, CSV, TSV, JSON or Arrow | ✓ | ✓ |
 
 A folder — local, remote or a storage prefix — reads as one table. Parquet is
 read by column and row group, over the network too, so a narrow query fetches
