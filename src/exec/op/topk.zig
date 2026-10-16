@@ -6,7 +6,8 @@
 //! A candidate is an `Entry`: the first order key as `sort.leadKey` packs it, its
 //! `seq`, and where its row is kept. Entries compare on that head, then on the other
 //! keys through `KeyArr.orderAcross`, then on `seq`, so no two are equal. A group's
-//! buffer grows to `cap` (2k, at least k + `floor`); a quickselect then keeps the best
+//! buffer grows to `cap` (2k), allocated once at that size when it is small, as one
+//! per partition of many is; a quickselect then keeps the best
 //! k and the k-th becomes the group's threshold, PostgreSQL's bounded sort pruned at
 //! the boundary as DuckDB's and Trino's top-N do. The worst of the first k is the
 //! threshold until then. A row that does not rank before its group's threshold is
@@ -45,7 +46,7 @@ pub const TopK = struct {
     rest: []const Sort.Key,
     part: []const usize,
     k: usize,
-    floor: usize = 64,
+    floor: usize = 0,
     compact_floor: usize = 1 << 16,
     slice: usize = 4096,
     threshold: ?*Threshold = null,
@@ -60,7 +61,16 @@ pub const TopK = struct {
     live: usize = 0,
 
     const Chunk = struct { cols: []column.Column, karr: []KeyArr };
-    const Group = struct { buf: std.ArrayListUnmanaged(Entry) = .empty, thr_at: ?usize = null, thr: Entry = undefined };
+    const Group = struct {
+        buf: std.ArrayListUnmanaged(Entry) = .empty,
+        thr_at: u32 = no_thr,
+
+        fn bound(g: *const Group) ?Entry {
+            return if (g.thr_at == no_thr) null else g.buf.items[g.thr_at];
+        }
+    };
+    const no_thr = std.math.maxInt(u32);
+    const exact_cap = 64;
     const FixedStore = keytable.FixedStore(keytable.NoPayload);
     const BoxedStore = keytable.GroupStore(keytable.NoPayload);
     const no_payload = keytable.NoPayload{};
@@ -86,13 +96,20 @@ pub const TopK = struct {
 
     pub fn deinit(self: *TopK) void {
         if (self.lookup) |*l| l.table.deinit();
+        self.groups.deinit(self.gpa);
         self.store.deinit();
         self.state.deinit();
     }
 
+    /// A group's buffer limit: 2k, as PostgreSQL's bounded sort keeps, or k + 1 for a
+    /// k small enough that selecting over k + 1 entries costs no more than a compare
+    /// or two, which leaves each of many small partitions holding k entries, not 2k.
     fn cap(self: *const TopK) usize {
-        return @max(self.k *| 2, self.k +| self.floor);
+        const c = if (self.k <= small_k) self.k + 1 else self.k *| 2;
+        return @max(c, self.k +| self.floor);
     }
+
+    const small_k = 8;
 
     /// Offers `b`'s rows, row `r` at input position `seqs[r]`, or `seq0 + r` without
     /// `seqs`. `scratch` holds what lives only as long as `b`.
@@ -150,12 +167,12 @@ pub const TopK = struct {
         for (from..to) |r| {
             const h: u128 = if (tag == null) 0 else leadKey(p.k0.?, r);
             const g = &groups[if (grouped) p.gid[r] else 0];
-            if (g.thr_at != null) {
-                if (h > g.thr.head) continue;
-                if (h == g.thr.head) {
+            if (g.bound()) |thr| {
+                if (h > thr.head) continue;
+                if (h == thr.head) {
                     if (p.rest == null) p.rest = try self.prepare(scratch, p.b.columns);
                     const seq = if (p.seqs) |s| s[r] else p.seq0 + r;
-                    if (self.rowOrder(p.rest.?, r, seq, g.thr) != .lt) continue;
+                    if (self.rowOrder(p.rest.?, r, seq, thr) != .lt) continue;
                 }
             }
             p.cand[nc] = r;
@@ -170,7 +187,7 @@ pub const TopK = struct {
     fn groupIds(self: *TopK, scratch: std.mem.Allocator, b: Batch) ![]const u32 {
         const sa = self.state.allocator();
         if (self.part.len == 0) {
-            if (self.groups.items.len == 0) try self.groups.append(sa, .{});
+            if (self.groups.items.len == 0) try self.groups.append(self.gpa, .{});
             return &.{};
         }
         const gid = try scratch.alloc(u32, b.len);
@@ -188,7 +205,7 @@ pub const TopK = struct {
                         const nr = try st.push(hashes[r]);
                         @memcpy(nr.keys, key.vals);
                         nr.mask.* = key.mask;
-                        try self.groups.append(sa, .{});
+                        try self.groups.append(self.gpa, .{});
                     }
                     gid[r] = f.slot;
                 }
@@ -202,7 +219,7 @@ pub const TopK = struct {
                     if (!f.found) {
                         const nr = try st.push(h);
                         for (nr.keys, probe) |*o, v| o.* = try dupeValue(sa, v);
-                        try self.groups.append(sa, .{});
+                        try self.groups.append(self.gpa, .{});
                     }
                     gid[r] = f.slot;
                 }
@@ -256,11 +273,12 @@ pub const TopK = struct {
 
     fn offer(self: *TopK, gi: u32, e: Entry) !void {
         const g = &self.groups.items[gi];
-        if (g.thr_at != null and self.order(e, g.thr) != .lt) return;
+        if (g.bound()) |thr| if (self.order(e, thr) != .lt) return;
+        if (g.buf.capacity == 0 and self.cap() <= exact_cap) try g.buf.ensureTotalCapacityPrecise(self.state.allocator(), self.cap());
         try g.buf.append(self.state.allocator(), e);
         self.live += 1;
         const len = g.buf.items.len;
-        if (g.thr_at == null and len == self.k) {
+        if (g.thr_at == no_thr and len == self.k) {
             var w: usize = 0;
             for (g.buf.items[1..], 1..) |x, i| {
                 if (self.order(x, g.buf.items[w]) == .gt) w = i;
@@ -277,11 +295,11 @@ pub const TopK = struct {
     /// Makes entry `at` the group's bound, published for a source to skip by when the
     /// group is a LIMIT's. Null, string and bytes bounds are not published.
     fn setThreshold(self: *TopK, g: *Group, at: usize) void {
-        g.thr_at = at;
-        g.thr = g.buf.items[at];
+        g.thr_at = @intCast(at);
+        const thr = g.buf.items[at];
         const t = self.threshold orelse return;
         if (self.keys.len == 0) return;
-        const v = self.chunks.items[g.thr.chunk].cols[self.keys[0].idx].getValue(g.thr.row);
+        const v = self.chunks.items[thr.chunk].cols[self.keys[0].idx].getValue(thr.row);
         if (v == .null or v == .string or v == .bytes) return;
         t.value = v;
         t.full = true;
@@ -365,7 +383,6 @@ pub const TopK = struct {
                 e.row = @intCast(i);
                 i += 1;
             }
-            if (g.thr_at) |at| g.thr = g.buf.items[at];
         }
         self.store.deinit();
         self.store = fresh;
