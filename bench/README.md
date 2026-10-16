@@ -81,7 +81,7 @@ spelled as the literal date it computes.
 
 ```
 query      suite      basalt    duckdb     ratio   rows  result
-tpch-q01   tpch        353ms      49ms     7.20x      4   ok
+tpch-q01   tpch        372ms     100ms     3.72x      4  ok
 ```
 
 `ratio` under 1 means basalt is faster. `result` is `ok` when the output matched
@@ -116,128 +116,18 @@ cache, min of 3. Every query matched DuckDB.
 | move-m02 (csv→csv) | 715 ms | 6,001,215 | 8.4 M rows/s |
 | move-m03 (csv→csv, 2% kept) | 581 ms | 122,005 | — |
 
-The sections below are the history: the first run, and what moved the numbers since.
+## Diagnosing a slow line
 
-## Baseline
-
-First run, recorded so later work has something to beat. basalt 0.5.7, DuckDB
-1.5.5, TPC-H SF1, AMD Ryzen 7 PRO 8700GE (16 threads), 61 GB RAM, fixtures in page
-cache, sinks on tmpfs, min of 3.
-
-| query | basalt | duckdb | ratio |
-| --- | --- | --- | --- |
-| tpch-q01 | 353 ms | 49 ms | 7.2× |
-| tpch-q03 | 636 ms | 41 ms | 15.5× |
-| tpch-q06 | 460 ms | 24 ms | 19.2× |
-| tpch-q12 | 665 ms | 29 ms | 22.9× |
-| tpch-q14 | 357 ms | 39 ms | 9.2× |
-
-| query | basalt | rows out | rate |
-| --- | --- | --- | --- |
-| move-m01 (parquet→csv) | 1716 ms | 6,001,215 | 3.5 M rows/s |
-| move-m02 (csv→csv) | 2809 ms | 6,001,215 | 2.1 M rows/s |
-| move-m03 (csv→csv, 2% kept) | 886 ms | 122,005 | — |
-
-Where the compute time goes, from `--explain` actuals (exclusive, summed across
-lanes, so these are CPU not wall):
-
-- **q01** aggregate 609 ms > scan 453 ms > filter 92 ms. The aggregate — 5.9 M rows
-  into **four** groups keyed by two short strings — is the single largest cost in
-  the query. It should be nearly free, and it is not, because grouping compares and
-  hashes string bytes.
-- **q06** scan 262 ms, filter 193 ms for a predicate that keeps 1.9% of rows.
-- **q14** scan 265 ms dominates; the join over 76 K surviving rows is 38 ms.
-
-### Since the baseline
-
-Four of the five queries were running on **one core** of sixteen — `-j 1` and `-j 16`
-were within a millisecond of each other — and the one query that did fan out (q01)
-had the smallest gap of the set. None of what follows is a kernel change; it is
-entirely about which shapes reach a parallel path.
-
-| query | baseline | now | ratio then → now |
-| --- | --- | --- | --- |
-| q03 | 636 ms | **299 ms** | 15.5× → **7.3×** |
-| q06 | 457 ms | **117 ms** | 18.3× → **4.9×** |
-| q12 | 665 ms | **374 ms** | 22.9× → **12.5×** |
-| q14 | 357 ms | **119 ms** | 9.2× → **3.1×** |
-
-- **q06** — the parallel parquet path refused an ungrouped aggregate outright, so
-  `SELECT SUM(x) FROM t WHERE ...` went to the serial driver.
-- **q12, q14** — join-then-aggregate matched no classifier: `classifyAggPipeline`
-  rejects a `.join`, `classifyMapJoinPipeline` rejects the aggregate because it is a
-  breaker. It fell between them and ran serially.
-- **q03** — the same, plus it joins *two* dimensions, so the shape had to accept a
-  join chain rather than a single join.
-- **any interleaved `SELECT` list** — `SELECT k, SUM(x), k2` carries a reordering
-  projection after the aggregate, and a tail projection used to disqualify the shape.
-  That one cost 379 ms against 88 ms on q01's shape without appearing in this table at
-  all, because the TPC-H queries here happen to list their keys first.
-
-q12's 1.8× is still short of q01's 3.3× because its build side — all of
-`orders.parquet` — is materialised serially before the fan-out starts.
-
-### Star-schema suites, first run
-
-basalt 0.5.9 against DuckDB 1.5.5, min of 2, same machine. Every query exact.
-
-| suite | queries | ratio range |
-| --- | --- | --- |
-| `tpcds-*` | 5 (of the 23 expressible) | **2.4 – 2.8×** |
-| `ssb-*` | 13 | **3.3 – 5.6×** |
-| `tpch-*` | 5 | 3.0 – 12.7× |
-
-The pattern is consistent: the closer a query is to a pure star-schema aggregation,
-the closer basalt gets. That is the shape the join-chain fan-out handles, and it is
-also the shape the dialect can express — the 23 TPC-DS queries runnable then were the
-star-shaped ones.
-
-Every SSB query fans out, including `q4.1`'s four-join chain: 893 ms at `-j 1` against
-291 ms at `-j 16`. On 0.5.7 the whole SSB suite could not run at all — every query puts
-its dimensions in a CTE, and a dynamic path inside a CTE reached the reader as a
-literal `${data}`.
-
-### The movement suite
-
-| query | baseline | now | |
-| --- | --- | --- | --- |
-| move-m01 (parquet→csv) | 1692 ms | **262 ms** | 6.5× |
-| move-m02 (csv→csv) | 2776 ms | **1007 ms** | 2.8× |
-| move-m03 (csv→csv, 2% kept) | 889 ms | 896 ms | — |
-
-Two causes, and neither was the read path:
-
-- **A string allocated per field.** The writer called `valueToString` for every
-  non-text value: allocate, format, copy into the output buffer, drop. Numbers and
-  timestamps now format straight into the buffer, since they can only need CSV
-  quoting when the delimiter is itself one of `[0-9+-.:eE ]`, which is a per-writer
-  constant.
-- **Formatting under the sink lock.** A shared sink held one mutex across the whole
-  of `writeBatch`, so every lane queued behind one thread doing all the formatting.
-  Write-heavy jobs therefore got *slower* with more threads — m01 was 752 ms at
-  `-j 1` and 835 ms at `-j 16`. Lanes now render into their own buffer and hold the
-  lock only for the append.
-
-Scaling, before and after that second change:
-
-```
-m01   before  j1=752  j4=798  j16=835      after  j1=754  j4=368  j16=276
-m02   before  j1=2071 j4=1584 j16=1860     after  j1=2071 j4=1407 j16=997
-```
-
-m03 barely writes, so it was never affected — which is exactly why comparing it
-against m02 located the sink in the first place.
-
-So: compare thread counts before concluding anything about a query's per-row cost.
-A flat line here means the shape never reached a parallel path, not that the engine
-is slow per row.
+Compare thread counts before concluding anything about a query's per-row cost. A
+time that stays flat from `-j 1` to `-j 16` means the shape never reached a
+parallel path, not that the engine is slow per row:
 
 ```sh
 for j in 1 4 16; do zig build run -Doptimize=ReleaseFast -- run bench/tpch/q12.sql \
   -p data=$BASALT_BENCH_DATA -p out=/tmp/q12 -j $j; done
 ```
 
-And `m03` versus `m02` isolates the sink: identical input and projection, 2% of the
-rows written, 886 ms against 2809 ms. Roughly 1.9 s of `m02` is materialising and
-serialising rows — about twice what parsing the 773 MB input costs. For the
-movement suite the **output path**, not the source, is the bottleneck.
+`m03` against `m02` isolates the sink: the same input and projection, with 2% of
+the rows written, so their difference is what materialising and serialising rows
+costs. `basalt run --trace` and a `zig build -Dstats=true` build break a run down further
+([Command line](../docs/tools/cli.md)).
