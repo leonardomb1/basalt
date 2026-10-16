@@ -1565,7 +1565,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PARAM n STRING DEFAULT upper('x');\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "param default must be a literal" },
         .{ "LET q = (SELECT x, x AS y FROM '$B/a.csv');\nLOAD INTO '$B/o.csv' AS SELECT $q AS a;", "LET `q`: must produce exactly one column, got 2" },
         .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LOAD INTO '$B/o.csv' WITH (bogus = 1) AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown `LOAD INTO` option `bogus`" },
-        .{ "CASE WHEN 1 = 0 THEN LOAD INTO '$B/o.xlsx' AS SELECT 1 AS a; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "does not write them" },
+        .{ "CASE WHEN 1 = 0 THEN LOAD INTO '$B/o.xlsx' WITH (sheet = 'a/b') AS SELECT 1 AS a; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "cannot hold any of" },
         .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "only a starrocks or doris target" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' a JOIN '$B/a.csv' b ON a.x = b.x WITH (join_order = 'bad');", "join_order is 'auto' or 'written'" },
         .{ "LOAD INTO '$B/o.csv' WITH (jobs = 2) AS SELECT * FROM '$B/a.csv';", "unknown `LOAD INTO` option `jobs`" },

@@ -77,7 +77,7 @@ The first non-empty row is the header — an empty header cell is named by its
 column letter, a repeated one numbered (`total_2`) — or, with `header = false`,
 every row is data and the columns are `A`, `B`, …. `range = 'B3:F200'` reads
 that block, its first row the header, for a sheet with a title above its table;
-`B3:F` reads to the last row. Excel is read, never written.
+`B3:F` reads to the last row.
 
 A workbook's cells carry their own types, so a column's type is decided from
 every row, not a sample (a CSV's first 1024): numbers are `INT` when each is an
@@ -92,6 +92,36 @@ Empty cells and error values (`#N/A`, `#DIV/0!`) are null; a formula reads as
 the value Excel last saved, and a merged cell only in its first cell. Rows
 stream; what stays in memory is the workbook's shared-string table (up to 512
 MB). The old binary `.xls`, `.xlsb` and `.ods` are not read.
+
+### Writing Excel
+
+`LOAD INTO 'report.xlsx' AS ...` (or `WITH (format = 'xlsx')`) writes a workbook
+of one worksheet, `Sheet1` unless `WITH (sheet = 'Vendas')` names it: a header row
+of column names, then the rows. It streams in constant memory, to a local file
+(through a `.part`, as every file target) or to object storage, SFTP and SMB.
+
+```sql
+LOAD INTO 'fechamento.xlsx' WITH (sheet = 'Vendas') AS
+SELECT loja, dia, SUM(valor) AS total FROM 'vendas.csv' GROUP BY loja, dia;
+```
+
+A null is an empty cell; booleans are booleans; numbers are numbers — but Excel
+holds a number as a double, so an `INT` beyond 2^53 or a `DECIMAL` of more than
+15 significant digits is written as text keeping every digit rather than
+rounded, and a NaN or infinite float is an empty cell. `DATE`, `TIMESTAMP` and
+`TIME` are Excel dates in the formats `yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss` and
+`hh:mm:ss`, so they read back as dates (in basalt, DuckDB, LibreOffice), kept to
+the millisecond (finer digits are cut); a date before 1 March 1900 — where
+Excel's calendar holds a day that never was — or after 9999 is written as ISO
+text. Text is written as is, line breaks and control characters included
+(invalid UTF-8 becomes U+FFFD); `BYTES` is base64 text. An array or struct column
+is refused.
+
+Excel's limits are errors, never truncation: 1,048,575 data rows under the
+header, 16,384 columns, 32,767 characters a cell, a sheet name of 1 to 31
+characters without `[ ] : * ? / \`, and 4 GiB of sheet XML. `APPEND` and a
+`.xlsx.gz` name are refused: a workbook is a zip whose directory is written
+last. A macro-enabled `.xlsm` is read, never written.
 
 ## Arrow IPC
 

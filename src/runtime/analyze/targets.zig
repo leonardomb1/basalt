@@ -19,6 +19,7 @@ const std = @import("std");
 const replace = @import("../../db/replace.zig");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
+const xlsxwrite = @import("../../format/xlsx/write.zig");
 const zipsrc = @import("../../format/compress/zip.zig");
 
 pub const FileFormat = enum {
@@ -164,6 +165,21 @@ pub fn jsonShapeFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Er
 
 pub const json_array_append_fmt = "`APPEND` into `{s}` is not supported: a JSON array closes on its last byte, so appending means rewriting the file. Write NDJSON (no `array`) to append, or use `REPLACE`";
 
+/// An Excel sink's worksheet name, `Sheet1` when unset; validated here so `check`
+/// refuses a name Excel would.
+pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8 {
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, "sheet")) continue;
+        const name = switch (h.value) {
+            .str, .ident => |s| s,
+            else => return fail(diag, "`sheet` is a quoted worksheet name, like `sheet = 'Vendas'`", .{}),
+        };
+        if (xlsxwrite.sheetNameProblem(name)) |why| return fail(diag, "`sheet = '{s}'`: {s}", .{ name, why });
+        return name;
+    }
+    return "Sheet1";
+}
+
 /// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
 /// both answer `.csv`.
 pub fn formatOfPath(path: []const u8) ?FileFormat {
@@ -187,11 +203,14 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
 /// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    if (std.ascii.endsWithIgnoreCase(csv.dataName(path), ".xlsm"))
+        return "basalt writes `.xlsx`; a macro-enabled `.xlsm` holds macros it cannot write";
     if (csv.splitArchive(path) != null)
         return "basalt reads `.zip` archives but does not write them; write a `.csv` or `.csv.gz`";
     const codec = csv.splitCodec(path).codec;
     if (codec == .none) return null;
     const fmt = explicit orelse formatOfPath(path) orelse .csv;
+    if (fmt == .xlsx) return "an Excel workbook is a zip archive already, so it is written without a `.gz`/`.zst` suffix";
     if (fmt != .csv and fmt != .json) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
     if (codec == .zstd) return "basalt compresses CSV and JSON output as gzip; name it `.gz`, as zstd output is not supported";
     return null;
@@ -218,7 +237,7 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
     if (explicit != null) return null;
     if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`, read only) and JSON (`.json`, `.ndjson`, `.jsonl`), a CSV or JSON optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`) and JSON (`.json`, `.ndjson`, `.jsonl`), a CSV or JSON optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
 /// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so

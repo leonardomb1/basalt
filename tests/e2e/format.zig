@@ -1,5 +1,5 @@
-//! End-to-end reads of each format: CSV dialects, zip members, Excel, parquet logical
-//! and nested types, and the explode functions.
+//! End-to-end reads of each format: CSV dialects, zip members, Excel (and writing
+//! it), parquet logical and nested types, and the explode functions.
 
 const std = @import("std");
 const basalt = @import("basalt");
@@ -187,14 +187,80 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
         defer alloc.free(got);
         try std.testing.expectEqualStrings(c.want, got);
     }
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const w = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/out.xlsx' AS SELECT 1 AS a;", .{base});
-    const prog = try parser.parseSource(parena.allocator(), w, &pdiag);
-    var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
-    try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "does not write them") != null);
+}
+
+test "an Excel workbook is written and reads back typed, a named sheet, Excel's limits refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,s,d,ts,t,big,dec\n" ++
+        "1,\"a,b \"\"q\"\"\",2024-02-29,2024-02-29 23:59:59.5,08:15:00,9007199254740993,12.5\n" ++
+        "2,,1899-12-31,1970-01-01 00:00:00,23:59:59.999,-3,\n" ++
+        "3,\"line\nbreak _x0041_\",9999-12-31,2026-10-16 12:00:00,00:00:00,4,0.01\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\LOAD INTO '$B/out.xlsx' WITH (sheet = 'Vendas') AS
+        \\SELECT id, s, CAST(d AS DATE) AS d, CAST(ts AS TIMESTAMP) AS ts, CAST(t AS TIME) AS t, big, CAST(dec AS DECIMAL(10,2)) AS dec, id % 2 = 0 AS even FROM '$B/in.csv';
+        \\LOAD INTO '$B/out.csv' AS SELECT * FROM '$B/out.xlsx' WITH (sheet = 'Vendas');
+    , "$B", base);
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &.{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "id,s,d,ts,t,big,dec,even\n" ++
+            "1,\"a,b \"\"q\"\"\",2024-02-29,2024-02-29 23:59:59.500000,08:15:00,9007199254740993,12.5,false\n" ++
+            "2,,1899-12-31,1970-01-01 00:00:00,23:59:59.999000,-3,,true\n" ++
+            "3,\"line\nbreak _x0041_\",9999-12-31,2026-10-16 12:00:00,00:00:00,4,0.01,false\n",
+        out,
+    );
+
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (sheet = 'a/b') AS SELECT 1 AS a;", "cannot hold any of");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (sheet = 3) AS SELECT 1 AS a;", "quoted worksheet name");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (delimiter = ';') AS SELECT 1 AS a;", "does not apply to an Excel target");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (sheet = 'x') AS SELECT 1 AS a;", "`sheet` names the worksheet of an Excel");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' APPEND AS SELECT 1 AS a;", "an Excel workbook is a zip archive");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx.gz' AS SELECT 1 AS a;", "written without a `.gz`");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsm' AS SELECT 1 AS a;", "macro-enabled `.xlsm`");
+
+    const named = try std.mem.replaceOwned(u8, alloc,
+        \\LOAD INTO '$B/o.dat' WITH (format = 'xlsx', sheet = 'Dados') AS SELECT id, s FROM '$B/in.csv' WHERE id = 1;
+        \\LOAD INTO '$B/out.csv' AS SELECT * FROM '$B/o.dat' WITH (format = 'xlsx', sheet = 'Dados');
+    , "$B", base);
+    defer alloc.free(named);
+    const back = try runScript(alloc, &tmp, named, &.{});
+    defer alloc.free(back);
+    try std.testing.expectEqualStrings("id,s\n1,\"a,b \"\"q\"\"\"\n", back);
+}
+
+test "an Excel sheet takes 1,048,575 data rows under its header and refuses the next" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cases = [_]struct { n: []const u8, ok: bool }{ .{ .n = "1048575", .ok = true }, .{ .n = "1048576", .ok = false } };
+    for (cases) |c| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const script = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/big.xlsx' AS SELECT range AS x FROM range(0, {s});", .{ base, c.n });
+        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+        var rdiag: Diag = .{};
+        const got = run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag);
+        if (c.ok) {
+            _ = try got;
+            const check = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/n.csv' AS SELECT COUNT(*) AS n, MAX(x) AS hi FROM '{s}/big.xlsx';", .{ base, base });
+            var rd2: Diag = .{};
+            _ = try run(alloc, try parser.parseSource(parena.allocator(), check, &pdiag), .{ .log = .{ .quiet = true } }, &rd2);
+            const n = try tmp.dir.readFileAlloc(alloc, "n.csv", 1 << 10);
+            defer alloc.free(n);
+            try std.testing.expectEqualStrings("n,hi\n1048575,1048574\n", n);
+        } else {
+            try std.testing.expectError(error.XlsxTooManyRows, got);
+            try std.testing.expect(std.mem.indexOf(u8, basalt.runtime.failLabel(error.XlsxTooManyRows), "1048575 data rows") != null);
+        }
+    }
 }
 
 test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {

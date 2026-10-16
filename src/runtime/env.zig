@@ -281,6 +281,7 @@ pub const Env = struct {
     fmt_out: ?analyze.FileFormat = null,
     pq_codec: codec.Codec = .snappy,
     json_shape: jsonwrite.Shape = .ndjson,
+    xlsx_sheet: []const u8 = "Sheet1",
     cutover: @import("../db/replace.zig").Cutover = .truncate,
     src_name: []const u8 = "",
     pq_readers: usize = 0,

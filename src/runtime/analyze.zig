@@ -305,6 +305,7 @@ pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
 pub const jsonShapeFromHints = @import("analyze/targets.zig").jsonShapeFromHints;
 pub const json_array_append_fmt = @import("analyze/targets.zig").json_array_append_fmt;
 pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
+pub const xlsxSheetFromHints = @import("analyze/targets.zig").xlsxSheetFromHints;
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
@@ -1703,7 +1704,6 @@ const Ctx = struct {
     }
 };
 
-pub const xlsx_write_fmt = "cannot write `{s}`: basalt reads Excel workbooks but does not write them; write a `.csv` or `.parquet`";
 pub const append_unsupported_fmt = "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, or write each run to its own path";
 
 /// What a file or stdout sink is refused for, shared by `check` and the run's
@@ -1717,8 +1717,6 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
         const fmt = try formatFromHints(hints, diag);
         if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
             return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
-        if ((fmt orelse formatOfPath(w.target)) == .xlsx)
-            return fail(diag, xlsx_write_fmt, .{w.target});
     }
     _ = try dialectFromHints(hints, diag);
     if (hintText(hints, "encoding") != null)
@@ -1735,15 +1733,25 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
 const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "array" };
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
 const table_sink_keys = [_][]const u8{ "compression", "cutover" };
+const xlsx_sink_keys = [_][]const u8{ "format", "sheet" };
 
 /// `USING` names a load path, and only StarRocks and Doris have one to name; a
 /// `WITH` key the target's kind does not read is refused rather than ignored.
 pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u8, diag: *Diag) Error!void {
     const file = std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdout");
     const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
-    const keys: []const []const u8 = if (file) &file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
+    const xlsx_file = file and w.target.len > 0 and ((formatFromHints(hints, diag) catch null) orelse formatOfPath(w.target)) == .xlsx;
+    const keys: []const []const u8 = if (xlsx_file) &xlsx_sink_keys else if (file) &file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
     for (hints) |h| {
         if (containsName(keys, h.key)) continue;
+        if (std.mem.eql(u8, h.key, "sheet") or xlsx_file) {
+            const e = if (xlsx_file)
+                fail(diag, "`LOAD INTO` option `{s}` does not apply to an Excel target, which takes `sheet` and `format`", .{h.key})
+            else
+                fail(diag, "`sheet` names the worksheet of an Excel (`.xlsx`) target; it does not apply to a {s} target", .{if (file) "CSV, Parquet, Arrow or JSON" else connector});
+            diag.pos = h.pos;
+            return e;
+        }
         const known = containsName(&file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key);
         const e = if (known)
             fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format`, for Parquet `compression` and for JSON `array`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
@@ -1755,6 +1763,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     _ = try parquetCodecFromHints(w, hints, diag);
     _ = try jsonShapeFromHints(w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
+    _ = try xlsxSheetFromHints(hints, diag);
     const form = w.form orelse return;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });

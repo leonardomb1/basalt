@@ -12,7 +12,6 @@ const TableWriter = @import("../../connect/table.zig").TableWriter;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
 const arrow = @import("../../format/arrow/write.zig");
-const arrowread = @import("../../format/arrow/read.zig");
 const ast = @import("../../lang/ast.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
 const csv = @import("../../format/csv.zig");
@@ -45,7 +44,8 @@ const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
 const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
-const xlsx = @import("../../format/xlsx/read.zig");
+const xlsxwrite = @import("../../format/xlsx/write.zig");
+const eval = @import("../../exec/eval.zig");
 
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.
@@ -217,13 +217,18 @@ fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driv
 fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
-        if ((env.fmt_out == null and xlsx.isPath(w.target)) or env.fmt_out == .xlsx)
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.xlsx_write_fmt, .{w.target}));
         const wfmt = env.fmt_out orelse analyze.formatOfPath(w.target) orelse .csv;
         if (wfmt == .json) {
             const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, env.json_shape) catch |e|
                 return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
             return jw.sink();
+        }
+        if (wfmt == .xlsx) {
+            const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, env.xlsx_sheet) catch |e| switch (e) {
+                error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+                else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+            };
+            return xw.sink();
         }
         if (wfmt == .arrow) {
             const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {

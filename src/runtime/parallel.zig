@@ -81,6 +81,8 @@ pub const PipelinedSink = struct {
     busy: bool = false,
     stop: bool = false,
     err: ?anyerror = null,
+    note_buf: [480]u8 = undefined,
+    note_len: usize = 0,
     thread: ?std.Thread = null,
 
     pub fn start(self: *PipelinedSink) !void {
@@ -91,14 +93,20 @@ pub const PipelinedSink = struct {
         self.mtx.lock();
         defer self.mtx.unlock();
         while ((self.slot != null or self.busy) and self.err == null) self.cv.wait(&self.mtx);
-        if (self.err) |e| return e;
+        if (self.err) |e| return self.explained(e);
         self.slot = b;
         self.cv.broadcast();
     }
 
     pub fn finish(self: *PipelinedSink) !void {
         self.shutdown();
-        if (self.err) |e| return e;
+        if (self.err) |e| return self.explained(e);
+    }
+
+    /// The sink's own account of its failure (`eval.explain`) is thread-local to the
+    /// writer thread, so it is carried over to the caller's.
+    fn explained(self: *PipelinedSink, e: anyerror) anyerror {
+        return if (self.note_len > 0) eval.explain(e, self.note_buf[0..self.note_len]) else e;
     }
 
     pub fn shutdown(self: *PipelinedSink) void {
@@ -129,6 +137,10 @@ pub const PipelinedSink = struct {
             self.cv.broadcast();
             r catch |e| {
                 self.err = e;
+                if (eval.takeFailure(e)) |why| {
+                    self.note_len = @min(why.len, self.note_buf.len);
+                    @memcpy(self.note_buf[0..self.note_len], why[0..self.note_len]);
+                }
                 break;
             };
         }

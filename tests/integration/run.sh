@@ -963,6 +963,14 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
   else
     report "s3-json-write (run error)" bad
   fi
+
+  # an Excel workbook out to an object and back, through the same upload path
+  if brun run -c "LOAD INTO 's3://basalt-it/xl/seed.xlsx' WITH (sheet = 'Seed') AS SELECT * FROM 'tests/integration/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/s3_xlsx.csv' AS SELECT id, name, val FROM 's3://basalt-it/xl/seed.xlsx' WITH (sheet = 'Seed') ORDER BY id;"; then
+    check s3-xlsx-write "$out/s3_xlsx.csv" tests/integration/expected.csv
+  else
+    report "s3-xlsx-write (run error)" bad
+  fi
 fi
 
 # Quoted column names, end to end. Headers with spaces are the rule in

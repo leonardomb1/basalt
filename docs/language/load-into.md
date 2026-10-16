@@ -21,11 +21,13 @@ AS
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   ([FOR EACH](for-each.md)): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`. A file target
   built this way must end in a literal extension, which picks the writer.
-- `.xlsx` is read but never written: a workbook target is a plan-time error.
+- `LOAD INTO '/out/x.xlsx'` writes an Excel workbook of one sheet, `WITH (sheet =
+  'Name')` naming it ([Writing Excel](formats.md#writing-excel)); `REPLACE` only.
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
-  (a file), `compression` (a Parquet file: `snappy`, `gzip` or `none`), `array`
-  (a JSON file: one top-level array instead of a row a line) and
+  (a file), `sheet` (an Excel file), `compression` (a Parquet file: `snappy`,
+  `gzip` or `none`), `array` (a JSON file: one top-level array instead of a row
+  a line) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
   or SQL Server); a key the target does not read, or any
   other key, is a plan-time error rather than ignored.

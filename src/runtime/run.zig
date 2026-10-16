@@ -494,7 +494,7 @@ pub fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
         if (!failed) _ = t.rows.fetchAdd(f.rows, .monotonic);
     }
     const why: []const u8 = if (err) |e|
-        (if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else failLabel(e))
+        (if (env.errctx.msg.len > 0) env.errctx.msg else if (env.diag.msg.len > 0) env.diag.msg else eval.peekFailure(e) orelse errLabel(e))
     else
         "";
     if (env.on_load) |h| {

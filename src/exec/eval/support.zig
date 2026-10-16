@@ -136,6 +136,14 @@ pub fn takeFailure(e: anyerror) ?[]const u8 {
     return n.buf[0..n.len];
 }
 
+/// `takeFailure` that leaves the account for the next reader, for a caller that only
+/// reports the error on its way out.
+pub fn peekFailure(e: anyerror) ?[]const u8 {
+    const n = &fail_note;
+    if (n.err == null or n.err.? != e) return null;
+    return n.buf[0..n.len];
+}
+
 pub fn clip(s: []const u8) []const u8 {
     const max = 80;
     return if (s.len <= max) s else s[0..max];

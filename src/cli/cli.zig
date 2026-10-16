@@ -177,10 +177,11 @@ fn usage(w: anytype) !void {
         \\
         \\sources and sinks:
         \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,
-        \\             .ipc, .arrows; local), Excel (.xlsx, read; WITH (sheet =
-        \\             'Name', range = 'B3:F200', header = false)) and JSON (.json,
-        \\             .ndjson, .jsonl; WITH (items = 'data.rows') on a read, WITH
-        \\             (array = true) on a write for one array, not NDJSON) — the
+        \\             .ipc, .arrows; local), Excel (.xlsx, read and written;
+        \\             WITH (sheet = 'Name'), reads also range = 'B3:F200',
+        \\             header = false) and JSON (.json, .ndjson, .jsonl;
+        \\             WITH (items = 'data.rows') on a read, WITH (array = true)
+        \\             on a write for one array, not NDJSON) — the
         \\             extension picks the format; another needs WITH (format =
         \\             'csv'|'parquet'|'arrow'|'json'|'ndjson').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,

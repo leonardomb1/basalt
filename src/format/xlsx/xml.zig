@@ -244,22 +244,28 @@ pub fn unescapeOoxml(out: *std.array_list.Managed(u8), start: usize) void {
     var j: usize = 0;
     var tmp: [4]u8 = undefined;
     while (j < s.len) {
-        if (j + 7 <= s.len and s[j] == '_' and s[j + 1] == 'x' and s[j + 6] == '_') {
-            if (std.fmt.parseInt(u21, s[j + 2 .. j + 6], 16)) |cp| {
-                const n = std.unicode.utf8Encode(cp, &tmp) catch 0;
-                if (n > 0 and n <= 7) {
-                    @memcpy(s[w..][0..n], tmp[0..n]);
-                    w += n;
-                    j += 7;
-                    continue;
-                }
-            } else |_| {}
+        if (ooxmlEscape(s[j..])) |cp| {
+            const n = std.unicode.utf8Encode(cp, &tmp) catch 0;
+            if (n > 0 and n <= 7) {
+                @memcpy(s[w..][0..n], tmp[0..n]);
+                w += n;
+                j += 7;
+                continue;
+            }
         }
         s[w] = s[j];
         w += 1;
         j += 1;
     }
     out.shrinkRetainingCapacity(start + w);
+}
+
+/// The code point of the `_xHHHH_` escape `s` starts with, or null. A writer escapes
+/// the `_` of any text this matches, so no literal text decodes as an escape.
+pub fn ooxmlEscape(s: []const u8) ?u21 {
+    if (s.len < 7 or s[0] != '_' or s[1] != 'x' or s[6] != '_') return null;
+    for (s[2..6]) |c| if (!std.ascii.isHex(c)) return null;
+    return std.fmt.parseInt(u21, s[2..6], 16) catch null;
 }
 
 fn appendCodepoint(out: *std.array_list.Managed(u8), cp: u21) Error!void {

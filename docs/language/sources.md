@@ -135,7 +135,7 @@ source is asked to do are on [Pushdown](pushdown.md).
   is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
   always writes UTF-8, and being told otherwise is an error rather than ignored.
 - **`WITH (format = 'csv' | 'parquet' | 'arrow' | 'xlsx')`** — read or write a
-  path as this format whatever its extension says (`xlsx` reads only). Needed
+  path as this format whatever its extension says. Needed
   for a file named `.dat` or `.txt`, and for a URL that serves CSV from an
   extensionless path. Without it, an extension basalt does not know is refused
   at plan time rather than parsed as CSV, which would read a binary file's

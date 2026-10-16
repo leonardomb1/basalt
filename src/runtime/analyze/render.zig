@@ -102,6 +102,7 @@ pub fn appendUnsupported(target: []const u8, explicit: ?FileFormat) ?[]const u8 
     const arrow = if (explicit) |f| f == .arrow else arrowread.isPath(target);
     if (parquet) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
     if (arrow) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
+    if (if (explicit) |f| f == .xlsx else xlsx.isPath(target)) return "an Excel workbook is a zip archive whose directory is written last, so appending means rewriting the file";
     return null;
 }
 
