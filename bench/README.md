@@ -65,27 +65,17 @@ generated date dimension). Not `ssb-dbgen` output, so absolute numbers are not
 comparable to published SSB results — both engines read identical files, which is
 what makes the comparison valid.
 
-`tpcds-*` — **five of the 99 TPC-DS queries**, ported from the spec's comma-join form
-to explicit joins with the dimensions as CTEs. Only five because only **23 of the 99
-are expressible in this dialect at all**; the other 76 need a construct it does not
-have:
-
-| blocker | queries |
-| --- | --- |
-| subqueries (any position) | 70 |
-| window functions | 15 |
-| `ROLLUP` / `GROUPING SETS` | 10 |
-| `EXISTS` | 5 |
-| `INTERSECT` / `EXCEPT` as set operators | 4 |
-
-The expressible 23 are 3, 7, 13, 15, 17, 19, 25, 26, 29, 37, 40, 42, 43, 48, 50, 52,
-55, 72, 82, 84, 85, 91 and 96 — which are, not coincidentally, the star-schema-shaped
-ones. Generate the fixtures with `bench/tpcds_gen.sql`.
+`tpcds-*` — **five of the 99 TPC-DS queries** (3, 42, 52, 55, 96), ported from the
+spec's comma-join form to explicit joins. Only five were ported because, when the
+suite was written, only 23 of the 99 were expressible in the dialect. Subqueries,
+window functions, `EXISTS`, `INTERSECT` and `EXCEPT` have all landed since, so most of
+the rest are now portable; `ROLLUP` and `GROUPING SETS` are still missing. Porting
+more is open work. Generate the fixtures with `bench/tpcds_gen.sql`.
 
 Deviations from the TPC-H spec, all applied to both sides equally: `q14` emits its
-two SUMs rather than their ratio, and dimension tables are lifted into CTEs
-because basalt requires the right side of a join to be a CTE. Interval arithmetic
-is spelled as the literal date it computes.
+two SUMs rather than their ratio, and dimension tables sit in CTEs, which basalt
+once required of a join's right side and no longer does. Interval arithmetic is
+spelled as the literal date it computes.
 
 ## Reading the output
 
@@ -104,6 +94,29 @@ Timings are wall clock of the child process, so they include CLI startup. That i
 the honest number for a movement tool, but it is a fixed tax that matters most on
 the queries with tiny results, so the harness measures and prints each engine's
 startup separately.
+
+## Latest run
+
+basalt 0.11.9 against DuckDB 1.5.1, Intel i7-13700H (20 threads), fixtures in page
+cache, min of 3. Every query matched DuckDB.
+
+| query | basalt | duckdb | ratio |
+| --- | --- | --- | --- |
+| tpch-q01 | 372 ms | 100 ms | 3.72× |
+| tpch-q03 | 217 ms | 76 ms | 2.86× |
+| tpch-q06 | 118 ms | 41 ms | 2.88× |
+| tpch-q12 | 239 ms | 43 ms | 5.56× |
+| tpch-q14 | 163 ms | 60 ms | 2.72× |
+| ssb-q11 … q43 (13) | 102–281 ms | 38–91 ms | 1.86–3.54× |
+| tpcds-q03, q42, q52, q55, q96 | 67–115 ms | 27–48 ms | 1.81–3.19× |
+
+| query | basalt | rows out | rate |
+| --- | --- | --- | --- |
+| move-m01 (parquet→csv) | 208 ms | 6,001,215 | 28.9 M rows/s |
+| move-m02 (csv→csv) | 715 ms | 6,001,215 | 8.4 M rows/s |
+| move-m03 (csv→csv, 2% kept) | 581 ms | 122,005 | — |
+
+The sections below are the history: the first run, and what moved the numbers since.
 
 ## Baseline
 
@@ -176,7 +189,7 @@ basalt 0.5.9 against DuckDB 1.5.5, min of 2, same machine. Every query exact.
 
 The pattern is consistent: the closer a query is to a pure star-schema aggregation,
 the closer basalt gets. That is the shape the join-chain fan-out handles, and it is
-also the shape the dialect can express — the 23 runnable TPC-DS queries are the
+also the shape the dialect can express — the 23 TPC-DS queries runnable then were the
 star-shaped ones.
 
 Every SSB query fans out, including `q4.1`'s four-join chain: 893 ms at `-j 1` against
