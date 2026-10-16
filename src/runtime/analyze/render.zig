@@ -10,6 +10,7 @@ const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const targets = @import("targets.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
 const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
@@ -111,6 +112,7 @@ pub fn sinkKind(node: anytype) []const u8 {
         if (pqwrite.Writer.isPath(path)) return "parquet";
         if (arrowread.isPath(path)) return "arrow";
         if (xlsx.isPath(path)) return "xlsx";
+        if (targets.formatOfPath(path) == .json) return "json";
     }
     return node.connector;
 }

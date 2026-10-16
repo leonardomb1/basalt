@@ -302,7 +302,9 @@ pub const jsonOptions = @import("analyze/targets.zig").jsonOptions;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
 pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
-const formatOfPath = @import("analyze/targets.zig").formatOfPath;
+pub const jsonShapeFromHints = @import("analyze/targets.zig").jsonShapeFromHints;
+pub const json_array_append_fmt = @import("analyze/targets.zig").json_array_append_fmt;
+pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
@@ -1730,7 +1732,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     }
 }
 
-const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression" };
+const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "array" };
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
 const table_sink_keys = [_][]const u8{ "compression", "cutover" };
 
@@ -1744,13 +1746,14 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         if (containsName(keys, h.key)) continue;
         const known = containsName(&file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key);
         const e = if (known)
-            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format` and, for Parquet, `compression`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
+            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format`, for Parquet `compression` and for JSON `array`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
         else
-            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format` and, for Parquet, `compression`; a starrocks or doris table `label_prefix`)", .{h.key});
+            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format`, for Parquet `compression` and for JSON `array`; a starrocks or doris table `label_prefix`)", .{h.key});
         diag.pos = h.pos;
         return e;
     }
     _ = try parquetCodecFromHints(w, hints, diag);
+    _ = try jsonShapeFromHints(w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
     const form = w.form orelse return;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;

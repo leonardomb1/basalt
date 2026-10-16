@@ -71,11 +71,27 @@ test "an NDJSON file read on four lanes gives what one lane does, in file order"
     try std.testing.expect(std.mem.count(u8, got[0], "\n") > 9000);
 }
 
-test "a JSON file is not written, and STDIN is refused when stdin carries something else" {
+test "NDJSON and a JSON array are written and read back; an array is not appended to" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.json' AS SELECT 1 AS a;", "basalt reads JSON but does not write it");
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name,amt\n1,\"a \"\"q\"\"\",2.50\n2,,\n3,c\\d,-1.25\n" });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.ndjson' AS SELECT id, name, CAST(amt AS DECIMAL(5,2)) AS amt FROM '$B/in.csv';", 1, &.{});
+    const nd = try tmp.dir.readFileAlloc(alloc, "o.ndjson", 1 << 16);
+    defer alloc.free(nd);
+    try std.testing.expectEqualStrings("{\"id\":1,\"name\":\"a \\\"q\\\"\",\"amt\":\"2.50\"}\n{\"id\":2,\"name\":null,\"amt\":null}\n{\"id\":3,\"name\":\"c\\\\d\",\"amt\":\"-1.25\"}\n", nd);
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.json.gz' WITH (array = true) AS SELECT * FROM '$B/o.ndjson';", 4, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.ndjson' APPEND AS SELECT 4 AS id;", 1, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id, name, amt FROM '$B/o.json.gz' UNION ALL SELECT id, name, amt FROM '$B/o.ndjson' ORDER BY id, name;", 1, &.{});
+    const got = try out(alloc, &tmp);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("id,name,amt\n1,\"a \"\"q\"\"\",2.50\n1,\"a \"\"q\"\"\",2.50\n2,,\n2,,\n3,c\\d,-1.25\n3,c\\d,-1.25\n4,,\n", got);
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.json' APPEND WITH (array = true) AS SELECT 1 AS a;", "a JSON array closes on its last byte");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (array = true) AS SELECT 1 AS a;", "`array` applies to a JSON file target only");
+}
+
+test "STDIN is refused when stdin carries something else" {
+    const alloc = std.testing.allocator;
 
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();

@@ -954,6 +954,15 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
   else
     report "s3-json-prefix (run error)" bad
   fi
+
+  # basalt's own JSON out to objects and back: gzipped NDJSON and an array.
+  if brun run -c "LOAD INTO 's3://basalt-it/jw/a.ndjson.gz' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/jw/b.json' WITH (array = true) AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO '$out/s3_jsonw.csv' AS SELECT id, name, val FROM 's3://basalt-it/jw/' ORDER BY id;"; then
+    check s3-json-write "$out/s3_jsonw.csv" tests/integration/expected.csv
+  else
+    report "s3-json-write (run error)" bad
+  fi
 fi
 
 # Quoted column names, end to end. Headers with spaces are the rule in

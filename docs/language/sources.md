@@ -9,7 +9,7 @@ A query reads from one source, named after `FROM`, and joins may read more
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` ([dynamic names](for-each.md#dynamic-names--var-identifier-)) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
 | file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx' \| 'json' \| 'ndjson')` names one |
-| file — JSON or NDJSON | `FROM 'events.ndjson'` (also `.jsonl`) / `FROM 'rows.json'` — read only; see [JSON and NDJSON](#json-and-ndjson) |
+| file — JSON or NDJSON | `FROM 'events.ndjson'` (also `.jsonl`) / `FROM 'rows.json'`; see [JSON and NDJSON](#json-and-ndjson) |
 | standard input | `FROM STDIN` — CSV, or `WITH (format = 'json' \| 'ndjson')`; see [Standard input](#standard-input) |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` / `.ndjson.gz` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
@@ -72,8 +72,8 @@ Rows stream: an NDJSON file or an array is never held whole, only `items` reads
 its document whole to find the path. A local NDJSON file splits across lanes at
 line ends as a CSV does; a JSON array, a compressed or remote file reads on one.
 Every location a CSV reads from works the same way: a path, a URL, `s3://`,
-`az://`, SFTP, SMB, FTP, a `.gz`/`.zst` suffix, a zip member, a folder. basalt
-reads JSON but does not write it; `--format json` prints a `SELECT` as NDJSON.
+`az://`, SFTP, SMB, FTP, a `.gz`/`.zst` suffix, a zip member, a folder. Writing
+JSON is in [File formats](formats.md#json).
 
 ## Standard input
 

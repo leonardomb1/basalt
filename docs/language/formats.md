@@ -54,6 +54,20 @@ pages, smaller than Snappy's for somewhat more CPU (a fast DEFLATE level), and
 `compression = 'none'` leaves them uncompressed. `compression` is a Parquet
 sink's option only; any other target refuses it at plan time.
 
+## JSON
+
+`LOAD INTO 'events.ndjson'` (also `.jsonl` and `.json`) writes a JSON object a
+row, keyed by column name, one per line; `WITH (array = true)` writes one
+top-level array instead, as DuckDB's `COPY ... (ARRAY true)` does. Either reads
+back as the same rows, and `--format json` prints a `SELECT` the same way, as
+NDJSON. Decimals are written as strings, since most JSON readers hold a number
+as a double and would drop digits; a NaN or infinite float is `null`, dates,
+times and timestamps ISO text and bytes base64. Text that is not valid UTF-8 is
+repaired, each invalid byte U+FFFD. A `.gz` name gzips the file, and it goes to
+an object store, SFTP or SMB as a CSV does. `APPEND` adds rows to an NDJSON file
+(a newline first if its last line has none); an array is refused, as it closes
+on its last byte.
+
 ## Excel
 
 An Excel workbook — `.xlsx` or `.xlsm`, local, by URL or in object storage — reads

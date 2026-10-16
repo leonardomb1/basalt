@@ -5,7 +5,7 @@ const ArrowWriter = @import("../../format/arrow/write.zig").ArrowWriter;
 const Batch = @import("../../exec/batch.zig").Batch;
 const DiscardSink = @import("../connect.zig").DiscardSink;
 const Env = @import("../env.zig").Env;
-const JsonWriter = @import("../../connect/table.zig").JsonWriter;
+const jsonwrite = @import("../../format/json/write.zig");
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const TableWriter = @import("../../connect/table.zig").TableWriter;
@@ -66,6 +66,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
+    if (env.json_shape == .array) return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
 }
@@ -188,7 +189,7 @@ pub fn uniqueTargetColumns(env: *Env, w: ast.Write, schema: types.Schema) !void 
 fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driver.Sink {
     switch (env.stdout_format) {
         .json => {
-            const writer = JsonWriter.open(env.gpa, schema) catch
+            const writer = jsonwrite.Writer.openStdout(env.arena, schema) catch
                 return planErr(env.diag, "could not open stdout json writer");
             return writer.sink();
         },
@@ -218,7 +219,12 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         const fmode = try fileWriteMode(env, w);
         if ((env.fmt_out == null and xlsx.isPath(w.target)) or env.fmt_out == .xlsx)
             return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.xlsx_write_fmt, .{w.target}));
-        const wfmt = env.fmt_out orelse (if (pqwrite.Writer.isPath(w.target)) analyze.FileFormat.parquet else if (arrowread.isPath(w.target)) analyze.FileFormat.arrow else analyze.FileFormat.csv);
+        const wfmt = env.fmt_out orelse analyze.formatOfPath(w.target) orelse .csv;
+        if (wfmt == .json) {
+            const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, env.json_shape) catch |e|
+                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+            return jw.sink();
+        }
         if (wfmt == .arrow) {
             const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
                 error.ArrowRemoteSink => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),

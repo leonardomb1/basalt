@@ -11,10 +11,6 @@
 //! leaves it off, so its stdout is the whole result whether or not a terminal is
 //! watching. Colours use only foreground and plain attributes, so they read on
 //! dark and light terminals alike.
-//!
-//! `JsonWriter` is the `--format json` sink: NDJSON streamed per batch, never
-//! buffered. Decimals ride as strings (a float would lose precision), non-finite
-//! floats as null, temporal types as ISO text and bytes as base64.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -467,125 +463,6 @@ fn padded(out: *std.Io.Writer, s: []const u8, width: usize) !void {
     try out.splatBytesAll(" ", if (width > w) width - w else 0);
 }
 
-pub const JsonWriter = struct {
-    gpa: std.mem.Allocator,
-    keys: []const []const u8,
-    buf: [8192]u8 = undefined,
-    fw: std.fs.File.Writer = undefined,
-
-    pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*JsonWriter {
-        const self = try gpa.create(JsonWriter);
-        self.* = .{ .gpa = gpa, .keys = &.{} };
-        self.fw = std.fs.File.stdout().writerStreaming(&self.buf);
-        const keys = try gpa.alloc([]const u8, schema.fields.len);
-        for (schema.fields, 0..) |f, i| {
-            var k = std.array_list.Managed(u8).init(gpa);
-            try k.append('"');
-            try appendJsonEscaped(&k, f.name);
-            try k.appendSlice("\":");
-            keys[i] = try k.toOwnedSlice();
-        }
-        self.keys = keys;
-        return self;
-    }
-
-    pub fn writeBatch(self: *JsonWriter, _: std.mem.Allocator, batch: Batch) !void {
-        return writeRows(&self.fw.interface, self.keys, batch);
-    }
-
-    fn writeRows(out: *std.Io.Writer, keys: []const []const u8, batch: Batch) !void {
-        for (0..batch.len) |r| {
-            try out.writeByte('{');
-            for (batch.columns, 0..) |*col, c| {
-                if (c > 0) try out.writeByte(',');
-                try out.writeAll(keys[c]);
-                try celltext.write(out, col, r, JsonText{});
-            }
-            try out.writeAll("}\n");
-        }
-    }
-
-    /// The `celltext.write` policy for JSON: decimals and temporals ride as strings,
-    /// non-finite floats as null and bytes as base64.
-    const JsonText = struct {
-        pub const null_text = "null";
-        pub const bool_true = "true";
-        pub const bool_false = "false";
-        pub const quote_decimal = "\"";
-        pub const quote_temporal = "\"";
-
-        pub fn string(_: JsonText, out: *std.Io.Writer, s: []const u8) !void {
-            try out.writeByte('"');
-            try writeEscapedW(out, s);
-            try out.writeByte('"');
-        }
-
-        pub fn bytes(_: JsonText, out: *std.Io.Writer, s: []const u8) !void {
-            try out.writeByte('"');
-            try std.base64.standard.Encoder.encodeWriter(out, s);
-            try out.writeByte('"');
-        }
-
-        pub fn float(_: JsonText, out: *std.Io.Writer, x: f64) !void {
-            if (std.math.isFinite(x)) return out.print("{d}", .{x});
-            return out.writeAll("null");
-        }
-    };
-
-    pub fn close(self: *JsonWriter) !void {
-        try self.fw.interface.flush();
-        self.deinit();
-    }
-
-    pub fn abort(self: *JsonWriter) void {
-        self.deinit();
-    }
-
-    fn deinit(self: *JsonWriter) void {
-        for (self.keys) |k| self.gpa.free(k);
-        self.gpa.free(self.keys);
-        self.gpa.destroy(self);
-    }
-
-    pub fn sink(self: *JsonWriter) driver.Sink {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable = driver.sinkVTable(JsonWriter);
-};
-
-fn appendJsonEscaped(list: *std.array_list.Managed(u8), s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try list.appendSlice("\\\""),
-        '\\' => try list.appendSlice("\\\\"),
-        '\n' => try list.appendSlice("\\n"),
-        '\r' => try list.appendSlice("\\r"),
-        '\t' => try list.appendSlice("\\t"),
-        else => if (c < 0x20) {
-            var b: [6]u8 = undefined;
-            try list.appendSlice(std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch unreachable);
-        } else try list.append(c),
-    };
-}
-
-fn writeEscapedW(out: *std.Io.Writer, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try out.writeAll("\\\""),
-        '\\' => try out.writeAll("\\\\"),
-        '\n' => try out.writeAll("\\n"),
-        '\r' => try out.writeAll("\\r"),
-        '\t' => try out.writeAll("\\t"),
-        else => if (c < 0x20) try out.print("\\u{x:0>4}", .{c}) else try out.writeByte(c),
-    };
-}
-
-test "json escape covers quotes, backslash, and control bytes" {
-    var l = std.array_list.Managed(u8).init(std.testing.allocator);
-    defer l.deinit();
-    try appendJsonEscaped(&l, "a\"b\\c\nd\x01");
-    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\u0001", l.items);
-}
-
 test "fitColumns: everything when it fits, else both ends around an elided middle" {
     try std.testing.expectEqual(ColumnFit{ .left = 3, .right = 0 }, fitColumns(&.{ 4, 4, 4 }, 80));
     try std.testing.expectEqual(ColumnFit{ .left = 2, .right = 1 }, fitColumns(&.{ 10, 10, 10, 10, 10, 10 }, 40));
@@ -631,14 +508,13 @@ test "renderFitted: types row, right-aligned numbers, NULL, cut cells, elided ro
     try std.testing.expectEqualStrings("  1  ana      a value that is much longer than forty …    10.5", it.next().?);
 }
 
-test "table cells and JSON rows of every kind" {
+test "table cells of every kind" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const batches = try celltext.goldenBatches(a);
     const cells = try a.alloc([]const u8, batches.len);
-    const json = try a.alloc([]const u8, batches.len);
-    for (batches, cells, json) |batch, *c, *j| {
+    for (batches, cells) |batch, *c| {
         const tw = try TableWriter.open(std.testing.allocator, batch.schema.*);
         defer tw.deinit();
         try tw.writeBatch(a, batch);
@@ -648,12 +524,6 @@ test "table cells and JSON rows of every kind" {
             if (cell) |s| try w.writer.print("[{s}]", .{s}) else try w.writer.writeAll("null");
         }
         c.* = w.written();
-
-        const keys = try a.alloc([]const u8, batch.columns.len);
-        for (keys, batch.schema.fields) |*k, f| k.* = try std.fmt.allocPrint(a, "\"{s}\":", .{f.name});
-        var jw = std.Io.Writer.Allocating.init(a);
-        try JsonWriter.writeRows(&jw.writer, keys, batch);
-        j.* = jw.written();
     }
     const tiny = celltext.golden_tiny;
     try celltext.expectGolden(&.{
@@ -669,19 +539,6 @@ test "table cells and JSON rows of every kind" {
         "null null",
         "[1] [a b] [2.50] null null null [-2] [] [-0.1]",
     }, cells);
-    try celltext.expectGolden(&.{
-        "{\"c\":true}\n{\"c\":false}\n{\"c\":null}\n",
-        "{\"c\":0}\n{\"c\":-1}\n{\"c\":-9223372036854775808}\n{\"c\":9223372036854775807}\n{\"c\":null}\n",
-        "{\"c\":0.1}\n{\"c\":0}\n{\"c\":-0}\n{\"c\":" ++ tiny ++ "}\n{\"c\":1000000000000000000000}\n{\"c\":-2.25}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n",
-        "{\"c\":\"123.45\"}\n{\"c\":\"-0.0007\"}\n{\"c\":\"5\"}\n{\"c\":\"0.12345\"}\n{\"c\":\"-18446744073709.551615\"}\n{\"c\":\"0.00\"}\n{\"c\":null}\n",
-        "{\"c\":\"\"}\n{\"c\":\"plain\"}\n{\"c\":\"tab\\there\"}\n{\"c\":\"line\\nbreak\"}\n{\"c\":\"cr\\rlf\\r\\n\"}\n{\"c\":\"say \\\"hi\\\"\"}\n{\"c\":\"O'Brien\"}\n{\"c\":\"back\\\\slash\\\\\"}\n{\"c\":\"a\\\\Nb\"}\n{\"c\":\"\\\\N \"}\n{\"c\":\"NULL\"}\n{\"c\":\"a\\u0001b\\u0002c\"}\n{\"c\":\"a,b;c:d.e-1 0\"}\n{\"c\":\"\xc3\xb3 \xf0\x9f\x98\x80\"}\n{\"c\":\"\\u0000nul\"}\n{\"c\":\"sixteen bytes and more\\u0001\"}\n{\"c\":null}\n",
-        "{\"c\":\"\"}\n{\"c\":\"cGxhaW4=\"}\n{\"c\":\"AQIgXCAJCiI=\"}\n{\"c\":\"w7M=\"}\n{\"c\":null}\n",
-        "{\"c\":\"1970-01-01\"}\n{\"c\":\"2024-01-01\"}\n{\"c\":\"0000-01-01\"}\n{\"c\":\"-5877641-06-24\"}\n{\"c\":null}\n",
-        "{\"c\":\"00:00:00\"}\n{\"c\":\"01:02:03.000001\"}\n{\"c\":\"23:59:59.999999\"}\n{\"c\":null}\n",
-        "{\"c\":\"1970-01-01 00:00:00\"}\n{\"c\":\"2024-01-01 00:00:00.123456\"}\n{\"c\":\"1969-12-31 23:59:59.999999\"}\n{\"c\":\"0001-01-01 00:00:00\"}\n{\"c\":null}\n",
-        "{\"c\":null}\n{\"c\":null}\n",
-        "{\"i\":1,\"s\":\"a b\",\"d\":\"2.50\"}\n{\"i\":null,\"s\":null,\"d\":null}\n{\"i\":-2,\"s\":\"\",\"d\":\"-0.1\"}\n",
-    }, json);
 }
 
 test "renderPlain spells a null NULL, so it is never read as an empty string" {

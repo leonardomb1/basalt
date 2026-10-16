@@ -24,7 +24,8 @@ AS
 - `.xlsx` is read but never written: a workbook target is a plan-time error.
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
-  (a file), `compression` (a Parquet file: `snappy`, `gzip` or `none`) and
+  (a file), `compression` (a Parquet file: `snappy`, `gzip` or `none`), `array`
+  (a JSON file: one top-level array instead of a row a line) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
   or SQL Server); a key the target does not read, or any
   other key, is a plan-time error rather than ignored.
@@ -55,7 +56,9 @@ AS
   sits in a directory where `x.csv.part` cannot be created is instead truncated
   and written in place, keeping its inode, links and attributes but not the
   guarantee: a reader may see it half written, and a failed `LOAD` leaves it
-  truncated. Explicit `APPEND` accumulates for CSV only: the file is
+  truncated. Explicit `APPEND` accumulates for CSV and NDJSON only (an NDJSON
+  file gets a newline first when its last line has none, and `WITH (array =
+  true)` is refused): a CSV file is
   opened without truncating and the header row is written only when it was
   absent or empty (a `.csv.gz` whose content is empty counts as empty). A file
   that already has a header must have this load's columns — the same names, in

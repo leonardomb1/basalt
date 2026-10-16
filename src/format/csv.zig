@@ -1173,10 +1173,11 @@ pub const CsvWriter = struct {
         var header = true;
         var newline = false;
         if (mode == .append and self.out.end > 0) {
-            const prior = try appendTarget(arena, self.out.localFile().?, self.out.end, splitCodec(path).codec);
-            header = prior.empty;
-            newline = !prior.empty and !prior.ends_nl;
-            if (!prior.empty) try checkAppendHeader(arena, path, prior.header, schema, dialect);
+            if (try self.out.lastByte(arena, path)) |last| {
+                header = false;
+                newline = last != '\n';
+                try checkAppendHeader(arena, path, try appendHeader(arena, self.out.localFile().?, splitCodec(path).codec), schema, dialect);
+            }
         }
         try self.out.compress(path);
         if (newline) try self.out.writer().writeByte('\n');
@@ -1192,12 +1193,9 @@ pub const CsvWriter = struct {
         try w.writeByte('\n');
     }
 
-    const Prior = struct { empty: bool, ends_nl: bool, header: []const u8 };
-
-    /// The existing content an append extends: whether it is empty (a `.gz` of no
-    /// bytes is), whether it ends in a newline, and its header record. A `.gz` streams
-    /// through once for its last byte, in constant memory.
-    fn appendTarget(arena: std.mem.Allocator, file: std.fs.File, end: u64, codec: Codec) !Prior {
+    /// The header record of the file an append extends, read from its start; a `.gz`
+    /// is read through its decoder.
+    fn appendHeader(arena: std.mem.Allocator, file: std.fs.File, codec: Codec) ![]const u8 {
         const buf = try arena.alloc(u8, LINE_BUF);
         var fr = file.reader(buf);
         var gz: Gunzip = undefined;
@@ -1207,34 +1205,22 @@ pub const CsvWriter = struct {
             r = &gz.interface;
         }
         var head = std.array_list.Managed(u8).init(arena);
-        var in_header = true;
         var in_q = false;
-        var last: ?u8 = null;
         while (true) {
             const got = r.peekGreedy(1) catch |e| switch (e) {
-                error.EndOfStream => break,
+                error.EndOfStream => return head.items,
                 else => |x| return x,
             };
-            last = got[got.len - 1];
-            if (in_header) {
-                for (got, 0..) |c, k| {
-                    if (c == '"') in_q = !in_q;
-                    if (c == '\n' and !in_q) {
-                        try head.appendSlice(got[0..k]);
-                        in_header = false;
-                        break;
-                    }
-                } else try head.appendSlice(got);
+            for (got, 0..) |c, k| {
+                if (c == '"') in_q = !in_q;
+                if (c == '\n' and !in_q) {
+                    try head.appendSlice(got[0..k]);
+                    return head.items;
+                }
             }
+            try head.appendSlice(got);
             r.toss(got.len);
-            if (!in_header and codec == .none) {
-                var one: [1]u8 = undefined;
-                _ = try file.preadAll(&one, end - 1);
-                last = one[0];
-                break;
-            }
         }
-        return .{ .empty = last == null, .ends_nl = last == '\n', .header = head.items };
     }
 
     fn checkAppendHeader(arena: std.mem.Allocator, path: []const u8, line: []const u8, schema: types.Schema, d: Dialect) !void {

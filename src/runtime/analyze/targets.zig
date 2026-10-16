@@ -9,6 +9,7 @@ const ast = @import("../../lang/ast.zig");
 const pqcodec = @import("../../format/compress/codecs.zig");
 const csv = @import("../../format/csv.zig");
 const json = @import("../../format/json/read.zig");
+const jsonwrite = @import("../../format/json/write.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
@@ -131,16 +132,37 @@ pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
     o.sheet = hintText(hints, "sheet");
     if (hintText(hints, "range")) |r| o.range = xlsx.parseRange(r) orelse
         return fail(diag, "`range = '{s}'` is not a cell range like `A1:F100`, `B3` or `B3:F`", .{r});
-    for (hints) |h| {
-        if (!std.mem.eql(u8, h.key, "header")) continue;
-        o.header = switch (h.value) {
-            .flag => true,
-            .int => |n| n != 0,
-            .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else return fail(diag, "`header` is true or false, not `{s}`", .{s}),
-        };
-    }
+    if (try hintBool(hints, "header", diag)) |b| o.header = b;
     return o;
 }
+
+/// A yes-or-no option: bare (`WITH (header)`), a number, or `true`/`false`.
+pub fn hintBool(hints: []const ast.Hint, key: []const u8, diag: *Diag) Error!?bool {
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, key)) continue;
+        return switch (h.value) {
+            .flag => true,
+            .int => |n| n != 0,
+            .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else fail(diag, "`{s}` is true or false, not `{s}`", .{ key, s }),
+        };
+    }
+    return null;
+}
+
+/// A JSON sink's shape, `array = true` for one top-level array, else NDJSON. Any
+/// other target refuses the key.
+pub fn jsonShapeFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!jsonwrite.Shape {
+    const array = (try hintBool(hints, "array", diag)) orelse return .ndjson;
+    const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
+    const fmt = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) else null;
+    if (fmt != .json)
+        return fail(diag, "`array` applies to a JSON file target only: it writes one top-level array instead of a row a line", .{});
+    if (array and w.mode == .append)
+        return fail(diag, json_array_append_fmt, .{w.target});
+    return if (array) .array else .ndjson;
+}
+
+pub const json_array_append_fmt = "`APPEND` into `{s}` is not supported: a JSON array closes on its last byte, so appending means rewriting the file. Write NDJSON (no `array`) to append, or use `REPLACE`";
 
 /// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
 /// both answer `.csv`.
@@ -165,15 +187,13 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
 /// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    if ((explicit orelse formatOfPath(path)) == .json)
-        return "basalt reads JSON but does not write it; write `.csv`, `.parquet` or `.arrow`, or a `SELECT` with `--format json` for NDJSON on stdout";
     if (csv.splitArchive(path) != null)
         return "basalt reads `.zip` archives but does not write them; write a `.csv` or `.csv.gz`";
     const codec = csv.splitCodec(path).codec;
     if (codec == .none) return null;
     const fmt = explicit orelse formatOfPath(path) orelse .csv;
-    if (fmt != .csv) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
-    if (codec == .zstd) return "basalt compresses CSV output as gzip; name it `.csv.gz`, as zstd output is not supported";
+    if (fmt != .csv and fmt != .json) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
+    if (codec == .zstd) return "basalt compresses CSV and JSON output as gzip; name it `.gz`, as zstd output is not supported";
     return null;
 }
 
@@ -198,7 +218,7 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
     if (explicit != null) return null;
     if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`, read only) and JSON (`.json`, `.ndjson`, `.jsonl`, read only), a CSV or JSON optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`, read only) and JSON (`.json`, `.ndjson`, `.jsonl`), a CSV or JSON optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
 /// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so

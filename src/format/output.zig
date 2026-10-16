@@ -87,6 +87,30 @@ pub const Output = struct {
         };
     }
 
+    /// The last byte of the local file an append extends, decoded when its name says
+    /// `.gz`, null when it holds none: a `.gz` streams through once, in constant memory.
+    pub fn lastByte(self: *Output, arena: std.mem.Allocator, path: []const u8) !?u8 {
+        const f = self.localFile() orelse return null;
+        if (self.end == 0) return null;
+        if (stream.splitCodec(path).codec != .gzip) {
+            var one: [1]u8 = undefined;
+            _ = try f.preadAll(&one, self.end - 1);
+            return one[0];
+        }
+        var fr = f.reader(try arena.alloc(u8, stream.LINE_BUF));
+        var gz: stream.Gunzip = undefined;
+        gz.init(&fr.interface, try arena.alloc(u8, stream.codecBuffer(.gzip)), try arena.alloc(u8, stream.LINE_BUF));
+        var last: ?u8 = null;
+        while (true) {
+            const got = gz.interface.peekGreedy(1) catch |e| switch (e) {
+                error.EndOfStream => return last,
+                else => |x| return x,
+            };
+            last = got[got.len - 1];
+            gz.interface.toss(got.len);
+        }
+    }
+
     /// Recovers the error an upload actually hit (see `objstore.Writer.specific`);
     /// a file's error is already the real one.
     pub fn specific(self: *Output, e: anyerror) anyerror {

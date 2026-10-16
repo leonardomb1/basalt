@@ -179,7 +179,8 @@ fn usage(w: anytype) !void {
         \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,
         \\             .ipc, .arrows; local), Excel (.xlsx, read; WITH (sheet =
         \\             'Name', range = 'B3:F200', header = false)) and JSON (.json,
-        \\             .ndjson, .jsonl, read; WITH (items = 'data.rows')) — the
+        \\             .ndjson, .jsonl; WITH (items = 'data.rows') on a read, WITH
+        \\             (array = true) on a write for one array, not NDJSON) — the
         \\             extension picks the format; another needs WITH (format =
         \\             'csv'|'parquet'|'arrow'|'json'|'ndjson').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
