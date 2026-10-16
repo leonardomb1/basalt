@@ -137,7 +137,7 @@ test "a CSV column read only through CAST keeps its text past the sample, on one
     const bare = try std.fmt.allocPrint(alloc, "SELECT CAST(cep AS STRING) AS c FROM '{s}/c.csv' WHERE cep > 0;", .{base});
     defer alloc.free(bare);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.CsvTypeMismatch, run(alloc, try parser.parseSource(parena.allocator(), bare, &pdiag), .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+    try std.testing.expectError(error.TextTypeMismatch, run(alloc, try parser.parseSource(parena.allocator(), bare, &pdiag), .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
 }
 
 test "a bare name both sides of a join have is ambiguous in that query, wherever it is read; qualified, merged by USING, or past the query it is not" {

@@ -23,6 +23,7 @@ pub const replace = @import("db/replace.zig");
 pub const csv = @import("format/csv.zig");
 pub const jsonread = @import("format/json/read.zig");
 pub const jsonwrite = @import("format/json/write.zig");
+pub const texttype = @import("format/texttype.zig");
 pub const stream = @import("format/stream.zig");
 pub const table = @import("connect/table.zig");
 pub const streamload = @import("db/streamload.zig");

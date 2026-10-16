@@ -53,6 +53,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const objstore = @import("../store/objstore.zig");
 const Output = @import("output.zig").Output;
+const texttype = @import("texttype.zig");
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
 const json = @import("json/read.zig");
@@ -116,17 +117,6 @@ pub const Dialect = struct {
     encoding: Encoding = .utf8,
     text: []const []const u8 = &.{},
 };
-
-/// Each sniffed field's type, a field the query reads only through `CAST` (`text`)
-/// left as its text for the cast to convert.
-fn settle(fields: []types.Schema.Field, sniff: *const TypeSniffer, d: Dialect) void {
-    for (fields, 0..) |*f, j| {
-        f.ty = sniff.resolve(j);
-        for (d.text) |t| if (std.mem.eql(u8, t, f.name)) {
-            f.ty = types.Type.init(.string).asNullable();
-        };
-    }
-}
 
 /// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
 /// latin-1 file are, so the ordinary field costs one scan and no allocation.
@@ -314,7 +304,7 @@ pub const CsvReader = struct {
             try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
         }
         sniff.whole = self.stream_eof;
-        settle(fields.items, &sniff, self.dialect);
+        texttype.settle(fields.items, sniff.cols, sniff.whole, self.dialect.text);
 
         self.pending = try pending.toOwnedSlice();
         self.schema = .{ .fields = try fields.toOwnedSlice() };
@@ -577,7 +567,7 @@ pub const MappedCsv = struct {
             pos = rec.next;
         }
         sniff.whole = pos >= body.len;
-        settle(fields.items, &sniff, dialect);
+        texttype.settle(fields.items, sniff.cols, sniff.whole, dialect.text);
 
         self.* = .{
             .data = data,
@@ -708,14 +698,15 @@ const slice_vtable = driver.sourceVTable(CsvSliceReader);
 
 pub const SAMPLE_ROWS = 1024;
 
+/// A CSV sample's columns, each line split on the dialect's delimiter into
+/// `texttype.Column`s.
 const TypeSniffer = struct {
-    const ColState = struct { seen: bool = false, all_int: bool = true, all_float: bool = true, all_date: bool = true, scale: u8 = 0 };
-    cols: []ColState,
+    cols: []texttype.Column,
     delim: u8,
     whole: bool = false,
 
     fn init(arena: std.mem.Allocator, ncols: usize, delim: u8) !TypeSniffer {
-        const cols = try arena.alloc(ColState, ncols);
+        const cols = try arena.alloc(texttype.Column, ncols);
         for (cols) |*c| c.* = .{};
         return .{ .cols = cols, .delim = delim };
     }
@@ -725,153 +716,14 @@ const TypeSniffer = struct {
         for (self.cols) |*c| {
             if (i > line.len) break;
             const quoted = i < line.len and line[i] == '"';
-            const raw = nextField(line, &i, self.delim);
-            if (quoted) {
-                c.seen = true;
-                c.all_int = false;
-                c.all_float = false;
-                c.all_date = false;
-                noteScale(c, raw);
-            } else if (raw.len > 0) {
-                c.seen = true;
-                noteScale(c, raw);
-                if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
-                if (textLooking(raw)) {
-                    c.all_int = false;
-                    c.all_float = false;
-                } else {
-                    if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
-                    if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
-                }
-            }
+            c.note(nextField(line, &i, self.delim), quoted);
         }
     }
 
-    /// The most decimal places of a plain number in the cell (`1.25`, `"-3.5"`), which
-    /// a text column carries in its type's `scale` for `SUM` to type its exact result.
-    fn noteScale(c: *ColState, cell: []const u8) void {
-        const t = std.mem.trim(u8, cell, " ");
-        var i: usize = if (t.len > 0 and (t[0] == '-' or t[0] == '+')) 1 else 0;
-        var digits: usize = 0;
-        var places: ?usize = null;
-        while (i < t.len) : (i += 1) {
-            if (t[i] >= '0' and t[i] <= '9') {
-                digits += 1;
-                if (places) |*p| p.* += 1;
-            } else if (t[i] == '.' and places == null) {
-                places = 0;
-            } else return;
-        }
-        if (digits == 0 or digits > 38) return;
-        c.scale = @max(c.scale, @as(u8, @intCast(places orelse 0)));
-    }
-
-    /// A column's type from its sampled cells. One with no value at all in a sample
-    /// that read the whole file holds only NULLs, so it is of unknown type, as SQL
-    /// types a NULL: it compares and unifies with any type and is text where shown
-    /// or written. Past the sample it may hold text, so there it stays a string.
     fn resolve(self: *const TypeSniffer, j: usize) types.Type {
-        const c = self.cols[j];
-        if (!c.seen and self.whole) return .{ .kind = .string, .nullable = true, .unknown = true };
-        const k: types.TypeKind = if (!c.seen) .string else if (c.all_int) .int else if (c.all_float) .float else if (c.all_date) .date else .string;
-        var t = types.Type.init(k).asNullable();
-        if (k == .string) t.scale = c.scale;
-        return t;
+        return self.cols[j].resolve(self.whole);
     }
 };
-
-fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
-    if (raw.len == 0) return b.append(if (quoted and b.ty.kind == .string) Value{ .string = raw } else .null);
-    switch (b.ty.kind) {
-        .int => try b.appendInt(intCell(raw) orelse return error.CsvTypeMismatch),
-        .float => try b.appendFloat(floatCell(raw) orelse return error.CsvTypeMismatch),
-        .date => try b.append(.{ .date = @intCast(eval.parseIsoDate(raw) orelse return error.CsvTypeMismatch) }),
-        else => try b.appendStr(raw),
-    }
-}
-
-/// A `+` or a leading zero (`007`, `-01`) marks a code, not a number: the sniffer
-/// types such a column text, and a later row holding one in a numeric column is a
-/// mismatch rather than `01310100` read silently as 1310100.
-fn textLooking(raw: []const u8) bool {
-    return raw.len > 0 and (raw[0] == '+' or (raw.len > 1 and (raw[0] == '0' or (raw[0] == '-' and raw[1] == '0')) and std.mem.indexOfScalar(u8, raw, '.') == null));
-}
-
-fn intCell(raw: []const u8) ?i64 {
-    if (textLooking(raw)) return null;
-    return parseIntFast(raw) orelse eval.parseIntStrict(raw);
-}
-
-fn floatCell(raw: []const u8) ?f64 {
-    if (textLooking(raw)) return null;
-    return parseFloatFast(raw) orelse eval.parseFloatStrict(raw);
-}
-
-/// `[-]digits`, at most 18 of them so no i64 overflow: what a CSV cell needs of
-/// `std.fmt.parseInt`, without its per-call base, underscore and sign handling.
-fn parseIntFast(s: []const u8) ?i64 {
-    if (s.len == 0 or s.len > 19) return null;
-    var i: usize = 0;
-    const neg = s[0] == '-';
-    if (neg) i = 1;
-    if (s.len - i == 0 or s.len - i > 18) return null;
-    var v: i64 = 0;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (c < '0' or c > '9') return null;
-        v = v * 10 + (c - '0');
-    }
-    return if (neg) -v else v;
-}
-
-test "parseIntFast agrees with std and declines what it cannot prove" {
-    for ([_][]const u8{ "0", "7", "-7", "123456789012345678", "-123456789012345678", "007" }) |s| {
-        try std.testing.expectEqual(try std.fmt.parseInt(i64, s, 10), parseIntFast(s).?);
-    }
-    for ([_][]const u8{ "", "-", "+1", "1_000", "0x10", "1234567890123456789", "1.0", " 1" }) |s| {
-        try std.testing.expect(parseIntFast(s) == null);
-    }
-}
-
-/// `[-]digits[.digits]` with at most 15 significant digits, as an integer mantissa
-/// over a power of ten: both exact doubles, so one division rounds correctly
-/// (Clinger's fast path) and matches `std.fmt.parseFloat`. Anything else is null.
-fn parseFloatFast(s: []const u8) ?f64 {
-    if (s.len == 0 or s.len > 18) return null;
-    var i: usize = 0;
-    const neg = s[0] == '-';
-    if (neg) i = 1;
-    var mant: u64 = 0;
-    var digits: usize = 0;
-    var frac: usize = 0;
-    var seen_dot = false;
-    while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (c == '.') {
-            if (seen_dot) return null;
-            seen_dot = true;
-            continue;
-        }
-        if (c < '0' or c > '9') return null;
-        mant = mant * 10 + (c - '0');
-        digits += 1;
-        if (seen_dot) frac += 1;
-    }
-    if (digits == 0 or digits > 15) return null;
-    const pow10 = [_]f64{ 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
-    if (frac >= pow10.len) return null;
-    const v = @as(f64, @floatFromInt(mant)) / pow10[frac];
-    return if (neg) -v else v;
-}
-
-test "parseFloatFast agrees with std on plain decimals and declines the rest" {
-    for ([_][]const u8{ "0", "1", "-1", "3.25", "-0.001", "123456.789", "99.90", "0.1", "1234567890.12345" }) |s| {
-        try std.testing.expectEqual(try std.fmt.parseFloat(f64, s), parseFloatFast(s).?);
-    }
-    for ([_][]const u8{ "", "-", ".", "1e5", "+1", "1.2.3", "abc", "1234567890123456", "nan" }) |s| {
-        try std.testing.expect(parseFloatFast(s) == null);
-    }
-}
 
 /// One record from `data[start]` and where the next begins. Records were once cut
 /// on the first raw newline, so basalt could not read back its own quoted newlines.
@@ -1067,9 +919,9 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
     var n: usize = 0;
     while (i <= line.len) : (n += 1) {
         const raw = nextField(line, &i, d.delim);
-        if (e != error.CsvTypeMismatch or n >= ncols) continue;
+        if (e != error.TextTypeMismatch or n >= ncols) continue;
         const f = if (slot) |sl| (if (sl[n] >= 0) schema.fields[@intCast(sl[n])] else continue) else schema.fields[n];
-        if (cellParses(f.ty.kind, raw)) continue;
+        if (texttype.cellParses(f.ty.kind, raw)) continue;
         const want: []const u8 = switch (f.ty.kind) {
             .int => "an INT",
             .float => "a FLOAT",
@@ -1108,16 +960,6 @@ fn nextField(line: []const u8, i: *usize, delim: u8) []const u8 {
     return line[lo..(hi orelse end)];
 }
 
-fn cellParses(kind: types.TypeKind, raw: []const u8) bool {
-    if (raw.len == 0) return true;
-    return switch (kind) {
-        .int => intCell(raw) != null,
-        .float => floatCell(raw) != null,
-        .date => eval.parseIsoDate(raw) != null,
-        else => true,
-    };
-}
-
 inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?[]const i16, col: usize, raw: []const u8, enc: Encoding) !void {
     if (slot) |sl| {
         if (sl[col] < 0) return;
@@ -1127,8 +969,8 @@ inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?
 }
 
 inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8, quoted: bool, enc: Encoding) !void {
-    if (enc != .utf8) return appendCell(b, try decodeField(arena, enc, raw), quoted);
-    return appendCell(b, if (b.ty.kind == .string) try utf8Repair(arena, raw) else raw, quoted);
+    if (enc != .utf8) return texttype.appendCell(b, try decodeField(arena, enc, raw), quoted);
+    return texttype.appendCell(b, if (b.ty.kind == .string) try utf8Repair(arena, raw) else raw, quoted);
 }
 
 /// `s` when it is valid UTF-8, else a copy with each invalid byte as U+FFFD, as
@@ -1656,8 +1498,8 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
         err = e;
         break :blk null;
     }) |_| {}
-    try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-    const why = eval.takeFailure(error.CsvTypeMismatch).?;
+    try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
+    const why = eval.takeFailure(error.TextTypeMismatch).?;
     try std.testing.expect(std.mem.indexOf(u8, why, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
     try std.testing.expect(std.mem.endsWith(u8, why, "use CAST(id AS STRING) (or the type it holds) everywhere the query reads it"));
 
@@ -1669,8 +1511,8 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
         err = e;
         break :blk null;
     }) |_| {}
-    try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-    try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
+    try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
+    try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.TextTypeMismatch).?, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
 }
 
 test "serial and mapped readers agree whether the sample read the whole file" {
@@ -1733,8 +1575,8 @@ test "a cell past the sample that only lenient parsers accept is named with its 
             err = e;
             break :blk null;
         }) |_| {}
-        try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want) != null);
+        try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
+        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.TextTypeMismatch).?, c.want) != null);
 
         const m = try MappedCsv.open(a, path, .{});
         defer m.close();
@@ -1744,8 +1586,8 @@ test "a cell past the sample that only lenient parsers accept is named with its 
             err = e;
             break :blk null;
         }) |_| {}
-        try std.testing.expectEqual(@as(?anyerror, error.CsvTypeMismatch), err);
-        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvTypeMismatch).?, c.want) != null);
+        try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
+        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.TextTypeMismatch).?, c.want) != null);
     }
 }
 

@@ -1560,7 +1560,7 @@ test "csv: a leading-zero code past the sample is a mismatch, not a silent int" 
     try in.appendSlice("id,code\n");
     for (0..2000) |i| try in.print("{d},{d}\n", .{ i, 1000 + i });
     try in.appendSlice("2000,01310100\n");
-    try std.testing.expectError(error.CsvTypeMismatch, runToString(alloc, &tmp, in.items, "SELECT * FROM '$IN'"));
+    try std.testing.expectError(error.TextTypeMismatch, runToString(alloc, &tmp, in.items, "SELECT * FROM '$IN'"));
 }
 
 test "count: a float column past the int range is counted, not converted" {
