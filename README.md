@@ -1,9 +1,10 @@
 # basalt
 
-**Move data with SQL scripts.** A lightweight data movement engine in a single
-static binary: read from files, object storage, file servers, databases and
-APIs, transform with a query, and write the result to a file, a bucket, a share
-or a table.
+**Move data with SQL scripts.** A data movement engine with a parallel,
+vectorized query engine, in a single static binary: read from files, object
+storage, file servers, databases and APIs, transform with real SQL (joins,
+window functions, subqueries, aggregates), and write the result to a file, a
+bucket, a share or a table.
 
 [![CI](https://github.com/leonardomb1/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/leonardomb1/basalt/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/leonardomb1/basalt/graph/badge.svg)](https://codecov.io/gh/leonardomb1/basalt)
@@ -169,16 +170,33 @@ $ basalt kernel                                 # a session a notebook or editor
 for parallel lanes. Exit code `75` means a transient failure worth retrying,
 `1` a permanent one. See [Command line](https://leonardomb1.github.io/basalt/tools/cli.html).
 
-## When not to use it
+## Performance
+
+Pipelines stream in constant memory and fan out across cores. On one laptop
+(i7-13700H), against DuckDB reading the same files, with every result matching:
+
+| | basalt | DuckDB |
+|---|---|---|
+| TPC-H, SSB and TPC-DS queries at scale factor 1 (23 queries) | 67–372 ms | 27–100 ms |
+| 6 million rows, Parquet to CSV | 208 ms | |
+
+So basalt is within a few times of a columnar analytics database on that
+database's home ground, and on its own job, moving rows, it writes about 29
+million a second from Parquet to CSV. The numbers come from
+`zig build bench-e2e`, which anyone can rerun ([bench/README.md](bench/README.md)).
+
+## When to use something else
 
 - **Continuous replication.** basalt runs a script to completion; it does not
   follow a change log. Schedule it with cron, Airflow or the like.
-- **Inputs far larger than memory in a blocking step.** Pipelines stream, and a
-  sort, a join's build side, `DISTINCT` and a one-lane `GROUP BY` spill to disk
-  past `--op-memory`; but the per-lane tables of a parallel `GROUP BY` and
-  `count(DISTINCT)` stay in memory.
-- **Ad-hoc analytics over large local data.** A columnar database such as
-  DuckDB is the better tool for that.
+- **Inputs far larger than memory in a parallel aggregation.** A sort, a join's
+  build side, `DISTINCT` and a one-lane `GROUP BY` spill to disk past
+  `--op-memory`; the per-lane tables of a parallel `GROUP BY` and
+  `count(DISTINCT)` do not yet, so run such a `GROUP BY` with `-j 1` when it
+  outgrows memory.
+- **Interactive analytics where milliseconds matter.** On analytical queries
+  DuckDB is still about two to six times faster; basalt's edge is everything around
+  the query: sources, sinks, scripts and checks.
 
 ## Development
 
