@@ -131,7 +131,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var sink = runtime.OutcomeSink.init(alloc);
     defer sink.deinit();
     const progress = !no_progress and !log.quiet and (log.format == .json or std.posix.isatty(std.fs.File.stderr().handle));
-    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = fl.threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = fl.max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory }, &diag) catch |e| switch (e) {
+    _ = runtime.run(alloc, prog, .{ .params = params.items, .threads = fl.threads, .outcomes = &sink, .log = log, .explain = explain or prog.explain == .analyze, .stdout_format = stdout_format, .progress = progress, .items = true, .max_rows = fl.max_rows, .spill_dir = spill_dir, .spill_cap = spill_cap, .op_memory = op_memory, .stdin_free = !std.mem.eql(u8, src.label, "<stdin>") }, &diag) catch |e| switch (e) {
         error.Aborted => {
             if (eo.json)
                 try eo.report(.{ .msg = "aborted", .event = "aborted" })

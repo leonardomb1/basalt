@@ -279,11 +279,13 @@ pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
     if (pqwrite.Writer.isPath(path)) return true;
     if (arrowread.isPath(path)) return false;
     if (xlsx.isPath(path)) return false;
+    if (formatOfPath(path) == .json) return false;
     return std.mem.indexOf(u8, path, "://") == null;
 }
 
-/// A local CSV header, parquet footer, Parquet folder's first file or workbook's
-/// first pass, as the run reads them; everything else stays unresolved.
+/// A local CSV header, parquet footer, Parquet folder's first file, workbook's first
+/// pass or JSON file's (or JSON folder's first file's) sampled rows, as the run reads
+/// them; everything else stays unresolved.
 pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
     if (std.mem.eql(u8, rd.connector, "range")) {
@@ -296,8 +298,13 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         if (folder.isFolder(rd.form.path)) {
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;
-            if (explicit != null and explicit.? != .parquet) return null;
             const all = folder.list(arena, rd.form.path) catch return null;
+            if (explicit == .json or (explicit == null and std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .json }))) {
+                const files = folder.only(arena, all, .json) catch return null;
+                if (files.len == 0) return null;
+                return jsonSchema(arena, files, hints);
+            }
+            if (explicit != null and explicit.? != .parquet) return null;
             if (explicit == null and !std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .parquet })) return null;
             const files = folder.only(arena, all, .parquet) catch return null;
             if (files.len == 0) return null;
@@ -326,6 +333,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
             defer xr.close();
             return xr.schema;
         }
+        if (readFormat(rd.form.path, explicit) == .json) return jsonSchema(arena, &.{rd.form.path}, hints);
         var hdiag = Diag{};
         var d = dialectFromHints(hints, &hdiag) catch return null;
         d.text = rd.text_cols;
@@ -335,6 +343,12 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         return schema;
     }
     return null;
+}
+
+fn jsonSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint) ?types.Schema {
+    const f = json.Files.open(arena, arena, files, jsonOptions(hints)) catch return null;
+    defer f.close();
+    return f.reader.schema;
 }
 
 test "unreadableTarget: an extension basalt does not read is refused" {

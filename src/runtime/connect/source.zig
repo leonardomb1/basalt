@@ -38,6 +38,8 @@ const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
+const jsonread = @import("../../format/json.zig");
+const stream = @import("../../format/stream.zig");
 
 pub const ConstSource = struct {
     batch: Batch,
@@ -220,6 +222,41 @@ fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source
     return r.source();
 }
 
+/// JSON or NDJSON files as one table, `path` naming them in messages.
+fn openJson(env: *Env, path: []const u8, files: []const []const u8, hints: []const ast.Hint) !driver.Source {
+    const f = jsonread.Files.open(env.arena, env.gpa, files, analyze.jsonOptions(hints)) catch |e| {
+        if (e == error.InvalidJson)
+            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{path}));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read JSON `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+    };
+    return f.source();
+}
+
+/// The process's stdin, as CSV unless `format` names JSON or NDJSON. Refused when
+/// stdin is already spoken for: the script came from it, or a REPL or kernel reads it.
+fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
+    if (!env.stdin_free)
+        return planErr(env.diag, "FROM STDIN needs stdin free for data, but here it carries the script (`basalt run -`), a REPL's input or a kernel's requests; pass the script as a file or with -c");
+    var fdiag = analyze.Diag{};
+    const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
+    const s = try stream.Stream.openStdin(env.arena);
+    if (want == .json) {
+        const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, analyze.jsonOptions(hints)) catch |e| {
+            if (e == error.InvalidJson) return planErrT(env.diag, e, "stdin is not valid JSON or NDJSON in its first rows");
+            return e;
+        };
+        return f.source();
+    }
+    var ddiag = analyze.Diag{};
+    const d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    const r = csv.CsvReader.openStream(env.arena, s, d) catch |e| {
+        if (e == error.EmptyCsv) return planErrT(env.diag, e, "stdin is empty: a CSV read needs at least a header line");
+        return e;
+    };
+    if (project) |p| try r.project(p);
+    return r.source();
+}
+
 fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
     return openSourceCols(env, rd, hints, null);
 }
@@ -239,6 +276,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const s = gen.UnitSource.open(env.gpa) catch return error.OutOfMemory;
         return s.source();
     }
+    if (std.mem.eql(u8, rd.connector, "stdin")) return openStdin(env, hints, project);
     if (std.mem.eql(u8, rd.connector, "range")) {
         const r = rd.form.range;
         const s = gen.RangeSource.open(env.gpa, try rangeBound(env, r.lo), try rangeBound(env, r.hi)) catch
@@ -252,7 +290,11 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         try guardFileFormat(env, rd.form.path, want, "read");
         const fr = try resolveFolder(env, rd.form.path, hints);
         env.folder_memo = null;
-        if (fr) |f| if (f.kind == .parquet) return (try openParquetFolder(env, rd.form.path, f.files, null)).source();
+        if (fr) |f| switch (f.kind) {
+            .parquet => return (try openParquetFolder(env, rd.form.path, f.files, null)).source(),
+            .json => return openJson(env, rd.form.path, f.files, hints),
+            .csv => {},
+        };
         const boxed = csv.splitCodec(rd.form.path).codec != .none or csv.splitArchive(rd.form.path) != null;
         const rfmt = want orelse (if (!boxed and pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
         if (rfmt == .parquet) {
@@ -263,6 +305,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         }
         if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
         if (analyze.readFormat(rd.form.path, want) == .xlsx) return openXlsx(env, rd.form.path, hints);
+        if (analyze.readFormat(rd.form.path, want) == .json) return openJson(env, rd.form.path, if (fr) |f| f.files else &.{rd.form.path}, hints);
         var ddiag = analyze.Diag{};
         var d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
         d.text = rd.text_cols;

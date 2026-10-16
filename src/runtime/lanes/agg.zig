@@ -360,8 +360,7 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
     const slot = &ctx.slots[i];
     const wa = slot.arena.allocator();
 
-    var reader = ctx.mapped.reader(i, ctx.queue.nitems, ctx.csv_schema);
-    var cs = obs.CountingSource{ .inner = reader.source(), .count = ctx.rows_read };
+    var cs = obs.CountingSource{ .inner = try ctx.mapped.lane(wa, i, ctx.queue.nitems, ctx.csv_schema), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
     for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, child);

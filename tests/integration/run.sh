@@ -936,6 +936,24 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
   else
     report "s3-parquet-projection (run error)" bad
   fi
+
+  # JSON objects under one prefix — NDJSON, a gzipped NDJSON and a JSON array — read as
+  # one table. basalt does not write JSON, so curl puts them with its own SigV4.
+  printf '{"id":1,"name":"alpha","val":10}\n' >"$out/j1.ndjson"
+  printf '{"id":2,"name":"beta, gamma","val":20}\n' | gzip >"$out/j2.ndjson.gz"
+  printf '[{"val":30,"id":3,"name":"delta"}]' >"$out/j3.json"
+  printf 'id,name,val\n1,alpha,10\n2,"beta, gamma",20\n3,delta,30\n' >"$out/s3_json_expected.csv"
+  put_ok=1
+  for f in j1.ndjson j2.ndjson.gz j3.json; do
+    curl -sf --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:minioadmin" \
+      -T "$out/$f" "$AWS_ENDPOINT_URL/basalt-it/js/$f" >/dev/null || put_ok=0
+  done
+  if [ "$put_ok" = 1 ] &&
+     brun run -c "LOAD INTO '$out/s3_json.csv' AS SELECT id, name, val FROM 's3://basalt-it/js/' ORDER BY id;"; then
+    check s3-json-prefix "$out/s3_json.csv" "$out/s3_json_expected.csv"
+  else
+    report "s3-json-prefix (run error)" bad
+  fi
 fi
 
 # Quoted column names, end to end. Headers with spaces are the rule in

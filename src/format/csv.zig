@@ -55,6 +55,8 @@ const objstore = @import("../store/objstore.zig");
 const Part = @import("../store/part.zig").Part;
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
+const json = @import("json.zig");
+const release = stream.release;
 const Gunzip = stream.Gunzip;
 const codecBuffer = stream.codecBuffer;
 const folder = @import("../connect/folder.zig");
@@ -269,10 +271,29 @@ pub const CsvReader = struct {
         return self.openFirst(files[0]);
     }
 
-    fn openFirst(self: *CsvReader, first: []const u8) !*CsvReader {
-        const arena = self.arena;
+    /// A reader of `s`, a stream opened elsewhere (stdin), named by `s.name`.
+    pub fn openStream(arena: std.mem.Allocator, s: *Stream, dialect: Dialect) !*CsvReader {
+        const self = try arena.create(CsvReader);
+        self.* = .{
+            .arena = arena,
+            .dialect = dialect,
+            .stream = s,
+            .schema = undefined,
+            .done = false,
+            .join_buf = std.array_list.Managed(u8).init(arena),
+            .long_buf = std.array_list.Managed(u8).init(arena),
+        };
+        return self.start(s.name);
+    }
 
-        self.stream = try Stream.open(arena, first);
+    fn openFirst(self: *CsvReader, first: []const u8) !*CsvReader {
+        self.stream = try Stream.open(self.arena, first);
+        return self.start(first);
+    }
+
+    /// The header and the type sample of the stream just opened, its first file `first`.
+    fn start(self: *CsvReader, first: []const u8) !*CsvReader {
+        const arena = self.arena;
         self.begin(first);
 
         const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
@@ -470,13 +491,61 @@ pub const MappedCsv = struct {
     path: []const u8 = "",
     quoted_newlines: bool = false,
     quote_free: bool = false,
+    ndjson: ?json.Options = null,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
 
     pub fn project(self: *MappedCsv, arena: std.mem.Allocator, names: []const []const u8) !void {
+        if (self.ndjson != null) {
+            var keep = std.array_list.Managed(types.Schema.Field).init(arena);
+            for (self.schema.fields) |f| for (names) |n| {
+                if (std.mem.eql(u8, f.name, n)) {
+                    try keep.append(f);
+                    break;
+                }
+            };
+            if (keep.items.len > 0) self.schema = .{ .fields = keep.items };
+            return;
+        }
         const p = (try Projection.of(arena, self.schema, names)) orelse return;
         self.slot = p.slot;
         self.schema = p.schema;
+    }
+
+    /// A local NDJSON file mapped for lanes, its columns from its sampled rows. Every
+    /// newline ends a row, as a JSON string cannot hold a raw one, so it cuts where a
+    /// CSV does. A top-level array or an `items` path has no row per line and is
+    /// `NotMappable`, read serially instead.
+    pub fn openNdjson(arena: std.mem.Allocator, path: []const u8, opts: json.Options) !*MappedCsv {
+        if (splitCodec(path).codec != .none or splitArchive(path) != null or opts.items != null) return error.NotMappable;
+        const self = try arena.create(MappedCsv);
+        const file = try std.fs.cwd().openFile(path, .{});
+        errdefer file.close();
+        const size = (try file.stat()).size;
+        if (size == 0) return error.NotMappable;
+        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        errdefer std.posix.munmap(data);
+        const first = std.mem.indexOfNone(u8, data, " \t\r\n") orelse return error.NotMappable;
+        if (data[first] == '[' and opts.shape != .ndjson) return error.NotMappable;
+        var sample = opts;
+        sample.shape = .ndjson;
+        const r = json.Reader.openMapped(arena, arena, data, sample) catch return error.NotMappable;
+        self.* = .{ .data = data, .body = data, .schema = r.schema, .file = file, .path = try arena.dupe(u8, path), .quote_free = true, .ndjson = sample };
+        return self;
+    }
+
+    /// Lane `i` of `n`'s rows as a source, read from `scratch`: a CSV chunk through
+    /// `reader`, an NDJSON one in place through `json.Reader`.
+    pub fn lane(self: *const MappedCsv, scratch: std.mem.Allocator, i: usize, n: usize, schema: *const types.Schema) !driver.Source {
+        if (self.ndjson) |o| {
+            var opts = o;
+            opts.schema = schema.*;
+            const r = try json.Reader.openMapped(scratch, scratch, self.chunk(i, n), opts);
+            return r.source();
+        }
+        const rd = try scratch.create(CsvSliceReader);
+        rd.* = self.reader(i, n, schema);
+        return rd.source();
     }
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*MappedCsv {
@@ -577,18 +646,6 @@ pub const MappedCsv = struct {
         self.file.close();
     }
 };
-
-/// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
-/// process, so what was read once stops counting as resident; touched again, they
-/// fault back in from the file (anonymous memory would come back zeroed).
-fn release(bytes: []const u8) void {
-    const page = std.heap.page_size_min;
-    const lo = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
-    const hi = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
-    if (hi <= lo) return;
-    const at: [*]align(page) u8 = @ptrFromInt(lo);
-    std.posix.madvise(at, hi - lo, std.posix.MADV.DONTNEED) catch {};
-}
 
 /// A chunk of a mapped file, read a batch at a time; with `release`, every
 /// `release_every` bytes the pages already read are released, so a lane holds a few

@@ -168,6 +168,7 @@ pub const RunOptions = struct {
     spill_dir: ?[]const u8 = null,
     spill_cap: u64 = 8 << 30,
     op_memory: usize = 2 << 30,
+    stdin_free: bool = false,
 
     /// The lanes a query may fan out on: the `-j` given, or one per physical core.
     pub fn lanes(self: RunOptions) usize {
@@ -299,6 +300,7 @@ pub const Env = struct {
     on_let: ?LetHook = null,
     space: ?Space = null,
     op_memory: usize = 2 << 30,
+    stdin_free: bool = false,
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {
         var info = self.result;

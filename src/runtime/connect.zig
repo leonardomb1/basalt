@@ -164,12 +164,15 @@ pub const registerSftp = @import("connect/register.zig").registerSftp;
 pub const registerFtp = @import("connect/register.zig").registerFtp;
 pub const registerSmb = @import("connect/register.zig").registerSmb;
 
-/// Gates the mmap'd parallel-CSV fast paths; a `.parquet` path shares the `csv`
-/// connector and must not be parsed as text.
+/// Gates the mmap'd parallel fast paths of a local CSV or NDJSON file; a `.parquet`
+/// path shares the `csv` connector and must not be parsed as text.
 pub fn isLocalCsvRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
-        .path => |p| !csv.CsvReader.isUrl(p) and !folder.isFolder(p) and analyze.readFormat(p, null) == .csv,
+        .path => |p| !csv.CsvReader.isUrl(p) and !folder.isFolder(p) and switch (analyze.readFormat(p, null)) {
+            .csv, .json => true,
+            else => false,
+        },
         else => false,
     };
 }

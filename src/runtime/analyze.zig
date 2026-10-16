@@ -298,6 +298,7 @@ pub const readFormat = @import("analyze/targets.zig").readFormat;
 pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
+pub const jsonOptions = @import("analyze/targets.zig").jsonOptions;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
 pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;

@@ -306,6 +306,18 @@ pub const Stream = struct {
     }
 };
 
+/// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
+/// process, so what was read once stops counting as resident; touched again, they
+/// fault back in from the file (anonymous memory would come back zeroed).
+pub fn release(bytes: []const u8) void {
+    const page = std.heap.page_size_min;
+    const lo = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
+    const hi = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
+    if (hi <= lo) return;
+    const at: [*]align(page) u8 = @ptrFromInt(lo);
+    std.posix.madvise(at, hi - lo, std.posix.MADV.DONTNEED) catch {};
+}
+
 test "splitCodec / splitArchive / dataName walk the container chain" {
     try std.testing.expectEqual(Codec.gzip, splitCodec("a/orders.csv.gz").codec);
     try std.testing.expectEqualStrings("a/orders.csv", splitCodec("a/orders.csv.gz").rest);

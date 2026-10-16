@@ -8,8 +8,10 @@ A query reads from one source, named after `FROM`, and joins may read more
 | SQL table | `FROM erp.dbo.SC5010` |
 | SQL table (per-row name) | `FROM erp.dbo.IDENTIFIER($name)` ([dynamic names](for-each.md#dynamic-names--var-identifier-)) — still a table read |
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
-| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx')` names one |
-| compressed file | `FROM 'path.csv.gz'` / `.csv.zst` — the inner name picks the reader |
+| file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx' \| 'json' \| 'ndjson')` names one |
+| file — JSON or NDJSON | `FROM 'events.ndjson'` (also `.jsonl`) / `FROM 'rows.json'` — read only; see [JSON and NDJSON](#json-and-ndjson) |
+| standard input | `FROM STDIN` — CSV, or `WITH (format = 'json' \| 'ndjson')`; see [Standard input](#standard-input) |
+| compressed file | `FROM 'path.csv.gz'` / `.csv.zst` / `.ndjson.gz` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |
 | folder | `FROM 'sales/'` — a trailing `/`, local or remote, reads every Parquet file under it (subfolders too, as Spark's `year=2026/` layout) as one table, or every `.csv`/`.tsv`/`.txt` when it holds CSVs; see below |
 | object storage | `FROM 'az://account/container/path.parquet'` or `FROM 's3://bucket/key.parquet'`; a trailing `/` reads the prefix as a folder |
@@ -32,13 +34,61 @@ sr.db.t t`.
 
 A folder read lists the folder — subfolders included, names starting `_` or
 `.` skipped (`_SUCCESS`, `_temporary/`, `.crc`) — and reads the files sorted
-by path. Parquet files and no CSVs read as Parquet; CSVs as CSV, other files
-ignored; a folder of both is refused unless `WITH (format = 'parquet')` or
-`'csv'` picks one. Every Parquet file must have the first one's columns, in its
+by path. A folder of Parquet files reads as Parquet, of CSVs as CSV, of JSON
+files (`.json`, `.ndjson`, `.jsonl`, compressed too) as JSON, other files
+ignored; a folder holding two of these kinds is refused unless `WITH (format =
+'parquet')`, `'csv'` or `'json'` picks one. Every Parquet file must have the first one's columns, in its
 order and of its types, among those the query reads: a file with one missing,
 moved or retyped fails the read naming it, rather than putting values under the
 wrong name. Each file still skips the columns and row groups the query does
-not need. CSV files must repeat the first one's header.
+not need. CSV files must repeat the first one's header. JSON files take the
+first file's columns, as a REST read's later pages do.
+
+## JSON and NDJSON
+
+A JSON read takes NDJSON (one value per line), a top-level array whose
+elements are the rows, or a single object as one row; the first byte decides,
+and `WITH (format = 'ndjson')` reads one value per line whatever it starts with.
+`WITH (items = 'data.rows')` reads the array at that path of the document
+instead, as a REST read's `items` does.
+
+```sql
+SELECT user_id, count(*) AS events
+FROM 's3://logs/2026/10/events.ndjson.gz'
+WHERE json_get(payload, 'kind') = 'purchase'
+GROUP BY user_id;
+```
+
+Columns come from the first 1,024 rows: their keys, in the order first met, each
+typed from the values it took there. Integers are `INT`, any float makes it
+`FLOAT`, booleans `BOOL`, and strings, nested objects and arrays, or a mix of
+kinds `STRING`, nested values as compact JSON text that `json_get` and
+`JSON_EACH` take apart. JSON has no date type, so a date stays text until
+`CAST(d AS DATE)`. A later row is read into those columns as `CAST` reads a
+value: a missing key is `NULL`, a key not among the columns is dropped, and a
+value its column cannot read is `NULL` rather than a guess.
+
+Rows stream: an NDJSON file or an array is never held whole, only `items` reads
+its document whole to find the path. A local NDJSON file splits across lanes at
+line ends as a CSV does; a JSON array, a compressed or remote file reads on one.
+Every location a CSV reads from works the same way: a path, a URL, `s3://`,
+`az://`, SFTP, SMB, FTP, a `.gz`/`.zst` suffix, a zip member, a folder. basalt
+reads JSON but does not write it; `--format json` prints a `SELECT` as NDJSON.
+
+## Standard input
+
+`FROM STDIN` reads the process's stdin as a CSV, or as JSON or NDJSON with
+`WITH (format = 'json' | 'ndjson')`, taking a CSV's `delimiter` and `encoding`
+or JSON's `items`:
+
+```sh
+curl -s https://api.example.org/export.ndjson | basalt run -c "
+  LOAD INTO wh.events AS SELECT * FROM STDIN WITH (format = 'ndjson');"
+```
+
+Stdin must be free for data: a script read from stdin (`basalt run -`), the
+REPL and the notebook kernel already use it, and `FROM STDIN` is refused there.
+Parquet, Arrow and Excel need random access and are read from a path.
 
 ## SQL sources
 
@@ -104,7 +154,7 @@ error rather than ignored.
 
 | option | meaning |
 |---|---|
-| `format` | `csv`, `parquet`, `arrow` or `xlsx`, whatever the extension says |
+| `format` | `csv`, `parquet`, `arrow`, `xlsx`, `json` or `ndjson` (`jsonl`), whatever the extension says |
 | `delimiter` | a CSV's separator: one character, or `tab` (also on a `LOAD INTO` file) |
 | `encoding` | a CSV's text encoding: `utf8` (default), `latin1` / `iso-8859-1`, `cp1252` / `windows-1252` |
 | `sheet` | an Excel worksheet by name (default the first) |
@@ -116,7 +166,7 @@ error rather than ignored.
 
 | option | default | meaning |
 |---|---|---|
-| `items` | the response | dotted path to the array of rows when the response nests it, as `'data.rows'` |
+| `items` | the response | dotted path to the array of rows when the response (or a JSON file) nests it, as `'data.rows'` |
 | `method` | `get` | `post` sends `body` |
 | `body` | none | the request body; the page parameter is added to it when paginating a POST |
 | `body_type` | `form` | `json` sends the body as `application/json`, anything else as a form |
@@ -166,9 +216,10 @@ WHERE downloads > 0;
 ```
 
 The rows are the array at `items` (or the response itself); a single object —
-a detail endpoint's answer — is one row. Columns are typed from the first
-object: numbers, booleans and strings as themselves, nested objects and arrays
-as JSON text. A later row's value is read into its column as `CAST` would read
-it, and one that cannot be — `"yes"` in a `BOOL` column, `1e300` in an `INT` —
-is `NULL` rather than a guess. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
+a detail endpoint's answer — is one row. Columns are typed as a JSON file's are
+([JSON and NDJSON](#json-and-ndjson)), from the first page's rows: numbers,
+booleans and strings as themselves, nested objects and arrays as JSON text. A
+later row's value is read into its column as `CAST` would read it, and one that
+cannot be — `"yes"` in a `BOOL` column, `1e300` in an `INT` — is `NULL` rather
+than a guess. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
 the nested JSON text apart.

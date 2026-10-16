@@ -22,6 +22,8 @@ const column = @import("../exec/column.zig");
 const driver = @import("../connect/driver.zig");
 const eval = @import("../exec/eval.zig");
 const jt = @import("../exec/json.zig");
+const stream = @import("stream.zig");
+const Stream = stream.Stream;
 const std = @import("std");
 const types = @import("../lang/types.zig");
 
@@ -35,6 +37,7 @@ pub const Options = struct {
     sample: usize = 1024,
     batch_rows: usize = 2048,
     chunk: usize = 64 << 10,
+    schema: ?types.Schema = null,
 };
 
 pub const Infer = struct {
@@ -199,7 +202,7 @@ pub fn field(arena: std.mem.Allocator, doc: []const u8, path: []const u8) Error!
 }
 
 pub const Scan = struct {
-    in: *std.Io.Reader,
+    in: ?*std.Io.Reader,
     gpa: std.mem.Allocator,
     buf: std.ArrayListUnmanaged(u8) = .empty,
     at: usize = 0,
@@ -207,9 +210,21 @@ pub const Scan = struct {
     chunk: usize,
     array: bool = false,
     state: enum { start, first, more, done } = .start,
+    mapped: bool = false,
+    released: usize = 0,
+
+    const release_every = 4 << 20;
+
+    /// A scan of `text`, a slice of a file mapping read in place: nothing is copied,
+    /// and the pages behind the scan are released as it goes (`stream.release`).
+    pub fn ofMapped(gpa: std.mem.Allocator, text: []const u8) Scan {
+        var sc = Scan{ .in = null, .gpa = gpa, .chunk = 0, .eof = true, .mapped = true };
+        sc.buf.items = @constCast(text);
+        return sc;
+    }
 
     pub fn deinit(self: *Scan) void {
-        self.buf.deinit(self.gpa);
+        if (!self.mapped) self.buf.deinit(self.gpa);
     }
 
     /// Reads at least `min` more bytes unless the stream ends first; false when nothing came.
@@ -226,10 +241,11 @@ pub const Scan = struct {
         var got: usize = 0;
         while (got < want) {
             const dst = self.buf.unusedCapacitySlice();
-            const n = try self.in.readSliceShort(dst[0..@min(dst.len, want - got)]);
+            const ask = @min(dst.len, want - got);
+            const n = try self.in.?.readSliceShort(dst[0..ask]);
             self.buf.items.len += n;
             got += n;
-            if (n == 0) {
+            if (n < ask) {
                 self.eof = true;
                 break;
             }
@@ -287,6 +303,10 @@ pub const Scan = struct {
             const t = self.buf.items[self.at..];
             if (valueEnd(t, self.eof)) |end| {
                 self.at += end;
+                if (self.mapped and self.at - self.released >= release_every) {
+                    stream.release(self.buf.items[self.released..self.at]);
+                    self.released = self.at;
+                }
                 return t[0..end];
             }
             if (self.eof) return error.InvalidJson;
@@ -349,8 +369,17 @@ pub const Reader = struct {
     done: bool = false,
 
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, in: *std.Io.Reader, opts: Options) Error!*Reader {
+        return start(arena, .{ .in = in, .gpa = gpa, .chunk = opts.chunk }, opts);
+    }
+
+    /// A reader of `text`, a slice of a file mapping, read in place (`Scan.ofMapped`).
+    pub fn openMapped(arena: std.mem.Allocator, gpa: std.mem.Allocator, text: []const u8, opts: Options) Error!*Reader {
+        return start(arena, Scan.ofMapped(gpa, text), opts);
+    }
+
+    fn start(arena: std.mem.Allocator, scan: Scan, opts: Options) Error!*Reader {
         const self = try arena.create(Reader);
-        self.* = .{ .arena = arena, .scan = .{ .in = in, .gpa = gpa, .chunk = opts.chunk }, .opts = opts, .schema = undefined };
+        self.* = .{ .arena = arena, .scan = scan, .opts = opts, .schema = undefined };
         errdefer self.scan.deinit();
         if (opts.items) |path| {
             while (try self.scan.fill(0)) {}
@@ -365,6 +394,10 @@ pub const Reader = struct {
                 .ndjson => false,
                 .json, .auto => try self.scan.detect(),
             };
+        }
+        if (opts.schema) |sch| {
+            self.schema = sch;
+            return self;
         }
         var infer = Infer{};
         var held = std.array_list.Managed([]const u8).init(arena);
@@ -429,6 +462,68 @@ pub const Reader = struct {
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 
     pub fn source(self: *Reader) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+/// Files read as one table through one byte stream (`format/stream.zig`): the first
+/// file's rows fix the columns, every later file is read into them, as a folder of
+/// CSVs shares the first one's header. Stdin is a list of none after the stream.
+pub const Files = struct {
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    stream: *Stream,
+    rest: []const []const u8,
+    reader: *Reader,
+    opts: Options,
+
+    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !*Files {
+        const s = try Stream.open(arena, files[0]);
+        errdefer s.close();
+        return on(arena, gpa, s, files[1..], opts);
+    }
+
+    pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *Stream, rest: []const []const u8, opts: Options) !*Files {
+        const self = try arena.create(Files);
+        self.* = .{ .arena = arena, .gpa = gpa, .stream = s, .rest = rest, .reader = try Reader.open(arena, gpa, s.reader, opts), .opts = opts };
+        self.opts.schema = self.reader.schema;
+        return self;
+    }
+
+    pub fn next(self: *Files, arena: std.mem.Allocator) !?Batch {
+        while (true) {
+            if (try self.reader.next(arena)) |b| return b;
+            if (self.rest.len == 0) return null;
+            self.reader.close();
+            try self.stream.reopen(self.rest[0]);
+            self.rest = self.rest[1..];
+            self.reader = try Reader.open(self.arena, self.gpa, self.stream.reader, self.opts);
+        }
+    }
+
+    pub fn close(self: *Files) void {
+        self.reader.close();
+        self.stream.close();
+    }
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *Files = @ptrCast(@alignCast(ptr));
+        return self.reader.schema;
+    }
+
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+        const self: *Files = @ptrCast(@alignCast(ptr));
+        return self.next(arena);
+    }
+
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *Files = @ptrCast(@alignCast(ptr));
+        self.close();
+    }
+
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+
+    pub fn source(self: *Files) driver.Source {
         return .{ .ptr = self, .vtable = &vtable };
     }
 };

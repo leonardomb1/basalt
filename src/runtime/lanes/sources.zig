@@ -52,11 +52,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
             rs.* = .{ .r = rdr, .schema_ = g.m.src_schema };
             return .{ .ptr = rs, .vtable = &ReaderSource.vtable };
         },
-        .csv => |c| {
-            const rd = try scratch.create(csv.CsvSliceReader);
-            rd.* = c.mapped.reader(c.chunk, c.of, c.schema);
-            return rd.source();
-        },
+        .csv => |c| return try c.mapped.lane(scratch, c.chunk, c.of, c.schema),
     }
 }
 
@@ -133,16 +129,25 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     } };
 }
 
-/// Map `rd`'s CSV for splitting, or null; the caller must `close()` it. A quoted newline
-/// makes byte boundaries undecidable, so that file is closed here and read serially
-/// (leaking it before the caller's defer exhausted fds in a FOR EACH).
-pub fn csvSplitFile(env: *Env, rd: ast.Read, w: ast.Write) anyerror!?*csv.MappedCsv {
+/// Map `rd`'s CSV or NDJSON for splitting, or null; the caller must `close()` it. A
+/// quoted newline makes a CSV's byte boundaries undecidable, so that file is closed
+/// here and read serially (leaking it before the caller's defer exhausted fds in a FOR
+/// EACH); a JSON file that is one array is read serially too.
+pub fn csvSplitFile(env: *Env, rd: ast.Read, hints: []const ast.Hint, w: ast.Write) anyerror!?*csv.MappedCsv {
     const path = switch (rd.form) {
         .path => |p| p,
         else => return null,
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
-    if (analyze.readFormat(path, env.fmt_in) != .csv) return null;
+    switch (analyze.readFormat(path, env.fmt_in)) {
+        .csv => {},
+        .json => {
+            const m = csv.MappedCsv.openNdjson(env.arena, path, analyze.jsonOptions(hints)) catch return null;
+            if (rd.cols.len > 0) try m.project(env.arena, rd.cols);
+            return m;
+        },
+        else => return null,
+    }
 
     var d = env.csv_in;
     d.text = rd.text_cols;

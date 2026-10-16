@@ -111,7 +111,7 @@ pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast
     if (!shapeLaneSafe(shape)) return false;
     var rd = stages[0].node.read;
     if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
-    const mapped = (try csvSplitFile(env, rd, w)) orelse return false;
+    const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse return false;
     defer mapped.close();
     return runShape(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, shape, w, opts, stats, lanes_used);
 }

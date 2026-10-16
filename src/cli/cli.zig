@@ -177,11 +177,15 @@ fn usage(w: anytype) !void {
         \\
         \\sources and sinks:
         \\  files      CSV and Parquet, by path or URL, Arrow IPC (.arrow, .feather,
-        \\             .ipc, .arrows; local) and Excel (.xlsx, read; WITH (sheet =
-        \\             'Name', range = 'B3:F200', header = false)) — the extension picks
-        \\             the format; another needs WITH (format = 'csv'|'parquet'|'arrow').
+        \\             .ipc, .arrows; local), Excel (.xlsx, read; WITH (sheet =
+        \\             'Name', range = 'B3:F200', header = false)) and JSON (.json,
+        \\             .ndjson, .jsonl, read; WITH (items = 'data.rows')) — the
+        \\             extension picks the format; another needs WITH (format =
+        \\             'csv'|'parquet'|'arrow'|'json'|'ndjson').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
+        \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON WITH (format = 'ndjson'),
+        \\             piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;
         \\             'archive.zip :: inner.csv' reads one member (`::` optional
         \\             when the zip holds one file). Neither is splittable, so

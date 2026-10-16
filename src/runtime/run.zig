@@ -214,6 +214,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     env.space = scratch.space();
     env.op_memory = opts.op_memory;
+    env.stdin_free = opts.stdin_free;
     var scan = driver.ScanTally{};
     env.scan = &scan;
     var loads = obs.LoadTally{};

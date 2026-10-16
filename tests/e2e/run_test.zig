@@ -8,5 +8,6 @@ test {
     _ = @import("parallel.zig");
     _ = @import("script.zig");
     _ = @import("format.zig");
+    _ = @import("json.zig");
     _ = @import("outcome.zig");
 }
