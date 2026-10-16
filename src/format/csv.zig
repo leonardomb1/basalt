@@ -155,7 +155,7 @@ fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]typ
     return fields.toOwnedSlice();
 }
 
-fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
+pub fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
     if (enc == .utf8) return utf8Repair(arena, s);
     var high = false;
     for (s) |c| if (c >= 0x80) {

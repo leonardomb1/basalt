@@ -56,7 +56,7 @@ fn hidden(rel: []const u8) bool {
     return false;
 }
 
-pub const Kind = enum { parquet, csv, json };
+pub const Kind = enum { parquet, csv, json, xml };
 
 const csv_exts = [_][]const u8{ ".csv", ".tsv", ".txt", ".csv.gz", ".tsv.gz", ".txt.gz", ".csv.zst", ".tsv.zst", ".txt.zst" };
 
@@ -76,11 +76,19 @@ pub fn isJsonName(name: []const u8) bool {
     return false;
 }
 
+const xml_exts = [_][]const u8{ ".xml", ".xml.gz", ".xml.zst" };
+
+pub fn isXmlName(name: []const u8) bool {
+    for (xml_exts) |x| if (std.ascii.endsWithIgnoreCase(name, x)) return true;
+    return false;
+}
+
 fn isKind(name: []const u8, kind: Kind) bool {
     return switch (kind) {
         .parquet => isParquetName(name),
         .csv => isCsvName(name),
         .json => isJsonName(name),
+        .xml => isXmlName(name),
     };
 }
 
@@ -122,6 +130,7 @@ pub fn label(kind: Kind) []const u8 {
         .parquet => "Parquet",
         .csv => "CSV",
         .json => "JSON",
+        .xml => "XML",
     };
 }
 

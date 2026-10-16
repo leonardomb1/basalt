@@ -302,6 +302,7 @@ pub const jsonOptions = @import("analyze/targets.zig").jsonOptions;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
 pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
+pub const xmlOptions = @import("analyze/targets.zig").xmlOptions;
 pub const jsonShapeFromHints = @import("analyze/targets.zig").jsonShapeFromHints;
 pub const json_array_append_fmt = @import("analyze/targets.zig").json_array_append_fmt;
 pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
@@ -1397,8 +1398,8 @@ const Ctx = struct {
                     .unit => if (std.mem.eql(u8, connector, "stdin")) "stdin" else "unit",
                 };
                 if (std.mem.eql(u8, connector, "stdin")) if (try formatFromHints(lead.hints, self.diag)) |f| switch (f) {
-                    .csv, .json => {},
-                    else => return fail(self.diag, "STDIN is read as a stream, so it takes CSV, JSON or NDJSON; a {s} file needs random access — read it from a path", .{@tagName(f)}),
+                    .csv, .json, .xml => {},
+                    else => return fail(self.diag, "STDIN is read as a stream, so it takes CSV, JSON, NDJSON or XML; a {s} file needs random access — read it from a path", .{@tagName(f)}),
                 };
                 if (rd.form == .range) for ([_]*const ast.Expr{ rd.form.range.lo, rd.form.range.hi }) |b| {
                     if ((try dollarRefs(self.arena, b)).len == 0 and rangeBoundValue(b) == null)
@@ -1413,6 +1414,7 @@ const Ctx = struct {
                     if (archiveProblem(self.arena, rd.form.path, fmt, false)) |why|
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
                     if (readFormat(rd.form.path, fmt) == .xlsx) _ = try xlsxOptions(lead.hints, self.diag);
+                    if (readFormat(rd.form.path, fmt) == .xml) _ = try xmlOptions(lead.hints, &.{}, self.diag);
                     _ = try dialectFromHints(lead.hints, self.diag);
                 }
                 const rewritten = rd.form == .path and containsName(self.written, rd.form.path);
@@ -1774,7 +1776,8 @@ const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
 const csv_read_keys = [_][]const u8{ "format", "delimiter", "delim", "encoding" };
 const xlsx_read_keys = [_][]const u8{ "format", "sheet", "range", "header" };
 const json_read_keys = [_][]const u8{ "format", "items" };
-const stdin_read_keys = [_][]const u8{ "format", "items", "delimiter", "delim", "encoding" };
+const xml_read_keys = [_][]const u8{ "format", "row", "encoding" };
+const stdin_read_keys = [_][]const u8{ "format", "items", "row", "delimiter", "delim", "encoding" };
 const rest_read_keys = [_][]const u8{
     "items",          "method",        "body",         "body_type",   "header",    "bearer",
     "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
@@ -1789,7 +1792,8 @@ const ReadKind = struct { what: []const u8, keys: []const []const u8, takes: []c
 const csv_read = ReadKind{ .what = "a CSV read", .keys = &csv_read_keys, .takes = "format, delimiter, encoding" };
 const xlsx_read = ReadKind{ .what = "an Excel read", .keys = &xlsx_read_keys, .takes = "format, sheet, range, header" };
 const json_read = ReadKind{ .what = "a JSON read", .keys = &json_read_keys, .takes = "format, items" };
-const stdin_read = ReadKind{ .what = "a STDIN read", .keys = &stdin_read_keys, .takes = "format, items, delimiter, encoding" };
+const xml_read = ReadKind{ .what = "an XML read", .keys = &xml_read_keys, .takes = "format, row, encoding" };
+const stdin_read = ReadKind{ .what = "a STDIN read", .keys = &stdin_read_keys, .takes = "format, items, row, delimiter, encoding" };
 const columnar_read = ReadKind{ .what = "a Parquet or Arrow read", .keys = &[_][]const u8{"format"}, .takes = "only format" };
 const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
 const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind" }, .takes = "split, splits, split_kind" };
@@ -1808,6 +1812,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
                 .xlsx => xlsx_read,
                 .csv => csv_read,
                 .json => json_read,
+                .xml => xml_read,
                 else => columnar_read,
             } else csv_read;
         } else if (std.mem.eql(u8, connector, "stdin"))
@@ -1826,7 +1831,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
         if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
         const e = if (containsName(&join_hint_keys, h.key))
             fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})
-        else if (containsName(&csv_read_keys, h.key) or containsName(&xlsx_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
+        else if (containsName(&csv_read_keys, h.key) or containsName(&xlsx_read_keys, h.key) or containsName(&xml_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
             fail(diag, "read option `{s}` does not apply to {s}, which takes {s}", .{ h.key, kind.what, kind.takes })
         else
             fail(diag, "unknown read option `{s}`: {s} takes {s}", .{ h.key, kind.what, kind.takes });

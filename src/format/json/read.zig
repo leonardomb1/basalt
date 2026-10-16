@@ -466,67 +466,8 @@ pub const Reader = struct {
     }
 };
 
-/// Files read as one table through one byte stream (`format/stream.zig`): the first
-/// file's rows fix the columns, every later file is read into them, as a folder of
-/// CSVs shares the first one's header. Stdin is a list of none after the stream.
-pub const Files = struct {
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    stream: *Stream,
-    rest: []const []const u8,
-    reader: *Reader,
-    opts: Options,
-
-    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !*Files {
-        const s = try Stream.open(arena, files[0]);
-        errdefer s.close();
-        return on(arena, gpa, s, files[1..], opts);
-    }
-
-    pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *Stream, rest: []const []const u8, opts: Options) !*Files {
-        const self = try arena.create(Files);
-        self.* = .{ .arena = arena, .gpa = gpa, .stream = s, .rest = rest, .reader = try Reader.open(arena, gpa, s.reader, opts), .opts = opts };
-        self.opts.schema = self.reader.schema;
-        return self;
-    }
-
-    pub fn next(self: *Files, arena: std.mem.Allocator) !?Batch {
-        while (true) {
-            if (try self.reader.next(arena)) |b| return b;
-            if (self.rest.len == 0) return null;
-            self.reader.close();
-            try self.stream.reopen(self.rest[0]);
-            self.rest = self.rest[1..];
-            self.reader = try Reader.open(self.arena, self.gpa, self.stream.reader, self.opts);
-        }
-    }
-
-    pub fn close(self: *Files) void {
-        self.reader.close();
-        self.stream.close();
-    }
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *Files = @ptrCast(@alignCast(ptr));
-        return self.reader.schema;
-    }
-
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *Files = @ptrCast(@alignCast(ptr));
-        return self.next(arena);
-    }
-
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *Files = @ptrCast(@alignCast(ptr));
-        self.close();
-    }
-
-    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-
-    pub fn source(self: *Files) driver.Source {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-};
+/// JSON files read as one table (`files.Files`).
+pub const Files = @import("../files.zig").Files(Reader, Options);
 
 const testing = std.testing;
 

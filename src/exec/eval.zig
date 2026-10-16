@@ -406,6 +406,7 @@ pub const toF64 = @import("eval/support.zig").toF64;
 pub const explain = @import("eval/support.zig").explain;
 pub const takeFailure = @import("eval/support.zig").takeFailure;
 pub const peekFailure = @import("eval/support.zig").peekFailure;
+pub const clip = @import("eval/support.zig").clip;
 pub const orderF64 = @import("eval/support.zig").orderF64;
 pub const compareValues = @import("eval/support.zig").compareValues;
 

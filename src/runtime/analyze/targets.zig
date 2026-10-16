@@ -10,6 +10,7 @@ const pqcodec = @import("../../format/compress/codecs.zig");
 const csv = @import("../../format/csv.zig");
 const json = @import("../../format/json/read.zig");
 const jsonwrite = @import("../../format/json/write.zig");
+const xmlread = @import("../../format/xml/read.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
@@ -28,6 +29,7 @@ pub const FileFormat = enum {
     arrow,
     xlsx,
     json,
+    xml,
 };
 
 /// The named format, else the extension's, else CSV. The one place the CSV fast paths
@@ -77,7 +79,8 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
     inline for (.{ "xlsx", "excel" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .xlsx;
     inline for (.{ "json", "ndjson", "jsonl" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .json;
-    return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx, json, ndjson)", .{s});
+    if (std.ascii.eqlIgnoreCase(s, "xml")) return .xml;
+    return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx, json, ndjson, xml)", .{s});
 }
 
 /// How a JSON read cuts its input into rows: `format = 'ndjson'` (or `'jsonl'`)
@@ -180,6 +183,17 @@ pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8
     return "Sheet1";
 }
 
+/// An XML read's options: `row` names the row element, `encoding` overrides the
+/// declared one; validated here so `check` refuses a bad one before a run.
+pub fn xmlOptions(hints: []const ast.Hint, text: []const []const u8, diag: *Diag) Error!xmlread.Options {
+    var o = xmlread.Options{ .row = hintText(hints, "row"), .text = text };
+    if (hintText(hints, "encoding")) |s| {
+        o.encoding = csv.Encoding.parse(s) orelse
+            return fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
+    }
+    return o;
+}
+
 /// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
 /// both answer `.csv`.
 pub fn formatOfPath(path: []const u8) ?FileFormat {
@@ -189,6 +203,7 @@ pub fn formatOfPath(path: []const u8) ?FileFormat {
     if (xlsx.isPath(bare)) return .xlsx;
     if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
     inline for (.{ ".json", ".ndjson", ".jsonl" }) |ext| if (std.ascii.endsWithIgnoreCase(bare, ext)) return .json;
+    if (std.ascii.endsWithIgnoreCase(bare, ".xml")) return .xml;
     return null;
 }
 
@@ -237,7 +252,7 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
     if (explicit != null) return null;
     if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`) and JSON (`.json`, `.ndjson`, `.jsonl`), a CSV or JSON optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`), JSON (`.json`, `.ndjson`, `.jsonl`) and XML (`.xml`), a CSV, JSON or XML file optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
 }
 
 /// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so
@@ -318,7 +333,7 @@ pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
     if (pqwrite.Writer.isPath(path)) return true;
     if (arrowread.isPath(path)) return false;
     if (xlsx.isPath(path)) return false;
-    if (formatOfPath(path) == .json) return false;
+    if (formatOfPath(path) == .json or formatOfPath(path) == .xml) return false;
     return std.mem.indexOf(u8, path, "://") == null;
 }
 
@@ -342,6 +357,11 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
                 const files = folder.only(arena, all, .json) catch return null;
                 if (files.len == 0) return null;
                 return jsonSchema(arena, files, hints);
+            }
+            if (explicit == .xml or (explicit == null and std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .xml }))) {
+                const files = folder.only(arena, all, .xml) catch return null;
+                if (files.len == 0) return null;
+                return xmlSchema(arena, files, hints, rd.text_cols);
             }
             if (explicit != null and explicit.? != .parquet) return null;
             if (explicit == null and !std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .parquet })) return null;
@@ -373,6 +393,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
             return xr.schema;
         }
         if (readFormat(rd.form.path, explicit) == .json) return jsonSchema(arena, &.{rd.form.path}, hints);
+        if (readFormat(rd.form.path, explicit) == .xml) return xmlSchema(arena, &.{rd.form.path}, hints, rd.text_cols);
         var hdiag = Diag{};
         var d = dialectFromHints(hints, &hdiag) catch return null;
         d.text = rd.text_cols;
@@ -382,6 +403,13 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         return schema;
     }
     return null;
+}
+
+fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) ?types.Schema {
+    var d = Diag{};
+    const f = xmlread.Files.open(arena, arena, files, xmlOptions(hints, text, &d) catch return null) catch return null;
+    defer f.close();
+    return f.reader.schema;
 }
 
 fn jsonSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint) ?types.Schema {
@@ -403,7 +431,7 @@ test "unreadableTarget: an extension basalt does not read is refused" {
     try std.testing.expect(unreadableTarget("/data/inf.zip :: a.csv", null) == null);
     try std.testing.expect(unreadableTarget("/data/x.parquet.gz", null) != null);
 
-    try std.testing.expect(unreadableTarget("/data/rows.xml", null) != null);
+    try std.testing.expect(unreadableTarget("/data/rows.yaml", null) != null);
     try std.testing.expect(unreadableTarget("/data/book.xlsx", null) == null);
     try std.testing.expect(unreadableTarget("/data/book.xlsx.gz", null) != null);
     try std.testing.expect(unreadableTarget("/data/book.xls", null) != null);

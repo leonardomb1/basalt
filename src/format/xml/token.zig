@@ -22,29 +22,45 @@ pub const Tag = struct {
     /// The raw value of the attribute whose local name is `want`, or null. `r:id`
     /// answers to `id`.
     pub fn attr(self: Tag, want: []const u8) ?[]const u8 {
-        var i: usize = 0;
-        const s = self.attrs;
-        while (i < s.len) {
-            while (i < s.len and isSpace(s[i])) i += 1;
-            const ns = i;
-            while (i < s.len and s[i] != '=' and !isSpace(s[i])) i += 1;
-            const full = s[ns..i];
-            while (i < s.len and isSpace(s[i])) i += 1;
-            if (i >= s.len or s[i] != '=') return null;
-            i += 1;
-            while (i < s.len and isSpace(s[i])) i += 1;
-            if (i >= s.len) return null;
-            const q = s[i];
-            if (q != '"' and q != '\'') return null;
-            i += 1;
-            const vs = i;
-            while (i < s.len and s[i] != q) i += 1;
-            if (i >= s.len) return null;
-            const val = s[vs..i];
-            i += 1;
-            if (std.mem.eql(u8, localName(full), want)) return val;
-        }
+        var it = self.iterator();
+        while (it.next()) |a| if (std.mem.eql(u8, localName(a.name), want)) return a.value;
         return null;
+    }
+
+    pub fn iterator(self: Tag) Attrs {
+        return .{ .s = self.attrs };
+    }
+};
+
+/// A tag's attributes in order, each name as written (prefix and all) and its value
+/// raw; it stops at the first malformed one.
+pub const Attrs = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    pub const Attr = struct { name: []const u8, value: []const u8 };
+
+    pub fn next(self: *Attrs) ?Attr {
+        const s = self.s;
+        var i = self.i;
+        while (i < s.len and isSpace(s[i])) i += 1;
+        if (i >= s.len) return null;
+        const ns = i;
+        while (i < s.len and s[i] != '=' and !isSpace(s[i])) i += 1;
+        const full = s[ns..i];
+        while (i < s.len and isSpace(s[i])) i += 1;
+        if (i >= s.len or s[i] != '=') return null;
+        i += 1;
+        while (i < s.len and isSpace(s[i])) i += 1;
+        if (i >= s.len) return null;
+        const q = s[i];
+        if (q != '"' and q != '\'') return null;
+        i += 1;
+        const vs = i;
+        while (i < s.len and s[i] != q) i += 1;
+        if (i >= s.len) return null;
+        self.i = i + 1;
+        return .{ .name = full, .value = s[vs..i] };
     }
 };
 
