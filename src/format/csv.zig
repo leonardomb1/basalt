@@ -52,7 +52,7 @@ const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const objstore = @import("../store/objstore.zig");
-const Part = @import("../store/part.zig").Part;
+const Output = @import("output.zig").Output;
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
 const json = @import("json.zig");
@@ -1168,39 +1168,8 @@ test "utf8Repair keeps valid text and replaces each invalid byte" {
 const source_vtable = driver.sourceVTable(CsvReader);
 
 pub const CsvWriter = struct {
-    backend: Backend,
+    out: *Output,
     dialect: Dialect = .{},
-    write_buf: [LINE_BUF]u8 = undefined,
-    fw: std.fs.File.Writer = undefined,
-    owns_file: bool = true,
-    gz: ?*deflate.Deflate = null,
-    part: Part = .{},
-
-    const Backend = union(enum) {
-        file: std.fs.File,
-        object: objstore.Writer,
-    };
-
-    fn out(self: *CsvWriter) *std.Io.Writer {
-        if (self.gz) |g| return &g.interface;
-        return self.raw();
-    }
-
-    fn raw(self: *CsvWriter) *std.Io.Writer {
-        return switch (self.backend) {
-            .file => &self.fw.interface,
-            .object => |o| o.io,
-        };
-    }
-
-    /// Recovers the error an object destination actually hit (see
-    /// `objstore.Writer.specific`); a file's error is already the real one.
-    fn specific(self: *CsvWriter, e: anyerror) anyerror {
-        return switch (self.backend) {
-            .file => e,
-            .object => |o| o.specific(e),
-        };
-    }
 
     /// `.append` resumes at the file's end and writes the header only to an empty file,
     /// so a second header never lands among the rows; a file with rows must already
@@ -1210,45 +1179,28 @@ pub const CsvWriter = struct {
     /// unless appended to.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, mode: driver.FileMode, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
+        self.* = .{ .out = try Output.open(arena, path, "text/csv", mode), .dialect = dialect };
+        errdefer self.out.abort();
         var header = true;
         var newline = false;
-        if (mode == .append and objstore.isRemote(path)) return error.AppendNotSupported;
-        if (try objstore.openRemote(arena, path, "text/csv")) |o| {
-            self.* = .{ .backend = .{ .object = o } };
-        } else {
-            self.* = .{ .backend = undefined };
-            self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true }) else try self.part.create(path) };
-            self.fw = self.backend.file.writer(&self.write_buf);
-            if (mode == .append) {
-                errdefer self.backend.file.close();
-                const end = try self.backend.file.getEndPos();
-                if (end > 0) {
-                    const prior = try appendTarget(arena, self.backend.file, end, splitCodec(path).codec);
-                    header = prior.empty;
-                    newline = !prior.empty and !prior.ends_nl;
-                    if (!prior.empty) try checkAppendHeader(arena, path, prior.header, schema, dialect);
-                }
-                try self.fw.seekTo(end);
-            }
+        if (mode == .append and self.out.end > 0) {
+            const prior = try appendTarget(arena, self.out.localFile().?, self.out.end, splitCodec(path).codec);
+            header = prior.empty;
+            newline = !prior.empty and !prior.ends_nl;
+            if (!prior.empty) try checkAppendHeader(arena, path, prior.header, schema, dialect);
         }
-
-        switch (splitCodec(path).codec) {
-            .none => {},
-            .gzip => self.gz = try deflate.Deflate.init(std.heap.page_allocator, self.raw(), .{}),
-            .zstd => return error.ZstdWriteUnsupported,
-        }
-
-        self.dialect = dialect;
-        if (newline) try self.out().writeByte('\n');
-        if (header) {
-            const w = self.out();
-            for (schema.fields, 0..) |f, i| {
-                if (i > 0) try w.writeByte(dialect.delim);
-                try writeField(w, f.name, dialect.delim);
-            }
-            try w.writeByte('\n');
-        }
+        try self.out.compress(path);
+        if (newline) try self.out.writer().writeByte('\n');
+        if (header) try writeHeader(self.out.writer(), schema, dialect);
         return self;
+    }
+
+    fn writeHeader(w: *std.Io.Writer, schema: types.Schema, dialect: Dialect) !void {
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try w.writeByte(dialect.delim);
+            try writeField(w, f.name, dialect.delim);
+        }
+        try w.writeByte('\n');
     }
 
     const Prior = struct { empty: bool, ends_nl: bool, header: []const u8 };
@@ -1315,30 +1267,19 @@ pub const CsvWriter = struct {
         return openBorrowed(arena, std.fs.File.stdout(), schema, dialect);
     }
 
-    /// Writes to a file someone else owns: left open on `close`, and written from
-    /// where it stands, so a second writer carries on after the first.
+    /// Writes to a file someone else owns (`Output.openBorrowed`).
     pub fn openBorrowed(arena: std.mem.Allocator, file: std.fs.File, schema: types.Schema, dialect: Dialect) !*CsvWriter {
         const self = try arena.create(CsvWriter);
-        self.* = .{ .backend = .{ .file = file }, .owns_file = false, .dialect = dialect };
-        self.fw = self.backend.file.writerStreaming(&self.write_buf);
-        const w = self.out();
-        for (schema.fields, 0..) |f, i| {
-            if (i > 0) try w.writeByte(dialect.delim);
-            try writeField(w, f.name, dialect.delim);
-        }
-        try w.writeByte('\n');
+        self.* = .{ .out = try Output.openBorrowed(arena, file), .dialect = dialect };
+        try writeHeader(self.out.writer(), schema, dialect);
         return self;
     }
 
-    pub fn writeBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
-        self.writeRows(arena, batch) catch |e| return self.specific(e);
+    pub fn writeBatch(self: *CsvWriter, _: std.mem.Allocator, batch: Batch) !void {
+        self.renderRows(self.out.writer(), batch) catch |e| return self.out.specific(e);
     }
 
-    fn writeRows(self: *CsvWriter, _: std.mem.Allocator, batch: Batch) !void {
-        return self.renderRows(self.out(), batch);
-    }
-
-    /// Split from `writeRows` so a parallel lane renders into its own buffer and holds
+    /// Split from `writeBatch` so a parallel lane renders into its own buffer and holds
     /// the shared sink's lock only for the append (`driver.Sink.VTable.renderBatch`).
     fn renderRows(self: *CsvWriter, w: *std.Io.Writer, batch: Batch) !void {
         const d = self.dialect.delim;
@@ -1349,52 +1290,20 @@ pub const CsvWriter = struct {
     pub fn renderBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(arena);
         try aw.ensureUnusedCapacity(batch.len * 64 + 64);
-        self.renderRows(&aw.writer, batch) catch |e| return self.specific(e);
+        self.renderRows(&aw.writer, batch) catch |e| return self.out.specific(e);
         return aw.writer.buffered();
     }
 
     pub fn writeRendered(self: *CsvWriter, bytes: []const u8) !void {
-        self.out().writeAll(bytes) catch |e| return self.specific(e);
+        self.out.writer().writeAll(bytes) catch |e| return self.out.specific(e);
     }
 
     pub fn close(self: *CsvWriter) !void {
-        if (self.gz) |g| {
-            defer {
-                g.deinit(std.heap.page_allocator);
-                self.gz = null;
-            }
-            g.finish() catch |e| {
-                if (self.backend == .file) self.dropFile();
-                return self.specific(e);
-            };
-        }
-        switch (self.backend) {
-            .file => |f| {
-                self.fw.interface.flush() catch |e| {
-                    self.dropFile();
-                    return e;
-                };
-                if (self.owns_file) f.close();
-                try self.part.commit();
-            },
-            .object => |o| o.finish() catch |e| return self.specific(e),
-        }
+        return self.out.finish();
     }
 
     pub fn abort(self: *CsvWriter) void {
-        if (self.gz) |g| {
-            g.deinit(std.heap.page_allocator);
-            self.gz = null;
-        }
-        switch (self.backend) {
-            .file => self.dropFile(),
-            .object => |o| o.abort(),
-        }
-    }
-
-    fn dropFile(self: *CsvWriter) void {
-        if (self.owns_file) self.backend.file.close();
-        self.part.discard();
+        self.out.abort();
     }
 
     pub fn sink(self: *CsvWriter) driver.Sink {
@@ -2362,7 +2271,7 @@ test "csv writer: renderBatch produces exactly what writeBatch writes" {
 fn goldenCsv(a: std.mem.Allocator, d: u8) ![]const []const u8 {
     const batches = try celltext.goldenBatches(a);
     const out = try a.alloc([]const u8, batches.len);
-    var w = CsvWriter{ .backend = .{ .file = std.fs.File.stdout() }, .owns_file = false, .dialect = .{ .delim = d } };
+    var w = CsvWriter{ .out = try Output.openBorrowed(a, std.fs.File.stdout()), .dialect = .{ .delim = d } };
     for (batches, out) |batch, *o| o.* = try w.renderBatch(a, batch);
     return out;
 }
