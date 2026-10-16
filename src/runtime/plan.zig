@@ -13,7 +13,9 @@
 //! column fails loudly, a missed bound only skips less), and the Parquet footer
 //! shortcut for `COUNT(*)`/`MIN`/`MAX` applies only to an unfiltered, ungrouped
 //! read of the file itself. A field qualified by a joined right side is that
-//! side's column and is never asked of the read.
+//! side's column and is never asked of the read. A CTE, derived table or joined side
+//! is planned with its filters moved toward its read and the select columns its
+//! reader leaves unused dropped (`pruneSelects`), so neither boundary widens the read.
 //!
 //! Union branches are reconciled to a canon schema by a synthesized `select` of
 //! casts, widened column by column across every branch with SQL's UNION type
@@ -305,6 +307,161 @@ const Needs = struct {
     }
 };
 
+/// `stages` with each select's columns that no later stage reads dropped, so a CTE
+/// or derived table never reads a column its reader leaves unused. A select stays
+/// whole when what follows is unprovable (a `*`, a plain DISTINCT, whose rows a column
+/// sets apart, a `search`, or no later select or aggregate fixing the output) or when
+/// two of its items share a name, which a drop would rename.
+pub fn pruneSelects(arena: std.mem.Allocator, stages_in: []const ast.Stage) ![]const ast.Stage {
+    var out: ?[]ast.Stage = null;
+    var i = stages_in.len;
+    outer: while (i > 0) {
+        i -= 1;
+        const cur: []const ast.Stage = out orelse stages_in;
+        const items = switch (cur[i].node) {
+            .select => |s| s,
+            else => continue,
+        };
+        const used = (try laterNames(arena, cur[i + 1 ..])) orelse continue;
+        var names = std.StringHashMap(void).init(arena);
+        var keep = std.array_list.Managed(ast.SelectItem).init(arena);
+        for (items) |it| {
+            const name = switch (it) {
+                .field => |q| q.last(),
+                .computed => |c| c.name,
+                else => continue :outer,
+            };
+            if (std.mem.indexOf(u8, name, "${") != null) continue :outer;
+            if ((try names.getOrPut(name)).found_existing) continue :outer;
+            if (used.contains(name)) try keep.append(it);
+        }
+        if (keep.items.len == items.len) continue;
+        if (keep.items.len == 0) try keep.append(items[0]);
+        const o = out orelse try arena.dupe(ast.Stage, stages_in);
+        o[i].node = .{ .select = try keep.toOwnedSlice() };
+        out = o;
+    }
+    const o = out orelse return stages_in;
+    for (o, 0..) |*st, k| {
+        if (st.node != .join or st.node.join.own_cols.len == 0) continue;
+        const refs = (try allNames(arena, o[k + 1 ..])) orelse return stages_in;
+        var own = std.array_list.Managed(ast.QualName).init(arena);
+        for (st.node.join.own_cols) |q| if (refs.contains(q.last())) try own.append(q);
+        st.node.join.own_cols = try own.toOwnedSlice();
+    }
+    return o;
+}
+
+/// Every name any of `stages` reads, null when one holds a `search`.
+fn allNames(arena: std.mem.Allocator, stages: []const ast.Stage) !?std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(arena);
+    for (stages) |st| switch (st.node) {
+        .write => {},
+        .explode => |ex| try set.put(ex.field, {}),
+        .distinct => |d| if (d.on) |on| for (on) |q| try qualNames(q, &set),
+        .select => |items| for (items) |it| switch (it) {
+            .field => |q| try qualNames(q, &set),
+            .computed => |c| if (!try exprNames(arena, c.expr, &set)) return null,
+            else => {},
+        },
+        else => if (try stageReads(arena, st, &set) == .opaque_) return null,
+    };
+    return set;
+}
+
+/// Every name the stages up to the next select or aggregate may read, each part of a
+/// qualified one and a clash-renamed `x_r`'s `x` too; null when unprovable.
+fn laterNames(arena: std.mem.Allocator, stages: []const ast.Stage) !?std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(arena);
+    for (stages) |st| switch (try stageReads(arena, st, &set)) {
+        .opaque_ => return null,
+        .defines => return set,
+        .passes => {},
+    };
+    return null;
+}
+
+const Reads = enum { passes, defines, opaque_ };
+
+/// Adds the names `st` reads to `set`, and says whether its output is its input's
+/// rows and columns (`passes`), a new set of columns (`defines`), or unprovable.
+fn stageReads(arena: std.mem.Allocator, st: ast.Stage, set: *std.StringHashMap(void)) !Reads {
+    switch (st.node) {
+        .filter => |e| if (!try exprNames(arena, e, set)) return .opaque_,
+        .limit => {},
+        .sort => |so| for (so.keys) |k| try qualNames(k.field, set),
+        .distinct => |d| for (d.on orelse return .opaque_) |q| try qualNames(q, set),
+        .window => |wd| {
+            for (wd.partition_by) |q| try qualNames(q, set);
+            for (wd.order_by) |k| try qualNames(k.field, set);
+            for (wd.funcs) |f| {
+                if (f.arg) |q| try qualNames(q, set);
+                if (f.offset_expr) |e| if (!try exprNames(arena, e, set)) return .opaque_;
+                if (f.default) |e| if (!try exprNames(arena, e, set)) return .opaque_;
+            }
+        },
+        .join => |j| {
+            for (j.left_keys) |q| try qualNames(q, set);
+            for (j.own_cols) |q| try qualNames(q, set);
+            for (j.deferred) |d| {
+                if (!try exprNames(arena, d.a, set)) return .opaque_;
+                if (!try exprNames(arena, d.b, set)) return .opaque_;
+            }
+            if (j.residual) |e| if (!try exprNames(arena, e, set)) return .opaque_;
+        },
+        .aggregate => |ag| {
+            for (ag.by) |q| try qualNames(q, set);
+            for (ag.aggs) |a| if (a.arg) |e| if (!try exprNames(arena, e, set)) return .opaque_;
+            return .defines;
+        },
+        .select => |items| {
+            const through = Needs.passThrough(items) or (items.len == 1 and items[0] == .star_except);
+            for (items) |it| switch (it) {
+                .star, .star_except => if (!through) return .opaque_,
+                .star_rename, .star_of => return .opaque_,
+                .field => |q| try qualNames(q, set),
+                .computed => |c| if (!try exprNames(arena, c.expr, set)) return .opaque_,
+            };
+            if (!through) return .defines;
+        },
+        else => return .opaque_,
+    }
+    return .passes;
+}
+
+fn exprNames(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.StringHashMap(void)) !bool {
+    if (ast.hasSearch(e)) return false;
+    var quals = std.array_list.Managed(ast.QualName).init(arena);
+    try pushdown.collectQuals(arena, e, &quals);
+    for (quals.items) |q| try qualNames(q, set);
+    return true;
+}
+
+fn qualNames(q: ast.QualName, set: *std.StringHashMap(void)) !void {
+    if (q.dollar) return;
+    for (q.parts) |p| try set.put(p, {});
+    if (clashBase(q.last())) |b| try set.put(b, {});
+}
+
+/// A binding's stages readied for the pipeline that reads it (`after`), as a joined
+/// side is: filters moved toward its read, then its columns `after` leaves unused dropped.
+fn prepareRef(env: *Env, body: []const ast.Stage, after: []const ast.Stage) ![]const ast.Stage {
+    const side = try prepareJoinSide(env, body);
+    const whole = try std.mem.concat(env.arena, ast.Stage, &.{ side, after });
+    return (try pruneSelects(env.arena, whole))[0..side.len];
+}
+
+/// A joined side's stages with the columns no name of `needs` (its `rightNeeds`) may
+/// take dropped from its selects.
+fn pruneSide(arena: std.mem.Allocator, stages: []const ast.Stage, needs: []const []const u8) ![]const ast.Stage {
+    if (stages.len == 0) return stages;
+    const items = try arena.alloc(ast.SelectItem, needs.len);
+    for (needs, items) |n, *it| it.* = .{ .field = .{ .parts = try arena.dupe([]const u8, &.{n}) } };
+    const tail = [_]ast.Stage{.{ .node = .{ .select = items }, .hints = &.{}, .pos = stages[0].pos }};
+    const whole = try std.mem.concat(arena, ast.Stage, &.{ stages, &tail });
+    return (try pruneSelects(arena, whole))[0..stages.len];
+}
+
 /// `x` for a right column renamed `x_r` or `x_r2` on clashing with a left one.
 fn clashBase(n: []const u8) ?[]const u8 {
     const at = std.mem.lastIndexOf(u8, n, "_r") orelse return null;
@@ -528,7 +685,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                     try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
                 else
-                    try buildPipeline(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages);
+                    try buildPipeline(env, try prepareRef(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages, stages[1..]));
                 current = r.op;
                 schema = r.schema;
             }
@@ -837,6 +994,7 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
     var rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
     if (after) |rest| if (try rightNeeds(env, j, rest)) |needs| {
+        rstages = try pruneSide(env.arena, rstages, needs);
         rstages = try projectJoinedSqlRead(env, rstages, needs);
     };
     var right_late: ?keypush.Taker = null;
@@ -1004,6 +1162,46 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     try std.testing.expectEqualStrings("cid", rd.cols[2]);
 }
 
+test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its query, the joined CTE's its side" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../lang/sql_parser.zig");
+    const env_mod = @import("env.zig");
+
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
+        \\WITH d AS (SELECT k, nm FROM pg.public.dim)
+        \\SELECT o.id, d.nm FROM pg.public.orders o JOIN d ON o.k = d.k WHERE o.status = 1 AND d.nm = 'x';
+    , &pd);
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    var stages: []const ast.Stage = &.{};
+    for (prog.stmts) |st| switch (st) {
+        .connection => |c| try connections.put(c.name, c),
+        .binding => |b| try bindings.put(b.name, b.pipeline),
+        .output => |o| stages = o.stages,
+        else => {},
+    };
+    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+
+    const hoisted = (try pushdown.hoistFilters(a, a, stages, &bindings)).?;
+    const out = try descendLeadingWhere(&env, hoisted);
+    try std.testing.expect(std.mem.indexOf(u8, out[0].node.read.where, "\"status\" = 1") != null);
+    try std.testing.expect(out[1].node == .filter and out[2].node == .join);
+    try std.testing.expect(out[2].node.join.right_filter != null);
+}
+
 fn sortedNames(names: ?[][]const u8) ![]const []const u8 {
     const n = names orelse return error.TestUnexpectedResult;
     std.mem.sort([]const u8, n, {}, struct {
@@ -1060,6 +1258,84 @@ test "projectedColumns and rightNeeds: computed and deferred join keys narrow bo
         };
     }
     try std.testing.expect((try projectedColumns(&env, outs.items[2][1..])) == null);
+}
+
+fn cteAndReader(a: std.mem.Allocator, src: []const u8) ![]const ast.Stage {
+    const parser = @import("../lang/sql_parser.zig");
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, src, &pd);
+    var cte: []const ast.Stage = &.{};
+    for (prog.stmts) |st| switch (st) {
+        .binding => |b| if (std.mem.eql(u8, b.name, "c")) {
+            cte = b.pipeline.stages;
+        },
+        .output => |o| return std.mem.concat(a, ast.Stage, &.{ cte, o.stages[1..] }),
+        else => {},
+    };
+    return error.TestUnexpectedResult;
+}
+
+fn selectNames(a: std.mem.Allocator, st: ast.Stage) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(a);
+    for (st.node.select) |it| {
+        if (out.items.len > 0) try out.append(',');
+        try out.appendSlice(switch (it) {
+            .field => |q| q.last(),
+            .computed => |c| c.name,
+            else => "*",
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+test "pruneSelects: a CTE's columns its reader leaves unused are dropped, through a window" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const whole = try cteAndReader(a,
+        \\WITH c AS (SELECT f.ev, p.cat, f.amt, f.region,
+        \\  ROW_NUMBER() OVER (PARTITION BY p.cat ORDER BY f.amt DESC) AS rn
+        \\  FROM 'f.parquet' f JOIN 'p.parquet' p ON f.pid = p.pid WHERE f.ev = 'x')
+        \\SELECT cat, SUM(amt) AS total FROM c WHERE rn <= 10 GROUP BY cat;
+    );
+    const out = try pruneSelects(a, whole);
+    var sels = std.array_list.Managed([]const u8).init(a);
+    for (out) |st| if (st.node == .select) try sels.append(try selectNames(a, st));
+    try std.testing.expectEqual(@as(usize, 2), sels.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, sels.items[0], "region") == null and std.mem.indexOf(u8, sels.items[0], "ev") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sels.items[0], "amt") != null);
+    try std.testing.expectEqualStrings("cat,amt,rn", sels.items[1]);
+    for (out) |st| if (st.node == .join) for (st.node.join.own_cols) |q| {
+        try std.testing.expect(!std.mem.eql(u8, q.last(), "region"));
+    };
+}
+
+test "pruneSelects: a select stays whole before a plain DISTINCT, a `*`, a search or the output" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{
+        "WITH c AS (SELECT DISTINCT a, b FROM 't.csv') SELECT a FROM c;",
+        "WITH c AS (SELECT a, b FROM 't.csv') SELECT * FROM c;",
+        "WITH c AS (SELECT a, b FROM 't.csv') SELECT a FROM c WHERE search(*, 'x');",
+        "WITH c AS (SELECT a, b FROM 't.csv') SELECT a, b FROM c;",
+    }) |src| {
+        const whole = try cteAndReader(a, src);
+        const out = try pruneSelects(a, whole);
+        for (whole, out) |w, o| if (w.node == .select) try std.testing.expectEqual(w.node.select.len, o.node.select.len);
+    }
+    const counted = try pruneSelects(a, try cteAndReader(a, "WITH c AS (SELECT a, b FROM 't.csv') SELECT COUNT(*) AS n FROM c;"));
+    try std.testing.expectEqual(@as(usize, 1), counted[1].node.select.len);
+}
+
+test "pruneSide: a joined CTE keeps only the columns the join and what follows may take" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const side = try cteAndReader(a, "WITH c AS (SELECT k, w AS ww, s, category FROM 'r.csv' WHERE w > 1) SELECT * FROM c;");
+    const out = try pruneSide(a, side[0..3], &.{ "k", "category", "id" });
+    try std.testing.expectEqualStrings("k,category", try selectNames(a, out[2]));
+    try std.testing.expect(out[1].node == .filter);
 }
 
 test {

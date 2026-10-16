@@ -47,6 +47,7 @@ const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
 const projectedColumns = @import("../plan.zig").projectedColumns;
+const pruneSelects = @import("../plan.zig").pruneSelects;
 const pushdown = @import("../pushdown.zig");
 const readReport = @import("../connect.zig").readReport;
 const rebuildMapStages = @import("../plan.zig").rebuildMapStages;
@@ -257,6 +258,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         env.log.log(.debug, "filter hoisted through a projection or join: {d} -> {d} stages", .{ stages.len, hoisted.len });
         stages = hoisted;
     }
+    stages = try pruneSelects(arena, stages);
 
     if (stages[0].node == .read or stages[0].node == .union_) {
         var extra = std.array_list.Managed(ast.Hint).init(arena);
@@ -297,6 +299,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         @memcpy(joined[0..b.stages.len], b.stages);
         @memcpy(joined[b.stages.len..], head_stages[1..]);
         head_stages = joined;
+    }
+    if (inlined > 0) {
+        if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings)) |h| head_stages = h;
+        head_stages = try pruneSelects(arena, head_stages);
     }
     if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
         if (classifyLaneShape(head_stages)) |shape| {

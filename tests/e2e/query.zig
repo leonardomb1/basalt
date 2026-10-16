@@ -195,6 +195,43 @@ test "correlated subqueries: EXISTS, IN and scalar subqueries over the outer row
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "more than one row returned by a subquery used as an expression") != null);
 }
 
+test "join filters: a WHERE moves below a join only where the join keeps the rows it tests, at one lane and four" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = "id,k,v,s\n1,1,10,a\n2,1,60,b\n3,2,70,a\n4,,80,a\n5,3,,c\n6,9,90,a\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = "k,w,s\n1,5,a\n2,,x\n3,8,\n,7,a\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v > 50 AND (l.s = 'a' OR r.w IS NULL) ORDER BY l.id", .want = "id,w\n3,\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l LEFT JOIN '$B/r.csv' r ON l.k = r.k WHERE r.w IS NULL ORDER BY l.id", .want = "id,w\n3,\n4,\n6,\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l LEFT JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v >= 80 ORDER BY l.id", .want = "id,w\n4,\n6,\n" },
+        .{ .q = "SELECT l.id, r.k, r.w FROM '$B/l.csv' l RIGHT JOIN '$B/r.csv' r ON l.k = r.k WHERE r.w > 6 ORDER BY r.k", .want = "id,k,w\n5,3,8\n,,7\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l RIGHT JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v IS NULL ORDER BY r.w", .want = "id,w\n,7\n5,8\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l FULL JOIN '$B/r.csv' r ON l.k = r.k WHERE l.id IS NULL OR r.w > 6 ORDER BY r.w", .want = "id,w\n,7\n5,8\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l FULL JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v > 75 ORDER BY l.id", .want = "id,w\n4,\n6,\n" },
+        .{ .q = "SELECT l.id FROM '$B/l.csv' l WHERE l.k IN (SELECT k FROM '$B/r.csv') AND l.v > 50 ORDER BY l.id", .want = "id\n2\n3\n" },
+        .{ .q = "SELECT l.id FROM '$B/l.csv' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv') AND l.v > 50 ORDER BY l.id", .want = "id\n" },
+        .{ .q = "SELECT l.id FROM '$B/l.csv' l WHERE NOT EXISTS (SELECT 1 FROM '$B/r.csv' r WHERE r.k = l.k) AND l.v > 50 ORDER BY l.id", .want = "id\n4\n6\n" },
+        .{ .q = "SELECT l.id, r.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE l.s = 'a' ORDER BY l.id", .want = "id,s\n1,a\n3,x\n" },
+        .{ .q = "WITH e AS (SELECT l.id, r.w, l.v, ROW_NUMBER() OVER (PARTITION BY r.k ORDER BY l.v DESC) AS rn FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v > 5) SELECT id, rn FROM e WHERE rn = 1 ORDER BY id", .want = "id,rn\n2,1\n3,1\n" },
+        .{ .q = "WITH c AS (SELECT l.id, l.v, r.w, l.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k) SELECT a.id, b.w FROM c a JOIN c b ON a.id = b.id WHERE a.v > 50 ORDER BY a.id", .want = "id,w\n2,5\n3,\n" },
+        .{ .q = "WITH c AS (SELECT l.id, r.w, l.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k) SELECT COUNT(*) AS n FROM c", .want = "n\n4\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE CAST(CASE WHEN l.k IS NULL THEN 'bad' ELSE '1' END AS INT) = 1 AND l.v > 50 ORDER BY l.id", .want = "id,w\n2,5\n3,\n" },
+    };
+    for ([_]usize{ 1, 4 }) |threads| for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = threads });
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    };
+}
+
 test "INTERSECT / EXCEPT: NULLs compare equal, results are deduplicated, INTERSECT binds tighter" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
