@@ -121,7 +121,7 @@ const TopNCtx = struct {
     keys: []const op.Sort.Key,
     cap: u64,
     queue: WorkQueue,
-    kept: std.array_list.Managed(op.TopN.Entry),
+    kept: std.array_list.Managed(op.TopN.Kept),
     kept_arena: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
     rows_read: *obs.RowCounter,
@@ -150,15 +150,11 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
         .seq_base = @as(u64, i) << 40,
         .item = if (ctx.split == .parquet) &@as(*MorselSource, @ptrCast(@alignCast(inner.ptr))).cur_item else null,
     };
-    const local = (try tn.nextEntries(mem.batch.allocator())) orelse return;
+    const local = (try tn.nextKept(mem.batch.allocator())) orelse return;
 
     ctx.mtx.lock();
     defer ctx.mtx.unlock();
-    for (local) |e| {
-        const row = try ctx.kept_arena.alloc(Value, e.len);
-        for (row, e) |*o, v| o.* = try op.dupeValue(ctx.kept_arena, v);
-        try ctx.kept.append(row);
-    }
+    try ctx.kept.append(.{ .rows = try local.rows.deepCopy(ctx.kept_arena), .seqs = try ctx.kept_arena.dupe(u64, local.seqs) });
 }
 
 pub fn runParallelTopN(
@@ -208,20 +204,12 @@ pub fn runParallelTopN(
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
-    std.mem.sort(op.TopN.Entry, ctx.kept.items, ks, struct {
-        fn lt(keys: []const op.Sort.Key, x: op.TopN.Entry, y: op.TopN.Entry) bool {
-            return op.entryLess(x, y, keys);
-        }
-    }.lt);
-    var global = op.TopN{ .child = undefined, .in_schema = row_schema, .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
-    const start = @min(lim.offset, ctx.kept.items.len);
-    const end = @min(lim.offset +| lim.count, ctx.kept.items.len);
+    const top = try op.TopN.combine(env.gpa, arena, row_schema, ks, lim.count, lim.offset, ctx.kept.items);
 
     const snk = try openTailSink(env, w, &.{}, row_schema.*);
     var snk_open = true;
     errdefer if (snk_open) snk.abort();
-    if (start < end) {
-        const b = try global.emit(arena, ctx.kept.items[start..end]);
+    if (top) |b| {
         try snk.writeBatch(arena, b);
         stats.rows_out += b.len;
     }

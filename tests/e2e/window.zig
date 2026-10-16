@@ -600,3 +600,46 @@ test "decimal SUM: 38 digits are checked on the total only, in aggregates and fr
         try std.testing.expectEqualStrings(c.want, out);
     }
 }
+
+test "rn <= k and ORDER BY … LIMIT through the top-k core match a full sort, serial and in lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("id,k,g,v,s\n");
+    const parts = [_][]const u8{ "", "a", "b", "c" };
+    const strs = [_][]const u8{ "", "x", "xy", "abcdefghij", "abcdefghik" };
+    for (0..3000) |i| {
+        const v: []const u8 = if (i % 11 == 0) "" else try std.fmt.allocPrint(alloc, "{d}", .{@as(f64, @floatFromInt((i * 7) % 13)) / 2});
+        defer if (v.len > 0) alloc.free(v);
+        const g: []const u8 = if (i % 9 == 0) "" else try std.fmt.allocPrint(alloc, "{d}", .{(i * 31) % 17});
+        defer if (g.len > 0) alloc.free(g);
+        try csv.writer().print("{d},{s},{s},{s},{s}\n", .{ i, parts[(i * 5) % 4], g, v, strs[(i * 3) % 5] });
+    }
+    const orders = [_][]const u8{ "v DESC", "v NULLS FIRST", "g, v DESC", "s DESC, g", "g DESC NULLS FIRST, s" };
+    const ks = [_]u32{ 0, 1, 3, 100, 5000 };
+    for (orders) |o| for (ks) |k| for ([_]usize{ 1, 4 }) |threads| {
+        const tmpl = "SELECT * FROM (SELECT id, k, g, v, s, ROW_NUMBER() OVER (PARTITION BY k ORDER BY {s}) AS rn FROM '$IN') r WHERE {s} <= {d} ORDER BY id";
+        const fast = try std.fmt.allocPrint(alloc, tmpl, .{ o, "rn", k });
+        defer alloc.free(fast);
+        const slow = try std.fmt.allocPrint(alloc, tmpl, .{ o, "rn + 0", k });
+        defer alloc.free(slow);
+        const got = try runCsvThreaded(alloc, &tmp, csv.items, fast, threads);
+        defer alloc.free(got);
+        const want = try runCsvThreaded(alloc, &tmp, csv.items, slow, threads);
+        defer alloc.free(want);
+        try std.testing.expectEqualStrings(want, got);
+
+        const lim = "SELECT * FROM (SELECT * FROM '$IN' ORDER BY {s} LIMIT {d}) t LIMIT {d} OFFSET {d}";
+        const top = try std.fmt.allocPrint(alloc, "SELECT * FROM '$IN' ORDER BY {s} LIMIT {d} OFFSET {d}", .{ o, k, k / 3 });
+        defer alloc.free(top);
+        const full = try std.fmt.allocPrint(alloc, lim, .{ o, 100000, k, k / 3 });
+        defer alloc.free(full);
+        const got_top = try runCsvThreaded(alloc, &tmp, csv.items, top, threads);
+        defer alloc.free(got_top);
+        const want_top = try runCsvThreaded(alloc, &tmp, csv.items, full, threads);
+        defer alloc.free(want_top);
+        try std.testing.expectEqualStrings(want_top, got_top);
+    };
+}

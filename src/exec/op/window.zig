@@ -36,6 +36,8 @@ const ErrCtx = @import("../op.zig").ErrCtx;
 const KeyArr = @import("sort.zig").KeyArr;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
+const TopK = @import("topk.zig").TopK;
+const TopKEntry = @import("topk.zig").Entry;
 const Stats = @import("../op.zig").Stats;
 const Decimal = @import("../value.zig").Decimal;
 const Value = @import("../value.zig").Value;
@@ -43,13 +45,9 @@ const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const par = @import("../par.zig");
-const dupeRowGpa = @import("topn.zig").dupeRowGpa;
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const rescaleTo = @import("../eval.zig").rescaleTo;
-const freeRowGpa = @import("topn.zig").freeRowGpa;
-const keyOrder = @import("sort.zig").keyOrder;
-const rowOrder = @import("sort.zig").rowOrder;
 const keyhash = @import("../keyhash.zig");
 const aggFuncs = @import("aggregate/funcs.zig");
 const read = @import("aggregate/read.zig");
@@ -75,6 +73,8 @@ pub const Window = struct {
     gpa: ?std.mem.Allocator = null,
     threads: usize = 1,
 
+    pub const max_top_k: u64 = 1 << 19;
+
     pub const Off = struct { rows: i64 = 0, int: i128 = 0, float: f64 = 0 };
     pub const Bound = union(enum) { unbounded_preceding, preceding: Off, current_row, following: Off, unbounded_following };
     pub const Frame = struct { range: bool = true, start: Bound = .unbounded_preceding, end: Bound = .current_row };
@@ -97,88 +97,41 @@ pub const Window = struct {
         return true;
     }
 
-    const Kept = std.ArrayListUnmanaged([]Value);
-    const Parts = std.HashMap([]const Value, *Kept, keyhash.MultiKeyCtx, std.hash_map.default_max_load_percentage);
-
-    fn ranksBefore(self: *const Window, a: []const Value, b: []const Value) bool {
-        return rowOrder(self.ord, a, b) == .lt;
-    }
-
-    /// ROW_NUMBER up to rank `k`: per partition, the best `k` rows so far, best first.
-    /// A newcomer goes after every row it does not rank before, so ties keep input
-    /// order as the stable sort would, and one landing past `k` is never copied.
-    fn nextTopK(self: *Window, arena: std.mem.Allocator, k: u64, gpa: std.mem.Allocator) anyerror!?Batch {
-        var parts = Parts.init(gpa);
-        defer {
-            var it = parts.iterator();
-            while (it.next()) |e| {
-                freeRowGpa(gpa, @constCast(e.key_ptr.*));
-                for (e.value_ptr.*.items) |r| freeRowGpa(gpa, r);
-                e.value_ptr.*.deinit(gpa);
-                gpa.destroy(e.value_ptr.*);
-            }
-            parts.deinit();
-        }
+    /// ROW_NUMBER up to rank `k`: each partition's best `k` rows through the top-k
+    /// core, partitions in ascending key order, nulls last, each best first.
+    fn topK(self: *Window, arena: std.mem.Allocator, k: u64, gpa: std.mem.Allocator) anyerror!?Batch {
+        if (k == 0) return null;
+        const part = try arena.alloc(usize, self.part.len);
+        for (part, self.part) |*p, pk| p.* = pk.idx;
+        var core = TopK.init(gpa, self.in_schema, self.ord, part, @intCast(k));
+        defer core.deinit();
         var pull = std.heap.ArenaAllocator.init(gpa);
         defer pull.deinit();
-        const ncols = self.in_schema.fields.len;
-        const row = try arena.alloc(Value, ncols);
-        const key = try arena.alloc(Value, self.part.len);
-
-        if (k > 0) while (try self.child.next(pull.allocator())) |b| {
-            var r: usize = 0;
-            while (r < b.len) : (r += 1) {
-                for (row, b.columns) |*v, c| v.* = c.getValue(r);
-                for (key, self.part) |*v, pk| v.* = row[pk.idx];
-                const gop = try parts.getOrPut(key);
-                if (!gop.found_existing) {
-                    gop.key_ptr.* = try dupeRowGpa(gpa, key);
-                    gop.value_ptr.* = try gpa.create(Kept);
-                    gop.value_ptr.*.* = .{};
-                }
-                const kept = gop.value_ptr.*;
-                var lo: usize = 0;
-                var hi: usize = kept.items.len;
-                while (lo < hi) {
-                    const mid = (lo + hi) / 2;
-                    if (self.ranksBefore(row, kept.items[mid])) hi = mid else lo = mid + 1;
-                }
-                if (lo >= k) continue;
-                try kept.insert(gpa, lo, try dupeRowGpa(gpa, row));
-                if (kept.items.len > k) freeRowGpa(gpa, kept.pop().?);
-            }
+        var seq: u64 = 0;
+        while (try self.child.next(pull.allocator())) |b| {
+            try core.add(pull.allocator(), b, seq, null);
+            seq += b.len;
             _ = pull.reset(.retain_capacity);
-        };
+        }
 
-        const order = try arena.alloc(Parts.Entry, parts.count());
-        var it = parts.iterator();
-        var n: usize = 0;
+        const groups = try core.finish(arena);
         var total: usize = 0;
-        while (it.next()) |e| : (n += 1) {
-            order[n] = e;
-            total += e.value_ptr.*.items.len;
-        }
+        for (groups) |g| total += g.len;
         if (total == 0) return null;
-        std.mem.sort(Parts.Entry, order, {}, struct {
-            fn lt(_: void, a: Parts.Entry, b: Parts.Entry) bool {
-                for (a.key_ptr.*, b.key_ptr.*) |x, y| {
-                    const o = keyOrder(x, y, false, false);
-                    if (o != .eq) return o == .lt;
-                }
-                return false;
-            }
-        }.lt);
-
-        const builders = try arena.alloc(column.Builder, self.out_schema.fields.len);
-        for (builders, self.out_schema.fields) |*bd, f| bd.* = try column.Builder.initCapacity(arena, f.ty, total);
-        for (order) |e| {
-            for (e.value_ptr.*.items, 1..) |kr, rn| {
-                for (kr, builders[0..ncols]) |v, *bd| try bd.append(v);
-                try builders[ncols].append(.{ .int = @intCast(rn) });
-            }
+        const rows = try arena.alloc(TopKEntry, total);
+        const rn = try arena.alloc(i64, total);
+        var at: usize = 0;
+        for (groups) |g| {
+            @memcpy(rows[at..][0..g.len], g);
+            for (rn[at..][0..g.len], 1..) |*x, i| x.* = @intCast(i);
+            at += g.len;
         }
-        const cols = try arena.alloc(column.Column, builders.len);
-        for (builders, cols) |*bd, *c| c.* = try bd.finish();
+        const ncols = self.in_schema.fields.len;
+        const cols = try arena.alloc(column.Column, self.out_schema.fields.len);
+        try core.columns(arena, rows, self.out_schema.fields[0..ncols], cols[0..ncols]);
+        var bd = try column.Builder.initCapacity(arena, self.out_schema.fields[ncols].ty, total);
+        for (rn) |x| try bd.append(.{ .int = x });
+        cols[ncols] = try bd.finish();
         return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
     }
 
@@ -855,7 +808,7 @@ pub const Window = struct {
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.done) return null;
         self.done = true;
-        if (self.top_k) |k| return self.nextTopK(arena, k, self.gpa.?);
+        if (self.top_k) |k| return self.topK(arena, k, self.gpa.?);
         const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
         const n = all.len;
 

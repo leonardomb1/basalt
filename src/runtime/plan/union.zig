@@ -220,6 +220,8 @@ pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
 
 /// `... WHERE rn <= k` over a `ROW_NUMBER()` binding: rebuild its window with
 /// `top_k`. Sorting every row took 2 GB and 6 s over 10M rows; null if inapplicable.
+/// Past `Window.max_top_k` the window's parallel sort is as fast (k = 1M of 2M rows
+/// a partition: 0.83 s against 0.85 s; k = 500K: 0.55 s against 0.9 s), so it stays.
 pub fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: []const ast.Stage) !?[]const ast.Stage {
     if (after.len == 0 or after[0].node != .filter) return null;
     var wi = bstages.len;
@@ -248,6 +250,7 @@ pub fn windowTopK(arena: std.mem.Allocator, bstages: []const ast.Stage, after: [
         rn = kept orelse return null;
     }
     const k = rankBound(after[0].node.filter, rn) orelse return null;
+    if (k > op.Window.max_top_k) return null;
     const out = try arena.dupe(ast.Stage, bstages);
     var w = wd;
     w.top_k = k;

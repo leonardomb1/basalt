@@ -653,7 +653,7 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
 /// one pass per word; the scatter is stable, so records equal on every key keep the
 /// order they came in, and a small bucket goes to an insertion sort on the words
 /// with the row number last.
-fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) void {
+pub fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) void {
     const n = recs.len / stride;
     if (n < 2) return;
     const nkey = stride - 1;
@@ -969,6 +969,30 @@ fn orderedWord(k: KeyArr, i: usize) u64 {
         else => unreachable,
     };
     return if (k.desc) ~w else w;
+}
+
+/// Row `i`'s key as one number whose unsigned order is the key's on its leading word:
+/// the null flag `sortRows` writes above the first word `encWord` writes, a null's
+/// word 0. The whole key for an integer, date, bool or float (`leadExact`); a
+/// string's 8-byte prefix and any other kind's 0, so equal leads still compare.
+pub inline fn leadKey(k: KeyArr, i: usize) u128 {
+    const valid = k.valid.get(i);
+    const flag: u128 = @intFromBool(valid == k.nulls_first);
+    if (!valid) return flag << 64;
+    const w: u64 = switch (k.data) {
+        .ints, .floats => orderedWord(k, i),
+        .strs => encWord(k, .{ .words = 1, .exact = false, .nulls = false }, 0, i),
+        .decs, .boxed => 0,
+    };
+    return flag << 64 | w;
+}
+
+/// Whether `leadKey` of a column of `kind` is its whole key.
+pub fn leadExact(kind: types.TypeKind) bool {
+    return switch (kind) {
+        .int, .time, .timestamp, .date, .bool, .float => true,
+        else => false,
+    };
 }
 
 fn nullOrder(an: bool, bn: bool, nulls_first: bool) std.math.Order {

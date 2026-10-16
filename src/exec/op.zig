@@ -38,13 +38,13 @@
 //! per thread handed out as threads free up (`par`), and gives exactly the serial
 //! result.
 //!
-//! TopN fuses `sort | limit N [offset M]` into a bounded heap of M+N rows copied
-//! into `gpa`, up to `max_rows` (past it a radix sort is faster). Ties rank by input
+//! TopN fuses `sort | limit N [offset M]` into the top-k core (`topk.zig`) keeping
+//! M+N rows, up to `max_rows` (past it a radix sort is faster). Ties rank by input
 //! position (`seq_base`, and the row group `item` under a stealing source), so the
-//! rows kept are a stable sort's whatever lanes produced them. A row strictly worse
-//! than the worst kept on its first key is rejected off the typed column without
-//! boxing, and that bound can be published as a `threshold` so a source skips row
-//! groups.
+//! rows kept are a stable sort's whatever lanes produced them; lanes' rows combine
+//! through one more core, at their positions. A row not ranking before the kept
+//! bound is rejected off its batch's key column before any copy, and that bound can
+//! be published as a `threshold` so a source skips row groups.
 //!
 //! Window is a breaker: one sort over partition ++ order keys, then one pass per
 //! function. Nulls in a partition key group together, as in GROUP BY. The default
@@ -53,8 +53,8 @@
 //! adding and taking back, with a monotonic deque for MIN/MAX (re-walking the frame
 //! was O(partition^2)); MEDIAN and BIT_AND/OR recompute a frame that does not only
 //! grow. A sliding float frame can drift by rounding; a segment tree is the exact
-//! upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER (`top_k`) keeps only each
-//! partition's best k rows. Window SUM skips non-numeric kinds like nulls, and sums
+//! upgrade. Under `WHERE rn <= k` a lone ROW_NUMBER (`top_k`, k up to `max_top_k`)
+//! keeps only each partition's best k rows, through the same top-k core. Window SUM skips non-numeric kinds like nulls, and sums
 //! as the SUM aggregate does, range-checking only the frame's total.
 //!
 //! Aggregate is streaming hash aggregation, O(groups). Groups are typed records in
@@ -101,7 +101,7 @@
 //! rows and the ON evaluated over the pairs.
 //!
 //! The operators with more than a page of logic each live in op/: `aggregate.zig`,
-//! `join.zig`, `nljoin.zig`, `sort.zig`, `topn.zig`, `window.zig`, `distinct.zig` and
+//! `join.zig`, `nljoin.zig`, `sort.zig`, `topk.zig`, `topn.zig`, `window.zig`, `distinct.zig` and
 //! `explode.zig`. This file keeps the `Op` union and its dispatch, the simple
 //! operators (scan, filter, project, limit, union) and the error labels. Each part
 //! carries the tests of its own code; `testing_util.zig` holds the shared helpers.
@@ -334,7 +334,6 @@ pub const Distinct = @import("op/distinct.zig").Distinct;
 pub const Sort = @import("op/sort.zig").Sort;
 const KeyArr = @import("op/sort.zig").KeyArr;
 pub const TopN = @import("op/topn.zig").TopN;
-pub const entryLess = @import("op/topn.zig").entryLess;
 pub const keyOrder = @import("op/sort.zig").keyOrder;
 pub const Aggregate = @import("op/aggregate.zig").Aggregate;
 pub const dupeValue = @import("op/aggregate.zig").dupeValue;
@@ -647,6 +646,7 @@ test {
     _ = @import("op/keyset.zig");
     _ = @import("op/nljoin.zig");
     _ = @import("op/sort.zig");
+    _ = @import("op/topk.zig");
     _ = @import("op/topn.zig");
     _ = @import("op/window.zig");
     _ = @import("op/testing_util.zig");
