@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const xml = @import("../format/xml/token.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";
@@ -577,8 +578,9 @@ pub const MultipartWriter = struct {
                     .content_type = w.content_type,
                 });
                 if (r.code == 200) {
-                    const id = objstore.extractTag(r.body, "UploadId") orelse return w.failed(r);
-                    w.upload_id = try w.arena.dupe(u8, id);
+                    const ids = try xml.elementTexts(w.arena, r.body, "UploadId");
+                    if (ids.len == 0) return w.failed(r);
+                    w.upload_id = ids[0];
                     w.upload_id_enc = try uriEncode(w.arena, w.upload_id.?, .encode_slash);
                     return .done;
                 }

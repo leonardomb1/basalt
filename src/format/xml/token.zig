@@ -1,4 +1,4 @@
-//! A streaming XML tokenizer, just what reading an `.xlsx` needs.
+//! A streaming XML tokenizer: worksheets, object-store replies and XML files.
 //!
 //! Tokens come off a `std.Io.Reader` one at a time and are valid until the next
 //! call, so a worksheet streams through in a buffer the size of its longest tag or
@@ -61,12 +61,21 @@ pub const Tokenizer = struct {
     lo: usize = 0,
     eof: bool = false,
 
+    borrowed: bool = false,
+
     pub fn init(gpa: std.mem.Allocator, r: *std.Io.Reader) Tokenizer {
         return .{ .r = r, .buf = .init(gpa) };
     }
 
+    /// Tokens of a whole document already in memory, read in place: nothing is
+    /// copied or allocated, and tokens stay valid as long as `doc`.
+    pub fn initSlice(doc: []const u8) Tokenizer {
+        const buf = std.array_list.Managed(u8){ .items = @constCast(doc), .capacity = doc.len, .allocator = undefined };
+        return .{ .r = undefined, .buf = buf, .eof = true, .borrowed = true };
+    }
+
     pub fn deinit(self: *Tokenizer) void {
-        self.buf.deinit();
+        if (!self.borrowed) self.buf.deinit();
     }
 
     fn fill(self: *Tokenizer) Error!bool {
@@ -175,6 +184,52 @@ pub const Tokenizer = struct {
         return error.BadXml;
     }
 };
+
+/// The text of each element whose local name is `name`, in document order and
+/// entities decoded: a reply already in memory, such as an object store's listing.
+/// An empty element is the empty text, and an element a cut-off reply leaves open
+/// is not counted.
+pub fn elementTexts(arena: std.mem.Allocator, doc: []const u8, name: []const u8) Error![][]const u8 {
+    var tz = Tokenizer.initSlice(doc);
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    var text = std.array_list.Managed(u8).init(arena);
+    var inside = false;
+    while (tz.next() catch |e| switch (e) {
+        error.BadXml => null,
+        else => return e,
+    }) |t| switch (t) {
+        .open => |o| if (!inside and std.mem.eql(u8, o.name, name)) {
+            if (o.self_closing) try out.append(arena, "") else inside = true;
+        },
+        .text => |raw| if (inside) try decodeInto(&text, raw, false),
+        .cdata => |raw| if (inside) try text.appendSlice(raw),
+        .close => |c| if (inside and std.mem.eql(u8, c, name)) {
+            inside = false;
+            try out.append(arena, try arena.dupe(u8, text.items));
+            text.clearRetainingCapacity();
+        },
+    };
+    return out.items;
+}
+
+/// The undecoded text of the first element whose local name is `name`, for a value
+/// compared as written, such as an error code, where no allocator is at hand.
+pub fn firstRawText(doc: []const u8, name: []const u8) ?[]const u8 {
+    var tz = Tokenizer.initSlice(doc);
+    while (tz.next() catch return null) |t| switch (t) {
+        .open => |o| if (std.mem.eql(u8, o.name, name)) {
+            if (o.self_closing) return "";
+            const v = (tz.next() catch return null) orelse return null;
+            return switch (v) {
+                .text, .cdata => |raw| raw,
+                .close => "",
+                .open => null,
+            };
+        },
+        else => {},
+    };
+    return null;
+}
 
 /// The `>` closing a tag that starts at `s[0]`, skipping any inside quoted
 /// attribute values, where some writers leave a bare `>`.

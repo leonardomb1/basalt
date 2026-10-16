@@ -36,7 +36,7 @@ const driver = @import("../../connect/driver.zig");
 const Output = @import("../output.zig").Output;
 const zipwrite = @import("../compress/zipwrite.zig");
 const read = @import("read.zig");
-const xml = @import("xml.zig");
+const xml = @import("../xml/token.zig");
 
 pub const max_cols = 16384;
 pub const max_rows = 1048576;

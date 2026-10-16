@@ -38,50 +38,27 @@
 
 const std = @import("std");
 const azure = @import("azure.zig");
+const xml = @import("../format/xml/token.zig");
 const driver = @import("../connect/driver.zig");
 const http_client = @import("../net/http_client.zig");
 const s3 = @import("s3.zig");
 const sftp = @import("sftp.zig");
 const smb = @import("smb.zig");
 
-pub fn extractTag(xml: []const u8, name: []const u8) ?[]const u8 {
-    var open_buf: [64]u8 = undefined;
-    var close_buf: [64]u8 = undefined;
-    const open = std.fmt.bufPrint(&open_buf, "<{s}>", .{name}) catch return null;
-    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{name}) catch return null;
-    const s = std.mem.indexOf(u8, xml, open) orelse return null;
-    const from = s + open.len;
-    const e = std.mem.indexOfPos(u8, xml, from, close) orelse return null;
-    return xml[from..e];
-}
-
-/// The text of every `<name>…</name>` element, in document order. A flat listing
-/// carries item names in exactly one element kind, so a plain tag scan is enough.
-pub fn collectTag(arena: std.mem.Allocator, xml: []const u8, name: []const u8) ![][]const u8 {
-    var open_buf: [64]u8 = undefined;
-    var close_buf: [64]u8 = undefined;
-    const open = try std.fmt.bufPrint(&open_buf, "<{s}>", .{name});
-    const close = try std.fmt.bufPrint(&close_buf, "</{s}>", .{name});
-    var out = std.array_list.Managed([]const u8).init(arena);
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, xml, pos, open)) |s| {
-        const from = s + open.len;
-        const e = std.mem.indexOfPos(u8, xml, from, close) orelse break;
-        try out.append(try arena.dupe(u8, xml[from..e]));
-        pos = e + close.len;
-    }
-    return out.toOwnedSlice();
-}
-
+/// An error reply's code and the first line of its message, as written: a code is
+/// compared, and `describe` decodes the message for display.
 pub fn parseError(body: []const u8) ?struct { code: []const u8, message: []const u8 } {
-    const code = extractTag(body, "Code") orelse return null;
-    const msg = extractTag(body, "Message") orelse "";
+    const code = xml.firstRawText(body, "Code") orelse return null;
+    const msg = xml.firstRawText(body, "Message") orelse "";
     return .{ .code = code, .message = std.mem.sliceTo(msg, '\n') };
 }
 
 pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const u8 {
-    if (parseError(body)) |e|
-        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, e.message, code });
+    if (parseError(body)) |e| {
+        var msg = std.array_list.Managed(u8).init(arena);
+        xml.decodeInto(&msg, e.message, false) catch try msg.appendSlice(e.message);
+        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, msg.items, code });
+    }
     return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
 }
 
@@ -265,10 +242,10 @@ pub fn listPages(arena: std.mem.Allocator, spec: ListSpec, ctx: anytype, comptim
     var marker: []const u8 = "";
     while (true) {
         const body: []const u8 = try pageFn(ctx, marker);
-        try out.appendSlice(try collectTag(arena, body, spec.item_tag));
-        const next = extractTag(body, spec.next_tag) orelse "";
-        if (next.len == 0) break;
-        marker = try arena.dupe(u8, next);
+        try out.appendSlice(try xml.elementTexts(arena, body, spec.item_tag));
+        const next = try xml.elementTexts(arena, body, spec.next_tag);
+        if (next.len == 0 or next[0].len == 0) break;
+        marker = next[0];
     }
     return out.toOwnedSlice();
 }
@@ -441,16 +418,16 @@ test "describe renders the code and message a user needs" {
     try std.testing.expectEqualStrings("HTTP 500", try describe(a, 500, ""));
 }
 
-test "collectTag reads every item from a listing page and nothing else" {
+test "a listing page gives every item, entities decoded, and nothing else" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const names = try collectTag(a, "<Blobs><Blob><Name>p/a.csv</Name></Blob><Blob><Name>p/b.csv</Name></Blob></Blobs><NextMarker/>", "Name");
+    const names = try xml.elementTexts(a, "<Blobs><Blob><Name>p/a.csv</Name></Blob><Blob><Name>p/b.csv</Name></Blob></Blobs><NextMarker/>", "Name");
     try std.testing.expectEqual(@as(usize, 2), names.len);
     try std.testing.expectEqualStrings("p/a.csv", names[0]);
     try std.testing.expectEqualStrings("p/b.csv", names[1]);
 
-    const keys = try collectTag(a,
+    const keys = try xml.elementTexts(a,
         \\<ListBucketResult><Name>lake</Name><Prefix>p/</Prefix><KeyCount>2</KeyCount>
         \\<Contents><Key>p/a.csv</Key><Size>10</Size></Contents>
         \\<Contents><Key>p/b.csv</Key><Size>20</Size></Contents>
@@ -459,8 +436,11 @@ test "collectTag reads every item from a listing page and nothing else" {
     try std.testing.expectEqual(@as(usize, 2), keys.len);
     try std.testing.expectEqualStrings("p/b.csv", keys[1]);
 
-    try std.testing.expectEqual(@as(usize, 1), (try collectTag(a, "<Key>a</Key><Key>b", "Key")).len);
-    try std.testing.expectEqual(@as(usize, 0), (try collectTag(a, "", "Key")).len);
+    try std.testing.expectEqual(@as(usize, 1), (try xml.elementTexts(a, "<Key>a</Key><Key>b", "Key")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try xml.elementTexts(a, "", "Key")).len);
+    const amp = try xml.elementTexts(a, "<ListBucketResult><Contents><Key>p/a&amp;b &lt;1&gt;.csv</Key></Contents><Contents><Key><![CDATA[p/c&d.csv]]></Key></Contents></ListBucketResult>", "Key");
+    try std.testing.expectEqualStrings("p/a&b <1>.csv", amp[0]);
+    try std.testing.expectEqualStrings("p/c&d.csv", amp[1]);
 }
 
 test "retry policy: transport failures, 408, 429 and 5xx gateways retry; other 4xx do not" {

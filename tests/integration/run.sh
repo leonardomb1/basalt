@@ -806,6 +806,16 @@ if runs azure; then
     report "azure-prefix (run error)" bad
   fi
 
+  # a blob name with `&` and `<` is listed escaped (`&amp;`, `&lt;`); read as written
+  # it was a 404 that failed the whole prefix
+  if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/amp/a&b<1>.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/amp/c.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO '$out/azure_amp.csv' AS SELECT * FROM 'az://devstoreaccount1/basalt-it/amp/' ORDER BY id;"; then
+    check azure-prefix-escaped-names "$out/azure_amp.csv" tests/integration/expected.csv
+  else
+    report "azure-prefix-escaped-names (run error)" bad
+  fi
+
   # Volume: ~7MB is several 4MiB blocks, so this is the only test that commits a
   # multi-entry block list. A single-block write never exercises that path.
   if brun run -c "LOAD INTO 'az://devstoreaccount1/basalt-it/vol.csv' AS SELECT * FROM '$volcsv';" &&
@@ -893,6 +903,16 @@ if runs s3; then
     check s3-prefix "$out/s3_prefix.csv" tests/integration/expected.csv
   else
     report "s3-prefix (run error)" bad
+  fi
+
+  # a key with `&` and `<` is listed escaped (`&amp;`, `&lt;`); read as written it
+  # was a 404 that failed the whole prefix
+  if brun run -c "LOAD INTO 's3://basalt-it/amp/a&b<1>.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id <= 1;" &&
+     brun run -c "LOAD INTO 's3://basalt-it/amp/c.csv' AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 1;" &&
+     brun run -c "LOAD INTO '$out/s3_amp.csv' AS SELECT * FROM 's3://basalt-it/amp/' ORDER BY id;"; then
+    check s3-prefix-escaped-names "$out/s3_amp.csv" tests/integration/expected.csv
+  else
+    report "s3-prefix-escaped-names (run error)" bad
   fi
 
   # a prefix of Parquet objects, one nested, reads as one table; a marker object is skipped

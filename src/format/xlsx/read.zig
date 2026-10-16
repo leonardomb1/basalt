@@ -29,7 +29,7 @@ const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const zipsrc = @import("../compress/zip.zig");
-const xml = @import("xml.zig");
+const xml = @import("../xml/token.zig");
 
 pub const Error = error{
     NotXlsx,
