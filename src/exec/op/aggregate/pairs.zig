@@ -26,6 +26,7 @@ const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
 const no_payload = keytable.NoPayload{};
+const lane_table = @import("drain.zig").lane_table;
 
 pub const Pairs = struct {
     j: usize,
@@ -59,8 +60,10 @@ pub const Pairs = struct {
     };
 
     /// Aggregate `j`'s pairs over `nparts` partitions, partition `p`'s records in
-    /// `allocs[p]` (or `allocs[0]` for all) and its index in `table_alloc`.
-    pub fn init(a: std.mem.Allocator, j: usize, arg_ty: ?types.Type, grouped: bool, nparts: usize, allocs: []const std.mem.Allocator, table_alloc: std.mem.Allocator) !Pairs {
+    /// `allocs[p]` (or `allocs[0]` for all) and its index in `table_alloc`: a lane's
+    /// bounded (`GroupTable.initBounded`), as the merge dedups what it repeats, or
+    /// sized for `expect` pairs.
+    pub fn init(a: std.mem.Allocator, j: usize, arg_ty: ?types.Type, grouped: bool, nparts: usize, allocs: []const std.mem.Allocator, table_alloc: std.mem.Allocator, bounded: bool, expect: usize) !Pairs {
         var ty = arg_ty orelse types.Type.init(.string);
         if (arg_ty == null) ty.unknown = true;
         const kind = if (ty.unknown) null else keyhash.keyKindOf(ty.kind);
@@ -69,15 +72,24 @@ pub const Pairs = struct {
         errdefer for (parts[0..made]) |*p| p.table.deinit();
         for (parts, 0..) |*p, i| {
             const al = allocs[if (allocs.len == 1) 0 else i];
-            p.* = .{ .table = try GroupTable.init(table_alloc, 16), .store = try newStore(al, kind, grouped), .alloc = al };
+            const table = if (bounded) try GroupTable.initBounded(table_alloc, lane_table) else try GroupTable.init(table_alloc, GroupTable.capFor(expect));
+            p.* = .{ .table = table, .store = try newStore(al, kind, grouped), .alloc = al };
             made += 1;
         }
         return .{ .j = j, .ty = ty, .kind = kind, .grouped = grouped, .parts = parts, .alloc = a };
     }
 
-    /// An empty one-partition set like `like`, for a merge to absorb into.
-    pub fn initLike(a: std.mem.Allocator, like: *const Pairs, table_alloc: std.mem.Allocator) !Pairs {
-        return init(a, like.j, like.ty, like.grouped, 1, &.{a}, table_alloc);
+    /// An empty one-partition set like `like`, sized for `expect` pairs, for a merge
+    /// to absorb into.
+    pub fn initLike(a: std.mem.Allocator, like: *const Pairs, table_alloc: std.mem.Allocator, expect: usize) !Pairs {
+        return init(a, like.j, like.ty, like.grouped, 1, &.{a}, table_alloc, false, expect);
+    }
+
+    /// How many pairs partition `p` holds.
+    pub fn count(self: *const Pairs, p: usize) usize {
+        return switch (self.parts[p].store) {
+            inline else => |st| st.len,
+        };
     }
 
     fn newStore(a: std.mem.Allocator, kind: ?keyhash.KeyKind, grouped: bool) !Store {

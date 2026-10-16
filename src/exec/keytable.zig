@@ -20,8 +20,9 @@ pub const prefetch_ahead = 8;
 
 /// What a `-Dstats` build counts, per table and then in all: lookups, slots probed
 /// past the first, salt matches on another key, inserts, rehashes and the entries
-/// they moved, and items laid out in partition runs.
-pub const Count = enum { lookups, steps, false_hits, inserts, rehashes, moved, scattered };
+/// they moved, items laid out in partition runs, and a bounded table's clears and
+/// the keys it took as new without probing.
+pub const Count = enum { lookups, steps, false_hits, inserts, rehashes, moved, scattered, clears, skipped };
 
 const ncounts = if (stats) @typeInfo(Count).@"enum".fields.len else 0;
 const Counters = [ncounts]std.atomic.Value(u64);
@@ -37,7 +38,7 @@ pub fn report(w: *std.Io.Writer) !void {
     var v: [ncounts]u64 = undefined;
     for (&v, &totals) |*x, *t| x.* = t.load(.monotonic);
     const lookups: f64 = @floatFromInt(@max(v[@intFromEnum(Count.lookups)], 1));
-    try w.print("key tables: {d} lookups, {d:.3} extra slots and {d:.3} false salt hits a lookup, {d} inserts, {d} rehashes moving {d} entries, {d} items laid out in runs\n", .{
+    try w.print("key tables: {d} lookups, {d:.3} extra slots and {d:.3} false salt hits a lookup, {d} inserts, {d} rehashes moving {d} entries, {d} items laid out in runs, {d} clears, {d} keys taken unprobed\n", .{
         v[@intFromEnum(Count.lookups)],
         @as(f64, @floatFromInt(v[@intFromEnum(Count.steps)])) / lookups,
         @as(f64, @floatFromInt(v[@intFromEnum(Count.false_hits)])) / lookups,
@@ -45,6 +46,8 @@ pub fn report(w: *std.Io.Writer) !void {
         v[@intFromEnum(Count.rehashes)],
         v[@intFromEnum(Count.moved)],
         v[@intFromEnum(Count.scattered)],
+        v[@intFromEnum(Count.clears)],
+        v[@intFromEnum(Count.skipped)],
     });
 }
 
@@ -338,6 +341,30 @@ pub const GroupTable = struct {
     mask: u64,
     alloc: std.mem.Allocator,
     counts: Counters = [_]std.atomic.Value(u64){.init(0)} ** ncounts,
+    bounded: bool = false,
+    probes: u32 = 0,
+    skip: u32 = 0,
+
+    const skip_keys = 1 << 16;
+    const thin_pct = 95;
+
+    /// A table that never grows past `cap` entries, for a lane's partial fold whose
+    /// records a merge combines: full, it forgets its keys and starts again, so a key
+    /// met again becomes a second record. When a cycle reduced its keys by less than
+    /// 5% (DuckDB's `MaybeSkipLookups`), the next `skip_keys` keys are taken as new
+    /// without probing, then probing resumes and the cycle is judged again.
+    pub fn initBounded(alloc: std.mem.Allocator, cap: usize) !GroupTable {
+        var t = try init(alloc, cap);
+        t.bounded = true;
+        return t;
+    }
+
+    /// The smallest power of two, at least 256, holding `n` keys under the load limit.
+    pub fn capFor(n: usize) usize {
+        var cap: usize = 256;
+        while ((n + 1) * 10 >= cap * 7) cap *= growth;
+        return cap;
+    }
 
     pub fn init(alloc: std.mem.Allocator, cap_pow2: usize) !GroupTable {
         const e = try alloc.alloc(u32, cap_pow2);
@@ -374,8 +401,10 @@ pub const GroupTable = struct {
     /// Forget every key, keeping the records and the entries' memory, for a bounded
     /// table whose keys may then be met again as new records.
     pub fn clear(self: *GroupTable) void {
+        tally(&self.counts, .clears, 1);
         @memset(self.entries, 0);
         self.len = 0;
+        self.probes = 0;
     }
 
     /// Free the entries. Safe to repeat: a lane's sets and a merge each free theirs
@@ -446,7 +475,18 @@ pub const GroupTable = struct {
         new_slot: u32,
     ) !Found {
         if (new_slot >= max_groups) return error.TooManyGroups;
-        if (self.full()) try self.grow(store);
+        if (self.bounded) {
+            if (self.skip > 0) {
+                self.skip -= 1;
+                tally(&self.counts, .skipped, 1);
+                return .{ .slot = new_slot, .found = false };
+            }
+            if (self.full()) {
+                if (self.len * 100 >= @as(usize, self.probes) * thin_pct) self.skip = skip_keys;
+                self.clear();
+            }
+            self.probes += 1;
+        } else if (self.full()) try self.grow(store);
         tally(&self.counts, .lookups, 1);
         const want = saltOf(h) << idx_bits;
         var i = h & self.mask;
@@ -761,3 +801,47 @@ pub const Encoder = struct {
         if (x.id == absent_id and e.absent.len > 0) e.absent[r] = true;
     }
 };
+
+test "a bounded table clears when full, then skips probing while its cycles barely reduce" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const payload = NoPayload{};
+    const Put = struct {
+        fn put(tb: *GroupTable, s: *FixedStore(NoPayload), k: i64) !bool {
+            const key = FixedKey{ .vals = &.{k}, .mask = 0 };
+            const h = fixedHash(key.vals, 0);
+            const f = try tb.getOrPut(h, key, s, @intCast(s.len));
+            if (!f.found) {
+                const nr = try s.push(h);
+                nr.keys[0] = k;
+                nr.mask.* = 0;
+            }
+            return f.found;
+        }
+    };
+
+    var few = try GroupTable.initBounded(std.testing.allocator, 16);
+    defer few.deinit();
+    var st_few = FixedStore(NoPayload).init(a, 1, &payload);
+    for (0..400) |i| _ = try Put.put(&few, &st_few, @intCast(i % 5));
+    try std.testing.expectEqual(@as(usize, 5), st_few.len);
+    try std.testing.expectEqual(@as(u32, 0), few.skip);
+
+    var twice = try GroupTable.initBounded(std.testing.allocator, 16);
+    defer twice.deinit();
+    var st_twice = FixedStore(NoPayload).init(a, 1, &payload);
+    for (0..24) |i| _ = try Put.put(&twice, &st_twice, @intCast(i / 2));
+    try std.testing.expectEqual(@as(u32, 0), twice.skip);
+    try std.testing.expect(!try Put.put(&twice, &st_twice, 0));
+    try std.testing.expectEqual(@as(usize, 14), st_twice.len);
+
+    var thin = try GroupTable.initBounded(std.testing.allocator, 16);
+    defer thin.deinit();
+    var st_thin = FixedStore(NoPayload).init(a, 1, &payload);
+    for (0..12) |k| try std.testing.expect(!try Put.put(&thin, &st_thin, @intCast(k)));
+    try std.testing.expect(thin.skip > 0);
+    try std.testing.expect(!try Put.put(&thin, &st_thin, 11));
+    try std.testing.expectEqual(@as(usize, 13), st_thin.len);
+    try std.testing.expectEqual(@as(usize, 1), thin.len);
+}

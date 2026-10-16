@@ -79,12 +79,6 @@ pub const GroupSet = struct {
     }
 };
 
-fn capFor(n: usize) usize {
-    var cap: usize = 256;
-    while ((n + 1) * 10 >= cap * 7) cap *= 2;
-    return cap;
-}
-
 pub const GroupMerge = struct {
     alloc: std.mem.Allocator,
     aggs: []const Agg,
@@ -109,11 +103,15 @@ pub const GroupMerge = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg) !GroupMerge {
-        return initFor(alloc, like, aggs, 0);
+        return initFor(alloc, like, aggs, .{});
     }
 
-    /// As `init`, the index sized at once for `expect` groups.
-    pub fn initFor(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg, expect: usize) !GroupMerge {
+    /// How many groups, and pairs of each DISTINCT aggregate, a merge will be handed
+    /// at most, so its indexes are sized once.
+    pub const Expect = struct { groups: usize = 0, pairs: []const usize = &.{} };
+
+    /// As `init`, the indexes sized at once for what `expect` says is coming.
+    pub fn initFor(alloc: std.mem.Allocator, like: *const GroupSet, aggs: []const Agg, expect: Expect) !GroupMerge {
         const store: GroupSet.Store = switch (like.store) {
             .fixed => |st| blk: {
                 const n = try alloc.create(FixedStore);
@@ -134,12 +132,12 @@ pub const GroupMerge = struct {
             },
         };
         const pairs = try alloc.alloc(Pairs, if (like.store == .single) 0 else like.pairs.len);
-        for (pairs, like.pairs[0..pairs.len]) |*d, *s| d.* = try Pairs.initLike(alloc, s, alloc);
+        for (pairs, like.pairs[0..pairs.len], 0..) |*d, *s, i| d.* = try Pairs.initLike(alloc, s, alloc, if (i < expect.pairs.len) expect.pairs[i] else 0);
         return .{
             .alloc = alloc,
             .aggs = aggs,
             .set = .{ .store = store, .len = if (store == .single) 1 else 0, .key_kinds = like.key_kinds, .strs = like.strs },
-            .table = try GroupTable.init(alloc, capFor(expect)),
+            .table = try GroupTable.init(alloc, GroupTable.capFor(expect.groups)),
             .pairs = pairs,
         };
     }
@@ -251,7 +249,13 @@ pub const GroupMerge = struct {
             defer arena.deinit();
             const a = arena.allocator();
             for (c.m.globals.items[0].pairs) |*like| {
-                var u = try Pairs.initLike(a, like, std.heap.page_allocator);
+                var expect: usize = 0;
+                for (c.m.globals.items) |src| {
+                    for (src.pairs) |*s| if (s.j == like.j) {
+                        expect += s.count(p);
+                    };
+                }
+                var u = try Pairs.initLike(a, like, std.heap.page_allocator, expect);
                 defer u.deinit();
                 for (c.m.globals.items) |src| {
                     for (src.pairs) |*s| if (s.j == like.j) try u.absorb(0, s, p, null);

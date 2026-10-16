@@ -134,7 +134,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: u
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .shared_strs = in };
+    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .partial = true, .shared_strs = in };
     defer d.release();
 
     const enc: ?keytable.Encoder = if (ctx.keys.kinds) |k| try keytable.Encoder.init(ia, ctx.keys.idx, k) else null;
@@ -182,7 +182,11 @@ fn mergeOne(ctx: *MergeCtx, p: usize) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var table = try keytable.GroupTable.init(a, 16);
+    var rows: usize = 0;
+    for (ctx.items) |*item| for (item.pieces.items) |pc| {
+        rows += pc.starts[p + 1] - pc.starts[p];
+    };
+    var table = try keytable.GroupTable.init(a, keytable.GroupTable.capFor(rows));
     const nk = ctx.keys.idx.len;
     if (ctx.keys.kinds != null) {
         var st = keytable.FixedStore(keytable.NoPayload).init(a, nk, &no_payload);

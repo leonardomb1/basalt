@@ -527,14 +527,22 @@ fn pqMergeOne(ctx: *PqMergeCtx, p: usize) !void {
 /// is adopted as the result.
 fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p: usize) !void {
     var total: usize = 0;
+    var ndistinct: usize = 0;
     for (srcs) |*ls| {
-        if (ls.sets.len > p) total += ls.sets[p].len;
+        if (ls.sets.len > p) ndistinct = @max(ndistinct, ls.sets[p].pairs.len);
+    }
+    const npairs = try dst.arena.allocator().alloc(usize, ndistinct);
+    @memset(npairs, 0);
+    for (srcs) |*ls| {
+        if (ls.sets.len <= p) continue;
+        total += ls.sets[p].len;
+        for (ls.sets[p].pairs, npairs[0..ls.sets[p].pairs.len]) |*pp, *np| np.* += pp.count(p);
     }
     for (srcs) |*ls| {
         if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
         const st = &ls.sets[p];
         if (dst.merge == null) {
-            dst.merge = try op.Aggregate.GroupMerge.initFor(dst.arena.allocator(), st, aggs, total);
+            dst.merge = try op.Aggregate.GroupMerge.initFor(dst.arena.allocator(), st, aggs, .{ .groups = total, .pairs = npairs });
             dst.merge.?.own = true;
         }
         try dst.merge.?.addSet(st);

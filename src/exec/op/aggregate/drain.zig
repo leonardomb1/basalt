@@ -59,20 +59,14 @@ pub const part_shift = keytable.part_shift;
 pub const partOf = keytable.partOf;
 
 /// One partition's table and the store it indexes. A serial fold shares one store,
-/// so groups keep first-seen order; a lane's partitions each own theirs, and a
-/// lane's table is `bounded`: at `lane_table` entries it is cleared, not grown, and
-/// a key met again becomes a second record the merge combines. A lane then probes a
-/// table that stays cached instead of one of all its groups.
+/// so groups keep first-seen order; a lane's partitions each own theirs, indexed by
+/// a bounded table of `lane_table` entries (`GroupTable.initBounded`), so a lane
+/// probes a table that stays cached and the merge combines the records it repeats.
 pub fn FoldPart(comptime Store: type) type {
     return struct {
         table: GroupTable,
         store: *Store,
         alloc: std.mem.Allocator,
-        bounded: bool = false,
-
-        pub inline fn room(self: *@This()) void {
-            if (self.bounded and self.table.full()) self.table.clear();
-        }
     };
 }
 
@@ -87,7 +81,7 @@ pub fn foldParts(self: *Aggregate, comptime Store: type, layout: *const Layout) 
     errdefer for (parts[0..made]) |*p| p.table.deinit();
     if (self.part_state) |ps| {
         for (parts, ps) |*p, a| {
-            p.* = .{ .table = try GroupTable.init(tg, lane_table), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a, .bounded = true };
+            p.* = .{ .table = try GroupTable.initBounded(tg, lane_table), .store = try newIn(a, Store.init(a, self.by.len, layout)), .alloc = a };
             made += 1;
         }
     } else {
@@ -139,7 +133,7 @@ fn initPairs(self: *Aggregate, grouped: bool) !void {
     var i: usize = 0;
     for (self.aggs, 0..) |a, j| {
         if (!a.distinct) continue;
-        pairs[i] = try Pairs.init(self.state, j, a.arg_ty, grouped, fold_parts, allocs, self.table_gpa orelse self.gpa);
+        pairs[i] = try Pairs.init(self.state, j, a.arg_ty, grouped, fold_parts, allocs, self.table_gpa orelse self.gpa, self.part_state != null, 0);
         i += 1;
     }
     self.pairs = pairs;
@@ -262,7 +256,6 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
                 continue;
             }
             const at: u32 = @intCast(part.store.len);
-            part.room();
             const f = try part.table.getOrPut(h, key, part.store, at);
             const rec = if (f.found) part.store.at(f.slot) else blk: {
                 const nr = try part.store.push(h);
@@ -372,7 +365,6 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
                 break :blk part.store.at(sl);
             } else blk: {
                 const at: u32 = @intCast(part.store.len);
-                part.room();
                 const f = try part.table.getOrPut(h, probe, part.store, at);
                 if (f.found) break :blk part.store.at(f.slot);
                 const nr = try part.store.push(h);
