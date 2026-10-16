@@ -40,8 +40,11 @@ it, so including a library never runs anything. Its functions are namespaced
 under the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM st.orders($since)`;
 inside the library they call each other by their plain names, and outside it
 the plain names do not exist, so two libraries may each define `clean()`. An
-alias names one library (two files under one alias, or an alias that is also a
-connection's name, is an error). Without `AS`, a file is spliced whole, as above,
+alias is private to the file that writes it, as a Go import is: a library's own
+`@include 'util.sql' AS u` makes `u.f(...)` callable there and nowhere else, so
+two libraries may each use `u` for different files, and a file it includes
+without `AS` shares its namespace, as if written in it. One file may not give
+two includes the same alias, nor use a connection's name as one. Without `AS`, a file is spliced whole, as above,
 statements and all: the choice between running a file's statements and only
 taking its functions is written at each include.
 

@@ -100,12 +100,13 @@ pub const Options = struct {
     file: u16 = 0,
     aliases: []const []const u8 = &.{},
     namespace: ?[]const u8 = null,
+    own: []const []const u8 = &.{},
 };
 
 pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
     var toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     for (toks) |*t| t.file = opts.file;
-    if (opts.aliases.len > 0 or opts.namespace != null) toks = try qualify(arena, toks, opts.aliases, opts.namespace);
+    if (opts.aliases.len > 0 or opts.namespace != null) toks = try qualify(arena, toks, opts.aliases, opts.namespace, opts.own);
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
@@ -118,11 +119,15 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
 }
 
 /// Names functions across `@include ... AS alias`, on tokens, so a table function's
-/// body, kept as tokens and parsed again at each call, resolves alike: in a library
-/// included `AS ns`, each of its own functions, declared or called (`f(`), is
-/// `ns.f`; and `alias.f(` written to call into a library is joined to one name.
-fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8, namespace: ?[]const u8) Error![]Token {
+/// body, kept as tokens and parsed again at each call, resolves alike. A file in
+/// namespace `ns` (a library, or a file it includes without `AS`) has each of its
+/// functions, declared or called (`f(`), as `ns.f`, as are the plain names in
+/// `extra` its unaliased includes declared; and `alias.f(`, calling into a library
+/// this file includes, is joined to one name, `ns.alias.f`. An alias is private to
+/// the file that writes it, so two libraries may each use the same one.
+fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8, namespace: ?[]const u8, extra: []const []const u8) Error![]Token {
     var own = std.array_list.Managed([]const u8).init(arena);
+    try own.appendSlice(extra);
     if (namespace != null) for (toks, 0..) |t, i| {
         if (t.tag == .ident and eqlNoCase(t.text, "function") and i + 2 < toks.len and toks[i + 1].tag == .ident and toks[i + 2].tag == .lparen)
             try own.append(toks[i + 1].text);
@@ -134,7 +139,8 @@ fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8,
         const after_dot = i > 0 and toks[i - 1].tag == .dot;
         if (t.tag == .ident and !after_dot and i + 3 < toks.len and toks[i + 1].tag == .dot and toks[i + 2].tag == .ident and toks[i + 3].tag == .lparen) {
             if (containsNoCase(aliases, t.text)) {
-                t.text = try qualified(arena, t.text, toks[i + 2].text);
+                const lib = if (namespace) |ns| try qualified(arena, ns, t.text) else t.text;
+                t.text = try qualified(arena, lib, toks[i + 2].text);
                 t.end_line = toks[i + 2].end_line;
                 t.end_col = toks[i + 2].end_col;
                 try out.append(t);

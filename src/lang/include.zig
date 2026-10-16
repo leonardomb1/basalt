@@ -143,6 +143,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
     var seen = std.array_list.Managed(ast.Program).init(ctx.arena);
     var my_aliases = std.array_list.Managed([]const u8).init(ctx.arena);
+    var same_ns = std.array_list.Managed(ast.Program).init(ctx.arena);
     for (incs.items) |d| {
         const at = try locate(ctx, base, d, label);
         const resolved = at.shown;
@@ -152,18 +153,20 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             if (!std.mem.eql(u8, f.canon, canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
+        const sub_ns: ?[]const u8 = if (d.alias) |a| (if (namespace) |ns| try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ns, a }) else a) else namespace;
         if (d.alias) |a| {
             for (my_aliases.items) |m| if (std.ascii.eqlIgnoreCase(m, a))
                 return ctx.fail(label, d.line, d.col, "alias `{s}` names two includes here; give each its own", .{a});
             try my_aliases.append(a);
-            const gop = try ctx.aliases.getOrPut(try std.ascii.allocLowerString(ctx.arena, a));
+            const gop = try ctx.aliases.getOrPut(try std.ascii.allocLowerString(ctx.arena, sub_ns.?));
             if (gop.found_existing and !std.mem.eql(u8, gop.value_ptr.*, canon))
-                return ctx.fail(label, d.line, d.col, "alias `{s}` already names `{s}`; one alias, one library, so their functions cannot collide", .{ a, gop.value_ptr.* });
+                return ctx.fail(label, d.line, d.col, "`{s}` already names the library `{s}`, reached through another include; its functions would collide — choose another alias", .{ sub_ns.?, gop.value_ptr.* });
             gop.value_ptr.* = canon;
         }
-        const memo_key = try std.fmt.allocPrint(ctx.arena, "{s}\x00{s}", .{ canon, d.alias orelse "" });
+        const memo_key = try std.fmt.allocPrint(ctx.arena, "{s}\x00{s}", .{ canon, sub_ns orelse "" });
         if (canonical) if (ctx.memo.get(memo_key)) |cached| {
             try seen.append(cached);
+            if (d.alias == null) try same_ns.append(cached);
             continue;
         };
         const src = at.text orelse std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
@@ -178,7 +181,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
         const id = std.math.cast(u16, ctx.files.items.len) orelse
             return ctx.fail(label, d.line, d.col, "more than {d} @include files", .{std.math.maxInt(u16)});
         try ctx.files.append(resolved);
-        const sub = try load(ctx, src, resolved, at.base, id, d.alias);
+        const sub = try load(ctx, src, resolved, at.base, id, sub_ns);
         ctx.depth -= 1;
         _ = ctx.stack.pop();
         if (d.alias) |a| for (stmtsOf(sub)) |st| {
@@ -189,6 +192,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
         if (canonical) try ctx.memo.put(memo_key, sub);
         try subs.append(sub);
         try seen.append(sub);
+        if (d.alias == null) try same_ns.append(sub);
 
         const n = stmtsOf(sub).len;
         if (n > ctx.stmt_budget)
@@ -206,6 +210,12 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             if (st == .connection) try known.append(st.connection);
             if (st == .func and st.func.body == .table) try known_fns.append(st.func);
         };
+        var own = std.array_list.Managed([]const u8).init(ctx.arena);
+        if (namespace) |ns| for (same_ns.items) |sp| for (stmtsOf(sp)) |st| if (st == .func) {
+            const n = st.func.name;
+            if (n.len > ns.len + 1 and std.ascii.eqlIgnoreCase(n[0..ns.len], ns) and n[ns.len] == '.')
+                try own.append(n[ns.len + 1 ..]);
+        };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         main = parser.parseSourceOpts(ctx.arena, rest, &pdiag, .{
             .known_conns = known.items,
@@ -215,6 +225,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             .file = file,
             .aliases = my_aliases.items,
             .namespace = namespace,
+            .own = own.items,
         }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {
@@ -834,4 +845,27 @@ test "remote @include: refused until pinned, pinned by check, verified, its own 
     }
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'github.com/acme/kit/sql/lib.sql';\nSELECT 1 AS a;\n", "m.sql", base, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "names no version") != null);
+}
+
+test "@include AS: an alias is private to its file, so two libraries may both use one, and nothing leaks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(&tmp, "a/lib.sql", "@include 'util.sql' AS u;\n@include 'help.sql';\nCREATE FUNCTION f(x) AS u.g(h(x));\n");
+    try writeFile(&tmp, "a/util.sql", "CREATE FUNCTION g(x) AS x + 1;\n");
+    try writeFile(&tmp, "a/help.sql", "CREATE FUNCTION h(x) AS x * 10;\n");
+    try writeFile(&tmp, "b/lib.sql", "@include 'util.sql' AS u;\nCREATE FUNCTION f(x) AS u.g(x);\n");
+    try writeFile(&tmp, "b/util.sql", "CREATE FUNCTION g(x) AS x - 1;\n");
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    var diag: Diag = .{};
+    const prog = try loadProgram(a, "@include 'a/lib.sql' AS a;\n@include 'b/lib.sql' AS b;\nSELECT a.f(1) AS x, b.f(1) AS y;\n", "m.sql", base, &diag);
+    var names = std.array_list.Managed([]const u8).init(a);
+    for (prog.stmts) |s| if (s == .func) try names.append(s.func.name);
+    for ([_][]const u8{ "a.u.g", "a.h", "a.f", "b.u.g", "b.f" }, names.items) |w, g| try testing.expectEqualStrings(w, g);
+    try testing.expectEqual(@as(usize, 5), names.items.len);
+    try testing.expectEqualStrings("a.u.g", prog.stmts[3].func.body.expr.call.name);
+    try testing.expectEqualStrings("a.h", prog.stmts[3].func.body.expr.call.args[0].call.name);
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT u.g(1) AS x;\n", "m.sql", base, &diag));
 }
