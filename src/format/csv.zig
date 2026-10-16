@@ -18,12 +18,9 @@
 //! often really cp1252, whose 0x80–0x9F block holds curly quotes, dashes and the
 //! euro sign (its five undefined slots decode to U+FFFD).
 //!
-//! Compression is chosen by suffix, and the inner name picks the format: gzip and
-//! zstd through `std.http.Decompress`, the same path HTTP `Content-Encoding`
-//! uses. No `.xz`: std's decoder still has the old reader shape and the files are
-//! rare. Concatenated gzip members (`pigz`, `bgzip`, appends) read as one stream,
-//! where std stops after the first. `data.zip :: member.csv` names a member of an
-//! archive (spaces optional); a bare `.zip` must hold exactly one member.
+//! Where the bytes come from (a file, a URL, an object, SFTP, SMB, a zip member)
+//! and their gzip or zstd decoding is `stream.zig`'s; the reader parses its
+//! `Stream.reader` and moves to a folder's next file with `Stream.reopen`.
 //!
 //! Types are sniffed from the first `SAMPLE_ROWS` lines by the same rules in the
 //! serial and parallel readers, so both agree on a file's schema: int ⊂ float ⊂
@@ -54,17 +51,17 @@ const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
-const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
 const Part = @import("../store/part.zig").Part;
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const zipsrc = @import("compress/zip.zig");
+const stream = @import("stream.zig");
+const Stream = stream.Stream;
+const Gunzip = stream.Gunzip;
+const codecBuffer = stream.codecBuffer;
 const folder = @import("../connect/folder.zig");
 const deflate = @import("compress/deflate.zig");
 
 const BATCH_ROWS = 1024;
-const LINE_BUF = 64 * 1024;
+const LINE_BUF = stream.LINE_BUF;
 const MAX_RECORD = 64 * 1024 * 1024;
 
 pub const Encoding = enum {
@@ -105,50 +102,12 @@ const cp1252_high = [32]u21{
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
 };
 
-pub const Codec = enum { none, gzip, zstd };
-
-pub fn splitCodec(path: []const u8) struct { codec: Codec, rest: []const u8 } {
-    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
-    if (std.ascii.endsWithIgnoreCase(bare, ".gz")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 3] };
-    if (std.ascii.endsWithIgnoreCase(bare, ".gzip")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 5] };
-    if (std.ascii.endsWithIgnoreCase(bare, ".zst")) return .{ .codec = .zstd, .rest = bare[0 .. bare.len - 4] };
-    if (std.ascii.endsWithIgnoreCase(bare, ".zstd")) return .{ .codec = .zstd, .rest = bare[0 .. bare.len - 5] };
-    return .{ .codec = .none, .rest = bare };
-}
-
-pub const ArchiveRef = struct { archive: []const u8, member: ?[]const u8 };
-
-pub fn splitArchive(path: []const u8) ?ArchiveRef {
-    const at = std.mem.indexOf(u8, path, "::") orelse {
-        if (isArchive(path)) return .{ .archive = path, .member = null };
-        return null;
-    };
-    const archive = std.mem.trim(u8, path[0..at], " \t");
-    const member = std.mem.trim(u8, path[at + 2 ..], " \t");
-    if (archive.len == 0) return null;
-    return .{ .archive = archive, .member = if (member.len == 0) null else member };
-}
-
-pub fn isArchive(path: []const u8) bool {
-    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
-    return std.ascii.endsWithIgnoreCase(bare, ".zip");
-}
-
-pub fn dataName(path: []const u8) []const u8 {
-    const inner = if (splitArchive(path)) |a| (a.member orelse a.archive) else path;
-    return splitCodec(inner).rest;
-}
-
-/// Not `ContentEncoding.minBufferCapacity()`, which gives zstd only its window:
-/// `zstd.Decompress` needs the window plus `block_size_max`, or fails the stream
-/// with `OutputBufferUndersize`, as a real 2.6 MB `.csv.zst` did.
-fn codecBuffer(codec: Codec) usize {
-    return switch (codec) {
-        .none => 0,
-        .gzip => std.compress.flate.max_window_len,
-        .zstd => std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
-    };
-}
+pub const Codec = stream.Codec;
+pub const ArchiveRef = stream.ArchiveRef;
+pub const splitCodec = stream.splitCodec;
+pub const splitArchive = stream.splitArchive;
+pub const isArchive = stream.isArchive;
+pub const dataName = stream.dataName;
 
 pub const Dialect = struct {
     delim: u8 = ',',
@@ -235,44 +194,10 @@ fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const 
     return out.items;
 }
 
-const Gunzip = struct {
-    src: *std.Io.Reader,
-    dec: std.compress.flate.Decompress,
-    window: []u8,
-    interface: std.Io.Reader,
-
-    fn init(self: *Gunzip, src: *std.Io.Reader, window: []u8, buf: []u8) void {
-        self.* = .{
-            .src = src,
-            .dec = .init(src, .gzip, window),
-            .window = window,
-            .interface = .{ .vtable = &.{ .stream = streamFn }, .buffer = buf, .seek = 0, .end = 0 },
-        };
-    }
-
-    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Gunzip = @fieldParentPtr("interface", r);
-        while (true) {
-            return self.dec.reader.stream(w, limit) catch |e| switch (e) {
-                error.EndOfStream => {
-                    _ = self.src.peekByte() catch |e2| return switch (e2) {
-                        error.EndOfStream => error.EndOfStream,
-                        error.ReadFailed => error.ReadFailed,
-                    };
-                    self.dec = .init(self.src, .gzip, self.window);
-                    continue;
-                },
-                else => |x| return x,
-            };
-        }
-    }
-};
-
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     dialect: Dialect = .{},
-    backend: Backend,
-    read_buf: [LINE_BUF]u8 = undefined,
+    stream: *Stream,
     rdr: *std.Io.Reader = undefined,
     schema: types.Schema,
     pending: []const Pending = &.{},
@@ -284,37 +209,12 @@ pub const CsvReader = struct {
     join_buf: std.array_list.Managed(u8) = undefined,
     long_buf: std.array_list.Managed(u8) = undefined,
     path: []const u8 = "",
-    codec: Codec = .none,
     eol: u8 = '\n',
     line_no: u64 = 0,
     rec_line: u64 = 0,
-    codec_state: std.http.Decompress = undefined,
-    gunzip: Gunzip = undefined,
-    codec_bufs: ?CodecBufs = null,
     slot: ?[]const i16 = null,
 
-    const CodecBufs = struct { window: []u8, buf: []u8 };
     const Pending = struct { text: []const u8, line_no: u64, path: []const u8 };
-
-    const Backend = union(enum) {
-        file: FileBackend,
-        http: *HttpFetch,
-        member: *zipsrc.Member,
-        sftp: *sftp.Stream,
-        smb: *smb.Stream,
-    };
-    const FileBackend = struct {
-        file: std.fs.File,
-        fr: std.fs.File.Reader,
-    };
-    const HttpFetch = struct {
-        client: std.http.Client,
-        req: std.http.Client.Request,
-        response: std.http.Client.Response,
-        decompress: std.http.Decompress = undefined,
-        redirect_buf: [8 * 1024]u8 = undefined,
-        transfer_buf: [LINE_BUF]u8 = undefined,
-    };
 
     pub fn project(self: *CsvReader, names: []const []const u8) !void {
         const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
@@ -322,44 +222,22 @@ pub const CsvReader = struct {
         self.schema = p.schema;
     }
 
-    /// Starts reading `path` from `self.rdr`: its codec, its line ending and line count.
-    fn begin(self: *CsvReader, path: []const u8, name: []const u8) !void {
+    /// Starts reading `path` from its newly opened stream: its line ending and line count.
+    fn begin(self: *CsvReader, path: []const u8) void {
         self.path = path;
         self.line_no = 0;
-        self.codec = splitCodec(name).codec;
-        try self.decodeAs(self.codec);
+        self.rdr = self.stream.reader;
         self.eol = sniffEol(self.rdr);
     }
 
-    fn decodeAs(self: *CsvReader, codec: Codec) !void {
-        switch (codec) {
-            .none => {},
-            .gzip => {
-                const b = self.codec_bufs orelse blk: {
-                    const nb = CodecBufs{ .window = try self.arena.alloc(u8, codecBuffer(.gzip)), .buf = try self.arena.alloc(u8, LINE_BUF) };
-                    self.codec_bufs = nb;
-                    break :blk nb;
-                };
-                self.gunzip.init(self.rdr, b.window, b.buf);
-                self.rdr = &self.gunzip.interface;
-            },
-            .zstd => {
-                const cbuf = try self.arena.alloc(u8, codecBuffer(.zstd));
-                self.rdr = std.http.Decompress.init(&self.codec_state, self.rdr, cbuf, .zstd);
-            },
-        }
-    }
-
-    pub fn isUrl(path: []const u8) bool {
-        return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or objstore.isRemote(path);
-    }
+    pub const isUrl = stream.isUrl;
 
     pub fn open(arena: std.mem.Allocator, path: []const u8, dialect: Dialect) !*CsvReader {
         const self = try arena.create(CsvReader);
         self.* = .{
             .arena = arena,
             .dialect = dialect,
-            .backend = undefined,
+            .stream = undefined,
             .schema = undefined,
             .done = false,
             .join_buf = std.array_list.Managed(u8).init(arena),
@@ -381,7 +259,7 @@ pub const CsvReader = struct {
         self.* = .{
             .arena = arena,
             .dialect = dialect,
-            .backend = undefined,
+            .stream = undefined,
             .schema = undefined,
             .done = false,
             .join_buf = std.array_list.Managed(u8).init(arena),
@@ -394,30 +272,8 @@ pub const CsvReader = struct {
     fn openFirst(self: *CsvReader, first: []const u8) !*CsvReader {
         const arena = self.arena;
 
-        if (splitArchive(first)) |ar| {
-            const m = try zipsrc.openMember(arena, ar.archive, ar.member);
-            self.backend = .{ .member = m };
-            self.rdr = m.reader;
-        } else if (sftp.isUrl(first)) {
-            const st = try sftp.Stream.open(arena, first);
-            self.backend = .{ .sftp = st };
-            self.rdr = &st.interface;
-        } else if (smb.isUrl(first)) {
-            const st = try smb.Stream.open(arena, first);
-            self.backend = .{ .smb = st };
-            self.rdr = &st.interface;
-        } else if (isUrl(first)) {
-            try self.openHttp(first);
-        } else {
-            self.backend = .{ .file = .{ .file = try std.fs.cwd().openFile(first, .{}), .fr = undefined } };
-            self.backend.file.fr = self.backend.file.file.reader(&self.read_buf);
-            self.rdr = &self.backend.file.fr.interface;
-        }
-
-        try self.begin(first, switch (self.backend) {
-            .member => |m| m.name,
-            else => first,
-        });
+        self.stream = try Stream.open(arena, first);
+        self.begin(first);
 
         const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
         self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
@@ -493,76 +349,13 @@ pub const CsvReader = struct {
         const url = self.rest_urls[0];
         self.rest_urls = self.rest_urls[1..];
 
-        switch (self.backend) {
-            .http => |hf| {
-                try self.openHttp(url);
-                hf.req.deinit();
-                hf.client.deinit();
-            },
-            .sftp => |st| {
-                st.close();
-                const st2 = try sftp.Stream.open(self.arena, url);
-                self.backend = .{ .sftp = st2 };
-                self.rdr = &st2.interface;
-                try self.nextHeader(url);
-                return true;
-            },
-            .smb => |st| {
-                st.close();
-                const st2 = try smb.Stream.open(self.arena, url);
-                self.backend = .{ .smb = st2 };
-                self.rdr = &st2.interface;
-                try self.nextHeader(url);
-                return true;
-            },
-            .file => |*f| {
-                f.file.close();
-                f.file = try std.fs.cwd().openFile(url, .{});
-                f.fr = f.file.reader(&self.read_buf);
-                self.rdr = &f.fr.interface;
-                try self.nextHeader(url);
-                return true;
-            },
-            .member => {},
-        }
+        try self.stream.reopen(url);
         try self.nextHeader(url);
         return true;
     }
 
-    /// GETs `url`, signed when it names an object store, and reads its body decoded
-    /// per its Content-Encoding. A failed TLS handshake is retried once after
-    /// repairing the CA bundle for that host.
-    fn openHttp(self: *CsvReader, url: []const u8) !void {
-        const arena = self.arena;
-        const hf = try arena.create(HttpFetch);
-        hf.* = .{ .client = http_client.initClient(arena), .req = undefined, .response = undefined };
-        errdefer hf.client.deinit();
-        var req_url = url;
-        var extra: []const std.http.Header = &.{};
-        if (objstore.isUrl(url)) {
-            const obj = try objstore.parse(arena, url);
-            req_url = obj.url;
-            extra = try obj.getHeaders(arena);
-        }
-        const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
-        var prng = objstore.jitterPrng();
-        var opening: HttpOpen = .{ .arena = arena, .hf = hf, .uri = uri, .extra = extra };
-        try objstore.retry(.{ .rand = prng.random() }, &opening, HttpOpen.attempt);
-        errdefer hf.req.deinit();
-        const ce = hf.response.head.content_encoding;
-        if (ce == .compress) return error.UnsupportedCompressionMethod;
-        const win = switch (ce) {
-            .zstd => codecBuffer(.zstd),
-            .gzip, .deflate => codecBuffer(.gzip),
-            .compress, .identity => 0,
-        };
-        const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
-        self.rdr = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
-        self.backend = .{ .http = hf };
-    }
-
     fn nextHeader(self: *CsvReader, url: []const u8) !void {
-        try self.begin(url, url);
+        self.begin(url);
         const hdr = (try self.readLine()) orelse return error.EmptyCsv;
         const got = std.mem.trim(u8, stripBom(hdr), " \t\r");
         if (!std.mem.eql(u8, got, self.header_line))
@@ -570,57 +363,11 @@ pub const CsvReader = struct {
     }
 
     pub fn close(self: *CsvReader) void {
-        switch (self.backend) {
-            .file => |f| f.file.close(),
-            .http => |hf| {
-                hf.req.deinit();
-                hf.client.deinit();
-            },
-            .member => |m| m.close(),
-            .sftp => |st| st.close(),
-            .smb => |st| st.close(),
-        }
+        self.stream.close();
     }
 
     pub fn source(self: *CsvReader) driver.Source {
         return .{ .ptr = self, .vtable = &source_vtable };
-    }
-
-    /// One try at a GET's response head, retried by `objstore.retry` until a 200
-    /// arrives; a failed try drops its connection, so the next one dials afresh.
-    const HttpOpen = struct {
-        arena: std.mem.Allocator,
-        hf: *HttpFetch,
-        uri: std.Uri,
-        extra: []const std.http.Header,
-
-        fn attempt(self: *HttpOpen) !objstore.Verdict {
-            const hf = self.hf;
-            startHttp(hf, self.uri, self.extra) catch |e| switch (e) {
-                error.TlsInitializationFailed => {
-                    const h = http_client.uriHost(self.uri) orelse return e;
-                    if (!http_client.repairBundle(self.arena, &hf.client.ca_bundle, h, self.uri.port orelse 443)) return e;
-                    hf.client.next_https_rescan_certs = false;
-                    try startHttp(hf, self.uri, self.extra);
-                },
-                else => return e,
-            };
-            const code = @intFromEnum(hf.response.head.status);
-            if (code == 200) return .done;
-            if (hf.req.connection) |c| c.closing = true;
-            hf.req.deinit();
-            return .{ .failed = .{ .code = code, .err = http_client.statusError(code) } };
-        }
-    };
-
-    fn startHttp(hf: *HttpFetch, uri: std.Uri, extra: []const std.http.Header) !void {
-        hf.req = try hf.client.request(.GET, uri, .{ .extra_headers = extra });
-        errdefer {
-            if (hf.req.connection) |c| c.closing = true;
-            hf.req.deinit();
-        }
-        try hf.req.sendBodiless();
-        hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
 
     /// One record, which may span physical lines. Balanced quotes take the zero-copy
@@ -679,8 +426,8 @@ pub const CsvReader = struct {
     }
 
     fn readFailed(self: *CsvReader) anyerror {
-        if (self.codec == .none) return error.ReadFailed;
-        return explainf(error.ReadFailed, "`{s}`: the {s} stream is truncated or corrupt (it broke after line {d})", .{ self.path, @tagName(self.codec), self.line_no });
+        if (self.stream.codec == .none) return error.ReadFailed;
+        return explainf(error.ReadFailed, "`{s}`: the {s} stream is truncated or corrupt (it broke after line {d})", .{ self.path, @tagName(self.stream.codec), self.line_no });
     }
 };
 
@@ -2194,28 +1941,6 @@ test "CsvSliceReader over a MappedCsv chunk parses only its rows" {
         }
         try std.testing.expectEqualSlices(i64, want[i], ids.items);
     }
-}
-
-test "splitCodec / splitArchive / dataName walk the container chain" {
-    try std.testing.expectEqual(Codec.gzip, splitCodec("a/orders.csv.gz").codec);
-    try std.testing.expectEqualStrings("a/orders.csv", splitCodec("a/orders.csv.gz").rest);
-    try std.testing.expectEqual(Codec.zstd, splitCodec("x.csv.ZST").codec);
-    try std.testing.expectEqual(Codec.none, splitCodec("x.csv").codec);
-    try std.testing.expectEqual(Codec.gzip, splitCodec("https://h/x.csv.gz?sig=1").codec);
-
-    try std.testing.expect(splitArchive("plain.csv") == null);
-    const one = splitArchive("inf.zip").?;
-    try std.testing.expectEqualStrings("inf.zip", one.archive);
-    try std.testing.expect(one.member == null);
-    const two = splitArchive("d/inf.zip :: inner/data.csv").?;
-    try std.testing.expectEqualStrings("d/inf.zip", two.archive);
-    try std.testing.expectEqualStrings("inner/data.csv", two.member.?);
-    try std.testing.expectEqualStrings("a.csv", splitArchive("i.zip::a.csv").?.member.?);
-
-    try std.testing.expectEqualStrings("inner/data.csv", dataName("d/inf.zip :: inner/data.csv"));
-    try std.testing.expectEqualStrings("rows.csv", dataName("rows.csv.gz"));
-    try std.testing.expectEqualStrings("m.csv", dataName("a.zip :: m.csv.gz"));
-    try std.testing.expect(splitArchive("s3://bucket/key.csv") == null);
 }
 
 const fx_gz = @embedFile("testdata/rows.csv.gz");
