@@ -1,7 +1,9 @@
 # User functions
 
 `CREATE FUNCTION` names an expression, a block of statements or a query, so a
-script — or a library it `@include`s — can reuse it.
+script — or a library it `@include`s — can reuse it. A library included `AS st`
+exposes its functions as `st.name` ([Scripts](scripts.md)). A table function's
+body may call scalar functions, declared before or after it.
 
 ## Scalar and statement functions
 

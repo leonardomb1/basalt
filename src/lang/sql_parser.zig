@@ -98,11 +98,14 @@ pub const Options = struct {
     known_tables: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
     file: u16 = 0,
+    aliases: []const []const u8 = &.{},
+    namespace: ?[]const u8 = null,
 };
 
 pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
-    const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
+    var toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     for (toks) |*t| t.file = opts.file;
+    if (opts.aliases.len > 0 or opts.namespace != null) toks = try qualify(arena, toks, opts.aliases, opts.namespace);
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
         if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
@@ -112,6 +115,50 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     p.known_tables = opts.known_tables;
     p.errors = opts.errors;
     return p.parseProgram();
+}
+
+/// Names functions across `@include ... AS alias`, on tokens, so a table function's
+/// body, kept as tokens and parsed again at each call, resolves alike: in a library
+/// included `AS ns`, each of its own functions, declared or called (`f(`), is
+/// `ns.f`; and `alias.f(` written to call into a library is joined to one name.
+fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8, namespace: ?[]const u8) Error![]Token {
+    var own = std.array_list.Managed([]const u8).init(arena);
+    if (namespace != null) for (toks, 0..) |t, i| {
+        if (t.tag == .ident and eqlNoCase(t.text, "function") and i + 2 < toks.len and toks[i + 1].tag == .ident and toks[i + 2].tag == .lparen)
+            try own.append(toks[i + 1].text);
+    };
+    var out = std.array_list.Managed(Token).init(arena);
+    var i: usize = 0;
+    while (i < toks.len) : (i += 1) {
+        var t = toks[i];
+        const after_dot = i > 0 and toks[i - 1].tag == .dot;
+        if (t.tag == .ident and !after_dot and i + 3 < toks.len and toks[i + 1].tag == .dot and toks[i + 2].tag == .ident and toks[i + 3].tag == .lparen) {
+            if (containsNoCase(aliases, t.text)) {
+                t.text = try qualified(arena, t.text, toks[i + 2].text);
+                t.end_line = toks[i + 2].end_line;
+                t.end_col = toks[i + 2].end_col;
+                try out.append(t);
+                i += 2;
+                continue;
+            }
+        }
+        if (namespace) |ns| if (t.tag == .ident and !after_dot and i + 1 < toks.len and toks[i + 1].tag == .lparen and containsNoCase(own.items, t.text)) {
+            t.text = try qualified(arena, ns, t.text);
+        };
+        try out.append(t);
+    }
+    return out.items;
+}
+
+fn qualified(arena: std.mem.Allocator, ns: []const u8, name: []const u8) Error![]const u8 {
+    const s = std.fmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
+    for (s) |*c| c.* = std.ascii.toLower(c.*);
+    return s;
+}
+
+fn containsNoCase(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (eqlNoCase(x, s)) return true;
+    return false;
 }
 
 /// `text` as a message can carry it: bytes that are not UTF-8 become `\xNN`, so a

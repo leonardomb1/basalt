@@ -69,19 +69,7 @@ pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, args: [
 /// `expandProgramWith`, with `at` set on failure to where the problem is: the failing
 /// call, else the statement or declaration holding it.
 pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
-    var fns = std.StringHashMap(ast.FnDecl).init(arena);
-    for (program.stmts) |s| if (s == .func) {
-        at.* = s.func.pos;
-        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null) {
-            msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
-            return error.ExpandFailed;
-        }
-        if (!s.func.replace and fns.contains(s.func.name)) {
-            msg.* = std.fmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
-            return error.ExpandFailed;
-        }
-        try fns.put(s.func.name, s.func);
-    };
+    var fns = try collectFns(arena, program, msg, at);
 
     at.* = null;
     var json = std.StringHashMap(?std.json.Value).init(arena);
@@ -112,6 +100,35 @@ pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []c
         try out.append(try expandStmt(&cx, s));
     }
     return .{ .stmts = try out.toOwnedSlice() };
+}
+
+/// The program's `CREATE FUNCTION`s by name, a redefinition of a builtin, or of a
+/// name without `OR REPLACE`, refused.
+fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, at: *?ast.Pos) Error!std.StringHashMap(ast.FnDecl) {
+    var fns = std.StringHashMap(ast.FnDecl).init(arena);
+    for (program.stmts) |s| if (s == .func) {
+        at.* = s.func.pos;
+        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null) {
+            msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
+            return error.ExpandFailed;
+        }
+        if (!s.func.replace and fns.contains(s.func.name)) {
+            msg.* = std.fmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
+            return error.ExpandFailed;
+        }
+        try fns.put(s.func.name, s.func);
+    };
+    return fns;
+}
+
+/// A table function's body as declared, with the scalar functions it calls inlined,
+/// so `check` types it as each call, expanded, will be.
+pub fn expandTableCheck(arena: std.mem.Allocator, program: ast.Program, tc: ast.TableCheck, msg: *[]const u8, at: *?ast.Pos) Error!ast.TableCheck {
+    var fns = try collectFns(arena, program, msg, at);
+    var json = std.StringHashMap(?std.json.Value).init(arena);
+    at.* = null;
+    var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg, .at = at };
+    return .{ .bindings = try expandBlock(&cx, tc.bindings), .pipeline = try expandPipeline(&cx, tc.pipeline) };
 }
 
 fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {

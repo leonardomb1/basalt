@@ -157,7 +157,7 @@ fn usage(w: anytype) !void {
         \\usage:
         \\  basalt run   <script>|-|-c <script> [-p key=value ...] [-j N]
         \\               run a pipeline
-        \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2]
+        \\  basalt check <script>|-|-c <script> [--format json] [--known t1,t2] [--pin]
         \\               parse and validate without running, reporting every problem;
         \\               `EXPLAIN` prints the plan; json: an array of diagnostics with
         \\               their ranges; --known: tables the script reads, undeclared

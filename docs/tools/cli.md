@@ -2,7 +2,7 @@
 
 ```text
 basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE] [--trace FILE]
-basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2]
+basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2] [--pin]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
 basalt repl
 basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
@@ -123,7 +123,10 @@ or `CREATE FUNCTION` body, whose own `;`s make the statement's end unknowable,
 so the problems after a broken block go unreported until it is fixed. `--known
 enrich,daily` names tables the script reads but does not declare — a notebook's
 other cells — so `FROM enrich` is checked as a table whose columns are unknown
-rather than failing as an unknown source. `basalt complete --pos N` prints what
+rather than failing as an unknown source. `--pin` fetches each remote `@include`
+not yet pinned and records its SHA-256 in `basalt.sum` beside the script
+([Scripts](../language/scripts.md)); without it an unpinned one is an error, as it
+is for `run`. `basalt complete --pos N` prints what
 Tab would offer at byte offset `N` (the end, without `--pos`; `--utf16` counts
 `N` and the answer in UTF-16 units):
 `{"start":S,"end":N,"items":[{"text":…,"kind":…,"detail":…}]}`, the items

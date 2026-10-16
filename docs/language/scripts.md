@@ -4,6 +4,8 @@ A script is a sequence of `;`-terminated statements:
 
 ```sql ignore
 @include 'lib.sql';               -- top of file only; C-style, relative to this file
+@include 'lib/stats.sql' AS st;   -- a library: its functions as st.f(...)
+@include 'github.com/org/repo/sql/kit.sql@v1.2.0' AS kit;  -- remote, pinned in basalt.sum
 PARAM ...;                        -- CLI inputs
 LET name = <expr>;                -- sealed plan-time constant
 THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
@@ -30,6 +32,35 @@ and `dispersion.sql` both include `stats.sql` and a script includes both,
 twice — and each library still sees what it declares. That holds for every
 statement in it, so an included file's `LOAD INTO` runs once however many paths
 reach it.
+
+`@include 'lib/stats.sql' AS st;` includes a **library**: it may only declare
+functions — scalar, statement and table — and any other statement in it (a
+`LOAD INTO`, `SELECT`, `PARAM`, `LET`, connection or `CALL`) is an error naming
+it, so including a library never runs anything. Its functions are namespaced
+under the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM st.orders($since)`;
+inside the library they call each other by their plain names, and outside it
+the plain names do not exist, so two libraries may each define `clean()`. An
+alias names one library (two files under one alias, or an alias that is also a
+connection's name, is an error). Without `AS`, a file is spliced whole, as above,
+statements and all: the choice between running a file's statements and only
+taking its functions is written at each include.
+
+A path written as a repository — `github.com/owner/repo/path/file.sql@ref`,
+`gitlab.com/group/repo/path/file.sql@ref`, or `host/group/repo.git/path/file.sql@ref`
+for a self-hosted GitLab — is a **remote include**, fetched over HTTPS (no `git`
+needed; `GITHUB_TOKEN` or `GITLAB_TOKEN` in the environment reads a private
+repository). The `@ref` (a tag, branch or commit) is required. Each remote file
+is pinned by its SHA-256 in `basalt.sum` beside the root script, as Go's `go.sum`
+pins a module, and is refused until pinned: `basalt check --pin script.sql`
+fetches what is not pinned and records it. A file whose content no longer
+matches its pin — a moved tag or branch, a host serving something else — is
+refused, never run. Pinned files are kept in a cache (`$BASALT_CACHE`, else
+`$XDG_CACHE_HOME/basalt`, else `~/.cache/basalt`) and read from it with no
+network, so a scheduled run does not depend on the host. A remote file's own
+includes resolve inside the same repository and ref and cannot climb out of it
+or name a local path. A remote file may be included with or without `AS`, with
+the same meaning as a local one: commit `basalt.sum` with the script, so what
+runs is what was reviewed.
 
 `THROW <message> [WHEN <condition>];` asserts what the engine cannot infer.
 Both operands are ordinary expressions over `$params` and `$lets` ([Expressions](../reference/expressions.md)), so they

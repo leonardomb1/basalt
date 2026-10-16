@@ -927,7 +927,14 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
-    for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| try ctx.checkTableFn(s.func, tc);
+    for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| {
+        var tc_at: ?ast.Pos = null;
+        const etc = expand.expandTableCheck(arena, raw_program, tc, &expand_msg, &tc_at) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ExpandFailed => return failPos(diag, tc_at orelse s.func.pos, "{s}", .{expand_msg}),
+        };
+        try ctx.checkTableFn(s.func, etc);
+    };
 
     return .{ .outputs = try out_plans.toOwnedSlice() };
 }

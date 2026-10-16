@@ -5,6 +5,8 @@ const ErrOut = @import("args.zig").ErrOut;
 const analyze = @import("../runtime/analyze.zig");
 const ast = @import("../lang/ast.zig");
 const include = @import("../lang/include.zig");
+const remote = @import("../lang/remote.zig");
+const include_fetch = @import("../net/include_fetch.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
@@ -22,6 +24,7 @@ pub const CheckOpts = struct {
     known: []const analyze.KnownTable = &.{},
     declarations_only: bool = false,
     strict_params: bool = false,
+    remote: ?*remote.Resolver = null,
 };
 
 /// Every problem in `text`, in script order: each statement that does not parse
@@ -34,7 +37,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
     for (opts.known) |k| try names.append(k.name);
     var perrs = std.array_list.Managed(parser.Diagnostic).init(a);
     var idiag: include.Diag = .{};
-    const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .known_tables = names.items, .errors = &perrs }) catch |e| switch (e) {
+    const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .parse = .{ .known_tables = names.items, .errors = &perrs }, .remote = opts.remote }) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ParseFailed => {
             const p = idiag.parse;
@@ -82,8 +85,13 @@ pub fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var overrides = std.array_list.Managed(analyze.ParamOverride).init(a);
     var known = std.array_list.Managed(analyze.KnownTable).init(a);
     var json = false;
+    var pin = false;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--pin")) {
+            pin = true;
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--command")) {
             i += 1;
             continue;
@@ -132,7 +140,15 @@ pub fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         return 2;
     }
     const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
-    const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items, .strict_params = true });
+    var resolver = try remote.Resolver.init(a, src.dir, include_fetch.fetch(), pin);
+    const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items, .strict_params = true, .remote = &resolver });
+    if (pin) {
+        resolver.save() catch |e| {
+            try stderr.print("error: cannot write `{s}`: {s}\n", .{ resolver.sum_path, @errorName(e) });
+            return 1;
+        };
+        for (resolver.added.items) |k| try stderr.print("pinned {s} sha256:{s} in {s}\n", .{ k, resolver.pins.get(k).?, resolver.sum_path });
+    }
     if (json) try stdout.writeAll("[");
     for (issues, 0..) |is, k| {
         if (json and k > 0) try stdout.writeByte(',');
