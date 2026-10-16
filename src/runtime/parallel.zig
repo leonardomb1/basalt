@@ -20,6 +20,7 @@
 //! the last write error.
 
 const std = @import("std");
+const trace = @import("../exec/trace.zig");
 const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
@@ -277,6 +278,8 @@ pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, u
                 if (ctx.queue.failed.load(.seq_cst)) return;
                 const i = ctx.queue.next.fetchAdd(1, .seq_cst);
                 if (i >= ctx.queue.nitems) break;
+                const span = trace.begin(comptime trace.short(Ctx), i);
+                defer span.end();
                 workOne(ctx, i) catch |e| {
                     ctx.queue.fail(e);
                     return;

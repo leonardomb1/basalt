@@ -8,6 +8,7 @@
 //! others. `f` cannot fail: allocate before, report through `ctx` after.
 
 const std = @import("std");
+const trace = @import("trace.zig");
 
 pub const max_workers = 64;
 
@@ -35,6 +36,8 @@ pub fn each(threads: usize, count: usize, ctx: anytype, comptime f: fn (@TypeOf(
             while (true) {
                 const i = nx.fetchAdd(1, .monotonic);
                 if (i >= n) return;
+                const span = trace.begin(comptime trace.short(@TypeOf(c)), i);
+                defer span.end();
                 f(c, i);
             }
         }

@@ -16,6 +16,7 @@ const planErr = @import("../env.zig").planErr;
 const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
+const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const LaneMem = @import("../parallel.zig").LaneMem;
@@ -138,7 +139,9 @@ const ItemSource = struct {
 /// A lane: items taken from the queue in turn, each row group read through the lane's
 /// one open reader (reopening a file per row group re-parses its footer), its kept
 /// rows filed under the item's index so the index sees them in file order.
-fn buildLane(ctx: *BuildCtx, _: usize) void {
+fn buildLane(ctx: *BuildCtx, lane_idx: usize) void {
+    const span = trace.begin("join build lane", lane_idx);
+    defer span.end();
     buildLaneRun(ctx) catch |e| ctx.queue.fail(e);
 }
 

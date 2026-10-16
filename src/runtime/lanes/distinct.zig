@@ -29,6 +29,7 @@ const pqdecode = @import("../../format/parquet/read.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 
@@ -117,6 +118,8 @@ fn distinctWorker(ctx: *DistinctCtx, lane_idx: usize) void {
         if (i >= ctx.queue.nitems) return;
         _ = lane.mem.work.reset(.retain_capacity);
         _ = lane.mem.batch.reset(.retain_capacity);
+        const span = trace.begin("distinct item", i);
+        defer span.end();
         distinctWorkOne(ctx, &lane.mem, in, i) catch |e| return ctx.queue.fail(e);
     }
 }

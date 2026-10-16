@@ -14,8 +14,39 @@ const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
 const types = @import("../lang/types.zig");
 const std = @import("std");
+const stats = @import("build_options").stats;
 
 pub const prefetch_ahead = 8;
+
+/// What a `-Dstats` build counts, per table and then in all: lookups, slots probed
+/// past the first, salt matches on another key, inserts, rehashes and the entries
+/// they moved, and items laid out in partition runs.
+pub const Count = enum { lookups, steps, false_hits, inserts, rehashes, moved, scattered };
+
+const ncounts = if (stats) @typeInfo(Count).@"enum".fields.len else 0;
+const Counters = [ncounts]std.atomic.Value(u64);
+var totals: Counters = [_]std.atomic.Value(u64){.init(0)} ** ncounts;
+
+inline fn tally(counters: *const Counters, comptime c: Count, n: u64) void {
+    if (stats) _ = @constCast(&counters[@intFromEnum(c)]).fetchAdd(n, .monotonic);
+}
+
+/// The totals of every table freed so far, one line, in a `-Dstats` build.
+pub fn report(w: *std.Io.Writer) !void {
+    if (!stats) return;
+    var v: [ncounts]u64 = undefined;
+    for (&v, &totals) |*x, *t| x.* = t.load(.monotonic);
+    const lookups: f64 = @floatFromInt(@max(v[@intFromEnum(Count.lookups)], 1));
+    try w.print("key tables: {d} lookups, {d:.3} extra slots and {d:.3} false salt hits a lookup, {d} inserts, {d} rehashes moving {d} entries, {d} items laid out in runs\n", .{
+        v[@intFromEnum(Count.lookups)],
+        @as(f64, @floatFromInt(v[@intFromEnum(Count.steps)])) / lookups,
+        @as(f64, @floatFromInt(v[@intFromEnum(Count.false_hits)])) / lookups,
+        v[@intFromEnum(Count.inserts)],
+        v[@intFromEnum(Count.rehashes)],
+        v[@intFromEnum(Count.moved)],
+        v[@intFromEnum(Count.scattered)],
+    });
+}
 
 /// A direct array for one small-range integer key: a key `base + i` finds its record
 /// at `recs[i]` with no hashing. `base` is the smallest key of the first batch, so a
@@ -117,51 +148,68 @@ pub inline fn partOf(h: u64) usize {
 /// A batch's items laid out by radix partition, input order within one: partition
 /// `p` holds `starts[p]` to `starts[p + 1]`, each item's row, hash, key words and null
 /// mask copied there, so a walk over a partition reads all of them in order, not
-/// through an index of row numbers. Item `i` is row `rows_in[i]` (row `i` when
-/// `rows_in` is empty), in partition `pof[i]`; the hashes, keys and masks given are
-/// by row, `nk` key words a row, and no masks means no NULL.
+/// through an index of row numbers. Item `i` is row `rows_in[i]` (row `i`, and no row
+/// kept, when `rows_in` is empty), in partition `pof[i]`; the hashes, keys and masks
+/// given are by row, `nk` key words a row, and no masks means no NULL. With one
+/// partition nothing is copied: the accessors read the given arrays through the rows.
 pub fn Runs(comptime K: type) type {
     return struct {
         starts: []u32,
-        rows: []u32,
-        hashes: []u64,
-        keys: []K,
-        masks: []u64,
+        rows: []const u32,
+        hashes: []const u64,
+        keys: []const K,
+        masks: []const u64,
         nk: usize,
+        laid: bool,
 
         pub fn init(a: std.mem.Allocator, nparts: usize, nk: usize, pof: []const u8, rows_in: []const u32, hashes_in: []const u64, keys_in: []const K, masks_in: []const u64) !@This() {
             const m = pof.len;
-            const self = @This(){
-                .starts = try a.alloc(u32, nparts + 1),
-                .rows = try a.alloc(u32, m),
-                .hashes = try a.alloc(u64, m),
-                .keys = try a.alloc(K, m * nk),
-                .masks = try a.alloc(u64, if (masks_in.len == 0) 0 else m),
-                .nk = nk,
-            };
-            @memset(self.starts, 0);
-            for (pof) |p| self.starts[p + 1] += 1;
-            for (1..self.starts.len) |ci| self.starts[ci] += self.starts[ci - 1];
+            const starts = try a.alloc(u32, nparts + 1);
+            if (nparts == 1) {
+                starts[0] = 0;
+                starts[1] = @intCast(m);
+                return .{ .starts = starts, .rows = rows_in, .hashes = hashes_in, .keys = keys_in, .masks = masks_in, .nk = nk, .laid = false };
+            }
+            const rows = try a.alloc(u32, if (rows_in.len == 0) 0 else m);
+            const hashes = try a.alloc(u64, m);
+            const keys = try a.alloc(K, m * nk);
+            const masks = try a.alloc(u64, if (masks_in.len == 0) 0 else m);
+            @memset(starts, 0);
+            for (pof) |p| starts[p + 1] += 1;
+            for (1..starts.len) |ci| starts[ci] += starts[ci - 1];
+            tally(&totals, .scattered, m);
             var at: [parts]u32 = undefined;
-            @memcpy(at[0..nparts], self.starts[0..nparts]);
+            @memcpy(at[0..nparts], starts[0..nparts]);
             for (pof, 0..) |p, i| {
                 const d = at[p];
                 at[p] += 1;
                 const r = if (rows_in.len == 0) i else rows_in[i];
-                self.rows[d] = @intCast(r);
-                self.hashes[d] = hashes_in[r];
-                for (0..nk) |w| self.keys[d * nk + w] = keys_in[r * nk + w];
-                if (self.masks.len > 0) self.masks[d] = masks_in[r];
+                if (rows.len > 0) rows[d] = @intCast(r);
+                hashes[d] = hashes_in[r];
+                for (0..nk) |w| keys[d * nk + w] = keys_in[r * nk + w];
+                if (masks.len > 0) masks[d] = masks_in[r];
             }
-            return self;
+            return .{ .starts = starts, .rows = rows, .hashes = hashes, .keys = keys, .masks = masks, .nk = nk, .laid = true };
+        }
+
+        pub inline fn row(self: @This(), d: usize) usize {
+            return if (self.rows.len == 0) d else self.rows[d];
+        }
+
+        inline fn slot(self: @This(), d: usize) usize {
+            return if (self.laid) d else self.row(d);
+        }
+
+        pub inline fn hash(self: @This(), d: usize) u64 {
+            return self.hashes[self.slot(d)];
         }
 
         pub inline fn mask(self: @This(), d: usize) u64 {
-            return if (self.masks.len == 0) 0 else self.masks[d];
+            return if (self.masks.len == 0) 0 else self.masks[self.slot(d)];
         }
 
         pub inline fn key(self: @This(), d: usize) []const K {
-            return self.keys[d * self.nk ..][0..self.nk];
+            return self.keys[self.slot(d) * self.nk ..][0..self.nk];
         }
     };
 }
@@ -289,6 +337,7 @@ pub const GroupTable = struct {
     len: usize = 0,
     mask: u64,
     alloc: std.mem.Allocator,
+    counts: Counters = [_]std.atomic.Value(u64){.init(0)} ** ncounts,
 
     pub fn init(alloc: std.mem.Allocator, cap_pow2: usize) !GroupTable {
         const e = try alloc.alloc(u32, cap_pow2);
@@ -320,41 +369,24 @@ pub const GroupTable = struct {
     /// Free the entries. Safe to repeat: a table handed on by `GroupMerge.adopt` is left
     /// empty and its owner's cleanup still runs.
     pub fn deinit(self: *GroupTable) void {
+        if (stats and self.entries.len != 0) for (&totals, &self.counts) |*t, *c| {
+            _ = t.fetchAdd(c.load(.monotonic), .monotonic);
+        };
         self.alloc.free(self.entries);
         self.entries = &.{};
     }
 
-    /// Room for `n` keys in all, so a merge that knows how many it brings rehashes once.
-    pub fn reserve(self: *GroupTable, n: usize, store: anytype) !void {
-        var cap = self.entries.len;
-        while ((n + 1) * 10 >= cap * 7) cap *= growth;
-        if (cap != self.entries.len) try self.rehash(cap, store);
-    }
-
+    /// Rebuild at twice the size from this table's own entries, taking each hash from its
+    /// record, the records read a few entries ahead, and free the outgrown entries
+    /// (an arena kept every outgrown table). Walking the old entries writes the new
+    /// table nearly in order; walking the records wrote it at random and was slower.
     fn grow(self: *GroupTable, store: anytype) !void {
-        return self.rehash(self.entries.len * growth, store);
-    }
-
-    /// Rebuild at `cap`, each hash taken from its record, and free the outgrown
-    /// entries (an arena kept every outgrown table). A table holding every record of
-    /// its store reads the records in order; one sharing its store walks its entries,
-    /// reading records a few entries ahead.
-    fn rehash(self: *GroupTable, cap: usize, store: anytype) !void {
+        tally(&self.counts, .rehashes, 1);
+        tally(&self.counts, .moved, self.len);
+        const cap = self.entries.len * growth;
         const ne = try self.alloc.alloc(u32, cap);
         @memset(ne, 0);
         const nmask = cap - 1;
-        if (self.len == store.len) {
-            for (0..store.len) |idx| {
-                const h = store.hashAt(idx);
-                var i = h & nmask;
-                while (ne[i] != 0) i = (i + 1) & nmask;
-                ne[i] = pack(h, idx);
-            }
-            self.alloc.free(self.entries);
-            self.entries = ne;
-            self.mask = nmask;
-            return;
-        }
         for (self.entries, 0..) |e, ei| {
             if (ei + prefetch_ahead < self.entries.len) {
                 const ahead = self.entries[ei + prefetch_ahead];
@@ -375,14 +407,20 @@ pub const GroupTable = struct {
 
     /// The slot holding `key`, or null; never inserts or grows.
     pub fn find(self: *const GroupTable, h: u64, key: anytype, store: anytype) ?u32 {
+        tally(&self.counts, .lookups, 1);
         const want = saltOf(h) << idx_bits;
         var i = h & self.mask;
         while (true) : (i = (i + 1) & self.mask) {
             const e = self.entries[i];
             if (e == 0) return null;
-            if ((e >> idx_bits) << idx_bits != want) continue;
+            if ((e >> idx_bits) << idx_bits != want) {
+                tally(&self.counts, .steps, 1);
+                continue;
+            }
             const idx = (e & max_groups) - 1;
             if (store.eqlAt(idx, h, key)) return idx;
+            tally(&self.counts, .false_hits, 1);
+            tally(&self.counts, .steps, 1);
         }
     }
 
@@ -397,6 +435,7 @@ pub const GroupTable = struct {
     ) !Found {
         if (new_slot >= max_groups) return error.TooManyGroups;
         if ((self.len + 1) * 10 >= self.entries.len * 7) try self.grow(store);
+        tally(&self.counts, .lookups, 1);
         const want = saltOf(h) << idx_bits;
         var i = h & self.mask;
         while (true) : (i = (i + 1) & self.mask) {
@@ -404,11 +443,17 @@ pub const GroupTable = struct {
             if (e == 0) {
                 self.entries[i] = pack(h, new_slot);
                 self.len += 1;
+                tally(&self.counts, .inserts, 1);
                 return .{ .slot = new_slot, .found = false };
             }
-            if ((e >> idx_bits) << idx_bits != want) continue;
+            if ((e >> idx_bits) << idx_bits != want) {
+                tally(&self.counts, .steps, 1);
+                continue;
+            }
             const idx = (e & max_groups) - 1;
             if (store.eqlAt(idx, h, key)) return .{ .slot = idx, .found = true };
+            tally(&self.counts, .false_hits, 1);
+            tally(&self.counts, .steps, 1);
         }
     }
 };

@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    opts.addOption(bool, "stats", b.option(bool, "stats", "Count key table probes and print them after a run") orelse false);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),

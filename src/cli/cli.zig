@@ -241,6 +241,9 @@ fn usage(w: anytype) !void {
         \\  --log-format FMT   text|json — stderr log format (default text;
         \\                     json is NDJSON, one object per line, for collectors)
         \\  --log-level LVL    error|warn|info|debug (default warn)
+        \\  --trace FILE       run: write a timeline of its parallel work (lanes, row
+        \\                     groups, merge partitions, emits) as Chrome trace JSON,
+        \\                     for ui.perfetto.dev or chrome://tracing
         \\  --no-progress      no live progress line (it is only ever drawn when
         \\                     stderr is a terminal, and never under -q or
         \\                     --log-format json)

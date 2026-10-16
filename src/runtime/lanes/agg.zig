@@ -44,6 +44,7 @@ const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const trace = @import("../../exec/trace.zig");
 const tailSchema = @import("../plan.zig").tailSchema;
 const topNTail = @import("topn.zig").topNTail;
 const types = @import("../../lang/types.zig");
@@ -445,6 +446,7 @@ pub const MorselSource = struct {
     cur: ?*pqdecode.Reader = null,
     cur_item: usize = 0,
     fixed: ?struct { next: usize, step: usize } = null,
+    span: trace.Span = .{ .name = "", .arg = 0, .start = null },
 
     fn nextIndex(self: *MorselSource) ?usize {
         if (self.fixed) |*f| {
@@ -466,9 +468,11 @@ pub const MorselSource = struct {
             if (self.cur) |r| {
                 if (try r.next(arena)) |b| return b;
                 self.cur = null;
+                self.span.end();
             }
             if (self.m.queue.failed.load(.seq_cst)) return null;
             const i = self.nextIndex() orelse return null;
+            self.span = trace.begin("row group", i);
             self.cur = try openItem(self.m, self.scratch, &self.held, i);
             self.cur_item = i;
         }
@@ -487,6 +491,8 @@ fn pqAggLane(ctx: *PqAggCtx, lane_idx: usize) void {
 }
 
 fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
+    const span = trace.begin("parquet aggregate lane", lane_idx);
+    defer span.end();
     const ls = &ctx.lanes[lane_idx];
     const la = ls.arena.allocator();
 
@@ -531,11 +537,6 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
         break :blk m;
     };
     dst.merge.?.own = true;
-    var total: usize = 0;
-    for (srcs) |*ls| {
-        if (ls.sets.len > p) total += ls.sets[p].len;
-    }
-    try dst.merge.?.reserve(total);
     for (srcs, 0..) |*ls, i| {
         if (i == bi or ls.sets.len <= p) continue;
         const st = &ls.sets[p];
@@ -640,10 +641,12 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
     const t_emit0 = std.time.Instant.now() catch unreachable;
+    const emit_span = trace.begin("aggregate emit and write", 0);
     writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats) catch |e| {
         snk.abort();
         return e;
     };
+    emit_span.end();
     const t_emit1 = std.time.Instant.now() catch unreachable;
     if (split == .parquet) {
         var total: usize = 0;
@@ -702,6 +705,7 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.S
     if (ctx.morsels.queue.failure()) |e| return e;
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
+    const merge_span = trace.begin("aggregate merge", 0);
     if (la.by.len == 0) {
         const dst = &parts[0];
         for (lanes) |*l| {
@@ -718,6 +722,7 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.S
         _ = try parallel.spawnJoin(arena, nthreads, pqMergeWorker, &mctx);
         if (mctx.queue.failure()) |e| return e;
     }
+    merge_span.end();
     const t_mrg1 = std.time.Instant.now() catch unreachable;
     var lane_groups: usize = 0;
     for (lanes) |*l| {

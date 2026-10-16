@@ -1,7 +1,7 @@
 # Command line
 
 ```text
-basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE]
+basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE] [--trace FILE]
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
 basalt repl
@@ -30,6 +30,15 @@ and top-N 15–30% slower than fourteen. Without `-j` a CSV also gets no more th
 one lane per MiB, so a small file is not spread over threads that cost more to
 start than the file takes to read. A float `SUM` is reproducible for a given
 lane count, so pass `-j` when two machines must agree to the last bit.
+
+`--trace FILE` writes a timeline of the run's parallel work as Chrome trace
+JSON: a span for each lane's fold, each row group a lane reads, each merge
+partition and each emit, on the thread that ran it. Open it at
+[ui.perfetto.dev](https://ui.perfetto.dev) or `chrome://tracing` to see which
+lanes finished last and where threads waited. A build made with
+`zig build -Dstats=true` also prints, after the run, how its key tables were
+probed: lookups, slots probed past the first, inserts, rehashes and the
+entries they moved.
 
 ## Output formats
 

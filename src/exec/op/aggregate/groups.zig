@@ -159,14 +159,6 @@ pub const GroupMerge = struct {
         };
     }
 
-    /// Room for `n` groups in all, so a merge that knows what it brings rehashes once.
-    pub fn reserve(self: *GroupMerge, n: usize) !void {
-        switch (self.set.store) {
-            .single => {},
-            inline else => |st| try self.table.reserve(n, st),
-        }
-    }
-
     /// Every group of `src`, then its pairs re-keyed by the ordinals its groups got
     /// here; a global set's pairs wait for `settle`, which unions them by partition.
     pub fn addSet(self: *GroupMerge, src: *const GroupSet) !void {

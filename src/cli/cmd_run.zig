@@ -4,6 +4,7 @@ const ErrOut = @import("args.zig").ErrOut;
 const Flags = @import("args.zig").Flags;
 const analyze = @import("../runtime/analyze.zig");
 const ast = @import("../lang/ast.zig");
+const keytable = @import("../exec/keytable.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
@@ -13,6 +14,7 @@ const repeatedKey = @import("args.zig").repeatedKey;
 const runtime = @import("../runtime/run.zig");
 const sizeFlag = @import("args.zig").sizeFlag;
 const std = @import("std");
+const trace = @import("../exec/trace.zig");
 const sharedFlag = @import("args.zig").sharedFlag;
 const unknownOption = @import("args.zig").unknownOption;
 const wantsJsonLog = @import("args.zig").wantsJsonLog;
@@ -50,6 +52,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var spill_dir: ?[]const u8 = null;
     var spill_cap: u64 = (runtime.RunOptions{}).spill_cap;
     var op_memory: usize = (runtime.RunOptions{}).op_memory;
+    var trace_path: ?[]const u8 = null;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -74,6 +77,8 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
                 try stderr.print("error: --op-memory `{s}` is more than this machine can address\n", .{v});
                 return 2;
             };
+        } else if (std.mem.eql(u8, a, "--trace")) {
+            trace_path = (try nextVal(args, &i, a, stderr)) orelse return 2;
         } else if (std.mem.eql(u8, a, "--explain")) {
             explain = true;
         } else if (std.mem.eql(u8, a, "--no-progress")) {
@@ -124,6 +129,12 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     }
 
     log.summary = if (stdout_format == .json) .json_stdout else .stderr;
+
+    if (trace_path != null) trace.enable();
+    defer if (trace_path) |tp| trace.write(tp) catch |e| {
+        stderr.print("error: --trace {s}: {s}\n", .{ tp, @errorName(e) }) catch {};
+    };
+    defer keytable.report(stderr) catch {};
 
     var diag: runtime.Diag = .{};
     var sink = runtime.OutcomeSink.init(alloc);

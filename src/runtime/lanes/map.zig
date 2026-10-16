@@ -38,6 +38,7 @@ const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const sqlDescForStage = @import("../connect.zig").sqlDescForStage;
 const std = @import("std");
+const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const wrapProjected = @import("../../connect/split.zig").wrapProjected;
 
@@ -220,6 +221,8 @@ pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usi
                 if (ctx.queue.failed.load(.seq_cst)) return;
                 const i = ctx.queue.next.fetchAdd(1, .seq_cst);
                 if (i >= ctx.queue.nitems) break;
+                const span = trace.begin(comptime trace.short(Ctx), i);
+                defer span.end();
                 unitFn(ctx, i, &mem) catch |e| {
                     ctx.queue.fail(e);
                     ctx.ordered.?.wake();
@@ -417,8 +420,8 @@ fn laneParquetKeys(env: *Env, js: MapJoinShape, lane: LaneJoin, map_stages: []co
 /// join's build keys may narrow its left side; null otherwise.
 fn narrowingKeyExprs(arena: std.mem.Allocator, js: MapJoinShape, lane: LaneJoin, map_stages: []const ast.Stage) !?[]const ?*ast.Expr {
     if (!keypush.leftMayNarrow(js.join) or keypush.disabled(js.join_hints)) return null;
-    const trace = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
-    return keyExprs(arena, trace, lane.left_key_names);
+    const stages = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
+    return keyExprs(arena, stages, lane.left_key_names);
 }
 
 /// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`

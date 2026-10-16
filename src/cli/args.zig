@@ -63,7 +63,7 @@ pub fn loadSource(arena: std.mem.Allocator, verb: []const u8, args: [][:0]u8, st
     return Source{ .label = path, .text = text, .dir = std.fs.path.dirname(path) orelse "." };
 }
 
-const valued_flags = [_][]const u8{ "-c", "--command", "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory" };
+const valued_flags = [_][]const u8{ "-c", "--command", "-p", "--param", "-j", "--threads", "--format", "--log-format", "--log-level", "--max-rows", "--pos", "--known", "--spill-dir", "--spill-cap", "--op-memory", "--trace" };
 
 /// The first argument that is neither a flag nor a flag's value, `-` included, so the
 /// script may come before or after its flags.

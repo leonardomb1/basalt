@@ -227,11 +227,11 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         var nspill: usize = 0;
         for (0..m) |d| {
             if (d + prefetch_ahead < m) {
-                const ph = runs.hashes[d + prefetch_ahead];
+                const ph = runs.hash(d + prefetch_ahead);
                 parts[ph >> part_shift].table.prefetch(ph);
             }
-            const ri = runs.rows[d];
-            const h = runs.hashes[d];
+            const ri = runs.row(d);
+            const h = runs.hash(d);
             const key = Aggregate.FixedKey{ .vals = runs.key(d), .mask = runs.mask(d) };
             if (direct) |*dr| if (dr.find(key)) |hit| {
                 tails[ri] = hit.tail;
@@ -338,15 +338,17 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
 
         const pof = try pull.alloc(u8, b.len);
         for (pof, hashes) |*p, h| p.* = @intCast(h >> part_shift);
-        const runs = try keytable.Runs(Value).init(pull, fold_parts, nk, pof, &.{}, hashes, probes, &.{});
+        const all = try pull.alloc(u32, b.len);
+        for (all, 0..) |*x, i| x.* = @intCast(i);
+        const runs = try keytable.Runs(Value).init(pull, fold_parts, nk, pof, all, hashes, probes, &.{});
 
         for (0..b.len) |d| {
             if (d + prefetch_ahead < b.len) {
-                const ph = runs.hashes[d + prefetch_ahead];
+                const ph = runs.hash(d + prefetch_ahead);
                 parts[ph >> part_shift].table.prefetch(ph);
             }
-            r = runs.rows[d];
-            const h = runs.hashes[d];
+            r = runs.row(d);
+            const h = runs.hash(d);
             const probe = runs.key(d);
             const pi = h >> part_shift;
             const part = &parts[pi];

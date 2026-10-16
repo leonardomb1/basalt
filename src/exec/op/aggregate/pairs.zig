@@ -92,12 +92,6 @@ pub const Pairs = struct {
         return .{ .boxed = st };
     }
 
-    fn lenOf(self: *const Pairs, p: usize) usize {
-        return switch (self.parts[p].store) {
-            inline else => |st| st.len,
-        };
-    }
-
     pub fn freePart(self: *Pairs, p: usize) void {
         self.parts[p].table.deinit();
     }
@@ -180,14 +174,14 @@ pub const Pairs = struct {
             for (self.parts, 0..) |*part, p| {
                 const hi = runs.starts[p + 1];
                 for (runs.starts[p]..hi) |d| {
-                    if (d + keytable.prefetch_ahead < hi) part.table.prefetch(runs.hashes[d + keytable.prefetch_ahead]);
-                    try put(part, runs.hashes[d], runs.key(d));
+                    if (d + keytable.prefetch_ahead < hi) part.table.prefetch(runs.hash(d + keytable.prefetch_ahead));
+                    try put(part, runs.hash(d), runs.key(d));
                 }
             }
         } else {
             const runs = try keytable.Runs(Value).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, probes, &.{});
             for (self.parts, 0..) |*part, p| {
-                for (runs.starts[p]..runs.starts[p + 1]) |d| try putBoxed(part, runs.hashes[d], runs.key(d));
+                for (runs.starts[p]..runs.starts[p + 1]) |d| try putBoxed(part, runs.hash(d), runs.key(d));
             }
         }
     }
@@ -233,9 +227,6 @@ pub const Pairs = struct {
     /// ordinal through `remap`.
     pub fn absorb(self: *Pairs, dp: usize, src: *const Pairs, sp: usize, remap: ?[]const u32) !void {
         const part = &self.parts[dp];
-        switch (part.store) {
-            inline else => |st| try part.table.reserve(part.table.len + src.lenOf(sp), st),
-        }
         switch (src.parts[sp].store) {
             .fixed => |st| for (0..st.len) |i| {
                 const r = st.at(i);
