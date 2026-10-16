@@ -282,7 +282,7 @@ test "declOf names session declarations" {
     try std.testing.expectEqualStrings("f", declOf("CREATE FUNCTION f(a, b) AS a + b").?.name);
     try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
     try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
-    try std.testing.expect(declOf("CREATE ENDPOINT '/x'") == null);
+    try std.testing.expect(declOf("CREATE WIDGET w") == null);
     try std.testing.expectEqual(DeclKind.resource, declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.kind);
     try std.testing.expectEqualStrings("rc.countries", declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.name);
     try std.testing.expect(declOf("CREATE RESOURCE countries AS GET('/all')") == null);

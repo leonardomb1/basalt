@@ -238,36 +238,6 @@ test "sql: connection credential convention injects env calls" {
     try testing.expect(saw_user and saw_pass);
 }
 
-test "sql: every HTTP-mode form is refused with the one discontinuation message" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-
-    const cases = [_][2][]const u8{
-        .{ "CREATE ENDPOINT '/x' DOC 'd';\nSELECT 1 AS x;", "`CREATE ENDPOINT`: " ++ ast.http_mode_discontinued ++ "; run the script with `basalt run`" },
-        .{ "ACCEPT BODY (a INT) INTO BUFFER 'ev';\nSELECT 1 AS x;", "`ACCEPT`: " ++ ast.http_mode_discontinued },
-        .{ "SELECT * FROM BUFFER 'ev' AT '/w';", "`FROM BUFFER`: " ++ ast.http_mode_discontinued },
-        .{ "SELECT a FROM BODY (a INT NOT NULL);", "`FROM BODY`: " ++ ast.http_mode_discontinued },
-        .{ "PARAM t STRING FROM HEADER('X-Tenant');\nSELECT 1 AS x;", "`PARAM ... FROM`: " ++ ast.http_mode_discontinued ++ "; bind the param with `-p t=value`" },
-    };
-    for (cases) |c| {
-        try testing.expectError(error.ParseFailed, parseSource(a, c[0], &diag));
-        try testing.expectEqualStrings(c[1], diag.msg);
-    }
-
-    var errs = std.array_list.Managed(Diagnostic).init(a);
-    _ = try parseSourceOpts(a,
-        \\CREATE ENDPOINT '/x'
-        \\  ACCEPT BODY (a INT) INTO BUFFER 'ev';
-        \\SELECT a FROM BUFFER 'ev';
-        \\SELECT 1 AS x;
-    , &diag, .{ .errors = &errs });
-    try testing.expectEqual(@as(usize, 2), errs.items.len);
-    try testing.expectEqual(@as(u32, 1), errs.items[0].line);
-    try testing.expectEqual(@as(u32, 3), errs.items[1].line);
-}
-
 test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} templates" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

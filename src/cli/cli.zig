@@ -10,8 +10,7 @@
 //! job; a second signal exits 130. `--log-format json` is read before parsing, so
 //! a parse error has a runtime error's shape. Progress is a live line on a
 //! terminal, a `progress` event a second under a JSON log, and nothing on a pipe
-//! or under `-q`. `serve` and `run --port`, the HTTP mode, are refused with
-//! `ast.http_mode_discontinued`.
+//! or under `-q`.
 //!
 //! `repl` is an interactive loop that runs on `;` and prints results through a
 //! `write stdout` table sink. Declarations carry across entries in a `DeclStore`:
@@ -84,10 +83,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdCheck(alloc, args));
     } else if (std.mem.eql(u8, verb, "run")) {
         std.process.exit(try cmdRun(alloc, args));
-    } else if (std.mem.eql(u8, verb, "serve")) {
-        try stderr.writeAll("error: `basalt serve`: " ++ ast.http_mode_discontinued ++ "; run each script with `basalt run`\n");
-        try stderr.flush();
-        std.process.exit(2);
     } else if (std.mem.eql(u8, verb, "complete")) {
         std.process.exit(try cmdComplete(alloc, args));
     } else if (std.mem.eql(u8, verb, "kernel")) {

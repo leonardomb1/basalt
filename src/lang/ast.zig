@@ -63,8 +63,6 @@ pub const Pos = struct { line: u32, col: u32, file: u16 = 0 };
 
 pub const Span = struct { start: Pos, end: Pos };
 
-pub const http_mode_discontinued = "HTTP mode was discontinued after v0.10.3";
-
 pub const QualName = struct {
     parts: []const []const u8,
     safe: []const bool = &.{},

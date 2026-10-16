@@ -32,16 +32,12 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         if (!hasLiteralExt(tmpl))
             return self.fail(pos, "dynamic path needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
         node = .{ .read = .{ .connector = "csv", .form = .{ .path = tmpl } } };
-    } else if (self.isKw("body") and self.peekTag() == .lparen) {
-        return self.fail(self.curPos(), "`FROM BODY`: " ++ ast.http_mode_discontinued, .{});
     } else if (self.isKw("http") and self.peekTag() == .lparen) {
         _ = self.advance();
         _ = try self.expect(.lparen);
         const url = try self.expect(.string);
         _ = try self.expect(.rparen);
         node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
-    } else if (self.isKw("buffer") and self.peekTag() == .string) {
-        return self.fail(self.curPos(), "`FROM BUFFER`: " ++ ast.http_mode_discontinued, .{});
     } else if (self.isKw("each")) {
         return self.parseEachTableOf(read_hints);
     } else if (self.isKw("range") and self.peekTag() == .lparen) {

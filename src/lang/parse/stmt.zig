@@ -76,7 +76,6 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
 /// query LET's own subqueries create.
 pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     if (self.isKw("create")) return self.parseCreate(out);
-    if (self.isKw("accept")) return self.fail(self.curPos(), "`ACCEPT`: " ++ ast.http_mode_discontinued, .{});
     if (self.isKw("param")) {
         const p = try self.parseParam();
         try self.const_names.append(p.name);
@@ -247,8 +246,6 @@ pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
         try self.expectKw("replace");
         break :blk true;
     } else false;
-    if (self.isKw("endpoint"))
-        return self.fail(self.curPos(), "`CREATE ENDPOINT`: " ++ ast.http_mode_discontinued ++ "; run the script with `basalt run`", .{});
     if (self.eatKw("connection")) {
         const conn = try self.parseConnection(pos);
         try self.conn_names.append(conn.name);

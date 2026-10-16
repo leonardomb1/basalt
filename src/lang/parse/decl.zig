@@ -310,8 +310,6 @@ pub fn parseParam(self: *Parser) Error!ast.Param {
     }
     var default: ?*ast.Expr = null;
     if (self.eatKw("default")) default = try self.parseExpr();
-    if (self.isKw("from"))
-        return self.fail(self.curPos(), "`PARAM ... FROM`: " ++ ast.http_mode_discontinued ++ "; bind the param with `-p {s}=value`", .{name});
     _ = try self.expect(.semi);
     return .{ .name = name, .ty = ty, .default = default, .pos = pos, .is_json = is_json };
 }

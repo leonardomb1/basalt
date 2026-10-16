@@ -3,7 +3,6 @@
 const ErrOut = @import("args.zig").ErrOut;
 const Flags = @import("args.zig").Flags;
 const analyze = @import("../runtime/analyze.zig");
-const ast = @import("../lang/ast.zig");
 const keytable = @import("../exec/keytable.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
@@ -27,14 +26,6 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var stderr_file = std.fs.File.stderr().writerStreaming(&stderr_buf);
     const stderr = &stderr_file.interface;
     defer stderr.flush() catch {};
-
-    for (args[2..]) |a| {
-        const name = a[0 .. std.mem.indexOfScalar(u8, a, '=') orelse a.len];
-        if (std.mem.eql(u8, name, "--port") or std.mem.eql(u8, name, "--host")) {
-            try stderr.print("error: `run {s}`: " ++ ast.http_mode_discontinued ++ "; drop it to run the script once\n", .{name});
-            return 2;
-        }
-    }
 
     const src = loadSource(arena.allocator(), "run", args, stderr) catch |e| switch (e) {
         error.Usage, error.Unreadable => |le| return loadExit(le),
@@ -217,13 +208,4 @@ test "reportFailedItems: under --log-format json every line is an NDJSON event" 
     }
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\"2/3 item(s) failed\"") != null);
-}
-
-test "run refuses --port and --host, and an endpoint script fails to parse" {
-    var port = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("--port"), @constCast("8080"), @constCast("-c"), @constCast("SELECT 1 AS one;") };
-    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &port));
-    var host = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("-c"), @constCast("SELECT 1 AS one;"), @constCast("--host=127.0.0.1") };
-    try std.testing.expectEqual(@as(u8, 2), try cmdRun(std.testing.allocator, &host));
-    var endpoint = [_][:0]u8{ @constCast("basalt"), @constCast("run"), @constCast("-c"), @constCast("CREATE ENDPOINT '/x'; SELECT 1 AS one;") };
-    try std.testing.expectEqual(@as(u8, 1), try cmdRun(std.testing.allocator, &endpoint));
 }
