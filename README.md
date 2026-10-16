@@ -16,34 +16,71 @@ or a table.
 [Functions](https://leonardomb1.github.io/basalt/reference/functions.html) ·
 [Connectors](https://leonardomb1.github.io/basalt/connectors/databases.html)
 
+The first four examples run as written, against public data; paste one into
+`basalt run -c "..."` or a `.sql` file.
+
+A CSV on the web, summarized into a local Parquet file:
+
 ```sql
--- active funds from a Latin-1, semicolon-separated CSV, into Parquet
-LOAD INTO 'funds.parquet' AS
-SELECT cnpj, nome AS name,
-       CAST(replace(patrimonio, ',', '.') AS DECIMAL(18,2)) AS net_assets
-FROM 'funds.csv' WITH (delimiter = ';', encoding = 'latin1')
-WHERE situacao = 'EM FUNCIONAMENTO NORMAL';
+LOAD INTO 'survival.parquet' AS
+SELECT Pclass AS class, Sex AS sex, count(*) AS passengers,
+       round(avg(Survived) * 100, 1) AS survived_pct
+FROM 'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv'
+GROUP BY Pclass, Sex;
 ```
 
 ```console
-$ basalt check funds.sql
-ok: funds.sql checks out
-$ basalt run funds.sql
-Read 3 rows, loaded 2 into funds.parquet in 4ms (750 rows/s, 12 lanes)
-$ basalt run -c "SELECT * FROM 'funds.parquet';"
-cnpj                name                         net_assets
-------------------  ---------------------------  ----------
-11.222.333/0001-81  Fundo Ação Brasil            1500000.50
-33.444.555/0001-02  Fundo Imobiliário São Paulo  820000.00
-(2 rows)
+$ basalt run titanic.sql
+Read 891 rows, loaded 6 into survival.parquet in 320ms (2,784 rows/s)
+$ basalt run -c "SELECT * FROM 'survival.parquet' ORDER BY class, sex;"
+class  sex     passengers  survived_pct
+-----  ------  ----------  ------------
+1      female  94          96.8
+1      male    122         36.9
+2      female  76          92.1
+2      male    108         15.7
+3      female  144         50
+3      male    347         13.5
+(6 rows)
+```
+
+A JSON feed, its rows in a nested array, its fields in nested objects:
+
+```sql
+SELECT json_get(properties, 'place') AS place,
+       CAST(json_get(properties, 'mag') AS DOUBLE) AS magnitude
+FROM 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson'
+  WITH (format = 'json', items = 'features')
+ORDER BY magnitude DESC LIMIT 5;
+```
+
+A REST API, through a connection that names its base URL (retries, paging and
+auth are options of the connection and the read):
+
+```sql
+CREATE CONNECTION gh TYPE http OPTIONS (base_url = 'https://api.github.com');
+
+SELECT tag_name, CAST(published_at AS DATE) AS published, json_get(author, 'login') AS author
+FROM gh.GET('/repos/duckdb/duckdb/releases', per_page = 10)
+ORDER BY published DESC;
+```
+
+A 50 MB Parquet file over HTTPS, read by ranged requests: only the two columns
+the query uses are fetched.
+
+```sql
+SELECT payment_type, count(*) AS trips, round(avg(tip_amount), 2) AS avg_tip
+FROM 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet'
+GROUP BY payment_type ORDER BY trips DESC;
 ```
 
 A script is parsed, type-checked and planned before a row is read, so a typo
-fails in `check` rather than an hour into a load:
+fails at once, not an hour into a load; `basalt check` finds it without running
+anything wherever the columns are known offline, as for a local file:
 
 ```console
-$ basalt check -c "SELECT cnpj, situaco FROM 'funds.csv' WITH (delimiter = ';', encoding = 'latin1');"
-<command>:1:14: error: unknown field `situaco`
+$ basalt run -c "SELECT Pclass, Survivd FROM 'https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv';"
+<command>:1:16: error: unknown field `Survivd`
 ```
 
 The same shape moves a database table into a lake, with the `WHERE` run by the
@@ -71,7 +108,7 @@ chmod +x basalt
 A container image, with scripts mounted rather than baked in:
 
 ```console
-docker run --rm -v "$PWD:/scripts:ro" -w /scripts ghcr.io/leonardomb1/basalt check funds.sql
+docker run --rm -v "$PWD:/scripts:ro" -w /scripts ghcr.io/leonardomb1/basalt check pipeline.sql
 ```
 
 From source, with [Zig 0.15.2](https://ziglang.org/download/):
@@ -85,12 +122,13 @@ zig build -Doptimize=ReleaseFast
 
 | | read | write |
 |---|---|---|
-| **Files** — CSV (any delimiter, Latin-1 and CP1252), Parquet, Arrow IPC, Excel | ✓ | ✓ (not Excel) |
-| **Compressed and archived** — `.gz`, `.zst`, a member of a `.zip` | ✓ | `.gz` |
+| **Files** — CSV (any delimiter, Latin-1 and CP1252), Parquet, Arrow IPC, Excel, JSON and NDJSON, XML | ✓ | ✓ |
+| **Compressed and archived** — `.gz`, `.zst`, a member of a `.zip` | ✓ | `.gz` (CSV, JSON, XML) |
 | **Object storage** — S3 and S3-compatible, Azure Blob / ADLS Gen2 | ✓ | ✓ |
 | **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos) | ✓ | ✓ |
 | **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
 | **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
+| **Standard input** — `FROM STDIN`, as CSV, JSON, NDJSON or XML | ✓ | |
 
 A folder — local, remote or a storage prefix — reads as one table. Parquet is
 read by column and row group, over the network too, so a narrow query fetches
@@ -99,18 +137,37 @@ only what it needs. A connection named `erp` takes its login from `ERP_USER` and
 Each connector's page in the [documentation](https://leonardomb1.github.io/basalt/)
 has the details.
 
+## Reuse
+
+`CREATE FUNCTION` names an expression, a block of statements or a parameterized
+query (a table function, read with `FROM name(...)`). A file of them is a
+library: `@include 'lib/finance.sql' AS fin;` makes them `fin.name(...)`, and a
+library can live in a repository, pinned to a version and a hash:
+
+```sql ignore
+@include 'github.com/acme/sql-kit/finance.sql@v1.2.0' AS fin;
+
+SELECT fin.business_days(opened, closed) AS sla FROM 'tickets.csv';
+```
+
+`basalt check --pin` fetches a remote library and records its SHA-256 in
+`basalt.sum` beside the script; a run refuses a library that is not pinned or no
+longer matches, and runs pinned ones from a local cache, with no network. See
+[Scripts](https://leonardomb1.github.io/basalt/language/scripts.html).
+
 ## Commands
 
 ```console
 $ basalt run pipeline.sql -p since=2026-01-01   # run once; -p binds a PARAM
 $ basalt check pipeline.sql                     # validate without connecting
+$ basalt check --pin pipeline.sql               # ...and pin its remote @includes
 $ basalt repl                                   # an interactive session
 $ basalt kernel                                 # a session a notebook or editor drives
 ```
 
-`run` takes `--format json|csv|arrow` for programs reading its output, and
-`-j N` for parallel lanes. Exit code `75` means a transient failure worth
-retrying, `1` a permanent one. See [Command line](https://leonardomb1.github.io/basalt/tools/cli.html).
+`run` takes `--format table|json|csv|tsv|arrow` for what it prints, and `-j N`
+for parallel lanes. Exit code `75` means a transient failure worth retrying,
+`1` a permanent one. See [Command line](https://leonardomb1.github.io/basalt/tools/cli.html).
 
 ## When not to use it
 
