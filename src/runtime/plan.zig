@@ -311,7 +311,8 @@ const Needs = struct {
 /// or derived table never reads a column its reader leaves unused. A select stays
 /// whole when what follows is unprovable (a `*`, a plain DISTINCT, whose rows a column
 /// sets apart, a `search`, or no later select or aggregate fixing the output) or when
-/// two of its items share a name, which a drop would rename.
+/// two of its items share a name, which a drop would rename. A computed column that
+/// may fail on a row is kept, so a run that failed on it still fails.
 pub fn pruneSelects(arena: std.mem.Allocator, stages_in: []const ast.Stage) ![]const ast.Stage {
     var out: ?[]ast.Stage = null;
     var i = stages_in.len;
@@ -333,7 +334,8 @@ pub fn pruneSelects(arena: std.mem.Allocator, stages_in: []const ast.Stage) ![]c
             };
             if (std.mem.indexOf(u8, name, "${") != null) continue :outer;
             if ((try names.getOrPut(name)).found_existing) continue :outer;
-            if (used.contains(name)) try keep.append(it);
+            const raises = it == .computed and pushdown.mayRaise(it.computed.expr);
+            if (raises or used.contains(name)) try keep.append(it);
         }
         if (keep.items.len == items.len) continue;
         if (keep.items.len == 0) try keep.append(items[0]);
@@ -443,23 +445,21 @@ fn qualNames(q: ast.QualName, set: *std.StringHashMap(void)) !void {
     if (clashBase(q.last())) |b| try set.put(b, {});
 }
 
-/// A binding's stages readied for the pipeline that reads it (`after`), as a joined
-/// side is: filters moved toward its read, then its columns `after` leaves unused dropped.
-fn prepareRef(env: *Env, body: []const ast.Stage, after: []const ast.Stage) ![]const ast.Stage {
-    const side = try prepareJoinSide(env, body);
-    const whole = try std.mem.concat(env.arena, ast.Stage, &.{ side, after });
-    return (try pruneSelects(env.arena, whole))[0..side.len];
+/// `stages` with the select columns `after`, the stages reading their output, leave
+/// unused dropped.
+fn pruneFor(arena: std.mem.Allocator, stages: []const ast.Stage, after: []const ast.Stage) ![]const ast.Stage {
+    if (stages.len == 0 or after.len == 0) return stages;
+    const whole = try std.mem.concat(arena, ast.Stage, &.{ stages, after });
+    return (try pruneSelects(arena, whole))[0..stages.len];
 }
 
-/// A joined side's stages with the columns no name of `needs` (its `rightNeeds`) may
-/// take dropped from its selects.
-fn pruneSide(arena: std.mem.Allocator, stages: []const ast.Stage, needs: []const []const u8) ![]const ast.Stage {
-    if (stages.len == 0) return stages;
+/// A select of `needs`, standing for what reads a joined side (its `rightNeeds`).
+fn needsTail(arena: std.mem.Allocator, needs: []const []const u8) ![]const ast.Stage {
     const items = try arena.alloc(ast.SelectItem, needs.len);
     for (needs, items) |n, *it| it.* = .{ .field = .{ .parts = try arena.dupe([]const u8, &.{n}) } };
-    const tail = [_]ast.Stage{.{ .node = .{ .select = items }, .hints = &.{}, .pos = stages[0].pos }};
-    const whole = try std.mem.concat(arena, ast.Stage, &.{ stages, &tail });
-    return (try pruneSelects(arena, whole))[0..stages.len];
+    const tail = try arena.alloc(ast.Stage, 1);
+    tail[0] = .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    return tail;
 }
 
 /// `x` for a right column renamed `x_r` or `x_r2` on clashing with a left one.
@@ -685,7 +685,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                     try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
                 else
-                    try buildPipeline(env, try prepareRef(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages, stages[1..]));
+                    try buildPipeline(env, try prepareSide(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages, stages[1..]));
                 current = r.op;
                 schema = r.schema;
             }
@@ -943,10 +943,17 @@ pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.St
 /// A join's right side readied like a query's head pipeline, with filters moved
 /// and the SQL read narrowed, so a joined CTE no longer reads its whole table.
 pub fn prepareJoinSide(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
+    return prepareSide(env, stages_in, &.{});
+}
+
+/// `prepareJoinSide`, the select columns `after` (the stages reading the side's
+/// output) leaves unused dropped before the read is narrowed to what remains.
+fn prepareSide(env: *Env, stages_in: []const ast.Stage, after: []const ast.Stage) ![]const ast.Stage {
     if (stages_in.len == 0) return stages_in;
     var stages = try inlineHeadBindings(env, stages_in);
     stages = try analyze.substFilterParams(env.arena, stages, env.params_expr);
     if (try pushdown.hoistFilters(env.arena, env.gpa, stages, env.bindings)) |h| stages = h;
+    stages = try pruneFor(env.arena, stages, after);
     stages = try projectSqlRead(env, stages);
     return descendLeadingWhere(env, stages);
 }
@@ -992,11 +999,10 @@ pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_
 pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const ast.Stage) anyerror!JoinSide {
     if (env.bindings.get(j.binding) == null)
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
-    var rstages = try prepareJoinSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages));
-    if (after) |rest| if (try rightNeeds(env, j, rest)) |needs| {
-        rstages = try pruneSide(env.arena, rstages, needs);
-        rstages = try projectJoinedSqlRead(env, rstages, needs);
-    };
+    const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
+    const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
+    var rstages = try prepareSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages), tail);
+    if (needs) |n| rstages = try projectJoinedSqlRead(env, rstages, n);
     var right_late: ?keypush.Taker = null;
     const a_want: ?keypush.Want = if (keypush.disabled(hints) or !keypush.rightMayNarrow(j))
         null
@@ -1172,7 +1178,7 @@ test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its qu
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a,
         \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');
-        \\WITH d AS (SELECT k, nm FROM pg.public.dim)
+        \\WITH d AS (SELECT k, nm, extra FROM pg.public.dim)
         \\SELECT o.id, d.nm FROM pg.public.orders o JOIN d ON o.k = d.k WHERE o.status = 1 AND d.nm = 'x';
     , &pd);
     var params = std.StringHashMap(Value).init(a);
@@ -1199,7 +1205,14 @@ test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its qu
     const out = try descendLeadingWhere(&env, hoisted);
     try std.testing.expect(std.mem.indexOf(u8, out[0].node.read.where, "\"status\" = 1") != null);
     try std.testing.expect(out[1].node == .filter and out[2].node == .join);
-    try std.testing.expect(out[2].node.join.right_filter != null);
+    const j = out[2].node.join;
+    try std.testing.expect(j.right_filter != null);
+
+    const needs = (try rightNeeds(&env, j, out[3 .. out.len - 1])).?;
+    const side = try prepareSide(&env, try j.rightStages(a, bindings.get("d").?.stages), try needsTail(a, needs));
+    const cols = side[0].node.read.cols;
+    try std.testing.expectEqual(@as(usize, 2), cols.len);
+    for (cols) |c| try std.testing.expect(std.mem.eql(u8, c, "k") or std.mem.eql(u8, c, "nm"));
 }
 
 fn sortedNames(names: ?[][]const u8) ![]const []const u8 {
@@ -1310,7 +1323,7 @@ test "pruneSelects: a CTE's columns its reader leaves unused are dropped, throug
     };
 }
 
-test "pruneSelects: a select stays whole before a plain DISTINCT, a `*`, a search or the output" {
+test "pruneSelects: a select stays whole before a plain DISTINCT, a `*`, a search or the output, or keeps what may fail" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1319,6 +1332,7 @@ test "pruneSelects: a select stays whole before a plain DISTINCT, a `*`, a searc
         "WITH c AS (SELECT a, b FROM 't.csv') SELECT * FROM c;",
         "WITH c AS (SELECT a, b FROM 't.csv') SELECT a FROM c WHERE search(*, 'x');",
         "WITH c AS (SELECT a, b FROM 't.csv') SELECT a, b FROM c;",
+        "WITH c AS (SELECT a, CAST(b AS INT) AS bi FROM 't.csv') SELECT a FROM c;",
     }) |src| {
         const whole = try cteAndReader(a, src);
         const out = try pruneSelects(a, whole);
@@ -1328,12 +1342,12 @@ test "pruneSelects: a select stays whole before a plain DISTINCT, a `*`, a searc
     try std.testing.expectEqual(@as(usize, 1), counted[1].node.select.len);
 }
 
-test "pruneSide: a joined CTE keeps only the columns the join and what follows may take" {
+test "pruneFor: a joined CTE keeps only the columns the join and what follows may take" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const side = try cteAndReader(a, "WITH c AS (SELECT k, w AS ww, s, category FROM 'r.csv' WHERE w > 1) SELECT * FROM c;");
-    const out = try pruneSide(a, side[0..3], &.{ "k", "category", "id" });
+    const out = try pruneFor(a, side[0..3], try needsTail(a, &.{ "k", "category", "id" }));
     try std.testing.expectEqualStrings("k,category", try selectNames(a, out[2]));
     try std.testing.expect(out[1].node == .filter);
 }

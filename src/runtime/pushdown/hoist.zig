@@ -134,7 +134,7 @@ fn isRightName(name: []const u8, right: []const []const u8) bool {
 /// Whether evaluating `e` on some row could fail: a CAST of a column, arithmetic
 /// (overflow, division by zero), or a call not known to be total. Such a conjunct
 /// never crosses a join, where it would meet rows the join drops.
-fn mayRaise(e: *const ast.Expr) bool {
+pub fn mayRaise(e: *const ast.Expr) bool {
     const S = struct {
         const total = [_][]const u8{ "upper", "lower", "length", "strlen", "starts_with", "ends_with", "contains", "like", "trim", "coalesce", "nullif" };
         fn hit(_: void, n: *const ast.Expr) ?bool {

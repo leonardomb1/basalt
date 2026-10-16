@@ -341,6 +341,7 @@ pub const hoistThroughJoins = @import("pushdown/hoist.zig").hoistThroughJoins;
 pub const hoistFilters = @import("pushdown/hoist.zig").hoistFilters;
 pub const pushIntoJoinSides = @import("pushdown/hoist.zig").pushIntoJoinSides;
 pub const hoistThroughSelects = @import("pushdown/hoist.zig").hoistThroughSelects;
+pub const mayRaise = @import("pushdown/hoist.zig").mayRaise;
 
 pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?[]const u8 {
     return serialWhereWith(arena, dialect, stages, null, null);

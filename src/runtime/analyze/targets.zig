@@ -292,6 +292,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
             pqdecode.Reader.isPath(rd.form.path))
         {
             const pr = pqdecode.Reader.open(arena, rd.form.path) catch return null;
+            defer pr.close();
             return pr.schema;
         }
         var fdiag = Diag{};
