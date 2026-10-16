@@ -453,6 +453,14 @@ fn pruneFor(arena: std.mem.Allocator, stages: []const ast.Stage, after: []const 
     return (try pruneSelects(arena, whole))[0..stages.len];
 }
 
+/// `pruneSelects` where every source `stages` reads has columns known offline
+/// (`pushdown.sourcesKnown`); elsewhere unchanged, so a column a database lacks still
+/// reaches its read and fails there.
+pub fn pruneKnown(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
+    if (!pushdown.sourcesKnown(env.arena, env.bindings, stages)) return stages;
+    return pruneSelects(env.arena, stages);
+}
+
 /// A select of `needs`, standing for what reads a joined side (its `rightNeeds`).
 fn needsTail(arena: std.mem.Allocator, needs: []const []const u8) ![]const ast.Stage {
     const items = try arena.alloc(ast.SelectItem, needs.len);
@@ -953,7 +961,7 @@ fn prepareSide(env: *Env, stages_in: []const ast.Stage, after: []const ast.Stage
     var stages = try inlineHeadBindings(env, stages_in);
     stages = try analyze.substFilterParams(env.arena, stages, env.params_expr);
     if (try pushdown.hoistFilters(env.arena, env.gpa, stages, env.bindings)) |h| stages = h;
-    stages = try pruneFor(env.arena, stages, after);
+    if (pushdown.sourcesKnown(env.arena, env.bindings, stages)) stages = try pruneFor(env.arena, stages, after);
     stages = try projectSqlRead(env, stages);
     return descendLeadingWhere(env, stages);
 }
@@ -1168,7 +1176,7 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
     try std.testing.expectEqualStrings("cid", rd.cols[2]);
 }
 
-test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its query, the joined CTE's its side" {
+test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its query, the joined CTE's its side, whose read still asks for every column the CTE names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1211,8 +1219,8 @@ test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its qu
     const needs = (try rightNeeds(&env, j, out[3 .. out.len - 1])).?;
     const side = try prepareSide(&env, try j.rightStages(a, bindings.get("d").?.stages), try needsTail(a, needs));
     const cols = side[0].node.read.cols;
-    try std.testing.expectEqual(@as(usize, 2), cols.len);
-    for (cols) |c| try std.testing.expect(std.mem.eql(u8, c, "k") or std.mem.eql(u8, c, "nm"));
+    try std.testing.expectEqual(@as(usize, 3), cols.len);
+    for (cols) |c| try std.testing.expect(std.mem.eql(u8, c, "k") or std.mem.eql(u8, c, "nm") or std.mem.eql(u8, c, "extra"));
 }
 
 fn sortedNames(names: ?[][]const u8) ![]const []const u8 {

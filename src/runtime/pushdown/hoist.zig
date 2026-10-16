@@ -114,6 +114,31 @@ fn stageNames(
     return false;
 }
 
+/// Whether every source `stages` reads has columns known offline: a local file whose
+/// header or footer says them, through refs and each joined side. A select over a
+/// source only its database can name (or a union) keeps every item, so a column the
+/// database lacks still fails the read rather than vanishing with a pruned item.
+pub fn sourcesKnown(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage) bool {
+    return sourcesKnownAt(arena, bindings, stages, 0);
+}
+
+fn sourcesKnownAt(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage, depth: usize) bool {
+    if (depth > 16 or stages.len == 0) return false;
+    switch (stages[0].node) {
+        .read => |rd| if (offlineSchema(arena, rd, stages[0].hints) == null) return false,
+        .ref => |r| {
+            const pipe = bindings.get(r) orelse return false;
+            if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1)) return false;
+        },
+        else => return false,
+    }
+    for (stages[1..]) |st| if (st.node == .join) {
+        const pipe = bindings.get(st.node.join.binding) orelse return false;
+        if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1)) return false;
+    };
+    return true;
+}
+
 fn isRightName(name: []const u8, right: []const []const u8) bool {
     for (right) |r| {
         if (std.mem.eql(u8, name, r)) return true;

@@ -387,6 +387,22 @@ SELECT id, l.label AS a, upper(label) AS b FROM db.basalt_it t JOIN labels l ON 
   else
     report "postgres-join-projects-own-columns (run error)" bad
   fi
+
+  # A CTE column nothing reads is still asked of the database, so one the table
+  # lacks fails the run as it always did, rather than being pruned away unseen;
+  # the same for an unread column of a joined database side.
+  for q in "WITH c AS (SELECT id, nosuch FROM db.basalt_it) SELECT count(*) AS n FROM c;" \
+           "WITH c AS (SELECT s.id, t.nosuch FROM 'tests/integration/seed.csv' s JOIN db.basalt_it t ON s.id = t.id) SELECT count(*) AS n FROM c;"; do
+    if $B run -q -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+$q" >"$out/pg_unread.log" 2>&1; then
+      report "postgres-unread-missing-column (ran: $q)" bad
+    elif ! grep -q "nosuch" "$out/pg_unread.log"; then
+      report "postgres-unread-missing-column (wrong message)" bad
+      head -3 "$out/pg_unread.log"
+    else
+      report "postgres-unread-missing-column" ok
+    fi
+  done
 fi
 
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`
