@@ -488,7 +488,7 @@ test "an http parquet source routes to the network, never the local filesystem" 
 
 test "fuzz: page decode kernels survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzKernels, .{ .corpus = &fuzzKernels_corpus });
-    try @import("../../net/fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
+    try @import("../../testing/fuzzutil.zig").pound(fuzzKernels, &fuzzKernels_corpus);
 }
 
 test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polars" {

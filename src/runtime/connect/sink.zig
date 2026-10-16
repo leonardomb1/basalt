@@ -1,7 +1,7 @@
 //! Opening a sink: files by format and write mode, stdout, a SQL table, Stream Load.
 
-const ArrowFileSink = @import("../../format/arrow.zig").FileSink;
-const ArrowWriter = @import("../../format/arrow.zig").ArrowWriter;
+const ArrowFileSink = @import("../../format/arrow/write.zig").FileSink;
+const ArrowWriter = @import("../../format/arrow/write.zig").ArrowWriter;
 const Batch = @import("../../exec/batch.zig").Batch;
 const DiscardSink = @import("../connect.zig").DiscardSink;
 const Env = @import("../env.zig").Env;
@@ -11,8 +11,8 @@ const SqlDriver = @import("../connect.zig").SqlDriver;
 const TableWriter = @import("../../connect/table.zig").TableWriter;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
-const arrow = @import("../../format/arrow.zig");
-const arrowread = @import("../../format/arrowread.zig");
+const arrow = @import("../../format/arrow/write.zig");
+const arrowread = @import("../../format/arrow/read.zig");
 const ast = @import("../../lang/ast.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
 const csv = @import("../../format/csv.zig");
@@ -45,7 +45,7 @@ const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
 const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
-const xlsx = @import("../../format/xlsx.zig");
+const xlsx = @import("../../format/xlsx/read.zig");
 
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.

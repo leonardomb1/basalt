@@ -48,7 +48,7 @@ const sql = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
 const Space = @import("../exec/space.zig").Space;
-const deflate = @import("../format/deflate.zig");
+const deflate = @import("../format/compress/deflate.zig");
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;

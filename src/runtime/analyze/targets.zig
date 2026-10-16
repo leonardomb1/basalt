@@ -4,9 +4,9 @@
 
 const Diag = @import("../analyze.zig").Diag;
 const Error = @import("../analyze.zig").Error;
-const arrowread = @import("../../format/arrowread.zig");
+const arrowread = @import("../../format/arrow/read.zig");
 const ast = @import("../../lang/ast.zig");
-const pqcodec = @import("../../format/codec.zig");
+const pqcodec = @import("../../format/compress/codecs.zig");
 const csv = @import("../../format/csv.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
@@ -16,8 +16,8 @@ const pqwrite = @import("../../format/parquet/write.zig");
 const std = @import("std");
 const replace = @import("../../db/replace.zig");
 const types = @import("../../lang/types.zig");
-const xlsx = @import("../../format/xlsx.zig");
-const zipsrc = @import("../../format/zipsrc.zig");
+const xlsx = @import("../../format/xlsx/read.zig");
+const zipsrc = @import("../../format/compress/zip.zig");
 
 pub const FileFormat = enum {
     csv,

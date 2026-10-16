@@ -742,7 +742,7 @@ const fuzzPackets_corpus = [_][]const u8{
 
 test "fuzz: wire packet parsers survive arbitrary bytes" {
     try std.testing.fuzz({}, fuzzPackets, .{ .corpus = &fuzzPackets_corpus });
-    try @import("../net/fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
+    try @import("../testing/fuzzutil.zig").pound(fuzzPackets, &fuzzPackets_corpus);
 }
 
 /// mysql_native_password: SHA1(pw) XOR SHA1(salt ++ SHA1(SHA1(pw))).

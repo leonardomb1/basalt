@@ -536,5 +536,5 @@ const fuzzOne_corpus = [_][]const u8{
 
 test "fuzz: compact-protocol reader survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzOne, .{ .corpus = &fuzzOne_corpus });
-    try @import("../../net/fuzzutil.zig").pound(fuzzOne, &fuzzOne_corpus);
+    try @import("../../testing/fuzzutil.zig").pound(fuzzOne, &fuzzOne_corpus);
 }

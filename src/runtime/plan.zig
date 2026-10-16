@@ -38,8 +38,8 @@ const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
-const keypush = @import("keypush.zig");
-const joinorder = @import("joinorder.zig");
+const keypush = @import("plan/keypush.zig");
+const joinorder = @import("plan/joinorder.zig");
 const obs = @import("obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
@@ -1361,8 +1361,8 @@ test "pruneFor: a joined CTE keeps only the columns the join and what follows ma
 }
 
 test {
-    _ = @import("estimate.zig");
-    _ = @import("joinorder.zig");
+    _ = @import("plan/estimate.zig");
+    _ = @import("plan/joinorder.zig");
     _ = @import("plan/discover.zig");
     _ = @import("plan/union.zig");
 }

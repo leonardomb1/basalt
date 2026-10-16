@@ -1,17 +1,17 @@
 //! `basalt complete`: what Tab offers at an offset, as JSON, with the UTF-16
 //! conversions a JavaScript editor's positions need.
 
-const Catalog = @import("catalog.zig").Catalog;
-const Completer = @import("catalog.zig").Completer;
+const Catalog = @import("repl/catalog.zig").Catalog;
+const Completer = @import("repl/catalog.zig").Completer;
 const DeclStore = @import("entry.zig").DeclStore;
-const Offer = @import("catalog.zig").Offer;
+const Offer = @import("repl/catalog.zig").Offer;
 const declOf = @import("entry.zig").declOf;
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
-const suggestFor = @import("catalog.zig").suggestFor;
+const suggestFor = @import("repl/catalog.zig").suggestFor;
 const unknownOption = @import("args.zig").unknownOption;
 
 /// What Tab would offer at byte `--pos`, as JSON. Connections are asked for their

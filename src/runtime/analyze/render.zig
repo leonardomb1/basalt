@@ -2,7 +2,7 @@
 //! the physical shape a pipeline runs in.
 
 const Plan = @import("../analyze.zig").Plan;
-const arrowread = @import("../../format/arrowread.zig");
+const arrowread = @import("../../format/arrow/read.zig");
 const azure = @import("../../store/azure.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
 const s3 = @import("../../store/s3.zig");
@@ -10,7 +10,7 @@ const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
-const xlsx = @import("../../format/xlsx.zig");
+const xlsx = @import("../../format/xlsx/read.zig");
 const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
 const Stage = @import("../analyze.zig").Stage;

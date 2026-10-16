@@ -19,7 +19,7 @@ const op = @import("../exec/op.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
-const codec = @import("../format/codec.zig");
+const codec = @import("../format/compress/codecs.zig");
 const driver = @import("../connect/driver.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("../db/sql.zig");
@@ -33,7 +33,7 @@ const analyze = @import("analyze.zig");
 const obs = @import("obs.zig");
 const pushdown = @import("pushdown.zig");
 const Value = @import("../exec/value.zig").Value;
-const arrow = @import("../format/arrow.zig");
+const arrow = @import("../format/arrow/write.zig");
 const Space = @import("../exec/space.zig").Space;
 
 pub const Diag = struct {

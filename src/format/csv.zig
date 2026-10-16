@@ -59,9 +59,9 @@ const objstore = @import("../store/objstore.zig");
 const Part = @import("../store/part.zig").Part;
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
-const zipsrc = @import("zipsrc.zig");
+const zipsrc = @import("compress/zip.zig");
 const folder = @import("../connect/folder.zig");
-const deflate = @import("deflate.zig");
+const deflate = @import("compress/deflate.zig");
 
 const BATCH_ROWS = 1024;
 const LINE_BUF = 64 * 1024;

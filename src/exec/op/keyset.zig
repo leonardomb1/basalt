@@ -1,7 +1,7 @@
 //! The key values one side of a join holds, gathered so the other side's read can
 //! ask its database for only those: distinct non-null values up to a cap, and the
 //! smallest and largest, which still bound a key past the cap. The runtime turns
-//! them into `IN (…)` or a range (`keypush.zig`); a `KeyPush` is how a join hands
+//! them into `IN (…)` or a range (`runtime/plan/keypush.zig`); a `KeyPush` is how a join hands
 //! them over without knowing what reads them.
 
 const Batch = @import("../batch.zig").Batch;

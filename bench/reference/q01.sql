@@ -1,7 +1,7 @@
 -- DuckDB reference for bench/tpch/q01.sql. Must stay semantically identical to the
 -- basalt script, including the CSV sink, so the comparison is whole-pipeline and not
 -- basalt-writes-a-file vs duckdb-prints-a-table. @DATA@/@OUT@ are substituted by the
--- runner (src/bench_e2e.zig).
+-- runner (src/bench/e2e.zig).
 COPY (
   SELECT l_returnflag,
          l_linestatus,

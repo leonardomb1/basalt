@@ -6,7 +6,7 @@ const Env = @import("../env.zig").Env;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
-const arrowread = @import("../../format/arrowread.zig");
+const arrowread = @import("../../format/arrow/read.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
@@ -37,7 +37,7 @@ const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
-const xlsx = @import("../../format/xlsx.zig");
+const xlsx = @import("../../format/xlsx/read.zig");
 
 pub const ConstSource = struct {
     batch: Batch,

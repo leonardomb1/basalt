@@ -11,7 +11,7 @@ const resolveDbConfig = @import("dbconfig.zig").resolveDbConfig;
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
-const quoted = @import("../estimate.zig").quoted;
+const quoted = @import("../plan/estimate.zig").quoted;
 const sqlStr = @import("../pushdown.zig").sqlStr;
 const types = @import("../../lang/types.zig");
 

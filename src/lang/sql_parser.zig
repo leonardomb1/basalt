@@ -59,8 +59,8 @@
 //! is in parse/, one file per area (`stmt.zig`, `decl.zig`, `query.zig`,
 //! `tablefn.zig`, `correlate.zig`, `window.zig`, `from.zig`, `control.zig`,
 //! `rewrite.zig`, `expr.zig`), each method aliased back into `Parser` so
-//! `self.parseExpr()` reads as before. The parser's tests are in `parse/tests_expr.zig`,
-//! `parse/tests_query.zig`, `parse/tests_script.zig` and `parse/tests_window.zig`.
+//! `self.parseExpr()` reads as before. The parser's tests are in `parse/tests/expr.zig`,
+//! `parse/tests/query.zig`, `parse/tests/script.zig` and `parse/tests/window.zig`.
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -1005,9 +1005,9 @@ test {
     _ = @import("parse/tablefn.zig");
     _ = @import("parse/textcols.zig");
     _ = @import("parse/window.zig");
-    _ = @import("parse/tests_expr.zig");
-    _ = @import("parse/tests_query.zig");
-    _ = @import("parse/tests_script.zig");
-    _ = @import("parse/tests_window.zig");
+    _ = @import("parse/tests/expr.zig");
+    _ = @import("parse/tests/query.zig");
+    _ = @import("parse/tests/script.zig");
+    _ = @import("parse/tests/window.zig");
     _ = @import("parse/testing_util.zig");
 }

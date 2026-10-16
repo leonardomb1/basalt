@@ -2,8 +2,8 @@
 //! write files on a Windows share or a Samba server.
 //!
 //! Dialects 2.1 through 3.1.1 over direct TCP (445); `max_dialect` lowers the
-//! offer for a server that mishandles 3.1.1. Login is NTLMv2 (`ntlm.zig`) or
-//! Kerberos (`krb5.zig`, realm such as `CORP.LOCAL`, KDC looked up when empty,
+//! offer for a server that mishandles 3.1.1. Login is NTLMv2 (`net/auth/ntlm.zig`) or
+//! Kerberos (`net/auth/krb5.zig`, realm such as `CORP.LOCAL`, KDC looked up when empty,
 //! service `cifs/<host>` by default) inside SPNEGO. Every request after login is
 //! signed and every signed response checked — Windows 11 24H2 and Server 2025
 //! require signing by default, and a server that does not still accepts it:
@@ -33,9 +33,9 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
-const ntlm = @import("../net/ntlm.zig");
-const krb5 = @import("../net/krb5.zig");
-const spnego = @import("../net/spnego.zig");
+const ntlm = @import("../net/auth/ntlm.zig");
+const krb5 = @import("../net/auth/krb5.zig");
+const spnego = @import("../net/auth/spnego.zig");
 
 pub const Error = error{
     SmbProtocol,

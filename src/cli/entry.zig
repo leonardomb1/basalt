@@ -1,14 +1,14 @@
 //! A REPL or kernel entry as statements: where each ends, which are declarations,
 //! and the session's store of declarations that later entries build on.
 
-const Session = @import("repl.zig").Session;
-const isClear = @import("repl.zig").isClear;
-const isHelp = @import("repl.zig").isHelp;
-const isQuit = @import("repl.zig").isQuit;
+const Session = @import("repl/repl.zig").Session;
+const isClear = @import("repl/repl.zig").isClear;
+const isHelp = @import("repl/repl.zig").isHelp;
+const isQuit = @import("repl/repl.zig").isQuit;
 const parser = @import("../lang/sql_parser.zig");
 const std = @import("std");
-const Catalog = @import("catalog.zig").Catalog;
-const httpResources = @import("catalog.zig").httpResources;
+const Catalog = @import("repl/catalog.zig").Catalog;
+const httpResources = @import("repl/catalog.zig").httpResources;
 
 /// Next statement-level `;`, skipping strings, dollar quotes and comments by the
 /// lexer's own rules, so the REPL agrees with the parser on where a statement ends.

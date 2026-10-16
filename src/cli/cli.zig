@@ -37,17 +37,17 @@
 //!
 //! This file keeps the signal handling, the dispatch and the usage text. Each
 //! command is its own file (`cmd_run.zig`, `cmd_check.zig`, `cmd_complete.zig`,
-//! `repl.zig`, `kernel.zig`), with what they share in
+//! `repl/repl.zig`, `kernel.zig`), with what they share in
 //! `args.zig` (script and flags), `entry.zig` (statements and the session's
-//! declarations), `prepare.zig` (an entry made runnable), `catalog.zig` (what Tab
-//! fetches) and `wizard.zig` (`\connect`).
+//! declarations), `prepare.zig` (an entry made runnable), `repl/catalog.zig` (what Tab
+//! fetches) and `repl/wizard.zig` (`\connect`).
 
 const std = @import("std");
 const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
 const runtime = @import("../runtime/run.zig");
-const complete = @import("complete.zig");
+const complete = @import("repl/complete.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
 
@@ -136,11 +136,11 @@ const cmdRun = @import("cmd_run.zig").cmdRun;
 pub const DeclKind = @import("entry.zig").DeclKind;
 pub const DeclId = @import("entry.zig").DeclId;
 pub const DeclStore = @import("entry.zig").DeclStore;
-pub const Catalog = @import("catalog.zig").Catalog;
-pub const Completer = @import("catalog.zig").Completer;
-pub const Offer = @import("catalog.zig").Offer;
-pub const suggestFor = @import("catalog.zig").suggestFor;
-const cmdRepl = @import("repl.zig").cmdRepl;
+pub const Catalog = @import("repl/catalog.zig").Catalog;
+pub const Completer = @import("repl/catalog.zig").Completer;
+pub const Offer = @import("repl/catalog.zig").Offer;
+pub const suggestFor = @import("repl/catalog.zig").suggestFor;
+const cmdRepl = @import("repl/repl.zig").cmdRepl;
 pub const Pending = @import("prepare.zig").Pending;
 pub const Prepared = @import("prepare.zig").Prepared;
 pub const PrepareError = @import("prepare.zig").PrepareError;
@@ -148,7 +148,7 @@ pub const sessionText = @import("prepare.zig").sessionText;
 pub const prepareEntry = @import("prepare.zig").prepareEntry;
 pub const LetFreezer = @import("prepare.zig").LetFreezer;
 pub const letLiteral = @import("prepare.zig").letLiteral;
-pub const appendDisplaySinks = @import("repl.zig").appendDisplaySinks;
+pub const appendDisplaySinks = @import("repl/repl.zig").appendDisplaySinks;
 
 fn usage(w: anytype) !void {
     try w.writeAll(
@@ -249,7 +249,7 @@ fn usage(w: anytype) !void {
 }
 
 test "every meta command the REPL handles is one Tab offers, and the other way round" {
-    const src = @embedFile("repl.zig");
+    const src = @embedFile("repl/repl.zig");
     for (complete.meta_commands) |m| {
         if (std.mem.eql(u8, m, "\\quit") or std.mem.eql(u8, m, "\\h") or std.mem.eql(u8, m, "\\q") or std.mem.eql(u8, m, "\\help") or std.mem.eql(u8, m, "\\cls") or std.mem.eql(u8, m, "\\clear")) continue;
         var needle_buf: [64]u8 = undefined;
@@ -314,12 +314,12 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
 
 test {
     _ = @import("args.zig");
-    _ = @import("catalog.zig");
+    _ = @import("repl/catalog.zig");
     _ = @import("cmd_check.zig");
     _ = @import("cmd_complete.zig");
     _ = @import("cmd_run.zig");
     _ = @import("entry.zig");
     _ = @import("prepare.zig");
-    _ = @import("repl.zig");
-    _ = @import("wizard.zig");
+    _ = @import("repl/repl.zig");
+    _ = @import("repl/wizard.zig");
 }

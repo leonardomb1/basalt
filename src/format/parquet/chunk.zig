@@ -81,7 +81,7 @@ pub fn readEntries(
     return .{ .vals = d.vals, .reps = lv.reps.items, .defs = lv.defs.items };
 }
 
-const ReadError = Error || parquet.Error || @import("../codec.zig").Error;
+const ReadError = Error || parquet.Error || @import("../compress/codecs.zig").Error;
 
 /// Every read of a chunk walks its pages here: `rows` values, or with `rows` null
 /// the chunk's `num_values` entries along with their levels.

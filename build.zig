@@ -120,9 +120,14 @@ pub fn build(b: *std.Build) void {
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench.zig"),
+            .root_source_file = b.path("src/bench/simd.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "simd", .module = b.createModule(.{
+                .root_source_file = b.path("src/exec/simd.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }) }},
         }),
     });
     const run_bench = b.addRunArtifact(bench);
@@ -135,7 +140,7 @@ pub fn build(b: *std.Build) void {
     const bench_e2e = b.addExecutable(.{
         .name = "bench-e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_e2e.zig"),
+            .root_source_file = b.path("src/bench/e2e.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),

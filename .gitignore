@@ -2,6 +2,4 @@
 zig-out/
 .claude/
 .vscode/
-# what the examples write
-examples/out.csv
 /book/

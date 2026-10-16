@@ -17,12 +17,12 @@
 //! hostile file must produce an error, never a trap or a runaway allocation.
 //!
 //! The real-file tests use fixtures from an external writer, the same rows in five
-//! codecs, because the Snappy and LZ4 decoders in `codec.zig` are our own and only
+//! codecs, because the Snappy and LZ4 decoders in `compress/codecs.zig` are our own and only
 //! byte-identical page bodies prove them right.
 
 const std = @import("std");
 const thrift = @import("thrift.zig");
-const codec = @import("../codec.zig");
+const codec = @import("../compress/codecs.zig");
 
 pub const Error = error{
     NotParquet,
@@ -733,5 +733,5 @@ const fuzzParse_corpus = [_][]const u8{
 
 test "fuzz: file metadata parse survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzParse, .{ .corpus = &fuzzParse_corpus });
-    try @import("../../net/fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
+    try @import("../../testing/fuzzutil.zig").pound(fuzzParse, &fuzzParse_corpus);
 }
