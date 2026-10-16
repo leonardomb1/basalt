@@ -42,6 +42,7 @@ pub const SqlRead = struct { kind: SqlKind, dialect: sql.Dialect, port: u16 };
 pub const Connector = enum {
     csv,
     stdout,
+    stdin,
     http,
     unit,
     range,
@@ -83,7 +84,7 @@ pub const Connector = enum {
     /// Sources the engine reads without a `CREATE CONNECTION`.
     pub fn isBuiltinSource(self: Connector) bool {
         return switch (self) {
-            .csv, .http, .range, .unit => true,
+            .csv, .http, .range, .unit, .stdin => true,
             else => false,
         };
     }

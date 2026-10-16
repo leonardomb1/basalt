@@ -368,6 +368,32 @@ pub const Elements = struct {
     }
 };
 
+/// A validated object's members in the order written: each key's content as written
+/// (escapes unresolved, `decodeString` resolves them) and its value, as slices of the
+/// text.
+pub const Members = struct {
+    t: []const u8,
+    i: usize,
+
+    pub const Member = struct { key: []const u8, value: []const u8 };
+
+    pub fn root(t: []const u8) Members {
+        return .{ .t = t, .i = skipWs(t, skipWs(t, 0) + 1) };
+    }
+
+    pub fn next(self: *Members) ?Member {
+        if (self.i >= self.t.len or self.t[self.i] == '}') return null;
+        const ke = stringEnd(self.t, self.i);
+        const key = self.t[self.i + 1 .. ke - 1];
+        const vs = skipWs(self.t, skipWs(self.t, ke) + 1);
+        const ve = valueEnd(self.t, vs);
+        var j = skipWs(self.t, ve);
+        if (j < self.t.len and self.t[j] == ',') j = skipWs(self.t, j + 1);
+        self.i = j;
+        return .{ .key = key, .value = self.t[vs..ve] };
+    }
+};
+
 pub const Cell = union(enum) { null, text: []const u8 };
 
 pub fn cell(arena: std.mem.Allocator, raw: []const u8) Error!Cell {

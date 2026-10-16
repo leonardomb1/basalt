@@ -139,15 +139,20 @@ pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) 
     const kind: folder.Kind = if (want) |w| switch (w) {
         .parquet => .parquet,
         .csv => .csv,
-        else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads Parquet or CSV files", .{path})),
+        .json => .json,
+        else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads Parquet, CSV or JSON files", .{path})),
     } else switch (folder.kindOf(all)) {
         .kind => |k| k,
-        .mixed => |m| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}` holds both Parquet (`{s}`) and CSV (`{s}`) files; one table reads one format — name it with WITH (format = 'parquet') or 'csv'", .{ path, folder.below(m.parquet, path), folder.below(m.csv, path) })),
+        .mixed => |m| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}` holds both {s} (`{s}`) and {s} (`{s}`) files; one table reads one format — name it with WITH (format = '{s}') or '{s}'", .{ path, folder.label(m.a.kind), folder.below(m.a.file, path), folder.label(m.b.kind), folder.below(m.b.file, path), @tagName(m.a.kind), @tagName(m.b.kind) })),
         .empty => unreachable,
-        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no .parquet, .csv, .tsv or .txt file in folder `{s}`", .{path})),
+        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no .parquet, .csv, .tsv, .txt or .json file in folder `{s}`", .{path})),
     };
     const files = try folder.only(env.arena, all, kind);
-    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ if (kind == .parquet) ".parquet" else ".csv, .tsv or .txt", path }));
+    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ switch (kind) {
+        .parquet => ".parquet",
+        .csv => ".csv, .tsv or .txt",
+        .json => ".json, .ndjson or .jsonl",
+    }, path }));
     const read = FolderRead{ .kind = kind, .files = files };
     env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .read = read };
     return read;

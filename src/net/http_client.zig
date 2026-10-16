@@ -79,16 +79,18 @@
 //! writer (`decompress_direct`): through std's fixed window buffer the flate
 //! decoder could emit up to 258 bytes past the limit and abort the process.
 //!
-//! The schema is inferred from the first page (request.zig rules); later pages
-//! coerce to it: missing keys become null, new keys are dropped. Each page is
-//! fetched whole into the per-batch arena, so memory stays flat across pages.
+//! Pages are read as rows by `format/json.zig`, as a JSON file is: the schema from
+//! the first page's rows, later pages coerced to it, missing keys null and new keys
+//! dropped. Each page is fetched whole into the per-batch arena, so memory stays
+//! flat across pages.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("../connect/driver.zig");
-const request = @import("../connect/request.zig");
+const fjson = @import("../format/json.zig");
+const jt = @import("../exec/json.zig");
 const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
@@ -300,15 +302,15 @@ pub const AuthState = struct {
             obs.logOr(self.logger, .err, "login http {d} from {s}: {s}", .{ code, self.cc.login_url, b[0..@min(b.len, 300)] });
             return statusError(code);
         }
-        const root = try json.parseFromSliceLeaky(json.Value, arena, aw.writer.buffered(), .{});
+        const body = std.mem.trim(u8, aw.writer.buffered(), " \t\r\n");
+        if (body.len == 0) return error.LoginTokenMissing;
+        try jt.validate(arena, body);
         const path = if (self.cc.token_path.len > 0)
             self.cc.token_path
         else if (is_oauth) "access_token" else ".";
-        const tok_val = if (std.mem.eql(u8, path, ".")) root else (jsonPath(root, path) orelse return error.LoginTokenMissing);
-        const tok = switch (tok_val) {
-            .string => |t| t,
-            else => return error.LoginTokenMissing,
-        };
+        const raw = if (std.mem.eql(u8, path, ".")) body else ((try fjson.field(arena, body, path)) orelse return error.LoginTokenMissing);
+        if (raw[0] != '"') return error.LoginTokenMissing;
+        const tok = try jt.decodeString(arena, raw[1 .. raw.len - 1]);
         const prefix = self.cc.token_prefix orelse (if (is_oauth) "Bearer " else "");
         self.header = .{
             .name = self.cc.token_header,
@@ -597,12 +599,14 @@ pub const HttpSource = struct {
         const first_req = try self.pageReq(arena);
         const page = try self.fetchParsed(arena, first_req);
         const items = page.items;
-        self.schema = try request.inferSchema(arena, items);
-        self.first = try request.batchFromJson(arena, self.schema, items);
+        const schema = try arena.create(types.Schema);
+        schema.* = try fjson.schemaOf(arena, items, (fjson.Options{}).sample);
+        self.schema = schema;
+        self.first = try fjson.batchOf(arena, self.schema, items);
         self.noteProgress(items.len);
         if (opts.total_field) |tf| {
-            if (jsonPath(page.root, tf)) |tv| {
-                if (tv == .integer) self.total_pages = tv.integer;
+            if (try fjson.field(arena, page.root, tf)) |tv| {
+                if (jt.number(tv) == .int) self.total_pages = jt.number(tv).int;
             }
         }
         self.advance(arena, page.root, items.len) catch |e| return e;
@@ -627,18 +631,17 @@ pub const HttpSource = struct {
         }
     }
 
-    const Page = struct { root: json.Value, items: []const json.Value };
+    const Page = struct { root: []const u8, items: []const []const u8 };
 
     fn fetchParsed(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) !Page {
         const body = try self.fetchPage(arena, req);
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
-        if (trimmed.len == 0) return .{ .root = .null, .items = &.{} };
-        const root = try json.parseFromSliceLeaky(json.Value, arena, trimmed, .{});
-        if (root == .null) return .{ .root = .null, .items = &.{} };
-        return .{ .root = root, .items = try itemsOf(arena, root, self.opts.items) };
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "null")) return .{ .root = "null", .items = &.{} };
+        try jt.validate(arena, trimmed);
+        return .{ .root = trimmed, .items = try itemsOf(arena, trimmed, self.opts.items) };
     }
 
-    fn advance(self: *HttpSource, arena: std.mem.Allocator, root: json.Value, n_items: usize) !void {
+    fn advance(self: *HttpSource, arena: std.mem.Allocator, root: []const u8, n_items: usize) !void {
         self.pages_fetched += 1;
         switch (self.opts.paginate) {
             .none => self.done = true,
@@ -656,17 +659,15 @@ pub const HttpSource = struct {
                     self.done = true;
                     return;
                 }
-                const cur = jsonPath(root, self.opts.cursor_field) orelse {
+                const cur = (if (std.mem.eql(u8, root, "null")) null else try fjson.field(arena, root, self.opts.cursor_field)) orelse {
                     self.done = true;
                     return;
                 };
-                const tok = switch (cur) {
-                    .string => |s| s,
-                    else => {
-                        self.done = true;
-                        return;
-                    },
-                };
+                if (cur[0] != '"') {
+                    self.done = true;
+                    return;
+                }
+                const tok = try jt.decodeString(arena, cur[1 .. cur.len - 1]);
                 if (tok.len == 0) {
                     self.done = true;
                     return;
@@ -676,7 +677,6 @@ pub const HttpSource = struct {
                 } else {
                     self.next_url = try withParam(self.arena, self.base_url, self.opts.cursor_param, tok);
                 }
-                _ = arena;
             },
         }
     }
@@ -986,13 +986,12 @@ pub const HttpSource = struct {
 
     fn consumeBody(self: *HttpSource, arena: std.mem.Allocator, body: []const u8) !?Batch {
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
-        if (trimmed.len == 0) return self.finishEmpty();
-        const root = try json.parseFromSliceLeaky(json.Value, arena, trimmed, .{});
-        if (root == .null) return self.finishEmpty();
-        const items = try itemsOf(arena, root, self.opts.items);
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "null")) return self.finishEmpty();
+        try jt.validate(arena, trimmed);
+        const items = try itemsOf(arena, trimmed, self.opts.items);
         if (items.len == 0) return self.finishEmpty();
         self.noteProgress(items.len);
-        const batch = try request.batchFromJson(arena, self.schema, items);
+        const batch = try fjson.batchOf(arena, self.schema, items);
         if (self.opts.stop_short and items.len < self.opts.page_size) {
             self.issue_done = true;
             self.drainSlots();
@@ -1060,7 +1059,7 @@ pub const HttpSource = struct {
         try self.advance(arena, page.root, page.items.len);
         if (page.items.len == 0) return null;
         self.noteProgress(page.items.len);
-        return try request.batchFromJson(arena, self.schema, page.items);
+        return try fjson.batchOf(arena, self.schema, page.items);
     }
 
     pub fn close(self: *HttpSource) void {
@@ -1122,41 +1121,14 @@ fn envOpt(arena: std.mem.Allocator, name_opt: ?[]const u8) !?[]const u8 {
     return std.process.getEnvVarOwned(arena, name) catch return error.MissingAuthEnv;
 }
 
-fn itemsOf(arena: std.mem.Allocator, root: json.Value, items_path: ?[]const u8) ![]const json.Value {
+/// A validated page's rows: the array (or one object) at `items_path`, or the page
+/// itself, each a row's text.
+fn itemsOf(arena: std.mem.Allocator, doc: []const u8, items_path: ?[]const u8) ![]const []const u8 {
     if (items_path) |p| {
-        const v = jsonPath(root, p) orelse return error.ItemsFieldMissing;
-        return switch (v) {
-            .array => |a| a.items,
-            .object => blk: {
-                const one = try arena.alloc(json.Value, 1);
-                one[0] = v;
-                break :blk one;
-            },
-            else => error.ItemsFieldNotArray,
-        };
+        const v = (try fjson.field(arena, doc, p)) orelse return error.ItemsFieldMissing;
+        return (try fjson.rowsOf(arena, v, null)) orelse error.ItemsFieldNotArray;
     }
-    return switch (root) {
-        .array => |a| a.items,
-        .object => blk: {
-            const one = try arena.alloc(json.Value, 1);
-            one[0] = root;
-            break :blk one;
-        },
-        else => error.ExpectedJsonArrayOrObject,
-    };
-}
-
-fn jsonPath(root: json.Value, dotted: []const u8) ?json.Value {
-    var cur = root;
-    var it = std.mem.splitScalar(u8, dotted, '.');
-    while (it.next()) |key| {
-        switch (cur) {
-            .object => |o| cur = o.get(key) orelse return null,
-            else => return null,
-        }
-    }
-    if (cur == .null) return null;
-    return cur;
+    return (try fjson.rowsOf(arena, doc, null)) orelse error.ExpectedJsonArrayOrObject;
 }
 
 fn appendParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: []const u8) ![]const u8 {
@@ -1947,18 +1919,18 @@ test "statusError names each status family distinctly" {
     try std.testing.expectEqual(error.HttpServerBusy, statusError(503));
 }
 
-test "jsonPath walks dotted paths; null and missing are both absent" {
+test "a page field walks dotted paths; null and missing are both absent" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try json.parseFromSliceLeaky(json.Value, a,
+    const root =
         \\{"meta":{"next":"tok","total":3,"gone":null},"data":[1]}
-    , .{});
-    try std.testing.expectEqualStrings("tok", jsonPath(root, "meta.next").?.string);
-    try std.testing.expectEqual(@as(i64, 3), jsonPath(root, "meta.total").?.integer);
-    try std.testing.expect(jsonPath(root, "meta.missing") == null);
-    try std.testing.expect(jsonPath(root, "meta.gone") == null);
-    try std.testing.expect(jsonPath(root, "data.next") == null);
+    ;
+    try std.testing.expectEqualStrings("\"tok\"", (try fjson.field(a, root, "meta.next")).?);
+    try std.testing.expectEqualStrings("3", (try fjson.field(a, root, "meta.total")).?);
+    try std.testing.expect((try fjson.field(a, root, "meta.missing")) == null);
+    try std.testing.expect((try fjson.field(a, root, "meta.gone")) == null);
+    try std.testing.expect((try fjson.field(a, root, "data.next")) == null);
 }
 
 test "itemsOf: bare array, dotted path, and named errors" {
@@ -1966,22 +1938,16 @@ test "itemsOf: bare array, dotted path, and named errors" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    const arr = try json.parseFromSliceLeaky(json.Value, a, "[{\"id\":1},{\"id\":2}]", .{});
-    try std.testing.expectEqual(@as(usize, 2), (try itemsOf(a, arr, null)).len);
-
-    const wrapped = try json.parseFromSliceLeaky(json.Value, a,
+    try std.testing.expectEqual(@as(usize, 2), (try itemsOf(a, "[{\"id\":1},{\"id\":2}]", null)).len);
+    const wrapped =
         \\{"result":{"rows":[{"id":1}]}}
-    , .{});
+    ;
     try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, wrapped, "result.rows")).len);
     try std.testing.expectError(error.ItemsFieldMissing, itemsOf(a, wrapped, "result.nope"));
     try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, wrapped, "result")).len);
-    const scalar_at = try json.parseFromSliceLeaky(json.Value, a, "{\"n\":5}", .{});
-    try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, scalar_at, "n"));
-
-    const one = try json.parseFromSliceLeaky(json.Value, a, "{\"id\":9}", .{});
-    try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, one, null)).len);
-    const scalar = try json.parseFromSliceLeaky(json.Value, a, "5", .{});
-    try std.testing.expectError(error.ExpectedJsonArrayOrObject, itemsOf(a, scalar, null));
+    try std.testing.expectError(error.ItemsFieldNotArray, itemsOf(a, "{\"n\":5}", "n"));
+    try std.testing.expectEqual(@as(usize, 1), (try itemsOf(a, "{\"id\":9}", null)).len);
+    try std.testing.expectError(error.ExpectedJsonArrayOrObject, itemsOf(a, "5", null));
 }
 
 test "withParam and appendParam pick the right separator" {

@@ -38,6 +38,10 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         const url = try self.expect(.string);
         _ = try self.expect(.rparen);
         node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
+    } else if (self.isKw("stdin") and self.peekTag() != .dot) {
+        _ = self.advance();
+        node = .{ .read = .{ .connector = "stdin", .form = .unit } };
+        own = "stdin";
     } else if (self.isKw("each")) {
         return self.parseEachTableOf(read_hints);
     } else if (self.isKw("range") and self.peekTag() == .lparen) {

@@ -1390,7 +1390,11 @@ const Ctx = struct {
                     .query => "query",
                     .path => |p| p,
                     .range => "range",
-                    .unit => "unit",
+                    .unit => if (std.mem.eql(u8, connector, "stdin")) "stdin" else "unit",
+                };
+                if (std.mem.eql(u8, connector, "stdin")) if (try formatFromHints(lead.hints, self.diag)) |f| switch (f) {
+                    .csv, .json => {},
+                    else => return fail(self.diag, "STDIN is read as a stream, so it takes CSV, JSON or NDJSON; a {s} file needs random access — read it from a path", .{@tagName(f)}),
                 };
                 if (rd.form == .range) for ([_]*const ast.Expr{ rd.form.range.lo, rd.form.range.hi }) |b| {
                     if ((try dollarRefs(self.arena, b)).len == 0 and rangeBoundValue(b) == null)
@@ -1756,6 +1760,8 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
 const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
 const csv_read_keys = [_][]const u8{ "format", "delimiter", "delim", "encoding" };
 const xlsx_read_keys = [_][]const u8{ "format", "sheet", "range", "header" };
+const json_read_keys = [_][]const u8{ "format", "items" };
+const stdin_read_keys = [_][]const u8{ "format", "items", "delimiter", "delim", "encoding" };
 const rest_read_keys = [_][]const u8{
     "items",          "method",        "body",         "body_type",   "header",    "bearer",
     "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
@@ -1769,6 +1775,8 @@ const ReadKind = struct { what: []const u8, keys: []const []const u8, takes: []c
 
 const csv_read = ReadKind{ .what = "a CSV read", .keys = &csv_read_keys, .takes = "format, delimiter, encoding" };
 const xlsx_read = ReadKind{ .what = "an Excel read", .keys = &xlsx_read_keys, .takes = "format, sheet, range, header" };
+const json_read = ReadKind{ .what = "a JSON read", .keys = &json_read_keys, .takes = "format, items" };
+const stdin_read = ReadKind{ .what = "a STDIN read", .keys = &stdin_read_keys, .takes = "format, items, delimiter, encoding" };
 const columnar_read = ReadKind{ .what = "a Parquet or Arrow read", .keys = &[_][]const u8{"format"}, .takes = "only format" };
 const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
 const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind" }, .takes = "split, splits, split_kind" };
@@ -1786,9 +1794,12 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
             break :blk if (fmt) |f| switch (f) {
                 .xlsx => xlsx_read,
                 .csv => csv_read,
+                .json => json_read,
                 else => columnar_read,
             } else csv_read;
-        } else if (std.mem.eql(u8, connector, "http"))
+        } else if (std.mem.eql(u8, connector, "stdin"))
+            stdin_read
+        else if (std.mem.eql(u8, connector, "http"))
             rest_read
         else if (isSqlSource(connector))
             sql_read

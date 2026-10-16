@@ -4,8 +4,9 @@
 //! are what Spark and Hadoop leave beside the data. The listing is sorted by
 //! path, so the first file (whose schema the rest must match) and the order
 //! rows arrive in do not depend on how a server lists. With no `format`, a
-//! folder must hold Parquet files or CSVs; both is refused, as one table cannot
-//! be read from the two, and `Verdict.mixed` names one file of each.
+//! folder must hold one kind of file, Parquet, CSV or JSON; two kinds are
+//! refused, as one table cannot be read from both, and `Verdict.mixed` names one
+//! file of each.
 
 const std = @import("std");
 const http_client = @import("../net/http_client.zig");
@@ -55,7 +56,7 @@ fn hidden(rel: []const u8) bool {
     return false;
 }
 
-pub const Kind = enum { parquet, csv };
+pub const Kind = enum { parquet, csv, json };
 
 const csv_exts = [_][]const u8{ ".csv", ".tsv", ".txt", ".csv.gz", ".tsv.gz", ".txt.gz", ".csv.zst", ".tsv.zst", ".txt.zst" };
 
@@ -68,36 +69,60 @@ pub fn isParquetName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".parquet");
 }
 
+const json_exts = [_][]const u8{ ".json", ".ndjson", ".jsonl", ".json.gz", ".ndjson.gz", ".jsonl.gz", ".json.zst", ".ndjson.zst", ".jsonl.zst" };
+
+pub fn isJsonName(name: []const u8) bool {
+    for (json_exts) |x| if (std.ascii.endsWithIgnoreCase(name, x)) return true;
+    return false;
+}
+
+fn isKind(name: []const u8, kind: Kind) bool {
+    return switch (kind) {
+        .parquet => isParquetName(name),
+        .csv => isCsvName(name),
+        .json => isJsonName(name),
+    };
+}
+
+pub const Named = struct { kind: Kind, file: []const u8 };
+
 pub const Verdict = union(enum) {
     kind: Kind,
     empty,
     neither,
-    mixed: struct { parquet: []const u8, csv: []const u8 },
+    mixed: struct { a: Named, b: Named },
 };
 
 pub fn kindOf(files: []const []const u8) Verdict {
-    var pq: ?[]const u8 = null;
-    var cs: ?[]const u8 = null;
-    for (files) |f| {
-        if (pq == null and isParquetName(f)) pq = f;
-        if (cs == null and isCsvName(f)) cs = f;
+    var first: [std.meta.fields(Kind).len]?[]const u8 = @splat(null);
+    for (files) |f| inline for (std.meta.fields(Kind), 0..) |k, i| {
+        if (first[i] == null and isKind(f, @enumFromInt(k.value))) first[i] = f;
+    };
+    var found: ?Named = null;
+    for (first, 0..) |f, i| {
+        const name = f orelse continue;
+        const here = Named{ .kind = @enumFromInt(i), .file = name };
+        if (found) |a| return .{ .mixed = .{ .a = a, .b = here } };
+        found = here;
     }
-    if (pq != null and cs != null) return .{ .mixed = .{ .parquet = pq.?, .csv = cs.? } };
-    if (pq != null) return .{ .kind = .parquet };
-    if (cs != null) return .{ .kind = .csv };
+    if (found) |a| return .{ .kind = a.kind };
     return if (files.len == 0) .empty else .neither;
 }
 
 pub fn only(arena: std.mem.Allocator, files: []const []const u8, kind: Kind) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     for (files) |f| {
-        const keep = switch (kind) {
-            .parquet => isParquetName(f),
-            .csv => isCsvName(f),
-        };
-        if (keep) try out.append(f);
+        if (isKind(f, kind)) try out.append(f);
     }
     return out.items;
+}
+
+pub fn label(kind: Kind) []const u8 {
+    return switch (kind) {
+        .parquet => "Parquet",
+        .csv => "CSV",
+        .json => "JSON",
+    };
 }
 
 test "folder: hidden parts, kinds, a local walk sorted" {
@@ -109,7 +134,9 @@ test "folder: hidden parts, kinds, a local walk sorted" {
     const pq = [_][]const u8{ "d/a.parquet", "d/notes.pdf" };
     try std.testing.expectEqual(Kind.parquet, kindOf(&pq).kind);
     const mixed = [_][]const u8{ "d/a.parquet", "d/b.CSV" };
-    try std.testing.expectEqualStrings("d/b.CSV", kindOf(&mixed).mixed.csv);
+    try std.testing.expectEqualStrings("d/b.CSV", kindOf(&mixed).mixed.b.file);
+    const js = [_][]const u8{ "d/a.ndjson.gz", "d/b.jsonl" };
+    try std.testing.expectEqual(Kind.json, kindOf(&js).kind);
     const pics = [_][]const u8{"d/x.png"};
     try std.testing.expect(kindOf(&pics) == .neither);
     try std.testing.expect(kindOf(&.{}) == .empty);

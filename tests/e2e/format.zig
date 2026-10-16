@@ -30,10 +30,10 @@ test "an unreadable extension is refused by run, not just check" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "in.json", .data = "{\"a\":1}\n{\"a\":2}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "in.xml", .data = "<a>1</a>\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.json" });
+    const in_path = try std.fs.path.join(alloc, &.{ base, "in.xml" });
     defer alloc.free(in_path);
     const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
     defer alloc.free(out_path);
