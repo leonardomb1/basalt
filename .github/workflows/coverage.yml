@@ -8,6 +8,7 @@ on:
     branches: [main]
     paths-ignore:
       - 'README.md'
+      - 'bench/**/*.md'
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'
@@ -15,6 +16,7 @@ on:
     branches: [main]
     paths-ignore:
       - 'README.md'
+      - 'bench/**/*.md'
       - 'docs/**'
       - 'LICENSE'
       - '.gitignore'

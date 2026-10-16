@@ -8,12 +8,14 @@ on:
     branches: [main]
     paths-ignore:
       - 'README.md'
+      - 'bench/**/*.md'
       - 'LICENSE'
       - '.gitignore'
   pull_request:
     branches: [main]
     paths-ignore:
       - 'README.md'
+      - 'bench/**/*.md'
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:
