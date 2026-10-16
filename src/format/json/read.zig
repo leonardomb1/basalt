@@ -16,16 +16,16 @@
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
 //! into a tree. Only `items` reads its document whole, to find the path in it.
 
-const Batch = @import("../exec/batch.zig").Batch;
-const Value = @import("../exec/value.zig").Value;
-const column = @import("../exec/column.zig");
-const driver = @import("../connect/driver.zig");
-const eval = @import("../exec/eval.zig");
-const jt = @import("../exec/json.zig");
-const stream = @import("stream.zig");
+const Batch = @import("../../exec/batch.zig").Batch;
+const Value = @import("../../exec/value.zig").Value;
+const column = @import("../../exec/column.zig");
+const driver = @import("../../connect/driver.zig");
+const eval = @import("../../exec/eval.zig");
+const jt = @import("../../exec/json.zig");
+const stream = @import("../stream.zig");
 const Stream = stream.Stream;
 const std = @import("std");
-const types = @import("../lang/types.zig");
+const types = @import("../../lang/types.zig");
 
 pub const Error = error{ InvalidJson, OutOfMemory } || std.Io.Reader.ShortError;
 

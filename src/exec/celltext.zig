@@ -31,6 +31,38 @@ pub const Plain = struct {
     pub const bool_false = "false";
 };
 
+/// `s` cut into valid UTF-8 runs, each byte that starts no valid sequence given as
+/// U+FFFD in its place, so a writer repairs text as it escapes it, as pyarrow reads
+/// invalid bytes. A writer asks `std.unicode.utf8ValidateSlice` first and walks
+/// runs only for text that fails it.
+pub const Utf8Runs = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    pub const replacement = "\u{FFFD}";
+
+    pub fn next(self: *Utf8Runs) ?[]const u8 {
+        if (self.i >= self.s.len) return null;
+        const start = self.i;
+        while (self.i < self.s.len) {
+            const n = seqLen(self.s[self.i..]);
+            if (n == 0) break;
+            self.i += n;
+        }
+        if (self.i > start) return self.s[start..self.i];
+        self.i += 1;
+        return replacement;
+    }
+
+    fn seqLen(s: []const u8) usize {
+        if (s[0] < 0x80) return 1;
+        const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return 0;
+        if (n > s.len) return 0;
+        _ = std.unicode.utf8Decode(s[0..n]) catch return 0;
+        return n;
+    }
+};
+
 pub fn isNull(c: *const Column, r: usize) bool {
     return !c.validity.get(r) or c.ty.kind == .array or c.ty.kind == .@"struct";
 }

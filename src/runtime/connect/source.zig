@@ -38,7 +38,7 @@ const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
-const jsonread = @import("../../format/json.zig");
+const jsonread = @import("../../format/json/read.zig");
 const stream = @import("../../format/stream.zig");
 
 pub const ConstSource = struct {

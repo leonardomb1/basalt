@@ -79,7 +79,7 @@
 //! writer (`decompress_direct`): through std's fixed window buffer the flate
 //! decoder could emit up to 258 bytes past the limit and abort the process.
 //!
-//! Pages are read as rows by `format/json.zig`, as a JSON file is: the schema from
+//! Pages are read as rows by `format/json/read.zig`, as a JSON file is: the schema from
 //! the first page's rows, later pages coerced to it, missing keys null and new keys
 //! dropped. Each page is fetched whole into the per-batch arena, so memory stays
 //! flat across pages.
@@ -89,7 +89,7 @@ const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("../connect/driver.zig");
-const fjson = @import("../format/json.zig");
+const fjson = @import("../format/json/read.zig");
 const jt = @import("../exec/json.zig");
 const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;

@@ -55,7 +55,7 @@ const objstore = @import("../store/objstore.zig");
 const Output = @import("output.zig").Output;
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
-const json = @import("json.zig");
+const json = @import("json/read.zig");
 const release = stream.release;
 const Gunzip = stream.Gunzip;
 const codecBuffer = stream.codecBuffer;
@@ -1137,19 +1137,8 @@ inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8,
 fn utf8Repair(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     if (std.unicode.utf8ValidateSlice(s)) return s;
     var out = try std.array_list.Managed(u8).initCapacity(arena, s.len + 8);
-    var i: usize = 0;
-    while (i < s.len) {
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
-        if (n > 0 and i + n <= s.len) {
-            if (std.unicode.utf8Decode(s[i .. i + n])) |_| {
-                try out.appendSlice(s[i .. i + n]);
-                i += n;
-                continue;
-            } else |_| {}
-        }
-        try out.appendSlice("\u{FFFD}");
-        i += 1;
-    }
+    var runs = celltext.Utf8Runs{ .s = s };
+    while (runs.next()) |t| try out.appendSlice(t);
     return out.items;
 }
 
