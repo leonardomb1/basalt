@@ -4,6 +4,7 @@ const Env = @import("../env.zig").Env;
 const LaneSplit = @import("sources.zig").LaneSplit;
 const MorselSource = @import("agg.zig").MorselSource;
 const PqPart = @import("agg.zig").PqPart;
+const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
@@ -125,6 +126,7 @@ const TopNCtx = struct {
     kept_arena: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
     rows_read: *obs.RowCounter,
+    prof: ?*Profile = null,
 };
 
 const topnWorker = dispatchWorker(TopNCtx, topnWorkOne);
@@ -150,7 +152,15 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
         .seq_base = @as(u64, i) << 40,
         .item = if (ctx.split == .parquet) &@as(*MorselSource, @ptrCast(@alignCast(inner.ptr))).cur_item else null,
     };
-    const local = (try tn.nextKept(mem.batch.allocator())) orelse return;
+    const t0 = if (ctx.prof != null) std.time.Instant.now() catch null else null;
+    const kept = try tn.nextKept(mem.batch.allocator());
+    if (ctx.prof) |p| {
+        if (t0) |s| tn.stats.ns = if (std.time.Instant.now()) |now| now.since(s) else |_| 0;
+        tn.stats.rows = if (kept) |k| k.rows.len else 0;
+        tn.stats.calls = 1;
+        _ = try p.absorb(.{ .top_n = &tn });
+    }
+    const local = kept orelse return;
 
     ctx.mtx.lock();
     defer ctx.mtx.unlock();
@@ -196,6 +206,7 @@ pub fn runParallelTopN(
         .kept = .init(env.gpa),
         .kept_arena = kept_arena.allocator(),
         .rows_read = env.rows_read,
+        .prof = env.profile,
     };
     defer ctx.kept.deinit();
 
@@ -204,7 +215,12 @@ pub fn runParallelTopN(
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
+    const t_mrg0 = std.time.Instant.now() catch unreachable;
     const top = try op.TopN.combine(env.gpa, arena, row_schema, ks, lim.count, lim.offset, ctx.kept.items);
+    if (env.profile) |p| {
+        try p.phase("combine the lanes' best rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
+        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ split.label(), split.count(nthreads), split.unitName() });
+    }
 
     const snk = try openTailSink(env, w, &.{}, row_schema.*);
     var snk_open = true;

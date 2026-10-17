@@ -27,8 +27,9 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 
 /// `EXPLAIN [ANALYZE] <query>;` against what the statements above put in scope.
-/// ANALYZE runs the pipeline serially with the sink discarded; the plain form renders
-/// the static plan through `analyze.render`. Both are scoped to this one statement.
+/// ANALYZE runs the pipeline as it would run, with the sink discarded; the plain
+/// form renders the static plan through `analyze.render`. Both are scoped to this
+/// one statement.
 pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     if (e.mode == .describe) return runDescribe(env, e.pipeline, stats);
     if (e.mode == .analyze) {
@@ -37,7 +38,6 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
         defer env.explain = outer;
         var o = opts;
         o.explain = true;
-        o.threads = 1;
         return runOutput(env, e.pipeline, o, stats, lanes_used, batch_arena);
     }
 
@@ -83,6 +83,7 @@ pub fn notePlan(env: *Env, prof: *Profile, stages: []const ast.Stage) !void {
     for (stages) |st| for (profile.kindsOf(st.node)) |k| {
         if (prof.fallback.get(k) == 0) prof.fallback.set(k, profile.keyOf(st.pos));
     };
+    try prof.describe(profile.merged_at, .scan, "the lanes' partial results, merged");
     try noteStages(env, prof, stages, 0);
 }
 
@@ -175,7 +176,7 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
 
     try w.writeAll("Summary\n");
     try w.print("  Wall time: {f}   Operator time: {f}", .{ Dur{ .ns = facts.wall_ns }, Dur{ .ns = o.total_own } });
-    if (lanes > 1) try w.print(" (summed over {d} lanes)", .{lanes});
+    if (facts.lanes > 1) try w.print(" (summed over {d} lanes)", .{facts.lanes});
     try w.writeAll("\n");
     try w.print("  Rows read: {f}   Rows out: {f}   Path: {s}\n", .{ Count{ .n = facts.rows_read }, Count{ .n = facts.rows_out }, prof.path });
     for (prof.phases.items) |ph| try w.print("  {s}: {f}\n", .{ ph.name, Dur{ .ns = ph.ns } });

@@ -27,6 +27,11 @@ const root_path: u64 = 1;
 
 const Said = struct { at: u64, kind: Kind };
 
+/// The name of the scan a parallel breaker's tail reads: the lanes' partial results,
+/// merged. No stage stands for it, and the stage it follows shares its position with
+/// the pipeline's read.
+pub const merged_at: u64 = std.math.maxInt(u64);
+
 fn childPath(parent: Id, i: usize) u64 {
     var h = std.hash.Wyhash.init(parent.path);
     h.update(std.mem.asBytes(&parent.kind));
@@ -204,14 +209,16 @@ pub const Profile = struct {
         }
     }
 
-    /// Put the chain rooted at `build` under every join that has no build side of its
-    /// own: a lane's join probes an index built once, before the lanes.
-    pub fn graftBuild(self: *Profile, build: Id) !void {
+    /// Put the chain rooted at `build` under the joins built from the stage at
+    /// `join_at` that have no build side of their own: a lane's join probes an index
+    /// built once, before the lanes.
+    pub fn graftBuild(self: *Profile, join_at: u64, build: Id) !void {
         self.mtx.lock();
         defer self.mtx.unlock();
+        const at = if (join_at == 0) self.fallback.get(.join) else join_at;
         var grafted = false;
         for (self.nodes.values()) |*n| {
-            if (n.id.kind != .join or n.children.len != 1 or std.meta.eql(n.id, build)) continue;
+            if (n.id.kind != .join or n.id.at != at or n.children.len != 1) continue;
             const kids = try self.gpa.alloc(Child, 2);
             kids[0] = n.children[0];
             kids[1] = .{ .id = build, .role = .build };
@@ -220,6 +227,14 @@ pub const Profile = struct {
             grafted = true;
         }
         if (grafted) self.dropRoot(build);
+    }
+
+    /// The first root folded whose operator is `kind`.
+    pub fn rootOf(self: *Profile, kind: Kind) ?Id {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        for (self.roots.items) |r| if (r.kind == kind) return r;
+        return null;
     }
 
     fn dropRoot(self: *Profile, id: Id) void {
@@ -522,7 +537,7 @@ test "profile: a lane path's shared build side and its tail hang under the opera
     var j = op.Join{ .probe = .{ .scan = &pscan }, .build = null, .left_keys = &.{}, .right_keys = &.{}, .left_schema = &sch, .right_schema = &sch, .out_schema = &sch, .kind = .inner, .state = testing.allocator };
     j.stats = .{ .at = 2, .rows = 6 };
     const lane = try p.absorb(.{ .join = &j });
-    try p.graftBuild(build);
+    try p.graftBuild(2, build);
 
     var merged = op.Scan{ .src = undefined };
     var tail = op.Filter{ .child = .{ .scan = &merged }, .pred = undefined, .back = testing.allocator };

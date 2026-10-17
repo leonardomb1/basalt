@@ -48,6 +48,7 @@ const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
 const printProfile = @import("explain.zig").printProfile;
 const Profile = @import("../../exec/profile.zig").Profile;
+const profile = @import("../../exec/profile.zig");
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
 const projectedColumns = @import("../plan.zig").projectedColumns;
 const pruneKnown = @import("../plan.zig").pruneKnown;
@@ -419,15 +420,21 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)) };
                 lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
+                const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
+                    const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
+                    const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
+                    p.path = try std.fmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
+                    break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
+                } else null;
                 if (try buildParallelSink(env, wr, schema)) |mode| {
                     errdefer parallel.abortLanes(mode);
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read, profiled);
                     try parallel.finishLanes(mode);
                 } else {
                     const snk = try openSink(env, wr, schema);
                     var snk_open = true;
                     errdefer if (snk_open) snk.abort();
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read, profiled);
                     snk_open = false;
                     try snk.close();
                 }

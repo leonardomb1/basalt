@@ -342,6 +342,15 @@ pub const Stage = union(enum) {
             .explode => |e| e.transform(arena, b),
         };
     }
+
+    /// The operator the stage is, its chain below it.
+    pub fn asOp(self: Stage) Op {
+        return switch (self) {
+            .filter => |f| .{ .filter = f },
+            .project => |p| .{ .project = p },
+            .explode => |e| .{ .explode = e },
+        };
+    }
 };
 
 pub const Linear = struct { src: driver.Source, stages: []const Stage };

@@ -7,6 +7,7 @@ const Env = @import("../env.zig").Env;
 const LaneJoin = @import("join.zig").LaneJoin;
 const OneBatch = @import("../connect.zig").OneBatch;
 const OrderedOut = @import("map.zig").OrderedOut;
+const Profile = @import("../../exec/profile.zig").Profile;
 const PqTopNCtx = @import("topn.zig").PqTopNCtx;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
@@ -38,6 +39,7 @@ const parallel = @import("../parallel.zig");
 const planSplit = @import("../connect.zig").planSplit;
 const pqTopNWorker = @import("topn.zig").pqTopNWorker;
 const pqdecode = @import("../../format/parquet/read.zig");
+const profile = @import("../../exec/profile.zig");
 const pushdown = @import("../pushdown.zig");
 const resolveLaneJoins = @import("join.zig").resolveLaneJoins;
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
@@ -194,6 +196,7 @@ const LaneAgg = struct {
     out_schema: *const types.Schema,
     by: []const usize,
     aggs: []const op.Aggregate.Agg,
+    prof: ?*Profile = null,
 
     fn plan(env: *Env, in_schema: types.Schema, ag: ast.Aggregate, strs: *op.Aggregate.StrTable) !LaneAgg {
         const arena = env.arena;
@@ -202,7 +205,7 @@ const LaneAgg = struct {
         const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
         const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
         for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
-        return .{ .strs = strs, .in_schema = agg_in, .out_schema = try schemaPtr(arena, apl.schema), .by = apl.by, .aggs = aggs };
+        return .{ .strs = strs, .in_schema = agg_in, .out_schema = try schemaPtr(arena, apl.schema), .by = apl.by, .aggs = aggs, .prof = env.profile };
     }
 
     /// Fold `child` into private group tables, one per hash partition of `parts`.
@@ -220,7 +223,15 @@ const LaneAgg = struct {
             .part_state = &parts.allocs,
             .table_gpa = parts.backing(),
         };
-        return agg.drainParts();
+        const t0 = if (self.prof != null) std.time.Instant.now() catch null else null;
+        const sets = try agg.drainParts();
+        if (self.prof) |p| {
+            if (t0) |s| agg.stats.ns = if (std.time.Instant.now()) |now| now.since(s) else |_| 0;
+            for (sets) |st| agg.stats.rows += st.len;
+            agg.stats.calls = 1;
+            _ = try p.absorb(.{ .aggregate = &agg });
+        }
+        return sets;
     }
 
     fn emitter(self: LaneAgg, env: *Env) op.Aggregate {
@@ -263,7 +274,7 @@ fn writeGroups(
     if (sel != null or emitter.by.len == 0 or threads < 2 or sets.len < 2 or total < agg_combine_parallel_min or !rowwise) {
         var em = emitter;
         const batch = try em.emitSets(env.arena, sets, sel);
-        return writeTail(env, snk, batch, emitter.out_schema.*, tail, stats);
+        return writeTail(env, snk, batch, emitter.out_schema.*, tail, stats, .aggregate);
     }
 
     var ord = try OrderedOut.init(env.arena, sets.len, 2 * threads, snk);
@@ -276,10 +287,12 @@ fn writeGroups(
         .errctx = env.errctx,
         .queue = .{ .nitems = sets.len },
         .ordered = &ord,
+        .prof = env.profile,
     };
     _ = try parallel.spawnJoin(env.arena, @min(threads, sets.len), groupWriteWorker, &ctx);
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
+    if (env.profile) |p| if (ctx.top) |top| if (p.rootOf(.aggregate)) |a| try p.graftLeaf(top, a);
 }
 
 const GroupWriteCtx = struct {
@@ -291,6 +304,9 @@ const GroupWriteCtx = struct {
     queue: WorkQueue,
     ordered: ?*OrderedOut,
     rows_out: std.atomic.Value(u64) = .init(0),
+    prof: ?*Profile = null,
+    top: ?profile.Id = null,
+    top_mtx: std.Thread.Mutex = .{},
 };
 
 const groupWriteWorker = orderedWorker(GroupWriteCtx, groupWriteUnit);
@@ -306,14 +322,23 @@ fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem) !void {
         const out_schema = ctx.emitter.out_schema;
         var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
         var scan = op.Scan{ .src = ob.source() };
+        scan.stats.at = profile.merged_at;
         const chain = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.tail, &scan, out_schema);
         while (try chain.next(wa)) |b| try f.add(ord.snk, wa, b);
+        if (ctx.prof) |p| {
+            const top = try p.absorb(chain);
+            ctx.top_mtx.lock();
+            defer ctx.top_mtx.unlock();
+            ctx.top = top;
+        }
     }
     _ = ctx.rows_out.fetchAdd(f.rows, .monotonic);
     try ord.hand(i, f);
 }
 
-pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats) !void {
+/// Write a parallel breaker's merged result through `tail`; under a profile the tail's
+/// operators stand above the lanes' `feeds` operators, whose result they read.
+pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats, feeds: profile.Kind) !void {
     const arena = env.arena;
     if (tail.len == 0) {
         if (batch.len > 0) {
@@ -324,6 +349,7 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
     }
     var ob = OneBatch{ .b = batch, .sch = schema };
     var scan = op.Scan{ .src = ob.source() };
+    scan.stats.at = profile.merged_at;
     var cur: op.Op = .{ .scan = &scan };
     var sch = schema;
     var i: usize = 0;
@@ -333,11 +359,16 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
             break :blk try buildTopN(env, tail[i - 1].node.sort, tail[i].node.limit, cur, sch);
         } else try buildStage(env, tail[i], cur, sch);
         cur = r.op;
+        cur.stampNew(profile.keyOf(tail[if (cur == .top_n) i - 1 else i].pos));
         sch = r.schema;
     }
     while (try cur.next(arena)) |outb| {
         try snk.writeBatch(arena, outb);
         stats.rows_out += outb.len;
+    }
+    if (env.profile) |p| {
+        const top = try p.absorb(cur);
+        if (p.rootOf(feeds)) |below| try p.graftLeaf(top, below);
     }
 }
 
@@ -636,11 +667,14 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
             lanes_used.* = @max(lanes_used.*, lanes);
             env.log.log(.debug, "parallel csv aggregate: {d} chunks over {d} lanes", .{ nthreads, lanes });
             if (ctx.queue.failure()) |e| return e;
-            break :blk .{ try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts), opts.lanes() };
+            const t_mrg0 = std.time.Instant.now() catch unreachable;
+            const combined = try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts);
+            if (env.profile) |p| try p.phase("merge the lanes' groups", (std.time.Instant.now() catch unreachable).since(t_mrg0));
+            break :blk .{ combined, opts.lanes() };
         },
         .parquet => |m| blk: {
             pq_lanes = try allocPqLanes(env.gpa, nthreads);
-            sel = try foldParquet(env, la, m, prefix, lane_joins, tail, pq_lanes, parts, opts, lanes_used);
+            sel = try foldParquet(env, la, m, prefix, lane_joins, tail, pq_lanes, parts, lanes_used);
             break :blk .{ try partSets(env.arena, parts), nthreads };
         },
     };
@@ -658,12 +692,11 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
         var total: usize = 0;
         for (sets) |st| total += st.len;
         env.log.log(.debug, "pq agg tail: emit+write {d}ms ({d} groups)", .{ t_emit1.since(t_emit0) / 1_000_000, total });
-        if (opts.explain) {
-            std.debug.print(
-                \\  emit+write   {d:>8.1}ms {d:>12} rows
-                \\
-            , .{ @as(f64, @floatFromInt(t_emit1.since(t_emit0))) / 1e6, total });
-        }
+    }
+    if (env.profile) |p| {
+        try p.phase("emit and write the groups", t_emit1.since(t_emit0));
+        for (lane_joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
+        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
     }
     try snk.close();
     return true;
@@ -689,7 +722,7 @@ fn freePqLanes(gpa: std.mem.Allocator, lanes: []PqLane) void {
 
 /// Fold parquet morsels on `lanes`, one fixed slice of row groups each, and merge them
 /// into `parts`; returns each partition's top-N selection when the tail allows one.
-fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.Stage, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, opts: RunOptions, lanes_used: *usize) !?[]const []const u32 {
+fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.Stage, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, lanes_used: *usize) !?[]const []const u32 {
     const arena = env.arena;
     const ngroups = morsels.queue.nitems;
     const nthreads = lanes.len;
@@ -739,17 +772,9 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.S
         t_mrg1.since(t_mrg0) / 1_000_000,
         lane_groups,
     });
-    if (opts.explain) {
-        std.debug.print(
-            \\actuals (parallel aggregate, {d} lanes over {d} row groups):
-            \\  fold         {d:>8.1}ms {d:>12} groups
-            \\  merge        {d:>8.1}ms {d:>12} partitions
-            \\
-        , .{
-            used,                                                  ngroups,
-            @as(f64, @floatFromInt(t_fold1.since(t_fold0))) / 1e6, lane_groups,
-            @as(f64, @floatFromInt(t_mrg1.since(t_mrg0))) / 1e6,   pq_parts,
-        });
+    if (env.profile) |p| {
+        try p.phase("fold on the lanes", t_fold1.since(t_fold0));
+        try p.phase("merge the lanes' groups", t_mrg1.since(t_mrg0));
     }
 
     env.log.log(.debug, "parallel parquet aggregate: {d} row groups in {d} morsels over {d} lanes, merged in {d} partitions", .{ ngroups, ngroups, used, pq_parts });
@@ -865,13 +890,20 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     if (ctx.queue.failure()) |e| return e;
 
+    const t_mrg0 = std.time.Instant.now() catch unreachable;
     const csets = try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts);
+    const t_emit0 = std.time.Instant.now() catch unreachable;
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
     writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats) catch |e| {
         snk.abort();
         return e;
     };
+    if (env.profile) |p| {
+        try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
+        try p.phase("emit and write the groups", (std.time.Instant.now() catch unreachable).since(t_emit0));
+        p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+    }
     try snk.close();
     return true;
 }
