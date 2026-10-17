@@ -2,6 +2,13 @@
 //! the evaluator calls, the row form (`eval`) and the vector kernel (`vec`), so a
 //! function is written once. `F.args` lists its arguments' kinds, `F.apply(cx, ...)`
 //! takes them non-null and returns the result, an optional result meaning NULL.
+//!
+//! The result's kind follows `apply`'s type (text, `i64` INT, `f64` FLOAT, `bool`,
+//! `i32` DATE, `Decimal` DECIMAL) unless `F.result` names another kind stored the
+//! same way (BYTES for text, TIME or TIMESTAMP for `i64`). `F.resultType(call)`, when
+//! present, gives the whole type from the call's literal arguments (a DECIMAL's
+//! precision and scale); the typing rule should return the same, as both forms type
+//! their result by it, and a decimal is brought to its scale in either form.
 //! Every argument propagates NULL, the first NULL ending the row in argument order;
 //! `F.variadic` instead takes any number of text arguments as one slice.
 //!
@@ -38,6 +45,10 @@ const strAt = @import("vec.zig").strAt;
 const toF64 = @import("support.zig").toF64;
 const toI64 = @import("support.zig").toI64;
 const valueToString = @import("format.zig").valueToString;
+const Decimal = @import("../value.zig").Decimal;
+const rescaleTo = @import("cast.zig").rescaleTo;
+const decimalOverflow = @import("support.zig").decimalOverflow;
+const types = @import("../../lang/types.zig");
 
 pub const Arg = enum {
     str,
@@ -110,14 +121,45 @@ fn Payload(comptime F: type) type {
     return if (@typeInfo(R) == .optional) @typeInfo(R).optional.child else R;
 }
 
-fn toValue(comptime P: type, x: P) Value {
-    return switch (P) {
-        []const u8 => .{ .string = x },
-        i64 => .{ .int = x },
-        f64 => .{ .float = x },
-        bool => .{ .bool = x },
+/// The kind of `F`'s result: `F.result`, else the one its payload stores.
+fn kindOf(comptime F: type) types.TypeKind {
+    if (@hasDecl(F, "result")) return F.result;
+    return switch (Payload(F)) {
+        []const u8 => .string,
+        i64 => .int,
+        f64 => .float,
+        bool => .bool,
+        i32 => .date,
+        Decimal => .decimal,
         else => @compileError("unsupported scalar result"),
     };
+}
+
+/// The type of `F`'s result for this call.
+pub fn resultType(comptime F: type, c: ast.Expr.Call) Type {
+    if (@hasDecl(F, "resultType")) return F.resultType(c);
+    return Type.init(kindOf(F));
+}
+
+fn toValue(comptime F: type, x: Payload(F), ty: Type) EvalError!Value {
+    return switch (comptime kindOf(F)) {
+        .string => .{ .string = x },
+        .bytes => .{ .bytes = x },
+        .int => .{ .int = x },
+        .time => .{ .time = x },
+        .timestamp => .{ .timestamp = x },
+        .float => .{ .float = x },
+        .bool => .{ .bool = x },
+        .date => .{ .date = x },
+        .decimal => .{ .decimal = try atScale(x, ty) },
+        else => @compileError("unsupported scalar result"),
+    };
+}
+
+/// `d` at its column's scale, as every decimal of a column must be.
+fn atScale(d: Decimal, ty: Type) EvalError!Decimal {
+    if (d.scale == ty.scale) return d;
+    return rescaleTo(d, ty.scale) orelse decimalOverflow();
 }
 
 fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base() {
@@ -177,7 +219,7 @@ pub fn Scalar(comptime F: type) type {
                     t[i] = try rowArg(a, arena, v);
                 }
             }
-            return wrap(try @call(.auto, F.apply, .{cx} ++ t));
+            return wrap(try @call(.auto, F.apply, .{cx} ++ t), resultType(F, c));
         }
 
         fn evalMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -188,19 +230,19 @@ pub fn Scalar(comptime F: type) type {
                 if (v.isNull()) return .null;
                 p.* = try valueToString(arena, v);
             }
-            return wrap(try F.apply(.{ .arena = arena, .buf = &buf }, parts));
+            return wrap(try F.apply(.{ .arena = arena, .buf = &buf }, parts), resultType(F, c));
         }
 
-        fn wrap(r: Result(F)) Value {
+        fn wrap(r: Result(F), ty: Type) EvalError!Value {
             if (@typeInfo(Result(F)) == .optional) {
-                return if (r) |x| toValue(Payload(F), x) else .null;
+                return if (r) |x| toValue(F, x, ty) else .null;
             }
-            return toValue(Payload(F), r);
+            return toValue(F, r, ty);
         }
 
         fn vecFixed(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
             const n = batch.len;
-            var out = try Out(Payload(F)).init(arena, n);
+            var out = try Out(Payload(F)).init(arena, n, resultType(F, c));
             var cx = Cx{ .arena = arena, .buf = out.buf() };
             var ops: OperandTuple(F) = undefined;
             inline for (comptime argsOf(F), 0..) |a, i| {
@@ -237,7 +279,7 @@ pub fn Scalar(comptime F: type) type {
         fn vecMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
             const n = batch.len;
             if (c.args.len == 0) return error.Unsupported;
-            var out = try Out(Payload(F)).init(arena, n);
+            var out = try Out(Payload(F)).init(arena, n, resultType(F, c));
             var cx = Cx{ .arena = arena, .buf = out.buf() };
             const ops = try arena.alloc(Str, c.args.len);
             for (c.args, ops) |e, *o| o.* = asStr(try evalVec(arena, e, batch)) orelse return error.Unsupported;
@@ -277,9 +319,10 @@ fn Out(comptime P: type) type {
         []const u8 => struct {
             app: column.BytesAppender,
             bm: Bitmap,
+            ty: Type,
             any: bool = false,
-            fn init(arena: std.mem.Allocator, n: usize) !@This() {
-                return .{ .app = try column.BytesAppender.init(arena, n), .bm = try Bitmap.initFull(arena, n) };
+            fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
+                return .{ .app = try column.BytesAppender.init(arena, n), .bm = try Bitmap.initFull(arena, n), .ty = ty };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
                 return &o.app.values;
@@ -308,14 +351,15 @@ fn Out(comptime P: type) type {
                 o.any = true;
             }
             fn finish(o: *@This()) !Vec {
-                return mkCol(Type.init(.string).withNull(o.any), o.bm.len, o.bm, .{ .bytes = try o.app.finish() });
+                return mkCol(o.ty.withNull(o.any), o.bm.len, o.bm, .{ .bytes = try o.app.finish() });
             }
         },
         else => struct {
             f: Filled(P),
             scratch: std.array_list.Managed(u8),
-            fn init(arena: std.mem.Allocator, n: usize) !@This() {
-                return .{ .f = try .init(arena, n), .scratch = .init(arena) };
+            ty: Type,
+            fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
+                return .{ .f = try .init(arena, n), .scratch = .init(arena), .ty = ty };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
                 return &o.scratch;
@@ -325,19 +369,110 @@ fn Out(comptime P: type) type {
                 return 0;
             }
             fn put(o: *@This(), i: usize, _: usize, x: P) !void {
-                o.f.d[i] = x;
+                o.f.d[i] = if (P == Decimal) try atScale(x, o.ty) else x;
             }
             fn none(o: *@This(), i: usize, _: usize) !void {
                 o.f.setNull(i);
             }
             fn finish(o: *@This()) !Vec {
-                return o.f.finish(Type.init(switch (P) {
-                    i64 => .int,
-                    f64 => .float,
-                    bool => .bool,
-                    else => @compileError("unsupported scalar result"),
-                }));
+                return o.f.finish(o.ty);
             }
         },
     };
+}
+
+const T = struct {
+    const Bytes = struct {
+        pub const args = .{.str};
+        pub const result = .bytes;
+        pub fn apply(_: Cx, s: []const u8) EvalError![]const u8 {
+            return s[0..@min(s.len, 2)];
+        }
+    };
+    const Day = struct {
+        pub const args = .{.str};
+        pub fn apply(_: Cx, s: []const u8) EvalError!?i32 {
+            if (s.len == 0) return null;
+            return @intCast(s.len * 1000);
+        }
+    };
+    const Stamp = struct {
+        pub const args = .{.str};
+        pub const result = .timestamp;
+        pub fn apply(_: Cx, s: []const u8) EvalError!i64 {
+            return @intCast(s.len * 1_000_000);
+        }
+    };
+    const Clock = struct {
+        pub const args = .{.str};
+        pub const result = .time;
+        pub fn apply(_: Cx, s: []const u8) EvalError!i64 {
+            return @intCast(s.len * 1_000_000);
+        }
+    };
+    const Money = struct {
+        pub const args = .{ .str, .int };
+        pub fn resultType(c: ast.Expr.Call) Type {
+            return Type.decimal(18, @intCast(c.args[1].int_lit));
+        }
+        pub fn apply(_: Cx, s: []const u8, _: i64) EvalError!Decimal {
+            return .{ .unscaled = @intCast(s.len), .scale = 0 };
+        }
+    };
+};
+
+fn expectFormsAgree(comptime F: type, a: std.mem.Allocator, call_src: []const u8, batch: Batch, want: Type) !void {
+    const parser = @import("../../lang/sql_parser.zig");
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, call_src, &diag);
+    const v = try Scalar(F).vec(a, e.call, batch);
+    const col = v.col;
+    try std.testing.expectEqual(want.kind, col.ty.kind);
+    try std.testing.expectEqual(want.scale, col.ty.scale);
+    try std.testing.expectEqual(want.precision, col.ty.precision);
+    for (0..batch.len) |i| {
+        const row = try Scalar(F).eval(a, e.call, batch, i);
+        const got = col.getValue(i);
+        try std.testing.expect(std.meta.activeTag(row) == std.meta.activeTag(got));
+        switch (row) {
+            .null => {},
+            .bytes => |b| try std.testing.expectEqualStrings(b, got.bytes),
+            .date => |d| try std.testing.expectEqual(d, got.date),
+            .time => |t| try std.testing.expectEqual(t, got.time),
+            .timestamp => |t| try std.testing.expectEqual(t, got.timestamp),
+            .decimal => |d| {
+                try std.testing.expectEqual(want.scale, d.scale);
+                try std.testing.expectEqual(d.unscaled, got.decimal.unscaled);
+                try std.testing.expectEqual(d.scale, got.decimal.scale);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "results of every kind come out alike, row by row and vectorized, typed by the call" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const words = [_]?[]const u8{ "abc", "", null, "hello" };
+    var app = try column.BytesAppender.init(a, words.len);
+    var validity = try Bitmap.initFull(a, words.len);
+    for (words, 0..) |w, i| {
+        if (w) |s| {
+            try app.values.appendSlice(s);
+            try app.endRow();
+        } else {
+            try app.pushNull();
+            validity.setValid(i, false);
+        }
+    }
+    const scol = column.Column{ .ty = Type.init(.string).asNullable(), .len = words.len, .validity = validity, .data = .{ .bytes = try app.finish() } };
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string).asNullable() }} };
+    var cols = [_]column.Column{scol};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = words.len };
+    try expectFormsAgree(T.Bytes, a, "f(s)", batch, Type.init(.bytes));
+    try expectFormsAgree(T.Day, a, "f(s)", batch, Type.init(.date));
+    try expectFormsAgree(T.Stamp, a, "f(s)", batch, Type.init(.timestamp));
+    try expectFormsAgree(T.Clock, a, "f(s)", batch, Type.init(.time));
+    try expectFormsAgree(T.Money, a, "f(s, 2)", batch, Type.decimal(18, 2));
 }

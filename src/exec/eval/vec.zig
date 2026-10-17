@@ -1213,6 +1213,7 @@ pub fn Filled(comptime T: type) type {
             };
             const data: Column.Data = switch (T) {
                 bool => .{ .b = self.d },
+                i32 => .{ .i32 = self.d },
                 i64 => .{ .i64 = self.d },
                 f64 => .{ .f64 = self.d },
                 Decimal => .{ .dec = self.d },
