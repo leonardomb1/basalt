@@ -18,6 +18,7 @@ const expand = @import("../expand.zig");
 const max_tvf_depth = @import("../sql_parser.zig").max_tvf_depth;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
+const table_builtins = @import("../../connect/table_builtins.zig");
 
 fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
     var i = self.table_fns.items.len;
@@ -63,8 +64,11 @@ pub fn checkTableBody(self: *Parser) Error!struct { toks: []const Token, check: 
 /// `f(args)` in FROM or JOIN: bind the arguments, re-parse the body, and lower it to a
 /// binding like a derived table, so a filter on the call still reaches the source.
 pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from, join, lateral }) Error!TableCall {
-    const fd = findTableFn(self, name) orelse
+    const fd = findTableFn(self, name) orelse {
+        if (table_builtins.lookup(name) != null)
+            return self.fail(pos, "`{s}(...)` is a built-in table source, read in FROM; to join it, name it in a CTE first: WITH t AS (SELECT * FROM {s}(...))", .{ name, name });
         return self.fail(pos, "unknown table function `{s}` — declare it with CREATE FUNCTION {s}(...) RETURNS TABLE AS SELECT ...", .{ name, name });
+    };
     const lateral = place == .lateral;
     _ = try self.expect(.lparen);
     var args = std.array_list.Managed(*ast.Expr).init(self.arena);
