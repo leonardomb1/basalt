@@ -2,16 +2,14 @@
 //! the physical shape a pipeline runs in.
 
 const Plan = @import("../analyze.zig").Plan;
-const arrowread = @import("../../format/arrow/read.zig");
 const azure = @import("../../store/azure.zig");
-const pqwrite = @import("../../format/parquet/write.zig");
 const s3 = @import("../../store/s3.zig");
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const targets = @import("targets.zig");
-const xlsx = @import("../../format/xlsx/read.zig");
+const formats = @import("../../format/formats.zig");
 const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
 const Stage = @import("../analyze.zig").Stage;
@@ -98,25 +96,13 @@ pub fn render(plan: Plan, w: anytype) !void {
 pub fn appendUnsupported(target: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (azure.isUrl(target) or s3.isUrl(target)) return "an object-store blob is replaced on write, never extended";
     if (sftp.isUrl(target) or smb.isUrl(target)) return "a file on a server is written to `name.part` and renamed over the target once complete, never extended";
-    const parquet = if (explicit) |f| f == .parquet else pqwrite.Writer.isPath(target);
-    const arrow = if (explicit) |f| f == .arrow else arrowread.isPath(target);
-    if (parquet) return "a parquet file's footer indexes every row group and is written last, so appending means rewriting the file";
-    if (arrow) return "an Arrow IPC file's footer indexes every batch and is written last, so appending means rewriting the file";
-    if (if (explicit) |f| f == .xlsx else xlsx.isPath(target)) return "an Excel workbook is a zip archive whose directory is written last, so appending means rewriting the file";
-    if ((explicit orelse targets.formatOfPath(target)) == .xml) return "an XML file's root element closes on its last line, so appending means rewriting the file";
-    return null;
+    return formats.of(explicit orelse targets.formatOfPath(target) orelse .csv).write.append_refused;
 }
 
 /// Every file sink runs on the `csv` connector, so the format is named from the target.
 pub fn sinkKind(node: anytype) []const u8 {
     const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
-    if (std.mem.eql(u8, node.connector, "csv")) {
-        if (pqwrite.Writer.isPath(path)) return "parquet";
-        if (arrowread.isPath(path)) return "arrow";
-        if (xlsx.isPath(path)) return "xlsx";
-        if (targets.formatOfPath(path) == .json) return "json";
-        if (targets.formatOfPath(path) == .xml) return "xml";
-    }
+    if (std.mem.eql(u8, node.connector, "csv")) if (targets.formatOfPath(path)) |f| return @tagName(f);
     return node.connector;
 }
 

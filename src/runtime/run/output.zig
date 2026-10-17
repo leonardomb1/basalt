@@ -235,9 +235,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.csv_out = analyze.dialectFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.fmt_out = analyze.formatFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-    env.pq_codec = analyze.parquetCodecFromHints(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-    env.json_shape = analyze.jsonShapeFromHints(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-    env.xml_names = analyze.xmlNamesFromHints(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    env.write_opts = analyze.writeOptions(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.cutover = analyze.cutoverProblem(last.write, stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (stages[0].node == .read and stages[0].node.read.form == .path and
         std.mem.eql(u8, stages[0].node.read.connector, "csv"))
@@ -253,7 +251,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         analyze.checkSinkConnection(arena, c, &ddiag) catch |e| return aErr(env, &ddiag, e);
     analyze.checkBareUpsert(stages, env.connections, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.sink_label_prefix = analyze.hintText(stages[stages.len - 1].hints, "label_prefix");
-    env.xlsx_sheet = analyze.xlsxSheetFromHints(stages[stages.len - 1].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
 
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);
 

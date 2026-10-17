@@ -87,7 +87,7 @@ test "NDJSON and a JSON array are written and read back; an array is not appende
     defer alloc.free(got);
     try std.testing.expectEqualStrings("id,name,amt\n1,\"a \"\"q\"\"\",2.50\n1,\"a \"\"q\"\"\",2.50\n2,,\n2,,\n3,c\\d,-1.25\n3,c\\d,-1.25\n4,,\n", got);
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.json' APPEND WITH (array = true) AS SELECT 1 AS a;", "a JSON array closes on its last byte");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (array = true) AS SELECT 1 AS a;", "`array` applies to a JSON file target only");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (array = true) AS SELECT 1 AS a;", "`array` is an option of a JSON file");
 }
 
 test "STDIN is refused when stdin carries something else" {

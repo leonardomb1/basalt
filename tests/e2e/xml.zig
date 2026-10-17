@@ -52,6 +52,6 @@ test "an XML file is not appended to; root and row apply to an XML target only" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xml' APPEND AS SELECT 1 AS a;", "root element closes on its last line");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (row = 'r') AS SELECT 1 AS a;", "`root` and `row` apply to an XML file target only");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (row = 'r') AS SELECT 1 AS a;", "`row` is an option of an XML file");
     try expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/x.xml' WITH (items = 'a');", "does not apply to an XML read");
 }

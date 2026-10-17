@@ -43,6 +43,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
+const formats = @import("../format/formats.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
@@ -296,6 +297,7 @@ pub const appendUnsupported = @import("analyze/render.zig").appendUnsupported;
 const sinkKind = @import("analyze/render.zig").sinkKind;
 pub const FileFormat = @import("analyze/targets.zig").FileFormat;
 pub const readFormat = @import("analyze/targets.zig").readFormat;
+pub const stdinProblem = @import("analyze/targets.zig").stdinProblem;
 pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
@@ -309,6 +311,8 @@ pub const xmlNamesFromHints = @import("analyze/targets.zig").xmlNamesFromHints;
 pub const json_array_append_fmt = @import("analyze/targets.zig").json_array_append_fmt;
 pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 pub const xlsxSheetFromHints = @import("analyze/targets.zig").xlsxSheetFromHints;
+pub const WriteOptions = @import("analyze/targets.zig").WriteOptions;
+pub const writeOptions = @import("analyze/targets.zig").writeOptions;
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
@@ -1395,10 +1399,8 @@ const Ctx = struct {
                     .builtin => |b| table_builtins.of(b).label,
                     .unit => if (std.mem.eql(u8, connector, "stdin")) "stdin" else "unit",
                 };
-                if (std.mem.eql(u8, connector, "stdin")) if (try formatFromHints(lead.hints, self.diag)) |f| switch (f) {
-                    .csv, .json, .xml => {},
-                    else => return fail(self.diag, "STDIN is read as a stream, so it takes CSV, JSON, NDJSON or XML; a {s} file needs random access — read it from a path", .{@tagName(f)}),
-                };
+                if (std.mem.eql(u8, connector, "stdin")) if (try formatFromHints(lead.hints, self.diag)) |f| if (stdinProblem(f)) |why|
+                    return fail(self.diag, "{s}", .{why});
                 if (rd.form == .builtin) {
                     const tb = table_builtins.of(rd.form.builtin);
                     for (rd.form.builtin.args, tb.args[0..rd.form.builtin.args.len]) |e, kind| {
@@ -1733,41 +1735,54 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     }
 }
 
-const file_sink_keys = [_][]const u8{ "delimiter", "delim", "encoding", "format", "compression", "array", "root", "row" };
+const file_sink_keys: []const []const u8 = formats.all_write_keys ++ .{"encoding"};
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
 const table_sink_keys = [_][]const u8{ "compression", "cutover" };
-const xlsx_sink_keys = [_][]const u8{ "format", "sheet" };
+
+/// Each file format's write keys, `encoding` beside them for `checkFileSink` to refuse
+/// with its own reason, and how a message names the target and its keys.
+const file_writes = blk: {
+    var out: [formats.table.len]struct { keys: []const []const u8, what: []const u8, takes: []const u8 } = undefined;
+    for (formats.table, &out) |f, *o| o.* = .{
+        .keys = f.write_keys ++ .{"encoding"},
+        .what = f.read_what[0 .. f.read_what.len - " read".len] ++ " file",
+        .takes = formats.takes(f.write_keys),
+    };
+    break :blk out;
+};
+
+/// The file a write option belongs to, for a message refusing it on another; null
+/// for one no file write takes.
+fn ownerOf(key: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, "format")) return null;
+    for (formats.table, file_writes) |f, fw| if (containsName(f.write_keys, key)) return fw.what;
+    if (containsName(&stream_sink_keys, key)) return "a starrocks or doris table";
+    if (containsName(&table_sink_keys, key)) return "a database table";
+    return null;
+}
 
 /// `USING` names a load path, and only StarRocks and Doris have one to name; a
 /// `WITH` key the target's kind does not read is refused rather than ignored.
 pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u8, diag: *Diag) Error!void {
     const file = std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdout");
     const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
-    const xlsx_file = file and w.target.len > 0 and ((formatFromHints(hints, diag) catch null) orelse formatOfPath(w.target)) == .xlsx;
-    const keys: []const []const u8 = if (xlsx_file) &xlsx_sink_keys else if (file) &file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
+    const to_file = file and w.target.len > 0;
+    const fw = if (to_file) &file_writes[@intFromEnum((formatFromHints(hints, diag) catch null) orelse formatOfPath(w.target) orelse .csv)] else null;
+    const keys: []const []const u8 = if (fw) |f| f.keys else if (file) file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
     for (hints) |h| {
         if (containsName(keys, h.key)) continue;
-        if (std.mem.eql(u8, h.key, "sheet") or xlsx_file) {
-            const e = if (xlsx_file)
-                fail(diag, "`LOAD INTO` option `{s}` does not apply to an Excel target, which takes `sheet` and `format`", .{h.key})
-            else
-                fail(diag, "`sheet` names the worksheet of an Excel (`.xlsx`) target; it does not apply to a {s} target", .{if (file) "CSV, Parquet, Arrow or JSON" else connector});
-            diag.pos = h.pos;
-            return e;
-        }
-        const known = containsName(&file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key);
-        const e = if (known)
-            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `delimiter`, `format`, for Parquet `compression`, for JSON `array`, for XML `root` and `row`; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
+        const e = if (fw) |f| (if (ownerOf(h.key)) |owner|
+            fail(diag, "`LOAD INTO` option `{s}` does not apply to {s}, which takes {s}; `{s}` is an option of {s}", .{ h.key, f.what, f.takes, h.key, owner })
         else
-            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `delimiter`, `format`, for Parquet `compression`, for JSON `array`, for XML `root` and `row`; a starrocks or doris table `label_prefix`)", .{h.key});
+            fail(diag, "unknown `LOAD INTO` option `{s}` ({s} takes {s})", .{ h.key, f.what, f.takes })) else if (containsName(file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key))
+            fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `format` and its format's options; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
+        else
+            fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `format` and its format's options; a starrocks or doris table `label_prefix`)", .{h.key});
         diag.pos = h.pos;
         return e;
     }
-    _ = try parquetCodecFromHints(w, hints, diag);
-    _ = try jsonShapeFromHints(w, hints, diag);
-    _ = try xmlNamesFromHints(w, hints, diag);
+    _ = try writeOptions(w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
-    _ = try xlsxSheetFromHints(hints, diag);
     const form = w.form orelse return;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
@@ -1775,11 +1790,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
 }
 
 const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
-const csv_read_keys = [_][]const u8{ "format", "delimiter", "delim", "encoding" };
-const xlsx_read_keys = [_][]const u8{ "format", "sheet", "range", "header" };
-const json_read_keys = [_][]const u8{ "format", "items" };
-const xml_read_keys = [_][]const u8{ "format", "row", "encoding" };
-const stdin_read_keys = [_][]const u8{ "format", "items", "row", "delimiter", "delim", "encoding" };
+
 const rest_read_keys = [_][]const u8{
     "items",          "method",        "body",         "body_type",   "header",    "bearer",
     "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
@@ -1791,12 +1802,13 @@ const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_s
 
 const ReadKind = struct { what: []const u8, keys: []const []const u8, takes: []const u8 };
 
-const csv_read = ReadKind{ .what = "a CSV read", .keys = &csv_read_keys, .takes = "format, delimiter, encoding" };
-const xlsx_read = ReadKind{ .what = "an Excel read", .keys = &xlsx_read_keys, .takes = "format, sheet, range, header" };
-const json_read = ReadKind{ .what = "a JSON read", .keys = &json_read_keys, .takes = "format, items" };
-const xml_read = ReadKind{ .what = "an XML read", .keys = &xml_read_keys, .takes = "format, row, encoding" };
-const stdin_read = ReadKind{ .what = "a STDIN read", .keys = &stdin_read_keys, .takes = "format, items, row, delimiter, encoding" };
-const columnar_read = ReadKind{ .what = "a Parquet or Arrow read", .keys = &[_][]const u8{"format"}, .takes = "only format" };
+/// Each file format's read, its keys from `formats.zig`.
+const file_reads = blk: {
+    var out: [formats.table.len]ReadKind = undefined;
+    for (formats.table, &out) |f, *r| r.* = .{ .what = f.read_what, .keys = f.read_keys, .takes = formats.takes(f.read_keys) };
+    break :blk out;
+};
+const stdin_read = ReadKind{ .what = "a STDIN read", .keys = formats.stdin_read_keys, .takes = formats.takes(formats.stdin_read_keys) };
 const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
 const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind" }, .takes = "split, splits, split_kind" };
 const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes = "table_field, tag_field, tag_substr" };
@@ -1810,13 +1822,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
         .read => |rd| if (std.mem.eql(u8, connector, "csv")) blk: {
             const fmt = (formatFromHints(lead.hints, diag) catch null) orelse
                 (if (rd.form == .path) formatOfPath(rd.form.path) else null);
-            break :blk if (fmt) |f| switch (f) {
-                .xlsx => xlsx_read,
-                .csv => csv_read,
-                .json => json_read,
-                .xml => xml_read,
-                else => columnar_read,
-            } else csv_read;
+            break :blk file_reads[@intFromEnum(fmt orelse .csv)];
         } else if (std.mem.eql(u8, connector, "stdin"))
             stdin_read
         else if (std.mem.eql(u8, connector, "http"))
@@ -1833,7 +1839,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
         if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
         const e = if (containsName(&join_hint_keys, h.key))
             fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})
-        else if (containsName(&csv_read_keys, h.key) or containsName(&xlsx_read_keys, h.key) or containsName(&xml_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
+        else if (containsName(formats.all_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
             fail(diag, "read option `{s}` does not apply to {s}, which takes {s}", .{ h.key, kind.what, kind.takes })
         else
             fail(diag, "unknown read option `{s}`: {s} takes {s}", .{ h.key, kind.what, kind.takes });

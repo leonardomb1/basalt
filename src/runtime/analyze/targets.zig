@@ -16,7 +16,6 @@ const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
-const pqwrite = @import("../../format/parquet/write.zig");
 const std = @import("std");
 const table_builtins = @import("../../connect/table_builtins.zig");
 const replace = @import("../../db/replace.zig");
@@ -24,15 +23,9 @@ const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const zipsrc = @import("../../format/compress/zip.zig");
+const formats = @import("../../format/formats.zig");
 
-pub const FileFormat = enum {
-    csv,
-    parquet,
-    arrow,
-    xlsx,
-    json,
-    xml,
-};
+pub const FileFormat = formats.FileFormat;
 
 /// The named format, else the extension's, else CSV. The one place the CSV fast paths
 /// ask, so a binary format is never memory-mapped and parsed as text.
@@ -76,13 +69,8 @@ pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect 
 
 pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     const s = hintText(hints, "format") orelse return null;
-    if (std.ascii.eqlIgnoreCase(s, "csv")) return .csv;
-    if (std.ascii.eqlIgnoreCase(s, "parquet")) return .parquet;
-    inline for (.{ "arrow", "ipc", "feather" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .arrow;
-    inline for (.{ "xlsx", "excel" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .xlsx;
-    inline for (.{ "json", "ndjson", "jsonl" }) |n| if (std.ascii.eqlIgnoreCase(s, n)) return .json;
-    if (std.ascii.eqlIgnoreCase(s, "xml")) return .xml;
-    return fail(diag, "unknown format `{s}` (csv, parquet, arrow, xlsx, json, ndjson, xml)", .{s});
+    if (formats.byName(s)) |f| return f.tag;
+    return fail(diag, "unknown format `{s}` (" ++ formats.names_list ++ ")", .{s});
 }
 
 /// How a JSON read cuts its input into rows: `format = 'ndjson'` (or `'jsonl'`)
@@ -168,6 +156,34 @@ pub fn jsonShapeFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Er
     return if (array) .array else .ndjson;
 }
 
+/// A file write's options, parsed once for its format; a target that is not a file
+/// is `.csv`, its keys still checked by each format's parser so it refuses theirs.
+pub const WriteOptions = union(FileFormat) {
+    csv: void,
+    parquet: pqcodec.Codec,
+    arrow: void,
+    xlsx: []const u8,
+    json: jsonwrite.Shape,
+    xml: xmlwrite.Names,
+};
+
+pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
+    const codec = try parquetCodecFromHints(w, hints, diag);
+    const shape = try jsonShapeFromHints(w, hints, diag);
+    const names = try xmlNamesFromHints(w, hints, diag);
+    const sheet = try xlsxSheetFromHints(hints, diag);
+    const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
+    const fmt: FileFormat = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv else .csv;
+    return switch (fmt) {
+        .csv => .csv,
+        .parquet => .{ .parquet = codec },
+        .arrow => .arrow,
+        .xlsx => .{ .xlsx = sheet },
+        .json => .{ .json = shape },
+        .xml => .{ .xml = names },
+    };
+}
+
 /// An XML sink's root and row element names, `rows` and `row` when unset. Any other
 /// target refuses the keys.
 pub fn xmlNamesFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!xmlwrite.Names {
@@ -215,14 +231,7 @@ pub fn xmlOptions(hints: []const ast.Hint, text: []const []const u8, diag: *Diag
 /// `csv.dataName` walks the chain first, so `orders.csv.gz` and `inf.zip :: x.csv`
 /// both answer `.csv`.
 pub fn formatOfPath(path: []const u8) ?FileFormat {
-    const bare = csv.dataName(path);
-    if (pqwrite.Writer.isPath(bare)) return .parquet;
-    if (arrowread.isPath(bare)) return .arrow;
-    if (xlsx.isPath(bare)) return .xlsx;
-    if (std.ascii.endsWithIgnoreCase(bare, ".csv")) return .csv;
-    inline for (.{ ".json", ".ndjson", ".jsonl" }) |ext| if (std.ascii.endsWithIgnoreCase(bare, ext)) return .json;
-    if (std.ascii.endsWithIgnoreCase(bare, ".xml")) return .xml;
-    return null;
+    return formats.ofPath(path);
 }
 
 /// The format actually resolved, not the connector: every bare path is `csv`, which
@@ -231,6 +240,13 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
     var d = Diag{};
     const explicit = formatFromHints(hints, &d) catch null;
     return @tagName(explicit orelse formatOfPath(path) orelse .csv);
+}
+
+/// Why STDIN cannot be read as `fmt`, or null: stdin is a stream, so it takes only
+/// the formats read front to back.
+pub fn stdinProblem(fmt: FileFormat) ?[]const u8 {
+    if (formats.of(fmt).stdin) return null;
+    return "STDIN is read as a stream, so it takes " ++ formats.stdin_labels ++ "; a file needing random access is read from a path";
 }
 
 /// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
@@ -242,10 +258,9 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
         return "basalt reads `.zip` archives but does not write them; write a `.csv` or `.csv.gz`";
     const codec = csv.splitCodec(path).codec;
     if (codec == .none) return null;
-    const fmt = explicit orelse formatOfPath(path) orelse .csv;
-    if (fmt == .xlsx) return "an Excel workbook is a zip archive already, so it is written without a `.gz`/`.zst` suffix";
-    if (fmt != .csv and fmt != .json and fmt != .xml) return "Parquet and Arrow compress their own pages, so they are written without a `.gz`/`.zst` suffix";
-    if (codec == .zstd) return "basalt compresses CSV, JSON and XML output as gzip; name it `.gz`, as zstd output is not supported";
+    const fmt = formats.of(explicit orelse formatOfPath(path) orelse .csv);
+    if (fmt.write.gzip_refused) |why| return why;
+    if (codec == .zstd) return "basalt compresses " ++ formats.gzip_labels ++ " output as gzip; name it `.gz`, as zstd output is not supported";
     return null;
 }
 
@@ -256,21 +271,12 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
     if (csv.splitArchive(path) != null) return null;
 
-    const fmt = explicit orelse formatOfPath(path);
-    if (csv.splitCodec(path).codec != .none and fmt == .parquet)
-        return "parquet needs random access, so it cannot be read through compression; decompress it first";
-    if (fmt == .xlsx and csv.splitCodec(path).codec != .none)
-        return "an Excel workbook is a zip archive already, so it is read uncompressed; decompress it first";
-    if (fmt == .arrow) {
-        if (csv.splitCodec(path).codec != .none)
-            return "an Arrow IPC file is read memory-mapped, so it cannot be read through compression; decompress it first (IPC compresses its own buffers)";
-        if (std.mem.indexOf(u8, path, "://") != null)
-            return "Arrow IPC is read from a local file; fetch it first";
-    }
-
-    if (explicit != null) return null;
-    if (fmt != null) return null;
-    return "basalt handles `.csv`, `.parquet`, Arrow IPC (`.arrow`, `.feather`, `.ipc`, `.arrows`), Excel (`.xlsx`), JSON (`.json`, `.ndjson`, `.jsonl`) and XML (`.xml`), a CSV, JSON or XML file optionally `.gz`/`.zst` compressed or inside a `.zip`; name the format with `WITH (format = 'csv')` if the extension differs";
+    const tag = explicit orelse formatOfPath(path) orelse
+        return "basalt handles " ++ formats.handled_list ++ "; name the format with `WITH (format = 'csv')` if the extension differs";
+    const fmt = formats.of(tag);
+    if (csv.splitCodec(path).codec != .none) if (fmt.compressed_read_refused) |why| return why;
+    if (std.mem.indexOf(u8, path, "://") != null) if (fmt.local_only) |why| return why;
+    return null;
 }
 
 /// Opens the archive and stays quiet when it cannot (data may not be fetched yet), so
@@ -298,15 +304,9 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
 }
 
 fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFormat) ?[]const u8 {
-    if (explicit == null and formatOfPath(chosen) == null)
-        return std.fmt.allocPrint(arena, "`{s}` inside it is not a `.csv` or `.parquet`; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
-    if ((explicit orelse formatOfPath(chosen)) == .parquet)
-        return "parquet needs random access, so it cannot be read out of an archive; extract it first";
-    if ((explicit orelse formatOfPath(chosen)) == .arrow)
-        return "an Arrow IPC file is read memory-mapped, so it cannot be read out of an archive; extract it first";
-    if ((explicit orelse formatOfPath(chosen)) == .xlsx)
-        return "an Excel workbook is itself a zip archive, so it cannot be read out of another; extract it first";
-    return null;
+    const tag = explicit orelse formatOfPath(chosen) orelse
+        return std.fmt.allocPrint(arena, "`{s}` inside it has no extension basalt reads; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
+    return formats.of(tag).archive_refused;
 }
 
 fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
@@ -349,11 +349,11 @@ pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
         else => return false,
     };
     if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
-    if (pqwrite.Writer.isPath(path)) return true;
-    if (arrowread.isPath(path)) return false;
-    if (xlsx.isPath(path)) return false;
-    if (formatOfPath(path) == .json or formatOfPath(path) == .xml) return false;
-    return std.mem.indexOf(u8, path, "://") == null;
+    return switch (formats.of(readFormat(path, null)).lanes) {
+        .row_groups => true,
+        .local_ranges => std.mem.indexOf(u8, path, "://") == null,
+        .serial => false,
+    };
 }
 
 /// A local CSV header, parquet footer, Parquet folder's first file, workbook's first

@@ -42,6 +42,7 @@ const table_builtins = @import("../../connect/table_builtins.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
 const jsonread = @import("../../format/json/read.zig");
 const xmlread = @import("../../format/xml/read.zig");
+const formats = @import("../../format/formats.zig");
 const stream = @import("../../format/stream.zig");
 
 pub const ConstSource = struct {
@@ -141,25 +142,14 @@ pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) 
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
     };
     if (all.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{path}));
-    const kind: folder.Kind = if (want) |w| switch (w) {
-        .parquet => .parquet,
-        .csv => .csv,
-        .json => .json,
-        .xml => .xml,
-        else => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads Parquet, CSV, JSON or XML files", .{path})),
-    } else switch (folder.kindOf(all)) {
+    const kind: folder.Kind = if (want) |w| (if (formats.of(w).folder_exts.len > 0) w else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads " ++ formats.folder_labels ++ " files", .{path}))) else switch (folder.kindOf(all)) {
         .kind => |k| k,
         .mixed => |m| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}` holds both {s} (`{s}`) and {s} (`{s}`) files; one table reads one format — name it with WITH (format = '{s}') or '{s}'", .{ path, folder.label(m.a.kind), folder.below(m.a.file, path), folder.label(m.b.kind), folder.below(m.b.file, path), @tagName(m.a.kind), @tagName(m.b.kind) })),
         .empty => unreachable,
-        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no .parquet, .csv, .tsv, .txt, .json or .xml file in folder `{s}`", .{path})),
+        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no " ++ formats.folder_exts_list ++ " file in folder `{s}`", .{path})),
     };
     const files = try folder.only(env.arena, all, kind);
-    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ switch (kind) {
-        .parquet => ".parquet",
-        .csv => ".csv, .tsv or .txt",
-        .json => ".json, .ndjson or .jsonl",
-        .xml => ".xml",
-    }, path }));
+    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ formats.folder_exts_of[@intFromEnum(kind)], path }));
     const read = FolderRead{ .kind = kind, .files = files };
     env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .read = read };
     return read;
@@ -264,6 +254,7 @@ fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver
         return planErr(env.diag, "FROM STDIN needs stdin free for data, but here it carries the script (`basalt run -`), a REPL's input or a kernel's requests; pass the script as a file or with -c");
     var fdiag = analyze.Diag{};
     const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
+    if (want) |w| if (analyze.stdinProblem(w)) |why| return planErr(env.diag, why);
     const s = try stream.Stream.openStdin(env.arena);
     if (want == .json) {
         const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, analyze.jsonOptions(hints)) catch |e| {
@@ -321,19 +312,21 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .json => return openJson(env, rd.form.path, f.files, hints),
             .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
             .csv => {},
+            .arrow, .xlsx => unreachable,
         };
-        const boxed = csv.splitCodec(rd.form.path).codec != .none or csv.splitArchive(rd.form.path) != null;
-        const rfmt = want orelse (if (!boxed and pqdecode.Reader.isPath(rd.form.path)) analyze.FileFormat.parquet else analyze.FileFormat.csv);
-        if (rfmt == .parquet) {
-            const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
-            noteParquet(env, pr);
-            return pr.source();
+        switch (analyze.readFormat(rd.form.path, want)) {
+            .parquet => {
+                const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+                noteParquet(env, pr);
+                return pr.source();
+            },
+            .arrow => return openArrow(env, rd.form.path, null),
+            .xlsx => return openXlsx(env, rd.form.path, hints),
+            .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
+            .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
+            .csv => {},
         }
-        if (analyze.readFormat(rd.form.path, want) == .arrow) return openArrow(env, rd.form.path, null);
-        if (analyze.readFormat(rd.form.path, want) == .xlsx) return openXlsx(env, rd.form.path, hints);
-        if (analyze.readFormat(rd.form.path, want) == .json) return openJson(env, rd.form.path, if (fr) |f| f.files else &.{rd.form.path}, hints);
-        if (analyze.readFormat(rd.form.path, want) == .xml) return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols);
         var ddiag = analyze.Diag{};
         var d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
         d.text = rd.text_cols;

@@ -217,8 +217,8 @@ test "an Excel workbook is written and reads back typed, a named sheet, Excel's 
 
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (sheet = 'a/b') AS SELECT 1 AS a;", "cannot hold any of");
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (sheet = 3) AS SELECT 1 AS a;", "quoted worksheet name");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (delimiter = ';') AS SELECT 1 AS a;", "does not apply to an Excel target");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (sheet = 'x') AS SELECT 1 AS a;", "`sheet` names the worksheet of an Excel");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' WITH (delimiter = ';') AS SELECT 1 AS a;", "does not apply to an Excel file");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (sheet = 'x') AS SELECT 1 AS a;", "`sheet` is an option of an Excel file");
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx' APPEND AS SELECT 1 AS a;", "an Excel workbook is a zip archive");
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsx.gz' AS SELECT 1 AS a;", "written without a `.gz`");
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xlsm' AS SELECT 1 AS a;", "macro-enabled `.xlsm`");

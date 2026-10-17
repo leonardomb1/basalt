@@ -4,11 +4,12 @@
 //! are what Spark and Hadoop leave beside the data. The listing is sorted by
 //! path, so the first file (whose schema the rest must match) and the order
 //! rows arrive in do not depend on how a server lists. With no `format`, a
-//! folder must hold one kind of file, Parquet, CSV or JSON; two kinds are
+//! folder must hold one kind of file (`formats.zig` says which a folder reads); two kinds are
 //! refused, as one table cannot be read from both, and `Verdict.mixed` names one
 //! file of each.
 
 const std = @import("std");
+const formats = @import("../format/formats.zig");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
 const sftp = @import("../store/sftp.zig");
@@ -56,40 +57,10 @@ fn hidden(rel: []const u8) bool {
     return false;
 }
 
-pub const Kind = enum { parquet, csv, json, xml };
-
-const csv_exts = [_][]const u8{ ".csv", ".tsv", ".txt", ".csv.gz", ".tsv.gz", ".txt.gz", ".csv.zst", ".tsv.zst", ".txt.zst" };
-
-pub fn isCsvName(name: []const u8) bool {
-    for (csv_exts) |x| if (std.ascii.endsWithIgnoreCase(name, x)) return true;
-    return false;
-}
-
-pub fn isParquetName(name: []const u8) bool {
-    return std.ascii.endsWithIgnoreCase(name, ".parquet");
-}
-
-const json_exts = [_][]const u8{ ".json", ".ndjson", ".jsonl", ".json.gz", ".ndjson.gz", ".jsonl.gz", ".json.zst", ".ndjson.zst", ".jsonl.zst" };
-
-pub fn isJsonName(name: []const u8) bool {
-    for (json_exts) |x| if (std.ascii.endsWithIgnoreCase(name, x)) return true;
-    return false;
-}
-
-const xml_exts = [_][]const u8{ ".xml", ".xml.gz", ".xml.zst" };
-
-pub fn isXmlName(name: []const u8) bool {
-    for (xml_exts) |x| if (std.ascii.endsWithIgnoreCase(name, x)) return true;
-    return false;
-}
+pub const Kind = formats.FileFormat;
 
 fn isKind(name: []const u8, kind: Kind) bool {
-    return switch (kind) {
-        .parquet => isParquetName(name),
-        .csv => isCsvName(name),
-        .json => isJsonName(name),
-        .xml => isXmlName(name),
-    };
+    return formats.inFolder(formats.of(kind), name);
 }
 
 pub const Named = struct { kind: Kind, file: []const u8 };
@@ -126,12 +97,7 @@ pub fn only(arena: std.mem.Allocator, files: []const []const u8, kind: Kind) ![]
 }
 
 pub fn label(kind: Kind) []const u8 {
-    return switch (kind) {
-        .parquet => "Parquet",
-        .csv => "CSV",
-        .json => "JSON",
-        .xml => "XML",
-    };
+    return formats.of(kind).label;
 }
 
 test "folder: hidden parts, kinds, a local walk sorted" {
@@ -143,7 +109,7 @@ test "folder: hidden parts, kinds, a local walk sorted" {
     const pq = [_][]const u8{ "d/a.parquet", "d/notes.pdf" };
     try std.testing.expectEqual(Kind.parquet, kindOf(&pq).kind);
     const mixed = [_][]const u8{ "d/a.parquet", "d/b.CSV" };
-    try std.testing.expectEqualStrings("d/b.CSV", kindOf(&mixed).mixed.b.file);
+    try std.testing.expectEqualStrings("d/b.CSV", kindOf(&mixed).mixed.a.file);
     const js = [_][]const u8{ "d/a.ndjson.gz", "d/b.jsonl" };
     try std.testing.expectEqual(Kind.json, kindOf(&js).kind);
     const pics = [_][]const u8{"d/x.png"};

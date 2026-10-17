@@ -67,7 +67,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
-    if (env.json_shape == .array) return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
+    if (env.write_opts == .json and env.write_opts.json == .array) return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
     return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
 }
@@ -218,40 +218,43 @@ fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driv
 fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
-        const wfmt = env.fmt_out orelse analyze.formatOfPath(w.target) orelse .csv;
-        if (wfmt == .json) {
-            const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, env.json_shape) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
-            return jw.sink();
+        switch (env.write_opts) {
+            .json => |shape| {
+                const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, shape) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                return jw.sink();
+            },
+            .xml => |names| {
+                const xw = xmlwrite.Writer.open(env.arena, w.target, schema, names) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output XML `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                return xw.sink();
+            },
+            .xlsx => |sheet| {
+                const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, sheet) catch |e| switch (e) {
+                    error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                };
+                return xw.sink();
+            },
+            .arrow => {
+                const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
+                    error.ArrowRemoteSink => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
+                    error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry an array or struct column"),
+                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                };
+                return aw.sink();
+            },
+            .parquet => |codec| {
+                const pw = pqwrite.Writer.open(env.arena, w.target, schema, codec, fmode) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                return pw.sink();
+            },
+            .csv => {
+                const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode, env.csv_out) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                return writer.sink();
+            },
         }
-        if (wfmt == .xml) {
-            const xw = xmlwrite.Writer.open(env.arena, w.target, schema, env.xml_names) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output XML `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
-            return xw.sink();
-        }
-        if (wfmt == .xlsx) {
-            const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, env.xlsx_sheet) catch |e| switch (e) {
-                error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
-                else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
-            };
-            return xw.sink();
-        }
-        if (wfmt == .arrow) {
-            const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
-                error.ArrowRemoteSink => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
-                error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry an array or struct column"),
-                else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
-            };
-            return aw.sink();
-        }
-        if (wfmt == .parquet) {
-            const pw = pqwrite.Writer.open(env.arena, w.target, schema, env.pq_codec, fmode) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
-            return pw.sink();
-        }
-        const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode, env.csv_out) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
-        return writer.sink();
     }
     const conn = env.connections.get(w.connector) orelse
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, w.connector, "write"));
