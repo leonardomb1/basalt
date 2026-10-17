@@ -198,9 +198,12 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         diag.pos = at;
     };
 
+    var shared_arena = std.heap.ArenaAllocator.init(gpa);
+    defer shared_arena.deinit();
+    var shared = std.heap.ThreadSafeAllocator{ .child_allocator = shared_arena.allocator() };
     var sources = std.array_list.Managed(driver.Source).init(arena);
     defer for (sources.items) |sc| sc.close();
-    var env = Env{ .arena = arena, .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .fns = &fns };
+    var env = Env{ .arena = arena, .shared = shared.allocator(), .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .fns = &fns };
 
     var cit = connections.valueIterator();
     while (cit.next()) |c| {

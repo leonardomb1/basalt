@@ -249,6 +249,7 @@ pub const FolderRead = struct { kind: @import("../connect/folder.zig").Kind, fil
 pub const Env = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
+    shared: ?std.mem.Allocator = null,
     params: *std.StringHashMap(Value),
     bindings: *std.StringHashMap(ast.Pipeline),
     connections: *std.StringHashMap(ast.Connection),

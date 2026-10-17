@@ -129,7 +129,7 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     @memcpy(inner[0..b.stages.len], b.stages);
     const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
     inner[b.stages.len] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = b.pos };
-    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
@@ -191,7 +191,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
     inner[inner.len - 1] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = stages[wi].pos };
 
-    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
