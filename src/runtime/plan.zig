@@ -32,6 +32,7 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
+const profile = @import("../exec/profile.zig");
 const column = @import("../exec/column.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
@@ -86,31 +87,34 @@ pub fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const as
 pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
     var cur: op.Op = start;
     var sch = in_schema;
-    for (stages) |st| switch (st.node) {
-        .filter => |pred0| {
-            var ad = analyze.Diag{};
-            const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
-            const f = try ta.create(op.Filter);
-            f.* = .{ .child = cur, .pred = pred, .err = errctx, .back = ta };
-            cur = .{ .filter = f };
-        },
-        .select => |items| {
-            var ad = analyze.Diag{};
-            const rcols = try analyze.selectCols(ta, sch, items, params, &ad);
-            const cols = try ta.alloc(op.Project.Col, rcols.len);
-            for (rcols, cols) |rc, *c| c.* = .{ .source = switch (rc.source) {
-                .passthrough => |x| .{ .passthrough = x },
-                .expr => |e| .{ .expr = e },
-            }, .ty = rc.ty };
-            const out = try ta.create(types.Schema);
-            out.* = try analyze.schemaOfCols(ta, rcols);
-            const p = try ta.create(op.Project);
-            p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = errctx };
-            cur = .{ .project = p };
-            sch = out.*;
-        },
-        else => unreachable,
-    };
+    for (stages) |st| {
+        switch (st.node) {
+            .filter => |pred0| {
+                var ad = analyze.Diag{};
+                const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
+                const f = try ta.create(op.Filter);
+                f.* = .{ .child = cur, .pred = pred, .err = errctx, .back = ta };
+                cur = .{ .filter = f };
+            },
+            .select => |items| {
+                var ad = analyze.Diag{};
+                const rcols = try analyze.selectCols(ta, sch, items, params, &ad);
+                const cols = try ta.alloc(op.Project.Col, rcols.len);
+                for (rcols, cols) |rc, *c| c.* = .{ .source = switch (rc.source) {
+                    .passthrough => |x| .{ .passthrough = x },
+                    .expr => |e| .{ .expr = e },
+                }, .ty = rc.ty };
+                const out = try ta.create(types.Schema);
+                out.* = try analyze.schemaOfCols(ta, rcols);
+                const p = try ta.create(op.Project);
+                p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = errctx };
+                cur = .{ .project = p };
+                sch = out.*;
+            },
+            else => unreachable,
+        }
+        cur.stats().at = profile.keyOf(st.pos);
+    }
     return cur;
 }
 
@@ -705,6 +709,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
         },
         else => return planErr(env.diag, "a pipeline must start with `read`, `union`, or a binding reference"),
     }
+    current.stampNew(profile.keyOf(stages[0].pos));
 
     var si: usize = 1;
     while (si < stages.len) : (si += 1) {
@@ -713,6 +718,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             const r = try buildTopN(env, stage.node.sort, stages[si + 1].node.limit, current, schema);
             current = r.op;
             schema = r.schema;
+            current.stampNew(profile.keyOf(stage.pos));
             si += 1;
             continue;
         }
@@ -720,12 +726,14 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             const j = try joinorder.buildAt(env, stages, si, current, schema, if (take != null and si == take_at) take else null);
             current = j.res.op;
             schema = j.res.schema;
+            current.stampNew(profile.keyOf(stage.pos));
             si = j.next - 1;
             continue;
         }
         const r = try buildStage(env, stage, current, schema);
         current = r.op;
         schema = r.schema;
+        current.stampNew(profile.keyOf(stage.pos));
     }
     return .{ .op = current, .schema = schema };
 }

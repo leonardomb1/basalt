@@ -17,6 +17,7 @@ pub const eval = @import("exec/eval.zig");
 pub const json = @import("exec/json.zig");
 pub const builtins = @import("exec/builtins.zig");
 pub const op = @import("exec/op.zig");
+pub const profile = @import("exec/profile.zig");
 pub const simd = @import("exec/simd.zig");
 pub const driver = @import("connect/driver.zig");
 pub const sql = @import("db/sql.zig");

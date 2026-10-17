@@ -19,7 +19,6 @@ const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
 const exceptColumns = @import("../connect.zig").exceptColumns;
-const explainTree = @import("explain.zig").explainTree;
 const factsIfWanted = @import("../connect.zig").factsIfWanted;
 const forHintIdent = @import("../env.zig").forHintIdent;
 const ftp = @import("../../store/ftp.zig");
@@ -38,6 +37,7 @@ const localRead = @import("../connect/source.zig").localRead;
 const mem_connector = @import("../connect.zig").mem_connector;
 const moveLabel = @import("../run.zig").moveLabel;
 const noteLoad = @import("../run.zig").noteLoad;
+const notePlan = @import("explain.zig").notePlan;
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
 const openSource = @import("../connect.zig").openSource;
@@ -46,6 +46,8 @@ const parallel = @import("../parallel.zig");
 const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
+const printProfile = @import("explain.zig").printProfile;
+const Profile = @import("../../exec/profile.zig").Profile;
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
 const projectedColumns = @import("../plan.zig").projectedColumns;
 const pruneKnown = @import("../plan.zig").pruneKnown;
@@ -104,10 +106,27 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .lanes = lanes,
         });
     }
+    var prof: Profile = undefined;
+    const own_profile = opts_in.explain and env.profile == null;
+    if (own_profile) {
+        prof = Profile.init(env.gpa);
+        env.profile = &prof;
+    }
+    defer if (own_profile) {
+        env.profile = null;
+        prof.deinit();
+    };
+    const t0 = std.time.Instant.now() catch null;
     runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
         load_err = e;
         return e;
     };
+    if (own_profile) try printProfile(env, &prof, .{
+        .wall_ns = if (t0) |s| if (std.time.Instant.now()) |now| now.since(s) else |_| 0 else 0,
+        .rows_read = env.rows_read.load(.monotonic) - read0,
+        .rows_out = stats.rows_out - load_rows0,
+        .lanes = lanes_used.*,
+    });
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
         stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);
     };
@@ -305,6 +324,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings)) |h| head_stages = h;
         head_stages = try pruneKnown(env, head_stages);
     }
+    if (env.profile) |p| {
+        try notePlan(env, p, head_stages);
+        try notePlan(env, p, stages);
+    }
     if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
         if (classifyLaneShape(head_stages)) |shape| {
             const rd = head_stages[0].node.read;
@@ -433,6 +456,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         }
         snk_open = false;
         try snk.close();
+        if (env.profile) |p| _ = try p.absorb(res.op);
         return;
     }
 
@@ -457,7 +481,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     try pw.finish();
     snk_open = false;
     try snk.close();
-    if (opts.explain) try explainTree(arena, res.op);
+    if (env.profile) |p| _ = try p.absorb(res.op);
 }
 
 /// Split-parallel union: each branch runs as its own split pipeline into the shared

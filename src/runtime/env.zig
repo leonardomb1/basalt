@@ -36,6 +36,7 @@ const pushdown = @import("pushdown.zig");
 const Value = @import("../exec/value.zig").Value;
 const arrow = @import("../format/arrow/write.zig");
 const Space = @import("../exec/space.zig").Space;
+const Profile = @import("../exec/profile.zig").Profile;
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -293,6 +294,9 @@ pub const Env = struct {
     wrote_sink: bool = false,
     stdout_format: StdoutFormat = .table,
     explain: bool = false,
+    /// The actuals `EXPLAIN ANALYZE` collects for the pipeline it runs; null otherwise,
+    /// so a plain run folds nothing.
+    profile: ?*Profile = null,
     result: arrow.ResultInfo = .{},
     results_printed: u32 = 0,
     line_base: u32 = 0,
