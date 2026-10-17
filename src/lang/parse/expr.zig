@@ -396,6 +396,16 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
             return self.mk(.{ .field = q });
         },
         .ident => {
+            if (eqlNoCase(t.text, "x") and self.i + 1 < self.toks.len) {
+                const lit = self.toks[self.i + 1];
+                if (lit.tag == .string and lit.line == t.line and lit.col == t.col + 1) {
+                    _ = self.advance();
+                    _ = self.advance();
+                    const args = try self.arena.alloc(*ast.Expr, 1);
+                    args[0] = try self.mk(.{ .str_lit = lit.text });
+                    return self.mk(.{ .call = .{ .name = "unhex", .args = args } });
+                }
+            }
             if (eqlNoCase(t.text, "null")) {
                 _ = self.advance();
                 return self.mk(.null_lit);

@@ -146,8 +146,13 @@ pub const typing = struct {
     pub fn concat(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len == 0) return self.err("`concat` needs at least one argument", .{});
         var nn = false;
-        for (c.args, 0..) |_, i| nn = nn or (try self.wantText(c, i)).nullable;
-        return Type.init(.string).withNull(nn);
+        var bytes = false;
+        for (c.args, 0..) |_, i| {
+            const t = try self.wantText(c, i);
+            nn = nn or t.nullable;
+            bytes = bytes or t.kind == .bytes;
+        }
+        return Type.init(if (bytes) .bytes else .string).withNull(nn);
     }
 
     pub fn coalesce(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {

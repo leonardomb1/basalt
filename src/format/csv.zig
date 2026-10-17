@@ -62,6 +62,7 @@ const Gunzip = stream.Gunzip;
 const codecBuffer = stream.codecBuffer;
 const folder = @import("../connect/folder.zig");
 const deflate = @import("compress/deflate.zig");
+const charset = @import("charset.zig");
 
 const BATCH_ROWS = 1024;
 const LINE_BUF = stream.LINE_BUF;
@@ -96,13 +97,6 @@ pub const Encoding = enum {
         }) |c| if (norm.eq(s, c.name)) return c.enc;
         return null;
     }
-};
-
-const cp1252_high = [32]u21{
-    0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
-    0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
 };
 
 pub const Codec = stream.Codec;
@@ -156,34 +150,11 @@ fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]typ
 }
 
 pub fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
-    if (enc == .utf8) return utf8Repair(arena, s);
-    var high = false;
-    for (s) |c| if (c >= 0x80) {
-        high = true;
-        break;
-    };
-    if (!high) return s;
-
-    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len * 3);
-    var buf: [4]u8 = undefined;
-    for (s) |c| {
-        if (c < 0x80) {
-            out.appendAssumeCapacity(c);
-            continue;
-        }
-        const cp: u21 = switch (enc) {
-            .utf8 => unreachable,
-            .latin1 => c,
-            .cp1252 => blk: {
-                if (c > 0x9F) break :blk c;
-                const m = cp1252_high[c - 0x80];
-                break :blk if (m == 0) 0xFFFD else m;
-            },
-        };
-        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
-        out.appendSliceAssumeCapacity(buf[0..n]);
-    }
-    return out.items;
+    return charset.decode(arena, switch (enc) {
+        .utf8 => .utf8,
+        .latin1 => .latin1,
+        .cp1252 => .cp1252,
+    }, s);
 }
 
 pub const CsvReader = struct {
@@ -977,11 +948,7 @@ inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8,
 /// pyarrow reads one: a text value basalt holds is always UTF-8, so a Parquet or
 /// JSON file written from a mislabelled CSV stays readable everywhere.
 fn utf8Repair(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.unicode.utf8ValidateSlice(s)) return s;
-    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len + 8);
-    var runs = celltext.Utf8Runs{ .s = s };
-    while (runs.next()) |t| try out.appendSlice(t);
-    return out.items;
+    return charset.decode(arena, .utf8, s);
 }
 
 test "utf8Repair keeps valid text and replaces each invalid byte" {

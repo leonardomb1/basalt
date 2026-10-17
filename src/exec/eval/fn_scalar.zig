@@ -320,6 +320,7 @@ pub const Power = struct {
 /// NULL when any part is (`concat_ws` skips them instead).
 pub const Concat = struct {
     pub const variadic = true;
+    pub const bytes_if_any = true;
     pub fn apply(cx: Cx, parts: []const []const u8) EvalError![]const u8 {
         for (parts) |p| try cx.buf.appendSlice(p);
         return cx.written();

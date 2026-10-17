@@ -9,6 +9,12 @@
 //! present, gives the whole type from the call's literal arguments (a DECIMAL's
 //! precision and scale); the typing rule should return the same, as both forms type
 //! their result by it, and a decimal is brought to its scale in either form.
+//!
+//! Arguments may also be a DECIMAL (`dec`), a DATE as days (`day`) or a TIME or
+//! TIMESTAMP as microseconds (`micros`). `F.null_first` hands a NULL first argument
+//! to `apply` as null instead of ending the row, for an encoder that spells NULL. A
+//! variadic `F.bytes_if_any` returns BYTES when any argument is BYTES. `typeRule(F)`
+//! is the typing rule the arguments imply, `F.check` adding what literals must be.
 //! Every argument propagates NULL, the first NULL ending the row in argument order;
 //! `F.variadic` instead takes any number of text arguments as one slice.
 //!
@@ -49,6 +55,10 @@ const Decimal = @import("../value.zig").Decimal;
 const rescaleTo = @import("cast.zig").rescaleTo;
 const decimalOverflow = @import("support.zig").decimalOverflow;
 const types = @import("../../lang/types.zig");
+const TypeCtx = @import("../eval.zig").TypeCtx;
+const TypeError = @import("../eval.zig").TypeError;
+const intish = @import("../eval.zig").intish;
+const numericish = @import("../eval.zig").numericish;
 
 pub const Arg = enum {
     str,
@@ -57,13 +67,22 @@ pub const Arg = enum {
     num,
     opt_str,
     opt_int,
+    dec,
+    day,
+    micros,
 
     fn Base(comptime a: Arg) type {
         return switch (a) {
             .str, .opt_str => []const u8,
-            .int, .exact_int, .opt_int => i64,
+            .int, .exact_int, .opt_int, .micros => i64,
             .num => f64,
+            .dec => Decimal,
+            .day => i32,
         };
+    }
+
+    fn typed(comptime a: Arg) bool {
+        return a == .dec or a == .day or a == .micros;
     }
 
     fn T(comptime a: Arg) type {
@@ -107,8 +126,12 @@ fn argsOf(comptime F: type) [F.args.len]Arg {
 
 fn Args(comptime F: type) type {
     var fields: [F.args.len]type = undefined;
-    for (argsOf(F), 0..) |a, i| fields[i] = a.T();
+    for (argsOf(F), 0..) |a, i| fields[i] = if (i == 0 and nullFirst(F) and !a.optional()) ?a.T() else a.T();
     return std.meta.Tuple(&fields);
+}
+
+fn nullFirst(comptime F: type) bool {
+    return @hasDecl(F, "null_first") and F.null_first;
 }
 
 fn Result(comptime F: type) type {
@@ -168,16 +191,36 @@ fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base(
         .int, .opt_int => toI64(v),
         .exact_int => if (v == .int) v.int else error.TypeMismatch,
         .num => toF64(v),
+        .dec => switch (v) {
+            .decimal => |d| d,
+            .int => |x| .{ .unscaled = x, .scale = 0 },
+            else => error.TypeMismatch,
+        },
+        .day => if (v == .date) v.date else error.TypeMismatch,
+        .micros => switch (v) {
+            .time => |t| t,
+            .timestamp => |t| t,
+            else => error.TypeMismatch,
+        },
+    };
+}
+
+/// A DECIMAL, DATE, TIME or TIMESTAMP argument across a batch: a column or a constant.
+fn Typed(comptime E: type) type {
+    return union(enum) {
+        col: struct { d: []const E, v: Bitmap },
+        scalar: E,
     };
 }
 
 /// An argument across a batch as the kernel reads it, or null when absent.
 fn Operand(comptime a: Arg) type {
-    return if (a.text()) ?Str else ?Num;
+    return if (a.text()) ?Str else if (a.typed()) ?Typed(a.Base()) else ?Num;
 }
 
 fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!Operand(a) {
     if (comptime a.text()) return asStr(v) orelse error.Unsupported;
+    if (comptime a.typed()) return try typedArg(a, arena, v, n);
     const x = (try asNum(arena, v, n)) orelse return error.Unsupported;
     const int = x == .icol or x == .iscalar;
     const float = x == .fcol or x == .fscalar;
@@ -192,10 +235,92 @@ fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!
     return x;
 }
 
+fn typedArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!Typed(a.Base()) {
+    const E = a.Base();
+    switch (v) {
+        .scalar => |s| return .{ .scalar = switch (a) {
+            .dec => switch (s) {
+                .decimal => |d| d,
+                .int => |x| Decimal{ .unscaled = x, .scale = 0 },
+                else => return error.Unsupported,
+            },
+            .day => if (s == .date) s.date else return error.Unsupported,
+            .micros => switch (s) {
+                .time => |t| t,
+                .timestamp => |t| t,
+                else => return error.Unsupported,
+            },
+            else => unreachable,
+        } },
+        .col => |c| switch (a) {
+            .dec => switch (c.ty.kind) {
+                .decimal => return .{ .col = .{ .d = c.data.dec, .v = c.validity } },
+                .int => {
+                    const out = try arena.alloc(E, n);
+                    for (c.data.i64[0..n], out) |x, *o| o.* = .{ .unscaled = x, .scale = 0 };
+                    return .{ .col = .{ .d = out, .v = c.validity } };
+                },
+                else => return error.Unsupported,
+            },
+            .day => return if (c.ty.kind == .date) .{ .col = .{ .d = c.data.i32, .v = c.validity } } else error.Unsupported,
+            .micros => return if (c.ty.kind == .time or c.ty.kind == .timestamp) .{ .col = .{ .d = c.data.i64, .v = c.validity } } else error.Unsupported,
+            else => unreachable,
+        },
+    }
+}
+
 fn isBytes(v: Vec) bool {
     return switch (v) {
         .col => |c| c.ty.kind == .bytes,
         .scalar => |s| s == .bytes,
+    };
+}
+
+/// The typing rule `F`'s declaration implies: between its required and its total
+/// argument count, each argument of its kind, and `resultType`'s type, nullable when an
+/// argument is (a `null_first` one aside) or `F.may_null` says a value can come out
+/// NULL. `F.signature` names the arguments in the arity message, and `F.check`, when
+/// present, says what the call's literals must be.
+pub fn typeRule(comptime F: type) fn (*TypeCtx, ast.Expr.Call) TypeError!Type {
+    return struct {
+        fn rule(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+            const args = comptime argsOf(F);
+            const required = comptime blk: {
+                var n = 0;
+                for (args) |a| {
+                    if (!a.optional()) n += 1;
+                }
+                break :blk n;
+            };
+            if (c.args.len < required or c.args.len > args.len) return self.err("`{s}` takes " ++ F.signature, .{c.name});
+            var nullable = @hasDecl(F, "may_null") and F.may_null;
+            inline for (args, 0..) |a, i| if (i < c.args.len) {
+                const t = try self.argType(c, i);
+                const ok = switch (a) {
+                    .str, .opt_str => t.kind != .array and t.kind != .@"struct",
+                    .int, .exact_int, .opt_int => intish(t),
+                    .num => numericish(t),
+                    .dec => t.kind == .decimal or intish(t),
+                    .day => t.kind == .date,
+                    .micros => t.kind == .time or t.kind == .timestamp,
+                };
+                if (!ok and !t.unknown) return self.err("`{s}` argument {d} must be {s}, got {s}", .{ c.name, i + 1, argWord(a), @tagName(t.kind) });
+                if (t.nullable and !(i == 0 and nullFirst(F))) nullable = true;
+            };
+            if (@hasDecl(F, "check")) try F.check(self, c);
+            return resultType(F, c).withNull(nullable);
+        }
+    }.rule;
+}
+
+fn argWord(comptime a: Arg) []const u8 {
+    return switch (a) {
+        .str, .opt_str => "text or bytes",
+        .int, .exact_int, .opt_int => "an INT",
+        .num => "a number",
+        .dec => "a DECIMAL or INT",
+        .day => "a DATE",
+        .micros => "a TIME or TIMESTAMP",
     };
 }
 
@@ -214,9 +339,12 @@ pub fn Scalar(comptime F: type) type {
                     t[i] = null;
                 } else {
                     const v = try evalRow(arena, c.args[i], batch, row);
-                    if (v.isNull()) return .null;
-                    if (i == 0) cx.bytes = v == .bytes;
-                    t[i] = try rowArg(a, arena, v);
+                    if (v.isNull()) {
+                        if (comptime i == 0 and nullFirst(F)) t[i] = null else return .null;
+                    } else {
+                        if (i == 0) cx.bytes = v == .bytes;
+                        t[i] = try rowArg(a, arena, v);
+                    }
                 }
             }
             return wrap(try @call(.auto, F.apply, .{cx} ++ t), resultType(F, c));
@@ -225,12 +353,16 @@ pub fn Scalar(comptime F: type) type {
         fn evalMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
             var buf = std.array_list.Managed(u8).init(arena);
             const parts = try arena.alloc([]const u8, c.args.len);
+            var any_bytes = false;
             for (c.args, parts) |e, *p| {
                 const v = try evalRow(arena, e, batch, row);
                 if (v.isNull()) return .null;
+                any_bytes = any_bytes or v == .bytes;
                 p.* = try valueToString(arena, v);
             }
-            return wrap(try F.apply(.{ .arena = arena, .buf = &buf }, parts), resultType(F, c));
+            const r = try F.apply(.{ .arena = arena, .buf = &buf }, parts);
+            if (comptime @hasDecl(F, "bytes_if_any")) if (any_bytes) return .{ .bytes = r };
+            return wrap(r, resultType(F, c));
         }
 
         fn wrap(r: Result(F), ty: Type) EvalError!Value {
@@ -260,10 +392,14 @@ pub fn Scalar(comptime F: type) type {
                 var t: Args(F) = undefined;
                 inline for (comptime argsOf(F), 0..) |a, k| {
                     if (ops[k]) |op| {
-                        t[k] = at(a, op, i) orelse {
+                        if (at(a, op, i)) |x| {
+                            t[k] = x;
+                        } else if (comptime k == 0 and nullFirst(F)) {
+                            t[k] = null;
+                        } else {
                             try out.none(i, cx.mark);
                             continue :rows;
-                        };
+                        }
                     } else if (comptime a.optional()) {
                         t[k] = null;
                     } else unreachable;
@@ -282,7 +418,13 @@ pub fn Scalar(comptime F: type) type {
             var out = try Out(Payload(F)).init(arena, n, resultType(F, c));
             var cx = Cx{ .arena = arena, .buf = out.buf() };
             const ops = try arena.alloc(Str, c.args.len);
-            for (c.args, ops) |e, *o| o.* = asStr(try evalVec(arena, e, batch)) orelse return error.Unsupported;
+            for (c.args, ops) |e, *o| {
+                const v = try evalVec(arena, e, batch);
+                if (comptime @hasDecl(F, "bytes_if_any")) if (isBytes(v)) {
+                    out.ty = Type.init(.bytes);
+                };
+                o.* = asStr(v) orelse return error.Unsupported;
+            }
             const parts = try arena.alloc([]const u8, ops.len);
             rows: for (0..n) |i| {
                 cx.mark = out.begin();
@@ -297,6 +439,10 @@ pub fn Scalar(comptime F: type) type {
 
         inline fn at(comptime a: Arg, op: anytype, i: usize) ?a.Base() {
             if (comptime a.text()) return strAt(op, i);
+            if (comptime a.typed()) return switch (op) {
+                .scalar => |x| x,
+                .col => |col| if (col.v.get(i)) col.d[i] else null,
+            };
             return if (numValid(op, i)) numAt(a.Base(), op, i) else null;
         }
     };
@@ -381,7 +527,7 @@ fn Out(comptime P: type) type {
     };
 }
 
-const T = struct {
+const TestFns = struct {
     const Bytes = struct {
         pub const args = .{.str};
         pub const result = .bytes;
@@ -470,9 +616,9 @@ test "results of every kind come out alike, row by row and vectorized, typed by 
     const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string).asNullable() }} };
     var cols = [_]column.Column{scol};
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = words.len };
-    try expectFormsAgree(T.Bytes, a, "f(s)", batch, Type.init(.bytes));
-    try expectFormsAgree(T.Day, a, "f(s)", batch, Type.init(.date));
-    try expectFormsAgree(T.Stamp, a, "f(s)", batch, Type.init(.timestamp));
-    try expectFormsAgree(T.Clock, a, "f(s)", batch, Type.init(.time));
-    try expectFormsAgree(T.Money, a, "f(s, 2)", batch, Type.decimal(18, 2));
+    try expectFormsAgree(TestFns.Bytes, a, "f(s)", batch, Type.init(.bytes));
+    try expectFormsAgree(TestFns.Day, a, "f(s)", batch, Type.init(.date));
+    try expectFormsAgree(TestFns.Stamp, a, "f(s)", batch, Type.init(.timestamp));
+    try expectFormsAgree(TestFns.Clock, a, "f(s)", batch, Type.init(.time));
+    try expectFormsAgree(TestFns.Money, a, "f(s, 2)", batch, Type.decimal(18, 2));
 }

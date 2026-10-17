@@ -23,6 +23,41 @@ fn S(comptime F: type) type {
     return @import("scalar.zig").Scalar(F);
 }
 
+/// An entry whose typing rule, row form and kernel all come from `F`'s declaration.
+fn auto(comptime name: []const u8, comptime F: type) Builtin {
+    return .{ .name = name, .type_fn = @import("scalar.zig").typeRule(F), .eval_fn = S(F).eval, .vec_fn = S(F).vec, .sig = name ++ F.signature };
+}
+
+const r = @import("fn_records.zig");
+
+/// The byte, charset, field-decoding and field-encoding functions (`fn_records.zig`).
+const records = blk: {
+    const ints = .{ .{ "u8", u8 }, .{ "i8", i8 }, .{ "u16", u16 }, .{ "i16", i16 }, .{ "u32", u32 }, .{ "i32", i32 }, .{ "u64", u64 }, .{ "i64", i64 } };
+    const floats = .{ .{ "f32", f32 }, .{ "f64", f64 } };
+    var out: []const Builtin = &.{
+        auto("byte_len", r.ByteLen),           auto("byte_slice", r.ByteSlice),     auto("byte_at", r.ByteAt),
+        auto("byte_find", r.ByteFind),         auto("hex", r.Hex),                  auto("unhex", r.Unhex),
+        auto("decode", r.Decode),              auto("encode", r.Encode),            auto("text_at", r.TextAt),
+        auto("int_at", r.IntAt),               auto("decimal_at", r.DecimalAt),     auto("date_at", r.DateAt),
+        auto("time_at", r.TimeAt),             auto("timestamp_at", r.TimestampAt), auto("zoned_at", r.ZonedAt),
+        auto("packed_at", r.PackedAt),         auto("fmt_text", r.FmtText),         auto("fmt_int", r.FmtInt),
+        auto("fmt_decimal", r.FmtDecimal),     auto("fmt_date", r.FmtDate),         auto("fmt_time", r.FmtTime),
+        auto("fmt_timestamp", r.FmtTimestamp), auto("fmt_zoned", r.FmtZoned),       auto("fmt_packed", r.FmtPacked),
+    };
+    for (ints) |it| {
+        const one = @sizeOf(it[1]) == 1;
+        for (if (one) .{.little} else .{ .little, .big }) |e| {
+            const suffix = if (one) "" else if (e == .little) "le" else "be";
+            out = out ++ .{ auto(it[0] ++ suffix ++ "_at", r.BinIntAt(it[1], e)), auto("fmt_" ++ it[0] ++ suffix, r.FmtBinInt(it[1], e)) };
+        }
+    }
+    for (floats) |ft| for (.{ .little, .big }) |e| {
+        const suffix = if (e == .little) "le" else "be";
+        out = out ++ .{ auto(ft[0] ++ suffix ++ "_at", r.BinFloatAt(ft[1], e)), auto("fmt_" ++ ft[0] ++ suffix, r.FmtBinFloat(ft[1], e)) };
+    };
+    break :blk out;
+};
+
 pub const max_str_bytes = 1 << 20;
 
 pub const Builtin = struct {
@@ -30,9 +65,12 @@ pub const Builtin = struct {
     type_fn: *const fn (*TypeCtx, ast.Expr.Call) TypeError!Type,
     eval_fn: *const fn (std.mem.Allocator, ast.Expr.Call, Batch, usize) EvalError!Value,
     vec_fn: ?*const fn (std.mem.Allocator, ast.Expr.Call, Batch) VecError!Vec = null,
+    sig: ?[]const u8 = null,
 };
 
-pub const builtins = [_]Builtin{
+pub const builtins = base ++ records[0..records.len].*;
+
+const base = [_]Builtin{
     .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
     .{ .name = "today", .type_fn = typing.today, .eval_fn = per_row.today, .vec_fn = vectorized.today },
     .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace },

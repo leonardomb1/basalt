@@ -27,6 +27,7 @@
 - [Expressions and types](reference/expressions.md)
 - [Scalar functions](reference/functions.md)
 - [JSON functions](reference/json.md)
+- [Record functions](reference/records.md)
 - [Regular expressions](reference/regex.md)
 
 # Connectors

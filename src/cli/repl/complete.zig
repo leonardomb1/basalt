@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const hilite = @import("hilite.zig");
+const eval = @import("../../exec/eval.zig");
 
 pub const Kind = enum { meta, param, cte, connection, function, table, column, keyword, path };
 
@@ -44,7 +45,25 @@ pub const Names = struct {
 
 pub const Builtin = struct { name: []const u8, sig: []const u8 };
 
-pub const builtin_functions = [_]Builtin{
+/// Every function Tab offers: those listed here, then each registry entry that
+/// carries its own signature.
+pub const builtin_functions = listed ++ signed;
+
+const signed = blk: {
+    var n = 0;
+    for (eval.builtins) |b| {
+        if (b.sig != null) n += 1;
+    }
+    var out: [n]Builtin = undefined;
+    var k = 0;
+    for (eval.builtins) |b| if (b.sig) |sig| {
+        out[k] = .{ .name = b.name, .sig = sig };
+        k += 1;
+    };
+    break :blk out;
+};
+
+const listed = [_]Builtin{
     .{ .name = "now", .sig = "now()" },
     .{ .name = "today", .sig = "today()" },
     .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement[, flags])" },
