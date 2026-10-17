@@ -292,7 +292,7 @@ test "every meta command the REPL handles is one Tab offers, and the other way r
     try std.testing.expect(scraped >= 17);
 }
 
-test "Tab's built-in functions are exactly the engine's: every scalar, aggregate and window function, nothing else" {
+test "Tab's built-in functions are exactly the engine's: every scalar, aggregate, window and table function, nothing else" {
     const listed = struct {
         fn has(n: []const u8) bool {
             for (complete.builtin_functions) |f| if (std.mem.eql(u8, f.name, n)) return true;
@@ -315,6 +315,7 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
         const known = eval.lookupBuiltin(f.name) != null or
             aggregates.lookup(f.name) != null or
             std.meta.stringToEnum(ast.WinKind, f.name) != null or
+            table_builtins.lookup(f.name) != null or
             for (syntax) |x| (if (std.mem.eql(u8, x, f.name)) break true) else false;
         if (!known) {
             std.debug.print("complete.builtin_functions lists `{s}`, which the engine does not know\n", .{f.name});

@@ -416,14 +416,18 @@ fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
     return planErrT(env.diag, e, msg);
 }
 
-/// A table builtin opened on its arguments, params substituted as literals; a
-/// leading `-` is folded by `argValue` since `substExpr` does not.
+/// A table builtin opened on its arguments, params substituted and each folded to
+/// its value; a path it cannot open is named with why.
 fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
     const b = table_builtins.of(call);
     const vals = try env.arena.alloc(Value, call.args.len);
     for (call.args, b.args[0..call.args.len], vals) |e, kind, *v| {
         const r = try analyze.substExpr(env.arena, e, env.params_expr);
-        v.* = table_builtins.argValue(kind, r) orelse return planErr(env.diag, b.arg_msg);
+        v.* = try table_builtins.argValue(env.arena, kind, r) orelse return planErr(env.diag, b.arg_msg);
     }
-    return b.open(env.gpa, vals);
+    return b.open(env.arena, env.gpa, vals) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        const path = table_builtins.pathArg(b, vals) orelse return e;
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s}: could not open `{s}` ({s})", .{ b.label, path, try pathFail(env.arena, path, e) }));
+    };
 }

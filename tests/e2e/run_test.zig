@@ -12,4 +12,5 @@ test {
     _ = @import("xml.zig");
     _ = @import("records.zig");
     _ = @import("outcome.zig");
+    _ = @import("records_write.zig");
 }

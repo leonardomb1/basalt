@@ -174,6 +174,10 @@ const listed = [_]Builtin{
     .{ .name = "cast", .sig = "cast(x AS type)" },
     .{ .name = "try_cast", .sig = "try_cast(x AS type)" },
     .{ .name = "if", .sig = "if(cond, a, b)" },
+    .{ .name = "lines", .sig = "lines(path) → n, offset, rec" },
+    .{ .name = "fixed", .sig = "fixed(path, width[, skip_newlines]) → n, offset, rec" },
+    .{ .name = "split", .sig = "split(path, terminator) → n, offset, rec" },
+    .{ .name = "chunks", .sig = "chunks(path, size) → n, offset, rec" },
 };
 
 pub const meta_commands = [_][]const u8{ "\\connections", "\\c", "\\connect", "\\reset", "\\clear", "\\cls", "\\format", "\\f", "\\view", "\\v", "\\d", "\\dt", "\\i", "\\source", "\\save", "\\edit", "\\e", "\\help", "\\h", "\\q", "\\quit" };

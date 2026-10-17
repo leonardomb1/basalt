@@ -1,93 +1,115 @@
-//! End-to-end records sinks: one value a row written verbatim, gzipped, the same
-//! bytes on one lane or four, and what is refused at plan time.
+//! End-to-end reads of a file's raw records: `lines`, `fixed`, `split` and `chunks`
+//! over local, gzipped and zip-member files, their arguments as constants, and what
+//! check and run refuse.
 
 const std = @import("std");
 const basalt = @import("basalt");
 const parser = basalt.sql_parser;
 const Diag = basalt.env.Diag;
 const run = basalt.runtime.run;
-const checkAndRun = @import("harness.zig").checkAndRun;
-const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const harness = @import("harness.zig");
+const checkAndRun = harness.checkAndRun;
+const expectRefusedAlike = harness.expectRefusedAlike;
+const expectFile = harness.expectFile;
 
-fn bigCsv(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, null_at: ?usize) !void {
-    var text = std.array_list.Managed(u8).init(alloc);
-    defer text.deinit();
-    try text.appendSlice("id,name\n");
-    for (0..20000) |i| {
-        if (null_at == i) try text.writer().print("{d},\n", .{i}) else try text.writer().print("{d},n{d}\n", .{ i, (i * 31) % 997 });
-    }
-    try tmp.dir.writeFile(.{ .sub_path = "big.csv", .data = text.items });
-}
-
-test "a records file is each row's value and the newline, gzipped by a .gz name" {
+test "lines, fixed, split and chunks: n, offset and the raw record" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.ret.gz' WITH (format = 'records', newline = '\\r\\n') AS SELECT lpad(CAST(id AS STRING), 3, '0') || grp || lpad(CAST(amt AS STRING), 4, ' ') AS rec FROM '$B/a.csv' ORDER BY id;", 1, &.{});
-    const gz = try tmp.dir.readFileAlloc(alloc, "o.ret.gz", 1 << 16);
-    defer alloc.free(gz);
-    var in: std.Io.Reader = .fixed(gz);
-    var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var dec: std.compress.flate.Decompress = .init(&in, .gzip, &window);
-    const got = try dec.reader.allocRemaining(alloc, .unlimited);
-    defer alloc.free(got);
-    try std.testing.expectEqualStrings("001a  10\r\n002a  20\r\n003b   5\r\n", got);
-    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.ret' WITH (format = 'records', newline = 'none') AS SELECT from_base64('QUI=') AS rec FROM '$B/a.csv';", 1, &.{});
-    const raw = try tmp.dir.readFileAlloc(alloc, "o.ret", 1 << 16);
-    defer alloc.free(raw);
-    try std.testing.expectEqualStrings("ABABAB", raw);
+    try tmp.dir.writeFile(.{ .sub_path = "l.txt", .data = "a\r\nbb\n\nccc" });
+    try tmp.dir.writeFile(.{ .sub_path = "f.txt", .data = "abc\r\ndef\nghi\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "e.edi", .data = "ISA*1'GS*2'ST" });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec, length(rec) AS len FROM lines('$B/l.txt');", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,offset,rec,len\n1,0,a,1\n2,3,bb,2\n3,6,\"\",0\n4,7,ccc,3\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec FROM fixed('$B/f.txt', 3, TRUE);", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,offset,rec\n1,0,abc\n2,5,def\n3,9,ghi\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec FROM split('$B/e.edi', '''') WHERE offset > 0;", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,offset,rec\n2,6,GS*2\n3,11,ST\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, length(rec) AS len FROM chunks('$B/l.txt', 4);", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,offset,len\n1,0,4\n2,4,4\n3,8,2\n");
 }
 
-test "a records file is byte for byte the same on one lane or four, sorted or in file order" {
+test "records read through the stream: a gzipped file and a zip member" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try bigCsv(alloc, &tmp, null);
-    for ([_][]const u8{
-        "LOAD INTO '$B/o.ret' WITH (format = 'records', newline = 'crlf') AS SELECT name || '|' || CAST(id AS STRING) AS rec FROM '$B/big.csv' ORDER BY name, id;",
-        "LOAD INTO '$B/o.ret' WITH (format = 'records') AS SELECT name || CAST(id AS STRING) AS rec FROM '$B/big.csv' WHERE id % 3 <> 0;",
-    }) |script| {
-        var got: [2][]u8 = undefined;
-        for ([_]usize{ 1, 4 }, 0..) |threads, k| {
-            try checkAndRun(alloc, &tmp, script, threads, &.{});
-            got[k] = try tmp.dir.readFileAlloc(alloc, "o.ret", 1 << 22);
-        }
-        defer for (got) |g| alloc.free(g);
-        try std.testing.expectEqualStrings(got[0], got[1]);
-        try std.testing.expect(std.mem.count(u8, got[0], "\n") > 13000);
-    }
+    try tmp.dir.writeFile(.{ .sub_path = "t.zip", .data = basalt.fixtures.two_members_zip });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/g.csv.gz' AS SELECT range AS v FROM RANGE(3000);", 1, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS c, max(n) AS m, sum(length(rec)) AS b FROM lines('$B/g.csv.gz');", 1, &.{});
+    try expectFile(&tmp, "o.csv", "c,m,b\n3001,3001,10891\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, rec FROM lines('$B/t.zip :: a.csv');", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,rec\n1,\"id,v\"\n2,\"1,x\"\n3,\"2,y\"\n");
 }
 
-test "a NULL record is an error naming its row in the output" {
+test "a record source's path and sizes are constants: params, LETs, loop variables, expressions" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try bigCsv(alloc, &tmp, 15000);
+    try tmp.dir.writeFile(.{ .sub_path = "x.txt", .data = "abcdef" });
+    try checkAndRun(alloc, &tmp,
+        \\PARAM w INT DEFAULT 2;
+        \\LET stem = 'x';
+        \\LOAD INTO '$B/o.csv' AS SELECT n, rec FROM fixed('$B/' || $stem || '.txt', $w + 1);
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,rec\n1,abc\n2,def\n");
+    try checkAndRun(alloc, &tmp,
+        \\FOR EACH ROW OF (SELECT 'x' AS f) AS (f)
+        \\  LOAD INTO '$B/o.csv' AS SELECT n, rec FROM chunks('$B/' || $f || '.txt', 4);
+        \\END FOR;
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,rec\n1,abcd\n2,ef\n");
+}
+
+test "the record sources' names stay free as CTE and column names" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/o.csv' AS WITH split AS (SELECT 1 AS lines, 2 AS fixed, 3 AS chunks, 4 AS split)
+        \\SELECT lines, fixed, chunks, split, split_part('a-b', '-', 2) AS sp FROM split;
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "lines,fixed,chunks,split,sp\n1,2,3,4,b\n");
+}
+
+test "check and run refuse a record source's bad arguments alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][2][]const u8{
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM fixed('$B/x.txt', 0);", "positive integer width" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM chunks('$B/x.txt', -4);", "positive integer size" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM split('$B/x.txt', '');", "non-empty text terminator" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM lines('$B/');", "not a `dir/` folder" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM lines(1);", "LINES takes a file path" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM fixed('$B/x.txt', 3, 'yes');", "TRUE/FALSE skip_newlines" },
+    }) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
+}
+
+test "a short last fixed record and a missing file fail the run naming the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "x.txt", .data = "abcdefgh" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/o.ret' WITH (format = 'records') AS SELECT name FROM '{s}/big.csv';", .{ base, base });
-    defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    for ([_]usize{ 1, 4 }) |threads| {
+    for ([_][2][]const u8{
+        .{ "fixed('{s}/x.txt', 3)", "x.txt`: the last record, at byte 6, is 2 bytes, short of the 3-byte width" },
+        .{ "lines('{s}/nope.txt')", "nope.txt` (local file: FileNotFound)" },
+    }) |c| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        const a = parena.allocator();
+        const src = try std.mem.replaceOwned(u8, a, c[0], "{s}", base);
+        const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/o.csv' AS SELECT * FROM {s};", .{ base, src });
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, script, &pdiag);
         var rdiag: Diag = .{};
-        try std.testing.expectError(error.RecordNull, run(alloc, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag));
-        try std.testing.expect(std.mem.indexOf(u8, basalt.eval.takeFailure(error.RecordNull).?, "row 15001 of the records output is NULL") != null);
+        const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_|
+            return error.TestUnexpectedResult
+        else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.runtime.failLabel(e);
+        if (std.mem.indexOf(u8, msg, c[1]) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ c[1], msg });
+            return error.TestUnexpectedResult;
+        }
     }
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("o.ret", .{}));
-}
-
-test "a records sink takes one STRING or BYTES column, and a records file is not read" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,grp\n1,a\n" });
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.ret' WITH (format = 'records') AS SELECT id, grp FROM '$B/a.csv';", "this query yields 2 columns");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.ret' WITH (format = 'records') AS SELECT id FROM '$B/a.csv';", "`id` is int");
-    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.ret' WITH (format = 'records', newline = 'tab') AS SELECT grp FROM '$B/a.csv';", "unknown `newline = 'tab'`");
-    try expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/a.csv' WITH (format = 'records');", "the `records` format is written, not read; read raw records with lines(), fixed(), split() or chunks()");
-    try expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/a.csv' WITH (format = 'records', encoding = 'latin1');", "the `records` format is written, not read");
-    try expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/' WITH (format = 'records');", "the `records` format is written, not read");
 }

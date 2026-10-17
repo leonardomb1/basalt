@@ -35,7 +35,7 @@ constants — literals, `$params`, loop variables, and expressions over them —
 except under `JOIN LATERAL` (below). Arity, defaults and literal-argument
 types are checked as for a scalar function, the body is checked where it is
 declared, and an `@include`d table function is called like a local one. A
-built-in table source's name (`range`) cannot be taken, `OR REPLACE` or not. A body
+built-in table source's name (`range`, `lines`, `fixed`, `split`, `chunks`) cannot be taken, `OR REPLACE` or not. A body
 may call table functions declared before it; a call that reaches its own
 function (possible only through `OR REPLACE`) stops at 16 levels. A discovery
 query — `FOR EACH ROW OF (...)`, `EACH TABLE OF (SELECT ...)` — may call one

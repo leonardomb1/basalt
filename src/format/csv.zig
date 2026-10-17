@@ -59,6 +59,7 @@ const Stream = stream.Stream;
 const json = @import("json/read.zig");
 const release = stream.release;
 const Gunzip = stream.Gunzip;
+const explainf = stream.explainf;
 const codecBuffer = stream.codecBuffer;
 const folder = @import("../connect/folder.zig");
 const deflate = @import("compress/deflate.zig");
@@ -435,14 +436,6 @@ fn sniffEol(r: *std.Io.Reader) u8 {
     if (std.mem.indexOfScalar(u8, head, '\n') != null) return '\n';
     const cr = std.mem.indexOfScalar(u8, head, '\r') orelse return '\n';
     return if (cr + 1 < head.len) '\r' else '\n';
-}
-
-fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
-    var buf: [480]u8 = undefined;
-    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch blk: {
-        @memcpy(buf[buf.len - 3 ..], "...");
-        break :blk buf[0..];
-    });
 }
 
 fn clip(s: []const u8) []const u8 {

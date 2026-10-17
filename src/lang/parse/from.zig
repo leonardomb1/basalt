@@ -1,5 +1,6 @@
 //! FROM sources: paths, connections' tables and queries, HTTP calls and resources,
-//! buffers, `EACH TABLE OF`, table builtins (RANGE), and the read clauses (PAGINATE, RETRY, BODY).
+//! buffers, `EACH TABLE OF`, table builtins (RANGE, LINES, FIXED, SPLIT, CHUNKS),
+//! and the read clauses (PAGINATE, RETRY, BODY).
 
 const Parser = @import("../sql_parser.zig").Parser;
 const AliasSet = @import("../sql_parser.zig").AliasSet;

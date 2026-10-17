@@ -1424,7 +1424,7 @@ const Ctx = struct {
                 if (rd.form == .builtin) {
                     const tb = table_builtins.of(rd.form.builtin);
                     for (rd.form.builtin.args, tb.args[0..rd.form.builtin.args.len]) |e, kind| {
-                        if ((try dollarRefs(self.arena, e)).len == 0 and table_builtins.argValue(kind, e) == null)
+                        if ((try dollarRefs(self.arena, e)).len == 0 and try table_builtins.argValue(self.arena, kind, e) == null)
                             return fail(self.diag, "{s}", .{tb.arg_msg});
                     }
                 }

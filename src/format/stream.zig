@@ -13,6 +13,7 @@
 //! same buffers, so a folder of any length reads in constant memory.
 
 const std = @import("std");
+const eval = @import("../exec/eval.zig");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
 const sftp = @import("../store/sftp.zig");
@@ -305,6 +306,16 @@ pub const Stream = struct {
         hf.response = try hf.req.receiveHead(&hf.redirect_buf);
     }
 };
+
+/// `eval.explain` with a formatted message, cut to fit with `...`, for a reader
+/// failing mid-stream.
+pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+    var buf: [480]u8 = undefined;
+    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch blk: {
+        @memcpy(buf[buf.len - 3 ..], "...");
+        break :blk buf[0..];
+    });
+}
 
 /// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
 /// process, so what was read once stops counting as resident; touched again, they

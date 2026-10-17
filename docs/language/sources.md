@@ -23,7 +23,8 @@ A query reads from one source, named after `FROM`, and joins may read more
 | REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` ([HTTP APIs](../connectors/http.md)) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
 | discovered union | `FROM EACH TABLE OF (...)` ([UNION ALL BY NAME](set-operations.md)) |
-| generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are int literals or params |
+| raw records of a file | `FROM lines('app.log')` / `fixed('cnab.ret', 240)` / `split('order.edi', '~')` / `chunks('blob.bin', 65536)` — one row per record as `n`, `offset`, `rec`; see [Raw records](#raw-records) |
+| generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are integer constants: literals, params or expressions of them |
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
 | table function | `FROM paid_orders($since) p` — a `CREATE FUNCTION ... RETURNS TABLE` ([user functions](user-functions.md)), also as a `JOIN`'s right side |
@@ -90,6 +91,34 @@ curl -s https://api.example.org/export.ndjson | basalt run -c "
 Stdin must be free for data: a script read from stdin (`basalt run -`), the
 REPL and the notebook kernel already use it, and `FROM STDIN` is refused there.
 Parquet, Arrow and Excel need random access and are read from a path.
+
+## Raw records
+
+Four table sources read a file's bytes as records rather than parsing a
+format, for the files no reader fits — logs, fixed-width bank and mainframe
+exports, EDI:
+
+| call | one row per |
+|------|-------------|
+| `lines(p)` | line; `\n` and `\r\n` both end one (the `\r` is not in `rec`), a last line without one is a row |
+| `fixed(p, width [, skip_newlines])` | `width` bytes, back to back; `skip_newlines = TRUE` skips a `\n` or `\r\n` between records. A short last record fails the read naming its offset and length |
+| `split(p, terminator)` | record ended by the terminator's bytes (`'~'`, `''''`, any text), which is not in `rec` |
+| `chunks(p, size)` | block of `size` bytes, the last one shorter |
+
+Each returns `n INT` (the record's number, from 1), `offset INT` (its first
+byte in the decoded file, from 0) and `rec BYTES`. The path and sizes are
+constants: literals, `$params`, loop variables or expressions of them. Every
+location and codec a CSV reads from works — `s3://`, `az://`, SFTP, SMB, a URL,
+`.gz`/`.zst`, a zip member — one file at a time, not a folder. The read streams
+in constant memory; a line or `split` record past 64 MiB fails naming where it
+began, so a binary file is not read as one giant row.
+
+```sql
+LOAD INTO 'retorno.csv' AS
+SELECT n, substr(CAST(rec AS VARCHAR), 1, 3) AS banco, length(rec) AS bytes
+FROM fixed('sftp://bank/retorno/2026-10.ret.gz', 240, TRUE)
+WHERE n > 1;
+```
 
 ## SQL sources
 
