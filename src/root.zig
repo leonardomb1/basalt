@@ -48,6 +48,7 @@ pub const xml = @import("format/xml/token.zig");
 pub const xmlescape = @import("format/xml/escape.zig");
 pub const xmlread = @import("format/xml/read.zig");
 pub const xmlwrite = @import("format/xml/write.zig");
+pub const recordswrite = @import("format/records/write.zig");
 pub const remote_include = @import("lang/remote.zig");
 pub const xlsxwrite = @import("format/xlsx/write.zig");
 pub const ssh = @import("net/ssh.zig");

@@ -7,6 +7,7 @@ const DiscardSink = @import("../connect.zig").DiscardSink;
 const Env = @import("../env.zig").Env;
 const jsonwrite = @import("../../format/json/write.zig");
 const xmlwrite = @import("../../format/xml/write.zig");
+const recordswrite = @import("../../format/records/write.zig");
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const TableWriter = @import("../../connect/table.zig").TableWriter;
@@ -47,6 +48,7 @@ const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const eval = @import("../../exec/eval.zig");
+const formats = @import("../../format/formats.zig");
 
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.
@@ -75,6 +77,8 @@ fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
 /// `run` does not analyze first; without this a `.zip` was parsed as CSV and
 /// `COUNT(*)` answered with its deflate stream's newline count.
 pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
+    if (comptime std.mem.eql(u8, verb, "read")) if (explicit) |f| if (formats.readRefused(f)) |why|
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
     const unwritable = if (comptime std.mem.eql(u8, verb, "write")) analyze.unwritableTarget(path, explicit) else null;
     if (unwritable orelse analyze.unreadableTarget(path, explicit)) |why|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
@@ -185,6 +189,7 @@ pub fn uniqueTargetColumns(env: *Env, w: ast.Write, schema: types.Schema) !void 
     if (std.mem.eql(u8, w.connector, "stdout") or std.mem.eql(u8, w.connector, mem_connector)) return;
     var ad = analyze.Diag{};
     analyze.uniqueColumns(schema, &ad) catch |e| return aErr(env, &ad, e);
+    if (env.write_opts == .records) analyze.recordsColumn(schema, &ad) catch |e| return aErr(env, &ad, e);
 }
 
 fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driver.Sink {
@@ -248,6 +253,11 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 const pw = pqwrite.Writer.open(env.arena, w.target, schema, codec, fmode) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return pw.sink();
+            },
+            .records => |opts| {
+                const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|
+                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                return rw.sink();
             },
             .csv => {
                 const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode, env.csv_out) catch |e|

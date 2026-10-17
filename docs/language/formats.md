@@ -121,6 +121,30 @@ than tab, LF and CR) is U+FFFD. A `.gz` name gzips the file, and it goes to an
 object store, SFTP or SMB as a CSV does; `APPEND` is refused, as the root closes
 on the last line.
 
+## Records
+
+`WITH (format = 'records')` writes each row's one value verbatim followed by a
+newline, for the fixed-width, bank and EDI files a query composes itself:
+
+```sql
+LOAD INTO 'remessa.ret' WITH (format = 'records', newline = 'crlf', encoding = 'latin1')
+AS SELECT '1' || rpad(nome, 30, ' ') || lpad(CAST(valor AS STRING), 13, '0') AS rec
+FROM 'boletos.csv'
+ORDER BY nosso_numero;
+```
+
+The query yields exactly one STRING or BYTES column, or the plan is refused. BYTES
+are written as they are; text is written in `encoding` (`utf8`, the default,
+`latin1` or `cp1252`; it applies to text only), and a character it cannot hold
+is an error naming the row. `newline` is `lf` (the default), `crlf`, `cr` or
+`none` (records back to back), also spelled `'\n'`, `'\r\n'`, `'\r'` or `''`. A
+NULL row is an error naming its row in the output, never skipped or written
+empty — a `||` with any NULL is NULL, so `coalesce` the parts that may be. The
+format has no extension; it is chosen by `format` alone, and it is written, not
+read. A `.gz` name gzips the file, it goes to an object store, SFTP or SMB as a
+CSV does, and `APPEND` adds records (the newline first if the file's last record
+has none).
+
 ## Excel
 
 An Excel workbook — `.xlsx` or `.xlsm`, local, by URL or in object storage — reads

@@ -10,5 +10,6 @@ test {
     _ = @import("format.zig");
     _ = @import("json.zig");
     _ = @import("xml.zig");
+    _ = @import("records.zig");
     _ = @import("outcome.zig");
 }

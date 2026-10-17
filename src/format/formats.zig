@@ -1,14 +1,15 @@
 //! The file formats basalt reads and writes, one entry each: the names `format = '…'`
 //! takes, the extensions that pick it, what it can be read through (compression, an
 //! archive, a remote location, stdin, a folder), how a read fans out, the options a
-//! read and a write take, and how it is written and appended to. Every check and
+//! read and a write take, and how it is written and appended to. A format may be
+//! write-only (`read_refused` says why), and every read-side list skips it. Every check and
 //! every message that lists formats is derived from this table, the lists at compile
 //! time, so a new format is one entry and no message goes stale.
 
 const std = @import("std");
 const stream = @import("stream.zig");
 
-pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml };
+pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records };
 
 /// How a read splits across lanes: by row group anywhere, by byte range of a local
 /// uncompressed file, or not at all.
@@ -28,6 +29,7 @@ pub const Format = struct {
     names: []const []const u8,
     exts: []const []const u8,
     folder_exts: []const []const u8 = &.{},
+    read_refused: ?[]const u8 = null,
     compressed_read_refused: ?[]const u8 = null,
     archive_refused: ?[]const u8 = null,
     local_only: ?[]const u8 = null,
@@ -119,7 +121,29 @@ pub const table = [_]Format{
         .write = .{ .append_refused = "an XML file's root element closes on its last line, so appending means rewriting the file" },
         .write_keys = &.{ "format", "root", "row" },
     },
+    .{
+        .tag = .records,
+        .label = "records",
+        .read_what = "a records read",
+        .names = &.{"records"},
+        .exts = &.{},
+        .read_refused = "the `records` format is written, not read; read raw records with lines(), fixed(), split() or chunks()",
+        .lanes = .serial,
+        .read_keys = &.{},
+        .write = .{},
+        .write_keys = &.{ "format", "newline", "encoding" },
+    },
 };
+
+/// Whether `f` can be read; a write-only format is left out of every read-side list.
+pub fn readable(f: Format) bool {
+    return f.read_refused == null;
+}
+
+/// Why a read naming `tag` is refused, null for a format basalt reads.
+pub fn readRefused(tag: FileFormat) ?[]const u8 {
+    return of(tag).read_refused;
+}
 
 pub fn of(tag: FileFormat) *const Format {
     return &table[@intFromEnum(tag)];
@@ -141,6 +165,7 @@ pub fn ofPath(path: []const u8) ?FileFormat {
 
 /// Whether a file in a folder is one of `f`'s, compressed or not.
 pub fn inFolder(f: *const Format, name: []const u8) bool {
+    if (!readable(f.*)) return false;
     const bare = stream.splitCodec(name).rest;
     for (f.folder_exts) |e| if (std.ascii.endsWithIgnoreCase(bare, e)) return true;
     return false;
@@ -158,23 +183,19 @@ pub const names_list: []const u8 = blk: {
 /// What basalt reads, for the message refusing a file it does not.
 pub const handled_list: []const u8 = blk: {
     var s: []const u8 = "";
-    for (table, 0..) |f, i| {
+    var n_read = 0;
+    for (table) |f| if (readable(f)) {
+        n_read += 1;
+    };
+    var i = 0;
+    for (table) |f| if (readable(f)) {
         var exts: []const u8 = "";
         for (f.exts) |e| exts = exts ++ (if (exts.len == 0) "" else ", ") ++ "`" ++ e ++ "`";
-        const sep = if (i == 0) "" else if (i + 1 == table.len) " and " else ", ";
+        const sep = if (i == 0) "" else if (i + 1 == n_read) " and " else ", ";
         s = s ++ sep ++ f.label ++ " (" ++ exts ++ ")";
-    }
-    var stream_labels: []const u8 = "";
-    var n_stream = 0;
-    for (table) |f| if (f.compressed_read_refused == null) {
-        n_stream += 1;
+        i += 1;
     };
-    var k = 0;
-    for (table) |f| if (f.compressed_read_refused == null) {
-        k += 1;
-        stream_labels = stream_labels ++ (if (k == 1) "" else if (k == n_stream) " or " else ", ") ++ f.label;
-    };
-    break :blk s ++ ", a " ++ stream_labels ++ " file optionally `.gz`/`.zst` compressed or inside a `.zip`";
+    break :blk s ++ ", a " ++ labels(streamsCompressed) ++ " file optionally `.gz`/`.zst` compressed or inside a `.zip`";
 };
 
 /// The labels of the formats one predicate admits, joined as prose ("CSV, JSON or XML").
@@ -194,12 +215,16 @@ fn labels(comptime pred: fn (Format) bool) []const u8 {
     }
 }
 
+fn streamsCompressed(f: Format) bool {
+    return readable(f) and f.compressed_read_refused == null;
+}
+
 fn readsStdin(f: Format) bool {
-    return f.stdin;
+    return readable(f) and f.stdin;
 }
 
 fn readsFolder(f: Format) bool {
-    return f.folder_exts.len > 0;
+    return readable(f) and f.folder_exts.len > 0;
 }
 
 fn gzips(f: Format) bool {
@@ -224,7 +249,9 @@ pub const folder_exts_of: [table.len][]const u8 = blk: {
 /// Every extension a folder is scanned for, for the message that finds none.
 pub const folder_exts_list: []const u8 = blk: {
     var all: []const []const u8 = &.{};
-    for (table) |f| all = all ++ f.folder_exts;
+    for (table) |f| if (readsFolder(f)) {
+        all = all ++ f.folder_exts;
+    };
     var s: []const u8 = "";
     for (all, 0..) |e, i| s = s ++ (if (i == 0) "" else if (i + 1 == all.len) " or " else ", ") ++ e;
     break :blk s;
@@ -237,7 +264,7 @@ pub const all_write_keys = union_of(.write);
 fn union_of(comptime side: enum { read, write }) []const []const u8 {
     comptime {
         var out: []const []const u8 = &.{};
-        for (table) |f| for (if (side == .read) f.read_keys else f.write_keys) |k| {
+        for (table) |f| if (side == .write or readable(f)) for (if (side == .read) f.read_keys else f.write_keys) |k| {
             const seen = for (out) |o| {
                 if (std.mem.eql(u8, o, k)) break true;
             } else false;
@@ -250,7 +277,7 @@ fn union_of(comptime side: enum { read, write }) []const []const u8 {
 /// The keys of every format stdin reads, for a STDIN read.
 pub const stdin_read_keys: []const []const u8 = blk: {
     var out: []const []const u8 = &.{};
-    for (table) |f| if (f.stdin) for (f.read_keys) |k| {
+    for (table) |f| if (readsStdin(f)) for (f.read_keys) |k| {
         const seen = for (out) |o| {
             if (std.mem.eql(u8, o, k)) break true;
         } else false;
@@ -281,7 +308,11 @@ test "formats: tags index the table, names and extensions resolve, lists are gen
     try std.testing.expect(ofPath("x.yaml") == null);
     try std.testing.expect(inFolder(of(.csv), "d/a.tsv.zst"));
     try std.testing.expect(!inFolder(of(.csv), "d/a.json"));
-    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml", names_list);
+    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records", names_list);
+    try std.testing.expectEqual(FileFormat.records, byName("Records").?.tag);
+    try std.testing.expect(readRefused(.records) != null and readRefused(.csv) == null);
+    try std.testing.expect(std.mem.indexOf(u8, handled_list, "records") == null);
+    try std.testing.expect(std.mem.endsWith(u8, handled_list, "JSON (`.json`, `.ndjson`, `.jsonl`) and XML (`.xml`), a CSV, JSON or XML file optionally `.gz`/`.zst` compressed or inside a `.zip`"));
     try std.testing.expectEqualStrings("CSV, JSON or XML", stdin_labels);
     try std.testing.expectEqualStrings("CSV, Parquet, JSON or XML", folder_labels);
 }

@@ -188,7 +188,9 @@ fn usage(w: anytype) !void {
         \\             — the extension picks the format; another needs WITH (format
         \\             = 'csv'|'parquet'|'arrow'|'json'|'ndjson'|'xml').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
-        \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too)
+        \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too).
+        \\             WITH (format = 'records', newline = 'crlf') writes one
+        \\             STRING or BYTES column a row verbatim (fixed-width files)
         \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),
         \\             piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;

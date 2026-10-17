@@ -27,7 +27,8 @@ AS
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
   (a file), `sheet` (an Excel file), `compression` (a Parquet file: `snappy`,
   `gzip` or `none`), `array` (a JSON file: one top-level array instead of a row
-  a line), `root` and `row` (an XML file's element names) and
+  a line), `root` and `row` (an XML file's element names), `newline` and
+  `encoding` (a `format = 'records'` file, [Records](formats.md#records)) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
   or SQL Server); a key the target does not read, or any
   other key, is a plan-time error rather than ignored.

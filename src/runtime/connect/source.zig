@@ -312,7 +312,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .json => return openJson(env, rd.form.path, f.files, hints),
             .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
             .csv => {},
-            .arrow, .xlsx => unreachable,
+            .arrow, .xlsx, .records => unreachable,
         };
         switch (analyze.readFormat(rd.form.path, want)) {
             .parquet => {
@@ -325,6 +325,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .xlsx => return openXlsx(env, rd.form.path, hints),
             .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
             .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
+            .records => unreachable,
             .csv => {},
         }
         var ddiag = analyze.Diag{};

@@ -143,6 +143,22 @@ pub fn uniqueColumns(schema: types.Schema, diag: *Diag) Error!void {
     };
 }
 
+/// A records file writes each row's one value verbatim, so its query yields exactly
+/// one STRING or BYTES column.
+pub fn recordsColumn(schema: types.Schema, diag: *Diag) Error!void {
+    if (schema.fields.len != 1)
+        return fail(diag, "a `records` file writes one STRING or BYTES column a row, verbatim; this query yields {d} columns — compose the record into one with `||`", .{schema.fields.len});
+    const f = schema.fields[0];
+    if (f.ty.kind != .string and f.ty.kind != .bytes)
+        return fail(diag, "a `records` file writes one STRING or BYTES column a row, verbatim; `{s}` is {s} — CAST it to STRING or format it into the record", .{ f.name, if (f.ty.unknown) "an untyped NULL" else @tagName(f.ty.kind) });
+}
+
+fn recordsSink(w: ast.Write, hints: []const ast.Hint) bool {
+    if (!std.mem.eql(u8, w.connector, "csv") or w.target.len == 0) return false;
+    var d = Diag{};
+    return (formatFromHints(hints, &d) catch null) == .records;
+}
+
 /// A LIMIT or OFFSET expression's rows: its `$name`s replaced and the whole evaluated
 /// once into a whole number at least 0; null for NULL, which SQL reads as no bound.
 /// Text that spells one is taken too, as a loop variable is text. A fraction rounds
@@ -1346,6 +1362,10 @@ const Ctx = struct {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };
+        if (cur) |c| if (recordsSink(w, stages[stages.len - 1].hints)) recordsColumn(c, self.diag) catch |e| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return e;
+        };
 
         const src_is_sql = isSqlSource(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or
@@ -1718,13 +1738,15 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
         return fail(diag, "`{s}` is not a valid S3 target: {s}", .{ w.target, why });
     if (ftp.isUrl(w.target))
         return fail(diag, "cannot write `{s}`: basalt reads from FTP but does not write to it; write to `sftp://` or a local file", .{w.target});
-    if (std.mem.eql(u8, w.connector, "csv") and w.target.len > 0) {
+    const to_file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
+    if (to_file) {
         const fmt = try formatFromHints(hints, diag);
         if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
             return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
     }
     _ = try dialectFromHints(hints, diag);
-    if (hintText(hints, "encoding") != null)
+    const encodes = to_file and containsName(formats.of((try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv).write_keys, "encoding");
+    if (hintText(hints, "encoding") != null and !encodes)
         return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
     if (w.mode == .upsert)
         return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
@@ -1818,6 +1840,11 @@ const other_read = ReadKind{ .what = "this source", .keys = &.{}, .takes = "no o
 /// than ignored, so a misspelled `delimeter` fails instead of reading commas.
 /// `connector` is the resolved source type: a file is `csv` whatever its format.
 pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Error!void {
+    if (lead.node == .read and (std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdin")))
+        if (formatFromHints(lead.hints, diag) catch null) |f| if (formats.readRefused(f)) |why| {
+            if (lead.node.read.form == .path) return fail(diag, "cannot read `{s}`: {s}", .{ lead.node.read.form.path, why });
+            return fail(diag, "{s}", .{why});
+        };
     const kind: ReadKind = switch (lead.node) {
         .read => |rd| if (std.mem.eql(u8, connector, "csv")) blk: {
             const fmt = (formatFromHints(lead.hints, diag) catch null) orelse

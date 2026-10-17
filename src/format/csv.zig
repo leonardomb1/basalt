@@ -157,6 +157,17 @@ pub fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]co
     }, s);
 }
 
+/// `decodeField` reversed: UTF-8 text as `enc`'s bytes, the input itself when it is
+/// already that (UTF-8, or all ASCII). A character `enc` cannot hold, or text that is
+/// not UTF-8, is `error.Unencodable`.
+pub fn encodeField(arena: std.mem.Allocator, enc: Encoding, utf8: []const u8) ![]const u8 {
+    return charset.encode(arena, switch (enc) {
+        .utf8 => .utf8,
+        .latin1 => .latin1,
+        .cp1252 => .cp1252,
+    }, utf8);
+}
+
 pub const CsvReader = struct {
     arena: std.mem.Allocator,
     dialect: Dialect = .{},
@@ -1775,6 +1786,20 @@ test "Encoding.parse accepts the spellings the wild uses" {
     try std.testing.expectEqual(Encoding.utf8, Encoding.parse("UTF8").?);
     try std.testing.expect(Encoding.parse("latin9") == null);
     try std.testing.expect(Encoding.parse("") == null);
+}
+
+test "encodeField: UTF-8 narrows to latin-1 and cp1252, a character neither holds is refused" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ascii = "plain";
+    try std.testing.expect((try encodeField(a, .latin1, ascii)).ptr == ascii.ptr);
+    try std.testing.expectEqualStrings("LIQUIDA\xC7\xC3O", try encodeField(a, .latin1, "LIQUIDAÇÃO"));
+    try std.testing.expectEqualStrings("\x93hi\x94 \x80", try encodeField(a, .cp1252, "“hi” €"));
+    try std.testing.expectEqualStrings("“hi”", try encodeField(a, .utf8, "“hi”"));
+    try std.testing.expectError(error.Unencodable, encodeField(a, .latin1, "€"));
+    try std.testing.expectError(error.Unencodable, encodeField(a, .cp1252, "\u{0081}"));
+    try std.testing.expectError(error.Unencodable, encodeField(a, .latin1, "caf\xe9"));
 }
 
 test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {

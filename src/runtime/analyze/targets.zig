@@ -12,6 +12,7 @@ const json = @import("../../format/json/read.zig");
 const jsonwrite = @import("../../format/json/write.zig");
 const xmlread = @import("../../format/xml/read.zig");
 const xmlwrite = @import("../../format/xml/write.zig");
+const recordswrite = @import("../../format/records/write.zig");
 const fail = @import("../analyze.zig").fail;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
@@ -60,11 +61,16 @@ pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect 
         if (d.delim == '"' or d.delim == '\n' or d.delim == '\r')
             return fail(diag, "delimiter cannot be a quote or a newline", .{});
     }
-    if (hintText(hints, "encoding")) |s| {
-        d.encoding = csv.Encoding.parse(s) orelse
-            return fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
-    }
+    if (try encodingFromHints(hints, diag)) |e| d.encoding = e;
     return d;
+}
+
+/// The `encoding` option, null when unset; a read decodes from it, a records sink
+/// encodes its text to it.
+pub fn encodingFromHints(hints: []const ast.Hint, diag: *Diag) Error!?csv.Encoding {
+    const s = hintText(hints, "encoding") orelse return null;
+    return csv.Encoding.parse(s) orelse
+        fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
 }
 
 pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
@@ -165,6 +171,7 @@ pub const WriteOptions = union(FileFormat) {
     xlsx: []const u8,
     json: jsonwrite.Shape,
     xml: xmlwrite.Names,
+    records: recordswrite.Options,
 };
 
 pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
@@ -181,7 +188,18 @@ pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!Wr
         .xlsx => .{ .xlsx = sheet },
         .json => .{ .json = shape },
         .xml => .{ .xml = names },
+        .records => .{ .records = try recordsOptions(hints, diag) },
     };
+}
+
+/// A records sink's line ending and text encoding; parsed only for a records target,
+/// whose keys no other target takes.
+pub fn recordsOptions(hints: []const ast.Hint, diag: *Diag) Error!recordswrite.Options {
+    var o = recordswrite.Options{};
+    if (hintText(hints, "newline")) |s| o.newline = recordswrite.parseNewline(s) orelse
+        return fail(diag, "unknown `newline = '{s}'` (" ++ recordswrite.newline_names ++ ")", .{s});
+    if (try encodingFromHints(hints, diag)) |e| o.encoding = e;
+    return o;
 }
 
 /// An XML sink's root and row element names, `rows` and `row` when unset. Any other
@@ -221,10 +239,7 @@ pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8
 /// declared one; validated here so `check` refuses a bad one before a run.
 pub fn xmlOptions(hints: []const ast.Hint, text: []const []const u8, diag: *Diag) Error!xmlread.Options {
     var o = xmlread.Options{ .row = hintText(hints, "row"), .text = text };
-    if (hintText(hints, "encoding")) |s| {
-        o.encoding = csv.Encoding.parse(s) orelse
-            return fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
-    }
+    if (try encodingFromHints(hints, diag)) |e| o.encoding = e;
     return o;
 }
 
@@ -245,6 +260,7 @@ pub fn formatLabel(path: []const u8, hints: []const ast.Hint) []const u8 {
 /// Why STDIN cannot be read as `fmt`, or null: stdin is a stream, so it takes only
 /// the formats read front to back.
 pub fn stdinProblem(fmt: FileFormat) ?[]const u8 {
+    if (formats.readRefused(fmt)) |why| return why;
     if (formats.of(fmt).stdin) return null;
     return "STDIN is read as a stream, so it takes " ++ formats.stdin_labels ++ "; a file needing random access is read from a path";
 }
