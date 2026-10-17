@@ -14,8 +14,14 @@ pub const Space = struct {
     createFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!File,
     chargeFn: *const fn (ctx: *anyopaque, bytes: u64) anyerror!void,
     releaseFn: ?*const fn (ctx: *anyopaque, bytes: u64) void = null,
+    peakFn: ?*const fn (ctx: *anyopaque) u64 = null,
 
     pub const File = struct { file: std.fs.File, path: []const u8 };
+
+    /// The most bytes held at once so far, for `EXPLAIN ANALYZE`; 0 when untracked.
+    pub fn peak(self: Space) u64 {
+        return if (self.peakFn) |f| f(self.ctx) else 0;
+    }
 
     pub fn create(self: Space, arena: std.mem.Allocator, tag: []const u8) !File {
         return self.createFn(self.ctx, arena, tag);
@@ -38,7 +44,12 @@ pub const DirSpace = struct {
     seq: std.atomic.Value(u64) = .init(0),
 
     pub fn space(self: *DirSpace) Space {
-        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl };
+        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl, .peakFn = peakImpl };
+    }
+
+    fn peakImpl(ctx: *anyopaque) u64 {
+        const self: *DirSpace = @ptrCast(@alignCast(ctx));
+        return self.peak.load(.monotonic);
     }
 
     fn createImpl(ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!Space.File {

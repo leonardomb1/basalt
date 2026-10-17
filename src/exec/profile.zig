@@ -116,6 +116,9 @@ pub const Profile = struct {
     threads: std.AutoArrayHashMapUnmanaged(std.Thread.Id, void) = .empty,
     details: std.AutoHashMapUnmanaged(Said, []const u8) = .empty,
     phases: std.ArrayListUnmanaged(Phase) = .empty,
+    /// What the run asked its sources for, as sent: a SQL read's query, an HTTP
+    /// read's URL. Pushdown is only visible here.
+    sent: std.ArrayListUnmanaged([]const u8) = .empty,
     /// The stage an operator with no position of its own was built for, by kind: a
     /// lane's scan opens over a morsel of the pipeline's read, and its aggregate,
     /// top-N, distinct or join are built outside the planner, from the one stage of
@@ -143,6 +146,20 @@ pub const Profile = struct {
         while (dt.next()) |d| self.gpa.free(d.*);
         self.details.deinit(self.gpa);
         self.phases.deinit(self.gpa);
+        for (self.sent.items) |s| self.gpa.free(s);
+        self.sent.deinit(self.gpa);
+    }
+
+    /// Records a request made of a source, once however many lanes made it.
+    pub fn noteSent(self: *Profile, comptime fmt: []const u8, args: anytype) !void {
+        const text = try std.fmt.allocPrint(self.gpa, fmt, args);
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        for (self.sent.items) |s| if (std.mem.eql(u8, s, text)) {
+            self.gpa.free(text);
+            return;
+        };
+        try self.sent.append(self.gpa, text);
     }
 
     /// Fold a finished chain into the profile, on the lane of the calling thread, and
@@ -344,7 +361,10 @@ fn addTally(gpa: std.mem.Allocator, n: *Node, lane: usize, t: Tally) !void {
 
 fn addFact(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(Fact), f: Fact) !void {
     for (list.items) |*have| if (std.mem.eql(u8, have.name, f.name)) {
-        have.value += f.value;
+        have.value = switch (f.fold) {
+            .sum => have.value + f.value,
+            .max => @max(have.value, f.value),
+        };
         return;
     };
     try list.append(gpa, f);
@@ -568,6 +588,17 @@ test "profile: a path that does not pull its operators registers their shape and
     try p.credit(ids[0], .{ .ns = 50, .rows = 3, .calls = 1 });
     try testing.expectEqual(@as(u64, 20), p.nodes.getPtr(ids[0]).?.exclusive(&p));
     try testing.expectEqual(@as(u64, 8), p.nodes.getPtr(ids[0]).?.rowsIn(&p));
+}
+
+test "profile: chains' facts add up, but one every chain shares is counted once" {
+    var list: std.ArrayListUnmanaged(Fact) = .empty;
+    defer list.deinit(testing.allocator);
+    for (0..3) |_| {
+        try addFact(testing.allocator, &list, .{ .name = "sorted runs spilled", .value = 2 });
+        try addFact(testing.allocator, &list, .{ .name = "build rows", .value = 81, .fold = .max });
+    }
+    try testing.expectEqual(@as(u64, 6), list.items[0].value);
+    try testing.expectEqual(@as(u64, 81), list.items[1].value);
 }
 
 test "profile: a stage's text is its SQL" {

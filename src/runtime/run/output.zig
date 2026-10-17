@@ -118,19 +118,34 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         prof.deinit();
     };
     const t0 = std.time.Instant.now() catch null;
+    const scan0 = scanCounts(env);
     runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
         load_err = e;
         return e;
     };
-    if (own_profile) try printProfile(env, &prof, .{
-        .wall_ns = if (t0) |s| if (std.time.Instant.now()) |now| now.since(s) else |_| 0 else 0,
-        .rows_read = env.rows_read.load(.monotonic) - read0,
-        .rows_out = stats.rows_out - load_rows0,
-        .lanes = lanes_used.*,
-    });
+    if (own_profile) {
+        const scan1 = scanCounts(env);
+        try printProfile(env, &prof, .{
+            .wall_ns = if (t0) |s| if (std.time.Instant.now()) |now| now.since(s) else |_| 0 else 0,
+            .rows_read = env.rows_read.load(.monotonic) - read0,
+            .rows_out = stats.rows_out - load_rows0,
+            .lanes = lanes_used.*,
+            .row_groups = scan1[0] - scan0[0],
+            .row_groups_skipped = scan1[1] - scan0[1],
+            .columns_read = scan1[2] - scan0[2],
+            .columns_total = scan1[3] - scan0[3],
+            .spill_peak = if (env.space) |sp| sp.peak() else 0,
+        });
+    }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
         stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);
     };
+}
+
+/// The run's read counts so far: row groups read and skipped, columns read and offered.
+fn scanCounts(env: *Env) [4]u64 {
+    const t = env.scan orelse return .{ 0, 0, 0, 0 };
+    return .{ t.row_groups.load(.monotonic), t.row_groups_skipped.load(.monotonic), t.columns_read.load(.monotonic), t.columns_total.load(.monotonic) };
 }
 
 /// A derived table or CTE that aggregates a file or table is run first, in parallel,
@@ -343,8 +358,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.sql_desc = null;
     env.src_name = "";
     const src_base = env.sources.items.len;
+    const t_open = std.time.Instant.now() catch null;
     var res = try buildPipeline(env, stages[0 .. stages.len - 1]);
     defer res.op.release();
+    if (env.profile) |p| if (t_open) |t| try p.phase("plan and open the sources", (std.time.Instant.now() catch t).since(t));
 
     const wr = try resolveUpsertKeys(env, last.write);
 
@@ -359,6 +376,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 stages = ns;
                 res = try buildPipeline(env, ns[0 .. ns.len - 1]);
                 whole_agg = true;
+                if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
             }
         }
         if (!whole_agg and hasAggregate(stages))
@@ -376,6 +394,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             stages = ns;
             res = try buildPipeline(env, ns[0 .. ns.len - 1]);
             top_n = true;
+            if (env.profile) |p| p.path = "serial; ORDER BY ... LIMIT runs in the source";
         } else if (why.len > 0 and hasSort(stages))
             env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
     }
@@ -424,6 +443,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
                     const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
                     p.path = try std.fmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
+                    try p.noteSent("{s}, once per key range: {s}", .{ @tagName(env.sql_desc.?.kind), sp.base_sql });
                     break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
                 } else null;
                 if (try buildParallelSink(env, wr, schema)) |mode| {

@@ -172,8 +172,15 @@ pub const Stats = struct {
 pub const Unit = enum { count, bytes, ns };
 
 /// A figure an operator knows beyond time and rows, read off its state once it has
-/// run, for `EXPLAIN ANALYZE`: groups held, rows built, bytes spilled.
-pub const Fact = struct { name: []const u8, value: u64, unit: Unit = .count };
+/// run, for `EXPLAIN ANALYZE`: rows built, bytes held, spill depth. Chains' figures
+/// add up, except one every chain reads the same of (`max`): a lane's join probes
+/// the one index built before the lanes, and summing it counted it once per lane.
+pub const Fact = struct {
+    name: []const u8,
+    value: u64,
+    unit: Unit = .count,
+    fold: enum { sum, max } = .sum,
+};
 
 pub const Op = union(enum) {
     scan: *Scan,
@@ -236,10 +243,37 @@ pub const Op = union(enum) {
         }
     }
 
-    /// What the operator can tell beyond `Stats`, written into `buf`.
+    /// What the operator can tell beyond `Stats`, written into `buf` (room for four).
     pub fn facts(self: Op, buf: []Fact) []const Fact {
-        _ = self;
-        return buf[0..0];
+        var n: usize = 0;
+        switch (self) {
+            .join => |j| {
+                const fold: @FieldType(Fact, "fold") = if (j.build == null) .max else .sum;
+                if (j.index) |ix| {
+                    buf[0] = .{ .name = "build rows", .value = ix.rows(), .fold = fold };
+                    buf[1] = .{ .name = "build size", .value = ix.build_batch.heapBytes(), .unit = .bytes, .fold = fold };
+                    n = 2;
+                }
+                if (j.grace) |g| {
+                    buf[n] = .{ .name = "spilled, partition levels", .value = @as(u64, g.deepest) + 1, .fold = .max };
+                    n += 1;
+                }
+            },
+            .aggregate => |a| if (a.spill != null) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = @as(u64, a.spill_depth) + 1, .fold = .max };
+                n = 1;
+            },
+            .distinct => |d| if (d.spill != null) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = @as(u64, d.spill_depth) + 1, .fold = .max };
+                n = 1;
+            },
+            .sort => |s| if (s.runs > 0) {
+                buf[0] = .{ .name = "sorted runs spilled", .value = s.runs };
+                n = 1;
+            },
+            else => {},
+        }
+        return buf[0..n];
     }
 
     /// How the planner chose to run it, when it made a choice: which side of a join

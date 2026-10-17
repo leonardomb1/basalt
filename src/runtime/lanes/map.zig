@@ -608,6 +608,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     if (env.profile) |p| {
         if (lp.lane.build_root) |b| try p.graftBuild(lp.lane.at, b);
         p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel map+join, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+        try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
 
     if (ctx.queue.failure()) |e| return e;

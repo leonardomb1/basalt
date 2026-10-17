@@ -127,12 +127,18 @@ fn readText(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
     return out.written();
 }
 
-/// What the run around the operators came to, for the summary.
+/// What the run around the operators came to, for the summary. The read counts are
+/// the pipeline's share of the run's `ScanTally`.
 pub const RunFacts = struct {
     wall_ns: u64,
     rows_read: u64,
     rows_out: u64,
     lanes: usize,
+    row_groups: u64 = 0,
+    row_groups_skipped: u64 = 0,
+    columns_read: u64 = 0,
+    columns_total: u64 = 0,
+    spill_peak: u64 = 0,
 };
 
 /// The report, written to stderr in one piece: stdout carries the data, and a
@@ -179,6 +185,11 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
     if (facts.lanes > 1) try w.print(" (summed over {d} lanes)", .{facts.lanes});
     try w.writeAll("\n");
     try w.print("  Rows read: {f}   Rows out: {f}   Path: {s}\n", .{ Count{ .n = facts.rows_read }, Count{ .n = facts.rows_out }, prof.path });
+    if (facts.row_groups + facts.row_groups_skipped > 0)
+        try w.print("  Row groups: {d} read, {d} skipped\n", .{ facts.row_groups, facts.row_groups_skipped });
+    if (facts.columns_total > 0) try w.print("  Columns read: {d} of {d}\n", .{ facts.columns_read, facts.columns_total });
+    if (facts.spill_peak > 0) try w.print("  Spilled to disk, at most: {f}\n", .{Bytes{ .n = facts.spill_peak }});
+    for (prof.sent.items) |s| try w.print("  Sent to {s}\n", .{clip(s, 400)});
     for (prof.phases.items) |ph| try w.print("  {s}: {f}\n", .{ ph.name, Dur{ .ns = ph.ns } });
 
     const top = try hottest(arena, prof, o, 5);

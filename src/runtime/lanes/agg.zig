@@ -903,6 +903,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
         try p.phase("emit and write the groups", (std.time.Instant.now() catch unreachable).since(t_emit0));
         p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+        try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
     try snk.close();
     return true;

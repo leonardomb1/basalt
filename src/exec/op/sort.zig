@@ -56,6 +56,8 @@ pub const Sort = struct {
     batch_rows: usize = 1 << 16,
     gpa: std.mem.Allocator = std.heap.page_allocator,
     merge: ?*Merge = null,
+    /// Sorted runs written to disk, kept past the merge for `EXPLAIN ANALYZE`.
+    runs: usize = 0,
 
     /// `nulls_first` places nulls before every value, otherwise after.
     pub const Key = struct { idx: usize, desc: bool, nulls_first: bool };
@@ -178,6 +180,7 @@ pub const Sort = struct {
         if (give != null) held_owned = false;
         const m = try Merge.init(self.gpa, self.in_schema, self.keys, runs.items, mem, give);
         self.merge = m;
+        self.runs = runs.items.len;
         if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
         self.dropMerge();
         return null;
