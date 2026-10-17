@@ -53,6 +53,7 @@ const s3 = @import("../store/s3.zig");
 const xlsx = @import("../format/xlsx/read.zig");
 const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
+const table_builtins = @import("../connect/table_builtins.zig");
 const keypush = @import("plan/keypush.zig");
 const joinorder = @import("plan/joinorder.zig");
 const op = @import("../exec/op.zig");
@@ -590,17 +591,6 @@ pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
 pub fn unionCanonProblem(arena: std.mem.Allocator, canon: []const u8, names: []const []const u8) Error!?[]const u8 {
     if (std.mem.eql(u8, canon, "first") or containsName(names, canon)) return null;
     return try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
-}
-
-pub const range_bound_msg = "RANGE bounds must be integer literals or integer params";
-
-/// A `range(lo, hi)` bound once its params are literals: an integer, or a negated one.
-pub fn rangeBoundValue(e: *const ast.Expr) ?i64 {
-    return switch (e.*) {
-        .int_lit => |v| v,
-        .unary => |u| if (u.op == .neg and u.e.* == .int_lit) -u.e.int_lit else null,
-        else => null,
-    };
 }
 
 pub fn notJsonParamMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
@@ -1392,7 +1382,7 @@ const Ctx = struct {
         switch (lead.node) {
             .read => |rd| {
                 const conn: ?ast.Connection = self.connections.get(rd.connector);
-                if (!isBuiltinSource(rd.connector) and conn == null)
+                if (rd.form != .builtin and !isBuiltinSource(rd.connector) and conn == null)
                     return fail(self.diag, "{s}", .{try unknownConnectionMsg(self.arena, rd.connector, "read")});
                 const connector = if (conn) |c| c.connector else rd.connector;
                 if (conn != null and !isSqlSource(connector) and !std.mem.eql(u8, connector, "http"))
@@ -1402,17 +1392,20 @@ const Ctx = struct {
                     .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
                     .path => |p| p,
-                    .range => "range",
+                    .builtin => |b| table_builtins.of(b).label,
                     .unit => if (std.mem.eql(u8, connector, "stdin")) "stdin" else "unit",
                 };
                 if (std.mem.eql(u8, connector, "stdin")) if (try formatFromHints(lead.hints, self.diag)) |f| switch (f) {
                     .csv, .json, .xml => {},
                     else => return fail(self.diag, "STDIN is read as a stream, so it takes CSV, JSON, NDJSON or XML; a {s} file needs random access — read it from a path", .{@tagName(f)}),
                 };
-                if (rd.form == .range) for ([_]*const ast.Expr{ rd.form.range.lo, rd.form.range.hi }) |b| {
-                    if ((try dollarRefs(self.arena, b)).len == 0 and rangeBoundValue(b) == null)
-                        return fail(self.diag, "{s}", .{range_bound_msg});
-                };
+                if (rd.form == .builtin) {
+                    const tb = table_builtins.of(rd.form.builtin);
+                    for (rd.form.builtin.args, tb.args[0..rd.form.builtin.args.len]) |e, kind| {
+                        if ((try dollarRefs(self.arena, e)).len == 0 and table_builtins.argValue(kind, e) == null)
+                            return fail(self.diag, "{s}", .{tb.arg_msg});
+                    }
+                }
                 if (rd.form == .path and std.mem.eql(u8, connector, "csv") and std.mem.indexOf(u8, rd.form.path, "${") == null) {
                     if (s3.bucketNameError(rd.form.path)) |why|
                         return fail(self.diag, "`{s}` is not a valid S3 source: {s}", .{ rd.form.path, why });
@@ -1859,7 +1852,7 @@ fn containsName(names: []const []const u8, n: []const u8) bool {
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb, ftp";
 
 /// A `CREATE CONNECTION ... TYPE` that names a connector; the built-in sources
-/// (files, `range`) are never declared.
+/// (files, stdin) and the table builtins are never declared.
 pub fn isConnectionType(connector: []const u8) bool {
     const c = registry.Connector.parse(connector) orelse return false;
     return !c.isBuiltinSource() or c == .http;

@@ -229,11 +229,11 @@ pub const ReadForm = union(enum) {
     table: QualName,
     query: []const u8,
     path: []const u8,
-    range: RangeSpec,
+    builtin: BuiltinRead,
     unit,
 };
 
-pub const RangeSpec = struct { lo: *Expr, hi: *Expr };
+pub const BuiltinRead = struct { name: []const u8, args: []const *Expr };
 
 pub const SelectItem = union(enum) {
     star,

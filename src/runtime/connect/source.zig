@@ -2,6 +2,7 @@
 //! reads, generated rows and constant sources, with the columns a query reads.
 
 const Batch = @import("../../exec/batch.zig").Batch;
+const Value = @import("../../exec/value.zig").Value;
 const Env = @import("../env.zig").Env;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
@@ -37,6 +38,7 @@ const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const table_builtins = @import("../../connect/table_builtins.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
 const jsonread = @import("../../format/json/read.zig");
 const xmlread = @import("../../format/xml/read.zig");
@@ -306,12 +308,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         return s.source();
     }
     if (std.mem.eql(u8, rd.connector, "stdin")) return openStdin(env, hints, project);
-    if (std.mem.eql(u8, rd.connector, "range")) {
-        const r = rd.form.range;
-        const s = gen.RangeSource.open(env.gpa, try rangeBound(env, r.lo), try rangeBound(env, r.hi)) catch
-            return error.OutOfMemory;
-        return s.source();
-    }
+    if (rd.form == .builtin) return openTableBuiltin(env, rd.form.builtin);
     if (std.mem.eql(u8, rd.connector, "csv")) {
         if (rd.form != .path) return planErr(env.diag, "read csv needs a quoted path");
         var fdiag = analyze.Diag{};
@@ -425,9 +422,14 @@ fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
     return planErrT(env.diag, e, msg);
 }
 
-/// Params substitute as literals; a leading `-` is folded here since `substExpr`
-/// does not.
-fn rangeBound(env: *Env, e: *const ast.Expr) !i64 {
-    const r = try analyze.substExpr(env.arena, e, env.params_expr);
-    return analyze.rangeBoundValue(r) orelse planErr(env.diag, analyze.range_bound_msg);
+/// A table builtin opened on its arguments, params substituted as literals; a
+/// leading `-` is folded by `argValue` since `substExpr` does not.
+fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
+    const b = table_builtins.of(call);
+    const vals = try env.arena.alloc(Value, call.args.len);
+    for (call.args, b.args[0..call.args.len], vals) |e, kind, *v| {
+        const r = try analyze.substExpr(env.arena, e, env.params_expr);
+        v.* = table_builtins.argValue(kind, r) orelse return planErr(env.diag, b.arg_msg);
+    }
+    return b.open(env.gpa, vals);
 }

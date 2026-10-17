@@ -18,6 +18,7 @@ const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
 const std = @import("std");
+const table_builtins = @import("../../connect/table_builtins.zig");
 const replace = @import("../../db/replace.zig");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
@@ -338,6 +339,7 @@ pub fn laneHints(st: ast.Stage) bool {
 /// compressed stream or archive member has no offset-to-row mapping, matching
 /// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
 pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
+    if (node == .read and node.read.form == .builtin) return table_builtins.of(node.read.form.builtin).lanes;
     if (!std.mem.eql(u8, connector, "csv")) return false;
     const path = switch (node) {
         .read => |rd| switch (rd.form) {
@@ -359,11 +361,7 @@ pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
 /// them; everything else stays unresolved.
 pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
-    if (std.mem.eql(u8, rd.connector, "range")) {
-        const fields = arena.alloc(types.Schema.Field, 1) catch return null;
-        fields[0] = .{ .name = "range", .ty = .{ .kind = .int } };
-        return .{ .fields = fields };
-    }
+    if (rd.form == .builtin) return .{ .fields = arena.dupe(types.Schema.Field, table_builtins.of(rd.form.builtin).schema.fields) catch return null };
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path) or ftp.isUrl(rd.form.path)) return null;
         if (folder.isFolder(rd.form.path)) {

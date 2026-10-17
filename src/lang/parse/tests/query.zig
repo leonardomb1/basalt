@@ -154,6 +154,7 @@ test "sql: a table function call is checked where it is written" {
         .{ .q = "SELECT * FROM paid('x');", .msg = "`paid`: argument 1 (`minx`) expects INT, got STRING" },
         .{ .q = "CREATE FUNCTION since(d DATE) RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE d >= $d;\nSELECT * FROM since('2026-13-01');", .msg = "`since`: argument 1 (`d`) expects DATE, got `2026-13-01`" },
         .{ .q = "SELECT * FROM paid(id);", .msg = "`paid`: argument 1 (`minx`) must be a constant — a literal, a `$param`, or an expression over them" },
+        .{ .q = "CREATE OR REPLACE FUNCTION RANGE(n INT) RETURNS TABLE AS SELECT 1 AS a;", .msg = "`RANGE` is a built-in table function and cannot be redefined" },
         .{ .q = "SELECT * FROM nope(1);", .msg = "unknown table function `nope` — declare it with CREATE FUNCTION nope(...) RETURNS TABLE AS SELECT ..." },
         .{ .q = "CREATE OR REPLACE FUNCTION paid(minx INT DEFAULT 0) RETURNS TABLE AS SELECT * FROM paid($minx);\nSELECT * FROM paid(1);", .msg = "in `paid` called at 3:15: table function `paid` nests more than 16 calls deep — does it reach itself?" },
     };

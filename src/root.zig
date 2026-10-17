@@ -60,6 +60,7 @@ pub const folder = @import("connect/folder.zig");
 pub const pqwrite = @import("format/parquet/write.zig");
 pub const split = @import("connect/split.zig");
 pub const registry = @import("connect/registry.zig");
+pub const table_builtins = @import("connect/table_builtins.zig");
 pub const zipsrc = @import("format/compress/zip.zig");
 pub const zipwrite = @import("format/compress/zipwrite.zig");
 pub const flatbuf = @import("format/arrow/flatbuf.zig");

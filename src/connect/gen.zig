@@ -53,12 +53,11 @@ pub const RangeSource = struct {
 
     const batch_rows: i64 = 8192;
 
+    pub const fields = [_]types.Schema.Field{.{ .name = "range", .ty = .{ .kind = .int } }};
+
     pub fn open(gpa: std.mem.Allocator, lo: i64, hi: i64) !*RangeSource {
         const self = try gpa.create(RangeSource);
-        errdefer gpa.destroy(self);
-        const fields = try gpa.alloc(types.Schema.Field, 1);
-        fields[0] = .{ .name = "range", .ty = .{ .kind = .int } };
-        self.* = .{ .gpa = gpa, .schema_ = .{ .fields = fields }, .next_val = lo, .hi = hi };
+        self.* = .{ .gpa = gpa, .schema_ = .{ .fields = &fields }, .next_val = lo, .hi = hi };
         return self;
     }
 
@@ -87,7 +86,6 @@ pub const RangeSource = struct {
     }
 
     pub fn close(self: *RangeSource) void {
-        self.gpa.free(self.schema_.fields);
         self.gpa.destroy(self);
     }
 

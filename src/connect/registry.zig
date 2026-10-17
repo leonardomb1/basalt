@@ -45,7 +45,6 @@ pub const Connector = enum {
     stdin,
     http,
     unit,
-    range,
     starrocks,
     doris,
     sftp,
@@ -84,7 +83,7 @@ pub const Connector = enum {
     /// Sources the engine reads without a `CREATE CONNECTION`.
     pub fn isBuiltinSource(self: Connector) bool {
         return switch (self) {
-            .csv, .http, .range, .unit, .stdin => true,
+            .csv, .http, .unit, .stdin => true,
             else => false,
         };
     }

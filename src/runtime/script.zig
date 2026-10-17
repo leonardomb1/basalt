@@ -144,10 +144,11 @@ fn renderRead(arena: std.mem.Allocator, rd: ast.Read, lr: LoopRow) !ast.Read {
         .query => |s| .{ .query = try interpAll(arena, s, lr) },
         .path => |s| .{ .path = try interpAll(arena, s, lr) },
         .unit => .unit,
-        .range => |r| .{ .range = .{
-            .lo = try renderExpr(arena, r.lo, lr),
-            .hi = try renderExpr(arena, r.hi, lr),
-        } },
+        .builtin => |b| blk: {
+            const args = try arena.alloc(*ast.Expr, b.args.len);
+            for (b.args, args) |e, *dst| dst.* = try renderExpr(arena, e, lr);
+            break :blk .{ .builtin = .{ .name = b.name, .args = args } };
+        },
     };
     out.where = try interpAll(arena, rd.where, lr);
     return out;

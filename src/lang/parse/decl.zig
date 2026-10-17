@@ -8,6 +8,7 @@ const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const std = @import("std");
+const table_builtins = @import("../../connect/table_builtins.zig");
 const types = @import("../types.zig");
 
 pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
@@ -148,9 +149,8 @@ pub fn showResources(self: *Parser, conn: []const u8, like: ?[]const u8, pos: Po
         item.* = .{ .computed = .{ .name = name, .expr = e } };
     }
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
-    const lo = try self.mk(.{ .int_lit = 0 });
-    const hi = try self.mk(.{ .int_lit = @intCast(mine.items.len) });
-    try stages.append(.{ .node = .{ .read = .{ .connector = "range", .form = .{ .range = .{ .lo = lo, .hi = hi } } } }, .hints = &.{}, .pos = pos });
+    const n = try self.arena.dupe(*ast.Expr, &.{try self.mk(.{ .int_lit = @intCast(mine.items.len) })});
+    try stages.append(.{ .node = .{ .read = .{ .connector = "range", .form = .{ .builtin = .{ .name = "range", .args = n } } } }, .hints = &.{}, .pos = pos });
     try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
     if (like) |pat| {
         const args = try self.arena.alloc(*ast.Expr, 2);
@@ -201,6 +201,8 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     }
     if (self.eatKw("returns")) {
         try self.expectKw("table");
+        if (table_builtins.lookup(name) != null)
+            return self.fail(pos, "`{s}` is a built-in table function and cannot be redefined", .{name});
         try self.expectKw("as");
         if (!self.isKw("select") and !self.isKw("with"))
             return self.fail(self.curPos(), "`{s}`: a table function's body is a query — SELECT ... or WITH ...", .{name});

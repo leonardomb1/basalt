@@ -1,5 +1,5 @@
 //! FROM sources: paths, connections' tables and queries, HTTP calls and resources,
-//! buffers, `EACH TABLE OF`, RANGE, and the read clauses (PAGINATE, RETRY, BODY).
+//! buffers, `EACH TABLE OF`, table builtins (RANGE), and the read clauses (PAGINATE, RETRY, BODY).
 
 const Parser = @import("../sql_parser.zig").Parser;
 const AliasSet = @import("../sql_parser.zig").AliasSet;
@@ -9,6 +9,7 @@ const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const std = @import("std");
+const table_builtins = @import("../../connect/table_builtins.zig");
 
 /// A FROM source: a path, `IDENTIFIER(<expr>)`, HTTP('url'), a CTE, or a
 /// connection's table or QUERY. Registers the alias.
@@ -44,18 +45,8 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         own = "stdin";
     } else if (self.isKw("each")) {
         return self.parseEachTableOf(read_hints);
-    } else if (self.isKw("range") and self.peekTag() == .lparen) {
-        _ = self.advance();
-        _ = try self.expect(.lparen);
-        const a = try self.parseExpr();
-        var lo: *ast.Expr = try self.mk(.{ .int_lit = 0 });
-        var hi = a;
-        if (self.eat(.comma)) {
-            lo = a;
-            hi = try self.parseExpr();
-        }
-        _ = try self.expect(.rparen);
-        node = .{ .read = .{ .connector = "range", .form = .{ .range = .{ .lo = lo, .hi = hi } } } };
+    } else if (self.at(.ident) and self.peekTag() == .lparen and table_builtins.lookup(self.cur().text) != null) {
+        node = .{ .read = try parseTableBuiltin(self) };
     } else {
         const pos = self.curPos();
         const head = try self.expectIdent();
@@ -112,6 +103,22 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
     }
     if (!try claimFromAlias(self, aliases)) aliases.implicit = own;
     return node;
+}
+
+/// `name(args)` for a table builtin: its arguments, as many as the entry takes.
+fn parseTableBuiltin(self: *Parser) Error!ast.Read {
+    const b = table_builtins.lookup(self.advance().text).?;
+    _ = try self.expect(.lparen);
+    var args = std.array_list.Managed(*ast.Expr).init(self.arena);
+    if (b.min_args > 0 or !self.at(.rparen)) {
+        try args.append(try self.parseExpr());
+        while (args.items.len < b.args.len and (args.items.len < b.min_args or self.at(.comma))) {
+            _ = try self.expect(.comma);
+            try args.append(try self.parseExpr());
+        }
+    }
+    _ = try self.expect(.rparen);
+    return .{ .connector = b.name, .form = .{ .builtin = .{ .name = b.name, .args = try args.toOwnedSlice() } } };
 }
 
 /// `[AS] alias` after a FROM source, claimed for the FROM table; false when none follows.
