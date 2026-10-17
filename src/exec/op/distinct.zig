@@ -58,6 +58,10 @@ pub const Distinct = struct {
     max_spill_depth: u8 = spill_parts.default_max_depth,
     spill_depth: u8 = 0,
     spill: ?*Spill = null,
+    /// Levels that wrote spill files, this one and its replays' deeper ones, held
+    /// by the top `Distinct` (`spilled_to` points a replay at it).
+    spilled: u8 = 0,
+    spilled_to: ?*u8 = null,
 
     const Spill = struct {
         meter: spill_parts.Meter,
@@ -152,6 +156,10 @@ pub const Distinct = struct {
             if (got) |b| return b;
             sp.drained = true;
             sp.replay = .{ .runs = try sp.parts.finish() };
+            if (sp.replay.?.runs.len > 0) {
+                const top = self.spilled_to orelse &self.spilled;
+                top.* = @max(top.*, self.spill_depth + 1);
+            }
         }
         return sp.replay.?.next(self, self.gpa, arena);
     }
@@ -176,6 +184,7 @@ pub const Distinct = struct {
             .spill_at = self.spill_at,
             .max_spill_depth = self.max_spill_depth,
             .spill_depth = self.spill_depth + 1,
+            .spilled_to = self.spilled_to orelse &self.spilled,
         };
     }
 
@@ -456,6 +465,25 @@ test "distinct spill: a spill file that overflows again partitions one level dee
     const want = try runSpillDistinct(a, input, &.{0}, null, std.math.maxInt(usize), null);
     try expectSameRows(want, try runSpillDistinct(a, input, &.{0}, td.ds.space(), 1, null));
     try testing.expect(td.ds.seq.load(.monotonic) > spill_parts.fanout);
+}
+
+test "distinct spill: the levels that wrote files are counted, none when the keys fit" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const input = try spillInput(a, 5000, 100, 4000);
+    var td = try SpillDir.init(std.math.maxInt(u64));
+    defer td.deinit();
+    for ([_]struct { usize, bool }{ .{ std.math.maxInt(usize), false }, .{ 1, true } }) |c| {
+        var ts = TestSource{ .schema_ = spill_schema, .batches = input };
+        var scan = Scan{ .src = ts.src() };
+        var state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer state.deinit();
+        var dst = Distinct{ .child = .{ .scan = &scan }, .in_schema = &spill_schema, .keys = &.{0}, .state = state.allocator(), .gpa = testing.allocator, .space = td.ds.space(), .spill_at = c[0] };
+        while (try dst.next(a)) |_| {}
+        try testing.expectEqual(c[1], dst.spilled >= 2);
+        if (!c[1]) try testing.expectEqual(@as(u8, 0), dst.spilled);
+    }
 }
 
 test "distinct spill: past the disk cap fails with SpillCapExceeded" {

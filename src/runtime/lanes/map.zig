@@ -398,13 +398,16 @@ pub fn runParallelMap(
 /// Once every lane is done, a right/full join's unmatched build rows go through
 /// the join's suffix into the sink, after all the lanes' output: the shared sink,
 /// or one more lane sink numbered `lane_idx`, opened only if there is a row to write.
+/// Its chain folds into the lanes' join and suffix nodes, as more of their work.
 fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx: *std.Thread.Mutex, lane_idx: usize) !u64 {
     var state = std.heap.ArenaAllocator.init(env.gpa);
     defer state.deinit();
     var batch_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer batch_arena.deinit();
     const chain = (try buildLaneJoinDrain(state.allocator(), env.params_expr, env.errctx, lj)) orelse return 0;
-    return pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
+    const rows = try pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
+    if (env.profile) |p| _ = try p.absorb(chain);
+    return rows;
 }
 
 /// The indexed right side's keys as row-group tests for the Parquet morsels of the

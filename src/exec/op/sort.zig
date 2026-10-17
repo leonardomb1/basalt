@@ -141,6 +141,7 @@ pub const Sort = struct {
             const s = try self.sorted(held.allocator(), all);
             try runs.ensureUnusedCapacity(self.gpa, 1);
             runs.appendAssumeCapacity(try self.writeSorted(space, paths.allocator(), all, s.idx));
+            self.runs += 1;
             chunks.clearRetainingCapacity();
             _ = held.reset(.retain_capacity);
             rows = 0;
@@ -180,7 +181,6 @@ pub const Sort = struct {
         if (give != null) held_owned = false;
         const m = try Merge.init(self.gpa, self.in_schema, self.keys, runs.items, mem, give);
         self.merge = m;
-        self.runs = runs.items.len;
         if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
         self.dropMerge();
         return null;
@@ -1203,7 +1203,7 @@ fn mixedBatches(a: std.mem.Allocator, rnd: std.Random, nbatches: usize, max_rows
     return out;
 }
 
-const SortRun = struct { space: ?Space = null, spill_at: usize = std.math.maxInt(usize), fan_in: usize = 64, batch_rows: usize = 1 << 16 };
+const SortRun = struct { space: ?Space = null, spill_at: usize = std.math.maxInt(usize), fan_in: usize = 64, batch_rows: usize = 1 << 16, runs: ?*usize = null };
 
 fn drainSorted(a: std.mem.Allocator, batches: []const Batch, keys: []const Sort.Key, cfg: SortRun) ![]const []const Value {
     var ts = TestSource{ .schema_ = mixed_schema, .batches = batches };
@@ -1219,6 +1219,9 @@ fn drainSorted(a: std.mem.Allocator, batches: []const Batch, keys: []const Sort.
         .gpa = testing.allocator,
     };
     errdefer srt.dropMerge();
+    defer if (cfg.runs) |r| {
+        r.* = srt.runs;
+    };
     var rows = std.array_list.Managed([]const Value).init(a);
     while (try srt.next(a)) |b| {
         if (cfg.space != null and b.len > cfg.batch_rows and srt.merge != null) return error.TestUnexpectedResult;
@@ -1288,14 +1291,18 @@ test "sort spill: many runs merge in passes past the fan-in, ascending and desce
     const rnd = prng.random();
 
     const batches = try mixedBatches(a, rnd, 90, 40);
+    var written: usize = 0;
+    for (batches) |b| written += @intFromBool(b.len > 0);
     for ([_]bool{ false, true }) |desc| {
         const keys = [_]Sort.Key{ .{ .idx = 0, .desc = desc, .nulls_first = !desc }, .{ .idx = 3, .desc = !desc, .nulls_first = !desc } };
         const want = try drainSorted(a, batches, &keys, .{});
         for ([_]usize{ 2, 3, 5, 64 }) |fan_in| {
             const td = try SpillDir.init(std.math.maxInt(u64));
             defer td.deinit();
-            const got = try drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 0, .fan_in = fan_in, .batch_rows = 16 });
+            var runs: usize = 0;
+            const got = try drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 0, .fan_in = fan_in, .batch_rows = 16, .runs = &runs });
             try expectSameRows(want, got);
+            try testing.expectEqual(written, runs);
             try testing.expect(td.ds.peak.load(.monotonic) > 0);
             try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
             try testing.expectEqual(@as(usize, 0), try td.count());

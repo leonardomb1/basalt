@@ -259,12 +259,12 @@ pub const Op = union(enum) {
                     n += 1;
                 }
             },
-            .aggregate => |a| if (a.spill != null) {
-                buf[0] = .{ .name = "spilled, partition levels", .value = @as(u64, a.spill_depth) + 1, .fold = .max };
+            .aggregate => |a| if (a.spilled > 0) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = a.spilled, .fold = .max };
                 n = 1;
             },
-            .distinct => |d| if (d.spill != null) {
-                buf[0] = .{ .name = "spilled, partition levels", .value = @as(u64, d.spill_depth) + 1, .fold = .max };
+            .distinct => |d| if (d.spilled > 0) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = d.spilled, .fold = .max };
                 n = 1;
             },
             .sort => |s| if (s.runs > 0) {

@@ -119,6 +119,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
     const t0 = std.time.Instant.now() catch null;
     const scan0 = scanCounts(env);
+    const held0: u64 = if (own_profile) if (env.space) |sp| sp.restartPeak() else 0 else 0;
     runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
         load_err = e;
         return e;
@@ -134,7 +135,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .row_groups_skipped = scan1[1] - scan0[1],
             .columns_read = scan1[2] - scan0[2],
             .columns_total = scan1[3] - scan0[3],
-            .spill_peak = if (env.space) |sp| sp.peak() else 0,
+            .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
         });
     }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
@@ -152,7 +153,7 @@ fn scanCounts(env: *Env) [4]u64 {
 /// into memory, since built where it is read it ran on one thread. Returns the
 /// binding's name when materialized, for the caller to drop afterwards.
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
-    if (opts.lanes() < 2 or env.explain or stages[0].node != .ref) return null;
+    if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
     const b = env.bindings.get(name) orelse return null;
@@ -171,9 +172,36 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     defer env.mem_sink = outer_sink;
     var scratch: Stats = .{};
     var delegated = false;
-    try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    {
+        const outer_scope = enterScope(env, name);
+        defer leaveScope(env, outer_scope);
+        try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    }
+    try notePrelude(env, name, stages[0].pos);
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
     return name;
+}
+
+/// Under `EXPLAIN ANALYZE`, a run inside the pipeline's (an input read into memory
+/// first) is profiled in its own scope, its operators apart from the pipeline's
+/// built from the same stages; returns the scope to restore.
+fn enterScope(env: *Env, what: []const u8) u64 {
+    const p = env.profile orelse return 0;
+    const outer = p.scope;
+    p.scope = std.hash.Wyhash.hash(outer, what);
+    return outer;
+}
+
+fn leaveScope(env: *Env, outer: u64) void {
+    if (env.profile) |p| p.scope = outer;
+}
+
+/// Under `EXPLAIN ANALYZE`, the path names the input read into memory first and how,
+/// until the pipeline over it names its own, and the scan at `pos` over it is named.
+fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
+    const p = env.profile orelse return;
+    p.path = try std.fmt.allocPrint(env.arena, "{s} read into memory first ({s}), then serial", .{ what, p.path });
+    try p.describe(profile.keyOf(pos), .scan, try std.fmt.allocPrint(env.arena, "{s}, in memory", .{what}));
 }
 
 const window_input = "__window_input";
@@ -192,7 +220,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
         @memcpy(joined[b.stages.len..], stages[1..]);
         stages = joined;
     }
-    if (opts.lanes() < 2 or env.explain or stages.len < 3 or !laneEligible(stages, opts)) return null;
+    if (opts.lanes() < 2 or stages.len < 3 or !laneEligible(stages, opts)) return null;
     const rd = stages[0].node.read;
     if (!isLocalCsvRead(rd) and !isLocalParquetRead(rd) and !isFolderRead(rd)) return null;
     var wi: usize = 1;
@@ -233,7 +261,12 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     defer env.mem_sink = outer_sink;
     var scratch: Stats = .{};
     var delegated = false;
-    try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
+    {
+        const outer_scope = enterScope(env, window_input);
+        defer leaveScope(env, outer_scope);
+        try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
+    }
+    try notePrelude(env, "the window's input", stages[0].pos);
     try env.materialized.put(env.arena, window_input, .{ .schema = ms.schema, .batches = ms.batches.items });
 
     const outer = try env.arena.alloc(ast.Stage, stages.len - wi + 1);
@@ -542,7 +575,12 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const branch_hints = try split_hints.toOwnedSlice();
 
     const w = write_stage.node.write;
+    const outer_scope = if (env.profile) |p| p.scope else 0;
+    defer if (env.profile) |p| {
+        p.scope = outer_scope;
+    };
     for (specs, schemas, 0..) |s, sch, i| {
+        if (env.profile) |p| p.scope = std.hash.Wyhash.hash(outer_scope, std.mem.asBytes(&i));
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
         var bstages = std.array_list.Managed(ast.Stage).init(arena);
         try bstages.append(.{ .node = .{ .read = s.read }, .hints = branch_hints, .pos = u.pos });

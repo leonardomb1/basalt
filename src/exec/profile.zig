@@ -21,11 +21,11 @@ const print = @import("../lang/print.zig");
 
 pub const Kind = std.meta.Tag(op.Op);
 
-pub const Id = struct { at: u64, kind: Kind, path: u64 = root_path };
+pub const Id = struct { at: u64, kind: Kind, path: u64 = root_path, scope: u64 = 0 };
 
 const root_path: u64 = 1;
 
-const Said = struct { at: u64, kind: Kind };
+const Said = struct { at: u64, kind: Kind, scope: u64 = 0 };
 
 /// The name of the scan a parallel breaker's tail reads: the lanes' partial results,
 /// merged. No stage stands for it, and the stage it follows shares its position with
@@ -41,7 +41,10 @@ fn childPath(parent: Id, i: usize) u64 {
 
 pub const Role = enum { input, probe, build };
 
-pub const Child = struct { id: Id, role: Role };
+/// An input of a node; `nested` unless it ran outside the node's timer (a build
+/// side made before the lanes, the lanes under a merge), so the node's own time
+/// keeps it.
+pub const Child = struct { id: Id, role: Role, nested: bool = true };
 
 pub const Tally = struct {
     ns: u64 = 0,
@@ -71,7 +74,7 @@ pub const Node = struct {
     /// `next` inside its parent's.
     pub fn exclusive(self: *const Node, p: *const Profile) u64 {
         var kids: u64 = 0;
-        for (self.children) |c| if (p.nodes.getPtr(c.id)) |k| {
+        for (self.children) |c| if (c.nested) if (p.nodes.getPtr(c.id)) |k| {
             kids += k.total.ns;
         };
         return self.total.ns -| kids;
@@ -81,7 +84,7 @@ pub const Node = struct {
     pub fn laneExclusive(self: *const Node, p: *const Profile, lane: usize) u64 {
         const own = if (lane < self.lanes.items.len) self.lanes.items[lane].ns else 0;
         var kids: u64 = 0;
-        for (self.children) |c| if (p.nodes.getPtr(c.id)) |k| {
+        for (self.children) |c| if (c.nested) if (p.nodes.getPtr(c.id)) |k| {
             if (lane < k.lanes.items.len) kids += k.lanes.items[lane].ns;
         };
         return own -| kids;
@@ -126,6 +129,10 @@ pub const Profile = struct {
     fallback: std.EnumArray(Kind, u64) = .initFill(0),
     /// How the pipeline ran, as the run chose: `serial`, `parquet morsel-parallel`, ...
     path: []const u8 = "serial",
+    /// The run of a pipeline that executes in several separate runs over one stage
+    /// list, a split union's branches: its nodes and their descriptions are kept
+    /// apart from another run's of the same shape. 0 outside any.
+    scope: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Profile {
         return .{ .gpa = gpa };
@@ -217,7 +224,7 @@ pub const Profile = struct {
         while (self.nodes.getPtr(cur)) |n| {
             if (n.children.len == 0) {
                 const kids = try self.gpa.alloc(Child, 1);
-                kids[0] = .{ .id = below, .role = .input };
+                kids[0] = .{ .id = below, .role = .input, .nested = false };
                 n.children = kids;
                 self.dropRoot(below);
                 return;
@@ -235,10 +242,10 @@ pub const Profile = struct {
         const at = if (join_at == 0) self.fallback.get(.join) else join_at;
         var grafted = false;
         for (self.nodes.values()) |*n| {
-            if (n.id.kind != .join or n.id.at != at or n.children.len != 1) continue;
+            if (n.id.kind != .join or n.id.at != at or n.id.scope != self.scope or n.children.len != 1) continue;
             const kids = try self.gpa.alloc(Child, 2);
             kids[0] = n.children[0];
-            kids[1] = .{ .id = build, .role = .build };
+            kids[1] = .{ .id = build, .role = .build, .nested = false };
             self.gpa.free(n.children);
             n.children = kids;
             grafted = true;
@@ -250,7 +257,7 @@ pub const Profile = struct {
     pub fn rootOf(self: *Profile, kind: Kind) ?Id {
         self.mtx.lock();
         defer self.mtx.unlock();
-        for (self.roots.items) |r| if (r.kind == kind) return r;
+        for (self.roots.items) |r| if (r.kind == kind and r.scope == self.scope) return r;
         return null;
     }
 
@@ -270,56 +277,52 @@ pub const Profile = struct {
     fn walk(self: *Profile, node: op.Op, lane: usize, path: u64, count: bool) std.mem.Allocator.Error!Id {
         const st = node.stats();
         const at = if (st.at == 0) self.fallback.get(node) else st.at;
-        const id = Id{ .at = at, .kind = node, .path = path };
+        const id = Id{ .at = at, .kind = node, .path = path, .scope = self.scope };
 
-        var kids_buf: [64]Child = undefined;
-        const kids = try self.kidsOf(node, id, lane, count, &kids_buf);
-
-        const e = try self.nodes.getOrPut(self.gpa, id);
-        if (!e.found_existing) e.value_ptr.* = .{
-            .id = id,
-            .children = try self.gpa.dupe(Child, kids),
-            .note = try self.gpa.dupe(u8, node.note()),
-        };
+        const kids = try self.kidsOf(node, id, lane, count);
+        if (self.nodes.contains(id)) {
+            self.gpa.free(kids);
+        } else {
+            errdefer self.gpa.free(kids);
+            const note = try self.gpa.dupe(u8, node.note());
+            errdefer self.gpa.free(note);
+            try self.nodes.put(self.gpa, id, .{ .id = id, .children = kids, .note = note });
+        }
         if (!count) return id;
-        const n = e.value_ptr;
+        const n = self.nodes.getPtr(id).?;
         try addTally(self.gpa, n, lane, .{ .ns = st.ns, .rows = st.rows, .calls = st.calls });
         var facts_buf: [16]Fact = undefined;
         for (node.facts(&facts_buf)) |f| try addFact(self.gpa, &n.facts, f);
         return id;
     }
 
-    fn kidsOf(self: *Profile, node: op.Op, id: Id, lane: usize, count: bool, buf: *[64]Child) std.mem.Allocator.Error![]Child {
-        var n: usize = 0;
+    /// `node`'s inputs, folded, as many as it has.
+    fn kidsOf(self: *Profile, node: op.Op, id: Id, lane: usize, count: bool) std.mem.Allocator.Error![]Child {
+        const len: usize = switch (node) {
+            .scan => 0,
+            .join => |j| 1 + @as(usize, @intFromBool(j.build != null)),
+            .nl_join => |j| 1 + @as(usize, @intFromBool(j.build != null)),
+            .union_ => |u| u.children.len,
+            else => 1,
+        };
+        const kids = try self.gpa.alloc(Child, len);
+        errdefer self.gpa.free(kids);
         switch (node) {
             .scan => {},
             .join => |j| {
-                buf[0] = .{ .id = try self.walk(j.probe, lane, childPath(id, 0), count), .role = .probe };
-                n = 1;
-                if (j.build) |b| {
-                    buf[1] = .{ .id = try self.walk(b, lane, childPath(id, 1), count), .role = .build };
-                    n = 2;
-                }
+                kids[0] = .{ .id = try self.walk(j.probe, lane, childPath(id, 0), count), .role = .probe };
+                if (j.build) |b| kids[1] = .{ .id = try self.walk(b, lane, childPath(id, 1), count), .role = .build };
             },
             .nl_join => |j| {
-                buf[0] = .{ .id = try self.walk(j.probe, lane, childPath(id, 0), count), .role = .probe };
-                n = 1;
-                if (j.build) |b| {
-                    buf[1] = .{ .id = try self.walk(b, lane, childPath(id, 1), count), .role = .build };
-                    n = 2;
-                }
+                kids[0] = .{ .id = try self.walk(j.probe, lane, childPath(id, 0), count), .role = .probe };
+                if (j.build) |b| kids[1] = .{ .id = try self.walk(b, lane, childPath(id, 1), count), .role = .build };
             },
-            .union_ => |u| for (u.children) |c| {
-                if (n == buf.len) break;
-                buf[n] = .{ .id = try self.walk(c, lane, childPath(id, n), count), .role = .input };
-                n += 1;
+            .union_ => |u| for (u.children, kids, 0..) |c, *k, i| {
+                k.* = .{ .id = try self.walk(c, lane, childPath(id, i), count), .role = .input };
             },
-            inline else => |o| {
-                buf[0] = .{ .id = try self.walk(o.child, lane, childPath(id, 0), count), .role = .input };
-                n = 1;
-            },
+            inline else => |o| kids[0] = .{ .id = try self.walk(o.child, lane, childPath(id, 0), count), .role = .input },
         }
-        return buf[0..n];
+        return kids;
     }
 
     /// Text shown beside the `kind` operators built from the stage at `at`; the
@@ -329,12 +332,12 @@ pub const Profile = struct {
         if (at == 0 or text.len == 0) return;
         self.mtx.lock();
         defer self.mtx.unlock();
-        const e = try self.details.getOrPut(self.gpa, .{ .at = at, .kind = kind });
+        const e = try self.details.getOrPut(self.gpa, .{ .at = at, .kind = kind, .scope = self.scope });
         if (!e.found_existing) e.value_ptr.* = try self.gpa.dupe(u8, text);
     }
 
     pub fn detail(self: *const Profile, id: Id) []const u8 {
-        return self.details.get(.{ .at = id.at, .kind = id.kind }) orelse "";
+        return self.details.get(.{ .at = id.at, .kind = id.kind, .scope = id.scope }) orelse "";
     }
 
     pub fn phase(self: *Profile, name: []const u8, ns: u64) !void {
@@ -541,6 +544,67 @@ test "profile: a union's branches built from one stage stay apart" {
     try testing.expectEqual(@as(u64, 1), p.nodes.getPtr(un.children[0].id).?.total.rows);
     try testing.expectEqual(@as(u64, 2), p.nodes.getPtr(un.children[1].id).?.total.rows);
     try testing.expectEqual(@as(usize, 3), p.nodes.count());
+}
+
+test "profile: a union past 64 branches keeps every one" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    var scans: [80]op.Scan = undefined;
+    var kids: [80]op.Op = undefined;
+    for (&scans, &kids, 0..) |*sc, *k, i| {
+        sc.* = .{ .src = undefined };
+        sc.stats = .{ .at = 3, .rows = i };
+        k.* = .{ .scan = sc };
+    }
+    var u = op.Union{ .children = &kids };
+    u.stats = .{ .at = 3 };
+    _ = try p.absorb(.{ .union_ = &u });
+    const un = p.nodes.getPtr(.{ .at = 3, .kind = .union_ }).?;
+    try testing.expectEqual(@as(usize, 80), un.children.len);
+    try testing.expectEqual(@as(u64, 79 * 80 / 2), un.rowsIn(&p));
+}
+
+test "profile: separate runs of one stage list in their own scopes stay apart, each with its description" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    for ([_]u64{ 11, 22 }, [_][]const u8{ "csv a.csv", "csv b.csv" }, 1..) |rows, text, branch| {
+        p.scope = branch;
+        try p.describe(4, .scan, text);
+        var scan = op.Scan{ .src = undefined };
+        scan.stats = .{ .at = 4, .rows = rows };
+        _ = try p.absorb(.{ .scan = &scan });
+    }
+    try testing.expectEqual(@as(usize, 2), p.roots.items.len);
+    try testing.expectEqual(@as(u64, 11), p.nodes.getPtr(p.roots.items[0]).?.total.rows);
+    try testing.expectEqual(@as(u64, 22), p.nodes.getPtr(p.roots.items[1]).?.total.rows);
+    try testing.expectEqualStrings("csv a.csv", p.detail(p.roots.items[0]));
+    try testing.expectEqualStrings("csv b.csv", p.detail(p.roots.items[1]));
+}
+
+test "profile: work grafted under a node ran outside its timer and is not taken from its own time" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    const sch = @import("../lang/types.zig").Schema{ .fields = &.{} };
+    var bscan = op.Scan{ .src = undefined };
+    bscan.stats = .{ .at = 5, .ns = 100 };
+    const build = try p.absorb(.{ .scan = &bscan });
+    var pscan = op.Scan{ .src = undefined };
+    pscan.stats = .{ .at = 1, .ns = 30 };
+    var j = op.Join{ .probe = .{ .scan = &pscan }, .build = null, .left_keys = &.{}, .right_keys = &.{}, .left_schema = &sch, .right_schema = &sch, .out_schema = &sch, .kind = .inner, .state = testing.allocator };
+    j.stats = .{ .at = 2, .ns = 50 };
+    const lane = try p.absorb(.{ .join = &j });
+    try p.graftBuild(2, build);
+    try testing.expectEqual(@as(u64, 20), p.nodes.getPtr(lane).?.exclusive(&p));
+    try testing.expectEqual(@as(u64, 20), p.nodes.getPtr(lane).?.laneExclusive(&p, 0));
+
+    var merged = op.Scan{ .src = undefined };
+    merged.stats = .{ .ns = 40 };
+    var tail = op.Filter{ .child = .{ .scan = &merged }, .pred = undefined, .back = testing.allocator };
+    tail.stats = .{ .at = 3, .ns = 60 };
+    const top = try p.absorb(.{ .filter = &tail });
+    try p.graftLeaf(top, lane);
+    const leaf = p.nodes.getPtr(top).?.children[0].id;
+    try testing.expectEqual(@as(u64, 40), p.nodes.getPtr(leaf).?.exclusive(&p));
 }
 
 test "profile: a lane path's shared build side and its tail hang under the operators they meet" {

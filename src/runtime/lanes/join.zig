@@ -355,6 +355,7 @@ pub fn buildLaneJoinDrain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .probe_done = true,
         .state = ta,
     };
+    j.stats.at = lj.at;
     return try buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
 }
 
