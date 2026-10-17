@@ -355,7 +355,7 @@ pub fn laneHints(st: ast.Stage) bool {
 /// compressed stream or archive member has no offset-to-row mapping, matching
 /// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
 pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
-    if (node == .read and node.read.form == .builtin) return table_builtins.of(node.read.form.builtin).mode != null;
+    if (node == .read and node.read.form == .builtin) return recordLanes(node.read.form.builtin);
     if (!std.mem.eql(u8, connector, "csv")) return false;
     const path = switch (node) {
         .read => |rd| switch (rd.form) {
@@ -370,6 +370,20 @@ pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
         .local_ranges => std.mem.indexOf(u8, path, "://") == null,
         .serial => false,
     };
+}
+
+/// Whether a record builtin's read maps for lanes, as far as its literal arguments
+/// tell: a remote or compressed path and a longer `split` terminator read on one
+/// lane; a path from a param is assumed local.
+fn recordLanes(call: ast.BuiltinRead) bool {
+    if (table_builtins.of(call).mode == null) return false;
+    if (call.args[0].* == .str_lit) {
+        const path = call.args[0].str_lit;
+        if (std.mem.indexOf(u8, path, "://") != null or csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
+    }
+    if (std.ascii.eqlIgnoreCase(call.name, "split") and call.args.len > 1 and call.args[1].* == .str_lit)
+        return call.args[1].str_lit.len == 1;
+    return true;
 }
 
 /// A local CSV header, parquet footer, Parquet folder's first file, workbook's first

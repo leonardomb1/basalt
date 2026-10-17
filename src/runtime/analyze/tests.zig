@@ -89,6 +89,11 @@ test "physical plan: which file reads divide into morsels" {
         .{ .from = "'https://h/x.csv'", .morsel = false },
         .{ .from = "'az://acct/c/x.csv'", .morsel = false },
         .{ .from = "RANGE(10)", .morsel = false },
+        .{ .from = "fixed('/data/x.ret', 240, TRUE)", .morsel = true },
+        .{ .from = "lines('/data/x.log.gz')", .morsel = false },
+        .{ .from = "lines('sftp://h/x.log')", .morsel = false },
+        .{ .from = "split('/data/x.edi', '~')", .morsel = true },
+        .{ .from = "split('/data/x.edi', '<>')", .morsel = false },
     };
 
     for (cases) |c| {

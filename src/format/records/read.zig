@@ -23,6 +23,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
 const stream = @import("../stream.zig");
+const par = @import("../../exec/par.zig");
 const explainf = stream.explainf;
 
 pub const max_record = 64 * 1024 * 1024;
@@ -302,8 +303,8 @@ pub const Mapped = struct {
         return rs.source();
     }
 
-    /// The `n` ranges, worked out by the first lane that asks; a line count needs one
-    /// pass over the file, which every later lane shares.
+    /// The `n` ranges, worked out by the first lane that asks; the records ahead of
+    /// each range are counted for all ranges at once, then summed.
     fn cutsFor(self: *Mapped, n: usize) ![]const Cut {
         self.mu.lock();
         defer self.mu.unlock();
@@ -325,12 +326,25 @@ pub const Mapped = struct {
             else => '\n',
         };
         var lo: usize = 0;
-        var before: u64 = 0;
         for (self.cuts, 0..) |*c, k| {
             const hi = if (k + 1 == n) size else after(self.data, term, @max(lo, size * (k + 1) / n));
-            c.* = .{ .lo = lo, .hi = hi, .before = before };
-            before += countReleasing(self.data[lo..hi], term);
+            c.* = .{ .lo = lo, .hi = hi, .before = 0 };
             lo = hi;
+        }
+        const Count = struct {
+            m: *Mapped,
+            term: u8,
+            fn one(ctx: *const @This(), k: usize) void {
+                const c = &ctx.m.cuts[k];
+                c.before = countReleasing(ctx.m.data[c.lo..c.hi], ctx.term);
+            }
+        };
+        par.each(n, n, &Count{ .m = self, .term = term }, Count.one);
+        var before: u64 = 0;
+        for (self.cuts) |*c| {
+            const here = c.before;
+            c.before = before;
+            before += here;
         }
         return self.cuts;
     }
