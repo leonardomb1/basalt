@@ -35,6 +35,7 @@ const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
+const table_builtins = @import("../connect/table_builtins.zig");
 const folder = @import("../connect/folder.zig");
 const pqwrite = @import("../format/parquet/write.zig");
 const arrowread = @import("../format/arrow/read.zig");
@@ -175,6 +176,11 @@ pub fn isLocalCsvRead(rd: ast.Read) bool {
         },
         else => false,
     };
+}
+
+/// A `lines()`, `fixed()`, `split()` or `chunks()` read, which may map for lanes.
+pub fn isRecordRead(rd: ast.Read) bool {
+    return rd.form == .builtin and table_builtins.of(rd.form.builtin).mode != null;
 }
 
 pub fn isFolderRead(rd: ast.Read) bool {

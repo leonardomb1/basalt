@@ -3,7 +3,8 @@
 //! The parser, `check`, EXPLAIN and the run each `lookup` the read's entry, so a
 //! builtin missing from the table is unknown everywhere at once. An entry owns its
 //! name, its constant arguments (kinds and count), the columns `check` sees, its
-//! EXPLAIN label, whether it runs on lanes, and how it opens a `driver.Source`.
+//! EXPLAIN label, how it opens a `driver.Source` and, for a record reader, the
+//! record `Mode` its arguments give, which lets a local file split into lanes.
 //! An argument is any plan-time constant (a literal, a `$param`, a loop variable or
 //! an expression of them), folded and held to its kind by `argValue`.
 
@@ -26,7 +27,7 @@ pub const TableBuiltin = struct {
     arg_msg: []const u8,
     schema: types.Schema,
     label: []const u8,
-    lanes: bool,
+    mode: ?*const fn (args: []const Value) records.Mode,
     open: *const fn (arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source,
 };
 
@@ -38,7 +39,7 @@ pub const table = [_]TableBuiltin{
         .arg_msg = "RANGE bounds must be integer literals, params or expressions of them",
         .schema = .{ .fields = &gen.RangeSource.fields },
         .label = "range",
-        .lanes = false,
+        .mode = null,
         .open = openRange,
     },
     .{
@@ -48,7 +49,7 @@ pub const table = [_]TableBuiltin{
         .arg_msg = "LINES takes a file path: text, not a `dir/` folder",
         .schema = .{ .fields = &records.fields },
         .label = "lines",
-        .lanes = false,
+        .mode = modeLines,
         .open = openLines,
     },
     .{
@@ -58,7 +59,7 @@ pub const table = [_]TableBuiltin{
         .arg_msg = "FIXED takes a file path (text, not a `dir/` folder), a positive integer width of at most 64 MiB and an optional TRUE/FALSE skip_newlines",
         .schema = .{ .fields = &records.fields },
         .label = "fixed",
-        .lanes = false,
+        .mode = modeFixed,
         .open = openFixed,
     },
     .{
@@ -68,7 +69,7 @@ pub const table = [_]TableBuiltin{
         .arg_msg = "SPLIT takes a file path (text, not a `dir/` folder) and a non-empty text terminator",
         .schema = .{ .fields = &records.fields },
         .label = "split",
-        .lanes = false,
+        .mode = modeSplit,
         .open = openSplit,
     },
     .{
@@ -78,7 +79,7 @@ pub const table = [_]TableBuiltin{
         .arg_msg = "CHUNKS takes a file path (text, not a `dir/` folder) and a positive integer size of at most 64 MiB",
         .schema = .{ .fields = &records.fields },
         .label = "chunks",
-        .lanes = false,
+        .mode = modeChunks,
         .open = openChunks,
     },
 };
@@ -127,25 +128,41 @@ fn openRange(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Val
 }
 
 fn openLines(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, .lines);
+    return openRecords(arena, gpa, args, modeLines(args));
 }
 
-/// `fixed(p, width)` does not skip line ends between records.
 fn openFixed(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, .{ .fixed = .{ .width = @intCast(args[1].int), .skip_newlines = args.len > 2 and args[2].bool } });
+    return openRecords(arena, gpa, args, modeFixed(args));
 }
 
 fn openSplit(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, .{ .split = args[1].string });
+    return openRecords(arena, gpa, args, modeSplit(args));
 }
 
 fn openChunks(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, .{ .chunks = @intCast(args[1].int) });
+    return openRecords(arena, gpa, args, modeChunks(args));
 }
 
 fn openRecords(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, mode: records.Mode) anyerror!driver.Source {
     const s = try records.RecordSource.open(arena, gpa, args[0].string, mode);
     return s.source();
+}
+
+fn modeLines(_: []const Value) records.Mode {
+    return .lines;
+}
+
+/// `fixed(p, width)` does not skip line ends between records.
+fn modeFixed(args: []const Value) records.Mode {
+    return .{ .fixed = .{ .width = @intCast(args[1].int), .skip_newlines = args.len > 2 and args[2].bool } };
+}
+
+fn modeSplit(args: []const Value) records.Mode {
+    return .{ .split = args[1].string };
+}
+
+fn modeChunks(args: []const Value) records.Mode {
+    return .{ .chunks = @intCast(args[1].int) };
 }
 
 test "table builtins: unique names, each found through lookup in any case" {

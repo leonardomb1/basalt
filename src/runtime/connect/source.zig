@@ -418,13 +418,20 @@ fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
 
 /// A table builtin opened on its arguments, params substituted and each folded to
 /// its value; a path it cannot open is named with why.
-fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
+/// A builtin read's arguments, params substituted and folded to their kinds.
+pub fn builtinArgs(env: *Env, call: ast.BuiltinRead) ![]Value {
     const b = table_builtins.of(call);
     const vals = try env.arena.alloc(Value, call.args.len);
     for (call.args, b.args[0..call.args.len], vals) |e, kind, *v| {
         const r = try analyze.substExpr(env.arena, e, env.params_expr);
         v.* = try table_builtins.argValue(env.arena, kind, r) orelse return planErr(env.diag, b.arg_msg);
     }
+    return vals;
+}
+
+fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
+    const b = table_builtins.of(call);
+    const vals = try builtinArgs(env, call);
     return b.open(env.arena, env.gpa, vals) catch |e| {
         if (e == error.OutOfMemory) return e;
         const path = table_builtins.pathArg(b, vals) orelse return e;

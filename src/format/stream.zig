@@ -210,6 +210,10 @@ pub const Stream = struct {
             self.name = path;
         } else {
             const file = try std.fs.cwd().openFile(path, .{});
+            if ((try file.stat()).kind == .directory) {
+                file.close();
+                return explainf(error.IsDir, "`{s}` is a folder; end it with `/` to read the files in it", .{path});
+            }
             self.backend = .{ .file = .{ .file = file, .fr = undefined } };
             self.backend.file.fr = file.reader(&self.read_buf);
             self.reader = &self.backend.file.fr.interface;

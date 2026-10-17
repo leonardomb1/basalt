@@ -30,6 +30,7 @@ const hasSort = @import("../run.zig").hasSort;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
+const isRecordRead = @import("../connect.zig").isRecordRead;
 const isLocalParquetRead = @import("../connect.zig").isLocalParquetRead;
 const keysPreferSerial = @import("../plan.zig").keysPreferSerial;
 const laneEligible = @import("../lanes.zig").laneEligible;
@@ -309,7 +310,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             const rd = head_stages[0].node.read;
             if (isLocalParquetRead(rd) or isFolderRead(rd)) {
                 if (try runParquetLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
-            } else if (isLocalCsvRead(rd)) {
+            } else if (isLocalCsvRead(rd) or isRecordRead(rd)) {
                 if (try runCsvLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
             }
         }

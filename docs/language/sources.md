@@ -102,7 +102,7 @@ exports, EDI:
 |------|-------------|
 | `lines(p)` | line; `\n` and `\r\n` both end one (the `\r` is not in `rec`), a last line without one is a row |
 | `fixed(p, width [, skip_newlines])` | `width` bytes, back to back; `skip_newlines = TRUE` skips a `\n` or `\r\n` between records. A short last record fails the read naming its offset and length |
-| `split(p, terminator)` | record ended by the terminator's bytes (`'~'`, `''''`, any text), which is not in `rec` |
+| `split(p, terminator)` | record ended by the terminator's bytes (`'~'`, `''''`, any text), which is not in `rec`; a lone line end after the last one is not a record |
 | `chunks(p, size)` | block of `size` bytes, the last one shorter |
 
 Each returns `n INT` (the record's number, from 1), `offset INT` (its first
@@ -111,7 +111,15 @@ constants: literals, `$params`, loop variables or expressions of them. Every
 location and codec a CSV reads from works — `s3://`, `az://`, SFTP, SMB, a URL,
 `.gz`/`.zst`, a zip member — one file at a time, not a folder. The read streams
 in constant memory; a line or `split` record past 64 MiB fails naming where it
-began, so a binary file is not read as one giant row.
+began, so a binary file is not read as one giant row; `lines('logs')` on a
+folder fails saying it is one.
+
+Under `-j`, a local uncompressed file splits across lanes as a CSV does: `fixed`
+and `chunks` at record multiples, `lines` and a one-character `split` after a
+record's end, each lane numbering its records where the file has them, so `n`,
+`offset` and the rows are the ones a single lane reads. A `fixed` file whose
+line ends between records are not all alike, a longer `split` terminator, and
+every remote or compressed file read on one lane.
 
 ```sql
 LOAD INTO 'retorno.csv' AS

@@ -23,6 +23,8 @@ const pqdecode = @import("../../format/parquet/read.zig");
 const projectedColumns = @import("../plan.zig").projectedColumns;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sftp = @import("../../store/sftp.zig");
+const table_builtins = @import("../../connect/table_builtins.zig");
+const builtinArgs = @import("../connect/source.zig").builtinArgs;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
@@ -129,13 +131,14 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     } };
 }
 
-/// Map `rd`'s CSV or NDJSON for splitting, or null; the caller must `close()` it. A
+/// Map `rd`'s CSV, NDJSON or record file for splitting, or null; the caller must `close()` it. A
 /// quoted newline makes a CSV's byte boundaries undecidable, so that file is closed
 /// here and read serially (leaking it before the caller's defer exhausted fds in a FOR
 /// EACH); a JSON file that is one array is read serially too.
 pub fn csvSplitFile(env: *Env, rd: ast.Read, hints: []const ast.Hint, w: ast.Write) anyerror!?*csv.MappedCsv {
     const path = switch (rd.form) {
         .path => |p| p,
+        .builtin => |b| return recordSplitFile(env, b, w),
         else => return null,
     };
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
@@ -158,6 +161,21 @@ pub fn csvSplitFile(env: *Env, rd: ast.Read, hints: []const ast.Hint, w: ast.Wri
     }
     if (rd.cols.len > 0) try mapped.project(env.arena, rd.cols);
     return mapped;
+}
+
+/// A record builtin's file mapped for lanes, or null when it reads serially: not a
+/// record reader, remote, compressed, or cut only by reading its records in order.
+fn recordSplitFile(env: *Env, call: ast.BuiltinRead, w: ast.Write) anyerror!?*csv.MappedCsv {
+    const mode_of = table_builtins.of(call).mode orelse return null;
+    if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return null;
+    const args = builtinArgs(env, call) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return null,
+    };
+    return csv.MappedCsv.openRecords(env.arena, args[0].string, mode_of(args)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => null,
+    };
 }
 
 const min_lane_bytes = 1 << 20;

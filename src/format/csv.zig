@@ -57,6 +57,7 @@ const texttype = @import("texttype.zig");
 const stream = @import("stream.zig");
 const Stream = stream.Stream;
 const json = @import("json/read.zig");
+const records = @import("records/read.zig");
 const release = stream.release;
 const Gunzip = stream.Gunzip;
 const explainf = stream.explainf;
@@ -457,10 +458,12 @@ pub const MappedCsv = struct {
     quoted_newlines: bool = false,
     quote_free: bool = false,
     ndjson: ?json.Options = null,
+    recs: ?*records.Mapped = null,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
 
     pub fn project(self: *MappedCsv, arena: std.mem.Allocator, names: []const []const u8) !void {
+        if (self.recs != null) return;
         if (self.ndjson != null) {
             var keep = std.array_list.Managed(types.Schema.Field).init(arena);
             for (self.schema.fields) |f| for (names) |n| {
@@ -499,9 +502,28 @@ pub const MappedCsv = struct {
         return self;
     }
 
+    /// A local, uncompressed file mapped for `lines()`, `fixed()`, `split()` or
+    /// `chunks()` lanes, cut where `records.Mapped` finds record boundaries.
+    pub fn openRecords(arena: std.mem.Allocator, path: []const u8, mode: records.Mode) !*MappedCsv {
+        if (std.mem.indexOf(u8, path, "://") != null or splitCodec(path).codec != .none or splitArchive(path) != null) return error.NotMappable;
+        const file = try std.fs.cwd().openFile(path, .{});
+        errdefer file.close();
+        const size = (try file.stat()).size;
+        if (size == 0) return error.NotMappable;
+        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        errdefer std.posix.munmap(data);
+        const recs = try arena.create(records.Mapped);
+        recs.* = try records.Mapped.init(data, mode, try arena.dupe(u8, path));
+        const self = try arena.create(MappedCsv);
+        self.* = .{ .data = data, .body = data, .schema = .{ .fields = &records.fields }, .file = file, .path = recs.name, .quote_free = true, .recs = recs };
+        return self;
+    }
+
     /// Lane `i` of `n`'s rows as a source, read from `scratch`: a CSV chunk through
-    /// `reader`, an NDJSON one in place through `json.Reader`.
+    /// `reader`, an NDJSON one in place through `json.Reader`, records through
+    /// `records.Mapped`.
     pub fn lane(self: *const MappedCsv, scratch: std.mem.Allocator, i: usize, n: usize, schema: *const types.Schema) !driver.Source {
+        if (self.recs) |r| return r.lane(scratch, scratch, i, n);
         if (self.ndjson) |o| {
             var opts = o;
             opts.schema = schema.*;
@@ -607,6 +629,7 @@ pub const MappedCsv = struct {
     }
 
     pub fn close(self: *MappedCsv) void {
+        if (self.recs) |r| r.deinit();
         std.posix.munmap(self.data);
         self.file.close();
     }

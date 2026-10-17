@@ -355,7 +355,7 @@ pub fn laneHints(st: ast.Stage) bool {
 /// compressed stream or archive member has no offset-to-row mapping, matching
 /// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
 pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
-    if (node == .read and node.read.form == .builtin) return table_builtins.of(node.read.form.builtin).lanes;
+    if (node == .read and node.read.form == .builtin) return table_builtins.of(node.read.form.builtin).mode != null;
     if (!std.mem.eql(u8, connector, "csv")) return false;
     const path = switch (node) {
         .read => |rd| switch (rd.form) {

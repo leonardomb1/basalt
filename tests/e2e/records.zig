@@ -18,7 +18,7 @@ test "lines, fixed, split and chunks: n, offset and the raw record" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "l.txt", .data = "a\r\nbb\n\nccc" });
     try tmp.dir.writeFile(.{ .sub_path = "f.txt", .data = "abc\r\ndef\nghi\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "e.edi", .data = "ISA*1'GS*2'ST" });
+    try tmp.dir.writeFile(.{ .sub_path = "e.edi", .data = "ISA*1'GS*2'ST'\n" });
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec, length(rec) AS len FROM lines('$B/l.txt');", 1, &.{});
     try expectFile(&tmp, "o.csv", "n,offset,rec,len\n1,0,a,1\n2,3,bb,2\n3,6,\"\",0\n4,7,ccc,3\n");
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec FROM fixed('$B/f.txt', 3, TRUE);", 1, &.{});
@@ -85,16 +85,18 @@ test "check and run refuse a record source's bad arguments alike" {
     }) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }
 
-test "a short last fixed record and a missing file fail the run naming the file" {
+test "a short last fixed record, a missing file and a folder fail the run naming the file, on one lane or several" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "x.txt", .data = "abcdefgh" });
+    try tmp.dir.makeDir("sub");
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
-    for ([_][2][]const u8{
+    for ([_]usize{ 1, 4 }) |threads| for ([_][2][]const u8{
         .{ "fixed('{s}/x.txt', 3)", "x.txt`: the last record, at byte 6, is 2 bytes, short of the 3-byte width" },
         .{ "lines('{s}/nope.txt')", "nope.txt` (local file: FileNotFound)" },
+        .{ "lines('{s}/sub')", "sub` is a folder; end it with `/` to read the files in it" },
     }) |c| {
         var parena = std.heap.ArenaAllocator.init(alloc);
         defer parena.deinit();
@@ -104,13 +106,39 @@ test "a short last fixed record and a missing file fail the run naming the file"
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const prog = try parser.parseSource(a, script, &pdiag);
         var rdiag: Diag = .{};
-        const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_|
+        const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true }, .threads = threads }, &rdiag)) |_|
             return error.TestUnexpectedResult
         else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.runtime.failLabel(e);
         if (std.mem.indexOf(u8, msg, c[1]) == null) {
             std.debug.print("want `{s}` in `{s}`\n", .{ c[1], msg });
             return error.TestUnexpectedResult;
         }
+    };
+}
+
+test "lanes read a mapped file's records as one lane does: n, offset and bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var lines = std.array_list.Managed(u8).init(alloc);
+    defer lines.deinit();
+    var fixed = std.array_list.Managed(u8).init(alloc);
+    defer fixed.deinit();
+    for (0..1500) |i| {
+        try lines.writer().print("{d}{s}", .{ i * 7919 % 100003, if (i % 3 == 0) "\r\n" else "\n" });
+        try fixed.writer().print("{d:0>6}\r\n", .{i * 31 % 999983});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "l.txt", .data = lines.items });
+    try tmp.dir.writeFile(.{ .sub_path = "f.txt", .data = fixed.items });
+    for ([_][]const u8{ "lines('$B/l.txt')", "fixed('$B/f.txt', 6, TRUE)", "split('$B/l.txt', '1')", "chunks('$B/f.txt', 7)" }) |src| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        const a = parena.allocator();
+        const script = try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT n, offset, hex(rec) AS h FROM {s} WHERE n % 2 = 0;", .{src});
+        try checkAndRun(alloc, &tmp, script, 1, &.{});
+        const one = try tmp.dir.readFileAlloc(a, "o.csv", 1 << 24);
+        try checkAndRun(alloc, &tmp, script, 4, &.{});
+        try expectFile(&tmp, "o.csv", one);
     }
 }
 
