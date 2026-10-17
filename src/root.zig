@@ -8,6 +8,7 @@ pub const sql_lexer = @import("lang/sql_lexer.zig");
 pub const sql_parser = @import("lang/sql_parser.zig");
 pub const include = @import("lang/include.zig");
 pub const expand = @import("lang/expand.zig");
+pub const print = @import("lang/print.zig");
 pub const value = @import("exec/value.zig");
 pub const column = @import("exec/column.zig");
 pub const celltext = @import("exec/celltext.zig");
