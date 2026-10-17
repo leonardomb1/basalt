@@ -24,6 +24,8 @@ const trace = @import("../exec/trace.zig");
 const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
+const profile = @import("../exec/profile.zig");
+const Profile = profile.Profile;
 const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
 const sftp = @import("../store/sftp.zig");
@@ -224,9 +226,37 @@ const Shared = struct {
     sink_mode: SinkMode,
     rows_read: *obs.RowCounter,
     queue: WorkQueue,
+    profiled: ?Profiled = null,
 
     sink_mtx: std.Thread.Mutex = .{},
     rows: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+/// Where a split run's lanes report under `EXPLAIN ANALYZE`: the profile, and the
+/// nodes `stages` stand for, root first and the read last, as `Profile.chainIds`
+/// gives them. The lanes apply the stages without pulling them, so they time each one.
+pub const Profiled = struct { prof: *Profile, ids: []const profile.Id };
+
+/// One lane's time and rows for the read and each stage, folded into the profile
+/// when the lane is done.
+const LaneTally = struct {
+    t: []profile.Tally,
+
+    fn init(a: std.mem.Allocator, n: usize) !LaneTally {
+        const t = try a.alloc(profile.Tally, n + 1);
+        @memset(t, .{});
+        return .{ .t = t };
+    }
+
+    /// Credits each node its time with its inputs', as `Op.next` counts it.
+    fn credit(self: LaneTally, p: Profiled) !void {
+        var below: u64 = 0;
+        for (self.t, 0..) |own, k| {
+            below += own.ns;
+            const id = p.ids[p.ids.len - 1 - k];
+            try p.prof.credit(id, .{ .ns = below, .rows = own.rows, .calls = own.calls });
+        }
+    }
 };
 
 pub const WorkQueue = struct {
@@ -318,6 +348,12 @@ fn lane(sh: *Shared, lane_idx: usize) void {
         }
     };
 
+    const tally: ?LaneTally = if (sh.profiled) |p| (if (p.ids.len == sh.stages.len + 1) LaneTally.init(lane_alloc, sh.stages.len) catch null else null) else null;
+    defer if (tally) |t| {
+        t.credit(sh.profiled.?) catch {};
+        lane_alloc.free(t.t);
+    };
+
     while (true) {
         if (sh.queue.failed.load(.seq_cst)) return;
         const i = sh.queue.next.fetchAdd(1, .seq_cst);
@@ -340,19 +376,22 @@ fn lane(sh: *Shared, lane_idx: usize) void {
         while (true) {
             if (sh.queue.failed.load(.seq_cst)) return;
             _ = arena.reset(.retain_capacity);
+            var clock = if (tally != null) std.time.Instant.now() catch null else null;
             const maybe = src.next(a) catch |e| {
                 sh.queue.fail(e);
                 return;
             };
             var b = maybe orelse break;
             _ = sh.rows_read.fetchAdd(b.len, .monotonic);
+            if (tally) |t| lap(&clock, &t.t[0], b.len);
             var ok = true;
-            for (sh.stages) |st| {
+            for (sh.stages, 1..) |st, k| {
                 b = st.apply(a, b) catch |e| {
                     sh.queue.fail(e);
                     ok = false;
                     break;
                 };
+                if (tally) |t| lap(&clock, &t.t[k], b.len);
             }
             if (!ok) return;
             if (b.len == 0) continue;
@@ -366,6 +405,15 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     }
 }
 
+/// Adds the time since `clock` and a batch of `rows` to `t`, and restarts the clock.
+fn lap(clock: *?std.time.Instant, t: *profile.Tally, rows: usize) void {
+    const now = std.time.Instant.now() catch return;
+    if (clock.*) |c| t.ns += now.since(c);
+    t.rows += rows;
+    t.calls += 1;
+    clock.* = now;
+}
+
 /// Run the splits across `min(nthreads, predicates.len)` lanes. Returns total rows
 /// written, or the first error any lane hit.
 pub fn run(
@@ -377,6 +425,7 @@ pub fn run(
     sink_mode: SinkMode,
     nthreads: usize,
     rows_read: *obs.RowCounter,
+    profiled: ?Profiled,
 ) !usize {
     var sh = Shared{
         .gpa = gpa,
@@ -387,6 +436,7 @@ pub fn run(
         .sink_mode = sink_mode,
         .rows_read = rows_read,
         .queue = .{ .nitems = predicates.len },
+        .profiled = profiled,
     };
 
     const nlanes = @min(@max(@as(usize, 1), nthreads), predicates.len);
@@ -643,7 +693,7 @@ test "run: work-steals uneven splits across fewer lanes than splits; every split
     var rows_read = obs.RowCounter.init(0);
     var opens = [_]std.atomic.Value(usize){std.atomic.Value(usize).init(0)} ** 8;
     const preds = [_][]const u8{ "5", "3", "4", "1" };
-    const n = try run(testing.allocator, &preds, testOpenSplitCounted, &opens, &.{}, .{ .shared = snk.sink() }, 2, &rows_read);
+    const n = try run(testing.allocator, &preds, testOpenSplitCounted, &opens, &.{}, .{ .shared = snk.sink() }, 2, &rows_read, null);
     for (opens, 0..) |o, i| try testing.expectEqual(@as(usize, switch (i) {
         1, 3, 4, 5 => 1,
         else => 0,
@@ -660,7 +710,7 @@ test "run: lane count clamps to the split count; zero threads still runs one lan
         var totals = LaneSink.Totals{};
         var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{"2"};
-        try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 8, &rows_read));
+        try testing.expectEqual(@as(usize, 2), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 8, &rows_read, null));
         try testing.expectEqual(@as(usize, 1), totals.opened.load(.seq_cst));
         try testing.expectEqual(@as(usize, 2), totals.committed.load(.seq_cst));
     }
@@ -668,7 +718,7 @@ test "run: lane count clamps to the split count; zero threads still runs one lan
         var totals = LaneSink.Totals{};
         var rows_read = obs.RowCounter.init(0);
         const preds = [_][]const u8{ "3", "2" };
-        try testing.expectEqual(@as(usize, 5), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 0, &rows_read));
+        try testing.expectEqual(@as(usize, 5), try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 0, &rows_read, null));
         try testing.expectEqual(@as(usize, 1), totals.opened.load(.seq_cst));
         try testing.expectEqual(@as(usize, 5), totals.committed.load(.seq_cst));
     }
@@ -680,12 +730,12 @@ test "run: a lane's open or read failure is the run's error" {
     {
         var snk = CountSink{};
         const preds = [_][]const u8{"fail-open"};
-        try testing.expectError(error.SplitOpenFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read));
+        try testing.expectError(error.SplitOpenFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read, null));
     }
     {
         var snk = CountSink{};
         const preds = [_][]const u8{"fail-read"};
-        try testing.expectError(error.SplitReadFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read));
+        try testing.expectError(error.SplitReadFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 2, &rows_read, null));
         try testing.expectEqualStrings("row 7: bad cast", eval.takeFailure(error.SplitReadFailed).?);
     }
 }
@@ -695,7 +745,7 @@ test "run: per_lane sinks are opened by lanes and committed (closed) on success"
     var rows_read = obs.RowCounter.init(0);
     var dummy: u8 = 0;
     const preds = [_][]const u8{ "4", "2", "5" };
-    const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 2, &rows_read);
+    const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .per_lane = .{ .open = testOpenLaneSink, .ctx = &totals } }, 2, &rows_read, null);
     try testing.expectEqual(@as(usize, 11), n);
     try testing.expectEqual(@as(usize, 11), totals.committed.load(.seq_cst));
     try testing.expectEqual(@as(usize, 0), totals.aborted.load(.seq_cst));

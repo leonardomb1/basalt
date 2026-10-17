@@ -25,7 +25,7 @@ pub const Scratch = struct {
     }
 
     pub fn space(self: *Scratch) Space {
-        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl };
+        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl, .peakFn = peakImpl, .restartPeakFn = restartPeakImpl };
     }
 
     /// The directory, once a file has been made in it.
@@ -74,6 +74,16 @@ pub const Scratch = struct {
     fn releaseImpl(ctx: *anyopaque, bytes: u64) void {
         const self: *Scratch = @ptrCast(@alignCast(ctx));
         self.inner.space().release(bytes);
+    }
+
+    fn peakImpl(ctx: *anyopaque) u64 {
+        const self: *Scratch = @ptrCast(@alignCast(ctx));
+        return self.inner.space().peak();
+    }
+
+    fn restartPeakImpl(ctx: *anyopaque) u64 {
+        const self: *Scratch = @ptrCast(@alignCast(ctx));
+        return self.inner.space().restartPeak();
     }
 };
 

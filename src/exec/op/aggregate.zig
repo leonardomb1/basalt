@@ -55,6 +55,10 @@ pub const Aggregate = struct {
     max_spill_depth: u8 = spill_parts.default_max_depth,
     spill_depth: u8 = 0,
     spill: ?*Spill = null,
+    /// Levels that wrote spill files, this one and its replays' deeper ones, held
+    /// by the top aggregate (`spilled_to` points a replay at it).
+    spilled: u8 = 0,
+    spilled_to: ?*u8 = null,
     pairs: []Pairs = &.{},
 
     pub const Spill = @import("aggregate/spill.zig").Spill;

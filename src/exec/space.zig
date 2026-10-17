@@ -14,8 +14,21 @@ pub const Space = struct {
     createFn: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!File,
     chargeFn: *const fn (ctx: *anyopaque, bytes: u64) anyerror!void,
     releaseFn: ?*const fn (ctx: *anyopaque, bytes: u64) void = null,
+    peakFn: ?*const fn (ctx: *anyopaque) u64 = null,
+    restartPeakFn: ?*const fn (ctx: *anyopaque) u64 = null,
 
     pub const File = struct { file: std.fs.File, path: []const u8 };
+
+    /// The most bytes held at once so far, for `EXPLAIN ANALYZE`; 0 when untracked.
+    pub fn peak(self: Space) u64 {
+        return if (self.peakFn) |f| f(self.ctx) else 0;
+    }
+
+    /// Starts `peak` over from what is held now, and returns that: the peak a part of
+    /// the run reaches above it is `peak() - restartPeak()`. The cap is unaffected.
+    pub fn restartPeak(self: Space) u64 {
+        return if (self.restartPeakFn) |f| f(self.ctx) else 0;
+    }
 
     pub fn create(self: Space, arena: std.mem.Allocator, tag: []const u8) !File {
         return self.createFn(self.ctx, arena, tag);
@@ -38,7 +51,19 @@ pub const DirSpace = struct {
     seq: std.atomic.Value(u64) = .init(0),
 
     pub fn space(self: *DirSpace) Space {
-        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl };
+        return .{ .ctx = self, .createFn = createImpl, .chargeFn = chargeImpl, .releaseFn = releaseImpl, .peakFn = peakImpl, .restartPeakFn = restartPeakImpl };
+    }
+
+    fn peakImpl(ctx: *anyopaque) u64 {
+        const self: *DirSpace = @ptrCast(@alignCast(ctx));
+        return self.peak.load(.monotonic);
+    }
+
+    fn restartPeakImpl(ctx: *anyopaque) u64 {
+        const self: *DirSpace = @ptrCast(@alignCast(ctx));
+        const now = self.used.load(.monotonic);
+        self.peak.store(now, .monotonic);
+        return now;
     }
 
     fn createImpl(ctx: *anyopaque, arena: std.mem.Allocator, tag: []const u8) anyerror!Space.File {
@@ -65,6 +90,20 @@ pub const DirSpace = struct {
         while (self.used.cmpxchgWeak(cur, cur -| bytes, .monotonic, .monotonic)) |seen| cur = seen;
     }
 };
+
+test "DirSpace: a restarted peak counts from what is held then, and the cap still counts everything" {
+    var ds = DirSpace{ .dir = "", .cap = 100 };
+    const sp = ds.space();
+    try sp.charge(60);
+    sp.release(50);
+    try std.testing.expectEqual(@as(u64, 60), sp.peak());
+    const base = sp.restartPeak();
+    try std.testing.expectEqual(@as(u64, 10), base);
+    try std.testing.expectEqual(@as(u64, 0), sp.peak() - base);
+    try sp.charge(30);
+    try std.testing.expectEqual(@as(u64, 30), sp.peak() - base);
+    try std.testing.expectError(error.SpillCapExceeded, sp.charge(61));
+}
 
 test "DirSpace: a refused charge holds nothing, and released bytes make room again" {
     var tmp = std.testing.tmpDir(.{});

@@ -8,9 +8,10 @@
 //! statements may reuse a CTE name and each sees its own (registering all up front
 //! once made the last win for both). A `for` body's bindings are scoped to the
 //! body and restored after each row. Sources are closed on every way out: they own
-//! sockets and gpa memory outside the plan arena. `EXPLAIN ANALYZE` runs serially: ten parallel
-//! paths would each need their own lane figures, and a plan must not depend on the
-//! pipeline's shape to print at all.
+//! sockets and gpa memory outside the plan arena. `EXPLAIN ANALYZE` runs at the run's
+//! `-j`: every parallel path folds the chains its lanes build into one profile
+//! (`exec/profile.zig`), so the plan prints whatever path the pipeline takes, with
+//! the spread between lanes a serial run cannot show.
 //!
 //! Under `--format json` a LOAD run's stdout is the summary object and a SELECT
 //! run's the NDJSON rows, never both; a SELECT's summary then goes to a JSON log
@@ -109,8 +110,7 @@ const runEarlyThrows = @import("script.zig").runEarlyThrows;
 const Scratch = @import("scratch.zig").Scratch;
 
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
-    var opts = opts_in;
-    if (opts.explain) opts.threads = 1;
+    const opts = opts_in;
     ftp.beginRun();
     defer {
         if (diag.msg.len > 0) {

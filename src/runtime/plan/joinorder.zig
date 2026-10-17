@@ -44,6 +44,7 @@ const estimate = @import("estimate.zig");
 const op = @import("../../exec/op.zig");
 const plan = @import("../plan.zig");
 const planErr = @import("../env.zig").planErr;
+const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -186,6 +187,7 @@ fn buildChain(env: *Env, chain: []const ast.Stage, after: []const ast.Stage, pro
         for (chain, sides) |st, s| {
             const a = try plan.assembleJoin(env, st.node.join, st.hints, s, sch, cur, null);
             cur = .{ .join = a.o };
+            cur.stampNew(profile.keyOf(st.pos));
             sch = a.schema;
         }
         return .{ .op = cur, .schema = sch };
@@ -200,6 +202,7 @@ fn buildChain(env: *Env, chain: []const ast.Stage, after: []const ast.Stage, pro
         const a = try plan.assembleJoin(env, st.node.join, st.hints, sides[k], sch, cur, null);
         a.o.note = try std.fmt.allocPrint(arena, "joined {d} of {d}, written {d} (est. {s})", .{ n + 1, chain.len, k + 1, try estimate.describe(arena, order.rows[k], .rows) });
         cur = .{ .join = a.o };
+        cur.stampNew(profile.keyOf(st.pos));
         sch = a.schema;
     }
     env.log.log(.info, "{d} inner joins run smallest side first, not as written", .{chain.len});

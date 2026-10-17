@@ -160,10 +160,26 @@ pub fn errLabel(e: anyerror) []const u8 {
     };
 }
 
+/// `at` names the plan stage the operator was built from (`profile.keyOf`), 0 until
+/// the planner stamps it, so a profile folds every chain built for one stage together.
 pub const Stats = struct {
     ns: u64 = 0,
     rows: u64 = 0,
     calls: u64 = 0,
+    at: u64 = 0,
+};
+
+pub const Unit = enum { count, bytes, ns };
+
+/// A figure an operator knows beyond time and rows, read off its state once it has
+/// run, for `EXPLAIN ANALYZE`: rows built, bytes held, spill depth. Chains' figures
+/// add up, except one every chain reads the same of (`max`): a lane's join probes
+/// the one index built before the lanes, and summing it counted it once per lane.
+pub const Fact = struct {
+    name: []const u8,
+    value: u64,
+    unit: Unit = .count,
+    fold: enum { sum, max } = .sum,
 };
 
 pub const Op = union(enum) {
@@ -203,6 +219,71 @@ pub const Op = union(enum) {
             .union_ => |u| try buf.appendSlice(u.children),
             inline else => |o| try buf.append(o.child),
         }
+    }
+
+    /// Gives `at` to this operator and every input below it not yet stamped: the
+    /// operators one stage built (a join and the projection over it) share its name,
+    /// and inputs other stages built keep theirs.
+    pub fn stampNew(self: Op, at: u64) void {
+        const st = self.stats();
+        if (st.at != 0) return;
+        st.at = at;
+        switch (self) {
+            .scan => {},
+            .join => |j| {
+                j.probe.stampNew(at);
+                if (j.build) |b| b.stampNew(at);
+            },
+            .nl_join => |j| {
+                j.probe.stampNew(at);
+                if (j.build) |b| b.stampNew(at);
+            },
+            .union_ => |u| for (u.children) |c| c.stampNew(at),
+            inline else => |o| o.child.stampNew(at),
+        }
+    }
+
+    /// What the operator can tell beyond `Stats`, written into `buf` (room for four).
+    pub fn facts(self: Op, buf: []Fact) []const Fact {
+        var n: usize = 0;
+        switch (self) {
+            .join => |j| {
+                const fold: @FieldType(Fact, "fold") = if (j.build == null) .max else .sum;
+                if (j.index) |ix| {
+                    buf[0] = .{ .name = "build rows", .value = ix.rows(), .fold = fold };
+                    buf[1] = .{ .name = "build size", .value = ix.build_batch.heapBytes(), .unit = .bytes, .fold = fold };
+                    n = 2;
+                }
+                if (j.grace) |g| {
+                    buf[n] = .{ .name = "spilled, partition levels", .value = @as(u64, g.deepest) + 1, .fold = .max };
+                    n += 1;
+                }
+            },
+            .aggregate => |a| if (a.spilled > 0) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = a.spilled, .fold = .max };
+                n = 1;
+            },
+            .distinct => |d| if (d.spilled > 0) {
+                buf[0] = .{ .name = "spilled, partition levels", .value = d.spilled, .fold = .max };
+                n = 1;
+            },
+            .sort => |s| if (s.runs > 0) {
+                buf[0] = .{ .name = "sorted runs spilled", .value = s.runs };
+                n = 1;
+            },
+            else => {},
+        }
+        return buf[0..n];
+    }
+
+    /// How the planner chose to run it, when it made a choice: which side of a join
+    /// is held in memory, and on what estimates.
+    pub fn note(self: Op) []const u8 {
+        return switch (self) {
+            .join => |j| j.note,
+            .nl_join => |j| if (j.range != null) "range join: the right side sorted by its bound" else "nested loop: every left row against every right row",
+            else => "",
+        };
     }
 
     /// Frees what spilling operators in this tree still hold (files, their mappings,
@@ -293,6 +374,15 @@ pub const Stage = union(enum) {
             .filter => |f| f.transform(arena, b),
             .project => |p| p.transform(arena, b),
             .explode => |e| e.transform(arena, b),
+        };
+    }
+
+    /// The operator the stage is, its chain below it.
+    pub fn asOp(self: Stage) Op {
+        return switch (self) {
+            .filter => |f| .{ .filter = f },
+            .project => |p| .{ .project = p },
+            .explode => |e| .{ .explode = e },
         };
     }
 };

@@ -380,6 +380,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var hopts = http_client.optsFromHints(all);
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
+        if (env.profile) |p| try p.noteSent("{s}: {s}", .{ rd.connector, path });
         const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, path, hopts) catch |e|
             return httpOpenFailed(env, e, path);
         return s.source();
@@ -388,6 +389,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const cfg = try resolveDbConfig(env, conn, info.port);
         const query = try readSql(env, rd_eff);
         env.log.log(.debug, "sql read ({s}): {s}", .{ rd.connector, query });
+        if (env.profile) |p| try p.noteSent("{s}: {s}", .{ rd.connector, query });
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|

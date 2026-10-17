@@ -2,6 +2,7 @@
 //! running its own probe over it.
 
 const Env = @import("../env.zig").Env;
+const Profile = @import("../../exec/profile.zig").Profile;
 const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
@@ -14,6 +15,7 @@ const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const op = @import("../../exec/op.zig");
 const planErr = @import("../env.zig").planErr;
 const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
+const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
 const trace = @import("../../exec/trace.zig");
@@ -49,7 +51,9 @@ pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: ty
             env.sources.shrinkRetainingCapacity(src_base);
             return null;
         };
-        try list.append(lp.lane);
+        var lane = lp.lane;
+        lane.at = profile.keyOf(join_span[i].pos);
+        try list.append(lane);
         schema = lp.out_schema;
         i = k;
     }
@@ -83,6 +87,11 @@ pub const LaneJoin = struct {
     null_aware: bool,
     suffix: []const ast.Stage,
     shared_matched: ?[]std.atomic.Value(u64) = null,
+    /// The join stage, for the profile; 0 takes the pipeline's one join.
+    at: u64 = 0,
+    /// The profile's node for the chain that built `index`, which the lanes' joins
+    /// show as their build side.
+    build_root: ?profile.Id = null,
 };
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
@@ -117,6 +126,10 @@ const BuildCtx = struct {
     bytes: std.atomic.Value(usize) = .init(0),
     cap: usize,
     rows_read: *obs.RowCounter,
+    prof: ?*Profile = null,
+    read_at: u64 = 0,
+    root: ?profile.Id = null,
+    root_mtx: std.Thread.Mutex = .{},
 };
 
 /// One row group of the build file, read from the lane's open reader.
@@ -162,6 +175,7 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
         var item = ItemSource{ .r = r, .schema_ = m.src_schema };
         var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ItemSource.vtable }, .count = ctx.rows_read };
         var scan = op.Scan{ .src = cs.source() };
+        scan.stats.at = ctx.read_at;
         const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, m.src_schema);
         const part = &ctx.parts[i];
         const a = part.arena.allocator();
@@ -173,20 +187,27 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
             try part.batches.append(a, kept);
             if (ctx.bytes.fetchAdd(kept.heapBytes(), .monotonic) + kept.heapBytes() > ctx.cap) return error.JoinBuildTooLarge;
         }
+        if (ctx.prof) |p| {
+            const id = try p.absorb(child);
+            ctx.root_mtx.lock();
+            defer ctx.root_mtx.unlock();
+            ctx.root = id;
+        }
     }
 }
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
-fn indexInParallel(env: *Env, split: *LaneSplit, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, cap: usize) !*op.JoinIndex {
+fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
     const nitems = split.count(env.sort_threads);
     const parts = try arena.alloc(BuildPart, nitems);
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();
-    var ctx = BuildCtx{ .split = split, .stages = stages, .params = env.params_expr, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read };
+    var ctx = BuildCtx{ .split = split, .stages = stages, .params = env.params_expr, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
     _ = try parallel.spawnJoin(arena, env.sort_threads, buildLane, &ctx);
     if (ctx.queue.failure()) |e| return e;
+    root.* = ctx.root;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);
     return op.JoinIndex.fromBatches(arena, chunks.items, right_schema, right_keys, ctx.bytes.load(.monotonic), cap, env.sort_threads);
@@ -232,10 +253,14 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     var build_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer build_arena.deinit();
     const cap = try laneJoinCap(env, j, join_hints);
+    var build_root: ?profile.Id = null;
+    var build_chain: ?op.Op = null;
     const built = if (split) |*sp|
-        indexInParallel(env, sp, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, cap)
-    else
-        op.JoinIndex.create(arena, build_arena.allocator(), try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema), right_schema, right_keys, cap, env.sort_threads);
+        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, cap, &build_root)
+    else blk: {
+        build_chain = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
+        break :blk op.JoinIndex.create(arena, build_arena.allocator(), build_chain.?, right_schema, right_keys, cap, env.sort_threads);
+    };
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
         if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) {
@@ -246,6 +271,9 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
         env.sources.shrinkRetainingCapacity(src_base);
         env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, join_hints) });
         return null;
+    };
+    if (env.profile) |p| if (build_chain) |bc| {
+        build_root = try p.absorb(bc);
     };
     const shared_matched: ?[]std.atomic.Value(u64) = if (j.kind == .right or j.kind == .full) blk: {
         const words = try arena.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
@@ -270,6 +298,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .null_aware = j.null_aware,
             .suffix = suffix,
             .shared_matched = shared_matched,
+            .build_root = build_root,
         },
         .out_schema = final_schema,
     };
@@ -293,6 +322,7 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .shared_matched = lj.shared_matched,
         .state = ta,
     };
+    j.stats.at = lj.at;
     return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
 }
 
@@ -325,6 +355,7 @@ pub fn buildLaneJoinDrain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .probe_done = true,
         .state = ta,
     };
+    j.stats.at = lj.at;
     return try buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
 }
 

@@ -5,6 +5,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const LaneSplit = @import("sources.zig").LaneSplit;
+const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
@@ -104,6 +105,7 @@ const DistinctCtx = struct {
     items: []Item,
     lanes: []Lane,
     rows_read: *obs.RowCounter,
+    prof: ?*Profile = null,
 };
 
 /// A lane: work items taken from the queue until none are left, with the lane's own
@@ -136,9 +138,10 @@ fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: u
     const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
     var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .partial = true, .shared_strs = in };
     defer d.release();
+    const dop: op.Op = .{ .distinct = &d };
 
     const enc: ?keytable.Encoder = if (ctx.keys.kinds) |k| try keytable.Encoder.init(ia, ctx.keys.idx, k) else null;
-    while (try d.next(ia)) |b| {
+    while (try dop.next(ia)) |b| {
         const hashes = try ia.alloc(u64, b.len);
         var e: ?keytable.Encoded = null;
         if (enc) |en| {
@@ -166,6 +169,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: u
         @memset(keep, false);
         try item.pieces.append(ia, .{ .batch = b, .enc = e, .hashes = hashes, .starts = starts, .order = order, .keep = keep });
     }
+    if (ctx.prof) |p| _ = try p.absorb(dop);
 }
 
 const MergeCtx = struct {
@@ -317,6 +321,7 @@ pub fn runParallelDistinct(
         .items = items,
         .lanes = lane_state,
         .rows_read = env.rows_read,
+        .prof = env.profile,
     };
 
     const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
@@ -324,13 +329,18 @@ pub fn runParallelDistinct(
     env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
+    const t_mrg0 = std.time.Instant.now() catch unreachable;
     var mctx = MergeCtx{ .gpa = env.gpa, .keys = ctx.keys, .items = items, .queue = .{ .nitems = keytable.parts } };
     _ = try parallel.spawnJoin(arena, nthreads, mergeWorker, &mctx);
     if (mctx.queue.failure()) |e| return e;
     const merged = try gatherKept(arena, row_schema, items);
+    if (env.profile) |p| {
+        try p.phase("merge the lanes' rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
+        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ split.label(), nitems, split.unitName() });
+    }
 
     const snk = try openTailSink(env, w, tail, row_schema.*);
-    writeTail(env, snk, merged, row_schema.*, tail, stats) catch |e| {
+    writeTail(env, snk, merged, row_schema.*, tail, stats, .distinct) catch |e| {
         snk.abort();
         return e;
     };

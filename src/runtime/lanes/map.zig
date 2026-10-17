@@ -7,6 +7,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const LaneJoin = @import("join.zig").LaneJoin;
 const LaneSplit = @import("sources.zig").LaneSplit;
+const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
@@ -54,6 +55,7 @@ const MapCtx = struct {
     rows_read: *obs.RowCounter,
     join: ?LaneJoin = null,
     ordered: ?*OrderedOut = null,
+    prof: ?*Profile = null,
 };
 
 pub const OrderedOut = struct {
@@ -250,6 +252,7 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
     const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
     const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), i, chain, &mem.batch, &ctx.queue.failed);
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    if (ctx.prof) |p| _ = try p.absorb(chain);
 }
 
 fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
@@ -304,6 +307,7 @@ fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem) !void {
                 try f.add(ord.snk, mem.batch.allocator(), b);
                 _ = mem.batch.reset(.retain_capacity);
             }
+            if (ctx.prof) |p| _ = try p.absorb(chain);
         }
     }
     _ = ctx.rows_out.fetchAdd(f.rows, .monotonic);
@@ -352,6 +356,7 @@ pub fn runParallelMap(
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
         .join = lane_join,
+        .prof = env.profile,
     };
     var ordered: OrderedOut = undefined;
     if (sink_mode == .shared) {
@@ -375,10 +380,9 @@ pub fn runParallelMap(
     env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
         split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
     });
-    if (opts.explain and split == .parquet) {
-        std.debug.print("actuals (parallel map, {d} lanes over {d} row groups): {d} rows out\n", .{
-            lanes, units, ctx.rows_out.load(.monotonic),
-        });
+    if (env.profile) |p| {
+        if (lane_join) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
+        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel map{s}, {d} {s}", .{ split.label(), if (lane_join != null) "+join" else "", units, split.unitName() });
     }
 
     if (ctx.queue.failure()) |e| return e;
@@ -394,13 +398,16 @@ pub fn runParallelMap(
 /// Once every lane is done, a right/full join's unmatched build rows go through
 /// the join's suffix into the sink, after all the lanes' output: the shared sink,
 /// or one more lane sink numbered `lane_idx`, opened only if there is a row to write.
+/// Its chain folds into the lanes' join and suffix nodes, as more of their work.
 fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx: *std.Thread.Mutex, lane_idx: usize) !u64 {
     var state = std.heap.ArenaAllocator.init(env.gpa);
     defer state.deinit();
     var batch_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer batch_arena.deinit();
     const chain = (try buildLaneJoinDrain(state.allocator(), env.params_expr, env.errctx, lj)) orelse return 0;
-    return pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
+    const rows = try pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
+    if (env.profile) |p| _ = try p.absorb(chain);
+    return rows;
 }
 
 /// The indexed right side's keys as row-group tests for the Parquet morsels of the
@@ -493,6 +500,7 @@ const SqlMapJoinCtx = struct {
     sink_mtx: std.Thread.Mutex = .{},
     rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     rows_read: *obs.RowCounter,
+    prof: ?*Profile = null,
 };
 
 const SplitSource = struct {
@@ -544,6 +552,7 @@ fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
     const chain = try buildLaneJoinChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.join, probe);
     const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
+    if (ctx.prof) |p| _ = try p.absorb(chain);
 }
 
 /// Split-parallel SQL map+join. The serial plan's sources are closed before the shared
@@ -592,12 +601,18 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         .queue = .{ .nitems = sp.predicates.len },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
+        .prof = env.profile,
     };
 
     const nlanes = @min(@max(@as(usize, 1), opts.lanes()), sp.predicates.len);
     const lanes = try parallel.spawnJoin(arena, nlanes, sqlMapJoinLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
+    if (env.profile) |p| {
+        if (lp.lane.build_root) |b| try p.graftBuild(lp.lane.at, b);
+        p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel map+join, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+        try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
+    }
 
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);

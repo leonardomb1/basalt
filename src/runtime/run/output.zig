@@ -19,7 +19,6 @@ const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
 const exceptColumns = @import("../connect.zig").exceptColumns;
-const explainTree = @import("explain.zig").explainTree;
 const factsIfWanted = @import("../connect.zig").factsIfWanted;
 const forHintIdent = @import("../env.zig").forHintIdent;
 const ftp = @import("../../store/ftp.zig");
@@ -38,6 +37,7 @@ const localRead = @import("../connect/source.zig").localRead;
 const mem_connector = @import("../connect.zig").mem_connector;
 const moveLabel = @import("../run.zig").moveLabel;
 const noteLoad = @import("../run.zig").noteLoad;
+const notePlan = @import("explain.zig").notePlan;
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
 const openSource = @import("../connect.zig").openSource;
@@ -46,6 +46,9 @@ const parallel = @import("../parallel.zig");
 const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
+const printProfile = @import("explain.zig").printProfile;
+const Profile = @import("../../exec/profile.zig").Profile;
+const profile = @import("../../exec/profile.zig");
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
 const projectedColumns = @import("../plan.zig").projectedColumns;
 const pruneKnown = @import("../plan.zig").pruneKnown;
@@ -104,20 +107,53 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .lanes = lanes,
         });
     }
+    var prof: Profile = undefined;
+    const own_profile = opts_in.explain and env.profile == null;
+    if (own_profile) {
+        prof = Profile.init(env.gpa);
+        env.profile = &prof;
+    }
+    defer if (own_profile) {
+        env.profile = null;
+        prof.deinit();
+    };
+    const t0 = std.time.Instant.now() catch null;
+    const scan0 = scanCounts(env);
+    const held0: u64 = if (own_profile) if (env.space) |sp| sp.restartPeak() else 0 else 0;
     runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
         load_err = e;
         return e;
     };
+    if (own_profile) {
+        const scan1 = scanCounts(env);
+        try printProfile(env, &prof, .{
+            .wall_ns = if (t0) |s| if (std.time.Instant.now()) |now| now.since(s) else |_| 0 else 0,
+            .rows_read = env.rows_read.load(.monotonic) - read0,
+            .rows_out = stats.rows_out - load_rows0,
+            .lanes = lanes_used.*,
+            .row_groups = scan1[0] - scan0[0],
+            .row_groups_skipped = scan1[1] - scan0[1],
+            .columns_read = scan1[2] - scan0[2],
+            .columns_total = scan1[3] - scan0[3],
+            .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
+        });
+    }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
         stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);
     };
+}
+
+/// The run's read counts so far: row groups read and skipped, columns read and offered.
+fn scanCounts(env: *Env) [4]u64 {
+    const t = env.scan orelse return .{ 0, 0, 0, 0 };
+    return .{ t.row_groups.load(.monotonic), t.row_groups_skipped.load(.monotonic), t.columns_read.load(.monotonic), t.columns_total.load(.monotonic) };
 }
 
 /// A derived table or CTE that aggregates a file or table is run first, in parallel,
 /// into memory, since built where it is read it ran on one thread. Returns the
 /// binding's name when materialized, for the caller to drop afterwards.
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
-    if (opts.lanes() < 2 or env.explain or stages[0].node != .ref) return null;
+    if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
     const b = env.bindings.get(name) orelse return null;
@@ -136,9 +172,36 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     defer env.mem_sink = outer_sink;
     var scratch: Stats = .{};
     var delegated = false;
-    try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    {
+        const outer_scope = enterScope(env, name);
+        defer leaveScope(env, outer_scope);
+        try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    }
+    try notePrelude(env, name, stages[0].pos);
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
     return name;
+}
+
+/// Under `EXPLAIN ANALYZE`, a run inside the pipeline's (an input read into memory
+/// first) is profiled in its own scope, its operators apart from the pipeline's
+/// built from the same stages; returns the scope to restore.
+fn enterScope(env: *Env, what: []const u8) u64 {
+    const p = env.profile orelse return 0;
+    const outer = p.scope;
+    p.scope = std.hash.Wyhash.hash(outer, what);
+    return outer;
+}
+
+fn leaveScope(env: *Env, outer: u64) void {
+    if (env.profile) |p| p.scope = outer;
+}
+
+/// Under `EXPLAIN ANALYZE`, the path names the input read into memory first and how,
+/// until the pipeline over it names its own, and the scan at `pos` over it is named.
+fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
+    const p = env.profile orelse return;
+    p.path = try std.fmt.allocPrint(env.arena, "{s} read into memory first ({s}), then serial", .{ what, p.path });
+    try p.describe(profile.keyOf(pos), .scan, try std.fmt.allocPrint(env.arena, "{s}, in memory", .{what}));
 }
 
 const window_input = "__window_input";
@@ -157,7 +220,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
         @memcpy(joined[b.stages.len..], stages[1..]);
         stages = joined;
     }
-    if (opts.lanes() < 2 or env.explain or stages.len < 3 or !laneEligible(stages, opts)) return null;
+    if (opts.lanes() < 2 or stages.len < 3 or !laneEligible(stages, opts)) return null;
     const rd = stages[0].node.read;
     if (!isLocalCsvRead(rd) and !isLocalParquetRead(rd) and !isFolderRead(rd)) return null;
     var wi: usize = 1;
@@ -198,7 +261,12 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     defer env.mem_sink = outer_sink;
     var scratch: Stats = .{};
     var delegated = false;
-    try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
+    {
+        const outer_scope = enterScope(env, window_input);
+        defer leaveScope(env, outer_scope);
+        try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
+    }
+    try notePrelude(env, "the window's input", stages[0].pos);
     try env.materialized.put(env.arena, window_input, .{ .schema = ms.schema, .batches = ms.batches.items });
 
     const outer = try env.arena.alloc(ast.Stage, stages.len - wi + 1);
@@ -305,6 +373,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings)) |h| head_stages = h;
         head_stages = try pruneKnown(env, head_stages);
     }
+    if (env.profile) |p| {
+        try notePlan(env, p, head_stages);
+        try notePlan(env, p, stages);
+    }
     if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
         if (classifyLaneShape(head_stages)) |shape| {
             const rd = head_stages[0].node.read;
@@ -319,8 +391,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.sql_desc = null;
     env.src_name = "";
     const src_base = env.sources.items.len;
+    const t_open = std.time.Instant.now() catch null;
     var res = try buildPipeline(env, stages[0 .. stages.len - 1]);
     defer res.op.release();
+    if (env.profile) |p| if (t_open) |t| try p.phase("plan and open the sources", (std.time.Instant.now() catch t).since(t));
 
     const wr = try resolveUpsertKeys(env, last.write);
 
@@ -335,6 +409,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 stages = ns;
                 res = try buildPipeline(env, ns[0 .. ns.len - 1]);
                 whole_agg = true;
+                if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
             }
         }
         if (!whole_agg and hasAggregate(stages))
@@ -352,6 +427,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             stages = ns;
             res = try buildPipeline(env, ns[0 .. ns.len - 1]);
             top_n = true;
+            if (env.profile) |p| p.path = "serial; ORDER BY ... LIMIT runs in the source";
         } else if (why.len > 0 and hasSort(stages))
             env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
     }
@@ -396,15 +472,22 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)) };
                 lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
+                const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
+                    const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
+                    const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
+                    p.path = try std.fmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
+                    try p.noteSent("{s}, once per key range: {s}", .{ @tagName(env.sql_desc.?.kind), sp.base_sql });
+                    break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
+                } else null;
                 if (try buildParallelSink(env, wr, schema)) |mode| {
                     errdefer parallel.abortLanes(mode);
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read, profiled);
                     try parallel.finishLanes(mode);
                 } else {
                     const snk = try openSink(env, wr, schema);
                     var snk_open = true;
                     errdefer if (snk_open) snk.abort();
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read);
+                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read, profiled);
                     snk_open = false;
                     try snk.close();
                 }
@@ -433,6 +516,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         }
         snk_open = false;
         try snk.close();
+        if (env.profile) |p| _ = try p.absorb(res.op);
         return;
     }
 
@@ -457,7 +541,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     try pw.finish();
     snk_open = false;
     try snk.close();
-    if (opts.explain) try explainTree(arena, res.op);
+    if (env.profile) |p| _ = try p.absorb(res.op);
 }
 
 /// Split-parallel union: each branch runs as its own split pipeline into the shared
@@ -491,7 +575,12 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const branch_hints = try split_hints.toOwnedSlice();
 
     const w = write_stage.node.write;
+    const outer_scope = if (env.profile) |p| p.scope else 0;
+    defer if (env.profile) |p| {
+        p.scope = outer_scope;
+    };
     for (specs, schemas, 0..) |s, sch, i| {
+        if (env.profile) |p| p.scope = std.hash.Wyhash.hash(outer_scope, std.mem.asBytes(&i));
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
         var bstages = std.array_list.Managed(ast.Stage).init(arena);
         try bstages.append(.{ .node = .{ .read = s.read }, .hints = branch_hints, .pos = u.pos });

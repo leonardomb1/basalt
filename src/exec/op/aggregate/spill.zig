@@ -46,6 +46,10 @@ pub fn spillNext(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
             return e;
         };
         sp.replay = .{ .runs = try sp.parts.finish() };
+        if (sp.replay.?.runs.len > 0) {
+            const top = self.spilled_to orelse &self.spilled;
+            top.* = @max(top.*, self.spill_depth + 1);
+        }
         if (set.len > 0) return try self.emitSets(arena, &.{set}, null);
     }
     const sp = self.spill.?;
@@ -68,6 +72,7 @@ pub fn replayChild(self: *Aggregate, child: Op, state: std.mem.Allocator) Aggreg
         .spill_at = self.spill_at,
         .max_spill_depth = self.max_spill_depth,
         .spill_depth = self.spill_depth + 1,
+        .spilled_to = self.spilled_to orelse &self.spilled,
     };
 }
 
@@ -222,6 +227,7 @@ fn fmtValue(a: std.mem.Allocator, v: Value) ![]const u8 {
 }
 
 const Opts = struct {
+    spilled: ?*u8 = null,
     space: ?Space = null,
     spill_at: usize = std.math.maxInt(usize),
     max_depth: u8 = parts_mod.default_max_depth,
@@ -246,6 +252,9 @@ fn runAgg(a: std.mem.Allocator, input: []const Batch, by: []const usize, aggs: [
         .space = o.space,
         .spill_at = o.spill_at,
         .max_spill_depth = o.max_depth,
+    };
+    defer if (o.spilled) |p| {
+        p.* = agg.spilled;
     };
     var rows = std.array_list.Managed([]const u8).init(a);
     while (try agg.next(a)) |b| {
@@ -321,8 +330,10 @@ test "aggregate spill: a spill file that overflows again partitions one level de
     const want = try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{});
     var td = try TestDir.init(std.math.maxInt(u64));
     defer td.deinit();
-    try expectSameRows(want, try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{ .space = td.ds.space(), .spill_at = 1 }));
+    var levels: u8 = 0;
+    try expectSameRows(want, try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{ .space = td.ds.space(), .spill_at = 1, .spilled = &levels }));
     try testing.expect(td.ds.seq.load(.monotonic) > parts_mod.fanout);
+    try testing.expect(levels >= 2);
 }
 
 test "aggregate spill: past the depth limit fails clearly" {
@@ -358,6 +369,8 @@ test "aggregate spill: under the budget nothing is written" {
     var td = try TestDir.init(std.math.maxInt(u64));
     defer td.deinit();
     const want = try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{});
-    try expectSameRows(want, try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{ .space = td.ds.space(), .spill_at = 1 << 30 }));
+    var levels: u8 = 9;
+    try expectSameRows(want, try runAgg(a, input, &.{ 1, 0 }, &every_agg, .{ .space = td.ds.space(), .spill_at = 1 << 30, .spilled = &levels }));
     try testing.expectEqual(@as(u64, 0), td.ds.seq.load(.monotonic));
+    try testing.expectEqual(@as(u8, 0), levels);
 }
