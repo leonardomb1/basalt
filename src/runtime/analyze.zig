@@ -385,8 +385,22 @@ pub const Scope = struct { names: []const []const u8, values: []const Value };
 
 pub const Folded = union(enum) { value: Value, failed: []const u8 };
 
+/// Whether `e` calls a function that reads a file (`read_bytes`, `file_size`), which
+/// `check` does not fold, as it reads nothing.
+fn readsFiles(e: *const ast.Expr) bool {
+    const S = struct {
+        fn hit(_: void, n: *const ast.Expr) ?bool {
+            if (n.* != .call) return null;
+            const b = eval.lookupBuiltin(n.call.name) orelse return null;
+            return if (b.io) true else null;
+        }
+    };
+    return ast.anyExpr(e, {}, S.hit);
+}
+
 /// What an expression folds to over `sc`, or the label of why it does not.
 pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folded {
+    if (readsFiles(e)) return .{ .failed = "reads a file, which only a run does" };
     const v = eval.constEval(arena, e, sc.names, sc.values) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failed = env_mod.errLabel(err) };
@@ -902,7 +916,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             const all_known = for (refs) |q| {
                 if (!containsName(known_names.items, q.parts[0])) break false;
             } else true;
-            if (all_known) {
+            if (all_known and !readsFiles(le)) {
                 const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     const e = fail(diag, "LET `{s}`: {s}", .{ l.name, env_mod.errLabel(err) });

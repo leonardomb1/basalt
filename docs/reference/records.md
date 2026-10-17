@@ -29,6 +29,21 @@ Charsets are `utf8`, `latin1` (`iso-8859-1`), `cp1252` (`windows-1252`) and
 `cp037` (`ebcdic`). `decode` repairs invalid UTF-8; `encode` refuses a character
 the charset cannot hold.
 
+## Reading a file by range
+
+| Function | Returns |
+|---|---|
+| `read_bytes(path, offset, len)` | `len` bytes of the file from byte `offset` (from 0), as `BYTES` |
+| `file_size(path)` | the file's size in bytes |
+
+The path is any file basalt reads: local, `https://`, `s3://`, `az://`, SFTP or
+SMB, read by range requests, so only the bytes asked for are fetched. A range
+past the end of the file is an error naming it. A `LET` over them is read when
+the script runs (`LET header = read_bytes($file, 0, 32)`); `basalt check` reads
+nothing, so it types such a `LET` without reading it. For a whole file of
+records, `fixed()`, `lines()`, `split()` and `chunks()` stream it instead
+([Sources](../language/sources.md)).
+
 ## Decoding fields
 
 | Function | Returns |

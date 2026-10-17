@@ -51,7 +51,7 @@
 //! The reader's parts sit beside it: `encoding.zig` (page value encodings),
 //! `logical.zig` (types), `schema.zig` (the leaf columns), `chunk.zig` (a column
 //! chunk's pages), `nested.zig` (lists and structs), `stats.zig` (pruning),
-//! `remote.zig` (where the bytes come from) and `folder.zig` (many files as one).
+//! `../bytes.zig` (where the bytes come from) and `folder.zig` (many files as one).
 //! `write.zig` is the writer, `footer.zig` the file metadata, `thrift.zig` its codec.
 
 const std = @import("std");
@@ -69,6 +69,7 @@ const readAllText = @import("testing_util.zig").readAllText;
 
 pub const Error = error{
     CorruptParquetPage,
+    ByteRangeOutOfFile,
     UnsupportedParquetSchema,
     UnsupportedParquetEncoding,
     ParquetIntOverflow,
@@ -108,8 +109,8 @@ pub const fileMinMax = @import("stats.zig").fileMinMax;
 const wanted = @import("stats.zig").wanted;
 pub const leafType = @import("stats.zig").leafType;
 const cmp = @import("stats.zig").cmp;
-pub const Bytes = @import("remote.zig").Bytes;
-pub const Remote = @import("remote.zig").Remote;
+pub const Bytes = @import("../bytes.zig").Bytes;
+pub const Remote = @import("../bytes.zig").Remote;
 pub const Folder = @import("folder.zig").Folder;
 const source_vtable = driver.sourceVTable(Reader);
 const chunkEnd = @import("folder.zig").chunkEnd;
@@ -535,7 +536,7 @@ test {
     _ = @import("folder.zig");
     _ = @import("logical.zig");
     _ = @import("nested.zig");
-    _ = @import("remote.zig");
+    _ = @import("../bytes.zig");
     _ = @import("schema.zig");
     _ = @import("stats.zig");
     _ = @import("testing_util.zig");

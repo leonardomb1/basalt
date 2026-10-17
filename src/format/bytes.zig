@@ -1,14 +1,21 @@
-//! A Parquet file's bytes: in memory, a local file, or ranged reads over HTTP, an
-//! object store, SFTP or SMB.
+//! A file's bytes read by range, wherever it is: in memory, a local file, or ranged
+//! reads over HTTP, an object store, SFTP or SMB. A range past the end is
+//! `error.ByteRangeOutOfFile`. Parquet reads its footer and column chunks this way,
+//! and `read_bytes` any range a query names.
 
-const Error = @import("read.zig").Error;
-const http_client = @import("../../net/http_client.zig");
-const isRemote = @import("folder.zig").isRemote;
-const objstore = @import("../../store/objstore.zig");
-const sftp = @import("../../store/sftp.zig");
-const smb = @import("../../store/smb.zig");
+const http_client = @import("../net/http_client.zig");
+const objstore = @import("../store/objstore.zig");
+const sftp = @import("../store/sftp.zig");
+const smb = @import("../store/smb.zig");
 const std = @import("std");
 const testing = std.testing;
+
+/// Whether `path` is read over HTTP: a URL or an object-store path.
+pub fn isRemote(path: []const u8) bool {
+    return objstore.isUrl(path) or
+        std.mem.startsWith(u8, path, "http://") or
+        std.mem.startsWith(u8, path, "https://");
+}
 
 pub const Bytes = union(enum) {
     memory: []const u8,
@@ -40,31 +47,31 @@ pub const Bytes = union(enum) {
     pub fn range(self: Bytes, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         switch (self) {
             .memory => |m| {
-                if (off + len > m.len) return Error.CorruptParquetPage;
+                if (off + len > m.len) return error.ByteRangeOutOfFile;
                 return m[@intCast(off)..][0..len];
             },
             .file => |x| {
-                if (off + len > x.size) return Error.CorruptParquetPage;
+                if (off + len > x.size) return error.ByteRangeOutOfFile;
                 const buf = try arena.alloc(u8, len);
                 const n = try x.f.preadAll(buf, off);
-                if (n != len) return Error.CorruptParquetPage;
+                if (n != len) return error.ByteRangeOutOfFile;
                 return buf;
             },
             .remote => |r| {
-                if (off + len > r.total) return Error.CorruptParquetPage;
+                if (off + len > r.total) return error.ByteRangeOutOfFile;
                 return r.read(arena, off, len);
             },
             .sftp => |f| {
-                if (off + len > f.size) return Error.CorruptParquetPage;
+                if (off + len > f.size) return error.ByteRangeOutOfFile;
                 return f.read(arena, off, len) catch |e| switch (e) {
-                    error.EndOfStream => Error.CorruptParquetPage,
+                    error.EndOfStream => error.ByteRangeOutOfFile,
                     else => e,
                 };
             },
             .smb => |f| {
-                if (off + len > f.size) return Error.CorruptParquetPage;
+                if (off + len > f.size) return error.ByteRangeOutOfFile;
                 return f.read(arena, off, len) catch |e| switch (e) {
-                    error.EndOfStream => Error.CorruptParquetPage,
+                    error.EndOfStream => error.ByteRangeOutOfFile,
                     else => e,
                 };
             },
@@ -120,7 +127,7 @@ pub const Remote = struct {
     pub fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         if (len == 0) return "";
         if (self.whole) |w| {
-            if (off + len > w.len) return Error.CorruptParquetPage;
+            if (off + len > w.len) return error.ByteRangeOutOfFile;
             return w[@intCast(off)..][0..len];
         }
 
@@ -128,13 +135,13 @@ pub const Remote = struct {
         const res = try self.send(arena, .GET, hdr);
         switch (res.code) {
             206 => {
-                if (res.body.len != len) return Error.CorruptParquetPage;
+                if (res.body.len != len) return error.ByteRangeOutOfFile;
                 return res.body;
             },
             200 => {
                 const kept = try self.arena.dupe(u8, res.body);
                 self.whole = kept;
-                if (off + len > kept.len) return Error.CorruptParquetPage;
+                if (off + len > kept.len) return error.ByteRangeOutOfFile;
                 return kept[@intCast(off)..][0..len];
             },
             else => return self.statusError(res.code, res.body),
@@ -185,7 +192,7 @@ pub const Remote = struct {
         }, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const extra = try c.r.headers(c.arena, c.method, c.range_hdr);
-                const resp = try objstore.exchange(c.arena, c.r.client, .{ .method = c.method, .url = c.r.url, .headers = extra });
+                const resp = try objstore.exchange(c.arena, c.r.client, .{ .method = c.method, .url = c.r.url, .headers = extra, .identity = true });
                 c.out.* = resp;
                 if (objstore.retriable(resp.code)) return resp.failed(c.r.statusError(resp.code, resp.body));
                 return .done;
@@ -235,7 +242,7 @@ test "a Bytes range refuses to read past the end" {
     defer ar.deinit();
     const src = Bytes{ .memory = "0123456789" };
     try testing.expectEqualStrings("234", try src.range(ar.allocator(), 2, 3));
-    try testing.expectError(Error.CorruptParquetPage, src.range(ar.allocator(), 8, 5));
+    try testing.expectError(error.ByteRangeOutOfFile, src.range(ar.allocator(), 8, 5));
     try testing.expectEqual(@as(u64, 10), src.size());
 }
 
@@ -254,8 +261,8 @@ test "a remote whole-body read refuses to slice past the body it was given" {
         .whole = "0123456789",
     };
     try testing.expectEqualStrings("234", try r.read(a, 2, 3));
-    try testing.expectError(Error.CorruptParquetPage, r.read(a, 99992, 8));
-    try testing.expectError(Error.CorruptParquetPage, r.read(a, 8, 5));
+    try testing.expectError(error.ByteRangeOutOfFile, r.read(a, 99992, 8));
+    try testing.expectError(error.ByteRangeOutOfFile, r.read(a, 8, 5));
 }
 
 fn noSleep(_: u64) void {}

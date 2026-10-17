@@ -78,7 +78,7 @@ pub fn resolveLets(
         const l = s.let_const;
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
-            return planErrAt(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, errLabel(e) }), l.pos);
+            return planErrAt(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, eval.takeFailure(e) orelse errLabel(e) }), l.pos);
         try names.append(l.name);
         try values.append(v);
         try params.put(l.name, v);

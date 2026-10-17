@@ -25,7 +25,14 @@ fn S(comptime F: type) type {
 
 /// An entry whose typing rule, row form and kernel all come from `F`'s declaration.
 fn auto(comptime name: []const u8, comptime F: type) Builtin {
-    return .{ .name = name, .type_fn = @import("scalar.zig").typeRule(F), .eval_fn = S(F).eval, .vec_fn = S(F).vec, .sig = name ++ F.signature };
+    return .{
+        .name = name,
+        .type_fn = @import("scalar.zig").typeRule(F),
+        .eval_fn = S(F).eval,
+        .vec_fn = if (@hasDecl(F, "vec")) F.vec else S(F).vec,
+        .sig = name ++ F.signature,
+        .io = @hasDecl(F, "io") and F.io,
+    };
 }
 
 const r = @import("fn_records.zig");
@@ -43,6 +50,7 @@ const records = blk: {
         auto("packed_at", r.PackedAt),         auto("fmt_text", r.FmtText),         auto("fmt_int", r.FmtInt),
         auto("fmt_decimal", r.FmtDecimal),     auto("fmt_date", r.FmtDate),         auto("fmt_time", r.FmtTime),
         auto("fmt_timestamp", r.FmtTimestamp), auto("fmt_zoned", r.FmtZoned),       auto("fmt_packed", r.FmtPacked),
+        auto("read_bytes", r.ReadBytes),       auto("file_size", r.FileSize),
     };
     for (ints) |it| {
         const one = @sizeOf(it[1]) == 1;
@@ -66,6 +74,7 @@ pub const Builtin = struct {
     eval_fn: *const fn (std.mem.Allocator, ast.Expr.Call, Batch, usize) EvalError!Value,
     vec_fn: ?*const fn (std.mem.Allocator, ast.Expr.Call, Batch) VecError!Vec = null,
     sig: ?[]const u8 = null,
+    io: bool = false,
 };
 
 pub const builtins = base ++ records[0..records.len].*;

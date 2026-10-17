@@ -164,10 +164,12 @@ pub const Call = struct {
     headers: []const std.http.Header = &.{},
     payload: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    identity: bool = false,
 };
 
 /// One request, its body read whole into `arena` and decoded per its
-/// Content-Encoding. A bodiless request follows up to three redirects, as
+/// Content-Encoding; `identity` asks for none, as a byte range of a compressed body
+/// cannot be decoded. A bodiless request follows up to three redirects, as
 /// `Client.fetch` does. Header values are copied out before the body is read,
 /// which invalidates the head's strings. A request that fails before its response
 /// head arrives would leave its connection pooled (std keeps a `.ready` one), so the
@@ -178,7 +180,10 @@ pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) 
     var req = try client.request(call.method, uri, .{
         .redirect_behavior = redirects,
         .extra_headers = call.headers,
-        .headers = .{ .content_type = if (call.content_type) |ct| .{ .override = ct } else .default },
+        .headers = .{
+            .content_type = if (call.content_type) |ct| .{ .override = ct } else .default,
+            .accept_encoding = if (call.identity) .{ .override = "identity" } else .default,
+        },
     });
     defer req.deinit();
     errdefer if (req.connection) |c| {

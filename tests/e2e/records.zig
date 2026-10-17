@@ -113,3 +113,28 @@ test "a short last fixed record and a missing file fail the run naming the file"
         }
     }
 }
+
+test "read_bytes and file_size read a file by range; a LET of bytes folds; a range past the end fails the run" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "h.bin", .data = "000042HEADER\x01\x02rest" });
+    try checkAndRun(alloc, &tmp,
+        \\LET h = read_bytes('$B/h.bin', 0, 6);
+        \\LOAD INTO '$B/out.csv' AS
+        \\SELECT int_at($h, 0, 6) AS id, file_size('$B/h.bin') AS size,
+        \\       hex(read_bytes('$B/h.bin', 12, 2)) AS bin,
+        \\       decode(read_bytes('$B/h.bin', range * 3 + 6, 3), 'utf8') AS part
+        \\FROM RANGE(2);
+    , 1, &.{});
+    try expectFile(&tmp, "out.csv", "id,size,bin,part\n42,18,0102,HEA\n42,18,0102,DER\n");
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    const base = try tmp.dir.realpathAlloc(parena.allocator(), ".");
+    const script = try std.fmt.allocPrint(parena.allocator(), "SELECT read_bytes('{s}/h.bin', 10, 20) AS x;", .{base});
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.CastFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
+}

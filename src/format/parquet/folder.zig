@@ -4,7 +4,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const KeyBound = @import("stats.zig").KeyBound;
-const Bytes = @import("remote.zig").Bytes;
+const Bytes = @import("../bytes.zig").Bytes;
 const Error = @import("read.zig").Error;
 const Reader = @import("read.zig").Reader;
 const Threshold = @import("../../exec/value.zig").Threshold;
@@ -124,11 +124,7 @@ pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !
     return parquet.parseFooter(arena, footer);
 }
 
-pub fn isRemote(path: []const u8) bool {
-    return objstore.isUrl(path) or
-        std.mem.startsWith(u8, path, "http://") or
-        std.mem.startsWith(u8, path, "https://");
-}
+pub const isRemote = @import("../bytes.zig").isRemote;
 
 test "chunk extents come from the next chunk, never from total_compressed_size" {
     const b = [_]u64{ 4, 100, 250, 900 };

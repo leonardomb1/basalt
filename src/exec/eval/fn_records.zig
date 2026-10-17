@@ -10,6 +10,7 @@
 //! encoder writes a NULL as spaces, as fixed-width files spell one (binary encoders
 //! leave it NULL), refuses a value too wide for its field, and never rounds: a
 //! decimal with more places than its field has nonzero digits there is refused.
+//! `read_bytes` and `file_size` read a file by range wherever it is (`bytes.zig`).
 
 const std = @import("std");
 const ast = @import("../../lang/ast.zig");
@@ -22,6 +23,11 @@ const Cx = @import("scalar.zig").Cx;
 const failWith = @import("support.zig").failWith;
 const time = @import("time.zig");
 const charset = @import("../../format/charset.zig");
+const bytes = @import("../../format/bytes.zig");
+const vecmod = @import("vec.zig");
+const column = @import("../column.zig");
+const Batch = @import("../batch.zig").Batch;
+const Bitmap = @import("vec.zig").Bitmap;
 
 const max_digits = 38;
 
@@ -766,11 +772,78 @@ pub fn FmtBinFloat(comptime T: type, comptime endian: std.builtin.Endian) type {
     };
 }
 
+/// A file opened for `read_bytes` or `file_size`, or the error naming it.
+fn openFile(comptime name: []const u8, arena: std.mem.Allocator, path: []const u8) EvalError!bytes.Bytes {
+    return bytes.Bytes.open(arena, path) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => failWith(error.CastFailed, "`" ++ name ++ "`: cannot open `{s}` ({s})", .{ path, @errorName(e) }),
+    };
+}
+
+fn rangeOf(arena: std.mem.Allocator, src: bytes.Bytes, path: []const u8, off: i64, len: i64) EvalError![]const u8 {
+    if (off < 0 or len < 0) return failWith(error.CastFailed, "`read_bytes`: offset {d} and length {d} cannot be negative", .{ off, len });
+    return src.range(arena, @intCast(off), @intCast(len)) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ByteRangeOutOfFile => failWith(error.CastFailed, "`read_bytes`: bytes {d}..{d} are outside `{s}`'s {d} bytes", .{ off, off + len, path, src.size() }),
+        else => failWith(error.CastFailed, "`read_bytes`: reading `{s}` failed ({s})", .{ path, @errorName(e) }),
+    };
+}
+
+pub const ReadBytes = struct {
+    pub const args = .{ .str, .int, .int };
+    pub const result = .bytes;
+    pub const io = true;
+    pub const signature = "(path, offset, len)";
+    pub fn apply(cx: Cx, path: []const u8, off: i64, len: i64) EvalError![]const u8 {
+        const src = try openFile("read_bytes", cx.arena, path);
+        defer src.close();
+        return rangeOf(cx.arena, src, path, off, len);
+    }
+
+    /// The kernel: a path the same for the batch is opened once for all its rows.
+    pub fn vec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) vecmod.VecError!vecmod.Vec {
+        const p = vecmod.asStr(try vecmod.evalVec(arena, c.args[0], batch)) orelse return error.Unsupported;
+        const path = switch (p) {
+            .scalar => |x| x,
+            .col => return error.Unsupported,
+        };
+        const n = batch.len;
+        const offs = (try vecmod.asNum(arena, try vecmod.evalVec(arena, c.args[1], batch), n)) orelse return error.Unsupported;
+        const lens = (try vecmod.asNum(arena, try vecmod.evalVec(arena, c.args[2], batch), n)) orelse return error.Unsupported;
+        if (!vecmod.isIntNum(offs) or !vecmod.isIntNum(lens)) return error.Unsupported;
+        const src = openFile("read_bytes", arena, path) catch return error.Unsupported;
+        defer src.close();
+        var app = try column.BytesAppender.init(arena, n);
+        var valid = try Bitmap.initFull(arena, n);
+        var any_null = false;
+        for (0..n) |i| {
+            if (!vecmod.numValid(offs, i) or !vecmod.numValid(lens, i)) {
+                try app.pushNull();
+                valid.setValid(i, false);
+                any_null = true;
+                continue;
+            }
+            const got = rangeOf(arena, src, path, vecmod.numAt(i64, offs, i), vecmod.numAt(i64, lens, i)) catch return error.Unsupported;
+            try app.values.appendSlice(got);
+            try app.endRow();
+        }
+        return vecmod.mkCol(Type.init(.bytes).withNull(any_null), n, valid, .{ .bytes = try app.finish() });
+    }
+};
+
+pub const FileSize = struct {
+    pub const args = .{.str};
+    pub const io = true;
+    pub const signature = "(path)";
+    pub fn apply(cx: Cx, path: []const u8) EvalError!i64 {
+        const src = try openFile("file_size", cx.arena, path);
+        defer src.close();
+        return @intCast(src.size());
+    }
+};
+
 const testing = std.testing;
-const column = @import("../column.zig");
 const types = @import("../../lang/types.zig");
-const Batch = @import("../batch.zig").Batch;
-const Bitmap = @import("vec.zig").Bitmap;
 const evalVecNode = @import("vec.zig").evalVecNode;
 const evalRow = @import("row.zig").evalRow;
 
