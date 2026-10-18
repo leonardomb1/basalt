@@ -1662,12 +1662,12 @@ const Ctx = struct {
         return "";
     }
 
-    /// A local `.parquet` file read followed by only filters and selects.
+    /// A `.parquet` file, local or read by range, followed by only filters and selects.
     fn parquetFileSide(stages: []const ast.Stage) bool {
         if (stages.len == 0 or stages[0].node != .read) return false;
         const rd = stages[0].node.read;
         if (!std.mem.eql(u8, rd.connector, "csv") or rd.form != .path) return false;
-        if (!pqdecode.Reader.isPath(rd.form.path) or csv.CsvReader.isUrl(rd.form.path)) return false;
+        if (!pqdecode.Reader.isPath(rd.form.path) or ftp.isUrl(rd.form.path)) return false;
         for (stages[1..]) |x| switch (x.node) {
             .filter, .select => {},
             else => return false,

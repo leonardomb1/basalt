@@ -219,12 +219,14 @@ above, the table is read as `SELECT code, name FROM …`, since the key reads
 `code` and the output `name`. A query that keeps every column (`SELECT *`, or a
 join with nothing after it) reads them all.
 
-A local Parquet file or folder takes keys on the same terms, when no SQL side
-does: on the right of the join from the left side's read-ahead, and on the left
-once the right side is indexed. A Parquet left side skips under `-j` too, in
-every lane; a Parquet right side only on a serial run. It reads no less of a row
-group it reads, but skips each row group whose min/max statistics hold none of
-the key values (or, past 1,000 of them, no part of their range). Only a number,
+A Parquet file or folder, local or remote (`https://`, `s3://`, `az://`, SFTP,
+SMB), takes keys on the same terms, when no SQL side does: on the right of the
+join from the left side's read-ahead, and on the left once the right side is
+indexed. A Parquet left side skips under `-j` too, in every lane; a Parquet right
+side only on a serial run. It reads no less of a row group it reads, but skips
+each row group whose min/max statistics hold none of the key values (or, past
+1,000 of them, no part of their range); a remote file's skipped row groups are
+never fetched. Only a number,
 decimal, date or timestamp key that is one of the file's columns as it is counts:
 a key computed from them, a text key (whose statistics' byte order the file does
 not pin down), or a row group without statistics never skips.

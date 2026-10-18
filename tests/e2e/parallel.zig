@@ -789,3 +789,38 @@ test "a remote Parquet file splits at row groups over ranged reads, and is read 
         }
     }
 }
+
+test "a join's keys skip a remote Parquet file's row groups, which are then never fetched" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const harness = @import("harness.zig");
+    try harness.checkAndRun(alloc, &tmp, "LOAD INTO '$B/t.parquet' AS SELECT range AS id, 'v' || CAST(range % 13 AS VARCHAR) AS s FROM RANGE(350000);", 1, &.{});
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "id,tag\n200007,a\n250001,b\n299999,c\n" });
+    const data = try tmp.dir.readFileAlloc(alloc, "t.parquet", 1 << 26);
+    defer alloc.free(data);
+
+    const join = "SELECT t.id, t.s, k.tag FROM {s} AS t JOIN '$B/k.csv' AS k ON t.id = k.id ORDER BY t.id";
+    const scan = "SELECT count(*) AS n, max(s) AS m FROM {s}";
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    const a = parena.allocator();
+    const local = try std.mem.replaceOwned(u8, a, join, "{s}", "'$B/t.parquet'");
+    try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/want.csv' AS {s};", .{local}), 1, &.{});
+    const want = try tmp.dir.readFileAlloc(a, "want.csv", 1 << 16);
+    try std.testing.expectEqualStrings("id,s,tag\n200007,v2,a\n250001,v11,b\n299999,v11,c\n", want);
+
+    for ([_]usize{ 1, 4 }) |threads| {
+        var fetched: [2]usize = undefined;
+        for ([_][]const u8{ join, scan }, &fetched) |q, *count| {
+            var srv: basalt.objstore.RangeServer = undefined;
+            try srv.start(data, false);
+            defer srv.stop();
+            const remote = try std.mem.replaceOwned(u8, a, q, "{s}", try std.fmt.allocPrint(a, "'{s}'", .{try srv.url(a, "/t.parquet")}));
+            try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/got.csv' AS {s};", .{remote}), threads, &.{});
+            if (q.ptr == join.ptr) try harness.expectFile(&tmp, "got.csv", want);
+            count.* = srv.partial.load(.seq_cst);
+        }
+        try std.testing.expect(fetched[0] + 3 <= fetched[1]);
+    }
+}

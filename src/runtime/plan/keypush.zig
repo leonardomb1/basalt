@@ -24,9 +24,10 @@
 //! compared under a case- or trailing-space-insensitive collation keeps more rows
 //! than match, which the join then discards.
 //!
-//! A local Parquet file or folder takes keys the same way and on the same terms
-//! (`ParquetKeys`), but nothing is re-read: its row groups whose min/max statistics
-//! hold no key value (or, past the cap, no part of the keys' range) are skipped.
+//! A Parquet file or folder, local or read by range, takes keys the same way and
+//! on the same terms (`ParquetKeys`), but nothing is re-read: its row groups whose
+//! min/max statistics hold no key value (or, past the cap, no part of the keys'
+//! range) are skipped, and over a network never fetched.
 //! Only a key that is one of the file's columns as is counts; a computed one, a
 //! text one (`groupMayHoldKeys`), or a group without statistics of the key's own
 //! kind, keeps every group. A SQL side
@@ -97,7 +98,7 @@ pub fn sqlDialect(env: *Env, stages: []const ast.Stage) ?Dialect {
     return info.dialect;
 }
 
-/// What a read at the head of `stages` takes keys as: its SQL dialect, or a local
+/// What a read at the head of `stages` takes keys as: its SQL dialect, or a
 /// Parquet file or folder, followed by nothing but filters and selects.
 pub const Want = union(enum) { sql: Dialect, parquet };
 
@@ -107,8 +108,10 @@ pub fn takerFor(env: *Env, stages: []const ast.Stage) !?Want {
     return null;
 }
 
-/// A local Parquet file, or a folder of them, read with nothing but filters and
-/// selects after it. A folder that cannot be listed is left to fail on its read.
+/// A Parquet file, or a folder of them, local or read by range, with nothing but
+/// filters and selects after it: skipped row groups are never fetched. FTP reads a
+/// file whole, so it gains nothing. A folder that cannot be listed is left to fail
+/// on its read.
 pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
     if (stages.len == 0 or stages[0].node != .read) return false;
     const rd = stages[0].node.read;
@@ -118,7 +121,7 @@ pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
         else => return false,
     };
     const path = rd.form.path;
-    if (csv.CsvReader.isUrl(path) or ftp.isUrl(path)) return false;
+    if (ftp.isUrl(path)) return false;
     if (!folder.isFolder(path)) return pqdecode.Reader.isPath(path);
     const fr = (connect.resolveFolder(env, path, stages[0].hints) catch return false) orelse return false;
     return fr.kind == .parquet;
