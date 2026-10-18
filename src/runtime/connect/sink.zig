@@ -254,7 +254,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return pw.sink();
             },
-            .delta => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(.delta).write_refused.? })),
+            .delta, .iceberg => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(std.meta.activeTag(env.write_opts)).write_refused.? })),
             .records => |opts| {
                 const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));

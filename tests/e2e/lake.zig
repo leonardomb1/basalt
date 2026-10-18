@@ -1,6 +1,8 @@
-//! End-to-end reads of Delta Lake tables: data files written by basalt, the log
-//! written as text (a checkpoint as Parquet, flat as basalt writes it or nested as
-//! delta-rs does), each read checked by `check` and `run` alike.
+//! End-to-end reads of Delta Lake and Iceberg tables: data files written by basalt,
+//! a Delta log written as text (a checkpoint as Parquet, flat as basalt writes it or
+//! nested as delta-rs does), Iceberg metadata as text and its manifests through the
+//! test Avro writer, plus tables delta-rs and pyiceberg wrote; each read checked by
+//! `check` and `run` alike.
 
 const std = @import("std");
 const basalt = @import("basalt");
@@ -381,4 +383,375 @@ test "a join's keys skip a Delta table's row groups, partition constants pass th
         try testing.expectEqualStrings("name,q\neve,x\n", r.out);
         try testing.expectEqual(@as(u64, 1), r.summary.pushdown.row_groups_skipped);
     }
+}
+
+const avrow = basalt.avrowrite;
+
+const ice_loc = "s3://bucket/wh/";
+
+const list_schema =
+    \\{"type":"record","name":"manifest_file","fields":[
+    \\{"name":"manifest_path","field-id":500,"type":"string"},{"name":"manifest_length","field-id":501,"type":"long"},
+    \\{"name":"partition_spec_id","field-id":502,"type":"int"},{"name":"content","field-id":517,"type":"int"},
+    \\{"name":"added_snapshot_id","field-id":503,"type":"long"},{"name":"key_metadata","field-id":519,"type":["null","bytes"]}]}
+;
+
+const entry_schema =
+    \\{"type":"record","name":"manifest_entry","fields":[
+    \\{"name":"status","field-id":0,"type":"int"},{"name":"snapshot_id","field-id":1,"type":["null","long"]},
+    \\{"name":"data_file","field-id":2,"type":{"type":"record","name":"r2","fields":[
+    \\ {"name":"content","field-id":134,"type":"int"},{"name":"file_path","field-id":100,"type":"string"},
+    \\ {"name":"file_format","field-id":101,"type":"string"},
+    \\ {"name":"partition","field-id":102,"type":{"type":"record","name":"r102","fields":[{"name":"region","field-id":1000,"type":["null","string"]}]}},
+    \\ {"name":"record_count","field-id":103,"type":"long"},{"name":"file_size_in_bytes","field-id":104,"type":"long"},
+    \\ {"name":"key_metadata","field-id":131,"type":["null","bytes"]}]}}]}
+;
+
+const region_spec = "[{\"source-id\":3,\"field-id\":1000,\"transform\":\"identity\",\"name\":\"region\"}]";
+
+/// One manifest entry: `file` the data file's path under the tmp dir, named in the
+/// manifest under the table's location unless `uri` names it otherwise.
+const Entry = struct {
+    status: i64 = 1,
+    file: []const u8,
+    uri: ?[]const u8 = null,
+    region: ?[]const u8 = null,
+    content: i64 = 0,
+    format: []const u8 = "PARQUET",
+    key: bool = false,
+};
+
+fn manifest(a: std.mem.Allocator, tmp: *std.testing.TmpDir, rel: []const u8, codec: avrow.Codec, entries: []const Entry, deletes: bool) !void {
+    var recs = std.array_list.Managed([]const u8).init(a);
+    for (entries) |en| {
+        var e = avrow.Encoder.init(a);
+        try e.long(en.status);
+        try e.long(1);
+        try e.long(1);
+        try e.long(en.content);
+        try e.string(en.uri orelse try std.mem.concat(a, u8, &.{ ice_loc, en.file }));
+        try e.string(en.format);
+        if (en.region) |r| {
+            try e.long(1);
+            try e.string(r);
+        } else try e.long(0);
+        try e.long(1);
+        const st = tmp.dir.statFile(en.file) catch null;
+        try e.long(if (st) |x| @intCast(x.size) else 10);
+        if (en.key) {
+            try e.long(1);
+            try e.string("k");
+        } else try e.long(0);
+        try recs.append(e.out.items);
+    }
+    const header = [_][2][]const u8{ .{ "partition-spec", region_spec }, .{ "partition-spec-id", "0" }, .{ "format-version", "2" }, .{ "content", if (deletes) "deletes" else "data" } };
+    try put(tmp, rel, try avrow.container(a, entry_schema, codec, recs.items, 2, &header));
+}
+
+const Listed = struct { rel: []const u8, content: i64 = 0, key: bool = false };
+
+fn manifestList(a: std.mem.Allocator, tmp: *std.testing.TmpDir, rel: []const u8, codec: avrow.Codec, ms: []const Listed) !void {
+    var recs = std.array_list.Managed([]const u8).init(a);
+    for (ms) |m| {
+        var e = avrow.Encoder.init(a);
+        try e.string(try std.mem.concat(a, u8, &.{ ice_loc, m.rel }));
+        try e.long(100);
+        try e.long(0);
+        try e.long(m.content);
+        try e.long(1);
+        if (m.key) {
+            try e.long(1);
+            try e.string("k");
+        } else try e.long(0);
+        try recs.append(e.out.items);
+    }
+    try put(tmp, rel, try avrow.container(a, list_schema, codec, recs.items, 1, &.{}));
+}
+
+const ice_schema = "{\"type\":\"struct\",\"schema-id\":0,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":false,\"type\":\"long\"},{\"id\":2,\"name\":\"name\",\"required\":false,\"type\":\"string\"},{\"id\":3,\"name\":\"region\",\"required\":false,\"type\":\"string\"}]}";
+
+fn snapshot(a: std.mem.Allocator, id: i64, list: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"snapshot-id\":{d},\"sequence-number\":1,\"timestamp-ms\":0,\"manifest-list\":\"{s}{s}\",\"summary\":{{\"operation\":\"append\"}},\"schema-id\":0}}", .{ id, ice_loc, list });
+}
+
+/// Metadata for table `t` (located at `s3://bucket/wh/t`) of format version `fv`,
+/// its `schemas` current at `schema_id`, `snaps` current at `cur`.
+fn metadata(a: std.mem.Allocator, tmp: *std.testing.TmpDir, t: []const u8, rel: []const u8, fv: u8, schemas: []const u8, schema_id: i64, snaps: []const []const u8, cur: i64) !void {
+    try put(tmp, try std.fmt.allocPrint(a, "{s}/metadata/{s}", .{ t, rel }), try std.fmt.allocPrint(a,
+        \\{{"format-version":{d},"table-uuid":"u","location":"{s}{s}","last-updated-ms":0,"last-column-id":3,
+        \\"schemas":[{s}],"current-schema-id":{d},
+        \\"partition-specs":[{{"spec-id":0,"fields":{s}}}],"default-spec-id":0,"last-partition-id":1000,
+        \\"properties":{{}},"current-snapshot-id":{d},"snapshots":[{s}]}}
+    , .{ fv, ice_loc, t, schemas, schema_id, region_spec, cur, try std.mem.join(a, ",", snaps) }));
+}
+
+/// Table `ice/` of two snapshots: 101 adds `a` (eu) and `b` (us); 202 deletes `a`,
+/// keeps `b` and adds `c` (us) under an `s3a://` path. A stale version hint names 1.
+fn iceTable(a: std.mem.Allocator, tmp: *std.testing.TmpDir) !void {
+    const sel = "CAST(id AS INT) AS id, name, region";
+    try dataFile(a, tmp, "ice/data/a.parquet", "id,name,region\n1,ann,eu\n2,bob,eu\n", sel);
+    try dataFile(a, tmp, "ice/data/b.parquet", "id,name,region\n3,cy,us\n", sel);
+    try dataFile(a, tmp, "ice/data/c.parquet", "id,name,region\n4,dee,us\n", sel);
+    try manifest(a, tmp, "ice/metadata/m1.avro", .deflate, &.{ .{ .file = "ice/data/a.parquet", .region = "eu" }, .{ .file = "ice/data/b.parquet", .region = "us" } }, false);
+    try manifest(a, tmp, "ice/metadata/m2a.avro", .null, &.{ .{ .status = 2, .file = "ice/data/a.parquet", .region = "eu" }, .{ .status = 0, .file = "ice/data/b.parquet", .region = "us" } }, false);
+    try manifest(a, tmp, "ice/metadata/m2b.avro", .zstandard, &.{.{ .file = "ice/data/c.parquet", .uri = "s3a://bucket/wh/ice/data/c.parquet", .region = "us" }}, false);
+    try manifestList(a, tmp, "ice/metadata/snap-101.avro", .snappy, &.{.{ .rel = "ice/metadata/m1.avro" }});
+    try manifestList(a, tmp, "ice/metadata/snap-202.avro", .null, &.{ .{ .rel = "ice/metadata/m2a.avro" }, .{ .rel = "ice/metadata/m2b.avro" } });
+    const s1 = try snapshot(a, 101, "ice/metadata/snap-101.avro");
+    const s2 = try snapshot(a, 202, "ice/metadata/snap-202.avro");
+    try metadata(a, tmp, "ice", "v1.metadata.json", 2, ice_schema, 0, &.{s1}, 101);
+    try metadata(a, tmp, "ice", "v2.metadata.json", 2, ice_schema, 0, &.{ s1, s2 }, 202);
+    try put(tmp, "ice/metadata/version-hint.text", "1\n");
+}
+
+test "an Iceberg folder reads its current snapshot's live files; snapshot_id and a metadata path read others" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+
+    try testing.expectEqualStrings("id,name,region\n3,cy,us\n4,dee,us\n", try rows(a, &tmp, "SELECT * FROM '$B/ice/' ORDER BY id", 1));
+    try testing.expectEqualStrings("id,name,region\n3,cy,us\n4,dee,us\n", try rows(a, &tmp, "SELECT * FROM '$B/ice/' WITH (format = 'iceberg') ORDER BY id", 1));
+    try testing.expectEqualStrings("n\n4\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/ice/' WITH (format = 'parquet')", 1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' WITH (snapshot_id = 101) ORDER BY id", 1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' WITH (snapshot_id = '101') ORDER BY id", 1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/v1.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
+    try testing.expectEqualStrings("id\n3\n4\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/v2.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
+    try testing.expectEqualStrings("n\n2\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/ice/'", 1));
+    try testing.expectEqualStrings("fv\n2\n", try rows(a, &tmp, "SELECT \"format-version\" AS fv FROM '$B/ice/metadata/v1.metadata.json'", 1));
+    try testing.expectEqualStrings("name\ndee\n", try rows(a, &tmp, "SELECT name FROM '$B/ice/' WHERE id = 4", 1));
+}
+
+test "an Iceberg table's lanes return what one lane does, and lanes run" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    for ([_][]const u8{
+        "SELECT region, SUM(id) AS s FROM '$B/ice/' GROUP BY region ORDER BY region",
+        "SELECT DISTINCT name FROM '$B/ice/' WITH (snapshot_id = 101) ORDER BY name",
+        "WITH old AS (SELECT * FROM '$B/ice/' WITH (snapshot_id = 101)) SELECT region, COUNT(*) AS c FROM old GROUP BY region ORDER BY region",
+        "SELECT region, COUNT(*) AS c FROM '$B/ice/metadata/v1.metadata.json' WITH (format = 'iceberg') GROUP BY region ORDER BY region",
+    }, [_]usize{ 1, 3, 2, 2 }) |q, n| {
+        const one = try rows(a, &tmp, q, 1);
+        const r = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{q}), 4);
+        if (r.err != null) std.debug.print("{s}: {s}\n", .{ q, r.msg });
+        try testing.expect(r.err == null);
+        try testing.expectEqualStrings(one, r.out);
+        try testing.expectEqual(n + 1, std.mem.count(u8, one, "\n"));
+        try testing.expect(r.summary.threads > 1);
+    }
+}
+
+test "Iceberg identity partitions: a file lacking the column reads the manifest's value, a filter skips files unopened" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try dataFile(a, &tmp, "hv/data/region=eu/a.parquet", "id,name\n1,ann\n2,bob\n", "CAST(id AS INT) AS id, name");
+    try dataFile(a, &tmp, "hv/data/region=us/b.parquet", "id,name\n3,cy\n", "CAST(id AS INT) AS id, name");
+    try dataFile(a, &tmp, "hv/data/region=null/c.parquet", "id,name\n4,dee\n", "CAST(id AS INT) AS id, name");
+    try manifest(a, &tmp, "hv/metadata/m1.avro", .snappy, &.{
+        .{ .file = "hv/data/region=eu/a.parquet", .region = "eu" },
+        .{ .file = "hv/data/region=us/b.parquet", .region = "us" },
+        .{ .file = "hv/data/region=null/c.parquet" },
+    }, false);
+    try manifestList(a, &tmp, "hv/metadata/snap-7.avro", .deflate, &.{.{ .rel = "hv/metadata/m1.avro" }});
+    try metadata(a, &tmp, "hv", "v1.metadata.json", 1, ice_schema, 0, &.{try snapshot(a, 7, "hv/metadata/snap-7.avro")}, 7);
+
+    try testing.expectEqualStrings("id,name,region\n1,ann,eu\n2,bob,eu\n3,cy,us\n4,dee,\n", try rows(a, &tmp, "SELECT * FROM '$B/hv/' ORDER BY id", 1));
+    try testing.expectEqualStrings("region,c\n,1\neu,2\nus,1\n", try rows(a, &tmp, "SELECT region, COUNT(*) AS c FROM '$B/hv/' GROUP BY region ORDER BY region NULLS FIRST", 1));
+    const pruned = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/hv/' WHERE region = 'us';", 1);
+    try testing.expect(pruned.err == null);
+    try testing.expectEqualStrings("id\n3\n", pruned.out);
+    try testing.expectEqual(@as(u64, 1), pruned.summary.pushdown.row_groups);
+    try testing.expectEqualStrings("id\n4\n", try rows(a, &tmp, "SELECT id FROM '$B/hv/' WHERE region IS NULL", 1));
+}
+
+test "the Iceberg metadata read: the highest version listed, gzip forms, a tie refused, an empty table" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    const v2 = try tmp.dir.readFileAlloc(a, "ice/metadata/v2.metadata.json", 1 << 20);
+    const v1 = try tmp.dir.readFileAlloc(a, "ice/metadata/v1.metadata.json", 1 << 20);
+    try put(&tmp, "ice/metadata/v3.gz.metadata.json", try basalt.codec.compress(a, .gzip, v1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' ORDER BY id", 1));
+    try put(&tmp, "ice/metadata/00004-6f1e.metadata.json.gz", try basalt.codec.compress(a, .gzip, v2));
+    try testing.expectEqualStrings("id\n3\n4\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' ORDER BY id", 1));
+    try put(&tmp, "ice/metadata/00004-9a2b.metadata.json", v1);
+    try refused(a, &tmp, "SELECT id FROM '$B/ice/'", "has two metadata files of version 4", false);
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/00004-9a2b.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
+
+    try metadata(a, &tmp, "empty", "v1.metadata.json", 2, ice_schema, 0, &.{}, -1);
+    try testing.expectEqualStrings("n\n0\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/empty/'", 1));
+    try testing.expectEqualStrings("id,region\n", try rows(a, &tmp, "SELECT id, region FROM '$B/empty/' WHERE id > 0", 4));
+}
+
+test "a table pyiceberg wrote: its Avro shapes, a delete of one partition, a NULL partition, time travel, read from a copy" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (basalt.fixtures.iceberg_py) |f| try put(&tmp, try std.mem.concat(a, u8, &.{ "py/", f[0] }), f[1]);
+    try testing.expectEqualStrings(
+        \\id,name,day,amt,geo.lat,geo.city,tags
+        \\3,cy,2026-01-02,,,sp,[]
+        \\4,dee,2026-01-02,4.00,,,"[""x""]"
+        \\5,eve,,5.55,,,
+        \\
+    , try rows(a, &tmp, "SELECT * FROM '$B/py/' ORDER BY id", 1));
+    try testing.expectEqualStrings("n\n5\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/py/' WITH (snapshot_id = 4854212885010183066)", 1));
+    try testing.expectEqualStrings("id,day\n1,2026-01-01\n2,2026-01-01\n3,2026-01-02\n", try rows(a, &tmp, "SELECT id, day FROM '$B/py/' WITH (snapshot_id = 2072416895968069595) ORDER BY id", 1));
+    try testing.expectEqualStrings("s\n5.55\n", try rows(a, &tmp, "SELECT SUM(amt) AS s FROM '$B/py/' WHERE day IS NULL", 1));
+    const pruned = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/py/' WHERE day = CAST('2026-01-02' AS DATE) ORDER BY id;", 1);
+    try testing.expect(pruned.err == null);
+    try testing.expectEqualStrings("id\n3\n4\n", pruned.out);
+    const q = "SELECT day, COUNT(*) AS n, SUM(amt) AS s FROM '$B/py/' WITH (snapshot_id = 4854212885010183066) GROUP BY day ORDER BY day";
+    const one = try rows(a, &tmp, q, 1);
+    try testing.expectEqualStrings("day,n,s\n2026-01-01,2,3.75\n2026-01-02,2,4.00\n,1,5.55\n", one);
+    const four = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{q}), 4);
+    try testing.expectEqualStrings(one, four.out);
+}
+
+test "Iceberg refusals name the delete files, rename, format or snapshot a read cannot honour" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    const s1 = try snapshot(a, 101, "ice/metadata/snap-101.avro");
+    const s2 = try snapshot(a, 202, "ice/metadata/snap-202.avro");
+    const s3 = try snapshot(a, 303, "ice/metadata/snap-303.avro");
+
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/' WITH (snapshot_id = 999)", "has no snapshot 999 (snapshots: 101, 202)", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/' WITH (version = 1)", "`version` pins a Delta table to a commit; `", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/' WITH (snapshot_id = 'latest')", "`snapshot_id` is an Iceberg snapshot's id", false);
+
+    try manifest(a, &tmp, "ice/metadata/d1.avro", .null, &.{.{ .file = "ice/data/del.parquet", .content = 1 }}, true);
+    try manifestList(a, &tmp, "ice/metadata/snap-303.avro", .null, &.{ .{ .rel = "ice/metadata/m2a.avro" }, .{ .rel = "ice/metadata/d1.avro", .content = 1 } });
+    try metadata(a, &tmp, "ice", "v3.metadata.json", 2, ice_schema, 0, &.{ s1, s2, s3 }, 303);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "has delete files in its snapshot (`data/del.parquet`, position deletes); basalt does not apply row-level deletes", false);
+    try testing.expectEqualStrings("n\n2\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/ice/' WITH (snapshot_id = 202)", 1));
+    try manifest(a, &tmp, "ice/metadata/d1.avro", .null, &.{.{ .status = 2, .file = "ice/data/del.parquet", .content = 1 }}, true);
+    try testing.expectEqualStrings("n\n1\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/ice/'", 1));
+
+    for ([_]struct { Entry, []const u8 }{
+        .{ .{ .file = "ice/data/x.orc", .format = "ORC" }, "has data file `data/x.orc` in ORC; basalt reads Iceberg data files in Parquet" },
+        .{ .{ .file = "ice/data/e.parquet", .content = 2 }, "(`data/e.parquet`, equality deletes)" },
+        .{ .{ .file = "ice/data/b.parquet", .key = true }, "is encrypted (key_metadata on `data/b.parquet`)" },
+    }) |c| {
+        try manifest(a, &tmp, "ice/metadata/d1.avro", .null, &.{c[0]}, false);
+        try manifestList(a, &tmp, "ice/metadata/snap-303.avro", .null, &.{.{ .rel = "ice/metadata/d1.avro" }});
+        try refused(a, &tmp, "SELECT * FROM '$B/ice/'", c[1], false);
+    }
+    try put(&tmp, "ice/metadata/d1.avro", try avrow.container(a, entry_schema, .null, &.{}, 1, &.{.{ "avro.codec", "bzip2" }}));
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "has manifest `metadata/d1.avro` written with the Avro codec `bzip2`; basalt reads null, deflate, snappy and zstandard", false);
+    try put(&tmp, "ice/metadata/d1.avro", "Obj\x01\x02garbage");
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "has corrupt Avro in `metadata/d1.avro`", false);
+
+    try metadata(a, &tmp, "ice", "v3.metadata.json", 4, ice_schema, 0, &.{s2}, 202);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "is format version 4; basalt reads Iceberg format versions 1 to 3", false);
+    const renamed = "{\"type\":\"struct\",\"schema-id\":1,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":false,\"type\":\"long\"},{\"id\":2,\"name\":\"who\",\"required\":false,\"type\":\"string\"},{\"id\":3,\"name\":\"region\",\"required\":false,\"type\":\"string\"}]}";
+    try metadata(a, &tmp, "ice", "v3.metadata.json", 2, try std.mem.join(a, ",", &.{ ice_schema, renamed }), 1, &.{s2}, 202);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "has a column `who` renamed from `name`; basalt reads Iceberg data files by column name", false);
+    const wide = "{\"type\":\"struct\",\"schema-id\":1,\"fields\":[{\"id\":1,\"name\":\"id\",\"required\":false,\"type\":\"string\"},{\"id\":2,\"name\":\"name\",\"required\":false,\"type\":\"string\"},{\"id\":3,\"name\":\"region\",\"required\":false,\"type\":\"string\"},{\"id\":4,\"name\":\"extra\",\"required\":false,\"type\":\"date\"}]}";
+    try metadata(a, &tmp, "ice", "v3.metadata.json", 2, try std.mem.join(a, ",", &.{ ice_schema, wide }), 1, &.{s2}, 202);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/'", "has file `data/b.parquet` whose column `id` is int, not string as in the table's schema", true);
+    try tmp.dir.deleteFile("ice/metadata/v3.metadata.json");
+
+    try dataFile(a, &tmp, "plain/x.parquet", "id\n1\n", "CAST(id AS INT) AS id");
+    try refused(a, &tmp, "SELECT * FROM '$B/plain/' WITH (format = 'iceberg')", "has no metadata/*.metadata.json: it is not an Iceberg table", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/plain/' WITH (snapshot_id = 1)", "`snapshot_id` pins an Iceberg table to a snapshot", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/plain/x.parquet' WITH (format = 'iceberg')", "an Iceberg table is read from its root folder", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/' WITH (format = 'delta')", "has no _delta_log/: it is not a Delta table", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/ice/' WITH (format = 'parquet', snapshot_id = 1)", "read option `snapshot_id` does not apply to a Parquet read", false);
+    const w = try runIn(a, &tmp, "LOAD INTO '$B/w/' WITH (format = 'iceberg') AS SELECT 1 AS a;", 1);
+    try testing.expect(w.err != null and w.check_msg != null);
+    try testing.expect(std.mem.indexOf(u8, w.msg, "basalt reads Iceberg tables; it does not write them") != null);
+}
+
+test "EXPLAIN names an Iceberg scan with its snapshot and file count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const script = try std.fmt.allocPrint(a, "EXPLAIN LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/ice/' WITH (snapshot_id = 101);", .{ base, base });
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, script, &pd);
+    var adiag = analyze.Diag{};
+    const plan = try analyze.analyze(a, prog, &adiag);
+    var aw = std.Io.Writer.Allocating.init(a);
+    try analyze.render(plan, &aw.writer);
+    const want = try std.fmt.allocPrint(a, "iceberg {s}/ice/ (snapshot 101, 2 files)", .{base});
+    if (std.mem.indexOf(u8, aw.written(), want) == null) {
+        std.debug.print("want `{s}` in:\n{s}\n", .{ want, aw.written() });
+        return error.TestUnexpectedResult;
+    }
+}
+
+/// Every file under `dir` in the tmp dir, as (path, bytes) served at `/<dir>/...`.
+fn served(a: std.mem.Allocator, tmp: *std.testing.TmpDir, dir: []const u8) ![]const [2][]const u8 {
+    var out = std.array_list.Managed([2][]const u8).init(a);
+    var d = try tmp.dir.openDir(dir, .{ .iterate = true });
+    defer d.close();
+    var w = try d.walk(a);
+    defer w.deinit();
+    while (try w.next()) |en| {
+        if (en.kind != .file) continue;
+        const rel = try std.mem.concat(a, u8, &.{ dir, "/", en.path });
+        try out.append(.{ try std.mem.concat(a, u8, &.{ "/", rel }), try tmp.dir.readFileAlloc(a, rel, 1 << 24) });
+    }
+    return out.items;
+}
+
+test "an Iceberg table over http: its version hint, its paths rebased onto the URL, lanes and ranged reads" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    try put(&tmp, "ice/metadata/version-hint.text", "2\n");
+    const local = try rows(a, &tmp, "SELECT region, name, id FROM '$B/ice/' ORDER BY id", 1);
+    var srv: basalt.objstore.RangeServer = undefined;
+    try srv.startFiles(try served(a, &tmp, "ice"));
+    defer srv.stop();
+    const root = try srv.url(a, "/ice/");
+    for ([_]usize{ 1, 4 }) |threads| {
+        const r = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT region, name, id FROM '{s}' ORDER BY id;", .{root}), threads);
+        if (r.err != null) std.debug.print("{s}\n", .{r.msg});
+        try testing.expect(r.err == null);
+        try testing.expectEqualStrings(local, r.out);
+    }
+    const agg = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT region, COUNT(*) AS c FROM '{s}' WITH (snapshot_id = 101) GROUP BY region ORDER BY region;", .{root}), 4);
+    try testing.expect(agg.err == null);
+    try testing.expectEqualStrings("region,c\neu,2\nus,1\n", agg.out);
+    try testing.expect(agg.summary.threads > 1);
+    try testing.expect(srv.partial.load(.seq_cst) > 0);
+    const direct = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT id FROM '{s}metadata/v1.metadata.json' WITH (format = 'iceberg') ORDER BY id;", .{root}), 1);
+    try testing.expect(direct.err == null);
+    try testing.expectEqualStrings("id\n1\n2\n3\n", direct.out);
+
+    var bare: basalt.objstore.RangeServer = undefined;
+    const files = try served(a, &tmp, "ice");
+    var kept = std.array_list.Managed([2][]const u8).init(a);
+    for (files) |f| if (!std.mem.endsWith(u8, f[0], "version-hint.text")) try kept.append(f);
+    try bare.startFiles(kept.items);
+    defer bare.stop();
+    const r = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT id FROM '{s}' WITH (format = 'iceberg');", .{try bare.url(a, "/ice/")}), 1);
+    try testing.expect(r.err != null);
+    try testing.expect(std.mem.indexOf(u8, r.msg, "has no metadata/version-hint.text, which an http(s) URL needs") != null);
 }

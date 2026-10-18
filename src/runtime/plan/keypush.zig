@@ -41,6 +41,7 @@ const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const csv = @import("../../format/csv.zig");
 const folder = @import("../../connect/folder.zig");
+const lake = @import("../../format/lake/table.zig");
 const ftp = @import("../../store/ftp.zig");
 const op = @import("../../exec/op.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
@@ -122,7 +123,7 @@ pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
     };
     const path = rd.form.path;
     if (ftp.isUrl(path)) return false;
-    if (!folder.isFolder(path)) return pqdecode.Reader.isPath(path);
+    if (!lake.isTablePath(path, .iceberg)) return pqdecode.Reader.isPath(path);
     const fr = (connect.resolveFolder(env, path, stages[0].hints) catch return false) orelse return false;
     return fr.kind == .parquet;
 }

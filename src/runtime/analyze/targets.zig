@@ -80,18 +80,25 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     return fail(diag, "unknown format `{s}` (" ++ formats.names_list ++ ")", .{s});
 }
 
-/// The version a lake table read is pinned to: `version = N`, a commit number.
+/// What a lake table read is pinned to: `version = N`, a Delta commit number, or
+/// `snapshot_id = N`, an Iceberg snapshot's id.
 pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
+    var at = lake.At{};
     for (hints) |h| {
-        if (!std.mem.eql(u8, h.key, "version")) continue;
-        const n: ?u64 = switch (h.value) {
-            .int => |i| if (i >= 0) @intCast(i) else null,
-            .str, .ident => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        const n: ?i64 = switch (h.value) {
+            .int => |i| i,
+            .str, .ident => |s| std.fmt.parseInt(i64, s, 10) catch null,
             .flag => null,
         };
-        return .{ .version = n orelse return fail(diag, "`version` is a Delta table's commit number, a whole number from 0", .{}) };
+        if (std.mem.eql(u8, h.key, "version")) {
+            const v = n orelse -1;
+            if (v < 0) return fail(diag, "`version` is a Delta table's commit number, a whole number from 0", .{});
+            at.version = @intCast(v);
+        } else if (std.mem.eql(u8, h.key, "snapshot_id")) {
+            at.snapshot_id = n orelse return fail(diag, "`snapshot_id` is an Iceberg snapshot's id, a whole number", .{});
+        }
     }
-    return .{};
+    return at;
 }
 
 /// How a JSON read cuts its input into rows: `format = 'ndjson'` (or `'jsonl'`)
@@ -188,6 +195,7 @@ pub const WriteOptions = union(FileFormat) {
     xml: xmlwrite.Names,
     records: recordswrite.Options,
     delta: void,
+    iceberg: void,
 };
 
 pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
@@ -206,6 +214,7 @@ pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!Wr
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
         .delta => .delta,
+        .iceberg => .iceberg,
     };
 }
 
@@ -303,6 +312,7 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (std.mem.endsWith(u8, path, "/")) return null;
     if (explicit == .delta) return "a Delta table is read from its root folder: end the path with `/`";
+    if (explicit == .iceberg) return if (lake.isTablePath(path, .iceberg)) null else "an Iceberg table is read from its root folder (end the path with `/`) or from a metadata file (`.metadata.json`)";
 
     if (csv.splitArchive(path) != null) return null;
 
@@ -362,11 +372,12 @@ pub fn laneHints(st: ast.Stage) bool {
             if (st.node != .read or st.node.read.form != .path) return false;
             var d = Diag{};
             const f = (formatFromHints(st.hints, &d) catch return false) orelse return false;
-            const in_folder = folder.isFolder(st.node.read.form.path) and (f == .parquet or f == .delta);
-            if (!in_folder and f != readFormat(st.node.read.form.path, null)) return false;
+            const p = st.node.read.form.path;
+            const in_folder = (folder.isFolder(p) and f == .parquet) or (lake.Kind.of(f) != null and lake.isTablePath(p, lake.Kind.of(f)));
+            if (!in_folder and f != readFormat(p, null)) return false;
             continue;
         }
-        if (std.mem.eql(u8, h.key, "version") and st.node == .read and st.node.read.form == .path and folder.isFolder(st.node.read.form.path)) continue;
+        if ((std.mem.eql(u8, h.key, "version") or std.mem.eql(u8, h.key, "snapshot_id")) and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path, .iceberg)) continue;
         return false;
     }
     return true;
@@ -419,7 +430,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
             if (offlineTable(arena, rd.form.path, hints) catch null) |t| return t.layout.schema;
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;
-            if (explicit == .delta) return null;
+            if (lake.Kind.of(explicit) != null) return null;
             const all = folder.list(arena, rd.form.path) catch return null;
             if (explicit == .json or (explicit == null and std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .json }))) {
                 const files = folder.only(arena, all, .json) catch return null;
@@ -476,14 +487,15 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
 /// A local lake table resolved as a run would, for `check` to type and to refuse
 /// what a run refuses; null for a plain folder, a remote one, or one not there yet.
 pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const ast.Hint) !?*const lake.Resolved {
-    if (!folder.isFolder(path) or std.mem.indexOf(u8, path, "://") != null) return null;
     var d = Diag{};
     const explicit = formatFromHints(hints, &d) catch return null;
-    if (explicit != null and explicit.? != .delta) return null;
+    const named = lake.Kind.of(explicit);
+    if (explicit != null and named == null) return null;
+    if (!lake.isTablePath(path, named) or std.mem.indexOf(u8, path, "://") != null) return null;
     std.fs.cwd().access(path, .{}) catch return null;
     const at = lakeAt(hints, &d) catch return null;
-    const kind = (lake.detect(arena, path) catch return null) orelse
-        (if (explicit == .delta) lake.Kind.delta else if (at.version != null) return lake.notPinnable(path) else return null);
+    const kind = named orelse (lake.detect(arena, path) catch return null) orelse
+        (if (at.pinned()) return lake.notPinnable(path, at) else return null);
     return lake.resolve(arena, path, kind, at) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
 }
 

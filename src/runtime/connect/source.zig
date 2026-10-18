@@ -122,13 +122,15 @@ pub fn openSourceProjected(
     return openSourceCols(env, rd, hints, project);
 }
 
-/// A folder's format and files, or null when `path` is not a folder. Without
+/// A folder's format and files, or null when `path` is not a folder (nor, with
+/// `format = 'iceberg'`, an Iceberg metadata file). Without
 /// `format` the listing decides; a mix of Parquet and CSV is refused. Remembered
 /// until the source opens, since the read is resolved twice and listing is a round trip.
 pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?FolderRead {
-    if (!folder.isFolder(path)) return null;
+    if (!lake.isTablePath(path, .iceberg)) return null;
     var fdiag = analyze.Diag{};
     const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
+    if (!lake.isTablePath(path, lake.Kind.of(want))) return null;
     const at = analyze.lakeAt(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
     return resolveFolderFmt(env, path, want, at);
 }
@@ -137,7 +139,7 @@ pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?Fol
 /// the table's schema, whether `format` names it or not: read as a plain folder it
 /// would return the rows its log removed. `format = 'parquet'` reads the files plain.
 pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
-    if (!folder.isFolder(path)) return null;
+    if (!lake.isTablePath(path, lake.Kind.of(want))) return null;
     if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path) and m.want == want and m.at.eql(at)) return m.read;
     const read = try resolveTable(env, path, want, at) orelse try resolvePlain(env, path, want, at);
     env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .want = want, .at = at, .read = read };
@@ -145,8 +147,8 @@ pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat, 
 }
 
 fn resolveTable(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
-    if (want != null and want.? != .delta) return null;
-    const kind = if (want == .delta) lake.Kind.delta else (lake.detect(env.arena, path) catch |e|
+    if (want != null and lake.Kind.of(want) == null) return null;
+    const kind = lake.Kind.of(want) orelse (lake.detect(env.arena, path) catch |e|
         return listFailed(env, path, e)) orelse return null;
     const t = lake.resolve(env.arena, path, kind, at) catch |e| {
         if (eval.takeFailure(e)) |why| return planErrT(env.diag, e, try env.arena.dupe(u8, why));
@@ -164,8 +166,8 @@ fn listFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
 }
 
 fn resolvePlain(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !FolderRead {
-    if (at.version != null) {
-        const e = lake.notPinnable(path);
+    if (at.pinned()) {
+        const e = lake.notPinnable(path, at);
         return planErrT(env.diag, e, try env.arena.dupe(u8, eval.takeFailure(e).?));
     }
     const all = folder.list(env.arena, path) catch |e| return listFailed(env, path, e);
@@ -344,7 +346,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .json => return openJson(env, rd.form.path, f.files, hints),
             .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
             .csv => {},
-            .arrow, .xlsx, .records, .delta => unreachable,
+            .arrow, .xlsx, .records, .delta, .iceberg => unreachable,
         };
         switch (analyze.readFormat(rd.form.path, want)) {
             .parquet => {
@@ -357,7 +359,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .xlsx => return openXlsx(env, rd.form.path, hints),
             .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
             .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
-            .records, .delta => unreachable,
+            .records, .delta, .iceberg => unreachable,
             .csv => {},
         }
         var ddiag = analyze.Diag{};

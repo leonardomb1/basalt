@@ -37,6 +37,7 @@ const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const table_builtins = @import("../connect/table_builtins.zig");
 const folder = @import("../connect/folder.zig");
+const lake = @import("../format/lake/table.zig");
 const pqwrite = @import("../format/parquet/write.zig");
 const arrowread = @import("../format/arrow/read.zig");
 const arrow = @import("../format/arrow/write.zig");
@@ -183,9 +184,11 @@ pub fn isRecordRead(rd: ast.Read) bool {
     return rd.form == .builtin and table_builtins.of(rd.form.builtin).mode != null;
 }
 
+/// A folder read, or one of a `.metadata.json` file, which `resolveFolder` reads as
+/// an Iceberg table under `format = 'iceberg'`.
 pub fn isFolderRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
-    return rd.form == .path and folder.isFolder(rd.form.path);
+    return rd.form == .path and lake.isTablePath(rd.form.path, .iceberg);
 }
 
 /// One Parquet file, local or remote; `parquetSplit` decides whether it divides.

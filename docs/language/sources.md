@@ -48,7 +48,9 @@ first file's columns, as a REST read's later pages do.
 
 A folder holding a `_delta_log/` is read as the Delta table it is — its live
 files, typed by its schema, `WITH (version = N)` for an earlier version — not as
-its files ([Delta Lake](formats.md#delta-lake)).
+its files ([Delta Lake](formats.md#delta-lake)). One holding
+`metadata/*.metadata.json` is read as its Iceberg table, `WITH (snapshot_id = N)`
+for an earlier snapshot ([Apache Iceberg](formats.md#apache-iceberg)).
 
 ## JSON and NDJSON
 

@@ -15,6 +15,7 @@ const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const filterBounds = @import("../plan.zig").filterBounds;
 const folder = @import("../../connect/folder.zig");
+const lake = @import("../../format/lake/table.zig");
 const openItem = @import("agg.zig").openItem;
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
@@ -74,7 +75,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
 
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
-    if (folder.isFolder(path)) {
+    if (lake.isTablePath(path, .iceberg)) {
         const fr = (try connect_mod.resolveFolder(env, path, hints)) orelse return null;
         if (fr.kind != .parquet) return null;
         if (fr.table) |t| return tableSplit(env, t.layout, path, push_stages);

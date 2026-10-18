@@ -675,19 +675,30 @@ pub const FakeServer = struct {
 /// An HTTP/1.1 server of one file's bytes for range-read tests: HEAD answers its
 /// length, a GET with `Range: bytes=a-b` its slice as a 206, or the whole file as a
 /// 200 when `ignore_range` is set, as some servers do. One request per connection,
-/// served in turn. Counts the 206 and 200 bodies sent.
+/// served in turn. Counts the 206 and 200 bodies sent. `startFiles` serves several
+/// files, each at its own path, and a 404 for any other.
 pub const RangeServer = struct {
     listener: std.net.Server,
     data: []const u8,
     ignore_range: bool,
+    files: []const [2][]const u8 = &.{},
     thread: std.Thread = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
     partial: std.atomic.Value(usize) = .init(0),
     whole: std.atomic.Value(usize) = .init(0),
 
     pub fn start(self: *RangeServer, data: []const u8, ignore_range: bool) !void {
+        return self.begin(data, ignore_range, &.{});
+    }
+
+    /// `files` as (path, bytes) pairs, each path starting `/`.
+    pub fn startFiles(self: *RangeServer, files: []const [2][]const u8) !void {
+        return self.begin("", false, files);
+    }
+
+    fn begin(self: *RangeServer, data: []const u8, ignore_range: bool, files: []const [2][]const u8) !void {
         const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 64 }), .data = data, .ignore_range = ignore_range };
+        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 64 }), .data = data, .ignore_range = ignore_range, .files = files };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
     }
 
@@ -722,20 +733,37 @@ pub const RangeServer = struct {
             n += got;
         };
         var hdr: [256]u8 = undefined;
+        const data = self.find(head[0..end]) orelse
+            return stream.writeAll("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         if (std.mem.startsWith(u8, head[0..end], "HEAD ")) {
-            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n", .{self.data.len});
+            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n", .{data.len});
             return stream.writeAll(text);
         }
-        if (!self.ignore_range) if (rangeOf(head[0..end])) |r| if (r[0] <= r[1] and r[1] < self.data.len) {
+        if (!self.ignore_range) if (rangeOf(head[0..end])) |r| if (r[0] <= r[1] and r[1] < data.len) {
             _ = self.partial.fetchAdd(1, .seq_cst);
-            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {d}-{d}/{d}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ r[0], r[1], self.data.len, r[1] - r[0] + 1 });
+            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {d}-{d}/{d}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ r[0], r[1], data.len, r[1] - r[0] + 1 });
             try stream.writeAll(text);
-            return stream.writeAll(self.data[r[0] .. r[1] + 1]);
+            return stream.writeAll(data[r[0] .. r[1] + 1]);
         };
         _ = self.whole.fetchAdd(1, .seq_cst);
-        const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{self.data.len});
+        const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{data.len});
         try stream.writeAll(text);
-        return stream.writeAll(self.data);
+        return stream.writeAll(data);
+    }
+
+    /// The bytes a request's path names: the one file, or among `files` the one at
+    /// that path, its `%XX` escapes decoded.
+    fn find(self: *RangeServer, head: []const u8) ?[]const u8 {
+        if (self.files.len == 0) return self.data;
+        const sp = std.mem.indexOfScalar(u8, head, ' ') orelse return null;
+        const rest = head[sp + 1 ..];
+        const raw = rest[0 .. std.mem.indexOfScalar(u8, rest, ' ') orelse return null];
+        var buf: [1024]u8 = undefined;
+        if (raw.len > buf.len) return null;
+        @memcpy(buf[0..raw.len], raw);
+        const path = std.Uri.percentDecodeInPlace(buf[0..raw.len]);
+        for (self.files) |f| if (std.mem.eql(u8, f[0], path)) return f[1];
+        return null;
     }
 
     fn rangeOf(head: []const u8) ?[2]usize {

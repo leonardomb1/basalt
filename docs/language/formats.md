@@ -108,6 +108,56 @@ reads the folder's files plain, removed ones included. EXPLAIN and `check` name
 the version and file count of the table they read, and `check` types a local
 table from its log. basalt reads Delta tables; it does not write them.
 
+## Apache Iceberg
+
+A folder holding `metadata/*.metadata.json` is an Iceberg table, and a folder
+read of it reads the table: the data files its current snapshot keeps live, by
+column name, typed by the table's schema. Read plain, the folder would also
+return the rows of files a later snapshot deleted, so a folder read looks for the
+metadata, as it does for a Delta log, with or without `WITH (format = 'iceberg')`.
+A folder holding both (Delta UniForm) reads as Delta. A metadata file itself is
+read as the table it describes under `format = 'iceberg'`, and as plain JSON
+without it.
+
+```sql
+SELECT region, count(*) AS n FROM 's3://lake/events/' GROUP BY region;
+
+SELECT count(*) AS n_then FROM 's3://lake/events/' WITH (snapshot_id = 4854212885010183066);
+
+SELECT * FROM 's3://lake/events/metadata/00012-5a1c.metadata.json' WITH (format = 'iceberg');
+```
+
+The current metadata is the highest-numbered `metadata/` file
+(`v12.metadata.json`, `00012-<uuid>.metadata.json`, or their `.gz` forms). That
+is exact for a table a Hadoop catalog keeps; for a catalog-held table (Glue,
+REST, a database) it is the newest file written, so naming the metadata file the
+catalog points at reads exactly what the catalog does, and two files of the same
+number are refused asking for that. Over `https://`, which cannot be listed, the
+root's `metadata/version-hint.text` names the file, or the file is named directly.
+`WITH (snapshot_id = N)` reads an older snapshot the metadata still holds.
+
+From the snapshot come its manifest list and manifests, Avro files basalt reads
+itself (null, deflate, snappy and zstandard blocks), and from them the data files
+whose entries are ADDED or EXISTING. A path under the table's `location` is read
+under the root given, so a table copied or moved elsewhere — a local copy of an
+`s3://` table, say — reads its own files; `s3a://` and `abfss://` paths read as
+`s3://` and `az://`. The schema is the metadata's: a column a file lacks reads as
+NULL; an identity-partitioned one takes the file's value from its manifest, and a
+filter on it skips the files it rules out unopened. Iceberg types map as Parquet's
+do — `int` and `long` to `INT`, `timestamptz` to `TIMESTAMP`, `uuid` and `fixed`
+to `BYTES`, a struct to its dotted columns, a list or map to one JSON text column.
+Lanes, projection, row-group statistics, a join's keys and ranged reads apply as
+for any Parquet folder.
+
+Refused rather than read into wrong rows: a snapshot with live delete files
+(position or equality deletes, deletion vectors), which basalt does not apply; a
+column renamed, or dropped and added again under its old name, since files are
+read by name, not field id; a column with an `initial-default`; encrypted files;
+data files in ORC or Avro; `variant`, `geometry`, `geography` and nanosecond
+timestamps; format versions past 3. EXPLAIN and `check` name the snapshot and
+file count of the table they read, and `check` types a local table from its
+metadata. basalt reads Iceberg tables; it does not write them.
+
 ## JSON
 
 `LOAD INTO 'events.ndjson'` (also `.jsonl` and `.json`) writes a JSON object a

@@ -5,9 +5,9 @@
 //! Parquet `Layout`. Everything a Parquet folder does then applies: lanes,
 //! projection, row-group statistics and ranged reads.
 //!
-//! Each format reads its own log (`delta.zig`); what they share is here: how a
-//! path in a log maps to one basalt reads, how a partition value's text becomes a
-//! typed value, and reading a log file whole wherever it lives.
+//! Each format reads its own log (`delta.zig`, `iceberg.zig`); what they share is
+//! here: how a path in a log maps to one basalt reads, how a partition value's text
+//! becomes a typed value, and reading a log file whole wherever it lives.
 
 const std = @import("std");
 const Bytes = @import("../bytes.zig").Bytes;
@@ -16,28 +16,43 @@ const Value = @import("../../exec/value.zig").Value;
 const azure = @import("../../store/azure.zig");
 const cast = @import("../../exec/eval/cast.zig");
 const delta = @import("delta.zig");
+const iceberg = @import("iceberg.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
+const formats = @import("../formats.zig");
 const s3 = @import("../../store/s3.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
 pub const Kind = enum {
     delta,
+    iceberg,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
             .delta => "Delta",
+            .iceberg => "Iceberg",
         };
+    }
+
+    /// The kind a `format` names, null for none or one that is no table format.
+    pub fn of(f: ?formats.FileFormat) ?Kind {
+        return std.meta.stringToEnum(Kind, @tagName(f orelse return null));
     }
 };
 
-/// The version a read is pinned to; null reads the newest.
+/// What a read is pinned to: a Delta commit `version`, an Iceberg `snapshot_id`;
+/// neither reads the newest.
 pub const At = struct {
     version: ?u64 = null,
+    snapshot_id: ?i64 = null,
 
     pub fn eql(a: At, b: At) bool {
-        return a.version == b.version;
+        return a.version == b.version and a.snapshot_id == b.snapshot_id;
+    }
+
+    pub fn pinned(self: At) bool {
+        return self.version != null or self.snapshot_id != null;
     }
 };
 
@@ -54,28 +69,51 @@ pub const Error = error{LakeTableRefused};
 /// The table format `root` (a folder path) holds, or null for a plain folder. A
 /// listing that fails for any reason but the log's absence fails the read: reading
 /// the folder plain instead would return the removed files' rows.
+/// A folder holding both a Delta log and Iceberg metadata (Delta UniForm) is read
+/// as Delta.
 pub fn detect(arena: std.mem.Allocator, root: []const u8) !?Kind {
-    if (isHttp(root)) return null;
+    if (try holdsDelta(arena, root)) return .delta;
+    if (try iceberg.holds(arena, root)) return .iceberg;
+    return null;
+}
+
+fn holdsDelta(arena: std.mem.Allocator, root: []const u8) !bool {
+    if (isHttp(root)) return false;
     const log = try std.mem.concat(arena, u8, &.{ root, delta.log_dir });
     if (std.mem.indexOf(u8, root, "://") != null) {
-        const got = folder.listRaw(arena, log) catch |e| return if (absent(e)) null else e;
-        return if (got.len > 0) .delta else null;
+        const got = folder.listRaw(arena, log) catch |e| return if (absent(e)) false else e;
+        return got.len > 0;
     }
-    var dir = std.fs.cwd().openDir(log, .{}) catch |e| return if (absent(e)) null else e;
+    var dir = std.fs.cwd().openDir(log, .{}) catch |e| return if (absent(e)) false else e;
     dir.close();
-    return .delta;
+    return true;
 }
 
-/// Whether a listing failed because nothing is there.
+/// Whether a listing or a read failed because nothing is there.
 pub fn absent(e: anyerror) bool {
     return e == error.FileNotFound or e == error.NotDir or e == s3.Error.S3EmptyPrefix or
-        e == azure.Error.AzureEmptyPrefix or e == error.SftpNoSuchFile or e == error.SmbNoSuchFile;
+        e == azure.Error.AzureEmptyPrefix or e == error.SftpNoSuchFile or e == error.SmbNoSuchFile or
+        e == error.HttpNotFound or e == s3.Error.S3KeyNotFound or e == azure.Error.AzureBlobNotFound;
 }
 
+/// Whether `path` is read as a lake table: a folder, or with `format = 'iceberg'`
+/// an Iceberg metadata file.
+pub fn isTablePath(path: []const u8, want: ?Kind) bool {
+    return folder.isFolder(path) or (want == .iceberg and iceberg.isMetadataPath(path));
+}
+
+/// `root` read as a `kind` table: a folder, or an Iceberg metadata file.
 pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At) !*const Resolved {
-    return switch (kind) {
-        .delta => delta.resolve(arena, root, at),
-    };
+    switch (kind) {
+        .delta => {
+            if (at.snapshot_id != null) return refuse("`snapshot_id` pins an Iceberg table to a snapshot; `{s}` is a Delta table, pinned with `version`", .{root});
+            return delta.resolve(arena, root, at);
+        },
+        .iceberg => {
+            if (at.version != null) return refuse("`version` pins a Delta table to a commit; `{s}` is an Iceberg table, pinned with `snapshot_id`", .{root});
+            return iceberg.resolve(arena, root, !folder.isFolder(root), at);
+        },
+    }
 }
 
 pub fn isHttp(path: []const u8) bool {
@@ -151,9 +189,10 @@ pub fn mapPath(arena: std.mem.Allocator, root: []const u8, p: []const u8) ![]con
     return std.mem.concat(arena, u8, &.{ root, p });
 }
 
-/// `version` on a folder that is no table: refused, as reading it plain would
-/// ignore the version asked for.
-pub fn notPinnable(root: []const u8) anyerror {
+/// `version` or `snapshot_id` on a folder that is no table: refused, as reading it
+/// plain would ignore the version asked for.
+pub fn notPinnable(root: []const u8, at: At) anyerror {
+    if (at.snapshot_id != null) return refuse("`snapshot_id` pins an Iceberg table to a snapshot; folder `{s}` holds no metadata/*.metadata.json", .{root});
     return refuse("`version` pins a Delta table to a commit; folder `{s}` holds no _delta_log/", .{root});
 }
 
@@ -221,4 +260,5 @@ test "partitionValue: every type, empty and null text as NULL, both timestamp fo
 
 test {
     _ = @import("delta.zig");
+    _ = @import("iceberg.zig");
 }
