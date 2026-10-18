@@ -139,6 +139,8 @@ pub const RunFacts = struct {
     columns_read: u64 = 0,
     columns_total: u64 = 0,
     spill_peak: u64 = 0,
+    /// Where a run would write, which `EXPLAIN ANALYZE` never does: `parquet out.parquet`.
+    sink: []const u8 = "",
 };
 
 /// The report, written to stderr in one piece: stdout carries the data, and a
@@ -185,6 +187,7 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
     if (facts.lanes > 1) try w.print(" (summed over {d} lanes)", .{facts.lanes});
     try w.writeAll("\n");
     try w.print("  Rows read: {f}   Rows out: {f}   Path: {s}\n", .{ Count{ .n = facts.rows_read }, Count{ .n = facts.rows_out }, prof.path });
+    if (facts.sink.len > 0) try w.print("  Sink: {s}, not written: EXPLAIN ANALYZE moves no data\n", .{facts.sink});
     if (facts.row_groups + facts.row_groups_skipped > 0)
         try w.print("  Row groups: {d} read, {d} skipped\n", .{ facts.row_groups, facts.row_groups_skipped });
     if (facts.columns_total > 0) try w.print("  Columns read: {d} of {d}\n", .{ facts.columns_read, facts.columns_total });

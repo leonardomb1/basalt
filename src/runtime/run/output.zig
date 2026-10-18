@@ -136,6 +136,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .columns_read = scan1[2] - scan0[2],
             .columns_total = scan1[3] - scan0[3],
             .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
+            .sink = std.mem.trimRight(u8, try std.fmt.allocPrint(arena, "{s} {s}", .{ env.sink_name, try targetLabel(arena, last.write) }), " "),
         });
     }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {

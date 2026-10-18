@@ -21,24 +21,27 @@ operator tree with what each operator actually cost — its own time (its inputs
 taken out), its rows in and out, and across lanes the least and most any lane
 spent. See [Reading EXPLAIN ANALYZE](#reading-explain-analyze).
 
-Both print the same tree: root first, the scan deepest, which is the nesting a
-pull pipeline has. `EXPLAIN` annotates each operator with its detail and output
-schema, `EXPLAIN ANALYZE` with what it measured.
+Both print a summary, then the same tree: root first, the scan deepest, which is
+the nesting a pull pipeline has, each operator numbered and shown with its SQL.
+The summary names the sink and the path; `EXPLAIN` annotates each operator with
+the schema it yields, `EXPLAIN ANALYZE` with what it measured.
 
 ```console
 $ basalt run -c "EXPLAIN SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
+Summary
+  Sink: stdout (default)
+  Path: morsel-parallel candidate (per-lane partials, combined)
 plan
-  write  stdout  (default)
-    aggregate  1 agg(s), 1 group(s)
-      schema: g:string?  c:int
-      scan  parquet  x.parquet
-        schema: g:string?  v:int?
-  physical: morsel-parallel candidate (per-lane partials, combined)
+└─ aggregate (#1)  by g; count(*)
+   │  schema: g:string?  c:int
+   └─ scan (#2)  parquet x.parquet
+         schema: g:string?  v:int?
 
 $ basalt run -j 4 -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' WHERE v > 0 GROUP BY g;"
 Summary
   Wall time: 21.40ms   Operator time: 38.62ms (summed over 4 lanes)
   Rows read: 500.0K (500000)   Rows out: 601   Path: parquet parallel aggregate, 6 row groups
+  Sink: stdout, not written: EXPLAIN ANALYZE moves no data
   Row groups: 6 read, 0 skipped
   Columns read: 2 of 2
   fold on the lanes: 19.87ms
@@ -60,7 +63,7 @@ plan (actuals)
             rows: 500.0K (500000)   batches: 6   rows per lane [min=83.3K (83333), max=166.7K (166667)]
 ```
 
-The `physical:` line names the fan-out the plan is eligible for: `split-parallel`
+`EXPLAIN`'s `Path:` line names the fan-out the plan is eligible for: `split-parallel`
 for a SQL read divided into key ranges, `morsel-parallel` for a local CSV divided
 into byte-range chunks or a parquet divided into row groups, `serial` for
 everything else (a CSV over HTTP is fetched whole, so it parses serially). Both
@@ -73,21 +76,22 @@ remote object — reads `schema: unresolved`, said once at the scan rather than
 repeated down the tree. Neither form connects.
 
 A SQL read prints the WHERE it will send on a `pushdown:` line under its scan
-([Pushdown](pushdown.md)). A join prints its right side's read on a `right` line under it, with that
-read's own `pushdown:` — so a CTE or table function joined in shows that it
-filters at the source:
+([Pushdown](pushdown.md)). A join prints its right side's read as its `<build>`
+scan, with that read's own `pushdown:` — so a CTE or table function joined in
+shows that it filters at the source:
 
 ```console
 $ basalt run -c "... EXPLAIN SELECT o.id, c.nm FROM pg.orders o JOIN active(1) c ON o.cid = c.cid;"
+Summary
+  Sink: stdout (default)
+  Path: split-parallel candidate
 plan
-  write  stdout  (default)
-    select  id, nm
-      join  inner __tvf1_active
-        right  scan  postgres  table customers (via binding __tvf1_active)
-          pushdown: ("active" = 1)
-        scan  postgres  table orders
-          schema: unresolved
-  physical: split-parallel candidate
+└─ project (#1)  id, nm
+   └─ join (#2)  inner on cid = cid
+      ├─ <probe> scan (#3)  postgres table orders
+      │     schema: unresolved
+      └─ <build> scan (#4)  postgres table customers (via binding __tvf1_active)
+            pushdown: ("active" = 1)
 ```
 
 `EXPLAIN` is an ordinary statement: it goes anywhere a terminal `SELECT` or a

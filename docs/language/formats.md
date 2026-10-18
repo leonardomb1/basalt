@@ -288,7 +288,7 @@ Two consequences worth knowing:
 
 - **Neither is parallel.** There is no mapping from a byte offset in a compressed
   stream to a row, so `-j` cannot cut one up — the same reason gzip is not
-  splittable under Hadoop. `EXPLAIN` reports `physical: serial` for both, and a
+  splittable under Hadoop. `EXPLAIN` reports `Path: serial` for both, and a
   loose CSV is the faster shape if you have the disk for it.
 - **Parquet cannot be read through either.** It needs to seek — footer first, then
   the chunks the query wants — and neither a codec nor an archive member offers

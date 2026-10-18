@@ -58,6 +58,7 @@ const table_builtins = @import("../connect/table_builtins.zig");
 const keypush = @import("plan/keypush.zig");
 const joinorder = @import("plan/joinorder.zig");
 const op = @import("../exec/op.zig");
+const profile = @import("../exec/profile.zig");
 const body_stmt_rule = @import("env.zig").body_stmt_rule;
 const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
@@ -354,6 +355,10 @@ pub const Stage = struct {
     kind: []const u8,
     detail: []const u8,
     breaker: bool,
+    /// The stage in SQL, as `EXPLAIN ANALYZE` prints it beside the operator.
+    sql: []const u8 = "",
+    /// How a join with no key runs, `range` or `nested-loop`; empty for a hash join.
+    how: []const u8 = "",
     right_scan: ?[]const u8 = null,
     right_pushdown: []const u8 = "",
     /// Which side's SQL read a join narrows by the other side's keys, if either.
@@ -1334,6 +1339,7 @@ const Ctx = struct {
         for (stages[1 .. stages.len - 1], 1..) |st, si_at| {
             errdefer self.diag.stamp(st.pos);
             var si = try self.stageInfo(st);
+            si.sql = profile.stageText(self.arena, st) catch return error.OutOfMemory;
             if (st.node == .join) si.key_pushdown = try self.keyPushNote(stages[0..si_at], st);
             if (st.node == .join) si.join_order = joinorder.staticNote(st, stages[si_at + 1 ..]);
             if (si.breaker) {
@@ -1357,7 +1363,10 @@ const Ctx = struct {
                 if (cur != null and st.node == .join) how = try self.joinStrategy(c, st.node.join);
             } else try self.checkUnbound(st.node);
             if (how == null and st.node == .join and st.node.join.keyless()) how = "no key: range or nested-loop, decided at run time";
-            if (how) |h| si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, h });
+            if (how) |h| {
+                si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, h });
+                si.how = h;
+            }
             try stage_infos.append(si);
         }
 
@@ -1626,7 +1635,7 @@ const Ctx = struct {
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[0].node != .read) return st;
         var src = self.resolveSource(stages[0]) catch return st;
-        st.right_scan = try std.fmt.allocPrint(self.arena, "{s}  {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });
+        st.right_scan = try std.fmt.allocPrint(self.arena, "{s} {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });
         if (try self.previewPushdown(stages)) |pv| src.pushdown = pv.where;
         st.right_pushdown = src.pushdown;
         return st;

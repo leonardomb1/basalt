@@ -91,15 +91,16 @@ $ basalt check -c "SELECT regoin FROM 'orders.csv';"
 ```console
 $ basalt run -c "EXPLAIN SELECT region, SUM(amount) AS revenue FROM 'orders.csv'
                  WHERE amount > 50 GROUP BY region;"
+Summary
+  Sink: stdout (default)
+  Path: morsel-parallel candidate (per-lane partials, combined)
 plan
-  write  stdout  (default)
-    aggregate  1 agg(s), 1 group(s)
-      schema: region:string?  revenue:float?
-      filter
-        schema: id:int?  region:string?  amount:float?  placed_at:date?
-        scan  csv  orders.csv
-          schema: id:int?  region:string?  amount:float?  placed_at:date?
-  physical: morsel-parallel candidate (per-lane partials, combined)
+└─ aggregate (#1)  by region; sum(amount)
+   │  schema: region:string?  revenue:float?
+   └─ filter (#2)  amount > 50
+      │  schema: id:int?  region:string?  amount:float?  placed_at:date?
+      └─ scan (#3)  csv orders.csv
+            schema: id:int?  region:string?  amount:float?  placed_at:date?
 ```
 
 ## Next

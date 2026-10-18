@@ -218,15 +218,15 @@ test "EXPLAIN mid-script explains that query without running it" {
     const plan = try cap.end(alloc);
     defer alloc.free(plan);
     _ = try res;
-    const write_line = try std.fmt.allocPrint(alloc, "write  csv  {s}", .{never_path});
+    const write_line = try std.fmt.allocPrint(alloc, "Sink: csv {s}", .{never_path});
     defer alloc.free(write_line);
-    const scan_line = try std.fmt.allocPrint(alloc, "scan  csv  {s} (via binding paid)", .{in_path});
+    const scan_line = try std.fmt.allocPrint(alloc, "scan (#4)  csv {s} (via binding paid)", .{in_path});
     defer alloc.free(scan_line);
-    try std.testing.expect(std.mem.startsWith(u8, plan, "plan\n"));
+    try std.testing.expect(std.mem.startsWith(u8, plan, "Summary\n"));
     try std.testing.expect(std.mem.indexOf(u8, plan, write_line) != null);
-    try std.testing.expect(std.mem.indexOf(u8, plan, "filter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "filter (#") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan, scan_line) != null);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plan, "scan  csv"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, plan, "scan (#"));
 
     const ran = try tmp.dir.readFileAlloc(alloc, "ran.csv", 1 << 20);
     defer alloc.free(ran);

@@ -13,80 +13,97 @@ const formats = @import("../../format/formats.zig");
 const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
 const Stage = @import("../analyze.zig").Stage;
+const Output = @import("../analyze.zig").Output;
+const Source = @import("../analyze.zig").Source;
+const Physical = @import("../analyze.zig").Physical;
 const analyze = @import("../analyze.zig").analyze;
 const parse = @import("../analyze.zig").parse;
 
-/// The plan as a tree, root first and source deepest, as `EXPLAIN ANALYZE` prints it.
-/// A split or morsel fan-out prints as a candidate: only the source or file can settle it.
+/// The plan as `EXPLAIN ANALYZE` lays it out, without the figures: a summary naming
+/// the sink and the path, then the operators as a tree, root first and source
+/// deepest, numbered in the order they print, each with its SQL and the schema it
+/// yields. A split or morsel fan-out prints as a candidate: only the source or file
+/// can settle it.
 pub fn render(plan: Plan, w: anytype) !void {
     for (plan.outputs) |o| {
-        try w.writeAll("plan\n");
+        try w.writeAll("Summary\n  Sink: ");
+        try w.writeAll(sinkKind(o.sink));
+        if (o.sink.target.len > 0) try w.print(" {s}", .{o.sink.target});
+        try w.print(" ({s})\n  Path: ", .{o.sink.mode});
+        try physical(w, o.physical);
+        try w.writeAll("\nplan\n");
+        var num: usize = 0;
+        try stageNode(w, o, o.stages.len, .input, "", true, &num);
+    }
+}
 
-        var depth: usize = 1;
-        try indent(w, depth);
-        if (o.sink.target.len > 0) {
-            try w.print("write  {s}  {s} ({s})\n", .{ sinkKind(o.sink), o.sink.target, o.sink.mode });
-        } else {
-            try w.print("write  {s}  ({s})\n", .{ sinkKind(o.sink), o.sink.mode });
-        }
+const Role = enum { input, probe, build };
 
-        var i = o.stages.len;
-        while (i > 0) {
-            i -= 1;
-            depth += 1;
-            const st = o.stages[i];
-            try indent(w, depth);
-            if (st.detail.len > 0) {
-                try w.print("{s}  {s}\n", .{ st.kind, st.detail });
-            } else {
-                try w.print("{s}\n", .{st.kind});
-            }
-            try printSchema(w, depth + 1, st.out_schema);
-            if (st.right_scan) |rs| {
-                try indent(w, depth + 1);
-                try w.print("right  scan  {s}\n", .{rs});
-                if (st.right_pushdown.len > 0) {
-                    try indent(w, depth + 2);
-                    try w.print("pushdown: {s}\n", .{st.right_pushdown});
-                }
-            }
-            if (st.key_pushdown.len > 0) {
-                try indent(w, depth + 1);
-                try w.print("key pushdown: {s}\n", .{st.key_pushdown});
-            }
-            if (st.join_order.len > 0) {
-                try indent(w, depth + 1);
-                try w.print("join order: {s}\n", .{st.join_order});
-            }
-        }
+/// The stage at `i` (counting from 1; 0 is the source) and everything under it.
+fn stageNode(w: anytype, o: Output, i: usize, role: Role, prefix: []const u8, last: bool, num: *usize) !void {
+    if (i == 0) return sourceNode(w, o.source, role, prefix, last, num);
+    const st = o.stages[i - 1];
+    const name = if (std.mem.eql(u8, st.kind, "select")) "project" else if (st.how.len > 0) "nested-loop join" else st.kind;
+    try header(w, prefix, last, role, name, st.sql, num);
 
-        depth += 1;
-        try indent(w, depth);
-        try w.print("scan  {s}  {s}\n", .{ sinkKind(o.source), o.source.detail });
-        if (o.source.pushdown.len > 0) {
-            try indent(w, depth + 1);
-            try w.print("pushdown: {s}\n", .{o.source.pushdown});
-        }
-        if (o.source.schema == null) {
-            try indent(w, depth + 1);
-            try w.writeAll("schema: unresolved\n");
-        }
-        try printSchema(w, depth + 1, o.source.schema);
+    var kid_buf: [512]u8 = undefined;
+    const kid_prefix = childPrefix(&kid_buf, prefix, last);
+    var line_buf: [520]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{s}│  ", .{kid_prefix}) catch kid_prefix;
+    if (st.how.len > 0) try w.print("{s}strategy: {s}\n", .{ line, st.how });
+    if (st.key_pushdown.len > 0) try w.print("{s}key pushdown: {s}\n", .{ line, st.key_pushdown });
+    if (st.join_order.len > 0) try w.print("{s}join order: {s}\n", .{ line, st.join_order });
+    try printSchema(w, line, st.out_schema);
 
-        try w.writeAll("  physical: ");
-        if (o.physical.splittable) {
-            try w.writeAll("split-parallel candidate");
-            if (o.physical.sink_parallel) try w.writeAll(", per-lane sink");
-        } else if (o.physical.morsel_parallel) {
-            try w.writeAll("morsel-parallel candidate");
-            if (o.physical.has_breaker) try w.writeAll(" (per-lane partials, combined)");
-        } else {
-            try w.writeAll("serial");
-            if (o.physical.top_n) |n| {
-                if (o.physical.has_breaker) try w.print(" (top-N pushed, sorts at most {d} rows)", .{n}) else try w.print(" (limit pushed, at most {d} rows arrive)", .{n});
-            } else if (o.physical.has_breaker) try w.writeAll(" (has breaker, materializes)");
-        }
-        try w.writeAll("\n");
+    const join = std.mem.eql(u8, st.kind, "join");
+    try stageNode(w, o, i - 1, if (join) .probe else .input, kid_prefix, st.right_scan == null, num);
+    if (st.right_scan) |rs| {
+        try header(w, kid_prefix, true, .build, "scan", rs, num);
+        if (st.right_pushdown.len > 0) try w.print("{s}      pushdown: {s}\n", .{ kid_prefix, st.right_pushdown });
+    }
+}
+
+fn sourceNode(w: anytype, src: Source, role: Role, prefix: []const u8, last: bool, num: *usize) !void {
+    var text_buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&text_buf, "{s} {s}", .{ sinkKind(src), src.detail }) catch src.detail;
+    try header(w, prefix, last, role, "scan", text, num);
+    var kid_buf: [512]u8 = undefined;
+    const kid_prefix = childPrefix(&kid_buf, prefix, last);
+    if (src.pushdown.len > 0) try w.print("{s}   pushdown: {s}\n", .{ kid_prefix, src.pushdown });
+    if (src.schema == null) try w.print("{s}   schema: unresolved\n", .{kid_prefix});
+    var line_buf: [520]u8 = undefined;
+    try printSchema(w, std.fmt.bufPrint(&line_buf, "{s}   ", .{kid_prefix}) catch kid_prefix, src.schema);
+}
+
+fn header(w: anytype, prefix: []const u8, last: bool, role: Role, name: []const u8, text: []const u8, num: *usize) !void {
+    num.* += 1;
+    try w.print("{s}{s}", .{ prefix, if (last) "└─ " else "├─ " });
+    switch (role) {
+        .input => {},
+        .probe => try w.writeAll("<probe> "),
+        .build => try w.writeAll("<build> "),
+    }
+    try w.print("{s} (#{d})", .{ name, num.* });
+    if (text.len > 0) try w.print("  {s}", .{text});
+    try w.writeAll("\n");
+}
+
+fn childPrefix(buf: []u8, prefix: []const u8, last: bool) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, if (last) "   " else "│  " }) catch prefix;
+}
+
+fn physical(w: anytype, ph: Physical) !void {
+    if (ph.splittable) {
+        try w.writeAll("split-parallel candidate");
+        if (ph.sink_parallel) try w.writeAll(", per-lane sink");
+    } else if (ph.morsel_parallel) {
+        try w.writeAll("morsel-parallel candidate");
+        if (ph.has_breaker) try w.writeAll(" (per-lane partials, combined)");
+    } else {
+        try w.writeAll("serial");
+        if (ph.top_n) |n| {
+            if (ph.has_breaker) try w.print(" (top-N pushed, sorts at most {d} rows)", .{n}) else try w.print(" (limit pushed, at most {d} rows arrive)", .{n});
+        } else if (ph.has_breaker) try w.writeAll(" (has breaker, materializes)");
     }
 }
 
@@ -106,18 +123,11 @@ pub fn sinkKind(node: anytype) []const u8 {
     return node.connector;
 }
 
-fn indent(w: anytype, depth: usize) !void {
-    var n: usize = 0;
-    while (n < depth) : (n += 1) try w.writeAll("  ");
-}
-
-/// Printed once, at the scan that could not resolve it, and labelled, since a bare
-/// column list at a child's depth reads like another operator.
-fn printSchema(w: anytype, depth: usize, schema: ?types.Schema) !void {
-    const s = schema orelse return;
-    try indent(w, depth);
-    try w.writeAll("schema: ");
-    for (s.fields, 0..) |f, i| {
+/// The columns a node yields, on one line under it.
+fn printSchema(w: anytype, line: []const u8, schema: ?types.Schema) !void {
+    const sch = schema orelse return;
+    try w.print("{s}schema: ", .{line});
+    for (sch.fields, 0..) |f, i| {
         if (i > 0) try w.writeAll("  ");
         try w.print("{s}:{s}{s}", .{ f.name, @tagName(f.ty.kind), if (f.ty.nullable) "?" else "" });
     }
@@ -141,6 +151,7 @@ test "analyze: EXPLAIN shows the WHERE a join's right side sends, under the join
     try std.testing.expectEqualStrings("(\"active\" = 1)", join.?.right_pushdown);
     var out = std.Io.Writer.Allocating.init(a);
     try render(plan, &out.writer);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "right  scan  postgres  table customers (via binding __tvf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "<build> scan (#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "postgres table customers (via binding __tvf") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "pushdown: (\"active\" = 1)") != null);
 }
