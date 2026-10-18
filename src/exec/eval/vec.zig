@@ -444,6 +444,13 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
     const l = asBool(lv) orelse return error.Unsupported;
     const r = asBool(rv) orelse return error.Unsupported;
     const n = batch.len;
+    if (l == .col and r == .col and l.col.v.allSet(n) and r.col.v.allSet(n)) {
+        const out = try arena.alloc(bool, n);
+        if (op == .@"and") {
+            for (out, l.col.d[0..n], r.col.d[0..n]) |*o, x, y| o.* = x and y;
+        } else for (out, l.col.d[0..n], r.col.d[0..n]) |*o, x, y| o.* = x or y;
+        return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
+    }
     const out = try arena.alloc(bool, n);
     var bm = try Bitmap.initFull(arena, n);
     var any: bool = false;

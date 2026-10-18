@@ -2077,3 +2077,15 @@ test "where: IS [NOT] DISTINCT FROM compares with nulls as values, never null it
         };
     }
 }
+
+test "a WHERE's later conjunct never errs on a row an earlier one dropped, whether few or most rows survive" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "x\n0\n1\n2\n4\n5\n", "x\n0\n0\n0\n0\n5\n" }) |data| {
+        try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = data });
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT x FROM '$B/d.csv' WHERE x <> 0 AND 10 / x >= 2 AND x > 0;", 1, &.{});
+        const want = if (data[2] == '0' and data[4] == '1') "x\n1\n2\n4\n5\n" else "x\n5\n";
+        try expectFile(&tmp, "o.csv", want);
+    }
+}

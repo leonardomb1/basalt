@@ -541,22 +541,78 @@ pub const Limit = struct {
     }
 };
 
+/// The rows of `b` for which `pred` is true. A conjunction is evaluated a conjunct at
+/// a time, in the written order, each seeing only the rows the ones before it kept:
+/// once fewer than half remain the batch is narrowed (in `scratch`), so a selective
+/// conjunct spares the rest most of the batch, and the masks are otherwise ANDed in
+/// place. A row stays only where every conjunct is true; a false or null drops it,
+/// as it drops the whole AND. A conjunct evaluated over rows an earlier one dropped
+/// (the batch not narrowed) that fails is evaluated again over the kept rows only,
+/// so an error comes only from a row the row evaluator's short-circuit reaches.
 fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
-    const mask = try eval.evalColumn(scratch, pred, b, types.Type.init(.bool));
-    const keep = mask.data.b;
-    var kept: usize = 0;
-    if (mask.validity.allSet(b.len)) {
-        for (keep) |k| {
-            if (k) kept += 1;
-        }
-    } else {
-        for (keep, 0..) |*k, i| {
-            if (!mask.validity.get(i)) k.* = false;
-            if (k.*) kept += 1;
+    var conj = std.array_list.Managed(*const ast.Expr).init(scratch);
+    try conjuncts(&conj, pred);
+    var cur = b;
+    var keep: ?[]bool = null;
+    var kept: usize = b.len;
+    for (conj.items, 0..) |c, ci| {
+        const m = eval.evalColumn(scratch, c, cur, types.Type.init(.bool)) catch |e| blk: {
+            const k = keep orelse return e;
+            if (kept == cur.len or e == error.OutOfMemory) return e;
+            cur = try gatherBatch(scratch, cur, k, kept);
+            keep = null;
+            break :blk try eval.evalColumn(scratch, c, cur, types.Type.init(.bool));
+        };
+        const mask = try andMask(scratch, keep, m, cur.len, &kept);
+        keep = mask;
+        if (kept == 0) break;
+        if (ci + 1 < conj.items.len and kept * 2 < cur.len) {
+            cur = try gatherBatch(scratch, cur, mask, kept);
+            keep = null;
         }
     }
+    if (keep) |k| return gatherBatch(arena, cur, k, kept);
+    const outcols = try arena.alloc(column.Column, cur.columns.len);
+    for (cur.columns, outcols) |c, *o| o.* = try column.copy(arena, c);
+    return Batch{ .schema = b.schema, .columns = outcols, .len = cur.len };
+}
+
+/// `e`'s top-level AND operands, left to right.
+fn conjuncts(out: *std.array_list.Managed(*const ast.Expr), e: *const ast.Expr) !void {
+    if (e.* == .binary and e.binary.op == .@"and") {
+        try conjuncts(out, e.binary.l);
+        try conjuncts(out, e.binary.r);
+    } else try out.append(e);
+}
+
+/// `prev` (all true when null) ANDed with where `m` is true and not null, written
+/// into `prev` or a new mask; `kept` the rows left.
+fn andMask(scratch: std.mem.Allocator, prev: ?[]bool, m: column.Column, n: usize, kept: *usize) ![]bool {
+    const out = prev orelse try scratch.alloc(bool, n);
+    const d = m.data.b;
+    var k: usize = 0;
+    if (m.validity.allSet(n)) {
+        if (prev == null) {
+            for (out, d[0..n]) |*o, x| {
+                o.* = x;
+                k += @intFromBool(x);
+            }
+        } else for (out, d[0..n]) |*o, x| {
+            o.* = o.* and x;
+            k += @intFromBool(o.*);
+        }
+    } else for (out, 0..) |*o, i| {
+        const x = d[i] and m.validity.get(i);
+        o.* = (prev == null or o.*) and x;
+        k += @intFromBool(o.*);
+    }
+    kept.* = k;
+    return out;
+}
+
+fn gatherBatch(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) !Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, 0..) |*col, ci| outcols[ci] = try column.gather(arena, col.*, keep, kept);
+    for (b.columns, outcols) |c, *o| o.* = try column.gather(arena, c, keep, kept);
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 
