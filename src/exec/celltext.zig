@@ -98,6 +98,67 @@ pub fn text(c: *const Column, r: usize, buf: *[scalar_bound]u8, p: anytype) []co
     return fw.buffered();
 }
 
+/// `x` as `{d}` spells it: its shortest round-tripping decimal, in plain notation.
+/// A short decimal is written from its integer digits instead (`shortDecimal`);
+/// anything else takes `{d}`.
+pub fn writeFloat(w: anytype, x: f64) !void {
+    const d = shortDecimal(x) orelse return w.print("{d}", .{x});
+    var buf: [40]u8 = undefined;
+    var i: usize = buf.len;
+    var u = d.digits;
+    if (d.places > 0) {
+        for (0..d.places) |_| {
+            i -= 1;
+            buf[i] = '0' + @as(u8, @intCast(u % 10));
+            u /= 10;
+        }
+        i -= 1;
+        buf[i] = '.';
+    }
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(u % 10));
+        u /= 10;
+        if (u == 0) break;
+    }
+    if (d.neg) {
+        i -= 1;
+        buf[i] = '-';
+    }
+    return w.writeAll(buf[i..]);
+}
+
+const fast_places = 9;
+
+const ShortDecimal = struct { digits: u64, places: usize, neg: bool };
+
+/// `x` as an integer of digits and a count of decimal places, when it is the one
+/// decimal at the fewest places (up to `fast_places`) that reads back as `x`: that
+/// is the digit string the shortest round-trip form holds. A decimal reads back as
+/// `c / 10^k` divided in f64, both exact below 2^53, which IEEE division rounds as
+/// parsing does. Null for zero, NaN, infinities, magnitudes outside [1e-6, 1e15),
+/// or two decimals at the fewest places reading back alike (the shortest form then
+/// picks the nearer, which `{d}` works out).
+fn shortDecimal(x: f64) ?ShortDecimal {
+    const a = @abs(x);
+    if (!(a >= 1e-6 and a < 1e15)) return null;
+    var p: f64 = 1;
+    for (0..fast_places + 1) |k| {
+        const v = a * p;
+        if (v >= 9007199254740991.0) return null;
+        const c = @round(v);
+        var hit: ?f64 = null;
+        for ([_]f64{ c - 1, c, c + 1 }) |cand| {
+            if (cand < 0 or cand / p != a) continue;
+            if (hit != null) return null;
+            hit = cand;
+        }
+        if (hit) |h| return .{ .digits = @intFromFloat(h), .places = k, .neg = x < 0 };
+        p *= 10;
+    }
+    return null;
+}
+
 fn escapes(comptime P: type) bool {
     return @hasDecl(P, "escape_scalars") and P.escape_scalars;
 }
@@ -107,7 +168,7 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     switch (c.ty.kind) {
         .bool => try w.writeAll(if (c.data.b[r]) P.bool_true else P.bool_false),
         .int => try w.print("{d}", .{c.data.i64[r]}),
-        .float => if (@hasDecl(P, "float")) try p.float(w, c.data.f64[r]) else try w.print("{d}", .{c.data.f64[r]}),
+        .float => if (@hasDecl(P, "float")) try p.float(w, c.data.f64[r]) else try writeFloat(w, c.data.f64[r]),
         .decimal => {
             const q = if (@hasDecl(P, "quote_decimal")) P.quote_decimal else "";
             try w.writeAll(q);
@@ -203,4 +264,26 @@ pub fn goldenBatches(arena: std.mem.Allocator) ![]const Batch {
 pub fn expectGolden(want: []const []const u8, got: []const []const u8) !void {
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| try std.testing.expectEqualStrings(w, g);
+}
+
+test "writeFloat spells every float as {d} does: short decimals, near-ties, extremes, and random bits" {
+    var prng = std.Random.DefaultPrng.init(0xf10a7);
+    const rnd = prng.random();
+    const fixed = [_]f64{ 0, -0.0, 0.1, 0.2, 0.3, 1.0 / 3.0, 17, 17.5, -2.25, 21168.23, 1e14 + 0.5, 999999999999999.9, 123456789.123, 5e-7, 1e-6, 0.000123, 9007199254740991.0, 1e15, 1e21, 5e-324, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 0.15, 2.675, 1.005, 100, 1e-5 };
+    var a: [400]u8 = undefined;
+    var b: [400]u8 = undefined;
+    var i: usize = 0;
+    while (i < 300_000) : (i += 1) {
+        const x: f64 = if (i < fixed.len) fixed[i] else switch (i % 4) {
+            0 => @as(f64, @floatFromInt(rnd.intRangeAtMost(i64, -99_999_999_99, 99_999_999_99))) / std.math.pow(f64, 10, @floatFromInt(rnd.uintLessThan(u32, 10))),
+            1 => @bitCast(rnd.int(u64)),
+            2 => (rnd.float(f64) - 0.5) * std.math.pow(f64, 10, @floatFromInt(rnd.intRangeAtMost(i32, -8, 16))),
+            else => @as(f64, @floatFromInt(rnd.intRangeAtMost(i64, -10_000_000, 10_000_000))) / 100.0,
+        };
+        var fa = std.Io.Writer.fixed(&a);
+        var fb = std.Io.Writer.fixed(&b);
+        try writeFloat(&fa, x);
+        try fb.print("{d}", .{x});
+        try std.testing.expectEqualStrings(fb.buffered(), fa.buffered());
+    }
 }
