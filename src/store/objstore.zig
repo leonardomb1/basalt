@@ -672,6 +672,88 @@ pub const FakeServer = struct {
     }
 };
 
+/// An HTTP/1.1 server of one file's bytes for range-read tests: HEAD answers its
+/// length, a GET with `Range: bytes=a-b` its slice as a 206, or the whole file as a
+/// 200 when `ignore_range` is set, as some servers do. One request per connection,
+/// served in turn. Counts the 206 and 200 bodies sent.
+pub const RangeServer = struct {
+    listener: std.net.Server,
+    data: []const u8,
+    ignore_range: bool,
+    thread: std.Thread = undefined,
+    stopping: std.atomic.Value(bool) = .init(false),
+    partial: std.atomic.Value(usize) = .init(0),
+    whole: std.atomic.Value(usize) = .init(0),
+
+    pub fn start(self: *RangeServer, data: []const u8, ignore_range: bool) !void {
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 64 }), .data = data, .ignore_range = ignore_range };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    pub fn url(self: *RangeServer, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ self.listener.listen_address.getPort(), path });
+    }
+
+    pub fn stop(self: *RangeServer) void {
+        self.stopping.store(true, .seq_cst);
+        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
+        self.thread.join();
+        self.listener.deinit();
+    }
+
+    fn serve(self: *RangeServer) void {
+        while (true) {
+            const conn = self.listener.accept() catch return;
+            defer conn.stream.close();
+            if (self.stopping.load(.seq_cst)) return;
+            self.answer(conn.stream) catch {};
+        }
+    }
+
+    fn answer(self: *RangeServer, stream: std.net.Stream) !void {
+        var head: [8192]u8 = undefined;
+        var n: usize = 0;
+        const end = while (true) {
+            if (std.mem.indexOf(u8, head[0..n], "\r\n\r\n")) |at| break at + 4;
+            if (n == head.len) return error.HeadTooLarge;
+            const got = try stream.read(head[n..]);
+            if (got == 0) return error.EndOfStream;
+            n += got;
+        };
+        var hdr: [256]u8 = undefined;
+        if (std.mem.startsWith(u8, head[0..end], "HEAD ")) {
+            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n", .{self.data.len});
+            return stream.writeAll(text);
+        }
+        if (!self.ignore_range) if (rangeOf(head[0..end])) |r| if (r[0] <= r[1] and r[1] < self.data.len) {
+            _ = self.partial.fetchAdd(1, .seq_cst);
+            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {d}-{d}/{d}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ r[0], r[1], self.data.len, r[1] - r[0] + 1 });
+            try stream.writeAll(text);
+            return stream.writeAll(self.data[r[0] .. r[1] + 1]);
+        };
+        _ = self.whole.fetchAdd(1, .seq_cst);
+        const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{self.data.len});
+        try stream.writeAll(text);
+        return stream.writeAll(self.data);
+    }
+
+    fn rangeOf(head: []const u8) ?[2]usize {
+        var it = std.mem.splitSequence(u8, head, "\r\n");
+        while (it.next()) |h| {
+            const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
+            if (!std.ascii.eqlIgnoreCase(h[0..colon], "range")) continue;
+            const v = std.mem.trim(u8, h[colon + 1 ..], " ");
+            if (!std.mem.startsWith(u8, v, "bytes=")) return null;
+            const dash = std.mem.indexOfScalar(u8, v, '-') orelse return null;
+            const lo = std.fmt.parseInt(usize, v[6..dash], 10) catch return null;
+            const hi = std.fmt.parseInt(usize, v[dash + 1 ..], 10) catch return null;
+            return .{ lo, hi };
+        }
+        return null;
+    }
+};
+
 test "exchange surfaces ETag, Retry-After and the body, and a reset is a transient failure" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

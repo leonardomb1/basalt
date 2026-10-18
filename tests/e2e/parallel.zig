@@ -752,3 +752,40 @@ test "parallel parquet: an aggregate after DISTINCT and a HAVING both fan out an
     defer alloc.free(having);
     try std.testing.expectEqualStrings("g,c\n0,1250\n3,1250\n", having);
 }
+
+test "a remote Parquet file splits at row groups over ranged reads, and is read once, serially, when its server ignores ranges" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const harness = @import("harness.zig");
+    try harness.checkAndRun(alloc, &tmp, "LOAD INTO '$B/t.parquet' AS SELECT range AS id, range % 7 AS g, 'v' || CAST(range % 13 AS VARCHAR) AS s FROM RANGE(350000);", 1, &.{});
+    const data = try tmp.dir.readFileAlloc(alloc, "t.parquet", 1 << 26);
+    defer alloc.free(data);
+
+    const queries = [_][]const u8{
+        "SELECT g, count(*) AS n, sum(id) AS t, max(s) AS m FROM {s} GROUP BY g ORDER BY g",
+        "SELECT id, s FROM {s} WHERE id % 50000 = 7",
+    };
+    for (queries) |q| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        const a = parena.allocator();
+        const local = try std.mem.replaceOwned(u8, a, q, "{s}", "'$B/t.parquet'");
+        try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/want.csv' AS {s};", .{local}), 1, &.{});
+        const want = try tmp.dir.readFileAlloc(a, "want.csv", 1 << 16);
+        for ([_]bool{ false, true }) |ignore| {
+            var srv: basalt.objstore.RangeServer = undefined;
+            try srv.start(data, ignore);
+            defer srv.stop();
+            const remote = try std.mem.replaceOwned(u8, a, q, "{s}", try std.fmt.allocPrint(a, "'{s}'", .{try srv.url(a, "/t.parquet")}));
+            try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/got.csv' AS {s};", .{remote}), 4, &.{});
+            try harness.expectFile(&tmp, "got.csv", want);
+            if (ignore) {
+                try std.testing.expect(srv.whole.load(.seq_cst) <= 2);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), srv.whole.load(.seq_cst));
+                try std.testing.expect(srv.partial.load(.seq_cst) >= 4);
+            }
+        }
+    }
+}

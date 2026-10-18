@@ -30,7 +30,7 @@ const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
 const isRecordRead = @import("../connect.zig").isRecordRead;
-const isLocalParquetRead = @import("../connect.zig").isLocalParquetRead;
+const isParquetFileRead = @import("../connect.zig").isParquetFileRead;
 const keysPreferSerial = @import("../plan.zig").keysPreferSerial;
 const laneEligible = @import("../lanes.zig").laneEligible;
 const localRead = @import("../connect/source.zig").localRead;
@@ -223,7 +223,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     }
     if (opts.lanes() < 2 or stages.len < 3 or !laneEligible(stages, opts)) return null;
     const rd = stages[0].node.read;
-    if (!isLocalCsvRead(rd) and !isLocalParquetRead(rd) and !isFolderRead(rd)) return null;
+    if (!isLocalCsvRead(rd) and !isParquetFileRead(rd) and !isFolderRead(rd)) return null;
     var wi: usize = 1;
     var narrowed = false;
     while (wi < stages.len - 1) : (wi += 1) switch (stages[wi].node) {
@@ -381,7 +381,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
         if (classifyLaneShape(head_stages)) |shape| {
             const rd = head_stages[0].node.read;
-            if (isLocalParquetRead(rd) or isFolderRead(rd)) {
+            if (isParquetFileRead(rd) or isFolderRead(rd)) {
                 if (try runParquetLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
             } else if (isLocalCsvRead(rd) or isRecordRead(rd)) {
                 if (try runCsvLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;

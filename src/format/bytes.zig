@@ -25,12 +25,36 @@ pub const Bytes = union(enum) {
     smb: *smb.File,
 
     pub fn open(arena: std.mem.Allocator, path: []const u8) !Bytes {
+        return openSized(arena, path, null);
+    }
+
+    /// `open`, with the size already known from an earlier open: a remote file is
+    /// then not asked for it again.
+    pub fn openSized(arena: std.mem.Allocator, path: []const u8, known: ?u64) !Bytes {
         if (sftp.isUrl(path)) return .{ .sftp = try sftp.File.open(arena, path) };
         if (smb.isUrl(path)) return .{ .smb = try smb.File.open(arena, path) };
-        if (isRemote(path)) return .{ .remote = try Remote.open(arena, path) };
+        if (isRemote(path)) return .{ .remote = try Remote.openSized(arena, path, known) };
         const f = try std.fs.cwd().openFile(path, .{});
         errdefer f.close();
         return .{ .file = .{ .f = f, .size = (try f.stat()).size } };
+    }
+
+    /// Whether each read is a request over a network, so a reader should ask for
+    /// few large ranges rather than many small ones.
+    pub fn coalesces(self: Bytes) bool {
+        return switch (self) {
+            .memory, .file => false,
+            .remote, .sftp, .smb => true,
+        };
+    }
+
+    /// Whether ranges are read as ranges: false once a server answered a range
+    /// request with the whole file, which a second reader would download again.
+    pub fn rangesHonoured(self: Bytes) bool {
+        return switch (self) {
+            .remote => |r| r.whole == null,
+            else => true,
+        };
     }
 
     pub fn size(self: Bytes) u64 {
@@ -101,6 +125,11 @@ pub const Remote = struct {
 
     /// Sizes the object by HEAD; without a length it fetches the whole object once.
     pub fn open(arena: std.mem.Allocator, path: []const u8) !*Remote {
+        return openSized(arena, path, null);
+    }
+
+    /// `open`, taking the size when it is `known` rather than asking for it.
+    pub fn openSized(arena: std.mem.Allocator, path: []const u8, known: ?u64) !*Remote {
         const client = try arena.create(std.http.Client);
         client.* = http_client.initClient(arena);
         const self = try arena.create(Remote);
@@ -111,6 +140,10 @@ pub const Remote = struct {
             self.url = o.url;
         }
 
+        if (known) |n| {
+            self.total = n;
+            return self;
+        }
         if (self.contentLength(arena)) |n| {
             self.total = n;
         } else |e| {

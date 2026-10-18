@@ -59,8 +59,10 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
 }
 
 /// Open `rd`'s parquet input as splittable, or null. Local files split at row groups,
-/// each footer checked here; a remote folder splits at files and a single remote file
-/// stays serial. `push_stages` stops before a map path's join, whose names are the join's.
+/// each footer checked here; a remote folder splits at files; a single remote file
+/// splits at row groups when it has two or more and its server honours range
+/// requests, each lane on its own connection over the footer read here.
+/// `push_stages` stops before a map path's join, whose names are the join's.
 pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?LaneSplit {
     const arena = env.arena;
     const path = switch (rd.form) {
@@ -78,7 +80,6 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
         files = fr.files;
         root = path;
     } else {
-        if (csv.CsvReader.isUrl(path)) return null;
         const one = try arena.alloc([]const u8, 1);
         one[0] = path;
         files = one;
@@ -97,7 +98,12 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     }
 
     var items = std.array_list.Managed(PqItem).init(arena);
-    if (remote) {
+    var like: ?*const pqdecode.Reader = null;
+    if (remote and root == null) {
+        if (!probe.src.rangesHonoured() or probe.md.row_groups.len < 2) return null;
+        for (0..probe.md.row_groups.len) |g| try items.append(.{ .file = 0, .rg = @intCast(g), .rg_end = @intCast(g + 1) });
+        like = probe;
+    } else if (remote) {
         if (files.len < 2) return null;
         for (0..files.len) |k| try items.append(.{ .file = @intCast(k), .rg = 0, .rg_end = null });
     } else {
@@ -128,6 +134,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
         .queue = .{ .nitems = items.items.len },
         .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
         .check_in_lane = remote and root != null,
+        .like = like,
     } };
 }
 

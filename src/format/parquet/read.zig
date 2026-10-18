@@ -146,6 +146,8 @@ pub const Reader = struct {
     rg: usize = 0,
     rg_end: ?usize = null,
     path: []const u8 = "",
+    /// The current row group's chunks, fetched in a few coalesced ranges.
+    held: []const Held = &.{},
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -228,6 +230,26 @@ pub const Reader = struct {
         return self;
     }
 
+    /// A reader of `path` over the footer and projection `like` already parsed, on
+    /// its own connection: a lane of a split file, which then asks for neither the
+    /// size nor the footer again.
+    pub fn openLike(arena: std.mem.Allocator, path: []const u8, like: *const Reader) !*Reader {
+        const src = try Bytes.openSized(arena, path, like.src.size());
+        errdefer src.close();
+        const self = try arena.create(Reader);
+        self.* = .{
+            .arena = arena,
+            .src = src,
+            .md = like.md,
+            .schema = like.schema,
+            .leaves = like.leaves,
+            .outputs = like.outputs,
+            .boundaries = like.boundaries,
+            .path = path,
+        };
+        return self;
+    }
+
     /// One row group per call. Empty groups are skipped, since a zero-row batch reads
     /// as end-of-stream downstream.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
@@ -252,6 +274,7 @@ pub const Reader = struct {
                     continue;
                 }
             }
+            if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g);
             const cols = try arena.alloc(column.Column, self.outputs.len);
             for (self.outputs, 0..) |o, ci| switch (o) {
                 .leaf => |li| {
@@ -286,6 +309,45 @@ pub const Reader = struct {
 
     const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
 
+    const Held = struct { start: u64, bytes: []const u8 };
+
+    /// A gap between two chunks read through rather than paying another request:
+    /// about a round trip's worth of transfer.
+    const hole_limit: u64 = 1 << 20;
+    /// The most one request asks for.
+    const range_cap: u64 = 64 << 20;
+
+    /// Fetches the chunks of `g` this read decodes as a few ranges, adjacent and
+    /// nearby chunks merged into one: each request over a network costs a round trip
+    /// and restarts a cold transfer, so one range per chunk ran several times slower.
+    fn fetchGroup(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup) ![]const Held {
+        var spans = std.array_list.Managed([2]u64).init(arena);
+        for (self.leaves) |lf| {
+            if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
+            const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
+            const start = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
+            const end = chunkEnd(self.boundaries, start);
+            if (end <= start) return Error.CorruptParquetPage;
+            try spans.append(.{ start, end });
+        }
+        std.mem.sort([2]u64, spans.items, {}, struct {
+            fn lt(_: void, a: [2]u64, b: [2]u64) bool {
+                return a[0] < b[0];
+            }
+        }.lt);
+        var held = std.array_list.Managed(Held).init(arena);
+        var i: usize = 0;
+        while (i < spans.items.len) {
+            const lo = spans.items[i][0];
+            var hi = spans.items[i][1];
+            i += 1;
+            while (i < spans.items.len and spans.items[i][0] <= hi + hole_limit and @max(hi, spans.items[i][1]) - lo <= range_cap) : (i += 1)
+                hi = @max(hi, spans.items[i][1]);
+            try held.append(.{ .start = lo, .bytes = try self.src.range(arena, lo, @intCast(hi - lo)) });
+        }
+        return held.toOwnedSlice();
+    }
+
     /// A decode failure's account, prefixed with this file, which a folder read needs.
     fn named(self: *const Reader, e: anyerror) anyerror {
         const why = eval.takeFailure(e) orelse return e;
@@ -303,6 +365,8 @@ pub const Reader = struct {
         const start = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
         const end = chunkEnd(self.boundaries, start);
         if (end <= start) return Error.CorruptParquetPage;
+        for (self.held) |h| if (start >= h.start and end <= h.start + h.bytes.len)
+            return .{ .bytes = h.bytes[@intCast(start - h.start)..][0..@intCast(end - start)], .meta = meta, .start = start };
         return .{ .bytes = try self.src.range(arena, start, @intCast(end - start)), .meta = meta, .start = start };
     }
 

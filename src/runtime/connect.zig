@@ -188,10 +188,11 @@ pub fn isFolderRead(rd: ast.Read) bool {
     return rd.form == .path and folder.isFolder(rd.form.path);
 }
 
-pub fn isLocalParquetRead(rd: ast.Read) bool {
+/// One Parquet file, local or remote; `parquetSplit` decides whether it divides.
+pub fn isParquetFileRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
     return switch (rd.form) {
-        .path => |p| !csv.CsvReader.isUrl(p) and pqdecode.Reader.isPath(p),
+        .path => |p| pqdecode.Reader.isPath(p) and !folder.isFolder(p),
         else => false,
     };
 }

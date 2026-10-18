@@ -436,6 +436,9 @@ pub const PqMorsels = struct {
     tally: ?*driver.ScanTally = null,
     max_lanes: usize = std.math.maxInt(usize),
     check_in_lane: bool = false,
+    /// A single remote file's reader as planning opened it: lanes reuse its footer
+    /// and size, each on its own connection.
+    like: ?*const pqdecode.Reader = null,
 };
 
 pub const PqItem = struct { file: u32, rg: u32, rg_end: ?u32 };
@@ -452,7 +455,7 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
     };
     if (held.* == null) {
         const path = m.files[it.file];
-        const r = try pqdecode.Reader.openProjected(scratch, path, m.project);
+        const r = if (m.like) |l| try pqdecode.Reader.openLike(scratch, path, l) else try pqdecode.Reader.openProjected(scratch, path, m.project);
         if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema, m.project)) |why| {
             r.close();
             return eval.explain(error.ParquetFolderMismatch, pqdecode.mismatchMessage(scratch, m.root orelse "", path, m.files[0], why));

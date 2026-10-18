@@ -42,8 +42,11 @@ since the rows past it may hold text.
 Parquet reads use column projection, row-group skipping from statistics, and
 ranged reads — only the footer and the chunks a query needs are fetched. A
 remote `.parquet` (`https://...`, `az://...`, `s3://...`) is read the same way, by HTTP
-range request, so a projected query transfers only the chunks it decodes; a
-server that ignores `Range` falls back to one whole-object fetch. Parquet writes
+range request, so a projected query transfers only the chunks it decodes. The
+chunks a row group needs are fetched together, nearby ones in one request, and
+under `-j` a file with several row groups is read on lanes, each over its own
+connection, as a local file is. A server that ignores `Range` falls back to one
+whole-object fetch, read on one lane. Parquet writes
 store `DECIMAL` in the narrowest physical type its precision allows — INT32 to 9
 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY up to 38; past 38 digits (the engine's
 own ceiling) a value is refused rather than silently truncated.
