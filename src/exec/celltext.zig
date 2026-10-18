@@ -167,7 +167,7 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     const P = @TypeOf(p);
     switch (c.ty.kind) {
         .bool => try w.writeAll(if (c.data.b[r]) P.bool_true else P.bool_false),
-        .int => try w.print("{d}", .{c.data.i64[r]}),
+        .int => try format.writeInt(w, c.data.i64[r]),
         .float => if (@hasDecl(P, "float")) try p.float(w, c.data.f64[r]) else try writeFloat(w, c.data.f64[r]),
         .decimal => {
             const q = if (@hasDecl(P, "quote_decimal")) P.quote_decimal else "";
@@ -284,6 +284,45 @@ test "writeFloat spells every float as {d} does: short decimals, near-ties, extr
         var fb = std.Io.Writer.fixed(&b);
         try writeFloat(&fa, x);
         try fb.print("{d}", .{x});
+        try std.testing.expectEqualStrings(fb.buffered(), fa.buffered());
+    }
+}
+
+test "writeInt, writeDate and writeTimestamp spell values as their format strings do" {
+    var prng = std.Random.DefaultPrng.init(0xda7e);
+    const rnd = prng.random();
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    for (0..200_000) |i| {
+        var fa = std.Io.Writer.fixed(&a);
+        var fb = std.Io.Writer.fixed(&b);
+        switch (i % 3) {
+            0 => {
+                const v: i64 = if (i < 3) std.math.minInt(i64) else rnd.int(i64) >> @intCast(rnd.uintLessThan(u8, 63));
+                try format.writeInt(&fa, v);
+                try fb.print("{d}", .{v});
+            },
+            1 => {
+                const days = rnd.intRangeAtMost(i64, -1_000_000, 3_500_000);
+                try format.writeDate(&fa, days);
+                const c = @import("eval/time.zig").civilFromDays(days);
+                if (c.y < 0) try fb.writeByte('-');
+                try fb.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @abs(c.y), c.m, c.d });
+            },
+            else => {
+                const us = rnd.intRangeAtMost(i64, -50_000_000_000_000_000, 250_000_000_000_000_000);
+                const t = if (i % 2 == 0) @divFloor(us, 1_000_000) * 1_000_000 else us;
+                try format.writeTimestamp(&fa, t);
+                const days = @divFloor(t, 86_400_000_000);
+                const rest: u64 = @intCast(t - days * 86_400_000_000);
+                const secs = rest / 1_000_000;
+                const frac = rest % 1_000_000;
+                const c = @import("eval/time.zig").civilFromDays(days);
+                if (c.y < 0) try fb.writeByte('-');
+                try fb.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ @abs(c.y), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60 });
+                if (frac != 0) try fb.print(".{d:0>6}", .{frac});
+            },
+        }
         try std.testing.expectEqualStrings(fb.buffered(), fa.buffered());
     }
 }

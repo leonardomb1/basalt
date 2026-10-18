@@ -8,8 +8,43 @@ const evalLit = @import("testing_util.zig").evalLit;
 
 pub fn writeDate(w: anytype, days: i64) !void {
     const c = civilFromDays(days);
-    try writeYear(w, c.y);
-    try w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
+    if (c.y < 0 or c.y > 9999) {
+        try writeYear(w, c.y);
+        return w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
+    }
+    var buf: [10]u8 = undefined;
+    putDigits(buf[0..4], @intCast(c.y));
+    buf[4] = '-';
+    putDigits(buf[5..7], @intCast(c.m));
+    buf[7] = '-';
+    putDigits(buf[8..10], @intCast(c.d));
+    return w.writeAll(&buf);
+}
+
+/// `v` as exactly `out.len` digits, zero-padded on the left.
+inline fn putDigits(out: []u8, v: u64) void {
+    var x = v;
+    var i = out.len;
+    while (i > 0) {
+        i -= 1;
+        out[i] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+    }
+}
+
+/// `v` as `{d}` prints it, its digits set down in one write.
+pub fn writeInt(w: anytype, v: i64) !void {
+    var buf: [20]u8 = undefined;
+    var i: usize = buf.len;
+    var x: u64 = @abs(v);
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(x % 10));
+        x /= 10;
+        if (x == 0) break;
+    }
+    if (v < 0) try w.writeByte('-');
+    return w.writeAll(buf[i..]);
 }
 
 /// Four digits, zero-padded; a year before 0 carries a leading `-`, as ISO
@@ -36,6 +71,24 @@ pub fn writeTimestamp(w: anytype, micros: i64) !void {
     const secs = us / 1_000_000;
     const frac = us % 1_000_000;
     const c = civilFromDays(days);
+    if (c.y >= 0 and c.y <= 9999) {
+        var buf: [26]u8 = undefined;
+        putDigits(buf[0..4], @intCast(c.y));
+        buf[4] = '-';
+        putDigits(buf[5..7], @intCast(c.m));
+        buf[7] = '-';
+        putDigits(buf[8..10], @intCast(c.d));
+        buf[10] = ' ';
+        putDigits(buf[11..13], secs / 3600);
+        buf[13] = ':';
+        putDigits(buf[14..16], (secs % 3600) / 60);
+        buf[16] = ':';
+        putDigits(buf[17..19], secs % 60);
+        if (frac == 0) return w.writeAll(buf[0..19]);
+        buf[19] = '.';
+        putDigits(buf[20..26], frac);
+        return w.writeAll(&buf);
+    }
     try writeYear(w, c.y);
     if (frac != 0) {
         try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
