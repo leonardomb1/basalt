@@ -7,7 +7,6 @@ const types = @import("../lang/types.zig");
 const Column = @import("column.zig").Column;
 const column_mod = @import("column.zig");
 const intColumn = @import("column.zig").intColumn;
-const permute = @import("column.zig").permute;
 
 pub const Batch = struct {
     schema: *const types.Schema,

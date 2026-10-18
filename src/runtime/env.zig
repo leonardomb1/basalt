@@ -286,6 +286,10 @@ pub const Env = struct {
     src_name: []const u8 = "",
     pq_readers: usize = 0,
     pq_reader: ?*pqdecode.Reader = null,
+    /// A single remote Parquet file planning opened to decide its lanes and then read
+    /// serially: its bytes, kept open for the serial read, so the size is not asked
+    /// again and a body a server sent whole is not downloaded twice.
+    pq_held: ?struct { path: []const u8, src: pqdecode.Bytes } = null,
     pq_folder: ?*pqdecode.Folder = null,
     sort_threads: usize = 1,
     folder_memo: ?struct { path: []const u8, read: FolderRead } = null,

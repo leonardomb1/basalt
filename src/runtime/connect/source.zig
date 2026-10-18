@@ -104,7 +104,7 @@ pub fn openSourceProjected(
     const is_pq = std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and
         pqdecode.Reader.isPath(rd.form.path);
     if (is_pq) {
-        const pr = pqdecode.Reader.openProjected(env.arena, rd.form.path, project) catch |e|
+        const pr = openParquetFile(env, rd.form.path, project) catch |e|
             return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
         noteParquet(env, pr);
@@ -119,6 +119,16 @@ pub fn openSourceProjected(
             return openArrow(env, rd.form.path, project);
     }
     return openSourceCols(env, rd, hints, project);
+}
+
+/// A Parquet file's reader, over the bytes planning kept open for it when it
+/// opened this file and chose not to split it (`Env.pq_held`).
+fn openParquetFile(env: *Env, path: []const u8, project: ?[]const []const u8) !*pqdecode.Reader {
+    if (env.pq_held) |h| if (std.mem.eql(u8, h.path, path)) {
+        env.pq_held = null;
+        return pqdecode.Reader.openProjectedOn(env.arena, h.src, path, project);
+    };
+    return pqdecode.Reader.openProjected(env.arena, path, project);
 }
 
 /// A folder's format and files, or null when `path` is not a folder. Without
@@ -316,7 +326,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         };
         switch (analyze.readFormat(rd.form.path, want)) {
             .parquet => {
-                const pr = pqdecode.Reader.open(env.arena, rd.form.path) catch |e|
+                const pr = openParquetFile(env, rd.form.path, null) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
                 noteParquet(env, pr);
                 return pr.source();

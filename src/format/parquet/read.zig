@@ -160,7 +160,12 @@ pub const Reader = struct {
     /// `open`, decoding only the named columns. An unknown name is ignored; an empty
     /// projection (COUNT(*)) keeps the narrowest column so batches carry a row count.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
-        const src = try Bytes.open(arena, path);
+        return openProjectedOn(arena, try Bytes.open(arena, path), path, want);
+    }
+
+    /// `openProjected` over bytes already open, which the reader then owns (closing
+    /// them if it fails): a file planning opened and did not split, read on.
+    pub fn openProjectedOn(arena: std.mem.Allocator, src: Bytes, path: []const u8, want: ?[]const []const u8) !*Reader {
         errdefer src.close();
 
         var footer_start: u64 = 0;

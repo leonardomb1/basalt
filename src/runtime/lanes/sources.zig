@@ -89,7 +89,8 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     const project = try projectedColumns(env, push_stages);
     const bounds = try filterBounds(env, push_stages);
     const probe = pqdecode.Reader.openProjected(arena, files[0], project) catch return null;
-    defer probe.close();
+    var hold = false;
+    defer if (!hold) probe.close();
     var schema = probe.schema;
     if (root != null) {
         const fields = try arena.alloc(types.Schema.Field, schema.fields.len);
@@ -100,7 +101,12 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     var items = std.array_list.Managed(PqItem).init(arena);
     var like: ?*const pqdecode.Reader = null;
     if (remote and root == null) {
-        if (!probe.src.rangesHonoured() or probe.md.row_groups.len < 2) return null;
+        if (!probe.src.rangesHonoured() or probe.md.row_groups.len < 2) {
+            if (env.pq_held) |h| h.src.close();
+            env.pq_held = .{ .path = files[0], .src = probe.src };
+            hold = true;
+            return null;
+        }
         for (0..probe.md.row_groups.len) |g| try items.append(.{ .file = 0, .rg = @intCast(g), .rg_end = @intCast(g + 1) });
         like = probe;
     } else if (remote) {
