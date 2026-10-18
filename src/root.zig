@@ -45,6 +45,7 @@ pub const codec = @import("format/compress/codecs.zig");
 pub const thrift = @import("format/parquet/thrift.zig");
 pub const parquet = @import("format/parquet/footer.zig");
 pub const pqdecode = @import("format/parquet/read.zig");
+pub const lake = @import("format/lake/table.zig");
 pub const arrowread = @import("format/arrow/read.zig");
 pub const xlsx = @import("format/xlsx/read.zig");
 pub const xml = @import("format/xml/token.zig");

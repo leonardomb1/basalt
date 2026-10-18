@@ -439,6 +439,9 @@ pub const PqMorsels = struct {
     /// A single remote file's reader as planning opened it: lanes reuse its footer
     /// and size, each on its own connection.
     like: ?*const pqdecode.Reader = null,
+    /// A table's files, each opened fitted to `view`, the table's projected columns.
+    layout: ?*const pqdecode.Layout = null,
+    view: ?*const pqdecode.View = null,
 };
 
 pub const PqItem = struct { file: u32, rg: u32, rg_end: ?u32 };
@@ -455,6 +458,10 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
     };
     if (held.* == null) {
         const path = m.files[it.file];
+        if (m.layout) |lay| {
+            held.* = .{ .file = it.file, .r = try lay.open(scratch, m.view.?, it.file, m.bounds) orelse return null };
+            return positioned(m, held.*.?.r, it);
+        }
         const r = if (m.like) |l| try pqdecode.Reader.openLike(scratch, path, l) else try pqdecode.Reader.openProjected(scratch, path, m.project);
         if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema, m.project)) |why| {
             r.close();
@@ -462,7 +469,10 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
         };
         held.* = .{ .file = it.file, .r = r };
     }
-    const r = held.*.?.r;
+    return positioned(m, held.*.?.r, it);
+}
+
+fn positioned(m: *const PqMorsels, r: *pqdecode.Reader, it: PqItem) ?*pqdecode.Reader {
     r.bounds = m.bounds;
     r.keys = m.keys;
     r.tally = m.tally;

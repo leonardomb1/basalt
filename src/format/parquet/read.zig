@@ -112,6 +112,9 @@ const cmp = @import("stats.zig").cmp;
 pub const Bytes = @import("../bytes.zig").Bytes;
 pub const Remote = @import("../bytes.zig").Remote;
 pub const Folder = @import("folder.zig").Folder;
+pub const Fit = @import("fit.zig").Fit;
+pub const Layout = @import("fit.zig").Layout;
+pub const View = @import("fit.zig").View;
 const source_vtable = driver.sourceVTable(Reader);
 const chunkEnd = @import("folder.zig").chunkEnd;
 const chunkBoundaries = @import("folder.zig").chunkBoundaries;
@@ -148,6 +151,8 @@ pub const Reader = struct {
     path: []const u8 = "",
     /// The current row group's chunks, fetched in a few coalesced ranges.
     held: []const Held = &.{},
+    /// Set when the file is one of a table's whose schema governs it (`fit.zig`).
+    fit: ?*const Fit = null,
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -160,7 +165,13 @@ pub const Reader = struct {
     /// `open`, decoding only the named columns. An unknown name is ignored; an empty
     /// projection (COUNT(*)) keeps the narrowest column so batches carry a row count.
     pub fn openProjected(arena: std.mem.Allocator, path: []const u8, want: ?[]const []const u8) !*Reader {
-        const src = try Bytes.open(arena, path);
+        return openSized(arena, path, null, want);
+    }
+
+    /// `openProjected` with the file's size when a table's log already gave it, which
+    /// spares a remote file the request asking for it.
+    pub fn openSized(arena: std.mem.Allocator, path: []const u8, size: ?u64, want: ?[]const []const u8) !*Reader {
+        const src = try Bytes.openSized(arena, path, size);
         errdefer src.close();
 
         var footer_start: u64 = 0;
@@ -302,7 +313,8 @@ pub const Reader = struct {
                     cols[ci] = try assembleNested(arena, &n.root, entries, rows);
                 },
             };
-            return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
+            const b = Batch{ .schema = &self.schema, .columns = cols, .len = rows };
+            return if (self.fit) |f| try f.apply(arena, b) else b;
         }
         return null;
     }
@@ -598,6 +610,7 @@ test {
     _ = @import("chunk.zig");
     _ = @import("encoding.zig");
     _ = @import("folder.zig");
+    _ = @import("fit.zig");
     _ = @import("logical.zig");
     _ = @import("nested.zig");
     _ = @import("../bytes.zig");

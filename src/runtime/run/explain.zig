@@ -23,6 +23,8 @@ const profile = @import("../../exec/profile.zig");
 const runDescribe = @import("../run.zig").runDescribe;
 const runOutput = @import("output.zig").runOutput;
 const sourceLabel = @import("../connect.zig").sourceLabel;
+const resolveFolder = @import("../connect.zig").resolveFolder;
+const isFolderRead = @import("../connect.zig").isFolderRead;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
@@ -109,9 +111,14 @@ fn noteStages(env: *Env, prof: *Profile, stages: []const ast.Stage, depth: usize
 }
 
 /// A read as the tree names it: the connector, what it reads, and the WHERE it sends.
+/// A lake table is resolved here, as its run reuses: its kind and the version read.
 fn readText(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
     var out = std.Io.Writer.Allocating.init(env.arena);
     const w = &out.writer;
+    if (isFolderRead(rd)) if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.table) |t| {
+        try w.print("{s} {s} ({s})", .{ @tagName(t.kind), rd.form.path, t.label });
+        return out.written();
+    };
     try w.writeAll(sourceLabel(env, rd, hints));
     switch (rd.form) {
         .path => |p| try w.print(" {s}", .{p}),

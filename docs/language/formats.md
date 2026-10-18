@@ -57,6 +57,57 @@ pages, smaller than Snappy's for somewhat more CPU (a fast DEFLATE level), and
 `compression = 'none'` leaves them uncompressed. `compression` is a Parquet
 sink's option only; any other target refuses it at plan time.
 
+## Delta Lake
+
+A folder holding a `_delta_log/` is a Delta table, and a folder read of it —
+local, `s3://`, `az://`, SFTP or SMB — reads the table, not its files: the files
+its log keeps live at one version, each read by column name and typed by the
+table's schema. Read as a plain folder it would also return the rows of every
+file a later commit removed (an overwrite, a `DELETE`, a compaction), so a folder
+read looks for the log first, with or without `WITH (format = 'delta')`.
+
+```sql
+SELECT region, sum(amt) AS total
+FROM 's3://lake/sales/'
+WHERE day >= '2026-01-01'
+GROUP BY region;
+
+SELECT count(*) AS n_then FROM 's3://lake/sales/' WITH (version = 12);
+```
+
+The log is replayed as the protocol says: the newest complete checkpoint at or
+below the version read (one Parquet file, or every part of a multi-part one),
+then each JSON commit after it, an `add` putting a file in the table and a
+`remove` taking it out. `WITH (version = 12)` reads the table as commit 12 left
+it, as long as the log still holds what that takes; an older version, or a
+commit missing from `_delta_log/`, is refused naming the versions that can be
+read. `_last_checkpoint` is not needed, since the log's listing is read.
+
+The schema is the table's (`metaData.schemaString`): a column a file lacks reads
+as NULL, as one added after the file was written does, and a file whose column
+is of another type fails the read naming the file. A partition column's value
+comes from the log, as the protocol asks, whether or not the file holds it too;
+an empty or null value is NULL. A filter on a partition column skips the files
+whose value it rules out without opening them, and everything a Parquet folder
+does still applies: lanes under `-j`, projection, row-group statistics, a join's
+keys, ranged reads of remote files. Delta types map as Parquet's do — `long`,
+`integer`, `short` and `byte` to `INT`, `float` and `double` to `FLOAT`,
+`timestamp` and `timestamp_ntz` to `TIMESTAMP`, a struct to its dotted columns
+(`addr.city`), an array or map to one JSON text column.
+
+A table using a reader feature basalt does not honour is refused, naming it,
+rather than read into wrong rows: a deletion vector on a live file
+(`deletionVectors` alone is fine while no file carries one), column mapping by
+`name` or `id`, V2 checkpoints, a catalog-managed table, `typeWidening`,
+`variantType`, a reader version past 3, and any feature basalt does not know.
+`timestampNtz` and `vacuumProtocolCheck` read as usual.
+
+A Delta table is found by listing its log, which an `https://` URL cannot do; it
+is read from a local path, object storage, SFTP or SMB. `format = 'parquet'`
+reads the folder's files plain, removed ones included. EXPLAIN and `check` name
+the version and file count of the table they read, and `check` types a local
+table from its log. basalt reads Delta tables; it does not write them.
+
 ## JSON
 
 `LOAD INTO 'events.ndjson'` (also `.jsonl` and `.json`) writes a JSON object a

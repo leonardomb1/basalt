@@ -191,6 +191,8 @@ fn usage(w: anytype) !void {
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too).
         \\             WITH (format = 'records', newline = 'crlf') writes one
         \\             STRING or BYTES column a row verbatim (fixed-width files)
+        \\  delta      a folder holding _delta_log/ reads as the Delta table: its live
+        \\             files, typed by its schema; WITH (version = N) an older one
         \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),
         \\             piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;

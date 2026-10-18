@@ -9,7 +9,7 @@
 const std = @import("std");
 const stream = @import("stream.zig");
 
-pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records };
+pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, delta };
 
 /// How a read splits across lanes: by row group anywhere, by byte range of a local
 /// uncompressed file, or not at all.
@@ -30,6 +30,7 @@ pub const Format = struct {
     exts: []const []const u8,
     folder_exts: []const []const u8 = &.{},
     read_refused: ?[]const u8 = null,
+    write_refused: ?[]const u8 = null,
     compressed_read_refused: ?[]const u8 = null,
     archive_refused: ?[]const u8 = null,
     local_only: ?[]const u8 = null,
@@ -133,6 +134,20 @@ pub const table = [_]Format{
         .write = .{},
         .write_keys = &.{ "format", "newline", "encoding" },
     },
+    .{
+        .tag = .delta,
+        .label = "Delta",
+        .read_what = "a Delta table read",
+        .names = &.{"delta"},
+        .exts = &.{},
+        .compressed_read_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder",
+        .archive_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder; extract it first",
+        .lanes = .row_groups,
+        .read_keys = &.{ "format", "version" },
+        .write_refused = "basalt reads Delta tables; it does not write them",
+        .write = .{},
+        .write_keys = &.{"format"},
+    },
 };
 
 /// Whether `f` can be read; a write-only format is left out of every read-side list.
@@ -184,11 +199,11 @@ pub const names_list: []const u8 = blk: {
 pub const handled_list: []const u8 = blk: {
     var s: []const u8 = "";
     var n_read = 0;
-    for (table) |f| if (readable(f)) {
+    for (table) |f| if (readable(f) and f.exts.len > 0) {
         n_read += 1;
     };
     var i = 0;
-    for (table) |f| if (readable(f)) {
+    for (table) |f| if (readable(f) and f.exts.len > 0) {
         var exts: []const u8 = "";
         for (f.exts) |e| exts = exts ++ (if (exts.len == 0) "" else ", ") ++ "`" ++ e ++ "`";
         const sep = if (i == 0) "" else if (i + 1 == n_read) " and " else ", ";
@@ -308,7 +323,9 @@ test "formats: tags index the table, names and extensions resolve, lists are gen
     try std.testing.expect(ofPath("x.yaml") == null);
     try std.testing.expect(inFolder(of(.csv), "d/a.tsv.zst"));
     try std.testing.expect(!inFolder(of(.csv), "d/a.json"));
-    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records", names_list);
+    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta", names_list);
+    try std.testing.expect(std.mem.indexOf(u8, handled_list, "Delta") == null);
+    try std.testing.expect(of(.delta).write_refused != null);
     try std.testing.expectEqual(FileFormat.records, byName("Records").?.tag);
     try std.testing.expect(readRefused(.records) != null and readRefused(.csv) == null);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "records") == null);

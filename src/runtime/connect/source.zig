@@ -43,6 +43,7 @@ const xlsx = @import("../../format/xlsx/read.zig");
 const jsonread = @import("../../format/json/read.zig");
 const xmlread = @import("../../format/xml/read.zig");
 const formats = @import("../../format/formats.zig");
+const lake = @import("../../format/lake/table.zig");
 const stream = @import("../../format/stream.zig");
 
 pub const ConstSource = struct {
@@ -94,7 +95,7 @@ pub fn openSourceProjected(
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
             env.folder_memo = null;
-            const pf = try openParquetFolder(env, rd.form.path, fr.files, project);
+            const pf = try openParquetFolder(env, rd.form.path, fr, project);
             pf.bounds = bounds;
             env.pq_readers += 1;
             env.pq_folder = pf;
@@ -128,19 +129,46 @@ pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?Fol
     if (!folder.isFolder(path)) return null;
     var fdiag = analyze.Diag{};
     const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
-    return resolveFolderFmt(env, path, want);
+    const at = analyze.lakeAt(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
+    return resolveFolderFmt(env, path, want, at);
 }
 
-pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) !?FolderRead {
+/// A folder holding a lake table's log is that table, its live files read through
+/// the table's schema, whether `format` names it or not: read as a plain folder it
+/// would return the rows its log removed. `format = 'parquet'` reads the files plain.
+pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
     if (!folder.isFolder(path)) return null;
-    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path)) return m.read;
-    const all = folder.list(env.arena, path) catch |e| {
-        if (e == azure.Error.AzureEmptyPrefix)
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
-        if (e == s3.Error.S3EmptyPrefix)
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{path}));
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path) and m.want == want and m.at.eql(at)) return m.read;
+    const read = try resolveTable(env, path, want, at) orelse try resolvePlain(env, path, want, at);
+    env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .want = want, .at = at, .read = read };
+    return read;
+}
+
+fn resolveTable(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
+    if (want != null and want.? != .delta) return null;
+    const kind = if (want == .delta) lake.Kind.delta else (lake.detect(env.arena, path) catch |e|
+        return listFailed(env, path, e)) orelse return null;
+    const t = lake.resolve(env.arena, path, kind, at) catch |e| {
+        if (eval.takeFailure(e)) |why| return planErrT(env.diag, e, try env.arena.dupe(u8, why));
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read {s} table `{s}` ({s})", .{ kind.label(), path, try pathFail(env.arena, path, e) }));
     };
+    return .{ .kind = .parquet, .files = try t.layout.paths(env.arena), .table = t };
+}
+
+fn listFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
+    if (e == azure.Error.AzureEmptyPrefix)
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
+    if (e == s3.Error.S3EmptyPrefix)
+        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{path}));
+    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+}
+
+fn resolvePlain(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !FolderRead {
+    if (at.version != null) {
+        const e = lake.notPinnable(path);
+        return planErrT(env.diag, e, try env.arena.dupe(u8, eval.takeFailure(e).?));
+    }
+    const all = folder.list(env.arena, path) catch |e| return listFailed(env, path, e);
     if (all.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{path}));
     const kind: folder.Kind = if (want) |w| (if (formats.of(w).folder_exts.len > 0) w else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads " ++ formats.folder_labels ++ " files", .{path}))) else switch (folder.kindOf(all)) {
         .kind => |k| k,
@@ -150,14 +178,18 @@ pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat) 
     };
     const files = try folder.only(env.arena, all, kind);
     if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ formats.folder_exts_of[@intFromEnum(kind)], path }));
-    const read = FolderRead{ .kind = kind, .files = files };
-    env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .read = read };
-    return read;
+    return .{ .kind = kind, .files = files };
 }
 
 pub const FolderRead = env_mod.FolderRead;
 
-fn openParquetFolder(env: *Env, path: []const u8, files: []const []const u8, project: ?[][]const u8) !*pqdecode.Folder {
+fn openParquetFolder(env: *Env, path: []const u8, fr: FolderRead, project: ?[][]const u8) !*pqdecode.Folder {
+    if (fr.table) |t| {
+        const pf = try pqdecode.Folder.openLayout(env.arena, t.layout, project);
+        pf.tally = env.scan;
+        return pf;
+    }
+    const files = fr.files;
     const pf = pqdecode.Folder.open(env.arena, path, files, project) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` in folder `{s}` ({s})", .{ files[0], path, try pathFail(env.arena, files[0], e) }));
     if (pf.firstReader()) |first| {
@@ -308,11 +340,11 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const fr = try resolveFolder(env, rd.form.path, hints);
         env.folder_memo = null;
         if (fr) |f| switch (f.kind) {
-            .parquet => return (try openParquetFolder(env, rd.form.path, f.files, null)).source(),
+            .parquet => return (try openParquetFolder(env, rd.form.path, f, null)).source(),
             .json => return openJson(env, rd.form.path, f.files, hints),
             .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
             .csv => {},
-            .arrow, .xlsx, .records => unreachable,
+            .arrow, .xlsx, .records, .delta => unreachable,
         };
         switch (analyze.readFormat(rd.form.path, want)) {
             .parquet => {
@@ -325,7 +357,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .xlsx => return openXlsx(env, rd.form.path, hints),
             .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
             .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
-            .records => unreachable,
+            .records, .delta => unreachable,
             .csv => {},
         }
         var ddiag = analyze.Diag{};

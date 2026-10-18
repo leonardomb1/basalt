@@ -8,3 +8,4 @@ pub const openpyxl_xlsx = @embedFile("openpyxl.xlsx");
 pub const logical_types_parquet = @embedFile("logical_types.parquet");
 pub const lists_v1_parquet = @embedFile("lists_v1.parquet");
 pub const lists_v2_parquet = @embedFile("lists_v2.parquet");
+pub const delta_rs_checkpoint_parquet = @embedFile("delta_rs_checkpoint.parquet");

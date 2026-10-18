@@ -21,29 +21,37 @@ pub fn isFolder(path: []const u8) bool {
 
 pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
+    for (try listRaw(arena, path)) |f| if (!hidden(below(f, path))) try out.append(f);
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// Every file under `path`, hidden ones included, in the order the listing gave:
+/// what a table's log (`_delta_log/`) is read from. An SFTP or SMB listing still
+/// leaves out subfolders starting `_` or `.`.
+pub fn listRaw(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(arena);
     if (sftp.isUrl(path) or smb.isUrl(path)) {
         const names = if (sftp.isUrl(path)) try sftp.listPrefix(arena, path) else try smb.listPrefix(arena, path);
-        for (names) |n| if (!hidden(n)) try out.append(try std.mem.concat(arena, u8, &.{ path, n }));
+        for (names) |n| try out.append(try std.mem.concat(arena, u8, &.{ path, n }));
     } else if (objstore.isUrl(path)) {
         var client = http_client.initClient(arena);
         defer client.deinit();
-        const urls = try objstore.listPrefix(arena, &client, path);
-        for (urls) |u| if (!hidden(below(u, path))) try out.append(u);
+        try out.appendSlice(try objstore.listPrefix(arena, &client, path));
     } else {
         var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
         defer dir.close();
         var w = try dir.walk(arena);
         defer w.deinit();
         while (try w.next()) |en| {
-            if (en.kind != .file or hidden(en.path)) continue;
+            if (en.kind != .file) continue;
             try out.append(try std.fmt.allocPrint(arena, "{s}{s}", .{ path, en.path }));
         }
     }
-    std.mem.sort([]const u8, out.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
-        }
-    }.lt);
     return out.items;
 }
 

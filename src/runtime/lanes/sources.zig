@@ -75,8 +75,9 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
     if (folder.isFolder(path)) {
-        const fr = (try connect_mod.resolveFolderFmt(env, path, env.fmt_in)) orelse return null;
+        const fr = (try connect_mod.resolveFolderFmt(env, path, env.fmt_in, env.lake_at)) orelse return null;
         if (fr.kind != .parquet) return null;
+        if (fr.table) |t| return tableSplit(env, t.layout, path, push_stages);
         files = fr.files;
         root = path;
     } else {
@@ -135,6 +136,49 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
         .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
         .check_in_lane = remote and root != null,
         .like = like,
+    } };
+}
+
+/// A table's live files split at row groups, locally each file opened here so one
+/// that does not fit the table fails the plan; remotely at files. A file its
+/// partition values rule out is left out.
+fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, push_stages: []const ast.Stage) anyerror!?LaneSplit {
+    const arena = env.arena;
+    const project = try projectedColumns(env, push_stages);
+    const bounds = try filterBounds(env, push_stages);
+    const view = try layout.view(arena, project);
+    const remote = csv.CsvReader.isUrl(path);
+    var items = std.array_list.Managed(PqItem).init(arena);
+    var noted = false;
+    for (layout.files, 0..) |_, k| {
+        if (layout.pruned(k, bounds)) continue;
+        if (remote) {
+            try items.append(.{ .file = @intCast(k), .rg = 0, .rg_end = null });
+            continue;
+        }
+        const r = (try layout.open(arena, view, k, &.{})).?;
+        defer r.close();
+        if (!noted) if (env.scan) |t| {
+            noted = true;
+            driver.ScanTally.add(&t.columns_read, r.leaves.len);
+            driver.ScanTally.add(&t.columns_total, r.md.leafCount());
+        };
+        for (0..r.md.row_groups.len) |g| try items.append(.{ .file = @intCast(k), .rg = @intCast(g), .rg_end = @intCast(g + 1) });
+    }
+    if (items.items.len < 2) return null;
+    env.folder_memo = null;
+    return .{ .parquet = .{
+        .tally = env.scan,
+        .files = try layout.paths(arena),
+        .root = path,
+        .items = items.items,
+        .project = project,
+        .bounds = bounds,
+        .src_schema = &view.schema,
+        .queue = .{ .nitems = items.items.len },
+        .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
+        .layout = layout,
+        .view = view,
     } };
 }
 

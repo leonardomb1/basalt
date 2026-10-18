@@ -25,6 +25,7 @@ const xlsx = @import("../../format/xlsx/read.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const zipsrc = @import("../../format/compress/zip.zig");
 const formats = @import("../../format/formats.zig");
+const lake = @import("../../format/lake/table.zig");
 
 pub const FileFormat = formats.FileFormat;
 
@@ -77,6 +78,20 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     const s = hintText(hints, "format") orelse return null;
     if (formats.byName(s)) |f| return f.tag;
     return fail(diag, "unknown format `{s}` (" ++ formats.names_list ++ ")", .{s});
+}
+
+/// The version a lake table read is pinned to: `version = N`, a commit number.
+pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
+    for (hints) |h| {
+        if (!std.mem.eql(u8, h.key, "version")) continue;
+        const n: ?u64 = switch (h.value) {
+            .int => |i| if (i >= 0) @intCast(i) else null,
+            .str, .ident => |s| std.fmt.parseInt(u64, s, 10) catch null,
+            .flag => null,
+        };
+        return .{ .version = n orelse return fail(diag, "`version` is a Delta table's commit number, a whole number from 0", .{}) };
+    }
+    return .{};
 }
 
 /// How a JSON read cuts its input into rows: `format = 'ndjson'` (or `'jsonl'`)
@@ -172,6 +187,7 @@ pub const WriteOptions = union(FileFormat) {
     json: jsonwrite.Shape,
     xml: xmlwrite.Names,
     records: recordswrite.Options,
+    delta: void,
 };
 
 pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
@@ -189,6 +205,7 @@ pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!Wr
         .json => .{ .json = shape },
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
+        .delta => .delta,
     };
 }
 
@@ -268,6 +285,7 @@ pub fn stdinProblem(fmt: FileFormat) ?[]const u8 {
 /// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
 /// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    if (explicit) |f| if (formats.of(f).write_refused) |why| return why;
     if (std.ascii.endsWithIgnoreCase(csv.dataName(path), ".xlsm"))
         return "basalt writes `.xlsx`; a macro-enabled `.xlsm` holds macros it cannot write";
     if (csv.splitArchive(path) != null)
@@ -284,6 +302,7 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 /// and an archive is `archiveProblem`'s to judge.
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (std.mem.endsWith(u8, path, "/")) return null;
+    if (explicit == .delta) return "a Delta table is read from its root folder: end the path with `/`";
 
     if (csv.splitArchive(path) != null) return null;
 
@@ -343,9 +362,11 @@ pub fn laneHints(st: ast.Stage) bool {
             if (st.node != .read or st.node.read.form != .path) return false;
             var d = Diag{};
             const f = (formatFromHints(st.hints, &d) catch return false) orelse return false;
-            if (f != readFormat(st.node.read.form.path, null)) return false;
+            const in_folder = folder.isFolder(st.node.read.form.path) and (f == .parquet or f == .delta);
+            if (!in_folder and f != readFormat(st.node.read.form.path, null)) return false;
             continue;
         }
+        if (std.mem.eql(u8, h.key, "version") and st.node == .read and st.node.read.form == .path and folder.isFolder(st.node.read.form.path)) continue;
         return false;
     }
     return true;
@@ -395,8 +416,10 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path) or ftp.isUrl(rd.form.path)) return null;
         if (folder.isFolder(rd.form.path)) {
+            if (offlineTable(arena, rd.form.path, hints) catch null) |t| return t.layout.schema;
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;
+            if (explicit == .delta) return null;
             const all = folder.list(arena, rd.form.path) catch return null;
             if (explicit == .json or (explicit == null and std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .json }))) {
                 const files = folder.only(arena, all, .json) catch return null;
@@ -448,6 +471,20 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         return schema;
     }
     return null;
+}
+
+/// A local lake table resolved as a run would, for `check` to type and to refuse
+/// what a run refuses; null for a plain folder, a remote one, or one not there yet.
+pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const ast.Hint) !?*const lake.Resolved {
+    if (!folder.isFolder(path) or std.mem.indexOf(u8, path, "://") != null) return null;
+    var d = Diag{};
+    const explicit = formatFromHints(hints, &d) catch return null;
+    if (explicit != null and explicit.? != .delta) return null;
+    std.fs.cwd().access(path, .{}) catch return null;
+    const at = lakeAt(hints, &d) catch return null;
+    const kind = (lake.detect(arena, path) catch return null) orelse
+        (if (explicit == .delta) lake.Kind.delta else if (at.version != null) return lake.notPinnable(path) else return null);
+    return lake.resolve(arena, path, kind, at) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
 }
 
 fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) ?types.Schema {

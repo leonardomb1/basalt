@@ -119,6 +119,7 @@ pub fn appendUnsupported(target: []const u8, explicit: ?FileFormat) ?[]const u8 
 /// Every file sink runs on the `csv` connector, so the format is named from the target.
 pub fn sinkKind(node: anytype) []const u8 {
     const path = if (@hasField(@TypeOf(node), "target")) node.target else node.detail;
+    if (@hasField(@TypeOf(node), "format")) if (node.format) |f| return f;
     if (std.mem.eql(u8, node.connector, "csv")) if (targets.formatOfPath(path)) |f| return @tagName(f);
     return node.connector;
 }

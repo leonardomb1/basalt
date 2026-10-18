@@ -337,12 +337,17 @@ pub const archiveProblem = @import("analyze/targets.zig").archiveProblem;
 pub const laneHints = @import("analyze/targets.zig").laneHints;
 const morselParallelRead = @import("analyze/targets.zig").morselParallelRead;
 const offlineSchema = @import("analyze/targets.zig").offlineSchema;
+const offlineTable = @import("analyze/targets.zig").offlineTable;
+pub const lakeAt = @import("analyze/targets.zig").lakeAt;
+const folder = @import("../connect/folder.zig");
 
 pub const Source = struct {
     connector: []const u8,
     detail: []const u8,
     schema: ?types.Schema = null,
     pushdown: []const u8 = "",
+    /// The format a scan names when its path does not say, as a lake table's.
+    format: ?[]const u8 = null,
 };
 
 pub const Sink = struct {
@@ -1462,8 +1467,19 @@ const Ctx = struct {
                     if (readFormat(rd.form.path, fmt) == .xlsx) _ = try xlsxOptions(lead.hints, self.diag);
                     if (readFormat(rd.form.path, fmt) == .xml) _ = try xmlOptions(lead.hints, &.{}, self.diag);
                     _ = try dialectFromHints(lead.hints, self.diag);
+                    _ = try lakeAt(lead.hints, self.diag);
                 }
                 const rewritten = rd.form == .path and containsName(self.written, rd.form.path);
+                if (!rewritten and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
+                    const t = offlineTable(self.arena, rd.form.path, lead.hints) catch |e|
+                        return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
+                    if (t) |tb| return .{
+                        .connector = connector,
+                        .detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ detail, tb.label }),
+                        .schema = tb.layout.schema,
+                        .format = @tagName(tb.kind),
+                    };
+                }
                 const schema = if (rewritten) null else offlineSchema(self.arena, rd, lead.hints);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
@@ -1884,8 +1900,11 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
         .union_ => union_read,
         else => other_read,
     };
+    const plain_folder = lead.node == .read and lead.node.read.form == .path and folder.isFolder(lead.node.read.form.path) and
+        std.mem.eql(u8, connector, "csv") and (formatFromHints(lead.hints, diag) catch null) == null;
     for (lead.hints) |h| {
         if (containsName(kind.keys, h.key) or containsName(&any_read_keys, h.key)) continue;
+        if (plain_folder and std.mem.eql(u8, h.key, "version")) continue;
         if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
         const e = if (containsName(&join_hint_keys, h.key))
             fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})

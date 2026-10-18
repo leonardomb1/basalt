@@ -1,11 +1,13 @@
 //! A folder of Parquet files read as one table, every file checked against the first
-//! one's columns.
+//! one's columns; or a table's files (`fit.zig`), each fitted to the table's schema.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const KeyBound = @import("stats.zig").KeyBound;
 const Bytes = @import("../bytes.zig").Bytes;
 const Error = @import("read.zig").Error;
+const Layout = @import("fit.zig").Layout;
+const View = @import("fit.zig").View;
 const Reader = @import("read.zig").Reader;
 const Threshold = @import("../../exec/value.zig").Threshold;
 const driver = @import("../../connect/driver.zig");
@@ -30,6 +32,9 @@ pub const Folder = struct {
     tally: ?*driver.ScanTally = null,
     cur: ?*Reader = null,
     i: usize = 0,
+    layout: ?*const Layout = null,
+    view: ?*const View = null,
+    noted: bool = false,
 
     pub fn open(arena: std.mem.Allocator, root: []const u8, files: []const []const u8, project: ?[]const []const u8) !*Folder {
         if (files.len == 0) return error.EmptyFolder;
@@ -38,6 +43,15 @@ pub const Folder = struct {
         for (fields, first.schema.fields) |*f, src| f.* = .{ .name = src.name, .ty = src.ty.asNullable() };
         const self = try arena.create(Folder);
         self.* = .{ .arena = arena, .root = root, .files = files, .project = project, .schema = .{ .fields = fields }, .cur = first, .i = 1 };
+        return self;
+    }
+
+    /// A table's files, read lazily so a bound set after opening can skip a file
+    /// unopened; a table of no files reads as no rows.
+    pub fn openLayout(arena: std.mem.Allocator, layout: *const Layout, project: ?[]const []const u8) !*Folder {
+        const v = try layout.view(arena, project);
+        const self = try arena.create(Folder);
+        self.* = .{ .arena = arena, .root = layout.root, .files = try layout.paths(arena), .project = project, .schema = v.schema, .layout = layout, .view = v };
         return self;
     }
 
@@ -63,6 +77,15 @@ pub const Folder = struct {
             if (self.i >= self.files.len) return null;
             const path = self.files[self.i];
             self.i += 1;
+            if (self.layout) |lay| {
+                self.cur = try lay.open(self.arena, self.view.?, self.i - 1, self.bounds) orelse continue;
+                if (!self.noted) if (self.tally) |t| {
+                    self.noted = true;
+                    driver.ScanTally.add(&t.columns_read, self.cur.?.leaves.len);
+                    driver.ScanTally.add(&t.columns_total, self.cur.?.md.leafCount());
+                };
+                continue;
+            }
             const r = try Reader.openProjected(self.arena, path, self.project);
             if (self.mismatch(r.schema)) |why| {
                 r.close();

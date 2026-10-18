@@ -46,6 +46,10 @@ wrong name. Each file still skips the columns and row groups the query does
 not need. CSV files must repeat the first one's header. JSON files take the
 first file's columns, as a REST read's later pages do.
 
+A folder holding a `_delta_log/` is read as the Delta table it is — its live
+files, typed by its schema, `WITH (version = N)` for an earlier version — not as
+its files ([Delta Lake](formats.md#delta-lake)).
+
 ## JSON and NDJSON
 
 A JSON read takes NDJSON (one value per line), a top-level array whose

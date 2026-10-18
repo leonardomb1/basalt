@@ -19,6 +19,7 @@ const op = @import("../exec/op.zig");
 const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
+const lake = @import("../format/lake/table.zig");
 const codec = @import("../format/compress/codecs.zig");
 const jsonwrite = @import("../format/json/write.zig");
 const driver = @import("../connect/driver.zig");
@@ -245,7 +246,13 @@ pub const SqlDesc = struct {
     read: ast.Read = .{ .connector = "", .form = .unit },
 };
 
-pub const FolderRead = struct { kind: @import("../connect/folder.zig").Kind, files: []const []const u8 };
+/// A folder's format and files; for a lake table, the files its log keeps live and
+/// the table they were resolved from.
+pub const FolderRead = struct {
+    kind: @import("../connect/folder.zig").Kind,
+    files: []const []const u8,
+    table: ?*const lake.Resolved = null,
+};
 
 pub const Env = struct {
     arena: std.mem.Allocator,
@@ -288,7 +295,9 @@ pub const Env = struct {
     pq_reader: ?*pqdecode.Reader = null,
     pq_folder: ?*pqdecode.Folder = null,
     sort_threads: usize = 1,
-    folder_memo: ?struct { path: []const u8, read: FolderRead } = null,
+    folder_memo: ?struct { path: []const u8, want: ?analyze.FileFormat, at: lake.At, read: FolderRead } = null,
+    /// The version a lake table read is pinned to, from the read's options, as `fmt_in`.
+    lake_at: lake.At = .{},
     sink_name: []const u8 = "",
     last_target: []const u8 = "",
     wrote_sink: bool = false,
