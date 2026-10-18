@@ -525,7 +525,9 @@ fn fixedByteArrays(arena: std.mem.Allocator, body: []const u8, type_length: i32,
 
 /// Indices are bounds-checked once, then gathered through the typed dictionary.
 fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
-    for (idx) |ix| if (ix >= d.col.len) return Error.CorruptParquetPage;
+    var top: u32 = 0;
+    for (idx) |ix| top = @max(top, ix);
+    if (idx.len > 0 and top >= d.col.len) return Error.CorruptParquetPage;
     switch (d.col.data) {
         .bytes => {
             const vals = try rows.arena.alloc([]const u8, idx.len);

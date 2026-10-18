@@ -79,7 +79,10 @@ pub fn decodeRleHybrid(
             const run = src[pos..][0..bytes];
             const take = @min(vals, count - n);
             const mask = (@as(u64, 1) << width) - 1;
-            var i: usize = 0;
+            var i: usize = switch (width) {
+                inline 1...32 => |w| unpackGroups(w, run, out[n..][0..take]),
+                else => 0,
+            };
             while (width <= 32 and i < take) : (i += 1) {
                 const bit = i * width;
                 const byte = bit >> 3;
@@ -98,14 +101,31 @@ pub fn decodeRleHybrid(
             var v: u32 = 0;
             for (0..vb) |k| v |= @as(u32, src[pos + k]) << @intCast(8 * k);
             pos += vb;
-            for (0..run) |_| {
-                if (n >= count) break;
-                out[n] = v;
-                n += 1;
-            }
+            const take = @min(run, count - n);
+            @memset(out[n..][0..take], v);
+            n += take;
         }
     }
     return out;
+}
+
+/// The whole groups of eight `w`-bit values at the start of a bit-packed run, each
+/// group's shifts fixed at compile time; returns how many values it wrote. Stops at
+/// the first group whose last word would read past `run`, which the caller finishes.
+fn unpackGroups(comptime w: u6, run: []const u8, out: []u32) usize {
+    const mask: u64 = (@as(u64, 1) << w) - 1;
+    const groups = out.len / 8;
+    var g: usize = 0;
+    while (g < groups) : (g += 1) {
+        const base = g * @as(usize, w);
+        if (base + w + 8 > run.len) break;
+        const p = run[base..];
+        inline for (0..8) |k| {
+            const bit = k * @as(usize, w);
+            out[g * 8 + k] = @intCast((std.mem.readInt(u64, p[bit / 8 ..][0..8], .little) >> @intCast(bit % 8)) & mask);
+        }
+    }
+    return g * 8;
 }
 
 fn readVarint(src: []const u8, pos: *usize) Error!u64 {

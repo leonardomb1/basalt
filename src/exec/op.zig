@@ -571,7 +571,7 @@ fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, p
             keep = null;
         }
     }
-    if (keep) |k| return gatherBatch(arena, cur, k, kept);
+    if (keep) |k| if (kept < cur.len) return gatherBatch(arena, cur, k, kept);
     const outcols = try arena.alloc(column.Column, cur.columns.len);
     for (cur.columns, outcols) |c, *o| o.* = try column.copy(arena, c);
     return Batch{ .schema = b.schema, .columns = outcols, .len = cur.len };
@@ -610,9 +610,15 @@ fn andMask(scratch: std.mem.Allocator, prev: ?[]bool, m: column.Column, n: usize
     return out;
 }
 
+/// The rows `keep` marks, every column gathered by one selection worked out once.
 fn gatherBatch(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) !Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    for (b.columns, outcols) |c, *o| o.* = try column.gather(arena, c, keep, kept);
+    if (b.columns.len < 2) {
+        for (b.columns, outcols) |c, *o| o.* = try column.gather(arena, c, keep, kept);
+    } else {
+        const sel = try column.keptIndices(arena, keep, kept);
+        for (b.columns, outcols) |c, *o| o.* = try column.permute(arena, c, sel);
+    }
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 

@@ -145,28 +145,27 @@ pub const BytesAppender = struct {
     }
 };
 
-fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
-    const idx = try arena.alloc(usize, kept);
+/// The positions `keep` marks, `kept` of them. Every position is written and the
+/// cursor advanced by the mark, so the loop has no branch to mispredict; the slot
+/// past the last kept position takes the final write.
+pub fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
+    const idx = try arena.alloc(usize, kept + 1);
     var w: usize = 0;
     for (keep, 0..) |k, i| {
-        if (k) {
-            idx[w] = i;
-            w += 1;
-        }
+        idx[w] = i;
+        w += @intFromBool(k);
     }
-    return idx;
+    return idx[0..kept];
 }
 
 fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep: []const bool, kept: usize) ![]T {
-    const out = try arena.alloc(T, kept);
+    const out = try arena.alloc(T, kept + 1);
     var w: usize = 0;
-    for (keep, 0..) |k, i| {
-        if (k) {
-            out[w] = src[i];
-            w += 1;
-        }
+    for (keep, src[0..keep.len]) |k, x| {
+        out[w] = x;
+        w += @intFromBool(k);
     }
-    return out;
+    return out[0..kept];
 }
 
 /// Returns the all-valid bitmap untouched when the source has no nulls, as
