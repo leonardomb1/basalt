@@ -63,7 +63,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
 /// splits at row groups when it has two or more and its server honours range
 /// requests, each lane on its own connection over the footer read here.
 /// `push_stages` stops before a map path's join, whose names are the join's.
-pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?LaneSplit {
+pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stages: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?LaneSplit {
     const arena = env.arena;
     const path = switch (rd.form) {
         .path => |p| p,
@@ -75,7 +75,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, push_stages: []const ast.Stage, w: 
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
     if (folder.isFolder(path)) {
-        const fr = (try connect_mod.resolveFolderFmt(env, path, env.fmt_in, env.lake_at)) orelse return null;
+        const fr = (try connect_mod.resolveFolder(env, path, hints)) orelse return null;
         if (fr.kind != .parquet) return null;
         if (fr.table) |t| return tableSplit(env, t.layout, path, push_stages);
         files = fr.files;

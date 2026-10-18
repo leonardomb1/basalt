@@ -455,7 +455,6 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     var ddiag = analyze.Diag{};
     env.csv_in = analyze.dialectFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.fmt_in = analyze.formatFromHints(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-    env.lake_at = analyze.lakeAt(stages[0].hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     if (stages[0].node == .read and stages[0].node.read.form == .path and std.mem.eql(u8, stages[0].node.read.connector, "csv"))
         try guardFileFormat(env, stages[0].node.read.form.path, env.fmt_in, "read");
 

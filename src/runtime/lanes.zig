@@ -103,7 +103,7 @@ pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (!shapeLaneSafe(shape)) return false;
-    const split = (try parquetSplit(env, stages[0].node.read, pushStages(stages, shape), w, opts)) orelse return false;
+    const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse return false;
     return runShape(env, split, shape, w, opts, stats, lanes_used);
 }
 

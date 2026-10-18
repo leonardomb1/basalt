@@ -296,8 +296,6 @@ pub const Env = struct {
     pq_folder: ?*pqdecode.Folder = null,
     sort_threads: usize = 1,
     folder_memo: ?struct { path: []const u8, want: ?analyze.FileFormat, at: lake.At, read: FolderRead } = null,
-    /// The version a lake table read is pinned to, from the read's options, as `fmt_in`.
-    lake_at: lake.At = .{},
     sink_name: []const u8 = "",
     last_target: []const u8 = "",
     wrote_sink: bool = false,

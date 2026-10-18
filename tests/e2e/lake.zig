@@ -158,11 +158,14 @@ test "a Delta table's lanes return what one lane does, and lanes run" {
         "SELECT name, SUM(id) AS s FROM '$B/t/' GROUP BY name ORDER BY name",
         "SELECT id, name FROM '$B/t/' WHERE id > 3",
         "SELECT DISTINCT name FROM '$B/t/' WITH (format = 'delta', version = 1) ORDER BY name",
-    }) |q| {
+        "WITH old AS (SELECT * FROM '$B/t/' WITH (version = 0)) SELECT name, COUNT(*) AS c FROM old GROUP BY name ORDER BY name",
+        "WITH raw AS (SELECT * FROM '$B/t/' WITH (format = 'parquet')) SELECT name, COUNT(*) AS c FROM raw GROUP BY name ORDER BY name",
+    }, [_]usize{ 3, 2, 3, 4, 5 }) |q, n| {
         const one = try rows(a, &tmp, q, 1);
         const r = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{q}), 4);
         try testing.expect(r.err == null);
         try testing.expectEqualStrings(one, r.out);
+        try testing.expectEqual(n + 1, std.mem.count(u8, one, "\n"));
         try testing.expect(r.summary.threads > 1);
     }
 }
