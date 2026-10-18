@@ -2089,3 +2089,17 @@ test "a WHERE's later conjunct never errs on a row an earlier one dropped, wheth
         try expectFile(&tmp, "o.csv", want);
     }
 }
+
+test "date comparisons: column against column and against a literal on either side, with and without nulls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "a,b,c\n2024-01-05,2024-01-07,2024-01-05\n2024-02-01,2024-01-31,\n2024-01-31,2024-01-31,2024-01-31\n" });
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/o.csv' AS
+        \\SELECT CAST(a AS DATE) < CAST(b AS DATE) AS lt, CAST(a AS DATE) >= '2024-01-31' AS ge_lit,
+        \\       '2024-01-31' = CAST(b AS DATE) AS lit_eq, CAST(a AS DATE) <> CAST(c AS DATE) AS ne_null
+        \\FROM '$B/d.csv';
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "lt,ge_lit,lit_eq,ne_null\ntrue,false,false,false\nfalse,true,true,\nfalse,true,true,false\n");
+}

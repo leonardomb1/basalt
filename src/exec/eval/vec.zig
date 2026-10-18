@@ -330,6 +330,7 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             if (try asNum(arena, l, batch.len)) |ln| {
                 if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
             }
+            if (try dateCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
             if (try temporalPair(arena, l, r, batch.len)) |tp| {
                 return numOpVec(arena, b.op, tp[0], tp[1], batch.len);
             }
@@ -362,6 +363,10 @@ fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator,
     const ty = Type.init(if (Out == bool) .bool else if (T == i64) .int else .float);
     const out = try arena.alloc(Out, n);
     if (allValidNum(l, n) and allValidNum(r, n)) {
+        if (Out == bool and T == i64) {
+            cmpInto(i64, op, out, intSide(l), intSide(r));
+            return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
+        }
         for (0..n) |i| out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
         return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
     }
@@ -370,6 +375,78 @@ fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator,
         if (!numValid(l, i) or !numValid(r, i)) f.setNull(i) else out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
     }
     return f.finish(ty);
+}
+
+/// One operand of a comparison kernel: a column's values or one value for every row.
+fn CmpSide(comptime T: type) type {
+    return union(enum) { col: []const T, one: T };
+}
+
+inline fn intSide(x: Num) CmpSide(i64) {
+    return switch (x) {
+        .icol => |c| .{ .col = c.d },
+        .iscalar => |v| .{ .one = v },
+        else => unreachable,
+    };
+}
+
+inline fn cmpOne(comptime T: type, comptime op: ast.BinOp, a: T, b: T) bool {
+    return switch (op) {
+        .eq => a == b,
+        .ne => a != b,
+        .lt => a < b,
+        .le => a <= b,
+        .gt => a > b,
+        .ge => a >= b,
+        else => unreachable,
+    };
+}
+
+/// `op` over two null-free integer operands, one loop per operand shape so each
+/// compiles to a plain vectorizable compare.
+fn cmpInto(comptime T: type, comptime op: ast.BinOp, out: []bool, l: CmpSide(T), r: CmpSide(T)) void {
+    switch (l) {
+        .col => |a| switch (r) {
+            .col => |b| for (out, a[0..out.len], b[0..out.len]) |*o, x, y| {
+                o.* = cmpOne(T, op, x, y);
+            },
+            .one => |y| for (out, a[0..out.len]) |*o, x| {
+                o.* = cmpOne(T, op, x, y);
+            },
+        },
+        .one => |x| switch (r) {
+            .col => |b| for (out, b[0..out.len]) |*o, y| {
+                o.* = cmpOne(T, op, x, y);
+            },
+            .one => |y| @memset(out, cmpOne(T, op, x, y)),
+        },
+    }
+}
+
+/// A date compared with a date, each a null-free column or one value (a date
+/// literal or text that reads as one), on the stored days: no widening to i64.
+/// Null when the operands are not that shape.
+fn dateCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
+    if (l != .col and r != .col) return null;
+    const ls = dateSide(l, n) orelse return null;
+    const rs = dateSide(r, n) orelse return null;
+    const out = try arena.alloc(bool, n);
+    switch (op) {
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| cmpInto(i32, cop, out, ls, rs),
+        else => return null,
+    }
+    return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
+}
+
+fn dateSide(v: Vec, n: usize) ?CmpSide(i32) {
+    return switch (v) {
+        .col => |c| if (c.ty.kind == .date and c.validity.allSet(n)) .{ .col = c.data.i32 } else null,
+        .scalar => |x| switch (x) {
+            .date => |d| .{ .one = d },
+            .string => |t| if (parseDateText(t)) |d| (if (std.math.cast(i32, d)) |v32| CmpSide(i32){ .one = v32 } else null) else null,
+            else => null,
+        },
+    };
 }
 
 fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
