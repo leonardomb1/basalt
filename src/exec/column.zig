@@ -329,6 +329,29 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
     return Column.derived(c.ty, idx.len, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .idx = idx }));
 }
 
+/// `c`'s rows copied into `arena`, one memcpy per buffer: the gather of every row in
+/// order, without the gather. Only the rows' own span is copied, as `c` may view a
+/// larger buffer. The dictionary view is dropped, as `permute` drops it, since its
+/// codes may live in the arena `c` came from.
+pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
+    var out = c;
+    out.dict = null;
+    out.validity = try Bitmap.initFull(arena, c.len);
+    @memcpy(out.validity.bits, c.validity.bits[0..out.validity.bits.len]);
+    out.data = switch (c.data) {
+        .bytes => |b| blk: {
+            if (b.offsets.len == 0) break :blk .{ .bytes = .{ .offsets = try arena.alloc(i32, 0), .values = &.{} } };
+            const lo: usize = @intCast(b.offsets[0]);
+            const hi: usize = @intCast(b.offsets[c.len]);
+            const offs = try arena.alloc(i32, c.len + 1);
+            for (offs, b.offsets[0 .. c.len + 1]) |*o, x| o.* = x - b.offsets[0];
+            break :blk .{ .bytes = .{ .offsets = offs, .values = try arena.dupe(u8, b.values[lo..hi]) } };
+        },
+        inline else => |sl, tag| @unionInit(Column.Data, @tagName(tag), try arena.dupe(@typeInfo(@TypeOf(sl)).pointer.child, sl[0..c.len])),
+    };
+    return out;
+}
+
 /// `permute` on up to `threads` threads for a large `idx`, in chunks of rows: each
 /// gathers its own, a string column's chunks first summing their bytes so each knows
 /// where its values start.

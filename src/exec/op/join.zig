@@ -151,6 +151,12 @@ fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []cons
     return h.final();
 }
 
+/// Whether no row of `cols` has a null in a key column, so no row needs checking.
+fn keysAllValid(cols: []const column.Column, keys: []const usize, n: usize) bool {
+    for (keys) |k| if (!cols[k].validity.allSet(n)) return false;
+    return true;
+}
+
 fn anyNullKey(cols: []const column.Column, keys: []const usize, row: usize) bool {
     for (keys) |k| {
         if (!cols[k].validity.get(row)) return true;
@@ -367,6 +373,8 @@ pub const JoinIndex = struct {
     has_null_key: bool = false,
     parts: []Part = &.{},
     fixed: bool = true,
+    /// No two build rows share a key, so a probe row matches at most once.
+    unique: bool = false,
     kinds: []const keyhash.KeyKind = &.{},
     want: []const types.TypeKind = &.{},
     strs: ?*keytable.StrTable = null,
@@ -469,6 +477,7 @@ pub const JoinIndex = struct {
             self.has_null_key = true;
             break;
         };
+        self.unique = std.mem.allEqual(u32, chain, 0);
         return self;
     }
 
@@ -602,7 +611,9 @@ pub const JoinIndex = struct {
         const miss = try a.alloc(bool, lb.len);
         const hashes = try a.alloc(u64, lb.len);
         const empty = self.keys.len == 0 or self.build_batch.len == 0;
-        for (miss, 0..) |*m, r| m.* = empty or anyNullKey(lb.columns, probe_keys, r);
+        if (empty or !keysAllValid(lb.columns, probe_keys, lb.len)) {
+            for (miss, 0..) |*m, r| m.* = empty or anyNullKey(lb.columns, probe_keys, r);
+        } else @memset(miss, false);
         if (empty) return .{ .hashes = hashes, .miss = miss };
         if (enc) |en| {
             const in = keytable.Interner{ .table = @constCast(&self.strs), .cache = @constCast(&self.str_cache), .alloc = a };
@@ -774,7 +785,7 @@ pub const Join = struct {
             }
             self.cross_pos = end;
             if (end == lb.len * nb) self.cross_batch = null;
-            return try self.gatherOut(arena, ix, lb, lidx, ridx, &.{}, n);
+            return try self.gatherOut(arena, ix, lb, lidx, ridx, &.{}, n, false);
         }
     }
 
@@ -1164,7 +1175,12 @@ pub const Join = struct {
                 if (lb.len == 0) continue;
                 self.pending = try self.startPending(pa, ix, lb);
             }
-            const b = if (self.residual != null) try self.stepResidual(out, ix) else try self.stepPlain(out, ix);
+            const b = if (self.residual != null)
+                try self.stepResidual(out, ix)
+            else if (self.uniqueStep(ix))
+                try self.stepUnique(out, ix)
+            else
+                try self.stepPlain(out, ix);
             if (b.len > 0) return b;
         }
     }
@@ -1175,7 +1191,7 @@ pub const Join = struct {
             self.probe_enc = try ix.probeEncoder(self.state, self.left_keys);
             self.probe_keyed = true;
         }
-        const nulls = try pa.alloc(bool, lb.len);
+        const nulls = try pa.alloc(bool, if (self.null_aware) lb.len else 0);
         for (nulls, 0..) |*nl, i| nl.* = empty or anyNullKey(lb.columns, self.left_keys, i);
         const pr = try ix.probe(pa, lb, self.left_keys, self.probe_enc);
         var p = Pending{ .lb = lb, .probe = pr, .nulls = nulls, .empty = empty };
@@ -1205,6 +1221,58 @@ pub const Join = struct {
         p.started = false;
     }
 
+    /// Whether the batch can take `stepUnique`: build keys unique, and a kind that
+    /// marks no build row and keeps each probe row at most once.
+    fn uniqueStep(self: *const Join, ix: *const JoinIndex) bool {
+        if (!ix.unique or self.matched != null or self.shared_matched != null) return false;
+        return switch (self.kind) {
+            .inner, .left, .semi => true,
+            else => false,
+        };
+    }
+
+    /// The pending batch whole, against unique build keys: one lookup per row in a
+    /// plain loop, each row matching at most once, so the output is never larger than
+    /// the batch and needs no `out_chunk` split. When every row matched, the probe
+    /// columns are copied rather than gathered.
+    fn stepUnique(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
+        const p = &self.pending.?;
+        const lb = p.lb;
+        const arena = fresh(self.state, &self.batch_mem);
+        const left = self.kind == .left;
+        const lidx = try arena.alloc(usize, lb.len - p.r);
+        const ridx = try arena.alloc(usize, if (self.kind == .semi) 0 else lb.len - p.r);
+        const rnull = try arena.alloc(bool, if (left) lb.len - p.r else 0);
+        const from = p.r;
+        var n: usize = 0;
+        var r = p.r;
+        while (r < lb.len) : (r += 1) {
+            if (r + 16 < lb.len and !p.probe.miss[r + 16]) ix.prefetch(p.probe.hashes[r + 16]);
+            if (r + 8 < lb.len and !p.probe.miss[r + 8]) ix.prefetchRecord(p.probe.hashes[r + 8]);
+            const hit = ix.first(p.probe, r);
+            switch (self.kind) {
+                .semi => if (hit != null) {
+                    lidx[n] = r;
+                    n += 1;
+                },
+                .left => {
+                    lidx[n] = r;
+                    ridx[n] = hit orelse 0;
+                    rnull[n] = hit == null;
+                    n += 1;
+                },
+                else => if (hit) |br| {
+                    lidx[n] = r;
+                    ridx[n] = br;
+                    n += 1;
+                },
+            }
+        }
+        self.pending = null;
+        const same = from == 0 and n == lb.len;
+        return self.gatherOut(out, ix, lb, lidx[0..n], if (self.kind == .semi) &.{} else ridx[0..n], if (left) rnull[0..n] else &.{}, n, same);
+    }
+
     fn stepPlain(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
         const p = &self.pending.?;
         const arena = fresh(self.state, &self.batch_mem);
@@ -1229,7 +1297,7 @@ pub const Join = struct {
                         try rnull.append(true);
                     }
                 } else while (p.cur) |br| {
-                    if (lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+                    if (lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len, false);
                     try lidx.append(r);
                     try ridx.append(br);
                     if (fill_right) try rnull.append(false);
@@ -1241,7 +1309,7 @@ pub const Join = struct {
             self.nextRow(p);
         }
         self.pending = null;
-        return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len);
+        return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len, false);
     }
 
     /// The plain step with a residual condition: key matches become candidate pairs,
@@ -1273,7 +1341,7 @@ pub const Join = struct {
                         p.cur = null;
                         break;
                     }
-                    if (o.lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len);
+                    if (o.lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
                 }
                 p.cl.appendAssumeCapacity(r);
                 p.cr.appendAssumeCapacity(br);
@@ -1285,7 +1353,7 @@ pub const Join = struct {
         try self.flushPairs(ix, p, &o);
         while (p.fin < lb.len) : (p.fin += 1) try self.finishRow(p, &o, p.fin);
         self.pending = null;
-        return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len);
+        return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
     }
 
     const Outs = struct {
@@ -1359,11 +1427,12 @@ pub const Join = struct {
             if (!matched[self.drain_pos]) try ridx.append(self.drain_pos);
         }
         if (ridx.items.len == 0) return null;
-        return try self.gatherOut(arena, ix, null, &.{}, ridx.items, &.{}, ridx.items.len);
+        return try self.gatherOut(arena, ix, null, &.{}, ridx.items, &.{}, ridx.items.len, false);
     }
 
     /// Assemble `n` output rows with one gather per column. `lb == null` marks the
-    /// outer drain, where the whole left side is null.
+    /// outer drain, where the whole left side is null; `same_rows` that `lidx` is every
+    /// probe row once, in order, whose columns are then copied rather than gathered.
     fn gatherOut(
         self: *Join,
         arena: std.mem.Allocator,
@@ -1373,6 +1442,7 @@ pub const Join = struct {
         ridx: []const usize,
         rnull: []const bool,
         n: usize,
+        same_rows: bool,
     ) anyerror!Batch {
         const emit_right = (self.kind != .semi and self.kind != .anti);
         const nleft = if (lb) |b| b.columns.len else self.left_schema.fields.len;
@@ -1382,7 +1452,7 @@ pub const Join = struct {
         var i: usize = 0;
         while (i < nleft) : (i += 1) {
             cols[i] = if (lb) |b|
-                try takeCol(arena, b.columns[i], lidx, &.{})
+                (if (same_rows) try column.copy(arena, b.columns[i]) else try takeCol(arena, b.columns[i], lidx, &.{}))
             else
                 try nullColumn(arena, self.left_schema.fields[i].ty, n);
         }
@@ -1468,6 +1538,65 @@ test "join: inner/left/semi/anti; null keys never match, duplicate build keys fa
         const got = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
         try got.expect(case.keys, case.rvs);
     }
+}
+
+test "join: unique build keys take one lookup per row and give the chained path's rows, past one output chunk" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const n_probe = Join.out_chunk + 4464;
+    const pk = try a.alloc(?i64, n_probe);
+    const ps = try a.alloc(?[]const u8, n_probe);
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    for (pk, ps, 0..) |*k, *v, i| {
+        k.* = if (i % 97 == 0) null else prng.random().intRangeLessThan(i64, 0, 2100);
+        v.* = if (i % 89 == 0) null else try std.fmt.allocPrint(a, "s{d}", .{@mod(k.* orelse 0, 3)});
+    }
+    var uk = std.array_list.Managed(?i64).init(a);
+    var us = std.array_list.Managed(?[]const u8).init(a);
+    var k: i64 = 0;
+    while (k < 2000) : (k += 2) {
+        try uk.append(k);
+        try us.append(try std.fmt.allocPrint(a, "s{d}", .{@mod(k, 3)}));
+    }
+    var dk = try uk.clone();
+    var ds = try us.clone();
+    for (0..2) |_| {
+        try dk.append(100_001);
+        try ds.append("s0");
+    }
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, pk, ps)};
+    const unique = [_]Batch{try kvBatch(a, &join_right_schema, uk.items, us.items)};
+    const chained = [_]Batch{try kvBatch(a, &join_right_schema, dk.items, ds.items)};
+    for ([_][]const usize{ &.{0}, &.{ 0, 1 } }) |keys| for ([_]ast.JoinKind{ .inner, .left, .semi }) |kind| {
+        var rows: [2]JoinRows = undefined;
+        for ([_][]const Batch{ &unique, &chained }, &rows, [_]bool{ true, false }) |rb, *out, want_unique| {
+            var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+            var rts = TestSource{ .schema_ = join_right_schema, .batches = rb };
+            var lscan = Scan{ .src = lts.src() };
+            var rscan = Scan{ .src = rts.src() };
+            const emit_right = kind != .semi;
+            var jn = Join{
+                .probe = .{ .scan = &lscan },
+                .build = .{ .scan = &rscan },
+                .left_keys = keys,
+                .right_keys = keys,
+                .left_schema = &join_left_schema,
+                .right_schema = &join_right_schema,
+                .out_schema = if (emit_right) &join_both_schema else &join_left_schema,
+                .kind = kind,
+                .state = a,
+            };
+            out.* = try JoinRows.collect(a, .{ .join = &jn }, if (emit_right) @as(?usize, 3) else null);
+            try testing.expectEqual(want_unique, jn.index.?.unique);
+        }
+        try testing.expectEqualSlices(?i64, rows[1].keys.items, rows[0].keys.items);
+        try testing.expectEqual(rows[1].rvs.items.len, rows[0].rvs.items.len);
+        for (rows[1].rvs.items, rows[0].rvs.items) |x, y| {
+            if (x == null or y == null) try testing.expectEqual(x == null, y == null) else try testing.expectEqualStrings(x.?, y.?);
+        }
+        if (kind == .left) try testing.expectEqual(@as(usize, n_probe), rows[0].keys.items.len);
+    };
 }
 
 test "join: key pushdown sends one side's keys first and replays a read-ahead probe unchanged" {
