@@ -197,7 +197,25 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
             return o.c.data.bytes.take(o.arena, try keptIndices(o.arena, o.keep, o.kept));
         }
     };
-    return Column.derived(c.ty, kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .keep = keep, .kept = kept }));
+    var out = Column.derived(c.ty, kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .keep = keep, .kept = kept }));
+    if (c.dict) |d| out.dict = try carryDict(arena, d, try gatherSlice(u32, arena, d.codes, keep, kept));
+    return out;
+}
+
+/// Past this many entries a dictionary view is dropped rather than copied along.
+const dict_carry_max = 1024;
+
+/// A dictionary view for a column derived from one that had `d`, over `codes`: the
+/// values are copied into `arena`, since they may live in the arena the source
+/// column came from, so only a small dictionary is carried; null past
+/// `dict_carry_max` entries, the consumer then reading the values themselves.
+fn carryDict(arena: std.mem.Allocator, d: *const Column.Dict, codes: []const u32) !?*const Column.Dict {
+    if (d.values.len > dict_carry_max) return null;
+    const vals = try arena.alloc([]const u8, d.values.len);
+    for (vals, d.values) |*o, v| o.* = try arena.dupe(u8, v);
+    const out = try arena.create(Column.Dict);
+    out.* = .{ .values = vals, .codes = codes, .id = d.id };
+    return out;
 }
 
 /// The validity of `chunks` laid end to end.
@@ -325,16 +343,21 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
             return o.c.data.bytes.take(o.arena, o.idx);
         }
     };
-    return Column.derived(c.ty, idx.len, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .idx = idx }));
+    var out = Column.derived(c.ty, idx.len, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .idx = idx }));
+    if (c.dict) |d| if (d.values.len <= dict_carry_max) {
+        const codes = try arena.alloc(u32, idx.len);
+        for (codes, idx) |*o, r| o.* = d.codes[r];
+        out.dict = try carryDict(arena, d, codes);
+    };
+    return out;
 }
 
 /// `c`'s rows copied into `arena`, one memcpy per buffer: the gather of every row in
 /// order, without the gather. Only the rows' own span is copied, as `c` may view a
-/// larger buffer. The dictionary view is dropped, as `permute` drops it, since its
-/// codes may live in the arena `c` came from.
+/// larger buffer; a small dictionary view comes along (`carryDict`).
 pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
     var out = c;
-    out.dict = null;
+    out.dict = if (c.dict) |d| try carryDict(arena, d, try arena.dupe(u32, d.codes[0..c.len])) else null;
     out.validity = try Bitmap.initFull(arena, c.len);
     @memcpy(out.validity.bits, c.validity.bits[0..out.validity.bits.len]);
     out.data = switch (c.data) {
@@ -635,6 +658,52 @@ pub const Builder = struct {
             l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
             try self.pushValid(present);
         }
+    }
+
+    /// Rows given as codes into a dictionary page's values, laid end to end in
+    /// `flat` at `offs` with at least 16 bytes to spare past the last: `codes` are the
+    /// present rows' in order, `defs` (when given) places them among the nulls. An
+    /// entry of 16 bytes or fewer moves in one fixed copy, never a call, and neither
+    /// side is read or written past what it holds.
+    pub fn appendDictBytes(self: *Builder, flat: []const u8, offs: []const i32, codes: []const u32, defs: ?[]const u32, max_def: u32) !void {
+        if (self.store != .bytes) return error.BulkTypeMismatch;
+        const l = &self.store.bytes;
+        var total: usize = 0;
+        for (codes) |c| total += @intCast(offs[c + 1] - offs[c]);
+        try l.values.ensureUnusedCapacity(total + 16);
+        const rows = if (defs) |d| d.len else codes.len;
+        try l.ends.ensureUnusedCapacity(rows);
+        const out = l.values.items.ptr;
+        var w = l.values.items.len;
+        if (defs == null or defs.?.len == codes.len) {
+            for (codes) |c| {
+                w = moveEntry(out, w, flat, offs[c], offs[c + 1]);
+                l.ends.appendAssumeCapacity(@intCast(w));
+            }
+            l.values.items.len = w;
+            return self.pushValidRun(codes.len);
+        }
+        var j: usize = 0;
+        for (defs.?) |lvl| {
+            const present = lvl == max_def;
+            if (present) {
+                if (j >= codes.len) return error.BulkTypeMismatch;
+                w = moveEntry(out, w, flat, offs[codes[j]], offs[codes[j] + 1]);
+                j += 1;
+            }
+            l.ends.appendAssumeCapacity(@intCast(w));
+            l.values.items.len = w;
+            try self.pushValid(present);
+        }
+    }
+
+    inline fn moveEntry(out: [*]u8, w: usize, flat: []const u8, lo_i: i32, hi_i: i32) usize {
+        const lo: usize = @intCast(lo_i);
+        const n: usize = @intCast(hi_i - lo_i);
+        if (n <= 16) {
+            out[w..][0..16].* = flat[lo..][0..16].*;
+        } else @memcpy(out[w..][0..n], flat[lo..][0..n]);
+        return w + n;
     }
 
     /// Bulk append where only present rows supply a value: `defs[i] == max_def`
@@ -946,4 +1015,29 @@ test "builder validity: nulls, bulk runs and partial bytes interleave correctly"
     try std.testing.expectEqual(@as(usize, 17), c2.len);
     for (0..18) |k| try std.testing.expect(c2.validity.allSet(k));
     try std.testing.expectEqual(@as(usize, 3), c2.validity.bits.len);
+}
+
+test "a small dictionary view survives gather, permute and copy, each row's code naming its own value" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const vals = [_][]const u8{ "MAIL", "SHIP", "AIR" };
+    const codes = [_]u32{ 2, 0, 1, 1, 0, 2 };
+    var b = Builder.init(a, types.Type.init(.string));
+    for (codes) |cd| try b.append(.{ .string = vals[cd] });
+    var c = try b.finish();
+    const d = Column.Dict{ .values = &vals, .codes = &codes, .id = 7 };
+    c.dict = &d;
+    const keep = [_]bool{ true, false, true, true, false, true };
+    const idx = [_]usize{ 5, 0, 3 };
+    for ([_]Column{ try gather(a, c, &keep, 4), try permute(a, c, &idx), try copy(a, c) }) |got| {
+        const gd = got.dict orelse return error.TestExpectedDict;
+        try std.testing.expectEqual(@as(u64, 7), gd.id);
+        for (0..got.len) |r| try std.testing.expectEqualStrings(got.data.bytes.at(r), gd.values[gd.codes[r]]);
+    }
+    var big_vals: [dict_carry_max + 1][]const u8 = undefined;
+    for (&big_vals) |*v| v.* = "x";
+    const big = Column.Dict{ .values = &big_vals, .codes = &codes, .id = 8 };
+    c.dict = &big;
+    try std.testing.expect((try copy(a, c)).dict == null);
 }

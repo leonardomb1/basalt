@@ -159,6 +159,10 @@ const Dict = struct {
     col: column.Column,
     entries: []const []const u8,
     id: u64,
+    /// A byte array dictionary's values end to end with 16 bytes to spare, and
+    /// where each starts, for `Builder.appendDictBytes`.
+    flat: []const u8 = &.{},
+    offs: []const i32 = &.{},
 };
 
 var dict_ids = std.atomic.Value(u64).init(1);
@@ -169,15 +173,20 @@ fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMeta
     var db = try column.Builder.initCapacity(arena, cast.ty, n);
     try pushPlain(arena, Rows{ .arena = arena, .b = &db, .defs = null, .max_def = 0 }, cast, meta.ty, elem.type_length orelse 0, pg.data, n);
     const col = try db.finish();
-    const entries: []const []const u8 = switch (col.data) {
-        .bytes => |bs| blk: {
-            const out = try arena.alloc([]const u8, n);
-            for (out, 0..) |*o, i| o.* = bs.at(i);
-            break :blk out;
-        },
-        else => &.{},
-    };
-    return .{ .col = col, .entries = entries, .id = dict_ids.fetchAdd(1, .monotonic) };
+    var d = Dict{ .col = col, .entries = &.{}, .id = dict_ids.fetchAdd(1, .monotonic) };
+    if (col.data == .bytes) {
+        const bs = col.data.bytes;
+        const out = try arena.alloc([]const u8, n);
+        for (out, 0..) |*o, i| o.* = bs.at(i);
+        d.entries = out;
+        const used: usize = @intCast(bs.offsets[n]);
+        const flat = try arena.alloc(u8, used + 16);
+        @memcpy(flat[0..used], bs.values[0..used]);
+        @memset(flat[used..], 0);
+        d.flat = flat;
+        d.offs = bs.offsets[0 .. n + 1];
+    }
+    return d;
 }
 
 /// v1 length-prefixes each level section; v2 keeps them unprefixed with lengths
@@ -530,9 +539,7 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
     if (idx.len > 0 and top >= d.col.len) return Error.CorruptParquetPage;
     switch (d.col.data) {
         .bytes => {
-            const vals = try rows.arena.alloc([]const u8, idx.len);
-            for (vals, idx) |*o, ix| o.* = d.entries[ix];
-            try rows.bytes(cast, vals);
+            rows.b.appendDictBytes(d.flat, d.offs, idx, rows.defs, rows.max_def) catch |e| return landed(e);
             try rows.b.noteDict(d.id, d.entries, idx, rows.defs, rows.max_def);
         },
         inline else => |vals| {
