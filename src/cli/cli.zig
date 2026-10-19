@@ -192,7 +192,9 @@ fn usage(w: anytype) !void {
         \\             WITH (format = 'records', newline = 'crlf') writes one
         \\             STRING or BYTES column a row verbatim (fixed-width files)
         \\  delta      a folder holding _delta_log/ reads as the Delta table: its live
-        \\             files, typed by its schema; WITH (version = N) an older one
+        \\             files, typed by its schema; WITH (version = N) an older one.
+        \\             LOAD INTO 'folder/' appends to it or REPLACEs it; WITH
+        \\             (format = 'delta', partition_by = 'c') creates one
         \\  iceberg    a folder holding metadata/*.metadata.json reads as the Iceberg
         \\             table's current snapshot; WITH (snapshot_id = N) an older one
         \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),

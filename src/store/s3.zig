@@ -61,6 +61,7 @@ pub const Error = error{
     S3Throttled,
     S3EmptyPrefix,
     S3UploadMissing,
+    S3ConditionalWriteUnsupported,
 };
 
 pub const Obj = struct {
@@ -629,6 +630,46 @@ pub const MultipartWriter = struct {
         }.attempt);
     }
 
+    /// One PUT of `bytes` with `If-None-Match: *`: true when it made the object,
+    /// false when one was there (412), or a concurrent conditional write held the
+    /// key (409). A store answering 501 does not do conditional writes, and is
+    /// refused rather than trusted to overwrite.
+    pub fn putIfAbsent(self: *MultipartWriter, bytes: []const u8) !bool {
+        var created = false;
+        const Ctx = struct { w: *MultipartWriter, ph: []const u8, bytes: []const u8, created: *bool };
+        const ctx = Ctx{ .w = self, .ph = try payloadHash(self.arena, bytes), .bytes = bytes, .created = &created };
+        try objstore.retry(self.policy(), ctx, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const signed_hdrs = try w.signed("PUT", w.obj.uri_path, &.{}, c.ph, w.content_type);
+                const hdrs = try std.mem.concat(w.arena, std.http.Header, &.{ signed_hdrs, &.{.{ .name = "If-None-Match", .value = "*" }} });
+                const r = try objstore.exchange(w.arena, w.client, .{
+                    .method = .PUT,
+                    .url = w.obj.url,
+                    .headers = hdrs,
+                    .payload = c.bytes,
+                    .content_type = w.content_type,
+                });
+                switch (r.code) {
+                    200 => c.created.* = true,
+                    409, 412 => c.created.* = false,
+                    501 => {
+                        w.last_error = objstore.describe(w.arena, r.code, r.body) catch "";
+                        w.last_status = Error.S3ConditionalWriteUnsupported;
+                        return r.failed(Error.S3ConditionalWriteUnsupported);
+                    },
+                    else => {
+                        if (try w.createBucketIfMissing(r.code, r.body)) return .again;
+                        return w.failed(r);
+                    },
+                }
+                w.last_status = null;
+                return .done;
+            }
+        }.attempt);
+        return created;
+    }
+
     /// Commits the object: a single PUT when the buffer never filled, else the final
     /// part and CompleteMultipartUpload. A 200 carrying `<Error>` is documented S3
     /// behaviour under internal faults and is retried as a failure. A replay whose
@@ -1091,6 +1132,7 @@ pub const provider = objstore.Provider{
         .request_headers = vtRequestHeaders,
         .status_to_error = vtStatusToError,
         .open_writer = vtOpenWriter,
+        .put_if_absent = vtPutIfAbsent,
     },
 };
 
@@ -1118,4 +1160,45 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
 
 fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
     return objstore.writer(try MultipartWriter.init(arena, client, objstore.cast(Obj, ptr).*, content_type));
+}
+
+fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
+    var w = MultipartWriter{
+        .interface = .{ .vtable = &MultipartWriter.vtable, .buffer = &.{} },
+        .arena = arena,
+        .client = client,
+        .obj = objstore.cast(Obj, ptr).*,
+        .creds = try credsFromEnv(arena),
+        .content_type = content_type,
+        .part_buf = &.{},
+        .etags = std.array_list.Managed([]const u8).init(arena),
+        .rand = objstore.jitterPrng(),
+    };
+    return w.putIfAbsent(bytes) catch |e| {
+        why.* = w.last_error;
+        return e;
+    };
+}
+
+test "putIfAbsent: 200 creates, 412 and 409 find one there, a 503 is retried, a 501 is refused" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        reply("503 Slow Down", "", "<Error><Code>SlowDown</Code></Error>"),
+        reply("200 OK", "", ""),
+        reply("412 Precondition Failed", "", "<Error><Code>PreconditionFailed</Code></Error>"),
+        reply("409 Conflict", "", "<Error><Code>ConditionalRequestConflict</Code></Error>"),
+        reply("501 Not Implemented", "", "<Error><Code>NotImplemented</Code><Message>If-None-Match</Message></Error>"),
+    });
+    defer srv.stop();
+    var w = try testWriter(a, &client, &srv);
+    try std.testing.expect(try w.putIfAbsent("{}"));
+    try std.testing.expect(!try w.putIfAbsent("{}"));
+    try std.testing.expect(!try w.putIfAbsent("{}"));
+    try std.testing.expectError(Error.S3ConditionalWriteUnsupported, w.putIfAbsent("{}"));
+    try std.testing.expectEqualStrings("PUT /lake/out.csv HTTP/1.1", srv.line(0));
 }

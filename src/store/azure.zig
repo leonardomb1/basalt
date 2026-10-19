@@ -154,6 +154,7 @@ pub const SignParams = struct {
     content_length: usize = 0,
     content_type: []const u8 = "",
     range: []const u8 = "",
+    if_none_match: []const u8 = "",
     query: []const []const u8 = &.{},
 };
 
@@ -173,7 +174,7 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     try w.writeAll("\n");
     try w.writeAll("\n");
     try w.writeAll("\n");
-    try w.writeAll("\n");
+    try w.print("{s}\n", .{p.if_none_match});
     try w.writeAll("\n");
     try w.print("{s}\n", .{p.range});
 
@@ -235,6 +236,7 @@ fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8,
     for (p.ms_headers) |h| try out.append(.{ .name = h.name, .value = h.value });
     try out.append(.{ .name = "Authorization", .value = auth });
     if (p.range.len > 0) try out.append(.{ .name = "Range", .value = p.range });
+    if (p.if_none_match.len > 0) try out.append(.{ .name = "If-None-Match", .value = p.if_none_match });
     return out.toOwnedSlice();
 }
 
@@ -355,6 +357,44 @@ pub const BlockBlobWriter = struct {
             .query = &.{"comp:blocklist"},
         };
         try self.send(url, sign, body.items);
+    }
+
+    /// Put Blob of `bytes` with `If-None-Match: *`: true when it made the blob,
+    /// false when one was there (409 BlobAlreadyExists, or 412). A missing
+    /// container is created once and the put retried.
+    pub fn putIfAbsent(self: *BlockBlobWriter, bytes: []const u8) !bool {
+        var created = false;
+        const Ctx = struct { w: *BlockBlobWriter, bytes: []const u8, created: *bool, made_container: bool = false };
+        var ctx = Ctx{ .w = self, .bytes = bytes, .created = &created };
+        try objstore.retry(self.policy(), &ctx, struct {
+            fn attempt(c: *Ctx) !objstore.Verdict {
+                const w = c.w;
+                const hdrs = try signedHeaders(w.arena, w.blob.account, w.key, .{
+                    .method = "PUT",
+                    .canonical_resource = w.blob.canonical_resource,
+                    .ms_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+                    .content_length = c.bytes.len,
+                    .content_type = w.content_type,
+                    .if_none_match = "*",
+                });
+                const r = try objstore.exchange(w.arena, w.client, .{ .method = .PUT, .url = w.blob.url, .headers = hdrs, .payload = c.bytes, .content_type = w.content_type });
+                switch (r.code) {
+                    200, 201 => c.created.* = true,
+                    409, 412 => c.created.* = false,
+                    else => {
+                        if (!c.made_container and statusToError(r.code, r.body) == Error.AzureContainerMissing) {
+                            c.made_container = true;
+                            try w.createContainer();
+                            return .again;
+                        }
+                        return w.failed(r);
+                    },
+                }
+                w.last_status = null;
+                return .done;
+            }
+        }.attempt);
+        return created;
     }
 
     const Sign = struct { ms_headers: []const MsHeader = &.{}, content_length: usize, query: []const []const u8 };
@@ -479,6 +519,53 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     try std.testing.expectEqual(@as(usize, 5), srv.requests());
     try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
     try std.testing.expectEqualStrings(srv.line(3), srv.line(4));
+}
+
+test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container is made once" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = objstore.FakeServer.reply;
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var srv: objstore.FakeServer = undefined;
+    try srv.start(&.{
+        reply("201 Created", "", ""),
+        reply("409 Conflict", "", "<Error><Code>BlobAlreadyExists</Code></Error>"),
+        reply("412 Precondition Failed", "", "<Error><Code>ConditionNotMet</Code></Error>"),
+        reply("404 Not Found", "", "<Error><Code>ContainerNotFound</Code></Error>"),
+        reply("201 Created", "", ""),
+        reply("201 Created", "", ""),
+    });
+    defer srv.stop();
+    var w = BlockBlobWriter{
+        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
+        .arena = a,
+        .client = &client,
+        .blob = try parseUrl(a, "az://devstoreaccount1/c/_delta_log/0.json", try srv.url(a, "")),
+        .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+        .block_ids = std.array_list.Managed([]const u8).init(a),
+        .content_type = "application/json",
+        .rand = std.Random.DefaultPrng.init(0),
+        .sleep = testSleep,
+    };
+    try std.testing.expect(try w.putIfAbsent("{}"));
+    try std.testing.expect(!try w.putIfAbsent("{}"));
+    try std.testing.expect(!try w.putIfAbsent("{}"));
+    try std.testing.expect(try w.putIfAbsent("{}"));
+    try std.testing.expectEqual(@as(usize, 6), srv.requests());
+    try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "restype=container") != null);
+}
+
+test "If-None-Match is signed in its own line of the string to sign" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+    const p = SignParams{ .method = "PUT", .canonical_resource = "/acct/c/f" };
+    var q = p;
+    q.if_none_match = "*";
+    try std.testing.expect(!std.mem.eql(u8, try authHeader(a, "acct", key, p), try authHeader(a, "acct", key, q)));
 }
 
 test "query values escape the base64 characters that are not URL-safe" {
@@ -689,6 +776,7 @@ pub const provider = objstore.Provider{
         .request_headers = vtRequestHeaders,
         .status_to_error = vtStatusToError,
         .open_writer = vtOpenWriter,
+        .put_if_absent = vtPutIfAbsent,
     },
 };
 
@@ -716,4 +804,21 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
 
 fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
     return objstore.writer(try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type));
+}
+
+fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
+    var w = BlockBlobWriter{
+        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
+        .arena = arena,
+        .client = client,
+        .blob = objstore.cast(Blob, ptr).*,
+        .key = try keyFromEnv(arena),
+        .block_ids = std.array_list.Managed([]const u8).init(arena),
+        .content_type = content_type,
+        .rand = objstore.jitterPrng(),
+    };
+    return w.putIfAbsent(bytes) catch |e| {
+        why.* = w.last_error;
+        return e;
+    };
 }

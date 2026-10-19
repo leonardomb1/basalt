@@ -71,6 +71,20 @@ fn parseName(name: []const u8) Name {
     return .{ .checkpoint = .{ .version = v, .part = part, .parts = parts } };
 }
 
+/// Whether a listing of `_delta_log/` (at `log_path`) holds a commit or a
+/// checkpoint, which a table has from its first version on.
+pub fn hasVersions(listed: []const []const u8, log_path: []const u8) bool {
+    for (listed) |u| {
+        const rel = folder.below(u, log_path);
+        if (std.mem.indexOfAny(u8, rel, "/\\") != null) continue;
+        switch (parseName(rel)) {
+            .commit, .checkpoint, .v2 => return true,
+            .other => {},
+        }
+    }
+    return false;
+}
+
 /// One checkpoint at a version: a classic one has one part. Two of a version (a
 /// classic one and a multi-part one, or two part counts) are each kept, and any
 /// complete one serves.
@@ -148,13 +162,14 @@ const Log = struct {
     }
 };
 
-/// A live file: `path` decoded from the log's URI form, `dv` set when it carries
-/// a deletion vector.
-const Add = struct {
+/// A live file: `path` decoded from the log's URI form, `raw` as the log wrote it
+/// (what a `remove` must name), `dv` its deletion vector's descriptor, if any.
+pub const Add = struct {
     path: []const u8,
+    raw: []const u8 = "",
     size: ?u64 = null,
     parts: ?std.json.Value = null,
-    dv: bool = false,
+    dv: ?std.json.Value = null,
 };
 
 /// A deletion vector's `uniqueId`: its storage type and path or inline bytes, with
@@ -171,18 +186,23 @@ fn jsonDv(arena: std.mem.Allocator, v: ?std.json.Value) !?[]const u8 {
     return try dvId(arena, str(d.object.get("storageType")) orelse "", str(d.object.get("pathOrInlineDv")) orelse "", if (off) |o| (if (o == .integer) o.integer else null) else null);
 }
 
-/// The table as the actions read so far leave it.
-const State = struct {
+/// The table as the actions read so far leave it: at `version` once replayed.
+pub const State = struct {
     arena: std.mem.Allocator,
     name: []const u8,
     /// The root a log's paths are resolved against to key them, absolute for a
     /// local table, so a file added by a relative path and removed by an absolute
     /// one is one file.
     key_root: []const u8,
+    version: u64 = 0,
     reader_version: i64 = 1,
+    writer_version: i64 = 1,
     features: []const []const u8 = &.{},
+    writer_features: []const []const u8 = &.{},
+    table_id: ?[]const u8 = null,
     schema_string: ?[]const u8 = null,
     part_cols: []const []const u8 = &.{},
+    config: ?std.json.Value = null,
     mapping: ?[]const u8 = null,
     v2: ?[]const u8 = null,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
@@ -199,29 +219,39 @@ const State = struct {
         return std.mem.concat(self.arena, u8, &.{ at, "\x00", id });
     }
 
-    fn put(self: *State, a: Add, dv: ?[]const u8) !void {
+    fn put(self: *State, a: Add) !void {
         var x = a;
+        x.raw = a.path;
         x.path = try table.percentDecode(self.arena, a.path);
-        x.dv = dv != null;
-        try self.files.put(self.arena, try self.key(x.path, dv), x);
+        try self.files.put(self.arena, try self.key(x.path, try jsonDv(self.arena, a.dv)), x);
     }
 
     fn drop(self: *State, path: []const u8, dv: ?[]const u8) !void {
         _ = self.files.swapRemove(try self.key(try table.percentDecode(self.arena, path), dv));
     }
 
-    fn protocol(self: *State, version: i64, features: ?std.json.Value) !void {
+    fn protocol(self: *State, version: i64, writer: ?i64, features: ?std.json.Value, writer_features: ?std.json.Value) !void {
         self.reader_version = version;
+        self.writer_version = writer orelse 1;
         self.features = try strings(self.arena, features);
+        self.writer_features = try strings(self.arena, writer_features);
     }
 
-    fn meta(self: *State, schema: []const u8, parts: ?std.json.Value, config: ?std.json.Value) !void {
+    fn meta(self: *State, id: ?[]const u8, schema: []const u8, parts: ?std.json.Value, config: ?std.json.Value) !void {
+        self.table_id = id;
         self.schema_string = schema;
         self.part_cols = try strings(self.arena, parts);
+        self.config = if (config) |c| (if (c == .object) c else null) else null;
         self.mapping = null;
-        if (config) |c| if (c == .object) if (c.object.get("delta.columnMapping.mode")) |m| if (m == .string) {
+        if (self.config) |c| if (c.object.get("delta.columnMapping.mode")) |m| if (m == .string) {
             self.mapping = m.string;
         };
+    }
+
+    /// A table property's text, null when unset.
+    pub fn property(self: *const State, prop: []const u8) ?[]const u8 {
+        const c = self.config orelse return null;
+        return str(c.object.get(prop));
     }
 
     /// One commit line's action; unknown actions and fields are ignored, as the
@@ -242,15 +272,17 @@ const State = struct {
                     .path = p,
                     .size = if (o.get("size")) |s| (if (s == .integer and s.integer >= 0) @as(u64, @intCast(s.integer)) else null) else null,
                     .parts = o.get("partitionValues"),
-                }, try jsonDv(self.arena, o.get("deletionVector")));
+                    .dv = if (o.get("deletionVector")) |d| (if (d == .object) d else null) else null,
+                });
             } else if (std.mem.eql(u8, k, "remove")) {
                 try self.drop(str(o.get("path")) orelse continue, try jsonDv(self.arena, o.get("deletionVector")));
             } else if (std.mem.eql(u8, k, "metaData")) {
-                try self.meta(str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
+                try self.meta(str(o.get("id")), str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
             } else if (std.mem.eql(u8, k, "protocol")) {
                 const rv = o.get("minReaderVersion") orelse continue;
                 if (rv != .integer) continue;
-                try self.protocol(rv.integer, o.get("readerFeatures"));
+                const wv: ?i64 = if (o.get("minWriterVersion")) |w| (if (w == .integer) w.integer else null) else null;
+                try self.protocol(rv.integer, wv, o.get("readerFeatures"), o.get("writerFeatures"));
             }
         }
     }
@@ -267,11 +299,16 @@ const State = struct {
             const c_dv = b.schema.indexOf("add.deletionVector.storageType");
             const c_dv_at = b.schema.indexOf("add.deletionVector.pathOrInlineDv");
             const c_dv_off = b.schema.indexOf("add.deletionVector.offset");
+            const c_dv_size = b.schema.indexOf("add.deletionVector.sizeInBytes");
+            const c_dv_card = b.schema.indexOf("add.deletionVector.cardinality");
+            const c_id = b.schema.indexOf("metaData.id");
             const c_schema = b.schema.indexOf("metaData.schemaString");
             const c_pcols = b.schema.indexOf("metaData.partitionColumns");
             const c_config = b.schema.indexOf("metaData.configuration");
             const c_rv = b.schema.indexOf("protocol.minReaderVersion");
+            const c_wv = b.schema.indexOf("protocol.minWriterVersion");
             const c_feat = b.schema.indexOf("protocol.readerFeatures");
+            const c_wfeat = b.schema.indexOf("protocol.writerFeatures");
             const c_v2 = [_]?usize{ b.schema.indexOf("checkpointMetadata.version"), b.schema.indexOf("sidecar.path") };
             for (0..b.len) |i| {
                 for (c_v2) |c| if (cell(b, c, i) != .null) {
@@ -280,22 +317,34 @@ const State = struct {
                 if (cell(b, c_path, i) == .string) {
                     const size = cell(b, c_size, i);
                     const storage = cell(b, c_dv, i);
-                    const where = cell(b, c_dv_at, i);
-                    const off = cell(b, c_dv_off, i);
-                    const dv: ?[]const u8 = if (storage == .string)
-                        try dvId(self.arena, storage.string, if (where == .string) where.string else "", if (off == .int) off.int else null)
-                    else
-                        null;
+                    var dv: ?std.json.Value = null;
+                    if (storage == .string) {
+                        var o = std.json.ObjectMap.init(self.arena);
+                        try o.put("storageType", .{ .string = try self.arena.dupe(u8, storage.string) });
+                        const where = cell(b, c_dv_at, i);
+                        if (where == .string) try o.put("pathOrInlineDv", .{ .string = try self.arena.dupe(u8, where.string) });
+                        const ints = [_]struct { ?usize, []const u8 }{ .{ c_dv_off, "offset" }, .{ c_dv_size, "sizeInBytes" }, .{ c_dv_card, "cardinality" } };
+                        for (ints) |f| {
+                            const v = cell(b, f[0], i);
+                            if (v == .int) try o.put(f[1], .{ .integer = v.int });
+                        }
+                        dv = .{ .object = o };
+                    }
                     try self.put(.{
                         .path = try self.arena.dupe(u8, cell(b, c_path, i).string),
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
                         .parts = try self.jsonOf(cell(b, c_parts, i)),
-                    }, dv);
+                        .dv = dv,
+                    });
                 }
-                if (cell(b, c_schema, i) == .string)
-                    try self.meta(try self.arena.dupe(u8, cell(b, c_schema, i).string), try self.jsonOf(cell(b, c_pcols, i)), try self.jsonOf(cell(b, c_config, i)));
-                if (cell(b, c_rv, i) == .int)
-                    try self.protocol(cell(b, c_rv, i).int, try self.jsonOf(cell(b, c_feat, i)));
+                if (cell(b, c_schema, i) == .string) {
+                    const id = cell(b, c_id, i);
+                    try self.meta(if (id == .string) try self.arena.dupe(u8, id.string) else null, try self.arena.dupe(u8, cell(b, c_schema, i).string), try self.jsonOf(cell(b, c_pcols, i)), try self.jsonOf(cell(b, c_config, i)));
+                }
+                if (cell(b, c_rv, i) == .int) {
+                    const wv = cell(b, c_wv, i);
+                    try self.protocol(cell(b, c_rv, i).int, if (wv == .int) wv.int else null, try self.jsonOf(cell(b, c_feat, i)), try self.jsonOf(cell(b, c_wfeat, i)));
+                }
             }
         }
     }
@@ -307,7 +356,7 @@ const State = struct {
 
     /// Refuses a table whose reader features basalt does not honour, each only where
     /// the table uses it: column mapping by name or id, not merely enabled.
-    fn checkProtocol(self: *const State) !void {
+    pub fn checkProtocol(self: *const State) !void {
         if (self.reader_version < 1 or self.reader_version > 3)
             return refuse("{s} needs Delta reader version {d}; basalt reads reader versions 1 to 3", .{ self.name, self.reader_version });
         if (self.mapping) |m| if (!std.mem.eql(u8, m, "none"))
@@ -327,10 +376,11 @@ const State = struct {
 };
 
 const checkpoint_columns = [_][]const u8{
-    "add.path",                          "add.size",                  "add.partitionValues",     "add.deletionVector.storageType",
-    "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "metaData.schemaString",   "metaData.partitionColumns",
-    "metaData.configuration",            "protocol.minReaderVersion", "protocol.readerFeatures", "checkpointMetadata.version",
-    "sidecar.path",
+    "add.path",                          "add.size",                  "add.partitionValues",            "add.deletionVector.storageType",
+    "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "add.deletionVector.sizeInBytes", "add.deletionVector.cardinality",
+    "metaData.id",                       "metaData.schemaString",     "metaData.partitionColumns",      "metaData.configuration",
+    "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",        "protocol.writerFeatures",
+    "checkpointMetadata.version",        "sidecar.path",
 };
 
 fn cell(b: Batch, c: ?usize, row: usize) Value {
@@ -412,6 +462,51 @@ fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
 /// `root`'s table at `at`; `listed` is `_delta_log/`'s listing when detection
 /// already made it.
 pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*const table.Resolved {
+    const st = try snapshot(arena, root, at, listed_in);
+    const name = st.name;
+    const target = st.version;
+    try st.checkProtocol();
+    const schema = try schemaOf(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
+    if (schema.fields.len == 0) return refuse("{s} has a schema with no columns", .{name});
+
+    const part_fields = try arena.alloc(usize, st.part_cols.len);
+    for (part_fields, st.part_cols) |*pf, c| pf.* = schema.indexOf(c) orelse
+        return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
+
+    const files = try arena.alloc(Layout.File, st.files.count());
+    for (files, st.files.values()) |*f, a| {
+        const decoded = a.path;
+        if (a.dv != null) return refuse("{s} has file `{s}` with a deletion vector (reader feature `deletionVectors`); basalt does not apply deletion vectors, and reading the file whole would return deleted rows", .{ name, decoded });
+        const parts = try arena.alloc(Value, part_fields.len);
+        for (parts, part_fields, st.part_cols) |*p, fi, c| {
+            const text: ?[]const u8 = if (a.parts) |pv| (if (pv == .object) str(pv.object.get(c)) else null) else null;
+            p.* = (try table.partitionValue(arena, text, schema.fields[fi].ty)) orelse
+                return refuse("{s} has file `{s}` with partition value `{s}` for column `{s}`, which is not a {s}", .{ name, decoded, text.?, c, try schema.fields[fi].ty.name(arena) });
+        }
+        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts };
+    }
+    std.mem.sort(Layout.File, files, {}, struct {
+        fn lt(_: void, a: Layout.File, b: Layout.File) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+
+    const layout = try arena.create(Layout);
+    layout.* = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files };
+    const r = try arena.create(table.Resolved);
+    r.* = .{
+        .kind = .delta,
+        .root = root,
+        .label = try std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ target, files.len, if (files.len == 1) "" else "s" }),
+        .layout = layout,
+    };
+    return r;
+}
+
+/// `root`'s log replayed to `at` (the newest version when unpinned), refusing
+/// only what makes the replay itself unreliable; what a reader or a writer
+/// cannot honour each judges from the state.
+pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*State {
     const name = try std.fmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
         return refuse("{s} cannot be read over http(s): a Delta table is found by listing _delta_log/, which a URL cannot do; read it from a local path, s3://, az://, sftp:// or smb://", .{name});
@@ -448,42 +543,10 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
             if (t.len > 0) try st.action(t);
         }
     }
-    try st.checkProtocol();
-    const schema = try schemaOf(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
-    if (schema.fields.len == 0) return refuse("{s} has a schema with no columns", .{name});
-
-    const part_fields = try arena.alloc(usize, st.part_cols.len);
-    for (part_fields, st.part_cols) |*pf, c| pf.* = schema.indexOf(c) orelse
-        return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
-
-    const files = try arena.alloc(Layout.File, st.files.count());
-    for (files, st.files.values()) |*f, a| {
-        const decoded = a.path;
-        if (a.dv) return refuse("{s} has file `{s}` with a deletion vector (reader feature `deletionVectors`); basalt does not apply deletion vectors, and reading the file whole would return deleted rows", .{ name, decoded });
-        const parts = try arena.alloc(Value, part_fields.len);
-        for (parts, part_fields, st.part_cols) |*p, fi, c| {
-            const text: ?[]const u8 = if (a.parts) |pv| (if (pv == .object) str(pv.object.get(c)) else null) else null;
-            p.* = (try table.partitionValue(arena, text, schema.fields[fi].ty)) orelse
-                return refuse("{s} has file `{s}` with partition value `{s}` for column `{s}`, which is not a {s}", .{ name, decoded, text.?, c, try schema.fields[fi].ty.name(arena) });
-        }
-        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts };
-    }
-    std.mem.sort(Layout.File, files, {}, struct {
-        fn lt(_: void, a: Layout.File, b: Layout.File) bool {
-            return std.mem.lessThan(u8, a.path, b.path);
-        }
-    }.lt);
-
-    const layout = try arena.create(Layout);
-    layout.* = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files };
-    const r = try arena.create(table.Resolved);
-    r.* = .{
-        .kind = .delta,
-        .root = root,
-        .label = try std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ target, files.len, if (files.len == 1) "" else "s" }),
-        .layout = layout,
-    };
-    return r;
+    st.version = target;
+    const out = try arena.create(State);
+    out.* = st;
+    return out;
 }
 
 test "log names: commits, single and multi-part checkpoints, V2 checkpoints, and what a reader skips" {
@@ -564,7 +627,7 @@ test "a file is keyed by its resolved path and deletion vector, so line order in
         try st.action("{\"add\":{\"path\":\"a.parquet\",\"partitionValues\":{}}}");
         for (order) |line| try st.action(line);
         try testing.expectEqual(@as(usize, 1), st.files.count());
-        try testing.expect(st.files.values()[0].dv);
+        try testing.expect(st.files.values()[0].dv != null);
         try st.action("{\"remove\":{\"path\":\"a.parquet\",\"deletionVector\":" ++ dv ++ "}}");
         try testing.expectEqual(@as(usize, 0), st.files.count());
     }

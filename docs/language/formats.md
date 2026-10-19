@@ -109,7 +109,87 @@ A Delta table is found by listing its log, which an `https://` URL cannot do; it
 is read from a local path, object storage, SFTP or SMB. `format = 'parquet'`
 reads the folder's files plain, removed ones included. EXPLAIN and `check` name
 the version and file count of the table they read, and `check` types a local
-table from its log. basalt reads Delta tables; it does not write them.
+table from its log.
+
+### Writing Delta
+
+A Delta table is a table target for [LOAD INTO](load-into.md): a folder path
+(ending in `/`) whose `_delta_log/` holds the table, or, with `WITH (format =
+'delta')`, one where a write creates it. Local folders, `s3://` and `az://` are
+written; SFTP, SMB and `https://` are refused, as they offer no create-if-absent
+write a commit needs.
+
+```sql
+LOAD INTO 's3://lake/sales/' WITH (format = 'delta', partition_by = 'region, day') AS
+SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_2026.csv';
+
+LOAD INTO 's3://lake/sales/' AS                          -- APPEND, the default
+SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_late.csv';
+
+LOAD INTO 's3://lake/sales/' REPLACE AS
+SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_fixed.csv';
+```
+
+`APPEND` (the default, as for a database table) adds the rows as new files in
+one commit; `REPLACE` is one commit that removes every file live at the version
+it read and adds the new ones, so a reader sees the old rows or the new, never
+neither, and every earlier version stays readable with `WITH (version = N)`.
+`UPSERT` into a Delta table is not supported yet. A write of no rows commits
+nothing, except that it still creates a table, and a `REPLACE` of no rows
+empties one.
+
+A created table is version 0 with protocol 1/2 and the rows' schema: `INT` as
+`long`, `FLOAT` as `double`, `DECIMAL(p,s)` as `decimal(p,s)`, `TIMESTAMP` as
+`timestamp` (UTC-adjusted in its files), `BOOL`, `STRING`, `BYTES` and `DATE` as
+`boolean`, `string`, `binary` and `date`, every column nullable. A `TIME`, an
+array, a struct or an untyped NULL column is refused, to be cast first.
+`WITH (partition_by = 'c1, c2')` partitions it; a later write takes the table's
+own partition columns, and naming different ones is refused. A write to an
+existing table must give exactly its columns — by name, in any order; one
+missing or one more is refused, as the schema is never changed — each of the
+table's type: an integer column of the table's `integer`, `short` or `byte` is
+written as one, its range checked; `float` as a 4-byte float; a decimal whose
+scale and integer digits fit the table's is rescaled to it, and a wider one is
+refused; `timestamp_ntz` as a local timestamp. A NULL in a column the table
+declares not nullable fails the write naming the column.
+
+Data files are `part-<uuid>.snappy.parquet` (`compression = 'gzip'` or `'none'`
+picks another codec), under Hive-style `col=value/` folders for a partitioned
+table, escaped as Spark escapes them, NULL as `__HIVE_DEFAULT_PARTITION__`; the
+partition columns are not written into the files, as the log carries them. An
+empty string partition value is NULL, as Delta reads it. Each `add` carries the
+file's statistics: `numRecords`, every data column's `nullCount`, and `minValues`
+and `maxValues` for numbers, dates, timestamps (cut to the millisecond, as the
+protocol allows) and strings (a string over 32 bytes has its 32-byte prefix as
+its minimum and no maximum); booleans and binary have none. At most 16 files are
+open at once — the least recently written is closed when another partition
+needs one — and a file is closed at 128 MiB, so memory stays near 16 Parquet row
+groups, and an object store's upload buffer each, however many partitions there
+are. No checkpoint is written; a table basalt alone writes is replayed from its
+JSON commits.
+
+The commit is created only if no writer made that version first: a local one by
+hard-linking a fully written, synced hidden file to its name, an object store's
+by one PUT with `If-None-Match: *` (a store that ignores the condition is caught
+by sending the same create again and is refused). A version taken by another
+writer is read: one that changed the table's metadata or protocol, or created it,
+fails the write; so does any change to the table's files under a `REPLACE`; an
+`APPEND` otherwise moves to the next version, up to ten times. The data files are
+written before the commit, so no version names a file not yet there; a failed
+commit names the files it wrote, which no version references and `VACUUM`
+removes. A run that fails before its commit deletes its local data files.
+
+A table that asks a writer for what basalt does not do is refused, naming it: a
+writer version past 7, a writer feature other than `appendOnly`, `invariants`,
+`checkConstraints`, `changeDataFeed`, `generatedColumns`, `columnMapping`,
+`identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
+`vacuumProtocolCheck` and `allowColumnDefaults`, and among those any the table
+actually uses — a column invariant, a CHECK constraint, a generated or identity
+column, column mapping by name or id — as well as a `REPLACE` of a
+`delta.appendOnly` table and every reader feature a read refuses. EXPLAIN and
+`check` name the table's version and file count, or that the write creates it,
+and `check` refuses what it can see of a local table: its features, its columns
+and types, its partitioning.
 
 ## Apache Iceberg
 

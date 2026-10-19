@@ -144,9 +144,8 @@ pub const table = [_]Format{
         .archive_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder; extract it first",
         .lanes = .row_groups,
         .read_keys = &.{ "format", "version" },
-        .write_refused = "basalt reads Delta tables; it does not write them",
         .write = .{},
-        .write_keys = &.{"format"},
+        .write_keys = &.{ "format", "partition_by", "compression" },
     },
     .{
         .tag = .iceberg,
@@ -339,7 +338,7 @@ test "formats: tags index the table, names and extensions resolve, lists are gen
     try std.testing.expect(!inFolder(of(.csv), "d/a.json"));
     try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta, iceberg", names_list);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "Delta") == null);
-    try std.testing.expect(of(.delta).write_refused != null and of(.iceberg).write_refused != null);
+    try std.testing.expect(of(.delta).write_refused == null and of(.iceberg).write_refused != null);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "Iceberg") == null);
     try std.testing.expectEqual(FileFormat.records, byName("Records").?.tag);
     try std.testing.expect(readRefused(.records) != null and readRefused(.csv) == null);

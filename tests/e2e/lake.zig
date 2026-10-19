@@ -342,9 +342,9 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
     try refused(a, &tmp, "SELECT * FROM '$B/t' WITH (format = 'delta')", "a Delta table is read from its root folder: end the path with `/`", false);
     try refused(a, &tmp, "SELECT * FROM '$B/t/' WITH (format = 'parquet', version = 1)", "read option `version` does not apply to a Parquet read", false);
     try refused(a, &tmp, "SELECT * FROM 'http://127.0.0.1:1/t/' WITH (format = 'delta')", "a Delta table is found by listing _delta_log/, which a URL cannot do", true);
-    const w = try runIn(a, &tmp, "LOAD INTO '$B/w/' WITH (format = 'delta') AS SELECT 1 AS a;", 1);
+    const w = try runIn(a, &tmp, "LOAD INTO '$B/w/' WITH (format = 'iceberg') AS SELECT 1 AS a;", 1);
     try testing.expect(w.err != null and w.check_msg != null);
-    try testing.expect(std.mem.indexOf(u8, w.msg, "basalt reads Delta tables; it does not write them") != null);
+    try testing.expect(std.mem.indexOf(u8, w.msg, "basalt reads Iceberg tables; it does not write them") != null);
 }
 
 test "EXPLAIN names a Delta scan with its version and file count" {

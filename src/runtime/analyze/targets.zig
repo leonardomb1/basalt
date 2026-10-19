@@ -112,16 +112,31 @@ pub fn jsonOptions(hints: []const ast.Hint) json.Options {
     return o;
 }
 
+/// The format a file write names, else a folder's (a Delta table), else the
+/// extension's; null when none says.
+pub fn writeFormat(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
+    if (try formatFromHints(hints, diag)) |f| return f;
+    if (folder.isFolder(w.target)) return .delta;
+    return formatOfPath(w.target);
+}
+
+/// Whether a file write goes to a Delta table: a folder, or `format = 'delta'`.
+pub fn deltaTarget(w: ast.Write, hints: []const ast.Hint) bool {
+    if (!std.mem.eql(u8, w.connector, "csv") or w.target.len == 0) return false;
+    var d = Diag{};
+    return (writeFormat(w, hints, &d) catch return false) == .delta;
+}
+
 /// A Parquet sink's page codec, `compression = 'snappy' | 'gzip' | 'none'`, snappy
-/// when unset. Any other target refuses the key: a CSV file takes its codec from
-/// a `.gz` suffix.
+/// when unset; a Delta table's data files take it too. Any other target refuses
+/// the key: a CSV file takes its codec from a `.gz` suffix.
 pub fn parquetCodecFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!pqcodec.Codec {
     const s = hintText(hints, "compression") orelse return .snappy;
     const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
-    const fmt = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) else null;
+    const fmt = if (file) try writeFormat(w, hints, diag) else null;
     if (!file)
         return fail(diag, "`compression` applies to a Parquet file target only; a starrocks or doris load is compressed by the connection's `compression` option", .{});
-    if (fmt != .parquet)
+    if (fmt != .parquet and fmt != .delta)
         return fail(diag, "`compression` applies to a Parquet file target only; a CSV file is gzipped by a `.gz` suffix", .{});
     if (std.ascii.eqlIgnoreCase(s, "snappy")) return .snappy;
     if (std.ascii.eqlIgnoreCase(s, "gzip")) return .gzip;
@@ -194,17 +209,38 @@ pub const WriteOptions = union(FileFormat) {
     json: jsonwrite.Shape,
     xml: xmlwrite.Names,
     records: recordswrite.Options,
-    delta: void,
+    delta: DeltaOptions,
     iceberg: void,
 };
 
-pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
+/// A Delta write's data file codec and, for a table it creates, its partition
+/// columns.
+pub const DeltaOptions = struct {
+    codec: pqcodec.Codec = .snappy,
+    partition_by: ?[]const []const u8 = null,
+};
+
+/// `partition_by = 'c1, c2'`: the columns a created Delta table is partitioned
+/// by, in order.
+pub fn partitionBy(arena: std.mem.Allocator, hints: []const ast.Hint, diag: *Diag) Error!?[]const []const u8 {
+    const s = hintText(hints, "partition_by") orelse return null;
+    var out = std.array_list.Managed([]const u8).init(arena);
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |part| {
+        const n = std.mem.trim(u8, part, " \t");
+        if (n.len == 0) return fail(diag, "`partition_by = '{s}'` names an empty column; list them as `partition_by = 'c1, c2'`", .{s});
+        out.append(n) catch return error.OutOfMemory;
+    }
+    return out.items;
+}
+
+pub fn writeOptions(arena: std.mem.Allocator, w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
     const codec = try parquetCodecFromHints(w, hints, diag);
     const shape = try jsonShapeFromHints(w, hints, diag);
     const names = try xmlNamesFromHints(w, hints, diag);
     const sheet = try xlsxSheetFromHints(hints, diag);
     const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
-    const fmt: FileFormat = if (file) (try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv else .csv;
+    const fmt: FileFormat = if (file) (try writeFormat(w, hints, diag)) orelse .csv else .csv;
     return switch (fmt) {
         .csv => .csv,
         .parquet => .{ .parquet = codec },
@@ -213,7 +249,7 @@ pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!Wr
         .json => .{ .json = shape },
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
-        .delta => .delta,
+        .delta => .{ .delta = .{ .codec = codec, .partition_by = try partitionBy(arena, hints, diag) } },
         .iceberg => .iceberg,
     };
 }

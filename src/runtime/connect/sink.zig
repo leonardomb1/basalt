@@ -49,6 +49,7 @@ const types = @import("../../lang/types.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const eval = @import("../../exec/eval.zig");
 const formats = @import("../../format/formats.zig");
+const delta_write = @import("../../format/lake/delta_write.zig");
 
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.
@@ -254,7 +255,18 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return pw.sink();
             },
-            .delta, .iceberg => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(std.meta.activeTag(env.write_opts)).write_refused.? })),
+            .delta => |o| {
+                const mode: delta_write.Mode = switch (w.mode) {
+                    .default, .append => .append,
+                    .overwrite => .replace,
+                    .upsert => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` is not supported yet; use `APPEND` (the default for a table) or `REPLACE`", .{w.target})),
+                };
+                const p = delta_write.plan(env.arena, w.target, mode, env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
+                    return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
+                const ds = try delta_write.Sink.open(env.gpa, env.arena, p);
+                return ds.sink();
+            },
+            .iceberg => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(.iceberg).write_refused.? })),
             .records => |opts| {
                 const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));

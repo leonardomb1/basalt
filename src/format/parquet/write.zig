@@ -66,6 +66,7 @@ pub const Error = error{
     UnsupportedParquetWrite,
     AppendNotSupported,
     UnsupportedParquetDecimal,
+    ParquetValueOutOfRange,
 } || std.mem.Allocator.Error || codec.Error;
 
 pub const row_group_rows = 100_000;
@@ -79,18 +80,36 @@ const Mapping = struct {
     scale: ?i32 = null,
     type_length: ?i32 = null,
     optional: bool = true,
+    int_bits: u8 = 64,
+    utc: bool = false,
+};
+
+/// A column laid out narrower than its basalt type, or naming a timezone, for a
+/// file that must match a table's schema: an 8-, 16- or 32-bit integer, a 32-bit
+/// float, a timestamp adjusted to UTC.
+pub const Physical = struct {
+    int_bits: u8 = 64,
+    float32: bool = false,
+    utc: bool = false,
 };
 
 fn mapType(t: types.Type) Error!Mapping {
+    return mapPhysical(t, .{});
+}
+
+fn mapPhysical(t: types.Type, ph: Physical) Error!Mapping {
     return switch (t.kind) {
         .bool => .{ .phys = .boolean },
-        .int => .{ .phys = .int64 },
-        .float => .{ .phys = .double },
+        .int => switch (ph.int_bits) {
+            8, 16, 32 => .{ .phys = .int32, .converted = logical.conv_int8 + @as(i32, std.math.log2_int(u8, ph.int_bits)) - 3, .int_bits = ph.int_bits },
+            else => .{ .phys = .int64 },
+        },
+        .float => if (ph.float32) .{ .phys = .float } else .{ .phys = .double },
         .string => .{ .phys = .byte_array, .converted = logical.conv_utf8 },
         .bytes => .{ .phys = .byte_array },
         .date => .{ .phys = .int32, .converted = logical.conv_date },
         .time => .{ .phys = .int64, .converted = logical.conv_time_micros },
-        .timestamp => .{ .phys = .int64, .converted = logical.conv_timestamp_micros },
+        .timestamp => .{ .phys = .int64, .converted = logical.conv_timestamp_micros, .utc = ph.utc },
         .decimal => blk: {
             const p: i32 = @max(1, @min(38, @as(i32, t.precision)));
             const s: i32 = @as(i32, t.scale);
@@ -369,6 +388,19 @@ pub const Writer = struct {
         compression: codec.Codec,
         mode: driver.FileMode,
     ) !*Writer {
+        return openPhysical(plan_arena, path, schema, compression, mode, &.{});
+    }
+
+    /// `open` with each column's `Physical` layout, by position; columns past
+    /// `phys` take their type's.
+    pub fn openPhysical(
+        plan_arena: std.mem.Allocator,
+        path: []const u8,
+        schema: types.Schema,
+        compression: codec.Codec,
+        mode: driver.FileMode,
+        phys: []const Physical,
+    ) !*Writer {
         if (mode == .append) return Error.AppendNotSupported;
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
         const mem = try plan_arena.create(std.heap.ArenaAllocator);
@@ -376,8 +408,8 @@ pub const Writer = struct {
         errdefer mem.deinit();
         const arena = mem.allocator();
         const maps = try arena.alloc(Mapping, schema.fields.len);
-        for (schema.fields, maps) |f, *m| {
-            m.* = try mapType(f.ty);
+        for (schema.fields, maps, 0..) |f, *m, i| {
+            m.* = try mapPhysical(f.ty, if (i < phys.len) phys[i] else .{});
             m.optional = f.ty.nullable;
         }
 
@@ -573,6 +605,49 @@ pub const Writer = struct {
     }
 
     pub fn close(self: *Writer) !void {
+        _ = try self.finish(null);
+    }
+
+    /// One column's statistics over the whole file: `bounded` false when a row
+    /// group held values but no min and max (a NaN), so the file has none.
+    pub const ColumnStats = struct { nulls: i64 = 0, min: ?Value = null, max: ?Value = null, bounded: bool = true };
+
+    pub const Summary = struct { rows: i64, bytes: u64, columns: []ColumnStats };
+
+    /// `close`, returning the file's row count, size and per-column statistics,
+    /// copied into `out`.
+    pub fn closeSummary(self: *Writer, out: std.mem.Allocator) !Summary {
+        return (try self.finish(out)).?;
+    }
+
+    fn summarize(self: *Writer, out: std.mem.Allocator) !Summary {
+        const cols = try out.alloc(ColumnStats, self.cols.len);
+        for (cols, 0..) |*c, k| {
+            c.* = .{};
+            for (self.groups.items) |g| {
+                const ch = g.chunks[k];
+                c.nulls += ch.nulls;
+                if (ch.num_values - ch.nulls == 0) continue;
+                const mn = ch.min orelse {
+                    c.bounded = false;
+                    continue;
+                };
+                const mx = ch.max orelse {
+                    c.bounded = false;
+                    continue;
+                };
+                if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try own(out, mn);
+                if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try own(out, mx);
+            }
+            if (!c.bounded) {
+                c.min = null;
+                c.max = null;
+            }
+        }
+        return .{ .rows = self.total_rows, .bytes = @intCast(self.offset), .columns = cols };
+    }
+
+    fn finish(self: *Writer, out: ?std.mem.Allocator) !?Summary {
         try self.flushRowGroup();
         self.freeScratch();
 
@@ -598,7 +673,9 @@ pub const Writer = struct {
             .object => |o| o.finish() catch |e| return self.specific(e),
             .memory => {},
         }
+        const sum = if (out) |a| try self.summarize(a) else null;
         self.freeOwn();
+        return sum;
     }
 
     fn freeOwn(self: *Writer) void {
@@ -891,8 +968,16 @@ fn writeLogicalType(w: *thrift.Writer, m: Mapping) !void {
             try w.structEnd();
         },
         logical.conv_date => try emptyVariant(w, 6),
-        logical.conv_time_micros => try timeVariant(w, 7),
-        logical.conv_timestamp_micros => try timeVariant(w, 8),
+        logical.conv_time_micros => try timeVariant(w, 7, false),
+        logical.conv_timestamp_micros => try timeVariant(w, 8, m.utc),
+        logical.conv_int8, logical.conv_int16, logical.conv_int32 => {
+            try w.fieldBegin(.@"struct", 10);
+            try w.structBegin();
+            try w.fieldBegin(.byte, 1);
+            try w.out.append(m.int_bits);
+            try w.writeBool(2, true);
+            try w.structEnd();
+        },
         else => {},
     }
     try w.structEnd();
@@ -904,10 +989,10 @@ fn emptyVariant(w: *thrift.Writer, id: i16) !void {
     try w.structEnd();
 }
 
-fn timeVariant(w: *thrift.Writer, id: i16) !void {
+fn timeVariant(w: *thrift.Writer, id: i16, utc: bool) !void {
     try w.fieldBegin(.@"struct", id);
     try w.structBegin();
-    try w.writeBool(1, false);
+    try w.writeBool(1, utc);
     try w.fieldBegin(.@"struct", 2);
     try w.structBegin();
     try emptyVariant(w, 2);
@@ -1228,7 +1313,11 @@ fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
         .int32 => {
             const x: i32 = switch (v) {
                 .date => |d| d,
-                .int => |i| @intCast(i),
+                .int => |i| blk: {
+                    const lim = @as(i64, 1) << @intCast(m.int_bits - 1);
+                    if (i < -lim or i >= lim) return Error.ParquetValueOutOfRange;
+                    break :blk @intCast(i);
+                },
                 .decimal => |d| try rescaleTo(i32, d, m.scale orelse 0),
                 else => 0,
             };
@@ -1256,6 +1345,15 @@ fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
             if (len > buf.len) return Error.UnsupportedParquetDecimal;
             try decimalBytes(buf[0..len], x);
             return buf[0..len];
+        },
+        .float => {
+            const x: f32 = switch (v) {
+                .float => |f| @floatCast(f),
+                .int => |i| @floatFromInt(i),
+                else => 0,
+            };
+            std.mem.writeInt(u32, buf[0..4], @bitCast(x), .little);
+            return buf[0..4];
         },
         .double => {
             const x: f64 = switch (v) {
@@ -1294,6 +1392,18 @@ fn decimalBytes(b: []u8, x: i128) Error!void {
 const sink_vtable = driver.sinkVTable(Writer);
 
 const testing = std.testing;
+
+test "a Physical layout narrows integers and floats and marks a timestamp UTC" {
+    const short = try mapPhysical(types.Type.init(.int), .{ .int_bits = 16 });
+    try testing.expectEqual(parquet.PhysicalType.int32, short.phys);
+    try testing.expectEqual(@as(?i32, logical.conv_int16), short.converted);
+    try testing.expectEqual(@as(?i32, logical.conv_int8), (try mapPhysical(types.Type.init(.int), .{ .int_bits = 8 })).converted);
+    try testing.expectEqual(parquet.PhysicalType.float, (try mapPhysical(types.Type.init(.float), .{ .float32 = true })).phys);
+    try testing.expect((try mapPhysical(types.Type.init(.timestamp), .{ .utc = true })).utc);
+    var buf: [16]u8 = undefined;
+    try testing.expectError(Error.ParquetValueOutOfRange, plainFixed(&buf, short, .{ .int = 40_000 }));
+    try testing.expectEqual(@as(usize, 4), (try plainFixed(&buf, short, .{ .int = -32_768 })).len);
+}
 
 test "basalt types map onto Parquet physical and converted types" {
     try testing.expectEqual(parquet.PhysicalType.boolean, (try mapType(types.Type.init(.bool))).phys);
