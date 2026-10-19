@@ -228,7 +228,7 @@ fn gatherKept(arena: std.mem.Allocator, row_schema: *const types.Schema, items: 
         for (pc.keep) |k| kept += @intFromBool(k);
         if (kept == 0) continue;
         const cols = try arena.alloc(column.Column, pc.batch.columns.len);
-        for (pc.batch.columns, cols) |c, *o| o.* = try column.gather(arena, c, pc.keep, kept);
+        try column.gatherColumns(arena, pc.batch.columns, cols, pc.keep, kept);
         try parts_.append(.{ .schema = row_schema, .columns = cols, .len = kept });
         total += kept;
     };
