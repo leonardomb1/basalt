@@ -231,7 +231,7 @@ pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
     var bound: usize = batch.len;
     for (batch.columns) |*c| {
         bound += batch.len * (1 + cellBound(c.ty.kind));
-        if (c.data == .bytes) bound += c.data.bytes.values.len;
+        if (c.data == .bytes) bound += c.data.bytes.span(batch.len);
     }
     try out.ensureUnusedCapacity(bound);
     for (0..batch.len) |r| {
@@ -1058,6 +1058,27 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     var out = std.array_list.Managed(u8).init(a);
     try appendBatchTsv(&out, batch);
     try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x022\x01clean value\x02", out.items);
+}
+
+test "stream-load TSV body of a few rows sliced from a long string column reserves for those rows alone" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const columnmod = @import("../exec/column.zig");
+    const str_ty = types.Type.init(.string);
+    var sb = columnmod.Builder.init(a, str_ty);
+    const cell = "x" ** 100;
+    for (0..2 * Batch.max_rows) |_| try sb.append(.{ .string = cell });
+    const cols = try a.alloc(columnmod.Column, 1);
+    cols[0] = try sb.finish();
+    var schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = str_ty }} };
+    const whole = Batch{ .schema = &schema, .columns = cols, .len = 2 * Batch.max_rows };
+    const part = try whole.slice(a, Batch.max_rows, 8);
+
+    var out = std.array_list.Managed(u8).init(a);
+    try appendBatchTsv(&out, part);
+    try std.testing.expectEqual(@as(usize, 8 * (cell.len + 1)), out.items.len);
+    try std.testing.expect(out.capacity < 16 * 1024);
 }
 
 test "a value that is literally the null marker is refused, not written as null" {

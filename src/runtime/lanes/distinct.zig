@@ -248,25 +248,6 @@ fn gatherKept(arena: std.mem.Allocator, row_schema: *const types.Schema, items: 
     return .{ .schema = row_schema, .columns = cols, .len = total };
 }
 
-pub const ReaderSource = struct {
-    r: *pqdecode.Reader,
-    schema_: *const types.Schema,
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        return self.schema_.*;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        return self.r.next(arena);
-    }
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        self.r.close();
-    }
-    pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-};
-
 pub fn runParallelDistinct(
     env: *Env,
     split: LaneSplit,
