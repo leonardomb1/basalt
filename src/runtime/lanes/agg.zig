@@ -499,16 +499,16 @@ pub const MorselSource = struct {
     }
     fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        if (try self.slicer.take(arena)) |s| return s;
-        const into = self.slicer.into(self.scratch);
         while (true) {
             if (self.cur) |r| {
-                if (try r.next(into)) |b| return try self.slicer.give(arena, b);
+                if (try self.slicer.read(arena, r)) |b| return b;
                 self.cur = null;
                 self.span.end();
             }
-            if (self.m.queue.failed.load(.seq_cst)) return null;
-            const i = self.nextIndex() orelse return null;
+            const i = (if (self.m.queue.failed.load(.seq_cst)) null else self.nextIndex()) orelse {
+                self.slicer.deinit();
+                return null;
+            };
             self.span = trace.begin("row group", i);
             self.cur = try openItem(self.m, self.scratch, &self.held, i);
             self.cur_item = i;
@@ -539,6 +539,7 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
         .scratch = la,
         .fixed = .{ .next = lane_idx, .step = ctx.lanes.len },
     };
+    defer ms.slicer.deinit();
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try buildMapChain(la, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.morsels.src_schema);

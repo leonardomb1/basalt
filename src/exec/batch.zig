@@ -47,7 +47,7 @@ pub const Batch = struct {
         var n: usize = 0;
         for (self.columns) |c| {
             n += c.validity.bits.len + switch (c.data) {
-                .bytes => |b| if (b.offsets.len == 0) 0 else @as(usize, @intCast(b.offsets[b.offsets.len - 1] - b.offsets[0])) + b.offsets.len * @sizeOf(i32),
+                .bytes => |b| b.span(c.len) + b.offsets.len * @sizeOf(i32),
                 inline else => |s| std.mem.sliceAsBytes(s).len,
             };
         }
@@ -60,14 +60,26 @@ pub const Batch = struct {
 /// the next batch is read, because the caller resets the arena it pulls into on every
 /// pull, so a remainder kept there would be overwritten. A slice is therefore valid
 /// until the caller's next pull, which every lane consumer honours (none holds a batch
-/// across pulls).
+/// across pulls). `rows` sits on `back`, never on a lane's arena, so a reset that
+/// outgrows one buffer and `deinit` give the decoded rows back.
 pub const Slicer = struct {
+    back: std.mem.Allocator = std.heap.page_allocator,
     rows: ?std.heap.ArenaAllocator = null,
     pend: ?Batch = null,
     at: usize = 0,
 
-    /// The next slice of the batch in hand, or null when the source must be read.
-    pub fn take(self: *Slicer, arena: std.mem.Allocator) !?Batch {
+    /// The next slice from `src` (anything with `next(arena) !?Batch`): of the batch
+    /// in hand, else of the next one it reads; null when it is spent.
+    pub fn read(self: *Slicer, arena: std.mem.Allocator, src: anytype) !?Batch {
+        if (try self.take(arena)) |s| return s;
+        const b = (try src.next(self.into())) orelse return null;
+        if (b.len <= Batch.max_rows) return b;
+        self.pend = b;
+        self.at = 0;
+        return try self.take(arena);
+    }
+
+    fn take(self: *Slicer, arena: std.mem.Allocator) !?Batch {
         const b = self.pend orelse return null;
         const n = @min(Batch.max_rows, b.len - self.at);
         const out = try b.slice(arena, self.at, n);
@@ -76,24 +88,15 @@ pub const Slicer = struct {
         return out;
     }
 
-    /// The arena to read the next batch into, emptied of the last one.
-    pub fn into(self: *Slicer, back: std.mem.Allocator) std.mem.Allocator {
-        if (self.rows == null) self.rows = .init(back);
+    fn into(self: *Slicer) std.mem.Allocator {
+        if (self.rows == null) self.rows = .init(self.back);
         _ = self.rows.?.reset(.retain_capacity);
         return self.rows.?.allocator();
     }
 
-    /// `b`, read into `into`, whole when it is small, else its first slice.
-    pub fn give(self: *Slicer, arena: std.mem.Allocator, b: Batch) !Batch {
-        if (b.len <= Batch.max_rows) return b;
-        self.pend = b;
-        self.at = 0;
-        return (try self.take(arena)).?;
-    }
-
     pub fn deinit(self: *Slicer) void {
         if (self.rows) |*r| r.deinit();
-        self.* = .{};
+        self.* = .{ .back = self.back };
     }
 };
 
@@ -140,38 +143,41 @@ test "slices of a batch together weigh what the batch does" {
     try std.testing.expectEqual(whole.heapBytes() + extra_offsets, parts);
 }
 
-test "a slicer hands a long batch on in max_rows views that outlive the caller's per-pull reset" {
-    var back = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer back.deinit();
+test "a slicer hands each batch on in max_rows views that outlive the caller's per-pull reset, and gives its rows back" {
     var pull = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer pull.deinit();
     const schema = types.Schema{ .fields = &.{.{ .name = "i", .ty = types.Type.init(.int).asNullable() }} };
-    const total = 2 * Batch.max_rows + 100;
-    var sl = Slicer{};
+    const Src = struct {
+        schema: *const types.Schema,
+        sizes: []const usize,
+        k: usize = 0,
+        fn next(self: *@This(), into: std.mem.Allocator) !?Batch {
+            if (self.k == self.sizes.len) return null;
+            const rows = self.sizes[self.k];
+            self.k += 1;
+            var b = column_mod.Builder.init(into, types.Type.init(.int).asNullable());
+            for (0..rows) |i| try b.append(if (i % 11 == 0) .null else .{ .int = @intCast(i) });
+            const cols = try into.alloc(Column, 1);
+            cols[0] = try b.finish();
+            return .{ .schema = self.schema, .columns = cols, .len = rows };
+        }
+    };
+    const sizes = [_]usize{ 7, 2 * Batch.max_rows + 100, 3 * Batch.max_rows + 5, 7 };
+    var src = Src{ .schema = &schema, .sizes = &sizes };
+    var sl = Slicer{ .back = std.testing.allocator };
     defer sl.deinit();
-    const lens: [2][]const usize = .{ &.{ Batch.max_rows, Batch.max_rows, 100 }, &.{7} };
-    for ([_]usize{ total, 7 }, lens) |rows, want| {
-        try std.testing.expect((try sl.take(pull.allocator())) == null);
-        const into = sl.into(back.allocator());
-        var b = column_mod.Builder.init(into, types.Type.init(.int).asNullable());
-        for (0..rows) |i| try b.append(if (i % 11 == 0) .null else .{ .int = @intCast(i) });
-        const cols = try into.alloc(Column, 1);
-        cols[0] = try b.finish();
-        var got = try sl.give(pull.allocator(), .{ .schema = &schema, .columns = cols, .len = rows });
+    for (sizes) |rows| {
         var at: usize = 0;
-        for (want, 0..) |n, k| {
-            if (k > 0) {
-                _ = pull.reset(.retain_capacity);
-                got = (try sl.take(pull.allocator())).?;
-            }
-            try std.testing.expectEqual(n, got.len);
-            for (0..n) |r| {
+        while (at < rows) {
+            _ = pull.reset(.retain_capacity);
+            const got = (try sl.read(pull.allocator(), &src)).?;
+            try std.testing.expectEqual(@min(Batch.max_rows, rows - at), got.len);
+            for (0..got.len) |r| {
                 const v = got.columns[0].getValue(r);
                 if ((at + r) % 11 == 0) try std.testing.expect(v == .null) else try std.testing.expectEqual(@as(i64, @intCast(at + r)), v.int);
             }
-            at += n;
+            at += got.len;
         }
-        _ = pull.reset(.retain_capacity);
     }
-    try std.testing.expect((try sl.take(pull.allocator())) == null);
+    try std.testing.expect((try sl.read(pull.allocator(), &src)) == null);
 }

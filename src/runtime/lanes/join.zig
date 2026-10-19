@@ -23,6 +23,7 @@ const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const LaneSplit = @import("sources.zig").LaneSplit;
+const ReaderSource = @import("sources.zig").ReaderSource;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const buildMapChain = @import("../plan.zig").buildMapChain;
 const HeldFile = @import("agg.zig").HeldFile;
@@ -132,23 +133,6 @@ const BuildCtx = struct {
     root_mtx: std.Thread.Mutex = .{},
 };
 
-/// One row group of the build file, read from the lane's open reader.
-const ItemSource = struct {
-    r: *pqdecode.Reader,
-    schema_: *const types.Schema,
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *ItemSource = @ptrCast(@alignCast(ptr));
-        return self.schema_.*;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *ItemSource = @ptrCast(@alignCast(ptr));
-        return self.r.next(arena);
-    }
-    fn closeFn(_: *anyopaque) void {}
-    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-};
-
 /// A lane: items taken from the queue in turn, each row group read through the lane's
 /// one open reader (reopening a file per row group re-parses its footer), its kept
 /// rows filed under the item's index so the index sees them in file order.
@@ -167,13 +151,15 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
     defer keep.deinit();
     var held: ?HeldFile = null;
     defer if (held) |h| h.r.close();
+    var item = ReaderSource{ .r = undefined, .schema_ = m.src_schema, .own = false };
+    defer item.slicer.deinit();
     while (!ctx.queue.failed.load(.seq_cst)) {
         const i = ctx.queue.next.fetchAdd(1, .seq_cst);
         if (i >= ctx.queue.nitems) return;
         _ = mem.work.reset(.retain_capacity);
         const r = (try openItem(m, keep.allocator(), &held, i)) orelse continue;
-        var item = ItemSource{ .r = r, .schema_ = m.src_schema };
-        var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ItemSource.vtable }, .count = ctx.rows_read };
+        item.r = r;
+        var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
         var scan = op.Scan{ .src = cs.source() };
         scan.stats.at = ctx.read_at;
         const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, m.src_schema);

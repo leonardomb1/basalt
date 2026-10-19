@@ -83,6 +83,13 @@ pub const Bytes = struct {
         return self.values[lo..hi];
     }
 
+    /// The value bytes of the first `n` rows, which may start past 0 and end before
+    /// `values` does when the column views a larger buffer.
+    pub fn span(self: Bytes, n: usize) usize {
+        if (self.offsets.len == 0) return 0;
+        return @as(usize, @intCast(self.offsets[n])) - @as(usize, @intCast(self.offsets[0]));
+    }
+
     fn spanOf(self: Bytes, rows_idx: []const usize) usize {
         var total: usize = 0;
         for (rows_idx) |r| total += self.at(r).len;
@@ -267,7 +274,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
         r.* = off;
         b.* = span;
         off += c.len;
-        if (c.data == .bytes) span += @as(usize, @intCast(c.data.bytes.offsets[c.len])) - @as(usize, @intCast(c.data.bytes.offsets[0]));
+        if (c.data == .bytes) span += c.data.bytes.span(c.len);
     }
     const out = try allocData(arena, chunks[0].data, total, span);
     const Copy = struct {
@@ -297,10 +304,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
 
 fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
     var span: usize = 0;
-    for (chunks) |c| {
-        const b = c.data.bytes;
-        span += @as(usize, @intCast(b.offsets[c.len])) - @as(usize, @intCast(b.offsets[0]));
-    }
+    for (chunks) |c| span += c.data.bytes.span(c.len);
     const values = try arena.alloc(u8, span);
     const offsets = try arena.alloc(i32, total + 1);
     offsets[0] = 0;

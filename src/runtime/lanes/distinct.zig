@@ -3,7 +3,6 @@
 //! in file order so the first row overall wins, and gathered back in file order.
 
 const Batch = @import("../../exec/batch.zig").Batch;
-const Slicer = @import("../../exec/batch.zig").Slicer;
 const Env = @import("../env.zig").Env;
 const LaneSplit = @import("sources.zig").LaneSplit;
 const Profile = @import("../../exec/profile.zig").Profile;
@@ -248,30 +247,6 @@ fn gatherKept(arena: std.mem.Allocator, row_schema: *const types.Schema, items: 
     }
     return .{ .schema = row_schema, .columns = cols, .len = total };
 }
-
-pub const ReaderSource = struct {
-    r: *pqdecode.Reader,
-    schema_: *const types.Schema,
-    scratch: std.mem.Allocator,
-    slicer: Slicer = .{},
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        return self.schema_.*;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        if (try self.slicer.take(arena)) |s| return s;
-        const b = (try self.r.next(self.slicer.into(self.scratch))) orelse return null;
-        return try self.slicer.give(arena, b);
-    }
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        self.r.close();
-        self.slicer.deinit();
-    }
-    pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-};
 
 pub fn runParallelDistinct(
     env: *Env,

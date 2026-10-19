@@ -6,7 +6,8 @@ const HeldFile = @import("agg.zig").HeldFile;
 const MorselSource = @import("agg.zig").MorselSource;
 const PqItem = @import("agg.zig").PqItem;
 const PqMorsels = @import("agg.zig").PqMorsels;
-const ReaderSource = @import("distinct.zig").ReaderSource;
+const Batch = @import("../../exec/batch.zig").Batch;
+const Slicer = @import("../../exec/batch.zig").Slicer;
 const RunOptions = @import("../env.zig").RunOptions;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
@@ -34,6 +35,35 @@ const LaneRows = union(enum) {
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, chunk: usize, of: usize },
 };
 
+/// One open Parquet reader as a lane source, its row groups handed on in
+/// `Batch.max_rows` slices. `own` says whether closing the source closes the reader
+/// and whether a spent reader gives the slicer's rows back at once; a join build lane
+/// keeps its reader open across items, points `r` at each in turn, and releases the
+/// slicer when it finishes.
+pub const ReaderSource = struct {
+    r: *pqdecode.Reader,
+    schema_: *const types.Schema,
+    own: bool = true,
+    slicer: Slicer = .{},
+
+    fn schemaFn(ptr: *anyopaque) types.Schema {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        return self.schema_.*;
+    }
+    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        const b = try self.slicer.read(arena, self.r);
+        if (b == null and self.own) self.slicer.deinit();
+        return b;
+    }
+    fn closeFn(ptr: *anyopaque) void {
+        const self: *ReaderSource = @ptrCast(@alignCast(ptr));
+        if (self.own) self.r.close();
+        self.slicer.deinit();
+    }
+    pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+};
+
 /// This lane's row stream, or null when the item holds nothing (a file that shrank
 /// since planning). The reader comes from `scratch` because the source borrows it;
 /// closing the source releases it.
@@ -51,7 +81,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
                 return null;
             };
             const rs = try scratch.create(ReaderSource);
-            rs.* = .{ .r = rdr, .schema_ = g.m.src_schema, .scratch = scratch };
+            rs.* = .{ .r = rdr, .schema_ = g.m.src_schema };
             return .{ .ptr = rs, .vtable = &ReaderSource.vtable };
         },
         .csv => |c| return try c.mapped.lane(scratch, c.chunk, c.of, c.schema),
