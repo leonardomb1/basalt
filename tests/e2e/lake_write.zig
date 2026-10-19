@@ -175,6 +175,13 @@ test "Delta write: an existing table's types, narrower than basalt's, are writte
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/n/' AS SELECT 7 AS i, 1 AS b, CAST(1.5 AS DOUBLE) AS f, 'x' AS n;", "has column `d`, which the rows lack");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/n/' AS SELECT 7 AS i, 1 AS b, CAST(1.5 AS DOUBLE) AS f, CAST('2.5' AS DECIMAL(4,1)) AS d, 'x' AS n, 1 AS extra;", "the rows have column `extra`");
     try testing.expect(!exists(&tmp, "n/_delta_log/00000000000000000002.json"));
+
+    try load(&tmp, "LOAD INTO '$B/n/' AS SELECT 8 AS i, 1 AS b, CAST(2.5 AS DOUBLE) AS f, CAST('3.25' AS DECIMAL(4,2)) AS d, 'y' AS n;", 1);
+    try load(&tmp, "LOAD INTO '$B/n/' UPSERT ON (i) PARTIAL COLS (n) AS SELECT 7 AS i, 'x2' AS n;", 1);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "n", 3, "remove"));
+    try load(&tmp, "LOAD INTO '$B/n/' UPSERT ON (d) PARTIAL COLS (n) AS SELECT CAST('3.25' AS DECIMAL(4,2)) AS d, 'y2' AS n;", 1);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "n", 4, "remove"));
+    try testing.expectEqualStrings("i,b,f,d,n\n7,-8,1.5,2.500,x2\n8,1,2.5,3.250,y2\n", try rows(a, &tmp, "SELECT * FROM '$B/n/' ORDER BY i"));
 }
 
 test "Delta write: what is refused, at check where it can be seen" {
@@ -332,6 +339,8 @@ test "Delta UPSERT: a partitioned table rewrites only the partitions holding a m
     try testing.expect(std.mem.indexOf(u8, v2, "{\"remove\":{\"path\":\"grp=x/") != null);
     try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,99\n3,b,5\n4,a,4\n7,b,70\n8,x,2\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' ORDER BY id"));
     try testing.expectEqualStrings("grp,n\na,3\nb,2\nx,1\n", try rows(a, &tmp, "SELECT grp, COUNT(*) AS n FROM '$B/p/' GROUP BY grp ORDER BY grp"));
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n7,x,1\n8,x,2\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' WITH (version = 0) ORDER BY id"));
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,99\n3,b,5\n4,a,4\n7,x,1\n8,x,2\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' WITH (version = 1) ORDER BY id"));
 }
 
 test "Delta UPSERT: past --op-memory the spool and the joins spill, with the rows a roomy run writes; lanes alike" {
