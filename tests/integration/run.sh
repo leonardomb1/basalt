@@ -10,7 +10,8 @@
 # Suite names: mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow
 # stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
-# kernel needs python3)
+# kernel needs python3; azure needs the `az` CLI and s3 python3, to put the Delta
+# and Iceberg tables)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail

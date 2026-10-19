@@ -140,10 +140,14 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
     } };
 }
 
-/// A table's live files split at files when they are remote or at least as many
-/// as the lanes, each opened only by its lane; otherwise at row groups, each file
-/// opened here so one that does not fit the table fails the plan. A file its
-/// partition values rule out is left out.
+/// Live files per lane at which a local table splits at files rather than row
+/// groups: planning then opens no footer per file, and lanes stay busy.
+const files_per_lane = 8;
+
+/// A table's live files split at files when they are remote or many (`files_per_lane`
+/// for each lane), each opened only by its lane, the first here for the scan's
+/// column counts; otherwise at row groups, each file opened here so one that does
+/// not fit the table fails the plan. A file its partition values rule out is left out.
 fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, push_stages: []const ast.Stage, lanes: usize) anyerror!?LaneSplit {
     const arena = env.arena;
     const project = try projectedColumns(env, push_stages);
@@ -153,22 +157,24 @@ fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, push_
     for (layout.files, 0..) |_, k| {
         if (!layout.pruned(k, bounds)) live += 1;
     }
-    const by_file = csv.CsvReader.isUrl(path) or live >= lanes;
+    const remote = csv.CsvReader.isUrl(path);
+    const by_file = remote or live >= lanes *| files_per_lane;
     var items = std.array_list.Managed(PqItem).init(arena);
     var noted = false;
     for (layout.files, 0..) |_, k| {
         if (layout.pruned(k, bounds)) continue;
-        if (by_file) {
-            try items.append(.{ .file = @intCast(k), .rg = 0, .rg_end = null });
-            continue;
-        }
+        if (by_file) try items.append(.{ .file = @intCast(k), .rg = 0, .rg_end = null });
+        if (by_file and (remote or noted)) continue;
         const r = (try layout.open(arena, view, k, &.{})).?;
         defer r.close();
-        if (!noted) if (env.scan) |t| {
+        if (!noted) {
             noted = true;
-            driver.ScanTally.add(&t.columns_read, r.leaves.len);
-            driver.ScanTally.add(&t.columns_total, r.md.leafCount());
-        };
+            if (env.scan) |t| {
+                driver.ScanTally.add(&t.columns_read, r.leaves.len);
+                driver.ScanTally.add(&t.columns_total, r.md.leafCount());
+            }
+        }
+        if (by_file) continue;
         for (0..r.md.row_groups.len) |g| try items.append(.{ .file = @intCast(k), .rg = @intCast(g), .rg_end = @intCast(g + 1) });
     }
     if (items.items.len < 2) return null;
@@ -182,7 +188,7 @@ fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, push_
         .bounds = bounds,
         .src_schema = &view.schema,
         .queue = .{ .nitems = items.items.len },
-        .max_lanes = if (!csv.CsvReader.isUrl(path)) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
+        .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
         .layout = layout,
         .view = view,
     } };

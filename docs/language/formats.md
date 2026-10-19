@@ -133,7 +133,8 @@ SELECT * FROM 's3://lake/events/metadata/00012-5a1c.metadata.json' WITH (format 
 The current metadata is the highest-numbered `metadata/` file
 (`v12.metadata.json`, `00012-<uuid>.metadata.json`, or their `.gz` forms; a
 bare `<uuid>.metadata.json`, which a commit writes before renaming it, is not
-one). That
+one, and a table with no file named as a version is refused, asking for the
+file by name). That
 is exact for a table a Hadoop catalog keeps; for a catalog-held table (Glue,
 REST, a database) it is the newest file written, so naming the metadata file the
 catalog points at reads exactly what the catalog does, and two files of the same

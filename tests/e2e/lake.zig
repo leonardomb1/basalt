@@ -809,3 +809,48 @@ test "Iceberg data files are checked by field id: a column renamed or re-added a
     try put(&tmp, cur, md);
     try testing.expectEqualStrings("id,name\n3,cy\n4,dee\n5,eve\n", try rows(a, &tmp, "SELECT id, name FROM '$B/py/' ORDER BY id", 1));
 }
+
+test "a local Delta table of many files splits at files: rows as one lane reads them, column counts kept, a missing file named from its lane" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var lines = std.array_list.Managed([]const u8).init(a);
+    try lines.appendSlice(&.{ protocol1, try meta(a, try std.mem.join(a, ",", &.{ try field(a, "id", "long"), try field(a, "name", "string") }), "[]", "{}") });
+    for (0..20) |i| {
+        const f = try std.fmt.allocPrint(a, "m/f{d:0>2}.parquet", .{i});
+        try dataFile(a, &tmp, f, try std.fmt.allocPrint(a, "id,name\n{d},n{d}\n{d},n{d}\n", .{ 2 * i, i % 3, 2 * i + 1, i % 3 }), "CAST(id AS INT) AS id, name");
+        try lines.append(try add(a, f["m/".len..], "{}"));
+    }
+    try commit(a, &tmp, "m", 0, lines.items);
+    const q = "SELECT name, COUNT(*) AS c, SUM(id) AS s FROM '$B/m/' GROUP BY name ORDER BY name";
+    const one = try rows(a, &tmp, q, 1);
+    try testing.expectEqualStrings("name,c,s\nn0,14,259\nn1,14,287\nn2,12,234\n", one);
+    const two = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{q}), 2);
+    try testing.expect(two.err == null);
+    try testing.expectEqualStrings(one, two.out);
+    try testing.expect(two.summary.threads > 1);
+    try testing.expectEqual(@as(u64, 2), two.summary.pushdown.columns_total);
+
+    try commit(a, &tmp, "m", 1, &.{try add(a, "gone.parquet", "{}")});
+    const r = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT name, COUNT(*) AS c FROM '$B/m/' GROUP BY name;", 2);
+    try testing.expect(r.err != null);
+    if (std.mem.indexOf(u8, r.msg, "could not read its file `gone.parquet` (") == null) {
+        std.debug.print("lanes: {s}\n", .{r.msg});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "an Iceberg folder whose metadata files are none named as a version is refused, not read plain" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try iceTable(a, &tmp);
+    try tmp.dir.rename("ice/metadata/v1.metadata.json", "ice/metadata/00001-abc.metadata.json");
+    try tmp.dir.deleteFile("ice/metadata/v2.metadata.json");
+    try refused(a, &tmp, "SELECT id FROM '$B/ice/'", "has no metadata file named as a version (`v<N>.metadata.json` or `<N>-<uuid>.metadata.json`), only files such as `00001-abc.metadata.json`", false);
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/00001-abc.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
+}

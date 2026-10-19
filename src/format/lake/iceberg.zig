@@ -65,9 +65,10 @@ fn gzipped(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".gz.metadata.json") or std.mem.endsWith(u8, path, ".metadata.json.gz");
 }
 
-/// Whether `root` holds an Iceberg table's metadata, listing `metadata/` (or, over
-/// http(s), which cannot list, fetching `version-hint.text`); a remote listing is
-/// kept for `locate`.
+/// Whether `root` holds an Iceberg table's metadata, any `metadata/*.metadata.json`,
+/// listing `metadata/` (or, over http(s), which cannot list, fetching
+/// `version-hint.text`); a remote listing is kept for `locate`, which refuses a
+/// table none of whose metadata files is named as a version.
 pub fn holds(arena: std.mem.Allocator, root: []const u8) !?table.Listed {
     const dir = try std.mem.concat(arena, u8, &.{ root, metadata_dir });
     if (table.isHttp(root)) {
@@ -78,11 +79,11 @@ pub fn holds(arena: std.mem.Allocator, root: []const u8) !?table.Listed {
         var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch |e| return if (table.absent(e)) null else e;
         defer d.close();
         var it = d.iterate();
-        while (try it.next()) |en| if (en.kind == .file and metadataVersion(en.name) != null) return .{};
+        while (try it.next()) |en| if (en.kind == .file and isMetadataPath(en.name)) return .{};
         return null;
     }
     const got = folder.listRaw(arena, dir) catch |e| return if (table.absent(e)) null else e;
-    for (got) |u| if (metadataVersion(folder.below(u, dir)) != null) return .{ .items = got };
+    for (got) |u| if (isMetadataPath(folder.below(u, dir))) return .{ .items = got };
     return null;
 }
 
@@ -107,17 +108,24 @@ fn locate(arena: std.mem.Allocator, name: []const u8, root: []const u8, listed_i
     var best: ?[]const u8 = null;
     var best_v: u64 = 0;
     var tie: ?[]const u8 = null;
+    var unversioned: ?[]const u8 = null;
     for (listed) |u| {
         const rel = folder.below(u, dir);
         if (std.mem.indexOfAny(u8, rel, "/\\") != null) continue;
-        const v = metadataVersion(rel) orelse continue;
+        const v = metadataVersion(rel) orelse {
+            if (isMetadataPath(rel)) unversioned = rel;
+            continue;
+        };
         if (best == null or v > best_v) {
             best = u;
             best_v = v;
             tie = null;
         } else if (v == best_v) tie = u;
     }
-    const b = best orelse return refuse("folder `{s}` has no metadata/*.metadata.json: it is not an Iceberg table", .{root});
+    const b = best orelse {
+        if (unversioned) |f| return refuse("{s} has no metadata file named as a version (`v<N>.metadata.json` or `<N>-<uuid>.metadata.json`), only files such as `{s}`; read the current one by name: '{s}metadata/<file>.metadata.json' WITH (format = 'iceberg')", .{ name, f, root });
+        return refuse("folder `{s}` has no metadata/*.metadata.json: it is not an Iceberg table", .{root});
+    };
     if (tie) |t| return refuse("{s} has two metadata files of version {d} (`{s}`, `{s}`); read the current one by name: '{s}' WITH (format = 'iceberg')", .{ name, best_v, folder.below(b, dir), folder.below(t, dir), b });
     return b;
 }
