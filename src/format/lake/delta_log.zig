@@ -5,7 +5,8 @@
 //! object store a single PUT carries `If-None-Match: *`. A store that ignores the
 //! condition would let two writers overwrite each other's commit, so after a
 //! remote commit lands the same create is sent again and must be refused; one
-//! that is not is refused as a store basalt cannot commit to. Data files are
+//! that is not fails the write, saying the version it did commit, as a store
+//! basalt cannot commit to safely. Data files are
 //! written before the commit, so a reader never meets a commit naming a file that
 //! is not there yet.
 //!
@@ -128,7 +129,7 @@ fn createObject(arena: std.mem.Allocator, at: []const u8, bytes: []const u8) !bo
     const made = obj.putIfAbsent(arena, &client, bytes, "application/json", &why) catch |e| return explainStore(e, at, why);
     if (!made) return false;
     if (obj.putIfAbsent(arena, &client, bytes, "application/json", &why) catch |e| return explainStore(e, at, why))
-        return eval.explain(Error.DeltaStoreUnsafe, try std.fmt.allocPrint(arena, "the store holding `{s}` ignored `If-None-Match: *` (a second create of the commit succeeded), so two writers could overwrite each other's commit; basalt does not commit to it", .{at}));
+        return eval.explain(Error.DeltaStoreUnsafe, try std.fmt.allocPrint(arena, "`{s}` was committed, but its store ignored `If-None-Match: *` (a second create of it succeeded), so two writers could overwrite each other's commit there; do not write this table from basalt on this store", .{at}));
     return true;
 }
 
@@ -217,7 +218,10 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commi
         if (attempts >= max_attempts)
             return fail(arena, name, c, try std.fmt.allocPrint(arena, "it lost the race for {d} versions in a row (the last tried was {d})", .{ max_attempts, version }));
         const made = store.create(arena, version, c.body) catch |e| {
-            if (try ours(arena, store, version, c.txn_id)) return version;
+            if (e != Error.DeltaStoreUnsafe and try ours(arena, store, version, c.txn_id)) {
+                _ = eval.takeFailure(e);
+                return version;
+            }
             return e;
         };
         if (made) return version;
@@ -257,6 +261,8 @@ const FakeStore = struct {
     raced: usize = 0,
     /// Whether a create lands but reports a failure, as a lost answer does.
     lose_answer: bool = false,
+    /// Whether a create lands and then reports the store ignored its condition.
+    unsafe: bool = false,
 
     fn store(self: *FakeStore) Store {
         return .{ .ptr = self, .vtable = &.{ .read = read, .create = create } };
@@ -279,6 +285,7 @@ const FakeStore = struct {
             self.lose_answer = false;
             return error.ConnectionResetByPeer;
         }
+        if (self.unsafe) return Error.DeltaStoreUnsafe;
         return true;
     }
 };
@@ -328,6 +335,8 @@ test "commit: a lost answer is recognised by txnId; endless winners are bounded"
     const a = ar.allocator();
     var s1 = FakeStore{ .arena = a, .lose_answer = true };
     try testing.expectEqual(@as(u64, 0), try commit(a, s1.store(), "T", testCommit(.create, null, "T")));
+    var s0 = FakeStore{ .arena = a, .unsafe = true };
+    try testing.expectError(Error.DeltaStoreUnsafe, commit(a, s0.store(), "T", testCommit(.create, null, "T")));
 
     const many = [_][]const u8{"{\"add\":{\"path\":\"w.parquet\"}}"} ** (max_attempts + 1);
     var s2 = FakeStore{ .arena = a, .race = &many };

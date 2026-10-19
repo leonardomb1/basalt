@@ -156,8 +156,10 @@ declares not nullable fails the write naming the column.
 Data files are `part-<uuid>.snappy.parquet` (`compression = 'gzip'` or `'none'`
 picks another codec), under Hive-style `col=value/` folders for a partitioned
 table, escaped as Spark escapes them, NULL as `__HIVE_DEFAULT_PARTITION__`; the
-partition columns are not written into the files, as the log carries them. An
-empty string partition value is NULL, as Delta reads it. Each `add` carries the
+partition columns are not written into the files, as the log carries them. A
+partition value is written as the protocol serializes it, a `timestamp` in its
+recommended UTC form (`2026-01-01T01:02:03.123456Z`), a `timestamp_ntz` as
+`2026-01-01 01:02:03.123456`; an empty string is NULL, as Delta reads it. Each `add` carries the
 file's statistics: `numRecords`, every data column's `nullCount`, and `minValues`
 and `maxValues` for numbers, dates, timestamps (cut to the millisecond, as the
 protocol allows) and strings (a string over 32 bytes has its 32-byte prefix as
@@ -165,13 +167,16 @@ its minimum and no maximum); booleans and binary have none. At most 16 files are
 open at once — the least recently written is closed when another partition
 needs one — and a file is closed at 128 MiB, so memory stays near 16 Parquet row
 groups, and an object store's upload buffer each, however many partitions there
-are. No checkpoint is written; a table basalt alone writes is replayed from its
+are. The file count is what grows instead: rows of more than 16 partitions
+interleaved across batches reopen a file per partition per batch, so ordering
+the rows by the partition columns keeps one file per partition. No checkpoint is written; a table basalt alone writes is replayed from its
 JSON commits.
 
 The commit is created only if no writer made that version first: a local one by
 hard-linking a fully written, synced hidden file to its name, an object store's
 by one PUT with `If-None-Match: *` (a store that ignores the condition is caught
-by sending the same create again and is refused). A version taken by another
+by sending the same create again, and the write fails naming the version it
+committed, so the table is not written there again). A version taken by another
 writer is read: one that changed the table's metadata or protocol, or created it,
 fails the write; so does any change to the table's files under a `REPLACE`; an
 `APPEND` otherwise moves to the next version, up to ten times. The data files are
