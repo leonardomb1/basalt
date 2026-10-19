@@ -24,10 +24,11 @@ AS
 - `LOAD INTO '/out/x.xlsx'` writes an Excel workbook of one sheet, `WITH (sheet =
   'Name')` naming it ([Writing Excel](formats.md#writing-excel)); `REPLACE` only.
 - A folder target (`LOAD INTO 's3://lake/sales/'`, ending in `/`) is a Delta
-  table, written as a table target: `APPEND` by default, or `REPLACE`; `WITH
-  (format = 'delta')` creates it when the folder holds no `_delta_log/`, and
-  `partition_by = 'c1, c2'` partitions the table it creates
-  ([Writing Delta](formats.md#writing-delta)).
+  table, written as a table target: `APPEND` by default, `REPLACE`, or `UPSERT`
+  (copy-on-write, in one commit); `WITH (format = 'delta')` creates it when the
+  folder holds no `_delta_log/`, and `partition_by = 'c1, c2'` partitions the
+  table it creates ([Writing Delta](formats.md#writing-delta), where `PARTIAL
+  COLS` and repeated or NULL keys are spelled out).
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
   (a file), `sheet` (an Excel file), `compression` (a Parquet file or a Delta

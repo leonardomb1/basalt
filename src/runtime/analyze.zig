@@ -1429,9 +1429,8 @@ const Ctx = struct {
     fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema: ?types.Schema) !?[]const u8 {
         if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
-        const mode: delta_write.Mode = if (w.mode == .overwrite) .replace else .append;
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
-        const p = delta_write.plan(self.arena, w.target, mode, create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
+        const p = delta_write.plan(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
             if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
             _ = eval.takeFailure(e);
             return null;
@@ -1553,7 +1552,7 @@ const Ctx = struct {
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
-                return .{ .connector = w.connector, .target = w.target, .mode = if (w.mode == .overwrite) "replace" else "append", .format = "delta" };
+                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.modeOf(w.mode).label(self.arena), .format = "delta" };
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
@@ -1818,8 +1817,6 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
         return fail(diag, "cannot write `{s}`: a folder is written as a Delta table, not as {s} files; drop `format`, or name a file", .{ w.target, formats.of(f).label });
     if (deltaTarget(w, hints)) {
         if (delta_write.storeProblem(w.target)) |why| return fail(diag, "cannot write Delta table `{s}`: {s}", .{ w.target, why });
-        if (w.mode == .upsert)
-            return fail(diag, "`UPSERT` into Delta table `{s}` is not supported yet; use `APPEND` (the default for a table) or `REPLACE`", .{w.target});
         return;
     }
     if (w.mode == .upsert)

@@ -27,6 +27,10 @@
 //! (numbers, dates, timestamps cut to milliseconds as the protocol allows, strings
 //! of up to 32 bytes; a longer string's minimum is its 32-byte prefix).
 //!
+//! An UPSERT matches rows by its key columns and rewrites the files holding a
+//! matched row (`delta_merge.zig`); under PARTIAL COLS the rows may leave out
+//! table columns other than the key and the listed ones.
+//!
 //! No checkpoint is written: the Parquet writer writes flat columns, and a
 //! checkpoint's actions are nested structs and maps.
 
@@ -38,12 +42,14 @@ const codecs = @import("../compress/codecs.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
+const merge = @import("delta_merge.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
+const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const s3 = @import("../../store/s3.zig");
 const table = @import("table.zig");
@@ -53,7 +59,42 @@ const testing = std.testing;
 
 const refuse = table.refuse;
 
-pub const Mode = enum { append, replace };
+pub const Mode = union(enum) {
+    append,
+    replace,
+    upsert: Upsert,
+
+    /// How EXPLAIN names it: `append`, `replace`, `upsert on (id) partial cols (a)`.
+    pub fn label(self: Mode, arena: std.mem.Allocator) ![]const u8 {
+        const u = switch (self) {
+            .upsert => |u| u,
+            else => return @tagName(self),
+        };
+        const keys = try std.mem.join(arena, ", ", u.keys);
+        const on = if (u.keys.len == 0) "upsert (key from the source)" else try std.fmt.allocPrint(arena, "upsert on ({s})", .{keys});
+        const pc = u.partial orelse return on;
+        return std.fmt.allocPrint(arena, "{s} partial cols ({s})", .{ on, try std.mem.join(arena, ", ", pc) });
+    }
+};
+
+/// An UPSERT's key columns (none until a bare UPSERT's are resolved) and, under
+/// PARTIAL COLS, the columns a matched row takes from the incoming one.
+pub const Upsert = struct {
+    keys: []const []const u8,
+    partial: ?[]const []const u8 = null,
+};
+
+/// The disposition a LOAD names, as a Delta write takes it.
+pub fn modeOf(m: ast.WriteMode) Mode {
+    return switch (m) {
+        .default, .append => .append,
+        .overwrite => .replace,
+        .upsert => |u| .{ .upsert = .{ .keys = u.keys, .partial = u.partial } },
+    };
+}
+
+/// A table column the rows leave out (`Col.src`), as PARTIAL COLS allows.
+pub const absent = std.math.maxInt(usize);
 
 /// Files open for writing at once; past it the least recently written is closed.
 pub const max_open = 16;
@@ -74,7 +115,7 @@ pub const Col = struct {
     ty: types.Type,
     phys: pqwrite.Physical = .{},
     nullable: bool = true,
-    /// Its position in the incoming rows.
+    /// Its position in the incoming rows, `absent` when they leave it out.
     src: usize,
 };
 
@@ -93,6 +134,12 @@ pub const Plan = struct {
     /// Which of `cols` go into the data files.
     data: []const usize,
     schema_string: []const u8,
+    /// An UPSERT's key columns, as indices into `cols`.
+    keys: []const usize = &.{},
+    /// Under PARTIAL COLS, the columns a matched row takes from the incoming one.
+    partial: ?[]const usize = null,
+    /// The incoming rows' columns.
+    in_fields: []const types.Schema.Field = &.{},
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -136,17 +183,56 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
         return refuse("{s} is partitioned by ({s}), not ({s}); `partition_by` applies only when a write creates the table", .{ name, try std.mem.join(arena, ", ", st.part_cols), try std.mem.join(arena, ", ", want) });
     p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = &.{}, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.? };
     const schema = schema_in orelse return p;
+    const partial = mode == .upsert and mode.upsert.partial != null;
     const cols = try arena.alloc(Col, fields.len);
     for (fields, cols) |f, *c| {
-        const src = indexOf(schema, f.name) orelse
-            return refuse("{s} has column `{s}`, which the rows lack; a write gives every column of the table a value (`CAST(NULL AS ...) AS {s}` leaves it empty)", .{ name, f.name, f.name });
+        const src = indexOf(schema, f.name) orelse {
+            if (!partial) return refuse("{s} has column `{s}`, which the rows lack; a write gives every column of the table a value (`CAST(NULL AS ...) AS {s}` leaves it empty)", .{ name, f.name, f.name });
+            var none = types.Type.init(.string);
+            none.unknown = true;
+            c.* = try tableCol(name, f, none, absent);
+            continue;
+        };
         c.* = try tableCol(name, f, schema.fields[src].ty, src);
     }
     for (schema.fields) |f| if (indexOfField(fields, f.name) == null)
         return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table", .{ f.name, name });
-    p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.? };
+    p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.?, .in_fields = schema.fields };
     try split(p, arena, st.part_cols);
+    try upsertCols(p, arena);
     return p;
+}
+
+/// Resolves an UPSERT's key and PARTIAL COLS columns against the table, refusing
+/// a key the table or the rows lack, a listed column that is a key, that the
+/// table or the rows lack, and a name given twice.
+fn upsertCols(p: *Plan, arena: std.mem.Allocator) !void {
+    const u = switch (p.mode) {
+        .upsert => |u| u,
+        else => return,
+    };
+    if (u.keys.len == 0 or p.cols.len == 0) return;
+    const keys = try arena.alloc(usize, u.keys.len);
+    for (u.keys, keys, 0..) |kn, *o, i| {
+        o.* = colIndex(p.cols, kn) orelse return refuse("{s} has no column `{s}` to match an UPSERT's rows on", .{ p.name, kn });
+        if (std.mem.indexOfScalar(usize, keys[0..i], o.*) != null) return refuse("`UPSERT ON` names `{s}` twice", .{kn});
+        if (p.cols[o.*].src == absent) return refuse("the rows lack key column `{s}`; an UPSERT matches rows by every key column", .{kn});
+    }
+    p.keys = keys;
+    const listed = u.partial orelse return;
+    const out = try arena.alloc(usize, listed.len);
+    for (listed, out, 0..) |cn, *o, i| {
+        o.* = colIndex(p.cols, cn) orelse return refuse("`PARTIAL COLS` names `{s}`, which {s} lacks", .{ cn, p.name });
+        if (std.mem.indexOfScalar(usize, keys, o.*) != null) return refuse("`PARTIAL COLS` names key column `{s}`; a key is what rows are matched by, and a matched row keeps it", .{cn});
+        if (std.mem.indexOfScalar(usize, out[0..i], o.*) != null) return refuse("`PARTIAL COLS` names `{s}` twice", .{cn});
+        if (p.cols[o.*].src == absent) return refuse("`PARTIAL COLS` names `{s}`, which the rows lack", .{cn});
+    }
+    p.partial = out;
+}
+
+fn colIndex(cols: []const Col, name: []const u8) ?usize {
+    for (cols, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
+    return null;
 }
 
 fn sameNames(a: []const []const u8, b: []const []const u8) bool {
@@ -202,8 +288,9 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
         try w.print(",\"type\":\"{s}\",\"nullable\":true,\"metadata\":{{}}}}", .{c.delta_type});
     }
     try w.writeAll("]}");
-    var p = Plan{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = null, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = aw.written() };
+    var p = Plan{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = null, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = aw.written(), .in_fields = schema.fields };
     try split(&p, arena, partition_by orelse &.{});
+    try upsertCols(&p, arena);
     return p;
 }
 
@@ -343,8 +430,10 @@ fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
         while (it.next()) |kv| if (std.mem.startsWith(u8, kv.key_ptr.*, "delta.constraints."))
             return refuse("{s} has CHECK constraint `{s}`, which basalt does not enforce, so it does not write the table", .{ st.name, kv.key_ptr.*["delta.constraints.".len..] });
     }
-    if (mode == .replace) if (st.property("delta.appendOnly")) |v| if (std.ascii.eqlIgnoreCase(v, "true"))
-        return refuse("{s} is append-only (`delta.appendOnly`), so a REPLACE cannot remove its files", .{st.name});
+    if (mode != .append) if (st.property("delta.appendOnly")) |v| if (std.ascii.eqlIgnoreCase(v, "true"))
+        return refuse("{s} is append-only (`delta.appendOnly`), so {s} cannot remove its files", .{ st.name, if (mode == .replace) "a REPLACE" else "an UPSERT" });
+    if (mode == .upsert) if (st.property("delta.enableChangeDataFeed")) |v| if (std.ascii.eqlIgnoreCase(v, "true"))
+        return refuse("{s} records a change data feed (`delta.enableChangeDataFeed`), which an UPSERT's rewritten files would misreport (every row of a rewritten file as deleted and inserted); basalt does not write the change files that would say which rows changed", .{st.name});
 }
 
 fn oneOf(s: []const u8, set: []const []const u8) bool {
@@ -497,6 +586,7 @@ const Open = struct {
 pub const Sink = struct {
     gpa: std.mem.Allocator,
     mem: std.heap.ArenaAllocator,
+    /// The plan files are written by: for an UPSERT, the table's columns in order.
     plan: *const Plan,
     file_schema: types.Schema,
     phys: []const pqwrite.Physical,
@@ -505,6 +595,10 @@ pub const Sink = struct {
     added: std.ArrayListUnmanaged(Added) = .empty,
     /// Every data file begun, local ones removed when the write fails.
     begun: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// An UPSERT's spooled rows, merged with the table at `close`.
+    merging: ?*merge.Merge = null,
+    /// Whether an UPSERT's joins went to disk.
+    spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
     /// Set once `close` or `abort` has freed everything, so an `abort` after a
@@ -512,10 +606,20 @@ pub const Sink = struct {
     done: bool = false,
 
     /// A sink on `plan_arena` (which outlives it), its buffers on `gpa`.
-    pub fn open(gpa: std.mem.Allocator, plan_arena: std.mem.Allocator, p: *const Plan) !*Sink {
+    pub fn open(gpa: std.mem.Allocator, plan_arena: std.mem.Allocator, p: *const Plan, opts: merge.Opts) !*Sink {
         const self = try plan_arena.create(Sink);
         self.* = .{ .gpa = gpa, .mem = std.heap.ArenaAllocator.init(gpa), .plan = p, .file_schema = undefined, .phys = &.{} };
+        errdefer self.mem.deinit();
         const a = self.mem.allocator();
+        if (p.mode == .upsert) {
+            const out = try plan_arena.create(Plan);
+            out.* = p.*;
+            const cols = try plan_arena.dupe(Col, p.cols);
+            for (cols, 0..) |*c, k| c.src = k;
+            out.cols = cols;
+            self.plan = out;
+            self.merging = try merge.Merge.init(gpa, p, opts);
+        }
         const fields = try a.alloc(types.Schema.Field, p.data.len);
         const phys = try a.alloc(pqwrite.Physical, p.data.len);
         for (p.data, fields, phys) |k, *f, *ph| {
@@ -534,6 +638,12 @@ pub const Sink = struct {
     const vtable = driver.sinkVTable(Sink);
 
     pub fn writeBatch(self: *Sink, arena: std.mem.Allocator, b: Batch) !void {
+        if (self.merging) |m| return m.take(b);
+        return self.route(arena, b);
+    }
+
+    /// Writes rows shaped as `plan` reads them, each to its partition's file.
+    pub fn route(self: *Sink, arena: std.mem.Allocator, b: Batch) !void {
         if (b.len == 0) return;
         try self.check(b);
         const p = self.plan;
@@ -666,15 +776,28 @@ pub const Sink = struct {
     pub fn close(self: *Sink) !void {
         defer self.destroy();
         errdefer self.discard();
-        while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
         const p = self.plan;
         const a = self.mem.allocator();
-        if (p.snap != null and self.added.items.len == 0 and (p.mode == .append or p.snap.?.files.count() == 0)) return;
+        var removes: []const delta.Add = &.{};
+        var read_set: []const []const u8 = &.{};
+        if (self.merging) |m| {
+            if (m.rows == 0) return;
+            const done = try m.finish(self);
+            self.spilled = m.spilled;
+            removes = done.removed;
+            read_set = done.read_set;
+        } else if (p.mode == .replace) if (p.snap) |st| {
+            removes = st.files.values();
+            const rs = try a.alloc([]const u8, removes.len);
+            for (rs, removes) |*r, f| r.* = f.raw;
+            read_set = rs;
+        };
+        while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
+        if (p.snap != null and self.added.items.len == 0 and (p.mode == .append or removes.len == 0)) return;
         const now = std.time.milliTimestamp();
         const txn = dlog.uuid();
         var aw = std.Io.Writer.Allocating.init(a);
         const w = &aw.writer;
-        try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
         var pb = std.Io.Writer.Allocating.init(a);
         try pb.writer.writeByte('[');
         for (p.parts, 0..) |k, i| {
@@ -682,7 +805,18 @@ pub const Sink = struct {
             try jsonString(&pb.writer, p.cols[k].name);
         }
         try pb.writer.writeByte(']');
-        try jsonString(w, pb.written());
+        switch (p.mode) {
+            .upsert => |u| {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"MERGE\",\"operationParameters\":{{\"predicate\":", .{now});
+                var pred = std.Io.Writer.Allocating.init(a);
+                for (u.keys, 0..) |k, i| try pred.writer.print("{s}target.`{s}` = source.`{s}`", .{ if (i > 0) " AND " else "", k, k });
+                try jsonString(w, pred.written());
+            },
+            else => {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
+                try jsonString(w, pb.written());
+            },
+        }
         try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null) "true" else "false", @import("build_options").version, &txn });
         if (p.snap == null) {
             try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
@@ -692,9 +826,7 @@ pub const Sink = struct {
             try w.writeAll(pb.written());
             try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
         }
-        var read_set = std.array_list.Managed([]const u8).init(a);
-        if (p.mode == .replace) if (p.snap) |st| for (st.files.values()) |f| {
-            try read_set.append(f.raw);
+        for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
             try jsonString(w, f.raw);
             try w.print(",\"deletionTimestamp\":{d},\"dataChange\":true,\"extendedFileMetadata\":true,\"partitionValues\":", .{now});
@@ -705,7 +837,7 @@ pub const Sink = struct {
                 try std.json.Stringify.value(dv, .{}, w);
             }
             try w.writeAll("}}\n");
-        };
+        }
         const names = try a.alloc([]const u8, self.added.items.len);
         for (self.added.items, names) |f, *nm| {
             nm.* = try std.mem.concat(a, u8, &.{ p.root, f.rel });
@@ -725,12 +857,18 @@ pub const Sink = struct {
         var ts = dlog.TableStore{ .root = p.root };
         self.begun.clearRetainingCapacity();
         self.committed = try dlog.commit(a, ts.store(), p.name, .{
-            .kind = if (p.snap == null) .create else if (p.mode == .append) .append else .replace,
+            .kind = if (p.snap == null) .create else switch (p.mode) {
+                .append => .append,
+                .replace => .replace,
+                .upsert => .upsert,
+            },
             .read_version = if (p.snap) |st| st.version else null,
             .txn_id = &txn,
             .body = aw.written(),
             .added = names,
-            .read_set = read_set.items,
+            .read_set = read_set,
+            .key_root = if (p.snap) |st| st.key_root else "",
+            .hold = if (self.merging) |m| m.hold() else null,
         });
     }
 
@@ -754,6 +892,8 @@ pub const Sink = struct {
     }
 
     fn destroy(self: *Sink) void {
+        if (self.merging) |m| m.deinit();
+        self.merging = null;
         self.mem.deinit();
         self.done = true;
     }

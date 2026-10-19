@@ -128,15 +128,20 @@ SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_late.csv';
 
 LOAD INTO 's3://lake/sales/' REPLACE AS
 SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_fixed.csv';
+
+LOAD INTO 's3://lake/sales/' UPSERT ON (order_id) AS
+SELECT region, CAST(day AS DATE) AS day, order_id, amt FROM 'sales_changed.csv';
+
+LOAD INTO 's3://lake/sales/' UPSERT ON (order_id) PARTIAL COLS (amt) AS
+SELECT order_id, amt FROM 'amounts_corrected.csv';
 ```
 
 `APPEND` (the default, as for a database table) adds the rows as new files in
 one commit; `REPLACE` is one commit that removes every file live at the version
 it read and adds the new ones, so a reader sees the old rows or the new, never
 neither, and every earlier version stays readable with `WITH (version = N)`.
-`UPSERT` into a Delta table is not supported yet. A write of no rows commits
-nothing, except that it still creates a table, and a `REPLACE` of no rows
-empties one.
+`UPSERT` merges by key (below). A write of no rows commits nothing, except that
+it still creates a table, and a `REPLACE` of no rows empties one.
 
 A created table is version 0 with protocol 1/2 and the rows' schema: `INT` as
 `long`, `FLOAT` as `double`, `DECIMAL(p,s)` as `decimal(p,s)`, `TIMESTAMP` as
@@ -172,14 +177,54 @@ interleaved across batches reopen a file per partition per batch, so ordering
 the rows by the partition columns keeps one file per partition. No checkpoint is written; a table basalt alone writes is replayed from its
 JSON commits.
 
+`UPSERT ON (k1, k2)` merges the rows into the table copy-on-write, in one
+commit: a row whose key matches a live row replaces it, a row with a new key is
+inserted, and every file holding a matched row is rewritten and removed while
+the files holding none are kept as they are. Bare `UPSERT` takes the key from
+the source table's primary key, as for a database; with none found it is an
+error. The key columns must be the table's and in the rows; without `PARTIAL
+COLS` the rows give every column, as for `APPEND`. `PARTIAL COLS (a, b)` lists
+the only columns a matched row takes from the incoming one, the rest keeping
+the table's values; the rows must carry the key and the listed columns and may
+leave out any other column, which an inserted row then holds as NULL (refused
+for a column declared not nullable). Differences from a database's upsert,
+where the columns that change are the ones the rows carry and `PARTIAL COLS`
+only switches StarRocks and Doris to their partial update: here a column the
+rows carry but `PARTIAL COLS` does not list fills inserted rows only, and a
+listed key column is refused. As a primary key would, a NULL in a key column
+fails the write naming the column, and a key two incoming rows share fails it
+naming the key (whatever their order, which parallel lanes do not keep); a live
+row whose key is NULL matches nothing and stays. A row may move partition: a
+matched row is written where its new values put it. An UPSERT into a folder with
+`format = 'delta'` and no table creates it with the rows.
+
+Only the live files that may hold an incoming key are read: those whose
+partition value (for a key column that partitions the table) or statistics
+(`nullCount`, `minValues`, `maxValues`; a string maximum of 32 bytes or more, as
+a writer may cut one, bounds nothing) leave the key's range between the
+incoming rows' smallest and largest, column by column, are skipped unopened; a
+file without statistics is read. Their key columns are joined against the
+incoming keys to find the files holding a match, and only those are read whole,
+through a FULL hash join with the incoming rows as its build side. The incoming
+rows are spooled to the run's spill space as they arrive, and both joins spill
+past `--op-memory` as any join does, so memory stays near `--op-memory` plus a
+row group of each file read and the 16 open output files, whatever the table's
+or the rows' size. A file with a deletion vector among those read is refused,
+and a table recording a change data feed (`delta.enableChangeDataFeed`) is
+refused, as its rewritten files would misreport every row as changed.
+
 The commit is created only if no writer made that version first: a local one by
 hard-linking a fully written, synced hidden file to its name, an object store's
 by one PUT with `If-None-Match: *` (a store that ignores the condition is caught
 by sending the same create again, and the write fails naming the version it
 committed, so the table is not written there again). A version taken by another
 writer is read: one that changed the table's metadata or protocol, or created it,
-fails the write; so does any change to the table's files under a `REPLACE`; an
-`APPEND` otherwise moves to the next version, up to ten times. The data files are
+fails the write; so does the removal of a file the write read (by any path form
+of it), any change to the table's files under a `REPLACE`, and, under an
+`UPSERT`, an added file whose partition values or statistics may hold an
+incoming key, as that row would then be in the table twice; an `APPEND`, or an
+`UPSERT` whose concurrent writers touched none of its keys, otherwise moves to
+the next version, up to ten times. The data files are
 written before the commit, so no version names a file not yet there; a failed
 commit names the files it wrote, which no version references and `VACUUM`
 removes. A run that fails before its commit deletes its local data files.
@@ -190,11 +235,11 @@ writer version past 7, a writer feature other than `appendOnly`, `invariants`,
 `identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
 `vacuumProtocolCheck` and `allowColumnDefaults`, and among those any the table
 actually uses — a column invariant, a CHECK constraint, a generated or identity
-column, column mapping by name or id — as well as a `REPLACE` of a
+column, column mapping by name or id — as well as a `REPLACE` or `UPSERT` of a
 `delta.appendOnly` table and every reader feature a read refuses. EXPLAIN and
 `check` name the table's version and file count, or that the write creates it,
 and `check` refuses what it can see of a local table: its features, its columns
-and types, its partitioning.
+and types, its partitioning, an UPSERT's key and `PARTIAL COLS`.
 
 ## Apache Iceberg
 

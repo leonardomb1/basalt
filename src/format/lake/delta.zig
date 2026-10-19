@@ -163,14 +163,27 @@ const Log = struct {
 };
 
 /// A live file: `path` decoded from the log's URI form, `raw` as the log wrote it
-/// (what a `remove` must name), `dv` its deletion vector's descriptor, if any.
+/// (what a `remove` must name), `dv` its deletion vector's descriptor, if any, and
+/// `stats` its statistics' JSON text, if the log has them.
 pub const Add = struct {
     path: []const u8,
     raw: []const u8 = "",
     size: ?u64 = null,
     parts: ?std.json.Value = null,
     dv: ?std.json.Value = null,
+    stats: ?[]const u8 = null,
 };
+
+/// A file's path, decoded from the log, as the protocol identifies it: resolved
+/// against the table's root (`key_root`, absolute for a local table), or as
+/// written when its scheme is one basalt does not read.
+pub fn fileKey(arena: std.mem.Allocator, key_root: []const u8, decoded: []const u8) ![]const u8 {
+    return table.mapPath(arena, key_root, decoded) catch |e| {
+        if (e != table.Error.LakeTableRefused) return e;
+        _ = eval.takeFailure(e);
+        return decoded;
+    };
+}
 
 /// A deletion vector's `uniqueId`: its storage type and path or inline bytes, with
 /// `@offset` when it has one.
@@ -210,11 +223,7 @@ pub const State = struct {
     /// A file's identity in the log: its path resolved against the root, and its
     /// deletion vector's id. A path whose scheme basalt does not read keys as written.
     fn key(self: *State, decoded: []const u8, dv: ?[]const u8) ![]const u8 {
-        const at = table.mapPath(self.arena, self.key_root, decoded) catch |e| blk: {
-            if (e != table.Error.LakeTableRefused) return e;
-            _ = eval.takeFailure(e);
-            break :blk decoded;
-        };
+        const at = try fileKey(self.arena, self.key_root, decoded);
         const id = dv orelse return at;
         return std.mem.concat(self.arena, u8, &.{ at, "\x00", id });
     }
@@ -273,6 +282,7 @@ pub const State = struct {
                     .size = if (o.get("size")) |s| (if (s == .integer and s.integer >= 0) @as(u64, @intCast(s.integer)) else null) else null,
                     .parts = o.get("partitionValues"),
                     .dv = if (o.get("deletionVector")) |d| (if (d == .object) d else null) else null,
+                    .stats = str(o.get("stats")),
                 });
             } else if (std.mem.eql(u8, k, "remove")) {
                 try self.drop(str(o.get("path")) orelse continue, try jsonDv(self.arena, o.get("deletionVector")));
@@ -301,6 +311,7 @@ pub const State = struct {
             const c_dv_off = b.schema.indexOf("add.deletionVector.offset");
             const c_dv_size = b.schema.indexOf("add.deletionVector.sizeInBytes");
             const c_dv_card = b.schema.indexOf("add.deletionVector.cardinality");
+            const c_stats = b.schema.indexOf("add.stats");
             const c_id = b.schema.indexOf("metaData.id");
             const c_schema = b.schema.indexOf("metaData.schemaString");
             const c_pcols = b.schema.indexOf("metaData.partitionColumns");
@@ -330,11 +341,13 @@ pub const State = struct {
                         }
                         dv = .{ .object = o };
                     }
+                    const stats = cell(b, c_stats, i);
                     try self.put(.{
                         .path = try self.arena.dupe(u8, cell(b, c_path, i).string),
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
                         .parts = try self.jsonOf(cell(b, c_parts, i)),
                         .dv = dv,
+                        .stats = if (stats == .string) try self.arena.dupe(u8, stats.string) else null,
                     });
                 }
                 if (cell(b, c_schema, i) == .string) {
@@ -376,11 +389,11 @@ pub const State = struct {
 };
 
 const checkpoint_columns = [_][]const u8{
-    "add.path",                          "add.size",                  "add.partitionValues",            "add.deletionVector.storageType",
-    "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "add.deletionVector.sizeInBytes", "add.deletionVector.cardinality",
-    "metaData.id",                       "metaData.schemaString",     "metaData.partitionColumns",      "metaData.configuration",
-    "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",        "protocol.writerFeatures",
-    "checkpointMetadata.version",        "sidecar.path",
+    "add.path",                       "add.size",                          "add.partitionValues",       "add.deletionVector.storageType",
+    "add.stats",                      "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "add.deletionVector.sizeInBytes",
+    "add.deletionVector.cardinality", "metaData.id",                       "metaData.schemaString",     "metaData.partitionColumns",
+    "metaData.configuration",         "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",
+    "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",
 };
 
 fn cell(b: Batch, c: ?usize, row: usize) Value {
@@ -463,9 +476,31 @@ fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
 /// already made it.
 pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*const table.Resolved {
     const st = try snapshot(arena, root, at, listed_in);
-    const name = st.name;
-    const target = st.version;
     try st.checkProtocol();
+    const layout = try layoutOf(arena, st, root, st.files.values());
+    std.mem.sort(Layout.File, layout.files, {}, struct {
+        fn lt(_: void, a: Layout.File, b: Layout.File) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lt);
+    const r = try arena.create(table.Resolved);
+    r.* = .{
+        .kind = .delta,
+        .root = root,
+        .label = try std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ st.version, layout.files.len, if (layout.files.len == 1) "" else "s" }),
+        .layout = &layout.layout,
+    };
+    return r;
+}
+
+/// A layout over some of a table's live files, `files` aligned with `adds`.
+pub const FileLayout = struct { layout: Layout, files: []Layout.File };
+
+/// `adds` (live files of `st`) as a Parquet layout of the table's schema, in the
+/// order given; a file with a deletion vector is refused, as reading it whole
+/// would return the rows it deletes.
+pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, adds: []const Add) !*FileLayout {
+    const name = st.name;
     const schema = try schemaOf(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
     if (schema.fields.len == 0) return refuse("{s} has a schema with no columns", .{name});
 
@@ -473,8 +508,8 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
     for (part_fields, st.part_cols) |*pf, c| pf.* = schema.indexOf(c) orelse
         return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
 
-    const files = try arena.alloc(Layout.File, st.files.count());
-    for (files, st.files.values()) |*f, a| {
+    const files = try arena.alloc(Layout.File, adds.len);
+    for (files, adds) |*f, a| {
         const decoded = a.path;
         if (a.dv != null) return refuse("{s} has file `{s}` with a deletion vector (reader feature `deletionVectors`); basalt does not apply deletion vectors, and reading the file whole would return deleted rows", .{ name, decoded });
         const parts = try arena.alloc(Value, part_fields.len);
@@ -485,22 +520,9 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
         }
         f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts };
     }
-    std.mem.sort(Layout.File, files, {}, struct {
-        fn lt(_: void, a: Layout.File, b: Layout.File) bool {
-            return std.mem.lessThan(u8, a.path, b.path);
-        }
-    }.lt);
-
-    const layout = try arena.create(Layout);
-    layout.* = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files };
-    const r = try arena.create(table.Resolved);
-    r.* = .{
-        .kind = .delta,
-        .root = root,
-        .label = try std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ target, files.len, if (files.len == 1) "" else "s" }),
-        .layout = layout,
-    };
-    return r;
+    const out = try arena.create(FileLayout);
+    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files }, .files = files };
+    return out;
 }
 
 /// `root`'s log replayed to `at` (the newest version when unpinned), refusing

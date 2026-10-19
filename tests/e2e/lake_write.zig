@@ -1,7 +1,7 @@
-//! End-to-end writes of Delta tables: a LOAD creating a table, appending to it and
-//! replacing it, each version read back by basalt; partitioned tables, the log's
-//! actions and statistics as written, and what a write refuses, in `check` and
-//! `run` alike where `check` can see it.
+//! End-to-end writes of Delta tables: a LOAD creating a table, appending to it,
+//! replacing it and upserting into it, each version read back by basalt;
+//! partitioned tables, the log's actions and statistics as written, and what a
+//! write refuses, in `check` and `run` alike where `check` can see it.
 
 const std = @import("std");
 const basalt = @import("basalt");
@@ -193,7 +193,12 @@ test "Delta write: what is refused, at check where it can be seen" {
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO 'sftp://host/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", "SFTP and SMB have no create-if-absent write");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/x/' WITH (format = 'delta', delimiter = ';') AS SELECT * FROM '$B/a.csv';", "does not apply to a Delta table, which takes format, partition_by, compression");
     try testing.expect(!exists(&tmp, "x"));
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", "`UPSERT` into Delta table");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (nope) AS SELECT * FROM '$B/a.csv';", "has no column `nope` to match an UPSERT's rows on");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (id) AS SELECT * FROM '$B/a.csv';", "`PARTIAL COLS` names key column `id`");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (amt) AS SELECT id, grp FROM '$B/a.csv';", "`PARTIAL COLS` names `amt`, which the rows lack");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT id, grp FROM '$B/a.csv';", "has column `amt`, which the rows lack");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (grp) PARTIAL COLS (amt) AS SELECT id, amt FROM '$B/a.csv';", "the rows lack key column `grp`");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT AS SELECT * FROM '$B/a.csv';", "infers the primary key from the source");
 
     const v0 = try logFile(a, &tmp, "t", 0);
     const featured = try std.mem.replaceOwned(u8, a, v0, "{\"minReaderVersion\":1,\"minWriterVersion\":2}", "{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"appendOnly\",\"rowTracking\"]}");
@@ -206,4 +211,148 @@ test "Delta write: what is refused, at check where it can be seen" {
     try tmp.dir.writeFile(.{ .sub_path = "ao/_delta_log/00000000000000000000.json", .data = append_only });
     try load(&tmp, "LOAD INTO '$B/ao/' AS SELECT * FROM '$B/a.csv';", 1);
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/ao/' REPLACE AS SELECT * FROM '$B/a.csv';", "is append-only");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/ao/' UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", "so an UPSERT cannot remove its files");
+
+    const cdf = try std.mem.replaceOwned(u8, a, v0, "\"configuration\":{}", "\"configuration\":{\"delta.enableChangeDataFeed\":\"true\"}");
+    try tmp.dir.makePath("cdf/_delta_log");
+    try tmp.dir.writeFile(.{ .sub_path = "cdf/_delta_log/00000000000000000000.json", .data = cdf });
+    try load(&tmp, "LOAD INTO '$B/cdf/' AS SELECT * FROM '$B/a.csv';", 1);
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/cdf/' UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", "records a change data feed");
+}
+
+/// The number of `action` lines in version `v` of the table at `root`.
+fn actions(a: std.mem.Allocator, tmp: *testing.TmpDir, root: []const u8, v: u64, action: []const u8) !usize {
+    return std.mem.count(u8, try logFile(a, tmp, root, v), try std.fmt.allocPrint(a, "{{\"{s}\":", .{action}));
+}
+
+test "Delta UPSERT: insert-only, update-only and mixed, each a MERGE commit removing only the files it changed" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT * FROM '$B/b.csv';", 1);
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT id + 100 AS id, grp, amt FROM '$B/a.csv';", 1);
+    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 2, "remove"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "\"operation\":\"MERGE\"") != null);
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT id, 'y' AS grp, amt * 10 AS amt FROM '$B/b.csv';", 1);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 3, "remove"));
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 3, "add"));
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT id * 2 AS id, 'z' AS grp, amt FROM '$B/a.csv';", 1);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 4, "remove"));
+
+    const want = [_][]const u8{
+        "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n",
+        "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n7,x,1\n8,x,2\n",
+        "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n7,x,1\n8,x,2\n101,a,10\n102,a,20\n103,b,5\n",
+        "id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n7,y,10\n8,y,20\n101,a,10\n102,a,20\n103,b,5\n",
+        "id,grp,amt\n1,a,10\n2,z,10\n3,b,5\n4,z,20\n6,z,5\n7,y,10\n8,y,20\n101,a,10\n102,a,20\n103,b,5\n",
+    };
+    for (want, 0..) |w, v| try testing.expectEqualStrings(w, try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT * FROM '$B/t/' WITH (version = {d}) ORDER BY id", .{v})));
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
+}
+
+test "Delta UPSERT: PARTIAL COLS changes only the listed columns; an insert leaves the rest NULL, refused where NOT NULL" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (amt) AS SELECT id, 'ignored' AS grp, amt + 1 AS amt FROM '$B/a.csv' WHERE id <> 3 UNION ALL SELECT 9 AS id, 'new' AS grp, 90 AS amt;", 1);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,21\n3,b,5\n9,new,90\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (grp) AS SELECT id, 'g' || id AS grp FROM '$B/b.csv' UNION ALL SELECT 1 AS id, 'one' AS grp;", 1);
+    try testing.expectEqualStrings("id,grp,amt\n1,one,11\n2,a,21\n3,b,5\n7,g7,\n8,g8,\n9,new,90\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+
+    try load(&tmp, "LOAD INTO '$B/nn/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "nn", 0);
+    const nn = try std.mem.replaceOwned(u8, a, v0, "\\\"name\\\":\\\"amt\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true", "\\\"name\\\":\\\"amt\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":false");
+    try testing.expect(!std.mem.eql(u8, nn, v0));
+    try tmp.dir.writeFile(.{ .sub_path = "nn/_delta_log/00000000000000000000.json", .data = nn });
+    try load(&tmp, "LOAD INTO '$B/nn/' UPSERT ON (id) PARTIAL COLS (grp) AS SELECT id, 'u' AS grp FROM '$B/a.csv';", 1);
+    try runRefuses(a, &tmp, "LOAD INTO '$B/nn/' UPSERT ON (id) PARTIAL COLS (grp) AS SELECT 5 AS id, 'u' AS grp;", "column `amt` is NOT NULL");
+    try testing.expectEqualStrings("id,grp,amt\n1,u,10\n2,u,20\n3,u,5\n", try rows(a, &tmp, "SELECT * FROM '$B/nn/' ORDER BY id"));
+    try testing.expect(!exists(&tmp, "nn/_delta_log/00000000000000000002.json"));
+}
+
+test "Delta UPSERT: a repeated or NULL key fails naming it, commits nothing and leaves no data file" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT * FROM '$B/b.csv' UNION ALL SELECT * FROM '$B/b.csv';", "the rows hold key (id) = (7) more than once");
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id, grp) AS SELECT 1 AS id, 'a' AS grp, 0 AS amt UNION ALL SELECT 1 AS id, 'a' AS grp, 1 AS amt;", "the rows hold key (id, grp) = (1, a) more than once");
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT CASE WHEN id = 2 THEN NULL ELSE id END AS id, grp, amt FROM '$B/a.csv';", "column `id` is a key of this UPSERT");
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id, grp) AS SELECT 1 AS id, 'b' AS grp, 7 AS amt;", 1);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n1,b,7\n2,a,20\n3,b,5\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id, grp"));
+    var dir = try tmp.dir.openDir("t", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var files: usize = 0;
+    while (try it.next()) |e| files += @intFromBool(std.mem.endsWith(u8, e.name, ".parquet"));
+    try testing.expectEqual(@as(usize, 2), files);
+}
+
+test "Delta UPSERT: a live row with a NULL key stays; a table the UPSERT creates takes every row" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/c/' WITH (format = 'delta') UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "c", 0), "{\"metaData\":") != null);
+    try load(&tmp, "LOAD INTO '$B/c/' AS SELECT CAST(NULL AS BIGINT) AS id, 'n' AS grp, 0 AS amt;", 1);
+    try load(&tmp, "LOAD INTO '$B/c/' UPSERT ON (id) AS SELECT id, 'u' AS grp, amt FROM '$B/a.csv' WHERE id = 1;", 1);
+    try testing.expectEqualStrings("id,grp,amt\n1,u,10\n2,a,20\n3,b,5\n,n,0\n", try rows(a, &tmp, "SELECT * FROM '$B/c/' ORDER BY id NULLS LAST"));
+}
+
+test "Delta UPSERT: a partitioned table rewrites only the partitions holding a matched key; a row may move partition" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta', partition_by = 'grp') AS SELECT * FROM '$B/a.csv' UNION ALL SELECT * FROM '$B/b.csv';", 1);
+    try testing.expectEqual(@as(usize, 3), try actions(a, &tmp, "p", 0, "add"));
+    try load(&tmp, "LOAD INTO '$B/p/' UPSERT ON (grp, id) AS SELECT 2 AS id, 'a' AS grp, 99 AS amt UNION ALL SELECT 4 AS id, 'a' AS grp, 4 AS amt;", 1);
+    const v1 = try logFile(a, &tmp, "p", 1);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, v1, "{\"remove\":"));
+    try testing.expect(std.mem.indexOf(u8, v1, "{\"remove\":{\"path\":\"grp=a/") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,99\n3,b,5\n4,a,4\n7,x,1\n8,x,2\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' ORDER BY id"));
+
+    try load(&tmp, "LOAD INTO '$B/p/' UPSERT ON (id) AS SELECT 7 AS id, 'b' AS grp, 70 AS amt;", 1);
+    const v2 = try logFile(a, &tmp, "p", 2);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, v2, "{\"remove\":"));
+    try testing.expect(std.mem.indexOf(u8, v2, "{\"remove\":{\"path\":\"grp=x/") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,99\n3,b,5\n4,a,4\n7,b,70\n8,x,2\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' ORDER BY id"));
+    try testing.expectEqualStrings("grp,n\na,3\nb,2\nx,1\n", try rows(a, &tmp, "SELECT grp, COUNT(*) AS n FROM '$B/p/' GROUP BY grp ORDER BY grp"));
+}
+
+test "Delta UPSERT: past --op-memory the spool and the joins spill, with the rows a roomy run writes; lanes alike" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(a);
+    try csv.appendSlice("id,k,v\n");
+    for (0..20000) |i| try csv.writer().print("{d},{d},v{d}\n", .{ i, i % 7, i });
+    try tmp.dir.writeFile(.{ .sub_path = "many.csv", .data = csv.items });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const script = try std.mem.replaceOwned(u8, a,
+        \\LOAD INTO '$B/s/' UPSERT ON (id) AS SELECT id, k, 'u' || v AS v FROM '$B/many.csv' WHERE id % 3 = 0;
+        \\LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s, SUM(CASE WHEN v LIKE 'u%' THEN 1 ELSE 0 END) AS u FROM '$B/s/';
+    , "$B", base);
+    for ([_]usize{ 1, 4 }) |threads| {
+        tmp.dir.deleteTree("s") catch {};
+        try load(&tmp, "LOAD INTO '$B/s/' WITH (format = 'delta', partition_by = 'k') AS SELECT id, k, v FROM '$B/many.csv' WHERE id % 2 = 0;", 1);
+        const out = try harness.runScriptOpts(a, &tmp, script, .{ .threads = threads, .op_memory = 64 << 10, .log = .{ .quiet = true } });
+        try testing.expectEqualStrings("n,s,u\n13333,133316667,6667\n", out);
+    }
 }

@@ -840,8 +840,9 @@ lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/
 }
 
 # A Delta table written to an object store: created partitioned, appended to,
-# replaced, each version read back. The commits go through the store's
-# create-if-absent PUT, which a store ignoring `If-None-Match` fails.
+# upserted (whole rows and PARTIAL COLS), replaced, each version read back. The
+# commits go through the store's create-if-absent PUT, which a store ignoring
+# `If-None-Match` fails.
 lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
   local t="$2dw_$$/"
   printf 'id,name,val\n1,alpha,10\n2,"beta, gamma",\n3,delta,7\n11,alpha,10\n12,"beta, gamma",\n13,delta,7\n' >"$out/dw_all.csv"
@@ -854,6 +855,14 @@ lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
     check "$1-delta-write-v0" "$out/dw_$1_v0.csv" tests/integration/expected.csv
   else
     report "$1-delta-write-append (run error)" bad
+  fi
+  printf 'id,name,val\n1,alpha,10\n2,"beta, gamma",\n3,delta,7\n4,omega,40\n11,alpha,10\n12,"beta, gamma",99\n13,delta,70\n' >"$out/dw_up.csv"
+  if brun run -c "LOAD INTO '$t' UPSERT ON (id) AS SELECT 12 AS id, 'beta, gamma' AS name, 99 AS val UNION ALL SELECT 4 AS id, 'omega' AS name, 40 AS val;" &&
+     brun run -c "LOAD INTO '$t' UPSERT ON (id) PARTIAL COLS (val) AS SELECT 13 AS id, 70 AS val;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_up.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-upsert" "$out/dw_$1_up.csv" "$out/dw_up.csv"
+  else
+    report "$1-delta-write-upsert (run error)" bad
   fi
   if brun run -j 4 -c "LOAD INTO '$t' REPLACE AS SELECT id + 100 AS id, name, val FROM 'tests/integration/seed.csv' WHERE id = 1;" &&
      brun run -c "LOAD INTO '$out/dw_$1_rep.csv' AS SELECT * FROM '$t' ORDER BY id;"; then

@@ -256,14 +256,12 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 return pw.sink();
             },
             .delta => |o| {
-                const mode: delta_write.Mode = switch (w.mode) {
-                    .default, .append => .append,
-                    .overwrite => .replace,
-                    .upsert => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` is not supported yet; use `APPEND` (the default for a table) or `REPLACE`", .{w.target})),
-                };
-                const p = delta_write.plan(env.arena, w.target, mode, env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
+                if (w.mode == .upsert and w.mode.upsert.keys.len == 0)
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
+                const p = delta_write.plan(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
-                const ds = try delta_write.Sink.open(env.gpa, env.arena, p);
+                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.sort_threads, .err = env.errctx }) catch |e|
+                    return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 return ds.sink();
             },
             .iceberg => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(.iceberg).write_refused.? })),

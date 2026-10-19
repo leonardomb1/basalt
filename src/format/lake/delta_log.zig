@@ -12,14 +12,18 @@
 //!
 //! When the version is taken, the winner's actions decide, as Delta's conflict
 //! rules do: a winner that changed the table's metadata or protocol, created it,
-//! or removed a file this commit read fails the commit; a REPLACE fails on any
-//! winner that added or removed files; a blind APPEND moves to the next version,
-//! a bounded number of times. Every commit carries a fresh `txnId` in its
+//! or removed a file this commit read fails the commit (paths compared as the
+//! reader keys them, resolved against the root); a REPLACE fails on any winner
+//! that added or removed files; an UPSERT fails on a winner that added a file
+//! which, by its partition values and statistics, may hold a key the UPSERT
+//! writes, as the row would then be there twice. Otherwise the commit moves to the
+//! next version, a bounded number of times. Every commit carries a fresh `txnId` in its
 //! `commitInfo`, so a create whose answer was lost and whose retry found the name
 //! taken is recognised as its own. A failed commit names the data files it wrote,
 //! which no version references.
 
 const std = @import("std");
+const delta = @import("delta.zig");
 const eval = @import("../../exec/eval.zig");
 const objstore = @import("../../store/objstore.zig");
 const http_client = @import("../../net/http_client.zig");
@@ -53,7 +57,14 @@ pub const Store = struct {
 };
 
 /// What a commit does, which decides what a concurrent winner may have done.
-pub const Kind = enum { create, append, replace };
+pub const Kind = enum { create, append, replace, upsert };
+
+/// Whether a file a concurrent commit added (its `add` action) may hold a key an
+/// UPSERT writes.
+pub const Hold = struct {
+    ctx: *const anyopaque,
+    may: *const fn (ctx: *const anyopaque, arena: std.mem.Allocator, add: std.json.ObjectMap) anyerror!bool,
+};
 
 pub const Commit = struct {
     kind: Kind,
@@ -67,6 +78,11 @@ pub const Commit = struct {
     /// The live files the commit read, as the log names them: a winner removing
     /// one of them changed what the commit was computed from.
     read_set: []const []const u8 = &.{},
+    /// The root paths are resolved against to compare them (`delta.State.key_root`);
+    /// empty compares them decoded, as written.
+    key_root: []const u8 = "",
+    /// An UPSERT's test of a winner's added file.
+    hold: ?Hold = null,
 };
 
 /// The log at `root` (a folder path ending in `/`), local or in an object store.
@@ -164,7 +180,7 @@ pub fn uuid() [36]u8 {
 const Winner = struct {
     meta: bool = false,
     protocol: bool = false,
-    adds: usize = 0,
+    adds: std.ArrayListUnmanaged(std.json.ObjectMap) = .empty,
     removed: std.ArrayListUnmanaged([]const u8) = .empty,
     txn: ?[]const u8 = null,
 };
@@ -183,8 +199,8 @@ fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
             const body = kv.value_ptr.*;
             if (std.mem.eql(u8, k, "metaData")) w.meta = true;
             if (std.mem.eql(u8, k, "protocol")) w.protocol = true;
-            if (std.mem.eql(u8, k, "add")) w.adds += 1;
             if (body != .object) continue;
+            if (std.mem.eql(u8, k, "add")) try w.adds.append(arena, body.object);
             if (std.mem.eql(u8, k, "remove")) if (body.object.get("path")) |p| if (p == .string)
                 try w.removed.append(arena, try table.percentDecode(arena, p.string));
             if (std.mem.eql(u8, k, "commitInfo")) if (body.object.get("txnId")) |x| if (x == .string) {
@@ -201,13 +217,24 @@ fn conflict(arena: std.mem.Allocator, c: Commit, w: Winner, version: u64) !?[]co
         return try std.fmt.allocPrint(arena, "another writer created the table first (version {d})", .{version});
     if (w.meta or w.protocol)
         return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's {s}", .{ version, if (w.meta) "metadata (schema, partitioning or properties)" else "protocol" });
-    for (w.removed.items) |r| for (c.read_set) |mine| {
-        if (std.mem.eql(u8, try table.percentDecode(arena, mine), r))
+    if (w.removed.items.len > 0 and c.read_set.len > 0) {
+        var mine: std.StringHashMapUnmanaged(void) = .empty;
+        for (c.read_set) |f| try mine.put(arena, try keyOf(arena, c.key_root, try table.percentDecode(arena, f)), {});
+        for (w.removed.items) |r| if (mine.contains(try keyOf(arena, c.key_root, r)))
             return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, removed `{s}`, which this write read", .{ version, r });
-    };
-    if (c.kind == .replace and (w.adds > 0 or w.removed.items.len > 0))
+    }
+    if (c.kind == .replace and (w.adds.items.len > 0 or w.removed.items.len > 0))
         return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's files after this REPLACE read them", .{version});
+    if (c.hold) |h| for (w.adds.items) |add| if (try h.may(h.ctx, arena, add)) {
+        const p = if (add.get("path")) |x| (if (x == .string) try table.percentDecode(arena, x.string) else "?") else "?";
+        return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, added `{s}`, which may hold a key this UPSERT writes, so the row could end up in the table twice", .{ version, p });
+    };
     return null;
+}
+
+fn keyOf(arena: std.mem.Allocator, key_root: []const u8, decoded: []const u8) ![]const u8 {
+    if (key_root.len == 0) return decoded;
+    return delta.fileKey(arena, key_root, decoded);
 }
 
 /// Commits `c`, returning the version it became.
@@ -342,6 +369,35 @@ test "commit: a lost answer is recognised by txnId; endless winners are bounded"
     var s2 = FakeStore{ .arena = a, .race = &many };
     try testing.expectError(Error.DeltaCommitConflict, commit(a, s2.store(), "T", testCommit(.append, 0, "T")));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "lost the race") != null);
+}
+
+test "commit: an UPSERT fails on a winner adding a file that may hold its keys, or removing one it read by any path form" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Hot = struct {
+        fn may(_: *const anyopaque, _: std.mem.Allocator, add: std.json.ObjectMap) anyerror!bool {
+            const p = add.get("path") orelse return true;
+            return std.mem.startsWith(u8, p.string, "hot");
+        }
+    };
+    var c = testCommit(.upsert, 3, "T");
+    c.key_root = "/t/";
+    c.hold = .{ .ctx = &c, .may = Hot.may };
+
+    var s1 = FakeStore{ .arena = a, .race = &.{"{\"commitInfo\":{\"txnId\":\"W\"}}\n{\"add\":{\"path\":\"cold.parquet\"}}\n"} };
+    try testing.expectEqual(@as(u64, 5), try commit(a, s1.store(), "T", c));
+
+    var s2 = FakeStore{ .arena = a, .race = &.{"{\"add\":{\"path\":\"hot%20x.parquet\"}}\n"} };
+    try testing.expectError(Error.DeltaCommitConflict, commit(a, s2.store(), "T", c));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "added `hot x.parquet`, which may hold a key this UPSERT writes") != null);
+
+    var s3 = FakeStore{ .arena = a, .race = &.{"{\"remove\":{\"path\":\"file:///t/x%3D1/b%20c.parquet\"}}\n"} };
+    try testing.expectError(Error.DeltaCommitConflict, commit(a, s3.store(), "T", c));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "which this write read") != null);
+
+    var s4 = FakeStore{ .arena = a, .race = &.{"{\"remove\":{\"path\":\"other.parquet\"}}\n"} };
+    try testing.expectEqual(@as(u64, 5), try commit(a, s4.store(), "T", c));
 }
 
 test "local commit: a hidden synced file linked to the name, refused once the name exists" {
