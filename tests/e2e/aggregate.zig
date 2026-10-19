@@ -396,6 +396,7 @@ test "GROUP BY and DISTINCT past --op-memory spill to disk and return what they 
     const queries = [_][]const u8{
         "SELECT g, s, COUNT(*) AS c, SUM(v) AS sv, SUM(f) AS sf, AVG(f) AS af, MIN(v) AS mn, MAX(s) AS mx, COUNT(DISTINCT s) AS ds, median(v) AS md, stddev_pop(f) AS sd FROM '$B/in.csv' GROUP BY g, s ORDER BY g, s",
         "SELECT g, COUNT(*) AS c, SUM(v * 2) AS sv, bit_xor(v) AS bx FROM '$B/in.csv' GROUP BY g ORDER BY g",
+        "WITH t AS (SELECT g, v, CAST(f AS DECIMAL(10,2)) AS d FROM '$B/in.csv') SELECT g, COUNT(*) AS c, SUM(d * v) AS sd, SUM(d - 1.255) AS se FROM t GROUP BY g ORDER BY g",
         "SELECT DISTINCT g, s FROM '$B/in.csv' ORDER BY g, s",
         "WITH d AS (SELECT DISTINCT ON (g) g, v FROM '$B/in.csv') SELECT * FROM d ORDER BY g",
     };

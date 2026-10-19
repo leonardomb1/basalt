@@ -5,7 +5,9 @@
 //! it has one) and a validity-checked one otherwise; a column whose type the op
 //! cannot take directly is read value by value and cast to the op's type. The
 //! grouped loop adds row `r` into the state at `tails[r] + off`, skipping a row with
-//! no group (one sent to a spill file).
+//! no group (one sent to a spill file). An op taking DECIMALs that sets `fold_expr`
+//! also gets `foldExpr`/`foldExprRows`, which take a decimal arithmetic argument's
+//! values straight from its operands (`eval.decFold`), no column built between.
 //!
 //! `Layout` places each aggregate's state after a group's keys, so a COUNT pays
 //! eight bytes and a SUM its own, and carries the per-aggregate `Ctx`. With a
@@ -13,8 +15,10 @@
 //! names the group in the aggregate's pairs (`pairs.zig`).
 
 const Agg = @import("../aggregate.zig").Aggregate.Agg;
+const Batch = @import("../../batch.zig").Batch;
 const Decimal = @import("../../value.zig").Decimal;
 const Value = @import("../../value.zig").Value;
+const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const funcs = @import("funcs.zig");
@@ -50,10 +54,18 @@ pub const Kernel = struct {
     finish: *const fn ([*]const u8, Ctx) anyerror!Value,
     finishAll: *const fn ([]const [*]const u8, usize, Ctx, *column.Builder) anyerror!void,
     own: ?*const fn ([*]u8, Ctx) anyerror!void,
+    foldExpr: ?*const fn ([*]u8, *const ast.Expr, Batch, Ctx) anyerror!bool = null,
+    foldExprRows: ?*const fn ([]const ?[*]u8, usize, *const ast.Expr, Batch, Rows) anyerror!bool = null,
 };
 
 fn hasAddAll(comptime Op: type) bool {
     return @hasDecl(Op, "addAll") and @TypeOf(Op.addAll) != void;
+}
+
+fn foldsExpr(comptime Op: type) bool {
+    if (!@hasDecl(Op, "fold_expr") or !Op.fold_expr) return false;
+    comptime std.debug.assert(Op.In == Decimal);
+    return true;
 }
 
 pub fn make(comptime Op: type) Kernel {
@@ -107,6 +119,31 @@ pub fn make(comptime Op: type) Kernel {
             }
         }
 
+        fn foldExpr(p: [*]u8, e: *const ast.Expr, b: Batch, cx: Ctx) anyerror!bool {
+            const Sink = struct {
+                s: *Op.State,
+                cx: Ctx,
+                pub inline fn put(self: @This(), _: usize, d: Decimal) eval.EvalError!void {
+                    try @call(.always_inline, Op.add, .{ self.s, d, self.cx });
+                }
+            };
+            return eval.decFold(cx.scratch, e, b, Sink{ .s = st(p), .cx = cx });
+        }
+
+        fn foldExprRows(tails: []const ?[*]u8, off: usize, e: *const ast.Expr, b: Batch, rows: Rows) anyerror!bool {
+            const needs_alloc = @hasDecl(Op, "needs_alloc") and Op.needs_alloc;
+            const Sink = struct {
+                tails: []const ?[*]u8,
+                off: usize,
+                rows: Rows,
+                pub inline fn put(self: @This(), r: usize, d: Decimal) eval.EvalError!void {
+                    const tp = self.tails[r] orelse return;
+                    try @call(.always_inline, Op.add, .{ st(tp + self.off), d, if (needs_alloc) self.rows.at(r) else self.rows.cx });
+                }
+            };
+            return eval.decFold(rows.cx.scratch, e, b, Sink{ .tails = tails, .off = off, .rows = rows });
+        }
+
         fn merge(d: [*]u8, s: [*]const u8, cx: Ctx) anyerror!void {
             return Op.merge(st(d), cst(s), cx);
         }
@@ -131,6 +168,8 @@ pub fn make(comptime Op: type) Kernel {
         .finish = K.finish,
         .finishAll = K.finishAll,
         .own = if (@hasDecl(Op, "own")) K.own else null,
+        .foldExpr = if (foldsExpr(Op)) K.foldExpr else null,
+        .foldExprRows = if (foldsExpr(Op)) K.foldExprRows else null,
     };
 }
 

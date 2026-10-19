@@ -13,14 +13,13 @@ const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const failLabel = @import("../../op.zig").failLabel;
-const funcs = @import("funcs.zig");
 const keytable = @import("../../keytable.zig");
 const read = @import("read.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
 /// One batch into the global aggregate's single record, each argument evaluated
-/// once as a column. A DECIMAL SUM of arithmetic is summed fused, the column unbuilt.
+/// once as a column, or straight from its operands where the kernel has `foldExpr`.
 pub fn foldSingle(self: *Aggregate, arena: std.mem.Allocator, b: Batch, layout: *const Layout, tail: [*]u8) anyerror!void {
     for (self.aggs, 0..) |agg, j| {
         const p = tail + layout.offs[j];
@@ -34,15 +33,7 @@ pub fn foldSingle(self: *Aggregate, arena: std.mem.Allocator, b: Batch, layout: 
             try self.pairsOf(j).add(arena, try self.argColumn(arena, agg, e, b), b.len, null, self.interner());
             continue;
         }
-        if (agg.func == .sum and agg.ty.kind == .decimal) {
-            const fused = eval.decSum(arena, e, b, agg.ty.scale) catch |err| return inAggregate(self, err);
-            if (fused) |f| {
-                const s: *funcs.SumDecimal.State = @ptrCast(@alignCast(p));
-                s.s = std.math.add(i256, s.s, f.sum) catch return eval.decimalOverflow();
-                s.n += @intCast(f.nvalid);
-                continue;
-            }
-        }
+        if (layout.kernels[j].foldExpr) |fx| if (fx(p, e, b, cx) catch |err| return inAggregate(self, err)) continue;
         try layout.kernels[j].fold(p, try self.argColumn(arena, agg, e, b), b.len, cx);
     }
 }
@@ -70,7 +61,7 @@ pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const
 }
 
 /// `err`, its message noted as raised in an aggregate.
-fn inAggregate(self: *Aggregate, err: anyerror) anyerror {
+pub fn inAggregate(self: *Aggregate, err: anyerror) anyerror {
     if (self.err) |ec| ec.set("{s}: in aggregate", .{failLabel(err)});
     return err;
 }
