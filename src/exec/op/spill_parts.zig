@@ -106,7 +106,7 @@ pub const Parts = struct {
             }
             if (n == 0) continue;
             const cols = try scratch.alloc(column.Column, b.columns.len);
-            for (cols, b.columns) |*o, c| o.* = try column.gather(scratch, c, mask, n);
+            try column.gatherColumns(scratch, b.columns, cols, mask, n);
             if (self.writers[p] == null) self.writers[p] = try spill.Writer.init(self.space, self.alloc, self.schema, self.tag);
             try self.writers[p].?.write(.{ .schema = self.schema, .columns = cols, .len = n });
         }

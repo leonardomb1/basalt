@@ -320,8 +320,8 @@ fn newIn(a: std.mem.Allocator, v: anytype) !*@TypeOf(v) {
 /// `keyhash.canonF64`, as GROUP BY keeps its keys.
 fn gatherKept(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, key_idx: []const usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
+    try column.gatherColumns(arena, b.columns, outcols, keep, kept);
     for (b.columns, outcols, 0..) |col, *o, ci| {
-        o.* = try column.gather(arena, col, keep, kept);
         if (col.ty.kind == .float and std.mem.indexOfScalar(usize, key_idx, ci) != null)
             for (o.data.f64[0..kept]) |*x| {
                 x.* = keyhash.canonF64(x.*);

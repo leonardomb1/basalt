@@ -2140,3 +2140,36 @@ test "a WHERE's NULL conjunct keeps its row in for the ones after it, as AND's s
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT c AS a FROM '$B/n.csv' WHERE a < 5 AND b <> 0 AND c % 2 = 0;", 1, &.{});
     try expectFile(&tmp, "o.csv", want.items);
 }
+
+test "a WHERE narrowed twice keeps every column of the surviving rows, those no later conjunct reads included" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rows = std.array_list.Managed(u8).init(alloc);
+    defer rows.deinit();
+    var want2 = std.array_list.Managed(u8).init(alloc);
+    defer want2.deinit();
+    var want1 = std.array_list.Managed(u8).init(alloc);
+    defer want1.deinit();
+    try rows.appendSlice("a,b,c,s,n\n");
+    try want2.appendSlice("c,s,n,a\n");
+    try want1.appendSlice("s,c\n");
+    for (0..5000) |i| {
+        const a = i % 50;
+        const b: ?usize = if (i % 13 == 0) null else i % 3;
+        if (b) |v| {
+            try rows.writer().print("{d},{d},{d},str{d}x,", .{ a, v, i, i * 7 });
+        } else try rows.writer().print("{d},,{d},str{d}x,", .{ a, i, i * 7 });
+        if (i % 5 == 0) try rows.appendSlice("\n") else try rows.writer().print("{d}\n", .{i % 9});
+        if (a < 10 and b != null and b.? == 1 and i % 4 != 3) {
+            try want2.writer().print("{d},str{d}x,", .{ i, i * 7 });
+            if (i % 5 == 0) try want2.writer().print(",{d}\n", .{a}) else try want2.writer().print("{d},{d}\n", .{ i % 9, a });
+        }
+        if (a < 10) try want1.writer().print("str{d}x,{d}\n", .{ i * 7, i });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "w.csv", .data = rows.items });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT c, s, n, a FROM '$B/w.csv' WHERE a < 10 AND b = 1 AND c % 4 <> 3;", 1, &.{});
+    try expectFile(&tmp, "o.csv", want2.items);
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT s, c FROM '$B/w.csv' WHERE a < 10 AND a < 20;", 1, &.{});
+    try expectFile(&tmp, "o.csv", want1.items);
+}

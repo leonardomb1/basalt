@@ -659,12 +659,7 @@ fn conjuncts(out: *std.array_list.Managed(*const ast.Expr), e: *const ast.Expr) 
 /// The rows `keep` marks, every column gathered by one selection worked out once.
 fn gatherBatch(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) !Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    if (b.columns.len < 2) {
-        for (b.columns, outcols) |c, *o| o.* = try column.gather(arena, c, keep, kept);
-    } else {
-        const sel = try column.keptIndices(arena, keep, kept);
-        for (b.columns, outcols) |c, *o| o.* = try column.permute(arena, c, sel);
-    }
+    try column.gatherColumns(arena, b.columns, outcols, keep, kept);
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }
 

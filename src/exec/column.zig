@@ -145,61 +145,182 @@ pub const BytesAppender = struct {
     }
 };
 
-/// The positions `keep` marks, `kept` of them. Every position is written and the
-/// cursor advanced by the mark, so the loop has no branch to mispredict; the slot
-/// past the last kept position takes the final write.
-pub fn keptIndices(arena: std.mem.Allocator, keep: []const bool, kept: usize) ![]usize {
-    const idx = try arena.alloc(usize, kept + 1);
-    var w: usize = 0;
-    for (keep, 0..) |k, i| {
-        idx[w] = i;
-        w += @intFromBool(k);
-    }
-    return idx[0..kept];
-}
+/// The rows a `[]bool` mask keeps, worked out once for every column gathered by
+/// it, 64 rows at a time: consecutive all-kept words merge into `runs`, each copied
+/// as one block, and every other kept row is gathered by `idx`, the source row of
+/// each output row outside the runs. An all-dropped word costs nothing per column.
+pub const Selection = struct {
+    idx: []const u32,
+    runs: []const Run,
+    kept: usize,
 
-fn gatherSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, keep: []const bool, kept: usize) ![]T {
-    const out = try arena.alloc(T, kept + 1);
-    var w: usize = 0;
-    for (keep, src[0..keep.len]) |k, x| {
-        out[w] = x;
-        w += @intFromBool(k);
+    pub const Run = struct { at: usize, src: usize, len: usize };
+
+    const full = std.math.maxInt(u64);
+
+    pub fn init(arena: std.mem.Allocator, keep: []const bool, kept: usize) !Selection {
+        const idx = try arena.alloc(u32, kept + 8);
+        var runs = std.ArrayListUnmanaged(Run).empty;
+        var w: usize = 0;
+        var lo: usize = 0;
+        var in_run = false;
+        while (lo < keep.len) : (lo += 64) {
+            const m = maskWord(keep, lo);
+            const was_run = in_run;
+            in_run = m == full;
+            if (in_run) {
+                if (was_run) {
+                    runs.items[runs.items.len - 1].len += 64;
+                } else try runs.append(arena, .{ .at = w, .src = lo, .len = 64 });
+                w += 64;
+            } else if (@popCount(m) < sparse_word) {
+                var x = m;
+                while (x != 0) : (x &= x - 1) {
+                    idx[w] = @intCast(lo + @ctz(x));
+                    w += 1;
+                }
+            } else {
+                var j: usize = 0;
+                while (j < 64) : (j += 8) {
+                    const b: u8 = @truncate(m >> @intCast(j));
+                    const at: @Vector(8, u32) = byte_rows[b];
+                    idx[w..][0..8].* = at + @as(@Vector(8, u32), @splat(@intCast(lo + j)));
+                    w += @popCount(b);
+                }
+            }
+        }
+        return .{ .idx = idx[0..kept], .runs = runs.items, .kept = kept };
     }
-    return out[0..kept];
+
+    /// Bit `j` set when row `lo + j` is kept; rows past the mask are not.
+    fn maskWord(keep: []const bool, lo: usize) u64 {
+        if (lo + 64 <= keep.len) {
+            const v: @Vector(64, u8) = @as(*const [64]u8, @ptrCast(keep[lo..].ptr)).*;
+            return @bitCast(v != @as(@Vector(64, u8), @splat(0)));
+        }
+        var m: u64 = 0;
+        for (keep[lo..], 0..) |k, j| m |= @as(u64, @intFromBool(k)) << @intCast(j);
+        return m;
+    }
+};
+
+/// A mixed word with fewer kept rows than this has its indices found bit by bit; a
+/// denser one eight rows at a time, each byte of its mask writing the positions
+/// it sets (`byte_rows`) in one store and advancing by their count.
+const sparse_word = 8;
+
+/// For each byte value, the positions of its set bits, lowest first.
+const byte_rows: [256][8]u32 = blk: {
+    @setEvalBranchQuota(10000);
+    var t: [256][8]u32 = undefined;
+    for (&t, 0..) |*row, b| {
+        row.* = @splat(0);
+        var n: usize = 0;
+        for (0..8) |bit| if ((b >> bit) & 1 != 0) {
+            row[n] = bit;
+            n += 1;
+        };
+    }
+    break :blk t;
+};
+
+fn selectSlice(comptime T: type, arena: std.mem.Allocator, src: []const T, sel: Selection) ![]T {
+    const out = try arena.alloc(T, sel.kept);
+    var w: usize = 0;
+    for (sel.runs) |r| {
+        for (sel.idx[w..r.at], out[w..r.at]) |i, *o| o.* = src[i];
+        @memcpy(out[r.at..][0..r.len], src[r.src..][0..r.len]);
+        w = r.at + r.len;
+    }
+    for (sel.idx[w..], out[w..]) |i, *o| o.* = src[i];
+    return out;
 }
 
 /// Returns the all-valid bitmap untouched when the source has no nulls, as
 /// `concat` and `permute` do: this backs the filter hot path.
-fn gatherValidity(arena: std.mem.Allocator, v: Bitmap, keep: []const bool, kept: usize) !Bitmap {
-    var bm = try Bitmap.initFull(arena, kept);
-    if (v.allSet(v.len)) return bm;
+fn selectValidity(arena: std.mem.Allocator, v: Bitmap, n: usize, sel: Selection) !Bitmap {
+    var bm = try Bitmap.initFull(arena, sel.kept);
+    if (v.allSet(n)) return bm;
     var w: usize = 0;
-    for (keep, 0..) |k, i| {
-        if (k) {
-            if (!v.get(i)) bm.setValid(w, false);
-            w += 1;
-        }
+    for (sel.runs) |r| {
+        for (sel.idx[w..r.at], w..) |i, at| if (!v.get(i)) bm.setValid(at, false);
+        for (0..r.len) |j| if (!v.get(r.src + j)) bm.setValid(r.at + j, false);
+        w = r.at + r.len;
     }
+    for (sel.idx[w..], w..) |i, at| if (!v.get(i)) bm.setValid(at, false);
     return bm;
 }
 
-pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usize) !Column {
-    const bm = try gatherValidity(arena, c.validity, keep, kept);
+fn selectBytes(arena: std.mem.Allocator, b: Bytes, sel: Selection) !Bytes {
+    var span: usize = 0;
+    var w: usize = 0;
+    for (sel.runs) |r| {
+        for (sel.idx[w..r.at]) |i| span += b.at(i).len;
+        span += @intCast(b.offsets[r.src + r.len] - b.offsets[r.src]);
+        w = r.at + r.len;
+    }
+    for (sel.idx[w..]) |i| span += b.at(i).len;
+    const values = try arena.alloc(u8, span);
+    const offsets = try arena.alloc(i32, sel.kept + 1);
+    offsets[0] = 0;
+    var off: usize = 0;
+    w = 0;
+    for (sel.runs) |r| {
+        off = takeRows(b, sel.idx[w..r.at], values, offsets[w + 1 ..], off);
+        const lo: usize = @intCast(b.offsets[r.src]);
+        const hi: usize = @intCast(b.offsets[r.src + r.len]);
+        @memcpy(values[off..][0 .. hi - lo], b.values[lo..hi]);
+        const shift: i32 = @as(i32, @intCast(off)) - @as(i32, @intCast(lo));
+        for (b.offsets[r.src + 1 ..][0..r.len], offsets[r.at + 1 ..][0..r.len]) |x, *dst| dst.* = x + shift;
+        off += hi - lo;
+        w = r.at + r.len;
+    }
+    _ = takeRows(b, sel.idx[w..], values, offsets[w + 1 ..], off);
+    return .{ .offsets = offsets, .values = values };
+}
+
+/// Appends `b`'s rows `idx` at `off` of `values`, each one's end offset into
+/// `ends`; the offset past them.
+fn takeRows(b: Bytes, idx: []const u32, values: []u8, ends: []i32, off: usize) usize {
+    var o = off;
+    for (idx, ends[0..idx.len]) |i, *e| {
+        const s = b.at(i);
+        @memcpy(values[o..][0..s.len], s);
+        o += s.len;
+        e.* = @intCast(o);
+    }
+    return o;
+}
+
+/// The rows `sel` keeps of `c`, its dictionary view carried along (`carryDict`).
+pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
+    const bm = try selectValidity(arena, c.validity, c.len, sel);
     const Op = struct {
         arena: std.mem.Allocator,
         c: Column,
-        keep: []const bool,
-        kept: usize,
+        sel: Selection,
         fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
-            return gatherSlice(Elem(t), o.arena, @field(o.c.data, @tagName(t)), o.keep, o.kept);
+            return selectSlice(Elem(t), o.arena, @field(o.c.data, @tagName(t)), o.sel);
         }
         fn bytes(o: @This()) !Bytes {
-            return o.c.data.bytes.take(o.arena, try keptIndices(o.arena, o.keep, o.kept));
+            return selectBytes(o.arena, o.c.data.bytes, o.sel);
         }
     };
-    var out = Column.derived(c.ty, kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .keep = keep, .kept = kept }));
-    if (c.dict) |d| out.dict = try carryDict(arena, d, try gatherSlice(u32, arena, d.codes, keep, kept));
+    var out = Column.derived(c.ty, sel.kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .sel = sel }));
+    if (c.dict) |d| if (d.values.len <= dict_carry_max) {
+        out.dict = try carryDict(arena, d, try selectSlice(u32, arena, d.codes, sel));
+    };
     return out;
+}
+
+pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usize) !Column {
+    return select(arena, c, try Selection.init(arena, keep, kept));
+}
+
+/// The rows `keep` marks of every column of `src`, into `out`, by one selection.
+pub fn gatherColumns(arena: std.mem.Allocator, src: []const Column, out: []Column, keep: []const bool, kept: usize) !void {
+    const sel = try Selection.init(arena, keep, kept);
+    for (src, out) |c, *o| o.* = try select(arena, c, sel);
 }
 
 /// Past this many entries a dictionary view is dropped rather than copied along.
@@ -940,6 +1061,66 @@ test "gather selects flagged rows preserving validity; all-false keep yields emp
 
     const none = try gather(a, c, &.{ false, false, false, false }, 0);
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "gather by 64-row words agrees with a row-by-row pick at every block boundary and density" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(42);
+    const rnd = prng.random();
+    const vals = [_][]const u8{ "", "MAIL", "TRUCK AND SHIP", "x" };
+    for ([_]usize{ 1, 63, 64, 65, 129, 200, 300 }) |n| {
+        var ib = Builder.init(a, types.Type.init(.int).asNullable());
+        var sb = Builder.init(a, types.Type.init(.string).asNullable());
+        var db = Builder.init(a, types.Type.init(.string));
+        const codes = try a.alloc(u32, n);
+        for (0..n) |i| {
+            const nul = rnd.uintLessThan(u8, 7) == 0;
+            try ib.append(if (nul) .null else .{ .int = @intCast(i * 3) });
+            try sb.append(if (nul) .null else .{ .string = vals[i % vals.len] });
+            codes[i] = rnd.uintLessThan(u32, vals.len);
+            try db.append(.{ .string = vals[codes[i]] });
+        }
+        var dc = try db.finish();
+        const d = Column.Dict{ .values = &vals, .codes = codes, .id = 3 };
+        dc.dict = &d;
+        const srcs = [_]Column{ try ib.finish(), try sb.finish(), dc };
+        const keep = try a.alloc(bool, n);
+        for (0..6) |pattern| {
+            var kept: usize = 0;
+            for (keep, 0..) |*k, i| {
+                k.* = switch (pattern) {
+                    0 => true,
+                    1 => false,
+                    2 => rnd.uintLessThan(u8, 50) == 0,
+                    3 => rnd.uintLessThan(u8, 50) != 0,
+                    4 => i < 3 or i >= 70,
+                    else => rnd.boolean(),
+                };
+                kept += @intFromBool(k.*);
+            }
+            const outs = try a.alloc(Column, srcs.len);
+            try gatherColumns(a, &srcs, outs, keep, kept);
+            for (srcs, outs) |src, got| {
+                try std.testing.expectEqual(kept, got.len);
+                var w: usize = 0;
+                for (keep, 0..) |k, i| if (k) {
+                    const want = src.getValue(i);
+                    const have = got.getValue(w);
+                    try std.testing.expectEqual(want.isNull(), have.isNull());
+                    if (!want.isNull()) switch (want) {
+                        .int => |x| try std.testing.expectEqual(x, have.int),
+                        .string => |s| try std.testing.expectEqualStrings(s, have.string),
+                        else => unreachable,
+                    };
+                    if (got.dict) |gd| try std.testing.expectEqual(codes[i], gd.codes[w]);
+                    w += 1;
+                };
+            }
+            try std.testing.expect(outs[2].dict != null);
+        }
+    }
 }
 
 test "builder finish with zero appended rows yields an empty column" {
