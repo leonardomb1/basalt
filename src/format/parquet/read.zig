@@ -171,7 +171,12 @@ pub const Reader = struct {
     /// `openProjected` with the file's size when a table's log already gave it, which
     /// spares a remote file the request asking for it.
     pub fn openSized(arena: std.mem.Allocator, path: []const u8, size: ?u64, want: ?[]const []const u8) !*Reader {
-        const src = try Bytes.openSized(arena, path, size);
+        return openProjectedOn(arena, try Bytes.openSized(arena, path, size), path, want);
+    }
+
+    /// `openProjected` over bytes already open, which the reader then owns (closing
+    /// them if it fails): a file planning opened and did not split, read on.
+    pub fn openProjectedOn(arena: std.mem.Allocator, src: Bytes, path: []const u8, want: ?[]const []const u8) !*Reader {
         errdefer src.close();
 
         var footer_start: u64 = 0;

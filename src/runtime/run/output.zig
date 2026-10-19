@@ -282,6 +282,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const gpa = env.gpa;
     var stages = stages_in;
     env.sort_threads = opts.lanes();
+    defer if (env.pq_held) |h| {
+        h.src.close();
+        env.pq_held = null;
+    };
 
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {

@@ -753,7 +753,7 @@ test "parallel parquet: an aggregate after DISTINCT and a HAVING both fan out an
     try std.testing.expectEqualStrings("g,c\n0,1250\n3,1250\n", having);
 }
 
-test "a remote Parquet file splits at row groups over ranged reads, and is read once, serially, when its server ignores ranges" {
+test "a remote Parquet file splits at row groups over coalesced ranged reads, sized once, and is downloaded once, serially, when its server ignores ranges" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -780,11 +780,13 @@ test "a remote Parquet file splits at row groups over ranged reads, and is read 
             const remote = try std.mem.replaceOwned(u8, a, q, "{s}", try std.fmt.allocPrint(a, "'{s}'", .{try srv.url(a, "/t.parquet")}));
             try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/got.csv' AS {s};", .{remote}), 4, &.{});
             try harness.expectFile(&tmp, "got.csv", want);
+            try std.testing.expectEqual(@as(usize, 1), srv.heads.load(.seq_cst));
             if (ignore) {
-                try std.testing.expect(srv.whole.load(.seq_cst) <= 2);
+                try std.testing.expectEqual(@as(usize, 1), srv.whole.load(.seq_cst));
             } else {
                 try std.testing.expectEqual(@as(usize, 0), srv.whole.load(.seq_cst));
-                try std.testing.expect(srv.partial.load(.seq_cst) >= 4);
+                const ranges = srv.partial.load(.seq_cst);
+                try std.testing.expect(ranges >= 4 and ranges <= 4 + 1);
             }
         }
     }

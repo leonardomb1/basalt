@@ -134,9 +134,22 @@ pub fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, foote
     return sl;
 }
 
+/// Over a network the file's last `tail_guess` bytes are read in one request, which
+/// usually holds the trailer and the whole footer: one round trip, not three. The
+/// trailing magic is checked either way; the leading one only where it is cheap.
 pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parquet.FileMetaData {
     const total = src.size();
     if (total < parquet.trailer_len + parquet.magic.len) return parquet.Error.NotParquet;
+    if (src.coalesces()) {
+        const take: usize = @intCast(@min(total, tail_guess));
+        const from = total - take;
+        const tail = try src.range(arena, from, take);
+        if (take == total and !std.mem.eql(u8, tail[0..parquet.magic.len], parquet.magic)) return parquet.Error.NotParquet;
+        const r = try parquet.footerRange(total, tail);
+        footer_start.* = r.offset;
+        const footer = if (r.offset >= from) tail[@intCast(r.offset - from)..][0..r.len] else try src.range(arena, r.offset, r.len);
+        return parquet.parseFooter(arena, footer);
+    }
     const head = try src.range(arena, 0, parquet.magic.len);
     if (!std.mem.eql(u8, head, parquet.magic)) return parquet.Error.NotParquet;
 
@@ -146,6 +159,8 @@ pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !
     const footer = try src.range(arena, r.offset, r.len);
     return parquet.parseFooter(arena, footer);
 }
+
+const tail_guess: u64 = 64 << 10;
 
 pub const isRemote = @import("../bytes.zig").isRemote;
 

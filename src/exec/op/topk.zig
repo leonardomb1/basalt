@@ -261,11 +261,17 @@ pub const TopK = struct {
         return out;
     }
 
-    /// Rows `rows` of `b` copied into a new chunk; its index.
+    /// Rows `rows` of `b` copied into a new chunk; its index. Dictionary views are
+    /// left behind: a chunk may hold a handful of rows, and a copy of the dictionary
+    /// per chunk would outweigh them in a store that lives for the whole input.
     fn addChunk(self: *TopK, b: Batch, rows: []const usize) !u32 {
         const a = self.store.allocator();
         const cols = try a.alloc(column.Column, b.columns.len);
-        for (cols, b.columns) |*o, c| o.* = try column.permute(a, c, rows);
+        for (cols, b.columns) |*o, c| {
+            var plain = c;
+            plain.dict = null;
+            o.* = try column.permute(a, plain, rows);
+        }
         try self.chunks.append(self.state.allocator(), .{ .cols = cols, .karr = try self.prepare(a, cols) });
         self.stored += rows.len;
         return @intCast(self.chunks.items.len - 1);

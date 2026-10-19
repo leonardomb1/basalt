@@ -2089,3 +2089,54 @@ test "a WHERE's later conjunct never errs on a row an earlier one dropped, wheth
         try expectFile(&tmp, "o.csv", want);
     }
 }
+
+test "date comparisons: column against column and against a literal on either side, with and without nulls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "a,b,c\n2024-01-05,2024-01-07,2024-01-05\n2024-02-01,2024-01-31,\n2024-01-31,2024-01-31,2024-01-31\n" });
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/o.csv' AS
+        \\SELECT CAST(a AS DATE) < CAST(b AS DATE) AS lt, CAST(a AS DATE) >= '2024-01-31' AS ge_lit,
+        \\       '2024-01-31' = CAST(b AS DATE) AS lit_eq, CAST(a AS DATE) <> CAST(c AS DATE) AS ne_null
+        \\FROM '$B/d.csv';
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "lt,ge_lit,lit_eq,ne_null\ntrue,false,false,false\nfalse,true,true,\nfalse,true,true,false\n");
+}
+
+test "a WHERE's NULL conjunct keeps its row in for the ones after it, as AND's short-circuit does, then drops it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "x,y\n1,1\n,0\n2,2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    const a = parena.allocator();
+    const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/o.csv' AS SELECT x, y FROM '{s}/t.csv' WHERE CAST(x AS INT) > 0 AND 10 / CAST(y AS INT) > 1;", .{ base, base });
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, script, &pdiag);
+    var rdiag: Diag = .{};
+    const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_|
+        return error.TestUnexpectedResult
+    else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.runtime.failLabel(e);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "division by zero") != null);
+
+    var rows = std.array_list.Managed(u8).init(alloc);
+    defer rows.deinit();
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try rows.appendSlice("a,b,c\n");
+    try want.appendSlice("a\n");
+    for (0..3000) |i| {
+        const av: ?usize = if (i % 7 == 0) null else i % 50;
+        const bv: ?usize = if (i % 11 == 0) null else i % 3;
+        if (av) |v| try rows.writer().print("{d},", .{v}) else try rows.appendSlice(",");
+        if (bv) |v| try rows.writer().print("{d},{d}\n", .{ v, i }) else try rows.writer().print(",{d}\n", .{i});
+        if (av != null and bv != null and av.? < 5 and bv.? != 0 and i % 2 == 0) try want.writer().print("{d}\n", .{i});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "n.csv", .data = rows.items });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT c AS a FROM '$B/n.csv' WHERE a < 5 AND b <> 0 AND c % 2 = 0;", 1, &.{});
+    try expectFile(&tmp, "o.csv", want.items);
+}

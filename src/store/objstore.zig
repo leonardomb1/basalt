@@ -696,8 +696,8 @@ pub const FakeServer = struct {
 /// An HTTP/1.1 server of one file's bytes for range-read tests: HEAD answers its
 /// length, a GET with `Range: bytes=a-b` its slice as a 206, or the whole file as a
 /// 200 when `ignore_range` is set, as some servers do. One request per connection,
-/// served in turn. Counts the 206 and 200 bodies sent. `startFiles` serves several
-/// files, each at its own path, and a 404 for any other.
+/// served in turn. Counts the HEADs answered and the 206 and 200 bodies sent.
+/// `startFiles` serves several files, each at its own path, and a 404 for any other.
 pub const RangeServer = struct {
     listener: std.net.Server,
     data: []const u8,
@@ -705,6 +705,7 @@ pub const RangeServer = struct {
     files: []const [2][]const u8 = &.{},
     thread: std.Thread = undefined,
     stopping: std.atomic.Value(bool) = .init(false),
+    heads: std.atomic.Value(usize) = .init(0),
     partial: std.atomic.Value(usize) = .init(0),
     whole: std.atomic.Value(usize) = .init(0),
 
@@ -757,6 +758,7 @@ pub const RangeServer = struct {
         const data = self.find(head[0..end]) orelse
             return stream.writeAll("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         if (std.mem.startsWith(u8, head[0..end], "HEAD ")) {
+            _ = self.heads.fetchAdd(1, .seq_cst);
             const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n", .{data.len});
             return stream.writeAll(text);
         }
