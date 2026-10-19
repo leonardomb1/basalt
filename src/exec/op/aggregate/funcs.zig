@@ -8,7 +8,9 @@
 //! `In` is the value the state takes: `void` when only presence counts, `Value` when
 //! no physical type fits. Optional hooks: `addN` (k values at once, for `void`),
 //! `addAll` (a slice with no nulls, where a vector loop beats one at a time),
-//! `needs_alloc` (the state allocates per value), `own` (rebuild in the group's
+//! `needs_alloc` (the state allocates per value), `fold_expr` (a DECIMAL arithmetic
+//! argument is added value by value from its operands, as the column would hold
+//! them, without the column), `own` (rebuild in the group's
 //! allocator when a merge frees its source), and `remove` (the exact inverse of
 //! `add`, which a window frame slides with when a value leaves it). A DISTINCT
 //! aggregate is its plain math behind `pairs.zig`'s filter.
@@ -106,6 +108,7 @@ pub const SumInt = struct {
 
 pub const SumDecimal = struct {
     pub const In = Decimal;
+    pub const fold_expr = true;
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
         try eval.addAtScale(&s.s, x, cx.out.scale);

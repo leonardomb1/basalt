@@ -377,6 +377,101 @@ test "aggregate: a decimal sum checks 38 digits on the total, whatever the batch
     };
 }
 
+test "aggregate: a grouped decimal SUM of arithmetic folded from its operands matches the row path per group" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+
+    const dty = types.Type.decimal(38, 2).asNullable();
+    const ity = types.Type.init(.int);
+    const in_schema = types.Schema{ .fields = &.{
+        .{ .name = "k1", .ty = ity },
+        .{ .name = "k2", .ty = ity },
+        .{ .name = "x", .ty = ity.asNullable() },
+        .{ .name = "d", .ty = dty },
+        .{ .name = "e", .ty = dty },
+    } };
+    var prng = std.Random.DefaultPrng.init(0xdec5);
+    const rnd = prng.random();
+    const exprs = [_][]const u8{ "d * e", "d + x", "x * 0.5 - d", "e - 1.255" };
+    for ([_]usize{ 1025, 2049, 4097 }) |ngroups| {
+        var batches: [2]Batch = undefined;
+        for (&batches, 0..) |*bt, bi| {
+            const n = ngroups * 2 + bi * 7;
+            var cb: [5]column.Builder = undefined;
+            for (&cb, in_schema.fields) |*b, f| b.* = column.Builder.init(a, f.ty);
+            for (0..n) |i| {
+                try cb[0].append(.{ .int = @intCast(i % ngroups) });
+                try cb[1].append(.{ .int = @intCast((i / 3) % 2) });
+                try cb[2].append(if (rnd.uintLessThan(u8, 9) == 0) .null else .{ .int = rnd.intRangeAtMost(i64, -50_000, 50_000) });
+                for (cb[3..]) |*b| {
+                    const pick = rnd.uintLessThan(u8, 10);
+                    if (pick == 0) {
+                        try b.append(.null);
+                        continue;
+                    }
+                    const scale: u8 = switch (pick) {
+                        1 => 0,
+                        2 => 4,
+                        3 => 3,
+                        else => 2,
+                    };
+                    try b.append(.{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -9_999_999, 9_999_999), .scale = scale } });
+                }
+            }
+            const cols = try a.alloc(column.Column, 5);
+            for (cols, &cb) |*c, *b| c.* = try b.finish();
+            bt.* = .{ .schema = &in_schema, .columns = cols, .len = n };
+        }
+        for (exprs) |src| {
+            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const e = try parser.parseExprStr(a, src, &diag);
+            var tcx = eval.TypeCtx{ .schema = in_schema, .arena = a };
+            const sty = types.Type.decimal(38, (try tcx.typeOf(e)).scale).asNullable();
+            for ([_][]const usize{ &.{}, &.{0}, &.{ 0, 1 } }) |by| {
+                var want = std.AutoHashMap([2]i64, struct { s: i256 = 0, n: usize = 0 }).init(a);
+                for (batches) |bt| for (0..bt.len) |r| {
+                    const v = try eval.evalRow(a, e, bt, r);
+                    var key = [2]i64{ 0, 0 };
+                    for (by, 0..) |ci, j| key[j] = bt.columns[ci].getValue(r).int;
+                    const g = try want.getOrPut(key);
+                    if (!g.found_existing) g.value_ptr.* = .{};
+                    if (v.isNull()) continue;
+                    g.value_ptr.s += eval.rescaleTo(v.decimal, sty.scale).?.unscaled;
+                    g.value_ptr.n += 1;
+                };
+                const aggs = [_]Aggregate.Agg{
+                    .{ .func = .count, .arg = null, .ty = ity },
+                    .{ .func = .sum, .arg = e, .ty = sty },
+                };
+                const fields = [_]types.Schema.Field{ .{ .name = "k1", .ty = ity }, .{ .name = "k2", .ty = ity }, .{ .name = "c", .ty = ity }, .{ .name = "s", .ty = sty } };
+                var of: [4]types.Schema.Field = undefined;
+                @memcpy(of[0..by.len], fields[0..by.len]);
+                @memcpy(of[by.len..][0..2], fields[2..4]);
+                const out_schema = types.Schema{ .fields = of[0 .. by.len + 2] };
+                var ts = TestSource{ .schema_ = in_schema, .batches = &batches };
+                var scan = Scan{ .src = ts.src() };
+                var agg = Aggregate{ .child = .{ .scan = &scan }, .in_schema = &in_schema, .by = by, .aggs = &aggs, .out_schema = &out_schema, .state = a, .gpa = testing.allocator };
+                const out = (try agg.next(a)).?;
+                try testing.expectEqual(want.count(), out.len);
+                for (0..out.len) |r| {
+                    var key = [2]i64{ 0, 0 };
+                    for (0..by.len) |j| key[j] = out.columns[j].getValue(r).int;
+                    const w = want.get(key).?;
+                    const got = out.columns[by.len + 1].getValue(r);
+                    if (w.n == 0) {
+                        try testing.expect(got.isNull());
+                        continue;
+                    }
+                    try testing.expectEqual(sty.scale, got.decimal.scale);
+                    try testing.expectEqual(w.s, got.decimal.unscaled);
+                }
+            }
+        }
+    }
+}
+
 test "aggregate: global vectorized reductions honor nulls; empty input edge cases" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

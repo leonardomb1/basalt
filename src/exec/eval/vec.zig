@@ -754,33 +754,31 @@ fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) V
     return f.finish(ty);
 }
 
-pub const DecSum = struct { sum: i256, nvalid: usize };
-
-/// `SUM(l op r)` over one batch as `SumDecimal.add` adds it at `scale`, with no decimal
-/// column built between; null when `expr` is not a decimal operation.
-pub fn decSum(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scale: u8) EvalError!?DecSum {
-    return decSumVec(arena, expr, batch, scale) catch |e| switch (e) {
-        error.Unsupported => null,
+/// Each valid row's `l op r` handed to `sink.put(row, value)`, the values `evalColumn`
+/// would hold, with no decimal column built between; false, before evaluating
+/// anything, when `expr` is not a decimal operation.
+pub fn decFold(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, sink: anytype) EvalError!bool {
+    return decFoldVec(arena, expr, batch, sink) catch |e| switch (e) {
+        error.Unsupported => false,
         else => |x| x,
     };
 }
 
-fn decSumVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, scale: u8) VecError!?DecSum {
-    if (expr.* != .binary) return null;
+fn decFoldVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, sink: anytype) VecError!bool {
+    if (expr.* != .binary) return false;
     const b = expr.binary;
     switch (b.op) {
         .add, .sub, .mul, .div, .mod => {},
-        else => return null,
+        else => return false,
     }
-    if (numKind(expr, batch) != .decimal) return null;
+    if (numKind(expr, batch) != .decimal) return false;
     forgetFailure();
     const l = try evalVec(arena, b.l, batch);
     const r = try evalVec(arena, b.r, batch);
-    if (scalarNull(l) or scalarNull(r)) return .{ .sum = 0, .nvalid = 0 };
+    if (scalarNull(l) or scalarNull(r)) return true;
     const bm = try bothValid(arena, l, r, batch.len);
-    var sink = SumSink{ .scale = scale };
-    try decApply(b.op, l, r, &sink, bm, !bm.allSet(batch.len));
-    return .{ .sum = sink.sum, .nvalid = simd.popcountValid(bm.bits, batch.len) };
+    try decApply(b.op, l, r, sink, bm, !bm.allSet(batch.len));
+    return true;
 }
 
 fn bothValid(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!Bitmap {
@@ -796,15 +794,6 @@ const StoreSink = struct {
 
     inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
         self.out[i] = d;
-    }
-};
-
-const SumSink = struct {
-    sum: i256 = 0,
-    scale: u8,
-
-    inline fn put(self: *SumSink, _: usize, d: Decimal) VecError!void {
-        try addAtScale(&self.sum, d, self.scale);
     }
 };
 
@@ -1793,7 +1782,23 @@ test "try_cast yields null exactly where cast raises" {
     try std.testing.expect(out.getValue(1).isNull());
 }
 
-test "decSum declines a non-decimal expression before evaluating it" {
+const TestSum = struct {
+    sum: i256 = 0,
+    nvalid: usize = 0,
+    scale: u8,
+
+    fn put(self: *TestSum, _: usize, d: Decimal) VecError!void {
+        try addAtScale(&self.sum, d, self.scale);
+        self.nvalid += 1;
+    }
+};
+
+fn testSum(a: std.mem.Allocator, e: *const ast.Expr, batch: Batch, scale: u8) EvalError!?TestSum {
+    var sink = TestSum{ .scale = scale };
+    return if (try decFold(a, e, batch, &sink)) sink else null;
+}
+
+test "decFold declines a non-decimal expression before evaluating it" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1803,9 +1808,9 @@ test "decSum declines a non-decimal expression before evaluating it" {
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     for ([_][]const u8{ "x * 2", "x * 2.5e0", "x || 'a'" }) |src| {
-        try std.testing.expect((try decSum(a, try parser.parseExprStr(a, src, &diag), batch, 2)) == null);
+        try std.testing.expect((try testSum(a, try parser.parseExprStr(a, src, &diag), batch, 2)) == null);
     }
-    const got = (try decSum(a, try parser.parseExprStr(a, "-1.25 - x", &diag), batch, 2)).?;
+    const got = (try testSum(a, try parser.parseExprStr(a, "-1.25 - x", &diag), batch, 2)).?;
     try std.testing.expectEqual(@as(usize, 2), got.nvalid);
     try std.testing.expectEqual(@as(i256, -(@as(i256, std.math.maxInt(i64)) + 2) * 100 - 250), got.sum);
 }
@@ -1885,7 +1890,7 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
                     _ = evalRow(a, e, batch, i) catch |row_err| break row_err;
                 } else return error.TestUnexpectedResult;
                 try std.testing.expectEqual(first, err);
-                if (ty.kind == .decimal) try std.testing.expectError(first, decSum(a, e, batch, ty.scale));
+                if (ty.kind == .decimal) try std.testing.expectError(first, testSum(a, e, batch, ty.scale));
                 continue;
             };
             var sum: ?i256 = 0;
@@ -1908,10 +1913,10 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
             }
             if (ty.kind != .decimal) continue;
             if (sum) |want| {
-                const got_sum = (try decSum(a, e, batch, ty.scale)).?;
+                const got_sum = (try testSum(a, e, batch, ty.scale)).?;
                 try std.testing.expectEqual(want, got_sum.sum);
                 try std.testing.expectEqual(nvalid, got_sum.nvalid);
-            } else try std.testing.expectError(error.IntOverflow, decSum(a, e, batch, ty.scale));
+            } else try std.testing.expectError(error.IntOverflow, testSum(a, e, batch, ty.scale));
         }
     }
 }

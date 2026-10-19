@@ -190,10 +190,12 @@ pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
     return q;
 }
 
-/// Adds `d` to a DECIMAL SUM's wide total, at the sum's `scale`.
+/// Adds `d` to a DECIMAL SUM's wide total, at the sum's `scale`. The add needs no
+/// check: each addend is an i128, so fewer than 2^63 of them (a state's i64 count)
+/// stay under 2^191, far inside i256.
 pub inline fn addAtScale(sum: *align(8) i256, d: Decimal, scale: u8) error{IntOverflow}!void {
     const u = if (d.scale == scale) d.unscaled else (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
-    sum.* = std.math.add(i256, sum.*, u) catch return decimalOverflow();
+    sum.* += u;
 }
 
 /// Shifts a decimal to `want`, rounding half away from zero; null on overflow.

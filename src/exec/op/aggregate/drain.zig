@@ -16,6 +16,7 @@ const KeyKind = Aggregate.KeyKind;
 const Layout = Aggregate.Layout;
 const Pairs = @import("pairs.zig").Pairs;
 const Rows = @import("kernel.zig").Rows;
+const inAggregate = @import("accumulate.zig").inAggregate;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
 const dupeValue = @import("../aggregate.zig").dupeValue;
@@ -161,7 +162,8 @@ pub fn keyKinds(self: *Aggregate) ![]types.TypeKind {
 
 /// Each aggregate's argument over a batch whose rows know their group record
 /// (`tails`, null for a row sent to a spill file) and partition (`pidx`), folded
-/// one aggregate at a time by its kernel.
+/// one aggregate at a time by its kernel, straight from the operands where it has
+/// `foldExprRows`.
 fn foldRows(self: *Aggregate, pull: std.mem.Allocator, b: Batch, layout: *const Layout, tails: []const ?[*]u8, parts: anytype, pidx: []const u8) !void {
     var allocs: [fold_parts]std.mem.Allocator = undefined;
     const per_part = self.part_state != null;
@@ -169,15 +171,17 @@ fn foldRows(self: *Aggregate, pull: std.mem.Allocator, b: Batch, layout: *const 
         allocs[i] = p.alloc;
     };
     for (self.aggs, 0..) |agg, j| {
-        const col = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+        const k = layout.kernels[j];
         if (agg.distinct) {
-            try self.pairsOf(j).add(pull, col.?, b.len, .{ .tails = tails, .pidx = pidx, .layout = layout }, self.interner());
+            try self.pairsOf(j).add(pull, try self.argColumn(pull, agg, agg.arg.?, b), b.len, .{ .tails = tails, .pidx = pidx, .layout = layout }, self.interner());
             continue;
         }
         var cx = layout.ctx(j, self.state);
         cx.scratch = pull;
         const rows = Rows{ .cx = cx, .allocs = if (per_part) &allocs else &.{}, .pidx = pidx };
-        try layout.kernels[j].foldRows(tails, layout.offs[j], col, rows);
+        if (agg.arg) |e| if (k.foldExprRows) |fx| if (fx(tails, layout.offs[j], e, b, rows) catch |err| return inAggregate(self, err)) continue;
+        const col = if (agg.arg) |e| try self.argColumn(pull, agg, e, b) else null;
+        try k.foldRows(tails, layout.offs[j], col, rows);
     }
 }
 
