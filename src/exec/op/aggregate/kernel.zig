@@ -124,7 +124,7 @@ pub fn make(comptime Op: type) Kernel {
                 s: *Op.State,
                 cx: Ctx,
                 pub inline fn put(self: @This(), _: usize, d: Decimal) eval.EvalError!void {
-                    try Op.add(self.s, d, self.cx);
+                    try @call(.always_inline, Op.add, .{ self.s, d, self.cx });
                 }
             };
             return eval.decFold(cx.scratch, e, b, Sink{ .s = st(p), .cx = cx });
@@ -138,7 +138,7 @@ pub fn make(comptime Op: type) Kernel {
                 rows: Rows,
                 pub inline fn put(self: @This(), r: usize, d: Decimal) eval.EvalError!void {
                     const tp = self.tails[r] orelse return;
-                    try Op.add(st(tp + self.off), d, if (needs_alloc) self.rows.at(r) else self.rows.cx);
+                    try @call(.always_inline, Op.add, .{ st(tp + self.off), d, if (needs_alloc) self.rows.at(r) else self.rows.cx });
                 }
             };
             return eval.decFold(rows.cx.scratch, e, b, Sink{ .tails = tails, .off = off, .rows = rows });
