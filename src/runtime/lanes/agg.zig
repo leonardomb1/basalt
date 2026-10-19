@@ -3,6 +3,7 @@
 //! path, the join-then-aggregate shape, and the CSV, Parquet and SQL entry points.
 
 const Batch = @import("../../exec/batch.zig").Batch;
+const Slicer = @import("../../exec/batch.zig").Slicer;
 const Env = @import("../env.zig").Env;
 const LaneJoin = @import("join.zig").LaneJoin;
 const OneBatch = @import("../connect.zig").OneBatch;
@@ -480,6 +481,7 @@ pub const MorselSource = struct {
     cur_item: usize = 0,
     fixed: ?struct { next: usize, step: usize } = null,
     span: trace.Span = .{ .name = "", .arg = 0, .start = null },
+    slicer: Slicer = .{},
 
     fn nextIndex(self: *MorselSource) ?usize {
         if (self.fixed) |*f| {
@@ -497,9 +499,11 @@ pub const MorselSource = struct {
     }
     fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
         const self: *MorselSource = @ptrCast(@alignCast(ptr));
+        if (try self.slicer.take(arena)) |s| return s;
+        const into = self.slicer.into(self.scratch);
         while (true) {
             if (self.cur) |r| {
-                if (try r.next(arena)) |b| return b;
+                if (try r.next(into)) |b| return try self.slicer.give(arena, b);
                 self.cur = null;
                 self.span.end();
             }
@@ -515,6 +519,7 @@ pub const MorselSource = struct {
         if (self.held) |h| h.r.close();
         self.held = null;
         self.cur = null;
+        self.slicer.deinit();
     }
     pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };

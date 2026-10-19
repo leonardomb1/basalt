@@ -826,3 +826,26 @@ test "a join's keys skip a remote Parquet file's row groups, which are then neve
         try std.testing.expect(fetched[0] + 3 <= fetched[1]);
     }
 }
+
+test "parallel parquet: row groups handed on in slices give the serial answer, nulls, strings and ties included" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const harness = @import("harness.zig");
+    try harness.checkAndRun(alloc, &tmp, "LOAD INTO '$B/t.parquet' AS SELECT range AS id, range % 3 AS g, CASE WHEN range % 9 = 0 THEN NULL ELSE 'v' || CAST(range % 5 AS VARCHAR) END AS s FROM RANGE(350000);", 1, &.{});
+    const queries = [_][]const u8{
+        "SELECT s, COUNT(*) AS n, COUNT(s) AS c, SUM(id) AS t, MIN(id) AS lo FROM '$B/t.parquet' GROUP BY s ORDER BY s",
+        "SELECT id, s FROM '$B/t.parquet' ORDER BY g, s LIMIT 25",
+        "SELECT DISTINCT s, g FROM '$B/t.parquet' ORDER BY s, g",
+        "SELECT id, s FROM '$B/t.parquet' WHERE id % 40000 = 8191 OR id % 40000 = 8192",
+    };
+    for (queries) |q| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        const a = parena.allocator();
+        try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/want.csv' AS {s};", .{q}), 1, &.{});
+        const want = try tmp.dir.readFileAlloc(a, "want.csv", 1 << 16);
+        try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/got.csv' AS {s};", .{q}), 4, &.{});
+        try harness.expectFile(&tmp, "got.csv", want);
+    }
+}

@@ -51,7 +51,7 @@ pub fn laneRowSource(rows: LaneRows, scratch: std.mem.Allocator) !?driver.Source
                 return null;
             };
             const rs = try scratch.create(ReaderSource);
-            rs.* = .{ .r = rdr, .schema_ = g.m.src_schema };
+            rs.* = .{ .r = rdr, .schema_ = g.m.src_schema, .scratch = scratch };
             return .{ .ptr = rs, .vtable = &ReaderSource.vtable };
         },
         .csv => |c| return try c.mapped.lane(scratch, c.chunk, c.of, c.schema),

@@ -323,12 +323,7 @@ fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !
 }
 
 pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column {
-    var bm = try Bitmap.initFull(arena, idx.len);
-    if (!c.validity.allSet(c.len)) {
-        for (idx, 0..) |r, i| {
-            if (!c.validity.get(r)) bm.setValid(i, false);
-        }
-    }
+    const bm = try permuteValidity(arena, c.validity, c.len, idx);
     const Op = struct {
         arena: std.mem.Allocator,
         c: Column,
@@ -350,6 +345,38 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
         out.dict = try carryDict(arena, d, codes);
     };
     return out;
+}
+
+/// Rows `start..start + n` of `c` as a view on its buffers, nothing copied: `start` is
+/// a multiple of 8 so the validity stays byte-aligned, byte offsets keep indexing the
+/// same values buffer, and a dictionary keeps its entries over a run of its codes.
+pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) !Column {
+    std.debug.assert(start % 8 == 0 and start + n <= c.len);
+    var out = c;
+    out.len = n;
+    out.validity = .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n };
+    out.data = switch (c.data) {
+        .bytes => |b| .{ .bytes = .{ .offsets = b.offsets[start..][0 .. n + 1], .values = b.values } },
+        inline else => |sl, tag| @unionInit(Column.Data, @tagName(tag), sl[start..][0..n]),
+    };
+    if (c.dict) |d| {
+        const v = try arena.create(Column.Dict);
+        v.* = .{ .values = d.values, .codes = d.codes[start..][0..n], .id = d.id };
+        out.dict = v;
+    }
+    return out;
+}
+
+/// The validity of rows `idx` of a column of `n` rows. A few rows of a long column (a
+/// probe batch's matches in a join's build side) are checked one by one: scanning the
+/// whole bitmap for a null first cost more than the rows themselves.
+fn permuteValidity(arena: std.mem.Allocator, v: Bitmap, n: usize, idx: []const usize) !Bitmap {
+    var bm = try Bitmap.initFull(arena, idx.len);
+    if (idx.len * 64 >= n and v.allSet(n)) return bm;
+    for (idx, 0..) |r, i| {
+        if (!v.get(r)) bm.setValid(i, false);
+    }
+    return bm;
 }
 
 /// `c`'s rows copied into `arena`, one memcpy per buffer: the gather of every row in
@@ -1040,4 +1067,61 @@ test "a small dictionary view survives gather, permute and copy, each row's code
     const big = Column.Dict{ .values = &big_vals, .codes = &codes, .id = 8 };
     c.dict = &big;
     try std.testing.expect((try copy(a, c)).dict == null);
+}
+
+test "a slice views its rows: nulls, strings past a nonzero first offset, and dictionary codes, through gather, permute, copy and concat" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const vals = [_][]const u8{ "MAIL", "SHIP", "AIR" };
+    var codes: [40]u32 = undefined;
+    var b = Builder.init(a, types.Type.init(.string).asNullable());
+    for (&codes, 0..) |*cd, i| {
+        cd.* = @intCast(i % 3);
+        if (i % 7 == 3) {
+            cd.* = 0;
+            try b.append(.null);
+        } else try b.append(.{ .string = vals[cd.*] });
+    }
+    var c = try b.finish();
+    const d = Column.Dict{ .values = &vals, .codes = &codes, .id = 9 };
+    c.dict = &d;
+    const s = try slice(a, c, 16, 20);
+    try std.testing.expect(s.data.bytes.offsets[0] != 0);
+    for (0..s.len) |r| {
+        try std.testing.expectEqual(c.validity.get(16 + r), s.validity.get(r));
+        try std.testing.expectEqualStrings(c.data.bytes.at(16 + r), s.data.bytes.at(r));
+        try std.testing.expectEqual(codes[16 + r], s.dict.?.codes[r]);
+    }
+    var keep: [20]bool = undefined;
+    for (&keep, 0..) |*k, i| k.* = i % 2 == 0;
+    var idx: [20]usize = undefined;
+    for (&idx, 0..) |*x, i| x.* = 19 - i;
+    const head = try slice(a, c, 0, 16);
+    const parts = [_]Column{ head, s };
+    const cat = try concat(a, &parts, 36);
+    for ([_]Column{ try gather(a, s, &keep, 10), try permute(a, s, &idx), try copy(a, s), cat }, [_][]const usize{ &.{ 0, 2, 4, 6, 8, 10, 12, 14, 16, 18 }, &.{ 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 }, &.{}, &.{} }) |got, rows| {
+        for (0..got.len) |r| {
+            const src: usize = if (got.len == 36) r else 16 + (if (rows.len > 0) rows[r] else r);
+            try std.testing.expectEqual(c.validity.get(src), got.validity.get(r));
+            try std.testing.expectEqualStrings(c.data.bytes.at(src), got.data.bytes.at(r));
+        }
+    }
+}
+
+test "a slice of fixed-width rows views the same values" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var b = Builder.init(a, types.Type.init(.int).asNullable());
+    for (0..30) |i| try b.append(if (i % 5 == 2) .null else .{ .int = @intCast(i) });
+    const c = try b.finish();
+    const s = try slice(a, c, 8, 22);
+    try std.testing.expectEqual(@as(usize, 22), s.data.i64.len);
+    for (0..s.len) |r| {
+        try std.testing.expectEqual(c.validity.get(8 + r), s.validity.get(r));
+        if (s.validity.get(r)) try std.testing.expectEqual(@as(i64, @intCast(8 + r)), s.data.i64[r]);
+    }
+    try std.testing.expect(!s.validity.allSet(s.len));
+    try std.testing.expect((try slice(a, c, 24, 2)).validity.allSet(2));
 }
