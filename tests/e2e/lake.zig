@@ -584,11 +584,11 @@ test "the Iceberg metadata read: the highest version listed, gzip forms, a tie r
     const v1 = try tmp.dir.readFileAlloc(a, "ice/metadata/v1.metadata.json", 1 << 20);
     try put(&tmp, "ice/metadata/v3.gz.metadata.json", try basalt.codec.compress(a, .gzip, v1));
     try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' ORDER BY id", 1));
-    try put(&tmp, "ice/metadata/00004-6f1e.metadata.json.gz", try basalt.codec.compress(a, .gzip, v2));
+    try put(&tmp, "ice/metadata/00004-6f1e0c2a-1b3d-4e5f-8a9b-0c1d2e3f4a5b.metadata.json.gz", try basalt.codec.compress(a, .gzip, v2));
     try testing.expectEqualStrings("id\n3\n4\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' ORDER BY id", 1));
-    try put(&tmp, "ice/metadata/00004-9a2b.metadata.json", v1);
+    try put(&tmp, "ice/metadata/00004-9a2b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d.metadata.json", v1);
     try refused(a, &tmp, "SELECT id FROM '$B/ice/'", "has two metadata files of version 4", false);
-    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/00004-9a2b.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/metadata/00004-9a2b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d.metadata.json' WITH (format = 'iceberg') ORDER BY id", 1));
 
     try metadata(a, &tmp, "empty", "v1.metadata.json", 2, ice_schema, 0, &.{}, -1);
     try testing.expectEqualStrings("n\n0\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/empty/'", 1));
@@ -754,4 +754,58 @@ test "an Iceberg table over http: its version hint, its paths rebased onto the U
     const r = try runIn(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT id FROM '{s}' WITH (format = 'iceberg');", .{try bare.url(a, "/ice/")}), 1);
     try testing.expect(r.err != null);
     try testing.expect(std.mem.indexOf(u8, r.msg, "has no metadata/version-hint.text, which an http(s) URL needs") != null);
+}
+
+test "Delta replay keys a file by its resolved path and deletion vector; a missing file and an empty schema are named" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try basicTable(a, &tmp);
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    const p3 = "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+    const dv = "{\"add\":{\"path\":\"c.parquet\",\"partitionValues\":{},\"dataChange\":true,\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"ab^-aqEH.-t@S}K{vb[*k^\",\"offset\":4,\"sizeInBytes\":40,\"cardinality\":1}}}";
+    try commit(a, &tmp, "t", 2, &.{ p3, dv, try remove(a, "c.parquet") });
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` with a deletion vector (reader feature `deletionVectors`)", false);
+    try commit(a, &tmp, "t", 2, &.{ p3, try remove(a, "c.parquet"), dv });
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` with a deletion vector (reader feature `deletionVectors`)", false);
+
+    try commit(a, &tmp, "t", 2, &.{try remove(a, try std.fmt.allocPrint(a, "file://{s}/t/b.parquet", .{base}))});
+    try testing.expectEqualStrings("id\n5\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id", 1));
+
+    try commit(a, &tmp, "t", 3, &.{try add(a, "gone.parquet", "{}")});
+    for ([_]usize{ 1, 4 }) |threads| {
+        const r = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/';", threads);
+        try testing.expect(r.err != null);
+        if (std.mem.indexOf(u8, r.msg, "could not read its file `gone.parquet` (") == null) {
+            std.debug.print("threads {d}: {s}\n", .{ threads, r.msg });
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    try commit(a, &tmp, "e", 0, &.{ protocol1, try meta(a, "", "[]", "{}") });
+    try refused(a, &tmp, "SELECT * FROM '$B/e/'", "has a schema with no columns", false);
+}
+
+test "Iceberg data files are checked by field id: a column renamed or re-added after its old schema is gone is refused, not read as NULL" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (basalt.fixtures.iceberg_py) |f| try put(&tmp, try std.mem.concat(a, u8, &.{ "py/", f[0] }), f[1]);
+    const cur = "py/metadata/00003-91ece667-5252-4853-b887-31591380dc23.metadata.json";
+    const md = try tmp.dir.readFileAlloc(a, cur, 1 << 20);
+
+    try put(&tmp, "py/metadata/12345678-aaaa-4bbb-8ccc-dddddddddddd.metadata.json", try tmp.dir.readFileAlloc(a, "py/metadata/00002-83198d25-577f-4aee-9c4a-9734541e16d5.metadata.json", 1 << 20));
+    try testing.expectEqualStrings("n\n3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/py/'", 1));
+
+    try put(&tmp, cur, try std.mem.replaceOwned(u8, a, md, "{\"id\":2,\"name\":\"name\"", "{\"id\":2,\"name\":\"label\""));
+    try refused(a, &tmp, "SELECT id, label FROM '$B/py/'", "holding column `label` (field id 2) as `name`: the column was renamed", true);
+    try put(&tmp, cur, try std.mem.replaceOwned(u8, a, md, "{\"id\":2,\"name\":\"name\"", "{\"id\":12,\"name\":\"name\""));
+    try refused(a, &tmp, "SELECT id, name FROM '$B/py/'", "whose column `name` has field id 2, not 12 as in the table's schema", true);
+    try put(&tmp, cur, md);
+    try testing.expectEqualStrings("id,name\n3,cy\n4,dee\n5,eve\n", try rows(a, &tmp, "SELECT id, name FROM '$B/py/' ORDER BY id", 1));
 }

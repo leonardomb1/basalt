@@ -78,7 +78,9 @@ SELECT count(*) AS n_then FROM 's3://lake/sales/' WITH (version = 12);
 The log is replayed as the protocol says: the newest complete checkpoint at or
 below the version read (one Parquet file, or every part of a multi-part one),
 then each JSON commit after it, an `add` putting a file in the table and a
-`remove` taking it out. `WITH (version = 12)` reads the table as commit 12 left
+`remove` taking it out. A file is the one its path names, relative or absolute,
+together with its deletion vector, so a commit that replaces a file's deletion
+vector reads the same whatever order its lines are in. `WITH (version = 12)` reads the table as commit 12 left
 it, as long as the log still holds what that takes; an older version, or a
 commit missing from `_delta_log/`, is refused naming the versions that can be
 read. `_last_checkpoint` is not needed, since the log's listing is read.
@@ -100,7 +102,8 @@ rather than read into wrong rows: a deletion vector on a live file
 (`deletionVectors` alone is fine while no file carries one), column mapping by
 `name` or `id`, V2 checkpoints, a catalog-managed table, `typeWidening`,
 `variantType`, a reader version past 3, and any feature basalt does not know.
-`timestampNtz` and `vacuumProtocolCheck` read as usual.
+`timestampNtz` and `vacuumProtocolCheck` read as usual. A live file missing from
+storage (a `version` older than a `VACUUM` kept, say) fails the read naming it.
 
 A Delta table is found by listing its log, which an `https://` URL cannot do; it
 is read from a local path, object storage, SFTP or SMB. `format = 'parquet'`
@@ -128,7 +131,9 @@ SELECT * FROM 's3://lake/events/metadata/00012-5a1c.metadata.json' WITH (format 
 ```
 
 The current metadata is the highest-numbered `metadata/` file
-(`v12.metadata.json`, `00012-<uuid>.metadata.json`, or their `.gz` forms). That
+(`v12.metadata.json`, `00012-<uuid>.metadata.json`, or their `.gz` forms; a
+bare `<uuid>.metadata.json`, which a commit writes before renaming it, is not
+one). That
 is exact for a table a Hadoop catalog keeps; for a catalog-held table (Glue,
 REST, a database) it is the newest file written, so naming the metadata file the
 catalog points at reads exactly what the catalog does, and two files of the same
@@ -152,7 +157,9 @@ for any Parquet folder.
 Refused rather than read into wrong rows: a snapshot with live delete files
 (position or equality deletes, deletion vectors), which basalt does not apply; a
 column renamed, or dropped and added again under its old name, since files are
-read by name, not field id; a column with an `initial-default`; encrypted files;
+read by name, not field id — found in the metadata's schemas, or, once those are
+gone, in a data file whose field ids disagree with its names; a column with an
+`initial-default`; encrypted files;
 data files in ORC or Avro; `variant`, `geometry`, `geography` and nanosecond
 timestamps; format versions past 3. EXPLAIN and `check` name the snapshot and
 file count of the table they read, and `check` types a local table from its

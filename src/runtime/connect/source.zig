@@ -94,7 +94,7 @@ pub fn openSourceProjected(
     const rd = try localRead(env, rd_in);
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
-            env.folder_memo = null;
+            env.forgetFolder(rd.form.path);
             const pf = try openParquetFolder(env, rd.form.path, fr, project);
             pf.bounds = bounds;
             env.pq_readers += 1;
@@ -140,17 +140,18 @@ pub fn resolveFolder(env: *Env, path: []const u8, hints: []const ast.Hint) !?Fol
 /// would return the rows its log removed. `format = 'parquet'` reads the files plain.
 pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
     if (!lake.isTablePath(path, lake.Kind.of(want))) return null;
-    if (env.folder_memo) |m| if (std.mem.eql(u8, m.path, path) and m.want == want and m.at.eql(at)) return m.read;
+    for (env.folder_memo.items) |m| if (std.mem.eql(u8, m.path, path) and m.want == want and m.at.eql(at)) return m.read;
     const read = try resolveTable(env, path, want, at) orelse try resolvePlain(env, path, want, at);
-    env.folder_memo = .{ .path = try env.arena.dupe(u8, path), .want = want, .at = at, .read = read };
+    try env.folder_memo.append(env.arena, .{ .path = try env.arena.dupe(u8, path), .want = want, .at = at, .read = read });
     return read;
 }
 
 fn resolveTable(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
     if (want != null and lake.Kind.of(want) == null) return null;
-    const kind = lake.Kind.of(want) orelse (lake.detect(env.arena, path) catch |e|
+    const found: lake.Found = if (lake.Kind.of(want)) |k| .{ .kind = k } else (lake.detect(env.arena, path) catch |e|
         return listFailed(env, path, e)) orelse return null;
-    const t = lake.resolve(env.arena, path, kind, at) catch |e| {
+    const kind = found.kind;
+    const t = lake.resolve(env.arena, path, kind, at, found.listed) catch |e| {
         if (eval.takeFailure(e)) |why| return planErrT(env.diag, e, try env.arena.dupe(u8, why));
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read {s} table `{s}` ({s})", .{ kind.label(), path, try pathFail(env.arena, path, e) }));
     };
@@ -340,7 +341,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
         try guardFileFormat(env, rd.form.path, want, "read");
         const fr = try resolveFolder(env, rd.form.path, hints);
-        env.folder_memo = null;
+        env.forgetFolder(rd.form.path);
         if (fr) |f| switch (f.kind) {
             .parquet => return (try openParquetFolder(env, rd.form.path, f, null)).source(),
             .json => return openJson(env, rd.form.path, f.files, hints),

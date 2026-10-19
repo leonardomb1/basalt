@@ -66,27 +66,46 @@ pub const Resolved = struct {
 
 pub const Error = error{LakeTableRefused};
 
+/// How deep a table's schema may nest structs; `collectLeaves` reads no deeper.
+pub const max_depth = 64;
+
+/// A table found in a folder; `listed` is its log's (or metadata's) listing when
+/// finding it took one, which resolving it then reads rather than listing again.
+pub const Found = struct { kind: Kind, listed: ?[]const []const u8 = null };
+
 /// The table format `root` (a folder path) holds, or null for a plain folder. A
 /// listing that fails for any reason but the log's absence fails the read: reading
-/// the folder plain instead would return the removed files' rows.
+/// the folder plain instead would return the removed files' rows. Remotely a plain
+/// folder costs a listing of each absent prefix, one request apiece.
 /// A folder holding both a Delta log and Iceberg metadata (Delta UniForm) is read
 /// as Delta.
-pub fn detect(arena: std.mem.Allocator, root: []const u8) !?Kind {
-    if (try holdsDelta(arena, root)) return .delta;
-    if (try iceberg.holds(arena, root)) return .iceberg;
+pub fn detect(arena: std.mem.Allocator, root: []const u8) !?Found {
+    if (try holdsDelta(arena, root)) |listed| return .{ .kind = .delta, .listed = listed.items };
+    if (try iceberg.holds(arena, root)) |listed| return .{ .kind = .iceberg, .listed = listed.items };
     return null;
 }
 
-fn holdsDelta(arena: std.mem.Allocator, root: []const u8) !bool {
-    if (isHttp(root)) return false;
+/// A listing, or none when a local folder was only opened.
+pub const Listed = struct { items: ?[]const []const u8 = null };
+
+fn holdsDelta(arena: std.mem.Allocator, root: []const u8) !?Listed {
+    if (isHttp(root)) return null;
     const log = try std.mem.concat(arena, u8, &.{ root, delta.log_dir });
     if (std.mem.indexOf(u8, root, "://") != null) {
-        const got = folder.listRaw(arena, log) catch |e| return if (absent(e)) false else e;
-        return got.len > 0;
+        const got = folder.listRaw(arena, log) catch |e| return if (absent(e)) null else e;
+        return if (got.len > 0) .{ .items = got } else null;
     }
-    var dir = std.fs.cwd().openDir(log, .{}) catch |e| return if (absent(e)) false else e;
+    var dir = std.fs.cwd().openDir(log, .{}) catch |e| return if (absent(e)) null else e;
     dir.close();
-    return true;
+    return .{};
+}
+
+/// `root` as an absolute path when it is a relative local one, so paths a log
+/// gives relative and absolute compare alike.
+pub fn absoluteRoot(arena: std.mem.Allocator, root: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, root, "://") != null or std.fs.path.isAbsolute(root)) return root;
+    const cwd = try std.process.getCwdAlloc(arena);
+    return std.mem.concat(arena, u8, &.{ try std.fs.path.resolve(arena, &.{ cwd, root }), "/" });
 }
 
 /// Whether a listing or a read failed because nothing is there.
@@ -102,16 +121,17 @@ pub fn isTablePath(path: []const u8, want: ?Kind) bool {
     return folder.isFolder(path) or (want == .iceberg and iceberg.isMetadataPath(path));
 }
 
-/// `root` read as a `kind` table: a folder, or an Iceberg metadata file.
-pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At) !*const Resolved {
+/// `root` read as a `kind` table: a folder, or an Iceberg metadata file; `listed`
+/// what `detect` listed, if it did.
+pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At, listed: ?[]const []const u8) !*const Resolved {
     switch (kind) {
         .delta => {
             if (at.snapshot_id != null) return refuse("`snapshot_id` pins an Iceberg table to a snapshot; `{s}` is a Delta table, pinned with `version`", .{root});
-            return delta.resolve(arena, root, at);
+            return delta.resolve(arena, root, at, listed);
         },
         .iceberg => {
             if (at.version != null) return refuse("`version` pins a Delta table to a commit; `{s}` is an Iceberg table, pinned with `snapshot_id`", .{root});
-            return iceberg.resolve(arena, root, !folder.isFolder(root), at);
+            return iceberg.resolve(arena, root, !folder.isFolder(root), at, listed);
         },
     }
 }

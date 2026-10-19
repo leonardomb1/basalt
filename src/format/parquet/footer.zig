@@ -77,6 +77,7 @@ pub const SchemaElement = struct {
     converted_type: ?i32 = null,
     scale: ?i32 = null,
     precision: ?i32 = null,
+    field_id: ?i32 = null,
     logical_type: ?LogicalType = null,
 
     pub fn isLeaf(self: SchemaElement) bool {
@@ -226,6 +227,7 @@ fn readSchemaElement(arena: std.mem.Allocator, r: *thrift.Reader) Error!SchemaEl
             6 => e.converted_type = try r.readI32(),
             7 => e.scale = try r.readI32(),
             8 => e.precision = try r.readI32(),
+            9 => e.field_id = try r.readI32(),
             10 => e.logical_type = if (f.ty == .@"struct") try readLogicalType(r) else blk: {
                 try r.skip(f.ty);
                 break :blk null;

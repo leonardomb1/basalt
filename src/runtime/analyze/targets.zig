@@ -494,9 +494,9 @@ pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const a
     if (!lake.isTablePath(path, named) or std.mem.indexOf(u8, path, "://") != null) return null;
     std.fs.cwd().access(path, .{}) catch return null;
     const at = lakeAt(hints, &d) catch return null;
-    const kind = named orelse (lake.detect(arena, path) catch return null) orelse
+    const found: lake.Found = if (named) |k| .{ .kind = k } else (lake.detect(arena, path) catch return null) orelse
         (if (at.pinned()) return lake.notPinnable(path, at) else return null);
-    return lake.resolve(arena, path, kind, at) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
+    return lake.resolve(arena, path, found.kind, at, found.listed) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
 }
 
 fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) ?types.Schema {

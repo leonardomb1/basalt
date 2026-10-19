@@ -36,7 +36,9 @@ pub fn isMetadataPath(path: []const u8) bool {
 }
 
 /// The version a metadata file's name carries (`v12.metadata.json`,
-/// `00012-<uuid>.metadata.json`, and their gzip forms); null for another name.
+/// `00012-<uuid>.metadata.json`, and their gzip forms); null for another name,
+/// such as a bare `<uuid>.metadata.json` a commit writes before it is renamed,
+/// even when the uuid starts with digits.
 fn metadataVersion(name: []const u8) ?u64 {
     const suf = for ([_][]const u8{ ".gz.metadata.json", ".metadata.json.gz", ".metadata.json" }) |x| {
         if (std.mem.endsWith(u8, name, x)) break x;
@@ -45,8 +47,18 @@ fn metadataVersion(name: []const u8) ?u64 {
     if (stem.len > 0 and stem[0] == 'v') stem = stem[1..];
     var n: usize = 0;
     while (n < stem.len and std.ascii.isDigit(stem[n])) n += 1;
-    if (n == 0 or (n < stem.len and stem[n] != '-')) return null;
+    if (n == 0) return null;
+    if (n < stem.len and (stem[n] != '-' or !isUuid(stem[n + 1 ..]))) return null;
     return std.fmt.parseInt(u64, stem[0..n], 10) catch null;
+}
+
+fn isUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        const dash = i == 8 or i == 13 or i == 18 or i == 23;
+        if (if (dash) c != '-' else !std.ascii.isHex(c)) return false;
+    }
+    return true;
 }
 
 fn gzipped(path: []const u8) bool {
@@ -54,28 +66,29 @@ fn gzipped(path: []const u8) bool {
 }
 
 /// Whether `root` holds an Iceberg table's metadata, listing `metadata/` (or, over
-/// http(s), which cannot list, fetching `version-hint.text`).
-pub fn holds(arena: std.mem.Allocator, root: []const u8) !bool {
+/// http(s), which cannot list, fetching `version-hint.text`); a remote listing is
+/// kept for `locate`.
+pub fn holds(arena: std.mem.Allocator, root: []const u8) !?table.Listed {
     const dir = try std.mem.concat(arena, u8, &.{ root, metadata_dir });
     if (table.isHttp(root)) {
-        _ = table.readWhole(arena, try std.mem.concat(arena, u8, &.{ dir, "version-hint.text" })) catch |e| return if (table.absent(e)) false else e;
-        return true;
+        _ = table.readWhole(arena, try std.mem.concat(arena, u8, &.{ dir, "version-hint.text" })) catch |e| return if (table.absent(e)) null else e;
+        return .{};
     }
     if (std.mem.indexOf(u8, root, "://") == null) {
-        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch |e| return if (table.absent(e)) false else e;
+        var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch |e| return if (table.absent(e)) null else e;
         defer d.close();
         var it = d.iterate();
-        while (try it.next()) |en| if (en.kind == .file and metadataVersion(en.name) != null) return true;
-        return false;
+        while (try it.next()) |en| if (en.kind == .file and metadataVersion(en.name) != null) return .{};
+        return null;
     }
-    const got = folder.listRaw(arena, dir) catch |e| return if (table.absent(e)) false else e;
-    for (got) |u| if (metadataVersion(folder.below(u, dir)) != null) return true;
-    return false;
+    const got = folder.listRaw(arena, dir) catch |e| return if (table.absent(e)) null else e;
+    for (got) |u| if (metadataVersion(folder.below(u, dir)) != null) return .{ .items = got };
+    return null;
 }
 
 /// The metadata file a root's table reads: the highest version listed, or over
 /// http(s) the one `version-hint.text` names.
-fn locate(arena: std.mem.Allocator, name: []const u8, root: []const u8) ![]const u8 {
+fn locate(arena: std.mem.Allocator, name: []const u8, root: []const u8, listed_in: ?[]const []const u8) ![]const u8 {
     const dir = try std.mem.concat(arena, u8, &.{ root, metadata_dir });
     if (table.isHttp(root)) {
         const hint = table.readWhole(arena, try std.mem.concat(arena, u8, &.{ dir, "version-hint.text" })) catch |e| {
@@ -87,7 +100,7 @@ fn locate(arena: std.mem.Allocator, name: []const u8, root: []const u8) ![]const
         if (std.mem.indexOfAny(u8, t, "/\\") == null and isMetadataPath(t)) return std.mem.concat(arena, u8, &.{ dir, t });
         return refuse("{s} has a metadata/version-hint.text that names no metadata file (`{s}`)", .{ name, t });
     }
-    const listed = folder.listRaw(arena, dir) catch |e| {
+    const listed = listed_in orelse folder.listRaw(arena, dir) catch |e| {
         if (table.absent(e)) return refuse("folder `{s}` has no metadata/*.metadata.json: it is not an Iceberg table", .{root});
         return e;
     };
@@ -149,13 +162,17 @@ fn obj(v: std.json.Value) ?Obj {
 /// A schema's columns as the reader names them, and each field id's full name.
 const Columns = struct {
     fields: std.array_list.Managed(types.Schema.Field),
+    /// Each column's field id, aligned with `fields`: what a data file is checked by.
+    field_ids: std.ArrayListUnmanaged(?i64) = .empty,
     ids: std.AutoArrayHashMapUnmanaged(i64, []const u8) = .empty,
     /// The top-level column each field id is, for identity partitions.
     top: std.AutoHashMapUnmanaged(i64, usize) = .empty,
 };
 
-/// `s`'s field ids and full names, struct fields within as `a.b`.
-fn walkIds(arena: std.mem.Allocator, out: *std.AutoArrayHashMapUnmanaged(i64, []const u8), prefix: []const u8, s: Obj) !void {
+/// `s`'s field ids and full names, struct fields within as `a.b`; `addColumns`
+/// has refused a schema nested too deep before this walks it.
+fn walkIds(arena: std.mem.Allocator, out: *std.AutoArrayHashMapUnmanaged(i64, []const u8), prefix: []const u8, s: Obj, depth: usize) !void {
+    if (depth >= table.max_depth) return;
     const fs = get(s, "fields") orelse return;
     if (fs != .array) return;
     for (fs.array.items) |f| {
@@ -164,11 +181,12 @@ fn walkIds(arena: std.mem.Allocator, out: *std.AutoArrayHashMapUnmanaged(i64, []
         const full = try std.mem.concat(arena, u8, &.{ prefix, str(o, "name") orelse continue });
         try out.put(arena, id, full);
         if (get(o, "type")) |t| if (obj(t)) |to| if (std.mem.eql(u8, str(to, "type") orelse "", "struct"))
-            try walkIds(arena, out, try std.mem.concat(arena, u8, &.{ full, "." }), to);
+            try walkIds(arena, out, try std.mem.concat(arena, u8, &.{ full, "." }), to, depth + 1);
     }
 }
 
-fn addColumns(arena: std.mem.Allocator, name: []const u8, cols: *Columns, prefix: []const u8, s: Obj, top: ?usize) !void {
+fn addColumns(arena: std.mem.Allocator, name: []const u8, cols: *Columns, prefix: []const u8, s: Obj, top: ?usize, depth: usize) !void {
+    if (depth >= table.max_depth) return refuse("{s} has a schema nested deeper than {d} levels", .{ name, table.max_depth });
     const fs = get(s, "fields") orelse return refuse("{s} has a schema with no fields", .{name});
     if (fs != .array) return refuse("{s} has a schema with no fields", .{name});
     for (fs.array.items) |f| {
@@ -179,15 +197,20 @@ fn addColumns(arena: std.mem.Allocator, name: []const u8, cols: *Columns, prefix
             return refuse("{s} has a column `{s}` with an initial-default, which basalt does not apply", .{ name, full });
         const t = get(o, "type") orelse return refuse("{s} has a column `{s}` with no type", .{ name, full });
         const here = top orelse cols.fields.items.len;
-        if (int(o, "id")) |id| try cols.top.put(arena, id, here);
+        const id = int(o, "id");
+        if (id) |x| try cols.top.put(arena, x, here);
         switch (t) {
-            .string => |ts| try cols.fields.append(.{ .name = full, .ty = (try primitive(name, full, ts)).asNullable() }),
+            .string => |ts| {
+                try cols.fields.append(.{ .name = full, .ty = (try primitive(name, full, ts)).asNullable() });
+                try cols.field_ids.append(arena, id);
+            },
             .object => |to| {
                 const kind = str(to, "type") orelse "";
                 if (std.mem.eql(u8, kind, "struct")) {
-                    try addColumns(arena, name, cols, try std.mem.concat(arena, u8, &.{ full, "." }), to, here);
+                    try addColumns(arena, name, cols, try std.mem.concat(arena, u8, &.{ full, "." }), to, here, depth + 1);
                 } else if (std.mem.eql(u8, kind, "list") or std.mem.eql(u8, kind, "map")) {
                     try cols.fields.append(.{ .name = full, .ty = types.Type.init(.string).asNullable() });
+                    try cols.field_ids.append(arena, id);
                 } else return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, full, kind });
             },
             else => return refuse("{s} has a column `{s}` with no type", .{ name, full }),
@@ -221,11 +244,11 @@ fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
 /// in files written before the rename, and a re-added one as the old column.
 fn checkNames(arena: std.mem.Allocator, name: []const u8, read: Obj, all: []const std.json.Value) !void {
     var want: std.AutoArrayHashMapUnmanaged(i64, []const u8) = .empty;
-    try walkIds(arena, &want, "", read);
+    try walkIds(arena, &want, "", read, 0);
     for (all) |sv| {
         const s = obj(sv) orelse continue;
         var had: std.AutoArrayHashMapUnmanaged(i64, []const u8) = .empty;
-        try walkIds(arena, &had, "", s);
+        try walkIds(arena, &had, "", s, 0);
         for (had.keys(), had.values()) |id, old| {
             if (want.get(id)) |now| if (!std.mem.eql(u8, now, old))
                 return refuse("{s} has a column `{s}` renamed from `{s}`; basalt reads Iceberg data files by column name, so files written before the rename would read it as null", .{ name, now, old });
@@ -377,7 +400,7 @@ fn readMetadata(arena: std.mem.Allocator, name: []const u8, path: []const u8) !O
 }
 
 /// `path` a table's root folder, or with `direct` its metadata file.
-pub fn resolve(arena: std.mem.Allocator, path: []const u8, direct: bool, at: table.At) !*const table.Resolved {
+pub fn resolve(arena: std.mem.Allocator, path: []const u8, direct: bool, at: table.At, listed: ?[]const []const u8) !*const table.Resolved {
     const name = try std.fmt.allocPrint(arena, "Iceberg table `{s}`", .{path});
     var root = path;
     var rebase = true;
@@ -387,7 +410,7 @@ pub fn resolve(arena: std.mem.Allocator, path: []const u8, direct: bool, at: tab
         rebase = std.mem.endsWith(u8, dir, "/metadata");
         root = if (rebase) path[0 .. dir.len - "metadata".len] else path[0 .. slash + 1];
     }
-    const meta_path = if (direct) path else try locate(arena, name, root);
+    const meta_path = if (direct) path else try locate(arena, name, root, listed);
     const md = try readMetadata(arena, name, meta_path);
 
     const fv = int(md, "format-version") orelse 1;
@@ -433,11 +456,11 @@ pub fn resolve(arena: std.mem.Allocator, path: []const u8, direct: bool, at: tab
         schema = obj(s);
     };
     const sch = schema orelse return refuse("{s} has no schema {d} in its metadata", .{ name, schema_id orelse 0 });
-    try checkNames(arena, name, sch, all_schemas);
     const cols = try arena.create(Columns);
     cols.* = .{ .fields = std.array_list.Managed(types.Schema.Field).init(arena) };
-    try addColumns(arena, name, cols, "", sch, null);
-    try walkIds(arena, &cols.ids, "", sch);
+    try addColumns(arena, name, cols, "", sch, null, 0);
+    try checkNames(arena, name, sch, all_schemas);
+    try walkIds(arena, &cols.ids, "", sch, 0);
     if (cols.fields.items.len == 0) return refuse("{s} has a schema with no columns", .{name});
 
     var specs: []const std.json.Value = if (get(md, "partition-specs")) |s| (if (s == .array) s.array.items else &.{}) else &.{};
@@ -478,7 +501,7 @@ pub fn resolve(arena: std.mem.Allocator, path: []const u8, direct: bool, at: tab
     }.lt);
 
     const layout = try arena.create(Layout);
-    layout.* = .{ .name = name, .root = root, .schema = .{ .fields = cols.fields.items }, .part_fields = part_cols.items, .files = files };
+    layout.* = .{ .name = name, .root = root, .schema = .{ .fields = cols.fields.items }, .ids = cols.field_ids.items, .part_fields = part_cols.items, .files = files };
     const r = try arena.create(table.Resolved);
     const plural = if (files.len == 1) "" else "s";
     r.* = .{
@@ -497,8 +520,11 @@ test "metadata file names: versions from either naming, gzip forms, other files 
     try testing.expectEqual(@as(?u64, 12), metadataVersion("v12.metadata.json"));
     try testing.expectEqual(@as(?u64, 3), metadataVersion("00003-91ece667-5252-4853-b887-31591380dc23.metadata.json"));
     try testing.expectEqual(@as(?u64, 4), metadataVersion("v4.gz.metadata.json"));
-    try testing.expectEqual(@as(?u64, 5), metadataVersion("00005-a.metadata.json.gz"));
-    for ([_][]const u8{ "version-hint.text", "snap-1-0-a.avro", "a-m0.avro", "vx.metadata.json", "12x.metadata.json", ".metadata.json" }) |n|
+    try testing.expectEqual(@as(?u64, 5), metadataVersion("00005-91ece667-5252-4853-b887-31591380dc23.metadata.json.gz"));
+    for ([_][]const u8{
+        "version-hint.text",                                  "snap-1-0-a.avro",       "a-m0.avro",          "vx.metadata.json", "12x.metadata.json", ".metadata.json",
+        "12345678-aaaa-4bbb-8ccc-dddddddddddd.metadata.json", "00005-a.metadata.json", "v3-x.metadata.json",
+    }) |n|
         try testing.expect(metadataVersion(n) == null);
     try testing.expect(isMetadataPath("s3://b/t/metadata/v1.metadata.json") and isMetadataPath("/t/metadata/00001-a.metadata.json.gz"));
     try testing.expect(!isMetadataPath("/t/metadata/v1.json"));
@@ -518,7 +544,7 @@ test "a schema as columns: structs dotted, lists and maps as text, types refused
         \\{"id":9,"name":"ts","required":false,"type":"timestamptz"},{"id":10,"name":"n","required":false,"type":"unknown"}]}
     , .{});
     var cols = Columns{ .fields = std.array_list.Managed(types.Schema.Field).init(a) };
-    try addColumns(a, "T", &cols, "", v.object, null);
+    try addColumns(a, "T", &cols, "", v.object, null, 0);
     const want = [_]struct { []const u8, types.TypeKind }{
         .{ "id", .int }, .{ "amt", .decimal }, .{ "geo.lat", .float }, .{ "tags", .string }, .{ "u", .bytes }, .{ "f", .bytes }, .{ "ts", .timestamp }, .{ "n", .string },
     };
@@ -529,6 +555,7 @@ test "a schema as columns: structs dotted, lists and maps as text, types refused
         try testing.expect(f.ty.nullable);
     }
     try testing.expectEqual(@as(usize, 2), cols.top.get(5).?);
+    try testing.expectEqualSlices(?i64, &.{ 1, 2, 5, 4, 7, 8, 9, 10 }, cols.field_ids.items);
     const eval = @import("../../exec/eval.zig");
     for ([_][2][]const u8{
         .{ "{\"fields\":[{\"id\":1,\"name\":\"v\",\"type\":\"variant\"}]}", "column `v` of type `variant`, which basalt does not read" },
@@ -537,9 +564,22 @@ test "a schema as columns: structs dotted, lists and maps as text, types refused
     }) |c| {
         const bad = try std.json.parseFromSliceLeaky(std.json.Value, a, c[0], .{});
         var bc = Columns{ .fields = std.array_list.Managed(types.Schema.Field).init(a) };
-        try testing.expectError(table.Error.LakeTableRefused, addColumns(a, "T", &bc, "", bad.object, null));
+        try testing.expectError(table.Error.LakeTableRefused, addColumns(a, "T", &bc, "", bad.object, null, 0));
         try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, c[1]) != null);
     }
+
+    var deep = std.array_list.Managed(u8).init(a);
+    try deep.append('{');
+    for (0..100_000) |_| try deep.appendSlice("\"fields\":[{\"id\":1,\"name\":\"a\",\"type\":{\"type\":\"struct\",");
+    try deep.appendSlice("\"fields\":[]");
+    for (0..100_000) |_| try deep.appendSlice("}}]");
+    try deep.append('}');
+    const dv = try std.json.parseFromSliceLeaky(std.json.Value, a, deep.items, .{});
+    var dc = Columns{ .fields = std.array_list.Managed(types.Schema.Field).init(a) };
+    try testing.expectError(table.Error.LakeTableRefused, addColumns(a, "T", &dc, "", dv.object, null, 0));
+    try testing.expectEqualStrings("T has a schema nested deeper than 64 levels", eval.takeFailure(table.Error.LakeTableRefused).?);
+    var ids: std.AutoArrayHashMapUnmanaged(i64, []const u8) = .empty;
+    try walkIds(a, &ids, "", dv.object, 0);
 }
 
 test "the name guard: a rename or a name re-added under a new id is refused, an added column is not" {

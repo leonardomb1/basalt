@@ -391,6 +391,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         var w_errctx = op.ErrCtx{};
         var w_env = ctx.base.*;
         w_env.arena = w_arena.allocator();
+        w_env.folder_memo = .empty;
         w_env.gpa = gpa;
         w_env.sources = &w_sources;
         w_env.diag = &w_diag;

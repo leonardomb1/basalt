@@ -1,9 +1,12 @@
 //! A Delta Lake table's state at one version, replayed from `_delta_log/`: the
 //! newest complete checkpoint at or below that version (one Parquet file, or every
 //! part of a multi-part one), then each JSON commit after it in order. An `add`
-//! puts a file in the table and a `remove` takes it out, keyed by its decoded
-//! path; the last `protocol` and `metaData` win. The log's listing is what is
-//! read, so `_last_checkpoint`, a hint for readers that do not list, is not needed.
+//! puts a file in the table and a `remove` takes it out, keyed as the protocol
+//! keys a file: its path resolved against the table's root, with its deletion
+//! vector's id, so a commit replacing a file's deletion vector is read whatever
+//! order its lines are in. The last `protocol` and `metaData` win. The log's
+//! listing is what is read, so `_last_checkpoint`, a hint for readers that do not
+//! list, is not needed.
 //!
 //! The table's schema is `metaData.schemaString`, its partition columns' values
 //! each file's `partitionValues`, which win over any copy of the column inside the
@@ -17,6 +20,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Layout = @import("../parquet/fit.zig").Layout;
 const Reader = @import("../parquet/read.zig").Reader;
 const Value = @import("../../exec/value.zig").Value;
+const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const table = @import("table.zig");
 const types = @import("../../lang/types.zig");
@@ -26,14 +30,24 @@ pub const log_dir = "_delta_log/";
 
 const refuse = table.refuse;
 
-/// One name in `_delta_log/`: a commit, a checkpoint (or one part of one), or a
-/// file a reader skips (`_last_checkpoint`, `.crc`, compacted commits, V2 and
-/// staged files).
+/// One name in `_delta_log/`: a commit, a checkpoint (or one part of one), a V2
+/// checkpoint (named by a UUID), or a file a reader skips (`_last_checkpoint`,
+/// `.crc`, compacted commits, sidecars and staged files).
 const Name = union(enum) {
     commit: u64,
     checkpoint: struct { version: u64, part: u32, parts: u32 },
+    v2: u64,
     other,
 };
+
+fn isUuid(s: []const u8) bool {
+    if (s.len != 36) return false;
+    for (s, 0..) |c, i| {
+        const dash = i == 8 or i == 13 or i == 18 or i == 23;
+        if (if (dash) c != '-' else !std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
 
 fn parseName(name: []const u8) Name {
     var n: usize = 0;
@@ -44,8 +58,11 @@ fn parseName(name: []const u8) Name {
     if (std.mem.eql(u8, rest, ".json")) return .{ .commit = v };
     if (std.mem.eql(u8, rest, ".checkpoint.parquet")) return .{ .checkpoint = .{ .version = v, .part = 1, .parts = 1 } };
     const pre = ".checkpoint.";
-    if (!std.mem.startsWith(u8, rest, pre) or !std.mem.endsWith(u8, rest, ".parquet")) return .other;
+    if (!std.mem.startsWith(u8, rest, pre)) return .other;
+    if (std.mem.endsWith(u8, rest, ".json") and isUuid(rest[pre.len .. rest.len - ".json".len])) return .{ .v2 = v };
+    if (!std.mem.endsWith(u8, rest, ".parquet")) return .other;
     const mid = rest[pre.len .. rest.len - ".parquet".len];
+    if (isUuid(mid)) return .{ .v2 = v };
     const dot = std.mem.indexOfScalar(u8, mid, '.') orelse return .other;
     if (dot != 10 or mid.len != 21) return .other;
     const part = std.fmt.parseInt(u32, mid[0..dot], 10) catch return .other;
@@ -54,30 +71,30 @@ fn parseName(name: []const u8) Name {
     return .{ .checkpoint = .{ .version = v, .part = part, .parts = parts } };
 }
 
-const Checkpoint = struct {
-    parts: u32,
-    files: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty,
-
-    fn complete(self: Checkpoint) bool {
-        return self.files.count() == self.parts;
-    }
-};
+/// One checkpoint at a version: a classic one has one part. Two of a version (a
+/// classic one and a multi-part one, or two part counts) are each kept, and any
+/// complete one serves.
+const Checkpoint = struct { version: u64, parts: u32 };
+const Parts = std.AutoArrayHashMapUnmanaged(u32, []const u8);
 
 /// What `_delta_log/` lists, and which of it a version is read from.
 const Log = struct {
     name: []const u8,
     commits: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
-    checkpoints: std.AutoArrayHashMapUnmanaged(u64, Checkpoint) = .empty,
+    checkpoints: std.AutoArrayHashMapUnmanaged(Checkpoint, Parts) = .empty,
+    /// The newest V2 checkpoint's version, which explains a log a reader of
+    /// classic checkpoints cannot reach a version through.
+    v2: ?u64 = null,
 
     fn add(self: *Log, arena: std.mem.Allocator, url: []const u8, rel: []const u8) !void {
         switch (parseName(rel)) {
             .commit => |v| try self.commits.put(arena, v, url),
             .checkpoint => |c| {
-                const gop = try self.checkpoints.getOrPut(arena, c.version);
-                if (!gop.found_existing) gop.value_ptr.* = .{ .parts = c.parts };
-                if (gop.value_ptr.parts != c.parts) return;
-                try gop.value_ptr.files.put(arena, c.part, url);
+                const gop = try self.checkpoints.getOrPut(arena, .{ .version = c.version, .parts = c.parts });
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.put(arena, c.part, url);
             },
+            .v2 => |v| self.v2 = @max(self.v2 orelse v, v),
             .other => {},
         }
     }
@@ -86,8 +103,8 @@ const Log = struct {
         var best: ?u64 = null;
         var it = self.commits.keyIterator();
         while (it.next()) |v| best = @max(best orelse v.*, v.*);
-        for (self.checkpoints.keys(), self.checkpoints.values()) |v, c| {
-            if (c.complete()) best = @max(best orelse v, v);
+        for (self.checkpoints.keys(), self.checkpoints.values()) |c, p| {
+            if (p.count() == c.parts) best = @max(best orelse c.version, c.version);
         }
         return best;
     }
@@ -95,30 +112,31 @@ const Log = struct {
     /// The oldest version every file needed to read it is still there for.
     fn oldest(self: *const Log, newest: u64) u64 {
         var lo: u64 = if (self.commits.contains(0)) 0 else newest;
-        for (self.checkpoints.keys(), self.checkpoints.values()) |v, c| {
-            if (c.complete() and v < lo) lo = v;
+        for (self.checkpoints.keys(), self.checkpoints.values()) |c, p| {
+            if (p.count() == c.parts and c.version < lo) lo = c.version;
         }
         return lo;
     }
 
     /// The checkpoint `target` is replayed from, null to replay every commit from
     /// 0; refused when a commit it needs is missing.
-    fn base(self: *const Log, target: u64) !?u64 {
-        var best: ?u64 = null;
-        var partial: ?u64 = null;
-        for (self.checkpoints.keys(), self.checkpoints.values()) |v, c| {
-            if (v > target) continue;
-            if (c.complete()) {
-                if (best == null or v > best.?) best = v;
-            } else if (partial == null or v > partial.?) partial = v;
+    fn base(self: *const Log, target: u64) !?Checkpoint {
+        var best: ?Checkpoint = null;
+        var partial: ?Checkpoint = null;
+        for (self.checkpoints.keys(), self.checkpoints.values()) |c, p| {
+            if (c.version > target) continue;
+            if (p.count() == c.parts) {
+                if (best == null or c.version > best.?.version) best = c;
+            } else if (partial == null or c.version > partial.?.version) partial = c;
         }
-        const from: u64 = if (best) |b| b + 1 else 0;
+        const from: u64 = if (best) |b| b.version + 1 else 0;
         var v = from;
         while (v <= target) : (v += 1) {
             if (self.commits.contains(v)) continue;
-            if (partial) |p| if (best == null or p > best.?) {
-                const c = self.checkpoints.get(p).?;
-                return refuse("{s}'s checkpoint {d} lists {d} parts but only {d} are in _delta_log/", .{ self.name, p, c.parts, c.files.count() });
+            if (self.v2) |x| if (x <= target and (best == null or x > best.?.version))
+                return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint {d}), which basalt does not read", .{ self.name, x });
+            if (partial) |p| if (best == null or p.version > best.?.version) {
+                return refuse("{s}'s checkpoint {d} lists {d} parts but only {d} are in _delta_log/", .{ self.name, p.version, p.parts, self.checkpoints.get(p).?.count() });
             };
             if (best == null and v == 0) {
                 const newest = self.latest().?;
@@ -130,6 +148,8 @@ const Log = struct {
     }
 };
 
+/// A live file: `path` decoded from the log's URI form, `dv` set when it carries
+/// a deletion vector.
 const Add = struct {
     path: []const u8,
     size: ?u64 = null,
@@ -137,10 +157,28 @@ const Add = struct {
     dv: bool = false,
 };
 
+/// A deletion vector's `uniqueId`: its storage type and path or inline bytes, with
+/// `@offset` when it has one.
+fn dvId(arena: std.mem.Allocator, storage: []const u8, where: []const u8, offset: ?i64) ![]const u8 {
+    if (offset) |o| return std.fmt.allocPrint(arena, "{s}{s}@{d}", .{ storage, where, o });
+    return std.mem.concat(arena, u8, &.{ storage, where });
+}
+
+fn jsonDv(arena: std.mem.Allocator, v: ?std.json.Value) !?[]const u8 {
+    const d = v orelse return null;
+    if (d != .object) return null;
+    const off = d.object.get("offset");
+    return try dvId(arena, str(d.object.get("storageType")) orelse "", str(d.object.get("pathOrInlineDv")) orelse "", if (off) |o| (if (o == .integer) o.integer else null) else null);
+}
+
 /// The table as the actions read so far leave it.
 const State = struct {
     arena: std.mem.Allocator,
     name: []const u8,
+    /// The root a log's paths are resolved against to key them, absolute for a
+    /// local table, so a file added by a relative path and removed by an absolute
+    /// one is one file.
+    key_root: []const u8,
     reader_version: i64 = 1,
     features: []const []const u8 = &.{},
     schema_string: ?[]const u8 = null,
@@ -149,13 +187,27 @@ const State = struct {
     v2: ?[]const u8 = null,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
 
-    fn put(self: *State, a: Add) !void {
-        const key = try table.percentDecode(self.arena, a.path);
-        try self.files.put(self.arena, key, a);
+    /// A file's identity in the log: its path resolved against the root, and its
+    /// deletion vector's id. A path whose scheme basalt does not read keys as written.
+    fn key(self: *State, decoded: []const u8, dv: ?[]const u8) ![]const u8 {
+        const at = table.mapPath(self.arena, self.key_root, decoded) catch |e| blk: {
+            if (e != table.Error.LakeTableRefused) return e;
+            _ = eval.takeFailure(e);
+            break :blk decoded;
+        };
+        const id = dv orelse return at;
+        return std.mem.concat(self.arena, u8, &.{ at, "\x00", id });
     }
 
-    fn drop(self: *State, path: []const u8) !void {
-        _ = self.files.swapRemove(try table.percentDecode(self.arena, path));
+    fn put(self: *State, a: Add, dv: ?[]const u8) !void {
+        var x = a;
+        x.path = try table.percentDecode(self.arena, a.path);
+        x.dv = dv != null;
+        try self.files.put(self.arena, try self.key(x.path, dv), x);
+    }
+
+    fn drop(self: *State, path: []const u8, dv: ?[]const u8) !void {
+        _ = self.files.swapRemove(try self.key(try table.percentDecode(self.arena, path), dv));
     }
 
     fn protocol(self: *State, version: i64, features: ?std.json.Value) !void {
@@ -190,10 +242,9 @@ const State = struct {
                     .path = p,
                     .size = if (o.get("size")) |s| (if (s == .integer and s.integer >= 0) @as(u64, @intCast(s.integer)) else null) else null,
                     .parts = o.get("partitionValues"),
-                    .dv = if (o.get("deletionVector")) |d| d == .object else false,
-                });
+                }, try jsonDv(self.arena, o.get("deletionVector")));
             } else if (std.mem.eql(u8, k, "remove")) {
-                try self.drop(str(o.get("path")) orelse continue);
+                try self.drop(str(o.get("path")) orelse continue, try jsonDv(self.arena, o.get("deletionVector")));
             } else if (std.mem.eql(u8, k, "metaData")) {
                 try self.meta(str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
             } else if (std.mem.eql(u8, k, "protocol")) {
@@ -214,6 +265,8 @@ const State = struct {
             const c_size = b.schema.indexOf("add.size");
             const c_parts = b.schema.indexOf("add.partitionValues");
             const c_dv = b.schema.indexOf("add.deletionVector.storageType");
+            const c_dv_at = b.schema.indexOf("add.deletionVector.pathOrInlineDv");
+            const c_dv_off = b.schema.indexOf("add.deletionVector.offset");
             const c_schema = b.schema.indexOf("metaData.schemaString");
             const c_pcols = b.schema.indexOf("metaData.partitionColumns");
             const c_config = b.schema.indexOf("metaData.configuration");
@@ -226,12 +279,18 @@ const State = struct {
                 };
                 if (cell(b, c_path, i) == .string) {
                     const size = cell(b, c_size, i);
+                    const storage = cell(b, c_dv, i);
+                    const where = cell(b, c_dv_at, i);
+                    const off = cell(b, c_dv_off, i);
+                    const dv: ?[]const u8 = if (storage == .string)
+                        try dvId(self.arena, storage.string, if (where == .string) where.string else "", if (off == .int) off.int else null)
+                    else
+                        null;
                     try self.put(.{
                         .path = try self.arena.dupe(u8, cell(b, c_path, i).string),
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
                         .parts = try self.jsonOf(cell(b, c_parts, i)),
-                        .dv = cell(b, c_dv, i) != .null,
-                    });
+                    }, dv);
                 }
                 if (cell(b, c_schema, i) == .string)
                     try self.meta(try self.arena.dupe(u8, cell(b, c_schema, i).string), try self.jsonOf(cell(b, c_pcols, i)), try self.jsonOf(cell(b, c_config, i)));
@@ -268,9 +327,10 @@ const State = struct {
 };
 
 const checkpoint_columns = [_][]const u8{
-    "add.path",                "add.size",                   "add.partitionValues",    "add.deletionVector.storageType",
-    "metaData.schemaString",   "metaData.partitionColumns",  "metaData.configuration", "protocol.minReaderVersion",
-    "protocol.readerFeatures", "checkpointMetadata.version", "sidecar.path",
+    "add.path",                          "add.size",                  "add.partitionValues",     "add.deletionVector.storageType",
+    "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "metaData.schemaString",   "metaData.partitionColumns",
+    "metaData.configuration",            "protocol.minReaderVersion", "protocol.readerFeatures", "checkpointMetadata.version",
+    "sidecar.path",
 };
 
 fn cell(b: Batch, c: ?usize, row: usize) Value {
@@ -301,11 +361,12 @@ fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
         return refuse("{s} has a schemaString that is not JSON", .{name});
     var out = std.array_list.Managed(types.Schema.Field).init(arena);
-    try addFields(arena, name, &out, "", v);
+    try addFields(arena, name, &out, "", v, 0);
     return .{ .fields = out.items };
 }
 
-fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Managed(types.Schema.Field), prefix: []const u8, v: std.json.Value) !void {
+fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Managed(types.Schema.Field), prefix: []const u8, v: std.json.Value, depth: usize) !void {
+    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
     const fields = if (v == .object) v.object.get("fields") else null;
     if (fields == null or fields.? != .array) return refuse("{s} has a schemaString that is not a struct of fields", .{name});
     for (fields.?.array.items) |f| {
@@ -318,7 +379,7 @@ fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Ma
             .object => |o| {
                 const kind = str(o.get("type")) orelse "";
                 if (std.mem.eql(u8, kind, "struct")) {
-                    try addFields(arena, name, out, try std.mem.concat(arena, u8, &.{ full, "." }), t);
+                    try addFields(arena, name, out, try std.mem.concat(arena, u8, &.{ full, "." }), t, depth + 1);
                 } else if (std.mem.eql(u8, kind, "array") or std.mem.eql(u8, kind, "map")) {
                     try out.append(.{ .name = full, .ty = types.Type.init(.string).asNullable() });
                 } else return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, full, kind });
@@ -348,12 +409,14 @@ fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
     return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, t });
 }
 
-pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At) !*const table.Resolved {
+/// `root`'s table at `at`; `listed` is `_delta_log/`'s listing when detection
+/// already made it.
+pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*const table.Resolved {
     const name = try std.fmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
         return refuse("{s} cannot be read over http(s): a Delta table is found by listing _delta_log/, which a URL cannot do; read it from a local path, s3://, az://, sftp:// or smb://", .{name});
     const log_path = try std.mem.concat(arena, u8, &.{ root, log_dir });
-    const listed = folder.listRaw(arena, log_path) catch |e| {
+    const listed = listed_in orelse folder.listRaw(arena, log_path) catch |e| {
         if (table.absent(e)) return refuse("folder `{s}` has no _delta_log/: it is not a Delta table", .{root});
         return e;
     };
@@ -369,14 +432,14 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At) !*const
         return refuse("{s} has no version {d} (versions {d} to {d} can be read)", .{ name, target, log.oldest(newest), newest });
     const from = try log.base(target);
 
-    var st = State{ .arena = arena, .name = name };
-    if (from) |v| {
-        const cp = log.checkpoints.get(v).?;
+    var st = State{ .arena = arena, .name = name, .key_root = try table.absoluteRoot(arena, root) };
+    if (from) |c| {
+        const files = log.checkpoints.get(c).?;
         var k: u32 = 1;
-        while (k <= cp.parts) : (k += 1) try st.checkpoint(cp.files.get(k).?);
+        while (k <= c.parts) : (k += 1) try st.checkpoint(files.get(k).?);
         if (st.v2) |f| return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint `{s}`), which basalt does not read", .{ name, folder.below(f, log_path) });
     }
-    var v: u64 = if (from) |f| f + 1 else 0;
+    var v: u64 = if (from) |f| f.version + 1 else 0;
     while (v <= target) : (v += 1) {
         const text = try table.readWhole(arena, log.commits.get(v).?);
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -387,13 +450,15 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At) !*const
     }
     try st.checkProtocol();
     const schema = try schemaOf(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
+    if (schema.fields.len == 0) return refuse("{s} has a schema with no columns", .{name});
 
     const part_fields = try arena.alloc(usize, st.part_cols.len);
     for (part_fields, st.part_cols) |*pf, c| pf.* = schema.indexOf(c) orelse
         return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
 
     const files = try arena.alloc(Layout.File, st.files.count());
-    for (files, st.files.keys(), st.files.values()) |*f, decoded, a| {
+    for (files, st.files.values()) |*f, a| {
+        const decoded = a.path;
         if (a.dv) return refuse("{s} has file `{s}` with a deletion vector (reader feature `deletionVectors`); basalt does not apply deletion vectors, and reading the file whole would return deleted rows", .{ name, decoded });
         const parts = try arena.alloc(Value, part_fields.len);
         for (parts, part_fields, st.part_cols) |*p, fi, c| {
@@ -421,7 +486,7 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At) !*const
     return r;
 }
 
-test "log names: commits, single and multi-part checkpoints, and what a reader skips" {
+test "log names: commits, single and multi-part checkpoints, V2 checkpoints, and what a reader skips" {
     try testing.expectEqual(@as(u64, 7), parseName("00000000000000000007.json").commit);
     const cp = parseName("00000000000000000010.checkpoint.parquet").checkpoint;
     try testing.expectEqual(@as(u64, 10), cp.version);
@@ -429,13 +494,14 @@ test "log names: commits, single and multi-part checkpoints, and what a reader s
     const mp = parseName("00000000000000000010.checkpoint.0000000002.0000000003.parquet").checkpoint;
     try testing.expectEqual(@as(u32, 2), mp.part);
     try testing.expectEqual(@as(u32, 3), mp.parts);
+    try testing.expectEqual(@as(u64, 10), parseName("00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json").v2);
+    try testing.expectEqual(@as(u64, 10), parseName("00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.parquet").v2);
     for ([_][]const u8{
         "_last_checkpoint",
         "00000000000000000007.crc",
         "00000000000000000001.00000000000000000004.compacted.json",
-        "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json",
-        "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.parquet",
         "00000000000000000010.checkpoint.0000000004.0000000003.parquet",
+        "00000000000000000010.checkpoint.notauuid.json",
     }) |n| try testing.expect(parseName(n) == .other);
 }
 
@@ -452,30 +518,70 @@ test "the base checkpoint: newest complete one at or below the version, commits 
         "00000000000000000005.json",                                     "00000000000000000005.checkpoint.0000000001.0000000002.parquet",
     }) |n| try log.add(a, n, n);
     try testing.expectEqual(@as(?u64, 5), log.latest());
-    try testing.expectEqual(@as(?u64, 4), try log.base(5));
-    try testing.expectEqual(@as(?u64, 4), try log.base(4));
-    try testing.expectEqual(@as(?u64, 2), try log.base(3));
-    try testing.expectEqual(@as(?u64, null), try log.base(1));
+    try testing.expectEqual(@as(u64, 4), (try log.base(5)).?.version);
+    try testing.expectEqual(@as(u64, 4), (try log.base(4)).?.version);
+    try testing.expectEqual(@as(u64, 2), (try log.base(3)).?.version);
+    try testing.expect(try log.base(1) == null);
 
     var gap = Log{ .name = "T" };
     for ([_][]const u8{ "00000000000000000002.checkpoint.parquet", "00000000000000000003.json", "00000000000000000005.json" }) |n| try gap.add(a, n, n);
     try testing.expectError(table.Error.LakeTableRefused, gap.base(5));
-    try testing.expectEqualStrings("T is missing commit 4 from _delta_log/ (commits 3 to 5 are needed to reach version 5)", @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?);
+    try testing.expectEqualStrings("T is missing commit 4 from _delta_log/ (commits 3 to 5 are needed to reach version 5)", eval.takeFailure(table.Error.LakeTableRefused).?);
     try testing.expectError(table.Error.LakeTableRefused, gap.base(1));
-    try testing.expectEqualStrings("T has no version 1 (versions 2 to 5 can be read)", @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?);
+    try testing.expectEqualStrings("T has no version 1 (versions 2 to 5 can be read)", eval.takeFailure(table.Error.LakeTableRefused).?);
 
     var part = Log{ .name = "T" };
     for ([_][]const u8{ "00000000000000000003.checkpoint.0000000001.0000000002.parquet", "00000000000000000004.json" }) |n| try part.add(a, n, n);
     try testing.expectError(table.Error.LakeTableRefused, part.base(4));
-    try testing.expectEqualStrings("T's checkpoint 3 lists 2 parts but only 1 are in _delta_log/", @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?);
+    try testing.expectEqualStrings("T's checkpoint 3 lists 2 parts but only 1 are in _delta_log/", eval.takeFailure(table.Error.LakeTableRefused).?);
+
+    var both = Log{ .name = "T" };
+    for ([_][]const u8{
+        "00000000000000000010.checkpoint.0000000001.0000000003.parquet", "00000000000000000010.checkpoint.0000000002.0000000003.parquet",
+        "00000000000000000010.checkpoint.parquet",                       "00000000000000000011.json",
+        "00000000000000000012.json",
+    }) |n| try both.add(a, n, n);
+    const c = (try both.base(12)).?;
+    try testing.expectEqual(@as(u64, 10), c.version);
+    try testing.expectEqual(@as(u32, 1), c.parts);
+    try testing.expectEqual(@as(u64, 10), both.oldest(12));
+
+    var v2 = Log{ .name = "T" };
+    for ([_][]const u8{ "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json", "00000000000000000011.json" }) |n| try v2.add(a, n, n);
+    try testing.expectError(table.Error.LakeTableRefused, v2.base(11));
+    try testing.expectEqualStrings("T uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint 10), which basalt does not read", eval.takeFailure(table.Error.LakeTableRefused).?);
+}
+
+test "a file is keyed by its resolved path and deletion vector, so line order in a commit does not matter" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const dv = "{\"storageType\":\"u\",\"pathOrInlineDv\":\"ab\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":1}";
+    const add_dv = "{\"add\":{\"path\":\"a.parquet\",\"partitionValues\":{},\"deletionVector\":" ++ dv ++ "}}";
+    const rm_old = "{\"remove\":{\"path\":\"a.parquet\"}}";
+    for ([_][2][]const u8{ .{ add_dv, rm_old }, .{ rm_old, add_dv } }) |order| {
+        var st = State{ .arena = a, .name = "T", .key_root = "/t/" };
+        try st.action("{\"add\":{\"path\":\"a.parquet\",\"partitionValues\":{}}}");
+        for (order) |line| try st.action(line);
+        try testing.expectEqual(@as(usize, 1), st.files.count());
+        try testing.expect(st.files.values()[0].dv);
+        try st.action("{\"remove\":{\"path\":\"a.parquet\",\"deletionVector\":" ++ dv ++ "}}");
+        try testing.expectEqual(@as(usize, 0), st.files.count());
+    }
+    var st = State{ .arena = a, .name = "T", .key_root = "/t/" };
+    try st.action("{\"add\":{\"path\":\"x%3D1/b.parquet\",\"partitionValues\":{}}}");
+    try st.action("{\"remove\":{\"path\":\"file:///t/x%3D1/b.parquet\"}}");
+    try testing.expectEqual(@as(usize, 0), st.files.count());
+    try st.action("{\"add\":{\"path\":\"hdfs://nn/t/c.parquet\",\"partitionValues\":{}}}");
+    try st.action("{\"remove\":{\"path\":\"hdfs://nn/t/c.parquet\"}}");
+    try testing.expectEqual(@as(usize, 0), st.files.count());
 }
 
 test "protocol: reader versions and features, refused only where the table uses them" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const eval = @import("../../exec/eval.zig");
-    var st = State{ .arena = a, .name = "T" };
+    var st = State{ .arena = a, .name = "T", .key_root = "/t/" };
     try st.checkProtocol();
     st.reader_version = 2;
     st.mapping = "none";
@@ -533,5 +639,12 @@ test "schemaString: primitives, a struct as dotted columns, array and map as JSO
     try testing.expectError(table.Error.LakeTableRefused, schemaOf(a, "T",
         \\{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}
     ));
-    try testing.expectEqualStrings("T has a column `v` of type `variant`, which basalt does not read", @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?);
+    try testing.expectEqualStrings("T has a column `v` of type `variant`, which basalt does not read", eval.takeFailure(table.Error.LakeTableRefused).?);
+
+    var deep = std.array_list.Managed(u8).init(a);
+    for (0..100_000) |_| try deep.appendSlice("{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"type\":");
+    try deep.appendSlice("\"long\"");
+    for (0..100_000) |_| try deep.appendSlice("}]}");
+    try testing.expectError(table.Error.LakeTableRefused, schemaOf(a, "T", deep.items));
+    try testing.expectEqualStrings("T has a schemaString nested deeper than 64 levels", eval.takeFailure(table.Error.LakeTableRefused).?);
 }

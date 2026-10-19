@@ -355,6 +355,7 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, la
 /// declared in one, so none reaches here.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     env.diag.pos = null;
+    env.folder_memo.clearRetainingCapacity();
     switch (s.*) {
         .output => |p| {
             env.noteResult(if (p.show) "show" else "select", p.pos);

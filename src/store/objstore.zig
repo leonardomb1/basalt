@@ -374,6 +374,27 @@ pub fn find(url: []const u8) ?*const Provider {
     return null;
 }
 
+pub const EncodeSlash = enum { keep_slash, encode_slash };
+
+/// URI encoding as both providers sign it (SigV4's, and Shared Key's encoded
+/// path): unreserved characters pass, the rest become uppercase %XX. A path keeps
+/// '/'; a query value encodes it too.
+pub fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
+    const hex = "0123456789ABCDEF";
+    var out = std.array_list.Managed(u8).init(arena);
+    for (s) |c| {
+        const unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
+        if (unreserved or (slash == .keep_slash and c == '/')) {
+            try out.append(c);
+        } else {
+            try out.append('%');
+            try out.append(hex[c >> 4]);
+            try out.append(hex[c & 0xF]);
+        }
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn isUrl(url: []const u8) bool {
     return find(url) != null;
 }

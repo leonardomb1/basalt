@@ -780,6 +780,64 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   catalogrt doris "$DB" it
 fi
 
+# Delta and Iceberg tables in an object store: found by listing `_delta_log/` and
+# `metadata/`, a Hive-escaped timestamp partition (a space and a literal `%3A` in
+# the object's name), the Iceberg paths rebased onto the copy, lanes over the
+# files the log sized. Each answer must be the one the same table gives on disk.
+lakebuild() { # the tables under $out/lake/, made once
+  [ -d "$out/lake" ] && return 0
+  local d="$out/lake/delta" p="ts=2026-01-01 00%3A00%3A00" q="ts=2026-01-02 00%3A00%3A00"
+  mkdir -p "$d/_delta_log" "$d/$p" "$d/$q"
+  brun run -c "LOAD INTO '$d/a.parquet' AS SELECT id, name FROM 'tests/integration/seed.csv' WHERE id = 1;" &&
+    brun run -c "LOAD INTO '$d/$p/b.parquet' AS SELECT id, name FROM 'tests/integration/seed.csv' WHERE id = 2;" &&
+    brun run -c "LOAD INTO '$d/$q/c.parquet' AS SELECT id, name FROM 'tests/integration/seed.csv' WHERE id = 3;" || return 1
+  local schema='{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"ts\",\"type\":\"timestamp\",\"nullable\":true,\"metadata\":{}}]}'
+  cat >"$d/_delta_log/00000000000000000000.json" <<J
+{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+{"metaData":{"id":"it","format":{"provider":"parquet","options":{}},"schemaString":"$schema","partitionColumns":["ts"],"configuration":{},"createdTime":0}}
+{"add":{"path":"a.parquet","partitionValues":{"ts":null},"size":$(stat -c %s "$d/a.parquet"),"modificationTime":0,"dataChange":true}}
+{"add":{"path":"ts=2026-01-01%2000%253A00%253A00/b.parquet","partitionValues":{"ts":"2026-01-01 00:00:00"},"size":$(stat -c %s "$d/$p/b.parquet"),"modificationTime":0,"dataChange":true}}
+J
+  cat >"$d/_delta_log/00000000000000000001.json" <<J
+{"remove":{"path":"a.parquet","deletionTimestamp":0,"dataChange":true}}
+{"add":{"path":"ts=2026-01-02%2000%253A00%253A00/c.parquet","partitionValues":{"ts":"2026-01-02 00:00:00"},"modificationTime":0,"dataChange":true}}
+J
+  cp -r src/format/testdata/iceberg_py "$out/lake/ice"
+}
+
+lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/`
+  local r="$2" j
+  printf 'id,name\n2,"beta, gamma"\n3,delta\n' >"$out/lake_names.csv"
+  printf 'n\n2\n' >"$out/lake_v0.csv"
+  brun run -c "LOAD INTO '$out/lake_local_delta.csv' AS SELECT id, name, ts FROM '$out/lake/delta/' ORDER BY id;" &&
+    brun run -c "LOAD INTO '$out/lake_local_ice.csv' AS SELECT * FROM '$out/lake/ice/' ORDER BY id;" || {
+    report "$1-lake (local read error)" bad
+    return
+  }
+  for j in 1 4; do
+    if brun run -j $j -c "LOAD INTO '$out/lake_$1_names_$j.csv' AS SELECT id, name FROM '${r}delta/' ORDER BY id;"; then
+      check "$1-delta-j$j" "$out/lake_$1_names_$j.csv" "$out/lake_names.csv"
+    else
+      report "$1-delta-j$j (run error)" bad
+    fi
+    if brun run -j $j -c "LOAD INTO '$out/lake_$1_ice_$j.csv' AS SELECT * FROM '${r}ice/' ORDER BY id;"; then
+      check "$1-iceberg-j$j" "$out/lake_$1_ice_$j.csv" "$out/lake_local_ice.csv"
+    else
+      report "$1-iceberg-j$j (run error)" bad
+    fi
+  done
+  if brun run -c "LOAD INTO '$out/lake_$1_ts.csv' AS SELECT id, name, ts FROM '${r}delta/' ORDER BY id;"; then
+    check "$1-delta-partitions" "$out/lake_$1_ts.csv" "$out/lake_local_delta.csv"
+  else
+    report "$1-delta-partitions (run error)" bad
+  fi
+  if brun run -c "LOAD INTO '$out/lake_$1_v0.csv' AS SELECT COUNT(*) AS n FROM '${r}delta/' WITH (version = 0);"; then
+    check "$1-delta-version" "$out/lake_$1_v0.csv" "$out/lake_v0.csv"
+  else
+    report "$1-delta-version (run error)" bad
+  fi
+}
+
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —
 # Azurite implements no DFS endpoint and no hierarchical namespace. Credentials
 # are Azurite's published well-known devstore pair, not a secret.
@@ -869,6 +927,14 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   else
     report "azure-empty-prefix (wrong message)" bad
     tail -3 "$out/empty.log"
+  fi
+
+  # Delta and Iceberg tables, put by az with the names as they are on disk.
+  if lakebuild && az storage blob upload-batch --only-show-errors --overwrite -d basalt-it --destination-path lake -s "$out/lake" \
+       --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$AZURE_STORAGE_KEY;BlobEndpoint=$AZURE_BLOB_ENDPOINT/devstoreaccount1;" >/dev/null; then
+    lakert azure "az://devstoreaccount1/basalt-it/lake/"
+  else
+    report "azure-lake (upload error)" bad
   fi
 fi
 
@@ -1000,6 +1066,23 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
     check s3-xlsx-write "$out/s3_xlsx.csv" tests/integration/expected.csv
   else
     report "s3-xlsx-write (run error)" bad
+  fi
+
+  # Delta and Iceberg tables, put by curl under their names percent-encoded once.
+  put_ok=1
+  if lakebuild; then
+    while IFS= read -r f; do
+      key=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "lake/${f#"$out/lake/"}")
+      curl -sf --aws-sigv4 "aws:amz:us-east-1:s3" --user "minioadmin:minioadmin" \
+        -T "$f" "$AWS_ENDPOINT_URL/basalt-it/$key" >/dev/null || put_ok=0
+    done < <(find "$out/lake" -type f)
+  else
+    put_ok=0
+  fi
+  if [ "$put_ok" = 1 ]; then
+    lakert s3 "s3://basalt-it/lake/"
+  else
+    report "s3-lake (upload error)" bad
   fi
 fi
 

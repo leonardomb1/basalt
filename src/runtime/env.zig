@@ -254,6 +254,10 @@ pub const FolderRead = struct {
     table: ?*const lake.Resolved = null,
 };
 
+/// A folder read resolved while planning, kept until its source opens: planning
+/// resolves each read several times, and a lake table's resolution replays its log.
+pub const FolderMemo = struct { path: []const u8, want: ?analyze.FileFormat, at: lake.At, read: FolderRead };
+
 pub const Env = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -295,7 +299,7 @@ pub const Env = struct {
     pq_reader: ?*pqdecode.Reader = null,
     pq_folder: ?*pqdecode.Folder = null,
     sort_threads: usize = 1,
-    folder_memo: ?struct { path: []const u8, want: ?analyze.FileFormat, at: lake.At, read: FolderRead } = null,
+    folder_memo: std.ArrayListUnmanaged(FolderMemo) = .empty,
     sink_name: []const u8 = "",
     last_target: []const u8 = "",
     wrote_sink: bool = false,
@@ -314,6 +318,17 @@ pub const Env = struct {
     space: ?Space = null,
     op_memory: usize = 2 << 30,
     stdin_free: bool = false,
+
+    /// Forgets `path`'s resolutions as its source opens, so a later read of it, after
+    /// a statement may have written there, lists it again.
+    pub fn forgetFolder(self: *Env, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.folder_memo.items.len) {
+            if (std.mem.eql(u8, self.folder_memo.items[i].path, path)) {
+                _ = self.folder_memo.swapRemove(i);
+            } else i += 1;
+        }
+    }
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {
         var info = self.result;

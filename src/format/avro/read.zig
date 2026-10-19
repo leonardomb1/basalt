@@ -12,8 +12,10 @@
 //! refused by name.
 //!
 //! Every count and length comes from an untrusted file, so each is checked against
-//! the bytes left, nesting is bounded, and the values a block may yield are capped
-//! by its size: a corrupt file is an error, never a crash or a runaway allocation.
+//! the bytes left, nesting is bounded, a block may decode to at most 64 times its
+//! stored size, and the values a block may yield are capped by its decoded size:
+//! a corrupt file is an error, never a crash or a runaway allocation, and what it
+//! decodes to is bounded by its own size.
 
 const std = @import("std");
 const codecs = @import("../compress/codecs.zig");
@@ -23,6 +25,7 @@ pub const Error = error{ AvroCorrupt, AvroBadSchema, AvroUnsupportedCodec } || s
 
 const max_depth = 64;
 const max_block = 256 << 20;
+const max_ratio = 64;
 
 pub const Schema = union(enum) {
     null,
@@ -158,15 +161,16 @@ pub fn codecSupported(codec: []const u8) bool {
 
 fn decompress(arena: std.mem.Allocator, codec: []const u8, raw: []const u8) Error![]const u8 {
     if (std.mem.eql(u8, codec, "null")) return raw;
+    const cap = @min(max_block, raw.len *| max_ratio +| 64);
     if (std.mem.eql(u8, codec, "deflate"))
-        return codecs.inflateAlloc(arena, raw, .raw, max_block) catch |e| return if (e == error.OutOfMemory) Error.OutOfMemory else Error.AvroCorrupt;
+        return codecs.inflateAlloc(arena, raw, .raw, cap) catch |e| return if (e == error.OutOfMemory) Error.OutOfMemory else Error.AvroCorrupt;
     if (std.mem.eql(u8, codec, "zstandard"))
-        return codecs.zstdAlloc(arena, raw, max_block) catch |e| return if (e == error.OutOfMemory) Error.OutOfMemory else Error.AvroCorrupt;
+        return codecs.zstdAlloc(arena, raw, cap) catch |e| return if (e == error.OutOfMemory) Error.OutOfMemory else Error.AvroCorrupt;
     if (std.mem.eql(u8, codec, "snappy")) {
         if (raw.len < 4) return Error.AvroCorrupt;
         const body = raw[0 .. raw.len - 4];
         const n = codecs.snappyLen(body) orelse return Error.AvroCorrupt;
-        if (n > max_block or n > body.len *| 64 +| 64) return Error.AvroCorrupt;
+        if (n > cap) return Error.AvroCorrupt;
         const out = codecs.decompress(arena, .snappy, body, n) catch |e| return if (e == error.OutOfMemory) Error.OutOfMemory else Error.AvroCorrupt;
         if (std.hash.Crc32.hash(out) != std.mem.readInt(u32, raw[raw.len - 4 ..][0..4], .big)) return Error.AvroCorrupt;
         return out;
@@ -499,6 +503,13 @@ test "corruption is caught: a snappy CRC, a sync marker, a codec basalt does not
     const c = try Container.open(a, bz);
     try testing.expectEqualStrings("bzip2", c.codec);
     try testing.expectError(Error.AvroUnsupportedCodec, c.records(a));
+
+    const zeros = try a.alloc([]const u8, 200_000);
+    @memset(zeros, "\x00");
+    const bomb = try testwrite.container(a, "\"long\"", .deflate, zeros, zeros.len, &.{});
+    try testing.expect(bomb.len * 64 < zeros.len);
+    try testing.expectError(Error.AvroCorrupt, (try Container.open(a, bomb)).records(a));
+    try testing.expectEqual(zeros.len, (try (try Container.open(a, try testwrite.container(a, "\"long\"", .null, zeros, zeros.len, &.{}))).records(a)).len);
 
     const ok = try testwrite.container(a, entry_schema, .deflate, &recs, 1, &.{});
     try testing.expectEqual(@as(usize, 1), (try (try Container.open(a, ok)).records(a)).len);

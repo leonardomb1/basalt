@@ -163,7 +163,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     if (bucket.len == 0 or key.len == 0) return Error.S3BadUrl;
 
     const region = regionFromEnv(arena);
-    const enc_key = try uriEncode(arena, key, .keep_slash);
+    const enc_key = try objstore.uriEncode(arena, key, .keep_slash);
     const base = try bucketBase(arena, bucket, region, endpoint);
     const sep: []const u8 = if (std.mem.endsWith(u8, base.uri_path, "/")) "" else "/";
     return .{
@@ -197,26 +197,6 @@ pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
     return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
     });
-}
-
-const EncodeSlash = enum { keep_slash, encode_slash };
-
-/// SigV4 URI encoding: unreserved characters pass, the rest become uppercase %XX.
-/// Canonical URIs keep '/'; query values encode it too.
-fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
-    const hex = "0123456789ABCDEF";
-    var out = std.array_list.Managed(u8).init(arena);
-    for (s) |c| {
-        const unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
-        if (unreserved or (slash == .keep_slash and c == '/')) {
-            try out.append(c);
-        } else {
-            try out.append('%');
-            try out.append(hex[c >> 4]);
-            try out.append(hex[c & 0xF]);
-        }
-    }
-    return out.toOwnedSlice();
 }
 
 pub fn payloadHash(arena: std.mem.Allocator, payload: []const u8) ![]const u8 {
@@ -429,9 +409,9 @@ const ListPage = struct {
     fn page(c: ListPage, token: []const u8) ![]const u8 {
         var q = std.array_list.Managed([]const u8).init(c.arena);
         if (token.len > 0)
-            try q.append(try std.fmt.allocPrint(c.arena, "continuation-token={s}", .{try uriEncode(c.arena, token, .encode_slash)}));
+            try q.append(try std.fmt.allocPrint(c.arena, "continuation-token={s}", .{try objstore.uriEncode(c.arena, token, .encode_slash)}));
         try q.append("list-type=2");
-        try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try uriEncode(c.arena, c.prefix, .encode_slash)}));
+        try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try objstore.uriEncode(c.arena, c.prefix, .encode_slash)}));
 
         var url = std.array_list.Managed(u8).init(c.arena);
         try url.appendSlice(c.base_url);
@@ -581,7 +561,7 @@ pub const MultipartWriter = struct {
                     const ids = try xml.elementTexts(w.arena, r.body, "UploadId");
                     if (ids.len == 0) return w.failed(r);
                     w.upload_id = ids[0];
-                    w.upload_id_enc = try uriEncode(w.arena, w.upload_id.?, .encode_slash);
+                    w.upload_id_enc = try objstore.uriEncode(w.arena, w.upload_id.?, .encode_slash);
                     return .done;
                 }
                 if (try w.createBucketIfMissing(r.code, r.body)) return .again;
@@ -825,7 +805,7 @@ test "sigv4: AWS example 2 — PUT object with payload hash and extra headers" {
     const a = ar.allocator();
     const ph = try payloadHash(a, "Welcome to Amazon S3.");
     try std.testing.expectEqualStrings("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072", ph);
-    try std.testing.expectEqualStrings("test%24file.text", try uriEncode(a, "test$file.text", .keep_slash));
+    try std.testing.expectEqualStrings("test%24file.text", try objstore.uriEncode(a, "test$file.text", .keep_slash));
     const h = try authHeader(a, example_access, example_secret, .{
         .method = "PUT",
         .uri_path = "/test%24file.text",
