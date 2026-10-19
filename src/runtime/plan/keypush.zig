@@ -123,7 +123,7 @@ pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
     };
     const path = rd.form.path;
     if (ftp.isUrl(path)) return false;
-    if (!lake.isTablePath(path, .iceberg)) return pqdecode.Reader.isPath(path);
+    if (!lake.isTablePath(path)) return pqdecode.Reader.isPath(path);
     const fr = (connect.resolveFolder(env, path, stages[0].hints) catch return false) orelse return false;
     return fr.kind == .parquet;
 }

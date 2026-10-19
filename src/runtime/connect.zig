@@ -184,11 +184,9 @@ pub fn isRecordRead(rd: ast.Read) bool {
     return rd.form == .builtin and table_builtins.of(rd.form.builtin).mode != null;
 }
 
-/// A folder read, or one of a `.metadata.json` file, which `resolveFolder` reads as
-/// an Iceberg table under `format = 'iceberg'`.
 pub fn isFolderRead(rd: ast.Read) bool {
     if (!std.mem.eql(u8, rd.connector, "csv")) return false;
-    return rd.form == .path and lake.isTablePath(rd.form.path, .iceberg);
+    return rd.form == .path and lake.isTablePath(rd.form.path);
 }
 
 /// One Parquet file, local or remote; `parquetSplit` decides whether it divides.

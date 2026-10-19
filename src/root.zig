@@ -46,9 +46,6 @@ pub const thrift = @import("format/parquet/thrift.zig");
 pub const parquet = @import("format/parquet/footer.zig");
 pub const pqdecode = @import("format/parquet/read.zig");
 pub const lake = @import("format/lake/table.zig");
-pub const avro = @import("format/avro/read.zig");
-/// The test-only Avro writer, for the end-to-end tests; absent outside a test build.
-pub const avrowrite = if (@import("builtin").is_test) @import("format/avro/testwrite.zig") else struct {};
 pub const arrowread = @import("format/arrow/read.zig");
 pub const xlsx = @import("format/xlsx/read.zig");
 pub const xml = @import("format/xml/token.zig");

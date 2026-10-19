@@ -5,9 +5,11 @@
 //! Parquet `Layout`. Everything a Parquet folder does then applies: lanes,
 //! projection, row-group statistics and ranged reads.
 //!
-//! Each format reads its own log (`delta.zig`, `iceberg.zig`); what they share is
+//! The format reads its own log (`delta.zig`); what a table read needs beside it is
 //! here: how a path in a log maps to one basalt reads, how a partition value's text
-//! becomes a typed value, and reading a log file whole wherever it lives.
+//! becomes a typed value, and reading a log file whole wherever it lives. A folder
+//! holding an Iceberg table's metadata is refused: basalt does not read Iceberg yet,
+//! and read plain the folder would return the rows of files the table deleted.
 
 const std = @import("std");
 const Bytes = @import("../bytes.zig").Bytes;
@@ -16,7 +18,6 @@ const Value = @import("../../exec/value.zig").Value;
 const azure = @import("../../store/azure.zig");
 const cast = @import("../../exec/eval/cast.zig");
 const delta = @import("delta.zig");
-const iceberg = @import("iceberg.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const formats = @import("../formats.zig");
@@ -26,12 +27,10 @@ const testing = std.testing;
 
 pub const Kind = enum {
     delta,
-    iceberg,
 
     pub fn label(self: Kind) []const u8 {
         return switch (self) {
             .delta => "Delta",
-            .iceberg => "Iceberg",
         };
     }
 
@@ -41,18 +40,16 @@ pub const Kind = enum {
     }
 };
 
-/// What a read is pinned to: a Delta commit `version`, an Iceberg `snapshot_id`;
-/// neither reads the newest.
+/// What a read is pinned to: a Delta commit `version`; none reads the newest.
 pub const At = struct {
     version: ?u64 = null,
-    snapshot_id: ?i64 = null,
 
     pub fn eql(a: At, b: At) bool {
-        return a.version == b.version and a.snapshot_id == b.snapshot_id;
+        return a.version == b.version;
     }
 
     pub fn pinned(self: At) bool {
-        return self.version != null or self.snapshot_id != null;
+        return self.version != null;
     }
 };
 
@@ -69,20 +66,41 @@ pub const Error = error{LakeTableRefused};
 /// How deep a table's schema may nest structs; `collectLeaves` reads no deeper.
 pub const max_depth = 64;
 
-/// A table found in a folder; `listed` is its log's (or metadata's) listing when
-/// finding it took one, which resolving it then reads rather than listing again.
+/// A table found in a folder; `listed` is its log's listing when finding it took
+/// one, which resolving it then reads rather than listing again.
 pub const Found = struct { kind: Kind, listed: ?[]const []const u8 = null };
 
 /// The table format `root` (a folder path) holds, or null for a plain folder. A
 /// listing that fails for any reason but the log's absence fails the read: reading
 /// the folder plain instead would return the removed files' rows. Remotely a plain
-/// folder costs a listing of each absent prefix, one request apiece.
-/// A folder holding both a Delta log and Iceberg metadata (Delta UniForm) is read
-/// as Delta.
+/// folder costs a listing of each absent prefix, one request apiece. A folder
+/// holding both a Delta log and Iceberg metadata (Delta UniForm) is read as Delta;
+/// one holding Iceberg metadata alone is refused.
 pub fn detect(arena: std.mem.Allocator, root: []const u8) !?Found {
     if (try holdsDelta(arena, root)) |listed| return .{ .kind = .delta, .listed = listed.items };
-    if (try iceberg.holds(arena, root)) |listed| return .{ .kind = .iceberg, .listed = listed.items };
+    if (try holdsIceberg(arena, root))
+        return refuse("`{s}` holds an Iceberg table (metadata/*.metadata.json), which basalt does not read yet; read as a plain folder it would return the rows of files the table deleted, so it is refused (`WITH (format = 'parquet')` reads its files plain)", .{root});
     return null;
+}
+
+/// Whether `root` holds an Iceberg table's metadata files.
+fn holdsIceberg(arena: std.mem.Allocator, root: []const u8) !bool {
+    if (isHttp(root)) return false;
+    const meta = try std.mem.concat(arena, u8, &.{ root, "metadata/" });
+    if (std.mem.indexOf(u8, root, "://") != null) {
+        const got = folder.listRaw(arena, meta) catch |e| return if (absent(e)) false else e;
+        for (got) |p| if (isIcebergMetadata(p)) return true;
+        return false;
+    }
+    var dir = std.fs.cwd().openDir(meta, .{ .iterate = true }) catch |e| return if (absent(e)) false else e;
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |e| if (isIcebergMetadata(e.name)) return true;
+    return false;
+}
+
+fn isIcebergMetadata(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".metadata.json") or std.mem.endsWith(u8, name, ".metadata.json.gz");
 }
 
 /// A listing, or none when a local folder was only opened.
@@ -115,25 +133,16 @@ pub fn absent(e: anyerror) bool {
         e == error.HttpNotFound or e == s3.Error.S3KeyNotFound or e == azure.Error.AzureBlobNotFound;
 }
 
-/// Whether `path` is read as a lake table: a folder, or with `format = 'iceberg'`
-/// an Iceberg metadata file.
-pub fn isTablePath(path: []const u8, want: ?Kind) bool {
-    return folder.isFolder(path) or (want == .iceberg and iceberg.isMetadataPath(path));
+/// Whether `path` may be a lake table: a folder.
+pub fn isTablePath(path: []const u8) bool {
+    return folder.isFolder(path);
 }
 
-/// `root` read as a `kind` table: a folder, or an Iceberg metadata file; `listed`
-/// what `detect` listed, if it did.
+/// `root` read as a `kind` table; `listed` what `detect` listed, if it did.
 pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At, listed: ?[]const []const u8) !*const Resolved {
-    switch (kind) {
-        .delta => {
-            if (at.snapshot_id != null) return refuse("`snapshot_id` pins an Iceberg table to a snapshot; `{s}` is a Delta table, pinned with `version`", .{root});
-            return delta.resolve(arena, root, at, listed);
-        },
-        .iceberg => {
-            if (at.version != null) return refuse("`version` pins a Delta table to a commit; `{s}` is an Iceberg table, pinned with `snapshot_id`", .{root});
-            return iceberg.resolve(arena, root, !folder.isFolder(root), at, listed);
-        },
-    }
+    return switch (kind) {
+        .delta => delta.resolve(arena, root, at, listed),
+    };
 }
 
 pub fn isHttp(path: []const u8) bool {
@@ -209,10 +218,9 @@ pub fn mapPath(arena: std.mem.Allocator, root: []const u8, p: []const u8) ![]con
     return std.mem.concat(arena, u8, &.{ root, p });
 }
 
-/// `version` or `snapshot_id` on a folder that is no table: refused, as reading it
-/// plain would ignore the version asked for.
-pub fn notPinnable(root: []const u8, at: At) anyerror {
-    if (at.snapshot_id != null) return refuse("`snapshot_id` pins an Iceberg table to a snapshot; folder `{s}` holds no metadata/*.metadata.json", .{root});
+/// `version` on a folder that is no table: refused, as reading it plain would
+/// ignore the version asked for.
+pub fn notPinnable(root: []const u8) anyerror {
     return refuse("`version` pins a Delta table to a commit; folder `{s}` holds no _delta_log/", .{root});
 }
 
@@ -280,5 +288,4 @@ test "partitionValue: every type, empty and null text as NULL, both timestamp fo
 
 test {
     _ = @import("delta.zig");
-    _ = @import("iceberg.zig");
 }

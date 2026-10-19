@@ -281,58 +281,6 @@ pub fn zstdInto(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void
     return zstdDecode(arena, src, out);
 }
 
-/// A deflate stream (raw, gzip or zlib) whose decoded length nothing records,
-/// decoded whole; one decoding to `cap` bytes or more is refused as corrupt.
-pub fn inflateAlloc(arena: std.mem.Allocator, src: []const u8, container: std.compress.flate.Container, cap: usize) Error![]u8 {
-    const win = try arena.alloc(u8, std.compress.flate.max_window_len);
-    defer arena.free(win);
-    var in: std.Io.Reader = .fixed(src);
-    var d = std.compress.flate.Decompress.init(&in, container, win);
-    return d.reader.allocRemaining(arena, .limited(cap)) catch |e| switch (e) {
-        error.OutOfMemory => Error.OutOfMemory,
-        else => Error.CorruptCompressedData,
-    };
-}
-
-/// `inflateAlloc` for a zstd frame, which need not record its decoded length.
-pub fn zstdAlloc(arena: std.mem.Allocator, src: []const u8, cap: usize) Error![]u8 {
-    const win = try arena.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
-    defer arena.free(win);
-    var in: std.Io.Reader = .fixed(src);
-    var d = std.compress.zstd.Decompress.init(&in, win, .{});
-    return d.reader.allocRemaining(arena, .limited(cap)) catch |e| switch (e) {
-        error.OutOfMemory => Error.OutOfMemory,
-        else => Error.CorruptCompressedData,
-    };
-}
-
-/// The decoded length a raw Snappy block declares in its leading varint.
-pub fn snappyLen(src: []const u8) ?usize {
-    var n: usize = 0;
-    var shift: u6 = 0;
-    for (src) |b| {
-        n |= @as(usize, b & 0x7F) << shift;
-        if (b & 0x80 == 0) return n;
-        shift += 7;
-        if (shift > 28) return null;
-    }
-    return null;
-}
-
-test "inflateAlloc and zstdAlloc decode streams of unrecorded length, refusing one past the cap" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings(ref_payload, try inflateAlloc(a, ref_gzip, .gzip, 1 << 20));
-    try std.testing.expectError(Error.CorruptCompressedData, inflateAlloc(a, ref_gzip, .gzip, 100));
-    try std.testing.expectError(Error.CorruptCompressedData, inflateAlloc(a, ref_gzip[0..40], .gzip, 1 << 20));
-    try std.testing.expectEqualStrings(ref_payload, try zstdAlloc(a, ref_zstd, 1 << 20));
-    try std.testing.expectError(Error.CorruptCompressedData, zstdAlloc(a, ref_zstd, 100));
-    const sn = try compress(a, .snappy, ref_payload);
-    try std.testing.expectEqual(@as(?usize, ref_payload.len), snappyLen(sn));
-    try std.testing.expectEqual(@as(?usize, null), snappyLen("\xff\xff"));
-}
-
 fn readLenExt(src: []const u8, i: *usize) Error!usize {
     var n: usize = 0;
     while (true) {

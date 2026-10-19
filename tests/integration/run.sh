@@ -11,7 +11,7 @@
 # stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
 # kernel needs python3; azure needs the `az` CLI and s3 python3, to put the Delta
-# and Iceberg tables)
+# table)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
@@ -781,11 +781,10 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   catalogrt doris "$DB" it
 fi
 
-# Delta and Iceberg tables in an object store: found by listing `_delta_log/` and
-# `metadata/`, a Hive-escaped timestamp partition (a space and a literal `%3A` in
-# the object's name), the Iceberg paths rebased onto the copy, lanes over the
-# files the log sized. Each answer must be the one the same table gives on disk.
-lakebuild() { # the tables under $out/lake/, made once
+# A Delta table in an object store: found by listing `_delta_log/`, a Hive-escaped
+# timestamp partition (a space and a literal `%3A` in the object's name), lanes over
+# the files the log sized. Each answer must be the one the same table gives on disk.
+lakebuild() { # the table under $out/lake/, made once
   [ -d "$out/lake" ] && return 0
   local d="$out/lake/delta" p="ts=2026-01-01 00%3A00%3A00" q="ts=2026-01-02 00%3A00%3A00"
   mkdir -p "$d/_delta_log" "$d/$p" "$d/$q"
@@ -803,15 +802,13 @@ J
 {"remove":{"path":"a.parquet","deletionTimestamp":0,"dataChange":true}}
 {"add":{"path":"ts=2026-01-02%2000%253A00%253A00/c.parquet","partitionValues":{"ts":"2026-01-02 00:00:00"},"modificationTime":0,"dataChange":true}}
 J
-  cp -r src/format/testdata/iceberg_py "$out/lake/ice"
 }
 
 lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/`
   local r="$2" j
   printf 'id,name\n2,"beta, gamma"\n3,delta\n' >"$out/lake_names.csv"
   printf 'n\n2\n' >"$out/lake_v0.csv"
-  brun run -c "LOAD INTO '$out/lake_local_delta.csv' AS SELECT id, name, ts FROM '$out/lake/delta/' ORDER BY id;" &&
-    brun run -c "LOAD INTO '$out/lake_local_ice.csv' AS SELECT * FROM '$out/lake/ice/' ORDER BY id;" || {
+  brun run -c "LOAD INTO '$out/lake_local_delta.csv' AS SELECT id, name, ts FROM '$out/lake/delta/' ORDER BY id;" || {
     report "$1-lake (local read error)" bad
     return
   }
@@ -820,11 +817,6 @@ lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/
       check "$1-delta-j$j" "$out/lake_$1_names_$j.csv" "$out/lake_names.csv"
     else
       report "$1-delta-j$j (run error)" bad
-    fi
-    if brun run -j $j -c "LOAD INTO '$out/lake_$1_ice_$j.csv' AS SELECT * FROM '${r}ice/' ORDER BY id;"; then
-      check "$1-iceberg-j$j" "$out/lake_$1_ice_$j.csv" "$out/lake_local_ice.csv"
-    else
-      report "$1-iceberg-j$j (run error)" bad
     fi
   done
   if brun run -c "LOAD INTO '$out/lake_$1_ts.csv' AS SELECT id, name, ts FROM '${r}delta/' ORDER BY id;"; then
@@ -930,7 +922,7 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
     tail -3 "$out/empty.log"
   fi
 
-  # Delta and Iceberg tables, put by az with the names as they are on disk.
+  # The Delta table, put by az with the names as they are on disk.
   if lakebuild && az storage blob upload-batch --only-show-errors --overwrite -d basalt-it --destination-path lake -s "$out/lake" \
        --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$AZURE_STORAGE_KEY;BlobEndpoint=$AZURE_BLOB_ENDPOINT/devstoreaccount1;" >/dev/null; then
     lakert azure "az://devstoreaccount1/basalt-it/lake/"
@@ -1069,7 +1061,7 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
     report "s3-xlsx-write (run error)" bad
   fi
 
-  # Delta and Iceberg tables, put by curl under their names percent-encoded once.
+  # The Delta table, put by curl under their names percent-encoded once.
   put_ok=1
   if lakebuild; then
     while IFS= read -r f; do

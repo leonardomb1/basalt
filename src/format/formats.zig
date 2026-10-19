@@ -9,7 +9,7 @@
 const std = @import("std");
 const stream = @import("stream.zig");
 
-pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, delta, iceberg };
+pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, delta };
 
 /// How a read splits across lanes: by row group anywhere, by byte range of a local
 /// uncompressed file, or not at all.
@@ -145,20 +145,6 @@ pub const table = [_]Format{
         .lanes = .row_groups,
         .read_keys = &.{ "format", "version" },
         .write_refused = "basalt reads Delta tables; it does not write them",
-        .write = .{},
-        .write_keys = &.{"format"},
-    },
-    .{
-        .tag = .iceberg,
-        .label = "Iceberg",
-        .read_what = "an Iceberg table read",
-        .names = &.{"iceberg"},
-        .exts = &.{},
-        .compressed_read_refused = "an Iceberg table is a folder of Parquet files and its metadata, read from its root folder or its metadata file",
-        .archive_refused = "an Iceberg table is a folder of Parquet files and its metadata, read from its root folder; extract it first",
-        .lanes = .row_groups,
-        .read_keys = &.{ "format", "snapshot_id" },
-        .write_refused = "basalt reads Iceberg tables; it does not write them",
         .write = .{},
         .write_keys = &.{"format"},
     },
@@ -337,10 +323,9 @@ test "formats: tags index the table, names and extensions resolve, lists are gen
     try std.testing.expect(ofPath("x.yaml") == null);
     try std.testing.expect(inFolder(of(.csv), "d/a.tsv.zst"));
     try std.testing.expect(!inFolder(of(.csv), "d/a.json"));
-    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta, iceberg", names_list);
+    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta", names_list);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "Delta") == null);
-    try std.testing.expect(of(.delta).write_refused != null and of(.iceberg).write_refused != null);
-    try std.testing.expect(std.mem.indexOf(u8, handled_list, "Iceberg") == null);
+    try std.testing.expect(of(.delta).write_refused != null);
     try std.testing.expectEqual(FileFormat.records, byName("Records").?.tag);
     try std.testing.expect(readRefused(.records) != null and readRefused(.csv) == null);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "records") == null);

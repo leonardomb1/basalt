@@ -105,7 +105,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
 
     var files: []const []const u8 = &.{};
     var root: ?[]const u8 = null;
-    if (lake.isTablePath(path, .iceberg)) {
+    if (lake.isTablePath(path)) {
         const fr = (try connect_mod.resolveFolder(env, path, hints)) orelse return null;
         if (fr.kind != .parquet) return null;
         if (fr.table) |t| return tableSplit(env, t.layout, path, push_stages, opts.lanes());

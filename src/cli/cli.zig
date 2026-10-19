@@ -193,8 +193,6 @@ fn usage(w: anytype) !void {
         \\             STRING or BYTES column a row verbatim (fixed-width files)
         \\  delta      a folder holding _delta_log/ reads as the Delta table: its live
         \\             files, typed by its schema; WITH (version = N) an older one
-        \\  iceberg    a folder holding metadata/*.metadata.json reads as the Iceberg
-        \\             table's current snapshot; WITH (snapshot_id = N) an older one
         \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),
         \\             piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;

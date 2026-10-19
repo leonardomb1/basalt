@@ -80,8 +80,7 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     return fail(diag, "unknown format `{s}` (" ++ formats.names_list ++ ")", .{s});
 }
 
-/// What a lake table read is pinned to: `version = N`, a Delta commit number, or
-/// `snapshot_id = N`, an Iceberg snapshot's id.
+/// What a lake table read is pinned to: `version = N`, a Delta commit number.
 pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     var at = lake.At{};
     for (hints) |h| {
@@ -94,8 +93,6 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
             const v = n orelse -1;
             if (v < 0) return fail(diag, "`version` is a Delta table's commit number, a whole number from 0", .{});
             at.version = @intCast(v);
-        } else if (std.mem.eql(u8, h.key, "snapshot_id")) {
-            at.snapshot_id = n orelse return fail(diag, "`snapshot_id` is an Iceberg snapshot's id, a whole number", .{});
         }
     }
     return at;
@@ -195,7 +192,6 @@ pub const WriteOptions = union(FileFormat) {
     xml: xmlwrite.Names,
     records: recordswrite.Options,
     delta: void,
-    iceberg: void,
 };
 
 pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
@@ -214,7 +210,6 @@ pub fn writeOptions(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!Wr
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
         .delta => .delta,
-        .iceberg => .iceberg,
     };
 }
 
@@ -312,7 +307,6 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (std.mem.endsWith(u8, path, "/")) return null;
     if (explicit == .delta) return "a Delta table is read from its root folder: end the path with `/`";
-    if (explicit == .iceberg) return if (lake.isTablePath(path, .iceberg)) null else "an Iceberg table is read from its root folder (end the path with `/`) or from a metadata file (`.metadata.json`)";
 
     if (csv.splitArchive(path) != null) return null;
 
@@ -373,11 +367,11 @@ pub fn laneHints(st: ast.Stage) bool {
             var d = Diag{};
             const f = (formatFromHints(st.hints, &d) catch return false) orelse return false;
             const p = st.node.read.form.path;
-            const in_folder = (folder.isFolder(p) and f == .parquet) or (lake.Kind.of(f) != null and lake.isTablePath(p, lake.Kind.of(f)));
+            const in_folder = (folder.isFolder(p) and f == .parquet) or (lake.Kind.of(f) != null and lake.isTablePath(p));
             if (!in_folder and f != readFormat(p, null)) return false;
             continue;
         }
-        if ((std.mem.eql(u8, h.key, "version") or std.mem.eql(u8, h.key, "snapshot_id")) and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path, .iceberg)) continue;
+        if (std.mem.eql(u8, h.key, "version") and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path)) continue;
         return false;
     }
     return true;
@@ -491,11 +485,11 @@ pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const a
     const explicit = formatFromHints(hints, &d) catch return null;
     const named = lake.Kind.of(explicit);
     if (explicit != null and named == null) return null;
-    if (!lake.isTablePath(path, named) or std.mem.indexOf(u8, path, "://") != null) return null;
+    if (!lake.isTablePath(path) or std.mem.indexOf(u8, path, "://") != null) return null;
     std.fs.cwd().access(path, .{}) catch return null;
     const at = lakeAt(hints, &d) catch return null;
-    const found: lake.Found = if (named) |k| .{ .kind = k } else (lake.detect(arena, path) catch return null) orelse
-        (if (at.pinned()) return lake.notPinnable(path, at) else return null);
+    const found: lake.Found = if (named) |k| .{ .kind = k } else (lake.detect(arena, path) catch |e| return if (e == lake.Error.LakeTableRefused) e else null) orelse
+        (if (at.pinned()) return lake.notPinnable(path) else return null);
     return lake.resolve(arena, path, found.kind, at, found.listed) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
 }
 

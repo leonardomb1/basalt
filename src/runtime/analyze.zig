@@ -1904,7 +1904,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
         std.mem.eql(u8, connector, "csv") and (formatFromHints(lead.hints, diag) catch null) == null;
     for (lead.hints) |h| {
         if (containsName(kind.keys, h.key) or containsName(&any_read_keys, h.key)) continue;
-        if (plain_folder and (std.mem.eql(u8, h.key, "version") or std.mem.eql(u8, h.key, "snapshot_id"))) continue;
+        if (plain_folder and std.mem.eql(u8, h.key, "version")) continue;
         if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
         const e = if (containsName(&join_hint_keys, h.key))
             fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})

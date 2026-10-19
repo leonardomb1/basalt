@@ -1,20 +1,16 @@
-//! A table whose own schema governs its Parquet files, as a Delta or Iceberg table's
-//! does: the files are the table's live ones, each read by column name and fitted
-//! to the table. A column a file lacks reads as null (a column added since it was
-//! written), a partition column is the file's constant from the table's log and wins
-//! over any copy in the file, and a column whose kind differs from the table's is
-//! refused naming the file. A decimal differing in precision alone is relabelled.
+//! A table whose own schema governs its Parquet files, as a Delta table's does: the
+//! files are the table's live ones, each read by column name and fitted to the
+//! table. A column a file lacks reads as null (a column added since it was written),
+//! a partition column is the file's constant from the table's log and wins over any
+//! copy in the file, and a column whose kind differs from the table's is refused
+//! naming the file. A decimal differing in precision alone is relabelled.
 //! A pushed bound on a partition column skips a whole file without opening it.
-//! When the table gives its columns field ids (Iceberg's) and a file carries them
-//! too, a column the file holds under another name, or a name the file gives
-//! another id, is refused: read by name it would be null, or another column.
 
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const Reader = @import("read.zig").Reader;
 const Value = @import("../../exec/value.zig").Value;
-const collectLeaves = @import("schema.zig").collectLeaves;
 const cmp = @import("stats.zig").cmp;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
@@ -28,8 +24,6 @@ pub const Layout = struct {
     name: []const u8,
     root: []const u8,
     schema: types.Schema,
-    /// Each column's field id, aligned with `schema`; empty when the table has none.
-    ids: []const ?i64 = &.{},
     /// The schema indices of the partition columns, each file's `parts` aligned to it.
     part_fields: []const usize = &.{},
     files: []const File,
@@ -107,7 +101,6 @@ pub const Layout = struct {
             return eval.explain(e, std.fmt.allocPrint(arena, "{s} could not read its file `{s}` ({s})", .{ self.name, below(file.path, self.root), why }) catch self.name);
         };
         errdefer r.close();
-        if (self.ids.len > 0) try self.checkIds(arena, r, file, v);
         const outs = try arena.alloc(Fit.Out, v.fields.len);
         for (outs, v.fields) |*o, fi| {
             const want = self.schema.fields[fi];
@@ -130,42 +123,6 @@ pub const Layout = struct {
         f.* = .{ .schema = &v.schema, .outs = outs };
         r.fit = f;
         return r;
-    }
-
-    /// Refuses a file whose field ids say a wanted column is held under another
-    /// name, or that a name the table reads is another column; a file without
-    /// field ids is read by name.
-    fn checkIds(self: *const Layout, arena: std.mem.Allocator, r: *const Reader, file: File, v: *const View) !void {
-        for (r.md.schema) |e| {
-            if (e.field_id != null) break;
-        } else return;
-        const all = try collectLeaves(arena, r.md.schema);
-        for (v.fields) |fi| {
-            if (self.partOf(fi) != null) continue;
-            const want = self.ids[fi] orelse continue;
-            const name = self.schema.fields[fi].name;
-            var named: ?[]const u8 = null;
-            var name_id: ?i32 = null;
-            var has_name = false;
-            for (all) |lf| {
-                const e = r.md.schema[if (lf.root) |rt| rt.idx else lf.schema_idx];
-                if (std.mem.eql(u8, lf.name, name)) {
-                    has_name = true;
-                    name_id = e.field_id;
-                }
-                if (e.field_id) |id| if (id == want) {
-                    named = lf.name;
-                };
-            }
-            if (has_name and (name_id == null or name_id.? == want)) continue;
-            if (!has_name and named == null) continue;
-            const rel = below(file.path, self.root);
-            const msg = if (has_name)
-                std.fmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` has field id {d}, not {d} as in the table's schema: a column was dropped and another added under its name, and basalt reads data files by column name", .{ self.name, rel, name, name_id.?, want })
-            else
-                std.fmt.allocPrint(arena, "{s} has file `{s}` holding column `{s}` (field id {d}) as `{s}`: the column was renamed, and basalt reads data files by column name", .{ self.name, rel, name, want, named.? });
-            return eval.explain(Error.LakeFileMismatch, msg catch self.name);
-        }
     }
 };
 
