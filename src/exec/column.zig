@@ -1125,3 +1125,16 @@ test "a slice of fixed-width rows views the same values" {
     try std.testing.expect(!s.validity.allSet(s.len));
     try std.testing.expect((try slice(a, c, 24, 2)).validity.allSet(2));
 }
+
+test "permute of a few rows of a long column checks only those rows' validity" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var b = Builder.init(a, types.Type.init(.int).asNullable());
+    for (0..1000) |i| try b.append(if (i % 100 == 37) .null else .{ .int = @intCast(i) });
+    const c = try b.finish();
+    const out = try permute(a, c, &.{ 5, 437, 999, 36 });
+    try std.testing.expect(out.validity.get(0) and !out.validity.get(1) and out.validity.get(2) and out.validity.get(3));
+    try std.testing.expectEqual(@as(i64, 999), out.data.i64[2]);
+    try std.testing.expect((try permute(a, c, &.{ 1, 38, 500 })).validity.allSet(3));
+}
