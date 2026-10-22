@@ -84,7 +84,8 @@ pub fn readEntries(
 const ReadError = Error || parquet.Error || @import("../compress/codecs.zig").Error;
 
 /// Every read of a chunk walks its pages here: `rows` values, or with `rows` null
-/// the chunk's `num_values` entries along with their levels.
+/// the chunk's `num_values` entries along with their levels. Pages holding more
+/// values than the row group's rows are corrupt, never cut to fit.
 fn readPages(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
@@ -123,6 +124,7 @@ fn readPages(
             else => return Error.CorruptParquetPage,
         }
     }
+    if (rows != null and produced != entries) return Error.CorruptParquetPage;
     const vals = try b.finish();
     try readUnsigned(elem, vals);
     return .{ .vals = vals, .levels = levels };
