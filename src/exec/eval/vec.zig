@@ -694,7 +694,7 @@ fn mergeBytes(arena: std.mem.Allocator, bm: *Bitmap, take: []const bool, ts: col
     var span: usize = 0;
     for (0..n) |i| span += (if (take[i]) ts.at(i) else es.at(i)).len;
 
-    const values = try arena.alloc(u8, span);
+    const values = try arena.alloc(u8, try column.checkSpan(span));
     const offsets = try arena.alloc(i32, n + 1);
     offsets[0] = 0;
     var off: usize = 0;

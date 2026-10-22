@@ -73,6 +73,16 @@ pub const Bitmap = struct {
     }
 };
 
+/// The most value bytes a string column holds: its offsets are `i32`. A copy,
+/// merge or build that would pass it fails as out of memory for the column, never
+/// with offsets that wrap negative and index outside it.
+pub const max_span: usize = std.math.maxInt(i32);
+
+pub fn checkSpan(n: usize) error{OutOfMemory}!usize {
+    if (n > max_span) return error.OutOfMemory;
+    return n;
+}
+
 pub const Bytes = struct {
     offsets: []i32,
     values: []u8,
@@ -97,7 +107,7 @@ pub const Bytes = struct {
     }
 
     fn take(self: Bytes, arena: std.mem.Allocator, rows_idx: []const usize) !Bytes {
-        const values = try arena.alloc(u8, self.spanOf(rows_idx));
+        const values = try arena.alloc(u8, try checkSpan(self.spanOf(rows_idx)));
         const offsets = try arena.alloc(i32, rows_idx.len + 1);
         offsets[0] = 0;
         var off: usize = 0;
@@ -127,7 +137,7 @@ pub const BytesAppender = struct {
     }
 
     pub fn endRow(self: *BytesAppender) !void {
-        try self.offsets.append(@intCast(self.values.items.len));
+        try self.offsets.append(@intCast(try checkSpan(self.values.items.len)));
     }
 
     pub fn push(self: *BytesAppender, s: []const u8) !void {
@@ -259,7 +269,7 @@ fn selectBytes(arena: std.mem.Allocator, b: Bytes, sel: Selection) !Bytes {
         w = r.at + r.len;
     }
     for (sel.idx[w..]) |i| span += b.at(i).len;
-    const values = try arena.alloc(u8, span);
+    const values = try arena.alloc(u8, try checkSpan(span));
     const offsets = try arena.alloc(i32, sel.kept + 1);
     offsets[0] = 0;
     var off: usize = 0;
@@ -418,7 +428,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
 fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Bytes {
     var span: usize = 0;
     for (chunks) |c| span += c.data.bytes.span(c.len);
-    const values = try arena.alloc(u8, span);
+    const values = try arena.alloc(u8, try checkSpan(span));
     const offsets = try arena.alloc(i32, total + 1);
     offsets[0] = 0;
 
@@ -625,7 +635,7 @@ pub fn allocData(arena: std.mem.Allocator, tag: Tag, n: usize, span: usize) !Col
         fn bytes(o: @This()) !Bytes {
             const offsets = try o.arena.alloc(i32, o.n + 1);
             offsets[0] = 0;
-            return .{ .offsets = offsets, .values = try o.arena.alloc(u8, o.span) };
+            return .{ .offsets = offsets, .values = try o.arena.alloc(u8, try checkSpan(o.span)) };
         }
     };
     return mapTag(tag, Op{ .arena = arena, .n = n, .span = span });
@@ -780,6 +790,7 @@ pub const Builder = struct {
         if (all_present) {
             var total: usize = 0;
             for (vals) |s| total += s.len;
+            _ = try checkSpan(l.values.items.len + total);
             try l.values.ensureUnusedCapacity(total);
             try l.ends.ensureUnusedCapacity(vals.len);
             for (vals) |s| {
@@ -799,7 +810,7 @@ pub const Builder = struct {
                 try l.values.appendSlice(vals[j]);
                 j += 1;
             }
-            l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
+            l.ends.appendAssumeCapacity(@intCast(try checkSpan(l.values.items.len)));
             try self.pushValid(present);
         }
     }
@@ -814,6 +825,7 @@ pub const Builder = struct {
         const l = &self.store.bytes;
         var total: usize = 0;
         for (codes) |c| total += @intCast(offs[c + 1] - offs[c]);
+        _ = try checkSpan(l.values.items.len + total);
         try l.values.ensureUnusedCapacity(total + 16);
         const rows = if (defs) |d| d.len else codes.len;
         try l.ends.ensureUnusedCapacity(rows);
@@ -896,7 +908,7 @@ pub const Builder = struct {
         try self.pushValid(true);
         const l = &self.store.bytes;
         try l.values.appendSlice(s);
-        try l.ends.append(@intCast(l.values.items.len));
+        try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
     }
 
     /// Room for `n` more bytes of a bytes column's next value, which a producer
@@ -911,7 +923,7 @@ pub const Builder = struct {
         try self.pushValid(true);
         const l = &self.store.bytes;
         l.values.items.len += n;
-        try l.ends.append(@intCast(l.values.items.len));
+        try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
     }
 
     pub fn append(self: *Builder, v: Value) !void {
@@ -925,7 +937,7 @@ pub const Builder = struct {
             .dec => |*l| try l.append(self.asDec(v)),
             .bytes => |*l| {
                 if (ok) try l.values.appendSlice(self.asBytes(v));
-                try l.ends.append(@intCast(l.values.items.len));
+                try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
             },
         }
     }
@@ -1314,4 +1326,9 @@ test "permute of a few rows of a long column checks only those rows' validity" {
     try std.testing.expect(out.validity.get(0) and !out.validity.get(1) and out.validity.get(2) and out.validity.get(3));
     try std.testing.expectEqual(@as(i64, 999), out.data.i64[2]);
     try std.testing.expect((try permute(a, c, &.{ 1, 38, 500 })).validity.allSet(3));
+}
+
+test "a string column's value bytes stop at the i32 offsets' reach" {
+    try std.testing.expectEqual(max_span, try checkSpan(max_span));
+    try std.testing.expectError(error.OutOfMemory, checkSpan(max_span + 1));
 }
