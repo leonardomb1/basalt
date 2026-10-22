@@ -19,8 +19,13 @@
 //! writes, as the row would then be there twice. Otherwise the commit moves to the
 //! next version, a bounded number of times. Every commit carries a fresh `txnId` in its
 //! `commitInfo`, so a create whose answer was lost and whose retry found the name
-//! taken is recognised as its own. A failed commit names the data files it wrote,
-//! which no version references.
+//! taken is recognised as its own. A failed commit says whether it landed: one
+//! that did not names the table, the version and its object-store data files,
+//! which no version references (local ones are deleted by the writer); one whose
+//! outcome a failed read-back leaves unknown is `DeltaCommitUnknown`, its files
+//! named and kept. A local commit is durable once made: its data files are synced
+//! by the writer before it, and `_delta_log/` (and a new table's root) after the
+//! link, a failure there being `DeltaCommitUnsynced`, as the version is visible.
 
 const std = @import("std");
 const delta = @import("delta.zig");
@@ -30,7 +35,7 @@ const http_client = @import("../../net/http_client.zig");
 const table = @import("table.zig");
 const testing = std.testing;
 
-pub const Error = error{ DeltaCommitConflict, DeltaStoreUnsafe };
+pub const Error = error{ DeltaCommitConflict, DeltaStoreUnsafe, DeltaCommitUnknown, DeltaCommitUnsynced };
 
 /// How many versions a blind append moves past before giving up.
 pub const max_attempts = 10;
@@ -114,11 +119,12 @@ pub const TableStore = struct {
 
 /// A hidden file in `_delta_log/` written and synced whole, then hard-linked to
 /// the commit's name: the link fails when the name exists, and a reader sees the
-/// name only once every byte is there.
+/// name only once every byte is there. The directory is synced after the link, and
+/// for version 0 the root and its parent too, so a reported commit survives a crash.
 fn createLocal(arena: std.mem.Allocator, root: []const u8, at: []const u8, version: u64, bytes: []const u8) !bool {
     const dir_path = try std.mem.concat(arena, u8, &.{ root, "_delta_log" });
     try std.fs.cwd().makePath(dir_path);
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
     const tmp = try std.fmt.allocPrint(arena, ".{d:0>20}.json.{s}.tmp", .{ version, &uuid() });
     {
@@ -132,7 +138,27 @@ fn createLocal(arena: std.mem.Allocator, root: []const u8, at: []const u8, versi
         error.PathAlreadyExists => return false,
         else => return e,
     };
+    std.posix.fsync(dir.fd) catch |e| return unsynced(arena, at, e);
+    if (version == 0) for ([_][]const u8{ trimDir(root), std.fs.path.dirname(trimDir(root)) orelse "." }) |d|
+        syncDir(d) catch |e| return unsynced(arena, at, e);
     return true;
+}
+
+fn unsynced(arena: std.mem.Allocator, at: []const u8, e: anyerror) anyerror {
+    return eval.explain(Error.DeltaCommitUnsynced, try std.fmt.allocPrint(arena, "`{s}` was committed, but syncing its folder to disk failed ({s}), so a crash could lose it; its data files are kept", .{ at, @errorName(e) }));
+}
+
+/// `path` without a trailing `/`, `.` for none left.
+pub fn trimDir(path: []const u8) []const u8 {
+    const t = std.mem.trimRight(u8, path, "/");
+    return if (t.len == 0) (if (path.len > 0) "/" else ".") else t;
+}
+
+/// Flushes a local directory's entries to disk.
+pub fn syncDir(path: []const u8) !void {
+    var dir = try std.fs.cwd().openDir(path, .{ .iterate = true });
+    defer dir.close();
+    try std.posix.fsync(dir.fd);
 }
 
 /// One conditional PUT, then the same create again, which a store honouring the
@@ -245,11 +271,13 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commi
         if (attempts >= max_attempts)
             return fail(arena, name, c, try std.fmt.allocPrint(arena, "it lost the race for {d} versions in a row (the last tried was {d})", .{ max_attempts, version }));
         const made = store.create(arena, version, c.body) catch |e| {
-            if (e != Error.DeltaStoreUnsafe and try ours(arena, store, version, c.txn_id)) {
+            if (e == Error.DeltaStoreUnsafe or e == Error.DeltaCommitUnsynced) return e;
+            const outcome = landed(arena, store, version, c.txn_id);
+            if (outcome == .mine) {
                 _ = eval.takeFailure(e);
                 return version;
             }
-            return e;
+            return failStore(arena, name, c, version, e, outcome == .other);
         };
         if (made) return version;
         const text = (try store.read(arena, version)) orelse continue;
@@ -260,23 +288,45 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commi
     }
 }
 
-/// Whether the commit at `version` is the one carrying `txn_id`: a create whose
-/// answer was lost may still have landed.
-fn ours(arena: std.mem.Allocator, store: Store, version: u64, txn_id: []const u8) !bool {
-    const text = (store.read(arena, version) catch return false) orelse return false;
-    const w = readWinner(arena, text) catch return false;
-    return if (w.txn) |t| std.mem.eql(u8, t, txn_id) else false;
+/// Whose commit is at `version` after a create that failed: a create whose answer
+/// was lost may still have landed; `unknown` when it cannot be read back.
+fn landed(arena: std.mem.Allocator, store: Store, version: u64, txn_id: []const u8) enum { mine, other, unknown } {
+    const text = (store.read(arena, version) catch return .unknown) orelse return .other;
+    const w = readWinner(arena, text) catch return .unknown;
+    return if (w.txn) |t| (if (std.mem.eql(u8, t, txn_id)) .mine else .other) else .other;
 }
 
 fn fail(arena: std.mem.Allocator, name: []const u8, c: Commit, why: []const u8) anyerror {
     var msg = std.array_list.Managed(u8).init(arena);
     try msg.writer().print("could not commit to {s}: {s}; nothing was committed", .{ name, why });
-    if (c.added.len > 0) {
-        try msg.appendSlice(", and the data files it wrote are referenced by no version: ");
-        for (c.added[0..@min(c.added.len, 5)], 0..) |f, i| try msg.writer().print("{s}`{s}`", .{ if (i == 0) "" else ", ", f });
-        if (c.added.len > 5) try msg.writer().print(" and {d} more", .{c.added.len - 5});
-    }
+    try orphans(&msg, c, false);
     return eval.explain(Error.DeltaCommitConflict, msg.items);
+}
+
+/// A create that failed with `e`: nothing committed when `sure`, else an unknown
+/// outcome whose files are kept.
+fn failStore(arena: std.mem.Allocator, name: []const u8, c: Commit, version: u64, e: anyerror, sure: bool) anyerror {
+    const why = try arena.dupe(u8, eval.takeFailure(e) orelse @errorName(e));
+    var msg = std.array_list.Managed(u8).init(arena);
+    try msg.writer().print("could not commit version {d} to {s}: {s}; ", .{ version, name, why });
+    if (sure) {
+        try msg.appendSlice("nothing was committed");
+        try orphans(&msg, c, false);
+        return eval.explain(e, msg.items);
+    }
+    try msg.appendSlice("reading the version back failed, so whether it was committed is unknown");
+    try orphans(&msg, c, true);
+    return eval.explain(Error.DeltaCommitUnknown, msg.items);
+}
+
+/// What became of the data files of a commit that failed: local ones are deleted
+/// unless `kept`; the others are named.
+fn orphans(msg: *std.array_list.Managed(u8), c: Commit, kept: bool) !void {
+    if (c.added.len == 0) return;
+    if (!kept and !objstore.isUrl(c.added[0])) return msg.writer().print(", and the {d} data file{s} it wrote {s} deleted", .{ c.added.len, if (c.added.len == 1) "" else "s", if (c.added.len == 1) "was" else "were" });
+    try msg.appendSlice(if (kept) ", and its data files are kept: " else ", and the data files it wrote are referenced by no version: ");
+    for (c.added[0..@min(c.added.len, 5)], 0..) |f, i| try msg.writer().print("{s}`{s}`", .{ if (i == 0) "" else ", ", f });
+    if (c.added.len > 5) try msg.writer().print(" and {d} more", .{c.added.len - 5});
 }
 
 /// A log held in memory, with a hook that lets a winner commit first.
@@ -290,6 +340,10 @@ const FakeStore = struct {
     lose_answer: bool = false,
     /// Whether a create lands and then reports the store ignored its condition.
     unsafe: bool = false,
+    /// A create fails with this, landing nothing.
+    refuse: ?anyerror = null,
+    /// A read fails.
+    unreadable: bool = false,
 
     fn store(self: *FakeStore) Store {
         return .{ .ptr = self, .vtable = &.{ .read = read, .create = create } };
@@ -297,11 +351,13 @@ const FakeStore = struct {
 
     fn read(p: *anyopaque, _: std.mem.Allocator, version: u64) anyerror!?[]const u8 {
         const self: *FakeStore = @ptrCast(@alignCast(p));
+        if (self.unreadable) return error.ConnectionResetByPeer;
         return self.commits.get(version);
     }
 
     fn create(p: *anyopaque, _: std.mem.Allocator, version: u64, bytes: []const u8) anyerror!bool {
         const self: *FakeStore = @ptrCast(@alignCast(p));
+        if (self.refuse) |e| return e;
         if (self.raced < self.race.len and !self.commits.contains(version)) {
             try self.commits.put(self.arena, version, self.race[self.raced]);
             self.raced += 1;
@@ -323,7 +379,7 @@ fn testCommit(kind: Kind, read_version: ?u64, txn: []const u8) Commit {
         .read_version = read_version,
         .txn_id = txn,
         .body = "{\"commitInfo\":{\"txnId\":\"T\"}}\n{\"add\":{\"path\":\"new.parquet\"}}\n",
-        .added = &.{"new.parquet"},
+        .added = &.{"s3://b/t/new.parquet"},
         .read_set = &.{ "a.parquet", "x=1/b%20c.parquet" },
     };
 }
@@ -341,7 +397,7 @@ test "commit: an append moves past winners that only added files; REPLACE and a 
     try testing.expectError(Error.DeltaCommitConflict, commit(a, s2.store(), "T", testCommit(.replace, 3, "T")));
     const msg = eval.takeFailure(Error.DeltaCommitConflict).?;
     try testing.expect(std.mem.indexOf(u8, msg, "changed the table's files after this REPLACE read them") != null);
-    try testing.expect(std.mem.indexOf(u8, msg, "`new.parquet`") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "referenced by no version: `s3://b/t/new.parquet`") != null);
 
     var s3 = FakeStore{ .arena = a, .race = &.{"{\"metaData\":{\"id\":\"x\"}}\n"} };
     try testing.expectError(Error.DeltaCommitConflict, commit(a, s3.store(), "T", testCommit(.append, 3, "T")));
@@ -354,6 +410,22 @@ test "commit: an append moves past winners that only added files; REPLACE and a 
     var s5 = FakeStore{ .arena = a, .race = &.{appended} };
     try testing.expectError(Error.DeltaCommitConflict, commit(a, s5.store(), "T", testCommit(.create, null, "T")));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "created the table first") != null);
+}
+
+test "commit: a create failing outright names the table, the version and the files; an unreadable outcome is unknown" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var s1 = FakeStore{ .arena = a, .refuse = error.AccessDenied };
+    try testing.expectError(error.AccessDenied, commit(a, s1.store(), "T", testCommit(.append, 3, "T")));
+    try testing.expectEqualStrings("could not commit version 4 to T: AccessDenied; nothing was committed, and the data files it wrote are referenced by no version: `s3://b/t/new.parquet`", eval.takeFailure(error.AccessDenied).?);
+    var local = testCommit(.append, 3, "T");
+    local.added = &.{ "/t/a.parquet", "/t/b.parquet" };
+    try testing.expectError(error.AccessDenied, commit(a, s1.store(), "T", local));
+    try testing.expect(std.mem.endsWith(u8, eval.takeFailure(error.AccessDenied).?, "nothing was committed, and the 2 data files it wrote were deleted"));
+    var s2 = FakeStore{ .arena = a, .refuse = error.ConnectionResetByPeer, .unreadable = true };
+    try testing.expectError(Error.DeltaCommitUnknown, commit(a, s2.store(), "T", local));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitUnknown).?, "whether it was committed is unknown, and its data files are kept: `/t/a.parquet`, `/t/b.parquet`") != null);
 }
 
 test "commit: a lost answer is recognised by txnId; endless winners are bounded" {

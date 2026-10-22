@@ -840,7 +840,8 @@ lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/
 }
 
 # A Delta table written to an object store: created partitioned, appended to,
-# upserted (whole rows and PARTIAL COLS), replaced, each version read back. The
+# upserted (whole rows, PARTIAL COLS, and spilling past --op-memory), replaced,
+# each version read back; an UPSERT of no rows creates its table. The
 # commits go through the store's create-if-absent PUT, which a store ignoring
 # `If-None-Match` fails.
 lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
@@ -863,6 +864,20 @@ lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
     check "$1-delta-write-upsert" "$out/dw_$1_up.csv" "$out/dw_up.csv"
   else
     report "$1-delta-write-upsert (run error)" bad
+  fi
+  printf 'id,name,val\n1,alpha,11\n2,"beta, gamma",\n3,delta,8\n4,omega,41\n11,alpha,11\n12,"beta, gamma",100\n13,delta,71\n' >"$out/dw_sp.csv"
+  if brun run -j 4 --op-memory 1KB -c "LOAD INTO '$t' UPSERT ON (id) AS SELECT id, name, val + 1 AS val FROM '$t';" &&
+     brun run -c "LOAD INTO '$out/dw_$1_sp.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-upsert-spilled" "$out/dw_$1_sp.csv" "$out/dw_sp.csv"
+  else
+    report "$1-delta-write-upsert-spilled (run error)" bad
+  fi
+  printf 'n\n0\n' >"$out/dw_empty.csv"
+  if brun run -c "LOAD INTO '$2dwe_$$/' WITH (format = 'delta') UPSERT ON (id) AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 99;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_empty.csv' AS SELECT COUNT(*) AS n FROM '$2dwe_$$/';"; then
+    check "$1-delta-write-empty-upsert" "$out/dw_$1_empty.csv" "$out/dw_empty.csv"
+  else
+    report "$1-delta-write-empty-upsert (run error)" bad
   fi
   if brun run -j 4 -c "LOAD INTO '$t' REPLACE AS SELECT id + 100 AS id, name, val FROM 'tests/integration/seed.csv' WHERE id = 1;" &&
      brun run -c "LOAD INTO '$out/dw_$1_rep.csv' AS SELECT * FROM '$t' ORDER BY id;"; then

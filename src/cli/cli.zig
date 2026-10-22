@@ -193,7 +193,8 @@ fn usage(w: anytype) !void {
         \\             STRING or BYTES column a row verbatim (fixed-width files)
         \\  delta      a folder holding _delta_log/ reads as the Delta table: its live
         \\             files, typed by its schema; WITH (version = N) an older one.
-        \\             LOAD INTO 'folder/' appends to it or REPLACEs it; WITH
+        \\             LOAD INTO 'folder/' appends to it, REPLACEs it, or
+        \\             UPSERT ON (k) [PARTIAL COLS (c)] merges rows into it; WITH
         \\             (format = 'delta', partition_by = 'c') creates one
         \\  iceberg    a folder holding metadata/*.metadata.json reads as the Iceberg
         \\             table's current snapshot; WITH (snapshot_id = N) an older one

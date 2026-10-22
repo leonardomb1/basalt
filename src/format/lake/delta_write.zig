@@ -20,8 +20,11 @@
 //! `__HIVE_DEFAULT_PARTITION__` for NULL); partition columns are not written into
 //! the files, as the log carries them. At most `max_open` files are open at once,
 //! the least recently written closed when another is needed, and a file is closed
-//! past `roll_bytes`, so memory is bounded by `max_open` Parquet row groups (and
-//! an object store's upload buffer each), whatever the number of partitions.
+//! past `roll_bytes`, so the data's memory is bounded by `max_open` Parquet row
+//! groups (and an object store's upload buffer each), whatever the number of
+//! partitions; the commit, built in memory, grows by an `add` line per file. A
+//! local file is synced once closed, and the folders holding them before the
+//! commit; a failed write deletes its local files and the folders it made.
 //! Each `add` carries the file's statistics: `numRecords`, and per data column
 //! `nullCount`, with `minValues` and `maxValues` where they are exact and cheap
 //! (numbers, dates, timestamps cut to milliseconds as the protocol allows, strings
@@ -188,6 +191,8 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
     for (fields, cols) |f, *c| {
         const src = indexOf(schema, f.name) orelse {
             if (!partial) return refuse("{s} has column `{s}`, which the rows lack; a write gives every column of the table a value (`CAST(NULL AS ...) AS {s}` leaves it empty)", .{ name, f.name, f.name });
+            if (f.metadata) |md| if (md.get("CURRENT_DEFAULT") != null)
+                return refuse("{s}'s column `{s}` has a default value (`CURRENT_DEFAULT`), which basalt does not apply, so a row an UPSERT inserts would not take it; give `{s}` in the rows", .{ name, f.name, f.name });
             var none = types.Type.init(.string);
             none.unknown = true;
             c.* = try tableCol(name, f, none, absent);
@@ -230,7 +235,7 @@ fn upsertCols(p: *Plan, arena: std.mem.Allocator) !void {
     p.partial = out;
 }
 
-fn colIndex(cols: []const Col, name: []const u8) ?usize {
+pub fn colIndex(cols: []const Col, name: []const u8) ?usize {
     for (cols, 0..) |c, i| if (std.mem.eql(u8, c.name, name)) return i;
     return null;
 }
@@ -470,7 +475,7 @@ fn partitionText(arena: std.mem.Allocator, c: Col, v: Value) !?[]const u8 {
         .null => return null,
         .string => |s| return if (s.len == 0) null else s,
         .int => |i| try w.print("{d}", .{i}),
-        .float => |f| if (c.phys.float32) try w.print("{d}", .{@as(f32, @floatCast(f))}) else try w.print("{d}", .{f}),
+        .float => |f| try writeDouble(w, f, c.phys.float32),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .date => |d| try writeDate(w, d),
         .timestamp => |us| try writeTimestamp(w, us, c.phys.utc, false),
@@ -484,6 +489,20 @@ fn partitionText(arena: std.mem.Allocator, c: Col, v: Value) !?[]const u8 {
 }
 
 pub const Error = error{ DeltaValueOutOfRange, DeltaNullInNotNull };
+
+/// A float as Delta's text: plain digits for a magnitude from 1e-4 to below 1e16,
+/// exponent form past them, NaN and the infinities as Java spells them; a 4-byte
+/// `float` column's value as its shortest 4-byte text.
+fn writeDouble(w: *std.Io.Writer, x: f64, float32: bool) !void {
+    const v: f64 = if (float32) @as(f32, @floatCast(x)) else x;
+    if (std.math.isNan(v)) return w.writeAll("NaN");
+    if (std.math.isInf(v)) return w.writeAll(if (v > 0) "Infinity" else "-Infinity");
+    const plain = v == 0 or (@abs(v) >= 1e-4 and @abs(v) < 1e16);
+    if (float32) {
+        const f: f32 = @floatCast(v);
+        if (plain) try w.print("{d}", .{f}) else try w.print("{e}", .{f});
+    } else if (plain) try w.print("{d}", .{v}) else try w.print("{e}", .{v});
+}
 
 /// Spark's escaping of a partition folder's name and value.
 fn escapePath(w: *std.Io.Writer, s: []const u8) !void {
@@ -511,7 +530,7 @@ fn statJson(arena: std.mem.Allocator, c: Col, v: Value, is_max: bool) !?[]const 
         .int => |i| try w.print("{d}", .{i}),
         .float => |f| {
             if (!std.math.isFinite(f)) return null;
-            if (c.phys.float32) try w.print("{d}", .{@as(f32, @floatCast(f))}) else try w.print("{d}", .{f});
+            try writeDouble(w, f, c.phys.float32);
         },
         .decimal => |d| try fmtnum.writeDecimal(w, d.unscaled, d.scale),
         .date => |d| {
@@ -565,15 +584,7 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
     return aw.written();
 }
 
-/// A data file the write made.
-const Added = struct {
-    rel: []const u8,
-    values: []const ?[]const u8,
-    size: u64,
-    stats: []const u8,
-};
-
-/// A data file being written.
+/// A data file being written, its names and values on its own arena.
 const Open = struct {
     mem: *std.heap.ArenaAllocator,
     writer: *pqwrite.Writer,
@@ -592,12 +603,20 @@ pub const Sink = struct {
     phys: []const pqwrite.Physical,
     files: std.StringArrayHashMapUnmanaged(*Open) = .empty,
     tick: u64 = 0,
-    added: std.ArrayListUnmanaged(Added) = .empty,
+    /// The commit being built: its header, then the `add` action of every data
+    /// file finished, one line each.
+    adds: std.Io.Writer.Allocating,
+    txn: [36]u8 = undefined,
+    n_added: usize = 0,
     /// Every data file begun, local ones removed when the write fails.
     begun: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// The local folders holding a finished file, synced before the commit.
+    dirs: std.StringArrayHashMapUnmanaged(void) = .empty,
+    /// Whether this write made the table's local root folder.
+    made_root: bool = false,
     /// An UPSERT's spooled rows, merged with the table at `close`.
     merging: ?*merge.Merge = null,
-    /// Whether an UPSERT's joins went to disk.
+    /// Whether an UPSERT's joins or its sort went to disk.
     spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
@@ -608,9 +627,18 @@ pub const Sink = struct {
     /// A sink on `plan_arena` (which outlives it), its buffers on `gpa`.
     pub fn open(gpa: std.mem.Allocator, plan_arena: std.mem.Allocator, p: *const Plan, opts: merge.Opts) !*Sink {
         const self = try plan_arena.create(Sink);
-        self.* = .{ .gpa = gpa, .mem = std.heap.ArenaAllocator.init(gpa), .plan = p, .file_schema = undefined, .phys = &.{} };
-        errdefer self.mem.deinit();
+        self.* = .{ .gpa = gpa, .mem = std.heap.ArenaAllocator.init(gpa), .plan = p, .file_schema = undefined, .phys = &.{}, .adds = std.Io.Writer.Allocating.init(gpa) };
+        errdefer {
+            self.adds.deinit();
+            self.mem.deinit();
+        }
         const a = self.mem.allocator();
+        if (!objstore.isUrl(p.root)) {
+            std.fs.cwd().access(dlog.trimDir(p.root), .{}) catch |e| {
+                if (e != error.FileNotFound) return e;
+                self.made_root = true;
+            };
+        }
         if (p.mode == .upsert) {
             const out = try plan_arena.create(Plan);
             out.* = p.*;
@@ -628,7 +656,47 @@ pub const Sink = struct {
         }
         self.file_schema = .{ .fields = fields };
         self.phys = phys;
+        try self.header();
         return self;
+    }
+
+    /// Begins the commit with its `commitInfo` (and, creating the table, its
+    /// protocol and `metaData`); each file's `add` follows as it is finished and
+    /// the removes at `close`, so the commit is built once, in place.
+    fn header(self: *Sink) !void {
+        const p = self.plan;
+        const a = self.mem.allocator();
+        self.txn = dlog.uuid();
+        const now = std.time.milliTimestamp();
+        const w = &self.adds.writer;
+        var pb = std.Io.Writer.Allocating.init(a);
+        try pb.writer.writeByte('[');
+        for (p.parts, 0..) |k, i| {
+            if (i > 0) try pb.writer.writeByte(',');
+            try jsonString(&pb.writer, p.cols[k].name);
+        }
+        try pb.writer.writeByte(']');
+        switch (p.mode) {
+            .upsert => |u| {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"MERGE\",\"operationParameters\":{{\"predicate\":", .{now});
+                var pred = std.Io.Writer.Allocating.init(a);
+                for (u.keys, 0..) |k, i| try pred.writer.print("{s}target.`{s}` = source.`{s}`", .{ if (i > 0) " AND " else "", k, k });
+                try jsonString(w, pred.written());
+            },
+            else => {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
+                try jsonString(w, pb.written());
+            },
+        }
+        try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null) "true" else "false", @import("build_options").version, &self.txn });
+        if (p.snap == null) {
+            try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
+            try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
+            try jsonString(w, p.schema_string);
+            try w.writeAll(",\"partitionColumns\":");
+            try w.writeAll(pb.written());
+            try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
+        }
     }
 
     pub fn sink(self: *Sink) driver.Sink {
@@ -642,14 +710,18 @@ pub const Sink = struct {
         return self.route(arena, b);
     }
 
-    /// Writes rows shaped as `plan` reads them, each to its partition's file.
+    /// Writes rows shaped as `plan` reads them, each to its partition's file: the
+    /// rows are grouped by a counting sort on their partition and each group's
+    /// write is freed before the next, so the work and memory are the batch's
+    /// whatever the number of partitions in it.
     pub fn route(self: *Sink, arena: std.mem.Allocator, b: Batch) !void {
         if (b.len == 0) return;
         try self.check(b);
         const p = self.plan;
-        if (p.parts.len == 0) return self.writeRows(arena, b, null, b.len, &.{}, "");
-        const Group = struct { keep: []bool, n: usize, values: []const ?[]const u8 };
+        if (p.parts.len == 0) return self.writeRows(arena, b, null, &.{}, "");
+        const Group = struct { n: usize, end: usize = 0, values: []const ?[]const u8 };
         var groups: std.StringArrayHashMapUnmanaged(Group) = .empty;
+        const of = try arena.alloc(u32, b.len);
         var key = std.array_list.Managed(u8).init(arena);
         const vals = try arena.alloc(?[]const u8, p.parts.len);
         for (0..b.len) |r| {
@@ -665,14 +737,28 @@ pub const Sink = struct {
             const gop = try groups.getOrPut(arena, key.items);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try arena.dupe(u8, key.items);
-                const keep = try arena.alloc(bool, b.len);
-                @memset(keep, false);
-                gop.value_ptr.* = .{ .keep = keep, .n = 0, .values = try arena.dupe(?[]const u8, vals) };
+                gop.value_ptr.* = .{ .n = 0, .values = try arena.dupe(?[]const u8, vals) };
             }
-            gop.value_ptr.keep[r] = true;
+            of[r] = @intCast(gop.index);
             gop.value_ptr.n += 1;
         }
-        for (groups.keys(), groups.values()) |k, g| try self.writeRows(arena, b, g.keep, g.n, g.values, k);
+        var at: usize = 0;
+        for (groups.values()) |*g| {
+            g.end = at;
+            at += g.n;
+        }
+        const idx = try arena.alloc(usize, b.len);
+        for (of, 0..) |gi, r| {
+            const g = &groups.values()[gi];
+            idx[g.end] = r;
+            g.end += 1;
+        }
+        var each = std.heap.ArenaAllocator.init(self.gpa);
+        defer each.deinit();
+        for (groups.keys(), groups.values()) |k, g| {
+            try self.writeRows(each.allocator(), b, idx[g.end - g.n .. g.end], g.values, k);
+            _ = each.reset(.retain_capacity);
+        }
     }
 
     /// Refuses a NULL in a column the table declares NOT NULL, and an integer
@@ -696,15 +782,17 @@ pub const Sink = struct {
         }
     }
 
-    fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, keep: ?[]const bool, n: usize, values: []const ?[]const u8, key: []const u8) !void {
+    /// Writes the rows of `b` at `rows` (every row when null) to the file of the
+    /// partition `key` names.
+    fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, rows: ?[]const usize, values: []const ?[]const u8, key: []const u8) !void {
         const p = self.plan;
         const cols = try arena.alloc(column.Column, p.data.len);
         for (p.data, cols) |k, *c| {
             const src = b.columns[p.cols[k].src];
-            c.* = if (keep) |m| try column.gather(arena, src, m, n) else src;
+            c.* = if (rows) |x| try column.permute(arena, src, x) else src;
         }
         const o = try self.fileFor(key, values);
-        o.writer.writeBatch(arena, .{ .schema = &self.file_schema, .columns = cols, .len = n }) catch |e| return self.explainWrite(e);
+        o.writer.writeBatch(arena, .{ .schema = &self.file_schema, .columns = cols, .len = if (rows) |x| x.len else b.len }) catch |e| return self.explainWrite(e);
         self.tick += 1;
         o.used = self.tick;
         if (o.writer.offset >= roll_bytes) try self.finishFile(key);
@@ -725,7 +813,13 @@ pub const Sink = struct {
             };
             try self.finishFile(self.files.keys()[oldest]);
         }
-        const a = self.mem.allocator();
+        const mem = try self.gpa.create(std.heap.ArenaAllocator);
+        mem.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer {
+            mem.deinit();
+            self.gpa.destroy(mem);
+        }
+        const a = mem.allocator();
         var aw = std.Io.Writer.Allocating.init(a);
         const w = &aw.writer;
         for (self.plan.parts, values) |k, v| {
@@ -742,35 +836,58 @@ pub const Sink = struct {
         const rel = aw.written();
         const full = try std.mem.concat(a, u8, &.{ self.plan.root, rel });
         if (!objstore.isUrl(full)) if (std.fs.path.dirname(full)) |d| try std.fs.cwd().makePath(d);
-        const mem = try self.gpa.create(std.heap.ArenaAllocator);
-        mem.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        errdefer {
-            mem.deinit();
-            self.gpa.destroy(mem);
-        }
-        const writer = try pqwrite.Writer.openPhysical(mem.allocator(), full, self.file_schema, self.plan.codec, .truncate, self.phys);
-        try self.begun.append(a, full);
+        const writer = try pqwrite.Writer.openPhysical(a, full, self.file_schema, self.plan.codec, .truncate, self.phys);
+        try self.begun.append(self.mem.allocator(), try self.mem.allocator().dupe(u8, full));
         const o = try a.create(Open);
         const kept = try a.alloc(?[]const u8, values.len);
         for (kept, values) |*k, v| k.* = if (v) |t| try a.dupe(u8, t) else null;
         o.* = .{ .mem = mem, .writer = writer, .rel = rel, .full = full, .values = kept, .used = self.tick };
-        try self.files.put(a, try a.dupe(u8, key), o);
+        try self.files.put(self.mem.allocator(), try a.dupe(u8, key), o);
         return o;
     }
 
+    /// Closes a file, syncs a local one to disk, and writes its `add` action.
     fn finishFile(self: *Sink, key: []const u8) !void {
         const o = self.files.get(key).?;
         _ = self.files.orderedRemove(key);
+        const mem = o.mem;
         defer {
-            o.mem.deinit();
-            self.gpa.destroy(o.mem);
+            mem.deinit();
+            self.gpa.destroy(mem);
         }
-        const a = self.mem.allocator();
+        const a = o.mem.allocator();
         const sum = o.writer.closeSummary(a) catch |e| {
             o.writer.abort();
             return self.explainWrite(e);
         };
-        try self.added.append(a, .{ .rel = o.rel, .values = o.values, .size = sum.bytes, .stats = try statsJson(a, self.plan, sum) });
+        if (!objstore.isUrl(o.full)) {
+            const f = try std.fs.cwd().openFile(o.full, .{});
+            defer f.close();
+            try f.sync();
+            const top = dlog.trimDir(self.plan.root);
+            var d = std.fs.path.dirname(o.full);
+            while (d) |x| : (d = std.fs.path.dirname(x)) {
+                const gop = try self.dirs.getOrPut(self.mem.allocator(), x);
+                if (gop.found_existing) break;
+                gop.key_ptr.* = try self.mem.allocator().dupe(u8, x);
+                if (x.len <= top.len) break;
+            }
+        }
+        const p = self.plan;
+        const w = &self.adds.writer;
+        try w.writeAll("{\"add\":{\"path\":");
+        try jsonString(w, try uriPath(a, o.rel));
+        try w.writeAll(",\"partitionValues\":{");
+        for (p.parts, o.values, 0..) |k, v, i| {
+            if (i > 0) try w.writeByte(',');
+            try jsonString(w, p.cols[k].name);
+            try w.writeByte(':');
+            if (v) |t| try jsonString(w, t) else try w.writeAll("null");
+        }
+        try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":true,\"stats\":", .{ sum.bytes, std.time.milliTimestamp() });
+        try jsonString(w, try statsJson(a, p, sum));
+        try w.writeAll("}}\n");
+        self.n_added += 1;
     }
 
     pub fn close(self: *Sink) !void {
@@ -781,11 +898,12 @@ pub const Sink = struct {
         var removes: []const delta.Add = &.{};
         var read_set: []const []const u8 = &.{};
         if (self.merging) |m| {
-            if (m.rows == 0) return;
-            const done = try m.finish(self);
-            self.spilled = m.spilled;
-            removes = done.removed;
-            read_set = done.read_set;
+            if (m.rows > 0) {
+                const done = try m.finish(self);
+                self.spilled = m.spilled;
+                removes = done.removed;
+                read_set = done.read_set;
+            } else if (p.snap != null) return;
         } else if (p.mode == .replace) if (p.snap) |st| {
             removes = st.files.values();
             const rs = try a.alloc([]const u8, removes.len);
@@ -793,39 +911,9 @@ pub const Sink = struct {
             read_set = rs;
         };
         while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
-        if (p.snap != null and self.added.items.len == 0 and (p.mode == .append or removes.len == 0)) return;
+        if (p.snap != null and self.n_added == 0 and (p.mode == .append or removes.len == 0)) return;
         const now = std.time.milliTimestamp();
-        const txn = dlog.uuid();
-        var aw = std.Io.Writer.Allocating.init(a);
-        const w = &aw.writer;
-        var pb = std.Io.Writer.Allocating.init(a);
-        try pb.writer.writeByte('[');
-        for (p.parts, 0..) |k, i| {
-            if (i > 0) try pb.writer.writeByte(',');
-            try jsonString(&pb.writer, p.cols[k].name);
-        }
-        try pb.writer.writeByte(']');
-        switch (p.mode) {
-            .upsert => |u| {
-                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"MERGE\",\"operationParameters\":{{\"predicate\":", .{now});
-                var pred = std.Io.Writer.Allocating.init(a);
-                for (u.keys, 0..) |k, i| try pred.writer.print("{s}target.`{s}` = source.`{s}`", .{ if (i > 0) " AND " else "", k, k });
-                try jsonString(w, pred.written());
-            },
-            else => {
-                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
-                try jsonString(w, pb.written());
-            },
-        }
-        try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null) "true" else "false", @import("build_options").version, &txn });
-        if (p.snap == null) {
-            try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
-            try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
-            try jsonString(w, p.schema_string);
-            try w.writeAll(",\"partitionColumns\":");
-            try w.writeAll(pb.written());
-            try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
-        }
+        const w = &self.adds.writer;
         for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
             try jsonString(w, f.raw);
@@ -838,38 +926,26 @@ pub const Sink = struct {
             }
             try w.writeAll("}}\n");
         }
-        const names = try a.alloc([]const u8, self.added.items.len);
-        for (self.added.items, names) |f, *nm| {
-            nm.* = try std.mem.concat(a, u8, &.{ p.root, f.rel });
-            try w.writeAll("{\"add\":{\"path\":");
-            try jsonString(w, try uriPath(a, f.rel));
-            try w.writeAll(",\"partitionValues\":{");
-            for (p.parts, f.values, 0..) |k, v, i| {
-                if (i > 0) try w.writeByte(',');
-                try jsonString(w, p.cols[k].name);
-                try w.writeByte(':');
-                if (v) |t| try jsonString(w, t) else try w.writeAll("null");
-            }
-            try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":true,\"stats\":", .{ f.size, now });
-            try jsonString(w, f.stats);
-            try w.writeAll("}}\n");
-        }
+        for (self.dirs.keys()) |d| try dlog.syncDir(d);
         var ts = dlog.TableStore{ .root = p.root };
-        self.begun.clearRetainingCapacity();
-        self.committed = try dlog.commit(a, ts.store(), p.name, .{
+        self.committed = dlog.commit(a, ts.store(), p.name, .{
             .kind = if (p.snap == null) .create else switch (p.mode) {
                 .append => .append,
                 .replace => .replace,
                 .upsert => .upsert,
             },
             .read_version = if (p.snap) |st| st.version else null,
-            .txn_id = &txn,
-            .body = aw.written(),
-            .added = names,
+            .txn_id = &self.txn,
+            .body = self.adds.written(),
+            .added = self.begun.items,
             .read_set = read_set,
             .key_root = if (p.snap) |st| st.key_root else "",
             .hold = if (self.merging) |m| m.hold() else null,
-        });
+        }) catch |e| {
+            if (e == dlog.Error.DeltaCommitUnknown or e == dlog.Error.DeltaCommitUnsynced or e == dlog.Error.DeltaStoreUnsafe) self.begun.clearRetainingCapacity();
+            return e;
+        };
+        self.begun.clearRetainingCapacity();
     }
 
     pub fn abort(self: *Sink) void {
@@ -878,22 +954,34 @@ pub const Sink = struct {
         self.destroy();
     }
 
-    /// Drops the open files and removes the local data files begun, unless a commit
-    /// naming them was attempted; remote ones are left, referenced by no version.
+    /// Drops the open files and removes the local data files begun, with the
+    /// folders they leave empty (the root only if this write made it); remote ones
+    /// are left, referenced by no version.
     fn discard(self: *Sink) void {
         for (self.files.values()) |o| {
             o.writer.abort();
-            o.mem.deinit();
-            self.gpa.destroy(o.mem);
+            const mem = o.mem;
+            mem.deinit();
+            self.gpa.destroy(mem);
         }
         self.files.clearRetainingCapacity();
-        for (self.begun.items) |f| if (!objstore.isUrl(f)) std.fs.cwd().deleteFile(f) catch {};
+        const top = dlog.trimDir(self.plan.root);
+        for (self.begun.items) |f| if (!objstore.isUrl(f)) {
+            std.fs.cwd().deleteFile(f) catch {};
+            var d = std.fs.path.dirname(f);
+            while (d) |x| : (d = std.fs.path.dirname(x)) {
+                if (x.len <= top.len) break;
+                std.fs.cwd().deleteDir(x) catch break;
+            }
+        };
+        if (self.made_root) std.fs.cwd().deleteDir(top) catch {};
         self.begun.clearRetainingCapacity();
     }
 
     fn destroy(self: *Sink) void {
         if (self.merging) |m| m.deinit();
         self.merging = null;
+        self.adds.deinit();
         self.mem.deinit();
         self.done = true;
     }
@@ -932,6 +1020,25 @@ test "partition values and statistics as the log writes them" {
     const f = Col{ .name = "f", .delta_type = "double", .ty = types.Type.init(.float), .src = 0 };
     try testing.expect(try statJson(a, f, .{ .float = std.math.inf(f64) }, true) == null);
     try testing.expectEqualStrings("2026-01-01", (try partitionText(a, .{ .name = "d", .delta_type = "date", .ty = types.Type.init(.date), .src = 0 }, .{ .date = 20454 })).?);
+}
+
+test "floats as partition values and statistics: compact past a moderate range, Java's NaN and infinities, read back exactly" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const d = Col{ .name = "f", .delta_type = "double", .ty = types.Type.init(.float), .src = 0 };
+    const f = Col{ .name = "f", .delta_type = "float", .ty = types.Type.init(.float), .phys = .{ .float32 = true }, .src = 0 };
+    const Case = struct { f64, []const u8 };
+    for ([_]Case{ .{ 1e301, "1e301" }, .{ -2.5e-300, "-2.5e-300" }, .{ 1e-7, "1e-7" }, .{ 0.0001, "0.0001" }, .{ 123.5, "123.5" }, .{ 1e16, "1e16" }, .{ 0, "0" }, .{ std.math.nan(f64), "NaN" }, .{ -std.math.inf(f64), "-Infinity" } }) |c| {
+        const text = (try partitionText(a, d, .{ .float = c[0] })).?;
+        try testing.expectEqualStrings(c[1], text);
+        const back = (try table.partitionValue(a, text, types.Type.init(.float))).?.float;
+        if (std.math.isNan(c[0])) try testing.expect(std.math.isNan(back)) else try testing.expectEqual(c[0], back);
+    }
+    try testing.expectEqualStrings("Infinity", (try partitionText(a, f, .{ .float = 1e300 })).?);
+    try testing.expectEqualStrings("0.1", (try partitionText(a, f, .{ .float = 0.1 })).?);
+    try testing.expectEqualStrings("1e-10", (try statJson(a, f, .{ .float = 1e-10 }, false)).?);
+    try testing.expectEqualStrings("1e300", (try statJson(a, d, .{ .float = 1e300 }, true)).?);
 }
 
 test "a table's column types: narrower integers and floats, decimals that hold every value" {

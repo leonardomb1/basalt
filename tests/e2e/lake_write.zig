@@ -351,7 +351,7 @@ test "Delta UPSERT: past --op-memory the spool and the joins spill, with the row
     defer tmp.cleanup();
     var csv = std.array_list.Managed(u8).init(a);
     try csv.appendSlice("id,k,v\n");
-    for (0..20000) |i| try csv.writer().print("{d},{d},v{d}\n", .{ i, i % 7, i });
+    for (0..20000) |i| try csv.writer().print("{d},{d},v{d}\n", .{ i, i % 40, i });
     try tmp.dir.writeFile(.{ .sub_path = "many.csv", .data = csv.items });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const script = try std.mem.replaceOwned(u8, a,
@@ -363,5 +363,106 @@ test "Delta UPSERT: past --op-memory the spool and the joins spill, with the row
         try load(&tmp, "LOAD INTO '$B/s/' WITH (format = 'delta', partition_by = 'k') AS SELECT id, k, v FROM '$B/many.csv' WHERE id % 2 = 0;", 1);
         const out = try harness.runScriptOpts(a, &tmp, script, .{ .threads = threads, .op_memory = 64 << 10, .log = .{ .quiet = true } });
         try testing.expectEqualStrings("n,s,u\n13333,133316667,6667\n", out);
+        try testing.expectEqual(@as(usize, 40), try actions(a, &tmp, "s", 1, "add"));
     }
+}
+
+/// A table at `root` made from a log of `fields` (the schemaString's, escaped).
+fn handMade(a: std.mem.Allocator, tmp: *testing.TmpDir, root: []const u8, fields: []const u8) !void {
+    try tmp.dir.makePath(try std.fmt.allocPrint(a, "{s}/_delta_log", .{root}));
+    try tmp.dir.writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}/_delta_log/00000000000000000000.json", .{root}), .data = try std.fmt.allocPrint(a,
+        \\{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+        \\{{"metaData":{{"id":"h","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[{s}]}}","partitionColumns":[],"configuration":{{}},"createdTime":0}}}}
+        \\
+    , .{fields}) });
+}
+
+test "Delta UPSERT: a key of a 4-byte float column matches as the table stores it, and keys equal as floats repeat" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try handMade(a, &tmp, "ft", "{\\\"name\\\":\\\"k\\\",\\\"type\\\":\\\"float\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"string\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}");
+    try load(&tmp, "LOAD INTO '$B/ft/' AS SELECT CAST(0.1 AS DOUBLE) AS k, 'old' AS v UNION ALL SELECT CAST(2.5 AS DOUBLE) AS k, 'old2' AS v;", 1);
+    try load(&tmp, "LOAD INTO '$B/ft/' UPSERT ON (k) AS SELECT CAST(0.1 AS DOUBLE) AS k, 'new' AS v UNION ALL SELECT CAST(2.5 AS DOUBLE) AS k, 'new2' AS v;", 1);
+    try testing.expectEqualStrings("v\nnew\nnew2\n", try rows(a, &tmp, "SELECT v FROM '$B/ft/' ORDER BY v"));
+    try load(&tmp, "LOAD INTO '$B/ft/' UPSERT ON (k) AS SELECT CAST(0.10000000149011612 AS DOUBLE) AS k, 'newer' AS v;", 1);
+    try testing.expectEqualStrings("v\nnew2\nnewer\n", try rows(a, &tmp, "SELECT v FROM '$B/ft/' ORDER BY v"));
+    try runRefuses(a, &tmp, "LOAD INTO '$B/ft/' UPSERT ON (k) AS SELECT CAST(0.1 AS DOUBLE) AS k, 'a' AS v UNION ALL SELECT CAST(0.100000001 AS DOUBLE) AS k, 'b' AS v;", "more than once");
+}
+
+test "Delta UPSERT: PARTIAL COLS leaving out a column with a default is refused, as basalt does not apply it" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try handMade(a, &tmp, "dt", "{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"string\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"d\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"CURRENT_DEFAULT\\\":\\\"42\\\"}}");
+    try load(&tmp, "LOAD INTO '$B/dt/' AS SELECT 1 AS id, 'a' AS v, 7 AS d;", 1);
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/dt/' UPSERT ON (id) PARTIAL COLS (v) AS SELECT 2 AS id, 'ins' AS v;", "column `d` has a default value (`CURRENT_DEFAULT`), which basalt does not apply");
+    try load(&tmp, "LOAD INTO '$B/dt/' UPSERT ON (id) PARTIAL COLS (v) AS SELECT 2 AS id, 'ins' AS v, 9 AS d;", 1);
+    try testing.expectEqualStrings("id,v,d\n1,a,7\n2,ins,9\n", try rows(a, &tmp, "SELECT * FROM '$B/dt/' ORDER BY id"));
+}
+
+test "Delta UPSERT: no rows into a folder with format = 'delta' still creates the table" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/eu/' WITH (format = 'delta') UPSERT ON (id) AS SELECT id, grp FROM '$B/a.csv' WHERE id > 99;", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "eu", 0), "{\"metaData\":") != null);
+    try load(&tmp, "LOAD INTO '$B/eu/' AS SELECT id, grp FROM '$B/a.csv';", 1);
+    try testing.expectEqualStrings("n\n3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/eu/'"));
+}
+
+test "Delta write: thousands of partitions in one sorted batch, one file each; doubles as compact partition text" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(a);
+    try csv.appendSlice("id\n");
+    for (0..20000) |i| try csv.writer().print("{d}\n", .{i});
+    try tmp.dir.writeFile(.{ .sub_path = "ids.csv", .data = csv.items });
+    try load(&tmp, "LOAD INTO '$B/hp/' WITH (format = 'delta', partition_by = 'p') AS SELECT id, id % 2000 AS p FROM '$B/ids.csv' ORDER BY p;", 1);
+    try testing.expectEqual(@as(usize, 2000), try actions(a, &tmp, "hp", 0, "add"));
+    try testing.expectEqualStrings("n,s,ps\n20000,199990000,2000\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s, COUNT(DISTINCT p) AS ps FROM '$B/hp/'"));
+
+    try load(&tmp, "LOAD INTO '$B/pf/' WITH (format = 'delta', partition_by = 'p') AS SELECT 1 AS id, CAST(1e300 AS DOUBLE) * 10 AS p UNION ALL SELECT 2 AS id, CAST(0.0000001 AS DOUBLE) AS p;", 1);
+    try testing.expect(exists(&tmp, "pf/p=1e301"));
+    try testing.expect(exists(&tmp, "pf/p=1e-7"));
+    try testing.expectEqualStrings("id\n1\n", try rows(a, &tmp, "SELECT id FROM '$B/pf/' WHERE p > 1e300"));
+}
+
+test "Delta write: a failed run deletes its data files and the folders it made; a failed commit names the table and deletes them" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(a);
+    try csv.appendSlice("id,v\n");
+    for (0..200000) |i| try csv.writer().print("{d},{d}\n", .{ i, i });
+    try csv.appendSlice("200000,x\n");
+    try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = csv.items });
+    try runRefuses(a, &tmp, "LOAD INTO '$B/fl/' WITH (format = 'delta', partition_by = 'p') AS SELECT id, id % 20 AS p, CAST(v AS INT) AS v FROM '$B/bad.csv';", "CAST");
+    try testing.expect(!exists(&tmp, "fl"));
+
+    if (@import("builtin").os.tag != .linux or std.os.linux.geteuid() == 0) return;
+    try load(&tmp, "LOAD INTO '$B/ro/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    var log = try tmp.dir.openDir("ro/_delta_log", .{ .iterate = true });
+    defer log.close();
+    try log.chmod(0o555);
+    defer log.chmod(0o755) catch {};
+    try runRefuses(a, &tmp, "LOAD INTO '$B/ro/' AS SELECT * FROM '$B/a.csv';", "could not commit version 1 to Delta table");
+    try runRefuses(a, &tmp, "LOAD INTO '$B/ro/' AS SELECT * FROM '$B/a.csv';", "nothing was committed, and the 1 data file it wrote was deleted");
+    var dir = try tmp.dir.openDir("ro", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var files: usize = 0;
+    while (try it.next()) |e| files += @intFromBool(std.mem.endsWith(u8, e.name, ".parquet"));
+    try testing.expectEqual(@as(usize, 1), files);
 }

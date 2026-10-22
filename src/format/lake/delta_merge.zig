@@ -19,10 +19,12 @@
 //!     matching another spooled row is a repeated key;
 //!   - a FULL join streams the touched files' rows against the spool, each output
 //!     row kept, merged or inserted, and written through the sink's partition
-//!     routing; with no file touched the spool is inserted as it is.
+//!     routing, a partitioned table's rows sorted by partition first (spilling
+//!     like any sort) so each partition gets one file; with no file touched the
+//!     spool is inserted as it is.
 //! Both are the hash join (`join.zig`) with the incoming rows as the build side,
 //! spilling past `--op-memory` like any join, and the files are read a row group
-//! at a time. So memory is bounded by `--op-memory` for the join, one row group per
+//! at a time. So memory is bounded by `--op-memory` for each join and the sort, one row group per
 //! file read, and the sink's open files; disk holds the spool and the join's spill.
 
 const std = @import("std");
@@ -65,13 +67,21 @@ const row_name = "\x00row";
 const stat_cut = 32;
 
 /// The span of an UPSERT's keys: per key column its name and type, whether it
-/// partitions the table, and the smallest and largest incoming value.
+/// partitions the table, and the smallest and largest incoming value. A key of a
+/// 4-byte `float` column is held as its 4-byte value, and so is a partition value
+/// or statistic read for it, which another writer may have written in fewer digits.
 pub const Bounds = struct {
     names: []const []const u8,
     tys: []const types.Type,
     part: []const bool,
     lo: []Value,
     hi: []Value,
+    float32: []const bool = &.{},
+
+    fn narrowed(self: *const Bounds, j: usize, v: Value) Value {
+        if (v != .float or j >= self.float32.len or !self.float32[j]) return v;
+        return .{ .float = @as(f32, @floatCast(v.float)) };
+    }
 
     fn widen(self: *Bounds, a: std.mem.Allocator, j: usize, v: Value) !void {
         if (v == .null) return;
@@ -87,7 +97,7 @@ pub const Bounds = struct {
         if (stats_text) |t| if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{ .parse_numbers = false })) |v| {
             if (v == .object) stats = v.object;
         } else |_| {};
-        for (self.names, self.tys, self.part, self.lo, self.hi) |name, ty, is_part, lo, hi| {
+        for (self.names, self.tys, self.part, self.lo, self.hi, 0..) |name, ty, is_part, lo, hi, j| {
             if (lo == .null) continue;
             if (is_part) {
                 const pv = parts orelse continue;
@@ -95,14 +105,14 @@ pub const Bounds = struct {
                 const e = pv.object.get(name) orelse continue;
                 if (e == .null) return false;
                 if (e != .string) continue;
-                const v = (try table.partitionValue(arena, e.string, ty)) orelse continue;
+                const v = self.narrowed(j, (try table.partitionValue(arena, e.string, ty)) orelse continue);
                 if (v == .null or before(v, lo) or before(hi, v)) return false;
                 continue;
             }
             const s = stats orelse continue;
             if (allNull(s, name)) return false;
-            if (try statValue(arena, s, "maxValues", name, ty)) |x| if (before(x, lo)) return false;
-            if (try statValue(arena, s, "minValues", name, ty)) |x| if (before(hi, x)) return false;
+            if (try statValue(arena, s, "maxValues", name, ty)) |x| if (before(self.narrowed(j, x), lo)) return false;
+            if (try statValue(arena, s, "minValues", name, ty)) |x| if (before(hi, self.narrowed(j, x))) return false;
         }
         return true;
     }
@@ -203,14 +213,16 @@ pub const Merge = struct {
         const part = try a.alloc(bool, nk);
         const lo = try a.alloc(Value, nk);
         const hi = try a.alloc(Value, nk);
-        for (p.keys, names, tys, part, lo, hi) |k, *n, *t, *is_part, *l, *h| {
+        const f32s = try a.alloc(bool, nk);
+        for (p.keys, names, tys, part, lo, hi, f32s) |k, *n, *t, *is_part, *l, *h, *f| {
+            f.* = p.cols[k].phys.float32;
             n.* = p.cols[k].name;
             t.* = p.cols[k].ty;
             is_part.* = std.mem.indexOfScalar(usize, p.parts, k) != null;
             l.* = .null;
             h.* = .null;
         }
-        self.bounds = .{ .names = names, .tys = tys, .part = part, .lo = lo, .hi = hi };
+        self.bounds = .{ .names = names, .tys = tys, .part = part, .lo = lo, .hi = hi, .float32 = f32s };
         return self;
     }
 
@@ -230,8 +242,8 @@ pub const Merge = struct {
         return eval.explain(e, try std.fmt.allocPrint(self.mem.allocator(), fmt, args));
     }
 
-    /// Spools one batch of incoming rows: a NULL key is refused, a decimal is put
-    /// at the table's scale, and every row numbered.
+    /// Spools one batch of incoming rows: a NULL key is refused, a value put as
+    /// the table holds it (`normal`), and every row numbered.
     pub fn take(self: *Merge, b: Batch) !void {
         if (b.len == 0) return;
         const p = self.plan;
@@ -270,13 +282,22 @@ pub const Merge = struct {
         self.rows += b.len;
     }
 
-    /// Column `c` of the incoming batch as the table types it: a decimal at the
-    /// table's scale, a bare NULL as a NULL of the column's type.
+    /// Column `c` of the incoming batch as the table holds it: a decimal at the
+    /// table's scale, a 4-byte `float` rounded to one, so keys match the rows read
+    /// back and are told apart as the table tells them; a bare NULL as a NULL of
+    /// the column's type.
     fn normal(self: *Merge, t: std.mem.Allocator, b: Batch, c: write.Col) !column.Column {
         const in = b.columns[c.src];
         if (self.plan.in_fields[c.src].ty.unknown) return join.nullColumn(t, c.ty, b.len);
         var out = in;
         out.ty = c.ty.asNullable();
+        if (c.phys.float32 and in.data == .f64) {
+            const xs = try t.alloc(f64, b.len);
+            for (xs, in.data.f64[0..b.len]) |*o, x| o.* = @as(f32, @floatCast(x));
+            out.data = .{ .f64 = xs };
+            out.dict = null;
+            return out;
+        }
         if (c.ty.kind != .decimal) return out;
         const same = for (in.data.dec[0..b.len], 0..) |d, r| {
             if (in.validity.get(r) and d.scale != c.ty.scale) break false;
@@ -333,6 +354,10 @@ pub const Merge = struct {
         for (files, fl.files, 0..) |*f, src, i| {
             const parts = try a.alloc(Value, src.parts.len + 1);
             @memcpy(parts[0..src.parts.len], src.parts);
+            for (parts[0..src.parts.len], base.part_fields) |*v, fi| {
+                const c = self.plan.cols[write.colIndex(self.plan.cols, base.schema.fields[fi].name) orelse continue];
+                if (c.phys.float32 and v.* == .float) v.* = .{ .float = @as(f32, @floatCast(v.float)) };
+            }
             parts[src.parts.len] = .{ .int = @intCast(i) };
             f.* = .{ .path = src.path, .size = src.size, .parts = parts };
         }
@@ -439,9 +464,11 @@ pub const Merge = struct {
         return hit;
     }
 
-    /// The touched files' rows FULL-joined against the spool, each output row kept,
-    /// merged or inserted, written through `out`; with none touched, the spool
-    /// inserted.
+    /// The touched files' rows FULL-joined against the spool (`Merged`), written
+    /// through `out`; with none touched, the spool inserted. A partitioned table's
+    /// rows are sorted by partition first, spilling past `--op-memory` as any sort
+    /// does, so each partition is written to one file however the join (a spilled
+    /// one by hash partition) ordered them.
     fn rewrite(self: *Merge, out: *write.Sink, lay: ?*const fit.Layout) !void {
         const p = self.plan;
         var pass = std.heap.ArenaAllocator.init(self.gpa);
@@ -449,85 +476,88 @@ pub const Merge = struct {
         const a = pass.allocator();
         var bm = std.heap.ArenaAllocator.init(self.gpa);
         defer bm.deinit();
-        const nc = p.cols.len;
         const shape = try a.create(types.Schema);
-        const tf = try a.alloc(types.Schema.Field, nc);
+        const tf = try a.alloc(types.Schema.Field, p.cols.len);
         for (tf, p.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
         shape.* = .{ .fields = tf };
 
         const build = try self.replay(a, null);
         defer build.close();
-        const l = lay orelse {
-            const src = build.source();
-            while (try src.next(bm.allocator())) |b| {
-                try self.emit(out, bm.allocator(), shape, b, 0, null, b.len);
-                _ = bm.reset(.retain_capacity);
-            }
-            return;
+        var feed: ?*Feed = null;
+        defer if (feed) |f| f.close();
+        var jn: ?*op.Join = null;
+        defer if (jn) |j| j.release();
+        if (lay) |l| {
+            const folder = try Folder.openLayout(a, l, null);
+            const fd = try a.create(Feed);
+            const parts = try a.alloc(Feed.Part, 1);
+            parts[0] = .{ .src = folder.source() };
+            fd.* = .{ .parts = parts, .schema = folder.schema };
+            feed = fd;
+            const rk = try a.alloc(usize, p.keys.len);
+            for (rk, p.keys) |*x, k| x.* = p.cols[k].src;
+            jn = try self.joinOf(a, fd, build, .full, p.keys, rk);
+        }
+        const merged = try a.create(Merged);
+        merged.* = .{ .m = self, .schema = shape, .join = jn, .build = build };
+        const scan = try a.create(op.Scan);
+        scan.* = .{ .src = merged.source() };
+        var top = op.Op{ .scan = scan };
+        var sort: ?*op.Sort = null;
+        defer if (sort) |s| s.release();
+        if (p.parts.len > 0) if (self.opts.space) |sp| {
+            const keys = try a.alloc(op.Sort.Key, p.parts.len);
+            for (keys, p.parts) |*k, i| k.* = .{ .idx = i, .desc = false, .nulls_first = false };
+            const s = try a.create(op.Sort);
+            s.* = .{ .child = top, .in_schema = shape, .keys = keys, .threads = self.opts.threads, .space = sp, .spill_at = self.opts.op_memory, .gpa = self.gpa };
+            sort = s;
+            top = .{ .sort = s };
         };
-        const folder = try Folder.openLayout(a, l, null);
-        const feed = try a.create(Feed);
-        const parts = try a.alloc(Feed.Part, 1);
-        parts[0] = .{ .src = folder.source() };
-        feed.* = .{ .parts = parts, .schema = folder.schema };
-        defer feed.close();
-        const rk = try a.alloc(usize, p.keys.len);
-        for (rk, p.keys) |*x, k| x.* = p.cols[k].src;
-        const jn = try self.joinOf(a, feed, build, .full, p.keys, rk);
-        defer jn.release();
-        const top = op.Op{ .join = jn };
-        const nt = nc + 1;
-        const rn = nt + p.in_fields.len;
         while (try top.next(bm.allocator())) |b| {
-            const t = bm.allocator();
-            const keep = try t.alloc(bool, b.len);
-            const merged = try t.alloc(bool, b.len);
-            const inserted = try t.alloc(bool, b.len);
-            var n_keep: usize = 0;
-            var n_merged: usize = 0;
-            var n_ins: usize = 0;
-            for (0..b.len) |r| {
-                const exists = b.columns[nc].validity.get(r);
-                const matched = b.columns[rn].validity.get(r);
-                keep[r] = exists and !matched;
-                merged[r] = exists and matched;
-                inserted[r] = !exists;
-                n_keep += @intFromBool(keep[r]);
-                n_merged += @intFromBool(merged[r]);
-                n_ins += @intFromBool(inserted[r]);
-            }
-            if (n_keep > 0) {
-                const cols = try t.alloc(column.Column, nc);
-                for (cols, 0..) |*c, k| c.* = try column.gather(t, b.columns[k], keep, n_keep);
-                try out.route(t, .{ .schema = shape, .columns = cols, .len = n_keep });
-            }
-            if (n_merged > 0) {
-                const cols = try t.alloc(column.Column, nc);
-                for (cols, p.cols, 0..) |*c, pc, k| {
-                    const fresh = if (p.partial) |pl| std.mem.indexOfScalar(usize, pl, k) != null else true;
-                    c.* = try column.gather(t, b.columns[if (fresh) nt + pc.src else k], merged, n_merged);
-                }
-                try out.route(t, .{ .schema = shape, .columns = cols, .len = n_merged });
-            }
-            if (n_ins > 0) try self.emit(out, t, shape, b, nt, inserted, n_ins);
+            try out.route(bm.allocator(), b);
             _ = bm.reset(.retain_capacity);
         }
-        self.spilled = self.spilled or jn.grace != null;
+        if (jn) |j| self.spilled = self.spilled or j.grace != null;
+        if (sort) |s| self.spilled = self.spilled or s.runs > 0;
     }
 
-    /// Inserts the incoming rows of `b` (the spool's columns from `at`) that `mask`
-    /// keeps, a column they lack as NULL.
-    fn emit(self: *Merge, out: *write.Sink, t: std.mem.Allocator, shape: *const types.Schema, b: Batch, at: usize, mask: ?[]const bool, n: usize) !void {
-        const cols = try t.alloc(column.Column, self.plan.cols.len);
-        for (cols, self.plan.cols) |*c, pc| {
-            if (pc.src == write.absent) {
-                c.* = try join.nullColumn(t, pc.ty, n);
-                continue;
-            }
-            const src = b.columns[at + pc.src];
-            c.* = if (mask) |m| try column.gather(t, src, m, n) else src;
+    /// One batch of the FULL join as the table's rows: the kept rows, then the
+    /// merged ones (under PARTIAL COLS only the listed columns from the incoming
+    /// row), then the inserted ones.
+    fn combine(self: *Merge, t: std.mem.Allocator, shape: *const types.Schema, b: Batch) !Batch {
+        const p = self.plan;
+        const nc = p.cols.len;
+        const nt = nc + 1;
+        const rn = nt + p.in_fields.len;
+        const masks = [3][]bool{ try t.alloc(bool, b.len), try t.alloc(bool, b.len), try t.alloc(bool, b.len) };
+        var counts = [3]usize{ 0, 0, 0 };
+        for (0..b.len) |r| {
+            const exists = b.columns[nc].validity.get(r);
+            const class: usize = if (!exists) 2 else if (b.columns[rn].validity.get(r)) 1 else 0;
+            for (masks, 0..) |m, i| m[r] = i == class;
+            counts[class] += 1;
         }
-        try out.route(t, .{ .schema = shape, .columns = cols, .len = n });
+        const cols = try t.alloc(column.Column, nc);
+        var chunks: [3]column.Column = undefined;
+        for (cols, p.cols, 0..) |*c, pc, k| {
+            const fresh = if (p.partial) |pl| std.mem.indexOfScalar(usize, pl, k) != null else true;
+            const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[nt + pc.src];
+            const from = [3]column.Column{ b.columns[k], if (fresh) incoming else b.columns[k], incoming };
+            var n: usize = 0;
+            for (from, masks, counts) |src, m, cnt| if (cnt > 0) {
+                chunks[n] = try column.gather(t, src, m, cnt);
+                n += 1;
+            };
+            c.* = if (n == 1) chunks[0] else try column.concat(t, chunks[0..n], b.len);
+        }
+        return .{ .schema = shape, .columns = cols, .len = b.len };
+    }
+
+    /// Spooled rows `b` as the table's rows to insert, a column they lack as NULL.
+    fn inserts(self: *Merge, t: std.mem.Allocator, shape: *const types.Schema, b: Batch) !Batch {
+        const cols = try t.alloc(column.Column, self.plan.cols.len);
+        for (cols, self.plan.cols) |*c, pc| c.* = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[pc.src];
+        return .{ .schema = shape, .columns = cols, .len = b.len };
     }
 
     /// A hash join of `probe` against `build` (the spool), spilling as the run's
@@ -564,6 +594,33 @@ pub const Merge = struct {
         };
         return jn;
     }
+};
+
+/// The rewrite's rows in the table's shape, a batch per batch of the join
+/// (`Merge.combine`); with no join, every spooled row inserted.
+const Merged = struct {
+    m: *Merge,
+    schema: *const types.Schema,
+    join: ?*op.Join,
+    build: *Replay,
+
+    pub fn next(self: *Merged, arena: std.mem.Allocator) !?Batch {
+        const jn = self.join orelse {
+            while (try self.build.next(arena)) |b| if (b.len > 0) return try self.m.inserts(arena, self.schema, b);
+            return null;
+        };
+        const top = op.Op{ .join = jn };
+        while (try top.next(arena)) |b| if (b.len > 0) return try self.m.combine(arena, self.schema, b);
+        return null;
+    }
+
+    pub fn close(_: *Merged) void {}
+
+    fn source(self: *Merged) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = driver.sourceVTable(Merged);
 };
 
 /// The spool read back, from its spill file or memory.
@@ -668,6 +725,14 @@ test "bounds: partition values and statistics rule a file out only when provably
     const ts = Bounds{ .names = &.{"t"}, .tys = &.{types.Type.init(.timestamp)}, .part = &.{false}, .lo = &tlo, .hi = &thi };
     try testing.expect(try ts.mayHold(a, null, "{\"maxValues\":{\"t\":\"1970-01-01T00:00:01.000Z\"}}"));
     try testing.expect(!try ts.mayHold(a, null, "{\"maxValues\":{\"t\":\"1970-01-01T00:00:00.999Z\"}}"));
+    var flo = [_]Value{.{ .float = @as(f32, 0.1) }};
+    var fhi = [_]Value{.{ .float = @as(f32, 0.1) }};
+    const fl = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &flo, .hi = &fhi, .float32 = &.{true} };
+    try testing.expect(try fl.mayHold(a, null, "{\"minValues\":{\"f\":0.1},\"maxValues\":{\"f\":0.1}}"));
+    const fp = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .lo = &flo, .hi = &fhi, .float32 = &.{true} };
+    try testing.expect(try fp.mayHold(a, try P.parts(a, "{\"f\":\"0.1\"}"), null));
+    const fd = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &flo, .hi = &fhi };
+    try testing.expect(!try fd.mayHold(a, null, "{\"maxValues\":{\"f\":0.1}}"));
     const str = Bounds{ .names = &.{"s"}, .tys = &.{types.Type.init(.string)}, .part = &.{false}, .lo = &slo, .hi = &shi };
     try testing.expect(!try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"abc\"}}"));
     try testing.expect(try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"" ++ "a" ** 32 ++ "\"}}"));
