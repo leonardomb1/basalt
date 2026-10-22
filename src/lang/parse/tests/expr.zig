@@ -148,6 +148,18 @@ test "sql: UNNEST(JSON_EACH(col)) is a json explode" {
     try testing.expect(ex.delim == null);
 }
 
+test "sql: UNNEST(SPLIT(col, '')) is refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const r = parseSource(a, "SELECT * FROM 'x.csv' CROSS JOIN UNNEST(SPLIT(tags, '')) AS tag;", &diag);
+    try testing.expectError(error.ParseFailed, r);
+    try testing.expectEqualStrings("SPLIT needs a non-empty delimiter", diag.msg);
+    try testing.expectEqual(@as(u32, 53), diag.col);
+}
+
 test "sql: BETWEEN lowers to >= AND <=" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

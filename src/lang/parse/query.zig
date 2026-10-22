@@ -917,7 +917,10 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 _ = try self.expect(.lparen);
                 field = try self.expectIdent();
                 _ = try self.expect(.comma);
-                delim = (try self.expect(.string)).text;
+                const dpos = self.curPos();
+                const dt = try self.expect(.string);
+                if (dt.text.len == 0) return self.fail(dpos, "SPLIT needs a non-empty delimiter", .{});
+                delim = dt.text;
                 _ = try self.expect(.rparen);
             } else {
                 field = try self.expectIdent();
