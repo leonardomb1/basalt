@@ -45,8 +45,11 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the basalt CLI");
     run_step.dependOn(&run_cmd.step);
 
+    const filters = b.option([]const []const u8, "test-filter", "Run only the tests whose names contain this text (repeatable)") orelse &.{};
+
     const unit_tests = b.addTest(.{
         .root_module = root_module,
+        .filters = filters,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -57,6 +60,7 @@ pub fn build(b: *std.Build) void {
     });
     basalt_module.addOptions("build_options", opts);
     const e2e_tests = b.addTest(.{
+        .filters = filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/e2e/run_test.zig"),
             .target = target,
@@ -67,6 +71,7 @@ pub fn build(b: *std.Build) void {
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
 
     const docs_tests = b.addTest(.{
+        .filters = filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/docs/examples_test.zig"),
             .target = target,
