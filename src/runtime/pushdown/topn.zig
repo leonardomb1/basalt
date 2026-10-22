@@ -113,14 +113,18 @@ fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Whether every filter before the limit runs exactly at the source; otherwise
-/// the pushed cap would count rows the engine then drops.
-fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, facts: ?*const Facts) !bool {
+/// The filters before the limit as one exact source predicate ("" with none), or
+/// null when one does not run exactly there: the cap must count only the rows the
+/// engine keeps, so this predicate, not a looser one, goes under it.
+fn filtersAllTranslate(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, facts: ?*const Facts) !?[]const u8 {
+    var w = std.array_list.Managed(u8).init(arena);
     for (stages[1..]) |st| {
         if (st.node != .filter) break;
-        if ((try translatePred(arena, st.node.filter, dialect, .{ .schema = schema, .check_fields = check_fields, .facts = facts, .need = .exact })) == null) return false;
+        const sql = (try translatePred(arena, st.node.filter, dialect, .{ .schema = schema, .check_fields = check_fields, .facts = facts, .need = .exact })) orelse return null;
+        if (w.items.len > 0) try w.appendSlice(" AND ");
+        try w.writer().print("({s})", .{sql});
     }
-    return true;
+    return w.items;
 }
 
 /// Key kinds every dialect orders exactly as the engine: numbers (NaN greatest)
@@ -139,7 +143,7 @@ pub const ExplainedTopN = struct { text: []const u8, rows: u64, sorted: bool };
 pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage) !?ExplainedTopN {
     var why: []const u8 = "";
     const t = (try classifyTopN(arena, stages, &why)) orelse return null;
-    if (!try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false, null)) return null;
+    _ = (try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false, null)) orelse return null;
     const d = try t.describe(arena);
     return .{
         .text = if (t.keys.len == 0) d else try std.fmt.allocPrint(arena, "{s} (if the keys are numeric or temporal)", .{d}),
@@ -149,10 +153,10 @@ pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
 }
 
 pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, facts: ?*const Facts, why: *[]const u8) !?[]const u8 {
-    if (!try filtersAllTranslate(arena, dialect, stages, src_schema, true, facts)) {
+    const where = (try filtersAllTranslate(arena, dialect, stages, src_schema, true, facts)) orelse {
         why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)});
         return null;
-    }
+    };
     for (t.keys) |k| {
         const idx = src_schema.indexOf(k.col) orelse {
             why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a source column", .{k.col});
@@ -164,7 +168,8 @@ pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8
             return null;
         }
     }
-    return try renderTopN(arena, dialect, base_sql, t);
+    const base = if (where.len == 0) base_sql else try std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base_sql, where });
+    return try renderTopN(arena, dialect, base, t);
 }
 
 /// `base_sql` ordered with each key's nulls placed as the engine places them, and
@@ -217,6 +222,12 @@ test "top-N: key types the source orders as the engine does, and filters that mu
     const f_t = (try classifyTopN(a, f_st, &why)).?;
     try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, f_st, f_t, null, &why)) == null);
     try std.testing.expect(std.mem.indexOf(u8, why, "does not translate") != null);
+
+    const w_st = try topNStagesOf(a, "SELECT * FROM db.t WHERE ts >= '2024-01-05T00:00:00Z' ORDER BY id LIMIT 5");
+    const w_t = (try classifyTopN(a, w_st, &why)).?;
+    const q = (try planTopN(a, .postgres, "SELECT * FROM \"t\"", schema, w_st, w_t, null, &why)).?;
+    try std.testing.expect(std.mem.startsWith(u8, q, "SELECT * FROM (SELECT * FROM (SELECT * FROM \"t\") _w WHERE ((\"ts\" >= '2024-01-05 00:00:00'))) _t"));
+    try std.testing.expect(std.mem.endsWith(u8, q, ") _t ORDER BY \"id\" NULLS LAST LIMIT 5"));
 }
 
 test "top-N: each dialect's spelling of the keys' null placement and the row cap" {
