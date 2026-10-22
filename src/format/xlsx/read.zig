@@ -50,6 +50,12 @@ const batch_rows = 4096;
 
 const max_cols = 16384;
 const max_rows = 1048576;
+/// Cells one row may list: one per column, with room for the duplicates some
+/// writers leave, so a small zip cannot inflate one row into gigabytes of cells.
+const max_row_cells = 4 * max_cols;
+/// Past Excel's last date (9999-12-31) a date-formatted number is read as a
+/// number; NaN and the infinities fail the range test too.
+const max_serial = 2958466.0;
 
 pub fn isPath(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(path, ".xlsx") or std.ascii.endsWithIgnoreCase(path, ".xlsm");
@@ -648,6 +654,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
         };
         if (!std.mem.eql(u8, o.name, "row")) continue;
         const num = if (o.attr("r")) |r| (std.fmt.parseInt(u32, r, 10) catch return error.BadXml) else prev_row.* + 1;
+        if (num == 0 or num > max_rows) return error.BadXml;
         prev_row.* = num;
         if (o.self_closing) return num;
         var col: u32 = 0;
@@ -659,6 +666,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
                     continue;
                 }
                 const at = if (c.attr("r")) |r| ((cellRef(r) orelse return error.BadXml).col) else if (started) col + 1 else 0;
+                if (at >= max_cols or out.items.len >= max_row_cells) return error.BadXml;
                 started = true;
                 col = at;
                 var cell = Cell{ .col = at, .kind = .empty };
@@ -668,7 +676,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
                     if (si < rd.styles.len) cell.fmt = rd.styles[si];
                 }
                 if (!c.self_closing) try readCell(tk, &cell, ty, scratch, rd);
-                if (cell.kind == .number and cell.fmt != .number and cell.num < 0) cell.fmt = .number;
+                if (cell.kind == .number and cell.fmt != .number and !(cell.num >= 0 and cell.num < max_serial)) cell.fmt = .number;
                 try out.append(cell);
             },
             .close => |name| if (std.mem.eql(u8, name, "row")) break,
@@ -862,6 +870,31 @@ test "cells out of column order: sorted, duplicates in document order, a reverse
         try std.testing.expectEqual(want, c.col);
         try std.testing.expectEqual(@as(f64, @floatFromInt(want + 1 + if (i % 2 == 1) @as(u32, max_cols) else 0)), c.num);
     }
+}
+
+test "a row number, column or cell count past the sheet's is refused, and a date serial past 9999 reads as a number" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var rd: Reader = undefined;
+    rd.strings = &.{};
+    const styles = [_]Fmt{ .number, .date };
+    rd.styles = &styles;
+    var cells = std.array_list.Managed(Cell).init(a);
+    var prev: u32 = 0;
+    var tk = xml.Tokenizer.initSlice("<row r=\"4000000000\"/>");
+    try std.testing.expectError(error.BadXml, nextRow(&tk, &cells, a, &rd, &prev));
+    var wide = std.array_list.Managed(u8).init(a);
+    try wide.appendSlice("<row r=\"1\">");
+    for (0..max_cols + 1) |_| try wide.appendSlice("<c><v>1</v></c>");
+    try wide.appendSlice("</row>");
+    tk = xml.Tokenizer.initSlice(wide.items);
+    try std.testing.expectError(error.BadXml, nextRow(&tk, &cells, a, &rd, &prev));
+    prev = 0;
+    tk = xml.Tokenizer.initSlice("<row r=\"1\"><c s=\"1\"><v>1e20</v></c><c s=\"1\"><v>45000</v></c></row>");
+    try std.testing.expectEqual(@as(?u32, 1), try nextRow(&tk, &cells, a, &rd, &prev));
+    try std.testing.expectEqual(Fmt.number, cells.items[0].fmt);
+    try std.testing.expectEqual(Fmt.date, cells.items[1].fmt);
 }
 
 test "ranges, cell references, column names" {
