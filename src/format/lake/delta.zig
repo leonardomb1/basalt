@@ -451,7 +451,7 @@ fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by:
     try addFields(arena, name, &out, "", v, 0);
     const b = by orelse return .{ .schema = .{ .fields = out.items } };
     const m = try arena.create(Mapping);
-    m.* = .{ .by = b, .fields = (try mapType(arena, name, b, "", v, 0)).children };
+    m.* = try Mapping.init(arena, b, (try mapType(arena, name, b, "", v, 0)).children);
     return .{ .schema = .{ .fields = out.items }, .mapping = m };
 }
 

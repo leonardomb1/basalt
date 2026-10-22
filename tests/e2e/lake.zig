@@ -541,16 +541,16 @@ test "Delta column mapping: a renamed column reads under its new name, by physic
     try testing.expectEqualStrings("letter,int\nb,228\n", try rows(a, &tmp, "SELECT letter, int FROM '$B/dat-column_mapping/' WITH (version = 1) WHERE letter = 'b'", 1));
     try testing.expectEqualStrings("new_int\n604\n604\n692\n692\n", try rows(a, &tmp, "SELECT new_int FROM '$B/dat-column_mapping/' WHERE new_int > 600 ORDER BY new_int", 1));
 
-    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, \"nested_struct.ac.aca\", array_of_map_of_arrays, \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
+    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, \"nested_struct.ac.aca\", array_of_map_of_arrays, array_of_structs, \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
     const by_id = try lanesAgree(a, &tmp, q);
     try testing.expectEqualStrings(
-        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
-        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
-        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
-        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
-        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
-        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
-        \\,,,,,,,,,,
+        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
+        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
+        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
+        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
+        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
+        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
+        \\,,,,,,,,,,,
         \\
     , by_id);
     const log = "table-with-columnmapping-mode-id/_delta_log/00000000000000000000.json";
@@ -729,4 +729,21 @@ test "an UPSERT into a table with deletion vectors rewrites a file without its d
     const log = try tmp.dir.readFileAlloc(a, "table-with-dv-small/_delta_log/00000000000000000002.json", 1 << 20);
     try testing.expect(std.mem.indexOf(u8, log, "\"remove\":{\"path\":\"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet\"") != null);
     try testing.expect(std.mem.indexOf(u8, log, "\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"vBn[lx{q8@P<9BNH/isA\"") != null);
+}
+
+test "Delta column mapping: a struct field dropped inside a list element or a map value is neither read nor shown" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(&tmp, "n/old.parquet", basalt.fixtures.mapped_nested_parquet);
+    const y = "{\"name\":\"y\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":ID,\"delta.columnMapping.physicalName\":\"col-y\"}}";
+    const l = try std.fmt.allocPrint(a, "{{\"name\":\"l\",\"type\":{{\"type\":\"array\",\"elementType\":{{\"type\":\"struct\",\"fields\":[{s}]}},\"containsNull\":true}},\"nullable\":true,\"metadata\":{{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-l\"}}}}", .{try std.mem.replaceOwned(u8, a, y, "ID", "3")});
+    const m = try std.fmt.allocPrint(a, "{{\"name\":\"m\",\"type\":{{\"type\":\"map\",\"keyType\":\"integer\",\"valueType\":{{\"type\":\"struct\",\"fields\":[{s}]}},\"valueContainsNull\":true}},\"nullable\":true,\"metadata\":{{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"col-m\"}}}}", .{try std.mem.replaceOwned(u8, a, y, "ID", "6")});
+    const fields = try std.mem.join(a, ",", &.{ try mfield(a, "a", "long", "col-a", 1), l, m });
+    for ([_][]const u8{ "name", "id" }) |mode| {
+        try commit(a, &tmp, "n", 0, &.{ "{\"protocol\":{\"minReaderVersion\":2,\"minWriterVersion\":5}}", try meta(a, fields, "[]", try std.fmt.allocPrint(a, "{{\"delta.columnMapping.mode\":\"{s}\"}}", .{mode})), try add(a, "old.parquet", "{}") });
+        try testing.expectEqualStrings("a,l,m\n1,\"[{\"\"y\"\":10},{\"\"y\"\":11}]\",\"{\"\"7\"\":{\"\"y\"\":30}}\"\n", try rows(a, &tmp, "SELECT * FROM '$B/n/'", 1));
+    }
 }

@@ -25,6 +25,7 @@ pub const NNode = struct {
     first_leaf: usize,
     nleaves: usize,
     max_def: u32 = 0,
+    schema_idx: usize = 0,
 
     pub const Kind = enum { leaf, group, list, map };
 };
@@ -45,6 +46,7 @@ fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, po
     const d2 = def + @as(u32, if (r == .required) 0 else 1);
     const r2 = rep + @as(u32, if (r == .repeated) 1 else 0);
     var node = NNode{
+        .schema_idx = pos.* - 1,
         .name = e.name,
         .def = d2,
         .rep = r2,
@@ -75,10 +77,57 @@ fn buildNode(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, po
     return node;
 }
 
+/// The tree under `root`, a struct's hidden fields (`isHidden`) left out where
+/// another field remains, so they are neither read nor shown; leaves numbered
+/// depth-first over what is kept.
 pub fn buildNested(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, root: RootRef) Error!NNode {
     var pos = root.idx;
     var next: usize = 0;
-    return buildNode(arena, schema, &pos, root.base_def, root.base_rep, &next, 0);
+    var tree = try buildNode(arena, schema, &pos, root.base_def, root.base_rep, &next, 0);
+    try prune(arena, &tree);
+    next = 0;
+    number(&tree, &next);
+    return tree;
+}
+
+/// Whether a field is one a table hides from its file (`fit.Mapping`): a column
+/// it dropped, whose name starts with a NUL byte.
+pub fn isHidden(name: []const u8) bool {
+    return name.len > 0 and name[0] == 0;
+}
+
+/// Drops a struct's hidden fields when one is left; a repeated group keeps them,
+/// as how many fields it has says whether it is a list's element.
+fn prune(arena: std.mem.Allocator, n: *NNode) Error!void {
+    for (n.children) |*c| try prune(arena, c);
+    if (n.kind != .group or n.repeated) return;
+    var shown: usize = 0;
+    for (n.children) |c| shown += @intFromBool(!isHidden(c.name));
+    if (shown == 0 or shown == n.children.len) return;
+    const kids = try arena.alloc(NNode, shown);
+    var k: usize = 0;
+    for (n.children) |c| if (!isHidden(c.name)) {
+        kids[k] = c;
+        k += 1;
+    };
+    n.children = kids;
+}
+
+fn number(n: *NNode, next: *usize) void {
+    n.first_leaf = next.*;
+    if (n.kind == .leaf and n.children.len == 0) {
+        n.nleaves = 1;
+        next.* += 1;
+        return;
+    }
+    for (n.children) |*c| number(c, next);
+    n.nleaves = next.* - n.first_leaf;
+}
+
+/// The schema indices of `n`'s leaves, in their order in the tree.
+pub fn leafIndices(n: *const NNode, out: *std.array_list.Managed(usize)) Error!void {
+    if (n.kind == .leaf and n.children.len == 0) return out.append(n.schema_idx);
+    for (n.children) |*c| try leafIndices(c, out);
 }
 
 /// Whether assembling `n` shows an object: a struct or a map anywhere in it, as
@@ -127,8 +176,11 @@ const Assembler = struct {
 
     fn object(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
         try self.out.append('{');
-        for (n.children, 0..) |*c, i| {
-            if (i > 0) try self.out.append(',');
+        var first = true;
+        for (n.children) |*c| {
+            if (isHidden(c.name)) continue;
+            if (!first) try self.out.append(',');
+            first = false;
             try appendJsonString(self.arena, self.out, c.name);
             try self.out.append(':');
             try self.field(c, spans);

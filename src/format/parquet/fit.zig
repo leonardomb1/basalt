@@ -165,8 +165,52 @@ pub const Deletes = struct {
 pub const Mapping = struct {
     by: By,
     fields: []const Node,
+    /// Each struct field by its parent node (0 for the table) and its physical
+    /// name or id, built once by `init` and only read after, so lanes share it.
+    index: std.HashMapUnmanaged(Key, *const Node, KeyContext, std.hash_map.default_max_load_percentage) = .empty,
 
     pub const By = enum { name, id };
+
+    const Key = struct { parent: usize, name: []const u8 = "", id: i32 = 0 };
+
+    const KeyContext = struct {
+        pub fn hash(_: KeyContext, k: Key) u64 {
+            var h = std.hash.Wyhash.init(k.parent);
+            h.update(k.name);
+            h.update(std.mem.asBytes(&k.id));
+            return h.final();
+        }
+        pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+            return a.parent == b.parent and a.id == b.id and std.mem.eql(u8, a.name, b.name);
+        }
+    };
+
+    pub fn init(arena: std.mem.Allocator, by: By, fields: []const Node) !Mapping {
+        var m = Mapping{ .by = by, .fields = fields };
+        try m.add(arena, 0, fields);
+        return m;
+    }
+
+    fn add(self: *Mapping, arena: std.mem.Allocator, parent: usize, nodes: []const Node) !void {
+        for (nodes) |*n| {
+            if (n.name != null) {
+                const k: ?Key = switch (self.by) {
+                    .name => .{ .parent = parent, .name = n.physical },
+                    .id => if (n.id) |id| .{ .parent = parent, .id = id } else null,
+                };
+                if (k) |key| try self.index.put(arena, key, n);
+            }
+            try self.add(arena, @intFromPtr(n), n.children);
+        }
+    }
+
+    fn find(self: *const Mapping, parent: usize, e: SchemaElement) ?*const Node {
+        const k: Key = switch (self.by) {
+            .name => .{ .parent = parent, .name = e.name },
+            .id => .{ .parent = parent, .id = e.field_id orelse return null },
+        };
+        return self.index.get(k);
+    }
 
     pub const Node = struct {
         /// The table's name; null for a list's element or a map's key or value,
@@ -190,8 +234,8 @@ pub const Mapping = struct {
             if (e.field_id != null) break;
         } else return eval.explain(Error.LakeFileMismatch, "it carries no Parquet field ids, by which the table (column mapping mode `id`) finds its columns, so basalt does not read it as all NULLs");
         const out = try arena.dupe(SchemaElement, schema);
-        var w = Renamer{ .arena = arena, .src = schema, .out = out, .by = self.by };
-        try w.children(@intCast(@max(0, schema[0].num_children)), self.fields, 0);
+        var w = Renamer{ .arena = arena, .src = schema, .out = out, .m = self };
+        try w.children(@intCast(@max(0, schema[0].num_children)), 0, 0);
         return out;
     }
 };
@@ -202,7 +246,7 @@ const Renamer = struct {
     arena: std.mem.Allocator,
     src: []const SchemaElement,
     out: []SchemaElement,
-    by: Mapping.By,
+    m: *const Mapping,
     pos: usize = 1,
 
     fn next(self: *Renamer, depth: usize) !SchemaElement {
@@ -211,17 +255,11 @@ const Renamer = struct {
         return self.src[self.pos];
     }
 
-    fn children(self: *Renamer, count: usize, nodes: []const Mapping.Node, depth: usize) anyerror!void {
+    fn children(self: *Renamer, count: usize, parent: usize, depth: usize) anyerror!void {
         for (0..count) |_| {
             const at = self.pos;
             const e = try self.next(depth);
-            const node = for (nodes) |*n| {
-                const hit = switch (self.by) {
-                    .name => std.mem.eql(u8, n.physical, e.name),
-                    .id => n.id != null and e.field_id != null and n.id.? == e.field_id.?,
-                };
-                if (hit) break n;
-            } else null;
+            const node = self.m.find(parent, e);
             self.out[at].name = if (node) |n| n.name orelse e.name else try std.mem.concat(self.arena, u8, &.{ "\x00", e.name });
             try self.below(e, node, depth);
         }
@@ -232,7 +270,7 @@ const Renamer = struct {
         const n = node orelse return self.skip(kids, depth);
         switch (n.kind) {
             .leaf => return self.skip(kids, depth),
-            .@"struct" => return self.children(kids, n.children, depth + 1),
+            .@"struct" => return self.children(kids, @intFromPtr(n), depth + 1),
             .list => {
                 if (kids != 1 or n.children.len != 1 or self.pos >= self.src.len) return self.skip(kids, depth);
                 const rep = self.src[self.pos];
@@ -383,7 +421,7 @@ test "a mapping renames a file's columns to the table's, nested ones too, and hi
     };
     const want = [_][]const u8{ "schema", "a", "s", "x", "l", "list", "element", "y", "m", "key_value", "key", "value", "z", "\x00old" };
     for ([_]Mapping.By{ .name, .id }) |by| {
-        const m = Mapping{ .by = by, .fields = &fields };
+        const m = try Mapping.init(a, by, &fields);
         const got = try m.rename(a, &schema);
         for (want, got) |w, g| try testing.expectEqualStrings(w, g.name);
         try testing.expectEqualStrings("c1", schema[1].name);
@@ -391,9 +429,9 @@ test "a mapping renames a file's columns to the table's, nested ones too, and hi
 
     var bare = schema;
     for (&bare) |*e| e.field_id = null;
-    const by_id = Mapping{ .by = .id, .fields = &fields };
+    const by_id = try Mapping.init(a, .id, &fields);
     try testing.expectError(Error.LakeFileMismatch, by_id.rename(a, &bare));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.LakeFileMismatch).?, "carries no Parquet field ids") != null);
-    const deep = Mapping{ .by = .name, .fields = &fields };
+    const deep = try Mapping.init(a, .name, &fields);
     try testing.expectError(error.UnsupportedParquetSchema, deep.rename(a, bare[0..6]));
 }

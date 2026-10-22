@@ -100,6 +100,7 @@ pub const NNode = @import("nested.zig").NNode;
 pub const Nested = @import("nested.zig").Nested;
 pub const buildNested = @import("nested.zig").buildNested;
 const holdsStruct = @import("nested.zig").holdsStruct;
+const leafIndices = @import("nested.zig").leafIndices;
 pub const assembleNested = @import("nested.zig").assembleNested;
 pub const Bound = @import("stats.zig").Bound;
 pub const KeyBound = @import("stats.zig").KeyBound;
@@ -207,12 +208,17 @@ pub const Reader = struct {
                     try roots_seen.append(rt.idx);
                     if (!wanted(want, lf.name)) continue;
                     const tree = try buildNested(arena, md.schema, rt);
+                    var at = std.array_list.Managed(usize).init(arena);
+                    try leafIndices(&tree, &at);
                     var ix = std.array_list.Managed(usize).init(arena);
-                    for (all) |o| if (o.root != null and o.root.?.idx == rt.idx) {
+                    for (at.items) |si| {
+                        const o = for (all) |x| {
+                            if (x.schema_idx == si) break x;
+                        } else return Error.UnsupportedParquetSchema;
                         _ = try basaltType(md.schema[o.schema_idx]);
                         try keep.append(o);
                         try ix.append(keep.items.len - 1);
-                    };
+                    }
                     if (ix.items.len != tree.nleaves) return Error.UnsupportedParquetSchema;
                     const n = try arena.create(Nested);
                     n.* = .{ .name = lf.name, .root = tree, .leaves = ix.items };
