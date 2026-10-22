@@ -38,16 +38,18 @@ const evalLit = @import("testing_util.zig").evalLit;
 const parser = @import("../../lang/sql_parser.zig");
 const vectorized = @import("fn_vec.zig").vectorized;
 
+/// `expr` over `batch`, vectorized where it can be. A value error the vector form
+/// raises is rechecked row by row, the reference: the vector form evaluates every
+/// branch and side, so the failing value may sit where no row's result reads it.
 pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, out_ty: Type) EvalError!column.Column {
     forgetFailure();
     const v = evalVec(arena, expr, batch) catch |e| switch (e) {
         error.Unsupported => return evalColumnRowwise(arena, expr, batch, out_ty),
-        error.CastFailed => return error.CastFailed,
-        error.DivByZero => return error.DivByZero,
+        error.CastFailed, error.DivByZero, error.IntOverflow, error.PatternTooComplex, error.InvalidJson => {
+            forgetFailure();
+            return evalColumnRowwise(arena, expr, batch, out_ty);
+        },
         error.TypeMismatch => return error.TypeMismatch,
-        error.IntOverflow => return error.IntOverflow,
-        error.PatternTooComplex => return error.PatternTooComplex,
-        error.InvalidJson => return error.InvalidJson,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
@@ -509,7 +511,7 @@ fn cmpStrVec(arena: std.mem.Allocator, op: ast.BinOp, l: Str, r: Str, n: usize) 
 /// branch, a short-circuited side), demoting a value-dependent error to Unsupported.
 fn evalVecLazy(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Vec {
     return evalVec(arena, e, batch) catch |err| switch (err) {
-        error.DivByZero, error.CastFailed => error.Unsupported,
+        error.DivByZero, error.CastFailed, error.IntOverflow, error.PatternTooComplex, error.InvalidJson => error.Unsupported,
         else => err,
     };
 }
@@ -1918,4 +1920,36 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
             } else try std.testing.expectError(error.IntOverflow, testSum(a, e, batch, ty.scale));
         }
     }
+}
+
+test "an error only an untaken branch or a short-circuited side would raise fails no row" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+        .{ .name = "y", .ty = Type.init(.int).asNullable() },
+    } };
+    var xs = [_]?i64{ 5, 9_000_000_000_000_000_000 };
+    var ys = [_]?i64{ 0, 2 };
+    var cols = [_]column.Column{ try column.intColumn(a, &xs), try column.intColumn(a, &ys) };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 2 };
+    const cases = [_]struct { src: []const u8, want: [2]i64 }{
+        .{ .src = "case when y = 0 then 0 when x / y > 1 then 1 else 2 end", .want = .{ 0, 1 } },
+        .{ .src = "if(x > 100, 0, x * 10)", .want = .{ 50, 0 } },
+        .{ .src = "case when x > 100 then 0 else x * 10 end", .want = .{ 50, 0 } },
+    };
+    for (cases) |c| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try parser.parseExprStr(a, c.src, &diag);
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        const col = try evalColumn(a, e, batch, try ctx.typeOf(e));
+        for (c.want, 0..) |w, i| try std.testing.expectEqual(w, col.getValue(i).int);
+    }
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const or_e = try parser.parseExprStr(a, "y = 2 or x * 10 > 0", &diag);
+    const ored = try evalColumn(a, or_e, batch, Type.init(.bool).asNullable());
+    for (0..2) |i| try std.testing.expect(ored.getValue(i).bool);
+    const fails = try parser.parseExprStr(a, "x * 10", &diag);
+    try std.testing.expectError(error.IntOverflow, evalColumn(a, fails, batch, Type.init(.int).asNullable()));
 }
