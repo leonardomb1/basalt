@@ -57,6 +57,7 @@ const OneBatch = @import("connect.zig").OneBatch;
 const openSourceProjected = @import("connect.zig").openSourceProjected;
 const projectSqlRead = @import("connect.zig").projectSqlRead;
 const projectJoinedSqlRead = @import("connect/sql_read.zig").projectJoinedSqlRead;
+const sql_read = @import("connect/sql_read.zig");
 const factsIfWanted = @import("connect.zig").factsIfWanted;
 const sqlConnInfo = @import("connect.zig").sqlConnInfo;
 const sourceLabel = @import("connect.zig").sourceLabel;
@@ -951,9 +952,9 @@ pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.St
     if (stages[0].node != .read) return stages;
     const arena = env.arena;
     const rd = stages[0].node.read;
-    if (rd.form != .table and rd.form != .query) return stages;
     const conn = env.connections.get(rd.connector) orelse return stages;
     const d = (sqlConnInfo(conn) orelse return stages).dialect;
+    if (!sql_read.pushableRead(d, rd)) return stages;
     const facts = try factsIfWanted(env, rd, d, stages[1..], .{ .fields = &.{} }, false, .superset);
     const extra = (try pushdown.serialWhereWith(arena, d, stages, facts, null)) orelse return stages;
     const out = try arena.dupe(ast.Stage, stages);

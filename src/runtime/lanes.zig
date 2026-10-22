@@ -61,6 +61,7 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
+const sql_read = @import("connect/sql_read.zig");
 
 const Env = @import("env.zig").Env;
 const RunOptions = @import("env.zig").RunOptions;
@@ -186,8 +187,8 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
     const desc = env.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
-    if (rd.form != .table and rd.form != .query) {
-        why.* = "the read is not a table or query";
+    if (!sql_read.pushableRead(desc.dialect, rd)) {
+        why.* = "the read is not a table or a query the source can take as a subquery";
         return null;
     }
     for (shape.prefix) |st| if (st.node != .filter) {
@@ -227,7 +228,7 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     const desc = env.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
-    if (rd.form != .table and rd.form != .query) return null;
+    if (!sql_read.pushableRead(desc.dialect, rd)) return null;
     const t = (try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], why)) orelse return null;
     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
     const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, stages[1 .. stages.len - 1], src_schema, true, .exact);

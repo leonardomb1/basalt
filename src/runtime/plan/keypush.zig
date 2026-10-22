@@ -39,6 +39,7 @@ const ast = @import("../../lang/ast.zig");
 const connect = @import("../connect.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
+const sql_read = @import("../connect/sql_read.zig");
 const folder = @import("../../connect/folder.zig");
 const lake = @import("../../format/lake/table.zig");
 const ftp = @import("../../store/ftp.zig");
@@ -88,9 +89,9 @@ pub fn leftMayNarrow(j: ast.Join) bool {
 pub fn sqlDialect(env: *Env, stages: []const ast.Stage) ?Dialect {
     if (stages.len == 0 or stages[0].node != .read) return null;
     const rd = stages[0].node.read;
-    if (rd.form != .table and rd.form != .query) return null;
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = connect.sqlConnInfo(conn) orelse return null;
+    if (!sql_read.pushableRead(info.dialect, rd)) return null;
     for (stages[1..]) |st| switch (st.node) {
         .filter, .select => {},
         else => return null,

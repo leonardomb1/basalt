@@ -30,6 +30,64 @@ pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
 }
 
+/// Whether pushdowns may wrap read `rd` as a subquery: a table always; a query unless
+/// SQL Server would refuse it in a derived table, as it does a leading `WITH` or a
+/// top-level `ORDER BY`. Such a query is then read as written, filtered here.
+pub fn pushableRead(dialect: sql.Dialect, rd: ast.Read) bool {
+    return switch (rd.form) {
+        .table => true,
+        .query => |q| dialect != .sqlserver or wrappableTsql(queryText(q)),
+        else => false,
+    };
+}
+
+fn wrappableTsql(q: []const u8) bool {
+    var depth: usize = 0;
+    var i: usize = 0;
+    var first = true;
+    while (i < q.len) {
+        const c = q[i];
+        if (c == '\'' or c == '"' or c == '[') {
+            const close: u8 = if (c == '[') ']' else c;
+            i += 1;
+            while (i < q.len and q[i] != close) i += 1;
+            i += 1;
+            continue;
+        }
+        if (c == '-' and i + 1 < q.len and q[i + 1] == '-') {
+            i = std.mem.indexOfScalarPos(u8, q, i, '\n') orelse q.len;
+            continue;
+        }
+        if (c == '/' and i + 1 < q.len and q[i + 1] == '*') {
+            i = if (std.mem.indexOfPos(u8, q, i + 2, "*/")) |e| e + 2 else q.len;
+            continue;
+        }
+        if (c == '(') depth += 1;
+        if (c == ')' and depth > 0) depth -= 1;
+        if (std.ascii.isAlphabetic(c) and (i == 0 or !isWordByte(q[i - 1]))) {
+            var e = i;
+            while (e < q.len and isWordByte(q[e])) e += 1;
+            const word = q[i..e];
+            if (first and std.ascii.eqlIgnoreCase(word, "with")) return false;
+            first = false;
+            if (depth == 0 and std.ascii.eqlIgnoreCase(word, "order")) {
+                var k = e;
+                while (k < q.len and std.ascii.isWhitespace(q[k])) k += 1;
+                if (k + 2 <= q.len and std.ascii.eqlIgnoreCase(q[k .. k + 2], "by") and (k + 2 == q.len or !isWordByte(q[k + 2]))) return false;
+            }
+            i = e;
+            continue;
+        }
+        if (!std.ascii.isWhitespace(c)) first = false;
+        i += 1;
+    }
+    return true;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
 /// A `query "..."` read's text without its trailing `;`: pushdowns wrap it as a
 /// subquery, where the terminator is a syntax error.
 fn queryText(q: []const u8) []const u8 {
@@ -191,9 +249,9 @@ pub fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig,
 pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     if (stage.node != .read) return null;
     var rd = stage.node.read;
-    if (rd.form != .table and rd.form != .query) return null;
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
+    if (!pushableRead(info.dialect, rd)) return null;
     if (forHintName(stage.hints, "where")) |wh| {
         if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
             rd.where = if (rd.where.len > 0)
@@ -315,4 +373,19 @@ test "a dotted or quote-bearing column name stays one quoted name in a read" {
     const a = ar.allocator();
     try std.testing.expectEqualStrings("\"a.b\"", try selectListFor(a, .postgres, &.{"a.b"}));
     try std.testing.expectEqualStrings("[a.b], [x]]y]", try selectListFor(a, .sqlserver, &.{ "a.b", "x]y" }));
+}
+
+test "a SQL Server query with a leading WITH or a top-level ORDER BY is never wrapped" {
+    const q = struct {
+        fn of(text: []const u8) ast.Read {
+            return .{ .connector = "db", .form = .{ .query = text } };
+        }
+    }.of;
+    try std.testing.expect(pushableRead(.sqlserver, q("SELECT id FROM t WHERE x = 1")));
+    try std.testing.expect(!pushableRead(.sqlserver, q("  WITH c AS (SELECT 1 AS id) SELECT id FROM c")));
+    try std.testing.expect(!pushableRead(.sqlserver, q("-- note\nwith c AS (SELECT 1 AS id) SELECT id FROM c;")));
+    try std.testing.expect(!pushableRead(.sqlserver, q("SELECT id FROM t ORDER BY id")));
+    try std.testing.expect(pushableRead(.sqlserver, q("SELECT id FROM (SELECT TOP 5 id FROM t ORDER BY id) s")));
+    try std.testing.expect(pushableRead(.sqlserver, q("SELECT 'ORDER BY x' AS s, [order by] FROM t")));
+    try std.testing.expect(pushableRead(.postgres, q("WITH c AS (SELECT 1) SELECT * FROM c ORDER BY 1")));
 }
