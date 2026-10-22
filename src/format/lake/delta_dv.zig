@@ -293,6 +293,12 @@ test "a stored deletion vector: framing, size, CRC-32, magic and version are eac
     try tmp.dir.writeFile(.{ .sub_path = name, .data = native });
     try testing.expectError(table.Error.LakeTableRefused, load(a, &r, 10));
     try testing.expect(std.mem.indexOf(u8, @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?, "native RoaringBitmapArray format") != null);
+    const other = try a.dupe(u8, native);
+    std.mem.writeInt(u32, other[5..9], 0x12345678, .little);
+    std.mem.writeInt(u32, other[other.len - 4 ..][0..4], std.hash.Crc32.hash(other[5 .. other.len - 4]), .big);
+    try tmp.dir.writeFile(.{ .sub_path = name, .data = other });
+    try testing.expectError(table.Error.LakeTableRefused, load(a, &r, 10));
+    try testing.expect(std.mem.indexOf(u8, @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?, "does not start with the portable RoaringBitmapArray magic") != null);
     try tmp.dir.writeFile(.{ .sub_path = name, .data = good[0..20] });
     try testing.expectError(table.Error.LakeTableRefused, load(a, &r, 10));
     try testing.expect(std.mem.indexOf(u8, @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused).?, "is shorter than the log says") != null);

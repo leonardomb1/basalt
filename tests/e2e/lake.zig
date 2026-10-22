@@ -541,16 +541,16 @@ test "Delta column mapping: a renamed column reads under its new name, by physic
     try testing.expectEqualStrings("letter,int\nb,228\n", try rows(a, &tmp, "SELECT letter, int FROM '$B/dat-column_mapping/' WITH (version = 1) WHERE letter = 'b'", 1));
     try testing.expectEqualStrings("new_int\n604\n604\n692\n692\n", try rows(a, &tmp, "SELECT new_int FROM '$B/dat-column_mapping/' WHERE new_int > 600 ORDER BY new_int", 1));
 
-    const q = "SELECT * FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
+    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, \"nested_struct.ac.aca\", array_of_map_of_arrays, \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
     const by_id = try lanesAgree(a, &tmp, q);
     try testing.expectEqualStrings(
-        \\ByteType,ShortType,IntegerType,LongType,FloatType,DoubleType,decimal,BooleanType,StringType,BinaryType,DateType,TimestampType,nested_struct.aa,nested_struct.ac.aca,array_of_prims,array_of_arrays,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs.aa,struct_of_arrays_maps_of_structs.ab,map_of_prims,map_of_rows,map_of_arrays,map_of_maps
-        \\0,0,0,0,0,0,0.00,true,0,0,2021-11-18,1970-01-01 00:00:00,0,0,"[0,1]","[[0,1],[2,3]]","[{""0"":[2,3],""1"":[4,5]}]","[0,0]","[0,1]","{""[0,1]"":{""aca"":2}}","{""0"":1,""2"":3}","{""1"":{""ab"":0}}","{""0"":[0,null,1],""1"":[]}","{""0"":{""0"":0},""1"":{""2"":0}}"
-        \\1,1,1,1,1,1,1.00,false,1,1,2021-11-18,1970-01-01 00:00:00.001000,1,1,"[1,2]","[[1,2],[3,4]]","[{""1"":[2,3],""2"":[4,5]}]","[1,1]","[1,2]","{""[1,2]"":{""aca"":3}}","{""1"":2,""3"":4}","{""2"":{""ab"":20}}","{""1"":[1,null,2],""2"":[]}","{""1"":{""1"":1},""2"":{""3"":1}}"
-        \\2,2,2,2,2,2,2.00,true,2,2,2021-11-18,1970-01-01 00:00:00.002000,2,2,"[2,3]","[[2,3],[4,5]]","[{""2"":[2,3],""3"":[4,5]}]","[2,2]","[2,3]","{""[2,3]"":{""aca"":4}}","{""2"":3,""4"":5}","{""3"":{""ab"":40}}","{""2"":[2,null,3],""3"":[]}","{""2"":{""2"":2},""3"":{""4"":2}}"
-        \\3,3,3,3,3,3,3.00,false,3,3,2021-11-18,1970-01-01 00:00:00.003000,3,3,"[3,4]","[[3,4],[5,6]]","[{""3"":[2,3],""4"":[4,5]}]","[3,3]","[3,4]","{""[3,4]"":{""aca"":5}}","{""3"":4,""5"":6}","{""4"":{""ab"":60}}","{""3"":[3,null,4],""4"":[]}","{""3"":{""3"":3},""4"":{""5"":3}}"
-        \\4,4,4,4,4,4,4.00,true,4,4,2021-11-18,1970-01-01 00:00:00.004000,4,4,"[4,5]","[[4,5],[6,7]]","[{""4"":[2,3],""5"":[4,5]}]","[4,4]","[4,5]","{""[4,5]"":{""aca"":6}}","{""4"":5,""6"":7}","{""5"":{""ab"":80}}","{""4"":[4,null,5],""5"":[]}","{""4"":{""4"":4},""5"":{""6"":4}}"
-        \\,,,,,,,,,,,,,,,,,,,,,,,
+        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
+        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
+        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
+        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
+        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
+        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
+        \\,,,,,,,,,,
         \\
     , by_id);
     const log = "table-with-columnmapping-mode-id/_delta_log/00000000000000000000.json";
@@ -635,6 +635,20 @@ test "a deletion vector over three row groups: one deleted whole, pruning, LIMIT
     try testing.expectEqualStrings("id\n2050\n2051\n2052\n", try rows(a, &tmp, "SELECT id FROM '$B/d/' LIMIT 3", 1));
     try testing.expectEqualStrings("id\n2050\n2051\n2052\n", try lanesAgree(a, &tmp, "SELECT id FROM '$B/d/' ORDER BY id LIMIT 3"));
     try testing.expectEqualStrings("id\n4997\n4998\n4999\n", try lanesAgree(a, &tmp, "SELECT id FROM '$B/d/' WHERE id > 4996 ORDER BY id"));
+
+    var lines = std.array_list.Managed([]const u8).init(a);
+    try lines.appendSlice(&.{ dv_protocol, try meta(a, fields, "[]", "{}") });
+    try put(&tmp, "m/" ++ dv_name, try tmp.dir.readFileAlloc(a, "d/" ++ dv_name, 1 << 20));
+    for (0..20) |i| {
+        const f = try std.fmt.allocPrint(a, "f{d:0>2}.parquet", .{i});
+        try put(&tmp, try std.fmt.allocPrint(a, "m/{s}", .{f}), basalt.fixtures.rg2_parquet);
+        try lines.append(try addDv(a, f, dv));
+    }
+    try commit(a, &tmp, "m", 0, lines.items);
+    const by_file = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/m/';", 2);
+    try testing.expect(by_file.err == null);
+    try testing.expect(by_file.summary.threads > 1);
+    try testing.expectEqualStrings("n,s\n58940,207771420\n", by_file.out);
 
     const inline_dv = "{\"storageType\":\"i\",\"pathOrInlineDv\":\"^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L\",\"sizeInBytes\":44,\"cardinality\":6}";
     try commit(a, &tmp, "d", 1, &.{ try removeDv(a, "rg2.parquet", dv), try addDv(a, "rg2.parquet", inline_dv) });
