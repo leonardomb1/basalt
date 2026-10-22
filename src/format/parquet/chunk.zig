@@ -371,13 +371,18 @@ const One = struct {
     }
 };
 
-/// A statistic's raw min or max as the column's pages would read it: the first
-/// PLAIN value of `raw` through the page kernel, so pruning and scans agree.
+/// A statistic's raw min or max as the column's pages would read it, through the
+/// page kernel so pruning and scans agree: the first PLAIN value of `raw`, except a
+/// BYTE_ARRAY statistic, which is the value's bytes with no length prefix.
 pub fn plainValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: []const u8) Error!Value {
     const cast: Cast = .{ .ty = try basaltType(elem), .tscale = temporalScale(elem) };
     var slot: [1][]const u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&slot));
     var v: Value = .null;
+    if (phys == .byte_array) {
+        try pushBytes(One{ .out = &v }, cast, &.{raw});
+        return v;
+    }
     try pushPlain(fba.allocator(), One{ .out = &v }, cast, phys, elem.type_length orelse 0, raw, 1);
     return v;
 }

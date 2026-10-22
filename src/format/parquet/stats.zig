@@ -186,7 +186,8 @@ pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
     return (try basaltType(e)).asNullable();
 }
 
-/// An unsigned bound reads as its unsigned value; one only the deprecated signed-order
+/// A text or binary bound is unknown: legacy writers ordered byte arrays as signed
+/// bytes, so it is not trusted to prune. An unsigned bound reads as its unsigned value; one only the deprecated signed-order
 /// `min`/`max` gave, or a UINT64 past 2^63-1, is unknown. An INT96 bound is unknown:
 /// the format leaves its order undefined, and writers that kept one compared the
 /// 12 bytes, nanoseconds first, not the instants.
@@ -194,6 +195,7 @@ fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]
     const b = raw orelse return null;
     if (meta.ty == .int96) return null;
     const v = plainValue(elem, meta.ty, b) catch return null;
+    if (v == .string or v == .bytes) return null;
     if (v == .int) if (unsignedBits(elem)) |bits| {
         if (meta.stats.legacy) return null;
         return .{ .int = asUnsigned(bits, v.int) orelse return null };
@@ -259,6 +261,29 @@ test "unsigned statistics compare in unsigned order" {
     chunks[0].meta.?.stats.legacy = true;
     const beyond = [_]Bound{.{ .column = "u", .op = .gt, .value = .{ .int = 4_000_000_000 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &beyond));
+}
+
+test "a BYTE_ARRAY statistic is the value's bytes, not a length-prefixed PLAIN value; text bounds never prune" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 2 },
+        .{ .name = "d", .ty = .byte_array, .repetition = .optional, .converted_type = 5, .scale = 0, .precision = 20 },
+        .{ .name = "s", .ty = .byte_array, .repetition = .optional, .converted_type = 0 },
+    };
+    const leaves = [_]Leaf{
+        .{ .schema_idx = 1, .chunk_idx = 0, .name = "d", .max_def = 1, .max_rep = 0 },
+        .{ .schema_idx = 2, .chunk_idx = 1, .name = "s", .max_def = 1, .max_rep = 0 },
+    };
+    const lo = [_]u8{ 1, 0, 0, 0, 2 };
+    const hi = [_]u8{ 1, 0, 0, 0, 5 };
+    const t_lo = [_]u8{ 4, 0, 0, 0, 'a', 'b', 'c', 'd' };
+    var chunks = [_]parquet.ColumnChunk{
+        .{ .meta = .{ .ty = .byte_array, .stats = .{ .min = &lo, .max = &hi } } },
+        .{ .meta = .{ .ty = .byte_array, .stats = .{ .min = &t_lo, .max = &t_lo } } },
+    };
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 2 };
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &.{.{ .column = "d", .op = .gt, .value = .{ .int = 100 } }}));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &.{.{ .column = "d", .op = .gt, .value = .{ .int = 4_294_967_301 } }}));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &.{.{ .column = "s", .op = .eq, .value = .{ .string = "zz" } }}));
 }
 
 test "INT96 statistics never prune: a byte-order max can sit below the group's latest instant" {
