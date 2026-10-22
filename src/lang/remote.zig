@@ -2,7 +2,8 @@
 //! `gitlab.com/group/repo/path.sql@ref`, or `host/group/sub/repo.git/path.sql@ref`
 //! for a self-hosted GitLab (`.git` marks where the project ends). The ref is a tag,
 //! branch or commit, and is required. Files are fetched over HTTPS as raw files, no
-//! git needed; `GITHUB_TOKEN` or `GITLAB_TOKEN` reads a private repository.
+//! git needed; `GITHUB_TOKEN` or `GITLAB_TOKEN` reads a private repository, the
+//! latter sent only to gitlab.com or the host `GITLAB_HOST` names.
 //!
 //! Every remote file is pinned by its SHA-256 in `basalt.sum` beside the root
 //! script, as Go's `go.sum` pins a module: a file not pinned is refused until
@@ -37,14 +38,23 @@ pub const Spec = struct {
         return std.fmt.allocPrint(arena, "https://{s}/{s}/-/raw/{s}/{s}", .{ self.host, self.project, self.ref, self.path });
     }
 
-    /// The header that reads a private repository, from the environment.
+    /// The header that reads a private repository, from the environment: the GitLab
+    /// token goes only to gitlab.com or the host `GITLAB_HOST` names, so an include
+    /// naming another host never receives it.
     pub fn auth(self: Spec, arena: std.mem.Allocator) !?std.http.Header {
         if (std.mem.eql(u8, self.host, "github.com")) {
             const t = std.process.getEnvVarOwned(arena, "GITHUB_TOKEN") catch return null;
             return .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) };
         }
+        if (!gitlabHost(arena, self.host)) return null;
         const t = std.process.getEnvVarOwned(arena, "GITLAB_TOKEN") catch return null;
         return .{ .name = "PRIVATE-TOKEN", .value = t };
+    }
+
+    fn gitlabHost(arena: std.mem.Allocator, host: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(host, "gitlab.com")) return true;
+        const named = std.process.getEnvVarOwned(arena, "GITLAB_HOST") catch return false;
+        return std.ascii.eqlIgnoreCase(std.mem.trim(u8, named, " /"), host);
     }
 
     /// `rel`, an include written inside this file, in the same repository and ref.
@@ -246,4 +256,16 @@ test "remote specs: GitHub, GitLab, a .git project, refs and relative paths" {
     try std.testing.expectEqualStrings("common.sql", (try gh.relative(a, "../common.sql")).path);
     try std.testing.expectError(error.RemoteEscapesRepo, gh.relative(a, "../../etc/x.sql"));
     try std.testing.expectError(error.RemoteAbsoluteInclude, gh.relative(a, "/etc/passwd"));
+}
+
+test "the GitLab token is sent only to gitlab.com or the host GITLAB_HOST names" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expect(Spec.gitlabHost(a, "GitLab.com"));
+    if (std.posix.getenv("GITLAB_HOST") == null) {
+        try std.testing.expect(!Spec.gitlabHost(a, "evil.example"));
+        const s = parse("evil.example/x/y.git/a.sql@v1").?;
+        try std.testing.expect((try s.auth(a)) == null);
+    }
 }

@@ -54,6 +54,8 @@ pub const FakeServer = struct {
     count: std.atomic.Value(usize) = .init(0),
     lines: [16][128]u8 = undefined,
     lens: [16]usize = .{0} ** 16,
+    heads: [16][1024]u8 = undefined,
+    head_lens: [16]usize = .{0} ** 16,
 
     pub fn start(self: *FakeServer, replies: []const ?[]const u8) !void {
         self.* = .{ .listener = try listen(128), .replies = replies };
@@ -76,6 +78,11 @@ pub const FakeServer = struct {
 
     pub fn line(self: *FakeServer, i: usize) []const u8 {
         return self.lines[i][0..self.lens[i]];
+    }
+
+    /// Request `i`'s head, its first 1 KiB, so a test can see which headers came.
+    pub fn headOf(self: *FakeServer, i: usize) []const u8 {
+        return self.heads[i][0..self.head_lens[i]];
     }
 
     pub fn stop(self: *FakeServer) void {
@@ -119,6 +126,9 @@ pub const FakeServer = struct {
             const len = @min(first.len, self.lines[k].len);
             @memcpy(self.lines[k][0..len], first[0..len]);
             self.lens[k] = len;
+            const hl = @min(end, self.heads[k].len);
+            @memcpy(self.heads[k][0..hl], head[0..hl]);
+            self.head_lens[k] = hl;
         }
     }
 };

@@ -85,6 +85,7 @@
 //! flat across pages.
 
 const std = @import("std");
+const objstore = @import("../store/objstore.zig");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -695,6 +696,7 @@ pub const HttpSource = struct {
                 }
                 if (std.mem.startsWith(u8, tok, "http://") or std.mem.startsWith(u8, tok, "https://")) {
                     if (!lineSafe(tok)) return eval.explain(error.BadHeaderValue, "the response's next-page URL holds a line break or NUL, which would inject into the request");
+                    if (!objstore.sameOrigin(self.base_url, tok)) return eval.explain(error.HttpCrossOriginPage, "the response's next-page URL is on another host or scheme than the first page's, and this read's headers and login go only to its own");
                     self.next_url = try self.arena.dupe(u8, tok);
                 } else {
                     self.next_url = try withParam(self.arena, self.base_url, self.opts.cursor_param, tok);
@@ -878,19 +880,13 @@ pub const HttpSource = struct {
         const sa = slot.snap.allocator();
         var attempt: i64 = 0;
         while (true) {
-            var aw = std.Io.Writer.Allocating.init(slot.gpa);
-            defer aw.deinit();
-            const res = slot.client.fetch(.{
+            const res = objstore.exchange(sa, slot.client, .{
                 .method = if (slot.method_post) .POST else .GET,
-                .location = .{ .url = slot.url },
-                .extra_headers = slot.hdrs[0..slot.nh],
-                .headers = .{
-                    .user_agent = .{ .override = slot.user_agent },
-                    .content_type = if (slot.content_type) |ct| .{ .override = ct } else .default,
-                },
+                .url = slot.url,
+                .headers = slot.hdrs[0..slot.nh],
                 .payload = slot.req_body,
-                .decompress_buffer = decompress_direct,
-                .response_writer = &aw.writer,
+                .content_type = slot.content_type,
+                .user_agent = slot.user_agent,
             }) catch |e| {
                 attempt += 1;
                 if (isRetryableNet(e) and attempt <= slot.retries and !driver.aborting()) {
@@ -900,17 +896,14 @@ pub const HttpSource = struct {
                 slot.err = e;
                 break;
             };
-            const code = @intFromEnum(res.status);
+            const code = res.code;
             if ((code == 429 or code >= 500 or (code != 401 and statusListed(slot.retry_statuses, code))) and attempt < slot.retries and !driver.aborting()) {
                 attempt += 1;
                 std.Thread.sleep(retryDelayNs(slot.retry_base_ms, attempt));
                 continue;
             }
             slot.code = code;
-            slot.body = sa.dupe(u8, aw.writer.buffered()) catch |e| {
-                slot.err = e;
-                break;
-            };
+            slot.body = res.body;
             break;
         }
         if (slot.state.cmpxchgStrong(
@@ -1035,23 +1028,17 @@ pub const HttpSource = struct {
                 nh += 1;
             }
         }
-        var aw = std.Io.Writer.Allocating.init(arena);
-        const res = try self.client.fetch(.{
+        const res = try objstore.exchange(arena, self.client, .{
             .method = if (self.opts.method == .post) .POST else .GET,
-            .location = .{ .url = req.url },
-            .extra_headers = hdrs[0..nh],
-            .headers = .{
-                .user_agent = .{ .override = userAgentOf(self.opts) },
-                .content_type = if (self.contentType()) |ct| .{ .override = ct } else .default,
-            },
+            .url = req.url,
+            .headers = hdrs[0..nh],
             .payload = req.body,
-            .decompress_buffer = decompress_direct,
-            .response_writer = &aw.writer,
+            .content_type = self.contentType(),
+            .user_agent = userAgentOf(self.opts),
         });
-        const code = @intFromEnum(res.status);
-        if (code == 204) return "";
-        if (code != 200) return self.raiseStatus(code, req.url, aw.writer.buffered());
-        return aw.writer.buffered();
+        if (res.code == 204) return "";
+        if (res.code != 200) return self.raiseStatus(res.code, req.url, res.body);
+        return res.body;
     }
 
     /// The single status policy for every fetch path: 401 goes to session re-login

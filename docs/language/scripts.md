@@ -52,7 +52,8 @@ A path written as a repository — `github.com/owner/repo/path/file.sql@ref`,
 `gitlab.com/group/repo/path/file.sql@ref`, or `host/group/repo.git/path/file.sql@ref`
 for a self-hosted GitLab — is a **remote include**, fetched over HTTPS (no `git`
 needed; `GITHUB_TOKEN` or `GITLAB_TOKEN` in the environment reads a private
-repository). The `@ref` (a tag, branch or commit) is required. Each remote file
+repository; the GitLab token goes only to gitlab.com, or to a self-hosted GitLab
+named in `GITLAB_HOST`). The `@ref` (a tag, branch or commit) is required. Each remote file
 is pinned by its SHA-256 in `basalt.sum` beside the root script, as Go's `go.sum`
 pins a module, and is refused until pinned: `basalt check --pin script.sql`
 fetches what is not pinned and records it. A file whose content no longer

@@ -167,22 +167,73 @@ pub const Call = struct {
     payload: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     identity: bool = false,
+    user_agent: ?[]const u8 = null,
 };
 
 /// One request, its body read whole into `arena` and decoded per its
 /// Content-Encoding; `identity` asks for none, as a byte range of a compressed body
-/// cannot be decoded. A bodiless request follows up to three redirects, as
-/// `Client.fetch` does. Header values are copied out before the body is read,
-/// which invalidates the head's strings. A request that fails before its response
-/// head arrives would leave its connection pooled (std keeps a `.ready` one), so the
-/// replay would write into the dead socket; a failure always drops it.
+/// cannot be decoded. A bodiless request follows up to three redirects, here rather
+/// than in std, which keeps `extra_headers` on a redirect to another host: a hop to
+/// another scheme, host or port drops `headers`, so a token or key never leaves its
+/// origin. Header values are copied out before the body is read, which invalidates
+/// the head's strings. A request that fails before its response head arrives would
+/// leave its connection pooled (std keeps a `.ready` one), so the replay would write
+/// into the dead socket; a failure always drops it.
 pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) !Response {
+    var hop = call;
+    var hops: u8 = 0;
+    while (true) {
+        var location: ?[]const u8 = null;
+        const out = try exchangeOnce(arena, client, hop, &location);
+        const loc = location orelse return out;
+        if (hop.payload != null or hops == 3) return out;
+        hops += 1;
+        const next = try resolveLocation(arena, hop.url, loc);
+        if (!sameOrigin(hop.url, next)) hop.headers = &.{};
+        hop.url = next;
+    }
+}
+
+fn isRedirect(code: u16) bool {
+    return switch (code) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+}
+
+/// `url`'s `scheme://host[:port]`, the part a redirect must keep for headers to follow.
+fn origin(url: []const u8) []const u8 {
+    const at = std.mem.indexOf(u8, url, "://") orelse return url;
+    const rest = url[at + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    return url[0 .. at + 3 + end];
+}
+
+/// Whether two absolute URLs share scheme, host and port.
+pub fn sameOrigin(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(origin(a), origin(b));
+}
+
+/// A `Location` against the URL that sent it: absolute, scheme-relative, rooted or
+/// relative to the sender's folder.
+fn resolveLocation(arena: std.mem.Allocator, base: []const u8, loc: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, loc, "://") != null) return loc;
+    const o = origin(base);
+    if (std.mem.startsWith(u8, loc, "//")) return std.mem.concat(arena, u8, &.{ o[0 .. std.mem.indexOf(u8, o, "://").? + 1], loc });
+    if (std.mem.startsWith(u8, loc, "/")) return std.mem.concat(arena, u8, &.{ o, loc });
+    const path_end = std.mem.indexOfAny(u8, base[o.len..], "?#") orelse base.len - o.len;
+    const path = base[o.len..][0..path_end];
+    const dir = path[0 .. (std.mem.lastIndexOfScalar(u8, path, '/') orelse 0)];
+    return std.mem.concat(arena, u8, &.{ o, dir, "/", loc });
+}
+
+fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, location: *?[]const u8) !Response {
     const uri = try std.Uri.parse(call.url);
-    const redirects: std.http.Client.Request.RedirectBehavior = if (call.payload == null) @enumFromInt(3) else .unhandled;
     var req = try client.request(call.method, uri, .{
-        .redirect_behavior = redirects,
+        .redirect_behavior = .unhandled,
         .extra_headers = call.headers,
         .headers = .{
+            .user_agent = if (call.user_agent) |ua| .{ .override = ua } else .default,
             .content_type = if (call.content_type) |ct| .{ .override = ct } else .default,
             .accept_encoding = if (call.identity) .{ .override = "identity" } else .default,
         },
@@ -201,13 +252,17 @@ pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) 
         try req.sendBodiless();
     }
 
-    var redirect_buf: [8 * 1024]u8 = undefined;
-    var resp = try req.receiveHead(if (call.payload == null) &redirect_buf else &.{});
+    var resp = try req.receiveHead(&.{});
     var out = Response{ .code = @intFromEnum(resp.head.status), .body = "", .content_length = resp.head.content_length };
     var it = resp.head.iterateHeaders();
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) out.retry_after_ms = retryAfterMs(h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "location") and isRedirect(out.code)) location.* = try arena.dupe(u8, h.value);
+    }
+    if (location.* != null) {
+        if (req.connection) |c| c.closing = true;
+        return out;
     }
     if (call.method == .HEAD) return out;
     if (resp.head.content_encoding == .compress) return error.UnsupportedCompressionMethod;
@@ -737,4 +792,40 @@ test "find dispatches on the scheme alone" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try std.testing.expectError(Error.NotObjectUrl, parse(ar.allocator(), "/tmp/f.csv"));
+}
+
+test "a redirect resolves against its sender, and headers follow only within one origin" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("https://h.io/x/b?q=1", try resolveLocation(a, "https://h.io/x/a?z=2", "b?q=1"));
+    try std.testing.expectEqualStrings("https://h.io/b", try resolveLocation(a, "https://h.io/x/a", "/b"));
+    try std.testing.expectEqualStrings("https://cdn.io/b", try resolveLocation(a, "https://h.io/x/a", "//cdn.io/b"));
+    try std.testing.expectEqualStrings("http://e.io/", try resolveLocation(a, "https://h.io/x/a", "http://e.io/"));
+    try std.testing.expect(sameOrigin("https://H.io/a", "https://h.io/b?c"));
+    try std.testing.expect(!sameOrigin("https://h.io/a", "http://h.io/a"));
+    try std.testing.expect(!sameOrigin("https://h.io/a", "https://h.io:8443/a"));
+    try std.testing.expect(!sameOrigin("https://h.io/a", "https://evil.io/a"));
+}
+
+test "a redirect to another host drops the request's headers; one within the origin keeps them" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var other: FakeServer = undefined;
+    try other.start(&.{FakeServer.reply("200 OK", "", "far")});
+    defer other.stop();
+    const away = try std.fmt.allocPrint(a, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{try other.url(a, "/x")});
+    var home: FakeServer = undefined;
+    try home.start(&.{ FakeServer.reply("302 Found", "location: /next\r\n", ""), FakeServer.reply("200 OK", "", "near"), away });
+    defer home.stop();
+    var client = http_client.initClient(std.testing.allocator);
+    defer client.deinit();
+    const auth = [_]std.http.Header{.{ .name = "Authorization", .value = "Bearer s3cret" }};
+    const near = try exchange(a, &client, .{ .method = .GET, .url = try home.url(a, "/a"), .headers = &auth });
+    try std.testing.expectEqualStrings("near", near.body);
+    try std.testing.expect(std.mem.indexOf(u8, home.headOf(1), "s3cret") != null);
+    const far = try exchange(a, &client, .{ .method = .GET, .url = try home.url(a, "/b"), .headers = &auth });
+    try std.testing.expectEqualStrings("far", far.body);
+    try std.testing.expect(std.mem.indexOf(u8, other.headOf(0), "s3cret") == null);
 }
