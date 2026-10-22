@@ -138,7 +138,7 @@ pub const Conn = struct {
                     }
                 },
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(p));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
                     return error.PgAuthFailed;
                 },
                 'Z' => return,
@@ -225,7 +225,7 @@ pub const Conn = struct {
 
         const t = try self.readMsg();
         if (t == 'E') {
-            self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+            try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
             return error.PgAuthFailed;
         }
         if (t != 'R' or (try readI32(self.payload.items, 0)) != 12) return error.PgAuthFailed;
@@ -265,7 +265,7 @@ pub const Conn = struct {
                 },
                 'C' => {},
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(p));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
                     return error.PgQueryFailed;
                 },
                 'Z' => {
@@ -290,11 +290,11 @@ pub const Conn = struct {
                 },
                 'Z' => return .end,
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(p));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
                     return error.PgQueryFailed;
                 },
                 'T' => {
-                    self.last_error = try self.gpa.dupe(u8, sql.one_result_set);
+                    try sql.setError(self.gpa, &self.last_error, sql.one_result_set);
                     return error.PgQueryFailed;
                 },
                 else => {},
@@ -308,7 +308,7 @@ pub const Conn = struct {
             const t = try self.readMsg();
             switch (t) {
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => break,
@@ -330,7 +330,7 @@ pub const Conn = struct {
             switch (try self.readMsg()) {
                 'G' => return,
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => return error.PgProtocol,
@@ -352,7 +352,7 @@ pub const Conn = struct {
             switch (try self.readMsg()) {
                 'C' => count = parseCopyCount(self.payload.items),
                 'E' => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(self.payload.items));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => return count orelse error.PgProtocol,
@@ -429,7 +429,7 @@ fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: 
             const cell = p[i .. i + ulen];
             const v = sql.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
-                    conn.last_error = try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell });
+                    sql.putError(conn.gpa, &conn.last_error, try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell }));
                 return e;
             };
             try builders[k].append(v);

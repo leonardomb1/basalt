@@ -258,7 +258,7 @@ pub const Conn = struct {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
+                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.QueryFailed;
                 },
                 0xE3 => {
@@ -450,8 +450,7 @@ pub const Conn = struct {
     }
 
     fn loginRefused(self: *Conn, comptime fmt: []const u8, args: anytype) Error {
-        if (self.last_error.len > 0) self.gpa.free(self.last_error);
-        self.last_error = try std.fmt.allocPrint(self.gpa, fmt, args);
+        sql.putError(self.gpa, &self.last_error, try std.fmt.allocPrint(self.gpa, fmt, args));
         return error.LoginFailed;
     }
 
@@ -469,7 +468,7 @@ pub const Conn = struct {
             switch (token) {
                 0xED => return p[i + 2 .. i + 2 + len],
                 0xAA => {
-                    self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
+                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.LoginFailed;
                 },
                 0xAB, 0xE3 => i += 2 + len,
@@ -499,7 +498,7 @@ pub const Conn = struct {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.last_error = try self.decodeError(p[i + 2 .. i + 2 + len]);
+                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.LoginFailed;
                 },
                 0xAB => {
@@ -913,8 +912,7 @@ const TdsCursor = struct {
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
                 0x81 => {
-                    if (self.conn.last_error.len > 0) self.gpa.free(self.conn.last_error);
-                    self.conn.last_error = try self.gpa.dupe(u8, sql.one_result_set);
+                    try sql.setError(self.gpa, &self.conn.last_error, sql.one_result_set);
                     return error.QueryFailed;
                 },
                 else => return error.TdsProtocol,
@@ -1180,7 +1178,7 @@ const TdsCursor = struct {
             const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
             const ascii = try self.gpa.alloc(u8, utf16.len / 2);
             for (ascii, 0..) |*c, k| c.* = utf16[k * 2];
-            self.conn.last_error = ascii;
+            sql.putError(self.gpa, &self.conn.last_error, ascii);
         }
         return error.QueryFailed;
     }

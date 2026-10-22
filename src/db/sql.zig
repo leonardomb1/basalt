@@ -103,6 +103,17 @@ pub const Cursor = struct {
 
 pub const RowStep = enum { row, end };
 
+/// Stores `owned` as a connection's `last_error`, freeing the message it replaces.
+pub fn putError(gpa: std.mem.Allocator, slot: *[]const u8, owned: []const u8) void {
+    if (slot.len > 0) gpa.free(slot.*);
+    slot.* = owned;
+}
+
+/// `putError` with a copy of `msg`.
+pub fn setError(gpa: std.mem.Allocator, slot: *[]const u8, msg: []const u8) !void {
+    putError(gpa, slot, try gpa.dupe(u8, msg));
+}
+
 pub const one_result_set = "the query returned more than one result set; a read takes one — keep a single SELECT in the batch (statements before or after it are fine)";
 
 /// Rename a socket's `EndOfStream`/`ReadFailed`/`WriteFailed` to names the exit
@@ -1590,4 +1601,14 @@ test "a string literal keeps a name from data inside it in every dialect" {
     try std.testing.expectEqualStrings("'x''); DROP TABLE t;--'", try Dialect.sqlserver.strLit(a, "x'); DROP TABLE t;--"));
     try std.testing.expectEqualStrings("'a\\b'", try Dialect.postgres.strLit(a, "a\\b"));
     try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
+}
+
+test "setError and putError free the message they replace" {
+    const gpa = std.testing.allocator;
+    var slot: []const u8 = "";
+    try setError(gpa, &slot, "first");
+    try setError(gpa, &slot, "second");
+    putError(gpa, &slot, try std.fmt.allocPrint(gpa, "third {d}", .{3}));
+    try std.testing.expectEqualStrings("third 3", slot);
+    putError(gpa, &slot, "");
 }

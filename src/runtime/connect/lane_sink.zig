@@ -207,8 +207,11 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
 
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
-    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, @errorName(e) }));
+    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
+        defer setup_conn.close();
+        const why = setup_conn.lastError();
+        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}{s}{s}", .{ conn.connector, @errorName(e), if (why.len > 0) ": " else "", why }));
+    };
     setup.sink().close() catch |e|
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
 

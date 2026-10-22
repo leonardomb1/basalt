@@ -90,7 +90,7 @@ pub const Conn = struct {
             switch (p[0]) {
                 0x00 => break,
                 0xff => {
-                    self.last_error = try self.gpa.dupe(u8, errMessage(p));
+                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
                     return error.MysqlAuthFailed;
                 },
                 0xfe => {
@@ -116,7 +116,7 @@ pub const Conn = struct {
                     if (p.len >= 2 and p[1] == 3) continue;
                     if (p.len >= 2 and p[1] == 4) {
                         if (self.tls == null) {
-                            self.last_error = try self.gpa.dupe(u8, "caching_sha2_password full auth needs `tls` (or a warmed server-side cache)");
+                            try sql.setError(self.gpa, &self.last_error, "caching_sha2_password full auth needs `tls` (or a warmed server-side cache)");
                             return error.MysqlAuthFailed;
                         }
                         const pw = try self.gpa.alloc(u8, password.len + 1);
@@ -145,7 +145,7 @@ pub const Conn = struct {
         _ = try self.readPacket();
         const p = self.buf.items;
         if (p.len > 0 and p[0] == 0xff) {
-            self.last_error = try self.gpa.dupe(u8, errMessage(p));
+            try sql.setError(self.gpa, &self.last_error, errMessage(p));
             return error.MysqlQueryFailed;
         }
     }
@@ -162,7 +162,7 @@ pub const Conn = struct {
         const rseq = try self.readPacket();
         const p = self.buf.items;
         if (p.len > 0 and p[0] == 0xff) {
-            self.last_error = try self.gpa.dupe(u8, errMessage(p));
+            try sql.setError(self.gpa, &self.last_error, errMessage(p));
             return error.MysqlQueryFailed;
         }
         if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol;
@@ -181,7 +181,7 @@ pub const Conn = struct {
         _ = try self.readPacket();
         const p = self.buf.items;
         if (p.len > 0 and p[0] == 0xff) {
-            self.last_error = try self.gpa.dupe(u8, errMessage(p));
+            try sql.setError(self.gpa, &self.last_error, errMessage(p));
             return error.MysqlQueryFailed;
         }
         return parseOkAffected(p) orelse error.MysqlProtocol;
@@ -226,7 +226,7 @@ pub const Conn = struct {
         const first = self.buf.items;
         if (first.len == 0) return error.MysqlProtocol;
         if (first[0] == 0xff) {
-            self.last_error = try self.gpa.dupe(u8, errMessage(first));
+            try sql.setError(self.gpa, &self.last_error, errMessage(first));
             return error.MysqlQueryFailed;
         }
         if (first[0] == 0x00 or first[0] == 0xfe) {
@@ -262,7 +262,7 @@ pub const Conn = struct {
         const r = self.buf.items;
         if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
         if (r.len > 0 and r[0] == 0xff) {
-            self.last_error = try self.gpa.dupe(u8, errMessage(r));
+            try sql.setError(self.gpa, &self.last_error, errMessage(r));
             return error.MysqlQueryFailed;
         }
         var ri: usize = 0;
@@ -275,7 +275,7 @@ pub const Conn = struct {
             else
                 sql.coerceText(arena, text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
-                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? });
+                        sql.putError(self.gpa, &self.last_error, try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? }));
                     return e;
                 };
             try builders[k].append(v);
@@ -389,7 +389,7 @@ pub const Conn = struct {
     /// over TLS: a server, or anyone between, asking for it on a plain connection
     /// is refused, as libmysqlclient refuses it unless told otherwise.
     fn clearRefused(self: *Conn) error{ MysqlAuthFailed, OutOfMemory } {
-        self.last_error = try self.gpa.dupe(u8, "the server asks for the password in clear text (mysql_clear_password) on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
+        try sql.setError(self.gpa, &self.last_error, "the server asks for the password in clear text (mysql_clear_password) on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
         return error.MysqlAuthFailed;
     }
 
