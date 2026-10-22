@@ -99,7 +99,7 @@ pub const Reader = struct {
             const v = try self.readZigZag();
             if (v < std.math.minInt(i16) or v > std.math.maxInt(i16)) return Error.CorruptThrift;
             break :blk @as(i16, @intCast(v));
-        } else self.last_id + delta;
+        } else std.math.add(i16, self.last_id, delta) catch return Error.CorruptThrift;
         self.last_id = id;
         return .{ .ty = ty, .id = id };
     }
@@ -123,7 +123,7 @@ pub const Reader = struct {
         var size: usize = (b >> 4) & 0x0F;
         if (size == 15) {
             const n = try self.readVarint();
-            if (n > self.buf.len) return Error.CorruptThrift;
+            if (n > self.buf.len - self.pos) return Error.CorruptThrift;
             size = @intCast(n);
         }
         return .{ .elem = elem, .size = size };
@@ -142,10 +142,11 @@ pub const Reader = struct {
                 if (self.depth >= max_depth) return Error.CorruptThrift;
                 self.depth += 1;
                 defer self.depth -= 1;
-                for (0..h.size) |_| try self.skip(h.elem);
+                for (0..h.size) |_| try self.skipElem(h.elem);
             },
             .map => {
                 const n = try self.readVarint();
+                if (n > self.buf.len - self.pos) return Error.CorruptThrift;
                 if (n > 0) {
                     const kv = try self.readByte();
                     const k: Type = @enumFromInt((kv >> 4) & 0x0F);
@@ -154,13 +155,24 @@ pub const Reader = struct {
                     self.depth += 1;
                     defer self.depth -= 1;
                     for (0..@as(usize, @intCast(n))) |_| {
-                        try self.skip(k);
-                        try self.skip(v);
+                        try self.skipElem(k);
+                        try self.skipElem(v);
                     }
                 }
             },
             .@"struct" => try self.skipStruct(),
             else => return Error.CorruptThrift,
+        }
+    }
+
+    /// One element of a list, set or map: there a bool is a byte of its own, and
+    /// `stop` is no element type. Every element so takes a byte, which, with the
+    /// counts capped at the bytes left, bounds the work a header can ask for.
+    fn skipElem(self: *Reader, ty: Type) Error!void {
+        switch (ty) {
+            .bool_true, .bool_false => _ = try self.readByte(),
+            .stop => return Error.CorruptThrift,
+            else => try self.skip(ty),
         }
     }
 
@@ -314,6 +326,27 @@ test "truncated input errors instead of reading past the buffer" {
 
     var b = Reader.init(&[_]u8{ 0x05, 'h' });
     try t.expectError(Error.CorruptThrift, b.readBinary());
+}
+
+test "a container's count past the bytes left is corrupt, and its bools take a byte each" {
+    var m = Reader.init(&[_]u8{ 0x80, 0x84, 0xAF, 0x5F, 0x11 });
+    try t.expectError(Error.CorruptThrift, m.skip(.map));
+    var big = Reader.init(&[_]u8{ 0xF5, 0xFF, 0xFF, 0x03, 0x02 });
+    try t.expectError(Error.CorruptThrift, big.skip(.list));
+    var stops = Reader.init(&[_]u8{ 0x20, 0x00, 0x00 });
+    try t.expectError(Error.CorruptThrift, stops.skip(.list));
+    const bools = [_]u8{ 0x21, 0x01, 0x02 };
+    var b = Reader.init(&bools);
+    try b.skip(.list);
+    try t.expectEqual(bools.len, b.pos);
+}
+
+test "a short-form field id past the i16 range is corrupt, not an overflow" {
+    var r = Reader.init(&[_]u8{ 0x05, 0xFE, 0xFF, 0x03, 0x00, 0x15 });
+    const f = try r.readField();
+    try t.expectEqual(@as(i16, 32767), f.id);
+    try r.skip(f.ty);
+    try t.expectError(Error.CorruptThrift, r.readField());
 }
 
 test "nesting deeper than max_depth is an error, not a stack overflow" {
