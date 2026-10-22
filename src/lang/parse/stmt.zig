@@ -72,8 +72,13 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
 }
 
 /// One top-level or arm-body statement, appended to `out` after any bindings a
-/// query LET's own subqueries create.
+/// query LET's own subqueries create. Blocks (CASE, FOR EACH, a function body)
+/// nesting past `max_stmt_depth` are refused, so a crafted script fails, not the stack.
 pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+    if (self.stmt_depth >= Parser.max_stmt_depth)
+        return self.fail(self.curPos(), "statements nest more than {d} levels deep", .{Parser.max_stmt_depth});
+    self.stmt_depth += 1;
+    defer self.stmt_depth -= 1;
     if (self.isKw("create")) return self.parseCreate(out);
     if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
     if (self.isKw("let")) {

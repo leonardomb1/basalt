@@ -497,6 +497,7 @@ pub const Parser = struct {
     qual_sink: ?*std.array_list.Managed(QualRef) = null,
     col_uses: ?*ColUses = null,
     query_depth: usize = 0,
+    stmt_depth: usize = 0,
     top_names: OutNames = .nested,
     key_aliases: ?*const AliasSet = null,
     corr: ?*CorrScope = null,
@@ -977,6 +978,7 @@ pub const Parser = struct {
     pub const max_expr_depth = 1000;
     pub const max_paren_depth = 256;
     pub const max_query_depth = 32;
+    pub const max_stmt_depth = 64;
 
     pub const deeperThan = @import("parse/expr.zig").deeperThan;
     pub const balanceChain = @import("parse/expr.zig").balanceChain;

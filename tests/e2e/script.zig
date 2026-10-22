@@ -1619,3 +1619,15 @@ test "an EXPLAIN statement's analyze error keeps check's position" {
     try std.testing.expectEqualStrings(adiag.msg, rdiag.msg);
     try std.testing.expectEqual(adiag.pos.?, rdiag.pos.?);
 }
+
+test "functions inlined into each other past 1000 levels are refused by check and run, never a stack overflow" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "+1" ** 900;
+    const script = "CREATE FUNCTION f0(x) AS x" ++ body ++ ";\n" ++
+        "CREATE FUNCTION f1(x) AS f0(x)" ++ body ++ ";\n" ++
+        "CREATE FUNCTION f2(x) AS f1(x)" ++ body ++ ";\n" ++
+        "SELECT f2(1) AS v;";
+    try expectRefusedAlike(alloc, &tmp, script, "with its functions inlined, the expression nests more than 1000 levels deep");
+}

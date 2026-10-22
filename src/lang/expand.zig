@@ -23,6 +23,7 @@ const builtins = @import("../exec/builtins.zig");
 const eval = @import("../exec/eval.zig");
 const aggregates = @import("aggregates.zig");
 const parser = @import("sql_parser.zig");
+const deeperThan = @import("parse/expr.zig").deeperThan;
 const ast = @import("ast.zig");
 const types = @import("types.zig");
 
@@ -40,6 +41,7 @@ const Ctx = struct {
     at: *?ast.Pos,
     pinned: bool = false,
     budget: usize = max_nodes,
+    level: usize = 0,
 
     /// The innermost failing call names the place, as the error unwinds through its callers.
     fn pin(self: *Ctx, span: ?ast.Span) void {
@@ -352,7 +354,25 @@ fn expandRecur(ctx: ExpandCtx, e: *const ast.Expr) Error!*ast.Expr {
     return expandExpr(ctx.cx, e, ctx.subst, ctx.depth);
 }
 
+/// `e` with its function calls inlined. Inlining splices bodies into each other, so
+/// the result can nest deeper than any one body the parser checked: a recursion
+/// level per output level is bounded as it runs, and the finished tree is checked
+/// whole, since an argument spliced in adds depth without a level.
 fn expandExpr(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!*ast.Expr {
+    cx.level += 1;
+    defer cx.level -= 1;
+    if (cx.level > parser.Parser.max_expr_depth) return tooDeep(cx);
+    const out = try expandExprNode(cx, e, subst, depth);
+    if (cx.level == 1 and deeperThan(out, parser.Parser.max_expr_depth)) return tooDeep(cx);
+    return out;
+}
+
+fn tooDeep(cx: *Ctx) Error {
+    cx.msg.* = std.fmt.comptimePrint("with its functions inlined, the expression nests more than {d} levels deep; build the value in steps", .{parser.Parser.max_expr_depth});
+    return error.ExpandFailed;
+}
+
+fn expandExprNode(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Error!*ast.Expr {
     if (depth > max_depth) {
         cx.msg.* = "function expansion too deep (a recursive function?)";
         return error.ExpandFailed;

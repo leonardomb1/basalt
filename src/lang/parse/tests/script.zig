@@ -795,3 +795,28 @@ test "sql: an unclosed `/*` or dollar quote refuses the script at its opener, ne
     const bare = try parseSource(a, "SELECT 1; SELECT 2;", &diag);
     try testing.expectEqual(bare.stmts.len, commented.stmts.len);
 }
+
+test "sql: the nesting limits hold inside CASE, LET, lambdas, subqueries and statement blocks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const chain = "1" ++ "+1" ** 1500;
+    const deep = [_][]const u8{
+        "SELECT CASE WHEN 1 = 1 THEN " ++ chain ++ " END AS v;",
+        "SELECT (let y = 1 in y+" ++ chain ++ ") AS v;",
+        "SELECT JSON_TRANSFORM('[1]', x -> x+" ++ chain ++ ") AS v;",
+        "SELECT (SELECT " ++ chain ++ " AS v) AS w FROM 'x.csv';",
+        "SELECT a FROM 'x.csv' WHERE a IN (SELECT b FROM 'y.csv' WHERE b = " ++ chain ++ ");",
+    };
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for (deep) |src| {
+        try testing.expectError(error.ParseFailed, parseSource(a, src, &diag));
+        try testing.expect(std.mem.indexOf(u8, diag.msg, "nests more than 1000") != null);
+    }
+    var nested = std.array_list.Managed(u8).init(a);
+    for (0..100) |_| try nested.appendSlice("CASE WHEN true THEN ");
+    try nested.appendSlice("PRINT 'x';");
+    for (0..100) |_| try nested.appendSlice(" END CASE;");
+    try testing.expectError(error.ParseFailed, parseSource(a, nested.items, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "statements nest more than 64") != null);
+}

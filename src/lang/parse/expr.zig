@@ -74,25 +74,38 @@ pub fn parseExpr(self: *Parser) Error!*ast.Expr {
     self.expr_nest += 1;
     defer self.expr_nest -= 1;
     const e = try self.parseBin(0);
-    if (self.expr_nest == 1 and deeperThan(e, max_expr_depth))
+    if (deeperThan(e, max_expr_depth))
         return self.fail(pos, "expression nests more than {d} levels deep — a long chain of `+`, `||` or comparisons; split it, or build the value in steps", .{max_expr_depth});
     return e;
 }
 
 /// Whether `e` is more than `limit` levels deep, stopping at the limit so the check
-/// cannot exhaust the stack itself.
+/// cannot exhaust the stack itself. Every variant is listed, with no catch-all, so
+/// a new kind of node cannot hide a deep tree from it.
 pub fn deeperThan(e: *const ast.Expr, limit: usize) bool {
     if (limit == 0) return true;
+    const l = limit - 1;
     return switch (e.*) {
-        .binary => |b| deeperThan(b.l, limit - 1) or deeperThan(b.r, limit - 1),
-        .unary => |u| deeperThan(u.e, limit - 1),
-        .is_null => |n| deeperThan(n.e, limit - 1),
-        .cast => |c| deeperThan(c.e, limit - 1),
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => false,
+        .binary => |b| deeperThan(b.l, l) or deeperThan(b.r, l),
+        .unary => |u| deeperThan(u.e, l),
+        .is_null => |n| deeperThan(n.e, l),
+        .cast => |c| deeperThan(c.e, l),
         .call => |c| for (c.args) |a| {
-            if (deeperThan(a, limit - 1)) break true;
+            if (deeperThan(a, l)) break true;
         } else false,
-        .cond => |c| deeperThan(c.cond, limit - 1) or deeperThan(c.then, limit - 1) or deeperThan(c.els, limit - 1),
-        else => false,
+        .cond => |c| deeperThan(c.cond, l) or deeperThan(c.then, l) or deeperThan(c.els, l),
+        .match => |m| blk: {
+            if (m.subject) |s| if (deeperThan(s, l)) break :blk true;
+            for (m.arms) |arm| {
+                for (arm.pats) |p| if (deeperThan(p, l)) break :blk true;
+                if (arm.guard) |g| if (deeperThan(g, l)) break :blk true;
+                if (deeperThan(arm.value, l)) break :blk true;
+            }
+            break :blk false;
+        },
+        .let_in => |li| deeperThan(li.value, l) or deeperThan(li.body, l),
+        .lambda => |la| deeperThan(la.body, l),
     };
 }
 
