@@ -311,6 +311,7 @@ pub const AuthState = struct {
         const raw = if (std.mem.eql(u8, path, ".")) body else ((try fjson.field(arena, body, path)) orelse return error.LoginTokenMissing);
         if (raw[0] != '"') return error.LoginTokenMissing;
         const tok = try jt.decodeString(arena, raw[1 .. raw.len - 1]);
+        if (!lineSafe(tok)) return eval.explain(error.BadHeaderValue, "the login response's token holds a line break or NUL, which would inject into every request's headers");
         const prefix = self.cc.token_prefix orelse (if (is_oauth) "Bearer " else "");
         self.header = .{
             .name = self.cc.token_header,
@@ -318,6 +319,12 @@ pub const AuthState = struct {
         };
     }
 };
+
+/// Whether a server-sent value can go into a header or request line as is: a CR,
+/// LF or NUL in it would end the line and start one the server chose.
+fn lineSafe(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n\x00") == null;
+}
 
 pub fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []const u8) !void {
     try buf.append('&');
@@ -658,6 +665,7 @@ pub const HttpSource = struct {
                     return;
                 }
                 if (std.mem.startsWith(u8, tok, "http://") or std.mem.startsWith(u8, tok, "https://")) {
+                    if (!lineSafe(tok)) return eval.explain(error.BadHeaderValue, "the response's next-page URL holds a line break or NUL, which would inject into the request");
                     self.next_url = try self.arena.dupe(u8, tok);
                 } else {
                     self.next_url = try withParam(self.arena, self.base_url, self.opts.cursor_param, tok);
@@ -1934,4 +1942,9 @@ test "retryDelayNs: exponential base doubling within the +-30% jitter band" {
     try std.testing.expect(a3 >= 280 * std.time.ns_per_ms and a3 <= 520 * std.time.ns_per_ms);
     const a99 = retryDelayNs(base_ms, 99);
     try std.testing.expect(a99 >= 4480 * std.time.ns_per_ms and a99 <= 8320 * std.time.ns_per_ms);
+}
+
+test "a server-sent token or next URL that would break a header line is refused" {
+    try std.testing.expect(lineSafe("Bearer abc.def"));
+    for ([_][]const u8{ "abc\r\nX-Evil: 1", "abc\nX: 1", "abc\rx", "a\x00b" }) |v| try std.testing.expect(!lineSafe(v));
 }
