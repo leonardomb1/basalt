@@ -87,6 +87,11 @@ pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileForma
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
 }
 
+/// Held from a stdout result's open to its close or abort, hook call included:
+/// stdout is one stream per process, so results from PARALLEL loop rows or
+/// concurrent kernel requests come out whole, one after another.
+var stdout_mu: std.Thread.Mutex = .{};
+
 const StdoutSink = struct {
     inner: driver.Sink,
     gpa: std.mem.Allocator,
@@ -125,6 +130,7 @@ const StdoutSink = struct {
     }
 
     pub fn close(self: *StdoutSink) !void {
+        defer stdout_mu.unlock();
         defer self.gpa.destroy(self);
         defer driver.resetStop();
         try self.inner.close();
@@ -134,6 +140,7 @@ const StdoutSink = struct {
     }
 
     pub fn abort(self: *StdoutSink) void {
+        defer stdout_mu.unlock();
         driver.resetStop();
         self.inner.abort();
         self.gpa.destroy(self);
@@ -174,9 +181,10 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             cap.?.* = .{ .max = n };
             info.cap = cap;
         }
+        stdout_mu.lock();
+        errdefer stdout_mu.unlock();
         driver.resetStop();
         const inner = try openStdoutSink(env, schema, info);
-        if (env.on_result == null and cap == null) return inner;
         errdefer inner.abort();
         return StdoutSink.wrap(env, inner, info, cap);
     }
