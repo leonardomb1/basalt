@@ -468,8 +468,10 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     const schema = types.Schema{ .fields = &describe_fields };
     const batch = try csv.parseSlice(arena, &schema, try describeRows(arena, res.schema));
     const snk = try openSink(env, pipe.stages[pipe.stages.len - 1].node.write, schema);
-    errdefer snk.abort();
-    try snk.writeBatch(arena, batch);
+    snk.writeBatch(arena, batch) catch |e| {
+        snk.abort();
+        return e;
+    };
     try snk.close();
     stats.rows_out += batch.len;
 }
