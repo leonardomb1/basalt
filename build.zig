@@ -7,7 +7,8 @@ pub fn build(b: *std.Build) void {
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "version", @import("build.zig.zon").version);
-    opts.addOption(bool, "stats", b.option(bool, "stats", "Count key table probes and print them after a run") orelse false);
+    const stats = b.option(bool, "stats", "Count key table probes and print them after a run") orelse false;
+    opts.addOption(bool, "stats", stats);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -17,9 +18,18 @@ pub fn build(b: *std.Build) void {
     });
     root_module.addOptions("build_options", opts);
 
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .unwind_tables = if (optimize != .Debug and !stats) .none else null,
+    });
+    exe_module.addOptions("build_options", opts);
+
     const exe = b.addExecutable(.{
         .name = "basalt",
-        .root_module = root_module,
+        .root_module = exe_module,
     });
     b.installArtifact(exe);
 
