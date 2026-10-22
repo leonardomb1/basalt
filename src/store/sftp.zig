@@ -745,6 +745,10 @@ pub const Upload = struct {
     }
 };
 
+/// How deep a folder read descends; a server whose listing loops (a folder that
+/// lists itself) is cut off here rather than walked forever.
+const max_walk_depth = 32;
+
 /// The regular files under `url` (ending in `/`) as `/`-separated paths relative to
 /// it, subfolders included but not those starting `_` or `.`, in server order.
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
@@ -766,7 +770,10 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
             healthy = isProtocolOk(e);
             return e;
         };
+        if (std.mem.count(u8, rel, "/") >= max_walk_depth) return error.FolderTooDeep;
         for (entries) |en| {
+            if (en.name.len == 0 or std.mem.indexOfAny(u8, en.name, "/\\") != null) continue;
+            if (std.mem.eql(u8, en.name, ".") or std.mem.eql(u8, en.name, "..")) continue;
             const sub = if (rel.len == 0) en.name else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, en.name });
             if (en.dir) {
                 if (en.name[0] != '_' and en.name[0] != '.') try todo.append(sub);

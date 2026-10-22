@@ -397,7 +397,7 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
     const cols = try arena.alloc(PgCol, n);
     const fields = try arena.alloc(types.Schema.Field, n);
     for (0..n) |k| {
-        const name = readCStr(p, &i);
+        const name = try readCStr(p, &i);
         i += 4;
         i += 2;
         const oid = try readI32(p, i);
@@ -587,6 +587,12 @@ test "parseRowDescription decodes names, OIDs, and column order" {
     try std.testing.expectEqual(types.TypeKind.int, rd.cols[0].engine_type.kind);
     try std.testing.expectEqualStrings("name", rd.fields[1].name);
     try std.testing.expectEqual(types.TypeKind.string, rd.fields[1].ty.kind);
+
+    var short = try a.dupe(u8, p.items[0 .. p.items.len - 2]);
+    short[1] = 3;
+    try std.testing.expectError(error.PgProtocol, parseRowDescription(a, short));
+    const cut = [_]u8{ 0, 1, 'i', 'd' };
+    try std.testing.expectError(error.PgProtocol, parseRowDescription(a, &cut));
 }
 
 fn appendCStr(list: *std.array_list.Managed(u8), s: []const u8) !void {
@@ -608,12 +614,14 @@ fn readI32(p: []const u8, i: usize) !i32 {
     if (i + 4 > p.len) return error.PgProtocol;
     return std.mem.readInt(i32, p[i..][0..4], .big);
 }
-fn readCStr(p: []const u8, i: *usize) []const u8 {
+/// A NUL-terminated string at `i`; one that starts past the payload or never
+/// ends is a protocol error.
+fn readCStr(p: []const u8, i: *usize) ![]const u8 {
     const start = i.*;
-    while (i.* < p.len and p[i.*] != 0) : (i.* += 1) {}
-    const s = p[start..i.*];
-    i.* += 1;
-    return s;
+    if (start >= p.len) return error.PgProtocol;
+    const end = std.mem.indexOfScalarPos(u8, p, start, 0) orelse return error.PgProtocol;
+    i.* = end + 1;
+    return p[start..end];
 }
 
 fn parseCopyCount(p: []const u8) ?u64 {

@@ -702,10 +702,10 @@ fn lenencInt(buf: []const u8, i: *usize) !u64 {
 }
 
 fn lenencStr(buf: []const u8, i: *usize) ![]const u8 {
-    const n: usize = @intCast(try lenencInt(buf, i));
-    if (i.* + n > buf.len) return error.MysqlProtocol;
-    const s = buf[i.* .. i.* + n];
-    i.* += n;
+    const n = try lenencInt(buf, i);
+    if (n > buf.len - i.*) return error.MysqlProtocol;
+    const s = buf[i.*..][0..@intCast(n)];
+    i.* += @intCast(n);
     return s;
 }
 
@@ -738,6 +738,7 @@ const fuzzPackets_corpus = [_][]const u8{
     "\xff\x28\x04#42000oops",
     "\xfe" ++ "caching_sha2_password" ++ "\x00" ++ "12345678",
     "\x03abc\xfb\x02xy",
+    "\xfe\xff\xff\xff\xff\xff\xff\xff\xff",
 };
 
 test "fuzz: wire packet parsers survive arbitrary bytes" {
