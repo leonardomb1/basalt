@@ -241,17 +241,34 @@ pub fn Extreme(comptime T: type, comptime want: std.math.Order) type {
     return struct {
         pub const In = T;
         pub const needs_alloc = T == []const u8;
-        pub const State = struct { has: bool = false, v: T = undefined };
+        pub const State = struct { has: bool = false, v: T = undefined, cap: if (T == []const u8) usize else void = if (T == []const u8) 0 else {} };
         pub fn add(s: *State, x: T, cx: Ctx) !void {
             if (s.has and order(T, x, s.v) != want) return;
-            s.v = if (T == []const u8) try cx.alloc.dupe(u8, x) else x;
+            if (T == []const u8) try keep(s, x, cx) else s.v = x;
             s.has = true;
+        }
+        /// Copies a new string extreme into the state's buffer, growing it only for a
+        /// longer value, so a run of improvements costs the longest one, not their sum.
+        fn keep(s: *State, x: []const u8, cx: Ctx) !void {
+            if (s.cap == 0 or x.len > s.cap) {
+                const buf = try cx.alloc.alloc(u8, @max(x.len, s.cap * 2));
+                @memcpy(buf[0..x.len], x);
+                s.cap = buf.len;
+                s.v = buf[0..x.len];
+                return;
+            }
+            const buf = @constCast(s.v.ptr)[0..s.cap];
+            std.mem.copyForwards(u8, buf[0..x.len], x);
+            s.v = buf[0..x.len];
         }
         pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
             if (s.has) try add(d, s.v, cx);
         }
         pub fn own(s: *State, cx: Ctx) !void {
-            if (T == []const u8 and s.has) s.v = try cx.alloc.dupe(u8, s.v);
+            if (T == []const u8 and s.has) {
+                s.v = try cx.alloc.dupe(u8, s.v);
+                s.cap = s.v.len;
+            }
         }
         pub fn finish(s: *const State, cx: Ctx) !Value {
             return if (s.has) toValue(T, s.v, cx.out) else .null;
@@ -538,4 +555,21 @@ pub fn selectNth(xs_all: []f64, k: usize) f64 {
         }
     }
     return xs[k];
+}
+
+test "string MAX over ascending input keeps one buffer, not a copy per improvement" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const cx = Ctx{ .out = types.Type.init(.string), .ty = types.Type.init(.string), .alloc = ar.allocator(), .scratch = ar.allocator() };
+    const M = Extreme([]const u8, .gt);
+    var st: M.State = .{};
+    var buf: [64]u8 = undefined;
+    for (0..20_000) |i| try M.add(&st, try std.fmt.bufPrint(&buf, "row-{d:0>40}-{d}", .{ i, i % 7 }), cx);
+    try std.testing.expectEqualStrings("row-0000000000000000000000000000000000019999-0", st.v);
+    try std.testing.expect(ar.queryCapacity() < 16 * 1024);
+
+    const N = Extreme([]const u8, .lt);
+    var mn: N.State = .{};
+    for ([_][]const u8{ "m", "", "zz", "" }) |x| try N.add(&mn, x, cx);
+    try std.testing.expectEqualStrings("", mn.v);
 }

@@ -36,6 +36,7 @@ pub const Pairs = struct {
     parts: []Part,
     alloc: std.mem.Allocator,
     seen: Seen = .{},
+    enc: ?keytable.Encoder = null,
 
     const Seen = struct { id: u64 = 0, bits: []u64 = &.{} };
 
@@ -76,7 +77,12 @@ pub const Pairs = struct {
             p.* = .{ .table = table, .store = try newStore(al, kind, grouped), .alloc = al };
             made += 1;
         }
-        return .{ .j = j, .ty = ty, .kind = kind, .grouped = grouped, .parts = parts, .alloc = a };
+        var enc: ?keytable.Encoder = null;
+        if (kind) |k| {
+            const kinds = try a.dupe(keyhash.KeyKind, &.{k});
+            enc = try keytable.Encoder.init(a, &.{0}, kinds);
+        }
+        return .{ .j = j, .ty = ty, .kind = kind, .grouped = grouped, .parts = parts, .alloc = a, .enc = enc };
     }
 
     /// An empty one-partition set like `like`, sized for `expect` pairs, for a merge
@@ -133,8 +139,7 @@ pub const Pairs = struct {
         var probes: []Value = &.{};
         var m: usize = 0;
         if (self.kind) |kind| {
-            const enc = try keytable.Encoder.init(scratch, &.{0}, &.{kind});
-            const e = try enc.encode(scratch, &.{col}, n, in, false);
+            const e = try self.enc.?.encode(scratch, &.{col}, n, in, false);
             if (rows) |rs| {
                 for (0..n) |r| {
                     const t = rs.tails[r] orelse continue;
@@ -277,3 +282,36 @@ pub const Pairs = struct {
         }
     }
 };
+
+test "pairs: a dictionary seen again is not re-interned into the state" {
+    var state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer state.deinit();
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const sa = state.allocator();
+    var strs: ?*keytable.StrTable = null;
+    var cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty;
+    const in = keytable.Interner{ .table = &strs, .cache = &cache, .alloc = sa };
+
+    const vals = try sa.alloc([]const u8, 10_000);
+    for (vals, 0..) |*v, i| v.* = try std.fmt.allocPrint(sa, "v{d}", .{i});
+    const n = 8192;
+    const codes = try sa.alloc(u32, n);
+    for (codes, 0..) |*c, i| c.* = @intCast(i * 7 % vals.len);
+    var bd = column.Builder.init(sa, types.Type.init(.string));
+    for (codes) |c| try bd.append(.{ .string = vals[c] });
+    var col = try bd.finish();
+    const d = column.Column.Dict{ .values = vals, .codes = codes, .id = 5 };
+    col.dict = &d;
+
+    var pairs = try Pairs.init(sa, 0, types.Type.init(.string), false, 1, &.{sa}, std.testing.allocator, false, 0);
+    defer pairs.deinit();
+    try pairs.add(scratch.allocator(), col, n, null, in);
+    const after_one = state.queryCapacity();
+    for (0..50) |_| {
+        _ = scratch.reset(.retain_capacity);
+        try pairs.add(scratch.allocator(), col, n, null, in);
+    }
+    try std.testing.expect(state.queryCapacity() - after_one < 64 * 1024);
+    try std.testing.expectEqual(@as(usize, 8192), pairs.count(0));
+}
