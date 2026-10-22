@@ -812,6 +812,7 @@ pub const HttpSource = struct {
         };
         errdefer freeSlot(slot);
         const sa = slot.snap.allocator();
+        slot.user_agent = try sa.dupe(u8, slot.user_agent);
         slot.url = try sa.dupe(u8, req.url);
         if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
         try self.snapshotInto(slot);
