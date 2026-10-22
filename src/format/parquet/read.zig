@@ -38,7 +38,10 @@
 //!
 //! `Reader` reads one batch per row group, fetching only the footer and the
 //! column chunks a query projects, so resident memory tracks the widest row
-//! group's projected columns rather than the file. `Bytes` is where those bytes
+//! group's projected columns rather than the file. A table's file may have rows
+//! the table deletes (`Deletes`, a Delta deletion vector): each is dropped from
+//! its row group's batch by its position in the whole file, and a row group they
+//! delete whole is not fetched. `Bytes` is where those bytes
 //! come from: a local file by pread, a resident buffer, an SFTP or SMB file by
 //! offset, or a `Remote` over HTTP range requests (`http(s)://`, or an `az://`
 //! blob whose Shared Key signature is redone per range). A server that answers a
@@ -96,6 +99,8 @@ pub const readEntries = @import("chunk.zig").readEntries;
 pub const NNode = @import("nested.zig").NNode;
 pub const Nested = @import("nested.zig").Nested;
 pub const buildNested = @import("nested.zig").buildNested;
+const holdsStruct = @import("nested.zig").holdsStruct;
+const leafIndices = @import("nested.zig").leafIndices;
 pub const assembleNested = @import("nested.zig").assembleNested;
 pub const Bound = @import("stats.zig").Bound;
 pub const KeyBound = @import("stats.zig").KeyBound;
@@ -112,6 +117,8 @@ pub const Folder = @import("folder.zig").Folder;
 pub const Fit = @import("fit.zig").Fit;
 pub const Layout = @import("fit.zig").Layout;
 pub const View = @import("fit.zig").View;
+pub const Deletes = @import("fit.zig").Deletes;
+const roaring = @import("../lake/roaring.zig");
 const source_vtable = driver.sourceVTable(Reader);
 const chunkEnd = @import("folder.zig").chunkEnd;
 const chunkBoundaries = @import("folder.zig").chunkBoundaries;
@@ -145,6 +152,11 @@ pub const Reader = struct {
     held: []const Held = &.{},
     /// Set when the file is one of a table's whose schema governs it (`fit.zig`).
     fit: ?*const Fit = null,
+    /// The rows the table deletes from this file, loaded into `deleted` when the
+    /// first row group is read; `firsts` holds each row group's first row.
+    deletes: ?Deletes = null,
+    deleted: ?roaring.Bitmap = null,
+    firsts: []const u64 = &.{},
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -170,10 +182,15 @@ pub const Reader = struct {
     /// them if it fails): a file planning opened and did not split, read on.
     pub fn openProjectedOn(arena: std.mem.Allocator, src: Bytes, path: []const u8, want: ?[]const []const u8) !*Reader {
         errdefer src.close();
-
         var footer_start: u64 = 0;
         const md = try parseFooterOf(arena, src, &footer_start);
+        return openParsed(arena, src, md, footer_start, path, want);
+    }
 
+    /// `openProjectedOn` over a footer already parsed (`parseFooterOf`), which a
+    /// table's file may have renamed its columns in (`fit.zig`). The reader owns
+    /// `src` once it is returned.
+    pub fn openParsed(arena: std.mem.Allocator, src: Bytes, md: parquet.FileMetaData, footer_start: u64, path: []const u8, want: ?[]const []const u8) !*Reader {
         const all = try collectLeaves(arena, md.schema);
         var keep = std.array_list.Managed(Leaf).init(arena);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
@@ -182,7 +199,7 @@ pub const Reader = struct {
         for (all, 0..) |lf, li| {
             const shared = if (lf.root) |rt| for (all, 0..) |other, oi| {
                 if (oi != li and other.root != null and other.root.?.idx == rt.idx) break true;
-            } else false else false;
+            } else holdsStruct(&try buildNested(arena, md.schema, rt)) else false;
             if (shared) {
                 const rt = lf.root.?;
                 for (roots_seen.items) |x| {
@@ -191,12 +208,17 @@ pub const Reader = struct {
                     try roots_seen.append(rt.idx);
                     if (!wanted(want, lf.name)) continue;
                     const tree = try buildNested(arena, md.schema, rt);
+                    var at = std.array_list.Managed(usize).init(arena);
+                    try leafIndices(&tree, &at);
                     var ix = std.array_list.Managed(usize).init(arena);
-                    for (all) |o| if (o.root != null and o.root.?.idx == rt.idx) {
+                    for (at.items) |si| {
+                        const o = for (all) |x| {
+                            if (x.schema_idx == si) break x;
+                        } else return Error.UnsupportedParquetSchema;
                         _ = try basaltType(md.schema[o.schema_idx]);
                         try keep.append(o);
                         try ix.append(keep.items.len - 1);
-                    };
+                    }
                     if (ix.items.len != tree.nleaves) return Error.UnsupportedParquetSchema;
                     const n = try arena.create(Nested);
                     n.* = .{ .name = lf.name, .root = tree, .leaves = ix.items };
@@ -263,7 +285,8 @@ pub const Reader = struct {
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
         const last = self.rg_end orelse self.md.row_groups.len;
         while (self.rg < last) {
-            const g = self.md.row_groups[self.rg];
+            const gi = self.rg;
+            const g = self.md.row_groups[gi];
             self.rg += 1;
             const rows = std.math.cast(usize, g.num_rows) orelse return Error.CorruptParquetPage;
             if (rows == 0) continue;
@@ -281,6 +304,16 @@ pub const Reader = struct {
                     if (self.tally) |ty| driver.ScanTally.add(&ty.row_groups_skipped, 1);
                     continue;
                 }
+            }
+            var keep: ?[]bool = null;
+            var kept = rows;
+            if (self.deletes) |d| {
+                const k = try arena.alloc(bool, rows);
+                @memset(k, true);
+                const n = (try self.deletedRows(d)).clear(self.firsts[gi], k);
+                if (n == rows) continue;
+                if (n > 0) keep = k;
+                kept = rows - n;
             }
             if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g);
             const cols = try arena.alloc(column.Column, self.outputs.len);
@@ -310,10 +343,28 @@ pub const Reader = struct {
                     cols[ci] = try assembleNested(arena, &n.root, entries, rows);
                 },
             };
-            const b = Batch{ .schema = &self.schema, .columns = cols, .len = rows };
+            if (keep) |k| try column.gatherColumns(arena, cols, cols, k, kept);
+            const b = Batch{ .schema = &self.schema, .columns = cols, .len = kept };
             return if (self.fit) |f| try f.apply(arena, b) else b;
         }
         return null;
+    }
+
+    /// The rows the table deletes from this file, loaded into the reader's own
+    /// arena on first use, with each row group's first row: a row is numbered by
+    /// its position in the whole file, whichever row groups a read skips.
+    fn deletedRows(self: *Reader, d: Deletes) !*const roaring.Bitmap {
+        if (self.deleted == null) {
+            const firsts = try self.arena.alloc(u64, self.md.row_groups.len);
+            var total: u64 = 0;
+            for (self.md.row_groups, firsts) |g, *f| {
+                f.* = total;
+                total += std.math.cast(u64, g.num_rows) orelse return Error.CorruptParquetPage;
+            }
+            self.firsts = firsts;
+            self.deleted = try d.load(d.ctx, self.arena, total);
+        }
+        return &self.deleted.?;
     }
 
     const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
@@ -585,6 +636,18 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
         \\id=4 xs=[null,5] ss=[]
         \\
     , try readAllText(a, @embedFile("../testdata/lists_polars.parquet"), "p.parquet"));
+}
+
+test "a list of a one-field struct reads as a list of objects, as DuckDB wrote and reads it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectEqualStrings(
+        \\id=1 xs=[{"ab":0},{"ab":1}]
+        \\id=2 xs=[{"ab":null},null]
+        \\id=3 xs=[]
+        \\id=4 xs=null
+        \\
+    , try readAllText(ar.allocator(), @embedFile("../testdata/list_one_field_struct.parquet"), "l.parquet"));
 }
 
 test "a nested fixture with bytes flipped anywhere errors or reads, never crashes" {

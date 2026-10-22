@@ -359,10 +359,10 @@ pub const Merge = struct {
                 if (c.phys.float32 and v.* == .float) v.* = .{ .float = @as(f32, @floatCast(v.float)) };
             }
             parts[src.parts.len] = .{ .int = @intCast(i) };
-            f.* = .{ .path = src.path, .size = src.size, .parts = parts };
+            f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes };
         }
         const out = try a.create(fit.Layout);
-        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files };
+        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping };
         return out;
     }
 

@@ -306,7 +306,7 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
     const dv = "{\"add\":{\"path\":\"c.parquet\",\"partitionValues\":{},\"dataChange\":true,\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"ab^-aqEH.-t@S}K{vb[*k^\",\"offset\":4,\"sizeInBytes\":40,\"cardinality\":1}}}";
     const p3 = "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
     try commit(a, &tmp, "t", 2, &.{ p3, try remove(a, "c.parquet"), dv });
-    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` with a deletion vector (reader feature `deletionVectors`)", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` whose deletion vector file `ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin` could not be opened", true);
     try testing.expectEqualStrings("n\n3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (version = 1)", 1));
 
     for ([_][2][]const u8{
@@ -322,7 +322,7 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
 
     const fields = try std.mem.join(a, ",", &.{ try field(a, "id", "long"), try field(a, "name", "string") });
     try commit(a, &tmp, "t", 2, &.{ "{\"protocol\":{\"minReaderVersion\":2,\"minWriterVersion\":5}}", try meta(a, fields, "[]", "{\"delta.columnMapping.mode\":\"name\"}") });
-    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "uses column mapping (mode `name`)", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "uses column mapping (mode `name`) but its column `id` has no physical name", false);
     try commit(a, &tmp, "t", 2, &.{try meta(a, try field(a, "v", "variant"), "[]", "{}")});
     try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has a column `v` of type `variant`, which basalt does not read", false);
     try commit(a, &tmp, "t", 2, &.{try meta(a, try std.mem.join(a, ",", &.{ try field(a, "id", "string"), try field(a, "name", "string") }), "[]", "{}")});
@@ -393,9 +393,9 @@ test "Delta replay keys a file by its resolved path and deletion vector; a missi
     const p3 = "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
     const dv = "{\"add\":{\"path\":\"c.parquet\",\"partitionValues\":{},\"dataChange\":true,\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"ab^-aqEH.-t@S}K{vb[*k^\",\"offset\":4,\"sizeInBytes\":40,\"cardinality\":1}}}";
     try commit(a, &tmp, "t", 2, &.{ p3, dv, try remove(a, "c.parquet") });
-    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` with a deletion vector (reader feature `deletionVectors`)", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` whose deletion vector file `ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin` could not be opened", true);
     try commit(a, &tmp, "t", 2, &.{ p3, try remove(a, "c.parquet"), dv });
-    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` with a deletion vector (reader feature `deletionVectors`)", false);
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `c.parquet` whose deletion vector file `ab/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin` could not be opened", true);
 
     try commit(a, &tmp, "t", 2, &.{try remove(a, try std.fmt.allocPrint(a, "file://{s}/t/b.parquet", .{base}))});
     try testing.expectEqualStrings("id\n5\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id", 1));
@@ -456,4 +456,294 @@ test "an Iceberg folder is refused rather than read as a plain folder; format = 
     try put(&tmp, "ice/metadata/v1.metadata.json", "{}");
     try refused(a, &tmp, "SELECT id FROM '$B/ice/'", "holds an Iceberg table (metadata/*.metadata.json), which basalt does not read yet", false);
     try testing.expectEqualStrings("id\n1\n2\n", try rows(a, &tmp, "SELECT id FROM '$B/ice/' WITH (format = 'parquet') ORDER BY id", 1));
+}
+
+/// The fixture table `name` (`src/format/testdata/delta/`) written under `name/`.
+fn golden(tmp: *std.testing.TmpDir, name: []const u8) !void {
+    for (basalt.fixtures.delta_tables) |f| {
+        if (f[0].len > name.len and std.mem.startsWith(u8, f[0], name) and f[0][name.len] == '/') try put(tmp, f[0], f[1]);
+    }
+}
+
+/// `query`'s rows on one lane and on four, which must agree.
+fn lanesAgree(a: std.mem.Allocator, tmp: *std.testing.TmpDir, query: []const u8) ![]const u8 {
+    const one = try rows(a, tmp, query, 1);
+    const four = try rows(a, tmp, query, 4);
+    try testing.expectEqualStrings(one, four);
+    return one;
+}
+
+test "Delta deletion vectors: Spark's tables read without their deleted rows, on one lane or four" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "table-with-dv-small", "dat-deletion_vectors", "log-replay-dv-key-cases" }) |t| try golden(&tmp, t);
+
+    try testing.expectEqualStrings("value\n1\n2\n3\n4\n5\n6\n7\n8\n", try lanesAgree(a, &tmp, "SELECT value FROM '$B/table-with-dv-small/' ORDER BY value"));
+    try testing.expectEqualStrings("n\n8\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/table-with-dv-small/'"));
+    try testing.expectEqualStrings("n\n10\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/table-with-dv-small/' WITH (version = 0)", 1));
+    try testing.expectEqualStrings("letter,int,date\nb,228,1978-12-01\n", try lanesAgree(a, &tmp, "SELECT * FROM '$B/dat-deletion_vectors/'"));
+    try testing.expectEqualStrings("n,s\n47,1204\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/log-replay-dv-key-cases/'"));
+    try testing.expectEqualStrings("n,s\n49,1225\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/log-replay-dv-key-cases/' WITH (version = 1)", 1));
+    try testing.expectEqualStrings("id\n1\n2\n3\n", try rows(a, &tmp, "SELECT id FROM '$B/log-replay-dv-key-cases/' WHERE id < 4 ORDER BY id", 1));
+    try testing.expectEqualStrings("id\n6\n8\n9\n13\n15\n", try rows(a, &tmp, "SELECT id FROM '$B/log-replay-dv-key-cases/' WHERE id >= 6 AND id <= 15 AND (id < 10 OR id > 12) ORDER BY id", 1));
+}
+
+test "Delta deletion vectors with column mapping, partitions and a Spark checkpoint" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "dv-with-columnmapping");
+    try testing.expectEqualStrings(
+        \\part,c,lo,hi,s
+        \\0,2,30,40,foo0
+        \\1,5,1,41,foo1
+        \\2,2,32,42,foo2
+        \\3,5,3,43,foo3
+        \\4,2,34,44,foo4
+        \\5,5,5,45,foo0
+        \\6,2,36,46,foo1
+        \\7,5,7,47,foo2
+        \\8,2,38,48,foo3
+        \\9,5,9,49,foo4
+        \\
+    , try lanesAgree(a, &tmp, "SELECT part, COUNT(*) AS c, MIN(col1) AS lo, MAX(col1) AS hi, MIN(col2) AS s FROM '$B/dv-with-columnmapping/' GROUP BY part ORDER BY part"));
+    try testing.expectEqualStrings("n,s\n35,1015\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n, SUM(col1) AS s FROM '$B/dv-with-columnmapping/'"));
+    try testing.expectEqualStrings("col1,col2\n3,foo3\n13,foo3\n23,foo3\n33,foo3\n43,foo3\n", try rows(a, &tmp, "SELECT col1, col2 FROM '$B/dv-with-columnmapping/' WHERE part = 3 ORDER BY col1", 1));
+}
+
+test "Delta column mapping: a renamed column reads under its new name, by physical name and by field id, nested names too" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "dat-column_mapping");
+    try golden(&tmp, "table-with-columnmapping-mode-id");
+    try testing.expectEqualStrings(
+        \\letter,new_int,date
+        \\a,25,2017-05-01
+        \\a,25,2017-05-01
+        \\a,95,1983-04-01
+        \\a,95,1983-04-01
+        \\a,604,1997-01-01
+        \\a,604,1997-01-01
+        \\a,692,2017-09-01
+        \\a,692,2017-09-01
+        \\b,228,1978-12-01
+        \\b,228,1978-12-01
+        \\
+    , try lanesAgree(a, &tmp, "SELECT * FROM '$B/dat-column_mapping/' ORDER BY letter, new_int"));
+    try testing.expectEqualStrings("letter,int\nb,228\n", try rows(a, &tmp, "SELECT letter, int FROM '$B/dat-column_mapping/' WITH (version = 1) WHERE letter = 'b'", 1));
+    try testing.expectEqualStrings("new_int\n604\n604\n692\n692\n", try rows(a, &tmp, "SELECT new_int FROM '$B/dat-column_mapping/' WHERE new_int > 600 ORDER BY new_int", 1));
+
+    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, \"nested_struct.ac.aca\", array_of_map_of_arrays, array_of_structs, \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
+    const by_id = try lanesAgree(a, &tmp, q);
+    try testing.expectEqualStrings(
+        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
+        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
+        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
+        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
+        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
+        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
+        \\,,,,,,,,,,,
+        \\
+    , by_id);
+    const log = "table-with-columnmapping-mode-id/_delta_log/00000000000000000000.json";
+    const text = try tmp.dir.readFileAlloc(a, log, 1 << 20);
+    try put(&tmp, log, try std.mem.replaceOwned(u8, a, text, "\"delta.columnMapping.mode\":\"id\"", "\"delta.columnMapping.mode\":\"name\""));
+    try testing.expectEqualStrings(by_id, try rows(a, &tmp, q, 1));
+}
+
+/// A deletion vector file deleting the rows of `runs` (first and last row, both
+/// below 65536), framed as Spark writes one at offset 1, under `magic` and file
+/// format `version`; `size` is set to its bitmap's size, `card` to its rows.
+fn dvFile(a: std.mem.Allocator, runs: []const [2]u16, magic: u32, version: u8, size: *usize, card: *usize) ![]const u8 {
+    var body = std.array_list.Managed(u8).init(a);
+    const w = struct {
+        fn int(l: *std.array_list.Managed(u8), comptime T: type, v: T, e: std.builtin.Endian) !void {
+            var x: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &x, v, e);
+            try l.appendSlice(&x);
+        }
+    }.int;
+    var n: usize = 0;
+    for (runs) |r| n += r[1] - r[0] + 1;
+    try w(&body, u32, magic, .little);
+    try w(&body, u64, 1, .little);
+    try w(&body, u32, 0, .little);
+    try w(&body, u32, 12347, .little);
+    try body.append(1);
+    try w(&body, u16, 0, .little);
+    try w(&body, u16, @intCast(n - 1), .little);
+    try w(&body, u16, @intCast(runs.len), .little);
+    for (runs) |r| {
+        try w(&body, u16, r[0], .little);
+        try w(&body, u16, r[1] - r[0], .little);
+    }
+    var out = std.array_list.Managed(u8).init(a);
+    try out.append(version);
+    try w(&out, u32, @intCast(body.items.len), .big);
+    try out.appendSlice(body.items);
+    try w(&out, u32, std.hash.Crc32.hash(body.items), .big);
+    size.* = body.items.len;
+    card.* = n;
+    return out.items;
+}
+
+const dv_protocol = "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}";
+const dv_uuid = "vBn[lx{q8@P<9BNH/isA";
+const dv_name = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
+
+fn addDv(a: std.mem.Allocator, path: []const u8, dv: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"add\":{{\"path\":\"{s}\",\"partitionValues\":{{}},\"dataChange\":true,\"deletionVector\":{s}}}}}", .{ path, dv });
+}
+
+fn removeDv(a: std.mem.Allocator, path: []const u8, dv: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"remove\":{{\"path\":\"{s}\",\"dataChange\":true,\"deletionVector\":{s}}}}}", .{ path, dv });
+}
+
+test "a deletion vector over three row groups: one deleted whole, pruning, LIMIT and lanes keep each row's file-wide position" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(&tmp, "d/rg2.parquet", basalt.fixtures.rg2_parquet);
+    var size: usize = 0;
+    var card: usize = 0;
+    try put(&tmp, "d/" ++ dv_name, try dvFile(a, &.{ .{ 0, 2048 }, .{ 2053, 2053 }, .{ 2148, 2148 }, .{ 4500, 4500 }, .{ 4999, 4999 } }, 1681511377, 1, &size, &card));
+    const dv = try std.fmt.allocPrint(a, "{{\"storageType\":\"u\",\"pathOrInlineDv\":\"{s}\",\"offset\":1,\"sizeInBytes\":{d},\"cardinality\":{d}}}", .{ dv_uuid, size, card });
+    const fields = try std.mem.join(a, ",", &.{ try field(a, "id", "integer"), try field(a, "f", "double"), try field(a, "g", "integer") });
+    try commit(a, &tmp, "d", 0, &.{ dv_protocol, try meta(a, fields, "[]", "{}"), try addDv(a, "rg2.parquet", dv) });
+
+    try testing.expectEqualStrings("n,s\n2947,10388571\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/d/'"));
+    const four = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT g, COUNT(*) AS n FROM '$B/d/' GROUP BY g ORDER BY g;", 4);
+    try testing.expect(four.err == null);
+    try testing.expect(four.summary.threads > 1);
+    try testing.expectEqualStrings(try rows(a, &tmp, "SELECT g, COUNT(*) AS n FROM '$B/d/' GROUP BY g ORDER BY g", 1), four.out);
+
+    const pruned = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/d/' WHERE id > 4096;", 1);
+    try testing.expect(pruned.err == null);
+    try testing.expectEqualStrings("n,s\n902,4102343\n", pruned.out);
+    try testing.expectEqual(@as(u64, 2), pruned.summary.pushdown.row_groups_skipped);
+    try testing.expectEqualStrings("n\n3\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/d/' WHERE id <= 2052"));
+    try testing.expectEqualStrings("id\n2050\n2051\n2052\n", try rows(a, &tmp, "SELECT id FROM '$B/d/' LIMIT 3", 1));
+    try testing.expectEqualStrings("id\n2050\n2051\n2052\n", try lanesAgree(a, &tmp, "SELECT id FROM '$B/d/' ORDER BY id LIMIT 3"));
+    try testing.expectEqualStrings("id\n4997\n4998\n4999\n", try lanesAgree(a, &tmp, "SELECT id FROM '$B/d/' WHERE id > 4996 ORDER BY id"));
+
+    var lines = std.array_list.Managed([]const u8).init(a);
+    try lines.appendSlice(&.{ dv_protocol, try meta(a, fields, "[]", "{}") });
+    try put(&tmp, "m/" ++ dv_name, try tmp.dir.readFileAlloc(a, "d/" ++ dv_name, 1 << 20));
+    for (0..20) |i| {
+        const f = try std.fmt.allocPrint(a, "f{d:0>2}.parquet", .{i});
+        try put(&tmp, try std.fmt.allocPrint(a, "m/{s}", .{f}), basalt.fixtures.rg2_parquet);
+        try lines.append(try addDv(a, f, dv));
+    }
+    try commit(a, &tmp, "m", 0, lines.items);
+    const by_file = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/m/';", 2);
+    try testing.expect(by_file.err == null);
+    try testing.expect(by_file.summary.threads > 1);
+    try testing.expectEqualStrings("n,s\n58940,207771420\n", by_file.out);
+
+    const inline_dv = "{\"storageType\":\"i\",\"pathOrInlineDv\":\"^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L\",\"sizeInBytes\":44,\"cardinality\":6}";
+    try commit(a, &tmp, "d", 1, &.{ try removeDv(a, "rg2.parquet", dv), try addDv(a, "rg2.parquet", inline_dv) });
+    try testing.expectEqualStrings("n,s\n4994,12502422\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/d/'"));
+
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try put(&tmp, "dvs/x y.bin", try dvFile(a, &.{.{ 1, 4998 }}, 1681511377, 1, &size, &card));
+    const abs = try std.fmt.allocPrint(a, "{{\"storageType\":\"p\",\"pathOrInlineDv\":\"file://{s}/dvs/x%20y.bin\",\"offset\":1,\"sizeInBytes\":{d},\"cardinality\":{d}}}", .{ base, size, card });
+    try commit(a, &tmp, "d", 2, &.{ try removeDv(a, "rg2.parquet", inline_dv), try addDv(a, "rg2.parquet", abs) });
+    try testing.expectEqualStrings("id\n1\n5000\n", try lanesAgree(a, &tmp, "SELECT id FROM '$B/d/' ORDER BY id"));
+}
+
+test "deletion vectors basalt does not read are refused: storage `r`, the native format, another file version" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(&tmp, "d/rg2.parquet", basalt.fixtures.rg2_parquet);
+    const fields = try std.mem.join(a, ",", &.{ try field(a, "id", "integer"), try field(a, "f", "double"), try field(a, "g", "integer") });
+    var size: usize = 0;
+    var card: usize = 0;
+    for ([_]struct { u32, u8, []const u8 }{
+        .{ 1681511376, 1, "is in the native RoaringBitmapArray format, not the portable one the Delta protocol specifies" },
+        .{ 1681511377, 2, "is format version 2; basalt reads version 1" },
+    }) |c| {
+        try put(&tmp, "d/" ++ dv_name, try dvFile(a, &.{.{ 3, 4 }}, c[0], c[1], &size, &card));
+        const dv = try std.fmt.allocPrint(a, "{{\"storageType\":\"u\",\"pathOrInlineDv\":\"{s}\",\"offset\":1,\"sizeInBytes\":{d},\"cardinality\":{d}}}", .{ dv_uuid, size, card });
+        try commit(a, &tmp, "d", 0, &.{ dv_protocol, try meta(a, fields, "[]", "{}"), try addDv(a, "rg2.parquet", dv) });
+        try refused(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/d/'", c[2], true);
+    }
+    try commit(a, &tmp, "d", 0, &.{ dv_protocol, try meta(a, fields, "[]", "{}"), try addDv(a, "rg2.parquet", "{\"storageType\":\"r\",\"pathOrInlineDv\":\"dv/x.bin\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":2}") });
+    try refused(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/d/'", "has file `rg2.parquet` whose deletion vector is stored as `r`", false);
+}
+
+/// A field with column mapping metadata: its physical name and field id.
+fn mfield(a: std.mem.Allocator, name: []const u8, ty: []const u8, phys: []const u8, id: u32) ![]const u8 {
+    return std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"type\":\"{s}\",\"nullable\":true,\"metadata\":{{\"delta.columnMapping.id\":{d},\"delta.columnMapping.physicalName\":\"{s}\"}}}}", .{ name, ty, id, phys });
+}
+
+test "Delta column mapping by name: a rename keeps its data, a dropped column re-added under its old name stays NULL in old files" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try dataFile(a, &tmp, "cm/f0.parquet", "a,b\n1,old\n", "CAST(a AS INT) AS a, b");
+    try dataFile(a, &tmp, "cm/f1.parquet", "a,b\n2,new\n", "CAST(a AS INT) AS a, b AS \"col-new\"");
+    try commit(a, &tmp, "cm", 0, &.{ protocol1, try meta(a, try std.mem.join(a, ",", &.{ try field(a, "a", "long"), try field(a, "b", "string") }), "[]", "{}"), try add(a, "f0.parquet", "{}") });
+    const mapped = try std.mem.join(a, ",", &.{ try mfield(a, "x", "long", "a", 1), try mfield(a, "b", "string", "col-new", 3), try mfield(a, "z", "string", "col-z", 4) });
+    try commit(a, &tmp, "cm", 1, &.{ "{\"protocol\":{\"minReaderVersion\":2,\"minWriterVersion\":5}}", try meta(a, mapped, "[]", "{\"delta.columnMapping.mode\":\"name\"}"), try add(a, "f1.parquet", "{}") });
+
+    try testing.expectEqualStrings("x,b,z\n1,,\n2,new,\n", try lanesAgree(a, &tmp, "SELECT * FROM '$B/cm/' ORDER BY x"));
+    try testing.expectEqualStrings("x\n2\n", try rows(a, &tmp, "SELECT x FROM '$B/cm/' WHERE b = 'new'", 1));
+    try testing.expectEqualStrings("a,b\n1,old\n", try rows(a, &tmp, "SELECT * FROM '$B/cm/' WITH (version = 0)", 1));
+
+    try commit(a, &tmp, "cm", 2, &.{try meta(a, mapped, "[]", "{\"delta.columnMapping.mode\":\"id\"}")});
+    try refused(a, &tmp, "SELECT * FROM '$B/cm/'", "could not read its file `f0.parquet` (it carries no Parquet field ids", true);
+    try commit(a, &tmp, "cm", 2, &.{try meta(a, mapped, "[]", "{\"delta.columnMapping.mode\":\"name\"}")});
+
+    const w = try runIn(a, &tmp, "LOAD INTO '$B/cm/' APPEND AS SELECT 3 AS x, 'w' AS b, 'z' AS z;", 1);
+    try testing.expect(w.err != null);
+    try testing.expect(std.mem.indexOf(u8, w.msg, "uses column mapping (mode `name`): its files name columns by physical name or field id, which basalt reads but does not write") != null);
+}
+
+test "an UPSERT into a table with deletion vectors rewrites a file without its deleted rows" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "table-with-dv-small");
+    try put(&tmp, "u.csv", "v\n0\n5\n");
+    const r = try runIn(a, &tmp, "LOAD INTO '$B/table-with-dv-small/' UPSERT ON (value) AS SELECT CAST(v AS INT) AS value FROM '$B/u.csv';", 1);
+    if (r.err != null) std.debug.print("upsert: {s}\n", .{r.msg});
+    try testing.expect(r.err == null);
+    try testing.expectEqualStrings("value\n0\n1\n2\n3\n4\n5\n6\n7\n8\n", try rows(a, &tmp, "SELECT value FROM '$B/table-with-dv-small/' ORDER BY value", 1));
+    const log = try tmp.dir.readFileAlloc(a, "table-with-dv-small/_delta_log/00000000000000000002.json", 1 << 20);
+    try testing.expect(std.mem.indexOf(u8, log, "\"remove\":{\"path\":\"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log, "\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"vBn[lx{q8@P<9BNH/isA\"") != null);
+}
+
+test "Delta column mapping: a struct field dropped inside a list element or a map value is neither read nor shown" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try put(&tmp, "n/old.parquet", basalt.fixtures.mapped_nested_parquet);
+    const y = "{\"name\":\"y\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":ID,\"delta.columnMapping.physicalName\":\"col-y\"}}";
+    const l = try std.fmt.allocPrint(a, "{{\"name\":\"l\",\"type\":{{\"type\":\"array\",\"elementType\":{{\"type\":\"struct\",\"fields\":[{s}]}},\"containsNull\":true}},\"nullable\":true,\"metadata\":{{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-l\"}}}}", .{try std.mem.replaceOwned(u8, a, y, "ID", "3")});
+    const m = try std.fmt.allocPrint(a, "{{\"name\":\"m\",\"type\":{{\"type\":\"map\",\"keyType\":\"integer\",\"valueType\":{{\"type\":\"struct\",\"fields\":[{s}]}},\"valueContainsNull\":true}},\"nullable\":true,\"metadata\":{{\"delta.columnMapping.id\":5,\"delta.columnMapping.physicalName\":\"col-m\"}}}}", .{try std.mem.replaceOwned(u8, a, y, "ID", "6")});
+    const fields = try std.mem.join(a, ",", &.{ try mfield(a, "a", "long", "col-a", 1), l, m });
+    for ([_][]const u8{ "name", "id" }) |mode| {
+        try commit(a, &tmp, "n", 0, &.{ "{\"protocol\":{\"minReaderVersion\":2,\"minWriterVersion\":5}}", try meta(a, fields, "[]", try std.fmt.allocPrint(a, "{{\"delta.columnMapping.mode\":\"{s}\"}}", .{mode})), try add(a, "old.parquet", "{}") });
+        try testing.expectEqualStrings("a,l,m\n1,\"[{\"\"y\"\":10},{\"\"y\"\":11}]\",\"{\"\"7\"\":{\"\"y\"\":30}}\"\n", try rows(a, &tmp, "SELECT * FROM '$B/n/'", 1));
+    }
 }

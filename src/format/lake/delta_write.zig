@@ -413,8 +413,8 @@ fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
         if (oneOf(f, &honoured)) continue;
         return refuse("{s} uses writer feature `{s}`, which basalt does not honour, so it does not write the table", .{ st.name, f });
     };
-    if (st.mapping) |m| if (!std.mem.eql(u8, m, "none"))
-        return refuse("{s} uses column mapping (mode `{s}`), which basalt does not write", .{ st.name, m });
+    if (st.mappingMode()) |m|
+        return refuse("{s} uses column mapping (mode `{s}`): its files name columns by physical name or field id, which basalt reads but does not write, so it does not write the table", .{ st.name, m });
     for (fields) |f| {
         const md = f.metadata orelse continue;
         var it = md.iterator();
