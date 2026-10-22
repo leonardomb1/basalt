@@ -237,6 +237,9 @@ error rather than ignored.
 | `timeout_ms` | `300000` | the limit on one page's fetch |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
+A page or login reply that decodes past 256 MiB stops the read (`HttpBodyTooLarge`),
+so a compressed bomb cannot exhaust memory; ask the endpoint for smaller pages.
+
 **Joins** — on the `JOIN` clause: `max_build = '16GB'` sets the right side's
 memory ceiling, past which the join spills to disk ([Joins](joins.md));
 `join_order = 'written'` (default `'auto'`) keeps an inner join's right side in
