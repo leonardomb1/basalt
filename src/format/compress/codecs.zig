@@ -312,7 +312,11 @@ fn expectRoundTrip(codec: Codec, comp: []const u8, want: []const u8) !void {
     try t.expectEqualStrings(want, got);
 }
 
-test "supported codecs" {
+test "codec enum holds the thrift ids and supported codecs" {
+    try t.expectEqual(1, @intFromEnum(Codec.snappy));
+    try t.expectEqual(2, @intFromEnum(Codec.gzip));
+    try t.expectEqual(6, @intFromEnum(Codec.zstd));
+    try t.expectEqual(7, @intFromEnum(Codec.lz4_raw));
     try t.expect(supported(.snappy) and supported(.lz4) and !supported(.brotli) and !supported(.lzo));
 }
 

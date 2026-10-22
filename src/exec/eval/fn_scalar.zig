@@ -257,11 +257,7 @@ pub fn UrlCode(comptime encode: bool) type {
         pub const args = .{.str};
         pub fn apply(cx: Cx, str: []const u8) EvalError![]const u8 {
             if (encode) {
-                for (str) |b| {
-                    if (percent.isUnreserved(b)) {
-                        try cx.buf.append(b);
-                    } else try cx.buf.writer().print("%{X:0>2}", .{b});
-                }
+                try percent.encode(cx.buf, str);
                 return cx.written();
             }
             const at = cx.buf.items.len;

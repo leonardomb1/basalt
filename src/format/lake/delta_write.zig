@@ -52,6 +52,7 @@ const folder = @import("../../connect/folder.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
+const percent = @import("../../net/percent.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const s3 = @import("../../store/s3.zig");
@@ -516,9 +517,11 @@ fn escapePath(w: *std.Io.Writer, s: []const u8) !void {
 /// `/` and `=` percent-encoded.
 fn uriPath(arena: std.mem.Allocator, rel: []const u8) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
-    for (rel) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "-._~/=", ch) != null) try aw.writer.writeByte(ch) else try aw.writer.print("%{X:0>2}", .{ch});
-    }
+    try std.Uri.Component.percentEncode(&aw.writer, rel, struct {
+        fn keep(ch: u8) bool {
+            return percent.isUnreserved(ch) or ch == '/' or ch == '=';
+        }
+    }.keep);
     return aw.written();
 }
 

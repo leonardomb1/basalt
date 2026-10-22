@@ -326,18 +326,7 @@ pub fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []cons
     try formEncode(buf, val);
 }
 
-pub fn formEncode(buf: *std.array_list.Managed(u8), val: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (val) |c| {
-        if (percent.isUnreserved(c)) {
-            try buf.append(c);
-        } else {
-            try buf.append('%');
-            try buf.append(hex[c >> 4]);
-            try buf.append(hex[c & 0xF]);
-        }
-    }
-}
+pub const formEncode = percent.encode;
 
 pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (path.len == 0) return base;
