@@ -478,7 +478,7 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
     const st = try snapshot(arena, root, at, listed_in);
     try st.checkProtocol();
     const layout = try layoutOf(arena, st, root, st.files.values());
-    std.mem.sort(Layout.File, layout.files, {}, struct {
+    std.sort.pdq(Layout.File, layout.files, {}, struct {
         fn lt(_: void, a: Layout.File, b: Layout.File) bool {
             return std.mem.lessThan(u8, a.path, b.path);
         }

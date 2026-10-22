@@ -22,7 +22,7 @@ pub fn isFolder(path: []const u8) bool {
 pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
     var out = std.array_list.Managed([]const u8).init(arena);
     for (try listRaw(arena, path)) |f| if (!hidden(below(f, path))) try out.append(f);
-    std.mem.sort([]const u8, out.items, {}, struct {
+    std.sort.pdq([]const u8, out.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.lessThan(u8, a, b);
         }

@@ -225,13 +225,13 @@ pub const SignParams = struct {
 /// are signed verbatim (all machine-built); a valueless query param signs as `name=`.
 fn canonicalRequest(arena: std.mem.Allocator, p: SignParams) !struct { text: []const u8, signed: []const u8 } {
     const hdrs = try arena.dupe(SignHeader, p.headers);
-    std.mem.sort(SignHeader, hdrs, {}, struct {
+    std.sort.insertion(SignHeader, hdrs, {}, struct {
         fn lt(_: void, x: SignHeader, y: SignHeader) bool {
             return std.mem.lessThan(u8, x.name, y.name);
         }
     }.lt);
     const q = try arena.dupe([]const u8, p.query);
-    std.mem.sort([]const u8, q, {}, struct {
+    std.sort.insertion([]const u8, q, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
         }

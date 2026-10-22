@@ -681,7 +681,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
             .close => |name| if (std.mem.eql(u8, name, "row")) break,
             else => {},
         };
-        std.mem.sort(Cell, out.items, {}, struct {
+        std.sort.insertion(Cell, out.items, {}, struct {
             fn lt(_: void, x: Cell, y: Cell) bool {
                 return x.col < y.col;
             }

@@ -340,7 +340,7 @@ pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usi
         if (off < entry_at) continue;
         try found.append(.{ .off = off, .stmt = st });
     }
-    std.mem.sort(Found, found.items, {}, struct {
+    std.sort.insertion(Found, found.items, {}, struct {
         fn lt(_: void, x: Found, y: Found) bool {
             return x.off < y.off;
         }

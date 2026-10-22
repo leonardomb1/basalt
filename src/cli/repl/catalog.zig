@@ -332,7 +332,7 @@ fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 
         if (!std.mem.startsWith(u8, e.name, name_part)) continue;
         try out.append(try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ dir_part, e.name, if (e.kind == .directory) "/" else "" }));
     }
-    std.mem.sort([]const u8, out.items, {}, struct {
+    std.sort.pdq([]const u8, out.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
             return std.mem.lessThan(u8, x, y);
         }

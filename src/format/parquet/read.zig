@@ -347,7 +347,7 @@ pub const Reader = struct {
             if (end <= start) return Error.CorruptParquetPage;
             try spans.append(.{ start, end });
         }
-        std.mem.sort([2]u64, spans.items, {}, struct {
+        std.sort.insertion([2]u64, spans.items, {}, struct {
             fn lt(_: void, a: [2]u64, b: [2]u64) bool {
                 return a[0] < b[0];
             }

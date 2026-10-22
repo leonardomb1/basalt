@@ -229,7 +229,7 @@ fn hottest(arena: std.mem.Allocator, prof: *const Profile, o: Ordered, limit: us
             return c.p.nodes.getPtr(a).?.exclusive(c.p) > c.p.nodes.getPtr(b).?.exclusive(c.p);
         }
     };
-    std.mem.sort(profile.Id, ids, Ctx{ .p = prof }, Ctx.more);
+    std.sort.insertion(profile.Id, ids, Ctx{ .p = prof }, Ctx.more);
     var n: usize = 0;
     while (n < ids.len and n < limit and prof.nodes.getPtr(ids[n]).?.exclusive(prof) > 0) n += 1;
     return ids[0..n];

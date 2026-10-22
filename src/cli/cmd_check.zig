@@ -58,7 +58,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
     }, &adiag);
     for (found.items) |f| try issues.append(.{ .msg = f.msg, .pos = f.pos, .end = f.end, .file = prog.fileOf(f.pos) });
 
-    std.mem.sort(CheckIssue, issues.items, {}, struct {
+    std.sort.insertion(CheckIssue, issues.items, {}, struct {
         fn lt(_: void, x: CheckIssue, y: CheckIssue) bool {
             const px = x.pos orelse ast.Pos{ .line = 0, .col = 0 };
             const py = y.pos orelse ast.Pos{ .line = 0, .col = 0 };

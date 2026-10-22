@@ -130,7 +130,7 @@ pub fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, foote
     }
     try out.append(footer_start);
     const sl = try out.toOwnedSlice();
-    std.mem.sort(u64, sl, {}, comptime std.sort.asc(u64));
+    std.sort.pdq(u64, sl, {}, comptime std.sort.asc(u64));
     return sl;
 }
 

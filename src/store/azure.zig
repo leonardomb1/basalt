@@ -179,7 +179,7 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     try w.print("{s}\n", .{p.range});
 
     const sorted = try arena.dupe(MsHeader, p.ms_headers);
-    std.mem.sort(MsHeader, sorted, {}, struct {
+    std.sort.insertion(MsHeader, sorted, {}, struct {
         fn lt(_: void, a: MsHeader, b: MsHeader) bool {
             return std.mem.lessThan(u8, a.name, b.name);
         }

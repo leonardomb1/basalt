@@ -580,7 +580,7 @@ fn buildLengths(freq: []u32, lens: []u8, max_bits: u5) void {
         n += 1;
     }
     const s = syms[0..n];
-    std.mem.sort(u16, s, freq, struct {
+    std.sort.insertion(u16, s, freq, struct {
         fn lt(f: []u32, a: u16, b: u16) bool {
             return f[a] < f[b] or (f[a] == f[b] and a < b);
         }
