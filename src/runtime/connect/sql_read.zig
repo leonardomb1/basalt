@@ -23,11 +23,17 @@ const std = @import("std");
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
-        .query => |q| q,
+        .query => |q| queryText(q),
         .table => |t| try std.fmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try fromName(env, rd.connector, t) }),
         else => return planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
     };
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
+}
+
+/// A `query "..."` read's text without its trailing `;`: pushdowns wrap it as a
+/// subquery, where the terminator is a syntax error.
+fn queryText(q: []const u8) []const u8 {
+    return std.mem.trimRight(u8, q, " \t\r\n;");
 }
 
 /// Each part quoted for the source's dialect, as a write names the table, so a
@@ -284,6 +290,13 @@ test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {
         "SELECT * FROM SC1010",
         try sqlWithWhere(a, "SELECT * FROM SC1010", false, ""),
     );
+}
+
+test "a query read's trailing semicolons are dropped before any pushdown wraps it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectEqualStrings("SELECT * FROM (SELECT id FROM t) _w WHERE id > 5", try sqlWithWhere(ar.allocator(), queryText("SELECT id FROM t;  \n"), true, "id > 5"));
+    try std.testing.expectEqualStrings("SELECT ';'", queryText("SELECT ';' ;;"));
 }
 
 test "a projected SQL read asks for its columns, quoted per dialect; none means *" {
