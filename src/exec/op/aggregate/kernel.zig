@@ -1,9 +1,9 @@
 //! The aggregate factory: `make(Op)` turns an aggregate's math (`funcs.zig`) into a
 //! `Kernel` holding every loop the operator runs, chosen once per aggregate by
-//! `kernelFor`. A loop is generated for each physical column type an argument can
-//! arrive in, with a tight path for a batch with no nulls (the op's `addAll` where
-//! it has one) and a validity-checked one otherwise; a column whose type the op
-//! cannot take directly is read value by value and cast to the op's type. The
+//! `kernelFor`. A loop is generated once per lane of column kinds the op reads
+//! alike (`read.Lane`), with a tight path for a batch with no nulls (the op's
+//! `addAll` where it has one) and a validity-checked one otherwise; every kind the
+//! op cannot take directly shares one lane, read value by value and cast. The
 //! grouped loop adds row `r` into the state at `tails[r] + off`, skipping a row with
 //! no group (one sent to a spill file). An op taking DECIMALs that sets `fold_expr`
 //! also gets `foldExpr`/`foldExprRows`, which take a decimal arithmetic argument's
@@ -68,6 +68,27 @@ fn foldsExpr(comptime Op: type) bool {
     return true;
 }
 
+const kinds = std.enums.values(types.TypeKind);
+
+/// Each column kind's lane when read as `In`, indexed by the kind.
+fn lanes(comptime In: type) *const [kinds.len]read.Lane {
+    const L = struct {
+        const of = blk: {
+            var t: [kinds.len]read.Lane = undefined;
+            for (kinds, &t) |k, *l| l.* = read.lane(In, k);
+            break :blk t;
+        };
+    };
+    return &L.of;
+}
+
+/// The kind a lane's loop is generated for, its first; null for a lane no kind
+/// takes when read as `In`, whose loop is never generated.
+fn laneKind(comptime In: type, comptime l: read.Lane) ?types.TypeKind {
+    for (kinds) |k| if (read.lane(In, k) == l) return k;
+    return null;
+}
+
 pub fn make(comptime Op: type) Kernel {
     const K = struct {
         fn st(p: [*]u8) *Op.State {
@@ -91,13 +112,13 @@ pub fn make(comptime Op: type) Kernel {
             if (Op.In == void) return Op.addN(s, if (col) |c| simd.popcountValid(c.validity.bits, n) else n);
             const c = col.?;
             const all = c.validity.allSet(n);
-            switch (c.ty.kind) {
-                inline else => |kind| {
+            switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
+                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
                     if (comptime read.Phys(kind)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, read.slice(S, c, n), cx);
                     if (all) {
                         for (0..n) |i| if (try read.atValid(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
                     } else for (0..n) |i| if (try read.at(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
-                },
+                } else unreachable,
             }
         }
 
@@ -109,13 +130,15 @@ pub fn make(comptime Op: type) Kernel {
                 return;
             };
             const all = c.validity.allSet(tails.len);
-            switch (c.ty.kind) {
-                inline else => |kind| for (tails, 0..) |t, r| {
-                    const tp = t orelse continue;
-                    const cx = if (needs_alloc) rows.at(r) else rows.cx;
-                    const x = (if (all) try read.atValid(Op.In, kind, c, r, cx) else try read.at(Op.In, kind, c, r, cx)) orelse continue;
-                    try Op.add(st(tp + off), x, cx);
-                },
+            switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
+                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
+                    for (tails, 0..) |t, r| {
+                        const tp = t orelse continue;
+                        const cx = if (needs_alloc) rows.at(r) else rows.cx;
+                        const x = (if (all) try read.atValid(Op.In, kind, c, r, cx) else try read.at(Op.In, kind, c, r, cx)) orelse continue;
+                        try Op.add(st(tp + off), x, cx);
+                    }
+                } else unreachable,
             }
         }
 

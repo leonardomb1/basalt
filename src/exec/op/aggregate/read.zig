@@ -138,6 +138,20 @@ pub fn inType(comptime In: type, out: types.Type) types.Type {
     };
 }
 
+/// The code `atValid` runs reading `In` from a column of a kind: kinds of one lane
+/// read alike, so an aggregate loop is generated once per lane, not per kind.
+pub const Lane = enum { none, nested, value, slow, b, i32, i64, f64, dec, bytes };
+
+pub fn lane(comptime In: type, comptime kind: types.TypeKind) Lane {
+    if (In == void) return .none;
+    const S = Phys(kind) orelse return .nested;
+    if (In == Value) return .value;
+    if (!converts(S, In)) return .slow;
+    return switch (column.storageOf(kind)) {
+        inline else => |t| @field(Lane, @tagName(t)),
+    };
+}
+
 /// Row `i` of a column of `kind` as `In`, or null when it is NULL; a nested value
 /// counts as present but reads as NULL otherwise. The one per-row read every
 /// aggregate loop makes.
