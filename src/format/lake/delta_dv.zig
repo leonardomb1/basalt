@@ -108,8 +108,19 @@ const z85_values: [256]u8 = blk: {
     break :blk t;
 };
 
+/// Whether `s` is Z85 text that decodes: a multiple of 5 characters of its
+/// alphabet, each group at most 2^32-1.
 fn isZ85(s: []const u8) bool {
-    for (s) |c| if (z85_values[c] == 0xFF) return false;
+    if (s.len % 5 != 0) return false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 5) {
+        var v: u64 = 0;
+        for (s[i..][0..5]) |c| {
+            if (z85_values[c] == 0xFF) return false;
+            v = v * 85 + z85_values[c];
+        }
+        if (v > std.math.maxInt(u32)) return false;
+    }
     return true;
 }
 
@@ -137,7 +148,8 @@ pub fn z85(arena: std.mem.Allocator, text: []const u8) !?[]u8 {
 pub fn location(arena: std.mem.Allocator, root: []const u8, d: Descriptor) ![]const u8 {
     if (d.storage == 'p') return table.mapPath(arena, root, try table.percentDecode(arena, d.where));
     const prefix = d.where[0 .. d.where.len - uuid_len];
-    const u = (try z85(arena, d.where[d.where.len - uuid_len ..])).?;
+    const u = (try z85(arena, d.where[d.where.len - uuid_len ..])) orelse
+        return refuse("deletion vector path `{s}` does not end in a Z85 UUID", .{d.where});
     const hex = std.fmt.bytesToHex(u[0..16].*, .lower);
     return std.fmt.allocPrint(arena, "{s}{s}{s}deletion_vector_{s}-{s}-{s}-{s}-{s}.bin", .{
         root, prefix, if (prefix.len > 0) "/" else "", hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32],
@@ -209,6 +221,8 @@ test "Z85: the protocol's UUID example and its path, the kernel-rs inline vector
     try testing.expect(try z85(a, "abcd") == null);
     try testing.expect(try z85(a, "abc\"d") == null);
     try testing.expect(try z85(a, "#####") == null);
+    try testing.expectError(table.Error.LakeTableRefused, location(a, "/t/", .{ .storage = 'u', .where = "#####aaaaaaaaaaaaaaa", .size = 4, .cardinality = 1 }));
+    _ = @import("../../exec/eval.zig").takeFailure(table.Error.LakeTableRefused);
     try testing.expectEqualSlices(u8, &.{ 0x86, 0x4F, 0xD2, 0x6F }, (try z85(a, "HelloWorld")).?[0..4]);
 
     const inline_dv = std.json.Value{ .object = blk: {
@@ -314,6 +328,7 @@ test "descriptors: storage types, offsets and sizes are checked before any read"
     for ([_][2][]const u8{
         .{ "{\"storageType\":\"r\",\"pathOrInlineDv\":\"x.bin\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":2}", "stored as `r`" },
         .{ "{\"storageType\":\"z\",\"pathOrInlineDv\":\"x\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":2}", "stored as `z`, a storage type the Delta protocol does not define" },
+        .{ "{\"storageType\":\"u\",\"pathOrInlineDv\":\"#####aaaaaaaaaaaaaaa\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":2}", "its path does not end in a Z85 UUID" },
         .{ "{\"storageType\":\"u\",\"pathOrInlineDv\":\"short\",\"offset\":1,\"sizeInBytes\":36,\"cardinality\":2}", "its path does not end in a Z85 UUID" },
         .{ "{\"storageType\":\"u\",\"pathOrInlineDv\":\"vBn[lx{q8@P<9BNH/isA\",\"offset\":0,\"sizeInBytes\":36,\"cardinality\":2}", "its offset is before" },
         .{ "{\"storageType\":\"i\",\"pathOrInlineDv\":\"HelloWorld\",\"offset\":1,\"sizeInBytes\":8,\"cardinality\":2}", "it is inline but has an offset" },
