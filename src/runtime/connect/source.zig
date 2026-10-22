@@ -91,6 +91,18 @@ pub fn openSourceProjected(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
+    var src = try openSourceOf(env, rd_in, hints, project, bounds);
+    src.stop = env.stop;
+    return src;
+}
+
+fn openSourceOf(
+    env: *Env,
+    rd_in: ast.Read,
+    hints: []const ast.Hint,
+    project: ?[][]const u8,
+    bounds: []const pqdecode.Bound,
+) !driver.Source {
     const rd = try localRead(env, rd_in);
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {

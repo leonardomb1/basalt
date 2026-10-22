@@ -285,6 +285,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.pq_readers = 0;
     env.pq_reader = null;
     env.pq_folder = null;
+    const outer_stop = env.stop;
+    defer env.stop = outer_stop;
+    env.stop = if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
+        const f = try arena.create(std.atomic.Value(bool));
+        f.* = .init(false);
+        break :blk f;
+    } else null;
     defer if (env.pq_held) |h| {
         h.src.close();
         env.pq_held = null;

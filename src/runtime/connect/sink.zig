@@ -119,7 +119,7 @@ const StdoutSink = struct {
         const room = c.max - c.kept;
         if (b.len > room) {
             c.truncated = true;
-            driver.requestStop();
+            if (c.stop) |f| f.store(true, .release);
         }
         const take: usize = @intCast(@min(room, b.len));
         if (take == 0) return;
@@ -132,7 +132,6 @@ const StdoutSink = struct {
     pub fn close(self: *StdoutSink) !void {
         defer stdout_mu.unlock();
         defer self.gpa.destroy(self);
-        defer driver.resetStop();
         try self.inner.close();
         const truncated = if (self.cap) |c| c.truncated else false;
         if (truncated) self.log.log(.warn, "result cut at --max-rows {d}", .{self.cap.?.max});
@@ -141,7 +140,6 @@ const StdoutSink = struct {
 
     pub fn abort(self: *StdoutSink) void {
         defer stdout_mu.unlock();
-        driver.resetStop();
         self.inner.abort();
         self.gpa.destroy(self);
     }
@@ -178,12 +176,11 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         var cap: ?*driver.RowCap = null;
         if (env.max_rows) |n| {
             cap = try env.arena.create(driver.RowCap);
-            cap.?.* = .{ .max = n };
+            cap.?.* = .{ .max = n, .stop = env.stop };
             info.cap = cap;
         }
         stdout_mu.lock();
         errdefer stdout_mu.unlock();
-        driver.resetStop();
         const inner = try openStdoutSink(env, schema, info);
         errdefer inner.abort();
         return StdoutSink.wrap(env, inner, info, cap);

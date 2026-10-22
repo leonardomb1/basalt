@@ -316,6 +316,9 @@ pub const Env = struct {
     scan: ?*driver.ScanTally = null,
     on_result: ?ResultHook = null,
     max_rows: ?u64 = null,
+    /// The running statement's row-cap flag when it shows a capped result: every
+    /// source it opens carries it, so the cap ends this statement's reads only.
+    stop: ?*std.atomic.Value(bool) = null,
     on_let: ?LetHook = null,
     space: ?Space = null,
     op_memory: usize = 2 << 30,

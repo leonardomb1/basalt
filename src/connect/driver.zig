@@ -41,20 +41,6 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
-var g_stop = std.atomic.Value(bool).init(false);
-
-/// Every source reports end of stream at its next pull, so the run finishes as if
-/// the data ran out. Set by a row cap only once the sink holds more rows than it
-/// keeps, so blocking operators have already read all they needed.
-pub fn requestStop() void {
-    g_stop.store(true, .seq_cst);
-}
-pub fn stopping() bool {
-    return g_stop.load(.seq_cst);
-}
-pub fn resetStop() void {
-    g_stop.store(false, .seq_cst);
-}
 
 pub const ScanTally = struct {
     row_groups: std.atomic.Value(u64) = .init(0),
@@ -68,13 +54,19 @@ pub const ScanTally = struct {
     }
 };
 
+/// A shown result's row cap. Once the sink holds more rows than it keeps, it sets
+/// `stop`, the flag its own statement's sources carry, so they report end of
+/// stream at their next pull and the statement finishes as if the data ran out;
+/// blocking operators have by then read all they needed, and no other statement
+/// sees it.
 pub const RowCap = struct {
     max: u64,
     kept: u64 = 0,
     truncated: bool = false,
+    stop: ?*std.atomic.Value(bool) = null,
 };
 
-test "stop flag: a source reports end of stream while it is set, and only then" {
+test "stop flag: a source reports end of stream once its statement's flag is set; others read on" {
     const Endless = struct {
         fn schemaFn(_: *anyopaque) types.Schema {
             return .{ .fields = &.{} };
@@ -86,13 +78,13 @@ test "stop flag: a source reports end of stream while it is set, and only then" 
         const vt = Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
     };
     var dummy: u8 = 0;
-    const src = Source{ .ptr = &dummy, .vtable = &Endless.vt };
-    defer resetStop();
+    var stop = std.atomic.Value(bool).init(false);
+    const src = Source{ .ptr = &dummy, .vtable = &Endless.vt, .stop = &stop };
+    const other = Source{ .ptr = &dummy, .vtable = &Endless.vt };
     try std.testing.expect((try src.next(std.testing.allocator)) != null);
-    requestStop();
+    stop.store(true, .release);
     try std.testing.expect((try src.next(std.testing.allocator)) == null);
-    resetStop();
-    try std.testing.expect((try src.next(std.testing.allocator)) != null);
+    try std.testing.expect((try other.next(std.testing.allocator)) != null);
 }
 
 /// A connector's own words for its last failure on this thread, held in `n` bytes
@@ -164,6 +156,8 @@ pub const FileMode = enum { truncate, append };
 pub const Source = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Its statement's row-cap flag (`RowCap.stop`), when the statement has one.
+    stop: ?*const std.atomic.Value(bool) = null,
 
     pub const VTable = struct {
         schema: *const fn (*anyopaque) types.Schema,
@@ -178,7 +172,7 @@ pub const Source = struct {
     /// one `next`, so a check in the sink loop alone let a cancelled GROUP BY run on.
     pub fn next(self: Source, arena: std.mem.Allocator) anyerror!?Batch {
         if (aborting()) return error.Aborted;
-        if (stopping()) return null;
+        if (self.stop) |s| if (s.load(.acquire)) return null;
         return self.vtable.next(self.ptr, arena);
     }
     pub fn close(self: Source) void {
