@@ -272,7 +272,7 @@ pub const Conn = struct {
             else
                 sql.coerceText(arena, text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
-                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable numeric value \"{s}\"", .{ c.name, text.? });
+                        self.last_error = try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? });
                     return e;
                 };
             try builders[k].append(v);

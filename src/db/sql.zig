@@ -41,6 +41,7 @@ const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
 const eval = @import("../exec/eval.zig");
+const daysInMonth = @import("../exec/eval/time.zig").daysInMonth;
 const driver = @import("../connect/driver.zig");
 const ast = @import("../lang/ast.zig");
 
@@ -1028,8 +1029,8 @@ pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !
         .float => .{ .float = std.fmt.parseFloat(f64, t) catch return error.UnparseableNumber },
         .decimal => parseDecimalText(t) orelse return error.UnparseableNumber,
         .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
-        .date => .{ .date = @intCast(parseDateText(t)) },
-        .timestamp => .{ .timestamp = parseDatetimeText(t) },
+        .date => if (zeroDate(t)) .null else .{ .date = std.math.cast(i32, parseDateText(t) orelse return error.UnparseableNumber) orelse return error.UnparseableNumber },
+        .timestamp => if (zeroDate(t)) .null else .{ .timestamp = parseDatetimeText(t) orelse return error.UnparseableNumber },
         else => .{ .string = try arena.dupe(u8, t) },
     };
 }
@@ -1084,48 +1085,96 @@ test "parseDecimalText rejects what it cannot read instead of inventing a number
     try std.testing.expect(parseDecimalText("R$ 10") == null);
 }
 
-fn parseDateText(t: []const u8) i64 {
-    if (t.len < 10) return 0;
-    return eval.daysFromCivil(atoiN(t[0..4]), @intCast(atoiN(t[5..7])), @intCast(atoiN(t[8..10])));
+const DateText = struct { days: i64, rest: []const u8 };
+
+/// `YYYY-MM-DD` at the start of `t`, the year four digits or more and a ` BC` at the
+/// end of `t` taken as its era; the month and day must exist. Null for anything
+/// else, `infinity` included, so a value no date can hold fails rather than reads
+/// as 1970-01-01.
+fn dateText(t: []const u8) ?DateText {
+    const bc = std.mem.endsWith(u8, t, " BC");
+    const body = if (bc) t[0 .. t.len - 3] else t;
+    var i: usize = 0;
+    while (i < body.len and i < 7 and std.ascii.isDigit(body[i])) i += 1;
+    if (i < 4 or body.len < i + 6 or body[i] != '-' or body[i + 3] != '-') return null;
+    for ([_]usize{ i + 1, i + 2, i + 4, i + 5 }) |k| if (!std.ascii.isDigit(body[k])) return null;
+    var y = atoiN(body[0..i]);
+    const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
+    const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
+    if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
+    if (bc) y = 1 - y;
+    return .{ .days = eval.daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
+}
+
+/// MySQL's zero date (`0000-00-00`, with or without a time), which stands for no
+/// date: it reads as NULL, as Connector/J's `zeroDateTimeBehavior=convertToNull` does.
+fn zeroDate(t: []const u8) bool {
+    return std.mem.startsWith(u8, t, "0000-00-00");
+}
+
+fn parseDateText(t: []const u8) ?i64 {
+    const dt = dateText(t) orelse return null;
+    if (dt.rest.len > 0) return null;
+    return dt.days;
 }
 
 /// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
 /// second identical, collapsing distinct rows and unsettling ORDER BY. A trailing
 /// offset (`-03`, `+05:45`, ` +00:00`), as a `timestamptz` prints in the session's
-/// zone, is folded into UTC, so a value reads the same whatever that zone is.
-fn parseDatetimeText(t: []const u8) i64 {
-    const days = parseDateText(t);
-    var secs: i64 = 0;
-    if (t.len >= 19) secs = atoiN(t[11..13]) * 3600 + atoiN(t[14..16]) * 60 + atoiN(t[17..19]);
+/// zone, is folded into UTC, so a value reads the same whatever that zone is. A
+/// date alone is its midnight; a malformed time is null, never zero.
+fn parseDatetimeText(t: []const u8) ?i64 {
+    const dt = dateText(t) orelse return null;
+    const r = dt.rest;
+    if (r.len == 0) return dt.days * 86_400_000_000;
+    if (r.len < 9 or (r[0] != ' ' and r[0] != 'T') or r[3] != ':' or r[6] != ':') return null;
+    for ([_]usize{ 1, 2, 4, 5, 7, 8 }) |k| if (!std.ascii.isDigit(r[k])) return null;
+    var secs: i64 = atoiN(r[1..3]) * 3600 + atoiN(r[4..6]) * 60 + atoiN(r[7..9]);
     var frac: i64 = 0;
-    var i: usize = @min(t.len, 19);
-    if (t.len > 20 and t[19] == '.') {
-        i = 20;
+    var i: usize = 9;
+    if (r.len > 10 and r[9] == '.') {
+        i = 10;
         var scale: i64 = 100_000;
-        while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1) {
-            if (scale > 0) frac += @as(i64, t[i] - '0') * scale;
+        while (i < r.len and r[i] >= '0' and r[i] <= '9') : (i += 1) {
+            if (scale > 0) frac += @as(i64, r[i] - '0') * scale;
             scale = @divTrunc(scale, 10);
         }
     }
-    if (i < t.len and t[i] == ' ') i += 1;
-    if (t.len >= 19 and i + 3 <= t.len and (t[i] == '+' or t[i] == '-')) {
-        const sign: i64 = if (t[i] == '-') -1 else 1;
-        var off = atoiN(t[i + 1 .. i + 3]) * 3600;
+    if (i < r.len and r[i] == ' ') i += 1;
+    if (i + 3 <= r.len and (r[i] == '+' or r[i] == '-')) {
+        const sign: i64 = if (r[i] == '-') -1 else 1;
+        var off = atoiN(r[i + 1 .. i + 3]) * 3600;
         var j = i + 3;
-        if (j < t.len and t[j] == ':') j += 1;
-        if (j + 2 <= t.len) off += atoiN(t[j .. j + 2]) * 60;
+        if (j < r.len and r[j] == ':') j += 1;
+        if (j + 2 <= r.len) off += atoiN(r[j .. j + 2]) * 60;
         secs -= sign * off;
     }
-    return days * 86_400_000_000 + secs * 1_000_000 + frac;
+    return dt.days * 86_400_000_000 + secs * 1_000_000 + frac;
+}
+
+test "text dates: the real ones read, BC and five-digit years included; no date reads as a made-up one" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(i32, 0), (try coerceText(a, "1970-01-01", types.Type.init(.date))).date);
+    try std.testing.expectEqual(@as(i32, 19727), (try coerceText(a, "2024-01-05", types.Type.init(.date))).date);
+    try std.testing.expectEqual(eval.daysFromCivil(-43, 3, 15), (try coerceText(a, "0044-03-15 BC", types.Type.init(.date))).date);
+    try std.testing.expectEqual(eval.daysFromCivil(10000, 1, 1), (try coerceText(a, "10000-01-01", types.Type.init(.date))).date);
+    try std.testing.expect((try coerceText(a, "0000-00-00", types.Type.init(.date))).isNull());
+    try std.testing.expect((try coerceText(a, "0000-00-00 00:00:00", types.Type.init(.timestamp))).isNull());
+    for ([_][]const u8{ "infinity", "-infinity", "2024-13-01", "2024-02-30", "24-01-05", "2024/01/05", "" }) |bad| {
+        try std.testing.expectError(error.UnparseableNumber, coerceText(a, bad, types.Type.init(.date)));
+    }
+    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "infinity", types.Type.init(.timestamp)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "2024-01-05 5:00", types.Type.init(.timestamp)));
+    try std.testing.expectEqual(parseDatetimeText("2024-01-05 00:00:00").?, parseDatetimeText("2024-01-05").?);
 }
 
 test "parseDatetimeText folds a timestamptz offset into UTC" {
-    const base = parseDatetimeText("2024-01-05 05:00:00");
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 02:00:00-03"));
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 10:45:00+05:45"));
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 05:00:00 +00:00"));
-    try std.testing.expectEqual(base + 250_000, parseDatetimeText("2024-01-05 02:00:00.25-03"));
-    try std.testing.expectEqual(base + 123_456, parseDatetimeText("2024-01-05 05:00:00.1234567"));
+    const base = parseDatetimeText("2024-01-05 05:00:00").?;
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 02:00:00-03").?);
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 10:45:00+05:45").?);
+    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 05:00:00 +00:00").?);
+    try std.testing.expectEqual(base + 250_000, parseDatetimeText("2024-01-05 02:00:00.25-03").?);
+    try std.testing.expectEqual(base + 123_456, parseDatetimeText("2024-01-05 05:00:00.1234567").?);
 }
 
 fn atoiN(s: []const u8) i64 {

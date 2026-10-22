@@ -429,7 +429,7 @@ fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: 
             const cell = p[i .. i + ulen];
             const v = sql.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
-                    conn.last_error = try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable numeric value \"{s}\"", .{ conn.cols[k].name, cell });
+                    conn.last_error = try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell });
                 return e;
             };
             try builders[k].append(v);
