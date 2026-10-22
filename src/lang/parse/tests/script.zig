@@ -779,3 +779,19 @@ test "sql: a refused correlated subquery fails its statement alone; the statemen
     };
     try testing.expect(semi and left);
 }
+
+test "sql: an unclosed `/*` or dollar quote refuses the script at its opener, never drops the statements after it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1;\n/* note;\nSELECT 3;", &diag));
+    try testing.expectEqualStrings("a `/*` comment here is never closed by `*/`", diag.msg);
+    try testing.expectEqual(@as(u32, 2), diag.line);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1;\nSELECT $$abc;", &diag));
+    try testing.expectEqualStrings("a `$`-quoted string here is never closed", diag.msg);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1 /*", &diag));
+    const commented = try parseSource(a, "SELECT 1; /* a */ /**/ SELECT 2;", &diag);
+    const bare = try parseSource(a, "SELECT 1; SELECT 2;", &diag);
+    try testing.expectEqual(bare.stmts.len, commented.stmts.len);
+}

@@ -109,7 +109,7 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     if (opts.aliases.len > 0 or opts.namespace != null) toks = try qualify(arena, toks, opts.aliases, opts.namespace, opts.own);
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
-        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
+        if (t.tag == .invalid) return p.failInvalid(t);
     }
     p.known_conns = opts.known_conns;
     p.known_fns = opts.known_fns;
@@ -201,7 +201,7 @@ pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic
     const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
     for (toks) |t| {
-        if (t.tag == .invalid) return p.fail(.{ .line = t.line, .col = t.col }, "invalid token `{s}`", .{try shownText(arena, t.text)});
+        if (t.tag == .invalid) return p.failInvalid(t);
     }
     const e = try p.parseExpr();
     if (!p.at(.eof)) return p.fail(p.curPos(), "unexpected trailing input in expression", .{});
@@ -759,6 +759,15 @@ pub const Parser = struct {
             } else for (t.text) |c| try buf.append(std.ascii.toLower(c));
         }
         return buf.toOwnedSlice();
+    }
+
+    /// An `.invalid` token refused; an unclosed comment or dollar quote, whose text
+    /// runs to the end of the script, is named by its opener.
+    fn failInvalid(self: *Parser, t: Token) Error {
+        const pos: Pos = .{ .line = t.line, .col = t.col };
+        if (std.mem.startsWith(u8, t.text, "/*")) return self.fail(pos, "a `/*` comment here is never closed by `*/`", .{});
+        if (t.text.len > 1 and t.text[0] == '$') return self.fail(pos, "a `$`-quoted string here is never closed", .{});
+        return self.fail(pos, "invalid token `{s}`", .{try shownText(self.arena, t.text)});
     }
 
     pub fn fail(self: *Parser, pos: Pos, comptime fmt: []const u8, args: anytype) Error {

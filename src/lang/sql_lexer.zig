@@ -45,7 +45,9 @@ pub const Lexer = struct {
         return c;
     }
 
-    fn skipTrivia(self: *Lexer) void {
+    /// Skips blanks and comments; a `/*` never closed is returned as an invalid
+    /// token, so the rest of the script is refused rather than silently dropped.
+    fn skipTrivia(self: *Lexer) ?Token {
         while (self.i < self.src.len) {
             const c = self.src[self.i];
             if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
@@ -53,9 +55,13 @@ pub const Lexer = struct {
             } else if (c == '-' and self.peek(1) == '-') {
                 while (self.i < self.src.len and self.src[self.i] != '\n') _ = self.bump();
             } else if (c == '/' and self.peek(1) == '*') {
+                const start = self.i;
+                const line = self.line;
+                const col = self.col;
                 _ = self.bump();
                 _ = self.bump();
-                while (self.i < self.src.len) {
+                while (true) {
+                    if (self.i >= self.src.len) return self.make(.invalid, self.src[start..], line, col);
                     if (self.src[self.i] == '*' and self.peek(1) == '/') {
                         _ = self.bump();
                         _ = self.bump();
@@ -65,6 +71,7 @@ pub const Lexer = struct {
                 }
             } else break;
         }
+        return null;
     }
 
     /// Called once the token is consumed, so the lexer's position is its end.
@@ -119,7 +126,7 @@ pub const Lexer = struct {
     }
 
     pub fn next(self: *Lexer) !Token {
-        self.skipTrivia();
+        if (self.skipTrivia()) |open| return open;
         const line = self.line;
         const col = self.col;
         if (self.i >= self.src.len) return self.make(.eof, "", line, col);
