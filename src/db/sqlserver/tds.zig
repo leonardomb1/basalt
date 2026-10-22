@@ -721,10 +721,7 @@ const PacketReader = struct {
             if (self.eom) return false;
             const r = self.r;
             var hdr: [8]u8 = undefined;
-            r.readSliceAll(&hdr) catch |e| {
-                if (e == error.EndOfStream) return false;
-                return e;
-            };
+            try r.readSliceAll(&hdr);
             const len: usize = (@as(usize, hdr[2]) << 8) | hdr[3];
             if (len < 8) return error.TdsProtocol;
             self.eom = (hdr[1] & STATUS_EOM) != 0;
@@ -844,10 +841,7 @@ const TdsCursor = struct {
                     self.done = true;
                     return;
                 },
-                else => {
-                    self.done = true;
-                    return;
-                },
+                else => return error.TdsProtocol,
             }
         }
     }
@@ -868,10 +862,7 @@ const TdsCursor = struct {
         var n: usize = 0;
         while (n < sql.STREAM_ROWS) {
             const token = self.reader.readByte() catch |e| {
-                if (e == error.EndOfMessage) {
-                    self.done = true;
-                    break;
-                }
+                if (e == error.EndOfMessage) return error.TdsProtocol;
                 return e;
             };
             switch (token) {
@@ -891,10 +882,7 @@ const TdsCursor = struct {
                     break;
                 },
                 0xAA => try self.handleError(),
-                else => {
-                    self.done = true;
-                    break;
-                },
+                else => return error.TdsProtocol,
             }
         }
         self.full = n == sql.STREAM_ROWS;
@@ -1701,6 +1689,58 @@ test "win1252 text decodes as its pieces decode, split anywhere" {
     }
 }
 
+/// A final DONE token: status 0, no more results, row count 0.
+const done_final = [_]u8{0xFD} ++ [_]u8{0} ** 12;
+
+/// `payload` framed as TDS packets of at most `chunk` bytes, the last flagged EOM.
+fn framePackets(a: std.mem.Allocator, payload: []const u8, chunk: usize) ![]const u8 {
+    var stream = std.array_list.Managed(u8).init(a);
+    var off: usize = 0;
+    while (off < payload.len) {
+        const n = @min(chunk, payload.len - off, 0xFFFF - 8);
+        const last = off + n == payload.len;
+        try stream.appendSlice(&.{ 0x04, if (last) STATUS_EOM else 0, @intCast((n + 8) >> 8), @intCast((n + 8) & 0xFF), 0, 0, 0, 0 });
+        try stream.appendSlice(payload[off..][0..n]);
+        off += n;
+    }
+    return stream.items;
+}
+
+test "a rowset cut off before its DONE, by a closed socket, an early EOM or an unknown token, is an error, never a short read" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var cols = [_]ColumnDesc{.{ .tds_type = 0x38, .engine_type = types.Type.init(.int).asNullable(), .kind = .fixed, .fixed_len = 4 }};
+    const row = [_]u8{ 0xD1, 7, 0, 0, 0 };
+    const whole = try framePackets(a, &(row ++ row ++ done_final), 64);
+    const closed = whole[0 .. 8 + row.len];
+    var unflagged = try a.dupe(u8, closed);
+    unflagged[1] = 0;
+    const early_eom = try framePackets(a, &(row ++ row), 64);
+    const unknown = try framePackets(a, &(row ++ [_]u8{0x42} ++ row ++ done_final), 64);
+    const cases = [_]struct { bytes: []const u8, want: ?anyerror }{
+        .{ .bytes = whole, .want = null },
+        .{ .bytes = unflagged, .want = error.EndOfStream },
+        .{ .bytes = early_eom, .want = error.TdsProtocol },
+        .{ .bytes = unknown, .want = error.TdsProtocol },
+    };
+    for (cases) |c| {
+        var src = std.Io.Reader.fixed(c.bytes);
+        const cur = try gpa.create(TdsCursor);
+        defer gpa.destroy(cur);
+        cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &cols, .schema = undefined, .done = false };
+        defer cur.reader.deinit();
+        if (c.want) |e| {
+            try std.testing.expectError(e, cur.fetchBatch(a));
+        } else {
+            const b = (try cur.fetchBatch(a)).?;
+            try std.testing.expectEqual(@as(usize, 2), b.len);
+            try std.testing.expect(cur.done);
+        }
+    }
+}
+
 test "rows split across packets of every small size decode as each cell decoded alone" {
     const gpa = std.testing.allocator;
     var ar = std.heap.ArenaAllocator.init(gpa);
@@ -1764,17 +1804,9 @@ test "rows split across packets of every small size decode as each cell decoded 
             cell.* = try decodeValue(a, col, raw[0..len]);
         }
     }
+    try payload.appendSlice(&done_final);
     for ([_]usize{ 1, 2, 3, 5, 7, 13, 64, 1 << 16 }) |chunk| {
-        var stream = std.array_list.Managed(u8).init(a);
-        var off: usize = 0;
-        while (off < payload.items.len) {
-            const n = @min(chunk, payload.items.len - off, 0xFFFF - 8);
-            const last = off + n == payload.items.len;
-            try stream.appendSlice(&.{ 0x04, if (last) STATUS_EOM else 0, @intCast((n + 8) >> 8), @intCast((n + 8) & 0xFF), 0, 0, 0, 0 });
-            try stream.appendSlice(payload.items[off..][0..n]);
-            off += n;
-        }
-        var src = std.Io.Reader.fixed(stream.items);
+        var src = std.Io.Reader.fixed(try framePackets(a, payload.items, chunk));
         const cur = try gpa.create(TdsCursor);
         defer gpa.destroy(cur);
         cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &cols, .schema = undefined, .done = false };
