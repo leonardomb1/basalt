@@ -53,8 +53,8 @@ fn fetchRows(cx: *const Completer, select: []const u8) []const []const []const u
     var scratch = std.heap.ArenaAllocator.init(cx.gpa);
     defer scratch.deinit();
     const sa = scratch.allocator();
-    var path_buf: [96]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/tmp/basalt-tab-{d}-{d}.csv", .{ std.os.linux.getpid(), std.time.milliTimestamp() }) catch return &.{};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = @import("repl.zig").tmpPath(&path_buf, "tab", "csv") catch return &.{};
     defer std.fs.cwd().deleteFile(path) catch {};
 
     var text = std.array_list.Managed(u8).init(sa);

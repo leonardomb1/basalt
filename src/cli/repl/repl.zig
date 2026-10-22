@@ -127,13 +127,23 @@ fn sourceFile(alloc: std.mem.Allocator, path: []const u8, sess: *Session, msg: *
     try runBlock(alloc, trimmed, sess, msg);
 }
 
+/// A fresh path under `$TMPDIR` (or `/tmp`) another local user cannot guess, so
+/// none can plant a file or link there first.
+pub fn tmpPath(buf: []u8, stem: []const u8, ext: []const u8) ![]const u8 {
+    var rnd: [8]u8 = undefined;
+    std.crypto.random.bytes(&rnd);
+    const dir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    return std.fmt.bufPrint(buf, "{s}/basalt-{s}-{x}.{s}", .{ dir, stem, rnd, ext });
+}
+
 pub fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const path = if (path_arg.len > 0) try alloc.dupe(u8, path_arg) else (startupPath(alloc) orelse return msg.writeAll("error: no HOME to save under\n"));
     defer alloc.free(path);
     if (std.fs.path.dirname(path)) |d| std.fs.cwd().makePath(d) catch {};
-    const f = std.fs.cwd().createFile(path, .{}) catch |e|
+    const f = std.fs.cwd().createFile(path, .{ .mode = 0o600 }) catch |e|
         return msg.print("error: could not write `{s}`: {s}\n", .{ path, @errorName(e) });
     defer f.close();
+    f.chmod(0o600) catch {};
     var n: usize = 0;
     for (sess.decls.items.items) |e| {
         try f.writeAll(e.text);
@@ -147,11 +157,11 @@ pub fn saveDecls(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session,
 fn editAndRun(alloc: std.mem.Allocator, path_arg: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
     const editor = std.process.getEnvVarOwned(alloc, "EDITOR") catch try alloc.dupe(u8, "vi");
     defer alloc.free(editor);
-    var tmp_buf: [64]u8 = undefined;
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/basalt-edit-{d}.sql", .{std.os.linux.getpid()});
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = try tmpPath(&tmp_buf, "edit", "sql");
     const path = if (path_arg.len > 0) path_arg else tmp;
     if (path_arg.len == 0) {
-        const f = try std.fs.cwd().createFile(tmp, .{});
+        const f = try std.fs.cwd().createFile(tmp, .{ .exclusive = true, .mode = 0o600 });
         defer f.close();
         if (sess.last_entry) |l| try f.writeAll(l);
         try f.writeAll("\n");
@@ -912,4 +922,32 @@ test "searchProgram keeps the declarations and the last SELECT, ending it in sea
         \\LOAD INTO 'out.csv' AS SELECT 1 AS x FROM RANGE(0, 1);
     , &diag);
     try std.testing.expect((try searchProgram(a, loads, "x", false)) == null);
+}
+
+test "a REPL temp path is fresh each time, and the saved startup file is private to its owner" {
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const p1 = try tmpPath(&b1, "edit", "sql");
+    const p2 = try tmpPath(&b2, "edit", "sql");
+    try std.testing.expect(!std.mem.eql(u8, p1, p2));
+    try std.testing.expect(std.mem.endsWith(u8, p1, ".sql"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "init.sql", .data = "old" });
+    {
+        const f = try tmp.dir.openFile("init.sql", .{});
+        defer f.close();
+        try f.chmod(0o644);
+    }
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "init.sql");
+    defer std.testing.allocator.free(path);
+    var sess: Session = undefined;
+    sess.decls = @TypeOf(sess.decls).init(std.testing.allocator);
+    defer sess.decls.items.deinit();
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try saveDecls(std.testing.allocator, path, &sess, &aw.writer);
+    const st = try tmp.dir.statFile("init.sql");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), st.mode & 0o777);
 }

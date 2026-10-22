@@ -136,8 +136,9 @@ pub const Editor = struct {
         };
         if (self.hist.items.len > max_history) self.gpa.free(self.hist.orderedRemove(0));
         const path = self.hist_path orelse return;
-        const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return;
+        const f = std.fs.cwd().createFile(path, .{ .truncate = false, .mode = 0o600 }) catch return;
         defer f.close();
+        f.chmod(0o600) catch {};
         f.seekFromEnd(0) catch return;
         const flat = self.gpa.dupe(u8, t) catch return;
         defer self.gpa.free(flat);
