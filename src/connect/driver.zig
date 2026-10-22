@@ -41,7 +41,6 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
-
 pub const ScanTally = struct {
     row_groups: std.atomic.Value(u64) = .init(0),
     row_groups_skipped: std.atomic.Value(u64) = .init(0),

@@ -223,7 +223,7 @@ fn resolveLocation(arena: std.mem.Allocator, base: []const u8, loc: []const u8) 
     if (std.mem.startsWith(u8, loc, "/")) return std.mem.concat(arena, u8, &.{ o, loc });
     const path_end = std.mem.indexOfAny(u8, base[o.len..], "?#") orelse base.len - o.len;
     const path = base[o.len..][0..path_end];
-    const dir = path[0 .. (std.mem.lastIndexOfScalar(u8, path, '/') orelse 0)];
+    const dir = path[0..(std.mem.lastIndexOfScalar(u8, path, '/') orelse 0)];
     return std.mem.concat(arena, u8, &.{ o, dir, "/", loc });
 }
 
