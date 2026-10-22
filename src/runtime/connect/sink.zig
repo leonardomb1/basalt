@@ -349,6 +349,8 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
             cfg.user = try evalCfgStr(env, attr.value);
         } else if (std.mem.eql(u8, k, "password")) {
             cfg.password = try evalCfgStr(env, attr.value);
+        } else if (std.mem.eql(u8, k, "tls")) {
+            cfg.tls = std.meta.stringToEnum(sql.TlsMode, try evalCfgStr(env, attr.value)) orelse return planErr(env.diag, env_mod.tls_values_msg);
         } else if (std.mem.eql(u8, k, "buckets")) {
             cfg.buckets = @intCast(try evalCfgInt(env, attr.value));
         } else if (std.mem.eql(u8, k, "replication_num")) {

@@ -20,8 +20,7 @@
 //! that Arrow and DuckDB reject.
 //!
 //! mysql_clear_password sends the password in the clear for the server (e.g.
-//! LDAP or external auth) to validate, so pair it with `tls` whenever the path to
-//! the server is not already trusted.
+//! LDAP or external auth) to validate, so it is sent only over `tls`.
 
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -81,6 +80,7 @@ pub const Conn = struct {
             rseq += 1;
         }
 
+        if (hs.plugin == .clear and password.len > 0 and self.tls == null) return self.clearRefused();
         try self.writeHandshakeResponse(rseq, user, password, database, hs.salt, hs.plugin);
 
         while (true) {
@@ -106,7 +106,10 @@ pub const Conn = struct {
                             const token = cachingSha2Token(password, &sw.salt);
                             _ = try self.writePacket(rseq +% 1, &token);
                         },
-                        .clear => try self.writeClearPassword(rseq +% 1, password),
+                        .clear => {
+                            if (self.tls == null) return self.clearRefused();
+                            try self.writeClearPassword(rseq +% 1, password);
+                        },
                     }
                 },
                 0x01 => {
@@ -380,6 +383,14 @@ pub const Conn = struct {
         @memcpy(pw[0..password.len], password);
         pw[password.len] = 0;
         _ = try self.writePacket(seq, pw);
+    }
+
+    /// mysql_clear_password puts the password on the wire as is, so it goes only
+    /// over TLS: a server, or anyone between, asking for it on a plain connection
+    /// is refused, as libmysqlclient refuses it unless told otherwise.
+    fn clearRefused(self: *Conn) error{ MysqlAuthFailed, OutOfMemory } {
+        self.last_error = try self.gpa.dupe(u8, "the server asks for the password in clear text (mysql_clear_password) on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
+        return error.MysqlAuthFailed;
     }
 
     fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8, plugin: AuthPlugin) !void {
@@ -775,4 +786,33 @@ test "mysql_native_password token matches a known vector" {
     var salt2 = salt;
     salt2[0] ^= 0xFF;
     try std.testing.expect(!std.mem.eql(u8, &tok, &mysqlAuthToken("foobar", &salt2)));
+}
+
+test "a server asking for the password in clear text on a plain connection is refused before it is sent" {
+    const http_fake = @import("../testing/http_fake.zig");
+    var listener = try http_fake.listen(1);
+    defer listener.deinit();
+    const Srv = struct {
+        fn serve(l: *std.net.Server, got: *[256]u8, n: *usize) void {
+            const conn = l.accept() catch return;
+            defer conn.stream.close();
+            var body: [128]u8 = undefined;
+            var w = std.Io.Writer.fixed(&body);
+            w.writeAll("\x0a8.0\x00\x01\x00\x00\x00abcdefgh\x00\x00\xff\x21\x00\x00\x08\x80\x15") catch return;
+            w.writeAll(&([_]u8{0} ** 10)) catch return;
+            w.writeAll("ijklmnopqrst\x00mysql_clear_password\x00") catch return;
+            const len = w.buffered().len;
+            const hdr = [4]u8{ @intCast(len & 0xff), @intCast(len >> 8), 0, 0 };
+            conn.stream.writeAll(&hdr) catch return;
+            conn.stream.writeAll(w.buffered()) catch return;
+            n.* = conn.stream.read(got) catch 0;
+        }
+    };
+    var got: [256]u8 = undefined;
+    var n: usize = 0;
+    const t = try std.Thread.spawn(.{}, Srv.serve, .{ &listener, &got, &n });
+    const port = listener.listen_address.getPort();
+    try std.testing.expectError(error.MysqlAuthFailed, Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "s3cret", "", .off));
+    t.join();
+    try std.testing.expect(std.mem.indexOf(u8, got[0..n], "s3cret") == null);
 }

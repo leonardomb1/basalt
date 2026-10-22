@@ -12,7 +12,11 @@ MySQL protocol (`fe_host`/`host`, `fe_port`/`port`, default 9030) with the same
 `user`/`password` — no second `mysql` connection pointed at the FE is needed.
 Reads get everything a SQL source gets: `WHERE` and whole-aggregate pushdown in
 the StarRocks dialect, key-range splits under `-j`, and `FOR EACH ROW OF
-(sr.QUERY(...))` discovery.
+(sr.QUERY(...))` discovery. `tls = 'require'` (or `'insecure'` for a
+self-signed certificate) encrypts the FE connection, its DDL and catalog queries
+included; it is needed where the FE authenticates by LDAP, as basalt sends a
+password in clear text (`mysql_clear_password`) only over TLS, here and on a
+`mysql` connection alike.
 
 Before a load, the target's database and table are created only if
 `information_schema` does not list them (`auto_create = false` skips this

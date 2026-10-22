@@ -118,6 +118,8 @@ pub const Config = struct {
     database: []const u8,
     user: []const u8 = "root",
     password: []const u8 = "",
+    /// TLS on the FE's MySQL port, for its DDL and catalog queries.
+    tls: sql.TlsMode = .off,
     buckets: u32 = 4,
     replication_num: u32 = 1,
     auto_create: bool = true,
@@ -423,7 +425,7 @@ pub const StreamLoadSink = struct {
     }
 
     fn runDDL(self: *StreamLoadSink, stmt: []const u8) !void {
-        const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off);
+        const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", self.cfg.tls);
         defer conn.close();
         conn.exec(stmt) catch |e| {
             obs.logOr(self.logger, .err, "{s} DDL error: {s} (sql: {s})", .{ self.cfg.flavor.name(), conn.last_error, stmt });
@@ -444,7 +446,7 @@ pub const StreamLoadSink = struct {
             try q.appendSlice(" AND TABLE_NAME = ");
             try appendStrLit(&q, t);
         }
-        const conn = mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", .off) catch return false;
+        const conn = mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", self.cfg.tls) catch return false;
         var cur = conn.sqlConn().queryCursor(q.items) catch {
             conn.close();
             return false;
