@@ -14,6 +14,7 @@ const OutcomeSink = basalt.env.OutcomeSink;
 const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 const runScript = @import("harness.zig").runScript;
+const exec = @import("harness.zig").exec;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
@@ -50,6 +51,19 @@ const StderrCapture = struct {
     }
 };
 
+/// What running `script` with `opts` printed to stdout, captured into `dir`.
+fn runToStdout(alloc: std.mem.Allocator, dir: std.fs.Dir, script: []const u8, opts: basalt.env.RunOptions) ![]u8 {
+    var rdiag: Diag = .{};
+    var out = try StderrCapture.beginFd(dir, std.posix.STDOUT_FILENO, "stdout.txt");
+    const res = exec(alloc, script, opts, &rdiag);
+    const printed = try out.end(alloc);
+    _ = res catch |e| {
+        alloc.free(printed);
+        return e;
+    };
+    return printed;
+}
+
 test "a shown result, CTE or derived table repeats a name as SQL does; a reference to it is ambiguous; LOAD INTO refuses one, naming it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -67,16 +81,8 @@ test "a shown result, CTE or derived table repeats a name as SQL does; a referen
         \\SELECT b, count(*) AS n FROM (SELECT x AS a, g AS a, 1 AS b FROM '{s}/t.csv') d GROUP BY b;
     , .{ base, base, base, base, base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    var rdiag: Diag = .{};
-    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
-    const res = run(alloc, prog, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
-    const printed = try out.end(alloc);
+    const printed = try runToStdout(alloc, tmp.dir, script, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
     defer alloc.free(printed);
-    _ = try res;
     try std.testing.expectEqualStrings(
         "a,a,a\n10,cd,11\n5,Ab,6\n" ++
             "s,s,count(*),count(*)\n5,5,1,1\n1,1,1,1\n12,10,2,2\n3,3,1,1\n" ++
@@ -97,7 +103,8 @@ test "a shown result, CTE or derived table repeats a name as SQL does; a referen
 
     const load = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/o.csv' AS SELECT * FROM '{s}/dup.csv';", .{ base, base });
     defer alloc.free(load);
-    try std.testing.expectError(error.PlanFailed, run(alloc, try parser.parseSource(parena.allocator(), load, &pdiag), .{ .log = .{ .quiet = true } }, &rdiag));
+    var rdiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, exec(alloc, load, .{ .log = .{ .quiet = true } }, &rdiag));
     try std.testing.expectEqualStrings("LOAD INTO writes each column under its own name, and two columns are named `a` — alias one apart in the SELECT list", rdiag.msg);
 }
 
@@ -119,25 +126,14 @@ test "a CSV column read only through CAST keeps its text past the sample, on one
     , .{ base, base });
     defer alloc.free(script);
     for ([_]usize{ 1, 4 }) |lanes| {
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-        var rdiag: Diag = .{};
-        var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
-        const res = run(alloc, prog, .{ .threads = lanes, .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
-        const printed = try out.end(alloc);
+        const printed = try runToStdout(alloc, tmp.dir, script, .{ .threads = lanes, .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
         defer alloc.free(printed);
-        _ = try res;
         try std.testing.expectEqualStrings("cep,v\n01310100,12345678901234567.12\nn\n1\n", printed);
     }
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const bare = try std.fmt.allocPrint(alloc, "SELECT CAST(cep AS STRING) AS c FROM '{s}/c.csv' WHERE cep > 0;", .{base});
     defer alloc.free(bare);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.TextTypeMismatch, run(alloc, try parser.parseSource(parena.allocator(), bare, &pdiag), .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+    try std.testing.expectError(error.TextTypeMismatch, exec(alloc, bare, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
 }
 
 test "a bare name both sides of a join have is ambiguous in that query, wherever it is read; qualified, merged by USING, or past the query it is not" {
@@ -155,16 +151,8 @@ test "a bare name both sides of a join have is ambiguous in that query, wherever
         \\WITH j AS (SELECT * FROM '{s}/l.csv' l JOIN '{s}/r.csv' r ON l.id = r.id) SELECT v, v_r FROM j;
     , .{ base, base, base, base, base, base, base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    var rdiag: Diag = .{};
-    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
-    const res = run(alloc, prog, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
-    const printed = try out.end(alloc);
+    const printed = try runToStdout(alloc, tmp.dir, script, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
     defer alloc.free(printed);
-    _ = try res;
     try std.testing.expectEqualStrings("v,v_r\na,x\n" ++ "id,v,id_r,v_r\n1,a,1,x\n" ++ "id,v\n1,a\n" ++ "v,v_r\na,x\n", printed);
 
     const refuse = @import("harness.zig").expectRefusedAlike;
@@ -255,12 +243,8 @@ test "for-each over a JSON array param iterates and binds fields by name" {
         "END FOR;", .{base});
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = try run(alloc, prog, .{ .params = &.{.{ .key = "job", .val = body }} }, &rdiag);
+    _ = try exec(alloc, script, .{ .params = &.{.{ .key = "job", .val = body }} }, &rdiag);
     const first = try tmp.dir.readFileAlloc(alloc, "out_01.csv", 1 << 20);
     defer alloc.free(first);
     try std.testing.expectEqualStrings("id,EMPRESA\n1,01\n2,01\n", first);
@@ -283,14 +267,8 @@ test "for-each loop var used as an expression value binds per row" {
         "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, $name AS empresa FROM '{s}/${{name}}.csv';\nEND FOR;", .{ base, base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{}, &rdiag);
 
     const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
     defer alloc.free(a);
@@ -318,12 +296,8 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     try std.testing.expectEqualStrings("id,twice\n7,10\n", out);
 
     try tmp.dir.writeFile(.{ .sub_path = "nums.csv", .data = "n\nana\n" });
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{ .log = .{ .quiet = true } }, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "loop variable `n`: `ana` is not int") != null);
 }
 
@@ -482,14 +456,8 @@ test "LOAD INTO IDENTIFIER: one output file per for-each row" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{}, &rdiag);
 
     const north = try tmp.dir.readFileAlloc(alloc, "out_north.csv", 1 << 16);
     defer alloc.free(north);
@@ -516,13 +484,8 @@ test "for-each fans out over a discovered list with interpolation" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+    const stats = exec(alloc, script, .{}, &rdiag) catch |e| {
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -545,13 +508,9 @@ test "log defaults to warn: a healthy run writes nothing to stderr" {
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     var cap = try StderrCapture.begin(tmp.dir);
-    const res = run(alloc, prog, .{}, &rdiag);
+    const res = exec(alloc, script, .{}, &rdiag);
     const logged = try cap.end(alloc);
     defer alloc.free(logged);
     _ = try res;
@@ -569,13 +528,9 @@ test "a lone LOAD logs load_complete under --log-format json at info" {
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';", .{ base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
     var cap = try StderrCapture.begin(tmp.dir);
-    const res = run(alloc, prog, .{ .items = true, .log = .{ .format = .json, .level = .info, .summary = .none } }, &rdiag);
+    const res = exec(alloc, script, .{ .items = true, .log = .{ .format = .json, .level = .info, .summary = .none } }, &rdiag);
     const logged = try cap.end(alloc);
     defer alloc.free(logged);
     _ = try res;
@@ -603,20 +558,16 @@ test "summary: --max-rows counts the printed rows, and a parallel FOR EACH names
     , .{ base, base, base });
     defer alloc.free(loop);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    var rdiag: Diag = .{};
     var summary: obs.Summary = .{ .run_id = 0 };
-    var out = try StderrCapture.beginFd(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
-    const res = run(alloc, prog, .{ .threads = 2, .max_rows = 2, .stdout_format = .csv, .summary_out = &summary, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
-    const printed = try out.end(alloc);
+    const printed = try runToStdout(alloc, tmp.dir, script, .{ .threads = 2, .max_rows = 2, .stdout_format = .csv, .summary_out = &summary, .log = .{ .quiet = true, .summary = .none } });
     defer alloc.free(printed);
-    _ = try res;
     try std.testing.expectEqualStrings("id\n1\n2\n", printed);
     try std.testing.expectEqual(@as(u64, 2 + 4), summary.rows_written);
 
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var rdiag: Diag = .{};
     var loop_summary: obs.Summary = .{ .run_id = 0 };
     _ = try run(alloc, try parser.parseSource(parena.allocator(), loop, &pdiag), .{ .threads = 2, .summary_out = &loop_summary, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
     try std.testing.expectEqual(@as(u64, 8), loop_summary.rows_written);
@@ -642,13 +593,8 @@ test "for-each discovers its rows from an in-engine SELECT" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+    const stats = exec(alloc, script, .{}, &rdiag) catch |e| {
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -678,13 +624,8 @@ test "for-each SELECT discovery with fewer columns than loop variables fails to 
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "fewer columns than loop variables") != null);
 }
 
@@ -704,13 +645,8 @@ test "for-each parallel + on_error=continue isolates a failing table" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .threads = 2 }, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{ .threads = 2 }, &rdiag));
     const a = try tmp.dir.readFileAlloc(alloc, "out_alpha.csv", 1 << 20);
     defer alloc.free(a);
     try std.testing.expectEqualStrings("id\n7\n", a);
@@ -799,18 +735,13 @@ test "for-each on_error=continue with an OutcomeSink: run succeeds, failure reco
         "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM '{s}/${{name}}.csv';\nEND FOR;", .{ base, base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var oc_arena = std.heap.ArenaAllocator.init(alloc);
     defer oc_arena.deinit();
     var outcomes = OutcomeSink.init(oc_arena.allocator());
     defer outcomes.deinit();
 
     var rdiag: Diag = .{};
-    const stats = try run(alloc, prog, .{ .outcomes = &outcomes }, &rdiag);
+    const stats = try exec(alloc, script, .{ .outcomes = &outcomes }, &rdiag);
     try std.testing.expectEqual(@as(usize, 1), stats.rows_out);
     try std.testing.expectEqual(@as(usize, 2), outcomes.list.items.len);
     try std.testing.expectEqual(@as(usize, 1), outcomes.failures());
@@ -837,12 +768,8 @@ test "for-each with an empty discovery list is a no-op" {
         "  LOAD INTO '{s}/out.csv' AS SELECT * FROM '{s}/${{name}}.csv';\nEND FOR;", .{ base, base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    const stats = try run(alloc, prog, .{}, &rdiag);
+    const stats = try exec(alloc, script, .{}, &rdiag);
     try std.testing.expectEqual(@as(usize, 0), stats.rows_out);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20));
 }
@@ -858,11 +785,7 @@ fn letScript(alloc: std.mem.Allocator, base: []const u8) ![]u8 {
 }
 
 fn runLetScript(alloc: std.mem.Allocator, script: []const u8, cli: []const ParamArg, rdiag: *Diag) !void {
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-    _ = try run(alloc, prog, .{ .params = cli, .log = .{ .summary = .none, .quiet = true } }, rdiag);
+    _ = try exec(alloc, script, .{ .params = cli, .log = .{ .summary = .none, .quiet = true } }, rdiag);
 }
 
 test "LET value is shared across statements" {
@@ -967,13 +890,8 @@ test "CALL renders a statement function per call (defaults fill the omitted arg)
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    const stats = run(alloc, prog, .{}, &rdiag) catch |e| {
+    const stats = exec(alloc, script, .{}, &rdiag) catch |e| {
         return e;
     };
     try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
@@ -1003,13 +921,8 @@ test "CALL nesting is depth-guarded (mutual recursion)" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "too deep") != null);
 }
 
@@ -1021,27 +934,22 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-
     const guarded = try std.fmt.allocPrint(alloc,
         \\PARAM tbl STRING DEFAULT '';
         \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
         \\LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';
     , .{ base, base });
     defer alloc.free(guarded);
-    const gprog = try parser.parseSource(parena.allocator(), guarded, &pdiag);
 
     var gdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, gprog, .{}, &gdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, guarded, .{}, &gdiag));
     try std.testing.expectEqualStrings("tbl is required (e.g. -p tbl=SC5)", gdiag.msg);
     try std.testing.expect(!gdiag.retryable);
     try std.testing.expect(!isTransient(error.PlanFailed));
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20));
 
     var okdiag: Diag = .{};
-    _ = try run(alloc, gprog, .{ .params = &[_]ParamArg{.{ .key = "tbl", .val = "SC5" }} }, &okdiag);
+    _ = try exec(alloc, guarded, .{ .params = &[_]ParamArg{.{ .key = "tbl", .val = "SC5" }} }, &okdiag);
     const wrote = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
     defer alloc.free(wrote);
     try std.testing.expect(std.mem.indexOf(u8, wrote, "id") != null);
@@ -1052,10 +960,9 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
         \\LOAD INTO '{s}/never.csv' AS SELECT id FROM '{s}/in.csv';
     , .{ base, base });
     defer alloc.free(bare);
-    const bprog = try parser.parseSource(parena.allocator(), bare, &pdiag);
 
     var bdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, bprog, .{}, &bdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, bare, .{}, &bdiag));
     try std.testing.expectEqualStrings("unreachable branch: zz", bdiag.msg);
     try std.testing.expect(!bdiag.retryable);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "never.csv", 1 << 20));
@@ -1065,9 +972,8 @@ test "THROW: a fired guard is the verbatim, permanent error; a false WHEN is a n
         \\THROW 'late';
     , .{ base, base });
     defer alloc.free(late);
-    const lprog = try parser.parseSource(parena.allocator(), late, &pdiag);
     var ldiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, lprog, .{}, &ldiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, late, .{}, &ldiag));
     try std.testing.expectEqualStrings("late", ldiag.msg);
     try std.testing.expectEqual(@as(u32, 2), ldiag.pos.?.line);
     try std.testing.expectError(error.FileNotFound, tmp.dir.readFileAlloc(alloc, "early.csv", 1 << 20));
@@ -1097,14 +1003,9 @@ test "PRINT runs at the top level and per row inside a FOR EACH body" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
     var cap = try StderrCapture.begin(tmp.dir);
-    const res = run(alloc, prog, .{}, &rdiag);
+    const res = exec(alloc, script, .{}, &rdiag);
     const printed = try cap.end(alloc);
     defer alloc.free(printed);
     const stats = try res;
@@ -1127,13 +1028,8 @@ test "PRINT over an unbound name is a plan error, not a silent blank" {
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "PRINT:") != null);
 }
 
@@ -1149,13 +1045,8 @@ test "a plan failure carries the failing stage's position" {
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS\nSELECT id\nFROM '{s}'\nWHERE nosuch > 1;", .{ base, in_path });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expectEqualStrings("unknown field `nosuch`", rdiag.msg);
     try std.testing.expectEqual(@as(u32, 4), rdiag.pos.?.line);
     try std.testing.expectEqual(@as(u32, 7), rdiag.pos.?.col);
@@ -1262,12 +1153,8 @@ test "nested for-each: an outer loop variable is a name, a value, a THROW operan
         defer alloc.free(firing);
         const fscript = try std.mem.replaceOwned(u8, alloc, firing, "$B", base);
         defer alloc.free(fscript);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), fscript, &pdiag);
         var rdiag: Diag = .{};
-        try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .threads = 4, .log = .{ .quiet = true } }, &rdiag));
+        try std.testing.expectError(error.PlanFailed, exec(alloc, fscript, .{ .threads = 4, .log = .{ .quiet = true } }, &rdiag));
         try std.testing.expectEqualStrings("for-each row name=b: for-each row suffix=one: never b", rdiag.msg);
     }
 }

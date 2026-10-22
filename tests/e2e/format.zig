@@ -3,12 +3,11 @@
 
 const std = @import("std");
 const basalt = @import("basalt");
-const parser = basalt.sql_parser;
 const fixtures = basalt.fixtures;
 const Diag = basalt.env.Diag;
 const ParamArg = basalt.env.ParamArg;
-const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
+const exec = @import("harness.zig").exec;
 const runScript = @import("harness.zig").runScript;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 
@@ -40,13 +39,9 @@ test "an unreadable extension is refused by run, not just check" {
 
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT COUNT(*) AS c FROM '{s}';", .{ out_path, in_path });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "cannot read") != null);
 }
 
@@ -104,13 +99,9 @@ test "a zip holding several files refuses to guess which one" {
 
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT * FROM '{s}/t.zip';", .{ out_path, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "a.csv") != null);
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "b.csv") != null);
 }
@@ -175,14 +166,8 @@ test "an Excel workbook reads as a table: typed columns, a named sheet and range
         defer alloc.free(q);
         const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
         defer alloc.free(script);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-            return e;
-        };
+        _ = try exec(alloc, script, .{}, &rdiag);
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
         defer alloc.free(got);
         try std.testing.expectEqualStrings(c.want, got);
@@ -243,16 +228,14 @@ test "an Excel sheet takes 1,048,575 data rows under its header and refuses the 
     for (cases) |c| {
         var parena = std.heap.ArenaAllocator.init(alloc);
         defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const script = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/big.xlsx' AS SELECT range AS x FROM range(0, {s});", .{ base, c.n });
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        const got = run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag);
+        const got = exec(alloc, script, .{ .log = .{ .quiet = true } }, &rdiag);
         if (c.ok) {
             _ = try got;
             const check = try std.fmt.allocPrint(parena.allocator(), "LOAD INTO '{s}/n.csv' AS SELECT COUNT(*) AS n, MAX(x) AS hi FROM '{s}/big.xlsx';", .{ base, base });
             var rd2: Diag = .{};
-            _ = try run(alloc, try parser.parseSource(parena.allocator(), check, &pdiag), .{ .log = .{ .quiet = true } }, &rd2);
+            _ = try exec(alloc, check, .{ .log = .{ .quiet = true } }, &rd2);
             const n = try tmp.dir.readFileAlloc(alloc, "n.csv", 1 << 10);
             defer alloc.free(n);
             try std.testing.expectEqualStrings("n,hi\n1048575,1048574\n", n);
@@ -372,12 +355,8 @@ test "a CSV header's quoted names lose their quotes, a delimiter inside one incl
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT \"Valor Total\" AS v, \"a,b\" AS ab FROM '{s}/q.csv' ORDER BY v;", .{ base, base });
     defer alloc.free(script);
     for ([_]usize{ 1, 4 }) |threads| {
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag);
+        _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag);
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 16);
         defer alloc.free(got);
         try std.testing.expectEqualStrings("v,ab\n1,2\n4,5\n", got);

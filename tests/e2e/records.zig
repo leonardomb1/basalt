@@ -4,9 +4,8 @@
 
 const std = @import("std");
 const basalt = @import("basalt");
-const parser = basalt.sql_parser;
+const exec = @import("harness.zig").exec;
 const Diag = basalt.env.Diag;
-const run = basalt.runtime.run;
 const harness = @import("harness.zig");
 const checkAndRun = harness.checkAndRun;
 const expectRefusedAlike = harness.expectRefusedAlike;
@@ -103,10 +102,8 @@ test "a short last fixed record, a missing file and a folder fail the run naming
         const a = parena.allocator();
         const src = try std.mem.replaceOwned(u8, a, c[0], "{s}", base);
         const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/o.csv' AS SELECT * FROM {s};", .{ base, src });
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(a, script, &pdiag);
         var rdiag: Diag = .{};
-        const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true }, .threads = threads }, &rdiag)) |_|
+        const msg = if (exec(alloc, script, .{ .log = .{ .quiet = true }, .threads = threads }, &rdiag)) |_|
             return error.TestUnexpectedResult
         else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.runtime.failLabel(e);
         if (std.mem.indexOf(u8, msg, c[1]) == null) {
@@ -161,8 +158,6 @@ test "read_bytes and file_size read a file by range; a LET of bytes folds; a ran
     defer parena.deinit();
     const base = try tmp.dir.realpathAlloc(parena.allocator(), ".");
     const script = try std.fmt.allocPrint(parena.allocator(), "SELECT read_bytes('{s}/h.bin', 10, 20) AS x;", .{base});
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.CastFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectError(error.CastFailed, exec(alloc, script, .{ .log = .{ .quiet = true } }, &rdiag));
 }

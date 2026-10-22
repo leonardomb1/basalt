@@ -1,3 +1,9 @@
+//! The build graph. The e2e and docs tests see the engine only as the `basalt` module,
+//! its public API; the docs check reads docs/, so it always re-runs. Coverage builds the
+//! tests with LLVM, since kcov cannot read the self-hosted backend's debug info, and makes
+//! zig-out/ first, since kcov creates only its own folder. `bench-e2e` times the installed
+//! CLI, so it needs -Doptimize=ReleaseFast for meaningful numbers.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -34,7 +40,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    // End-to-end tests see the engine only as the `basalt` module, its public API.
     const basalt_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -51,8 +56,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
 
-    // The book's SQL examples, checked as `basalt check` would; it reads docs/, so
-    // an edit there alone must re-run it.
     const docs_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/docs/examples_test.zig"),
@@ -76,14 +79,10 @@ pub fn build(b: *std.Build) void {
     const e2e_step = b.step("test-e2e", "Run the end-to-end tests in tests/e2e/");
     e2e_step.dependOn(&run_e2e_tests.step);
 
-    // Line coverage of src/ by both suites, through kcov. The tests are built with
-    // LLVM here: the self-hosted backend's debug info is not one kcov can read.
     const coverage_step = b.step("coverage", "Measure the tests' line coverage of src/ (needs kcov)");
     if (b.findProgram(&.{"kcov"}, &.{})) |kcov| {
         const out_dir = b.getInstallPath(.prefix, "coverage");
         const include = b.fmt("--include-path={s}", .{b.pathFromRoot("src")});
-        // kcov makes its output folder but not the parents, and a fresh checkout
-        // has no zig-out/ yet.
         const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", b.getInstallPath(.prefix, "") });
         mkdir.has_side_effects = true;
         const merge = b.addSystemCommand(&.{ kcov, "--merge", out_dir });
@@ -134,9 +133,6 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run SIMD microbenchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
-    // End-to-end harness: times the installed CLI on committed scripts, so it needs
-    // the binary built first. Build with -Doptimize=ReleaseFast or the numbers are
-    // meaningless.
     const bench_e2e = b.addExecutable(.{
         .name = "bench-e2e",
         .root_module = b.createModule(.{
