@@ -121,6 +121,7 @@ pub fn parseFlags(s: []const u8) ?Flags {
 pub const Regex = struct {
     alt: []const []const Item,
     ngroups: u8,
+    lead_any: bool = false,
 
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) Error!Regex {
         return compileOpts(gpa, pattern, .{});
@@ -130,7 +131,18 @@ pub const Regex = struct {
         var p = Parser{ .src = pattern, .gpa = gpa, .icase = opts.icase };
         const alt = try p.parseAlt();
         if (p.i != pattern.len) return Error.BadPattern;
-        return .{ .alt = alt, .ngroups = p.ngroup };
+        return .{ .alt = alt, .ngroups = p.ngroup, .lead_any = leadsWithAny(alt) };
+    }
+
+    /// Every branch opens with an unbounded `.`: a match starting later also
+    /// starts at `from`, so only that start needs trying.
+    fn leadsWithAny(alt: []const []const Item) bool {
+        for (alt) |branch| {
+            if (branch.len == 0) return false;
+            const it = branch[0];
+            if (it.atom != .any or it.max != std.math.maxInt(u32)) return false;
+        }
+        return alt.len > 0;
     }
 
     /// Leftmost match span at or after `from`, with `caps` filled (index 0 is
@@ -148,6 +160,7 @@ pub const Regex = struct {
                     return .{ start, end };
                 }
             }
+            if (self.lead_any) break;
         }
         return null;
     }
@@ -799,6 +812,25 @@ test "regex: a pathological pattern gives up instead of hanging" {
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
     try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);
+}
+
+test "regex: a leading .* tries one start, so a long non-matching subject stays linear" {
+    var buf: [32 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    const line = "2026-10-22 12:00:01 INFO request served in 12ms from cache\n";
+    const text = line ** 1000;
+    for ([_][]const u8{ ".*timeout", ".*foo.*", ".+?timeout", ".{2,}timeout" }) |pat| {
+        const re = try Regex.compile(a, pat);
+        try std.testing.expect((try re.find(text, 0, &caps)) == null);
+    }
+    const hit = try Regex.compile(a, ".*(cache)");
+    try std.testing.expectEqual([2]usize{ 3, line.len - 1 }, (try hit.find(line, 3, &caps)).?);
+    try std.testing.expectEqual([2]usize{ line.len - 6, line.len - 1 }, caps[1].?);
+    const mixed = try Regex.compile(a, ".*z|ca");
+    try std.testing.expectEqual([2]usize{ line.len - 6, line.len - 4 }, (try mixed.find(line, 0, &caps)).?);
 }
 
 test "regex: groups nested past 128 deep are too complex, not a stack overflow" {
