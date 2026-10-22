@@ -10,16 +10,22 @@
 //!
 //! The table's schema is `metaData.schemaString`, its partition columns' values
 //! each file's `partitionValues`, which win over any copy of the column inside the
-//! file. A table using a reader feature basalt does not honour is refused naming
-//! it, where reading on would return wrong rows: a deletion vector on a live file,
-//! column mapping by name or id, V2 checkpoints, catalog-managed commits, type
-//! widening, variants, and any feature basalt does not know.
+//! file. A file's deletion vector (`delta_dv.zig`) is applied as the file is read,
+//! so its deleted rows are never returned. Under column mapping (mode `name` or
+//! `id`, honoured where the protocol enables the feature) each column is found in
+//! the files by its physical name or field id (`fit.Mapping`), and partition values
+//! are keyed by physical name. A table using a reader feature basalt does not
+//! honour is refused naming it, where reading on would return wrong rows: V2
+//! checkpoints, catalog-managed commits, type widening, variants, and any feature
+//! basalt does not know.
 
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Layout = @import("../parquet/fit.zig").Layout;
+const Mapping = @import("../parquet/fit.zig").Mapping;
 const Reader = @import("../parquet/read.zig").Reader;
 const Value = @import("../../exec/value.zig").Value;
+const dvs = @import("delta_dv.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const table = @import("table.zig");
@@ -263,6 +269,17 @@ pub const State = struct {
         return str(c.object.get(prop));
     }
 
+    /// The column mapping mode the table's files are read by, null for `none`: the
+    /// property counts only where the protocol enables the feature (reader version
+    /// 2, or 3 with `columnMapping` among its reader features), as the protocol
+    /// says a reader ignores it otherwise.
+    pub fn mappingMode(self: *const State) ?[]const u8 {
+        const m = self.mapping orelse return null;
+        if (std.mem.eql(u8, m, "none")) return null;
+        const on = self.reader_version == 2 or (self.reader_version == 3 and oneOf("columnMapping", self.features));
+        return if (on) m else null;
+    }
+
     /// One commit line's action; unknown actions and fields are ignored, as the
     /// protocol asks.
     fn action(self: *State, line: []const u8) !void {
@@ -367,13 +384,13 @@ pub const State = struct {
         return std.json.parseFromSliceLeaky(std.json.Value, self.arena, v.string, .{}) catch null;
     }
 
-    /// Refuses a table whose reader features basalt does not honour, each only where
-    /// the table uses it: column mapping by name or id, not merely enabled.
+    /// Refuses a table whose reader version or features basalt does not honour, or
+    /// whose column mapping mode the protocol does not define.
     pub fn checkProtocol(self: *const State) !void {
         if (self.reader_version < 1 or self.reader_version > 3)
             return refuse("{s} needs Delta reader version {d}; basalt reads reader versions 1 to 3", .{ self.name, self.reader_version });
-        if (self.mapping) |m| if (!std.mem.eql(u8, m, "none"))
-            return refuse("{s} uses column mapping (mode `{s}`): its data files name columns by physical name, which basalt does not read", .{ self.name, m });
+        if (self.mappingMode()) |m| if (!oneOf(m, &.{ "name", "id" }))
+            return refuse("{s} uses column mapping mode `{s}`, which the Delta protocol does not define (`none`, `name` or `id`); basalt cannot tell how its files name their columns", .{ self.name, m });
         if (self.reader_version < 3) return;
         for (self.features) |f| {
             if (oneOf(f, &.{ "columnMapping", "deletionVectors", "timestampNtz", "vacuumProtocolCheck" })) continue;
@@ -421,11 +438,62 @@ fn strings(arena: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
 /// `schemaString` as the reader's columns: a struct's fields as dotted columns,
 /// an array or map as one JSON text column, every column nullable.
 fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types.Schema {
+    return (try parseSchema(arena, name, text, null)).schema;
+}
+
+const Parsed = struct { schema: types.Schema, mapping: ?*const Mapping = null };
+
+/// `schemaOf`, with how the files name each column when the table maps them `by`.
+fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by: ?Mapping.By) !Parsed {
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
         return refuse("{s} has a schemaString that is not JSON", .{name});
     var out = std.array_list.Managed(types.Schema.Field).init(arena);
     try addFields(arena, name, &out, "", v, 0);
-    return .{ .fields = out.items };
+    const b = by orelse return .{ .schema = .{ .fields = out.items } };
+    const m = try arena.create(Mapping);
+    m.* = .{ .by = b, .fields = (try mapType(arena, name, b, "", v, 0)).children };
+    return .{ .schema = .{ .fields = out.items }, .mapping = m };
+}
+
+/// A type of `schemaString` as the mapping of what it nests: a struct's fields,
+/// each found by its physical name or id, a list's element, a map's key and value.
+fn mapType(arena: std.mem.Allocator, name: []const u8, by: Mapping.By, col: []const u8, t: std.json.Value, depth: usize) !Mapping.Node {
+    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
+    if (t != .object) return .{};
+    const kind = str(t.object.get("type")) orelse "";
+    if (std.mem.eql(u8, kind, "array")) {
+        const kids = try arena.alloc(Mapping.Node, 1);
+        kids[0] = try mapType(arena, name, by, col, t.object.get("elementType") orelse .null, depth + 1);
+        return .{ .kind = .list, .children = kids };
+    }
+    if (std.mem.eql(u8, kind, "map")) {
+        const kids = try arena.alloc(Mapping.Node, 2);
+        kids[0] = try mapType(arena, name, by, col, t.object.get("keyType") orelse .null, depth + 1);
+        kids[1] = try mapType(arena, name, by, col, t.object.get("valueType") orelse .null, depth + 1);
+        return .{ .kind = .map, .children = kids };
+    }
+    const fields = t.object.get("fields") orelse return .{};
+    if (fields != .array) return .{};
+    var kids = std.array_list.Managed(Mapping.Node).init(arena);
+    for (fields.array.items) |f| {
+        if (f != .object) continue;
+        const fname = str(f.object.get("name")) orelse continue;
+        const full = if (col.len == 0) fname else try std.mem.concat(arena, u8, &.{ col, ".", fname });
+        const md = f.object.get("metadata");
+        const meta = if (md) |x| (if (x == .object) x.object else null) else null;
+        var n = try mapType(arena, name, by, full, f.object.get("type") orelse .null, depth + 1);
+        n.name = fname;
+        n.physical = (if (meta) |o| str(o.get("delta.columnMapping.physicalName")) else null) orelse "";
+        if (meta) |o| if (o.get("delta.columnMapping.id")) |id| if (id == .integer and id.integer >= 0 and id.integer <= std.math.maxInt(i32)) {
+            n.id = @intCast(id.integer);
+        };
+        if (by == .name and n.physical.len == 0)
+            return refuse("{s} uses column mapping (mode `name`) but its column `{s}` has no physical name (`delta.columnMapping.physicalName`), so basalt cannot find it in the files", .{ name, full });
+        if (by == .id and n.id == null)
+            return refuse("{s} uses column mapping (mode `id`) but its column `{s}` has no field id (`delta.columnMapping.id`), so basalt cannot find it in the files", .{ name, full });
+        try kids.append(n);
+    }
+    return .{ .kind = .@"struct", .children = kids.items };
 }
 
 fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Managed(types.Schema.Field), prefix: []const u8, v: std.json.Value, depth: usize) !void {
@@ -497,31 +565,47 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
 pub const FileLayout = struct { layout: Layout, files: []Layout.File };
 
 /// `adds` (live files of `st`) as a Parquet layout of the table's schema, in the
-/// order given; a file with a deletion vector is refused, as reading it whole
-/// would return the rows it deletes.
+/// order given, each file with its deletion vector's descriptor checked (read
+/// only when the file is) and, under column mapping, how its columns are named.
 pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, adds: []const Add) !*FileLayout {
     const name = st.name;
-    const schema = try schemaOf(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
+    const mode = st.mappingMode();
+    const by: ?Mapping.By = if (mode) |m| (if (std.mem.eql(u8, m, "id")) .id else .name) else null;
+    const parsed = try parseSchema(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}), by);
+    const schema = parsed.schema;
     if (schema.fields.len == 0) return refuse("{s} has a schema with no columns", .{name});
 
     const part_fields = try arena.alloc(usize, st.part_cols.len);
-    for (part_fields, st.part_cols) |*pf, c| pf.* = schema.indexOf(c) orelse
-        return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
+    const part_keys = try arena.alloc([]const u8, st.part_cols.len);
+    for (part_fields, part_keys, st.part_cols) |*pf, *pk, c| {
+        pf.* = schema.indexOf(c) orelse
+            return refuse("{s} has a partition column `{s}` its schema lacks", .{ name, c });
+        pk.* = c;
+        if (parsed.mapping) |m| for (m.fields) |n| if (std.mem.eql(u8, n.name.?, c)) {
+            if (n.physical.len == 0)
+                return refuse("{s} uses column mapping (mode `{s}`) but its partition column `{s}` has no physical name (`delta.columnMapping.physicalName`), by which its files' partition values are keyed", .{ name, mode.?, c });
+            pk.* = n.physical;
+        };
+    }
 
     const files = try arena.alloc(Layout.File, adds.len);
     for (files, adds) |*f, a| {
         const decoded = a.path;
-        if (a.dv != null) return refuse("{s} has file `{s}` with a deletion vector (reader feature `deletionVectors`); basalt does not apply deletion vectors, and reading the file whole would return deleted rows", .{ name, decoded });
         const parts = try arena.alloc(Value, part_fields.len);
-        for (parts, part_fields, st.part_cols) |*p, fi, c| {
-            const text: ?[]const u8 = if (a.parts) |pv| (if (pv == .object) str(pv.object.get(c)) else null) else null;
+        for (parts, part_fields, part_keys, st.part_cols) |*p, fi, k, c| {
+            const text: ?[]const u8 = if (a.parts) |pv| (if (pv == .object) str(pv.object.get(k)) else null) else null;
             p.* = (try table.partitionValue(arena, text, schema.fields[fi].ty)) orelse
                 return refuse("{s} has file `{s}` with partition value `{s}` for column `{s}`, which is not a {s}", .{ name, decoded, text.?, c, try schema.fields[fi].ty.name(arena) });
         }
         f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts };
+        if (a.dv) |dv| {
+            const ref = try arena.create(dvs.Ref);
+            ref.* = .{ .name = name, .root = root, .file = decoded, .d = try dvs.descriptor(name, decoded, dv) };
+            if (ref.d.cardinality > 0) f.deletes = ref.deletes();
+        }
     }
     const out = try arena.create(FileLayout);
-    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files }, .files = files };
+    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files, .mapping = parsed.mapping }, .files = files };
     return out;
 }
 
@@ -672,8 +756,19 @@ test "protocol: reader versions and features, refused only where the table uses 
     st.mapping = "none";
     try st.checkProtocol();
     st.mapping = "name";
+    try st.checkProtocol();
+    try testing.expectEqualStrings("name", st.mappingMode().?);
+    st.mapping = "nonsense";
     try testing.expectError(table.Error.LakeTableRefused, st.checkProtocol());
-    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "column mapping (mode `name`)") != null);
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "column mapping mode `nonsense`, which the Delta protocol does not define") != null);
+    st.reader_version = 1;
+    try st.checkProtocol();
+    try testing.expect(st.mappingMode() == null);
+    st.reader_version = 3;
+    st.mapping = "id";
+    try testing.expect(st.mappingMode() == null);
+    st.features = &.{"columnMapping"};
+    try testing.expectEqualStrings("id", st.mappingMode().?);
     st.mapping = null;
     st.reader_version = 3;
     st.features = &.{ "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "columnMapping" };
