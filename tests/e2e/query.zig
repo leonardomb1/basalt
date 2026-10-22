@@ -209,6 +209,8 @@ test "join filters: a WHERE moves below a join only where the join keeps the row
         .{ .q = "SELECT l.id FROM '$B/l.csv' l WHERE l.k NOT IN (SELECT k FROM '$B/r.csv') AND l.v > 50 ORDER BY l.id", .want = "id\n" },
         .{ .q = "SELECT l.id FROM '$B/l.csv' l WHERE NOT EXISTS (SELECT 1 FROM '$B/r.csv' r WHERE r.k = l.k) AND l.v > 50 ORDER BY l.id", .want = "id\n4\n6\n" },
         .{ .q = "SELECT l.id, r.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE l.s = 'a' ORDER BY l.id", .want = "id,s\n1,a\n3,x\n" },
+        .{ .q = "SELECT l.id, r.w FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.id = r.k WHERE l.k = 2 OR r.k = 9 ORDER BY l.id", .want = "id,w\n3,8\n" },
+        .{ .q = "WITH u AS (SELECT k, w FROM '$B/r.csv' UNION ALL SELECT k, w FROM '$B/r.csv' WHERE k < 0) SELECT l.id, u.w FROM '$B/l.csv' l JOIN u ON l.id = u.k WHERE l.k = 2 ORDER BY l.id", .want = "id,w\n3,8\n" },
         .{ .q = "WITH e AS (SELECT l.id, r.w, l.v, ROW_NUMBER() OVER (PARTITION BY r.k ORDER BY l.v DESC) AS rn FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k WHERE l.v > 5) SELECT id, rn FROM e WHERE rn = 1 ORDER BY id", .want = "id,rn\n2,1\n3,1\n" },
         .{ .q = "WITH c AS (SELECT l.id, l.v, r.w, l.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k) SELECT a.id, b.w FROM c a JOIN c b ON a.id = b.id WHERE a.v > 50 ORDER BY a.id", .want = "id,w\n2,5\n3,\n" },
         .{ .q = "WITH c AS (SELECT l.id, r.w, l.s FROM '$B/l.csv' l JOIN '$B/r.csv' r ON l.k = r.k) SELECT COUNT(*) AS n FROM c", .want = "n\n4\n" },

@@ -283,6 +283,10 @@ pub fn mkExpr(arena: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
     return p;
 }
 
+/// A filter over the right side's join keys alone, restated over the left keys so
+/// it runs before an inner join: only references written with the right side's
+/// name (`c.id`) qualify, since a bare or other-qualified name may be a left
+/// column that shares a key's name.
 fn deriveProbePredicate(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
@@ -296,10 +300,12 @@ fn deriveProbePredicate(
     defer map.deinit();
     for (j.right_keys, j.left_keys) |r, l| try map.put(r.last(), l.last());
 
+    const side = if (j.alias.len > 0) j.alias else j.binding;
     var list = std.array_list.Managed(ast.QualName).init(arena);
     try collectQuals(arena, e, &list);
     if (list.items.len == 0) return null;
     for (list.items) |q| {
+        if (q.parts.len != 2 or !std.mem.eql(u8, q.parts[0], side)) return null;
         if (map.get(q.last()) == null) return null;
     }
     return try swapKeysRecur(.{ .arena = arena, .map = &map }, e);
@@ -923,7 +929,7 @@ test "derive: a predicate on the join key gains a probe-side twin" {
     try std.testing.expectEqualStrings("(\"k\" = 7)", where);
 }
 
-test "derive: only for an inner join, and only when every ref is a key" {
+test "derive: only for an inner join, and only when every ref is a right-side key written with its name" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -945,4 +951,10 @@ test "derive: only for an inner join, and only when every ref is a key" {
     stages[2] = try eqFilter(a, &.{ "r", "name" }, 7);
     stages[3] = writeStage();
     try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+
+    const j = (try joinStage(a, .inner, "r", "k", "rk")).node.join;
+    try std.testing.expect((try deriveProbePredicate(a, a, (try eqFilter(a, &.{ "r", "rk" }, 7)).node.filter, j)) != null);
+    for ([_][]const []const u8{ &.{ "l", "rk" }, &.{"rk"} }) |ref| {
+        try std.testing.expect((try deriveProbePredicate(a, a, (try eqFilter(a, ref, 7)).node.filter, j)) == null);
+    }
 }
