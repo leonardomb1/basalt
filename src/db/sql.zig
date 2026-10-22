@@ -1006,12 +1006,7 @@ fn writeQuotedName(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []c
     try buf.append(close);
 }
 
-pub fn nameIn(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| {
-        if (std.mem.eql(u8, x, n)) return true;
-    }
-    return false;
-}
+const nameIn = ast.nameIn;
 
 pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !Value {
     const t = text orelse return .null;

@@ -488,7 +488,6 @@ pub const Parser = struct {
     conn_types: std.array_list.Managed([]const u8) = undefined,
     resources: std.array_list.Managed(Resource) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
-    const_names: std.array_list.Managed([]const u8) = undefined,
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
     derived_n: usize = 0,
     hidden_keys: std.ArrayList([2][]const u8) = .empty,
@@ -813,12 +812,6 @@ pub const Parser = struct {
         }
         return false;
     }
-    fn isScriptConst(self: *Parser, name: []const u8) bool {
-        for (self.const_names.items) |c| {
-            if (std.mem.eql(u8, c, name)) return true;
-        }
-        return false;
-    }
 
     pub const parseProgram = @import("parse/stmt.zig").parseProgram;
     pub const opensBlock = @import("parse/stmt.zig").opensBlock;
@@ -986,6 +979,8 @@ pub const Parser = struct {
     pub const parseUnary = @import("parse/expr.zig").parseUnary;
     pub const parsePrimary = @import("parse/expr.zig").parsePrimary;
     pub const parseQualNameField = @import("parse/expr.zig").parseQualNameField;
+    pub const qualRest = @import("parse/expr.zig").qualRest;
+    pub const parseWhenHead = @import("parse/expr.zig").parseWhenHead;
     pub const parseCaseExpr = @import("parse/expr.zig").parseCaseExpr;
     pub const parseSearch = @import("parse/expr.zig").parseSearch;
 };

@@ -59,8 +59,6 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const csv = @import("../format/csv.zig");
-const sql = @import("../db/sql.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
 
@@ -167,7 +165,7 @@ pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
 /// filters only before it (a `select` renames the keys) and no hint on the read; any
-/// tail. `pushdown.planWholeAgg` decides whether the aggregate itself renders.
+/// tail. `pushdown.planWholeAggWhy` decides whether the aggregate itself renders.
 pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
     if (stages.len < 3 or stages[0].node != .read) return null;
     if (stages[0].hints.len != 0) return null;

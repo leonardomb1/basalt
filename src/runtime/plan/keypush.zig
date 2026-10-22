@@ -39,7 +39,6 @@ const ast = @import("../../lang/ast.zig");
 const connect = @import("../connect.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
-const csv = @import("../../format/csv.zig");
 const folder = @import("../../connect/folder.zig");
 const lake = @import("../../format/lake/table.zig");
 const ftp = @import("../../store/ftp.zig");

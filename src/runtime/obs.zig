@@ -613,15 +613,8 @@ pub const CountingSource = struct {
     }
 };
 
-fn writeEscaped(w: anytype, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => if (c < 0x20) try w.print("\\u{x:0>4}", .{c}) else try w.writeByte(c),
-    };
+fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
+    return std.json.Stringify.encodeJsonStringChars(s, .{}, w);
 }
 
 test "progress line: counts, rate and clock, and a label that gives way to the width" {
@@ -666,9 +659,9 @@ test "writeEscaped: quotes, backslashes and control characters are escaped" {
     var fbw = std.Io.Writer.fixed(&buf);
     const w = &fbw;
     try w.writeAll("{\"msg\":\"");
-    try writeEscaped(w, "a\"b\nc\\d\t\r\x01");
+    try writeEscaped(w, "a\"b\nc\\d\t\r\x01\x08\x0c");
     try w.writeAll("\"}");
-    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\"}", w.buffered());
+    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\\b\\f\"}", w.buffered());
 }
 
 test "summary renderJson: one status-ok object with every metric field" {

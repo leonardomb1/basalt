@@ -18,7 +18,6 @@ const Pairs = @import("pairs.zig").Pairs;
 const Rows = @import("kernel.zig").Rows;
 const inAggregate = @import("accumulate.zig").inAggregate;
 const Value = @import("../../value.zig").Value;
-const column = @import("../../column.zig");
 const dupeValue = @import("../aggregate.zig").dupeValue;
 const few_groups = Aggregate.few_groups;
 const keyKindOf = Aggregate.keyKindOf;

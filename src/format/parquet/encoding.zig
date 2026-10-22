@@ -2,9 +2,9 @@
 //! forms and BYTE_STREAM_SPLIT. PLAIN values are read in place by chunk.zig's kernel.
 
 const Error = @import("read.zig").Error;
-const parquet = @import("footer.zig");
 const std = @import("std");
 const testing = std.testing;
+const varint = @import("../varint.zig");
 
 pub const BitReader = struct {
     buf: []const u8,
@@ -129,16 +129,7 @@ fn unpackGroups(comptime w: u6, run: []const u8, out: []u32) usize {
 }
 
 fn readVarint(src: []const u8, pos: *usize) Error!u64 {
-    var v: u64 = 0;
-    var shift: u6 = 0;
-    while (true) {
-        if (pos.* >= src.len) return Error.CorruptParquetPage;
-        const b = src[pos.*];
-        pos.* += 1;
-        v |= @as(u64, b & 0x7F) << shift;
-        if (b & 0x80 == 0) return v;
-        shift = std.math.add(u6, shift, 7) catch return Error.CorruptParquetPage;
-    }
+    return varint.read(src, pos) catch Error.CorruptParquetPage;
 }
 
 /// INT96: Julian day (2440588 is 1970-01-01) plus nanoseconds of day. Saturates,
@@ -203,8 +194,7 @@ pub fn decodeDeltaBinaryPacked(
 }
 
 fn readZigZagAt(src: []const u8, pos: *usize) Error!i64 {
-    const u = try readVarint(src, pos);
-    return @as(i64, @bitCast(u >> 1)) ^ -@as(i64, @intCast(u & 1));
+    return varint.unzigzag(try readVarint(src, pos));
 }
 
 pub fn decodeDeltaLengthByteArray(

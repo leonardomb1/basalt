@@ -5,9 +5,8 @@ const Env = @import("../env.zig").Env;
 const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
 const Value = @import("../../exec/value.zig").Value;
 const ast = @import("../../lang/ast.zig");
-const connectSql = @import("../connect.zig").connectSql;
+const catalogQuery = @import("../plan/estimate.zig").catalogQuery;
 const pushdown = @import("../pushdown.zig");
-const resolveDbConfig = @import("dbconfig.zig").resolveDbConfig;
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
@@ -45,33 +44,23 @@ pub fn factsIfWanted(env: *Env, rd: ast.Read, dialect: sql.Dialect, stages: []co
     return columnFacts(env, rd);
 }
 
-/// Restores the run's diag, so a failed probe leaves no message behind.
 fn probeFacts(env: *Env, ca: std.mem.Allocator, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, out: *pushdown.Facts) !void {
-    const saved = env.diag.*;
-    defer env.diag.* = saved;
-    const cfg = try resolveDbConfig(env, conn, info.port);
-    const q = try factsQuery(env.arena, info.dialect, parts);
-    const c = try connectSql(env.gpa, info.kind, cfg);
-    var cur = c.queryCursor(q) catch |e| {
-        c.close();
-        return e;
-    };
-    defer cur.close();
-    var scratch = std.heap.ArenaAllocator.init(env.gpa);
-    defer scratch.deinit();
-    while (try cur.nextBatch(scratch.allocator())) |b| {
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            const name = b.columns[0].getValue(r);
-            if (name.isNull()) continue;
-            try out.put(try ca.dupe(u8, name.string), .{
-                .text = flag(b.columns[1].getValue(r)),
-                .byte_order = flag(b.columns[2].getValue(r)),
-                .pads = flag(b.columns[3].getValue(r)),
-                .wide = flag(b.columns[4].getValue(r)),
-            });
+    const Ctx = struct { ca: std.mem.Allocator, out: *pushdown.Facts };
+    try catalogQuery(env, conn, info, try factsQuery(env.arena, info.dialect, parts), Ctx{ .ca = ca, .out = out }, struct {
+        fn rows(cx: Ctx, b: anytype) !void {
+            var r: usize = 0;
+            while (r < b.len) : (r += 1) {
+                const name = b.columns[0].getValue(r);
+                if (name.isNull()) continue;
+                try cx.out.put(try cx.ca.dupe(u8, name.string), .{
+                    .text = flag(b.columns[1].getValue(r)),
+                    .byte_order = flag(b.columns[2].getValue(r)),
+                    .pads = flag(b.columns[3].getValue(r)),
+                    .wide = flag(b.columns[4].getValue(r)),
+                });
+            }
         }
-    }
+    }.rows);
 }
 
 fn flag(v: Value) bool {

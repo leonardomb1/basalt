@@ -2,30 +2,16 @@
 
 const Batch = @import("../batch.zig").Batch;
 const Bitmap = @import("vec.zig").Bitmap;
-const Num = @import("vec.zig").Num;
 const Str = @import("vec.zig").Str;
 const Type = @import("../../lang/types.zig").Type;
 const Vec = @import("vec.zig").Vec;
 const VecError = @import("vec.zig").VecError;
-const asNum = @import("vec.zig").asNum;
-const asStr = @import("vec.zig").asStr;
 const ast = @import("../../lang/ast.zig");
-const caseMapInto = @import("strings.zig").caseMapInto;
-const charCount = @import("strings.zig").charCount;
 const column = @import("../column.zig");
-const eq = @import("support.zig").eq;
-const evalVec = @import("vec.zig").evalVec;
-const isAscii = @import("strings.zig").isAscii;
-const isIntNum = @import("vec.zig").isIntNum;
-const likeMatch = @import("strings.zig").likeMatch;
 const mkCol = @import("vec.zig").mkCol;
-const numI = @import("vec.zig").numI;
-const numValid = @import("vec.zig").numValid;
 const std = @import("std");
 const strArg = @import("vec.zig").strArg;
 const strAt = @import("vec.zig").strAt;
-const substrChars = @import("strings.zig").substrChars;
-const trim = @import("support.zig").trim;
 
 pub const vectorized = struct {
     pub fn now(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {

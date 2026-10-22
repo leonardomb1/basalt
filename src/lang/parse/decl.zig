@@ -214,13 +214,10 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     try self.expectKw("as");
 
     if (self.atStmtBody()) {
-        const const_base = self.const_names.items.len;
-        for (params.items) |p| try self.const_names.append(p.name);
         var body = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof) and !self.isKw("end")) {
             try self.parseStatement(&body);
         }
-        self.const_names.shrinkRetainingCapacity(const_base);
         try self.expectKw("end");
         _ = try self.expect(.semi);
         if (body.items.len == 0)

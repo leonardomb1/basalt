@@ -189,16 +189,11 @@ pub fn markedCell(out: *std.Io.Writer, s: []const u8, width: usize, right: bool,
 
 pub const ColFilter = struct { col: usize, f: Filter };
 
-/// The kept rows to show: those every filter keeps, sorted stably by the sort
-/// column with NULLs last whichever way it runs. gpa-owned.
-pub fn arrange(gpa: std.mem.Allocator, g: Grid, kinds: []const ?types.TypeKind, sort: ?Sort, filters: []const ColFilter) ![]usize {
-    return arrangeWith(gpa, g, kinds, sort, filters, .{});
-}
-
 pub const Sort = struct { col: usize, dir: Dir };
 
-/// `arrange`, keeping only the rows `find` holds as well.
-pub fn arrangeWith(gpa: std.mem.Allocator, g: Grid, kinds: []const ?types.TypeKind, sort: ?Sort, filters: []const ColFilter, find: Find) ![]usize {
+/// The kept rows to show: those every filter and `find` keep, sorted stably by the
+/// sort column with NULLs last whichever way it runs. gpa-owned.
+pub fn arrange(gpa: std.mem.Allocator, g: Grid, kinds: []const ?types.TypeKind, sort: ?Sort, filters: []const ColFilter, find: Find) ![]usize {
     var rows = std.array_list.Managed(usize).init(gpa);
     errdefer rows.deinit();
     rows: for (0..g.kept()) |r| {
@@ -264,7 +259,7 @@ const View = struct {
             ff.fold = self.fold();
             try fs.append(.{ .col = c, .f = ff });
         };
-        const rows = try arrangeWith(
+        const rows = try arrange(
             self.gpa,
             self.g,
             self.kinds,
@@ -679,16 +674,16 @@ const test_kinds = [_]?types.TypeKind{ .string, .decimal, .date };
 test "view: a number column sorts by value, NULLs last either way, and stably" {
     const gpa = std.testing.allocator;
     const g = testGrid();
-    const up = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .asc }, &.{});
+    const up = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .asc }, &.{}, .{});
     defer gpa.free(up);
     try std.testing.expectEqualSlices(usize, &.{ 1, 4, 0, 3, 2 }, up);
-    const down = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{});
+    const down = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{}, .{});
     defer gpa.free(down);
     try std.testing.expectEqualSlices(usize, &.{ 3, 0, 4, 1, 2 }, down);
-    const uf = try arrange(gpa, g, &test_kinds, .{ .col = 0, .dir = .asc }, &.{});
+    const uf = try arrange(gpa, g, &test_kinds, .{ .col = 0, .dir = .asc }, &.{}, .{});
     defer gpa.free(uf);
     try std.testing.expectEqualSlices(usize, &.{ 3, 1, 0, 4, 2 }, uf);
-    const dia = try arrange(gpa, g, &test_kinds, .{ .col = 2, .dir = .asc }, &.{});
+    const dia = try arrange(gpa, g, &test_kinds, .{ .col = 2, .dir = .asc }, &.{}, .{});
     defer gpa.free(dia);
     try std.testing.expectEqualSlices(usize, &.{ 4, 1, 2, 0, 3 }, dia);
 }
@@ -696,19 +691,19 @@ test "view: a number column sorts by value, NULLs last either way, and stably" {
 test "view: a filter keeps a substring in any case, excludes with !, compares by type" {
     const gpa = std.testing.allocator;
     const g = testGrid();
-    const sp = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 0, .f = Filter.parse("sp").? }});
+    const sp = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 0, .f = Filter.parse("sp").? }}, .{});
     defer gpa.free(sp);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, sp);
-    const not_sp = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 0, .f = Filter.parse("!sp").? }});
+    const not_sp = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 0, .f = Filter.parse("!sp").? }}, .{});
     defer gpa.free(not_sp);
     try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, not_sp);
-    const big = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{.{ .col = 1, .f = Filter.parse(">= 9.5").? }});
+    const big = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{.{ .col = 1, .f = Filter.parse(">= 9.5").? }}, .{});
     defer gpa.free(big);
     try std.testing.expectEqualSlices(usize, &.{ 3, 0, 4 }, big);
-    const y2026 = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 2, .f = Filter.parse(">=2026-01-01").? }});
+    const y2026 = try arrange(gpa, g, &test_kinds, null, &.{.{ .col = 2, .f = Filter.parse(">=2026-01-01").? }}, .{});
     defer gpa.free(y2026);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, y2026);
-    const both = try arrange(gpa, g, &test_kinds, null, &.{ .{ .col = 0, .f = Filter.parse("sp").? }, .{ .col = 1, .f = Filter.parse("> 10").? } });
+    const both = try arrange(gpa, g, &test_kinds, null, &.{ .{ .col = 0, .f = Filter.parse("sp").? }, .{ .col = 1, .f = Filter.parse("> 10").? } }, .{});
     defer gpa.free(both);
     try std.testing.expectEqualSlices(usize, &.{0}, both);
     try std.testing.expect(Filter.parse("  ") == null);
@@ -763,31 +758,31 @@ test "view: a find keeps the rows holding every word in any column, in any case"
     const g = testGrid();
     var sp = try Find.parse(gpa, "sp", g.names);
     defer sp.deinit(gpa);
-    const a = try arrangeWith(gpa, g, &test_kinds, null, &.{}, sp);
+    const a = try arrange(gpa, g, &test_kinds, null, &.{}, sp);
     defer gpa.free(a);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2, 4 }, a);
 
     var across = try Find.parse(gpa, "sp 2026", g.names);
     defer across.deinit(gpa);
-    const b = try arrangeWith(gpa, g, &test_kinds, null, &.{}, across);
+    const b = try arrange(gpa, g, &test_kinds, null, &.{}, across);
     defer gpa.free(b);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, b);
 
     var not = try Find.parse(gpa, "-sp", g.names);
     defer not.deinit(gpa);
-    const c = try arrangeWith(gpa, g, &test_kinds, null, &.{}, not);
+    const c = try arrange(gpa, g, &test_kinds, null, &.{}, not);
     defer gpa.free(c);
     try std.testing.expectEqualSlices(usize, &.{ 1, 3 }, c);
 
     var col = try Find.parse(gpa, "dia:12", g.names);
     defer col.deinit(gpa);
-    const d = try arrangeWith(gpa, g, &test_kinds, null, &.{}, col);
+    const d = try arrange(gpa, g, &test_kinds, null, &.{}, col);
     defer gpa.free(d);
     try std.testing.expectEqualSlices(usize, &.{4}, d);
 
     var anywhere = try Find.parse(gpa, "01", g.names);
     defer anywhere.deinit(gpa);
-    const e = try arrangeWith(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{.{ .col = 0, .f = Filter.parse("!mg").? }}, anywhere);
+    const e = try arrange(gpa, g, &test_kinds, .{ .col = 1, .dir = .desc }, &.{.{ .col = 0, .f = Filter.parse("!mg").? }}, anywhere);
     defer gpa.free(e);
     try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, e);
 }
@@ -842,12 +837,12 @@ test "view: with accents ignored, the filters, the find and the marks match unac
     const kinds = [_]?types.TypeKind{.string};
     var plain = try Find.parse(gpa, "credito", g.names);
     defer plain.deinit(gpa);
-    const a = try arrangeWith(gpa, g, &kinds, null, &.{}, plain);
+    const a = try arrange(gpa, g, &kinds, null, &.{}, plain);
     defer gpa.free(a);
     try std.testing.expectEqualSlices(usize, &.{2}, a);
     var loose = try Find.parseFold(gpa, "credito", g.names, .accents);
     defer loose.deinit(gpa);
-    const b = try arrangeWith(gpa, g, &kinds, null, &.{}, loose);
+    const b = try arrange(gpa, g, &kinds, null, &.{}, loose);
     defer gpa.free(b);
     try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, b);
 

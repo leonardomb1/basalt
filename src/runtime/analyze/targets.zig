@@ -70,7 +70,7 @@ pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect 
 /// encodes its text to it.
 pub fn encodingFromHints(hints: []const ast.Hint, diag: *Diag) Error!?csv.Encoding {
     const s = hintText(hints, "encoding") orelse return null;
-    return csv.Encoding.parse(s) orelse
+    return csv.parseEncoding(s) orelse
         fail(diag, "unknown encoding `{s}` (utf8, latin1 / iso-8859-1, cp1252 / windows-1252)", .{s});
 }
 

@@ -15,7 +15,6 @@ const connect_mod = @import("../connect.zig");
 const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const filterBounds = @import("../plan.zig").filterBounds;
-const folder = @import("../../connect/folder.zig");
 const lake = @import("../../format/lake/table.zig");
 const openItem = @import("agg.zig").openItem;
 const planErr = @import("../env.zig").planErr;

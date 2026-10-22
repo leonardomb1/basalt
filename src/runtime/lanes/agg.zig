@@ -863,7 +863,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
 
     const facts = try connect_mod.factsIfWanted(env, stages[0].node.read, desc.dialect, prefix, src_schema.*, true, .superset);
-    const pd = try pushdown.planAggWith(arena, desc.dialect, src_schema.*, prefix, ag, facts);
+    const pd = try pushdown.planAgg(arena, desc.dialect, src_schema.*, prefix, ag, facts);
     const eff = if (pd.proj_schema) |ps| try schemaPtr(arena, ps) else src_schema;
 
     var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);

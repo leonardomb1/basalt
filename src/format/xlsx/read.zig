@@ -30,6 +30,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const zipsrc = @import("../compress/zip.zig");
 const xml = @import("../xml/token.zig");
+const civilFromDays = @import("../../exec/eval/time.zig").civilFromDays;
 
 pub const Error = error{
     NotXlsx,
@@ -619,16 +620,8 @@ fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
 /// ISO `YYYY-MM-DD` for days since 1970, before it too (the
 /// civil-from-days algorithm), since a 1904 workbook's serials start in 1904.
 fn fmtDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
-    const z = days + 719468;
-    const era = @divFloor(z, 146097);
-    const doe: u64 = @intCast(z - era * 146097);
-    const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const mp = (5 * doy + 2) / 153;
-    const d = doy - (153 * mp + 2) / 5 + 1;
-    const m = if (mp < 10) mp + 3 else mp - 9;
-    const y = @as(i64, @intCast(yoe)) + era * 400 + @intFromBool(m <= 2);
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(y, 0))), m, d });
+    const c = civilFromDays(days);
+    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
 }
 
 fn fmtTime(arena: std.mem.Allocator, us: i64) ![]const u8 {

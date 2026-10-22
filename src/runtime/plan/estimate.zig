@@ -155,10 +155,22 @@ pub fn sqlRows(env: *Env, rd: ast.Read) ?u64 {
 }
 
 fn askCatalog(env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8) !?u64 {
+    var out: ?u64 = null;
+    try catalogQuery(env, conn, info, try statsQuery(env.arena, info.dialect, parts), &out, struct {
+        fn first(o: *?u64, b: anytype) !void {
+            if (o.* == null and b.len > 0 and b.columns.len > 0) o.* = valueRows(b.columns[0].getValue(0));
+        }
+    }.first);
+    return out;
+}
+
+/// Runs `q` on a connection of its own to `conn`'s server, each batch handed to
+/// `onBatch(ctx, batch)`. Restores the run's diag, so a failed probe leaves no
+/// message behind.
+pub fn catalogQuery(env: *Env, conn: ast.Connection, info: SqlConnInfo, q: []const u8, ctx: anytype, comptime onBatch: anytype) !void {
     const saved = env.diag.*;
     defer env.diag.* = saved;
     const cfg = try resolveDbConfig(env, conn, info.port);
-    const q = try statsQuery(env.arena, info.dialect, parts);
     const c = try connectSql(env.gpa, info.kind, cfg);
     var cur = c.queryCursor(q) catch |e| {
         c.close();
@@ -167,11 +179,7 @@ fn askCatalog(env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const
     defer cur.close();
     var scratch = std.heap.ArenaAllocator.init(env.gpa);
     defer scratch.deinit();
-    var out: ?u64 = null;
-    while (try cur.nextBatch(scratch.allocator())) |b| {
-        if (out == null and b.len > 0 and b.columns.len > 0) out = valueRows(b.columns[0].getValue(0));
-    }
-    return out;
+    while (try cur.nextBatch(scratch.allocator())) |b| try onBatch(ctx, b);
 }
 
 /// A catalog's count as rows: positive numbers only, as zero and below mean

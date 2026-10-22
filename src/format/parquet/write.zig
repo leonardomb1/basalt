@@ -49,6 +49,7 @@ const parquet = @import("footer.zig");
 const logical = @import("logical.zig");
 const pqdecode = @import("read.zig");
 const thrift = @import("thrift.zig");
+const varint = @import("../varint.zig");
 const codec = @import("../compress/codecs.zig");
 const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
@@ -1043,7 +1044,7 @@ fn encodeHybrid(comptime T: type, out: *List(u8), vals: []const T, width: u8) !v
     while (i < n) {
         const run = runLen(T, vals, i);
         if (run >= 8) {
-            try putVarint(out, @as(u64, run) << 1);
+            try varint.write(out, @as(u64, run) << 1);
             var v: u64 = vals[i];
             var k: usize = 0;
             while (k < (@as(usize, width) + 7) / 8) : (k += 1) {
@@ -1075,20 +1076,10 @@ fn runLen(comptime T: type, vals: []const T, at: usize) usize {
     return e - at;
 }
 
-fn putVarint(out: *List(u8), x: u64) !void {
-    var h = x;
-    while (true) {
-        const b: u8 = @intCast(h & 0x7F);
-        h >>= 7;
-        try out.append(if (h != 0) b | 0x80 else b);
-        if (h == 0) break;
-    }
-}
-
 /// One bit-packed run of `vals`, padded with zeros to a whole group of eight.
 fn packBits(comptime T: type, out: *List(u8), vals: []const T, width: u8) !void {
     const groups = (vals.len + 7) / 8;
-    try putVarint(out, (@as(u64, groups) << 1) | 1);
+    try varint.write(out, (@as(u64, groups) << 1) | 1);
     var bit_buf: u64 = 0;
     var bit_n: u7 = 0;
     for (0..groups * 8) |k| {

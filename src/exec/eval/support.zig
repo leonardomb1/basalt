@@ -4,7 +4,6 @@
 const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
-const Decimal = @import("../value.zig").Decimal;
 const asDecimal = @import("row.zig").asDecimal;
 const asDecimalValue = @import("cast.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;

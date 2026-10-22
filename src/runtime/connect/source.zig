@@ -322,11 +322,7 @@ fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver
     return r.source();
 }
 
-fn openSourceAll(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Source {
-    return openSourceCols(env, rd, hints, null);
-}
-
-/// `openSourceAll`, a CSV converting only the columns `project` names. A union's
+/// A source opened for `rd`, a CSV converting only the columns `project` names. A union's
 /// branches already carry its `where` hint, so it is not folded in twice.
 fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "http")) {

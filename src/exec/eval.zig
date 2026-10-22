@@ -64,12 +64,9 @@
 //! the tests of its own code; `testing_util.zig` holds the helpers they share.
 
 const std = @import("std");
-const regex = @import("regex.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const column = @import("column.zig");
 pub const Value = @import("value.zig").Value;
-const json = @import("json.zig");
 pub const Batch = @import("batch.zig").Batch;
 
 const Type = types.Type;
@@ -356,7 +353,6 @@ pub fn comparable(a: Type, b: Type) bool {
 
 pub const evalColumn = @import("eval/vec.zig").evalColumn;
 pub const decFold = @import("eval/vec.zig").decFold;
-const evalVec = @import("eval/vec.zig").evalVec;
 pub const constEval = @import("eval/vec.zig").constEval;
 pub const evalRow = @import("eval/row.zig").evalRow;
 const decimalArithType = @import("eval/row.zig").decimalArithType;
@@ -366,7 +362,6 @@ pub const bindLambda = @import("eval/row.zig").bindLambda;
 pub const Builtin = @import("eval/functions.zig").Builtin;
 pub const builtins = @import("eval/functions.zig").builtins;
 pub const lookupBuiltin = @import("eval/functions.zig").lookupBuiltin;
-const vectorized = @import("eval/fn_vec.zig").vectorized;
 pub const castValueTyped = @import("eval/cast.zig").castValueTyped;
 pub const exactSumText = @import("eval/cast.zig").exactSumText;
 pub const floatToDecimal = @import("eval/cast.zig").floatToDecimal;

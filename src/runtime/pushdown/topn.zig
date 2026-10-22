@@ -8,7 +8,7 @@ const split = @import("../../connect/split.zig");
 const std = @import("std");
 const translatePred = @import("translate.zig").translatePred;
 const types = @import("../../lang/types.zig");
-pub const topNStagesOf = @import("../pushdown.zig").topNStagesOf;
+pub const topNStagesOf = @import("testing_util.zig").topNStagesOf;
 
 pub const TopN = struct {
     rows: u64,

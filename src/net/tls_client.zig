@@ -1,11 +1,18 @@
-//! Vendored from Zig 0.15 `std.crypto.tls.Client` with one functional change,
-//! TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
-//! the `client_cert_requested` uses around the client Finished. MySQL servers
-//! always request a client certificate (for optional x509 auth); RFC 8446
-//! §4.4.2 has a client without one reply with an empty Certificate message, but
-//! std errors with TlsUnexpectedMessage, which makes MySQL over TLS impossible.
-//! The comments below are upstream's, kept so the file diffs cleanly against
-//! std. Drop this vendor once std supports client certificates.
+//! Vendored from Zig 0.15.2 `std.crypto.tls.Client`, without upstream's inline
+//! comments and without its options no caller sets (`ssl_key_log`,
+//! `allow_truncation_attacks`, `alert`) or `end`. Two functional changes:
+//!
+//! - TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
+//!   the `client_cert_requested` uses around the client Finished. MySQL servers
+//!   always request a client certificate (for optional x509 auth); RFC 8446
+//!   §4.4.2 has a client without one reply with an empty Certificate message, but
+//!   std errors with TlsUnexpectedMessage, which makes MySQL over TLS impossible.
+//! - ChainCapture: `Options.chain` receives the DER of each certificate as it is
+//!   read, and under `.ca = .no_verification` the whole chain is read instead of
+//!   only the first certificate, for http_client's `repairBundle`. With `chain`
+//!   null the behaviour is std's.
+//!
+//! Drop this vendor once std supports client certificates.
 //!
 //! Scope: TLS 1.3 only. A TLS 1.2 server that requests a client certificate
 //! still fails (MySQL forced to `--tls-version=TLSv1.2`, which is rare); 1.2
@@ -55,13 +62,7 @@ write_seq: u64,
 /// When this is true, the stream may still not be at the end because there
 /// may be data in the input buffer.
 received_close_notify: bool,
-allow_truncation_attacks: bool,
 application_cipher: tls.ApplicationCipher,
-
-/// If non-null, ssl secrets are logged to a stream. Creating such a log file
-/// allows other programs with access to that file to decrypt all traffic over
-/// this connection.
-ssl_key_log: ?*SslKeyLog,
 
 pub const ReadError = error{
     /// The alert description will be stored in `alert`.
@@ -74,23 +75,6 @@ pub const ReadError = error{
     TlsUnexpectedMessage,
     TlsIllegalParameter,
     TlsSequenceOverflow,
-};
-
-pub const SslKeyLog = struct {
-    client_key_seq: u64,
-    server_key_seq: u64,
-    client_random: [32]u8,
-    writer: *Writer,
-
-    fn clientCounter(key_log: *@This()) u64 {
-        defer key_log.client_key_seq += 1;
-        return key_log.client_key_seq;
-    }
-
-    fn serverCounter(key_log: *@This()) u64 {
-        defer key_log.server_key_seq += 1;
-        return key_log.server_key_seq;
-    }
 };
 
 /// The `Reader` supplied to `init` requires a buffer capacity
@@ -118,25 +102,8 @@ pub const Options = struct {
         /// Verify that the server certificate is authorized by a given ca bundle.
         bundle: Certificate.Bundle,
     },
-    /// If non-null, ssl secrets are logged to this stream. Creating such a log file allows
-    /// other programs with access to that file to decrypt all traffic over this connection.
-    ///
-    /// Only the `writer` field is observed during the handshake (`init`).
-    /// After that, the other fields are populated.
-    ssl_key_log: ?*SslKeyLog = null,
-    /// By default, reaching the end-of-stream when reading from the server will
-    /// cause `error.TlsConnectionTruncated` to be returned, unless a close_notify
-    /// message has been received. By setting this flag to `true`, instead, the
-    /// end-of-stream will be forwarded to the application layer above TLS.
-    ///
-    /// This makes the application vulnerable to truncation attacks unless the
-    /// application layer itself verifies that the amount of data received equals
-    /// the amount of data expected, such as HTTP with the Content-Length header.
-    allow_truncation_attacks: bool = false,
     write_buffer: []u8,
     read_buffer: []u8,
-    /// Populated when `error.TlsAlert` is returned from `init`.
-    alert: ?*tls.Alert = null,
     /// When set, the raw DER of every certificate the server presents is copied
     /// here during the handshake (in presentation order). Combine with
     /// `.ca = .no_verification` to harvest a chain for out-of-band path building
@@ -226,7 +193,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
     var random_buffer: [176]u8 = undefined;
     crypto.random.bytes(&random_buffer);
     const client_hello_rand = random_buffer[0..32].*;
-    var key_seq: u64 = 0;
     var server_hello_rand: [32]u8 = undefined;
     const legacy_session_id = random_buffer[32..64].*;
 
@@ -444,10 +410,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
         switch (ct) {
             .alert => {
                 ctd.ensure(2) catch continue :fragment;
-                if (options.alert) |a| a.* = .{
-                    .level = ctd.decode(tls.Alert.Level),
-                    .description = ctd.decode(tls.Alert.Description),
-                };
                 return error.TlsAlert;
             },
             .change_cipher_spec => {
@@ -560,12 +522,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         pv.master_secret = P.Hkdf.extract(&ap_derived_secret, &zeroes);
                                         const client_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "c hs traffic", &hello_hash, P.Hash.digest_length);
                                         const server_secret = hkdfExpandLabel(P.Hkdf, pv.handshake_secret, "s hs traffic", &hello_hash, P.Hash.digest_length);
-                                        if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                            .client_random = &client_hello_rand,
-                                        }, .{
-                                            .SERVER_HANDSHAKE_TRAFFIC_SECRET = &server_secret,
-                                            .CLIENT_HANDSHAKE_TRAFFIC_SECRET = &client_secret,
-                                        });
                                         pv.client_finished_key = hkdfExpandLabel(P.Hkdf, client_secret, "finished", "", P.Hmac.key_length);
                                         pv.server_finished_key = hkdfExpandLabel(P.Hkdf, server_secret, "finished", "", P.Hmac.key_length);
                                         pv.client_handshake_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
@@ -752,11 +708,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                     &client_hello_rand,
                                     &server_hello_rand,
                                 }, 48);
-                                if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                    .client_random = &client_hello_rand,
-                                }, .{
-                                    .CLIENT_RANDOM = &master_secret,
-                                });
                                 const key_block = hmacExpandLabel(
                                     P.Hmac,
                                     &master_secret,
@@ -899,14 +850,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
 
                                     const client_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "c ap traffic", &app_hash, P.Hash.digest_length);
                                     const server_secret = hkdfExpandLabel(P.Hkdf, pv.master_secret, "s ap traffic", &app_hash, P.Hash.digest_length);
-                                    if (options.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                        .counter = key_seq,
-                                        .client_random = &client_hello_rand,
-                                    }, .{
-                                        .SERVER_TRAFFIC_SECRET = &server_secret,
-                                        .CLIENT_TRAFFIC_SECRET = &client_secret,
-                                    });
-                                    key_seq += 1;
                                     break :app_cipher @unionInit(tls.ApplicationCipher, @tagName(tag), .{ .tls_1_3 = .{
                                         .client_secret = client_secret,
                                         .server_secret = server_secret,
@@ -925,12 +868,6 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 },
                                 else => unreachable,
                             },
-                        };
-                        if (options.ssl_key_log) |ssl_key_log| ssl_key_log.* = .{
-                            .client_key_seq = key_seq,
-                            .server_key_seq = key_seq,
-                            .client_random = client_hello_rand,
-                            .writer = ssl_key_log.writer,
                         };
                         return .{
                             .input = input,
@@ -963,9 +900,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                 else => unreachable,
                             },
                             .received_close_notify = false,
-                            .allow_truncation_attacks = options.allow_truncation_attacks,
                             .application_cipher = app_cipher,
-                            .ssl_key_log = options.ssl_key_log,
                         };
                     },
                     else => return error.TlsUnexpectedMessage,
@@ -1019,17 +954,6 @@ fn flush(w: *Writer) Writer.Error!void {
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
-}
-
-/// Sends a `close_notify` alert, which is necessary for the server to
-/// distinguish between a properly finished TLS session, or a truncation
-/// attack.
-pub fn end(c: *Client) Writer.Error!void {
-    try flush(&c.writer);
-    const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
-    output.advance(prepared.ciphertext_end);
 }
 
 fn prepareCiphertextRecord(
@@ -1155,14 +1079,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
     if (c.eof()) return error.EndOfStream;
     const input = c.input;
     const record_header = input.peek(tls.record_header_len) catch |err| switch (err) {
-        error.EndOfStream => {
-            if (c.allow_truncation_attacks) {
-                c.received_close_notify = true;
-                return error.EndOfStream;
-            } else {
-                return failRead(c, error.TlsConnectionTruncated);
-            }
-        },
+        error.EndOfStream => return failRead(c, error.TlsConnectionTruncated),
         error.ReadFailed => return error.ReadFailed,
     };
     const ct: tls.ContentType = @enumFromInt(record_header[0]);
@@ -1270,12 +1187,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                                 const pv = &p.tls_1_3;
                                 const P = @TypeOf(p.*);
                                 const server_secret = hkdfExpandLabel(P.Hkdf, pv.server_secret, "traffic upd", "", P.Hash.digest_length);
-                                if (c.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                    .counter = key_log.serverCounter(),
-                                    .client_random = &key_log.client_random,
-                                }, .{
-                                    .SERVER_TRAFFIC_SECRET = &server_secret,
-                                });
                                 pv.server_secret = server_secret;
                                 pv.server_key = hkdfExpandLabel(P.Hkdf, server_secret, "key", "", P.AEAD.key_length);
                                 pv.server_iv = hkdfExpandLabel(P.Hkdf, server_secret, "iv", "", P.AEAD.nonce_length);
@@ -1290,12 +1201,6 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                                         const pv = &p.tls_1_3;
                                         const P = @TypeOf(p.*);
                                         const client_secret = hkdfExpandLabel(P.Hkdf, pv.client_secret, "traffic upd", "", P.Hash.digest_length);
-                                        if (c.ssl_key_log) |key_log| logSecrets(key_log.writer, .{
-                                            .counter = key_log.clientCounter(),
-                                            .client_random = &key_log.client_random,
-                                        }, .{
-                                            .CLIENT_TRAFFIC_SECRET = &client_secret,
-                                        });
                                         pv.client_secret = client_secret;
                                         pv.client_key = hkdfExpandLabel(P.Hkdf, client_secret, "key", "", P.AEAD.key_length);
                                         pv.client_iv = hkdfExpandLabel(P.Hkdf, client_secret, "iv", "", P.AEAD.nonce_length);
@@ -1334,15 +1239,6 @@ fn rebase(r: *Reader, capacity: usize) void {
 fn failRead(c: *Client, err: ReadError) error{ReadFailed} {
     c.read_err = err;
     return error.ReadFailed;
-}
-
-fn logSecrets(w: *Writer, context: anytype, secrets: anytype) void {
-    inline for (@typeInfo(@TypeOf(secrets)).@"struct".fields) |field| w.print("{s}" ++
-        (if (@hasField(@TypeOf(context), "counter")) "_{d}" else "") ++ " {x} {x}\n", .{field.name} ++
-        (if (@hasField(@TypeOf(context), "counter")) .{context.counter} else .{}) ++ .{
-        context.client_random,
-        @field(secrets, field.name),
-    }) catch {};
 }
 
 fn big(x: anytype) @TypeOf(x) {

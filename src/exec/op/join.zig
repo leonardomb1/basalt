@@ -123,14 +123,6 @@ fn classOf(a: column.Column, b: column.Column) KeyClass {
     };
 }
 
-fn cellEq(cls: KeyClass, a: *const column.Column, ar: usize, b: *const column.Column, br: usize) bool {
-    return switch (cls) {
-        .i64s => a.data.i64[ar] == b.data.i64[br],
-        .bytes => std.mem.eql(u8, a.data.bytes.at(ar), b.data.bytes.at(br)),
-        .boxed => keyhash.valueEq(a.getValue(ar), b.getValue(br)),
-    };
-}
-
 /// Composite key hash for one row, folded from the typed store exactly as
 /// `keyhash.MultiKeyCtx` folds boxed values, so build and probe sides agree.
 fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) u64 {

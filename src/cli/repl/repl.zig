@@ -443,13 +443,8 @@ fn metaCommand(t: []const u8, sess: *Session, msg: *std.Io.Writer) !void {
         return msg.writeAll("reset: declarations forgotten\n");
     }
     if (std.mem.eql(u8, cmd, "\\format") or std.mem.eql(u8, cmd, "\\f")) {
-        if (rest.len == 0) {
-            // fall through to the echo below
-        } else if (parseReplFormat(rest)) |f| {
-            sess.format = f;
-        } else {
+        if (rest.len > 0) sess.format = parseReplFormat(rest) orelse
             return msg.print("error: \\format takes `table`, `json`, `csv` or `tsv`, got `{s}`\n", .{rest});
-        }
         return msg.print("format {s}\n", .{@tagName(sess.format)});
     }
     if (std.mem.eql(u8, cmd, "\\d") or std.mem.eql(u8, cmd, "\\dt")) {

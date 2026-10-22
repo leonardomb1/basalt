@@ -139,14 +139,6 @@ pub const BytesAppender = struct {
         try self.endRow();
     }
 
-    /// Appends `s` as a whole row and returns the just-written region, so a kernel
-    /// can transform it in place instead of duping first.
-    pub fn pushMutable(self: *BytesAppender, s: []const u8) ![]u8 {
-        const start = self.values.items.len;
-        try self.push(s);
-        return self.values.items[start..];
-    }
-
     pub fn finish(self: *BytesAppender) !Bytes {
         return .{ .offsets = try self.offsets.toOwnedSlice(), .values = try self.values.toOwnedSlice() };
     }

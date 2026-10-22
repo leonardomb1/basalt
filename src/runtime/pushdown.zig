@@ -27,7 +27,7 @@
 //! numeric: sources disagree on `CAST('1000,00' AS DECIMAL)` (NULL on mysql, an
 //! error on postgres and here). Builtins in `pushable` must also be engine builtins.
 //!
-//! `planWholeAgg` is the exception to advisory pushdown: the source's GROUP BY
+//! `planWholeAggWhy` is the exception to advisory pushdown: the source's GROUP BY
 //! result is what the pipeline emits, so every gate must prove the rendering
 //! identical on postgres, mysql and sqlserver, and each aggregate is CAST to the
 //! engine's planned output type. Null semantics match by construction: NULL keys
@@ -36,9 +36,6 @@
 //! engine re-sorts and re-limits, so the source need only send a sufficient set,
 //! which holds when every earlier filter runs at the source and the keys order
 //! alike, nulls placed per key as the engine places them.
-//!
-//! The test schema arrays are file-scope on purpose: as function locals,
-//! `&.{…}` pointed at a stack temporary that dangled in release builds.
 //!
 //! This file plans what an aggregate or a map pipeline sends to a SQL source and
 //! builds the WHERE it sends; `pushdown/translate.zig` renders expressions in each
@@ -50,16 +47,21 @@ const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const split = @import("../connect/split.zig");
 pub const Dialect = @import("../db/sql.zig").Dialect;
+const base_t = @import("pushdown/testing_util.zig").base_t;
+const bin = @import("pushdown/testing_util.zig").bin;
 const byList = @import("pushdown/testing_util.zig").byList;
 const expectWholeAggRefused = @import("pushdown/testing_util.zig").expectWholeAggRefused;
 const fieldItem = @import("pushdown/testing_util.zig").fieldItem;
+const fld = @import("pushdown/testing_util.zig").fld;
 const geFilter = @import("pushdown/testing_util.zig").geFilter;
 const intLit = @import("pushdown/testing_util.zig").intLit;
+const planWholeAgg = @import("pushdown/testing_util.zig").planWholeAgg;
 const projStage = @import("pushdown/testing_util.zig").projStage;
 const schema4 = @import("pushdown/testing_util.zig").schema4;
 const selectStage = @import("pushdown/testing_util.zig").selectStage;
 const testSchema = @import("pushdown/testing_util.zig").testSchema;
 const topNOf = @import("pushdown/testing_util.zig").topNOf;
+const wholeSchema = @import("pushdown/testing_util.zig").wholeSchema;
 
 pub const Plan = struct {
     proj_select: ?[]const u8 = null,
@@ -74,11 +76,7 @@ pub fn inSchema(schema: types.Schema, name: []const u8) bool {
 
 /// Projection and predicate pushdown for `read … | prefix | aggregate ag`. A
 /// `select` in the prefix disables projection (renames blur attribution); filters still go.
-pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate) !Plan {
-    return planAggWith(arena, dialect, src_schema, prefix, ag, null);
-}
-
-pub fn planAggWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate, facts: ?*const Facts) !Plan {
+pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate, facts: ?*const Facts) !Plan {
     var plan = Plan{};
 
     const has_select = for (prefix) |st| {
@@ -116,22 +114,9 @@ pub const WholeAgg = struct {
     where_sql: ?[]const u8 = null,
 };
 
-/// The aggregate as one grouped source query, or null to keep it engine-side.
-/// Refuses AVG, non-int SUM, MIN/MAX over text or timestamps, and non-COUNT DISTINCT.
-pub fn planWholeAgg(
-    arena: std.mem.Allocator,
-    dialect: Dialect,
-    base_sql: []const u8,
-    src_schema: types.Schema,
-    prefix: []const ast.Stage,
-    ag: ast.Aggregate,
-    plan_schema: types.Schema,
-) !?WholeAgg {
-    var why: []const u8 = "";
-    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, null, &why);
-}
-
-/// `planWholeAgg` that also says which gate refused, in one line for the run log.
+/// The aggregate as one grouped source query, or null to keep it engine-side, with
+/// `why` naming the gate that refused, in one line for the run log. Refuses AVG,
+/// non-int SUM, MIN/MAX over text or timestamps, and non-COUNT DISTINCT.
 pub fn planWholeAggWhy(
     arena: std.mem.Allocator,
     dialect: Dialect,
@@ -249,11 +234,7 @@ pub const MapPlan = struct {
 
 /// Pushdown for a map-only split read. Only filters before the first non-filter
 /// stage become a WHERE; projection is a backward liveness pass from `out_cols`.
-pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8) !MapPlan {
-    return planMapWith(arena, dialect, src_schema, middle, out_cols, null);
-}
-
-pub fn planMapWith(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8, facts: ?*const Facts) !MapPlan {
+pub fn planMap(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, middle: []const ast.Stage, out_cols: []const []const u8, facts: ?*const Facts) !MapPlan {
     var plan = MapPlan{};
 
     plan.where_extra = try leadingWhere(arena, dialect, middle, .{ .schema = src_schema, .check_fields = true, .facts = facts });
@@ -399,70 +380,13 @@ pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
     }
 }
 
-const testing = std.testing;
-
-pub const test_schema_fields = [_]types.Schema.Field{
-    .{ .name = "a", .ty = types.Type.init(.int) },
-    .{ .name = "b", .ty = types.Type.init(.string) },
-    .{ .name = "c", .ty = types.Type.init(.int) },
-};
-
-pub fn fld(arena: std.mem.Allocator, name: []const u8) !*ast.Expr {
-    const q = try arena.create(ast.Expr);
-    const parts = try arena.alloc([]const u8, 1);
-    parts[0] = name;
-    q.* = .{ .field = .{ .parts = parts } };
-    return q;
-}
-
-pub fn bin(arena: std.mem.Allocator, op: ast.BinOp, l: *ast.Expr, r: *ast.Expr) !*ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .binary = .{ .op = op, .l = l, .r = r } };
-    return e;
-}
-
-pub const schema4_fields = [_]types.Schema.Field{
-    .{ .name = "a", .ty = types.Type.init(.int) },
-    .{ .name = "b", .ty = types.Type.init(.string) },
-    .{ .name = "c", .ty = types.Type.init(.int) },
-    .{ .name = "d", .ty = types.Type.init(.int) },
-};
-
-const whole_schema_fields = [_]types.Schema.Field{
-    .{ .name = "a", .ty = types.Type.init(.int) },
-    .{ .name = "b", .ty = types.Type.init(.string) },
-    .{ .name = "c", .ty = types.Type.init(.int) },
-    .{ .name = "f", .ty = types.Type.init(.float) },
-    .{ .name = "m", .ty = types.Type.decimal(12, 2) },
-    .{ .name = "t", .ty = types.Type.init(.timestamp) },
-};
-
-pub fn wholeSchema() types.Schema {
-    return .{ .fields = &whole_schema_fields };
-}
-
-pub const base_t = "SELECT * FROM t";
-
 pub fn qual(arena: std.mem.Allocator, parts: []const []const u8) !ast.QualName {
     const p = try arena.alloc([]const u8, parts.len);
     for (parts, p) |src, *dst| dst.* = src;
     return .{ .parts = p };
 }
 
-pub fn qfld(arena: std.mem.Allocator, parts: []const []const u8) !*ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .field = try qual(arena, parts) };
-    return e;
-}
-
-pub fn topNStagesOf(arena: std.mem.Allocator, sql: []const u8) ![]const ast.Stage {
-    const parser = @import("../lang/sql_parser.zig");
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const src = try std.fmt.allocPrint(arena, "CREATE CONNECTION db TYPE postgres OPTIONS (host = 'h');\n{s};", .{sql});
-    const prog = try parser.parseSource(arena, src, &pdiag);
-    for (prog.stmts) |s| if (s == .output) return s.output.stages[0 .. s.output.stages.len - 1];
-    return error.TestUnexpectedResult;
-}
+const testing = std.testing;
 
 test "planAgg: projects only referenced columns and pushes the filter" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
@@ -482,7 +406,7 @@ test "planAgg: projects only referenced columns and pushes the filter" {
     aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
     const ag = ast.Aggregate{ .aggs = aggs, .by = by };
 
-    const plan = try planAgg(a, .sqlserver, schema, &.{filt}, ag);
+    const plan = try planAgg(a, .sqlserver, schema, &.{filt}, ag, null);
     try testing.expectEqualStrings("[a], [b], [c]", plan.proj_select.?);
     try testing.expectEqual(@as(usize, 3), plan.proj_schema.?.fields.len);
     try testing.expectEqualStrings("([a] >= 5)", plan.where_extra.?);
@@ -503,7 +427,7 @@ test "planMap: a downstream select narrows a wide reconcile (dead items pruned)"
     const middle = [_]ast.Stage{ selectStage(a, recon), selectStage(a, down) };
     const out_cols = [_][]const u8{ "c", "a" };
 
-    const plan = try planMap(a, .postgres, schema4(), &middle, &out_cols);
+    const plan = try planMap(a, .postgres, schema4(), &middle, &out_cols, null);
     try testing.expectEqualStrings("\"a\", \"c\"", plan.proj_select.?);
     try testing.expectEqual(@as(usize, 2), plan.proj_schema.?.fields.len);
     try testing.expectEqual(@as(usize, 2), plan.stages.?[0].node.select.len);
@@ -526,7 +450,7 @@ test "planMap: a downstream filter through the reconcile keeps its column live" 
     const middle = [_]ast.Stage{ selectStage(a, recon), fc, selectStage(a, down) };
     const out_cols = [_][]const u8{"b"};
 
-    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
+    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols, null);
     try testing.expect(plan.where_extra == null);
     try testing.expectEqualStrings("`b`, `c`", plan.proj_select.?);
 }
@@ -543,7 +467,7 @@ test "planMap: a leading filter is pushed as a predicate" {
     const middle = [_]ast.Stage{ filt, selectStage(a, down) };
     const out_cols = [_][]const u8{"a"};
 
-    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols);
+    const plan = try planMap(a, .mysql, schema4(), &middle, &out_cols, null);
     try testing.expectEqualStrings("(`a` > 0)", plan.where_extra.?);
     try testing.expectEqualStrings("`a`", plan.proj_select.?);
 }
@@ -556,7 +480,7 @@ test "planMap: a star select disables projection" {
     items[0] = .star;
     const middle = [_]ast.Stage{selectStage(a, items)};
     const out_cols = [_][]const u8{ "a", "b" };
-    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols);
+    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols, null);
     try testing.expect(plan.proj_select == null);
 }
 
@@ -569,7 +493,7 @@ test "planAgg: no projection when the aggregate consumes every source column" {
     by[1] = .{ .parts = &.{"b"} };
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
-    const plan = try planAgg(a, .mysql, testSchema(), &.{}, .{ .aggs = aggs, .by = by });
+    const plan = try planAgg(a, .mysql, testSchema(), &.{}, .{ .aggs = aggs, .by = by }, null);
     try testing.expect(plan.proj_select == null);
     try testing.expect(plan.proj_schema == null);
     try testing.expect(plan.where_extra == null);
@@ -586,7 +510,7 @@ test "planAgg: an untranslatable filter is not pushed but its columns stay proje
     by[0] = .{ .parts = &.{"a"} };
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "total", .func = .sum, .arg = try fld(a, "c") };
-    const plan = try planAgg(a, .mysql, schema4(), &.{filt}, .{ .aggs = aggs, .by = by });
+    const plan = try planAgg(a, .mysql, schema4(), &.{filt}, .{ .aggs = aggs, .by = by }, null);
     try testing.expect(plan.where_extra == null);
     try testing.expectEqualStrings("`a`, `b`, `c`", plan.proj_select.?);
 }
@@ -601,7 +525,7 @@ test "planMap: no projection when every source column reaches the sink" {
     items[2] = try fieldItem(a, "c");
     const middle = [_]ast.Stage{selectStage(a, items)};
     const out_cols = [_][]const u8{ "a", "b", "c" };
-    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols);
+    const plan = try planMap(a, .postgres, testSchema(), &middle, &out_cols, null);
     try testing.expect(plan.proj_select == null);
     try testing.expect(plan.stages == null);
     try testing.expect(plan.where_extra == null);
@@ -623,7 +547,7 @@ test "planAgg: a select in the prefix disables projection (filter still pushed)"
     aggs[0] = .{ .name = "n", .func = .count, .arg = null };
     const ag = ast.Aggregate{ .aggs = aggs, .by = by };
 
-    const plan = try planAgg(a, .postgres, testSchema(), &.{ filt, sel }, ag);
+    const plan = try planAgg(a, .postgres, testSchema(), &.{ filt, sel }, ag, null);
     try testing.expect(plan.proj_select == null);
     try testing.expectEqualStrings("(\"a\" >= 5)", plan.where_extra.?);
 }
@@ -638,7 +562,7 @@ test "planAgg: a filter after a select stays engine-side, as it may name a compu
     by[0] = .{ .parts = &.{"c"} };
     const ag = ast.Aggregate{ .aggs = &.{}, .by = by };
 
-    const plan = try planAgg(a, .postgres, testSchema(), &.{ projStage(items), try geFilter(a, "c", 5) }, ag);
+    const plan = try planAgg(a, .postgres, testSchema(), &.{ projStage(items), try geFilter(a, "c", 5) }, ag, null);
     try testing.expect(plan.where_extra == null);
 }
 

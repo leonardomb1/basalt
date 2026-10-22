@@ -529,7 +529,7 @@ fn declared(in: *std.Io.Reader) !Encoding {
     const tag = token.Tag{ .name = "xml", .attrs = head[5..end], .self_closing = false };
     const name = tag.attr("encoding") orelse return .utf8;
     if (std.ascii.eqlIgnoreCase(name, "us-ascii") or std.ascii.eqlIgnoreCase(name, "ascii")) return .utf8;
-    return Encoding.parse(name) orelse eval.explain(error.XmlUnsupportedEncoding, "the document declares an encoding basalt does not read; it reads UTF-8, ISO-8859-1 and windows-1252, and `WITH (encoding = ...)` overrides a wrong declaration");
+    return csv.parseEncoding(name) orelse eval.explain(error.XmlUnsupportedEncoding, "the document declares an encoding basalt does not read; it reads UTF-8, ISO-8859-1 and windows-1252, and `WITH (encoding = ...)` overrides a wrong declaration");
 }
 
 const testing = std.testing;

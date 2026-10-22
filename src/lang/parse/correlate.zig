@@ -398,7 +398,6 @@ pub fn existsSubquery(self: *Parser, negated: bool, pos: Pos) Error!*ast.Expr {
         stages[k + 2] = .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{.{ .computed = .{ .name = "exists", .expr = test_ } }}) }, .hints = &.{}, .pos = pos };
         const name = try self.freshName("__scalar{d}");
         try self.pending_bindings.append(.{ .let_const = .{ .name = name, .expr = null, .query = .{ .stages = stages, .pos = cap.pipe.pos }, .pos = pos } });
-        try self.const_names.append(name);
         var q = try self.singleName(name);
         q.dollar = true;
         const e = try self.mk(.{ .field = q });

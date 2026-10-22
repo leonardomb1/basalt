@@ -34,7 +34,6 @@ const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const profile = @import("../exec/profile.zig");
 const column = @import("../exec/column.zig");
-const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const analyze = @import("analyze.zig");

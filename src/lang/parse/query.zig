@@ -327,7 +327,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         try placeKey(self, &extended, proj.len, &k.field);
                         continue;
                     }
-                    if (nameListed(have_names.items, k.field.last())) continue;
+                    if (ast.nameIn(have_names.items, k.field.last())) continue;
                     try have_names.append(k.field.last());
                     const hidden = for (computed.items) |c| {
                         if (std.mem.eql(u8, c.computed.name, k.field.last())) break c;
@@ -469,11 +469,6 @@ fn placeKey(self: *Parser, items: *std.array_list.Managed(ast.SelectItem), visib
         .renamed => |nm| k.* = try self.singleName(nm),
         .missing => try items.append(.{ .field = k.* }),
     }
-}
-
-fn nameListed(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
-    return false;
 }
 
 /// Refuses an ORDER BY or GROUP BY on a name two SELECT items share, unless they are
@@ -997,9 +992,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (lateral and self.isKw("on") and self.peekTag() == .ident and eqlNoCase(self.peekTok().text, "true")) {
             _ = self.advance();
             _ = self.advance();
-        } else if (lateral and lateral_keys.len > 0 and !self.isKw("on")) {
-            // keys from the call alone
-        } else if (kind == .cross) {
+        } else if (lateral and lateral_keys.len > 0 and !self.isKw("on")) {} else if (kind == .cross) {
             if (self.isKw("on") or self.isKw("using"))
                 return self.fail(self.curPos(), "CROSS JOIN takes no ON or USING clause — it pairs every row with every row", .{});
         } else if (self.eatKw("using")) {
@@ -1283,7 +1276,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         group = try keys.toOwnedSlice();
         if (input_named.items.len > 0) {
             var kept_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
-            for (expr_aliases.items) |m| if (!nameListed(input_named.items, m.out)) try kept_aliases.append(m);
+            for (expr_aliases.items) |m| if (!ast.nameIn(input_named.items, m.out)) try kept_aliases.append(m);
             expr_aliases = kept_aliases;
         }
     }
@@ -1403,7 +1396,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         lifted = true;
                         continue;
                     }
-                    if (group.len > 0 and (!isGroupKey(group, try self.singleName(c.name)) or nameListed(input_named.items, c.name)) and !self.constItemExpr(stripped)) {
+                    if (group.len > 0 and (!isGroupKey(group, try self.singleName(c.name)) or ast.nameIn(input_named.items, c.name)) and !self.constItemExpr(stripped)) {
                         const keyed = try self.stripExpr(try self.groupKeyRefs(c.expr, group, expr_aliases.items), &aliases);
                         try self.groupedOnly(keyed, group, aggs.items, &.{}, pos);
                         try post.append(.{ .computed = .{ .name = c.name, .expr = keyed } });

@@ -51,7 +51,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
-const objstore = @import("../store/objstore.zig");
+const http_fake = @import("../testing/http_fake.zig");
 const Output = @import("output.zig").Output;
 const texttype = @import("texttype.zig");
 const stream = @import("stream.zig");
@@ -70,36 +70,15 @@ const BATCH_ROWS = 1024;
 const LINE_BUF = stream.LINE_BUF;
 const MAX_RECORD = 64 * 1024 * 1024;
 
-pub const Encoding = enum {
-    utf8,
-    latin1,
-    cp1252,
+/// A text encoding CSV, records and XML read and write: a `Charset` other than EBCDIC.
+pub const Encoding = charset.Charset;
 
-    pub fn parse(s: []const u8) ?Encoding {
-        const norm = struct {
-            fn eq(a: []const u8, b: []const u8) bool {
-                var i: usize = 0;
-                var j: usize = 0;
-                while (true) {
-                    while (i < a.len and (a[i] == '-' or a[i] == '_')) i += 1;
-                    while (j < b.len and (b[j] == '-' or b[j] == '_')) j += 1;
-                    if (i == a.len or j == b.len) return i == a.len and j == b.len;
-                    if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
-                    i += 1;
-                    j += 1;
-                }
-            }
-        };
-        for ([_]struct { name: []const u8, enc: Encoding }{
-            .{ .name = "utf8", .enc = .utf8 },
-            .{ .name = "latin1", .enc = .latin1 },
-            .{ .name = "iso88591", .enc = .latin1 },
-            .{ .name = "cp1252", .enc = .cp1252 },
-            .{ .name = "windows1252", .enc = .cp1252 },
-        }) |c| if (norm.eq(s, c.name)) return c.enc;
-        return null;
-    }
-};
+/// An `Encoding` by name as `Charset.parse` reads one, EBCDIC (`cp037`, `ebcdic`,
+/// `ibm037`) refused.
+pub fn parseEncoding(s: []const u8) ?Encoding {
+    const cs = charset.Charset.parse(s) orelse return null;
+    return if (cs == .cp037) null else cs;
+}
 
 pub const Codec = stream.Codec;
 pub const ArchiveRef = stream.ArchiveRef;
@@ -114,8 +93,6 @@ pub const Dialect = struct {
     text: []const []const u8 = &.{},
 };
 
-/// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
-/// latin-1 file are, so the ordinary field costs one scan and no allocation.
 /// The column names of a header line, every one a nullable string until sniffed. A
 /// quoted name loses its quotes (`""` is one quote) and may hold the delimiter; an
 /// unquoted one is trimmed of spaces and tabs.
@@ -151,23 +128,17 @@ fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]typ
     return fields.toOwnedSlice();
 }
 
+/// Returns the input untouched when already UTF-8 or all ASCII, as most fields of a
+/// latin-1 file are, so the ordinary field costs one scan and no allocation.
 pub fn decodeField(arena: std.mem.Allocator, enc: Encoding, s: []const u8) ![]const u8 {
-    return charset.decode(arena, switch (enc) {
-        .utf8 => .utf8,
-        .latin1 => .latin1,
-        .cp1252 => .cp1252,
-    }, s);
+    return charset.decode(arena, enc, s);
 }
 
 /// `decodeField` reversed: UTF-8 text as `enc`'s bytes, the input itself when it is
 /// already that (UTF-8, or all ASCII). A character `enc` cannot hold, or text that is
 /// not UTF-8, is `error.Unencodable`.
 pub fn encodeField(arena: std.mem.Allocator, enc: Encoding, utf8: []const u8) ![]const u8 {
-    return charset.encode(arena, switch (enc) {
-        .utf8 => .utf8,
-        .latin1 => .latin1,
-        .cp1252 => .cp1252,
-    }, utf8);
+    return charset.encode(arena, enc, utf8);
 }
 
 pub const CsvReader = struct {
@@ -1184,44 +1155,15 @@ fn needsQuote(s: []const u8, delim: u8) bool {
     return false;
 }
 
-/// Wakes a `serveOnce` still blocked in `accept` because the reader never connected,
-/// so a regression fails the test instead of hanging the suite at the join.
-fn releaseAccept(listener: *std.net.Server) void {
-    if (std.net.tcpConnectToAddress(listener.listen_address)) |c| c.close() else |_| {}
-}
-
-fn serveOnce(listener: *std.net.Server, status_line: []const u8, body: []const u8) void {
-    serveOnceInner(listener, status_line, body) catch {};
-}
-fn serveOnceInner(listener: *std.net.Server, status_line: []const u8, body: []const u8) !void {
-    const conn = try listener.accept();
-    defer conn.stream.close();
-    var rb: [4096]u8 = undefined;
-    _ = try conn.stream.read(&rb);
-    var wb: [512]u8 = undefined;
-    const head = try std.fmt.bufPrint(
-        &wb,
-        "HTTP/1.1 {s}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n",
-        .{ status_line, body.len },
-    );
-    try conn.stream.writeAll(head);
-    try conn.stream.writeAll(body);
-}
-
 test "CsvReader streams a CSV over http" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "200 OK", "id,name\n1,alpha\n2,beta\n" });
-    defer th.join();
-    defer releaseAccept(&listener);
-
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/data.csv", .{listener.listen_address.getPort()});
-    const r = try CsvReader.open(a, url, .{});
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{http_fake.FakeServer.reply("200 OK", "", "id,name\n1,alpha\n2,beta\n")});
+    defer srv.stop();
+    const r = try CsvReader.open(a, try srv.url(a, "/data.csv"), .{});
     defer r.close();
     try std.testing.expectEqual(@as(usize, 2), r.schema.fields.len);
     try std.testing.expectEqualStrings("id", r.schema.fields[0].name);
@@ -1240,22 +1182,11 @@ test "CsvReader reads a list of http CSVs, each decoded per its Content-Encoding
     defer ar.deinit();
     const a = ar.allocator();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    const gz = "200 OK\r\ncontent-encoding: gzip";
-    const th1 = try std.Thread.spawn(.{}, serveOnce, .{ &listener, gz, fx_gz });
-    defer th1.join();
-    defer releaseAccept(&listener);
-    const th2 = try std.Thread.spawn(.{}, serveOnce, .{ &listener, gz, fx_gz });
-    defer th2.join();
-    defer releaseAccept(&listener);
-
-    const port = listener.listen_address.getPort();
-    const urls = [_][]const u8{
-        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/a.csv", .{port}),
-        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/b.csv", .{port}),
-    };
+    const gz = http_fake.FakeServer.reply("200 OK", "content-encoding: gzip\r\n", fx_gz);
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{ gz, gz });
+    defer srv.stop();
+    const urls = [_][]const u8{ try srv.url(a, "/a.csv"), try srv.url(a, "/b.csv") };
     const r = try CsvReader.openList(a, &urls, .{});
     defer r.close();
     var rows: usize = 0;
@@ -1268,24 +1199,19 @@ test "CsvReader fails at once on a 4xx" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        var listener = try addr.listen(.{ .reuse_address = true });
-        defer listener.deinit();
-        const th = try std.Thread.spawn(.{}, serveOnce, .{ &listener, "404 Not Found", "nope" });
-        defer th.join();
-        defer releaseAccept(&listener);
-        const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/missing.csv", .{listener.listen_address.getPort()});
-        try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, url, .{}));
-    }
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{http_fake.FakeServer.reply("404 Not Found", "", "nope")});
+    defer srv.stop();
+    try std.testing.expectError(error.HttpNotFound, CsvReader.open(a, try srv.url(a, "/missing.csv"), .{}));
+    try std.testing.expectEqual(@as(usize, 1), srv.requests());
 }
 
 test "CsvReader retries a 503, a reset and a 502 before the 200" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const reply = objstore.FakeServer.reply;
-    var srv: objstore.FakeServer = undefined;
+    const reply = http_fake.FakeServer.reply;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         reply("503 Service Unavailable", "", ""),
         null,
@@ -1793,15 +1719,16 @@ test "csv reader: a lone zip member's own name picks its codec" {
     try std.testing.expectEqualStrings("2", rows[2]);
 }
 
-test "Encoding.parse accepts the spellings the wild uses" {
-    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("latin1").?);
-    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("ISO-8859-1").?);
-    try std.testing.expectEqual(Encoding.latin1, Encoding.parse("iso_8859_1").?);
-    try std.testing.expectEqual(Encoding.cp1252, Encoding.parse("cp1252").?);
-    try std.testing.expectEqual(Encoding.cp1252, Encoding.parse("Windows-1252").?);
-    try std.testing.expectEqual(Encoding.utf8, Encoding.parse("UTF8").?);
-    try std.testing.expect(Encoding.parse("latin9") == null);
-    try std.testing.expect(Encoding.parse("") == null);
+test "parseEncoding accepts the spellings the wild uses and refuses EBCDIC" {
+    try std.testing.expectEqual(Encoding.latin1, parseEncoding("latin1").?);
+    try std.testing.expectEqual(Encoding.latin1, parseEncoding("ISO-8859-1").?);
+    try std.testing.expectEqual(Encoding.latin1, parseEncoding("iso_8859_1").?);
+    try std.testing.expectEqual(Encoding.cp1252, parseEncoding("cp1252").?);
+    try std.testing.expectEqual(Encoding.cp1252, parseEncoding("Windows-1252").?);
+    try std.testing.expectEqual(Encoding.utf8, parseEncoding("UTF8").?);
+    try std.testing.expect(parseEncoding("latin9") == null);
+    try std.testing.expect(parseEncoding("") == null);
+    for ([_][]const u8{ "cp037", "EBCDIC", "ibm-037" }) |n| try std.testing.expect(parseEncoding(n) == null);
 }
 
 test "encodeField: UTF-8 narrows to latin-1 and cp1252, a character neither holds is refused" {

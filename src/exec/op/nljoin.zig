@@ -31,11 +31,13 @@ const Stats = @import("../op.zig").Stats;
 const TestSource = @import("testing_util.zig").TestSource;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
+const bin = @import("../../testing/ast_util.zig").bin;
 const column = @import("../column.zig");
 const compareValues = @import("../eval/support.zig").compareValues;
 const eval = @import("../eval.zig");
 const failLabel = @import("../op.zig").failLabel;
 const fieldIndex = @import("../eval/support.zig").fieldIndex;
+const fld = @import("../../testing/ast_util.zig").fld;
 const nullColumn = @import("join.zig").nullColumn;
 const op_mod = @import("../op.zig");
 const std = @import("std");
@@ -523,22 +525,6 @@ const LRow = struct { x: ?i64, lv: ?[]const u8 };
 const RRow = struct { lo: ?i64, hi: ?i64, rv: ?[]const u8 };
 
 const Cond = enum { less, between, or_eq, above_hi, all };
-
-fn mkE(a: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
-    const p = try a.create(ast.Expr);
-    p.* = e;
-    return p;
-}
-
-fn fld(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
-    const parts = try a.alloc([]const u8, 1);
-    parts[0] = name;
-    return mkE(a, .{ .field = .{ .parts = parts } });
-}
-
-fn bin(a: std.mem.Allocator, op: ast.BinOp, l: *ast.Expr, r: *ast.Expr) !*ast.Expr {
-    return mkE(a, .{ .binary = .{ .op = op, .l = l, .r = r } });
-}
 
 fn condExpr(a: std.mem.Allocator, c: Cond) !?*const ast.Expr {
     return switch (c) {

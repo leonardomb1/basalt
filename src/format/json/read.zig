@@ -23,7 +23,6 @@ const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const jt = @import("../../exec/json.zig");
 const stream = @import("../stream.zig");
-const Stream = stream.Stream;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 

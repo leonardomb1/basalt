@@ -17,6 +17,7 @@ const likeMatch = @import("strings.zig").likeMatch;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const padChars = @import("strings.zig").padChars;
 const parseHexI64 = @import("support.zig").parseHexI64;
+const percent = @import("../../net/percent.zig");
 const reverseChars = @import("strings.zig").reverseChars;
 const std = @import("std");
 const substrChars = @import("strings.zig").substrChars;
@@ -257,23 +258,17 @@ pub fn UrlCode(comptime encode: bool) type {
         pub fn apply(cx: Cx, str: []const u8) EvalError![]const u8 {
             if (encode) {
                 for (str) |b| {
-                    if (std.ascii.isAlphanumeric(b) or b == '-' or b == '.' or b == '_' or b == '~') {
+                    if (percent.isUnreserved(b)) {
                         try cx.buf.append(b);
                     } else try cx.buf.writer().print("%{X:0>2}", .{b});
                 }
                 return cx.written();
             }
-            var i: usize = 0;
-            while (i < str.len) : (i += 1) {
-                if (str[i] == '%' and i + 2 < str.len) {
-                    if (std.fmt.parseInt(u8, str[i + 1 .. i + 3], 16)) |b| {
-                        try cx.buf.append(b);
-                        i += 2;
-                        continue;
-                    } else |_| {}
-                }
-                try cx.buf.append(str[i]);
-            }
+            const at = cx.buf.items.len;
+            try cx.buf.appendSlice(str);
+            const out = std.Uri.percentDecodeInPlace(cx.buf.items[at..]);
+            std.mem.copyForwards(u8, cx.buf.items[at..], out);
+            cx.buf.shrinkRetainingCapacity(at + out.len);
             return cx.written();
         }
     };

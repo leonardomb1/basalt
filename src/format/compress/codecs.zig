@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const deflate = @import("deflate.zig");
+const varint = @import("../varint.zig");
 
 pub const Codec = enum(i32) {
     uncompressed = 0,
@@ -32,10 +33,6 @@ pub const Codec = enum(i32) {
     lz4 = 5,
     zstd = 6,
     lz4_raw = 7,
-
-    pub fn fromInt(v: i32) ?Codec {
-        return std.meta.intToEnum(Codec, v) catch null;
-    }
 };
 
 pub const Error = error{
@@ -106,16 +103,7 @@ fn expectExhausted(r: *std.Io.Reader) Error!void {
 fn snappyBlock(src: []const u8, out: []u8) Error!void {
     var i: usize = 0;
 
-    var declared: usize = 0;
-    var shift: u6 = 0;
-    while (true) {
-        if (i >= src.len) return Error.CorruptCompressedData;
-        const b = src[i];
-        i += 1;
-        declared |= @as(usize, b & 0x7F) << shift;
-        if (b & 0x80 == 0) break;
-        shift = std.math.add(u6, shift, 7) catch return Error.CorruptCompressedData;
-    }
+    const declared = varint.read(src, &i) catch return Error.CorruptCompressedData;
     if (declared != out.len) return Error.CorruptCompressedData;
 
     var pos: usize = 0;
@@ -324,11 +312,7 @@ fn expectRoundTrip(codec: Codec, comp: []const u8, want: []const u8) !void {
     try t.expectEqualStrings(want, got);
 }
 
-test "codec enum maps the thrift ids and rejects unknown ones" {
-    try t.expectEqual(Codec.snappy, Codec.fromInt(1).?);
-    try t.expectEqual(Codec.zstd, Codec.fromInt(6).?);
-    try t.expectEqual(Codec.lz4_raw, Codec.fromInt(7).?);
-    try t.expect(Codec.fromInt(99) == null);
+test "supported codecs" {
     try t.expect(supported(.snappy) and supported(.lz4) and !supported(.brotli) and !supported(.lzo));
 }
 
@@ -473,7 +457,7 @@ const snappy_min_match = 4;
 /// would encode as offset 0.
 fn snappyCompress(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
     var out = std.array_list.Managed(u8).init(arena);
-    try putVarint(&out, src.len);
+    try varint.write(&out, src.len);
     if (src.len == 0) return out.toOwnedSlice();
 
     const table = try arena.alloc(u32, 1 << snappy_hash_bits);
@@ -510,16 +494,6 @@ fn snappyCompress(arena: std.mem.Allocator, src: []const u8) Error![]u8 {
 fn snappyHash(b: *const [4]u8) usize {
     const v = std.mem.readInt(u32, b, .little);
     return (v *% 0x1e35a7bd) >> (32 - snappy_hash_bits);
-}
-
-fn putVarint(out: *std.array_list.Managed(u8), n_in: usize) Error!void {
-    var n = n_in;
-    while (true) {
-        const b: u8 = @intCast(n & 0x7F);
-        n >>= 7;
-        try out.append(if (n != 0) b | 0x80 else b);
-        if (n == 0) return;
-    }
 }
 
 fn emitLiteral(out: *std.array_list.Managed(u8), data: []const u8) Error!void {

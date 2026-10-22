@@ -48,13 +48,10 @@ const ftp = @import("../store/ftp.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const csv = @import("../format/csv.zig");
-const column = @import("../exec/column.zig");
 const arrow = @import("../format/arrow/write.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
-const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
-const pushdown = @import("pushdown.zig");
 const obs = @import("obs.zig");
 const Value = @import("../exec/value.zig").Value;
 

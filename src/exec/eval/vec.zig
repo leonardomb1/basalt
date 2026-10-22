@@ -22,7 +22,6 @@ const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("cast.zig").rescaleTo;
 const addAtScale = @import("cast.zig").addAtScale;
 const pow10_i128 = @import("../value.zig").pow10_i128;
-const simd = @import("../simd.zig");
 const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;

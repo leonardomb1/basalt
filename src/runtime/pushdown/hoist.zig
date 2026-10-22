@@ -16,16 +16,16 @@ const ast = @import("../../lang/ast.zig");
 const qual = @import("../pushdown.zig").qual;
 const std = @import("std");
 pub const Dialect = @import("../pushdown.zig").Dialect;
-pub const bin = @import("../pushdown.zig").bin;
+pub const bin = @import("testing_util.zig").bin;
 const dimBindings = @import("testing_util.zig").dimBindings;
 const eqFilter = @import("testing_util.zig").eqFilter;
 const filterStage = @import("testing_util.zig").filterStage;
-pub const fld = @import("../pushdown.zig").fld;
+pub const fld = @import("testing_util.zig").fld;
 const intLit = @import("testing_util.zig").intLit;
 const joinStage = @import("testing_util.zig").joinStage;
 const offlineSchema = @import("../analyze/targets.zig").offlineSchema;
 const projStage = @import("testing_util.zig").projStage;
-pub const qfld = @import("../pushdown.zig").qfld;
+pub const qfld = @import("testing_util.zig").qfld;
 const readStage = @import("testing_util.zig").readStage;
 const serialWhere = @import("../pushdown.zig").serialWhere;
 const writeStage = @import("testing_util.zig").writeStage;
@@ -184,11 +184,6 @@ pub fn mayRaise(e: *const ast.Expr) bool {
     return ast.anyExpr(e, {}, S.hit);
 }
 
-fn listed(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
-    return false;
-}
-
 const Own = struct { written: []const []const u8 = &.{}, has: []const []const u8 = &.{} };
 
 /// The columns written with the FROM table's alias (`f.x`, stripped to `x`), when only
@@ -239,8 +234,8 @@ fn refsOnlyProbe(
             }
             continue;
         }
-        if (q.sides.len == 0 and listed(own.written, q.last())) {
-            if (listed(own.has, q.last())) continue :names;
+        if (q.sides.len == 0 and ast.nameIn(own.written, q.last())) {
+            if (ast.nameIn(own.has, q.last())) continue :names;
             return false;
         }
         if (isRightName(q.last(), right)) return false;

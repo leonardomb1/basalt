@@ -20,11 +20,12 @@
 //! read once per lane. Sessions are pooled per server and user for the life of
 //! the process, each opened file its own handle on a session the opener has to
 //! itself until it closes the file. `CREATE CONNECTION … TYPE sftp` registers a
-//! `Conn` so a path's host part can name it. `last_error_buf` (thread-local) keeps
+//! `Conn` so a path's host part can name it. `last_error` (thread-local) keeps
 //! why the last attempt to reach a server failed, in the session's own words (an
 //! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
+const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const objstore = @import("objstore.zig");
 const ssh = @import("../net/ssh.zig");
 
@@ -540,7 +541,7 @@ fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
 
 pub fn checkout(cfg: ssh.Config) !*Client {
     ssh.clearFailure();
-    last_error_len = 0;
+    last_error.clear();
     var kb: [512]u8 = undefined;
     const key = poolKey(&kb, cfg);
     while (takePooled(key)) |c| {
@@ -585,17 +586,10 @@ pub fn checkin(c: *Client, healthy: bool) void {
     pool.append(std.heap.page_allocator, c) catch c.destroy();
 }
 
-pub threadlocal var last_error_buf: [512]u8 = undefined;
-pub threadlocal var last_error_len: usize = 0;
-
-fn noteError(text: []const u8) void {
-    const n = @min(text.len, last_error_buf.len);
-    @memcpy(last_error_buf[0..n], text[0..n]);
-    last_error_len = n;
-}
+threadlocal var last_error: ThreadNote(512) = .{};
 
 pub fn lastError() []const u8 {
-    return last_error_buf[0..last_error_len];
+    return last_error.get();
 }
 
 pub const File = struct {
@@ -607,16 +601,16 @@ pub const File = struct {
     pub fn open(arena: std.mem.Allocator, url: []const u8) !*File {
         const t = try resolve(arena, url);
         const c = checkout(t.cfg) catch |e| {
-            noteError(sshWhy(e, t.cfg));
+            last_error.set(sshWhy(e, t.cfg));
             return e;
         };
         const handle = c.openHandle(t.path, flags.read) catch |e| {
-            noteError(c.lastError());
+            last_error.set(c.lastError());
             checkin(c, isProtocolOk(e));
             return e;
         };
         const size = c.sizeOf(handle, t.path) catch |e| {
-            noteError(c.lastError());
+            last_error.set(c.lastError());
             c.closeHandle(handle) catch {};
             c.gpa.free(handle);
             checkin(c, isProtocolOk(e));
@@ -637,6 +631,14 @@ pub const File = struct {
         return buf;
     }
 
+    /// For `Stream`: any failed read leaves the session unhealthy.
+    pub fn readChunk(self: *File, off: u64, buf: []u8) !usize {
+        return self.client.readRange(self.handle, off, buf) catch |e| {
+            self.healthy = false;
+            return e;
+        };
+    }
+
     pub fn close(self: *File) void {
         if (self.healthy) self.client.closeHandle(self.handle) catch {
             self.healthy = false;
@@ -646,74 +648,9 @@ pub const File = struct {
     }
 };
 
-pub const Stream = struct {
-    file: *File,
-    at: u64 = 0,
-    end: u64,
-    owns_file: bool,
-    chunk: []u8,
-    pos: usize = 0,
-    len: usize = 0,
-    interface: std.Io.Reader,
-
-    const chunk_size = 1 << 20;
-
-    pub fn open(arena: std.mem.Allocator, url: []const u8) !*Stream {
-        const f = try File.open(arena, url);
-        errdefer f.close();
-        return make(arena, f, 0, f.size, true);
-    }
-
-    /// `len` bytes of an open file from `off`: a zip member inside a remote archive.
-    pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Stream {
-        return make(arena, f, off, off + len, false);
-    }
-
-    fn make(arena: std.mem.Allocator, f: *File, start: u64, end: u64, owns: bool) !*Stream {
-        const self = try arena.create(Stream);
-        self.* = .{
-            .file = f,
-            .at = start,
-            .end = end,
-            .owns_file = owns,
-            .chunk = try arena.alloc(u8, chunk_size),
-            .interface = .{
-                .buffer = try arena.alloc(u8, 64 * 1024),
-                .vtable = &.{ .stream = streamFn },
-                .seek = 0,
-                .end = 0,
-            },
-        };
-        return self;
-    }
-
-    pub fn close(self: *Stream) void {
-        if (self.owns_file) self.file.close();
-    }
-
-    /// Fetches a whole chunk at a time (32 reads in flight) and hands it out in the
-    /// sizes asked: fetching only the reader's 64 KiB kept two reads in flight and
-    /// streamed CSV at a quarter of a Parquet read's speed.
-    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Stream = @fieldParentPtr("interface", r);
-        if (self.pos == self.len) {
-            if (self.at >= self.end) return error.EndOfStream;
-            const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
-            const n = self.file.client.readRange(self.file.handle, self.at, self.chunk[0..want]) catch {
-                self.file.healthy = false;
-                return error.ReadFailed;
-            };
-            if (n == 0) return error.EndOfStream;
-            self.at += n;
-            self.pos = 0;
-            self.len = n;
-        }
-        const n = limit.minInt(self.len - self.pos);
-        w.writeAll(self.chunk[self.pos..][0..n]) catch return error.WriteFailed;
-        self.pos += n;
-        return n;
-    }
-};
+/// Fetches 1 MiB at a time (32 reads in flight): fetching only the reader's 64 KiB
+/// kept two reads in flight and streamed CSV at a quarter of a Parquet read's speed.
+pub const Stream = objstore.ChunkStream(File, 1 << 20);
 
 pub const Upload = struct {
     const upload_vtable = std.Io.Writer.VTable{ .drain = objstore.drain(Upload) };
@@ -733,12 +670,12 @@ pub const Upload = struct {
     pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
         const t = try resolve(arena, url);
         const c = checkout(t.cfg) catch |e| {
-            noteError(sshWhy(e, t.cfg));
+            last_error.set(sshWhy(e, t.cfg));
             return e;
         };
         const part = try std.fmt.allocPrint(arena, "{s}.part", .{t.path});
         const handle = c.openHandle(part, flags.write | flags.creat | flags.trunc) catch |e| {
-            noteError(c.lastError());
+            last_error.set(c.lastError());
             checkin(c, isProtocolOk(e));
             return e;
         };
@@ -813,7 +750,7 @@ pub const Upload = struct {
 pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
     const t = try resolve(arena, url);
     const c = checkout(t.cfg) catch |e| {
-        noteError(sshWhy(e, t.cfg));
+        last_error.set(sshWhy(e, t.cfg));
         return e;
     };
     var healthy = true;
@@ -825,7 +762,7 @@ pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8
     while (todo.pop()) |rel| {
         const dir = if (rel.len == 0) (if (top.len == 0) "." else top) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ top, rel });
         const entries = c.listDir(arena, dir) catch |e| {
-            noteError(c.lastError());
+            last_error.set(c.lastError());
             healthy = isProtocolOk(e);
             return e;
         };

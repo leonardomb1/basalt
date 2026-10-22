@@ -48,10 +48,8 @@ const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
 const eval = @import("../exec/eval.zig");
-const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
-const xlsx = @import("../format/xlsx/read.zig");
 const ftp = @import("../store/ftp.zig");
 const registry = @import("../connect/registry.zig");
 const table_builtins = @import("../connect/table_builtins.zig");
@@ -509,7 +507,7 @@ fn valuesEqualLoose(arena: std.mem.Allocator, a: Value, b: Value) bool {
 fn foldsHere(arena: std.mem.Allocator, exprs: []const ?*const ast.Expr, sc: Scope) Error!bool {
     for (exprs) |maybe| {
         const e = maybe orelse continue;
-        for (try dollarRefs(arena, e)) |q| if (!containsName(sc.names, q.parts[0])) return false;
+        for (try dollarRefs(arena, e)) |q| if (!ast.nameIn(sc.names, q.parts[0])) return false;
     }
     return true;
 }
@@ -640,7 +638,7 @@ pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
 
 /// `ANCHOR SCHEMA name` must name one of the union's tables (`first` names the first).
 pub fn unionCanonProblem(arena: std.mem.Allocator, canon: []const u8, names: []const []const u8) Error!?[]const u8 {
-    if (std.mem.eql(u8, canon, "first") or containsName(names, canon)) return null;
+    if (std.mem.eql(u8, canon, "first") or ast.nameIn(names, canon)) return null;
     return try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
 }
 
@@ -848,6 +846,8 @@ pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Opt
     return p;
 }
 
+/// A LET over what the run binds for sure, a PARAM given a value or a DEFAULT and the
+/// LETs folded from them, is folded here as the run folds it.
 fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
     const cli = opts.overrides;
     var expand_msg: []const u8 = "";
@@ -875,8 +875,6 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         return fail(diag, "nothing to run: the script needs a `LOAD INTO` or a terminal `SELECT`", .{});
 
     var params_map = ParamMap.init(arena);
-    // What the run will bind for sure — a PARAM given a value or a DEFAULT, and the LETs
-    // folded from them — so a LET over them is folded here as the run folds it.
     var known_names = std.array_list.Managed([]const u8).init(arena);
     var known_values = std.array_list.Managed(Value).init(arena);
     for (cli) |o| for (program.stmts) |s| if (s == .let_const and std.mem.eql(u8, s.let_const.name, o.name))
@@ -931,7 +929,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
         if (l.expr) |le| {
             const refs = try dollarRefs(arena, le);
             const all_known = for (refs) |q| {
-                if (!containsName(known_names.items, q.parts[0])) break false;
+                if (!ast.nameIn(known_names.items, q.parts[0])) break false;
             } else true;
             if (all_known and !readsFiles(le)) {
                 const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
@@ -1276,7 +1274,7 @@ const Ctx = struct {
         switch (fe.source) {
             .json_path => |q| {
                 const declared = self.json_params orelse return;
-                if (!containsName(declared, q.parts[0]))
+                if (!ast.nameIn(declared, q.parts[0]))
                     return self.note(failAt(self.diag, q.span, "{s}", .{try notJsonParamMsg(self.arena, q.parts[0])}));
             },
             .pipeline => |p| {
@@ -1493,7 +1491,7 @@ const Ctx = struct {
                     _ = try dialectFromHints(lead.hints, self.diag);
                     _ = try lakeAt(lead.hints, self.diag);
                 }
-                const rewritten = rd.form == .path and containsName(self.written, rd.form.path);
+                const rewritten = rd.form == .path and ast.nameIn(self.written, rd.form.path);
                 if (!rewritten and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
                     const t = offlineTable(self.arena, rd.form.path, lead.hints) catch |e|
                         return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
@@ -1810,7 +1808,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
             return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
     }
     _ = try dialectFromHints(hints, diag);
-    const encodes = to_file and containsName(formats.of((try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv).write_keys, "encoding");
+    const encodes = to_file and ast.nameIn(formats.of((try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv).write_keys, "encoding");
     if (hintText(hints, "encoding") != null and !encodes)
         return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
     if (to_file) if (try writeFormat(w, hints, diag)) |f| if (folder.isFolder(w.target) and f != .delta)
@@ -1848,9 +1846,9 @@ const file_writes = blk: {
 /// for one no file write takes.
 fn ownerOf(key: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, key, "format")) return null;
-    for (formats.table, file_writes) |f, fw| if (containsName(f.write_keys, key)) return fw.what;
-    if (containsName(&stream_sink_keys, key)) return "a starrocks or doris table";
-    if (containsName(&table_sink_keys, key)) return "a database table";
+    for (formats.table, file_writes) |f, fw| if (ast.nameIn(f.write_keys, key)) return fw.what;
+    if (ast.nameIn(&stream_sink_keys, key)) return "a starrocks or doris table";
+    if (ast.nameIn(&table_sink_keys, key)) return "a database table";
     return null;
 }
 
@@ -1863,11 +1861,11 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     const fw = if (to_file) &file_writes[@intFromEnum((writeFormat(w, hints, diag) catch null) orelse .csv)] else null;
     const keys: []const []const u8 = if (fw) |f| f.keys else if (file) file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
     for (hints) |h| {
-        if (containsName(keys, h.key)) continue;
+        if (ast.nameIn(keys, h.key)) continue;
         const e = if (fw) |f| (if (ownerOf(h.key)) |owner|
             fail(diag, "`LOAD INTO` option `{s}` does not apply to {s}, which takes {s}; `{s}` is an option of {s}", .{ h.key, f.what, f.takes, h.key, owner })
         else
-            fail(diag, "unknown `LOAD INTO` option `{s}` ({s} takes {s})", .{ h.key, f.what, f.takes })) else if (containsName(file_sink_keys, h.key) or containsName(&stream_sink_keys, h.key))
+            fail(diag, "unknown `LOAD INTO` option `{s}` ({s} takes {s})", .{ h.key, f.what, f.takes })) else if (ast.nameIn(file_sink_keys, h.key) or ast.nameIn(&stream_sink_keys, h.key))
             fail(diag, "`LOAD INTO` option `{s}` does not apply to a {s} target (a file takes `format` and its format's options; a starrocks or doris table `label_prefix`)", .{ h.key, if (file) "file" else connector })
         else
             fail(diag, "unknown `LOAD INTO` option `{s}` (a file takes `format` and its format's options; a starrocks or doris table `label_prefix`)", .{h.key});
@@ -1937,12 +1935,12 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
     const plain_folder = lead.node == .read and lead.node.read.form == .path and folder.isFolder(lead.node.read.form.path) and
         std.mem.eql(u8, connector, "csv") and (formatFromHints(lead.hints, diag) catch null) == null;
     for (lead.hints) |h| {
-        if (containsName(kind.keys, h.key) or containsName(&any_read_keys, h.key)) continue;
+        if (ast.nameIn(kind.keys, h.key) or ast.nameIn(&any_read_keys, h.key)) continue;
         if (plain_folder and std.mem.eql(u8, h.key, "version")) continue;
         if (std.mem.eql(u8, connector, "http") and std.mem.startsWith(u8, h.key, "query:")) continue;
-        const e = if (containsName(&join_hint_keys, h.key))
+        const e = if (ast.nameIn(&join_hint_keys, h.key))
             fail(diag, "`{s}` is an option of a JOIN clause: write it in the `WITH (...)` after the joined source", .{h.key})
-        else if (containsName(formats.all_read_keys, h.key) or containsName(&rest_read_keys, h.key) or containsName(&union_read_keys, h.key) or containsName(sql_read.keys, h.key))
+        else if (ast.nameIn(formats.all_read_keys, h.key) or ast.nameIn(&rest_read_keys, h.key) or ast.nameIn(&union_read_keys, h.key) or ast.nameIn(sql_read.keys, h.key))
             fail(diag, "read option `{s}` does not apply to {s}, which takes {s}", .{ h.key, kind.what, kind.takes })
         else
             fail(diag, "unknown read option `{s}`: {s} takes {s}", .{ h.key, kind.what, kind.takes });
@@ -1952,11 +1950,6 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
 }
 
 const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
-
-fn containsName(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
-    return false;
-}
 
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb, ftp";
 
