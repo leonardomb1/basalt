@@ -299,7 +299,8 @@ pub const AuthState = struct {
         const code = @intFromEnum(res.status);
         if (code != 200) {
             const b = aw.writer.buffered();
-            obs.logOr(self.logger, .err, "login http {d} from {s}: {s}", .{ code, self.cc.login_url, b[0..@min(b.len, 300)] });
+            var ub: [512]u8 = undefined;
+            obs.logOr(self.logger, .err, "login http {d} from {s}: {f}", .{ code, redactUrl(&ub, self.cc.login_url), std.zig.fmtString(b[0..@min(b.len, 300)]) });
             return statusError(code);
         }
         const body = std.mem.trim(u8, aw.writer.buffered(), " \t\r\n");
@@ -319,6 +320,34 @@ pub const AuthState = struct {
         };
     }
 };
+
+/// `url` as logs and messages show it: without a `user:pass@` and with each query
+/// value replaced by `...`, as either may hold a credential.
+pub fn redactUrl(buf: []u8, url: []const u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |at| {
+        w.writeAll(rest[0 .. at + 3]) catch return "(url)";
+        rest = rest[at + 3 ..];
+        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        if (std.mem.lastIndexOfScalar(u8, rest[0..host_end], '@')) |amp| rest = rest[amp + 1 ..];
+    }
+    const q = std.mem.indexOfScalar(u8, rest, '?') orelse {
+        w.writeAll(rest) catch return "(url)";
+        return w.buffered();
+    };
+    w.writeAll(rest[0 .. q + 1]) catch return "(url)";
+    var it = std.mem.splitScalar(u8, rest[q + 1 ..], '&');
+    var first = true;
+    while (it.next()) |kv| {
+        if (!first) w.writeByte('&') catch return "(url)";
+        first = false;
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
+        w.writeAll(kv[0..eq]) catch return "(url)";
+        if (eq < kv.len) w.writeAll("=...") catch return "(url)";
+    }
+    return w.buffered();
+}
 
 /// Whether a server-sent value can go into a header or request line as is: a CR,
 /// LF or NUL in it would end the line and start one the server chose.
@@ -750,8 +779,9 @@ pub const HttpSource = struct {
         if (self.opts.timeout_ms <= 0) return self.fetchPageRaw(arena, req);
         const slot = try self.spawnFetch(req, 0);
         const url_copy = arena.dupe(u8, slot.url) catch "";
+        var red_buf: [512]u8 = undefined;
         self.awaitSlot(slot) catch |e| {
-            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
+            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, url_copy) });
             return e;
         };
         defer freeSlot(slot);
@@ -954,13 +984,14 @@ pub const HttpSource = struct {
         }
         const slot = self.slots.orderedRemove(0);
         const url_copy = arena.dupe(u8, slot.url) catch "";
+        var red_buf: [512]u8 = undefined;
         self.awaitSlot(slot) catch |e| {
-            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), url_copy });
+            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, url_copy) });
             return e;
         };
         defer freeSlot(slot);
         if (slot.err) |e| {
-            obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), slot.url });
+            obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, slot.url) });
             return mapTransport(e);
         }
         if (slot.code == 401) {
@@ -1026,7 +1057,9 @@ pub const HttpSource = struct {
     /// The single status policy for every fetch path: 401 goes to session re-login
     /// first, and only when auth declines does `listedFallback` apply.
     fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
-        obs.logOr(self.logger, .warn, "http {d} from {s}: {s}", .{ code, url, body[0..@min(body.len, 300)] });
+        var ub: [512]u8 = undefined;
+        const shown = redactUrl(&ub, url);
+        obs.logOr(self.logger, .warn, "http {d} from {s}: {f}", .{ code, shown, std.zig.fmtString(body[0..@min(body.len, 300)]) });
         const e = if (code == 401)
             error.HttpUnauthorized
         else if (statusListed(self.opts.retry_statuses, code))
@@ -1034,7 +1067,7 @@ pub const HttpSource = struct {
         else
             statusError(code);
         var buf: [400]u8 = undefined;
-        return eval.explain(e, std.fmt.bufPrint(&buf, "http {d} from {s}", .{ code, url }) catch url);
+        return eval.explain(e, std.fmt.bufPrint(&buf, "http {d} from {s}", .{ code, shown }) catch shown);
     }
 
     fn listedFallback(self: *HttpSource, code: u16, e: anyerror) anyerror {
@@ -1857,7 +1890,7 @@ test "http source: a cursor token is URL-encoded; a later page's failure names i
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=c%202%26x%2By ") != null);
     const why = eval.takeFailure(error.HttpBadRequest).?;
     try std.testing.expect(std.mem.startsWith(u8, why, "http 400 from http://127.0.0.1:"));
-    try std.testing.expect(std.mem.endsWith(u8, why, "/items?cursor=c%202%26x%2By"));
+    try std.testing.expect(std.mem.endsWith(u8, why, "/items?cursor=..."));
 }
 
 test "connFromKvs: bearer auth without a token is an error" {
@@ -1947,4 +1980,11 @@ test "retryDelayNs: exponential base doubling within the +-30% jitter band" {
 test "a server-sent token or next URL that would break a header line is refused" {
     try std.testing.expect(lineSafe("Bearer abc.def"));
     for ([_][]const u8{ "abc\r\nX-Evil: 1", "abc\nX: 1", "abc\rx", "a\x00b" }) |v| try std.testing.expect(!lineSafe(v));
+}
+
+test "a URL in a log or message keeps no login and no query values" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("https://api.example.com/v1/x?api_key=...&page=...", redactUrl(&buf, "https://user:secret@api.example.com/v1/x?api_key=abc&page=2"));
+    try std.testing.expectEqualStrings("http://h/p", redactUrl(&buf, "http://h/p"));
+    try std.testing.expectEqualStrings("http://h/p?flag", redactUrl(&buf, "http://h/p?flag"));
 }
