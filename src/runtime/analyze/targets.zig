@@ -533,13 +533,13 @@ fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const
     var d = Diag{};
     const f = xmlread.Files.open(arena, arena, files, xmlOptions(hints, text, &d) catch return null) catch return null;
     defer f.close();
-    return f.reader.schema;
+    return f.schema;
 }
 
 fn jsonSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint) ?types.Schema {
     const f = json.Files.open(arena, arena, files, jsonOptions(hints)) catch return null;
     defer f.close();
-    return f.reader.schema;
+    return f.schema;
 }
 
 test "unreadableTarget: an extension basalt does not read is refused" {

@@ -19,7 +19,8 @@ pub fn Files(comptime R: type, comptime O: type) type {
         gpa: std.mem.Allocator,
         stream: *Stream,
         rest: []const []const u8,
-        reader: *R,
+        reader: ?*R,
+        schema: types.Schema,
         opts: O,
 
         const Self = @This();
@@ -34,16 +35,20 @@ pub fn Files(comptime R: type, comptime O: type) type {
 
         pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *Stream, rest: []const []const u8, opts: O) !*Self {
             const self = try arena.create(Self);
-            self.* = .{ .arena = arena, .gpa = gpa, .stream = s, .rest = rest, .reader = try R.open(arena, gpa, s.reader, opts), .opts = opts };
-            self.opts.schema = self.reader.schema;
+            const r = try R.open(arena, gpa, s.reader, opts);
+            self.* = .{ .arena = arena, .gpa = gpa, .stream = s, .rest = rest, .reader = r, .schema = r.schema, .opts = opts };
+            self.opts.schema = r.schema;
             return self;
         }
 
+        /// A later file that fails to open leaves no reader, so `close` frees each once.
         pub fn next(self: *Self, arena: std.mem.Allocator) !?Batch {
             while (true) {
-                if (try self.reader.next(arena)) |b| return b;
+                const r = self.reader orelse return null;
+                if (try r.next(arena)) |b| return b;
                 if (self.rest.len == 0) return null;
-                self.reader.close();
+                r.close();
+                self.reader = null;
                 try self.stream.reopen(self.rest[0]);
                 if (@hasField(O, "source_name")) self.opts.source_name = self.rest[0];
                 self.rest = self.rest[1..];
@@ -52,13 +57,13 @@ pub fn Files(comptime R: type, comptime O: type) type {
         }
 
         pub fn close(self: *Self) void {
-            self.reader.close();
+            if (self.reader) |r| r.close();
             self.stream.close();
         }
 
         fn schemaFn(ptr: *anyopaque) types.Schema {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return self.reader.schema;
+            return self.schema;
         }
 
         fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {

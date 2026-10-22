@@ -578,3 +578,18 @@ test "malformed or truncated input is an error, not rows" {
         try testing.expectError(error.InvalidJson, readAll(a, bad, .{}));
     }
 }
+
+test "a folder whose later file cannot be opened fails once and frees each reader once" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "1.jsonl", .data = "{\"k\":1}\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const files = [_][]const u8{ try std.fs.path.join(a, &.{ base, "1.jsonl" }), try std.fs.path.join(a, &.{ base, "gone.jsonl" }) };
+    const f = try Files.open(a, std.testing.allocator, &files, .{});
+    defer f.close();
+    try std.testing.expect((try f.next(a)) != null);
+    try std.testing.expectError(error.FileNotFound, f.next(a));
+}
