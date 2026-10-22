@@ -41,6 +41,9 @@ pub const Aggregate = struct {
     out_schema: *const types.Schema,
     err: ?*ErrCtx = null,
     state: std.mem.Allocator,
+    /// The arena `state` comes from when this aggregate owns it, freed by
+    /// `release`, so a statement's groups go with the statement, not the run.
+    own_state: ?*std.heap.ArenaAllocator = null,
     gpa: std.mem.Allocator,
     part_state: ?[]const std.mem.Allocator = null,
     table_gpa: ?std.mem.Allocator = null,

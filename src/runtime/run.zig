@@ -464,6 +464,7 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
         env.sources.shrinkRetainingCapacity(base);
     }
     const res = try buildPipeline(env, stages);
+    defer res.op.release();
 
     const schema = types.Schema{ .fields = &describe_fields };
     const batch = try csv.parseSlice(arena, &schema, try describeRows(arena, res.schema));

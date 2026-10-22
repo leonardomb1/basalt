@@ -282,6 +282,9 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const gpa = env.gpa;
     var stages = stages_in;
     env.sort_threads = opts.lanes();
+    env.pq_readers = 0;
+    env.pq_reader = null;
+    env.pq_folder = null;
     defer if (env.pq_held) |h| {
         h.src.close();
         env.pq_held = null;
@@ -412,6 +415,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 env.sources.shrinkRetainingCapacity(src_base);
                 env.sql_desc = null;
                 stages = ns;
+                res.op.release();
                 res = try buildPipeline(env, ns[0 .. ns.len - 1]);
                 whole_agg = true;
                 if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
@@ -430,6 +434,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             env.sources.shrinkRetainingCapacity(src_base);
             env.sql_desc = null;
             stages = ns;
+            res.op.release();
             res = try buildPipeline(env, ns[0 .. ns.len - 1]);
             top_n = true;
             if (env.profile) |p| p.path = "serial; ORDER BY ... LIMIT runs in the source";
@@ -445,6 +450,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
                 if (env.sources.items.len == src_base) {
                     env.sql_desc = null;
+                    res.op.release();
                     res = try buildPipeline(env, stages[0 .. stages.len - 1]);
                 }
             }

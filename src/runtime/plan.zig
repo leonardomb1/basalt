@@ -805,7 +805,8 @@ pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schem
                 keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
             }
             const o = try arena.create(op.Distinct);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = arena, .gpa = env.gpa, .err = env.errctx, .space = env.space, .spill_at = env.op_memory };
+            const st = try ownState(env);
+            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .err = env.errctx, .space = env.space, .spill_at = env.op_memory };
             return .{ .op = .{ .distinct = o }, .schema = schema };
         },
         .sort => |s| {
@@ -889,6 +890,15 @@ pub fn buildProject(env: *Env, items: []const ast.SelectItem, in_schema: types.S
     return .{ .op = .{ .project = p }, .schema = out.* };
 }
 
+/// A grouping operator's own state arena on the run's gpa, freed by the operator's
+/// `release` when its statement or loop row is done: on the plan arena, every
+/// row of a sequential FOR EACH kept its groups until the run ended.
+fn ownState(env: *Env) !*std.heap.ArenaAllocator {
+    const st = try env.arena.create(std.heap.ArenaAllocator);
+    st.* = std.heap.ArenaAllocator.init(env.gpa);
+    return st;
+}
+
 fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.Op) anyerror!PipeRes {
     const arena = env.arena;
     var ad = analyze.Diag{};
@@ -897,7 +907,8 @@ fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.
     for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
     const out = try schemaPtr(arena, ap.schema);
     const o = try arena.create(op.Aggregate);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = arena, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
+    const st = try ownState(env);
+    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
     return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 

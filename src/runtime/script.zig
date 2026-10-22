@@ -371,6 +371,46 @@ fn forRecordFail(ctx: *ForCtx, item: []const u8, label: []const u8, msg: []const
     if (ctx.on_error == .stop) ctx.stop.store(true, .release);
 }
 
+/// A sequential loop row's own arena, as a PARALLEL row has one: what a row
+/// plans, reads and groups goes when it ends, so a long loop runs in the memory of
+/// one row. What a row may leave in `env` pointing into that arena is put back as
+/// it was, or, for the target read after the row, copied out; the source and sink
+/// names are static or the program's, and a message is in `Diag`'s own buffer.
+const RowScope = struct {
+    arena: std.mem.Allocator,
+    materialized: @FieldType(Env, "materialized"),
+    folder_memo: @FieldType(Env, "folder_memo"),
+    sql_desc: @FieldType(Env, "sql_desc"),
+    mem_sink: @FieldType(Env, "mem_sink"),
+    sink_label_prefix: @FieldType(Env, "sink_label_prefix"),
+    last_target: []const u8,
+
+    fn enter(env: *Env, row: std.mem.Allocator) RowScope {
+        const kept = RowScope{ .arena = env.arena, .materialized = env.materialized, .folder_memo = env.folder_memo, .sql_desc = env.sql_desc, .mem_sink = env.mem_sink, .sink_label_prefix = env.sink_label_prefix, .last_target = env.last_target };
+        env.arena = row;
+        env.folder_memo = .empty;
+        return kept;
+    }
+
+    fn leave(self: RowScope, env: *Env) void {
+        env.arena = self.arena;
+        env.materialized = self.materialized;
+        env.folder_memo = self.folder_memo;
+        env.sql_desc = self.sql_desc;
+        env.mem_sink = self.mem_sink;
+        env.sink_label_prefix = self.sink_label_prefix;
+        env.pq_readers = 0;
+        env.pq_reader = null;
+        env.pq_folder = null;
+        env.last_target = self.keep(env.last_target, self.last_target);
+    }
+
+    fn keep(self: RowScope, now: []const u8, before: []const u8) []const u8 {
+        if (now.ptr == before.ptr and now.len == before.len) return now;
+        return self.arena.dupe(u8, now) catch before;
+    }
+};
+
 /// The worker Env is a copy of the run's, not a field list: listing fields once
 /// dropped `explain`, `stdout_format` and the replay label pinning in PARALLEL loops.
 fn forWorker(ctx: *ForCtx, _: usize) void {
@@ -620,7 +660,12 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 env.diag.msg = "";
                 env.diag.pos = null;
                 const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = outer };
-                if (run_body(env, fe.body, lr, opts, stats, lanes_used, batch_arena)) |_| {
+                var row_mem = std.heap.ArenaAllocator.init(env.gpa);
+                defer row_mem.deinit();
+                const kept = RowScope.enter(env, row_mem.allocator());
+                const ran = run_body(env, fe.body, lr, opts, stats, lanes_used, batch_arena);
+                kept.leave(env);
+                if (ran) |_| {
                     for (env.sources.items[base..]) |sc| sc.close();
                     env.sources.shrinkRetainingCapacity(base);
                     if (opts.outcomes) |sink| sink.record(row[0], true, "", false);

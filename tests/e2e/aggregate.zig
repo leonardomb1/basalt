@@ -555,3 +555,73 @@ test "past 64 key columns a NULL in one key is told apart from a NULL in another
         }
     }
 }
+
+/// Wraps the testing allocator, counting the bytes live at once across threads.
+const PeakAlloc = struct {
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *PeakAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn grow(self: *PeakAlloc, n: usize) void {
+        const now = self.live.fetchAdd(n, .monotonic) + n;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
+    fn alloc(p: *anyopaque, n: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        const r = std.testing.allocator.rawAlloc(n, al, ra) orelse return null;
+        self.grow(n);
+        return r;
+    }
+    fn resize(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        if (!std.testing.allocator.rawResize(m, al, n, ra)) return false;
+        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
+        return true;
+    }
+    fn remap(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        const r = std.testing.allocator.rawRemap(m, al, n, ra) orelse return null;
+        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
+        return r;
+    }
+    fn free(p: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        std.testing.allocator.rawFree(m, al, ra);
+        _ = self.live.fetchSub(m.len, .monotonic);
+    }
+};
+
+test "a sequential loop's GROUP BY and DISTINCT free their groups each row, so twenty rows peak as one does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("k,v\n");
+    for (0..20000) |i| try csv.writer().print("key_{d},{d}\n", .{ i, i });
+    try tmp.dir.writeFile(.{ .sub_path = "data.csv", .data = csv.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    var peaks: [2]usize = undefined;
+    for ([_]usize{ 1, 20 }, &peaks) |rows, *peak| {
+        var loop = std.array_list.Managed(u8).init(alloc);
+        defer loop.deinit();
+        try loop.appendSlice("i\n");
+        for (0..rows) |i| try loop.writer().print("{d}\n", .{i});
+        try tmp.dir.writeFile(.{ .sub_path = "loop.csv", .data = loop.items });
+        const script = try std.mem.replaceOwned(u8, alloc,
+            \\FOR EACH ROW OF (SELECT i FROM '$B/loop.csv') AS (i)
+            \\  LOAD INTO '$B/g.csv' AS SELECT k, COUNT(*) AS n, SUM(v) AS s FROM '$B/data.csv' GROUP BY k;
+            \\  LOAD INTO '$B/d.csv' AS SELECT DISTINCT k FROM '$B/data.csv';
+            \\END FOR;
+        , "$B", base);
+        defer alloc.free(script);
+        var pa = PeakAlloc{};
+        var diag: Diag = .{};
+        _ = try exec(pa.allocator(), script, .{ .threads = 1, .log = .{ .quiet = true } }, &diag);
+        peak.* = pa.peak.load(.monotonic);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] * 2);
+}

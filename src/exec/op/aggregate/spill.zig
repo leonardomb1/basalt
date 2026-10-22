@@ -24,10 +24,17 @@ pub const Spill = struct {
     replay: ?parts_mod.Replay(Aggregate) = null,
 };
 
-/// Drops the spill files a consumer that stopped early never read; safe twice.
+/// Drops the spill files a consumer that stopped early never read, then the
+/// groups' own arena; safe twice.
 pub fn release(self: *Aggregate) void {
-    const sp = self.spill orelse return;
-    if (sp.replay) |*r| r.release() else sp.parts.abort();
+    if (self.spill) |sp| {
+        if (sp.replay) |*r| r.release() else sp.parts.abort();
+    }
+    if (self.own_state) |a| {
+        self.spill = null;
+        self.own_state = null;
+        a.deinit();
+    }
 }
 
 /// `next` in spilling mode: the whole input folded (spilling what does not fit),

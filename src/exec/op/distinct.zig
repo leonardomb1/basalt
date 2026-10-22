@@ -42,6 +42,8 @@ pub const Distinct = struct {
     in_schema: *const types.Schema,
     keys: ?[]const usize,
     state: std.mem.Allocator,
+    /// The arena `state` comes from when this operator owns it, freed by `release`.
+    own_state: ?*std.heap.ArenaAllocator = null,
     gpa: std.mem.Allocator,
     seen: ?Seen = null,
     strs: ?*keytable.StrTable = null,
@@ -164,11 +166,18 @@ pub const Distinct = struct {
         return sp.replay.?.next(self, self.gpa, arena);
     }
 
-    /// Drops the spill files a consumer that stopped early never read; safe twice.
+    /// Drops the spill files a consumer that stopped early never read, then the
+    /// operator's own arena; safe twice.
     pub fn release(self: *Distinct) void {
         self.freeSeen();
-        const sp = self.spill orelse return;
-        if (sp.replay) |*r| r.release() else sp.parts.abort();
+        if (self.spill) |sp| {
+            if (sp.replay) |*r| r.release() else sp.parts.abort();
+        }
+        if (self.own_state) |a| {
+            self.spill = null;
+            self.own_state = null;
+            a.deinit();
+        }
     }
 
     /// A fresh `Distinct` over one spill file, one level deeper, on `state`.

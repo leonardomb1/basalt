@@ -352,6 +352,7 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
     var scan = op.Scan{ .src = ob.source() };
     scan.stats.at = profile.merged_at;
     var cur: op.Op = .{ .scan = &scan };
+    defer cur.release();
     var sch = schema;
     var i: usize = 0;
     while (i < tail.len) : (i += 1) {
