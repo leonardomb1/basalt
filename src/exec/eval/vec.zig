@@ -586,17 +586,7 @@ fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Ve
     }
 }
 
-/// Float to int rounding half to even, as PostgreSQL casts float8 (a decimal
-/// rounds half away from zero instead), guarding the i64 range and NaN/inf,
-/// which `@intFromFloat` treats as illegal behavior; out of range is
-/// CastFailed, as for a string.
-pub fn floatToInt(x: f64) error{CastFailed}!i64 {
-    if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
-    const f = @floor(x);
-    const d = x - f;
-    const r = if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
-    return @intFromFloat(r);
-}
+pub const floatToInt = column.floatToInt;
 
 fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: usize) VecError!Vec {
     const src = col.ty.kind;

@@ -83,6 +83,18 @@ pub fn checkSpan(n: usize) error{OutOfMemory}!usize {
     return n;
 }
 
+/// Float to int rounding half to even, as PostgreSQL casts float8 (a decimal
+/// rounds half away from zero instead), guarding the i64 range and NaN/inf,
+/// which `@intFromFloat` treats as illegal behavior; out of range is
+/// CastFailed, as for a string.
+pub fn floatToInt(x: f64) error{CastFailed}!i64 {
+    if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
+    const f = @floor(x);
+    const d = x - f;
+    const r = if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
+    return @intFromFloat(r);
+}
+
 pub const Bytes = struct {
     offsets: []i32,
     values: []u8,
@@ -927,12 +939,13 @@ pub const Builder = struct {
     }
 
     pub fn append(self: *Builder, v: Value) !void {
-        const ok = !v.isNull();
+        const int: ?i64 = if (self.store == .i64 and !v.isNull()) self.asI64(v) else null;
+        const ok = !v.isNull() and (self.store != .i64 or int != null);
         try self.pushValid(ok);
         switch (self.store) {
             .b => |*l| try l.append(if (ok) v.bool else false),
             .i32 => |*l| try l.append(if (ok) v.date else 0),
-            .i64 => |*l| try l.append(if (ok) self.asI64(v) else 0),
+            .i64 => |*l| try l.append(int orelse 0),
             .f64 => |*l| try l.append(if (ok) self.asF64(v) else 0),
             .dec => |*l| try l.append(self.asDec(v)),
             .bytes => |*l| {
@@ -944,15 +957,17 @@ pub const Builder = struct {
 
     /// `else => 0` once swallowed decimals appended to a numeric column; a kind with
     /// no numeric reading (string, date) still becomes 0 rather than widening `append`'s error set.
-    fn asI64(self: *Builder, v: Value) i64 {
+    /// A float or decimal rounds as CAST does; one no i64 holds (NaN, infinite, past
+    /// 2^63) is null.
+    fn asI64(self: *Builder, v: Value) ?i64 {
         return switch (self.ty.kind) {
             .time => v.time,
             .timestamp => v.timestamp,
             else => switch (v) {
                 .int => |x| x,
-                .float => |x| @intFromFloat(x),
+                .float => |x| floatToInt(x) catch null,
                 .bool => |x| @intFromBool(x),
-                .decimal => |d| @intFromFloat(d.toF64()),
+                .decimal => |d| floatToInt(@round(d.toF64())) catch null,
                 else => 0,
             },
         };
@@ -1331,4 +1346,16 @@ test "permute of a few rows of a long column checks only those rows' validity" {
 test "a string column's value bytes stop at the i32 offsets' reach" {
     try std.testing.expectEqual(max_span, try checkSpan(max_span));
     try std.testing.expectError(error.OutOfMemory, checkSpan(max_span + 1));
+}
+
+test "an int builder rounds a float or decimal as CAST does, and one no i64 holds is null" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var b = Builder.init(ar.allocator(), types.Type.init(.int));
+    for ([_]Value{ .{ .float = 2.5 }, .{ .float = std.math.nan(f64) }, .{ .float = 1e19 }, .{ .decimal = .{ .unscaled = 127, .scale = 1 } }, .{ .int = 7 } }) |v| try b.append(v);
+    const c = try b.finish();
+    try std.testing.expectEqual(@as(i64, 2), c.data.i64[0]);
+    try std.testing.expect(!c.validity.get(1) and !c.validity.get(2));
+    try std.testing.expectEqual(@as(i64, 13), c.data.i64[3]);
+    try std.testing.expectEqual(@as(i64, 7), c.data.i64[4]);
 }

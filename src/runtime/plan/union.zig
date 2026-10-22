@@ -130,7 +130,7 @@ fn deriveSubstr(s: []const u8, spec: []const u8) ?[]const u8 {
     const len = std.fmt.parseInt(usize, std.mem.trim(u8, spec[comma + 1 ..], " "), 10) catch return null;
     if (start == 0 or start > s.len) return null;
     const a = start - 1;
-    return s[a..@min(a + len, s.len)];
+    return s[a..][0..@min(len, s.len - a)];
 }
 
 pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Schema, canon_opt: ?[]const u8, except: []const []const u8) !types.Schema {
@@ -422,4 +422,10 @@ test "windowTopK: a whole-item ROW_NUMBER, filtered by its alias, gets top_k; on
             try std.testing.expectEqual(k, top.?);
         } else try std.testing.expect(got == null);
     }
+}
+
+test "deriveSubstr clamps a length past the end, however large" {
+    try std.testing.expectEqualStrings("bcd", deriveSubstr("abcd", "2,18446744073709551615").?);
+    try std.testing.expectEqualStrings("bc", deriveSubstr("abcd", "2,2").?);
+    try std.testing.expect(deriveSubstr("abcd", "5,1") == null);
 }

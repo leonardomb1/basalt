@@ -245,7 +245,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
     defer if (opts.summary_out) |so| {
-        so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(std.time.milliTimestamp() - t0), lanes_used, &loads, &scan, runnable == 1);
+        so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(@max(0, std.time.milliTimestamp() - t0)), lanes_used, &loads, &scan, runnable == 1);
     };
     for (program.stmts[1..]) |s| switch (s) {
         .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
@@ -267,7 +267,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     };
 
     stats.rows_read = rows_read.load(.monotonic);
-    stats.elapsed_ms = @intCast(std.time.milliTimestamp() - t0);
+    stats.elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - t0));
     stats.source = env.src_name;
     stats.sink = env.sink_name;
 

@@ -103,7 +103,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         if (is_load and !delegated) noteLoad(env, out.pos, load_err, .{
             .rows = stats.rows_out - load_rows0,
             .rows_read = env.rows_read.load(.monotonic) - read0,
-            .elapsed_ms = @intCast(std.time.milliTimestamp() - load_t0),
+            .elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - load_t0)),
             .lanes = lanes,
         });
     }

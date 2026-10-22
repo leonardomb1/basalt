@@ -508,7 +508,7 @@ pub const per_row = struct {
         const m = toI64(mv);
         const d = toI64(dv);
         const bad = "make_date: year {d}, month {d}, day {d} is not a date";
-        if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m)))
+        if (y < -1_000_000_000 or y > 1_000_000_000 or m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m)))
             return failWith(error.CastFailed, bad, .{ y, m, d });
         const days = daysFromCivil(y, @intCast(m), @intCast(d));
         return Value{ .date = std.math.cast(i32, days) orelse return failWith(error.CastFailed, bad, .{ y, m, d }) };
