@@ -831,6 +831,54 @@ lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/
   fi
 }
 
+# A Delta table written to an object store: created partitioned, appended to,
+# upserted (whole rows, PARTIAL COLS, and spilling past --op-memory), replaced,
+# each version read back; an UPSERT of no rows creates its table. The
+# commits go through the store's create-if-absent PUT, which a store ignoring
+# `If-None-Match` fails.
+lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
+  local t="$2dw_$$/"
+  printf 'id,name,val\n1,alpha,10\n2,"beta, gamma",\n3,delta,7\n11,alpha,10\n12,"beta, gamma",\n13,delta,7\n' >"$out/dw_all.csv"
+  printf 'id,name,val\n101,alpha,10\n' >"$out/dw_rep.csv"
+  if brun run -c "LOAD INTO '$t' WITH (format = 'delta', partition_by = 'name') AS SELECT * FROM 'tests/integration/seed.csv';" &&
+     brun run -c "LOAD INTO '$t' AS SELECT id + 10 AS id, name, val FROM 'tests/integration/seed.csv';" &&
+     brun run -c "LOAD INTO '$out/dw_$1_all.csv' AS SELECT * FROM '$t' ORDER BY id;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_v0.csv' AS SELECT * FROM '$t' WITH (version = 0) ORDER BY id;"; then
+    check "$1-delta-write-append" "$out/dw_$1_all.csv" "$out/dw_all.csv"
+    check "$1-delta-write-v0" "$out/dw_$1_v0.csv" tests/integration/expected.csv
+  else
+    report "$1-delta-write-append (run error)" bad
+  fi
+  printf 'id,name,val\n1,alpha,10\n2,"beta, gamma",\n3,delta,7\n4,omega,40\n11,alpha,10\n12,"beta, gamma",99\n13,delta,70\n' >"$out/dw_up.csv"
+  if brun run -c "LOAD INTO '$t' UPSERT ON (id) AS SELECT 12 AS id, 'beta, gamma' AS name, 99 AS val UNION ALL SELECT 4 AS id, 'omega' AS name, 40 AS val;" &&
+     brun run -c "LOAD INTO '$t' UPSERT ON (id) PARTIAL COLS (val) AS SELECT 13 AS id, 70 AS val;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_up.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-upsert" "$out/dw_$1_up.csv" "$out/dw_up.csv"
+  else
+    report "$1-delta-write-upsert (run error)" bad
+  fi
+  printf 'id,name,val\n1,alpha,11\n2,"beta, gamma",\n3,delta,8\n4,omega,41\n11,alpha,11\n12,"beta, gamma",100\n13,delta,71\n' >"$out/dw_sp.csv"
+  if brun run -j 4 --op-memory 1KB -c "LOAD INTO '$t' UPSERT ON (id) AS SELECT id, name, val + 1 AS val FROM '$t';" &&
+     brun run -c "LOAD INTO '$out/dw_$1_sp.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-upsert-spilled" "$out/dw_$1_sp.csv" "$out/dw_sp.csv"
+  else
+    report "$1-delta-write-upsert-spilled (run error)" bad
+  fi
+  printf 'n\n0\n' >"$out/dw_empty.csv"
+  if brun run -c "LOAD INTO '$2dwe_$$/' WITH (format = 'delta') UPSERT ON (id) AS SELECT * FROM 'tests/integration/seed.csv' WHERE id > 99;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_empty.csv' AS SELECT COUNT(*) AS n FROM '$2dwe_$$/';"; then
+    check "$1-delta-write-empty-upsert" "$out/dw_$1_empty.csv" "$out/dw_empty.csv"
+  else
+    report "$1-delta-write-empty-upsert (run error)" bad
+  fi
+  if brun run -j 4 -c "LOAD INTO '$t' REPLACE AS SELECT id + 100 AS id, name, val FROM 'tests/integration/seed.csv' WHERE id = 1;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_rep.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-replace" "$out/dw_$1_rep.csv" "$out/dw_rep.csv"
+  else
+    report "$1-delta-write-replace (run error)" bad
+  fi
+}
+
 # Azure Blob (Azurite). ADLS Gen2 data is reached through the Blob endpoint —
 # Azurite implements no DFS endpoint and no hierarchical namespace. Credentials
 # are Azurite's published well-known devstore pair, not a secret.
@@ -929,6 +977,7 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
   else
     report "azure-lake (upload error)" bad
   fi
+  lakewrite azure "az://devstoreaccount1/basalt-it/"
 fi
 
 # S3 (SeaweedFS). Real SigV4 signing, ListObjectsV2 and ranged GETs against an S3
@@ -1077,6 +1126,7 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
   else
     report "s3-lake (upload error)" bad
   fi
+  lakewrite s3 "s3://basalt-it/"
 fi
 
 # Quoted column names, end to end. Headers with spaces are the rule in

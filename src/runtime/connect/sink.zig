@@ -49,6 +49,7 @@ const types = @import("../../lang/types.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const eval = @import("../../exec/eval.zig");
 const formats = @import("../../format/formats.zig");
+const delta_write = @import("../../format/lake/delta_write.zig");
 
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.
@@ -254,7 +255,15 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return pw.sink();
             },
-            .delta => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, formats.of(std.meta.activeTag(env.write_opts)).write_refused.? })),
+            .delta => |o| {
+                if (w.mode == .upsert and w.mode.upsert.keys.len == 0)
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
+                const p = delta_write.plan(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
+                    return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
+                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.sort_threads, .err = env.errctx }) catch |e|
+                    return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
+                return ds.sink();
+            },
             .records => |opts| {
                 const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|
                     return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));

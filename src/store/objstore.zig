@@ -266,6 +266,7 @@ pub const Provider = struct {
         request_headers: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, method: []const u8, range: []const u8) anyerror![]const std.http.Header,
         status_to_error: *const fn (code: u16, body: []const u8) anyerror,
         open_writer: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!Writer,
+        put_if_absent: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool,
     };
 };
 
@@ -288,6 +289,13 @@ pub const Object = struct {
 
     pub fn openWriter(self: Object, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) !Writer {
         return self.provider.vtable.open_writer(self.ptr, arena, client, content_type);
+    }
+
+    /// Writes `bytes` as the object only if none is there, in one request: true
+    /// when it made it, false when one existed. `why` gets the store's message on
+    /// failure.
+    pub fn putIfAbsent(self: Object, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) !bool {
+        return self.provider.vtable.put_if_absent(self.ptr, arena, client, bytes, content_type, why);
     }
 };
 

@@ -330,6 +330,11 @@ pub const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 pub const xlsxSheetFromHints = @import("analyze/targets.zig").xlsxSheetFromHints;
 pub const WriteOptions = @import("analyze/targets.zig").WriteOptions;
 pub const writeOptions = @import("analyze/targets.zig").writeOptions;
+pub const writeFormat = @import("analyze/targets.zig").writeFormat;
+pub const deltaTarget = @import("analyze/targets.zig").deltaTarget;
+pub const partitionBy = @import("analyze/targets.zig").partitionBy;
+const delta_write = @import("../format/lake/delta_write.zig");
+const lake = @import("../format/lake/table.zig");
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
@@ -354,6 +359,8 @@ pub const Sink = struct {
     connector: []const u8,
     target: []const u8,
     mode: []const u8,
+    /// The format a sink writes when its path does not say, as a Delta table's.
+    format: ?[]const u8 = null,
 };
 
 pub const Stage = struct {
@@ -1394,6 +1401,8 @@ const Ctx = struct {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
         };
+        var sink_out = sink;
+        if (try self.offlineDelta(w, stages[stages.len - 1].hints, cur)) |label| sink_out.mode = try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ sink.mode, label });
 
         const src_is_sql = isSqlSource(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or
@@ -1403,7 +1412,7 @@ const Ctx = struct {
         return .{
             .source = source,
             .stages = try stage_infos.toOwnedSlice(),
-            .sink = sink,
+            .sink = sink_out,
             .physical = .{
                 .has_breaker = has_breaker,
                 .splittable = splittable,
@@ -1412,6 +1421,21 @@ const Ctx = struct {
                 .top_n = if (top_n) |t| (if (!t.sorted or breakers == 1) t.rows else null) else null,
             },
         };
+    }
+
+    /// A local Delta target planned as a run would, so `check` refuses a table it
+    /// cannot write or rows that do not fit it; its label, or null when the target
+    /// is remote, templated, or no Delta table.
+    fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema: ?types.Schema) !?[]const u8 {
+        if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
+        const opts = try writeOptions(self.arena, w, hints, self.diag);
+        const create = (formatFromHints(hints, self.diag) catch null) == .delta;
+        const p = delta_write.plan(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
+            if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
+            _ = eval.takeFailure(e);
+            return null;
+        };
+        return try p.label(self.arena);
     }
 
     /// Every binding's read, a UNION branch's among them, is checked where it is
@@ -1527,6 +1551,8 @@ const Ctx = struct {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
+            if (deltaTarget(w, hints))
+                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.modeOf(w.mode).label(self.arena), .format = "delta" };
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
@@ -1787,6 +1813,12 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     const encodes = to_file and containsName(formats.of((try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv).write_keys, "encoding");
     if (hintText(hints, "encoding") != null and !encodes)
         return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
+    if (to_file) if (try writeFormat(w, hints, diag)) |f| if (folder.isFolder(w.target) and f != .delta)
+        return fail(diag, "cannot write `{s}`: a folder is written as a Delta table, not as {s} files; drop `format`, or name a file", .{ w.target, formats.of(f).label });
+    if (deltaTarget(w, hints)) {
+        if (delta_write.storeProblem(w.target)) |why| return fail(diag, "cannot write Delta table `{s}`: {s}", .{ w.target, why });
+        return;
+    }
     if (w.mode == .upsert)
         return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
     if (w.mode == .append) {
@@ -1806,7 +1838,7 @@ const file_writes = blk: {
     var out: [formats.table.len]struct { keys: []const []const u8, what: []const u8, takes: []const u8 } = undefined;
     for (formats.table, &out) |f, *o| o.* = .{
         .keys = f.write_keys ++ .{"encoding"},
-        .what = f.read_what[0 .. f.read_what.len - " read".len] ++ " file",
+        .what = f.read_what[0 .. f.read_what.len - " read".len] ++ (if (std.mem.endsWith(u8, f.read_what, "table read")) "" else " file"),
         .takes = formats.takes(f.write_keys),
     };
     break :blk out;
@@ -1828,7 +1860,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     const file = std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdout");
     const stream = if (registry.Connector.parse(connector)) |c| c.streamLoad() else false;
     const to_file = file and w.target.len > 0;
-    const fw = if (to_file) &file_writes[@intFromEnum((formatFromHints(hints, diag) catch null) orelse formatOfPath(w.target) orelse .csv)] else null;
+    const fw = if (to_file) &file_writes[@intFromEnum((writeFormat(w, hints, diag) catch null) orelse .csv)] else null;
     const keys: []const []const u8 = if (fw) |f| f.keys else if (file) file_sink_keys else if (stream) &stream_sink_keys else &table_sink_keys;
     for (hints) |h| {
         if (containsName(keys, h.key)) continue;
@@ -1842,7 +1874,9 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         diag.pos = h.pos;
         return e;
     }
-    _ = try writeOptions(w, hints, diag);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    _ = try writeOptions(scratch.allocator(), w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
     const form = w.form orelse return;
     if (stream and std.mem.eql(u8, form, "stream_load")) return;

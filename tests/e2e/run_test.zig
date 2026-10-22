@@ -14,4 +14,5 @@ test {
     _ = @import("outcome.zig");
     _ = @import("records_write.zig");
     _ = @import("lake.zig");
+    _ = @import("lake_write.zig");
 }
