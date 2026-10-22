@@ -46,10 +46,10 @@
 //! Per-thread state, since parallel lanes evaluate concurrently: `field_memo`
 //! (column index per name, verified on every hit so a stale entry costs one
 //! compare, never a wrong column), `RegexCache` (keyed by pattern bytes, not
-//! address, because batch-arena patterns reuse addresses), `reduce_memo`, and
-//! `fail_note`, the human reason for the last builtin failure. A note is tied to
-//! the error code it explains and dropped when evaluation restarts, so an error
-//! swallowed by TRY_CAST or a fallback never lends its note to a later one.
+//! address, because batch-arena patterns reuse addresses), and `fail_note`, the
+//! human reason for the last builtin failure. A note is tied to the error code it
+//! explains and dropped when evaluation restarts, so an error swallowed by
+//! TRY_CAST or a fallback never lends its note to a later one.
 //!
 //! Rendering: `valueToString` spells a value as text; years before 0 print with
 //! a sign.

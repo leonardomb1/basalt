@@ -547,18 +547,14 @@ pub fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory
     }
 }
 
-threadlocal var reduce_memo: struct { args: ?[*]const *ast.Expr = null, schema: ?*const types.Schema = null, ty: Type = undefined } = .{};
-
+/// The accumulator type, typed afresh per row: a memo keyed by the call's address
+/// would hand a re-planned call at a reused address the old plan's type.
 pub fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) EvalError!Type {
-    const m = &reduce_memo;
-    if (m.args == c.args.ptr and m.schema == batch.schema) return m.ty;
     var tc = TypeCtx{ .schema = batch.schema.*, .arena = arena };
-    const ty = typing.reduceAcc(&tc, c) catch |e| switch (e) {
+    return typing.reduceAcc(&tc, c) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TypeError => return error.TypeMismatch,
     };
-    m.* = .{ .args = c.args.ptr, .schema = batch.schema, .ty = ty };
-    return ty;
 }
 
 test "integer arithmetic overflow is an error, not a silent wrap" {
