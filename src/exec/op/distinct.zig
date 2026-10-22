@@ -97,7 +97,7 @@ pub const Distinct = struct {
             break :blk all;
         };
         const kinds = try self.state.alloc(keyhash.KeyKind, key_idx.len);
-        var fixed = true;
+        var fixed = key_idx.len <= keyhash.max_fixed_keys;
         for (key_idx, kinds) |ci, *k| k.* = keyhash.keyKindOf(self.in_schema.fields[ci].ty.kind) orelse blk: {
             fixed = false;
             break :blk .i64k;

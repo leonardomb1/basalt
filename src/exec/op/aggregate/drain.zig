@@ -291,7 +291,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     defer scratch.deinit();
     const pull = scratch.allocator();
 
-    if (self.by.len != 0) fixed: {
+    if (self.by.len != 0 and self.by.len <= keyhash.max_fixed_keys) fixed: {
         const kinds = try self.state.alloc(KeyKind, self.by.len);
         for (self.by, kinds) |ci, *k| k.* = keyKindOf(self.in_schema.fields[ci].ty.kind) orelse break :fixed;
         var counts_only = true;

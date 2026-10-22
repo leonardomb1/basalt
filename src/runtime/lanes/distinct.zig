@@ -58,6 +58,7 @@ const Keys = struct {
 
     fn of(a: std.mem.Allocator, schema: *const types.Schema, idx: []const usize) !Keys {
         const kinds = try a.alloc(keyhash.KeyKind, idx.len);
+        if (idx.len > keyhash.max_fixed_keys) return .{ .idx = idx, .kinds = null };
         for (idx, kinds) |ci, *k| k.* = keyhash.keyKindOf(schema.fields[ci].ty.kind) orelse return .{ .idx = idx, .kinds = null };
         return .{ .idx = idx, .kinds = kinds };
     }

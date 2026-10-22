@@ -43,6 +43,10 @@ pub fn canonValue(v: Value) Value {
 /// `valueEq`'s within that kind; null for a kind it boxes.
 pub const KeyKind = enum { i64k, i32k, boolk, f64k, strk };
 
+/// The most keys a fixed-width encoding takes: each row's NULL keys are one bit
+/// each in a `u64` mask, so wider keys are boxed.
+pub const max_fixed_keys = 64;
+
 pub fn keyKindOf(kind: types.TypeKind) ?KeyKind {
     return switch (kind) {
         .int, .time, .timestamp => .i64k,

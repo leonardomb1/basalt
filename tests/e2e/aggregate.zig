@@ -522,3 +522,36 @@ test "an expression over grouping expressions sits in SELECT, HAVING and ORDER B
         try std.testing.expectEqualStrings(r[1], pdiag.msg);
     }
 }
+
+test "past 64 key columns a NULL in one key is told apart from a NULL in another: DISTINCT * and GROUP BY, one lane and four" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    var cols = std.array_list.Managed(u8).init(alloc);
+    defer cols.deinit();
+    for (0..70) |i| {
+        if (i > 0) try cols.append(',');
+        try cols.writer().print("c{d}", .{i});
+    }
+    try csv.appendSlice(cols.items);
+    try csv.append('\n');
+    for ([_]usize{ 0, 64, 0 }) |empty| {
+        for (0..70) |i| {
+            if (i > 0) try csv.append(',');
+            if (i != empty) try csv.append('0');
+        }
+        try csv.append('\n');
+    }
+    const distinct = "SELECT COUNT(*) AS n FROM (SELECT DISTINCT * FROM '$IN') d";
+    const grouped = try std.fmt.allocPrint(alloc, "SELECT COUNT(*) AS n FROM (SELECT {s}, COUNT(*) AS k FROM '$IN' GROUP BY {s}) g", .{ cols.items, cols.items });
+    defer alloc.free(grouped);
+    for ([_]usize{ 1, 4 }) |threads| {
+        for ([_][]const u8{ distinct, grouped }) |q| {
+            const out = try runCsvThreaded(alloc, &tmp, csv.items, q, threads);
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings("n\n2\n", out);
+        }
+    }
+}

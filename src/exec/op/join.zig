@@ -428,6 +428,7 @@ pub const JoinIndex = struct {
                 break :blk .i64k;
             };
         }
+        if (right_keys.len > keyhash.max_fixed_keys) self.fixed = false;
         self.want = want;
         self.kinds = kinds;
         const chain = try state.alloc(u32, n);

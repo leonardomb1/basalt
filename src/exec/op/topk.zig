@@ -232,7 +232,7 @@ pub const TopK = struct {
         if (self.lookup) |*l| return l;
         const sa = self.state.allocator();
         const kinds = try sa.alloc(keyhash.KeyKind, self.part.len);
-        var fixed = true;
+        var fixed = self.part.len <= keyhash.max_fixed_keys;
         for (self.part, kinds) |ci, *kk| kk.* = keyhash.keyKindOf(self.schema.fields[ci].ty.kind) orelse blk: {
             fixed = false;
             break :blk .i64k;
