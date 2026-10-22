@@ -25,6 +25,7 @@ const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
+const fits = @import("../bytes.zig").fits;
 
 pub const Error = error{
     ZipMemberNotFound,
@@ -111,7 +112,7 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
         const loc = try lr.takeStruct(zip.EndLocator64, .little);
         if (!std.mem.eql(u8, &loc.signature, &zip.end_locator64_sig)) return Error.ZipBadCentralDirectory;
         if (loc.total_disk_count != 1) return Error.ZipMultiDiskUnsupported;
-        if (loc.record_file_offset + @sizeOf(zip.EndRecord64) > total) return Error.ZipBadCentralDirectory;
+        if (!fits(loc.record_file_offset, @sizeOf(zip.EndRecord64), total)) return Error.ZipBadCentralDirectory;
         var rr = std.Io.Reader.fixed(try src.range(arena, loc.record_file_offset, @sizeOf(zip.EndRecord64)));
         const end64 = try rr.takeStruct(zip.EndRecord64, .little);
         if (!std.mem.eql(u8, &end64.signature, &zip.end_record64_sig)) return Error.ZipBadCentralDirectory;
@@ -119,7 +120,7 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
         cd_size = end64.central_directory_size;
         cd_off = end64.central_directory_offset;
     }
-    if (cd_off + cd_size > total) return Error.ZipBadCentralDirectory;
+    if (!fits(cd_off, cd_size, total)) return Error.ZipBadCentralDirectory;
 
     const cd = if (cd_off >= tail_off)
         tail[@intCast(cd_off - tail_off)..][0..@intCast(cd_size)]
@@ -191,12 +192,12 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
     }
 
     const lh_len = @sizeOf(zip.LocalFileHeader);
-    if (e.local_offset + lh_len > m.src.size()) return Error.ZipBadFileOffset;
+    if (!fits(e.local_offset, lh_len, m.src.size())) return Error.ZipBadFileOffset;
     var hr = std.Io.Reader.fixed(try m.src.range(arena, e.local_offset, lh_len));
     const lh = try hr.takeStruct(zip.LocalFileHeader, .little);
     if (!std.mem.eql(u8, &lh.signature, &zip.local_file_header_sig)) return Error.ZipBadFileOffset;
     const data_off = e.local_offset + lh_len + lh.filename_len + lh.extra_len;
-    if (data_off + e.compressed_size > m.src.size()) return Error.ZipBadFileOffset;
+    if (!fits(data_off, e.compressed_size, m.src.size())) return Error.ZipBadFileOffset;
 
     const inner: *std.Io.Reader = switch (m.src) {
         .memory => unreachable,
@@ -208,7 +209,7 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         .remote => |rm| blk: {
             if (rm.whole != null or e.compressed_size == 0) {
                 const w = rm.whole orelse "";
-                if (e.compressed_size > 0 and data_off + e.compressed_size > w.len) return Error.ZipBadFileOffset;
+                if (e.compressed_size > 0 and !fits(data_off, e.compressed_size, w.len)) return Error.ZipBadFileOffset;
                 m.body = .{ .fixed = .fixed(if (e.compressed_size == 0) "" else w[@intCast(data_off)..][0..@intCast(e.compressed_size)]) };
                 break :blk &m.body.fixed;
             }

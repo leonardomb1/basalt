@@ -18,6 +18,12 @@ pub fn isRemote(path: []const u8) bool {
         std.mem.startsWith(u8, path, "https://");
 }
 
+/// Whether `len` bytes at `off` lie within `total`, without the sum that a huge
+/// offset from a file's own header would wrap.
+pub fn fits(off: u64, len: u64, total: u64) bool {
+    return off <= total and len <= total - off;
+}
+
 pub const Bytes = union(enum) {
     memory: []const u8,
     file: struct { f: std.fs.File, size: u64 },
@@ -72,29 +78,29 @@ pub const Bytes = union(enum) {
     pub fn range(self: Bytes, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         switch (self) {
             .memory => |m| {
-                if (off + len > m.len) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, m.len)) return error.ByteRangeOutOfFile;
                 return m[@intCast(off)..][0..len];
             },
             .file => |x| {
-                if (off + len > x.size) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, x.size)) return error.ByteRangeOutOfFile;
                 const buf = try arena.alloc(u8, len);
                 const n = try x.f.preadAll(buf, off);
                 if (n != len) return error.ByteRangeOutOfFile;
                 return buf;
             },
             .remote => |r| {
-                if (off + len > r.total) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, r.total)) return error.ByteRangeOutOfFile;
                 return r.read(arena, off, len);
             },
             .sftp => |f| {
-                if (off + len > f.size) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, f.size)) return error.ByteRangeOutOfFile;
                 return f.read(arena, off, len) catch |e| switch (e) {
                     error.EndOfStream => error.ByteRangeOutOfFile,
                     else => e,
                 };
             },
             .smb => |f| {
-                if (off + len > f.size) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, f.size)) return error.ByteRangeOutOfFile;
                 return f.read(arena, off, len) catch |e| switch (e) {
                     error.EndOfStream => error.ByteRangeOutOfFile,
                     else => e,
@@ -161,7 +167,7 @@ pub const Remote = struct {
     pub fn read(self: *Remote, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         if (len == 0) return "";
         if (self.whole) |w| {
-            if (off + len > w.len) return error.ByteRangeOutOfFile;
+            if (!fits(off, len, w.len)) return error.ByteRangeOutOfFile;
             return w[@intCast(off)..][0..len];
         }
 
@@ -175,7 +181,7 @@ pub const Remote = struct {
             200 => {
                 const kept = try self.arena.dupe(u8, res.body);
                 self.whole = kept;
-                if (off + len > kept.len) return error.ByteRangeOutOfFile;
+                if (!fits(off, len, kept.len)) return error.ByteRangeOutOfFile;
                 return kept[@intCast(off)..][0..len];
             },
             else => return self.statusError(res.code, res.body),
@@ -330,4 +336,17 @@ test "a ranged read replays a 503, a reset and a 504 before the 206" {
     try testing.expectEqual(@as(usize, 4), srv.requests());
     try testing.expectError(error.HttpNotFound, r.read(a, 2, 4));
     try testing.expectEqual(@as(usize, 5), srv.requests());
+}
+
+test "a range whose offset plus length would wrap is out of the file, never a slice past it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const max = std.math.maxInt(u64);
+    try std.testing.expect(fits(2, 3, 5));
+    try std.testing.expect(!fits(2, 4, 5));
+    try std.testing.expect(!fits(max, 2, 5));
+    try std.testing.expect(!fits(4, max, 5));
+    const b = Bytes{ .memory = "hello" };
+    try std.testing.expectError(error.ByteRangeOutOfFile, b.range(ar.allocator(), max - 1, 4));
+    try std.testing.expectEqualStrings("llo", try b.range(ar.allocator(), 2, 3));
 }
