@@ -321,7 +321,7 @@ pub const Reader = struct {
         const attrs = try self.attrsOf(arena, o);
         for (attrs) |a| try cells.append(.{ .kind = .attr, .name = a.name, .value = a.value });
         if (o.self_closing) return cells.items;
-        const node = try self.readBody(arena, name, attrs, false);
+        const node = try self.readBody(arena, name, attrs, false, 0);
         for (node.children, 0..) |child, i| {
             const dup = for (node.children[0..i]) |p| {
                 if (std.mem.eql(u8, p.name, child.name)) break true;
@@ -338,8 +338,11 @@ pub const Reader = struct {
         return cells.items;
     }
 
-    /// The rest of an element just opened, children and text, up to its close.
-    fn readBody(self: *Reader, arena: std.mem.Allocator, name: []const u8, attrs: []const Attr, nil: bool) anyerror!*Node {
+    /// The rest of an element just opened, children and text, up to its close; a
+    /// row nested past `max_depth` is refused, which bounds every walk of its tree.
+    fn readBody(self: *Reader, arena: std.mem.Allocator, name: []const u8, attrs: []const Attr, nil: bool, depth: usize) anyerror!*Node {
+        if (depth > max_depth)
+            return self.malformed(std.fmt.allocPrint(self.arena, "row {d}, a `{s}` element, nests elements more than {d} deep", .{ self.rows_seen, self.row_name, max_depth }) catch "a row nests too deep");
         var children = std.array_list.Managed(*const Node).init(arena);
         var text = Text{};
         while (try self.tz.next()) |t| {
@@ -360,7 +363,7 @@ pub const Reader = struct {
                         const leaf = try arena.create(Node);
                         leaf.* = .{ .name = cname, .attrs = cattrs, .text = "", .children = &.{}, .nil = cnil };
                         try children.append(leaf);
-                    } else try children.append(try self.readBody(arena, cname, cattrs, cnil));
+                    } else try children.append(try self.readBody(arena, cname, cattrs, cnil, depth + 1));
                 },
                 .text => |raw| try text.add(self, arena, raw, true),
                 .cdata => |raw| try text.add(self, arena, raw, false),
@@ -432,6 +435,7 @@ pub const Reader = struct {
     const max_names = 4096;
     const max_row_bytes = 64 << 20;
     const max_row_elems = 100_000;
+    const max_depth = 128;
 
     /// A tag's attributes, decoded, but for namespace declarations and `xsi:` ones.
     fn attrsOf(self: *Reader, arena: std.mem.Allocator, o: token.Tag) ![]const Attr {
@@ -613,5 +617,11 @@ test "a document cut short, with no element or text outside its root, is an erro
     try testing.expectError(error.BadXml, readAll(a, "{\"a\":1}\n{\"a\":2}\n", .{}));
     try testing.expectError(error.BadXml, readAll(a, "", .{}));
     try testing.expectError(error.BadXml, readAll(a, "<r><x/></r><r><x/></r>", .{}));
+    var deep = std.array_list.Managed(u8).init(a);
+    try deep.appendSlice("<r><row>");
+    for (0..20_000) |_| try deep.appendSlice("<a>");
+    for (0..20_000) |_| try deep.appendSlice("</a>");
+    try deep.appendSlice("</row></r>");
+    try testing.expectError(error.BadXml, readAll(a, deep.items, .{}));
     try testing.expectEqual(@as(usize, 0), (try readAll(a, "<r/>", .{})).rows.len);
 }
