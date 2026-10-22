@@ -208,6 +208,10 @@ pub fn derive(key: []const u8, constant: []const u8) Key {
     return k;
 }
 
+/// The most PBKDF2 rounds a KDC may ask for: the default is 4096, and an
+/// unauthenticated reply asking billions would stall the login for hours.
+const max_iterations: u32 = 1 << 20;
+
 /// The key of a password (RFC 3962 4): PBKDF2-HMAC-SHA1 over the salt, then DK
 /// with "kerberos". `iterations` defaults to 4096 when the KDC sends no params.
 pub fn stringToKey(etype: i32, password: []const u8, salt: []const u8, iterations: u32) !Key {
@@ -593,7 +597,7 @@ pub fn asExchange(gpa: std.mem.Allocator, cred: Credential) !Ticket {
             var j: usize = 0;
             only_rc4 = true;
             while (El.at(entries.body, j)) |ent| : (j = ent.end) {
-                const et: i32 = @intCast((ent.field(0) orelse continue).int());
+                const et = std.math.cast(i32, (ent.field(0) orelse continue).int()) orelse continue;
                 if (et != etype_aes256 and et != etype_aes128) continue;
                 only_rc4 = false;
                 if (found and et != etype_aes256) continue;
@@ -606,6 +610,7 @@ pub fn asExchange(gpa: std.mem.Allocator, cred: Credential) !Ticket {
                 }
                 if (ent.field(2)) |p| if (p.body.len == 4) {
                     iterations = std.mem.readInt(u32, p.body[0..4], .big);
+                    if (iterations == 0 or iterations > max_iterations) return fail(error.KrbProtocol, "the KDC asks for {d} key-derivation rounds; basalt accepts 1 to {d}", .{ iterations, max_iterations });
                 };
             }
         }
