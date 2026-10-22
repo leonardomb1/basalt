@@ -81,6 +81,17 @@ pub fn buildNested(arena: std.mem.Allocator, schema: []const parquet.SchemaEleme
     return buildNode(arena, schema, &pos, root.base_def, root.base_rep, &next, 0);
 }
 
+/// Whether assembling `n` shows an object: a struct or a map anywhere in it, as
+/// the assembler reads it. A list of a one-field struct has a single leaf, yet
+/// its elements are objects.
+pub fn holdsStruct(n: *const NNode) bool {
+    return switch (n.kind) {
+        .leaf => false,
+        .group, .map => true,
+        .list => if (Assembler.elementOf(&n.children[0], false)) |el| holdsStruct(el) else holdsStruct(&n.children[0]),
+    };
+}
+
 const Span = struct { lo: usize, hi: usize };
 
 const Assembler = struct {

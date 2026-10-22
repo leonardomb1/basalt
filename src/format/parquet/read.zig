@@ -99,6 +99,7 @@ pub const readEntries = @import("chunk.zig").readEntries;
 pub const NNode = @import("nested.zig").NNode;
 pub const Nested = @import("nested.zig").Nested;
 pub const buildNested = @import("nested.zig").buildNested;
+const holdsStruct = @import("nested.zig").holdsStruct;
 pub const assembleNested = @import("nested.zig").assembleNested;
 pub const Bound = @import("stats.zig").Bound;
 pub const KeyBound = @import("stats.zig").KeyBound;
@@ -197,7 +198,7 @@ pub const Reader = struct {
         for (all, 0..) |lf, li| {
             const shared = if (lf.root) |rt| for (all, 0..) |other, oi| {
                 if (oi != li and other.root != null and other.root.?.idx == rt.idx) break true;
-            } else false else false;
+            } else holdsStruct(&try buildNested(arena, md.schema, rt)) else false;
             if (shared) {
                 const rt = lf.root.?;
                 for (roots_seen.items) |x| {
@@ -629,6 +630,18 @@ test "parquet LIST columns read as JSON from pyarrow (pages v1 and v2) and polar
         \\id=4 xs=[null,5] ss=[]
         \\
     , try readAllText(a, @embedFile("../testdata/lists_polars.parquet"), "p.parquet"));
+}
+
+test "a list of a one-field struct reads as a list of objects, as DuckDB wrote and reads it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectEqualStrings(
+        \\id=1 xs=[{"ab":0},{"ab":1}]
+        \\id=2 xs=[{"ab":null},null]
+        \\id=3 xs=[]
+        \\id=4 xs=null
+        \\
+    , try readAllText(ar.allocator(), @embedFile("../testdata/list_one_field_struct.parquet"), "l.parquet"));
 }
 
 test "a nested fixture with bytes flipped anywhere errors or reads, never crashes" {
