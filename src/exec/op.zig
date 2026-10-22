@@ -154,6 +154,7 @@ pub fn errLabel(e: anyerror) []const u8 {
         error.InterpFailed => "a `${...}` interpolation failed",
         error.JoinBuildTooLarge => "join build side exceeds its cap — raise it with WITH (max_build = '8GB') on the join, filter the CTE, or flip the join",
         error.SpillCapExceeded => "spilling to disk passed the run's cap — raise it with --spill-cap, give operators more memory with --op-memory, or filter earlier",
+        error.HttpBodyTooLarge => "an HTTP response body decoded past 256 MiB — ask the endpoint for smaller pages",
         error.CorruptSpill => "a spill file read back corrupt — the scratch directory was changed or the disk failed during the run",
         else => @errorName(e),
     };

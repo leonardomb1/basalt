@@ -99,6 +99,9 @@ const obs = @import("../runtime/obs.zig");
 const percent = @import("percent.zig");
 const http_fake = @import("../testing/http_fake.zig");
 
+/// The most one response body may decode to, a page or a login reply.
+const max_page_bytes = 256 << 20;
+
 /// Adds to `bundle` each certificate the server presents that verifies against one
 /// already there, repeating to a fixpoint so order doesn't matter. Trusts nothing
 /// new that does not chain to an existing root; true if the bundle grew.
@@ -288,23 +291,21 @@ pub const AuthState = struct {
             payload = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = map }, .{});
         }
 
-        var aw = std.Io.Writer.Allocating.init(arena);
-        const res = try client.fetch(.{
+        const res = try objstore.exchange(arena, client, .{
             .method = .POST,
-            .location = .{ .url = self.cc.login_url },
-            .headers = .{ .content_type = .{ .override = content_type } },
+            .url = self.cc.login_url,
             .payload = payload,
-            .decompress_buffer = decompress_direct,
-            .response_writer = &aw.writer,
+            .content_type = content_type,
+            .max_body = max_page_bytes,
         });
-        const code = @intFromEnum(res.status);
+        const code = res.code;
         if (code != 200) {
-            const b = aw.writer.buffered();
+            const b = res.body;
             var ub: [512]u8 = undefined;
             obs.logOr(self.logger, .err, "login http {d} from {s}: {f}", .{ code, redactUrl(&ub, self.cc.login_url), std.zig.fmtString(b[0..@min(b.len, 300)]) });
             return statusError(code);
         }
-        const body = std.mem.trim(u8, aw.writer.buffered(), " \t\r\n");
+        const body = std.mem.trim(u8, res.body, " \t\r\n");
         if (body.len == 0) return error.LoginTokenMissing;
         try jt.validate(arena, body);
         const path = if (self.cc.token_path.len > 0)
@@ -887,6 +888,7 @@ pub const HttpSource = struct {
                 .payload = slot.req_body,
                 .content_type = slot.content_type,
                 .user_agent = slot.user_agent,
+                .max_body = max_page_bytes,
             }) catch |e| {
                 attempt += 1;
                 if (isRetryableNet(e) and attempt <= slot.retries and !driver.aborting()) {
@@ -1035,6 +1037,7 @@ pub const HttpSource = struct {
             .payload = req.body,
             .content_type = self.contentType(),
             .user_agent = userAgentOf(self.opts),
+            .max_body = max_page_bytes,
         });
         if (res.code == 204) return "";
         if (res.code != 200) return self.raiseStatus(res.code, req.url, res.body);

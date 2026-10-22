@@ -168,11 +168,13 @@ pub const Call = struct {
     content_type: ?[]const u8 = null,
     identity: bool = false,
     user_agent: ?[]const u8 = null,
+    max_body: ?usize = null,
 };
 
 /// One request, its body read whole into `arena` and decoded per its
 /// Content-Encoding; `identity` asks for none, as a byte range of a compressed body
-/// cannot be decoded. A bodiless request follows up to three redirects, here rather
+/// cannot be decoded. A body that decodes past `max_body` bytes is
+/// `HttpBodyTooLarge`, so a compressed bomb stops at the cap. A bodiless request follows up to three redirects, here rather
 /// than in std, which keeps `extra_headers` on a redirect to another host: a hop to
 /// another scheme, host or port drops `headers`, so a token or key never leaves its
 /// origin. Header values are copied out before the body is read, which invalidates
@@ -270,10 +272,16 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, 
     var transfer_buf: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = resp.readerDecompressing(&transfer_buf, &decompress, http_client.decompress_direct);
-    _ = reader.streamRemaining(&aw.writer) catch |e| switch (e) {
-        error.ReadFailed => return resp.bodyErr().?,
-        else => |x| return x,
-    };
+    var left: usize = call.max_body orelse std.math.maxInt(usize);
+    while (true) {
+        const n = reader.stream(&aw.writer, .limited(left +| 1)) catch |e| switch (e) {
+            error.EndOfStream => break,
+            error.ReadFailed => return resp.bodyErr().?,
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        if (n > left) return error.HttpBodyTooLarge;
+        left -= n;
+    }
     out.body = aw.writer.buffered();
     return out;
 }
@@ -828,4 +836,23 @@ test "a redirect to another host drops the request's headers; one within the ori
     const far = try exchange(a, &client, .{ .method = .GET, .url = try home.url(a, "/b"), .headers = &auth });
     try std.testing.expectEqualStrings("far", far.body);
     try std.testing.expect(std.mem.indexOf(u8, other.headOf(0), "s3cret") == null);
+}
+
+test "exchange stops a body at max_body" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var srv: FakeServer = undefined;
+    try srv.start(&.{
+        FakeServer.reply("200 OK", "", "x" ** 100),
+        FakeServer.reply("200 OK", "", "x" ** 100),
+    });
+    defer srv.stop();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    const url = try srv.url(a, "/k");
+
+    try std.testing.expectError(error.HttpBodyTooLarge, exchange(a, &client, .{ .method = .GET, .url = url, .max_body = 99 }));
+    const ok = try exchange(a, &client, .{ .method = .GET, .url = url, .max_body = 100 });
+    try std.testing.expectEqual(@as(usize, 100), ok.body.len);
 }

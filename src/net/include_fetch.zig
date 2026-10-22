@@ -18,8 +18,10 @@ fn get(_: *anyopaque, arena: std.mem.Allocator, url: []const u8, header: ?std.ht
     var client = http_client.initClient(arena);
     defer client.deinit();
     const one = [1]std.http.Header{header orelse .{ .name = "", .value = "" }};
-    const r = try objstore.exchange(arena, &client, .{ .method = .GET, .url = url, .headers = if (header != null) &one else &.{} });
+    const r = objstore.exchange(arena, &client, .{ .method = .GET, .url = url, .headers = if (header != null) &one else &.{}, .max_body = max_bytes }) catch |e| switch (e) {
+        error.HttpBodyTooLarge => return error.IncludeTooLarge,
+        else => |x| return x,
+    };
     if (r.code != 200) return http_client.statusError(r.code);
-    if (r.body.len > max_bytes) return error.IncludeTooLarge;
     return r.body;
 }
