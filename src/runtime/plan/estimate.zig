@@ -32,7 +32,6 @@ const resolveDbConfig = @import("../connect/dbconfig.zig").resolveDbConfig;
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
-const sqlStr = @import("../pushdown.zig").sqlStr;
 
 pub const Estimate = struct {
     rows: ?u64 = null,
@@ -202,15 +201,15 @@ pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const
     switch (dialect) {
         .postgres => {
             const obj = try quoted(arena, parts, '"', '"');
-            return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try sqlStr(arena, obj)});
+            return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try dialect.strLit(arena, obj)});
         },
         .sqlserver => {
             const obj = try quoted(arena, parts, '[', ']');
-            return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try sqlStr(arena, obj)});
+            return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try dialect.strLit(arena, obj)});
         },
         .mysql, .starrocks, .doris => {
-            const schema = if (parts.len >= 2) try sqlStr(arena, parts[parts.len - 2]) else "DATABASE()";
-            return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ schema, try sqlStr(arena, table) });
+            const schema = if (parts.len >= 2) try dialect.strLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ schema, try dialect.strLit(arena, table) });
         },
     }
 }

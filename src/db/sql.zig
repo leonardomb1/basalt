@@ -260,6 +260,19 @@ pub const Dialect = enum {
         };
     }
 
+    /// `s` as a string literal: quotes doubled, and on the MySQL wire a `\`
+    /// doubled too, so a table or schema name from data cannot end the literal.
+    pub fn strLit(self: Dialect, arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+        var out = std.array_list.Managed(u8).init(arena);
+        try out.append('\'');
+        for (s) |c| {
+            if (c == '\'' or (c == '\\' and self.mysqlWire())) try out.append(c);
+            try out.append(c);
+        }
+        try out.append('\'');
+        return out.toOwnedSlice();
+    }
+
     fn qOpen(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
@@ -1519,4 +1532,13 @@ test "DDL and CAST spell each kind the way each dialect declares it" {
     try std.testing.expectEqualStrings("TINYINT(1)", try Dialect.mysql.ddlType(a, types.Type.init(.bool), false));
     try std.testing.expectEqualStrings("BIGINT", try Dialect.mysql.ddlType(a, types.Type.init(.int), false));
     try std.testing.expectEqualStrings("SIGNED", (try Dialect.mysql.castType(a, types.Type.init(.int))).?);
+}
+
+test "a string literal keeps a name from data inside it in every dialect" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("'x''); DROP TABLE t;--'", try Dialect.sqlserver.strLit(a, "x'); DROP TABLE t;--"));
+    try std.testing.expectEqualStrings("'a\\b'", try Dialect.postgres.strLit(a, "a\\b"));
+    try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
 }

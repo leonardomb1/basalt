@@ -69,28 +69,29 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
 /// Every primary-key column name for `table`, in key order, or empty when there
 /// is none. Used to infer upsert keys from the source.
 pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) ![]const []const u8 {
+    const lit = try dialect.strLit(arena, table);
     const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname
             \\FROM pg_index i
             \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            \\WHERE i.indrelid = '{s}'::regclass AND i.indisprimary
+            \\WHERE i.indrelid = {s}::regclass AND i.indisprimary
             \\ORDER BY (SELECT k FROM generate_subscripts(i.indkey, 1) k WHERE i.indkey[k] = a.attnum)
-        , .{table}),
+        , .{lit}),
         .sqlserver => try std.fmt.allocPrint(arena,
             \\SELECT c.name
             \\FROM sys.indexes i
             \\JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
             \\JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
-            \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
+            \\WHERE i.object_id = OBJECT_ID({s}) AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
-        , .{table}),
+        , .{lit}),
         .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME
             \\FROM information_schema.KEY_COLUMN_USAGE k
-            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = {s}
             \\ORDER BY k.ORDINAL_POSITION
-        , .{table}),
+        , .{lit}),
     };
     const conn = prober.open() catch return &.{};
     var cur = conn.queryCursor(query) catch {
@@ -110,6 +111,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
 }
 
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
+    const lit = try dialect.strLit(arena, table);
     const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
@@ -117,8 +119,8 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             \\JOIN pg_type t ON t.oid = a.atttypid
             \\JOIN pg_class c ON c.oid = i.indrelid
-            \\WHERE i.indrelid = '{s}'::regclass AND i.indisprimary
-        , .{table}),
+            \\WHERE i.indrelid = {s}::regclass AND i.indisprimary
+        , .{lit}),
         .sqlserver => try std.fmt.allocPrint(arena,
             \\SELECT c.name, ty.name, p.rows
             \\FROM sys.indexes i
@@ -126,17 +128,17 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\JOIN sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
             \\JOIN sys.types ty ON ty.user_type_id = c.user_type_id
             \\JOIN (SELECT object_id, SUM(rows) AS rows FROM sys.partitions WHERE index_id IN (0,1) GROUP BY object_id) p ON p.object_id = i.object_id
-            \\WHERE i.object_id = OBJECT_ID('{s}') AND i.is_primary_key = 1
+            \\WHERE i.object_id = OBJECT_ID({s}) AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
-        , .{table}),
+        , .{lit}),
         .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME, c.DATA_TYPE, t.TABLE_ROWS
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
             \\JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = k.TABLE_SCHEMA AND t.TABLE_NAME = k.TABLE_NAME
-            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = '{s}'
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = {s}
             \\ORDER BY k.ORDINAL_POSITION
-        , .{table}),
+        , .{lit}),
     };
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(query) catch {
