@@ -32,8 +32,8 @@ const Bitmap = @import("vec.zig").Bitmap;
 const max_digits = 38;
 
 fn fieldOf(comptime name: []const u8, rec: []const u8, pos: i64, len: i64) EvalError![]const u8 {
-    if (pos < 0 or len < 0 or pos + len > rec.len)
-        return failWith(error.CastFailed, "`" ++ name ++ "`: bytes {d}..{d} are outside the record's {d} bytes", .{ pos, pos + len, rec.len });
+    if (pos < 0 or len < 0 or pos > rec.len or len > @as(i64, @intCast(rec.len)) - pos)
+        return failWith(error.CastFailed, "`" ++ name ++ "`: {d} bytes at {d} are outside the record's {d} bytes", .{ len, pos, rec.len });
     const p: usize = @intCast(pos);
     return rec[p .. p + @as(usize, @intCast(len))];
 }
@@ -945,4 +945,8 @@ test "decoders read fields and encoders write them back" {
     try testing.expectEqual(@as(f64, 1.5), (try lit(a, "f64le_at(fmt_f64le(1.5), 0)")).float);
     try testing.expectError(error.CastFailed, lit(a, "fmt_u8(256)"));
     try testing.expectError(error.CastFailed, lit(a, "int_at('1 2', 0, 3)"));
+    try testing.expectError(error.CastFailed, lit(a, "byte_slice('abc', 1, 9223372036854775807)"));
+    try testing.expectError(error.CastFailed, lit(a, "text_at('abc', 9223372036854775807, 1)"));
+    try testing.expectError(error.CastFailed, lit(a, "byte_slice('abc', 2, 2)"));
+    try testing.expectEqualStrings("c", (try lit(a, "byte_slice('abc', 2, 1)")).bytes);
 }
