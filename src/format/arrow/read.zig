@@ -185,7 +185,19 @@ const TypeTag = enum(u8) {
     _,
 };
 
+/// How deep a field's children may nest; deeper is refused, so this parse and
+/// every walk over the tree after it stay within the stack.
+const max_depth = 64;
+
 fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
+    return parseFieldAt(arena, f, why, 0);
+}
+
+fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize) Error!Field {
+    if (depth > max_depth) {
+        why.* = "the schema nests fields more than 64 deep";
+        return Error.UnsupportedArrow;
+    }
     var out = Field{ .name = try arena.dupe(u8, (try f.string(0)) orelse ""), .kind = .null_ };
     const tag: TypeTag = @enumFromInt(try f.int(u8, 2, 0));
     const t = try f.table(3);
@@ -294,7 +306,7 @@ fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
     }
     if (try f.vector(5, 4)) |kids| {
         out.children = try arena.alloc(Field, kids.len);
-        for (out.children, 0..) |*c, i| c.* = try parseField(arena, try f.tableAt(kids, i), why);
+        for (out.children, 0..) |*c, i| c.* = try parseFieldAt(arena, try f.tableAt(kids, i), why, depth + 1);
     }
     const want_children: ?usize = switch (out.kind) {
         .list, .large_list, .fixed_list, .map => 1,
@@ -348,13 +360,15 @@ const Walk = struct {
     bi: usize = 0,
     vi: usize = 0,
 
+    /// A field node's length and null count. A length past 2^31-1 is refused, so
+    /// every buffer size computed from it (length times width) fits.
     fn node(self: *Walk) Error!struct { len: usize, nulls: usize } {
         if (self.ni >= self.nodes.len) return Error.CorruptArrow;
         const at = self.nodes.at + self.ni * 16;
         self.ni += 1;
         const len = try Fb.rd(i64, self.meta, at);
         const nulls = try Fb.rd(i64, self.meta, at + 8);
-        if (len < 0 or nulls < 0 or nulls > len) return Error.CorruptArrow;
+        if (len < 0 or len > std.math.maxInt(i32) or nulls < 0 or nulls > len) return Error.CorruptArrow;
         return .{ .len = @intCast(len), .nulls = @intCast(nulls) };
     }
 

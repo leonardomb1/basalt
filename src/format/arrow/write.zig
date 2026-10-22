@@ -749,3 +749,36 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         try std.testing.expectEqual(@as(usize, 6), rows);
     }
 }
+
+test "a batch and field length past 2^31-1 is refused by the reader, never multiplied into a wrapped buffer size" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]types.Schema.Field{.{ .name = "x", .ty = .{ .kind = .int, .nullable = true } }};
+    const schema = types.Schema{ .fields = &fields };
+    var xs = [_]?i64{ 1, 2, 3 };
+    var cols = [_]Column{try column.intColumn(a, &xs)};
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, schema, &.{});
+    defer sw.deinit();
+    try sw.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 3 });
+    try sw.finish();
+
+    const bytes = try a.dupe(u8, aw.written());
+    const f0 = try readFrame(bytes, 0);
+    const meta_at = f0.next + 8;
+    const ml: usize = std.mem.readInt(u32, bytes[f0.next + 4 ..][0..4], .little);
+    var patched: usize = 0;
+    var i: usize = meta_at;
+    while (i + 8 <= meta_at + ml) : (i += 8) {
+        if (std.mem.readInt(i64, bytes[i..][0..8], .little) == 3) {
+            std.mem.writeInt(i64, bytes[i..][0..8], 1 << 61, .little);
+            patched += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), patched);
+    const read = @import("read.zig");
+    const r = try read.Reader.openBytes(a, bytes, null);
+    try std.testing.expectError(read.Error.CorruptArrow, r.next(a));
+}
