@@ -69,7 +69,7 @@ pub fn keyF64(v: Value) f64 {
 
 const RegexCache = struct {
     buf: [16 * 1024]u8 = undefined,
-    src: []const u8 = &.{},
+    src: []const u8 = undefined,
     re: regex.Regex = undefined,
     icase: bool = false,
     valid: bool = false,
