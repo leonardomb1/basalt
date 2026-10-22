@@ -139,6 +139,22 @@ pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) i64 {
     return (days *| 86_400_000_000) +| @as(i64, @intCast(nanos_of_day / 1000));
 }
 
+const DeltaHeader = struct { miniblocks: usize, per_mini: usize, total: usize, first: i64 };
+
+/// A DELTA_BINARY_PACKED header held to the spec: a block a multiple of 128
+/// values, each miniblock a multiple of 32, capped, so the sizes computed from
+/// them (values times a width of up to 64 bits) cannot overflow.
+fn deltaHeader(src: []const u8, pos: *usize) Error!DeltaHeader {
+    const block_size = try readVarint(src, pos);
+    const miniblocks = try readVarint(src, pos);
+    const total = try readVarint(src, pos);
+    const first = try readZigZagAt(src, pos);
+    if (block_size == 0 or block_size % 128 != 0 or block_size > 1 << 20) return Error.CorruptParquetPage;
+    if (miniblocks == 0 or block_size % miniblocks != 0 or (block_size / miniblocks) % 32 != 0) return Error.CorruptParquetPage;
+    if (total > std.math.maxInt(usize)) return Error.CorruptParquetPage;
+    return .{ .miniblocks = @intCast(miniblocks), .per_mini = @intCast(block_size / miniblocks), .total = @intCast(total), .first = first };
+}
+
 /// DELTA_BINARY_PACKED: `<block size> <miniblocks> <count> <first>`, then per block
 /// `<min delta> <widths> <miniblocks>`. Running sums desync on any miscount, so
 /// every bound is checked; a width byte over 64 is corrupt (it was once a panic).
@@ -148,15 +164,11 @@ pub fn decodeDeltaBinaryPacked(
     count: usize,
 ) Error![]i64 {
     var pos: usize = 0;
-    const block_size: usize = @intCast(try readVarint(src, &pos));
-    const miniblocks: usize = @intCast(try readVarint(src, &pos));
-    const total: usize = @intCast(try readVarint(src, &pos));
-    var value: i64 = try readZigZagAt(src, &pos);
-
-    if (miniblocks == 0 or block_size == 0 or block_size % miniblocks != 0) {
-        return Error.CorruptParquetPage;
-    }
-    const per_mini = block_size / miniblocks;
+    const h = try deltaHeader(src, &pos);
+    const miniblocks = h.miniblocks;
+    const per_mini = h.per_mini;
+    const total = h.total;
+    var value: i64 = h.first;
 
     const want = @min(count, total);
     const out = try arena.alloc(i64, count);
@@ -168,7 +180,7 @@ pub fn decodeDeltaBinaryPacked(
 
     while (n < want) {
         const min_delta = try readZigZagAt(src, &pos);
-        if (pos + miniblocks > src.len) return Error.CorruptParquetPage;
+        if (miniblocks > src.len - pos) return Error.CorruptParquetPage;
         const widths = src[pos..][0..miniblocks];
         pos += miniblocks;
 
@@ -253,14 +265,11 @@ fn decodeDeltaBinaryPackedTracking(
     end: *usize,
 ) Error![]i64 {
     var pos: usize = 0;
-    const block_size: usize = @intCast(try readVarint(src, &pos));
-    const miniblocks: usize = @intCast(try readVarint(src, &pos));
-    const total: usize = @intCast(try readVarint(src, &pos));
-    var value: i64 = try readZigZagAt(src, &pos);
-    if (miniblocks == 0 or block_size == 0 or block_size % miniblocks != 0) {
-        return Error.CorruptParquetPage;
-    }
-    const per_mini = block_size / miniblocks;
+    const h = try deltaHeader(src, &pos);
+    const miniblocks = h.miniblocks;
+    const per_mini = h.per_mini;
+    const total = h.total;
+    var value: i64 = h.first;
 
     const out = try arena.alloc(i64, count);
     const want = @min(count, total);
@@ -271,7 +280,7 @@ fn decodeDeltaBinaryPackedTracking(
     }
     while (n < want) {
         const min_delta = try readZigZagAt(src, &pos);
-        if (pos + miniblocks > src.len) return Error.CorruptParquetPage;
+        if (miniblocks > src.len - pos) return Error.CorruptParquetPage;
         const widths = src[pos..][0..miniblocks];
         pos += miniblocks;
         for (widths) |w| {
@@ -429,4 +438,20 @@ test "decodeDeltaBinaryPacked: a miniblock width above 64 is a corrupt page" {
         Error.CorruptParquetPage,
         decodeDeltaBinaryPacked(fba.allocator(), &page, 2),
     );
+}
+
+test "decodeDeltaBinaryPacked: a header off the spec, or one whose sizes would overflow, is a corrupt page" {
+    var mem: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&mem);
+    const huge = [_]u8{0xFF} ** 9 ++ [_]u8{0x01};
+    const pages = [_][]const u8{
+        &(huge ++ huge ++ [_]u8{ 0x02, 0x00, 0x00 }),
+        &[_]u8{ 0x64, 0x01, 0x02, 0x00 },
+        &[_]u8{ 0x80, 0x01, 0x08, 0x02, 0x00 },
+        &([_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10 } ++ [_]u8{ 0x01, 0x02, 0x00 }),
+    };
+    for (pages) |page| {
+        fba.reset();
+        try std.testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(fba.allocator(), page, 2));
+    }
 }
