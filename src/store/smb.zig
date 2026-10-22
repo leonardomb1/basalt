@@ -328,6 +328,11 @@ pub const Session = struct {
                 self.gpa.free(bytes);
                 continue;
             }
+            const pre_auth = m.command == @intFromEnum(Command.negotiate) or m.command == @intFromEnum(Command.session_setup);
+            if (!was_sealed and !pre_auth and self.sealedTree(m.tree_id))
+                return fail(error.SmbSignature, "a response came unencrypted on an encrypted session or share — the message may have been altered", .{});
+            if (self.signing and !was_sealed and !pre_auth and m.flags & flag_signed == 0)
+                return fail(error.SmbSignature, "a response came unsigned on a signed session — the message may have been altered", .{});
             if (m.flags & flag_signed != 0 and self.signing and !was_sealed) {
                 var sig: [16]u8 = undefined;
                 @memcpy(&sig, bytes[48..64]);
@@ -442,7 +447,8 @@ pub const Session = struct {
             var k: usize = 0;
             while (k < ctx_count and at + 8 <= m.bytes.len) : (k += 1) {
                 const ty = std.mem.readInt(u16, m.bytes[at..][0..2], .little);
-                const n = std.mem.readInt(u16, m.bytes[at + 2 ..][0..2], .little);
+                const n: usize = std.mem.readInt(u16, m.bytes[at + 2 ..][0..2], .little);
+                if (n > m.bytes.len - at - 8) break;
                 const data = m.bytes[at + 8 ..][0..n];
                 if (ty == 2 and n >= 4) self.cipher = std.mem.readInt(u16, data[2..4], .little);
                 at = std.mem.alignForward(usize, at + 8 + n, 8);
@@ -528,6 +534,7 @@ pub const Session = struct {
     }
 
     fn loggedIn(self: *Session, m: Msg) Error!void {
+        if (m.body().len < 4) return fail(error.SmbProtocol, "short SESSION_SETUP response", .{});
         const flags = std.mem.readInt(u16, m.body()[2..4], .little);
         if (flags & 0x3 != 0)
             return fail(error.SmbLogonFailure, "the server logged {s} in as a guest — check the user name and password", .{self.cfg.user});
@@ -568,9 +575,9 @@ pub const Session = struct {
     fn sessionBlob(m: Msg) []const u8 {
         const r = m.body();
         if (r.len < 8) return &.{};
-        const off = std.mem.readInt(u16, r[4..6], .little);
-        const n = std.mem.readInt(u16, r[6..8], .little);
-        if (off + n > m.bytes.len) return &.{};
+        const off: usize = std.mem.readInt(u16, r[4..6], .little);
+        const n: usize = std.mem.readInt(u16, r[6..8], .little);
+        if (off > m.bytes.len or n > m.bytes.len - off) return &.{};
         return m.bytes[off..][0..n];
     }
 
@@ -608,6 +615,10 @@ pub const Session = struct {
 
     fn sealed(self: *Session, cmd: Command, tree_id: u32) bool {
         if (cmd == .negotiate or cmd == .session_setup) return false;
+        return self.sealedTree(tree_id);
+    }
+
+    fn sealedTree(self: *Session, tree_id: u32) bool {
         if (self.seal_all) return true;
         for (self.sealed_trees[0..self.n_sealed]) |t| if (t == tree_id) return true;
         return false;
@@ -675,6 +686,7 @@ pub const Session = struct {
                 fail(error.SmbAccessDenied, "{s} may not open the share {s} — or it requires encryption, which SMB {s} cannot do", .{ self.cfg.user, share, dialectName(self.dialect) }),
             else => return fail(error.SmbFailure, "opening the share {s} failed (status 0x{x:0>8})", .{ share, m.status }),
         }
+        if (m.body().len < 8) return fail(error.SmbProtocol, "short TREE_CONNECT response", .{});
         const flags = std.mem.readInt(u32, m.body()[4..8], .little);
         if (flags & share_flag_encrypt != 0 and !self.seal_all) {
             if (!self.have_keys)
@@ -717,6 +729,7 @@ pub const Session = struct {
         defer self.gpa.free(m.bytes);
         if (m.status != Status.success) return self.fileFailed(m.status, share, path);
         const r = m.body();
+        if (r.len < 80) return fail(error.SmbProtocol, "short CREATE response", .{});
         var h = Handle{ .tree = t, .id = undefined, .size = std.mem.readInt(u64, r[48..56], .little), .directory = std.mem.readInt(u32, r[56..60], .little) & attr_directory != 0 };
         @memcpy(&h.id, r[64..80]);
         return h;
@@ -795,9 +808,11 @@ pub const Session = struct {
             }
             if (m.status != Status.success) return fail(error.SmbFailure, "a read failed (status 0x{x:0>8})", .{m.status});
             const r = m.body();
-            const data_off = r[2];
-            const n = std.mem.readInt(u32, r[4..8], .little);
-            if (data_off + n > m.bytes.len) return fail(error.SmbProtocol, "a read response overruns its message", .{});
+            if (r.len < 16) return fail(error.SmbProtocol, "a read response is too short", .{});
+            const data_off: usize = r[2];
+            const n: usize = std.mem.readInt(u32, r[4..8], .little);
+            if (n > @min(u, out.len - pos) or data_off > m.bytes.len or n > m.bytes.len - data_off)
+                return fail(error.SmbProtocol, "a read response holds more than was asked, or overruns its message", .{});
             @memcpy(out[pos..][0..n], m.bytes[data_off..][0..n]);
             got = @max(got, pos + n);
             if (pos + n < out.len and n < @min(u, out.len - pos)) short = true;
@@ -864,9 +879,10 @@ pub const Session = struct {
             if (m.status == Status.no_more_files) break;
             if (m.status != Status.success) return fail(error.SmbFailure, "listing a folder failed (status 0x{x:0>8})", .{m.status});
             const r = m.body();
-            const off = std.mem.readInt(u16, r[2..4], .little);
-            const n = std.mem.readInt(u32, r[4..8], .little);
-            if (off + n > m.bytes.len) return fail(error.SmbProtocol, "a folder listing overruns its message", .{});
+            if (r.len < 8) return fail(error.SmbProtocol, "short QUERY_DIRECTORY response", .{});
+            const off: usize = std.mem.readInt(u16, r[2..4], .little);
+            const n: usize = std.mem.readInt(u32, r[4..8], .little);
+            if (off > m.bytes.len or n > m.bytes.len - off) return fail(error.SmbProtocol, "a folder listing overruns its message", .{});
             const buf = m.bytes[off..][0..n];
             var at: usize = 0;
             while (at + 64 <= buf.len) {
