@@ -97,13 +97,35 @@ keys, ranged reads of remote files. Delta types map as Parquet's do — `long`,
 `timestamp` and `timestamp_ntz` to `TIMESTAMP`, a struct to its dotted columns
 (`addr.city`), an array or map to one JSON text column.
 
+A file's deletion vector — the rows a `DELETE`, `UPDATE` or `MERGE` removed
+without rewriting the file — is applied as the file is read, so those rows are
+never returned: stored inline in the log, in a `deletion_vector_*.bin` file under
+the table, or at an absolute path, read through the same storage as the table.
+A deleted row is skipped by its position in the whole file, whichever row groups
+a filter skips, under lanes and `LIMIT` alike, and a row group it deletes whole
+is not fetched. `count(*)` counts the rows left. Each vector's size,
+CRC-32 and row count are checked against the log, and one that fails, one in
+the non-portable (native) bitmap format, or one stored in a way the protocol
+does not define (`r`) fails the read naming the file, rather than return the
+rows it deletes.
+
+Under column mapping (`delta.columnMapping.mode` `name` or `id`, which counts
+where the protocol enables the feature: reader version 2, or 3 with
+`columnMapping`) a column is found in the files by its physical name or by its
+Parquet field id, nested struct fields too, and partition values by physical
+name; a list's or map's JSON names its struct fields as the table does. A
+renamed column reads under its new name, a dropped one is not read, a column a
+file lacks reads as NULL, and a column dropped and added again under its old
+name reads NULL from files written before, as their data is the old column's.
+In `id` mode a file without field ids fails the read naming it, rather than read
+as all NULLs.
+
 A table using a reader feature basalt does not honour is refused, naming it,
-rather than read into wrong rows: a deletion vector on a live file
-(`deletionVectors` alone is fine while no file carries one), column mapping by
-`name` or `id`, V2 checkpoints, a catalog-managed table, `typeWidening`,
-`variantType`, a reader version past 3, and any feature basalt does not know.
-`timestampNtz` and `vacuumProtocolCheck` read as usual. A live file missing from
-storage (a `version` older than a `VACUUM` kept, say) fails the read naming it.
+rather than read into wrong rows: V2 checkpoints, a catalog-managed table,
+`typeWidening`, `variantType`, a reader version past 3, and any feature basalt
+does not know. `deletionVectors`, `columnMapping`, `timestampNtz` and
+`vacuumProtocolCheck` read as described. A live file missing from storage (a
+`version` older than a `VACUUM` kept, say) fails the read naming it.
 
 A Delta table is found by listing its log, which an `https://` URL cannot do; it
 is read from a local path, object storage, SFTP or SMB. `format = 'parquet'`
@@ -222,9 +244,11 @@ row group of each file read and the 16 open output files, whatever the table's
 or the rows' size. A partitioned table's rewritten and inserted rows are sorted
 by partition before they are written (an external sort, also within
 `--op-memory`), so each touched partition gets one new file however the join
-ordered them. A file with a deletion vector among those read is refused,
-and a table recording a change data feed (`delta.enableChangeDataFeed`) is
-refused, as its rewritten files would misreport every row as changed.
+ordered them. A file with a deletion vector is read without its deleted rows,
+so its rewrite drops them, and its `remove` names the deletion vector. A table
+recording a change data feed (`delta.enableChangeDataFeed`) is refused, as its
+rewritten files would misreport every row as changed. basalt writes no deletion
+vectors of its own.
 
 The commit is created only if no writer made that version first: a local one by
 hard-linking a fully written, synced hidden file to its name, an object store's
@@ -253,7 +277,8 @@ writer version past 7, a writer feature other than `appendOnly`, `invariants`,
 `identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
 `vacuumProtocolCheck` and `allowColumnDefaults`, and among those any the table
 actually uses — a column invariant, a CHECK constraint, a generated or identity
-column, column mapping by name or id, a column default an UPSERT's `PARTIAL
+column, column mapping by name or id (read, but not written: its files name
+columns by physical name or field id), a column default an UPSERT's `PARTIAL
 COLS` leaves to it — as well as a `REPLACE` or `UPSERT` of a
 `delta.appendOnly` table and every reader feature a read refuses. EXPLAIN and
 `check` name the table's version and file count, or that the write creates it,
