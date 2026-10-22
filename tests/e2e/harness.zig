@@ -50,7 +50,10 @@ fn runCsvOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const
 }
 
 /// Parses `script` and runs it with `opts`, the run's message left in `diag`.
+/// `alloc` is the run's gpa, which threads share, so it may not be an arena.
 pub fn exec(alloc: std.mem.Allocator, script: []const u8, opts: basalt.env.RunOptions, diag: *Diag) !basalt.env.Stats {
+    var probe = std.heap.ArenaAllocator.init(std.testing.allocator);
+    if (alloc.vtable == probe.allocator().vtable) return error.RunNeedsThreadSafeAllocator;
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };

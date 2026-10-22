@@ -361,7 +361,8 @@ test "Delta UPSERT: past --op-memory the spool and the joins spill, with the row
     for ([_]usize{ 1, 4 }) |threads| {
         tmp.dir.deleteTree("s") catch {};
         try load(&tmp, "LOAD INTO '$B/s/' WITH (format = 'delta', partition_by = 'k') AS SELECT id, k, v FROM '$B/many.csv' WHERE id % 2 = 0;", 1);
-        const out = try harness.runScriptOpts(a, &tmp, script, .{ .threads = threads, .op_memory = 64 << 10, .log = .{ .quiet = true } });
+        const out = try harness.runScriptOpts(gpa, &tmp, script, .{ .threads = threads, .op_memory = 64 << 10, .log = .{ .quiet = true } });
+        defer gpa.free(out);
         try testing.expectEqualStrings("n,s,u\n13333,133316667,6667\n", out);
         try testing.expectEqual(@as(usize, 40), try actions(a, &tmp, "s", 1, "add"));
     }

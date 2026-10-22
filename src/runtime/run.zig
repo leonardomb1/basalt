@@ -106,6 +106,8 @@ const runEarlyThrows = @import("script.zig").runEarlyThrows;
 
 const Scratch = @import("scratch.zig").Scratch;
 
+/// `gpa` must be thread-safe: the pipelined writer, lanes and parallel operators
+/// allocate from it alongside the reading thread, so an `ArenaAllocator` will not do.
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
     const opts = opts_in;
     ftp.beginRun();
