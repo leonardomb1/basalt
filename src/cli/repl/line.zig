@@ -41,6 +41,8 @@ const charLen = @import("line/layout.zig").charLen;
 pub const layoutRows = @import("line/layout.zig").layoutRows;
 pub const rowOf = @import("line/layout.zig").rowOf;
 const colsBetween = @import("line/layout.zig").colsBetween;
+pub const TermSize = @import("../../connect/table.zig").TermSize;
+pub const termSize = @import("../../connect/table.zig").termSize;
 pub const Buffer = @import("line/buffer.zig").Buffer;
 
 pub const Editor = struct {
@@ -540,15 +542,6 @@ pub fn readPasted(gpa: std.mem.Allocator, fd: std.posix.fd_t) ![]u8 {
         }
     }
     return pasted.toOwnedSlice();
-}
-
-pub const TermSize = struct { cols: usize = 80, rows: usize = 24 };
-
-pub fn termSize(file: std.fs.File) TermSize {
-    var ws: std.posix.winsize = undefined;
-    const rc = std.posix.system.ioctl(file.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return .{};
-    return .{ .cols = ws.col, .rows = if (ws.row == 0) 24 else ws.row };
 }
 
 test "historyMatch: newest first, older on repeat, any case, nothing for an empty query" {

@@ -1,11 +1,20 @@
-//! Vendored from Zig 0.15 `std.crypto.tls.Client` with one functional change,
-//! TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
-//! the `client_cert_requested` uses around the client Finished. MySQL servers
-//! always request a client certificate (for optional x509 auth); RFC 8446
-//! §4.4.2 has a client without one reply with an empty Certificate message, but
-//! std errors with TlsUnexpectedMessage, which makes MySQL over TLS impossible.
-//! The comments below are upstream's, kept so the file diffs cleanly against
-//! std. Drop this vendor once std supports client certificates.
+//! Vendored from Zig 0.15.2 `std.crypto.tls.Client`, without upstream's inline
+//! comments or its unused `end`. Two functional changes:
+//!
+//! - TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
+//!   the `client_cert_requested` uses around the client Finished. MySQL servers
+//!   always request a client certificate (for optional x509 auth); RFC 8446
+//!   §4.4.2 has a client without one reply with an empty Certificate message, but
+//!   std errors with TlsUnexpectedMessage, which makes MySQL over TLS impossible.
+//! - ChainCapture: `Options.chain` receives the DER of each certificate as it is
+//!   read, and under `.ca = .no_verification` the whole chain is read instead of
+//!   only the first certificate, for http_client's `repairBundle`. With `chain`
+//!   null the behaviour is std's.
+//!
+//! The rest, options no caller sets included, stays as upstream has it: the record
+//! layer compiles to the same code as std's and the linker folds the two copies, so
+//! trimming it costs binary size. Drop this vendor once std supports client
+//! certificates.
 //!
 //! Scope: TLS 1.3 only. A TLS 1.2 server that requests a client certificate
 //! still fails (MySQL forced to `--tls-version=TLSv1.2`, which is rare); 1.2
@@ -1019,17 +1028,6 @@ fn flush(w: *Writer) Writer.Error!void {
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
-}
-
-/// Sends a `close_notify` alert, which is necessary for the server to
-/// distinguish between a properly finished TLS session, or a truncation
-/// attack.
-pub fn end(c: *Client) Writer.Error!void {
-    try flush(&c.writer);
-    const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
-    output.advance(prepared.ciphertext_end);
 }
 
 fn prepareCiphertextRecord(

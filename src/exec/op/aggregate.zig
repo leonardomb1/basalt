@@ -15,13 +15,10 @@ const ErrCtx = @import("../op.zig").ErrCtx;
 const Op = @import("../op.zig").Op;
 const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
-const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
-const keyhash = @import("../keyhash.zig");
 const keytable = @import("../keytable.zig");
-const simd = @import("../simd.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Scan = @import("../op.zig").Scan;
@@ -112,10 +109,6 @@ pub const Aggregate = struct {
     pub const Layout = @import("aggregate/kernel.zig").Layout;
     pub const foldSingle = @import("aggregate/accumulate.zig").foldSingle;
 };
-
-pub fn lessV(a: Value, b: Value) bool {
-    return (eval.compareValues(a, b) orelse .eq) == .lt;
-}
 
 pub const selectNth = @import("aggregate/funcs.zig").selectNth;
 pub const dupeValue = @import("aggregate/funcs.zig").dupeValue;

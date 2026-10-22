@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const http_fake = @import("../testing/http_fake.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
 pub const api_version = "2021-08-06";
@@ -487,10 +488,10 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const reply = objstore.FakeServer.reply;
+    const reply = http_fake.FakeServer.reply;
     var client = std.http.Client{ .allocator = std.testing.allocator };
     defer client.deinit();
-    var srv: objstore.FakeServer = undefined;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         null,
         reply("503 Server Busy", "Retry-After: 2\r\n", "<Error><Code>ServerBusy</Code></Error>"),
@@ -525,10 +526,10 @@ test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const reply = objstore.FakeServer.reply;
+    const reply = http_fake.FakeServer.reply;
     var client = std.http.Client{ .allocator = std.testing.allocator };
     defer client.deinit();
-    var srv: objstore.FakeServer = undefined;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         reply("201 Created", "", ""),
         reply("409 Conflict", "", "<Error><Code>BlobAlreadyExists</Code></Error>"),

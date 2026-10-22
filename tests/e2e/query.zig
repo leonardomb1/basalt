@@ -8,6 +8,7 @@ const Diag = basalt.env.Diag;
 const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
+const exec = @import("harness.zig").exec;
 const runScript = @import("harness.zig").runScript;
 const runScriptOpts = @import("harness.zig").runScriptOpts;
 const checkAndRun = @import("harness.zig").checkAndRun;
@@ -109,12 +110,8 @@ test "union: plain UNION [ALL] lines branches up by position" {
 
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT k FROM '{s}/t1.csv' UNION ALL SELECT k, v FROM '{s}/t2.csv';", .{ base, base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.PlanFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "branch 2 has 2 columns") != null);
 }
 
@@ -186,12 +183,8 @@ test "correlated subqueries: EXISTS, IN and scalar subqueries over the outer row
 
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT c.id, (SELECT o.oid FROM '{s}/o.csv' o WHERE o.cust = c.id) AS one FROM '{s}/c.csv' c;", .{ base, base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.CastFailed, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.CastFailed, exec(alloc, script, .{}, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "more than one row returned by a subquery used as an expression") != null);
 }
 
@@ -650,12 +643,8 @@ test "join spill: a build side past --op-memory spills to disk, serially and und
             .{ base, base, base, case.order },
         );
         defer alloc.free(script);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .log = .{ .quiet = true } }, &rdiag);
+        _ = try exec(alloc, script, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .log = .{ .quiet = true } }, &rdiag);
 
         const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
         defer alloc.free(out);
@@ -674,7 +663,7 @@ test "join spill: a build side past --op-memory spills to disk, serially and und
         while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
 
         var capped: Diag = .{};
-        try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .spill_cap = 64, .log = .{ .quiet = true } }, &capped));
+        try std.testing.expectError(error.SpillCapExceeded, exec(alloc, script, .{ .threads = case.threads, .op_memory = 1024, .spill_dir = base, .spill_cap = 64, .log = .{ .quiet = true } }, &capped));
     }
 }
 
@@ -728,12 +717,8 @@ test "join spill: partitions still past max_build split again, and one key past 
         .{ base, base, base },
     );
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.JoinBuildTooLarge, run(alloc, prog, .{ .spill_dir = base, .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectError(error.JoinBuildTooLarge, exec(alloc, script, .{ .spill_dir = base, .log = .{ .quiet = true } }, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "a single join key holds 5000 rows") != null);
     var it = tmp.dir.iterate();
     while (try it.next()) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, "basalt-spill-"));
@@ -759,14 +744,10 @@ test "cross join and NOT IN keep their in-memory caps" {
     inline for (cases) |c| for ([_]usize{ 1, 4 }) |threads| {
         const script = try std.fmt.allocPrint(alloc, c.sql, .{ base, base, base });
         defer alloc.free(script);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
         var opts: basalt.env.RunOptions = .{ .threads = threads, .log = .{ .quiet = true } };
         if (c.op_memory) |m| opts.op_memory = m;
-        try std.testing.expectError(error.JoinBuildTooLarge, run(alloc, prog, opts, &rdiag));
+        try std.testing.expectError(error.JoinBuildTooLarge, exec(alloc, script, opts, &rdiag));
         try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, c.msg) != null);
     };
 
@@ -793,15 +774,8 @@ test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" 
     );
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{}, &rdiag);
     const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
     defer alloc.free(out);
     try std.testing.expectEqualStrings("src,id,v\n01,1,10\n01,2,20\n02,3,\n", out);
@@ -925,14 +899,8 @@ test "join: an empty build side drops all rows (inner) and null-fills (left)" {
         "SELECT t.id, l.label FROM '{s}/in.csv' t LEFT JOIN labels l ON t.code = l.code;", .{ base, base, base, base, base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{}, &rdiag);
     const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
     defer alloc.free(inner);
     try std.testing.expectEqualStrings("id,label\n", inner);
@@ -1032,12 +1000,8 @@ test "aggregate: SUM over text refuses what it cannot add exactly, naming the CA
         defer alloc.free(base);
         const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT SUM(s) AS s FROM '{s}/in.csv';", .{ base, base });
         defer alloc.free(script);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_| return error.TestUnexpectedResult else |_| {}
+        if (exec(alloc, script, .{ .log = .{ .quiet = true } }, &rdiag)) |_| return error.TestUnexpectedResult else |_| {}
         if (std.mem.indexOf(u8, rdiag.msg, c.want) == null) {
             std.debug.print("want `{s}` in `{s}`\n", .{ c.want, rdiag.msg });
             return error.TestUnexpectedResult;
@@ -1200,14 +1164,8 @@ test "join: duplicate build keys fan out (inner); semi/anti reduce to existence"
         "SELECT * FROM '{s}/in.csv' t ANTI JOIN labels l ON t.code = l.code;", .{ base, base, base, base, base, base, base, base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{}, &rdiag);
     const inner = try tmp.dir.readFileAlloc(alloc, "inner.csv", 1 << 20);
     defer alloc.free(inner);
     try std.testing.expectEqualStrings("id,label\n1,x1\n1,x2\n", inner);
@@ -1230,12 +1188,8 @@ test "generated sources: SELECT with no FROM and RANGE(lo, hi)" {
         "LOAD INTO '{s}/r.csv' AS SELECT range AS i FROM RANGE(2, 5) WHERE range != 3;\n", .{ base, base });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = try run(alloc, prog, .{}, &rdiag);
+    _ = try exec(alloc, script, .{}, &rdiag);
 
     const one = try tmp.dir.readFileAlloc(alloc, "one.csv", 1 << 20);
     defer alloc.free(one);
@@ -1305,14 +1259,8 @@ test "table functions: defaults, a join side, two calls with their own CTEs, one
         defer alloc.free(d);
         const script = try std.fmt.allocPrint(alloc, "{s}LOAD INTO '{s}/out.csv' AS {s};", .{ d, base, c.q });
         defer alloc.free(script);
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
         var rdiag: Diag = .{};
-        _ = run(alloc, prog, .{}, &rdiag) catch |e| {
-            return e;
-        };
+        _ = try exec(alloc, script, .{}, &rdiag);
         const got = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
         defer alloc.free(got);
         try std.testing.expectEqualStrings(c.want, got);
@@ -1463,14 +1411,10 @@ test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to t
     defer alloc.free(spill_dir);
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT id, k, s FROM '{s}/in.csv' ORDER BY k DESC, s;", .{ base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     for ([_]usize{ 2 << 30, 1, 20_000 }) |op_memory| {
         var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
+        _ = try exec(alloc, script, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
         const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
         defer alloc.free(out);
         try std.testing.expectEqualStrings(want.items, out);
@@ -1481,7 +1425,7 @@ test "sort: an ORDER BY past --op-memory spills sorted runs and merges them to t
     }
 
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.SpillCapExceeded, run(alloc, prog, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 1024, .log = .{ .quiet = true } }, &rdiag));
+    try std.testing.expectError(error.SpillCapExceeded, exec(alloc, script, .{ .op_memory = 1, .spill_dir = spill_dir, .spill_cap = 1024, .log = .{ .quiet = true } }, &rdiag));
 }
 
 test "spill: a LIMIT over a spilled sort, join, GROUP BY or DISTINCT gives its disk back before the next statement" {
@@ -1662,12 +1606,8 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
     ;
     const bad = try std.mem.replaceOwned(u8, alloc, "LOAD INTO '$B/bad.csv' AS " ++ with_u ++ "\nSELECT * FROM u;", "$B", base);
     defer alloc.free(bad);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const bad_prog = try parser.parseSource(parena.allocator(), bad, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expect(std.meta.isError(run(alloc, bad_prog, .{ .log = .{ .quiet = true } }, &rdiag)));
+    try std.testing.expect(std.meta.isError(exec(alloc, bad, .{ .log = .{ .quiet = true } }, &rdiag)));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "no common type") != null);
 
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/ok.csv' AS " ++ with_u ++ "\nSELECT * EXCEPT (x) FROM u ORDER BY id;", 1, &.{});
@@ -1805,16 +1745,12 @@ test "join order: a turned-around join that spills gives the written rows" {
         \\SELECT * FROM '$B/small.csv' s JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') ORDER BY s.k, s.v, b.w;
     , "$B", base);
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
 
     var want: ?[]u8 = null;
     defer if (want) |w| alloc.free(w);
     for ([_]usize{ 2 << 30, 64 }) |op_memory| {
         var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
+        _ = try exec(alloc, script, .{ .op_memory = op_memory, .spill_dir = spill_dir, .log = .{ .quiet = true } }, &rdiag);
         try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
         const got = try readOut(alloc, &tmp, "auto.csv");
         if (want) |w| {
@@ -2115,10 +2051,8 @@ test "a WHERE's NULL conjunct keeps its row in for the ones after it, as AND's s
     defer parena.deinit();
     const a = parena.allocator();
     const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/o.csv' AS SELECT x, y FROM '{s}/t.csv' WHERE CAST(x AS INT) > 0 AND 10 / CAST(y AS INT) > 1;", .{ base, base });
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(a, script, &pdiag);
     var rdiag: Diag = .{};
-    const msg = if (run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag)) |_|
+    const msg = if (exec(alloc, script, .{ .log = .{ .quiet = true } }, &rdiag)) |_|
         return error.TestUnexpectedResult
     else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.runtime.failLabel(e);
     try std.testing.expect(std.mem.indexOf(u8, msg, "division by zero") != null);

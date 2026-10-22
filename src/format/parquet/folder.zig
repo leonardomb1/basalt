@@ -13,7 +13,6 @@ const Threshold = @import("../../exec/value.zig").Threshold;
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const mismatchMessage = @import("read.zig").mismatchMessage;
-const objstore = @import("../../store/objstore.zig");
 const parquet = @import("footer.zig");
 const schemaMismatch = @import("read.zig").schemaMismatch;
 const std = @import("std");
@@ -162,20 +161,10 @@ pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !
 
 const tail_guess: u64 = 64 << 10;
 
-pub const isRemote = @import("../bytes.zig").isRemote;
-
 test "chunk extents come from the next chunk, never from total_compressed_size" {
     const b = [_]u64{ 4, 100, 250, 900 };
     try testing.expectEqual(@as(u64, 100), chunkEnd(&b, 4));
     try testing.expectEqual(@as(u64, 250), chunkEnd(&b, 100));
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 250));
     try testing.expectEqual(@as(u64, 900), chunkEnd(&b, 900));
-}
-
-test "remote paths are recognised, local ones left alone" {
-    try testing.expect(isRemote("https://host/a.parquet"));
-    try testing.expect(isRemote("http://host/a.parquet"));
-    try testing.expect(isRemote("az://acct/ctr/a.parquet"));
-    try testing.expect(!isRemote("/data/a.parquet"));
-    try testing.expect(!isRemote("a.parquet"));
 }

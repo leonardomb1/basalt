@@ -23,7 +23,6 @@
 
 const std = @import("std");
 const sql = @import("../db/sql.zig");
-const types = @import("../lang/types.zig");
 const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
 

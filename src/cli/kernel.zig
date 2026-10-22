@@ -355,11 +355,6 @@ fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls
     try reply(a, out, req.id, .{ .ok = true, .complete = aw.written() });
 }
 
-fn usageErr(stderr: *std.Io.Writer, m: []const u8) !u8 {
-    try stderr.print("error: {s}\n", .{m});
-    return 2;
-}
-
 fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
     defer q.close();
     var buf: [64 * 1024]u8 = undefined;

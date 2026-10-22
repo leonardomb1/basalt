@@ -3,7 +3,6 @@
 const Diag = @import("../analyze.zig").Diag;
 const Plan = @import("../analyze.zig").Plan;
 const analyze = @import("../analyze.zig").analyze;
-const ast = @import("../../lang/ast.zig");
 const parse = @import("../analyze.zig").parse;
 const std = @import("std");
 /// Analyze `LOAD INTO ... AS <query over a 2-col CSV>` offline and expect an error
@@ -35,10 +34,4 @@ pub fn analyzeCsv(a: std.mem.Allocator, csv_data: []const u8, query: []const u8,
     return analyze(a, try parse(a, src), diag);
 }
 
-pub fn tfld(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
-    const parts = try a.alloc([]const u8, 1);
-    parts[0] = name;
-    const e = try a.create(ast.Expr);
-    e.* = .{ .field = .{ .parts = parts } };
-    return e;
-}
+pub const tfld = @import("../../testing/ast_util.zig").fld;

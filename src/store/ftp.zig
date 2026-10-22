@@ -19,6 +19,8 @@
 //! permanent (550 is a missing file); both carry the server's text in `lastError`.
 
 const std = @import("std");
+const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const percentDecode = @import("../net/percent.zig").decode;
 
 pub const default_port = 21;
 const timeout_s = 60;
@@ -109,40 +111,17 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
     };
 }
 
-fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
-    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len);
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        if (s[i] == '%' and i + 2 < s.len) {
-            if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |b| {
-                out.appendAssumeCapacity(b);
-                i += 2;
-                continue;
-            } else |_| {}
-        }
-        out.appendAssumeCapacity(s[i]);
-    }
-    return out.items;
-}
-
-threadlocal var last_err_buf: [256]u8 = undefined;
-threadlocal var last_err_len: usize = 0;
+threadlocal var last_err: ThreadNote(256) = .{};
 
 /// The last server reply that failed a request on this thread, as `550 text`.
 pub fn lastError() []const u8 {
-    return last_err_buf[0..last_err_len];
-}
-
-fn setLastError(code: u16, text: []const u8) void {
-    const s = std.fmt.bufPrint(&last_err_buf, "{d} {s}", .{ code, text }) catch last_err_buf[0..];
-    last_err_len = s.len;
+    return last_err.get();
 }
 
 /// A refusal by its code: 4xx is worth retrying, 530 is the login, 550 a missing
 /// file or folder.
 fn refusal(code: u16, text: []const u8) anyerror {
-    setLastError(code, text);
+    last_err.print("{d} {s}", .{ code, text });
     if (code >= 400 and code < 500) return error.FtpServerBusy;
     if (code == 530) return error.FtpLoginFailed;
     if (code == 550) return error.FileNotFound;
@@ -296,7 +275,7 @@ pub const Session = struct {
             while (it.next()) |l| if (mlsdEntry(l)) |en| try out.append(en);
             return out.items;
         }
-        last_err_len = 0;
+        last_err.clear();
         const data = try self.transfer("NLST", path);
         const body = try drain(arena, data);
         try self.finish();
@@ -390,7 +369,7 @@ pub fn localize(arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 
 fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const gpa = std.heap.page_allocator;
-    last_err_len = 0;
+    last_err.clear();
     const u = try parseUrl(arena, url);
     if (local.dir == null) {
         const base = std.process.getEnvVarOwned(arena, "TMPDIR") catch try arena.dupe(u8, "/tmp");
@@ -449,9 +428,7 @@ fn walk(s: *Session, arena: std.mem.Allocator, dir: []const u8, rel: []const u8,
 }
 
 fn note(e: anyerror, text: []const u8) anyerror {
-    const n = @min(text.len, last_err_buf.len);
-    @memcpy(last_err_buf[0..n], text[0..n]);
-    last_err_len = n;
+    last_err.set(text);
     return e;
 }
 

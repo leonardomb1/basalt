@@ -108,7 +108,6 @@
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
-const aggregates = @import("../lang/aggregates.zig");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 pub const Batch = @import("batch.zig").Batch;
@@ -201,24 +200,6 @@ pub const Op = union(enum) {
         return switch (self) {
             inline else => |o| &o.stats,
         };
-    }
-
-    /// This operator's inputs, written into `buf`, used to turn inclusive timings into
-    /// exclusive ones.
-    pub fn inputs(self: Op, buf: *std.array_list.Managed(Op)) !void {
-        switch (self) {
-            .scan => {},
-            .join => |j| {
-                try buf.append(j.probe);
-                if (j.build) |b| try buf.append(b);
-            },
-            .nl_join => |j| {
-                try buf.append(j.probe);
-                if (j.build) |b| try buf.append(b);
-            },
-            .union_ => |u| try buf.appendSlice(u.children),
-            inline else => |o| try buf.append(o.child),
-        }
     }
 
     /// Gives `at` to this operator and every input below it not yet stamped: the
@@ -422,7 +403,6 @@ pub const Explode = @import("op/explode.zig").Explode;
 pub const Window = @import("op/window.zig").Window;
 pub const Distinct = @import("op/distinct.zig").Distinct;
 pub const Sort = @import("op/sort.zig").Sort;
-const KeyArr = @import("op/sort.zig").KeyArr;
 pub const TopN = @import("op/topn.zig").TopN;
 pub const keyOrder = @import("op/sort.zig").keyOrder;
 pub const Aggregate = @import("op/aggregate.zig").Aggregate;

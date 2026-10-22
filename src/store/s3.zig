@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const http_fake = @import("../testing/http_fake.zig");
 const xml = @import("../format/xml/token.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
@@ -989,7 +990,7 @@ fn testSleep(ns: u64) void {
     test_slept_ms += ns / std.time.ns_per_ms;
 }
 
-fn testWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *objstore.FakeServer) !MultipartWriter {
+fn testWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *http_fake.FakeServer) !MultipartWriter {
     return .{
         .interface = .{ .vtable = &MultipartWriter.vtable, .buffer = &.{} },
         .arena = a,
@@ -1006,7 +1007,7 @@ fn testWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *objstore.Fak
     };
 }
 
-const reply = objstore.FakeServer.reply;
+const reply = http_fake.FakeServer.reply;
 const reply_reset: ?[]const u8 = null;
 const reply_no_upload = reply("404 Not Found", "", "<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>");
 
@@ -1014,7 +1015,7 @@ test "a listing page that meets SlowDown is fetched again" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var srv: objstore.FakeServer = undefined;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         reply("503 Slow Down", "", "<Error><Code>SlowDown</Code></Error>"),
         reply("200 OK", "", "<ListBucketResult><Contents><Key>p/a.csv</Key></Contents></ListBucketResult>"),
@@ -1048,7 +1049,7 @@ test "an upload part is re-put under its part number after a reset and a 502; a 
     var client = std.http.Client{ .allocator = std.testing.allocator };
     defer client.deinit();
     {
-        var srv: objstore.FakeServer = undefined;
+        var srv: http_fake.FakeServer = undefined;
         try srv.start(&.{
             reply_reset,
             reply("502 Bad Gateway", "", ""),
@@ -1065,7 +1066,7 @@ test "an upload part is re-put under its part number after a reset and a 502; a 
         try std.testing.expectEqualStrings(srv.line(0), srv.line(2));
     }
     {
-        var srv: objstore.FakeServer = undefined;
+        var srv: http_fake.FakeServer = undefined;
         try srv.start(&.{
             reply("403 Forbidden", "", "<Error><Code>AccessDenied</Code></Error>"),
         });
@@ -1096,7 +1097,7 @@ test "a complete whose answer was lost counts as done only when the object it ma
         .{ .replies = &.{reply_no_upload}, .ok = false, .requests = 1 },
     };
     for (cases) |c| {
-        var srv: objstore.FakeServer = undefined;
+        var srv: http_fake.FakeServer = undefined;
         try srv.start(c.replies);
         defer srv.stop();
         var w = try testWriter(a, &client, &srv);
@@ -1186,7 +1187,7 @@ test "putIfAbsent: 200 creates, 412 and 409 find one there, a 503 is retried, a 
     const a = ar.allocator();
     var client = std.http.Client{ .allocator = std.testing.allocator };
     defer client.deinit();
-    var srv: objstore.FakeServer = undefined;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         reply("503 Slow Down", "", "<Error><Code>SlowDown</Code></Error>"),
         reply("200 OK", "", ""),

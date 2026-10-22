@@ -5,6 +5,7 @@
 
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
+const http_fake = @import("../testing/http_fake.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const std = @import("std");
@@ -270,6 +271,14 @@ pub const Remote = struct {
     }
 };
 
+test "remote paths are recognised, local ones left alone" {
+    try testing.expect(isRemote("https://host/a.parquet"));
+    try testing.expect(isRemote("http://host/a.parquet"));
+    try testing.expect(isRemote("az://acct/ctr/a.parquet"));
+    try testing.expect(!isRemote("/data/a.parquet"));
+    try testing.expect(!isRemote("a.parquet"));
+}
+
 test "a Bytes range refuses to read past the end" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -304,8 +313,8 @@ test "a ranged read replays a 503, a reset and a 504 before the 206" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const reply = objstore.FakeServer.reply;
-    var srv: objstore.FakeServer = undefined;
+    const reply = http_fake.FakeServer.reply;
+    var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
         reply("503 Service Unavailable", "", ""),
         null,

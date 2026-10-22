@@ -169,22 +169,7 @@ pub fn readWhole(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
 }
 
 /// `%XX` escapes decoded, as a log's URI paths need; a malformed escape is kept.
-pub fn percentDecode(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
-    var out = try std.array_list.Managed(u8).initCapacity(arena, s.len);
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        if (s[i] == '%' and i + 2 < s.len) {
-            if (std.fmt.parseInt(u8, s[i + 1 .. i + 3], 16)) |b| {
-                try out.append(b);
-                i += 2;
-                continue;
-            } else |_| {}
-        }
-        try out.append(s[i]);
-    }
-    return out.items;
-}
+pub const percentDecode = @import("../../net/percent.zig").decode;
 
 /// A path a log names as one basalt reads: relative ones under `root`, `file:` URIs
 /// as local paths, Hadoop's `s3a://` and `s3n://` as `s3://`, and an ADLS

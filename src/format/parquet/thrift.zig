@@ -21,6 +21,7 @@
 //! `readBinary` slices borrow the input buffer.
 
 const std = @import("std");
+const varint = @import("../varint.zig");
 
 pub const Error = error{
     CorruptThrift,
@@ -70,30 +71,17 @@ pub const Reader = struct {
     }
 
     pub fn readVarint(self: *Reader) Error!u64 {
-        var v: u64 = 0;
-        var shift: u6 = 0;
-        while (true) {
-            const b = try self.readByte();
-            v |= @as(u64, b & 0x7F) << shift;
-            if (b & 0x80 == 0) return v;
-            shift = std.math.add(u6, shift, 7) catch return Error.CorruptThrift;
-        }
+        return varint.read(self.buf, &self.pos) catch Error.CorruptThrift;
     }
 
     pub fn readZigZag(self: *Reader) Error!i64 {
-        const u = try self.readVarint();
-        return @as(i64, @bitCast(u >> 1)) ^ -@as(i64, @intCast(u & 1));
+        return varint.unzigzag(try self.readVarint());
     }
 
     pub fn readI32(self: *Reader) Error!i32 {
         const v = try self.readZigZag();
         if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return Error.CorruptThrift;
         return @intCast(v);
-    }
-
-    pub fn readDouble(self: *Reader) Error!f64 {
-        const b = try self.take(8);
-        return @bitCast(std.mem.readInt(u64, b[0..8], .little));
     }
 
     pub fn readBinary(self: *Reader) Error![]const u8 {
@@ -188,6 +176,10 @@ pub const Reader = struct {
 };
 
 const t = std.testing;
+
+test {
+    _ = varint;
+}
 
 test "varint and zigzag round-trip the boundary values" {
     var r = Reader.init(&[_]u8{ 0x00, 0x01, 0x7f, 0x80, 0x01, 0xff, 0xff, 0x03 });
@@ -286,11 +278,6 @@ test "binary borrows from the buffer without copying" {
     try t.expectEqual(buf.ptr + 1, got.ptr);
 }
 
-test "double is little-endian, unlike the binary protocol" {
-    var r = Reader.init(&[_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f });
-    try t.expectEqual(@as(f64, 1.0), try r.readDouble());
-}
-
 test "skip walks past every type, including nested lists and structs" {
     const bytes = [_]u8{ 0x19, 0x1c, 0x15, 0x02, 0x00 } ++
         [_]u8{ 0x18, 0x03, 'a', 'b', 'c' } ++
@@ -358,18 +345,12 @@ pub const Writer = struct {
         return .{ .out = out };
     }
 
-    pub fn writeVarint(self: *Writer, v_in: u64) !void {
-        var v = v_in;
-        while (true) {
-            const b: u8 = @intCast(v & 0x7F);
-            v >>= 7;
-            try self.out.append(if (v != 0) b | 0x80 else b);
-            if (v == 0) return;
-        }
+    pub fn writeVarint(self: *Writer, v: u64) !void {
+        try varint.write(self.out, v);
     }
 
     pub fn writeZigZag(self: *Writer, v: i64) !void {
-        try self.writeVarint(@bitCast((v >> 63) ^ (v << 1)));
+        try varint.write(self.out, varint.zigzag(v));
     }
 
     pub fn structBegin(self: *Writer) !void {

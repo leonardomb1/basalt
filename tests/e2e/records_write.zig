@@ -3,10 +3,9 @@
 
 const std = @import("std");
 const basalt = @import("basalt");
-const parser = basalt.sql_parser;
 const Diag = basalt.env.Diag;
-const run = basalt.runtime.run;
 const checkAndRun = @import("harness.zig").checkAndRun;
+const exec = @import("harness.zig").exec;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 
 fn bigCsv(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, null_at: ?usize) !void {
@@ -67,13 +66,9 @@ test "a NULL record is an error naming its row in the output" {
     defer alloc.free(base);
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/o.ret' WITH (format = 'records') AS SELECT name FROM '{s}/big.csv';", .{ base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     for ([_]usize{ 1, 4 }) |threads| {
         var rdiag: Diag = .{};
-        try std.testing.expectError(error.RecordNull, run(alloc, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag));
+        try std.testing.expectError(error.RecordNull, exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag));
         try std.testing.expect(std.mem.indexOf(u8, basalt.eval.takeFailure(error.RecordNull).?, "row 15001 of the records output is NULL") != null);
     }
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("o.ret", .{}));

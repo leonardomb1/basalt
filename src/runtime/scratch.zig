@@ -11,8 +11,6 @@ const DirSpace = @import("../exec/space.zig").DirSpace;
 const Space = @import("../exec/space.zig").Space;
 const std = @import("std");
 
-pub const default_cap: u64 = 8 << 30;
-
 pub const Scratch = struct {
     gpa: std.mem.Allocator,
     base: ?[]const u8,
@@ -99,7 +97,7 @@ test "Scratch makes no directory until the first create, then puts each file in 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
 
-    var s = Scratch.init(std.testing.allocator, base, default_cap);
+    var s = Scratch.init(std.testing.allocator, base, 8 << 30);
     defer s.deinit();
     try s.space().charge(10);
     try std.testing.expect(s.dir() == null);
@@ -140,7 +138,7 @@ test "Scratch deinit removes the directory and every file in it" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
 
-    var s = Scratch.init(std.testing.allocator, base, default_cap);
+    var s = Scratch.init(std.testing.allocator, base, 8 << 30);
     const f = try s.space().create(ar.allocator(), "join");
     try f.file.writeAll("spilled");
     f.file.close();
@@ -186,7 +184,7 @@ test "Scratch makes a missing spill directory and creates from parallel threads"
     const base = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/spill", .{root});
     defer std.testing.allocator.free(base);
 
-    var s = Scratch.init(std.testing.allocator, base, default_cap);
+    var s = Scratch.init(std.testing.allocator, base, 8 << 30);
     defer s.deinit();
     const Worker = struct {
         fn go(sc: *Scratch, ok: *bool) void {

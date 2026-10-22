@@ -21,36 +21,18 @@ const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 
 pub fn runToString(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8) ![]u8 {
-    return runToStringP(alloc, tmp, input, query, &[_]ParamArg{});
+    return runCsvOpts(alloc, tmp, input, query, .{});
 }
 
 pub fn runToStringP(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, cli_params: []const ParamArg) ![]u8 {
-    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
-    const in_path = try std.fs.path.join(alloc, &.{ base, "in.csv" });
-    defer alloc.free(in_path);
-    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
-    defer alloc.free(out_path);
-
-    const q = try std.mem.replaceOwned(u8, alloc, query, "$IN", in_path);
-    defer alloc.free(q);
-    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
-    defer alloc.free(script);
-
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
-    var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .params = cli_params }, &rdiag) catch |e| {
-        return e;
-    };
-    return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    return runCsvOpts(alloc, tmp, input, query, .{ .params = cli_params });
 }
 
 pub fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, threads: usize) ![]u8 {
+    return runCsvOpts(alloc, tmp, input, query, .{ .threads = threads });
+}
+
+fn runCsvOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, opts: basalt.env.RunOptions) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
@@ -62,38 +44,29 @@ pub fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input:
     defer alloc.free(q);
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, opts, &rdiag);
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
-pub fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, cli_params: []const ParamArg) ![]u8 {
+/// Parses `script` and runs it with `opts`, the run's message left in `diag`.
+pub fn exec(alloc: std.mem.Allocator, script: []const u8, opts: basalt.env.RunOptions, diag: *Diag) !basalt.env.Stats {
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    return run(alloc, try parser.parseSource(parena.allocator(), script, &pdiag), opts, diag);
+}
 
+pub fn runScript(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, cli_params: []const ParamArg) ![]u8 {
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .params = cli_params }, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{ .params = cli_params }, &rdiag);
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
 /// `runScript` with the run's options given, e.g. a tiny `op_memory` to force spilling.
 pub fn runScriptOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, script: []const u8, opts: basalt.env.RunOptions) ![]u8 {
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = try run(alloc, prog, opts, &rdiag);
+    _ = try exec(alloc, script, opts, &rdiag);
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
 }
 

@@ -462,7 +462,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     const out_cols = try arena.alloc([]const u8, schema.fields.len);
                     for (schema.fields, out_cols) |f, *o| o.* = f.name;
                     const facts = try factsIfWanted(env, stages[0].node.read, env.sql_desc.?.dialect, middle, src_schema, true, .superset);
-                    const mp = try pushdown.planMapWith(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols, facts);
+                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols, facts);
                     where_extra = mp.where_extra;
                     if (mp.proj_schema) |ps| {
                         if (rebuildMapStages(env, mp.stages orelse middle, try schemaPtr(arena, ps))) |rs| {

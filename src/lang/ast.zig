@@ -295,6 +295,12 @@ pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, disti
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
 
 pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
+
+/// Whether `n` is one of `names`, byte for byte.
+pub fn nameIn(names: []const []const u8, n: []const u8) bool {
+    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
+    return false;
+}
 /// Whether `e` calls `search`, which reads whole rows: no column list proves what
 /// it needs, so a filter holding one is never moved across a select or a join.
 pub fn hasSearch(e: *const Expr) bool {

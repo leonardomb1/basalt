@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Sha512 = crypto.hash.sha2.Sha512;
@@ -71,15 +72,14 @@ pub const Config = struct {
 
 const client_version = "SSH-2.0-basalt";
 
-threadlocal var failure_buf: [512]u8 = undefined;
-threadlocal var failure_len: usize = 0;
+threadlocal var failure: ThreadNote(512) = .{};
 
 pub fn lastFailure() []const u8 {
-    return failure_buf[0..failure_len];
+    return failure.get();
 }
 
 pub fn clearFailure() void {
-    failure_len = 0;
+    failure.clear();
 }
 
 const msg = struct {
@@ -325,18 +325,12 @@ const Dir = struct {
     }
 };
 
+/// AES-CTR over `buf` in place, `ctr` advanced past every block used, a partial last one included.
 fn ctrRun(comptime Aes: type, key: [Aes.key_bits / 8]u8, ctr: *[16]u8, buf: []u8) void {
     const ctx = Aes.initEnc(key);
-    var i: usize = 0;
-    while (i < buf.len) : (i += 16) {
-        var ks: [16]u8 = undefined;
-        ctx.encrypt(&ks, ctr);
-        const n = @min(16, buf.len - i);
-        for (buf[i..][0..n], ks[0..n]) |*b, k| b.* ^= k;
-        var c = std.mem.readInt(u128, ctr, .big);
-        c +%= 1;
-        std.mem.writeInt(u128, ctr, c, .big);
-    }
+    crypto.core.modes.ctr(@TypeOf(ctx), ctx, buf, buf, ctr.*, .big);
+    const blocks: u128 = (buf.len + 15) / 16;
+    std.mem.writeInt(u128, ctr, std.mem.readInt(u128, ctr, .big) +% blocks, .big);
 }
 
 pub const Session = struct {
@@ -432,9 +426,7 @@ pub const Session = struct {
     fn fail(self: *Session, e: Error, comptime fmt: []const u8, args: anytype) Error {
         self.why.clearRetainingCapacity();
         self.why.writer().print(fmt, args) catch {};
-        const n = @min(self.why.items.len, failure_buf.len);
-        @memcpy(failure_buf[0..n], self.why.items[0..n]);
-        failure_len = n;
+        failure.set(self.why.items);
         return e;
     }
 
@@ -1461,6 +1453,68 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     const sk = try pc.str();
     if (pk.len != 32 or sk.len != 64) return error.SshKeyUnsupported;
     return .{ .public = pk[0..32].*, .secret = sk[0..64].* };
+}
+
+test "aes-ctr matches SP 800-38A F.5.1 across split calls, in place" {
+    const key = [_]u8{ 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
+    const pt = [_]u8{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c, 0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+        0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11, 0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef,
+        0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17, 0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+    };
+    const ct = [_]u8{
+        0x87, 0x4d, 0x61, 0x91, 0xb6, 0x20, 0xe3, 0x26, 0x1b, 0xef, 0x68, 0x64, 0x99, 0x0d, 0xb6, 0xce,
+        0x98, 0x06, 0xf6, 0x6b, 0x79, 0x70, 0xfd, 0xff, 0x86, 0x17, 0x18, 0x7b, 0xb9, 0xff, 0xfd, 0xff,
+        0x5a, 0xe4, 0xdf, 0x3e, 0xdb, 0xd5, 0xd3, 0x5e, 0x5b, 0x4f, 0x09, 0x02, 0x0d, 0xb0, 0x3e, 0xab,
+        0x1e, 0x03, 0x1d, 0xda, 0x2f, 0xbe, 0x03, 0xd1, 0x79, 0x21, 0x70, 0xa0, 0xf3, 0x00, 0x9c, 0xee,
+    };
+    const iv0 = [_]u8{ 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff };
+    for ([_]usize{ 0, 16, 32, 64 }) |cut| {
+        var buf = pt;
+        var iv = iv0;
+        ctrRun(crypto.core.aes.Aes128, key, &iv, buf[0..cut]);
+        ctrRun(crypto.core.aes.Aes128, key, &iv, buf[cut..]);
+        try std.testing.expectEqualSlices(u8, &ct, &buf);
+        try std.testing.expectEqual(std.mem.readInt(u128, &iv0, .big) +% 4, std.mem.readInt(u128, &iv, .big));
+    }
+    var short = pt[0..20].*;
+    var iv = iv0;
+    ctrRun(crypto.core.aes.Aes128, key, &iv, &short);
+    try std.testing.expectEqualSlices(u8, ct[0..20], &short);
+    try std.testing.expectEqual(std.mem.readInt(u128, &iv0, .big) +% 2, std.mem.readInt(u128, &iv, .big));
+}
+
+test "aes-ctr over packets past the parallel width matches a block-at-a-time keystream" {
+    const Ref = struct {
+        fn run(key: [32]u8, ctr: *[16]u8, buf: []u8) void {
+            const ctx = crypto.core.aes.Aes256.initEnc(key);
+            var i: usize = 0;
+            while (i < buf.len) : (i += 16) {
+                var ks: [16]u8 = undefined;
+                ctx.encrypt(&ks, ctr);
+                const n = @min(16, buf.len - i);
+                for (buf[i..][0..n], ks[0..n]) |*b, k| b.* ^= k;
+                std.mem.writeInt(u128, ctr, std.mem.readInt(u128, ctr, .big) +% 1, .big);
+            }
+        }
+    };
+    var data: [1000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7);
+    const key = [_]u8{0x42} ** 32;
+    const iv0 = [_]u8{0xff} ** 12 ++ [_]u8{ 0xff, 0xff, 0xff, 0xfd };
+    for ([_]usize{ 0, 37, 512, 999 }) |cut| {
+        var want = data;
+        var wiv = iv0;
+        Ref.run(key, &wiv, want[0..cut]);
+        Ref.run(key, &wiv, want[cut..]);
+        var got = data;
+        var iv = iv0;
+        ctrRun(crypto.core.aes.Aes256, key, &iv, got[0..cut]);
+        ctrRun(crypto.core.aes.Aes256, key, &iv, got[cut..]);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+        try std.testing.expectEqualSlices(u8, &wiv, &iv);
+    }
 }
 
 test "wire: mpint sign byte, name-list choice" {

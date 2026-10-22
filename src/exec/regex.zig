@@ -557,18 +557,7 @@ fn escapeAtom(e: u8) Error!Atom {
 }
 
 /// `regexp_replace` without the global flag: `\1`..`\9` in `repl` expand to
-/// captures, `\0` to the whole match. Compiles on every call; for a whole
-/// column, compile once and use `replaceFirstRe`.
-pub fn replaceFirst(
-    out: std.mem.Allocator,
-    scratch: std.mem.Allocator,
-    s: []const u8,
-    pattern: []const u8,
-    repl: []const u8,
-) Error![]const u8 {
-    return replaceFirstRe(out, try Regex.compile(scratch, pattern), s, repl);
-}
-
+/// captures, `\0` to the whole match.
 pub fn replaceFirstRe(
     out: std.mem.Allocator,
     re: Regex,
@@ -654,24 +643,12 @@ test "regex: the ClickBench host-extraction pattern" {
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const pat = "^https?://(?:www\\.)?([^/]+)/.*$";
 
-    const got = try replaceFirst(
-        std.testing.allocator,
-        fba.allocator(),
-        "http://www.example.com/a/b",
-        pat,
-        "\\1",
-    );
+    const got = try replaceFirstRe(std.testing.allocator, try Regex.compile(fba.allocator(), pat), "http://www.example.com/a/b", "\\1");
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("example.com", got);
 
     fba.reset();
-    const got2 = try replaceFirst(
-        std.testing.allocator,
-        fba.allocator(),
-        "https://sub.host.org/x",
-        pat,
-        "\\1",
-    );
+    const got2 = try replaceFirstRe(std.testing.allocator, try Regex.compile(fba.allocator(), pat), "https://sub.host.org/x", "\\1");
     defer std.testing.allocator.free(got2);
     try std.testing.expectEqualStrings("sub.host.org", got2);
 }
@@ -775,7 +752,7 @@ test "regex: characters are UTF-8 code points, a stray byte one of its own" {
 test "regex: no match leaves the subject alone" {
     var buf: [8 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const got = try replaceFirst(std.testing.allocator, fba.allocator(), "plain", "^x(y)z$", "\\1");
+    const got = try replaceFirstRe(std.testing.allocator, try Regex.compile(fba.allocator(), "^x(y)z$"), "plain", "\\1");
     try std.testing.expectEqualStrings("plain", got);
 }
 

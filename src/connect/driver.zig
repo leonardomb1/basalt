@@ -95,6 +95,32 @@ test "stop flag: a source reports end of stream while it is set, and only then" 
     try std.testing.expect((try src.next(std.testing.allocator)) != null);
 }
 
+/// A connector's own words for its last failure on this thread, held in `n` bytes
+/// and cut to fit. Each connector keeps one as a `threadlocal var`.
+pub fn ThreadNote(comptime n: usize) type {
+    return struct {
+        buf: [n]u8 = undefined,
+        len: usize = 0,
+
+        pub fn get(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+
+        pub fn clear(self: *@This()) void {
+            self.len = 0;
+        }
+
+        pub fn set(self: *@This(), text: []const u8) void {
+            self.len = @min(text.len, n);
+            @memcpy(self.buf[0..self.len], text[0..self.len]);
+        }
+
+        pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) void {
+            self.len = (std.fmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..]).len;
+        }
+    };
+}
+
 /// TCP_NODELAY, since drivers flush whole messages then wait (Nagle + delayed ACK
 /// stalls each exchange); SO_KEEPALIVE so idle multi-hour loads behind NATs surface
 /// a dead peer as an error, not a hang. Best-effort: never fails a connect.

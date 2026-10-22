@@ -7,8 +7,8 @@ const basalt = @import("basalt");
 const parser = basalt.sql_parser;
 const Diag = basalt.env.Diag;
 const ParamArg = basalt.env.ParamArg;
-const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
+const exec = @import("harness.zig").exec;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const runScript = @import("harness.zig").runScript;
 const runScriptOpts = @import("harness.zig").runScriptOpts;
@@ -42,12 +42,8 @@ test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
 
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT g, x, SUM(x) OVER (ORDER BY g, x) AS s FROM '{s}/big.csv';", .{ base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    try std.testing.expectError(error.IntOverflow, run(alloc, prog, .{}, &rdiag));
+    try std.testing.expectError(error.IntOverflow, exec(alloc, script, .{}, &rdiag));
 }
 
 test "aggregate: two aggregates over different expressions stay separate" {

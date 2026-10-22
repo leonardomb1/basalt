@@ -59,7 +59,7 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
     for (items) |item| switch (item) {
         .star => for (in.fields, 0..) |f, idx| try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash }),
         .star_except => |names| for (in.fields, 0..) |f, idx| {
-            if (nameIn(names, f.name)) continue;
+            if (ast.nameIn(names, f.name)) continue;
             try cols.append(.{ .name = f.name, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash });
         },
         .star_rename => |renames| {
@@ -81,12 +81,12 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         .star_of => |so| for (in.fields, 0..) |f, idx| {
             if (so.rel.len > 0) {
                 if (!std.mem.eql(u8, f.rel, so.rel)) continue;
-            } else if (nameIn(so.rights, f.rel)) continue;
+            } else if (ast.nameIn(so.rights, f.rel)) continue;
             if (renameTo(so.copies, f.name)) |key| {
                 try cols.append(.{ .name = try freeName(arena, cols.items, key, key), .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
                 continue;
             }
-            if (nameIn(so.drop, f.name)) continue;
+            if (ast.nameIn(so.drop, f.name)) continue;
             const nm = try freeName(arena, cols.items, if (f.base.len > 0) f.base else f.name, f.name);
             try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base });
         },
@@ -694,11 +694,6 @@ fn keyLabel(arena: std.mem.Allocator, name: []const u8, using: []const u8) Error
 
 fn isNumeric(k: types.TypeKind) bool {
     return k == .int or k == .float or k == .decimal;
-}
-
-fn nameIn(names: []const []const u8, n: []const u8) bool {
-    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
-    return false;
 }
 
 fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {

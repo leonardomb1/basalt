@@ -20,6 +20,8 @@
 //! counts toward the account's lockout.
 
 const std = @import("std");
+const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
+const civilFromDays = @import("../../exec/eval/time.zig").civilFromDays;
 
 pub const Error = error{
     KrbProtocol,
@@ -55,22 +57,19 @@ pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u
     return .{ .user = user, .password = password, .realm = std.ascii.upperString(buf[0..realm.len], realm), .kdc = kdc };
 }
 
-threadlocal var why_buf: [512]u8 = undefined;
-threadlocal var why_len: usize = 0;
+threadlocal var why: ThreadNote(512) = .{};
 
 pub fn lastError() []const u8 {
-    return why_buf[0..why_len];
+    return why.get();
 }
 
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    const s = std.fmt.bufPrint(&why_buf, fmt, args) catch why_buf[0..];
-    why_len = s.len;
+    why.print(fmt, args);
     return e;
 }
 
 pub const etype_aes128: i32 = 17;
 pub const etype_aes256: i32 = 18;
-const etype_rc4: i32 = 23;
 const cksum_aes128: i32 = 15;
 const cksum_aes256: i32 = 16;
 
@@ -393,21 +392,8 @@ const B = struct {
 fn kerberosTime(buf: *[15]u8, unix: i64) []const u8 {
     const days = @divFloor(unix, 86400);
     const secs: u64 = @intCast(unix - days * 86400);
-    const c = civil(days);
+    const c = civilFromDays(days);
     return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{ @as(u64, @intCast(c.y)), c.m, c.d, secs / 3600, (secs / 60) % 60, secs % 60 }) catch unreachable;
-}
-
-fn civil(z0: i64) struct { y: i64, m: u32, d: u32 } {
-    const z = z0 + 719468;
-    const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe = z - era * 146097;
-    const yoe = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
-    const y = yoe + era * 400;
-    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
-    const mp = @divFloor(5 * doy + 2, 153);
-    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
-    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
-    return .{ .y = y + (if (m <= 2) @as(i64, 1) else 0), .m = m, .d = d };
 }
 
 fn parseTime(s: []const u8) i64 {
@@ -478,11 +464,8 @@ pub const El = struct {
 
 const pvno = 5;
 const msg_as_req = 10;
-const msg_as_rep = 11;
 const msg_tgs_req = 12;
-const msg_tgs_rep = 13;
 const msg_ap_req = 14;
-const msg_error = 30;
 const nt_principal = 1;
 const nt_srv_inst = 2;
 const pa_tgs_req = 1;
@@ -843,7 +826,7 @@ fn remember(key: []const u8, t: Ticket) void {
 }
 
 pub fn serviceTicket(gpa: std.mem.Allocator, cred: Credential, spn: []const u8) !Ticket {
-    why_len = 0;
+    why.clear();
     var kb: [512]u8 = undefined;
     const skey = cacheKey(&kb, cred, spn);
     if (cached(skey)) |t| return t;

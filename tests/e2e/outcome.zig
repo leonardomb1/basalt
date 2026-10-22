@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const basalt = @import("basalt");
+const exec = @import("harness.zig").exec;
 const parser = basalt.sql_parser;
 const Diag = basalt.env.Diag;
 const isTransient = basalt.env.isTransient;
@@ -42,16 +43,14 @@ test "a database that closes the connection is a transient failure (exit 75), at
 
     var parena = std.heap.ArenaAllocator.init(alloc);
     defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
     for ([_][]const u8{ "postgres", "mysql", "sqlserver" }) |kind| {
         const top = try std.fmt.allocPrint(parena.allocator(),
             \\CREATE CONNECTION db TYPE {s} OPTIONS (host = '127.0.0.1', port = {d}, user = 'u', password = 'p', database = 'd');
             \\LOAD INTO '{s}/out.csv' AS SELECT * FROM db.t;
         , .{ kind, port, base });
-        const tprog = try parser.parseSource(parena.allocator(), top, &pdiag);
         var tdiag: Diag = .{};
-        const te = if (run(alloc, tprog, .{}, &tdiag)) |_| return error.TestUnexpectedResult else |e| e;
+        const te = if (exec(alloc, top, .{}, &tdiag)) |_| return error.TestUnexpectedResult else |e| e;
         if (!(tdiag.retryable or isTransient(te))) {
             std.debug.print("{s}: {s} ({s}) not transient\n", .{ kind, @errorName(te), tdiag.msg });
             return error.TestUnexpectedResult;
@@ -63,10 +62,9 @@ test "a database that closes the connection is a transient failure (exit 75), at
             \\  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT * FROM db.t;
             \\END FOR;
         , .{ kind, port, base, base });
-        const eprog = try parser.parseSource(parena.allocator(), each, &pdiag);
         var sink = OutcomeSink.init(parena.allocator());
         var ediag: Diag = .{};
-        _ = run(alloc, eprog, .{ .outcomes = &sink }, &ediag) catch {};
+        _ = exec(alloc, each, .{ .outcomes = &sink }, &ediag) catch {};
         try std.testing.expectEqual(@as(usize, 2), sink.failures());
         try std.testing.expectEqual(@as(usize, 2), sink.list.items.len);
         for (sink.list.items) |o| {
@@ -134,7 +132,6 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
     var ar = std.heap.ArenaAllocator.init(alloc);
     defer ar.deinit();
     const a = ar.allocator();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
     {
         var log = LoadLog{ .arena = a, .list = .init(a) };
@@ -142,10 +139,9 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             \\LOAD INTO '{s}/one.csv' AS SELECT range AS v FROM RANGE(5);
             \\LOAD INTO '/nonexistent/x.csv' AS SELECT 1 AS v;
         , .{base});
-        const prog = try parser.parseSource(a, src, &pdiag);
         var summary: basalt.obs.Summary = .{ .run_id = 0 };
         var rdiag: Diag = .{};
-        try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag));
+        try std.testing.expectError(error.PlanFailed, exec(alloc, src, .{ .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag));
         try std.testing.expectEqual(@as(usize, 2), log.list.items.len);
         const ok = log.list.items[0];
         try std.testing.expect(ok.ok);
@@ -171,9 +167,8 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             \\  LOAD INTO IDENTIFIER('{s}/out_' || $n || '.csv') AS SELECT range AS v FROM RANGE(3);
             \\END FOR;
         , .{ base, base });
-        const prog = try parser.parseSource(a, src, &pdiag);
         var rdiag: Diag = .{};
-        _ = try run(alloc, prog, .{ .on_load = .{ .ctx = &log, .f = LoadLog.f } }, &rdiag);
+        _ = try exec(alloc, src, .{ .on_load = .{ .ctx = &log, .f = LoadLog.f } }, &rdiag);
         try std.testing.expectEqual(@as(usize, 2), log.list.items.len);
         for (log.list.items, 1..) |l, k| {
             try std.testing.expect(l.ok);
@@ -197,10 +192,9 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
             \\  LOAD INTO IDENTIFIER('{s}/par_' || $n || '.csv') AS SELECT v FROM IDENTIFIER('{s}/in_' || $n || '.csv');
             \\END FOR;
         , .{ base, base, base });
-        const prog = try parser.parseSource(a, src, &pdiag);
         var summary: basalt.obs.Summary = .{ .run_id = 0 };
         var rdiag: Diag = .{};
-        _ = run(alloc, prog, .{ .threads = 4, .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag) catch |e| {
+        _ = exec(alloc, src, .{ .threads = 4, .on_load = .{ .ctx = &log, .f = LoadLog.f }, .summary_out = &summary }, &rdiag) catch |e| {
             std.debug.print("parallel on_load run: {s} ({s})\n", .{ @errorName(e), rdiag.msg });
             return e;
         };

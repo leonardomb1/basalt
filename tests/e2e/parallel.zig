@@ -3,12 +3,11 @@
 
 const std = @import("std");
 const basalt = @import("basalt");
-const parser = basalt.sql_parser;
 const fixtures = basalt.fixtures;
 const Diag = basalt.env.Diag;
 const agg_combine_parallel_min = basalt.lanes.agg_combine_parallel_min;
-const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
+const exec = @import("harness.zig").exec;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 
 test "parallel map keeps file order: a threaded load writes the rows a serial one does" {
@@ -49,12 +48,8 @@ test "parallel load into parquet: lanes encode row groups, the file keeps every 
         \\LOAD INTO '{s}/back.csv' AS SELECT id, s FROM '{s}/out.parquet';
     , .{ base, base, base, base });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = try run(alloc, prog, .{ .threads = 4 }, &rdiag);
+    _ = try exec(alloc, script, .{ .threads = 4 }, &rdiag);
     const got = try tmp.dir.readFileAlloc(alloc, "back.csv", 64 << 20);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(input.items, got);
@@ -74,14 +69,8 @@ fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query:
     defer alloc.free(q);
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
     defer alloc.free(script);
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
     var rdiag: Diag = .{};
-    _ = run(alloc, prog, .{ .threads = threads }, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{ .threads = threads }, &rdiag);
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
@@ -478,16 +467,9 @@ fn runJoinLanes(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []cons
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q2 });
     defer alloc.free(script);
 
-    var parena = std.heap.ArenaAllocator.init(alloc);
-    defer parena.deinit();
-    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
-
     var rdiag: Diag = .{};
     var summary: basalt.obs.Summary = .{ .run_id = 0 };
-    _ = run(alloc, prog, .{ .threads = threads, .summary_out = &summary }, &rdiag) catch |e| {
-        return e;
-    };
+    _ = try exec(alloc, script, .{ .threads = threads, .summary_out = &summary }, &rdiag);
     lanes.* = summary.threads;
     return tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
 }
@@ -705,14 +687,11 @@ test "parallel join: a FULL join's drained rows land after the lanes' row groups
         const back = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS SELECT * FROM '{s}';", .{ back_path, pq_path });
         defer alloc.free(back);
 
-        var parena = std.heap.ArenaAllocator.init(alloc);
-        defer parena.deinit();
-        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         var rdiag: Diag = .{};
         var summary: basalt.obs.Summary = .{ .run_id = 0 };
-        _ = try run(alloc, try parser.parseSource(parena.allocator(), load, &pdiag), .{ .threads = threads, .summary_out = &summary }, &rdiag);
+        _ = try exec(alloc, load, .{ .threads = threads, .summary_out = &summary }, &rdiag);
         if (threads > 1) try std.testing.expect(summary.threads > 1);
-        _ = try run(alloc, try parser.parseSource(parena.allocator(), back, &pdiag), .{ .threads = 1 }, &rdiag);
+        _ = try exec(alloc, back, .{ .threads = 1 }, &rdiag);
         out.* = try tmp.dir.readFileAlloc(alloc, "back.csv", 1 << 20);
     }
     defer for (outs) |o| alloc.free(o);
@@ -774,7 +753,7 @@ test "a remote Parquet file splits at row groups over coalesced ranged reads, si
         try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/want.csv' AS {s};", .{local}), 1, &.{});
         const want = try tmp.dir.readFileAlloc(a, "want.csv", 1 << 16);
         for ([_]bool{ false, true }) |ignore| {
-            var srv: basalt.objstore.RangeServer = undefined;
+            var srv: basalt.http_fake.RangeServer = undefined;
             try srv.start(data, ignore);
             defer srv.stop();
             const remote = try std.mem.replaceOwned(u8, a, q, "{s}", try std.fmt.allocPrint(a, "'{s}'", .{try srv.url(a, "/t.parquet")}));
@@ -815,7 +794,7 @@ test "a join's keys skip a remote Parquet file's row groups, which are then neve
     for ([_]usize{ 1, 4 }) |threads| {
         var fetched: [2]usize = undefined;
         for ([_][]const u8{ join, scan }, &fetched) |q, *count| {
-            var srv: basalt.objstore.RangeServer = undefined;
+            var srv: basalt.http_fake.RangeServer = undefined;
             try srv.start(data, false);
             defer srv.stop();
             const remote = try std.mem.replaceOwned(u8, a, q, "{s}", try std.fmt.allocPrint(a, "'{s}'", .{try srv.url(a, "/t.parquet")}));

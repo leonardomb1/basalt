@@ -8,7 +8,6 @@ const Decimal = @import("../../value.zig").Decimal;
 const GroupSet = Aggregate.GroupSet;
 const Layout = @import("kernel.zig").Layout;
 const Value = @import("../../value.zig").Value;
-const aggregates = @import("../../../lang/aggregates.zig");
 const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");

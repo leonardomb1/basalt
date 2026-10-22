@@ -49,6 +49,7 @@ const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
 const Space = @import("../exec/space.zig").Space;
 const deflate = @import("../format/compress/deflate.zig");
+const isUnreserved = @import("../net/percent.zig").isUnreserved;
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
@@ -139,10 +140,6 @@ fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.append('\'');
 }
 
-pub fn srType(arena: std.mem.Allocator, t: types.Type) ![]const u8 {
-    return sql.Dialect.starrocks.ddlType(arena, t, false);
-}
-
 pub fn genCreateTable(
     arena: std.mem.Allocator,
     flavor: Flavor,
@@ -169,10 +166,6 @@ fn loadUrl(gpa: std.mem.Allocator, base: []const u8, db: []const u8, table: []co
     try std.Uri.Component.percentEncode(w, table, isUnreserved);
     try w.writeAll("/_stream_load");
     return aw.toOwnedSlice();
-}
-
-fn isUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
 }
 
 test "loadUrl percent-encodes the database and table" {
@@ -915,11 +908,11 @@ test "type mapping" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectEqualStrings("BIGINT", try srType(a, types.Type.init(.int)));
-    try std.testing.expectEqualStrings("VARCHAR(65533)", try srType(a, types.Type.init(.string)));
-    try std.testing.expectEqualStrings("DOUBLE", try srType(a, types.Type.init(.float)));
-    try std.testing.expectEqualStrings("DECIMAL(10,2)", try srType(a, types.Type.decimal(10, 2)));
-    try std.testing.expectEqualStrings("DATETIME", try srType(a, types.Type.init(.timestamp)));
+    try std.testing.expectEqualStrings("BIGINT", try sql.Dialect.starrocks.ddlType(a, types.Type.init(.int), false));
+    try std.testing.expectEqualStrings("VARCHAR(65533)", try sql.Dialect.starrocks.ddlType(a, types.Type.init(.string), false));
+    try std.testing.expectEqualStrings("DOUBLE", try sql.Dialect.starrocks.ddlType(a, types.Type.init(.float), false));
+    try std.testing.expectEqualStrings("DECIMAL(10,2)", try sql.Dialect.starrocks.ddlType(a, types.Type.decimal(10, 2), false));
+    try std.testing.expectEqualStrings("DATETIME", try sql.Dialect.starrocks.ddlType(a, types.Type.init(.timestamp), false));
 }
 
 test "create table: append -> Duplicate Key" {

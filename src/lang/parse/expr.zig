@@ -380,7 +380,6 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 const pipe = cap.pipe;
                 const name = try self.freshName("__scalar{d}");
                 try self.pending_bindings.append(.{ .let_const = .{ .name = name, .expr = null, .query = pipe, .pos = spos } });
-                try self.const_names.append(name);
                 var q = try self.singleName(name);
                 q.dollar = true;
                 return self.mk(.{ .field = q });
@@ -526,10 +525,16 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
 /// A column reference in an expression: `a`, `t.col`, `a.b.c` (with `?.`).
 pub fn parseQualNameField(self: *Parser) Error!ast.QualName {
     const start = self.curPos();
+    return self.qualRest(start, try self.expectIdent(), true);
+}
+
+/// A qualified name from its `first` part on: each `.x` or `?.x` after it, taken only
+/// when an identifier follows if `checked`.
+pub fn qualRest(self: *Parser, start: Pos, first: []const u8, comptime checked: bool) Error!ast.QualName {
     var parts = std.array_list.Managed([]const u8).init(self.arena);
     var safes = std.array_list.Managed(bool).init(self.arena);
-    try parts.append(try self.expectIdent());
-    while ((self.at(.dot) or self.at(.qdot)) and (self.peekTag() == .ident or self.peekTag() == .qident)) {
+    try parts.append(first);
+    while ((self.at(.dot) or self.at(.qdot)) and (!checked or self.peekTag() == .ident or self.peekTag() == .qident)) {
         const safe = self.at(.qdot);
         _ = self.advance();
         try parts.append(try self.expectIdent());
@@ -552,17 +557,9 @@ pub fn parseCaseExpr(self: *Parser) Error!*ast.Expr {
 
     var arms = std.array_list.Managed(ast.MatchArm).init(self.arena);
     while (self.eatKw("when")) {
-        var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
-        var guard: ?*ast.Expr = null;
-        if (subject != null) {
-            try pats.append(try self.parseExpr());
-            while (self.eat(.comma)) try pats.append(try self.parseExpr());
-        } else {
-            guard = try self.parseExpr();
-        }
-        try self.expectKw("then");
+        const head = try self.parseWhenHead(subject != null);
         const value = try self.parseExpr();
-        try arms.append(.{ .pats = try pats.toOwnedSlice(), .guard = guard, .value = value, .is_default = false });
+        try arms.append(.{ .pats = head.pats, .guard = head.guard, .value = value, .is_default = false });
     }
     if (self.eatKw("else")) {
         const value = try self.parseExpr();
@@ -572,6 +569,21 @@ pub fn parseCaseExpr(self: *Parser) Error!*ast.Expr {
     if (arms.items.len == 0)
         return self.fail(self.curPos(), "CASE needs at least one WHEN arm", .{});
     return self.mk(.{ .match = .{ .subject = subject, .arms = try arms.toOwnedSlice() } });
+}
+
+/// A CASE arm's `WHEN … THEN` head: the `,`-separated patterns under a subject, else
+/// the guard.
+pub fn parseWhenHead(self: *Parser, has_subject: bool) Error!struct { pats: []*ast.Expr, guard: ?*ast.Expr } {
+    var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
+    var guard: ?*ast.Expr = null;
+    if (has_subject) {
+        try pats.append(try self.parseExpr());
+        while (self.eat(.comma)) try pats.append(try self.parseExpr());
+    } else {
+        guard = try self.parseExpr();
+    }
+    try self.expectKw("then");
+    return .{ .pats = try pats.toOwnedSlice(), .guard = guard };
 }
 
 /// `search(cols, query[, options])`. The columns become string items of a `search_cols` call

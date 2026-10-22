@@ -74,14 +74,10 @@ pub fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error
         } else break;
     }
 
-    const const_base = self.const_names.items.len;
-    for (names.items) |n| try self.const_names.append(n);
-
     var body = std.array_list.Managed(ast.Stmt).init(self.arena);
     while (!self.at(.eof) and !self.isKw("end")) {
         try self.parseStatement(&body);
     }
-    self.const_names.shrinkRetainingCapacity(const_base);
     try self.expectKw("end");
     try self.expectKw("for");
     _ = self.eat(.semi);
@@ -98,24 +94,9 @@ pub fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error
 
 pub fn parseDollarPath(self: *Parser) Error!ast.QualName {
     const start = self.curPos();
-    const t = try self.expect(.dollar_ident);
-    var parts = std.array_list.Managed([]const u8).init(self.arena);
-    var safes = std.array_list.Managed(bool).init(self.arena);
-    try parts.append(t.text);
-    while (self.at(.dot) or self.at(.qdot)) {
-        const safe = self.at(.qdot);
-        _ = self.advance();
-        try parts.append(try self.expectIdent());
-        try safes.append(safe);
-    }
-    var any_safe = false;
-    for (safes.items) |s| any_safe = any_safe or s;
-    return .{
-        .parts = try parts.toOwnedSlice(),
-        .safe = if (any_safe) try safes.toOwnedSlice() else &.{},
-        .span = self.spanFrom(start),
-        .dollar = true,
-    };
+    var q = try self.qualRest(start, (try self.expect(.dollar_ident)).text, false);
+    q.dollar = true;
+    return q;
 }
 
 pub fn parseCaseStmt(self: *Parser) Error!ast.StmtMatch {
@@ -126,25 +107,12 @@ pub fn parseCaseStmt(self: *Parser) Error!ast.StmtMatch {
 
     var arms = std.array_list.Managed(ast.StmtArm).init(self.arena);
     while (self.eatKw("when")) {
-        var pats = std.array_list.Managed(*ast.Expr).init(self.arena);
-        var guard: ?*ast.Expr = null;
-        if (subject != null) {
-            try pats.append(try self.parseExpr());
-            while (self.eat(.comma)) try pats.append(try self.parseExpr());
-        } else {
-            guard = try self.parseExpr();
-        }
-        try self.expectKw("then");
+        const head = try self.parseWhenHead(subject != null);
         var body = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof) and !self.isKw("when") and !self.isKw("else") and !self.isKw("end")) {
             try self.parseStatement(&body);
         }
-        try arms.append(.{
-            .pats = try pats.toOwnedSlice(),
-            .guard = guard,
-            .body = try body.toOwnedSlice(),
-            .is_default = false,
-        });
+        try arms.append(.{ .pats = head.pats, .guard = head.guard, .body = try body.toOwnedSlice(), .is_default = false });
     }
     if (self.eatKw("else")) {
         var body = std.array_list.Managed(ast.Stmt).init(self.arena);

@@ -95,8 +95,8 @@ const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
-
-const json = std.json;
+const percent = @import("percent.zig");
+const http_fake = @import("../testing/http_fake.zig");
 
 /// Adds to `bundle` each certificate the server presents that verifies against one
 /// already there, repeating to a fixpoint so order doesn't matter. Trusts nothing
@@ -326,22 +326,7 @@ pub fn appendForm(buf: *std.array_list.Managed(u8), key: []const u8, val: []cons
     try formEncode(buf, val);
 }
 
-pub fn formEncode(buf: *std.array_list.Managed(u8), val: []const u8) !void {
-    const hex = "0123456789ABCDEF";
-    for (val) |c| {
-        if (formUnreserved(c)) {
-            try buf.append(c);
-        } else {
-            try buf.append('%');
-            try buf.append(hex[c >> 4]);
-            try buf.append(hex[c & 0xF]);
-        }
-    }
-}
-
-fn formUnreserved(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
-}
+pub const formEncode = percent.encode;
 
 pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (path.len == 0) return base;
@@ -1237,8 +1222,7 @@ const TestServer = struct {
 
     fn start(responses: []const []const u8) !*TestServer {
         const self = try std.testing.allocator.create(TestServer);
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true }), .responses = responses };
+        self.* = .{ .listener = try http_fake.listen(128), .responses = responses };
         return self;
     }
     fn port(self: *TestServer) u16 {
@@ -1251,7 +1235,7 @@ const TestServer = struct {
     /// expected, so a regression fails the test instead of hanging it in `accept`.
     fn finish(self: *TestServer, th: std.Thread) void {
         self.stop.store(true, .seq_cst);
-        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
+        http_fake.wake(&self.listener);
         th.join();
     }
     fn serve(self: *TestServer) !void {
@@ -1304,13 +1288,7 @@ fn readRequest(stream: std.net.Stream, buf: []u8) !usize {
         if (got == 0) break;
         n += got;
         const end = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse continue;
-        var want: usize = 0;
-        var lines = std.mem.splitSequence(u8, buf[0..end], "\r\n");
-        while (lines.next()) |ln| {
-            if (std.ascii.startsWithIgnoreCase(ln, "content-length:"))
-                want = std.fmt.parseInt(usize, std.mem.trim(u8, ln["content-length:".len..], " "), 10) catch 0;
-        }
-        if (n >= end + 4 + want) break;
+        if (n >= end + 4 + http_fake.contentLength(buf[0..end])) break;
     }
     return n;
 }
@@ -1572,7 +1550,6 @@ test "http source: prefetch fetches the pages ahead and stops on empty" {
     });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
-    // Prefetched requests arrive in any order; read what the server saw once it is done.
     srv.finish(th);
     joined = true;
     var seen2 = false;
@@ -1781,8 +1758,7 @@ test "a black-holed page request times out instead of hanging the run" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try addr.listen(.{ .reuse_address = true });
+    var listener = try http_fake.listen(128);
     defer listener.deinit();
     hang_released.store(false, .seq_cst);
     const th = try std.Thread.spawn(.{}, serveOneThenHang, .{&listener});
@@ -1891,21 +1867,10 @@ test "http source: a 404 on open is HttpNotFound" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    var listener_addr = try std.net.Address.parseIp("127.0.0.1", 0);
-    var listener = try listener_addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    const th = try std.Thread.spawn(.{}, serve404Once, .{&listener});
-    defer th.join();
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/x", .{listener.listen_address.getPort()});
-    try std.testing.expectError(error.HttpNotFound, HttpSource.open(a, std.testing.allocator, url, .{}));
-}
-
-fn serve404Once(listener: *std.net.Server) void {
-    const conn = listener.accept() catch return;
-    defer conn.stream.close();
-    var rb: [2048]u8 = undefined;
-    _ = conn.stream.read(&rb) catch return;
-    conn.stream.writeAll("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n") catch return;
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{http_fake.FakeServer.reply("404 Not Found", "", "")});
+    defer srv.stop();
+    try std.testing.expectError(error.HttpNotFound, HttpSource.open(a, std.testing.allocator, try srv.url(a, "/x"), .{}));
 }
 
 test "statusError names each status family distinctly" {

@@ -1,22 +1,76 @@
-//! Test helpers shared by the tests of pushdown.zig's parts.
+//! Test helpers shared by the tests of pushdown.zig and its parts. The schema arrays
+//! are file-scope on purpose: as function locals, `&.{…}` pointed at a stack
+//! temporary that dangled in release builds.
 
 pub const Dialect = @import("../pushdown.zig").Dialect;
 const TopN = @import("topn.zig").TopN;
+const WholeAgg = @import("../pushdown.zig").WholeAgg;
 const ast = @import("../../lang/ast.zig");
-pub const base_t = @import("../pushdown.zig").base_t;
-pub const bin = @import("../pushdown.zig").bin;
+pub const bin = @import("../../testing/ast_util.zig").bin;
 const classifyTopN = @import("topn.zig").classifyTopN;
-pub const fld = @import("../pushdown.zig").fld;
+pub const fld = @import("../../testing/ast_util.zig").fld;
 const planWholeAggWhy = @import("../pushdown.zig").planWholeAggWhy;
-pub const qfld = @import("../pushdown.zig").qfld;
 const qual = @import("../pushdown.zig").qual;
-pub const schema4_fields = @import("../pushdown.zig").schema4_fields;
 const std = @import("std");
-pub const test_schema_fields = @import("../pushdown.zig").test_schema_fields;
 const testing = std.testing;
-pub const topNStagesOf = @import("../pushdown.zig").topNStagesOf;
 const types = @import("../../lang/types.zig");
-pub const wholeSchema = @import("../pushdown.zig").wholeSchema;
+
+pub const test_schema_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+};
+
+pub const schema4_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+    .{ .name = "d", .ty = types.Type.init(.int) },
+};
+
+const whole_schema_fields = [_]types.Schema.Field{
+    .{ .name = "a", .ty = types.Type.init(.int) },
+    .{ .name = "b", .ty = types.Type.init(.string) },
+    .{ .name = "c", .ty = types.Type.init(.int) },
+    .{ .name = "f", .ty = types.Type.init(.float) },
+    .{ .name = "m", .ty = types.Type.decimal(12, 2) },
+    .{ .name = "t", .ty = types.Type.init(.timestamp) },
+};
+
+pub fn wholeSchema() types.Schema {
+    return .{ .fields = &whole_schema_fields };
+}
+
+pub const base_t = "SELECT * FROM t";
+
+pub fn qfld(arena: std.mem.Allocator, parts: []const []const u8) !*ast.Expr {
+    const e = try arena.create(ast.Expr);
+    e.* = .{ .field = try qual(arena, parts) };
+    return e;
+}
+
+pub fn topNStagesOf(arena: std.mem.Allocator, sql: []const u8) ![]const ast.Stage {
+    const parser = @import("../../lang/sql_parser.zig");
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const src = try std.fmt.allocPrint(arena, "CREATE CONNECTION db TYPE postgres OPTIONS (host = 'h');\n{s};", .{sql});
+    const prog = try parser.parseSource(arena, src, &pdiag);
+    for (prog.stmts) |s| if (s == .output) return s.output.stages[0 .. s.output.stages.len - 1];
+    return error.TestUnexpectedResult;
+}
+
+pub fn planWholeAgg(
+    arena: std.mem.Allocator,
+    dialect: Dialect,
+    base_sql: []const u8,
+    src_schema: types.Schema,
+    prefix: []const ast.Stage,
+    ag: ast.Aggregate,
+    plan_schema: types.Schema,
+) !?WholeAgg {
+    var why: []const u8 = "";
+    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, null, &why);
+}
+
 pub fn testSchema() types.Schema {
     return .{ .fields = &test_schema_fields };
 }

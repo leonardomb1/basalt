@@ -27,7 +27,6 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
     try self.table_fns.appendSlice(self.known_fns);
     self.let_names = std.array_list.Managed([]const u8).init(self.arena);
     self.pending_bindings = std.array_list.Managed(ast.Stmt).init(self.arena);
-    self.const_names = std.array_list.Managed([]const u8).init(self.arena);
     self.pending_semijoins = std.array_list.Managed(PendingSemiJoin).init(self.arena);
 
     var explain: ast.ExplainMode = .none;
@@ -76,14 +75,9 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
 /// query LET's own subqueries create.
 pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     if (self.isKw("create")) return self.parseCreate(out);
-    if (self.isKw("param")) {
-        const p = try self.parseParam();
-        try self.const_names.append(p.name);
-        return out.append(.{ .param = p });
-    }
+    if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
     if (self.isKw("let")) {
         const l = try self.parseLetStmt();
-        try self.const_names.append(l.name);
         if (self.pending_bindings.items.len > 0) {
             try out.appendSlice(self.pending_bindings.items);
             self.pending_bindings.clearRetainingCapacity();

@@ -41,6 +41,8 @@ const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
 const driver = @import("../connect/driver.zig");
 const http_client = @import("../net/http_client.zig");
+const percent = @import("../net/percent.zig");
+const FakeServer = @import("../testing/http_fake.zig").FakeServer;
 const s3 = @import("s3.zig");
 const sftp = @import("sftp.zig");
 const smb = @import("smb.zig");
@@ -235,6 +237,75 @@ pub fn drain(comptime T: type) *const fn (*std.Io.Writer, []const []const u8, us
     }.f;
 }
 
+/// A front-to-back reader over `[start, end)` of a remote `File`, fetched a whole
+/// `chunk_size` at a time and handed out in the sizes asked. `File` supplies `open`,
+/// `size`, `close` and `readChunk(off, buf)`, which marks the file unhealthy as its
+/// protocol needs.
+pub fn ChunkStream(comptime File: type, comptime chunk_size: usize) type {
+    return struct {
+        const Self = @This();
+
+        file: *File,
+        at: u64 = 0,
+        end: u64,
+        owns_file: bool,
+        chunk: []u8,
+        pos: usize = 0,
+        len: usize = 0,
+        interface: std.Io.Reader,
+
+        pub fn open(arena: std.mem.Allocator, url: []const u8) !*Self {
+            const f = try File.open(arena, url);
+            errdefer f.close();
+            return make(arena, f, 0, f.size, true);
+        }
+
+        /// `len` bytes of an open file from `off`: a zip member inside a remote archive.
+        pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Self {
+            return make(arena, f, off, off + len, false);
+        }
+
+        fn make(arena: std.mem.Allocator, f: *File, start: u64, end: u64, owns: bool) !*Self {
+            const self = try arena.create(Self);
+            self.* = .{
+                .file = f,
+                .at = start,
+                .end = end,
+                .owns_file = owns,
+                .chunk = try arena.alloc(u8, chunk_size),
+                .interface = .{
+                    .buffer = try arena.alloc(u8, 64 * 1024),
+                    .vtable = &.{ .stream = streamFn },
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+            return self;
+        }
+
+        pub fn close(self: *Self) void {
+            if (self.owns_file) self.file.close();
+        }
+
+        fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *Self = @fieldParentPtr("interface", r);
+            if (self.pos == self.len) {
+                if (self.at >= self.end) return error.EndOfStream;
+                const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
+                const n = self.file.readChunk(self.at, self.chunk[0..want]) catch return error.ReadFailed;
+                if (n == 0) return error.EndOfStream;
+                self.at += n;
+                self.pos = 0;
+                self.len = n;
+            }
+            const n = limit.minInt(self.len - self.pos);
+            w.writeAll(self.chunk[self.pos..][0..n]) catch return error.WriteFailed;
+            self.pos += n;
+            return n;
+        }
+    };
+}
+
 pub const ListSpec = struct {
     item_tag: []const u8,
     next_tag: []const u8,
@@ -388,27 +459,19 @@ pub const EncodeSlash = enum { keep_slash, encode_slash };
 /// path): unreserved characters pass, the rest become uppercase %XX. A path keeps
 /// '/'; a query value encodes it too.
 pub fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
-    const hex = "0123456789ABCDEF";
-    var out = std.array_list.Managed(u8).init(arena);
-    for (s) |c| {
-        const unreserved = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~';
-        if (unreserved or (slash == .keep_slash and c == '/')) {
-            try out.append(c);
-        } else {
-            try out.append('%');
-            try out.append(hex[c >> 4]);
-            try out.append(hex[c & 0xF]);
-        }
+    var aw = std.Io.Writer.Allocating.init(arena);
+    switch (slash) {
+        inline else => |sl| std.Uri.Component.percentEncode(&aw.writer, s, struct {
+            fn keep(c: u8) bool {
+                return percent.isUnreserved(c) or (sl == .keep_slash and c == '/');
+            }
+        }.keep) catch return error.OutOfMemory,
     }
-    return out.toOwnedSlice();
+    return aw.toOwnedSlice();
 }
 
 pub fn isUrl(url: []const u8) bool {
     return find(url) != null;
-}
-
-pub fn isPrefix(url: []const u8) bool {
-    return isUrl(url) and std.mem.endsWith(u8, url, "/");
 }
 
 pub const Error = error{NotObjectUrl};
@@ -604,188 +667,6 @@ test "retry stops as soon as the run is aborting" {
     try std.testing.expectEqual(@as(usize, 1), again.calls);
 }
 
-/// A scripted HTTP/1.1 server for request-path tests: each connection gets the next
-/// reply, `null` resetting it unanswered; past the script every request gets a 418.
-/// Request lines are recorded so a test can check what was replayed.
-pub const FakeServer = struct {
-    listener: std.net.Server,
-    replies: []const ?[]const u8,
-    thread: std.Thread = undefined,
-    stopping: std.atomic.Value(bool) = .init(false),
-    count: std.atomic.Value(usize) = .init(0),
-    lines: [16][128]u8 = undefined,
-    lens: [16]usize = .{0} ** 16,
-
-    pub fn start(self: *FakeServer, replies: []const ?[]const u8) !void {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true }), .replies = replies };
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
-    }
-
-    pub fn url(self: *FakeServer, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ self.listener.listen_address.getPort(), path });
-    }
-
-    /// A whole response: `status` like "503 Slow Down", `extra` header lines each
-    /// ending in CRLF.
-    pub fn reply(comptime status: []const u8, comptime extra: []const u8, comptime body: []const u8) []const u8 {
-        return std.fmt.comptimePrint("HTTP/1.1 {s}\r\n{s}content-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ status, extra, body.len, body });
-    }
-
-    pub fn requests(self: *FakeServer) usize {
-        return self.count.load(.seq_cst);
-    }
-
-    pub fn line(self: *FakeServer, i: usize) []const u8 {
-        return self.lines[i][0..self.lens[i]];
-    }
-
-    pub fn stop(self: *FakeServer) void {
-        self.stopping.store(true, .seq_cst);
-        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
-        self.thread.join();
-        self.listener.deinit();
-    }
-
-    fn serve(self: *FakeServer) void {
-        var i: usize = 0;
-        while (true) : (i += 1) {
-            const conn = self.listener.accept() catch return;
-            defer conn.stream.close();
-            if (self.stopping.load(.seq_cst)) return;
-            self.record(conn.stream) catch continue;
-            const next: ?[]const u8 = if (i < self.replies.len) self.replies[i] else reply("418 Unscripted", "", "");
-            if (next) |text| {
-                conn.stream.writeAll(text) catch {};
-            } else {
-                const linger = extern struct { onoff: c_int, secs: c_int }{ .onoff = 1, .secs = 0 };
-                std.posix.setsockopt(conn.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&linger)) catch {};
-            }
-        }
-    }
-
-    fn record(self: *FakeServer, stream: std.net.Stream) !void {
-        var head: [8192]u8 = undefined;
-        var n: usize = 0;
-        const end = while (true) {
-            if (std.mem.indexOf(u8, head[0..n], "\r\n\r\n")) |at| break at + 4;
-            if (n == head.len) return error.HeadTooLarge;
-            const got = try stream.read(head[n..]);
-            if (got == 0) return error.EndOfStream;
-            n += got;
-        };
-        var left = bodyLength(head[0..end]) -| (n - end);
-        var sink: [4096]u8 = undefined;
-        while (left > 0) {
-            const got = try stream.read(sink[0..@min(sink.len, left)]);
-            if (got == 0) return error.EndOfStream;
-            left -= got;
-        }
-        const first = head[0 .. std.mem.indexOf(u8, head[0..end], "\r\n") orelse 0];
-        const k = self.count.fetchAdd(1, .seq_cst);
-        if (k < self.lines.len) {
-            const len = @min(first.len, self.lines[k].len);
-            @memcpy(self.lines[k][0..len], first[0..len]);
-            self.lens[k] = len;
-        }
-    }
-
-    fn bodyLength(head: []const u8) usize {
-        var it = std.mem.splitSequence(u8, head, "\r\n");
-        while (it.next()) |h| {
-            const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
-            if (!std.ascii.eqlIgnoreCase(h[0..colon], "content-length")) continue;
-            return std.fmt.parseInt(usize, std.mem.trim(u8, h[colon + 1 ..], " "), 10) catch 0;
-        }
-        return 0;
-    }
-};
-
-/// An HTTP/1.1 server of one file's bytes for range-read tests: HEAD answers its
-/// length, a GET with `Range: bytes=a-b` its slice as a 206, or the whole file as a
-/// 200 when `ignore_range` is set, as some servers do. One request per connection,
-/// served in turn. Counts the HEADs answered and the 206 and 200 bodies sent.
-pub const RangeServer = struct {
-    listener: std.net.Server,
-    data: []const u8,
-    ignore_range: bool,
-    thread: std.Thread = undefined,
-    stopping: std.atomic.Value(bool) = .init(false),
-    heads: std.atomic.Value(usize) = .init(0),
-    partial: std.atomic.Value(usize) = .init(0),
-    whole: std.atomic.Value(usize) = .init(0),
-
-    pub fn start(self: *RangeServer, data: []const u8, ignore_range: bool) !void {
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        self.* = .{ .listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 64 }), .data = data, .ignore_range = ignore_range };
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
-    }
-
-    pub fn url(self: *RangeServer, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ self.listener.listen_address.getPort(), path });
-    }
-
-    pub fn stop(self: *RangeServer) void {
-        self.stopping.store(true, .seq_cst);
-        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |c| c.close() else |_| {}
-        self.thread.join();
-        self.listener.deinit();
-    }
-
-    fn serve(self: *RangeServer) void {
-        while (true) {
-            const conn = self.listener.accept() catch return;
-            defer conn.stream.close();
-            if (self.stopping.load(.seq_cst)) return;
-            self.answer(conn.stream) catch {};
-        }
-    }
-
-    fn answer(self: *RangeServer, stream: std.net.Stream) !void {
-        var head: [8192]u8 = undefined;
-        var n: usize = 0;
-        const end = while (true) {
-            if (std.mem.indexOf(u8, head[0..n], "\r\n\r\n")) |at| break at + 4;
-            if (n == head.len) return error.HeadTooLarge;
-            const got = try stream.read(head[n..]);
-            if (got == 0) return error.EndOfStream;
-            n += got;
-        };
-        var hdr: [256]u8 = undefined;
-        const data = self.data;
-        if (std.mem.startsWith(u8, head[0..end], "HEAD ")) {
-            _ = self.heads.fetchAdd(1, .seq_cst);
-            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n", .{data.len});
-            return stream.writeAll(text);
-        }
-        if (!self.ignore_range) if (rangeOf(head[0..end])) |r| if (r[0] <= r[1] and r[1] < data.len) {
-            _ = self.partial.fetchAdd(1, .seq_cst);
-            const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {d}-{d}/{d}\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ r[0], r[1], data.len, r[1] - r[0] + 1 });
-            try stream.writeAll(text);
-            return stream.writeAll(data[r[0] .. r[1] + 1]);
-        };
-        _ = self.whole.fetchAdd(1, .seq_cst);
-        const text = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{data.len});
-        try stream.writeAll(text);
-        return stream.writeAll(data);
-    }
-
-    fn rangeOf(head: []const u8) ?[2]usize {
-        var it = std.mem.splitSequence(u8, head, "\r\n");
-        while (it.next()) |h| {
-            const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
-            if (!std.ascii.eqlIgnoreCase(h[0..colon], "range")) continue;
-            const v = std.mem.trim(u8, h[colon + 1 ..], " ");
-            if (!std.mem.startsWith(u8, v, "bytes=")) return null;
-            const dash = std.mem.indexOfScalar(u8, v, '-') orelse return null;
-            const lo = std.fmt.parseInt(usize, v[6..dash], 10) catch return null;
-            const hi = std.fmt.parseInt(usize, v[dash + 1 ..], 10) catch return null;
-            return .{ lo, hi };
-        }
-        return null;
-    }
-};
-
 test "exchange surfaces ETag, Retry-After and the body, and a reset is a transient failure" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -848,14 +729,11 @@ test "listPages follows the continuation marker and stops on the page without on
     try std.testing.expectError(error.S3AuthFailed, listPages(a, .{ .item_tag = "Key", .next_tag = "NextContinuationToken" }, &bad, Broken.page));
 }
 
-test "find and isPrefix dispatch on the scheme alone" {
+test "find dispatches on the scheme alone" {
     try std.testing.expect(find("az://a/c/f.csv") == &azure.provider);
     try std.testing.expect(find("s3://b/k.csv") == &s3.provider);
     try std.testing.expect(find("https://x/y.csv") == null);
     try std.testing.expect(find("/tmp/f.csv") == null);
-    try std.testing.expect(isPrefix("az://a/c/") and isPrefix("s3://b/dir/") and isPrefix("s3://b/"));
-    try std.testing.expect(!isPrefix("az://a/c/f.csv"));
-    try std.testing.expect(!isPrefix("s3://b/f.csv") and !isPrefix("/tmp/dir/"));
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     try std.testing.expectError(Error.NotObjectUrl, parse(ar.allocator(), "/tmp/f.csv"));

@@ -583,6 +583,11 @@ pub fn readPage(
 
 const t = std.testing;
 
+test "enumFrom maps codec ids and rejects an unknown one" {
+    try t.expectEqual(codec.Codec.zstd, try enumFrom(codec.Codec, 6));
+    try t.expectError(Error.CorruptParquet, enumFrom(codec.Codec, 99));
+}
+
 test "footerRange locates the footer from the trailer and rejects bad magic" {
     var trailer: [8]u8 = undefined;
     std.mem.writeInt(u32, trailer[0..4], 322, .little);

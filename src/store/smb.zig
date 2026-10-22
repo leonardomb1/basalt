@@ -32,6 +32,7 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
+const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const objstore = @import("objstore.zig");
 const ntlm = @import("../net/auth/ntlm.zig");
 const krb5 = @import("../net/auth/krb5.zig");
@@ -67,16 +68,14 @@ pub const Config = struct {
 
 pub const Auth = enum { ntlm, kerberos };
 
-threadlocal var why_buf: [512]u8 = undefined;
-threadlocal var why_len: usize = 0;
+threadlocal var why_note: ThreadNote(512) = .{};
 
 pub fn lastError() []const u8 {
-    return why_buf[0..why_len];
+    return why_note.get();
 }
 
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    const s = std.fmt.bufPrint(&why_buf, fmt, args) catch why_buf[0..];
-    why_len = s.len;
+    why_note.print(fmt, args);
     return e;
 }
 
@@ -95,7 +94,6 @@ const Command = enum(u16) {
     set_info = 0x11,
 };
 
-const flag_server_to_redir: u32 = 0x1;
 const flag_async: u32 = 0x2;
 const flag_signed: u32 = 0x8;
 
@@ -140,11 +138,8 @@ pub const Access = struct {
     pub const read_data: u32 = 0x1;
     pub const write_data: u32 = 0x2;
     pub const read_attributes: u32 = 0x80;
-    pub const write_attributes: u32 = 0x100;
     pub const delete: u32 = 0x10000;
     pub const synchronize: u32 = 0x100000;
-    pub const generic_read: u32 = 0x8000_0000;
-    pub const generic_write: u32 = 0x4000_0000;
 };
 const share_all: u32 = 0x7;
 const disposition_open: u32 = 1;
@@ -1073,7 +1068,7 @@ fn poolKey(buf: []u8, cfg: Config) []const u8 {
 }
 
 pub fn checkout(cfg: Config) !*Session {
-    why_len = 0;
+    why_note.clear();
     var kb: [512]u8 = undefined;
     const key = poolKey(&kb, cfg);
     while (takePooled(key)) |p| {
@@ -1145,12 +1140,15 @@ pub const File = struct {
 
     pub fn read(self: *File, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
         const buf = try arena.alloc(u8, len);
-        const n = self.session.readAt(self.handle, off, buf) catch |e| {
+        if (try self.readChunk(off, buf) != len) return error.EndOfStream;
+        return buf;
+    }
+
+    pub fn readChunk(self: *File, off: u64, buf: []u8) !usize {
+        return self.session.readAt(self.handle, off, buf) catch |e| {
             self.healthy = isProtocolOk(e);
             return e;
         };
-        if (n != len) return error.EndOfStream;
-        return buf;
     }
 
     pub fn close(self: *File) void {
@@ -1159,70 +1157,7 @@ pub const File = struct {
     }
 };
 
-pub const Stream = struct {
-    file: *File,
-    at: u64 = 0,
-    end: u64,
-    owns_file: bool,
-    chunk: []u8,
-    pos: usize = 0,
-    len: usize = 0,
-    interface: std.Io.Reader,
-
-    const chunk_size = 4 << 20;
-
-    pub fn open(arena: std.mem.Allocator, url: []const u8) !*Stream {
-        const f = try File.open(arena, url);
-        errdefer f.close();
-        return make(arena, f, 0, f.size, true);
-    }
-
-    pub fn window(arena: std.mem.Allocator, f: *File, off: u64, len: u64) !*Stream {
-        return make(arena, f, off, off + len, false);
-    }
-
-    fn make(arena: std.mem.Allocator, f: *File, start: u64, end: u64, owns: bool) !*Stream {
-        const self = try arena.create(Stream);
-        self.* = .{
-            .file = f,
-            .at = start,
-            .end = end,
-            .owns_file = owns,
-            .chunk = try arena.alloc(u8, chunk_size),
-            .interface = .{
-                .buffer = try arena.alloc(u8, 64 * 1024),
-                .vtable = &.{ .stream = streamFn },
-                .seek = 0,
-                .end = 0,
-            },
-        };
-        return self;
-    }
-
-    pub fn close(self: *Stream) void {
-        if (self.owns_file) self.file.close();
-    }
-
-    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Stream = @fieldParentPtr("interface", r);
-        if (self.pos == self.len) {
-            if (self.at >= self.end) return error.EndOfStream;
-            const want: usize = @intCast(@min(@as(u64, self.chunk.len), self.end - self.at));
-            const n = self.file.session.readAt(self.file.handle, self.at, self.chunk[0..want]) catch |e| {
-                self.file.healthy = isProtocolOk(e);
-                return error.ReadFailed;
-            };
-            if (n == 0) return error.EndOfStream;
-            self.at += n;
-            self.pos = 0;
-            self.len = n;
-        }
-        const n = limit.minInt(self.len - self.pos);
-        w.writeAll(self.chunk[self.pos..][0..n]) catch return error.WriteFailed;
-        self.pos += n;
-        return n;
-    }
-};
+pub const Stream = objstore.ChunkStream(File, 4 << 20);
 
 pub const Upload = struct {
     const upload_vtable = std.Io.Writer.VTable{ .drain = objstore.drain(Upload) };
