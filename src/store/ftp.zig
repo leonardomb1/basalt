@@ -294,11 +294,13 @@ pub const Session = struct {
 };
 
 /// A file or folder in an MLSD listing (`type=file;size=12; name`); `cdir`,
-/// `pdir` and links are left out.
+/// `pdir` and links are left out, and so is a name that is not one path part
+/// (`a/../x`, `..`, a NUL), which would land outside the download folder.
 pub fn mlsdEntry(line: []const u8) ?Session.Entry {
     const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const name = line[sp + 1 ..];
-    if (name.len == 0) return null;
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\\x00") != null) return null;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return null;
     var facts = std.mem.tokenizeScalar(u8, line[0..sp], ';');
     while (facts.next()) |f| {
         if (f.len < 5 or !std.ascii.eqlIgnoreCase(f[0..5], "type=")) continue;
@@ -521,7 +523,7 @@ test "an ftp URL parses its login, port and percent-encoded path; anonymous with
     try std.testing.expectError(error.InvalidFtpUrl, parseUrl(a, "ftp:///x"));
 }
 
-test "an MLSD line is a file or a folder by its type fact; the current and parent folders are left out" {
+test "an MLSD line is a file or a folder by its type fact; the current and parent folders and names that are not one path part are left out" {
     const f = mlsdEntry("type=file;size=12;modify=20260101000000; dados 2026.csv").?;
     try std.testing.expectEqualStrings("dados 2026.csv", f.name);
     try std.testing.expect(!f.dir);
@@ -529,6 +531,9 @@ test "an MLSD line is a file or a folder by its type fact; the current and paren
     try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("type=cdir; ."));
     try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("type=pdir; .."));
     try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("garbage"));
+    for ([_][]const u8{ "type=file; a/../../../home/u/.ssh/authorized_keys", "type=file; ..", "type=dir; .", "type=file; a\\b", "type=file; a\x00b" }) |line| {
+        try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry(line));
+    }
 }
 
 test "a registered name stands in for the host, port and login; the URL's login still wins" {
