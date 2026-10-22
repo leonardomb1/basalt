@@ -336,6 +336,11 @@ const Parser = struct {
     gpa: std.mem.Allocator,
     ngroup: u8 = 1,
     icase: bool = false,
+    depth: usize = 0,
+
+    /// How deep groups may nest: the parse, and the match after it, recurse per
+    /// level, so a pattern from data nested deeper fails rather than overflow the stack.
+    const max_depth = 128;
 
     fn parseAlt(self: *Parser) Error![]const []const Item {
         var branches = std.array_list.Managed([]const Item).init(self.gpa);
@@ -433,7 +438,10 @@ const Parser = struct {
                     cap = self.ngroup;
                     self.ngroup += 1;
                 }
+                if (self.depth >= max_depth) return Error.PatternTooComplex;
+                self.depth += 1;
                 const alt = try self.parseAlt();
+                self.depth -= 1;
                 if (self.i >= self.src.len or self.src[self.i] != ')') return Error.BadPattern;
                 self.i += 1;
                 return .{ .group = .{ .alt = alt, .cap = cap } };
@@ -791,6 +799,18 @@ test "regex: a pathological pattern gives up instead of hanging" {
     const long = "b" ** 200_000 ++ "zq";
     const lit = try Regex.compile(a, "zq");
     try std.testing.expectEqual([2]usize{ 200_000, 200_002 }, (try lit.find(long, 0, &caps)).?);
+}
+
+test "regex: groups nested past 128 deep are too complex, not a stack overflow" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var caps: Captures = undefined;
+    const deep = try std.mem.concat(a, u8, &.{ "(?:" ** 30_000, "a", ")" ** 30_000 });
+    try std.testing.expectError(Error.PatternTooComplex, Regex.compile(a, deep));
+    const ok = try std.mem.concat(a, u8, &.{ "(?:" ** 100, "a", ")" ** 100 });
+    const re = try Regex.compile(a, ok);
+    try std.testing.expectEqual([2]usize{ 0, 1 }, (try re.find("a", 0, &caps)).?);
 }
 
 test "regex: a repetition of a group that matches nothing ends the loop" {
