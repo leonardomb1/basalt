@@ -577,10 +577,7 @@ pub const Session = struct {
             },
         }
         d.seq +%= 1;
-        if (p.items.len < 1) return error.SshProtocol;
-        const padn = p.items[0];
-        if (padn + 1 > p.items.len) return error.SshProtocol;
-        return p.items[1 .. p.items.len - padn];
+        return payloadOf(p.items);
     }
 
     /// Reads the server's version line inclusive of its `\n`: the exclusive form left
@@ -1047,6 +1044,7 @@ pub const Session = struct {
                     self.chan_remote = try c.u32be();
                     self.remote_window = try c.u32be();
                     self.remote_max_packet = try c.u32be();
+                    if (self.remote_max_packet <= 64) return self.fail(error.SshProtocol, "the server's channel takes packets of at most {d} bytes, too small to carry data", .{self.remote_max_packet});
                     self.local_window = local_window_size;
                     self.chan_open = true;
                     break;
@@ -1453,6 +1451,24 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     const sk = try pc.str();
     if (pk.len != 32 or sk.len != 64) return error.SshKeyUnsupported;
     return .{ .public = pk[0..32].*, .secret = sk[0..64].* };
+}
+
+/// A decrypted packet's payload: the bytes between its padding-length byte and
+/// that many padding bytes; a length the packet cannot hold is refused.
+fn payloadOf(pkt: []u8) error{SshProtocol}![]u8 {
+    if (pkt.len < 1) return error.SshProtocol;
+    const padn: usize = pkt[0];
+    if (padn + 1 > pkt.len) return error.SshProtocol;
+    return pkt[1 .. pkt.len - padn];
+}
+
+test "a packet's padding length is checked against the packet, all 255 values included" {
+    var big = [_]u8{ 255, 1, 2, 3 };
+    try std.testing.expectError(error.SshProtocol, payloadOf(&big));
+    var none = [_]u8{};
+    try std.testing.expectError(error.SshProtocol, payloadOf(&none));
+    var ok = [_]u8{ 2, 'h', 'i', 0, 0 };
+    try std.testing.expectEqualStrings("hi", try payloadOf(&ok));
 }
 
 test "aes-ctr matches SP 800-38A F.5.1 across split calls, in place" {
