@@ -681,14 +681,33 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
             .close => |name| if (std.mem.eql(u8, name, "row")) break,
             else => {},
         };
-        std.sort.insertion(Cell, out.items, {}, struct {
-            fn lt(_: void, x: Cell, y: Cell) bool {
-                return x.col < y.col;
-            }
-        }.lt);
+        try sortCells(out.items, scratch);
         return num;
     }
     return null;
+}
+
+/// Cells into column order, duplicates kept in document order: a scan when already in
+/// order, as writers emit them, else n log n whatever the input.
+fn sortCells(cells: []Cell, scratch: std.mem.Allocator) !void {
+    var i: usize = 1;
+    while (i < cells.len and cells[i - 1].col <= cells[i].col) i += 1;
+    if (i >= cells.len) return;
+    const seq = try scratch.alloc(u32, cells.len);
+    for (seq, 0..) |*s, k| s.* = @intCast(k);
+    const Ctx = struct {
+        cells: []Cell,
+        seq: []u32,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            if (c.cells[a].col != c.cells[b].col) return c.cells[a].col < c.cells[b].col;
+            return c.seq[a] < c.seq[b];
+        }
+        pub fn swap(c: @This(), a: usize, b: usize) void {
+            std.mem.swap(Cell, &c.cells[a], &c.cells[b]);
+            std.mem.swap(u32, &c.seq[a], &c.seq[b]);
+        }
+    };
+    std.sort.pdqContext(0, cells.len, Ctx{ .cells = cells, .seq = seq });
 }
 
 /// The body of a `<c>`, read as its `t` says. A formula (`<f>`) is skipped: its cached
@@ -812,6 +831,44 @@ fn readStyles(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8
         else => {},
     };
     return out.items;
+}
+
+test "cells out of column order: sorted, duplicates in document order, a reversed full-width row" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var rd: Reader = undefined;
+    rd.strings = &.{};
+    rd.styles = &.{};
+    var cells = std.array_list.Managed(Cell).init(a);
+    var prev: u32 = 0;
+
+    var tk = xml.Tokenizer.initSlice("<row r=\"1\"><c r=\"C1\"><v>3</v></c><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c><c r=\"A1\"><v>9</v></c></row>");
+    try std.testing.expectEqual(@as(?u32, 1), try nextRow(&tk, &cells, a, &rd, &prev));
+    const want_col = [_]u32{ 0, 0, 1, 2 };
+    const want_num = [_]f64{ 1, 9, 2, 3 };
+    try std.testing.expectEqual(want_col.len, cells.items.len);
+    for (cells.items, want_col, want_num) |c, col, num| {
+        try std.testing.expectEqual(col, c.col);
+        try std.testing.expectEqual(num, c.num);
+    }
+
+    var doc = std.array_list.Managed(u8).init(a);
+    try doc.appendSlice("<row r=\"2\">");
+    var col: u32 = max_cols;
+    while (col > 0) : (col -= 1) {
+        const name = try colName(a, col - 1);
+        try doc.print("<c r=\"{s}2\"><v>{d}</v></c><c r=\"{s}2\"><v>{d}</v></c>", .{ name, col, name, col + max_cols });
+    }
+    try doc.appendSlice("</row>");
+    tk = xml.Tokenizer.initSlice(doc.items);
+    try std.testing.expectEqual(@as(?u32, 2), try nextRow(&tk, &cells, a, &rd, &prev));
+    try std.testing.expectEqual(@as(usize, 2 * max_cols), cells.items.len);
+    for (cells.items, 0..) |c, i| {
+        const want: u32 = @intCast(i / 2);
+        try std.testing.expectEqual(want, c.col);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(want + 1 + if (i % 2 == 1) @as(u32, max_cols) else 0)), c.num);
+    }
 }
 
 test "ranges, cell references, column names" {
