@@ -484,6 +484,7 @@ fn dictCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize)
         return null;
     };
     const d = col.dict.?;
+    if (d.values.len == 0) return null;
     const per = try arena.alloc(bool, d.values.len);
     for (d.values, per) |v, *o| o.* = cmpResult(op, if (flip) std.mem.order(u8, lit, v) else std.mem.order(u8, v, lit));
     var f = try Filled(bool).masked(arena, n, try copyBits(arena, col.validity, n));
@@ -1952,4 +1953,23 @@ test "an error only an untaken branch or a short-circuited side would raise fail
     for (0..2) |i| try std.testing.expect(ored.getValue(i).bool);
     const fails = try parser.parseExprStr(a, "x * 10", &diag);
     try std.testing.expectError(error.IntOverflow, evalColumn(a, fails, batch, Type.init(.int).asNullable()));
+}
+
+test "an all-null column carrying an empty dictionary compares to null, never reading an entry it lacks" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = Type.init(.string).asNullable() }} };
+    var b = column.Builder.init(a, Type.init(.string).asNullable());
+    for (0..3) |_| try b.append(.null);
+    var c = try b.finish();
+    const codes = [_]u32{ 0, 0, 0 };
+    const d = column.Column.Dict{ .values = &.{}, .codes = &codes, .id = 9 };
+    c.dict = &d;
+    var cols = [_]column.Column{c};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 3 };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, "s = 'x'", &diag);
+    const got = try evalColumn(a, e, batch, Type.init(.bool).asNullable());
+    for (0..3) |i| try std.testing.expect(got.getValue(i).isNull());
 }

@@ -1002,7 +1002,7 @@ pub const Builder = struct {
             inline else => |*l, t| @unionInit(Column.Data, @tagName(t), try l.toOwnedSlice()),
         };
         var dict: ?*const Column.Dict = null;
-        if (self.dict_vals) |vals| if (self.dict_codes.items.len == n) {
+        if (self.dict_vals) |vals| if (vals.len > 0 and self.dict_codes.items.len == n) {
             const d = try self.arena.create(Column.Dict);
             d.* = .{ .values = vals, .codes = self.dict_codes.items, .id = self.dict_src.? };
             dict = d;
