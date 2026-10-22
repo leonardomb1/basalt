@@ -100,6 +100,21 @@ fn provablyNumeric(e: *const ast.Expr, schema: types.Schema) bool {
     };
 }
 
+/// Whether the operand is certainly text already: a string literal, or a column
+/// the schema at hand says is a string. Any other value's text form differs by
+/// source (a bit as `1`, seven fractional digits, `1e+20`), so its cast to text
+/// stays in the engine.
+fn provablyText(e: *const ast.Expr, schema: types.Schema) bool {
+    return switch (e.*) {
+        .str_lit => true,
+        .field => |q| blk: {
+            const idx = schema.indexOf(q.last()) orelse break :blk false;
+            break :blk schema.fields[idx].ty.kind == .string;
+        },
+        else => false,
+    };
+}
+
 /// Date or timestamp text the engine reads its own way (`'2024-1-5'`, a `T`, a zone)
 /// but not plain ISO: against a column of unknown type it stays in the engine, as
 /// a source may read it differently, e.g. dropping the zone.
@@ -256,6 +271,7 @@ const Tx = struct {
             .cast => |c| {
                 if (c.safe) return null;
                 if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
+                if (c.ty.kind == .string and !provablyText(c.e, self.o.schema)) return null;
                 const inner = (try self.value(c.e)) orelse return null;
                 const ty = (try self.dialect.castType(self.arena, c.ty)) orelse return null;
                 return try self.fmt("CAST({s} AS {s})", .{ inner, ty });
@@ -890,7 +906,7 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "CAST(v AS INT) > 5", .want = null },
         .{ .src = "CAST(v AS INT) > 5", .want = null, .d = .mysql },
         .{ .src = "CAST(5 AS INT) > 1", .want = "(CAST(5 AS BIGINT) > 1)" },
-        .{ .src = "CAST(v AS STRING) = 'x'", .want = "(CAST([v] AS VARCHAR(MAX)) = 'x')" },
+        .{ .src = "CAST(v AS STRING) = 'x'", .want = null },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
         .{ .src = "length(status) > 2", .want = null },
         .{ .src = "length(status) > 2", .want = null, .d = .mysql },
@@ -1118,4 +1134,30 @@ test "text comparisons against the column's collation: exact where it compares b
     const e = try sqlp.parseExprStr(a, "x >= 'B'", &diag);
     try std.testing.expect((try translatePred(a, e, .sqlserver, .{ .wants_facts = &wants })) == null);
     try std.testing.expect(wants);
+}
+
+test "translateExpr: a cast to text is sent only over text, as other values print differently at each source" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sqlp = @import("../../lang/sql_parser.zig");
+    const fields = [_]types.Schema.Field{
+        .{ .name = "s", .ty = types.Type.init(.string) },
+        .{ .name = "b", .ty = types.Type.init(.bool) },
+        .{ .name = "ts", .ty = types.Type.init(.timestamp) },
+        .{ .name = "f", .ty = types.Type.init(.float) },
+    };
+    const cases = [_]struct { src: []const u8, sent: bool }{
+        .{ .src = "CAST(s AS STRING) = 'x'", .sent = true },
+        .{ .src = "CAST('a' AS STRING) = 'x'", .sent = true },
+        .{ .src = "CAST(b AS STRING) = 'true'", .sent = false },
+        .{ .src = "CAST(ts AS STRING) = '2024-01-05 05:00:00'", .sent = false },
+        .{ .src = "CAST(f AS STRING) = '100000000000000000000'", .sent = false },
+    };
+    for (cases) |c| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, c.src, &diag);
+        const got = try translateExpr(a, e, .sqlserver, .{ .fields = &fields }, false);
+        try std.testing.expectEqual(c.sent, got != null);
+    }
 }
