@@ -228,7 +228,8 @@ pub fn decodeDeltaLengthByteArray(
 }
 
 /// DELTA_BYTE_ARRAY: prefix lengths shared with the previous value, suffix
-/// lengths, then the suffix bytes.
+/// lengths, then the suffix bytes. A first pass sizes the output so every value
+/// lands in one buffer, refused past `deltaBytesCap` of the page's length.
 pub fn decodeDeltaByteArray(
     arena: std.mem.Allocator,
     src: []const u8,
@@ -236,24 +237,47 @@ pub fn decodeDeltaByteArray(
 ) Error![][]const u8 {
     var pos: usize = 0;
     const prefixes = try decodeDeltaBinaryPackedTracking(arena, src, count, &pos);
-    var pos2 = pos;
+    var pos2: usize = 0;
     const suffixes = try decodeDeltaBinaryPackedTracking(arena, src[pos..], count, &pos2);
-    var off = pos + pos2;
+    const start = pos + pos2;
 
+    const cap = deltaBytesCap(src.len);
+    var total: usize = 0;
+    var prev: usize = 0;
+    var off = start;
+    for (prefixes, suffixes) |p, sfx| {
+        const plen: usize = @intCast(@max(0, p));
+        const slen: usize = @intCast(@max(0, sfx));
+        if (plen > prev or slen > src.len - off) return Error.CorruptParquetPage;
+        prev = plen + slen;
+        if (prev > cap - total) return Error.CorruptParquetPage;
+        total += prev;
+        off += slen;
+    }
+
+    const buf = try arena.alloc(u8, total);
     const out = try arena.alloc([]const u8, count);
-    var prev: []const u8 = "";
+    var w: usize = 0;
+    var last: usize = 0;
+    off = start;
     for (out, prefixes, suffixes) |*o, p, sfx| {
         const plen: usize = @intCast(@max(0, p));
         const slen: usize = @intCast(@max(0, sfx));
-        if (off + slen > src.len or plen > prev.len) return Error.CorruptParquetPage;
-        const buf = try arena.alloc(u8, plen + slen);
-        @memcpy(buf[0..plen], prev[0..plen]);
-        @memcpy(buf[plen..], src[off..][0..slen]);
+        @memcpy(buf[w..][0..plen], buf[last..][0..plen]);
+        @memcpy(buf[w + plen ..][0..slen], src[off..][0..slen]);
         off += slen;
-        o.* = buf;
-        prev = buf;
+        o.* = buf[w..][0 .. plen + slen];
+        last = w;
+        w += plen + slen;
     }
     return out;
+}
+
+/// The most bytes a DELTA_BYTE_ARRAY page of `page_len` bytes may decode to:
+/// shared prefixes legitimately repeat bytes, but a few KB claiming gigabytes is
+/// a crafted page. Never past i32, the column offsets' range.
+fn deltaBytesCap(page_len: usize) usize {
+    return @min(std.math.maxInt(i32), @max(64 << 20, page_len *| 256));
 }
 
 /// `decodeDeltaBinaryPacked` that also reports where the stream ended, so a
@@ -454,4 +478,23 @@ test "decodeDeltaBinaryPacked: a header off the spec, or one whose sizes would o
         fba.reset();
         try std.testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(fba.allocator(), page, 2));
     }
+}
+
+test "decodeDeltaByteArray: values share one buffer, and a page claiming far more bytes than it holds is corrupt" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prefixes = [_]u8{ 0x80, 0x01, 0x04, 0x02, 0x00, 0x80, 0x40, 0, 0, 0, 0 };
+    const suffixes = [_]u8{ 0x80, 0x01, 0x04, 0x02, 0x80, 0x40, 0xFF, 0x3F, 0, 0, 0, 0 };
+    const page = prefixes ++ suffixes ++ [_]u8{'x'} ** 4096;
+
+    const vals = try decodeDeltaByteArray(a, &page, 100);
+    try testing.expectEqual(@as(usize, 100), vals.len);
+    for (vals, 0..) |v, i| {
+        try testing.expectEqual(@as(usize, 4096), v.len);
+        try testing.expectEqual('x', v[4095]);
+        try testing.expectEqual(vals[0].ptr + i * 4096, v.ptr);
+    }
+
+    try testing.expectError(Error.CorruptParquetPage, decodeDeltaByteArray(a, &page, 20_000));
 }
