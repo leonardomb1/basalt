@@ -1,7 +1,6 @@
 //! What the evaluators share: the per-thread field and regex caches, the failure
 //! note a failed cast leaves for its error message, and the order of values.
 
-const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const asDecimal = @import("row.zig").asDecimal;
@@ -9,7 +8,6 @@ const asDecimalValue = @import("cast.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
-const evalRow = @import("row.zig").evalRow;
 const fmt_bound = @import("format.zig").fmt_bound;
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
@@ -146,19 +144,6 @@ pub fn peekFailure(e: anyerror) ?[]const u8 {
 pub fn clip(s: []const u8) []const u8 {
     const max = 80;
     return if (s.len <= max) s else s[0..max];
-}
-
-const RegexMatch = struct { s: []const u8, span: ?[2]usize, caps: regex.Captures };
-
-pub fn regexpFind(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!?RegexMatch {
-    const v = try evalRow(arena, c.args[0], batch, row);
-    if (v.isNull()) return null;
-    const pat = try evalRow(arena, c.args[1], batch, row);
-    if (pat.isNull()) return null;
-    const re = cachedRegex(try valueToString(arena, pat)) catch |e| return regexErr(e);
-    var m = RegexMatch{ .s = try valueToString(arena, v), .span = null, .caps = undefined };
-    m.span = re.find(m.s, 0, &m.caps) catch |e| return regexErr(e);
-    return m;
 }
 
 /// A regex failure as the evaluator raises it: a bad pattern is a CastFailed.

@@ -6,7 +6,6 @@ const Value = @import("../value.zig").Value;
 const accNode = @import("row.zig").accNode;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
-const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const castValueTyped = @import("cast.zig").castValueTyped;
 const charWidth = @import("strings.zig").charWidth;
 const clip = @import("support.zig").clip;
@@ -21,9 +20,7 @@ const lambdaSlots = @import("row.zig").lambdaSlots;
 const literalOf = @import("row.zig").literalOf;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const reduceTypeAt = @import("row.zig").reduceTypeAt;
-const regex = @import("../regex.zig");
-const regexpFind = @import("support.zig").regexpFind;
-const regexErr = @import("support.zig").regexErr;
+const regexpReplaceText = @import("fn_scalar.zig").regexpReplaceText;
 const std = @import("std");
 const valueToString = @import("format.zig").valueToString;
 const writeJsonValue = @import("row.zig").writeJsonValue;
@@ -46,42 +43,22 @@ pub const per_row = struct {
         return .{ .date = @intCast(days) };
     }
 
+    /// Both the pattern and the replacement are evaluated before either is checked
+    /// for NULL, and the flags only then.
     pub fn regexpReplace(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v.isNull()) return .null;
         const pat = try evalRow(arena, c.args[1], batch, row);
         const rep = try evalRow(arena, c.args[2], batch, row);
         if (pat.isNull() or rep.isNull()) return .null;
-        var flags = regex.Flags{};
+        var flags: ?[]const u8 = null;
         if (c.args.len == 4) {
             const fv = try evalRow(arena, c.args[3], batch, row);
             if (fv.isNull()) return .null;
-            flags = regex.parseFlags(try valueToString(arena, fv)) orelse return error.CastFailed;
+            flags = try valueToString(arena, fv);
         }
-        const re = cachedRegexOpts(try valueToString(arena, pat), .{ .icase = flags.icase }) catch |e| return regexErr(e);
-        const replaceFn = if (flags.global) &regex.replaceAllRe else &regex.replaceFirstRe;
-        const out = replaceFn(
-            arena,
-            re,
-            try valueToString(arena, v),
-            try valueToString(arena, rep),
-        ) catch |e| return regexErr(e);
-        return .{ .string = out };
-    }
-
-    pub fn regexpMatches(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const m = try regexpFind(arena, c, batch, row) orelse return .null;
-        return .{ .bool = m.span != null };
-    }
-
-    /// Null where the pattern does not match, unlike DuckDB's '', which a load
-    /// cannot tell from an empty field.
-    pub fn regexpExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const m = try regexpFind(arena, c, batch, row) orelse return .null;
-        if (m.span == null) return .null;
-        const g: usize = if (c.args.len == 3) @intCast(c.args[2].int_lit) else 0;
-        const span = m.caps[g] orelse return .null;
-        return .{ .string = m.s[span[0]..span[1]] };
+        const s = try valueToString(arena, v);
+        return .{ .string = try regexpReplaceText(arena, s, try valueToString(arena, pat), try valueToString(arena, rep), flags) };
     }
 
     /// Values are written as `json_transform` writes elements, so a nested object or

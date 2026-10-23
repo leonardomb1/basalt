@@ -16,6 +16,10 @@ const roundOutScale = @import("cast.zig").roundOutScale;
 const time = @import("time.zig");
 const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
+const regex = @import("../regex.zig");
+const cachedRegex = @import("support.zig").cachedRegex;
+const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
+const regexErr = @import("support.zig").regexErr;
 const EvalError = @import("../eval.zig").EvalError;
 const caseMap = @import("strings.zig").caseMap;
 const caseMapInto = @import("strings.zig").caseMapInto;
@@ -562,6 +566,52 @@ pub const Power = struct {
         return std.math.pow(f64, a, b);
     }
 };
+
+/// The first match of `p` in `s`, its groups in `caps`. A pattern comes from the
+/// thread's cache, so a kernel compiles a constant one once per batch.
+fn regexFind(s: []const u8, p: []const u8, caps: *regex.Captures) EvalError!?[2]usize {
+    const re = cachedRegex(p) catch |e| return regexErr(e);
+    return re.find(s, 0, caps) catch |e| regexErr(e);
+}
+
+pub const RegexpMatches = struct {
+    pub const args = .{ .str, .str };
+    pub fn apply(_: Cx, s: []const u8, p: []const u8) EvalError!bool {
+        var caps: regex.Captures = undefined;
+        return (try regexFind(s, p, &caps)) != null;
+    }
+};
+
+/// Null where the pattern does not match, unlike DuckDB's '', which a load cannot
+/// tell from an empty field.
+pub const RegexpExtract = struct {
+    pub const args = .{ .str, .str, .opt_int };
+    pub fn apply(_: Cx, s: []const u8, p: []const u8, group: ?i64) EvalError!?[]const u8 {
+        var caps: regex.Captures = undefined;
+        if (try regexFind(s, p, &caps) == null) return null;
+        const span = caps[@intCast(group orelse 0)] orelse return null;
+        return s[span[0]..span[1]];
+    }
+};
+
+/// The kernel of `regexp_replace`, whose row form evaluates its arguments in its own
+/// order (`regexpReplaceText`).
+pub const RegexpReplace = struct {
+    pub const args = .{ .str, .str, .str, .opt_str };
+    pub fn apply(cx: Cx, s: []const u8, p: []const u8, rep: []const u8, flags: ?[]const u8) EvalError![]const u8 {
+        return regexpReplaceText(cx.arena, s, p, rep, flags);
+    }
+};
+
+/// `s` with the first match of `p` (every one, flag `g`; ignoring case, flag `i`)
+/// replaced by `rep`.
+pub fn regexpReplaceText(arena: std.mem.Allocator, s: []const u8, p: []const u8, rep: []const u8, flag_text: ?[]const u8) EvalError![]const u8 {
+    var flags = regex.Flags{};
+    if (flag_text) |t| flags = regex.parseFlags(t) orelse return error.CastFailed;
+    const re = cachedRegexOpts(p, .{ .icase = flags.icase }) catch |e| return regexErr(e);
+    const replaceFn = if (flags.global) &regex.replaceAllRe else &regex.replaceFirstRe;
+    return replaceFn(arena, re, s, rep) catch |e| regexErr(e);
+}
 
 /// `md5` and `sha256` as lowercase hex.
 pub fn Digest(comptime H: type) type {

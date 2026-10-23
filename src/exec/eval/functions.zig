@@ -99,9 +99,9 @@ pub const builtins = base ++ records[0..records.len].*;
 const base = [_]Builtin{
     .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
     .{ .name = "today", .type_fn = typing.today, .eval_fn = per_row.today, .vec_fn = vectorized.today },
-    .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace },
-    .{ .name = "regexp_matches", .type_fn = typing.regexpMatches, .eval_fn = per_row.regexpMatches },
-    .{ .name = "regexp_extract", .type_fn = typing.regexpExtract, .eval_fn = per_row.regexpExtract },
+    .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace, .vec_fn = S(f.RegexpReplace).vec },
+    .{ .name = "regexp_matches", .type_fn = typing.regexpMatches, .eval_fn = S(f.RegexpMatches).eval, .vec_fn = S(f.RegexpMatches).vec },
+    .{ .name = "regexp_extract", .type_fn = typing.regexpExtract, .eval_fn = S(f.RegexpExtract).eval, .vec_fn = S(f.RegexpExtract).vec },
     .{ .name = "md5", .type_fn = typing.digest, .eval_fn = S(f.Digest(std.crypto.hash.Md5)).eval, .vec_fn = S(f.Digest(std.crypto.hash.Md5)).vec },
     .{ .name = "sha256", .type_fn = typing.digest, .eval_fn = S(f.Digest(std.crypto.hash.sha2.Sha256)).eval, .vec_fn = S(f.Digest(std.crypto.hash.sha2.Sha256)).vec },
     .{ .name = "xxhash64", .type_fn = typing.digest, .eval_fn = S(f.XxHash64).eval, .vec_fn = S(f.XxHash64).vec },
@@ -308,5 +308,21 @@ test "hashing and text builtins: the kernels give the row forms' values, nulls a
     }, true);
     try testing_util.expectVecMatchesRows(a, batch, &.{
         "from_base64(u)", "md5(i)", "concat_ws('-', s, null, u)", "concat_ws(null, s)", "xxhash64(d)", "concat_ws('-', i, s, dt)",
+    }, false);
+}
+
+test "regexp builtins: the kernels give the row forms' values, nulls and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try testBatch(a);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "regexp_matches(s, 'p.*r')",              "regexp_matches(u, '^[0-9]{4}-')",           "regexp_matches(s, u)",
+        "regexp_extract(u, '([0-9]+)-([0-9]+)')", "regexp_extract(u, '([0-9]+)-([0-9]+)', 2)", "regexp_extract(s, '(z)?(i)', 1)",
+        "regexp_replace(s, '[aeiou]', '_')",      "regexp_replace(s, '[aeiou]', '_', 'g')",    "regexp_replace(u, '(\\d+)', '<\\1>', 'g')",
+        "regexp_replace(s, 'P', 'Q', 'gi')",      "regexp_replace(s, s, u)",                   "regexp_matches(s, 'A') and regexp_matches(u, '-')",
+    }, true);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "regexp_matches(s, concat('(', s))", "regexp_replace(s, 'a', 'b', s)", "regexp_replace(s, null, 1 / z)", "regexp_matches(i, '1')",
     }, false);
 }

@@ -38,14 +38,11 @@ test "builtins: aggregates and unknown names are not scalar builtins" {
 
 test "builtins: exactly these lack a vectorized kernel" {
     const rowwise_only = [_][]const u8{
-        "regexp_replace",
         "json_get",
         "json_filter",
         "json_transform",
         "json_any",
         "json_all",
-        "regexp_matches",
-        "regexp_extract",
         "json_object",
         "json_array",
         "json_reduce",
