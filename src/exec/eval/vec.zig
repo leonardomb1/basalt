@@ -766,26 +766,42 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column)
     return .{ .col = Column.derived(t.ty.withNull(true), n, bm, data) };
 }
 
+/// Rows that take the same side in a row are copied as one run.
 fn mergeBytes(arena: std.mem.Allocator, bm: *Bitmap, take: []const bool, ts: column.Bytes, es: column.Bytes, tv: Bitmap, ev: Bitmap) !column.Bytes {
     const n = take.len;
     var span: usize = 0;
-    for (0..n) |i| span += (if (take[i]) ts.at(i) else es.at(i)).len;
-
+    for (take, ts.offsets[0..n], ts.offsets[1 .. n + 1], es.offsets[0..n], es.offsets[1 .. n + 1]) |k, tl, th, el, eh| {
+        span += @intCast(if (k) th - tl else eh - el);
+    }
     const values = try arena.alloc(u8, try column.checkSpan(span));
     const offsets = try arena.alloc(i32, n + 1);
     offsets[0] = 0;
     var off: usize = 0;
-    for (0..n) |i| {
-        const s = if (take[i]) ts.at(i) else es.at(i);
-        @memcpy(values[off..][0..s.len], s);
-        off += s.len;
-        offsets[i + 1] = @intCast(off);
-        if (!(if (take[i]) tv.get(i) else ev.get(i))) bm.setValid(i, false);
+    var i: usize = 0;
+    while (i < n) {
+        const side = take[i];
+        const src = if (side) ts else es;
+        const lo: usize = @intCast(src.offsets[i]);
+        var j = i;
+        while (j < n and take[j] == side) : (j += 1) {
+            offsets[j + 1] = @intCast(off + @as(usize, @intCast(src.offsets[j + 1])) - lo);
+        }
+        const hi: usize = @intCast(src.offsets[j]);
+        @memcpy(values[off..][0 .. hi - lo], src.values[lo..hi]);
+        off += hi - lo;
+        i = j;
     }
+    if (!tv.allSet(n) or !ev.allSet(n)) for (take, 0..) |k, r| {
+        if (!(if (k) tv.get(r) else ev.get(r))) bm.setValid(r, false);
+    };
     return .{ .offsets = offsets, .values = values };
 }
 
 fn mergePick(comptime T: type, out: []T, bm: *Bitmap, take: []const bool, ts: []const T, es: []const T, tv: Bitmap, ev: Bitmap) void {
+    if (tv.allSet(out.len) and ev.allSet(out.len)) {
+        for (out, take, ts[0..out.len], es[0..out.len]) |*o, k, x, y| o.* = if (k) x else y;
+        return;
+    }
     for (0..out.len) |i| {
         if (take[i]) {
             out[i] = ts[i];
@@ -1393,13 +1409,45 @@ fn realize(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Column {
     }
 }
 
+/// `s` in each of `n` rows of an `out_ty` column, converted once as `Builder.append`
+/// converts it and then copied.
 fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) EvalError!Column {
     var ty = out_ty;
     if (ty.unknown) ty = Type.init(.string).asNullable();
     var b = column.Builder.init(arena, ty);
-    var i: usize = 0;
-    while (i < n) : (i += 1) try b.append(s);
-    return b.finish();
+    try b.append(s);
+    const one = try b.finish();
+    const bm = try Bitmap.initFull(arena, n);
+    if (s.isNull()) @memset(bm.bits, 0);
+    const Op = struct {
+        arena: std.mem.Allocator,
+        one: Column,
+        n: usize,
+        pub fn fixed(o: @This(), comptime tag: column.Tag) ![]column.Elem(tag) {
+            const out = try o.arena.alloc(column.Elem(tag), o.n);
+            @memset(out, @field(o.one.data, @tagName(tag))[0]);
+            return out;
+        }
+        pub fn bytes(o: @This()) !column.Bytes {
+            const v = o.one.data.bytes.at(0);
+            _ = std.math.cast(i32, v.len * o.n) orelse return error.OutOfMemory;
+            const values = try o.arena.alloc(u8, v.len * o.n);
+            const offsets = try o.arena.alloc(i32, o.n + 1);
+            for (offsets, 0..) |*off, i| off.* = @intCast(i * v.len);
+            if (values.len > 0) {
+                @memcpy(values[0..v.len], v);
+                var filled = v.len;
+                while (filled < values.len) {
+                    const k = @min(filled, values.len - filled);
+                    @memcpy(values[filled..][0..k], values[0..k]);
+                    filled += k;
+                }
+            }
+            return .{ .offsets = offsets, .values = values };
+        }
+    };
+    const data = try column.mapTag(std.meta.activeTag(one.data), Op{ .arena = arena, .one = one, .n = n });
+    return Column.derived(one.ty, n, bm, data);
 }
 
 /// Evaluates an expression at plan time against named scalar bindings (params,
@@ -1629,6 +1677,36 @@ test "float comparisons on the vector lanes order NaN and signed zero as the row
         "f = 0e0",   "f < 0e0",   "0.5e0 >= f",   "f > x",       "x <= f", "x = f",
         "x < 2",     "2 >= x",    "f = 0.0 / 0e0", "1e0 < 2",
     }, true);
+}
+
+test "a constant and an IF or CASE with a constant arm come out as the row path's values" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var sb = column.Builder.init(a, Type.init(.string).asNullable());
+    var db = column.Builder.init(a, Type.decimal(10, 2).asNullable());
+    const words = [_]?[]const u8{ "apple", null, "", "kiwi", "banana split", null, "x" };
+    for (words, 0..) |w, i| {
+        try sb.append(if (w) |s| .{ .string = s } else .null);
+        try db.append(if (i == 3) .null else .{ .decimal = .{ .unscaled = @as(i128, @intCast(i)) * 15, .scale = if (i % 2 == 0) 2 else 1 } });
+    }
+    const x = try column.intColumn(a, &.{ 1, 2, 3, null, 5, 6, 7 });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "s", .ty = Type.init(.string).asNullable() },
+        .{ .name = "d", .ty = Type.decimal(10, 2).asNullable() },
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ try sb.finish(), try db.finish(), x };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = words.len };
+    try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{
+        "'x'",                                                    "''",
+        "42",                                                     "2.50",
+        "true",                                                   "if(x > 2, s, 'neg')",
+        "if(x > 2, 'pos', s)",                                    "if(x > 2, s, null)",
+        "if(x > 2, x, 0)",                                        "if(x > 2, d, 1.5)",
+        "case when x > 5 then 'a' when x > 2 then s else '' end", "case when x > 3 then x else 7 end",
+    }, true);
+    try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{"null"}, false);
 }
 
 test "vectorized string kernels match the rowwise evaluator" {
