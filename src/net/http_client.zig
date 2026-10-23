@@ -770,7 +770,7 @@ pub const HttpSource = struct {
         };
         defer freeSlot(slot);
         if (slot.err) |e| {
-            if (e == error.TlsInitializationFailed and !replay and self.tryRepair(slot.url)) return self.replayOf(arena, slot);
+            if (e == error.TlsInitializationFailed and !replay and self.alone() and self.tryRepair(slot.url)) return self.replayOf(arena, slot);
             obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), shown });
             return mapTransport(e);
         }
@@ -785,6 +785,11 @@ pub const HttpSource = struct {
         if (slot.code == 204) return "";
         if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
         return arena.dupe(u8, slot.body);
+    }
+
+    /// No other worker can be using the client, so its CA bundle may grow.
+    fn alone(self: *HttpSource) bool {
+        return self.slots.items.len == 0 and self.zombies == 0;
     }
 
     fn replayOf(self: *HttpSource, arena: std.mem.Allocator, slot: *Slot) ![]const u8 {
@@ -1744,6 +1749,49 @@ test "a black-holed page request times out instead of hanging the run" {
     try std.testing.expectError(error.ConnectionTimedOut, s.next(a));
     const waited = std.time.milliTimestamp() - started;
     try std.testing.expect(waited >= 350 and waited < 5_000);
+}
+
+fn serveThenHang(listener: *std.net.Server, replies: []const []const u8) void {
+    for (replies) |r| {
+        const conn = listener.accept() catch return;
+        defer conn.stream.close();
+        var rb: [2048]u8 = undefined;
+        _ = conn.stream.read(&rb) catch return;
+        conn.stream.writeAll(r) catch return;
+    }
+    const conn = listener.accept() catch return;
+    var rb: [2048]u8 = undefined;
+    _ = conn.stream.read(&rb) catch return;
+    var waited: usize = 0;
+    while (!hang_released.load(.seq_cst) and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);
+    conn.stream.close();
+}
+
+test "a page replayed after a re-login times out like any page" {
+    var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var listener = try http_fake.listen(128);
+    defer listener.deinit();
+    hang_released.store(false, .seq_cst);
+    const replies = [_][]const u8{
+        "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n\"tok-A\"",
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n\"tok-B\"",
+    };
+    const th = try std.Thread.spawn(.{}, serveThenHang, .{ &listener, @as([]const []const u8, &replies) });
+    defer th.join();
+    defer hang_released.store(true, .seq_cst);
+
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+    const started = std.time.milliTimestamp();
+    try std.testing.expectError(error.ConnectionTimedOut, HttpSource.openConn(a, std.heap.page_allocator, .{
+        .base_url = base,
+        .auth = .login_json,
+        .login_url = "/login",
+    }, "/items", .{ .retries = 0, .timeout_ms = 400 }));
+    try std.testing.expect(std.time.milliTimestamp() - started < 5_000);
 }
 
 test "joinUrl and encodeSpaces" {
