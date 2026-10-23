@@ -19,8 +19,9 @@
 //! keyboard-interactive, or an Ed25519 key (passphrase-protected too).
 //!
 //! The server may rekey at any moment; that is handled where it is met. Channel
-//! data arriving while a send waits on the window is held for the next `recv`. A
-//! packet longer than `max_packet` is refused rather than buffered. The failure
+//! data arriving while a send waits on the window is held for the next `recv`, its
+//! window granted back only then, so a server can make us hold at most one window;
+//! data past the window, or a packet longer than `max_packet`, is refused. The failure
 //! text (`why`, and the thread-local copy that outlives a failed `connect`) holds
 //! the server's disconnect message or a fingerprint, never a secret.
 
@@ -1103,19 +1104,21 @@ pub const Session = struct {
         }
     }
 
+    /// Holds data that arrives while `send` waits. Its window is granted back only
+    /// when `recv` hands it on, so what is held never exceeds one window.
     fn stash(self: *Session, p: []const u8) !void {
         var c = Cursor{ .s = p[1..] };
         _ = try c.u32be();
         const d = try c.str();
+        try self.arrived(d.len);
         try self.held.appendSlice(d);
-        try self.consumed(d.len);
     }
 
     pub fn recv(self: *Session, out: *std.array_list.Managed(u8)) !void {
         if (self.held.items.len > 0) {
             try out.appendSlice(self.held.items);
             self.held.clearRetainingCapacity();
-            return;
+            return self.regrant();
         }
         while (true) {
             const p = try self.next();
@@ -1124,14 +1127,16 @@ pub const Session = struct {
                 msg.channel_data => {
                     _ = try c.u32be();
                     const d = try c.str();
+                    try self.arrived(d.len);
                     try out.appendSlice(d);
-                    try self.consumed(d.len);
+                    try self.regrant();
                     if (d.len > 0) return;
                 },
                 msg.channel_extended_data => {
                     _ = try c.u32be();
                     _ = try c.u32be();
-                    try self.consumed((try c.str()).len);
+                    try self.arrived((try c.str()).len);
+                    try self.regrant();
                 },
                 msg.channel_window_adjust => try self.onWindow(p),
                 msg.channel_eof, msg.channel_close => {
@@ -1154,9 +1159,14 @@ pub const Session = struct {
         }
     }
 
+    /// Charges `n` received bytes to the window; a server sending past it breaks the protocol.
+    fn arrived(self: *Session, n: usize) !void {
+        if (n > self.local_window) return self.fail(error.SshProtocol, "the server sent past the channel window", .{});
+        self.local_window -= n;
+    }
+
     /// Give back window once half of it is used.
-    fn consumed(self: *Session, n: usize) !void {
-        self.local_window -|= n;
+    fn regrant(self: *Session) !void {
         if (self.local_window < local_window_size / 2) {
             const add: u32 = @intCast(local_window_size - self.local_window);
             var b = Buf.init(self.gpa);
@@ -1588,6 +1598,42 @@ test "fingerprint as OpenSSH prints it" {
     var out: [64]u8 = undefined;
     const fp = fingerprint("", &out);
     try std.testing.expectEqualStrings("SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU", fp);
+}
+
+test "channel data held during a send is bounded by the window" {
+    const a = std.testing.allocator;
+    const s = try a.create(Session);
+    defer a.destroy(s);
+    s.* = .{
+        .gpa = a,
+        .stream = undefined,
+        .sr = undefined,
+        .sw = undefined,
+        .cfg = .{ .host = "h", .user = "u" },
+        .packet = .init(a),
+        .out = .init(a),
+        .why = .init(a),
+        .held = .init(a),
+        .local_window = Session.local_window_size,
+    };
+    defer {
+        s.packet.deinit();
+        s.out.deinit();
+        s.why.deinit();
+        s.held.deinit();
+    }
+    var b = Buf.init(a);
+    defer b.deinit();
+    try b.byte(msg.channel_data);
+    try b.u32be(0);
+    try b.str(&([_]u8{'x'} ** (32 * 1024)));
+    var err: ?anyerror = null;
+    for (0..1000) |_| s.stash(b.list.items) catch |e| {
+        err = e;
+        break;
+    };
+    try std.testing.expectEqual(@as(?anyerror, error.SshProtocol), err);
+    try std.testing.expectEqual(@as(usize, Session.local_window_size), s.held.items.len);
 }
 
 test "live: log in and open sftp (BASALT_SSH_TEST_PORT)" {
