@@ -342,6 +342,7 @@ pub const Session = struct {
     rbuf: [max_packet + 1024]u8 = undefined,
     wbuf: [64 * 1024]u8 = undefined,
     cfg: Config,
+    cfg_text: []u8 = &.{},
     server_version: []const u8 = "",
     session_id: [32]u8 = undefined,
     have_session_id: bool = false,
@@ -383,13 +384,17 @@ pub const Session = struct {
     fn connectOnce(gpa: std.mem.Allocator, cfg: Config, pt: *PinTry) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
+        var owned = cfg;
+        const text = try ownConfig(gpa, &owned);
+        errdefer gpa.free(text);
         const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e| return e;
         self.* = .{
             .gpa = gpa,
             .stream = stream,
             .sr = undefined,
             .sw = undefined,
-            .cfg = cfg,
+            .cfg = owned,
+            .cfg_text = text,
             .packet = .init(gpa),
             .out = .init(gpa),
             .why = .init(gpa),
@@ -414,9 +419,33 @@ pub const Session = struct {
         if (self.server_version.len > 0) self.gpa.free(self.server_version);
     }
 
+    /// Copies `cfg`'s strings into one allocation and points `cfg` at the copies: a
+    /// pooled session outlives the statement whose URL it was opened from, and a
+    /// rekey checks the host key against `host`, `known_hosts` and `host_key` again.
+    fn ownConfig(gpa: std.mem.Allocator, cfg: *Config) ![]u8 {
+        const fields = .{ "host", "user", "password", "key_file", "key_passphrase", "known_hosts", "host_key" };
+        var n: usize = 0;
+        inline for (fields) |f| {
+            const v: ?[]const u8 = @field(cfg, f);
+            if (v) |x| n += x.len;
+        }
+        const text = try gpa.alloc(u8, n);
+        var at: usize = 0;
+        inline for (fields) |f| {
+            const v: ?[]const u8 = @field(cfg, f);
+            if (v) |x| {
+                @memcpy(text[at..][0..x.len], x);
+                @field(cfg, f) = text[at..][0..x.len];
+                at += x.len;
+            }
+        }
+        return text;
+    }
+
     pub fn close(self: *Session) void {
         const gpa = self.gpa;
         self.release();
+        gpa.free(self.cfg_text);
         gpa.destroy(self);
     }
 
@@ -1662,4 +1691,16 @@ test "live: log in and open sftp (BASALT_SSH_TEST_PORT)" {
     const pin = std.posix.getenv("BASALT_SSH_TEST_PIN") orelse return;
     const s = try Session.connect(a, .{ .host = "127.0.0.1", .port = port, .user = "basalt", .password = "pw", .host_key = pin });
     s.close();
+}
+
+test "a session's config is its own copy, so a pooled session outlives the URL it came from" {
+    var url = "sftp://bob@files.example:2222/x".*;
+    var cfg = Config{ .host = url[11..24], .user = url[7..10], .port = 2222, .known_hosts = "/tmp/kh" };
+    const text = try Session.ownConfig(std.testing.allocator, &cfg);
+    defer std.testing.allocator.free(text);
+    @memset(&url, 'x');
+    try std.testing.expectEqualStrings("files.example", cfg.host);
+    try std.testing.expectEqualStrings("bob", cfg.user);
+    try std.testing.expectEqualStrings("/tmp/kh", cfg.known_hosts.?);
+    try std.testing.expect(cfg.password == null);
 }
