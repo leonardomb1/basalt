@@ -47,7 +47,7 @@ for s in $SUITES; do
 done
 
 zig build
-B=./zig-out/bin/basalt
+B=${B:-./zig-out/bin/basalt}
 COMPOSE="docker compose -f tests/integration/compose.yaml"
 
 # The sftp suite logs in with a key made here, for this run only.
@@ -486,6 +486,37 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM '$volcsv';"
 runs mysql     && volrt mysql     "$MYSQL_OPTS"
 runs postgres  && volrt postgres  "$PG_OPTS"
 runs sqlserver && volrt sqlserver "$MSSQL_OPTS"
+
+# MySQL over TLS: the only path through the vendored tls_client. A round trip, the
+# bulk LOAD DATA volume, and the session's cipher, so a silent plaintext fallback fails.
+if runs mysql; then
+  tdecl="CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS, tls = 'insecure');"
+  if brun run -c "$tdecl
+LOAD INTO db.basalt_it_tls REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
+     brun run -c "$tdecl
+LOAD INTO '$out/mysql_tls.csv' AS SELECT * FROM db.basalt_it_tls ORDER BY id;"; then
+    check mysql-tls "$out/mysql_tls.csv" tests/integration/expected.csv
+  else
+    report "mysql-tls (run error)" bad
+  fi
+  if brun run -c "$tdecl
+LOAD INTO db.basalt_vol_tls REPLACE AS SELECT * FROM '$volcsv';" &&
+     brun run -c "$tdecl
+LOAD INTO '$out/vol_mysql_tls.csv' AS
+SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM db.basalt_vol_tls;"; then
+    check mysql-tls-volume "$out/vol_mysql_tls.csv" "$out/vol_expected.csv"
+  else
+    report "mysql-tls-volume (run error)" bad
+  fi
+  if brun run -c "$tdecl
+LOAD INTO '$out/mysql_tls_cipher.csv' AS SELECT * FROM db.QUERY(\$\$SHOW SESSION STATUS LIKE 'Ssl_cipher'\$\$);" &&
+     grep -q 'Ssl_cipher,.\+' "$out/mysql_tls_cipher.csv"; then
+    report mysql-tls-cipher ok
+  else
+    report "mysql-tls-cipher (no TLS cipher on the session)" bad
+    cat "$out/mysql_tls_cipher.csv" 2>/dev/null | head -3
+  fi
+fi
 
 # A value over 16 MB does not fit one MySQL packet; the server splits it and the
 # client must glue the run back together. `readPacket` took only the first
