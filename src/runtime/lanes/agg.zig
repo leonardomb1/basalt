@@ -700,12 +700,11 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     };
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
     const t_emit0 = std.time.Instant.now() catch unreachable;
     const emit_span = trace.begin("aggregate emit and write", 0);
-    writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats) catch |e| {
-        snk.abort();
-        return e;
-    };
+    try writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats);
     emit_span.end();
     const t_emit1 = std.time.Instant.now() catch unreachable;
     if (split == .parquet) {
@@ -718,6 +717,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
         for (lane_joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
         p.path = try std.fmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
     }
+    snk_open = false;
     try snk.close();
     return true;
 }
@@ -915,16 +915,16 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const t_emit0 = std.time.Instant.now() catch unreachable;
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
-    writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats) catch |e| {
-        snk.abort();
-        return e;
-    };
+    var snk_open = true;
+    errdefer if (snk_open) snk.abort();
+    try writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats);
     if (env.profile) |p| {
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
         try p.phase("emit and write the groups", (std.time.Instant.now() catch unreachable).since(t_emit0));
         p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
         try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
+    snk_open = false;
     try snk.close();
     return true;
 }
