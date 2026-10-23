@@ -158,15 +158,15 @@ const base = [_]Builtin{
     .{ .name = "initcap", .type_fn = typing.unaryString, .eval_fn = S(f.Initcap).eval, .vec_fn = S(f.Initcap).vec },
     .{ .name = "ascii", .type_fn = typing.strlen, .eval_fn = S(f.Ascii).eval, .vec_fn = S(f.Ascii).vec },
     .{ .name = "chr", .type_fn = typing.chr, .eval_fn = S(f.Chr).eval, .vec_fn = S(f.Chr).vec },
-    .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = per_row.jsonGet },
+    .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = S(f.JsonGet).eval, .vec_fn = S(f.JsonGet).vec },
     .{ .name = "json_filter", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_reduce", .type_fn = typing.jsonReduce, .eval_fn = per_row.jsonReduce },
-    .{ .name = "chars", .type_fn = typing.chars, .eval_fn = per_row.chars },
+    .{ .name = "chars", .type_fn = typing.chars, .eval_fn = S(f.Chars).eval, .vec_fn = S(f.Chars).vec },
     .{ .name = "json_range", .type_fn = typing.jsonRange, .eval_fn = per_row.jsonRange },
-    .{ .name = "json_length", .type_fn = typing.jsonLength, .eval_fn = per_row.jsonLength },
+    .{ .name = "json_length", .type_fn = typing.jsonLength, .eval_fn = S(f.JsonLength).eval, .vec_fn = S(f.JsonLength).vec },
     .{ .name = "json_slice", .type_fn = typing.jsonSlice, .eval_fn = per_row.jsonSlice },
     .{ .name = "json_concat", .type_fn = typing.jsonConcat, .eval_fn = per_row.jsonConcat },
     .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
@@ -324,5 +324,20 @@ test "regexp builtins: the kernels give the row forms' values, nulls and errors"
     }, true);
     try testing_util.expectVecMatchesRows(a, batch, &.{
         "regexp_matches(s, concat('(', s))", "regexp_replace(s, 'a', 'b', s)", "regexp_replace(s, null, 1 / z)", "regexp_matches(i, '1')",
+    }, false);
+}
+
+test "json builtins: the kernels give the row forms' values, nulls and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try testBatch(a);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "chars(s)",                                                  "chars(u)",                                       "json_length(chars(s))",
+        "json_get(concat('{\"a\":', i, ',\"b\":[1,null]}'), '$.a')", "json_get(concat('{\"k\":\"', s, '\"}'), '$.k')", "json_get('{\"b\":[1,null]}', concat('$.b[', abs(g), ']'))",
+        "json_length(concat('[', i, ',', z, ']'))",                  "json_get(chars(s), '$[0]')",
+    }, true);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "json_length(s)", "json_get(s, '$.a')", "json_get(null, 1 / z)", "json_length('{}')", "json_get(u, s)",
     }, false);
 }

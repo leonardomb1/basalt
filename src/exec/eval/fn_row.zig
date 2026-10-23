@@ -7,7 +7,6 @@ const accNode = @import("row.zig").accNode;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
 const castValueTyped = @import("cast.zig").castValueTyped;
-const charWidth = @import("strings.zig").charWidth;
 const clip = @import("support.zig").clip;
 const compareValues = @import("support.zig").compareValues;
 const eq = @import("support.zig").eq;
@@ -208,25 +207,6 @@ pub const per_row = struct {
         return acc;
     }
 
-    pub fn chars(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const str = try valueToString(arena, v);
-        var out = std.Io.Writer.Allocating.init(arena);
-        const w = &out.writer;
-        w.writeByte('[') catch return error.OutOfMemory;
-        var i: usize = 0;
-        while (i < str.len) {
-            const cw = charWidth(str, i);
-            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.encodeJsonString(str[i..][0..cw], .{}, w) catch return error.OutOfMemory;
-            i += cw;
-            if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "chars: the array passes {d} bytes", .{max_str_bytes});
-        }
-        w.writeByte(']') catch return error.OutOfMemory;
-        return .{ .string = out.written() };
-    }
-
     pub fn jsonRange(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var bounds = [2]i64{ 0, 0 };
         for (c.args, bounds[2 - c.args.len ..]) |e, *b| {
@@ -246,14 +226,6 @@ pub const per_row = struct {
         }
         w.writeByte(']') catch return error.OutOfMemory;
         return .{ .string = out.written() };
-    }
-
-    pub fn jsonLength(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const doc = try jsonArrayArg(arena, c.args[0], batch, row) orelse return .null;
-        var items = json.Elements.root(doc);
-        var n: i64 = 0;
-        while (items.next()) |_| n += 1;
-        return .{ .int = n };
     }
 
     /// Elements `start` up to (not including) `stop`, from 0; negative bounds count
@@ -303,18 +275,5 @@ pub const per_row = struct {
         }
         w.writeByte(']') catch return error.OutOfMemory;
         return .{ .string = out.written() };
-    }
-
-    pub fn jsonGet(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const dv = try evalRow(arena, c.args[0], batch, row);
-        const pv = try evalRow(arena, c.args[1], batch, row);
-        if (dv.isNull() or pv.isNull()) return .null;
-        const doc = try valueToString(arena, dv);
-        try json.validate(arena, doc);
-        const leaf = (try json.path(arena, doc, try valueToString(arena, pv))) orelse return .null;
-        return switch (try json.cell(arena, leaf)) {
-            .null => .null,
-            .text => |t| .{ .string = t },
-        };
     }
 };

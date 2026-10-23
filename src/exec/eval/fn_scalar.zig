@@ -17,6 +17,7 @@ const time = @import("time.zig");
 const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
 const regex = @import("../regex.zig");
+const json = @import("../json.zig");
 const cachedRegex = @import("support.zig").cachedRegex;
 const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const regexErr = @import("support.zig").regexErr;
@@ -612,6 +613,54 @@ pub fn regexpReplaceText(arena: std.mem.Allocator, s: []const u8, p: []const u8,
     const replaceFn = if (flags.global) &regex.replaceAllRe else &regex.replaceFirstRe;
     return replaceFn(arena, re, s, rep) catch |e| regexErr(e);
 }
+
+/// The value at a path of a JSON document, as text; NULL where the path leads
+/// nowhere or to a JSON null.
+pub const JsonGet = struct {
+    pub const args = .{ .str, .str };
+    pub const eval_all = true;
+    pub fn apply(cx: Cx, doc: []const u8, path: []const u8) EvalError!?[]const u8 {
+        try json.validate(cx.arena, doc);
+        const leaf = (try json.path(cx.arena, doc, path)) orelse return null;
+        return switch (try json.cell(cx.arena, leaf)) {
+            .null => null,
+            .text => |t| t,
+        };
+    }
+};
+
+/// The number of elements of a JSON array; any other document is invalid here.
+pub const JsonLength = struct {
+    pub const args = .{.str};
+    pub fn apply(cx: Cx, doc: []const u8) EvalError!i64 {
+        try json.validate(cx.arena, doc);
+        if (json.rootKind(doc) != .array) return error.InvalidJson;
+        var items = json.Elements.root(doc);
+        var n: i64 = 0;
+        while (items.next()) |_| n += 1;
+        return n;
+    }
+};
+
+/// The characters of a text as a JSON array of strings.
+pub const Chars = struct {
+    pub const args = .{.str};
+    pub fn apply(cx: Cx, str: []const u8) EvalError![]const u8 {
+        var out = std.Io.Writer.Allocating.init(cx.arena);
+        const w = &out.writer;
+        w.writeByte('[') catch return error.OutOfMemory;
+        var i: usize = 0;
+        while (i < str.len) {
+            const cw = charWidth(str, i);
+            if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+            std.json.Stringify.encodeJsonString(str[i..][0..cw], .{}, w) catch return error.OutOfMemory;
+            i += cw;
+            if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "chars: the array passes {d} bytes", .{max_str_bytes});
+        }
+        w.writeByte(']') catch return error.OutOfMemory;
+        return out.written();
+    }
+};
 
 /// `md5` and `sha256` as lowercase hex.
 pub fn Digest(comptime H: type) type {

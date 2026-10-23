@@ -38,7 +38,6 @@ test "builtins: aggregates and unknown names are not scalar builtins" {
 
 test "builtins: exactly these lack a vectorized kernel" {
     const rowwise_only = [_][]const u8{
-        "json_get",
         "json_filter",
         "json_transform",
         "json_any",
@@ -46,9 +45,7 @@ test "builtins: exactly these lack a vectorized kernel" {
         "json_object",
         "json_array",
         "json_reduce",
-        "chars",
         "json_range",
-        "json_length",
         "json_slice",
         "json_concat",
     };
