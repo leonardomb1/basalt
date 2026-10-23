@@ -60,6 +60,7 @@ pub const TableWriter = struct {
     right: []const bool,
     ncols: usize,
     cells: std.array_list.Managed(?[]const u8),
+    cell_text: std.heap.ArenaAllocator,
     tail: std.array_list.Managed(?[]const u8),
     tail_at: usize = 0,
     nrows: usize = 0,
@@ -71,13 +72,24 @@ pub const TableWriter = struct {
 
     pub fn open(gpa: std.mem.Allocator, schema: types.Schema) !*TableWriter {
         const self = try gpa.create(TableWriter);
+        errdefer gpa.destroy(self);
         const names = try gpa.alloc([]const u8, schema.fields.len);
+        errdefer gpa.free(names);
         const labels = try gpa.alloc([]const u8, schema.fields.len);
+        errdefer gpa.free(labels);
         const right = try gpa.alloc(bool, schema.fields.len);
+        errdefer gpa.free(right);
+        var made: usize = 0;
+        errdefer for (names[0..made], labels[0..made]) |n, l| {
+            gpa.free(n);
+            gpa.free(l);
+        };
         for (schema.fields, 0..) |f, i| {
             names[i] = try gpa.dupe(u8, f.name);
+            errdefer gpa.free(names[i]);
             labels[i] = try typeLabel(gpa, f.ty);
             right[i] = f.ty.kind.isNumeric();
+            made += 1;
         }
         self.* = .{
             .gpa = gpa,
@@ -86,19 +98,24 @@ pub const TableWriter = struct {
             .right = right,
             .ncols = schema.fields.len,
             .cells = std.array_list.Managed(?[]const u8).init(gpa),
+            .cell_text = std.heap.ArenaAllocator.init(gpa),
             .tail = std.array_list.Managed(?[]const u8).init(gpa),
             .tty = interactive and std.posix.isatty(std.fs.File.stdout().handle),
         };
         return self;
     }
 
+    /// Kept cells live in `cell_text`, one arena for the whole result; the tail ring's
+    /// on the heap, as each is freed when a newer row replaces it.
     pub fn writeBatch(self: *TableWriter, _: std.mem.Allocator, batch: Batch) !void {
         var buf: [celltext.scalar_bound]u8 = undefined;
+        const kept = self.cell_text.allocator();
         var r: usize = 0;
         while (r < batch.len) : (r += 1) {
             const overflow = self.tty and self.nrows >= keep_max;
+            const into = if (overflow) self.gpa else kept;
             for (batch.columns, 0..) |*col, c| {
-                const s: ?[]const u8 = if (celltext.isNull(col, r)) null else try self.gpa.dupe(u8, celltext.text(col, r, &buf, celltext.Plain{}));
+                const s: ?[]const u8 = if (celltext.isNull(col, r)) null else try into.dupe(u8, celltext.text(col, r, &buf, celltext.Plain{}));
                 if (!overflow) {
                     try self.cells.append(s);
                 } else if (self.tail.items.len < tail_rows * self.ncols) {
@@ -188,7 +205,7 @@ pub const TableWriter = struct {
     }
 
     fn deinit(self: *TableWriter) void {
-        for (self.cells.items) |c| if (c) |s| self.gpa.free(s);
+        self.cell_text.deinit();
         self.cells.deinit();
         for (self.tail.items) |c| if (c) |s| self.gpa.free(s);
         self.tail.deinit();
