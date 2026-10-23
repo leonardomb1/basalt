@@ -2160,3 +2160,48 @@ test "a row group is flushed at its byte cap, not only at its row count" {
     try testing.expect(md.row_groups.len >= 4);
     try expectCapRows(a, path, n);
 }
+
+test "a moderate write is one row group, whether written directly or through a unit encoder" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "tag", .ty = types.Type.init(.string).asNullable() },
+        .{ .name = "note", .ty = types.Type.init(.string) },
+    } };
+    const n = 90_000;
+    const step = 10_000;
+    var batches: [n / step]Batch = undefined;
+    for (&batches, 0..) |*bt, k| {
+        const cols = try a.alloc(column.Column, 3);
+        var bs: [3]column.Builder = undefined;
+        for (&bs, schema.fields) |*b, f| b.* = try column.Builder.initCapacity(a, f.ty, step);
+        for (k * step..(k + 1) * step) |i| {
+            try bs[0].append(.{ .int = @intCast(i) });
+            try bs[1].append(if (i % 9 == 0) .null else .{ .string = ([_][]const u8{ "a", "b", "c" })[i % 3] });
+            try bs[2].append(.{ .string = try std.fmt.allocPrint(a, "note-{d:0>24}", .{i}) });
+        }
+        for (cols, &bs) |*c, *b| c.* = try b.finish();
+        bt.* = .{ .schema = &schema, .columns = cols, .len = step };
+    }
+    for ([_]bool{ false, true }) |unit| {
+        const name = if (unit) "unit.parquet" else "direct.parquet";
+        const path = try std.fs.path.join(a, &.{ dir, name });
+        var w = try Writer.open(a, path, schema, .snappy, .truncate);
+        if (unit) {
+            const u = try w.openUnit(a);
+            for (batches) |bt| try u.vtable.write(u.ptr, a, bt);
+            try u.vtable.seal(u.ptr);
+            try u.vtable.commit(u.ptr);
+        } else for (batches) |bt| try w.writeBatch(a, bt);
+        try w.close();
+        const bytes = try tmp.dir.readFileAlloc(a, name, 1 << 24);
+        const md = try parquet.parseFile(a, bytes);
+        try testing.expectEqual(@as(usize, 1), md.row_groups.len);
+        try testing.expectEqual(@as(i64, n), md.row_groups[0].num_rows);
+    }
+}
