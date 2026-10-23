@@ -498,3 +498,239 @@ pub const typing = struct {
         return Type.init(.string).withNull(a.nullable);
     }
 };
+
+const parser = @import("../../lang/sql_parser.zig");
+
+const test_schema = types.Schema{ .fields = &.{
+    .{ .name = "i", .ty = Type.init(.int) },
+    .{ .name = "ni", .ty = Type.init(.int).asNullable() },
+    .{ .name = "f", .ty = Type.init(.float) },
+    .{ .name = "s", .ty = Type.init(.string) },
+    .{ .name = "ns", .ty = Type.init(.string).asNullable() },
+    .{ .name = "d", .ty = Type.init(.date) },
+    .{ .name = "ts", .ty = Type.init(.timestamp) },
+    .{ .name = "b", .ty = Type.init(.bool) },
+    .{ .name = "m", .ty = Type.decimal(10, 2) },
+    .{ .name = "arr", .ty = Type.init(.array) },
+} };
+
+fn typeOfSrc(ctx: *TypeCtx, src: []const u8) !Type {
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    return ctx.typeOf(try parser.parseExprStr(ctx.arena, src, &diag));
+}
+
+test "builtin typing: a wrong argument count or kind is refused with the function's own message" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const cases = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "now(1)", .msg = "`now` takes no arguments" },
+        .{ .src = "today(1)", .msg = "`today` takes no arguments" },
+        .{ .src = "regexp_replace(s, 'a')", .msg = "`regexp_replace` takes (string, pattern, replacement[, flags])" },
+        .{ .src = "regexp_replace(s, 'a', 'b', 'x')", .msg = "`regexp_replace` flags are `g` (every match) and `i` (ignore case), not `x`" },
+        .{ .src = "regexp_replace(s, '(', 'b')", .msg = "invalid regular expression `(`" },
+        .{ .src = "regexp_replace(arr, 'a', 'b')", .msg = "`regexp_replace` argument 1 must be text, got array" },
+        .{ .src = "regexp_matches(s)", .msg = "`regexp_matches` takes (string, pattern)" },
+        .{ .src = "regexp_extract(s)", .msg = "`regexp_extract` takes (string, pattern[, group])" },
+        .{ .src = "regexp_extract(s, 'a', i)", .msg = "`regexp_extract` needs a literal group number" },
+        .{ .src = "regexp_extract(s, 'a', -1)", .msg = "`regexp_extract` needs a literal group number" },
+        .{ .src = "regexp_extract(s, ns, 10)", .msg = "`regexp_extract` group 10 is not in the pattern" },
+        .{ .src = "regexp_extract(s, '(a)', 2)", .msg = "`regexp_extract` group 2 is not in the pattern" },
+        .{ .src = "md5(s, s)", .msg = "`md5` takes one argument" },
+        .{ .src = "xxhash64(arr)", .msg = "`xxhash64` argument 1 must be text, got array" },
+        .{ .src = "json_object('a')", .msg = "`json_object` takes key, value pairs" },
+        .{ .src = "json_array(s, arr)", .msg = "`json_array` argument 2 must be text, got array" },
+        .{ .src = "from_base64()", .msg = "`from_base64` takes one argument" },
+        .{ .src = "concat_ws('|')", .msg = "`concat_ws` takes (separator, value, ...)" },
+        .{ .src = "date_trunc('day')", .msg = "`date_trunc` takes (unit, timestamp)" },
+        .{ .src = "date_trunc(s, ts)", .msg = "`date_trunc` needs a literal unit" },
+        .{ .src = "date_trunc('fortnight', ts)", .msg = "unknown time unit `fortnight` (units: year, month, week, day, hour, minute, second)" },
+        .{ .src = "date_trunc('day', s)", .msg = "`date_trunc` needs a date or timestamp" },
+        .{ .src = "upper(s, s)", .msg = "`upper` takes one argument" },
+        .{ .src = "length()", .msg = "`length` takes one argument" },
+        .{ .src = "bit_count(s)", .msg = "`bit_count` takes one INT argument" },
+        .{ .src = "to_hex(i, i)", .msg = "`to_hex` takes one INT argument" },
+        .{ .src = "from_hex(i)", .msg = "`from_hex` takes one STRING argument" },
+        .{ .src = "from_hex()", .msg = "`from_hex` is missing an argument" },
+        .{ .src = "concat()", .msg = "`concat` needs at least one argument" },
+        .{ .src = "coalesce()", .msg = "`coalesce` needs at least one argument" },
+        .{ .src = "coalesce(i, d)", .msg = "`coalesce` args have incompatible types" },
+        .{ .src = "starts_with(s)", .msg = "`starts_with` takes (string, string)" },
+        .{ .src = "substr(s)", .msg = "`substr` takes (string, start[, length])" },
+        .{ .src = "substr(s, f)", .msg = "`substr` start must be an INT, got float" },
+        .{ .src = "substr(s, 1, s)", .msg = "`substr` length must be an INT, got string" },
+        .{ .src = "replace(s, 'a')", .msg = "`replace` takes (string, from, to)" },
+        .{ .src = "abs(i, i)", .msg = "`abs` takes one argument" },
+        .{ .src = "abs(s)", .msg = "`abs` needs a numeric argument" },
+        .{ .src = "floor()", .msg = "`floor` takes one argument" },
+        .{ .src = "ceil(d)", .msg = "`ceil` needs a numeric argument" },
+        .{ .src = "round(f, 1, 2)", .msg = "`round` takes (x) or (x, digits)" },
+        .{ .src = "round(s)", .msg = "`round` needs a numeric argument" },
+        .{ .src = "round(f, s)", .msg = "`round` digits must be an integer" },
+        .{ .src = "mod(i)", .msg = "`mod` takes (a, b)" },
+        .{ .src = "mod(i, s)", .msg = "`mod` needs numeric arguments" },
+        .{ .src = "power(i)", .msg = "`power` takes (base, exponent)" },
+        .{ .src = "power(s, i)", .msg = "`power` needs numeric arguments" },
+        .{ .src = "sqrt()", .msg = "`sqrt` takes one argument" },
+        .{ .src = "sqrt(s)", .msg = "`sqrt` needs a numeric argument" },
+        .{ .src = "sign()", .msg = "`sign` takes one argument" },
+        .{ .src = "sign(d)", .msg = "`sign` needs a numeric argument" },
+        .{ .src = "nullif(i)", .msg = "`nullif` takes (a, b)" },
+        .{ .src = "nullif(i, d)", .msg = "`nullif` arguments are not comparable" },
+        .{ .src = "greatest(i)", .msg = "`greatest` needs at least two arguments" },
+        .{ .src = "least(i, d)", .msg = "`least` arguments have incompatible types" },
+        .{ .src = "lpad(s)", .msg = "`lpad` takes (string, length[, fill])" },
+        .{ .src = "rpad(s, s)", .msg = "`rpad` length must be an INT, got string" },
+        .{ .src = "left(s)", .msg = "`left` takes (string, n)" },
+        .{ .src = "right(s, f)", .msg = "`right` n must be an INT, got float" },
+        .{ .src = "split_part(s, ',')", .msg = "`split_part` takes (string, delimiter, n)" },
+        .{ .src = "split_part(s, ',', s)", .msg = "`split_part` n must be an INT, got string" },
+        .{ .src = "json_filter(s, 1)", .msg = "`json_filter` takes (json array, x -> condition)" },
+        .{ .src = "json_transform(s)", .msg = "`json_transform` takes (json array, x -> value)" },
+        .{ .src = "json_any(s, (x, i, j) -> true)", .msg = "`json_any`'s lambda takes (x) or (x, i), not 3 parameters" },
+        .{ .src = "json_all(s, x -> 1)", .msg = "`json_all`: the lambda must be a condition (BOOL), not int" },
+        .{ .src = "json_reduce(s, 0)", .msg = "`json_reduce` takes (json array, initial, (acc, x) -> value)" },
+        .{ .src = "json_reduce(s, 0, x -> x)", .msg = "`json_reduce`'s lambda takes (acc, x) or (acc, x, i), not 1 parameter" },
+        .{ .src = "json_reduce(s, 0, (a, x, i, j) -> a)", .msg = "`json_reduce`'s lambda takes (acc, x) or (acc, x, i), not 4 parameters" },
+        .{ .src = "json_reduce(s, 0, (a, x) -> d)", .msg = "`json_reduce`: the lambda returns date, which an accumulator of int cannot hold" },
+        .{ .src = "chars()", .msg = "`chars` takes one argument" },
+        .{ .src = "json_range()", .msg = "`json_range` takes (n) or (start, stop)" },
+        .{ .src = "json_range(s)", .msg = "`json_range` stop must be an INT, got string" },
+        .{ .src = "json_range(f, 3)", .msg = "`json_range` start must be an INT, got float" },
+        .{ .src = "json_length()", .msg = "`json_length` takes one argument" },
+        .{ .src = "json_slice(s)", .msg = "`json_slice` takes (json array, start[, stop])" },
+        .{ .src = "json_slice(s, s)", .msg = "`json_slice` start must be an INT, got string" },
+        .{ .src = "json_slice(s, 1, f)", .msg = "`json_slice` stop must be an INT, got float" },
+        .{ .src = "json_concat(s)", .msg = "`json_concat` takes two or more JSON arrays" },
+        .{ .src = "json_get(s)", .msg = "`json_get` takes (json, path)" },
+        .{ .src = "strpos(s)", .msg = "`strpos` takes (string, substring)" },
+        .{ .src = "repeat(s)", .msg = "`repeat` takes (string, n)" },
+        .{ .src = "repeat(s, s)", .msg = "`repeat` n must be an INT, got string" },
+        .{ .src = "reverse()", .msg = "`reverse` takes one argument" },
+        .{ .src = "date_add('day', 1)", .msg = "`date_add` takes (unit, n, timestamp)" },
+        .{ .src = "date_add(s, 1, ts)", .msg = "`date_add` needs a literal unit" },
+        .{ .src = "date_add('eon', 1, ts)", .msg = "unknown time unit `eon` (units: year, month, week, day, hour, minute, second)" },
+        .{ .src = "date_add('day', s, ts)", .msg = "`date_add` needs an integer amount" },
+        .{ .src = "date_add('minute', 1, d)", .msg = "`date_add` cannot add `minute` to a date; cast it to a timestamp first" },
+        .{ .src = "date_add('day', 1, s)", .msg = "`date_add` needs a date or timestamp" },
+        .{ .src = "date_diff('day', d)", .msg = "`date_diff` takes (unit, start, end)" },
+        .{ .src = "date_diff(s, d, d)", .msg = "`date_diff` needs a literal unit" },
+        .{ .src = "date_diff('lustrum', d, d)", .msg = "unknown time unit `lustrum` (units: year, month, week, day, hour, minute, second)" },
+        .{ .src = "date_diff('day', d, s)", .msg = "`date_diff` needs date or timestamp arguments" },
+        .{ .src = "make_date(2024, 1)", .msg = "`make_date` takes (year, month, day)" },
+        .{ .src = "make_date(2024, s, 1)", .msg = "`make_date` needs integer arguments" },
+        .{ .src = "epoch()", .msg = "`epoch` takes one argument" },
+        .{ .src = "epoch(i)", .msg = "`epoch` needs a date or timestamp" },
+        .{ .src = "to_timestamp()", .msg = "`to_timestamp` takes one argument" },
+        .{ .src = "to_timestamp(d)", .msg = "`to_timestamp` needs a numeric argument" },
+        .{ .src = "strftime(ts)", .msg = "`strftime` takes (timestamp, format)" },
+        .{ .src = "strftime(s, '%Y')", .msg = "`strftime` needs a date or timestamp" },
+        .{ .src = "strftime(ts, '%Q')", .msg = "`strftime` does not support `%Q` (supported: %Y %m %d %H %M %S %y %%)" },
+        .{ .src = "strptime(s)", .msg = "`strptime` takes (text, format)" },
+        .{ .src = "try_strptime(s, '%Y-%q')", .msg = "`try_strptime` does not support `%q` (supported: %Y %m %d %H %M %S %y %%)" },
+        .{ .src = "translate(s, 'a')", .msg = "`translate` takes (string, from, to)" },
+        .{ .src = "chr(s)", .msg = "`chr` takes one INT argument" },
+        .{ .src = "chr(i, i)", .msg = "`chr` takes one INT argument" },
+    };
+    for (cases) |cs| {
+        var ctx = TypeCtx{ .schema = test_schema, .arena = ar.allocator() };
+        if (typeOfSrc(&ctx, cs.src)) |t| {
+            std.debug.print("`{s}` typed as {s}, expected the error `{s}`\n", .{ cs.src, @tagName(t.kind), cs.msg });
+            return error.TestUnexpectedResult;
+        } else |e| {
+            try std.testing.expectEqual(error.TypeError, e);
+            std.testing.expectEqualStrings(cs.msg, ctx.msg) catch |x| {
+                std.debug.print("in `{s}`\n", .{cs.src});
+                return x;
+            };
+        }
+    }
+}
+
+test "builtin typing: result kinds, nullability and decimal shapes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const cases = [_]struct { src: []const u8, kind: types.TypeKind, nullable: bool, precision: u8 = 0, scale: u8 = 0 }{
+        .{ .src = "now()", .kind = .timestamp, .nullable = false },
+        .{ .src = "today()", .kind = .date, .nullable = false },
+        .{ .src = "regexp_replace(ns, 'a', 'b', 'gi')", .kind = .string, .nullable = true },
+        .{ .src = "regexp_matches(s, ns)", .kind = .bool, .nullable = true },
+        .{ .src = "regexp_matches(s, 'a')", .kind = .bool, .nullable = false },
+        .{ .src = "regexp_extract(s, '(a)', 1)", .kind = .string, .nullable = true },
+        .{ .src = "xxhash64(s)", .kind = .int, .nullable = false },
+        .{ .src = "sha256(ns)", .kind = .string, .nullable = true },
+        .{ .src = "json_object('k', ns)", .kind = .string, .nullable = false },
+        .{ .src = "from_base64(s)", .kind = .bytes, .nullable = false },
+        .{ .src = "concat_ws(ns, s)", .kind = .string, .nullable = true },
+        .{ .src = "concat_ws('|', ns)", .kind = .string, .nullable = false },
+        .{ .src = "date_trunc('month', d)", .kind = .timestamp, .nullable = false },
+        .{ .src = "extract('year', ts)", .kind = .int, .nullable = false },
+        .{ .src = "length(ns)", .kind = .int, .nullable = true },
+        .{ .src = "to_hex(i)", .kind = .string, .nullable = false },
+        .{ .src = "bit_count(ni)", .kind = .int, .nullable = true },
+        .{ .src = "from_hex(s)", .kind = .int, .nullable = false },
+        .{ .src = "concat(s, from_base64(s))", .kind = .bytes, .nullable = false },
+        .{ .src = "concat(s, ns)", .kind = .string, .nullable = true },
+        .{ .src = "coalesce(ni, i)", .kind = .int, .nullable = false },
+        .{ .src = "coalesce(ni, ni)", .kind = .int, .nullable = true },
+        .{ .src = "contains(s, ns)", .kind = .bool, .nullable = true },
+        .{ .src = "substr(ns, 1, 2)", .kind = .string, .nullable = true },
+        .{ .src = "replace(s, 'a', 'b')", .kind = .string, .nullable = false },
+        .{ .src = "abs(m)", .kind = .decimal, .nullable = false, .precision = 10, .scale = 2 },
+        .{ .src = "floor(m)", .kind = .decimal, .nullable = false, .precision = 9, .scale = 0 },
+        .{ .src = "ceil(f)", .kind = .float, .nullable = false },
+        .{ .src = "floor(ni)", .kind = .int, .nullable = true },
+        .{ .src = "round(m, 1)", .kind = .decimal, .nullable = false, .precision = 10, .scale = 1 },
+        .{ .src = "round(i, 1)", .kind = .float, .nullable = false },
+        .{ .src = "round(i)", .kind = .int, .nullable = false },
+        .{ .src = "mod(i, f)", .kind = .float, .nullable = false },
+        .{ .src = "mod(ni, i)", .kind = .int, .nullable = true },
+        .{ .src = "power(i, ni)", .kind = .float, .nullable = true },
+        .{ .src = "sqrt(i)", .kind = .float, .nullable = true },
+        .{ .src = "sign(m)", .kind = .decimal, .nullable = false, .precision = 1, .scale = 0 },
+        .{ .src = "sign(f)", .kind = .float, .nullable = false },
+        .{ .src = "sign(ni)", .kind = .int, .nullable = true },
+        .{ .src = "nullif(i, 0)", .kind = .int, .nullable = true },
+        .{ .src = "greatest(i, ni)", .kind = .int, .nullable = true },
+        .{ .src = "lpad(s, 5, '0')", .kind = .string, .nullable = false },
+        .{ .src = "right(ns, 2)", .kind = .string, .nullable = true },
+        .{ .src = "split_part(s, ',', 1)", .kind = .string, .nullable = true },
+        .{ .src = "json_transform(s, x -> x)", .kind = .string, .nullable = true },
+        .{ .src = "json_filter(s, (x, i) -> i > 0)", .kind = .string, .nullable = true },
+        .{ .src = "json_any(s, x -> x = '1')", .kind = .bool, .nullable = false },
+        .{ .src = "json_all(ns, x -> x = '1')", .kind = .bool, .nullable = true },
+        .{ .src = "json_reduce(s, 0, (a, x) -> a + 1)", .kind = .int, .nullable = true },
+        .{ .src = "json_reduce(s, 0, (a, x) -> a + 1.5e0)", .kind = .float, .nullable = true },
+        .{ .src = "chars(ns)", .kind = .string, .nullable = true },
+        .{ .src = "json_range(1, ni)", .kind = .string, .nullable = true },
+        .{ .src = "json_length(s)", .kind = .int, .nullable = false },
+        .{ .src = "json_slice(s, 1, ni)", .kind = .string, .nullable = true },
+        .{ .src = "json_concat(s, ns)", .kind = .string, .nullable = true },
+        .{ .src = "json_get(s, 'a')", .kind = .string, .nullable = true },
+        .{ .src = "strpos(s, ns)", .kind = .int, .nullable = true },
+        .{ .src = "repeat(s, 2)", .kind = .string, .nullable = false },
+        .{ .src = "reverse(ns)", .kind = .string, .nullable = true },
+        .{ .src = "date_add('week', ni, d)", .kind = .date, .nullable = true },
+        .{ .src = "date_add('hour', 1, ts)", .kind = .timestamp, .nullable = false },
+        .{ .src = "date_diff('day', d, ts)", .kind = .int, .nullable = false },
+        .{ .src = "make_date(2024, ni, 1)", .kind = .date, .nullable = true },
+        .{ .src = "epoch(ts)", .kind = .int, .nullable = false },
+        .{ .src = "to_timestamp(f)", .kind = .timestamp, .nullable = false },
+        .{ .src = "strftime(d, ns)", .kind = .string, .nullable = true },
+        .{ .src = "strptime(s, '%Y')", .kind = .timestamp, .nullable = false },
+        .{ .src = "try_strptime(s, '%Y')", .kind = .timestamp, .nullable = true },
+        .{ .src = "translate(s, 'a', ns)", .kind = .string, .nullable = true },
+        .{ .src = "chr(ni)", .kind = .string, .nullable = true },
+    };
+    for (cases) |cs| {
+        var ctx = TypeCtx{ .schema = test_schema, .arena = ar.allocator() };
+        const t = typeOfSrc(&ctx, cs.src) catch |e| {
+            std.debug.print("`{s}` failed: {s}\n", .{ cs.src, ctx.msg });
+            return e;
+        };
+        errdefer std.debug.print("in `{s}`\n", .{cs.src});
+        try std.testing.expectEqual(cs.kind, t.kind);
+        try std.testing.expectEqual(cs.nullable, t.nullable);
+        try std.testing.expectEqual(cs.precision, t.precision);
+        try std.testing.expectEqual(cs.scale, t.scale);
+    }
+}
