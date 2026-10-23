@@ -169,7 +169,6 @@ pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) 
     const secs = rem / 1_000_000;
     const c = civilFromDays(day);
     const year: u32 = if (c.y < 0) 0 else @intCast(c.y);
-    const w = out.writer();
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
         if (fmt[i] != '%') {
@@ -179,17 +178,35 @@ pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) 
         i += 1;
         if (i >= fmt.len) return error.CastFailed;
         switch (fmt[i]) {
-            'Y' => try w.print("{d:0>4}", .{year}),
-            'y' => try w.print("{d:0>2}", .{year % 100}),
-            'm' => try w.print("{d:0>2}", .{c.m}),
-            'd' => try w.print("{d:0>2}", .{c.d}),
-            'H' => try w.print("{d:0>2}", .{secs / 3600}),
-            'M' => try w.print("{d:0>2}", .{(secs % 3600) / 60}),
-            'S' => try w.print("{d:0>2}", .{secs % 60}),
+            'Y' => try padded(out, year, 4),
+            'y' => try padded(out, year % 100, 2),
+            'm' => try padded(out, c.m, 2),
+            'd' => try padded(out, c.d, 2),
+            'H' => try padded(out, secs / 3600, 2),
+            'M' => try padded(out, (secs % 3600) / 60, 2),
+            'S' => try padded(out, secs % 60, 2),
             '%' => try out.append('%'),
             else => return error.CastFailed,
         }
     }
+}
+
+/// `x` in decimal, zero-padded to at least `width` digits.
+fn padded(out: *std.array_list.Managed(u8), x: u64, width: usize) !void {
+    var b: [20]u8 = undefined;
+    var i: usize = b.len;
+    var v = x;
+    while (true) {
+        i -= 1;
+        b[i] = @intCast('0' + v % 10);
+        v /= 10;
+        if (v == 0) break;
+    }
+    while (b.len - i < width) {
+        i -= 1;
+        b[i] = '0';
+    }
+    try out.appendSlice(b[i..]);
 }
 
 /// Numbers take up to their width in digits, `%y` pivots as POSIX does (69-99 are
