@@ -399,8 +399,8 @@ fn concatChunks(arena: std.mem.Allocator, schema: *const types.Schema, chunks: [
 /// A k-way merge of sorted sources: spilled runs in input order, then optionally the
 /// in-memory remainder `mem`, whose rows are `cols` in the order of `idx`. A binary
 /// heap of source indices orders heads by `KeyArr.orderAcross` and, on equal keys,
-/// by source index, so ties keep input order. Each output batch gathers its rows per
-/// source batch with `permute`, then interleaves them; a source is closed, its file
+/// by source index, so ties keep input order. Each output batch gathers its rows from
+/// the source batches at once (`takeAcross`); a source is closed, its file
 /// deleted, only once the batch reading from its mapping has been copied out.
 pub const Merge = struct {
     gpa: std.mem.Allocator,
@@ -555,7 +555,7 @@ pub const Merge = struct {
         if (self.live == 0) return null;
         for (self.cursors) |*c| c.seg = null;
         var segs: std.ArrayListUnmanaged([]const column.Column) = .empty;
-        const from = try arena.alloc(u32, max_rows);
+        const refs = try arena.alloc(Ref, max_rows);
         const rows = try arena.alloc(usize, max_rows);
         var n: usize = 0;
         while (n < max_rows and self.live > 0) : (n += 1) {
@@ -567,7 +567,7 @@ pub const Merge = struct {
                 break :blk s;
             };
             rows[n] = c.row();
-            from[n] = s;
+            refs[n] = .{ .chunk = s, .row = @intCast(rows[n]) };
             c.pos += 1;
             if (c.pos == c.len and !try c.load(self.keys)) {
                 self.live -= 1;
@@ -575,13 +575,14 @@ pub const Merge = struct {
             }
             if (self.live > 0) self.siftDown(0);
         }
-        const out = try self.gather(arena, segs.items, from[0..n], rows[0..n]);
+        const out = try self.gather(arena, segs.items, refs[0..n], rows[0..n]);
         for (self.cursors) |*c| if (c.exhausted) c.close(self.gpa);
         return out;
     }
 
-    /// Output row `i` is row `rows[i]` of segment `from[i]`, each copied once.
-    fn gather(self: *Merge, arena: std.mem.Allocator, segs: []const []const column.Column, from: []const u32, rows: []const usize) !Batch {
+    /// Output row `i` is row `refs[i].row` (`rows[i]`) of segment `refs[i].chunk`, each
+    /// copied once.
+    fn gather(self: *Merge, arena: std.mem.Allocator, segs: []const []const column.Column, refs: []const Ref, rows: []const usize) !Batch {
         const cols = try arena.alloc(column.Column, self.schema.fields.len);
         if (segs.len == 1) {
             for (cols, segs[0]) |*o, c| o.* = try column.permute(arena, c, rows);
@@ -590,7 +591,7 @@ pub const Merge = struct {
         const srcs = try arena.alloc(column.Column, segs.len);
         for (cols, 0..) |*o, ci| {
             for (srcs, segs) |*x, s| x.* = s[ci];
-            o.* = try column.interleave(arena, srcs, from, rows);
+            o.* = try column.takeAcross(arena, srcs, refs);
         }
         return .{ .schema = self.schema, .columns = cols, .len = rows.len };
     }

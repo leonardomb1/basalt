@@ -486,53 +486,21 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
     return out;
 }
 
-/// Rows drawn from several columns of one type, each copied once: row `i` is row
-/// `rows[i]` of `srcs[from[i]]`, as a merge interleaves its sources.
-pub fn interleave(arena: std.mem.Allocator, srcs: []const Column, from: []const u32, rows: []const usize) !Column {
-    std.debug.assert(srcs.len > 0 and from.len == rows.len);
-    var bm = try Bitmap.initFull(arena, rows.len);
-    const nulls = for (srcs) |s| {
-        if (!s.validity.allSet(s.len)) break true;
-    } else false;
-    if (nulls) for (from, rows, 0..) |s, r, i| {
-        if (!srcs[s].validity.get(r)) bm.setValid(i, false);
-    };
-    const Op = struct {
-        arena: std.mem.Allocator,
-        srcs: []const Column,
-        from: []const u32,
-        rows: []const usize,
-        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
-            const out = try o.arena.alloc(Elem(t), o.rows.len);
-            for (out, o.from, o.rows) |*x, s, r| x.* = @field(o.srcs[s].data, @tagName(t))[r];
-            return out;
-        }
-        fn bytes(o: @This()) !Bytes {
-            var span: usize = 0;
-            for (o.from, o.rows) |s, r| span += o.srcs[s].data.bytes.at(r).len;
-            const out = try allocData(o.arena, .bytes, o.rows.len, try checkSpan(span));
-            const b = out.bytes;
-            var off: usize = 0;
-            for (o.from, o.rows, b.offsets[1..]) |s, r, *end| {
-                const v = o.srcs[s].data.bytes.at(r);
-                @memcpy(b.values[off..][0..v.len], v);
-                off += v.len;
-                end.* = @intCast(off);
-            }
-            return b;
-        }
-    };
-    return Column.derived(srcs[0].ty, rows.len, bm, try mapTag(srcs[0].data, Op{ .arena = arena, .srcs = srcs, .from = from, .rows = rows }));
-}
-
 /// The rows `refs` name, each a `.chunk` index into `srcs` and a `.row` in that chunk,
-/// in that order: one column gathered across many of `srcs[0]`'s storage. Dictionary
-/// views are dropped, as each chunk's differs.
+/// in that order: one column gathered across many of `srcs[0]`'s storage, as a sort
+/// emits its chunks or a merge interleaves its sources. Rows taken from sources not
+/// much longer than they are skip the per-row validity when no source holds a null,
+/// as `permuteValidity` does. Dictionary views are dropped, as each chunk's differs.
 pub fn takeAcross(a: std.mem.Allocator, srcs: []const Column, refs: anytype) !Column {
     var bm = try Bitmap.initFull(a, refs.len);
-    for (refs, 0..) |e, i| {
+    var total: usize = 0;
+    for (srcs) |s| total += s.len;
+    const valid = refs.len * 64 >= total and for (srcs) |s| {
+        if (!s.validity.allSet(s.len)) break false;
+    } else true;
+    if (!valid) for (refs, 0..) |e, i| {
         if (!srcs[e.chunk].validity.get(e.row)) bm.setValid(i, false);
-    }
+    };
     const Refs = @TypeOf(refs);
     const Op = struct {
         a: std.mem.Allocator,
@@ -1231,12 +1199,13 @@ test "permute reorders values and validity" {
     try std.testing.expect(out.getValue(2).isNull());
 }
 
-test "interleave draws each row from its own source, values, strings and validity" {
+test "takeAcross draws each row from its own source, values, strings and validity" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const Ref = struct { chunk: u32, row: u32 };
     const ints = [_]Column{ try intColumn(a, &.{ 10, null, 30 }), try intColumn(a, &.{ 1, 2 }) };
-    const out = try interleave(a, &ints, &.{ 1, 0, 0, 1, 0 }, &.{ 1, 2, 1, 0, 0 });
+    const out = try takeAcross(a, &ints, @as([]const Ref, &.{ .{ .chunk = 1, .row = 1 }, .{ .chunk = 0, .row = 2 }, .{ .chunk = 0, .row = 1 }, .{ .chunk = 1, .row = 0 }, .{ .chunk = 0, .row = 0 } }));
     try std.testing.expectEqual(@as(usize, 5), out.len);
     try std.testing.expectEqual(@as(i64, 2), out.getValue(0).int);
     try std.testing.expectEqual(@as(i64, 30), out.getValue(1).int);
@@ -1244,17 +1213,23 @@ test "interleave draws each row from its own source, values, strings and validit
     try std.testing.expectEqual(@as(i64, 1), out.getValue(3).int);
     try std.testing.expectEqual(@as(i64, 10), out.getValue(4).int);
 
+    const full = [_]Column{ try intColumn(a, &.{ 7, 8 }), try intColumn(a, &.{9}) };
+    const all = try takeAcross(a, &full, @as([]const Ref, &.{ .{ .chunk = 1, .row = 0 }, .{ .chunk = 0, .row = 1 } }));
+    try std.testing.expect(all.validity.allSet(2));
+    try std.testing.expectEqual(@as(i64, 9), all.getValue(0).int);
+    try std.testing.expectEqual(@as(i64, 8), all.getValue(1).int);
+
     const ty = types.Type.init(.string).asNullable();
     var strs: [2]Column = undefined;
-    for (&strs, [_][]const ?[]const u8{ &.{ "a", null, "ccc" }, &.{ "", "dd" } }) |*s, vals| {
-        var b = Builder.init(a, ty);
-        for (vals) |v| try b.append(if (v) |x| .{ .string = x } else .null);
-        s.* = try b.finish();
+    for (&strs, [_][]const ?[]const u8{ &.{ "a", null, "ccc" }, &.{ "", "dd" } }) |*c, vals| {
+        var bd = Builder.init(a, ty);
+        for (vals) |v| try bd.append(if (v) |x| .{ .string = x } else .null);
+        c.* = try bd.finish();
     }
-    const got = try interleave(a, &strs, &.{ 0, 1, 0, 1, 0 }, &.{ 2, 1, 0, 0, 1 });
+    const got = try takeAcross(a, &strs, @as([]const Ref, &.{ .{ .chunk = 0, .row = 2 }, .{ .chunk = 1, .row = 1 }, .{ .chunk = 0, .row = 0 }, .{ .chunk = 1, .row = 0 }, .{ .chunk = 0, .row = 1 } }));
     const want = [_]?[]const u8{ "ccc", "dd", "a", "", null };
     for (want, 0..) |w, i| {
-        if (w) |s| try std.testing.expectEqualStrings(s, got.getValue(i).string) else try std.testing.expect(got.getValue(i).isNull());
+        if (w) |x| try std.testing.expectEqualStrings(x, got.getValue(i).string) else try std.testing.expect(got.getValue(i).isNull());
     }
 }
 
