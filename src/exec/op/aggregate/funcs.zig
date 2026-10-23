@@ -285,16 +285,31 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
     return struct {
         pub const In = Value;
         pub const needs_alloc = true;
-        pub const State = struct { v: Value = .null };
+        pub const State = struct { v: Value = .null, buf: []u8 = &.{} };
         pub fn add(s: *State, x: Value, cx: Ctx) !void {
             if (!s.v.isNull() and order(Value, x, s.v) != want) return;
-            s.v = try dupeValue(cx.alloc, x);
+            s.v = switch (x) {
+                .string => |b| .{ .string = try keep(s, b, cx) },
+                .bytes => |b| .{ .bytes = try keep(s, b, cx) },
+                else => x,
+            };
+        }
+        /// Copies a text or bytes extreme into the state's buffer, growing it only for
+        /// a longer value, so a run of improvements costs the longest one, not their sum.
+        fn keep(s: *State, x: []const u8, cx: Ctx) ![]const u8 {
+            if (s.buf.len == 0 or x.len > s.buf.len) s.buf = try cx.alloc.alloc(u8, @max(x.len, s.buf.len * 2));
+            std.mem.copyForwards(u8, s.buf[0..x.len], x);
+            return s.buf[0..x.len];
         }
         pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
             if (!s.v.isNull()) try add(d, s.v, cx);
         }
         pub fn own(s: *State, cx: Ctx) !void {
             s.v = try dupeValue(cx.alloc, s.v);
+            s.buf = switch (s.v) {
+                .string, .bytes => |b| @constCast(b),
+                else => &.{},
+            };
         }
         pub fn finish(s: *const State, _: Ctx) !Value {
             return s.v;
@@ -572,4 +587,25 @@ test "string MAX over ascending input keeps one buffer, not a copy per improveme
     var mn: N.State = .{};
     for ([_][]const u8{ "m", "", "zz", "" }) |x| try N.add(&mn, x, cx);
     try std.testing.expectEqualStrings("", mn.v);
+}
+
+test "untyped string MAX over ascending input keeps one buffer; an owned copy stays apart" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const cx = Ctx{ .out = types.Type.init(.string), .ty = types.Type.init(.string), .alloc = ar.allocator(), .scratch = ar.allocator() };
+    const M = ExtremeValue(.gt);
+    var st: M.State = .{};
+    var buf: [64]u8 = undefined;
+    for (0..20_000) |i| try M.add(&st, .{ .string = try std.fmt.bufPrint(&buf, "row-{d:0>40}-{d}", .{ i, i % 7 }) }, cx);
+    try std.testing.expectEqualStrings("row-0000000000000000000000000000000000019999-0", st.v.string);
+    try std.testing.expect(ar.queryCapacity() < 16 * 1024);
+
+    var copy = st;
+    try M.own(&copy, cx);
+    try M.add(&st, .{ .string = "s" }, cx);
+    try std.testing.expectEqualStrings("s", st.v.string);
+    try std.testing.expectEqualStrings("row-0000000000000000000000000000000000019999-0", copy.v.string);
+    try M.add(&copy, .{ .string = "t" }, cx);
+    try std.testing.expectEqualStrings("t", copy.v.string);
+    try std.testing.expectEqualStrings("s", st.v.string);
 }
