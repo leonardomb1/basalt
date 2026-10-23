@@ -836,3 +836,142 @@ test "CountingSource accumulates emitted rows across batches and forwards EOF" {
     try std.testing.expect((try src.next(std.testing.allocator)) == null);
     try std.testing.expectEqual(@as(u64, 5), cnt.load(.monotonic));
 }
+
+fn readLog(f: std.fs.File, buf: []u8) ![]const u8 {
+    try f.seekTo(0);
+    return buf[0..try f.readAll(buf)];
+}
+
+test "Logger.script, summary and item: a text line or one NDJSON object, nothing when quiet" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [2048]u8 = undefined;
+
+    const tf = try tmp.dir.createFile("text", .{ .read = true });
+    defer tf.close();
+    var tl = Logger{ .file = tf, .json = false, .min = .info, .run_id = 3 };
+    tl.script("hello \"x\"");
+    tl.summary(.{ .run_id = 3, .sink = "csv", .target = "o.csv", .rows_read = 10, .rows_written = 10, .elapsed_ms = 1000 });
+    try std.testing.expect(tl.item(.{ .target = "o.csv", .reason = "boom" }));
+    try std.testing.expectEqualStrings("hello \"x\"\nLoaded 10 rows into o.csv in 1.0s (10 rows/s)\n x o.csv  boom\n", try readLog(tf, &buf));
+
+    const qf = try tmp.dir.createFile("quiet", .{ .read = true });
+    defer qf.close();
+    var ql = Logger{ .file = qf, .json = false, .min = .info, .run_id = 3, .quiet = true };
+    ql.script("dropped");
+    try std.testing.expect(!ql.item(.{ .target = "o.csv" }));
+    try std.testing.expectEqualStrings("", try readLog(qf, &buf));
+
+    const jf = try tmp.dir.createFile("json", .{ .read = true });
+    defer jf.close();
+    var jl = Logger{ .file = jf, .json = true, .min = .info, .run_id = 4 };
+    jl.script("say \"hi\"\n");
+    jl.summary(.{ .run_id = 4, .source = "csv", .sink = "parquet", .rows_read = 6, .rows_written = 2, .elapsed_ms = 3 });
+    try std.testing.expect(jl.item(.{ .target = "t", .rows = 2, .elapsed_ms = 3, .reason = "bad \"row\"" }));
+    var wl = Logger{ .file = jf, .json = true, .min = .warn, .run_id = 4 };
+    try std.testing.expect(!wl.item(.{ .target = "t" }));
+
+    const out = try readLog(jf, &buf);
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    const want = [_]struct { level: []const u8, key: []const u8, val: []const u8 }{
+        .{ .level = "print", .key = "msg", .val = "say \"hi\"\n" },
+        .{ .level = "info", .key = "event", .val = "run_complete" },
+        .{ .level = "info", .key = "reason", .val = "bad \"row\"" },
+    };
+    for (want) |wl_| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, it.next().?, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object;
+        try std.testing.expectEqualStrings(wl_.level, o.get("level").?.string);
+        try std.testing.expectEqualStrings(wl_.val, o.get(wl_.key).?.string);
+        try std.testing.expectEqual(@as(i64, 4), o.get("run_id").?.integer);
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "progress loops: only the outermost loop counts, and its state survives nested ones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("log", .{ .read = true });
+    defer f.close();
+    var lg = Logger{ .file = f, .json = false, .min = .info, .run_id = 1 };
+    var rows = RowCounter.init(0);
+    var p = Progress{ .logger = &lg, .rows = &rows };
+    const outer = p.loopBegin(3);
+    const inner = p.loopBegin(7);
+    try std.testing.expect(outer);
+    try std.testing.expect(!inner);
+    p.loopTick(outer);
+    p.loopTick(inner);
+    p.loopTick(outer);
+    const st = p.loopState();
+    try std.testing.expectEqual(@as(usize, 2), st.done);
+    try std.testing.expectEqual(@as(usize, 3), st.total);
+    p.loopEnd();
+    try std.testing.expectEqual(@as(usize, 3), p.loopState().total);
+    p.loopEnd();
+    try std.testing.expectEqual(@as(usize, 0), p.loopState().total);
+    p.loopEnd();
+    try std.testing.expectEqual(@as(usize, 0), p.loop_depth);
+}
+
+const HookSeen = struct {
+    got: std.Thread.ResetEvent = .{},
+    ev: Progress.Event = undefined,
+    target: [64]u8 = undefined,
+
+    fn f(ctx: *anyopaque, ev: Progress.Event) void {
+        const self: *HookSeen = @ptrCast(@alignCast(ctx));
+        if (self.got.isSet()) return;
+        self.ev = ev;
+        @memcpy(self.target[0..ev.target.len], ev.target);
+        self.ev.target = self.target[0..ev.target.len];
+        self.got.set();
+    }
+};
+
+test "progress ticker: past the quiet time a hook gets the move's counts, and a line is drawn then erased" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("log", .{ .read = true });
+    defer f.close();
+    var lg = Logger{ .file = f, .json = false, .min = .info, .run_id = 1 };
+
+    var rows = RowCounter.init(100);
+    var seen = HookSeen{};
+    var hp = Progress{ .logger = &lg, .rows = &rows, .mode = .hook, .hook = .{ .ctx = &seen, .f = HookSeen.f } };
+    hp.start();
+    hp.begin("a.csv → b.csv");
+    _ = rows.fetchAdd(500, .monotonic);
+    try seen.got.timedWait(10 * std.time.ns_per_s);
+    hp.end();
+    hp.stop();
+    try std.testing.expectEqualStrings("a.csv → b.csv", seen.ev.target);
+    try std.testing.expectEqual(@as(u64, 500), seen.ev.rows);
+    try std.testing.expect(seen.ev.elapsed_ms >= Progress.quiet_ms);
+    try std.testing.expectEqual(@as(usize, 0), seen.ev.loop_total);
+
+    var lp = Progress{ .logger = &lg, .rows = &rows };
+    lp.start();
+    try std.testing.expect(lp.loopBegin(4));
+    lp.begin("x → y");
+    var waited: usize = 0;
+    while (waited < 200) : (waited += 1) {
+        lg.mutex.lock();
+        const drawn = lg.progress_drawn;
+        lg.mutex.unlock();
+        if (drawn) break;
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    lp.end();
+    lp.loopTick(true);
+    lp.loopEnd();
+    lp.stop();
+    var buf: [4096]u8 = undefined;
+    const out = try readLog(f, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, out, "\r\x1b[2K"));
+    try std.testing.expect(std.mem.indexOf(u8, out, " [1/4] x → y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " rows") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\r\x1b[2K"));
+    try std.testing.expect(!lg.progress_drawn);
+}
