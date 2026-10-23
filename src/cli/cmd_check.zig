@@ -45,7 +45,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
             return issues.toOwnedSlice();
         },
     };
-    for (perrs.items) |p| try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null });
+    for (perrs.items) |p| try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null, .file = prog.fileOf(.{ .line = p.line, .col = p.col, .file = p.file }) });
     if (opts.strict_params) for (opts.overrides) |o| if (try paramProblem(a, prog, o.name)) |why| try issues.append(.{ .msg = why });
 
     var found = std.array_list.Managed(analyze.Issue).init(a);
@@ -207,4 +207,19 @@ test "checkText: a problem inside an @include'd file names that file with its ow
     try std.testing.expectEqual(@as(usize, 1), issues.len);
     try std.testing.expect(std.mem.endsWith(u8, issues[0].file.?, "lib/bad.sql"));
     try std.testing.expectEqual(@as(u32, 3), issues[0].pos.?.line);
+}
+
+test "checkText: an error inside an included table function's body, reached from a call, names that file" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "CREATE FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';\n\nCREATE OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const issues = try checkText(a, "@include 'lib.sql';\nSELECT * FROM g();", "main.sql", base, .{});
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expect(std.mem.endsWith(u8, issues[0].file.?, "lib.sql"));
+    try std.testing.expectEqual(@as(u32, 3), issues[0].pos.?.line);
+    try std.testing.expectEqual(@as(u32, 63), issues[0].pos.?.col);
 }

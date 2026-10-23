@@ -229,7 +229,8 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
         }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {
-                ctx.diag.* = .{ .parse = pdiag, .label = label };
+                const shown = if (pdiag.file != 0 and pdiag.file != file and pdiag.file < ctx.files.items.len) ctx.files.items[pdiag.file] else label;
+                ctx.diag.* = .{ .parse = pdiag, .label = shown };
                 return error.ParseFailed;
             },
         };
@@ -674,6 +675,32 @@ test "a parse error inside an included file carries that file's label and line" 
 
     try testing.expect(std.mem.endsWith(u8, diag.label, "lib/bad.sql"));
     try testing.expectEqual(@as(u32, 3), diag.parse.line);
+}
+
+test "an error inside an included table function's body names that file, where the call does not" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib.sql",
+        \\-- lib
+        \\
+        \\
+        \\CREATE FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';
+        \\CREATE OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();
+    );
+
+    var diag: Diag = .{};
+    try testing.expectError(error.ParseFailed, loadProgram(a,
+        \\@include 'lib.sql';
+        \\SELECT * FROM g();
+    , "main.sql", base, &diag));
+
+    try testing.expect(std.mem.endsWith(u8, diag.label, "lib.sql"));
+    try testing.expectEqual(@as(u32, 5), diag.parse.line);
+    try testing.expectEqual(@as(u32, 63), diag.parse.col);
 }
 
 test "directive lines keep the includer's own line numbers" {

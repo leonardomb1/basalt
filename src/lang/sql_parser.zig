@@ -80,6 +80,7 @@ pub const Diagnostic = struct {
     col: u32,
     end_line: u32 = 0,
     end_col: u32 = 0,
+    file: u16 = 0,
 };
 pub const Error = error{ ParseFailed, OutOfMemory };
 
@@ -776,11 +777,12 @@ pub const Parser = struct {
             .msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic",
             .line = pos.line,
             .col = pos.col,
+            .file = pos.file,
         };
         const lo = if (self.i >= 4) self.i - 4 else 0;
         const hi = @min(self.toks.len, self.i + 2);
         for (self.toks[lo..hi]) |t| {
-            if (t.line == pos.line and t.col == pos.col and t.end_line > 0 and t.tag != .eof) {
+            if (t.file == pos.file and t.line == pos.line and t.col == pos.col and t.end_line > 0 and t.tag != .eof) {
                 self.diag.end_line = t.end_line;
                 self.diag.end_col = t.end_col;
                 break;
