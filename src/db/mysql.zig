@@ -239,7 +239,8 @@ pub const Conn = struct {
         }
 
         var ci: usize = 0;
-        const ncol: usize = @intCast(try lenencInt(first, &ci));
+        const ncol = try lenencInt(first, &ci);
+        if (ncol > max_columns) return error.MysqlProtocol;
         self.cols = try ma.alloc(MyCol, ncol);
         for (0..ncol) |k| {
             _ = try self.readPacket();
@@ -289,17 +290,7 @@ pub const Conn = struct {
     /// once left the continuations queued, so a 20 MB `longtext` broke the query and then
     /// the socket.
     fn readPacket(self: *Conn) !u8 {
-        const r = self.rd();
-        self.buf.clearRetainingCapacity();
-        while (true) {
-            var header: [4]u8 = undefined;
-            try r.readSliceAll(&header);
-            const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
-            const base = self.buf.items.len;
-            try self.buf.resize(base + len);
-            try r.readSliceAll(self.buf.items[base..][0..len]);
-            if (len < max_payload) return header[3];
-        }
+        return readLogical(self.rd(), &self.buf, max_logical);
     }
 
     /// Writes `payload` as a packet run starting at `seq`, returning the next sequence
@@ -582,6 +573,17 @@ test "caching_sha2_password token matches a known vector" {
     try std.testing.expectEqualSlices(u8, &expect, &tok);
 }
 
+test "a logical packet past its limit is refused before room is made for it" {
+    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer buf.deinit();
+    var one = std.Io.Reader.fixed("\x02\x00\x00\x07hi");
+    try std.testing.expectEqual(@as(u8, 7), try readLogical(&one, &buf, max_logical));
+    try std.testing.expectEqualStrings("hi", buf.items);
+    var claimed = std.Io.Reader.fixed("\xff\xff\xff\x00");
+    try std.testing.expectError(error.MysqlProtocol, readLogical(&claimed, &buf, 1 << 20));
+    try std.testing.expect(buf.capacity < 1 << 20);
+}
+
 test "lenenc integers: inline, 2/3/8-byte forms, truncation errors" {
     var i: usize = 0;
     try std.testing.expectEqual(@as(u64, 0xfa), try lenencInt("\xfa", &i));
@@ -697,6 +699,27 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
         0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
         else => types.Type.init(.string),
     }).asNullable();
+}
+
+/// Far above MySQL's 4096 columns per table, short of what a lying count could make us allocate.
+const max_columns = 1 << 16;
+/// The largest `max_allowed_packet` MySQL accepts.
+const max_logical: usize = 1 << 30;
+
+/// Reassembles one logical packet into `buf` from its 16 MiB wire packets, refusing
+/// one longer than `limit` before reserving room for it.
+fn readLogical(r: *std.Io.Reader, buf: *std.array_list.Managed(u8), limit: usize) !u8 {
+    buf.clearRetainingCapacity();
+    while (true) {
+        var header: [4]u8 = undefined;
+        try r.readSliceAll(&header);
+        const len: usize = @as(usize, header[0]) | (@as(usize, header[1]) << 8) | (@as(usize, header[2]) << 16);
+        const base = buf.items.len;
+        if (len > limit - base) return error.MysqlProtocol;
+        try buf.resize(base + len);
+        try r.readSliceAll(buf.items[base..][0..len]);
+        if (len < Conn.max_payload) return header[3];
+    }
 }
 
 fn lenencInt(buf: []const u8, i: *usize) !u64 {

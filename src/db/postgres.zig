@@ -207,6 +207,10 @@ pub const Conn = struct {
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
         const si = scramAttr(server_first, 'i') orelse return error.PgProtocol;
         const iters = std.fmt.parseInt(u32, si, 10) catch return error.PgProtocol;
+        if (iters == 0 or iters > max_scram_iterations) {
+            try sql.setError(self.gpa, &self.last_error, try std.fmt.allocPrint(a, "the server asks for {d} SCRAM iterations; basalt allows 1 to {d}", .{ iters, max_scram_iterations }));
+            return error.PgAuthFailed;
+        }
 
         const salt = try a.alloc(u8, try dec.calcSizeForSlice(ss));
         try dec.decode(salt, ss);
@@ -372,16 +376,31 @@ pub const Conn = struct {
     }
 
     fn readMsg(self: *Conn) !u8 {
-        const r = self.rd();
-        var hdr: [5]u8 = undefined;
-        try r.readSliceAll(&hdr);
-        const len = std.mem.readInt(u32, hdr[1..5], .big);
-        if (len < 4) return error.PgProtocol;
-        try self.payload.resize(len - 4);
-        try r.readSliceAll(self.payload.items);
-        return hdr[0];
+        return readMessage(self.rd(), &self.payload);
     }
 };
+
+/// PostgreSQL's own ceiling on a message (MaxAllocSize).
+const max_message: usize = (1 << 30) - 1;
+
+/// One message's type, its body left in `payload`. The body grows only as its bytes
+/// arrive, so a length a server merely claims reserves nothing up front.
+fn readMessage(r: *std.Io.Reader, payload: *std.array_list.Managed(u8)) !u8 {
+    var hdr: [5]u8 = undefined;
+    try r.readSliceAll(&hdr);
+    const len = std.mem.readInt(u32, hdr[1..5], .big);
+    if (len < 4 or len - 4 > max_message) return error.PgProtocol;
+    payload.clearRetainingCapacity();
+    var left: usize = len - 4;
+    while (left > 0) {
+        const step = @min(left, 1 << 20);
+        const start = payload.items.len;
+        try payload.resize(start + step);
+        try r.readSliceAll(payload.items[start..]);
+        left -= step;
+    }
+    return hdr[0];
+}
 
 const sql_vtable = sql.connVTable(Conn);
 const cursor_vtable = sql.textCursorVTable(Conn);
@@ -473,6 +492,9 @@ const ScramKeys = struct {
     stored_key: [32]u8,
     server_key: [32]u8,
 };
+
+/// Far above PostgreSQL's default of 4096, short of a stall a server could demand.
+const max_scram_iterations: u32 = 10_000_000;
 
 fn scramKeys(password: []const u8, salt: []const u8, iters: u32) !ScramKeys {
     var salted: [32]u8 = undefined;
@@ -628,6 +650,19 @@ fn parseCopyCount(p: []const u8) ?u64 {
     const tag = std.mem.sliceTo(p, 0);
     if (!std.mem.startsWith(u8, tag, "COPY ")) return null;
     return std.fmt.parseInt(u64, tag["COPY ".len..], 10) catch null;
+}
+
+test "a message is capped at PostgreSQL's limit and grows only as its bytes arrive" {
+    var payload = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer payload.deinit();
+    var huge = std.Io.Reader.fixed("D\x7f\xff\xff\xff");
+    try std.testing.expectError(error.PgProtocol, readMessage(&huge, &payload));
+    var short = std.Io.Reader.fixed("D\x3f\xff\xff\xffabc");
+    try std.testing.expectError(error.EndOfStream, readMessage(&short, &payload));
+    try std.testing.expect(payload.capacity <= 2 << 20);
+    var ok = std.Io.Reader.fixed("Z\x00\x00\x00\x05I");
+    try std.testing.expectEqual(@as(u8, 'Z'), try readMessage(&ok, &payload));
+    try std.testing.expectEqualStrings("I", payload.items);
 }
 
 test "parseCopyCount: COPY tag, other tags, junk" {

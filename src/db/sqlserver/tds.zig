@@ -322,6 +322,7 @@ pub const Conn = struct {
             const len: usize = (@as(usize, header[2]) << 8) | header[3];
             if (len < 8) return error.TdsProtocol;
             const start = self.msg.items.len;
+            if (len - 8 > max_message - start) return error.TdsProtocol;
             try self.msg.resize(start + (len - 8));
             try r.readSliceAll(self.msg.items[start..]);
             if (header[1] & STATUS_EOM != 0) break;
@@ -701,6 +702,10 @@ fn curClose(ptr: *anyopaque) void {
 }
 
 const SOCK_BUF = 64 * 1024;
+/// SQL Server's largest (max) or text value, 2^31 - 1 bytes.
+const max_lob: usize = (1 << 31) - 1;
+/// A non-rowset reply (login, a batch's messages, a bulk load's DONE) buffered whole.
+const max_message: usize = 1 << 30;
 
 const PacketReader = struct {
     r: *std.Io.Reader,
@@ -775,16 +780,18 @@ const PacketReader = struct {
     }
     /// PLP (Partially Length-Prefixed), how (max) types are framed: an 8-byte total
     /// (all ones = NULL, else ignored), then 4-byte-prefixed chunks until a 0-length one.
+    /// A total or chunks past `max_lob` are refused; a declared total may also be the
+    /// unknown-length marker.
     fn readPlp(self: *PacketReader, arena: std.mem.Allocator) !?[]u8 {
         const total = try self.readU64();
         if (total == 0xFFFFFFFFFFFFFFFF) return null;
+        if (total != 0xFFFFFFFFFFFFFFFE and total > max_lob) return error.TdsProtocol;
         var buf = std.array_list.Managed(u8).init(arena);
         while (true) {
             const chunk = try self.readU32();
             if (chunk == 0) break;
-            const start = buf.items.len;
-            try buf.resize(start + chunk);
-            try self.readBytes(buf.items[start..]);
+            if (chunk > max_lob - buf.items.len) return error.TdsProtocol;
+            try self.readGrowing(&buf, chunk);
         }
         return try buf.toOwnedSlice();
     }
@@ -792,6 +799,25 @@ const PacketReader = struct {
         const s = try arena.alloc(u8, n);
         try self.readBytes(s);
         return s;
+    }
+    /// A text, ntext or image value of `n` bytes, which the server announces up front.
+    fn readLob(self: *PacketReader, arena: std.mem.Allocator, n: usize) ![]u8 {
+        if (n > max_lob) return error.TdsProtocol;
+        var buf = std.array_list.Managed(u8).init(arena);
+        try self.readGrowing(&buf, n);
+        return try buf.toOwnedSlice();
+    }
+    /// Appends `n` bytes, growing `buf` only as they arrive, so a length the server
+    /// merely claims reserves nothing up front.
+    fn readGrowing(self: *PacketReader, buf: *std.array_list.Managed(u8), n: usize) !void {
+        var left = n;
+        while (left > 0) {
+            const step = @min(left, 1 << 20);
+            const start = buf.items.len;
+            try buf.resize(start + step);
+            try self.readBytes(buf.items[start..]);
+            left -= step;
+        }
     }
     fn skip(self: *PacketReader, n: usize) !void {
         var rem = n;
@@ -1163,7 +1189,7 @@ const TdsCursor = struct {
                 if (ptrlen == 0) return .null;
                 try self.reader.skip(@as(usize, ptrlen) + 8);
                 const dlen = try self.reader.readU32();
-                const bytes = try self.reader.readSlice(arena, dlen);
+                const bytes = try self.reader.readLob(arena, dlen);
                 return decodeValue(arena, col, bytes);
             },
         }
@@ -2153,6 +2179,44 @@ fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Manag
 
 fn rdU16(buf: []const u8, i: usize) usize {
     return @as(usize, buf[i]) | (@as(usize, buf[i + 1]) << 8);
+}
+
+test "PLP and text values past SQL Server's 2 GiB limit are refused before room is made for them" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pkt = struct {
+        fn of(comptime body: []const u8) []const u8 {
+            const len = body.len + 8;
+            return &[_]u8{ 0x04, STATUS_EOM, len >> 8, len & 0xff, 0, 0, 0, 0 } ++ body;
+        }
+    }.of;
+
+    var plp_total = std.Io.Reader.fixed(pkt("\x00\x00\x00\x80\x00\x00\x00\x00"));
+    var r1 = PacketReader.init(std.testing.allocator, &plp_total);
+    defer r1.deinit();
+    try std.testing.expectError(error.TdsProtocol, r1.readPlp(a));
+
+    var plp_chunk = std.Io.Reader.fixed(pkt("\xfe\xff\xff\xff\xff\xff\xff\xff\x02\x00\x00\x00hi\xff\xff\xff\xff"));
+    var r2 = PacketReader.init(std.testing.allocator, &plp_chunk);
+    defer r2.deinit();
+    try std.testing.expectError(error.TdsProtocol, r2.readPlp(a));
+
+    var plp_short = std.Io.Reader.fixed(pkt("\xfe\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x7fabc"));
+    var r3 = PacketReader.init(std.testing.allocator, &plp_short);
+    defer r3.deinit();
+    try std.testing.expectError(error.EndOfMessage, r3.readPlp(a));
+    try std.testing.expect(arena.queryCapacity() < 4 << 20);
+
+    var plp_ok = std.Io.Reader.fixed(pkt("\x02\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00hi\x00\x00\x00\x00"));
+    var r4 = PacketReader.init(std.testing.allocator, &plp_ok);
+    defer r4.deinit();
+    try std.testing.expectEqualStrings("hi", (try r4.readPlp(a)).?);
+
+    var text = std.Io.Reader.fixed(pkt("\xff\xff\xff\xff"));
+    var r5 = PacketReader.init(std.testing.allocator, &text);
+    defer r5.deinit();
+    try std.testing.expectError(error.TdsProtocol, r5.readLob(a, try r5.readU32()));
 }
 
 test "parseLoginResponse keeps the SSPI token beside the LOGINACK" {
