@@ -239,8 +239,7 @@ pub const Conn = struct {
         }
 
         var ci: usize = 0;
-        const ncol = try lenencInt(first, &ci);
-        if (ncol > max_columns) return error.MysqlProtocol;
+        const ncol = try columnCount(first, &ci);
         self.cols = try ma.alloc(MyCol, ncol);
         for (0..ncol) |k| {
             _ = try self.readPacket();
@@ -703,6 +702,24 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
 
 /// Far above MySQL's 4096 columns per table, short of what a lying count could make us allocate.
 const max_columns = 1 << 16;
+
+/// A result set's column count, refused past `max_columns` before anything is sized by it.
+fn columnCount(p: []const u8, i: *usize) !usize {
+    const n = try lenencInt(p, i);
+    if (n > max_columns) return error.MysqlProtocol;
+    return @intCast(n);
+}
+
+test "a column count past the cap is refused" {
+    var i: usize = 0;
+    try std.testing.expectEqual(@as(usize, 3), try columnCount("\x03", &i));
+    i = 0;
+    try std.testing.expectEqual(@as(usize, 1 << 16), try columnCount("\xfd\x00\x00\x01", &i));
+    i = 0;
+    try std.testing.expectError(error.MysqlProtocol, columnCount("\xfd\x01\x00\x01", &i));
+    i = 0;
+    try std.testing.expectError(error.MysqlProtocol, columnCount("\xfe\xff\xff\xff\xff\xff\xff\xff\xff", &i));
+}
 /// The largest `max_allowed_packet` MySQL accepts.
 const max_logical: usize = 1 << 30;
 

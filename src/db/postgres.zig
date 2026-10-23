@@ -206,11 +206,10 @@ pub const Conn = struct {
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
         const si = scramAttr(server_first, 'i') orelse return error.PgProtocol;
-        const iters = std.fmt.parseInt(u32, si, 10) catch return error.PgProtocol;
-        if (iters == 0 or iters > max_scram_iterations) {
-            try sql.setError(self.gpa, &self.last_error, try std.fmt.allocPrint(a, "the server asks for {d} SCRAM iterations; basalt allows 1 to {d}", .{ iters, max_scram_iterations }));
-            return error.PgAuthFailed;
-        }
+        const iters = scramIterations(si) catch |e| {
+            if (e == error.PgAuthFailed) try sql.setError(self.gpa, &self.last_error, try std.fmt.allocPrint(a, "the server asks for {s} SCRAM iterations; basalt allows 1 to {d}", .{ si, max_scram_iterations }));
+            return e;
+        };
 
         const salt = try a.alloc(u8, try dec.calcSizeForSlice(ss));
         try dec.decode(salt, ss);
@@ -495,6 +494,23 @@ const ScramKeys = struct {
 
 /// Far above PostgreSQL's default of 4096, short of a stall a server could demand.
 const max_scram_iterations: u32 = 10_000_000;
+
+/// The server's `i=` attribute, refused as an auth failure when out of range.
+fn scramIterations(si: []const u8) error{ PgProtocol, PgAuthFailed }!u32 {
+    const iters = std.fmt.parseInt(u32, si, 10) catch |e| return if (e == error.Overflow) error.PgAuthFailed else error.PgProtocol;
+    if (iters == 0 or iters > max_scram_iterations) return error.PgAuthFailed;
+    return iters;
+}
+
+test "SCRAM iterations are refused at zero and past the cap" {
+    try std.testing.expectEqual(@as(u32, 4096), try scramIterations("4096"));
+    try std.testing.expectEqual(max_scram_iterations, try scramIterations("10000000"));
+    try std.testing.expectError(error.PgAuthFailed, scramIterations("0"));
+    try std.testing.expectError(error.PgAuthFailed, scramIterations("10000001"));
+    try std.testing.expectError(error.PgAuthFailed, scramIterations("4294967295"));
+    try std.testing.expectError(error.PgAuthFailed, scramIterations("99999999999"));
+    try std.testing.expectError(error.PgProtocol, scramIterations("x"));
+}
 
 fn scramKeys(password: []const u8, salt: []const u8, iters: u32) !ScramKeys {
     var salted: [32]u8 = undefined;
