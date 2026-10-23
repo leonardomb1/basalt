@@ -563,6 +563,55 @@ pub const Power = struct {
     }
 };
 
+/// `md5` and `sha256` as lowercase hex.
+pub fn Digest(comptime H: type) type {
+    return struct {
+        pub const args = .{.str};
+        pub fn apply(cx: Cx, data: []const u8) EvalError![]const u8 {
+            var d: [H.digest_length]u8 = undefined;
+            H.hash(data, &d, .{});
+            const hex = std.fmt.bytesToHex(d, .lower);
+            @memcpy(try cx.extend(hex.len), &hex);
+            return cx.written();
+        }
+    };
+}
+
+pub const XxHash64 = struct {
+    pub const args = .{.str};
+    pub fn apply(_: Cx, data: []const u8) EvalError!i64 {
+        return @bitCast(std.hash.XxHash64.hash(0, data));
+    }
+};
+
+/// Surrounding whitespace is ignored.
+pub const FromBase64 = struct {
+    pub const args = .{.str};
+    pub const result = .bytes;
+    pub fn apply(cx: Cx, s: []const u8) EvalError![]const u8 {
+        const text = std.mem.trim(u8, s, " \t\r\n");
+        const dec = std.base64.standard.Decoder;
+        const bad = "from_base64: '{s}' is not base64";
+        const out = try cx.extend(dec.calcSizeForSlice(text) catch return failWith(error.CastFailed, bad, .{clip(text)}));
+        dec.decode(out, text) catch return failWith(error.CastFailed, bad, .{clip(text)});
+        return cx.written();
+    }
+};
+
+/// Postgres' `concat_ws`: NULL parts are skipped, where `concat` is NULL when any
+/// part is; a NULL separator is NULL.
+pub const ConcatWs = struct {
+    pub const variadic = true;
+    pub const skip_null = true;
+    pub fn apply(cx: Cx, parts: []const []const u8) EvalError![]const u8 {
+        for (parts[1..], 0..) |p, i| {
+            if (i > 0) try cx.buf.appendSlice(parts[0]);
+            try cx.buf.appendSlice(p);
+        }
+        return cx.written();
+    }
+};
+
 /// NULL when any part is (`concat_ws` skips them instead).
 pub const Concat = struct {
     pub const variadic = true;

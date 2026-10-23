@@ -84,21 +84,6 @@ pub const per_row = struct {
         return .{ .string = m.s[span[0]..span[1]] };
     }
 
-    pub fn digest(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const data = try valueToString(arena, v);
-        if (eq(c.name, "xxhash64")) return .{ .int = @bitCast(std.hash.XxHash64.hash(0, data)) };
-        if (eq(c.name, "md5")) {
-            var d: [std.crypto.hash.Md5.digest_length]u8 = undefined;
-            std.crypto.hash.Md5.hash(data, &d, .{});
-            return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
-        }
-        var d: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(data, &d, .{});
-        return .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&d}) };
-    }
-
     /// Values are written as `json_transform` writes elements, so a nested object or
     /// array goes in as JSON. A null key is an error.
     pub fn jsonObject(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -128,35 +113,6 @@ pub const per_row = struct {
         }
         w.writeByte(']') catch return error.OutOfMemory;
         return .{ .string = out.written() };
-    }
-
-    pub fn fromBase64(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const text = std.mem.trim(u8, try valueToString(arena, v), " \t\r\n");
-        const dec = std.base64.standard.Decoder;
-        const bad = "from_base64: '{s}' is not base64";
-        const out = try arena.alloc(u8, dec.calcSizeForSlice(text) catch return failWith(error.CastFailed, bad, .{clip(text)}));
-        dec.decode(out, text) catch return failWith(error.CastFailed, bad, .{clip(text)});
-        return .{ .bytes = out };
-    }
-
-    /// Postgres' `concat_ws`: nulls are skipped, where `concat` is null when any
-    /// value is (which hashed a row with one empty column to null).
-    pub fn concatWs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const sv = try evalRow(arena, c.args[0], batch, row);
-        if (sv.isNull()) return .null;
-        const sep = try valueToString(arena, sv);
-        var buf = std.array_list.Managed(u8).init(arena);
-        var first = true;
-        for (c.args[1..]) |e| {
-            const v = try evalRow(arena, e, batch, row);
-            if (v.isNull()) continue;
-            if (!first) try buf.appendSlice(sep);
-            first = false;
-            try buf.appendSlice(try valueToString(arena, v));
-        }
-        return .{ .string = buf.items };
     }
 
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {

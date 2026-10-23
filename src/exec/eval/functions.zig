@@ -102,10 +102,10 @@ const base = [_]Builtin{
     .{ .name = "regexp_replace", .type_fn = typing.regexpReplace, .eval_fn = per_row.regexpReplace },
     .{ .name = "regexp_matches", .type_fn = typing.regexpMatches, .eval_fn = per_row.regexpMatches },
     .{ .name = "regexp_extract", .type_fn = typing.regexpExtract, .eval_fn = per_row.regexpExtract },
-    .{ .name = "md5", .type_fn = typing.digest, .eval_fn = per_row.digest },
-    .{ .name = "sha256", .type_fn = typing.digest, .eval_fn = per_row.digest },
-    .{ .name = "xxhash64", .type_fn = typing.digest, .eval_fn = per_row.digest },
-    .{ .name = "concat_ws", .type_fn = typing.concatWs, .eval_fn = per_row.concatWs },
+    .{ .name = "md5", .type_fn = typing.digest, .eval_fn = S(f.Digest(std.crypto.hash.Md5)).eval, .vec_fn = S(f.Digest(std.crypto.hash.Md5)).vec },
+    .{ .name = "sha256", .type_fn = typing.digest, .eval_fn = S(f.Digest(std.crypto.hash.sha2.Sha256)).eval, .vec_fn = S(f.Digest(std.crypto.hash.sha2.Sha256)).vec },
+    .{ .name = "xxhash64", .type_fn = typing.digest, .eval_fn = S(f.XxHash64).eval, .vec_fn = S(f.XxHash64).vec },
+    .{ .name = "concat_ws", .type_fn = typing.concatWs, .eval_fn = S(f.ConcatWs).eval, .vec_fn = S(f.ConcatWs).vec },
     .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = S(f.DateTrunc).eval, .vec_fn = S(f.DateTrunc).vec },
     .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = S(f.Extract).eval, .vec_fn = S(f.Extract).vec },
     .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = S(f.CaseMap(true)).eval, .vec_fn = S(f.CaseMap(true)).vec },
@@ -172,7 +172,7 @@ const base = [_]Builtin{
     .{ .name = "json_object", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonObject },
     .{ .name = "json_array", .type_fn = typing.jsonBuild, .eval_fn = per_row.jsonArray },
     .{ .name = "to_base64", .type_fn = typing.unaryString, .eval_fn = S(f.ToBase64).eval, .vec_fn = S(f.ToBase64).vec },
-    .{ .name = "from_base64", .type_fn = typing.fromBase64, .eval_fn = per_row.fromBase64 },
+    .{ .name = "from_base64", .type_fn = typing.fromBase64, .eval_fn = S(f.FromBase64).eval, .vec_fn = S(f.FromBase64).vec },
     .{ .name = "url_encode", .type_fn = typing.unaryString, .eval_fn = S(f.UrlCode(true)).eval, .vec_fn = S(f.UrlCode(true)).vec },
     .{ .name = "url_decode", .type_fn = typing.unaryString, .eval_fn = S(f.UrlCode(false)).eval, .vec_fn = S(f.UrlCode(false)).vec },
 };
@@ -292,5 +292,21 @@ test "temporal builtins: the kernels give the row forms' values, nulls and error
         "date_add('day', 1 / z, dt)",                                 "date_add('day', nullif(z, 0), date_add('day', 1 / z, dt))", "to_timestamp(f)",
         "date_diff('day', nullif(t, t), date_add('day', 1 / z, dt))", "date_add('year', m, dt)",                                   "date_add('second', m, t)",
         "strftime(t, concat('%', s))",                                "date_add('month', i * 100000000, dt)",
+    }, false);
+}
+
+test "hashing and text builtins: the kernels give the row forms' values, nulls and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try testBatch(a);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "md5(s)",                                     "sha256(s)",                      "xxhash64(s)",               "md5('')",
+        "xxhash64(u)",                                "md5(from_base64(to_base64(s)))", "from_base64(to_base64(s))", "from_base64(' aGk= ')",
+        "concat_ws('-', s, u)",                       "concat_ws(s, u, u, s)",          "concat_ws('', s)",          "concat_ws(', ', 'a', s, 'b')",
+        "concat_ws(u, s, from_base64(to_base64(u)))",
+    }, true);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "from_base64(u)", "md5(i)", "concat_ws('-', s, null, u)", "concat_ws(null, s)", "xxhash64(d)", "concat_ws('-', i, s, dt)",
     }, false);
 }

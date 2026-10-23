@@ -18,7 +18,8 @@
 //! Every argument propagates NULL, the first NULL ending the row in argument order
 //! (`F.eval_all` evaluates every argument first, and it and `F.typed_last` read the
 //! arguments as their kinds only once all are evaluated); `F.variadic` instead takes any
-//! number of text arguments as one slice. `F.value_scale` keeps each DECIMAL result
+//! number of text arguments as one slice, `F.skip_null` leaving out a NULL past the
+//! first instead of ending the row. `F.value_scale` keeps each DECIMAL result
 //! at the scale `apply` gave it. `Overload` picks one of several declarations by an
 //! argument's kind, and `Numeric` builds the one-number functions from their math.
 //!
@@ -415,13 +416,18 @@ pub fn Scalar(comptime F: type) type {
             var buf = std.array_list.Managed(u8).init(arena);
             const parts = try arena.alloc([]const u8, c.args.len);
             var any_bytes = false;
-            for (c.args, parts) |e, *p| {
+            var k: usize = 0;
+            for (c.args, 0..) |e, i| {
                 const v = try evalRow(arena, e, batch, row);
-                if (v.isNull()) return .null;
+                if (v.isNull()) {
+                    if (i > 0 and flag(F, "skip_null")) continue;
+                    return .null;
+                }
                 any_bytes = any_bytes or v == .bytes;
-                p.* = try valueToString(arena, v);
+                parts[k] = try valueToString(arena, v);
+                k += 1;
             }
-            const r = try F.apply(.{ .arena = arena, .buf = &buf, .call = c }, parts);
+            const r = try F.apply(.{ .arena = arena, .buf = &buf, .call = c }, parts[0..k]);
             if (comptime @hasDecl(F, "bytes_if_any")) if (any_bytes) return .{ .bytes = r };
             return wrap(r, c);
         }
@@ -496,11 +502,16 @@ pub fn Scalar(comptime F: type) type {
             const parts = try arena.alloc([]const u8, ops.len);
             rows: for (0..n) |i| {
                 cx.mark = out.begin();
-                for (ops, parts) |o, *p| p.* = strAt(o, i) orelse {
-                    try out.none(i, cx.mark);
-                    continue :rows;
-                };
-                try out.put(i, cx.mark, F.apply(cx, parts) catch |e| return unsupported(e));
+                var k: usize = 0;
+                for (ops, 0..) |o, j| {
+                    parts[k] = strAt(o, i) orelse {
+                        if (j > 0 and flag(F, "skip_null")) continue;
+                        try out.none(i, cx.mark);
+                        continue :rows;
+                    };
+                    k += 1;
+                }
+                try out.put(i, cx.mark, F.apply(cx, parts[0..k]) catch |e| return unsupported(e));
             }
             return out.finish();
         }
