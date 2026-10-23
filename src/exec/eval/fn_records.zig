@@ -950,3 +950,198 @@ test "decoders read fields and encoders write them back" {
     try testing.expectError(error.CastFailed, lit(a, "byte_slice('abc', 2, 2)"));
     try testing.expectEqualStrings("c", (try lit(a, "byte_slice('abc', 2, 1)")).bytes);
 }
+
+test "record functions check their literal lengths, scales, charsets and patterns" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "r", .ty = types.Type.init(.bytes) },
+        .{ .name = "s", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+        .{ .name = "dt", .ty = types.Type.init(.date) },
+        .{ .name = "t", .ty = types.Type.init(.time) },
+        .{ .name = "ts", .ty = types.Type.init(.timestamp) },
+    } };
+    const cases = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "decimal_at(r, 0, n, 2)", .msg = "`decimal_at` needs its length as an integer literal" },
+        .{ .src = "decimal_at(r, 0, 41, 2)", .msg = "`decimal_at` length must be 1 to 40, not 41" },
+        .{ .src = "decimal_at(r, 0, 5, 39)", .msg = "`decimal_at` scale must be 0 to 38, not 39" },
+        .{ .src = "zoned_at(r, 0, 5, n)", .msg = "`zoned_at` needs its scale as an integer literal" },
+        .{ .src = "packed_at(r, 0, 20, 0)", .msg = "`packed_at` length must be 1 to 19, not 20" },
+        .{ .src = "packed_at(r, 0, 4, 40)", .msg = "`packed_at` scale must be 0 to 38, not 40" },
+        .{ .src = "encode(s, 'klingon')", .msg = "`encode`: unknown charset `klingon` (" ++ charset.names ++ ")" },
+        .{ .src = "text_at(r, 0, 3, 'klingon')", .msg = "`text_at`: unknown charset `klingon` (" ++ charset.names ++ ")" },
+        .{ .src = "fmt_text(s, 3, 'klingon')", .msg = "`fmt_text`: unknown charset `klingon` (" ++ charset.names ++ ")" },
+        .{ .src = "date_at(r, 0, 6, s)", .msg = "`date_at` needs its pattern as a string literal" },
+        .{ .src = "date_at(r, 0, 6, 'DDMMXX')", .msg = "`date_at` pattern `DDMMXX`: `X` is not a part (YYYY YY MM DD hh mm ss) nor punctuation" },
+        .{ .src = "date_at(r, 0, 6, 'DDMMhh')", .msg = "`date_at` pattern `DDMMhh` has a part this kind does not hold" },
+        .{ .src = "date_at(r, 0, 5, 'DDMMYY')", .msg = "`date_at` reads 5 bytes, but pattern `DDMMYY` is 6 long" },
+        .{ .src = "time_at(r, 0, 2, '--')", .msg = "`time_at` pattern `--` has no date or time part" },
+        .{ .src = "time_at(r, 0, 4, 'YYYY')", .msg = "`time_at` pattern `YYYY` has a part this kind does not hold" },
+        .{ .src = "timestamp_at(r, 0, 2, 'zz')", .msg = "`timestamp_at` pattern `zz`: `z` is not a part (YYYY YY MM DD hh mm ss) nor punctuation" },
+        .{ .src = "fmt_date(dt, 'hhmm')", .msg = "`fmt_date` pattern `hhmm` has a part this kind does not hold" },
+        .{ .src = "fmt_time(t, 'MM')", .msg = "`fmt_time` pattern `MM` has a part this kind does not hold" },
+        .{ .src = "fmt_timestamp(ts, '/')", .msg = "`fmt_timestamp` pattern `/` has no date or time part" },
+    };
+    for (cases) |cs| {
+        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        var ctx = TypeCtx{ .schema = schema, .arena = a };
+        try testing.expectError(error.TypeError, ctx.typeOf(try parser.parseExprStr(a, cs.src, &diag)));
+        testing.expectEqualStrings(cs.msg, ctx.msg) catch |e| {
+            std.debug.print("in `{s}`\n", .{cs.src});
+            return e;
+        };
+    }
+}
+
+test "record decoders: time and timestamp fields, overpunch and EBCDIC zones, refusals by message" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    const takeFailure = @import("support.zig").takeFailure;
+
+    try testing.expectEqual(@as(i64, (23 * 3600 + 59 * 60) * 1_000_000), (try lit(a, "time_at('2359', 0, 4, 'hhmm')")).time);
+    try testing.expectEqual(@as(i64, (19724 * 86_400 + 3 * 3600 + 4 * 60 + 5) * 1_000_000), (try lit(a, "timestamp_at('20240102 030405', 0, 15, 'YYYYMMDD hhmmss')")).timestamp);
+    try testing.expect((try lit(a, "time_at('    ', 0, 4, 'hhmm')")).isNull());
+    try testing.expect((try lit(a, "timestamp_at('00000000', 0, 8, 'YYYYMMDD', '00000000')")).isNull());
+    try testing.expect((try lit(a, "zoned_at('   ', 0, 3, 0)")).isNull());
+
+    const decs = [_]struct { src: []const u8, unscaled: i128 }{
+        .{ .src = "zoned_at('12A', 0, 3, 0)", .unscaled = 121 },
+        .{ .src = "zoned_at('12R', 0, 3, 0)", .unscaled = -129 },
+        .{ .src = "zoned_at(x'F1F2C3', 0, 3, 0)", .unscaled = 123 },
+        .{ .src = "zoned_at(x'F1F2F3', 0, 3, 0)", .unscaled = 123 },
+        .{ .src = "zoned_at(x'F1F2D3', 0, 3, 0)", .unscaled = -123 },
+        .{ .src = "decimal_at('1.230', 0, 5, 2, '.')", .unscaled = 123 },
+        .{ .src = "decimal_at('+1.5', 0, 4, 3, '.')", .unscaled = 1500 },
+    };
+    for (decs) |d| {
+        errdefer std.debug.print("in `{s}`\n", .{d.src});
+        try testing.expectEqual(d.unscaled, (try lit(a, d.src)).decimal.unscaled);
+    }
+
+    const refused = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "zoned_at(x'F1F2E3', 0, 3, 0)", .msg = "`zoned_at`: `\\xF1\\xF2\\xE3` is not a zoned decimal" },
+        .{ .src = "zoned_at('1x3', 0, 3, 0)", .msg = "`zoned_at`: `1x3` is not a zoned decimal" },
+        .{ .src = "decimal_at('1.235', 0, 5, 2, '.')", .msg = "`decimal_at`: `1.235` is not a decimal with at most its scale's places" },
+        .{ .src = "decimal_at('1.2.3', 0, 5, 2, '.')", .msg = "`decimal_at`: `1.2.3` is not a decimal" },
+        .{ .src = "decimal_at('12', 0, 2, 2, ';')", .msg = "`decimal_at`: the separator is `.` or `,`, not `;`" },
+        .{ .src = "decimal_at('12', 0, 2, 39)", .msg = "`decimal_at`: scale 39 is out of range" },
+        .{ .src = "decimal_at('-', 0, 1, 0)", .msg = "`decimal_at`: `-` is not a decimal" },
+        .{ .src = "date_at('31-02-24', 0, 8, 'DD-MM-YY')", .msg = "`date_at`: `31-02-24` is not a valid date or time" },
+        .{ .src = "date_at('31/12/24', 0, 8, 'DD-MM-YY')", .msg = "`date_at`: `31/12/24` is not in its pattern" },
+        .{ .src = "date_at('3a-12-24', 0, 8, 'DD-MM-YY')", .msg = "`date_at`: `3a-12-24` is not in its pattern" },
+        .{ .src = "date_at('311224', 0, 6, 'DDMMYYYY')", .msg = "`date_at`: `311224` is not as long as its pattern" },
+        .{ .src = "time_at('2460', 0, 4, 'hhmm')", .msg = "`time_at`: `2460` is not a valid date or time" },
+        .{ .src = "encode('\u{20AC}', 'latin1')", .msg = "`encode`: `\\xE2\\x82\\xAC` is not text the charset holds" },
+        .{ .src = "int_at('+', 0, 1)", .msg = "`int_at`: `+` is not an integer" },
+        .{ .src = "int_at('99999999999999999999', 0, 20)", .msg = "`int_at`: `99999999999999999999` is not an integer in range" },
+    };
+    for (refused) |r| {
+        errdefer std.debug.print("in `{s}`\n", .{r.src});
+        try testing.expectError(error.CastFailed, lit(a, r.src));
+        try testing.expectEqualStrings(r.msg, takeFailure(error.CastFailed).?);
+    }
+}
+
+test "record encoders: separators, padding, NULL as spaces, and every refusal by message" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    const takeFailure = @import("support.zig").takeFailure;
+
+    const written = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "fmt_decimal(CAST(1.5 AS DECIMAL(4,2)), 6, 2, ',')", .want = "001,50" },
+        .{ .src = "fmt_decimal(0.05, 5, 2, '.')", .want = "00.05" },
+        .{ .src = "fmt_decimal(-0.05, 6, 2, '.')", .want = "-00.05" },
+        .{ .src = "fmt_decimal(15, 4, 0, '.')", .want = "0015" },
+        .{ .src = "fmt_decimal(CAST(NULL AS DECIMAL(4,2)), 4, 2)", .want = "    " },
+        .{ .src = "fmt_time(CAST('23:59:58' AS TIME), 'hh:mm:ss')", .want = "23:59:58" },
+        .{ .src = "fmt_time(CAST(NULL AS TIME), 'hhmm')", .want = "    " },
+        .{ .src = "fmt_date(CAST(NULL AS DATE), 'YYYYMMDD')", .want = "        " },
+        .{ .src = "fmt_date(CAST('1969-07-20' AS DATE), 'DDMMYY')", .want = "200769" },
+        .{ .src = "fmt_timestamp(CAST(NULL AS TIMESTAMP), 'YYYY')", .want = "    " },
+        .{ .src = "fmt_zoned(CAST(NULL AS DECIMAL(4,2)), 3, 2)", .want = "   " },
+        .{ .src = "fmt_text(NULL, 3)", .want = "   " },
+        .{ .src = "fmt_text('ab', 4, 'latin1')", .want = "ab  " },
+    };
+    for (written) |w| {
+        errdefer std.debug.print("in `{s}`\n", .{w.src});
+        try testing.expectEqualStrings(w.want, (try lit(a, w.src)).bytes);
+    }
+
+    const refused = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "fmt_decimal(1.234, 6, 2)", .msg = "`fmt_decimal`: the value has more than 2 decimal places; round it first" },
+        .{ .src = "fmt_decimal(1.5, 6, 39)", .msg = "`fmt_decimal`: scale 39 is out of range" },
+        .{ .src = "fmt_decimal(1.5, 6, 2, ';')", .msg = "`fmt_decimal`: the separator is `.` or `,`, not `;`" },
+        .{ .src = "fmt_decimal(-1.5, 4, 2, '.')", .msg = "`fmt_decimal`: the value needs 5 bytes, more than its field's 4" },
+        .{ .src = "fmt_text('abcde', 3)", .msg = "`fmt_text`: the value needs 5 bytes, more than its field's 3" },
+        .{ .src = "fmt_text('\u{20AC}', 3, 'latin1')", .msg = "`fmt_text`: `\\xE2\\x82\\xAC` is not text the charset holds" },
+        .{ .src = "fmt_int(123, 2)", .msg = "`fmt_int`: the value needs 3 bytes, more than its field's 2" },
+        .{ .src = "fmt_int(NULL, -1)", .msg = "a field width cannot be negative (-1)" },
+        .{ .src = "fmt_zoned(12345, 3, 0)", .msg = "`fmt_zoned`: the value needs 5 bytes, more than its field's 3" },
+        .{ .src = "fmt_packed(1, 20, 0)", .msg = "`fmt_packed`: a width of 20 bytes is out of range" },
+        .{ .src = "fmt_packed(12345, 2, 0)", .msg = "`fmt_packed`: the value needs 3 bytes, more than its field's 2" },
+        .{ .src = "fmt_date(CAST('2070-01-01' AS DATE), 'YYMMDD')", .msg = "`fmt_date`: year 2070 would read back as another as YY, which holds 1969 to 2068" },
+    };
+    for (refused) |r| {
+        errdefer std.debug.print("in `{s}`\n", .{r.src});
+        try testing.expectError(error.CastFailed, lit(a, r.src));
+        try testing.expectEqualStrings(r.msg, takeFailure(error.CastFailed).?);
+    }
+}
+
+test "read_bytes and file_size: ranges of a file, NULL offsets per row, and the errors naming the file" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    const takeFailure = @import("support.zig").takeFailure;
+    const parser = @import("../../lang/sql_parser.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "f.bin", .data = "hello" });
+    const path = try tmp.dir.realpathAlloc(a, "f.bin");
+    const missing = try std.fs.path.join(a, &.{ std.fs.path.dirname(path).?, "nope.bin" });
+
+    const q = struct {
+        fn f(al: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]const u8 {
+            return std.fmt.allocPrint(al, fmt, args);
+        }
+    }.f;
+    try testing.expectEqualStrings("ell", (try lit(a, try q(a, "read_bytes('{s}', 1, 3)", .{path}))).bytes);
+    try testing.expectEqual(@as(i64, 5), (try lit(a, try q(a, "file_size('{s}')", .{path}))).int);
+
+    const refused = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = try q(a, "read_bytes('{s}', 3, 5)", .{path}), .msg = try q(a, "`read_bytes`: bytes 3..8 are outside `{s}`'s 5 bytes", .{path}) },
+        .{ .src = try q(a, "read_bytes('{s}', 0 - 1, 2)", .{path}), .msg = "`read_bytes`: offset -1 and length 2 cannot be negative" },
+        .{ .src = try q(a, "read_bytes('{s}', 0, 1)", .{missing}), .msg = try q(a, "`read_bytes`: cannot open `{s}` (FileNotFound)", .{missing}) },
+        .{ .src = try q(a, "file_size('{s}')", .{missing}), .msg = try q(a, "`file_size`: cannot open `{s}` (FileNotFound)", .{missing}) },
+    };
+    for (refused) |r| {
+        errdefer std.debug.print("in `{s}`\n", .{r.src});
+        try testing.expectError(error.CastFailed, lit(a, r.src));
+        try testing.expectEqualStrings(r.msg, takeFailure(error.CastFailed).?);
+    }
+
+    const batch = try testBatch(a);
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, try q(a, "read_bytes('{s}', int_at(r, 0, 1), 1)", .{path}), &diag);
+    const col = (try evalVecNode(a, e, batch)).col;
+    const want = [_]?[]const u8{ "e", "l", null, "l" };
+    for (want, 0..) |w, i| {
+        const got = col.getValue(i);
+        const row = try evalRow(a, e, batch, i);
+        if (w) |s| {
+            try testing.expectEqualStrings(s, got.bytes);
+            try testing.expectEqualStrings(s, row.bytes);
+        } else {
+            try testing.expect(got.isNull());
+            try testing.expect(row.isNull());
+        }
+    }
+}
