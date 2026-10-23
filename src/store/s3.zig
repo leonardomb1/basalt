@@ -24,13 +24,14 @@
 //! buffer, a multipart upload starts the first time it fills, and `finish`
 //! completes the ordered part list; an object that never fills it is one plain PUT.
 //! Parts are gathered whole (`objstore.Upload`) rather than staged from drain
-//! chunks, as S3 rejects a non-final part under 5 MiB. 8 MiB parts
-//! under the 10,000-part limit cap an object at ~78 GiB. Until `finish` returns
-//! the object does not exist; a dropped writer leaves an invisible upload that S3
-//! only garbage-collects under a bucket lifecycle rule, so an abort call may become
-//! worth adding. Staging runs under `std.Io.Writer`, whose only error is
-//! `WriteFailed`, so the writer keeps the typed error (`last_status`) and S3's
-//! message for the sink to re-raise.
+//! chunks, as S3 rejects a non-final part under 5 MiB, and each request's memory
+//! is freed before the next part. 8 MiB parts under the 10,000-part limit cap an
+//! object at ~78 GiB. Until `finish` returns the object does not exist; `abort`
+//! frees only the writer's client, leaving an invisible upload that S3
+//! garbage-collects under a bucket lifecycle rule (no AbortMultipartUpload is
+//! sent). Staging runs under `std.Io.Writer`, whose only error is `WriteFailed`,
+//! so the writer keeps the typed error (`last_status`) and S3's message for the
+//! sink to re-raise.
 //!
 //! `S3EmptyPrefix` is kept distinct from an empty object because its usual cause is
 //! a mistyped prefix in an otherwise full bucket.
