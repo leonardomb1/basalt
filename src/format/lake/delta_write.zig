@@ -452,19 +452,28 @@ fn jsonString(w: *std.Io.Writer, s: []const u8) !void {
 }
 
 /// `us` as `YYYY-MM-DD HH:MM:SS.ffffff`, with `T` for the space and a trailing `Z`
-/// when `utc`; `ms` cuts the fraction to milliseconds.
+/// when `utc`; `ms` cuts the fraction to milliseconds. A year outside 1..9999 has
+/// no such spelling and is `DeltaValueOutOfRange`.
 fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
     const day = @divFloor(us, 86_400_000_000);
-    const rest: u64 = @intCast(us - day * 86_400_000_000);
+    const rest: u64 = @intCast(@mod(us, 86_400_000_000));
+    const y = try fourDigitYear(day);
     const c = time.civilFromDays(day);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
     if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
     if (utc) try w.writeByte('Z');
 }
 
 fn writeDate(w: *std.Io.Writer, days: i64) !void {
+    const y = try fourDigitYear(days);
     const c = time.civilFromDays(days);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
+    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
+}
+
+fn fourDigitYear(days: i64) Error!u64 {
+    const y = time.civilFromDays(days).y;
+    if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
+    return @intCast(y);
 }
 
 /// A partition value as the log's text, null for NULL (and for an empty string,
@@ -538,12 +547,12 @@ fn statJson(arena: std.mem.Allocator, c: Col, v: Value, is_max: bool) !?[]const 
         .decimal => |d| try fmtnum.writeDecimal(w, d.unscaled, d.scale),
         .date => |d| {
             try w.writeByte('"');
-            try writeDate(w, d);
+            writeDate(w, d) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;
             try w.writeByte('"');
         },
         .timestamp => |us| {
             try w.writeByte('"');
-            try writeTimestamp(w, us, c.phys.utc, true);
+            writeTimestamp(w, us, c.phys.utc, true) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;
             try w.writeByte('"');
         },
         .string => |s| {
@@ -1023,6 +1032,12 @@ test "partition values and statistics as the log writes them" {
     const f = Col{ .name = "f", .delta_type = "double", .ty = types.Type.init(.float), .src = 0 };
     try testing.expect(try statJson(a, f, .{ .float = std.math.inf(f64) }, true) == null);
     try testing.expectEqualStrings("2026-01-01", (try partitionText(a, .{ .name = "d", .delta_type = "date", .ty = types.Type.init(.date), .src = 0 }, .{ .date = 20454 })).?);
+    const dc = Col{ .name = "d", .delta_type = "date", .ty = types.Type.init(.date), .src = 0 };
+    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, dc, .{ .date = -719163 }));
+    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, dc, .{ .date = 2932897 }));
+    try testing.expectEqualStrings("0001-01-01", (try partitionText(a, dc, .{ .date = -719162 })).?);
+    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, ts, .{ .timestamp = std.math.minInt(i64) }));
+    try testing.expect(try statJson(a, ts, .{ .timestamp = std.math.maxInt(i64) }, true) == null);
 }
 
 test "floats as partition values and statistics: compact past a moderate range, Java's NaN and infinities, read back exactly" {
