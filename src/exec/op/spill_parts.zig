@@ -75,6 +75,62 @@ pub const Meter = struct {
     }
 };
 
+/// A spilling operator `T`'s files and the meter over its `state`, filed under `tag`,
+/// its errors naming it `label`. `T` holds this as `spill`, beside `state`, `space`,
+/// `in_schema`, `own_state`, `err`, `spill_depth`, `max_spill_depth`, and `spilled`
+/// with `spilled_to`, the deepest level that wrote files, kept by the top operator.
+pub fn Spill(comptime T: type, comptime tag: []const u8, comptime label: []const u8) type {
+    return struct {
+        const Self = @This();
+
+        meter: Meter,
+        parts: Parts,
+        frozen: bool = false,
+        drained: bool = false,
+        replay: ?Replay(T) = null,
+
+        /// Starts spilling: the files made in `op.state`, which is metered from now on.
+        pub fn begin(op: *T) !*Self {
+            const sp = try op.state.create(Self);
+            sp.* = .{
+                .meter = .{ .child = op.state },
+                .parts = .{ .space = op.space.?, .alloc = op.state, .schema = op.in_schema, .tag = tag },
+            };
+            op.spill = sp;
+            op.state = sp.meter.allocator();
+            return sp;
+        }
+
+        /// The input is in: the files closed for replay, their level noted when any holds rows.
+        pub fn finish(sp: *Self, op: *T) !void {
+            sp.drained = true;
+            sp.replay = .{ .runs = try sp.parts.finish() };
+            if (sp.replay.?.runs.len > 0) {
+                const top = op.spilled_to orelse &op.spilled;
+                top.* = @max(top.*, op.spill_depth + 1);
+            }
+        }
+
+        /// Writes the rows `dest` marks to their files, failing past the depth limit.
+        pub fn route(sp: *Self, op: *const T, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
+            return sp.parts.route(scratch, b, dest, label, op.spill_depth, op.max_spill_depth, op.err);
+        }
+
+        /// Drops the spill files a consumer that stopped early never read, then the
+        /// operator's own arena; safe twice.
+        pub fn release(op: *T) void {
+            if (op.spill) |sp| {
+                if (sp.replay) |*r| r.release() else sp.parts.abort();
+            }
+            if (op.own_state) |a| {
+                op.spill = null;
+                op.own_state = null;
+                a.deinit();
+            }
+        }
+    };
+}
+
 /// The `fanout` spill files of one operator at one depth, each made on its first row.
 pub const Parts = struct {
     space: Space,

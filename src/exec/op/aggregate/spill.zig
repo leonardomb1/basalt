@@ -3,7 +3,7 @@
 //! and no `part_state` (per-lane partials never spill). `state` is metered from the
 //! first row; the drain loops call `overBudget` after each batch, and once frozen
 //! probe with `GroupTable.find` instead of inserting and hand the rows of absent
-//! keys to `spillRows`. Partitions are picked from the table's own key hash
+//! keys to `Spill.route`. Partitions are picked from the table's own key hash
 //! (`fixedHash` or `MultiKeyCtx.hash`), so equal keys, NULL keys and numeric keys
 //! that group together always share a file. A fixed-width string key not yet
 //! interned is absent by definition and is not interned while frozen, so spilled
@@ -17,50 +17,23 @@ const Op = @import("../../op.zig").Op;
 const parts_mod = @import("../spill_parts.zig");
 const std = @import("std");
 
-pub const Spill = struct {
-    meter: parts_mod.Meter,
-    parts: parts_mod.Parts,
-    frozen: bool = false,
-    replay: ?parts_mod.Replay(Aggregate) = null,
-};
+pub const Spill = parts_mod.Spill(Aggregate, "group-by", "GROUP BY");
 
-/// Drops the spill files a consumer that stopped early never read, then the
-/// groups' own arena; safe twice.
-pub fn release(self: *Aggregate) void {
-    if (self.spill) |sp| {
-        if (sp.replay) |*r| r.release() else sp.parts.abort();
-    }
-    if (self.own_state) |a| {
-        self.spill = null;
-        self.own_state = null;
-        a.deinit();
-    }
-}
+pub const release = Spill.release;
 
 /// `next` in spilling mode: the whole input folded (spilling what does not fit),
 /// the groups held in memory emitted, then each spill file aggregated in turn.
 pub fn spillNext(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
     if (self.spill == null) {
-        const sp = try self.state.create(Spill);
-        sp.* = .{
-            .meter = .{ .child = self.state },
-            .parts = .{ .space = self.space.?, .alloc = self.state, .schema = self.in_schema, .tag = "group-by" },
-        };
-        self.spill = sp;
-        self.state = sp.meter.allocator();
+        const sp = try Spill.begin(self);
         const set = self.drainSet() catch |e| {
             sp.parts.abort();
             return e;
         };
-        sp.replay = .{ .runs = try sp.parts.finish() };
-        if (sp.replay.?.runs.len > 0) {
-            const top = self.spilled_to orelse &self.spilled;
-            top.* = @max(top.*, self.spill_depth + 1);
-        }
+        try sp.finish(self);
         if (set.len > 0) return try self.emitSets(arena, &.{set}, null);
     }
-    const sp = self.spill.?;
-    return sp.replay.?.next(self, self.gpa, arena);
+    return self.spill.?.replay.?.next(self, self.gpa, arena);
 }
 
 /// A fresh aggregate over one spill file, one level deeper, on `state`.
@@ -97,11 +70,6 @@ pub fn overBudget(self: *Aggregate, parts: anytype) bool {
     for (self.pairs) |*pp| bytes += pp.tableBytes();
     if (groups > 0 and bytes > self.spill_at) sp.frozen = true;
     return sp.frozen;
-}
-
-/// Writes the rows `dest` marks to their spill files, failing past the depth limit.
-pub fn spillRows(self: *Aggregate, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
-    return self.spill.?.parts.route(scratch, b, dest, "GROUP BY", self.spill_depth, self.max_spill_depth, self.err);
 }
 
 /// A row's spill file from the key hash the fold already computed.

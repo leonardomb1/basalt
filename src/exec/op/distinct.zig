@@ -64,13 +64,7 @@ pub const Distinct = struct {
     spilled: u8 = 0,
     spilled_to: ?*u8 = null,
 
-    const Spill = struct {
-        meter: spill_parts.Meter,
-        parts: spill_parts.Parts,
-        frozen: bool = false,
-        drained: bool = false,
-        replay: ?spill_parts.Replay(Distinct) = null,
-    };
+    const Spill = spill_parts.Spill(Distinct, "distinct", "DISTINCT");
 
     const FixedStore = keytable.FixedStore(keytable.NoPayload);
     const BoxedStore = keytable.GroupStore(keytable.NoPayload);
@@ -139,28 +133,14 @@ pub const Distinct = struct {
 
     pub fn next(self: *Distinct, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.space == null or self.track_ords) return self.dedup(arena);
-        if (self.spill == null) {
-            const sp = try self.state.create(Spill);
-            sp.* = .{
-                .meter = .{ .child = self.state },
-                .parts = .{ .space = self.space.?, .alloc = self.state, .schema = self.in_schema, .tag = "distinct" },
-            };
-            self.spill = sp;
-            self.state = sp.meter.allocator();
-        }
-        const sp = self.spill.?;
+        const sp = self.spill orelse try Spill.begin(self);
         if (!sp.drained) {
             const got = self.dedup(arena) catch |e| {
                 sp.parts.abort();
                 return e;
             };
             if (got) |b| return b;
-            sp.drained = true;
-            sp.replay = .{ .runs = try sp.parts.finish() };
-            if (sp.replay.?.runs.len > 0) {
-                const top = self.spilled_to orelse &self.spilled;
-                top.* = @max(top.*, self.spill_depth + 1);
-            }
+            try sp.finish(self);
         }
         return sp.replay.?.next(self, self.gpa, arena);
     }
@@ -169,14 +149,7 @@ pub const Distinct = struct {
     /// operator's own arena; safe twice.
     pub fn release(self: *Distinct) void {
         self.freeSeen();
-        if (self.spill) |sp| {
-            if (sp.replay) |*r| r.release() else sp.parts.abort();
-        }
-        if (self.own_state) |a| {
-            self.spill = null;
-            self.own_state = null;
-            a.deinit();
-        }
+        Spill.release(self);
     }
 
     /// A fresh `Distinct` over one spill file, one level deeper, on `state`.
@@ -204,10 +177,6 @@ pub const Distinct = struct {
         const seen = &(self.seen orelse return false);
         if (seen.len() > 0 and sp.meter.bytes + seen.table.entries.len * @sizeOf(u32) > self.spill_at) sp.frozen = true;
         return sp.frozen;
-    }
-
-    fn spillRows(self: *Distinct, scratch: std.mem.Allocator, b: Batch, dest: []const u8) !void {
-        return self.spill.?.parts.route(scratch, b, dest, "DISTINCT", self.spill_depth, self.max_spill_depth, self.err);
     }
 
     /// The next batch of first rows: each row's key looked up in `seen` in input
@@ -260,7 +229,7 @@ pub const Distinct = struct {
                     kept = v.kept;
                 },
             }
-            if (nspill > 0) try self.spillRows(pull, b, dest);
+            if (nspill > 0) try self.spill.?.route(self, pull, b, dest);
             const base = self.seen_rows;
             self.seen_rows += b.len;
             if (kept == 0) {

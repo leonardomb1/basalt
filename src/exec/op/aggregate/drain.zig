@@ -3,7 +3,7 @@
 //!
 //! In spilling mode (`spill.zig`) both folds check the budget before each batch;
 //! once frozen they look keys up instead of inserting them, fold the rows they
-//! find, and send the rest to `spillRows`, picked by the hash they already have.
+//! find, and send the rest to `Spill.route`, picked by the hash they already have.
 
 const Aggregate = @import("../aggregate.zig").Aggregate;
 const Batch = @import("../../batch.zig").Batch;
@@ -280,7 +280,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         var fold = Fold(FixedStore){ .self = self, .parts = parts, .layout = layout, .tails = tails, .pidx = pidx, .dest = dest, .frozen = frozen, .direct = if (direct) |*d| d else null };
         try keytable.probe(FixedStore, .alias, &runs, 0, m, &fold);
 
-        if (fold.nspill > 0) try self.spillRows(pull, b, dest);
+        if (fold.nspill > 0) try self.spill.?.route(self, pull, b, dest);
         if (counts_only) {
             for (tails[0..b.len]) |t| {
                 const cs: [*]i64 = @ptrCast(@alignCast(t orelse continue));
@@ -358,7 +358,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
 
         var fold = Fold(GroupStore){ .self = self, .parts = parts, .layout = layout, .tails = tails, .pidx = pidx, .dest = dest, .frozen = frozen };
         try keytable.probe(GroupStore, .canon, &runs, 0, b.len, &fold);
-        if (fold.nspill > 0) try self.spillRows(pull, b, dest);
+        if (fold.nspill > 0) try self.spill.?.route(self, pull, b, dest);
         try foldRows(self, pull, b, layout, tails, parts, pidx);
         _ = scratch.reset(.retain_capacity);
     }
