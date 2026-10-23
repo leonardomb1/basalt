@@ -2,7 +2,8 @@
 //! where that is smaller, else PLAIN-encoded pages; one chunk per column per row group.
 //!
 //! Nullable columns are written OPTIONAL with definition levels; REQUIRED columns
-//! carry none. Rows accumulate until `group_rows`, then a row group is flushed.
+//! carry none. Rows accumulate until `group_rows`, or until the columns hold
+//! `group_bytes` as PLAIN, then a row group is flushed.
 //! That bounds memory to roughly one row group, the closest a Parquet writer gets
 //! to streaming: a chunk's size and offset must be known before its metadata, and
 //! the footer indexes every row group, so a file cannot be appended to.
@@ -18,7 +19,9 @@
 //! it up past `dict_max_entries` or `dict_max_bytes`, or once it is mostly distinct,
 //! and writes PLAIN; at the flush it keeps it only if it is smaller than PLAIN, so
 //! codes, dates and categories shrink while unique ids and timestamps do not grow.
-//! Values are PLAIN-encoded alongside throughout, so giving up costs nothing.
+//! While the dictionary holds, only its entries and indices are kept, plus a count
+//! of the PLAIN size for that comparison; giving it up rebuilds PLAIN from them,
+//! which the byte cap bounds.
 //!
 //! Both chunk size totals include page headers, per ColumnMetaData's "including
 //! the headers": without them a reader that bounds a chunk by
@@ -71,6 +74,10 @@ pub const Error = error{
 } || std.mem.Allocator.Error || codec.Error;
 
 pub const row_group_rows = 100_000;
+
+/// A row group is also flushed once its columns reach this many bytes as PLAIN,
+/// parquet-mr's and Arrow's 128 MiB, so wide rows do not hold 100,000 rows' worth.
+pub const row_group_bytes = 128 << 20;
 
 pub const page_target_bytes = 1 << 20;
 
@@ -167,6 +174,9 @@ const ColBuf = struct {
     dict_idx: List(u32),
     dict_ok: bool = false,
     dict_bytes: usize = 0,
+    /// The chunk's size as PLAIN, whether its values sit in `values`, in sealed
+    /// pages or in the dictionary: what the row group's byte cap counts.
+    plain: usize = 0,
     /// Whether the column's type is dictionary-encoded at all; `dict_ok` starts each
     /// row group from it, since a dictionary is per chunk.
     dict_eligible: bool = false,
@@ -216,6 +226,7 @@ const ColBuf = struct {
         self.fixed_raw.clearRetainingCapacity();
         self.dict_idx.clearRetainingCapacity();
         self.dict_bytes = 0;
+        self.plain = 0;
         self.dict_ok = self.dict_eligible;
     }
 
@@ -234,35 +245,32 @@ const ColBuf = struct {
     }
 
     /// Records a fixed-width value, given as its PLAIN bytes, against the dictionary.
-    fn dictPutFixed(self: *ColBuf, v: []const u8) !void {
+    /// Returns false, leaving it unrecorded, when it would take the dictionary past a cap.
+    fn dictPutFixed(self: *ColBuf, v: []const u8) !bool {
         var key: u128 = 0;
         for (v, 0..) |b, k| key |= @as(u128, b) << @intCast(8 * k);
         const gop = try self.fixed.getOrPut(key);
         if (!gop.found_existing) {
             if (self.dictFull(v.len)) {
                 self.fixed.removeByPtr(gop.key_ptr);
-                self.dict_ok = false;
-                return;
+                return false;
             }
             gop.value_ptr.* = @intCast(self.fixed.count() - 1);
             try self.fixed_raw.appendSlice(v);
             self.dict_bytes += v.len;
         }
         try self.dict_idx.append(gop.value_ptr.*);
+        return true;
     }
 
-    /// Records a byte-array value against the dictionary. Returns false once the
-    /// column has too many distinct values to be worth encoding this way.
+    /// Records a byte-array value against the dictionary. Returns false, leaving it
+    /// unrecorded, once the column has too many distinct values to be worth it.
     fn dictPut(self: *ColBuf, arena: std.mem.Allocator, v: []const u8) !bool {
-        if (!self.dict_ok) return false;
         if (self.dict.get(v)) |ix| {
             try self.dict_idx.append(ix);
             return true;
         }
-        if (self.dictFull(v.len)) {
-            self.dict_ok = false;
-            return false;
-        }
+        if (self.dictFull(v.len)) return false;
         self.dict_bytes += v.len;
         const owned = try arena.dupe(u8, v);
         const ix: u32 = @intCast(self.dict_order.items.len);
@@ -270,6 +278,72 @@ const ColBuf = struct {
         try self.dict_order.append(owned);
         try self.dict_idx.append(ix);
         return true;
+    }
+
+    /// A non-null fixed-width value, as its PLAIN bytes, after its definition level.
+    fn putFixed(self: *ColBuf, arena: std.mem.Allocator, optional: bool, v: []const u8) !void {
+        self.plain += v.len;
+        if (self.dict_ok) {
+            if (try self.dictPutFixed(v)) return;
+            try self.spill(arena, optional);
+        }
+        try self.values.appendSlice(v);
+    }
+
+    /// A non-null byte-array value after its definition level.
+    fn putBytes(self: *ColBuf, arena: std.mem.Allocator, optional: bool, v: []const u8) !void {
+        self.plain += 4 + v.len;
+        if (self.dict_ok) {
+            if (try self.dictPut(arena, v)) return;
+            try self.spill(arena, optional);
+        }
+        var len4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
+        try self.values.ensureUnusedCapacity(4 + v.len);
+        self.values.appendSliceAssumeCapacity(&len4);
+        self.values.appendSliceAssumeCapacity(v);
+    }
+
+    /// Gives the dictionary up mid-chunk, for a value whose definition level is
+    /// already appended but which the dictionary refused.
+    fn spill(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+        const last = self.defs.pop().?;
+        try self.rebuildPlain(arena, optional);
+        self.defs.appendAssumeCapacity(last);
+    }
+
+    /// The values the dictionary holds, written out PLAIN in row order from
+    /// `dict_idx` and sealed into pages as they pass `page_target_bytes`; the
+    /// dictionary is then dropped for the rest of the chunk. The byte cap on a row
+    /// group counts PLAIN bytes, so this never builds more than a group's worth.
+    fn rebuildPlain(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+        self.dict_ok = false;
+        const defs = try arena.dupe(u8, self.defs.items);
+        self.defs.clearRetainingCapacity();
+        const fixed_n = self.fixed.count();
+        const w = if (fixed_n == 0) 0 else self.fixed_raw.items.len / fixed_n;
+        var k: usize = 0;
+        for (defs) |d| {
+            self.defs.appendAssumeCapacity(d);
+            if (d == 0) continue;
+            const ix = self.dict_idx.items[k];
+            k += 1;
+            if (fixed_n == 0) {
+                const v = self.dict_order.items[ix];
+                var len4: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
+                try self.values.ensureUnusedCapacity(4 + v.len);
+                self.values.appendSliceAssumeCapacity(&len4);
+                self.values.appendSliceAssumeCapacity(v);
+            } else try self.values.appendSlice(self.fixed_raw.items[ix * w ..][0..w]);
+            if (self.values.items.len >= page_target_bytes) try self.sealPage(arena, optional);
+        }
+        self.dict.clearRetainingCapacity();
+        self.dict_order.clearRetainingCapacity();
+        self.fixed.clearRetainingCapacity();
+        self.fixed_raw.clearRetainingCapacity();
+        self.dict_idx.clearRetainingCapacity();
+        self.dict_bytes = 0;
     }
 
     /// Decimals compare as numbers, not mantissas: per-value scales once ranked `0.5`
@@ -291,6 +365,7 @@ const ColBuf = struct {
     fn pushBit(self: *ColBuf, b: bool) !void {
         if (b) self.bit_buf |= @as(u8, 1) << self.bit_n;
         if (self.bit_n == 7) {
+            self.plain += 1;
             try self.values.append(self.bit_buf);
             self.bit_buf = 0;
             self.bit_n = 0;
@@ -361,6 +436,7 @@ pub const Writer = struct {
     offset: i64 = 0,
     groups: List(RowGroupMeta),
     group_rows: usize = row_group_rows,
+    group_bytes: usize = row_group_bytes,
     part: Part = .{},
 
     const Backend = union(enum) {
@@ -457,15 +533,20 @@ pub const Writer = struct {
         };
     }
 
-    /// Column at a time: the batch is cut at row-group boundaries, then each column
-    /// encodes its rows of that piece in slices of `slice_rows`, after each of which a
-    /// PLAIN column past `page_target_bytes` seals a page.
+    /// Column at a time over spans of the batch: a span ends at `group_rows`, or
+    /// where the batch's bytes per row say `group_bytes` is reached, and each column
+    /// encodes its rows of it in slices of `slice_rows`, after each of which a PLAIN
+    /// column past `page_target_bytes` seals a page. A group that reached either cap
+    /// is flushed after the span, so wide rows overshoot the byte cap by about a row.
     pub fn writeBatch(self: *Writer, arena: std.mem.Allocator, batch: Batch) !void {
         _ = arena;
+        if (batch.len == 0) return;
         const sa = self.scratch.allocator();
+        const row_bytes = @max(1, batch.heapBytes() / batch.len);
         var start: usize = 0;
         while (start < batch.len) {
-            const end = start + @min(batch.len - start, self.group_rows - self.rows);
+            const room = self.group_bytes -| self.bufferedBytes();
+            const end = start + @max(1, @min(room / row_bytes, self.group_rows - self.rows, batch.len - start));
             for (batch.columns, self.cols, self.maps) |col, *cb, m| {
                 var lo = start;
                 while (lo < end) {
@@ -478,8 +559,14 @@ pub const Writer = struct {
             self.rows += end - start;
             self.total_rows += @intCast(end - start);
             start = end;
-            if (self.rows >= self.group_rows) try self.flushRowGroup();
+            if (self.rows >= self.group_rows or self.bufferedBytes() >= self.group_bytes) try self.flushRowGroup();
         }
+    }
+
+    fn bufferedBytes(self: *const Writer) usize {
+        var n: usize = 0;
+        for (self.cols) |cb| n += cb.plain;
+        return n;
     }
 
     fn flushRowGroup(self: *Writer) !void {
@@ -496,6 +583,7 @@ pub const Writer = struct {
                 cb.reset();
                 continue;
             }
+            if (cb.dict_ok) try cb.rebuildPlain(sa, m.optional);
             try cb.sealPage(sa, m.optional);
 
             const start = self.offset;
@@ -792,6 +880,7 @@ pub const Writer = struct {
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
             .group_rows = unit_group_rows,
+            .group_bytes = self.group_bytes,
             .col_mem = col_mem,
             .owner = self,
         };
@@ -849,13 +938,17 @@ const UnitEnc = struct {
     arena: std.mem.Allocator,
     held: List(Batch),
     held_rows: usize = 0,
+    held_bytes: usize = 0,
     enc: ?*Writer = null,
 
+    /// Batches are held until there is half a row group of them, by rows or bytes,
+    /// so a small unit goes to the writer whole instead of as a group of its own.
     fn write(self: *UnitEnc, b: Batch) !void {
         if (self.enc) |e| return e.writeBatch(self.arena, b);
         try self.held.append(try b.deepCopy(self.arena));
         self.held_rows += b.len;
-        if (self.held_rows < unit_min_rows) return;
+        self.held_bytes += b.heapBytes();
+        if (self.held_rows < unit_min_rows and self.held_bytes < self.parent.group_bytes / 2) return;
         const e = try self.parent.openEncoder(self.arena);
         self.enc = e;
         for (self.held.items) |hb| try e.writeBatch(self.arena, hb);
@@ -1106,13 +1199,13 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
     const k = col.ty.kind;
     switch (col.data) {
         .i64 => |d| if (m.phys == .int64 and (k == .int or k == .time or k == .timestamp))
-            return encodeFixedSlice(i64, cb, sa, col, d, lo, hi),
+            return encodeFixedSlice(i64, cb, sa, m.optional, col, d, lo, hi),
         .f64 => |d| if (m.phys == .double and k == .float)
-            return encodeFixedSlice(f64, cb, sa, col, d, lo, hi),
+            return encodeFixedSlice(f64, cb, sa, m.optional, col, d, lo, hi),
         .i32 => |d| if (m.phys == .int32 and k == .date)
-            return encodeFixedSlice(i32, cb, sa, col, d, lo, hi),
+            return encodeFixedSlice(i32, cb, sa, m.optional, col, d, lo, hi),
         .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
-            return encodeBytesSlice(cb, sa, col, lo, hi),
+            return encodeBytesSlice(cb, sa, m.optional, col, lo, hi),
         .dec => |d| if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
             return encodeDecimalSlice(cb, sa, m, col, d, lo, hi),
         else => {},
@@ -1127,12 +1220,17 @@ fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
         return;
     }
     try cb.observe(sa, v);
-    const before = cb.values.items.len;
-    try encodePlain(cb, m, v);
-    if (cb.dict_ok) switch (v) {
-        .string, .bytes => |x| _ = try cb.dictPut(sa, x),
-        else => try cb.dictPutFixed(cb.values.items[before..]),
-    };
+    switch (m.phys) {
+        .boolean => try cb.pushBit(v == .bool and v.bool),
+        .byte_array => try cb.putBytes(sa, m.optional, switch (v) {
+            .string, .bytes => |x| x,
+            else => "",
+        }),
+        else => {
+            var buf: [16]u8 = undefined;
+            try cb.putFixed(sa, m.optional, try plainFixed(&buf, m, v));
+        },
+    }
 }
 
 fn typedValue(kind: types.TypeKind, x: anytype) Value {
@@ -1147,10 +1245,10 @@ fn typedValue(kind: types.TypeKind, x: anytype) Value {
     };
 }
 
-fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, col: column.Column, data: []const T, lo: usize, hi: usize) !void {
+fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: column.Column, data: []const T, lo: usize, hi: usize) !void {
     const U = std.meta.Int(.unsigned, @bitSizeOf(T));
     try cb.defs.ensureUnusedCapacity(hi - lo);
-    try cb.values.ensureUnusedCapacity((hi - lo) * @sizeOf(T));
+    if (!cb.dict_ok) try cb.values.ensureUnusedCapacity((hi - lo) * @sizeOf(T));
     var mn: T = undefined;
     var mx: T = undefined;
     var any = false;
@@ -1165,8 +1263,7 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, col: c
         const x = data[r];
         var le: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(U, &le, @bitCast(x), .little);
-        cb.values.appendSliceAssumeCapacity(&le);
-        if (cb.dict_ok) try cb.dictPutFixed(&le);
+        try cb.putFixed(sa, optional, &le);
         if (T == f64 and std.math.isNan(x)) {
             nan = true;
             continue;
@@ -1198,7 +1295,7 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
     };
     if (width > 16) return Error.UnsupportedParquetDecimal;
     try cb.defs.ensureUnusedCapacity(hi - lo);
-    try cb.values.ensureUnusedCapacity((hi - lo) * width);
+    if (!cb.dict_ok) try cb.values.ensureUnusedCapacity((hi - lo) * width);
     var mn: i128 = 0;
     var mx: i128 = 0;
     var any = false;
@@ -1228,8 +1325,7 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
                 break :blk v;
             },
         };
-        cb.values.appendSliceAssumeCapacity(out);
-        if (cb.dict_ok) try cb.dictPutFixed(out);
+        try cb.putFixed(sa, m.optional, out);
         if (!any) {
             mn = x;
             mx = x;
@@ -1245,7 +1341,7 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
     }
 }
 
-fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, col: column.Column, lo: usize, hi: usize) !void {
+fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: column.Column, lo: usize, hi: usize) !void {
     const b = col.data.bytes;
     try cb.defs.ensureUnusedCapacity(hi - lo);
     var mn: ?[]const u8 = null;
@@ -1258,39 +1354,13 @@ fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, col: column.Column, lo: 
         }
         cb.defs.appendAssumeCapacity(1);
         const s = b.at(r);
-        var len4: [4]u8 = undefined;
-        std.mem.writeInt(u32, &len4, @intCast(s.len), .little);
-        try cb.values.ensureUnusedCapacity(4 + s.len);
-        cb.values.appendSliceAssumeCapacity(&len4);
-        cb.values.appendSliceAssumeCapacity(s);
-        if (cb.dict_ok) _ = try cb.dictPut(sa, s);
+        try cb.putBytes(sa, optional, s);
         if (mn == null or std.mem.order(u8, s, mn.?) == .lt) mn = s;
         if (mx == null or std.mem.order(u8, s, mx.?) == .gt) mx = s;
     }
     const text = col.ty.kind == .string;
     if (mn) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
     if (mx) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
-}
-
-fn encodePlain(cb: *ColBuf, m: Mapping, v: Value) !void {
-    switch (m.phys) {
-        .boolean => try cb.pushBit(v == .bool and v.bool),
-        .byte_array => {
-            const s: []const u8 = switch (v) {
-                .string => |x| x,
-                .bytes => |x| x,
-                else => "",
-            };
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b, @intCast(s.len), .little);
-            try cb.values.appendSlice(&b);
-            try cb.values.appendSlice(s);
-        },
-        else => {
-            var buf: [16]u8 = undefined;
-            try cb.values.appendSlice(try plainFixed(&buf, m, v));
-        },
-    }
 }
 
 /// A fixed-width value PLAIN-encoded into `buf`: a boolean as one byte (the
@@ -1708,7 +1778,7 @@ fn dictSmaller(cb: *const ColBuf, m: Mapping) bool {
     const entries = cb.entries();
     const dict = cb.dict_bytes + if (m.phys == .byte_array) 4 * entries else 0;
     const indices = (cb.dict_idx.items.len * indexWidth(entries) + 7) / 8;
-    return dict + indices < cb.values.items.len;
+    return dict + indices < cb.plain;
 }
 
 /// At least 1: a one-entry dictionary with width 0 is legal, but not every reader
@@ -1958,4 +2028,130 @@ test "chunk size totals account for page headers" {
         };
         try testing.expectEqual(end - start, meta.total_compressed_size);
     };
+}
+
+/// Test rows: column `c` of row `i` for the dictionary and byte-cap tests.
+fn capValue(a: std.mem.Allocator, c: usize, i: usize) !Value {
+    return switch (c) {
+        0 => if (i % 13 == 0) .null else if (i < 3000) .{ .string = ([_][]const u8{ "red", "green", "blue" })[i % 3] } else .{ .string = try std.fmt.allocPrint(a, "s{d:0>40}", .{i}) },
+        1 => if (i % 7 == 0) .null else .{ .int = if (i < 3000) @as(i64, @intCast(i % 4)) else @as(i64, @intCast(i)) * 1_000_003 },
+        2 => .{ .string = try std.fmt.allocPrint(a, "u{d}", .{i % 1000}) },
+        3 => .{ .decimal = .{ .unscaled = @as(i128, @intCast(i % 1000)) * 99_999_999_999, .scale = 2 } },
+        4 => if (i == 5) .{ .string = try a.alloc(u8, (dict_max_bytes * 3) / 2) } else .{ .string = "x" },
+        else => unreachable,
+    };
+}
+
+const cap_schema = types.Schema{ .fields = &.{
+    .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    .{ .name = "i", .ty = types.Type.init(.int).asNullable() },
+    .{ .name = "u", .ty = types.Type.init(.string) },
+    .{ .name = "d", .ty = types.Type.decimal(38, 2) },
+    .{ .name = "big", .ty = types.Type.init(.string) },
+} };
+
+fn capBatch(a: std.mem.Allocator, lo: usize, hi: usize) !Batch {
+    const cols = try a.alloc(column.Column, cap_schema.fields.len);
+    for (cols, cap_schema.fields, 0..) |*c, f, ci| {
+        var b = try column.Builder.initCapacity(a, f.ty, hi - lo);
+        for (lo..hi) |i| try b.append(try capValue(a, ci, i));
+        c.* = try b.finish();
+    }
+    return .{ .schema = &cap_schema, .columns = cols, .len = hi - lo };
+}
+
+fn expectCapRows(a: std.mem.Allocator, path: []const u8, n: usize) !void {
+    const r = try pqdecode.Reader.open(a, path);
+    var seen: usize = 0;
+    while (try r.next(a)) |back| {
+        for (0..back.len) |j| {
+            for (back.columns, 0..) |col, ci| {
+                const want = try capValue(a, ci, seen + j);
+                const got = col.getValue(j);
+                if (want == .null) {
+                    try testing.expect(got.isNull());
+                } else {
+                    try testing.expectEqual(std.math.Order.eq, eval.compareValues(want, got).?);
+                }
+            }
+        }
+        seen += back.len;
+    }
+    try testing.expectEqual(n, seen);
+}
+
+test "a dictionary keeps no PLAIN copy, and one given up mid-chunk rebuilds it exactly" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "c.parquet" });
+
+    var w = try Writer.open(a, path, cap_schema, .snappy, .truncate);
+    try w.writeBatch(a, try capBatch(a, 0, 2000));
+    for (w.cols[0..4]) |cb| {
+        try testing.expect(cb.dict_ok);
+        try testing.expectEqual(@as(usize, 0), cb.values.items.len);
+        try testing.expectEqual(@as(usize, 0), cb.pages.items.len);
+    }
+    try testing.expect(!w.cols[4].dict_ok);
+    const n = 20_000;
+    try w.writeBatch(a, try capBatch(a, 2000, n));
+    try testing.expect(!w.cols[0].dict_ok and !w.cols[1].dict_ok);
+    try w.close();
+
+    const bytes = try tmp.dir.readFileAlloc(a, "c.parquet", 1 << 24);
+    const md = try parquet.parseFile(a, bytes);
+    try testing.expectEqual(@as(usize, 1), md.row_groups.len);
+    for (md.row_groups[0].columns, 0..) |c, ci| {
+        const dict = std.mem.indexOfScalar(parquet.Encoding, c.meta.?.encodings, .rle_dictionary) != null;
+        try testing.expectEqual(ci == 2 or ci == 3, dict);
+    }
+    try expectCapRows(a, path, n);
+}
+
+test "a dictionary that loses to PLAIN at the flush is rebuilt as PLAIN" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "l.parquet" });
+
+    var w = try Writer.open(a, path, cap_schema, .snappy, .truncate);
+    try w.writeBatch(a, try capBatch(a, 0, 1000));
+    try testing.expect(w.cols[2].dict_ok and w.cols[3].dict_ok);
+    try w.close();
+
+    const bytes = try tmp.dir.readFileAlloc(a, "l.parquet", 1 << 24);
+    const md = try parquet.parseFile(a, bytes);
+    for (md.row_groups[0].columns[2..4]) |c|
+        try testing.expect(std.mem.indexOfScalar(parquet.Encoding, c.meta.?.encodings, .rle_dictionary) == null);
+    try expectCapRows(a, path, 1000);
+}
+
+test "a row group is flushed at its byte cap, not only at its row count" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "g.parquet" });
+
+    var w = try Writer.open(a, path, cap_schema, .snappy, .truncate);
+    w.group_bytes = 256 << 10;
+    const n = 12_000;
+    try w.writeBatch(a, try capBatch(a, 0, n / 2));
+    try testing.expect(w.bufferedBytes() < w.group_bytes);
+    try w.writeBatch(a, try capBatch(a, n / 2, n));
+    try w.close();
+
+    const bytes = try tmp.dir.readFileAlloc(a, "g.parquet", 1 << 24);
+    const md = try parquet.parseFile(a, bytes);
+    try testing.expect(md.row_groups.len >= 4);
+    try expectCapRows(a, path, n);
 }
