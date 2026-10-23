@@ -4,7 +4,7 @@
 pub const Dialect = @import("../../db/sql.zig").Dialect;
 const Facts = @import("translate.zig").Facts;
 const ast = @import("../../lang/ast.zig");
-const split = @import("../../connect/split.zig");
+const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
 const translatePred = @import("translate.zig").translatePred;
 const types = @import("../../lang/types.zig");
@@ -179,7 +179,7 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
     var ob = std.array_list.Managed(u8).init(arena);
     for (t.keys, 0..) |k, i| {
         if (i > 0) try ob.appendSlice(", ");
-        const q = try split.quoteName(arena, dialect, k.col);
+        const q = try quoteName(arena, dialect, k.col);
         try dialect.orderKey(ob.writer(), q, k.desc, k.nulls_first);
     }
     const order: []const u8 = if (ob.items.len > 0) try std.fmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";

@@ -199,34 +199,10 @@ pub fn valueRows(v: Value) ?u64 {
 pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
     const table = parts[parts.len - 1];
     switch (dialect) {
-        .postgres => {
-            const obj = try quoted(arena, parts, '"', '"');
-            return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try dialect.strLit(arena, obj)});
-        },
-        .sqlserver => {
-            const obj = try quoted(arena, parts, '[', ']');
-            return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try dialect.strLit(arena, obj)});
-        },
-        .mysql, .starrocks, .doris => {
-            const schema = if (parts.len >= 2) try dialect.strLit(arena, parts[parts.len - 2]) else "DATABASE()";
-            return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ schema, try dialect.strLit(arena, table) });
-        },
+        .postgres => return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try sql.objectLit(arena, dialect, parts)}),
+        .sqlserver => return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try sql.objectLit(arena, dialect, parts)}),
+        .mysql, .starrocks, .doris => return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try dialect.strLit(arena, table) }),
     }
-}
-
-/// `parts` as one dotted name, each part between `open` and `close`, a `close` in it doubled.
-pub fn quoted(arena: std.mem.Allocator, parts: []const []const u8, open: u8, close: u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    for (parts, 0..) |p, i| {
-        if (i > 0) try out.append('.');
-        try out.append(open);
-        for (p) |ch| {
-            if (ch == close) try out.append(close);
-            try out.append(ch);
-        }
-        try out.append(close);
-    }
-    return out.toOwnedSlice();
 }
 
 /// `950`, `1.2k`, `3.4M`, `5.6G`, with ` rows` or ` bytes` after.

@@ -99,12 +99,7 @@ fn queryText(q: []const u8) []const u8 {
 fn fromName(env: *Env, connector: []const u8, t: ast.QualName) ![]const u8 {
     const conn = env.connections.get(connector) orelse return qualStr(env.arena, t);
     const info = sqlConnInfo(conn) orelse return qualStr(env.arena, t);
-    var out = std.array_list.Managed(u8).init(env.arena);
-    for (t.parts, 0..) |p, i| {
-        if (i > 0) try out.append('.');
-        try out.appendSlice(try sql.quoteName(env.arena, info.dialect, p));
-    }
-    return out.toOwnedSlice();
+    return sql.quoteParts(env.arena, info.dialect, t.parts);
 }
 
 fn selectList(env: *Env, rd: ast.Read) ![]const u8 {
@@ -299,8 +294,8 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     var key: split.Key = undefined;
     if (hints.col) |col| {
         key = .{ .col = col, .kind = hints.kind orelse .auto };
-    } else if (desc.table) |table| {
-        const info = (try split.introspectKey(env.arena, prober, desc.dialect, table)) orelse return null;
+    } else if (desc.read.form == .table) {
+        const info = (try split.introspectKey(env.arena, prober, desc.dialect, desc.read.form.table.parts)) orelse return null;
         if (!forced and info.est_rows < split.min_rows_to_split) return null;
         key = info.key;
     } else {

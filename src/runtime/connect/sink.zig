@@ -59,7 +59,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     const table = desc.table orelse return planErr(env.diag, options.bare_upsert_query_msg);
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
-    const keys = split.introspectPkCols(env.arena, prober, desc.dialect, table) catch |e|
+    const keys = split.introspectPkCols(env.arena, prober, desc.dialect, desc.read.form.table.parts) catch |e|
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
     if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `UPSERT ON (col)`", .{table}));
     env.log.log(.debug, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });

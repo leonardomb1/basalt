@@ -45,7 +45,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const split = @import("../connect/split.zig");
+const sql = @import("../db/sql.zig");
 pub const Dialect = @import("../db/sql.zig").Dialect;
 const base_t = @import("pushdown/testing_util.zig").base_t;
 const bin = @import("pushdown/testing_util.zig").bin;
@@ -150,7 +150,7 @@ pub fn planWholeAggWhy(
         const out = plan_schema.fields[i];
         if (!std.mem.eql(u8, out.name, col)) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
         if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
-        const qc = try split.quoteName(arena, dialect, col);
+        const qc = try sql.quoteName(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
         if (sel.items.len > 0) try sel.appendSlice(", ");
@@ -165,7 +165,7 @@ pub fn planWholeAggWhy(
             return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");
         try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
-            inner, cast_to, try split.quoteName(arena, dialect, out.name),
+            inner, cast_to, try sql.quoteName(arena, dialect, out.name),
         }));
     }
 
@@ -198,7 +198,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
     const name = arg.field.parts[0];
     const idx = src_schema.indexOf(name) orelse return null;
     const src_kind = src_schema.fields[idx].ty.kind;
-    const col = try split.quoteName(arena, dialect, name);
+    const col = try sql.quoteName(arena, dialect, name);
 
     switch (item.func) {
         .count => {
@@ -295,7 +295,7 @@ fn buildProjection(arena: std.mem.Allocator, dialect: Dialect, src_schema: types
     for (src_schema.fields) |f| {
         if (!need.contains(f.name)) continue;
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try split.quoteName(arena, dialect, f.name));
+        try sel.appendSlice(try sql.quoteName(arena, dialect, f.name));
         try fields.append(f);
     }
     if (fields.items.len > 0 and fields.items.len < src_schema.fields.len)
@@ -331,17 +331,6 @@ pub fn serialWhere(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
 pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, facts: ?*const Facts, wants: ?*bool) !?[]const u8 {
     if (stages.len < 2 or stages[0].node != .read) return null;
     return leadingWhere(arena, dialect, stages[1..], .{ .facts = facts, .wants_facts = wants });
-}
-
-pub fn sqlStr(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
-    try out.append('\'');
-    for (s) |c| {
-        if (c == '\'') try out.append('\'');
-        try out.append(c);
-    }
-    try out.append('\'');
-    return out.toOwnedSlice();
 }
 
 /// Every source column an expression references, by `parts[0]`; a lambda's

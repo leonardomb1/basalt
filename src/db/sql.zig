@@ -1148,6 +1148,29 @@ pub fn quoteName(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) !
     return buf.toOwnedSlice();
 }
 
+/// A qualified name, each part quoted as `quoteName` quotes it.
+pub fn quoteParts(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(arena);
+    for (parts, 0..) |p, i| {
+        if (i > 0) try buf.append('.');
+        try writeQuotedName(&buf, dialect, p);
+    }
+    return buf.toOwnedSlice();
+}
+
+/// A table named in a catalog lookup as a literal of its quoted parts, the way a
+/// read names it: `'"s"."T"'::regclass` keeps the case PostgreSQL would fold.
+pub fn objectLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
+    return dialect.strLit(arena, try quoteParts(arena, dialect, parts));
+}
+
+/// The schema of a qualified name as a literal for an information_schema lookup,
+/// or the session's database when the name has no schema part.
+pub fn schemaLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
+    if (parts.len < 2) return "DATABASE()";
+    return dialect.strLit(arena, parts[parts.len - 2]);
+}
+
 /// `quoteIdent` straight into a list, so a sink on a general-purpose allocator does
 /// not leak one allocation per column (a 306-column load once leaked thousands).
 fn writeQuoted(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []const u8) !void {

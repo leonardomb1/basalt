@@ -10,7 +10,6 @@ const pushdown = @import("../pushdown.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
-const quoted = @import("../plan/estimate.zig").quoted;
 const types = @import("../../lang/types.zig");
 
 /// Per-column text and collation facts that decide which text comparisons may
@@ -78,7 +77,6 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
     const table = parts[parts.len - 1];
     switch (dialect) {
         .sqlserver => {
-            const obj = try quoted(arena, parts, '[', ']');
             return std.fmt.allocPrint(arena,
                 \\SELECT c.name,
                 \\ CASE WHEN c.collation_name IS NULL THEN 0 ELSE 1 END,
@@ -87,10 +85,9 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ 1,
                 \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
-            , .{try dialect.strLit(arena, obj)});
+            , .{try sql.objectLit(arena, dialect, parts)});
         },
         .postgres => {
-            const obj = try quoted(arena, parts, '"', '"');
             return std.fmt.allocPrint(arena,
                 \\SELECT a.attname,
                 \\ CASE WHEN t.typcategory = 'S' THEN 1 ELSE 0 END,
@@ -111,10 +108,10 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\        ELSE coalesce(to_jsonb(co) ->> 'collprovider', 'c') END AS prov,
                 \\   CASE WHEN co.collname = 'default' THEN d.datcollate ELSE to_jsonb(co) ->> 'collcollate' END AS locale) x
                 \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND d.datname = current_database()
-            , .{try dialect.strLit(arena, obj)});
+            , .{try sql.objectLit(arena, dialect, parts)});
         },
         .mysql => {
-            const schema = if (parts.len >= 2) try dialect.strLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            const schema = try sql.schemaLit(arena, dialect, parts);
             return std.fmt.allocPrint(arena,
                 \\SELECT c.COLUMN_NAME,
                 \\ CASE WHEN c.COLLATION_NAME IS NULL THEN 0 ELSE 1 END,
@@ -126,7 +123,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
             , .{ schema, try dialect.strLit(arena, table) });
         },
         .starrocks, .doris => {
-            const schema = if (parts.len >= 2) try dialect.strLit(arena, parts[parts.len - 2]) else "DATABASE()";
+            const schema = try sql.schemaLit(arena, dialect, parts);
             return std.fmt.allocPrint(arena,
                 \\SELECT COLUMN_NAME,
                 \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'char', 'string') THEN 1 ELSE 0 END,

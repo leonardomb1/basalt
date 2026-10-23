@@ -4,8 +4,7 @@
 pub const Dialect = @import("../../db/sql.zig").Dialect;
 const ast = @import("../../lang/ast.zig");
 const inSchema = @import("../pushdown.zig").inSchema;
-const split = @import("../../connect/split.zig");
-const sqlStr = @import("../pushdown.zig").sqlStr;
+const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 pub const bin = @import("testing_util.zig").bin;
@@ -260,12 +259,12 @@ const Tx = struct {
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .str_lit => |s| {
                 if (!self.dialect.textLitOk(s)) return null;
-                return try sqlStr(self.arena, s);
+                return try self.dialect.strLit(self.arena, s);
             },
             .field => |q| {
                 if (q.parts.len != 1) return null;
                 if (self.o.check_fields and !inSchema(self.o.schema, q.parts[0])) return null;
-                return try split.quoteName(self.arena, self.dialect, q.parts[0]);
+                return try quoteName(self.arena, self.dialect, q.parts[0]);
             },
             .cast => |c| {
                 if (c.safe) return null;
@@ -531,7 +530,7 @@ const Tx = struct {
         var out = std.array_list.Managed(u8).init(self.arena);
         for (lit) |c| if (!try self.dialect.likeLiteral(&out, c)) return null;
         try out.append('%');
-        return try sqlStr(self.arena, out.items);
+        return try self.dialect.strLit(self.arena, out.items);
     }
 
     /// `like`/`starts_with`/`ends_with`/`contains` on a literal pattern. The source's `_`
@@ -567,7 +566,7 @@ const Tx = struct {
             if (!f.byte_order or f.pads or (k == .text and k.text.fn_)) return null;
         }
         const target = (try self.value(c.args[0])) orelse return null;
-        return try self.fmt("({s} LIKE {s})", .{ target, try sqlStr(self.arena, pat) });
+        return try self.fmt("({s} LIKE {s})", .{ target, try self.dialect.strLit(self.arena, pat) });
     }
 };
 

@@ -66,10 +66,10 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
     return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
 }
 
-/// Every primary-key column name for `table`, in key order, or empty when there
-/// is none. Used to infer upsert keys from the source.
-pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) ![]const []const u8 {
-    const lit = try dialect.strLit(arena, table);
+/// Every primary-key column name for the table `parts` names, in key order, or
+/// empty when there is none. Used to infer upsert keys from the source.
+pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, parts: []const []const u8) ![]const []const u8 {
+    const lit = try catalogLit(arena, dialect, parts);
     const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname
@@ -89,7 +89,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
         .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME
             \\FROM information_schema.KEY_COLUMN_USAGE k
-            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = {s}
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND {s}
             \\ORDER BY k.ORDINAL_POSITION
         , .{lit}),
     };
@@ -110,8 +110,8 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
     return cols.toOwnedSlice();
 }
 
-pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, table: []const u8) !?KeyInfo {
-    const lit = try dialect.strLit(arena, table);
+pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, parts: []const []const u8) !?KeyInfo {
+    const lit = try catalogLit(arena, dialect, parts);
     const query = switch (dialect) {
         .postgres => try std.fmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
@@ -136,7 +136,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
             \\JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = k.TABLE_SCHEMA AND t.TABLE_NAME = k.TABLE_NAME
-            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = {s}
+            \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND {s}
             \\ORDER BY k.ORDINAL_POSITION
         , .{lit}),
     };
@@ -377,7 +377,24 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     });
 }
 
-pub const quoteName = sql.quoteName;
+/// What a catalog probe matches the table by: its quoted name as a literal on
+/// postgres and SQL Server, its schema and name columns on the MySQL family.
+fn catalogLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
+    return switch (dialect) {
+        .postgres, .sqlserver => sql.objectLit(arena, dialect, parts),
+        .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "k.TABLE_SCHEMA = {s} AND k.TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try dialect.strLit(arena, parts[parts.len - 1]) }),
+    };
+}
+
+test "catalog probes name the table by its quoted parts, as the read does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("'\"s\".\"Orders\"'", try catalogLit(a, .postgres, &.{ "s", "Orders" }));
+    try std.testing.expectEqualStrings("'[dbo].[o''x]'", try catalogLit(a, .sqlserver, &.{ "dbo", "o'x" }));
+    try std.testing.expectEqualStrings("k.TABLE_SCHEMA = 'db' AND k.TABLE_NAME = 't\\\\'", try catalogLit(a, .mysql, &.{ "db", "t\\" }));
+    try std.testing.expectEqualStrings("k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = 't'", try catalogLit(a, .doris, &.{"t"}));
+}
 
 fn dupeOne(arena: std.mem.Allocator, s: []const u8) ![]const []const u8 {
     const out = try arena.alloc([]const u8, 1);
