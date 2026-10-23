@@ -274,6 +274,141 @@ pub const Dialect = enum {
         return out.toOwnedSlice();
     }
 
+    /// Whether `s` may be sent as a string literal at all: SQL Server reads a
+    /// non-ASCII one through the column's code page, and the MySQL wire reads `\`
+    /// as an escape.
+    pub fn textLitOk(self: Dialect, s: []const u8) bool {
+        return switch (self) {
+            .sqlserver => for (s) |c| {
+                if (!std.ascii.isPrint(c)) break false;
+            } else true,
+            .mysql, .starrocks, .doris => std.mem.indexOfScalar(u8, s, '\\') == null,
+            .postgres => true,
+        };
+    }
+
+    /// A bool as a value; SQL Server has no TRUE, and a predicate is no value there.
+    pub fn boolLit(self: Dialect, b: bool) []const u8 {
+        return switch (self) {
+            .sqlserver => if (b) "1" else "0",
+            .postgres, .mysql, .starrocks, .doris => if (b) "TRUE" else "FALSE",
+        };
+    }
+
+    /// `l IS [NOT] DISTINCT FROM r`: PostgreSQL as written, the MySQL family as
+    /// `<=>`; null on SQL Server, which before 2022 has neither.
+    pub fn distinctPred(self: Dialect, arena: std.mem.Allocator, l: []const u8, r: []const u8, distinct: bool) !?[]const u8 {
+        return switch (self) {
+            .postgres => try std.fmt.allocPrint(arena, "({s} IS {s}DISTINCT FROM {s})", .{ l, if (distinct) "" else "NOT ", r }),
+            .mysql, .starrocks, .doris => if (distinct)
+                try std.fmt.allocPrint(arena, "(NOT ({s} <=> {s}))", .{ l, r })
+            else
+                try std.fmt.allocPrint(arena, "({s} <=> {s})", .{ l, r }),
+            .sqlserver => null,
+        };
+    }
+
+    /// The function giving text's length in bytes, trailing spaces counted, or
+    /// null where none is used.
+    pub fn byteLengthFn(self: Dialect) ?[]const u8 {
+        return switch (self) {
+            .sqlserver => "DATALENGTH",
+            .mysql, .starrocks, .doris => "LENGTH",
+            .postgres => null,
+        };
+    }
+
+    /// `c` matched as itself inside a LIKE pattern, appended to `out`; false when
+    /// it cannot be. SQL Server brackets `%`, `_` and `[`; elsewhere `\` is the
+    /// escape, and `%`, `_` and `\` are refused rather than escaped.
+    pub fn likeLiteral(self: Dialect, out: *std.array_list.Managed(u8), c: u8) !bool {
+        switch (self) {
+            .sqlserver => switch (c) {
+                '%', '_', '[' => try out.writer().print("[{c}]", .{c}),
+                else => try out.append(c),
+            },
+            .postgres, .mysql, .starrocks, .doris => switch (c) {
+                '%', '_', '\\' => return false,
+                else => try out.append(c),
+            },
+        }
+        return true;
+    }
+
+    /// Whether CONCAT is NULL when any argument is, as the engine's: the MySQL
+    /// family's is, PostgreSQL's and SQL Server's skip NULLs.
+    pub fn concatNullable(self: Dialect) bool {
+        return switch (self) {
+            .mysql, .starrocks, .doris => true,
+            .postgres, .sqlserver => false,
+        };
+    }
+
+    pub fn trimExpr(self: Dialect, arena: std.mem.Allocator, arg: []const u8) ![]const u8 {
+        return switch (self) {
+            .sqlserver => std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{arg}),
+            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "TRIM({s})", .{arg}),
+        };
+    }
+
+    pub fn ceilFn(self: Dialect) []const u8 {
+        return switch (self) {
+            .sqlserver => "CEILING",
+            .postgres, .mysql, .starrocks, .doris => "CEIL",
+        };
+    }
+
+    /// SQL Server has only `%`; both spellings take the dividend's sign.
+    pub fn modExpr(self: Dialect, arena: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
+        return switch (self) {
+            .sqlserver => std.fmt.allocPrint(arena, "({s} % {s})", .{ a, b }),
+            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ a, b }),
+        };
+    }
+
+    pub fn repeatFn(self: Dialect) []const u8 {
+        return switch (self) {
+            .sqlserver => "REPLICATE",
+            .postgres, .mysql, .starrocks, .doris => "REPEAT",
+        };
+    }
+
+    /// COUNT that cannot overflow a 32-bit result, as SQL Server's COUNT does.
+    pub fn countFn(self: Dialect) []const u8 {
+        return switch (self) {
+            .sqlserver => "COUNT_BIG",
+            .postgres, .mysql, .starrocks, .doris => "COUNT",
+        };
+    }
+
+    /// SUM of an integer column that cannot overflow the column's own type, as
+    /// SQL Server's int SUM does.
+    pub fn intSum(self: Dialect, arena: std.mem.Allocator, col: []const u8) ![]const u8 {
+        return switch (self) {
+            .sqlserver => std.fmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col}),
+            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "SUM({s})", .{col}),
+        };
+    }
+
+    /// One ORDER BY key with its nulls placed explicitly: `NULLS FIRST/LAST` on
+    /// postgres, a leading `k IS NULL` key on the MySQL family, a `CASE` key on SQL Server.
+    pub fn orderKey(self: Dialect, w: anytype, q: []const u8, desc: bool, nulls_first: bool) !void {
+        const dir = if (desc) " DESC" else "";
+        switch (self) {
+            .postgres => try w.print("{s}{s} {s}", .{ q, dir, if (nulls_first) "NULLS FIRST" else "NULLS LAST" }),
+            .mysql, .starrocks, .doris => try w.print("({s} IS NULL){s}, {s}{s}", .{ q, if (nulls_first) " DESC" else "", q, dir }),
+            .sqlserver => try w.print("CASE WHEN {s} IS NULL THEN {d} ELSE {d} END, {s}{s}", .{ q, @intFromBool(!nulls_first), @intFromBool(nulls_first), q, dir }),
+        }
+    }
+
+    /// The first `rows` rows of `base` in `order` (an ` ORDER BY ...` clause or "").
+    pub fn firstRows(self: Dialect, arena: std.mem.Allocator, base: []const u8, order: []const u8, rows: u64) ![]const u8 {
+        return switch (self) {
+            .sqlserver => std.fmt.allocPrint(arena, "SELECT TOP ({d}) * FROM ({s}) _t{s}", .{ rows, base, order }),
+            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _t{s} LIMIT {d}", .{ base, order, rows }),
+        };
+    }
+
     fn qOpen(self: Dialect) u8 {
         return switch (self) {
             .postgres => '"',
@@ -892,8 +1027,8 @@ fn serializeRow(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usi
 fn Literal(comptime dialect: Dialect) type {
     return struct {
         pub const null_text = "NULL";
-        pub const bool_true = if (dialect == .sqlserver) "1" else "TRUE";
-        pub const bool_false = if (dialect == .sqlserver) "0" else "FALSE";
+        pub const bool_true = dialect.boolLit(true);
+        pub const bool_false = dialect.boolLit(false);
         pub const quote_temporal = "'";
 
         pub fn string(_: @This(), w: anytype, s: []const u8) !void {

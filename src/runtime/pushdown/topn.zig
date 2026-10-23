@@ -180,19 +180,10 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
     for (t.keys, 0..) |k, i| {
         if (i > 0) try ob.appendSlice(", ");
         const q = try split.quoteName(arena, dialect, k.col);
-        const dir = if (k.desc) " DESC" else "";
-        const nf = k.nulls_first;
-        switch (dialect) {
-            .postgres => try ob.writer().print("{s}{s} {s}", .{ q, dir, if (nf) "NULLS FIRST" else "NULLS LAST" }),
-            .mysql, .starrocks, .doris => try ob.writer().print("({s} IS NULL){s}, {s}{s}", .{ q, if (nf) " DESC" else "", q, dir }),
-            .sqlserver => try ob.writer().print("CASE WHEN {s} IS NULL THEN {d} ELSE {d} END, {s}{s}", .{ q, @intFromBool(!nf), @intFromBool(nf), q, dir }),
-        }
+        try dialect.orderKey(ob.writer(), q, k.desc, k.nulls_first);
     }
     const order: []const u8 = if (ob.items.len > 0) try std.fmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";
-    return switch (dialect) {
-        .sqlserver => std.fmt.allocPrint(arena, "SELECT TOP ({d}) * FROM ({s}) _t{s}", .{ t.rows, base_sql, order }),
-        else => std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _t{s} LIMIT {d}", .{ base_sql, order, t.rows }),
-    };
+    return dialect.firstRows(arena, base_sql, order, t.rows);
 }
 
 test "top-N: key types the source orders as the engine does, and filters that must all descend" {

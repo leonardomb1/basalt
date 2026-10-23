@@ -253,14 +253,13 @@ const Tx = struct {
     /// TRY_CAST and text-to-number casts of unprovable input stay engine-side.
     fn value(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
         switch (e.*) {
-            .bool_lit => |b| return try self.boolLit(b),
+            .bool_lit => |b| return self.dialect.boolLit(b),
             .int_lit => |v| return try self.fmt("{d}", .{v}),
             .float_lit => |v| return try self.fmt("{d}", .{v}),
             .dec_lit => |v| return try self.fmt("{f}", .{v}),
             .null_lit => return try self.arena.dupe(u8, "NULL"),
             .str_lit => |s| {
-                if (self.dialect == .sqlserver and !asciiPrintable(s)) return null;
-                if (self.dialect.mysqlWire() and std.mem.indexOfScalar(u8, s, '\\') != null) return null;
+                if (!self.dialect.textLitOk(s)) return null;
                 return try sqlStr(self.arena, s);
             },
             .field => |q| {
@@ -430,7 +429,7 @@ const Tx = struct {
             },
             .bool => {
                 const b = (try litAs(self.arena, t, types.Type.init(.bool))) orelse return null;
-                return try self.boolLit(b.bool_lit);
+                return self.dialect.boolLit(b.bool_lit);
             },
             .date => {
                 const d = eval.parseDateText(t) orelse return null;
@@ -444,15 +443,8 @@ const Tx = struct {
         }
     }
 
-    /// A bool as a value; SQL Server has no TRUE, and a predicate is no value there.
-    fn boolLit(self: Tx, b: bool) ![]const u8 {
-        if (self.dialect == .sqlserver) return self.arena.dupe(u8, if (b) "1" else "0");
-        return self.arena.dupe(u8, if (b) "TRUE" else "FALSE");
-    }
-
-    /// `IS [NOT] DISTINCT FROM` where the source has it: PostgreSQL as written, the
-    /// MySQL family as `<=>`; SQL Server before 2022 has neither, so it stays in the
-    /// engine there. Over text, or a type not known and met by no number, only the
+    /// `IS [NOT] DISTINCT FROM` where the source has it (`Dialect.distinctPred`),
+    /// else it stays in the engine. Over text, or a type not known and met by no number, only the
     /// side a folding collation errs toward is sent; against NULL it is exact.
     fn distinctPred(self: Tx, op: ast.BinOp, l: *const ast.Expr, r: *const ast.Expr, need: Need) Err!?[]const u8 {
         const lk = self.kind(l);
@@ -462,14 +454,7 @@ const Tx = struct {
         if (!exact_kind and !foldSafe(if (op == .not_distinct) .eq else .ne, need)) return null;
         const ls = (try self.value(l)) orelse return null;
         const rs = (try self.value(r)) orelse return null;
-        return switch (self.dialect) {
-            .postgres => try self.fmt("({s} IS {s}DISTINCT FROM {s})", .{ ls, if (op == .not_distinct) "NOT " else "", rs }),
-            .mysql, .starrocks, .doris => if (op == .not_distinct)
-                try self.fmt("({s} <=> {s})", .{ ls, rs })
-            else
-                try self.fmt("(NOT ({s} <=> {s}))", .{ ls, rs }),
-            .sqlserver => null,
-        };
+        return self.dialect.distinctPred(self.arena, ls, rs, op != .not_distinct);
     }
 
     /// `col op 'L'` over text. Under padding the shorter side compares as if
@@ -525,11 +510,7 @@ const Tx = struct {
     fn padExact(self: Tx, op: ast.BinOp, cs: []const u8, ls: []const u8, lit: []const u8, f: ColFacts) Err!?[]const u8 {
         if (!f.byte_order or f.wide or !asciiPrintable(lit)) return null;
         if (lit.len > 0 and lit[lit.len - 1] == ' ') return null;
-        const len_fn: []const u8 = switch (self.dialect) {
-            .sqlserver => "DATALENGTH",
-            .mysql, .starrocks, .doris => "LENGTH",
-            .postgres => return null,
-        };
+        const len_fn = self.dialect.byteLengthFn() orelse return null;
         const n = lit.len;
         const eq = try self.fmt("({s} = {s} AND {s}({s}) = {d})", .{ cs, ls, len_fn, cs, n });
         if (op == .eq) return eq;
@@ -548,16 +529,7 @@ const Tx = struct {
 
     fn prefixLike(self: Tx, lit: []const u8) Err!?[]const u8 {
         var out = std.array_list.Managed(u8).init(self.arena);
-        for (lit) |c| switch (self.dialect) {
-            .sqlserver => switch (c) {
-                '%', '_', '[' => try out.writer().print("[{c}]", .{c}),
-                else => try out.append(c),
-            },
-            else => switch (c) {
-                '%', '_', '\\' => return null,
-                else => try out.append(c),
-            },
-        };
+        for (lit) |c| if (!try self.dialect.likeLiteral(&out, c)) return null;
         try out.append('%');
         return try sqlStr(self.arena, out.items);
     }
@@ -567,14 +539,14 @@ const Tx = struct {
     fn likePred(self: Tx, c: ast.Expr.Call, need: Need) Err!?[]const u8 {
         if (c.args.len != 2 or c.args[1].* != .str_lit) return null;
         const raw = c.args[1].str_lit;
-        if (!asciiPrintable(raw) and self.dialect == .sqlserver) return null;
+        if (!self.dialect.textLitOk(raw)) return null;
         for (raw) |ch| {
             if (ch == '_' or ch == '\\') return null;
             if (!std.mem.eql(u8, c.name, "like") and ch == '%') return null;
         }
         var body = std.array_list.Managed(u8).init(self.arena);
         for (raw) |ch| {
-            if (self.dialect == .sqlserver and ch == '[') try body.appendSlice("[[]") else try body.append(ch);
+            if (ch == '%') try body.append(ch) else if (!try self.dialect.likeLiteral(&body, ch)) return null;
         }
         const pat = if (std.mem.eql(u8, c.name, "starts_with"))
             try self.fmt("{s}%", .{body.items})
@@ -658,11 +630,11 @@ const render = struct {
         return try std.fmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
     }
 
-    /// NULL when any argument is, as the engine's `concat`: the MySQL family's
-    /// CONCAT already is, PostgreSQL's and SQL Server's skip NULLs, so they get a CASE.
+    /// NULL when any argument is, as the engine's `concat`: a CASE where the
+    /// source's CONCAT skips NULLs.
     fn concat(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         const call = (try plain(arena, p, c, args, dialect)).?;
-        if (dialect.mysqlWire()) return call;
+        if (dialect.concatNullable()) return call;
         var nulls = std.array_list.Managed(u8).init(arena);
         for (args, 0..) |a, i| {
             if (i > 0) try nulls.appendSlice(" OR ");
@@ -674,31 +646,20 @@ const render = struct {
     fn trim(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = p;
         _ = c;
-        return switch (dialect) {
-            .sqlserver => try std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{args[0]}),
-            else => try std.fmt.allocPrint(arena, "TRIM({s})", .{args[0]}),
-        };
+        return try dialect.trimExpr(arena, args[0]);
     }
 
     fn ceil(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = p;
         _ = c;
-        const f = switch (dialect) {
-            .sqlserver => "CEILING",
-            else => "CEIL",
-        };
-        return try std.fmt.allocPrint(arena, "{s}({s})", .{ f, args[0] });
+        return try std.fmt.allocPrint(arena, "{s}({s})", .{ dialect.ceilFn(), args[0] });
     }
 
-    /// SQL Server has only `%`; both spellings take the dividend's sign everywhere,
-    /// matching the engine.
+    /// Takes the dividend's sign everywhere, matching the engine.
     fn mod(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = p;
         _ = c;
-        return switch (dialect) {
-            .sqlserver => try std.fmt.allocPrint(arena, "({s} % {s})", .{ args[0], args[1] }),
-            else => try std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ args[0], args[1] }),
-        };
+        return try dialect.modExpr(arena, args[0], args[1]);
     }
 
     /// Only a literal count >= 0 is pushed: negative counts diverge across dialects.
@@ -708,10 +669,8 @@ const render = struct {
             "LEFT"
         else if (std.mem.eql(u8, p.name, "right"))
             "RIGHT"
-        else if (dialect == .sqlserver)
-            "REPLICATE"
         else
-            "REPEAT";
+            dialect.repeatFn();
         return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
 };

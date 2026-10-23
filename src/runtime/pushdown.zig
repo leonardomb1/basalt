@@ -186,7 +186,7 @@ fn refuse(why: *[]const u8, reason: []const u8) ?WholeAgg {
 /// One aggregate's SQL before the outer CAST. SQL Server takes COUNT_BIG and a
 /// bigint SUM addend, as its 32-bit COUNT and int SUM raise on overflow.
 fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, item: ast.AggItem, out_ty: types.Type) !?[]const u8 {
-    const count_fn: []const u8 = if (dialect == .sqlserver) "COUNT_BIG" else "COUNT";
+    const count_fn = dialect.countFn();
 
     if (item.func == .count and item.arg == null) {
         if (item.distinct) return null;
@@ -208,8 +208,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
         .sum => {
             if (item.distinct) return null;
             if (src_kind != .int or out_ty.kind != .int) return null;
-            if (dialect != .sqlserver) return try std.fmt.allocPrint(arena, "SUM({s})", .{col});
-            return try std.fmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col});
+            return try dialect.intSum(arena, col);
         },
         .min, .max => {
             if (item.distinct) return null;
