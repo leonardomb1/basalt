@@ -3,9 +3,6 @@
 //! parsing into a batch. Values arrive in text format, so the shared
 //! `sql.coerceText` does the typing. Exposes the `sql.Conn` interface.
 //!
-//! Socket reads go through a 64 KB buffer: unbuffered, every backend message costs
-//! two recv syscalls (header and body), about two per row, which caps throughput.
-//!
 //! Everything read off the wire is bounds-checked before use. Past bugs: a short
 //! md5 reply hashed adjacent heap into a digest sent to the server, and a DataRow
 //! field count that disagreed with the RowDescription indexed `builders` out of
@@ -19,35 +16,20 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("../connect/driver.zig");
 const sql = @import("sql.zig");
+const wire = @import("wire.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
 
-const SOCK_BUF = 64 * 1024;
-
 pub const Conn = struct {
-    gpa: std.mem.Allocator,
-    stream: std.net.Stream,
-    read_buf: [SOCK_BUF]u8 = undefined,
-    write_buf: [SOCK_BUF]u8 = undefined,
-    sr: std.net.Stream.Reader = undefined,
-    sw: std.net.Stream.Writer = undefined,
-    payload: std.array_list.Managed(u8),
-    last_error: []const u8 = "",
-    tls: ?*sql.TlsState = null,
+    wire: wire.Conn,
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []PgCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .payload = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.startup(user, database);
@@ -61,36 +43,16 @@ pub const Conn = struct {
         var req: [8]u8 = undefined;
         std.mem.writeInt(u32, req[0..4], 8, .big);
         std.mem.writeInt(u32, req[4..8], 80877103, .big);
-        const w = &self.sw.interface;
-        try w.writeAll(&req);
-        try w.flush();
+        try self.wire.wr().writeAll(&req);
+        try self.wire.flush();
         var resp: [1]u8 = undefined;
-        try self.sr.interface().readSliceAll(&resp);
+        try self.wire.rd().readSliceAll(&resp);
         if (resp[0] != 'S') return error.PgTlsRefused;
-
-        const ts = try self.gpa.create(sql.TlsState);
-        errdefer self.gpa.destroy(ts);
-        try ts.start(self.gpa, self.sr.interface(), &self.sw.interface, host, mode);
-        self.tls = ts;
+        try self.wire.startTls(host, mode);
     }
 
     pub fn close(self: *Conn) void {
-        if (self.last_error.len > 0) self.gpa.free(self.last_error);
-        if (self.tls) |t| t.deinit(self.gpa);
-        self.payload.deinit();
-        self.stream.close();
-        self.gpa.destroy(self);
-    }
-
-    fn rd(self: *Conn) *std.Io.Reader {
-        return if (self.tls) |t| &t.client.reader else self.sr.interface();
-    }
-    fn wr(self: *Conn) *std.Io.Writer {
-        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
-    }
-    fn flushOut(self: *Conn) !void {
-        if (self.tls) |t| try t.client.writer.flush();
-        try self.sw.interface.flush();
+        self.wire.close(self);
     }
 
     pub fn sqlConn(self: *Conn) sql.Conn {
@@ -98,7 +60,7 @@ pub const Conn = struct {
     }
 
     fn startup(self: *Conn, user: []const u8, database: []const u8) !void {
-        var body = std.array_list.Managed(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.wire.gpa);
         defer body.deinit();
         try writeI32(body.writer(), 0x0003_0000);
         try appendCStr(&body, "user");
@@ -113,16 +75,16 @@ pub const Conn = struct {
 
         var hdr: [4]u8 = undefined;
         std.mem.writeInt(u32, &hdr, @intCast(body.items.len + 4), .big);
-        const w = self.wr();
+        const w = self.wire.wr();
         try w.writeAll(&hdr);
         try w.writeAll(body.items);
-        try self.flushOut();
+        try self.wire.flush();
     }
 
     fn authenticate(self: *Conn, user: []const u8, password: []const u8) !void {
         while (true) {
             const t = try self.readMsg();
-            const p = self.payload.items;
+            const p = self.wire.msg.items;
             switch (t) {
                 'R' => {
                     const code = try readI32(p, 0);
@@ -138,7 +100,7 @@ pub const Conn = struct {
                     }
                 },
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
+                    try self.wire.setError(errMessage(p));
                     return error.PgAuthFailed;
                 },
                 'Z' => return,
@@ -149,7 +111,7 @@ pub const Conn = struct {
     }
 
     fn sendPassword(self: *Conn, password: []const u8) !void {
-        var body = std.array_list.Managed(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.wire.gpa);
         defer body.deinit();
         try appendCStr(&body, password);
         try self.writeMsg('p', body.items);
@@ -170,7 +132,7 @@ pub const Conn = struct {
         h.update(salt);
         h.final(&outer);
 
-        var body = std.array_list.Managed(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.wire.gpa);
         defer body.deinit();
         try body.appendSlice("md5");
         try body.appendSlice(&std.fmt.bytesToHex(&outer, .lower));
@@ -181,7 +143,7 @@ pub const Conn = struct {
     /// SASL SCRAM-SHA-256 (RFC 5802, RFC 7677). Reads the server-first and final messages;
     /// the outer auth loop then continues to AuthenticationOk and ReadyForQuery.
     fn scram(self: *Conn, password: []const u8) !void {
-        var aa = std.heap.ArenaAllocator.init(self.gpa);
+        var aa = std.heap.ArenaAllocator.init(self.wire.gpa);
         defer aa.deinit();
         const a = aa.allocator();
 
@@ -201,13 +163,13 @@ pub const Conn = struct {
         try init_msg.appendSlice(client_first);
         try self.writeMsg('p', init_msg.items);
 
-        if ((try self.readMsg()) != 'R' or (try readI32(self.payload.items, 0)) != 11) return error.PgAuthFailed;
-        const server_first = try a.dupe(u8, self.payload.items[4..]);
+        if ((try self.readMsg()) != 'R' or (try readI32(self.wire.msg.items, 0)) != 11) return error.PgAuthFailed;
+        const server_first = try a.dupe(u8, self.wire.msg.items[4..]);
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
         const si = scramAttr(server_first, 'i') orelse return error.PgProtocol;
         const iters = scramIterations(si) catch |e| {
-            if (e == error.PgAuthFailed) try sql.setError(self.gpa, &self.last_error, try std.fmt.allocPrint(a, "the server asks for {s} SCRAM iterations; basalt allows 1 to {d}", .{ si, max_scram_iterations }));
+            if (e == error.PgAuthFailed) try self.wire.printError("the server asks for {s} SCRAM iterations; basalt allows 1 to {d}", .{ si, max_scram_iterations });
             return e;
         };
 
@@ -228,12 +190,12 @@ pub const Conn = struct {
 
         const t = try self.readMsg();
         if (t == 'E') {
-            try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
+            try self.wire.setError(errMessage(self.wire.msg.items));
             return error.PgAuthFailed;
         }
-        if (t != 'R' or (try readI32(self.payload.items, 0)) != 12) return error.PgAuthFailed;
+        if (t != 'R' or (try readI32(self.wire.msg.items, 0)) != 12) return error.PgAuthFailed;
 
-        const sv = scramAttr(self.payload.items[4..], 'v') orelse return error.PgAuthFailed;
+        const sv = scramAttr(self.wire.msg.items[4..], 'v') orelse return error.PgAuthFailed;
         var server_sig: [32]u8 = undefined;
         if ((dec.calcSizeForSlice(sv) catch return error.PgAuthFailed) != 32) return error.PgAuthFailed;
         dec.decode(&server_sig, sv) catch return error.PgAuthFailed;
@@ -256,7 +218,7 @@ pub const Conn = struct {
         self.cur_schema = empty;
         while (true) {
             const t = try self.readMsg();
-            const p = self.payload.items;
+            const p = self.wire.msg.items;
             switch (t) {
                 'T' => {
                     const rowdesc = try parseRowDescription(ma, p);
@@ -268,7 +230,7 @@ pub const Conn = struct {
                 },
                 'C' => {},
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
+                    try self.wire.setError(errMessage(p));
                     return error.PgQueryFailed;
                 },
                 'Z' => {
@@ -285,7 +247,7 @@ pub const Conn = struct {
     pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         while (true) {
             const t = try self.readMsg();
-            const p = self.payload.items;
+            const p = self.wire.msg.items;
             switch (t) {
                 'D' => {
                     try parseDataRow(self, p, builders);
@@ -293,11 +255,11 @@ pub const Conn = struct {
                 },
                 'Z' => return .end,
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
+                    try self.wire.setError(errMessage(p));
                     return error.PgQueryFailed;
                 },
                 'T' => {
-                    try sql.setError(self.gpa, &self.last_error, sql.one_result_set);
+                    try self.wire.setError(sql.one_result_set);
                     return error.PgQueryFailed;
                 },
                 else => {},
@@ -311,7 +273,7 @@ pub const Conn = struct {
             const t = try self.readMsg();
             switch (t) {
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
+                    try self.wire.setError(errMessage(self.wire.msg.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => break,
@@ -321,7 +283,7 @@ pub const Conn = struct {
     }
 
     fn sendQuery(self: *Conn, stmt: []const u8) !void {
-        var body = std.array_list.Managed(u8).init(self.gpa);
+        var body = std.array_list.Managed(u8).init(self.wire.gpa);
         defer body.deinit();
         try appendCStr(&body, stmt);
         try self.writeMsg('Q', body.items);
@@ -333,7 +295,7 @@ pub const Conn = struct {
             switch (try self.readMsg()) {
                 'G' => return,
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
+                    try self.wire.setError(errMessage(self.wire.msg.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => return error.PgProtocol,
@@ -353,9 +315,9 @@ pub const Conn = struct {
         var count: ?u64 = null;
         while (true) {
             switch (try self.readMsg()) {
-                'C' => count = parseCopyCount(self.payload.items),
+                'C' => count = parseCopyCount(self.wire.msg.items),
                 'E' => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(self.payload.items));
+                    try self.wire.setError(errMessage(self.wire.msg.items));
                     return error.PgQueryFailed;
                 },
                 'Z' => return count orelse error.PgProtocol,
@@ -368,14 +330,14 @@ pub const Conn = struct {
         var hdr: [5]u8 = undefined;
         hdr[0] = msg_type;
         std.mem.writeInt(u32, hdr[1..5], @intCast(body.len + 4), .big);
-        const w = self.wr();
+        const w = self.wire.wr();
         try w.writeAll(&hdr);
         try w.writeAll(body);
-        try self.flushOut();
+        try self.wire.flush();
     }
 
     fn readMsg(self: *Conn) !u8 {
-        return readMessage(self.rd(), &self.payload);
+        return readMessage(self.wire.rd(), &self.wire.msg);
     }
 };
 
@@ -447,7 +409,7 @@ fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
             const cell = p[i .. i + ulen];
             const v = sql.coerceText(cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
-                    sql.putError(conn.gpa, &conn.last_error, try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell }));
+                    try conn.wire.printError("column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell });
                 return e;
             };
             try builders[k].append(v);

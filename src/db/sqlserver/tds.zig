@@ -49,6 +49,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
+const wire = @import("../wire.zig");
 const ntlm = @import("../../net/auth/ntlm.zig");
 const krb5 = @import("../../net/auth/krb5.zig");
 const spnego = @import("../../net/auth/spnego.zig");
@@ -71,17 +72,9 @@ pub fn lastError() []const u8 {
 }
 
 pub const Conn = struct {
-    gpa: std.mem.Allocator,
-    stream: std.net.Stream,
-    read_buf: [SOCK_BUF]u8 = undefined,
-    write_buf: [SOCK_BUF]u8 = undefined,
-    sr: std.net.Stream.Reader = undefined,
-    sw: std.net.Stream.Writer = undefined,
-    msg: std.array_list.Managed(u8),
-    last_error: []const u8 = "",
+    wire: wire.Conn,
     txn_desc: [8]u8 = @splat(0),
     sspi_reply: []const u8 = "",
-    tls: ?*sql.TlsState = null,
     shim: TlsShim = undefined,
     fed_required: bool = false,
     fed_nonce: ?[32]u8 = null,
@@ -90,17 +83,12 @@ pub const Conn = struct {
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         rejected.clear();
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         self.login(user, password, database, host) catch |e| {
-            rejected.set(self.last_error);
+            rejected.set(self.wire.last_error);
             return e;
         };
         try self.afterLogin();
@@ -113,12 +101,7 @@ pub const Conn = struct {
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         rejected.clear();
         if (tls_mode == .off) return error.EncryptionRequired;
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
         try self.preloginFed();
         try self.startTls(host, tls_mode);
@@ -127,7 +110,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            rejected.set(self.last_error);
+            rejected.set(self.wire.last_error);
             return e;
         };
         try self.afterLogin();
@@ -138,12 +121,7 @@ pub const Conn = struct {
     pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         rejected.clear();
         if (tls_mode == .off) return error.EncryptionRequired;
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
@@ -157,17 +135,12 @@ pub const Conn = struct {
     pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
         rejected.clear();
         if (tls_mode == .off) return error.EncryptionRequired;
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .msg = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         self.loginKerberos(cred, spn, database, host) catch |e| {
-            rejected.set(self.last_error);
+            rejected.set(self.wire.last_error);
             return e;
         };
         try self.afterLogin();
@@ -175,37 +148,15 @@ pub const Conn = struct {
     }
 
     fn startTls(self: *Conn, host: []const u8, mode: sql.TlsMode) !void {
-        self.shim = .{ .inner_r = self.sr.interface(), .inner_w = &self.sw.interface, .reader = undefined, .writer = undefined };
+        self.shim = .{ .inner_r = self.wire.sr.interface(), .inner_w = &self.wire.sw.interface, .reader = undefined, .writer = undefined };
         self.shim.reader = .{ .vtable = &TlsShim.reader_vtable, .buffer = &self.shim.rbuf, .seek = 0, .end = 0 };
         self.shim.writer = .{ .vtable = &TlsShim.writer_vtable, .buffer = &self.shim.wbuf };
-
-        const ts = try self.gpa.create(sql.TlsState);
-        errdefer self.gpa.destroy(ts);
-        try ts.start(self.gpa, &self.shim.reader, &self.shim.writer, host, mode);
-        self.tls = ts;
+        try self.wire.startTlsOver(host, mode, &self.shim.reader, &self.shim.writer);
         self.shim.handshaking = false;
     }
 
     pub fn close(self: *Conn) void {
-        if (self.last_error.len > 0) self.gpa.free(self.last_error);
-        if (self.tls) |t| t.deinit(self.gpa);
-        self.msg.deinit();
-        self.stream.close();
-        self.gpa.destroy(self);
-    }
-
-    fn rd(self: *Conn) *std.Io.Reader {
-        return if (self.tls) |t| &t.client.reader else self.sr.interface();
-    }
-    fn wr(self: *Conn) *std.Io.Writer {
-        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
-    }
-    fn flushOut(self: *Conn) !void {
-        if (self.tls) |t| {
-            try t.client.writer.flush();
-            try self.shim.writer.flush();
-        }
-        try self.sw.interface.flush();
+        self.wire.close(self);
     }
 
     pub fn sqlConn(self: *Conn) sql.Conn {
@@ -214,12 +165,12 @@ pub const Conn = struct {
 
     pub fn queryCursor(self: *Conn, stmt: []const u8) !sql.Cursor {
         try self.sendBatch(stmt);
-        const cur = try self.gpa.create(TdsCursor);
+        const cur = try self.wire.gpa.create(TdsCursor);
         cur.* = .{
-            .gpa = self.gpa,
+            .gpa = self.wire.gpa,
             .conn = self,
-            .reader = PacketReader.init(self.gpa, self.rd()),
-            .meta_arena = std.heap.ArenaAllocator.init(self.gpa),
+            .reader = PacketReader.init(self.wire.gpa, self.wire.rd()),
+            .meta_arena = std.heap.ArenaAllocator.init(self.wire.gpa),
             .cols = &.{},
             .schema = undefined,
             .done = false,
@@ -227,7 +178,7 @@ pub const Conn = struct {
         cur.readHeader() catch |e| {
             cur.reader.deinit();
             cur.meta_arena.deinit();
-            self.gpa.destroy(cur);
+            self.wire.gpa.destroy(cur);
             return e;
         };
         return .{ .ptr = cur, .vtable = &cursor_vtable };
@@ -245,10 +196,10 @@ pub const Conn = struct {
         try self.scanResultTokens();
     }
 
-    /// Scan a response token stream in `self.msg`, bounds-checked like
+    /// Scan a response token stream in `self.wire.msg`, bounds-checked like
     /// `parseLoginResponse`; an ERROR token sets `last_error` and returns QueryFailed.
     fn scanResultTokens(self: *Conn) !void {
-        const p = self.msg.items;
+        const p = self.wire.msg.items;
         var i: usize = 0;
         while (i < p.len) {
             const token = p[i];
@@ -258,7 +209,7 @@ pub const Conn = struct {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
-                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
+                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.QueryFailed;
                 },
                 0xE3 => {
@@ -296,7 +247,7 @@ pub const Conn = struct {
     }
 
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
-        const w = self.wr();
+        const w = self.wire.wr();
         var off: usize = 0;
         while (true) {
             const chunk: usize = @min(payload.len - off, self.pkt_payload);
@@ -310,21 +261,21 @@ pub const Conn = struct {
             off += chunk;
             if (last) break;
         }
-        try self.flushOut();
+        try self.wire.flush();
     }
 
     fn readMessage(self: *Conn) !void {
-        self.msg.clearRetainingCapacity();
-        const r = self.rd();
+        self.wire.msg.clearRetainingCapacity();
+        const r = self.wire.rd();
         while (true) {
             var header: [8]u8 = undefined;
             try r.readSliceAll(&header);
             const len: usize = (@as(usize, header[2]) << 8) | header[3];
             if (len < 8) return error.TdsProtocol;
-            const start = self.msg.items.len;
+            const start = self.wire.msg.items.len;
             if (len - 8 > max_message - start) return error.TdsProtocol;
-            try self.msg.resize(start + (len - 8));
-            try r.readSliceAll(self.msg.items[start..]);
+            try self.wire.msg.resize(start + (len - 8));
+            try r.readSliceAll(self.wire.msg.items[start..]);
             if (header[1] & STATUS_EOM != 0) break;
         }
     }
@@ -342,7 +293,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
 
-        const p = self.msg.items;
+        const p = self.wire.msg.items;
         var i: usize = 0;
         while (i + 5 <= p.len and p[i] != 0xFF) : (i += 5) {
             const tok = p[i];
@@ -374,7 +325,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_PRELOGIN, &payload);
         try self.readMessage();
 
-        const p = self.msg.items;
+        const p = self.wire.msg.items;
         var i: usize = 0;
         while (i + 5 <= p.len and p[i] != 0xFF) : (i += 5) {
             if (p[i] == 0x01) {
@@ -388,8 +339,8 @@ pub const Conn = struct {
     }
 
     fn login(self: *Conn, user: []const u8, password: []const u8, database: []const u8, host: []const u8) !void {
-        const payload = try buildLogin7(self.gpa, user, password, database, host);
-        defer self.gpa.free(payload);
+        const payload = try buildLogin7(self.wire.gpa, user, password, database, host);
+        defer self.wire.gpa.free(payload);
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
         try self.parseLoginResponse();
@@ -398,22 +349,22 @@ pub const Conn = struct {
     /// Three-leg NTLMv2 handshake (MS-TDS 2.2.6.8): Type 1 in the LOGIN7 SSPI field, Type 2
     /// in the server's SSPI token, Type 3 back in an SSPI packet (0x11).
     fn loginNtlm(self: *Conn, cred: ntlm.Credential, database: []const u8, host: []const u8) !void {
-        const neg = try ntlm.negotiate(self.gpa, cred);
-        defer self.gpa.free(neg);
-        const payload = try buildLogin7Sspi(self.gpa, neg, database, host);
-        defer self.gpa.free(payload);
+        const neg = try ntlm.negotiate(self.wire.gpa, cred);
+        defer self.wire.gpa.free(neg);
+        const payload = try buildLogin7Sspi(self.wire.gpa, neg, database, host);
+        defer self.wire.gpa.free(payload);
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
 
         const challenge = try self.sspiToken();
         var nonce: [8]u8 = undefined;
         std.crypto.random.bytes(&nonce);
-        const auth = try ntlm.authenticate(self.gpa, cred, challenge, ntlm.filetimeNow(), nonce);
-        defer self.gpa.free(auth);
+        const auth = try ntlm.authenticate(self.wire.gpa, cred, challenge, ntlm.filetimeNow(), nonce);
+        defer self.wire.gpa.free(auth);
         try self.writePacket(PKT_SSPI, auth);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            rejected.set(self.last_error);
+            rejected.set(self.wire.last_error);
             return e;
         };
     }
@@ -422,25 +373,25 @@ pub const Conn = struct {
     /// beside the LOGINACK is required and checked, so the server proves it holds the
     /// service key; a login without it is refused.
     fn loginKerberos(self: *Conn, cred: krb5.Credential, spn: []const u8, database: []const u8, host: []const u8) !void {
-        const t = krb5.serviceTicket(self.gpa, cred, spn) catch |e| return self.krbFailed(e);
-        const ctx = krb5.initContext(self.gpa, cred, &t) catch |e| return self.krbFailed(e);
-        defer self.gpa.free(ctx.token);
-        const tok = try spnego.initWith(self.gpa, &.{ &spnego.oid_krb5, &spnego.oid_ms_krb5 }, ctx.token);
-        defer self.gpa.free(tok);
-        const payload = try buildLogin7Sspi(self.gpa, tok, database, host);
-        defer self.gpa.free(payload);
+        const t = krb5.serviceTicket(self.wire.gpa, cred, spn) catch |e| return self.krbFailed(e);
+        const ctx = krb5.initContext(self.wire.gpa, cred, &t) catch |e| return self.krbFailed(e);
+        defer self.wire.gpa.free(ctx.token);
+        const tok = try spnego.initWith(self.wire.gpa, &.{ &spnego.oid_krb5, &spnego.oid_ms_krb5 }, ctx.token);
+        defer self.wire.gpa.free(tok);
+        const payload = try buildLogin7Sspi(self.wire.gpa, tok, database, host);
+        defer self.wire.gpa.free(payload);
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
 
         self.parseLoginResponse() catch |e| {
-            if (e == error.LoginFailed and self.last_error.len == 0 and self.sspi_reply.len > 0)
+            if (e == error.LoginFailed and self.wire.last_error.len == 0 and self.sspi_reply.len > 0)
                 return self.loginRefused("the server asked for a second Kerberos round, which basalt does not do", .{});
             return e;
         };
         if (self.sspi_reply.len == 0)
             return self.loginRefused("the server accepted the ticket without proving itself (no AP-REP)", .{});
         const reply = spnego.token(self.sspi_reply) orelse self.sspi_reply;
-        _ = krb5.acceptReply(self.gpa, &ctx, reply) catch |e| return self.krbFailed(e);
+        _ = krb5.acceptReply(self.wire.gpa, &ctx, reply) catch |e| return self.krbFailed(e);
         self.sspi_reply = "";
     }
 
@@ -451,14 +402,14 @@ pub const Conn = struct {
     }
 
     fn loginRefused(self: *Conn, comptime fmt: []const u8, args: anytype) Error {
-        sql.putError(self.gpa, &self.last_error, try std.fmt.allocPrint(self.gpa, fmt, args));
+        try self.wire.printError(fmt, args);
         return error.LoginFailed;
     }
 
     /// The server's SSPI token (0xED), a US_VARBYTE security blob. Returns a slice into
-    /// `self.msg`, valid until the next `readMessage`.
+    /// `self.wire.msg`, valid until the next `readMessage`.
     fn sspiToken(self: *Conn) ![]const u8 {
-        const p = self.msg.items;
+        const p = self.wire.msg.items;
         var i: usize = 0;
         while (i < p.len) {
             const token = p[i];
@@ -469,7 +420,7 @@ pub const Conn = struct {
             switch (token) {
                 0xED => return p[i + 2 .. i + 2 + len],
                 0xAA => {
-                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
+                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.LoginFailed;
                 },
                 0xAB, 0xE3 => i += 2 + len,
@@ -481,7 +432,7 @@ pub const Conn = struct {
 
     /// Also notes the response's SSPI token, if any, in `sspi_reply`.
     fn parseLoginResponse(self: *Conn) !void {
-        const p = self.msg.items;
+        const p = self.wire.msg.items;
         var i: usize = 0;
         var ok = false;
         self.sspi_reply = "";
@@ -499,7 +450,7 @@ pub const Conn = struct {
                     if (i + 2 > p.len) return error.TdsProtocol;
                     const len = rdU16(p, i);
                     if (i + 2 + len > p.len) return error.TdsProtocol;
-                    sql.putError(self.gpa, &self.last_error, try self.decodeError(p[i + 2 .. i + 2 + len]));
+                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
                     return error.LoginFailed;
                 },
                 0xAB => {
@@ -543,16 +494,16 @@ pub const Conn = struct {
 
     /// ERROR token body: Number(4) State(1) Class(1) MsgLen(2) Msg(UTF16)...
     fn decodeError(self: *Conn, body: []const u8) ![]const u8 {
-        if (body.len < 8) return try self.gpa.dupe(u8, "tds login error");
+        if (body.len < 8) return try self.wire.gpa.dupe(u8, "tds login error");
         const msglen: usize = rdU16(body, 6);
         const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
-        const out = try self.gpa.alloc(u8, utf16.len / 2);
+        const out = try self.wire.gpa.alloc(u8, utf16.len / 2);
         for (out, 0..) |*c, k| c.* = utf16[k * 2];
         return out;
     }
 
     fn sendBatch(self: *Conn, stmt: []const u8) !void {
-        var payload = std.array_list.Managed(u8).init(self.gpa);
+        var payload = std.array_list.Managed(u8).init(self.wire.gpa);
         defer payload.deinit();
         try payload.appendSlice(&[_]u8{
             22,   0,    0, 0,
@@ -563,8 +514,8 @@ pub const Conn = struct {
             0,    0,
         });
         @memcpy(payload.items[10..18], &self.txn_desc);
-        const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, stmt);
-        defer self.gpa.free(u16s);
+        const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.wire.gpa, stmt);
+        defer self.wire.gpa.free(u16s);
         try payload.appendSlice(std.mem.sliceAsBytes(u16s));
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
@@ -583,10 +534,10 @@ pub const Conn = struct {
         const total: u16 = @intCast(payload.len + 8);
         header[2] = @intCast(total >> 8);
         header[3] = @intCast(total & 0xff);
-        const w = self.wr();
+        const w = self.wire.wr();
         try w.writeAll(&header);
         try w.writeAll(payload);
-        if (self.tls != null or status & STATUS_EOM != 0) try self.flushOut();
+        if (self.wire.tls != null or status & STATUS_EOM != 0) try self.wire.flush();
     }
 
     /// Returns the DONE row count, the server's word on how many rows actually landed.
@@ -686,7 +637,7 @@ const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNe
 
 fn curLastError(ptr: *anyopaque) []const u8 {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
-    return self.conn.last_error;
+    return self.conn.wire.last_error;
 }
 
 fn curSchema(ptr: *anyopaque) types.Schema {
@@ -702,7 +653,6 @@ fn curClose(ptr: *anyopaque) void {
     self.closeCursor();
 }
 
-const SOCK_BUF = 64 * 1024;
 /// SQL Server's largest (max) or text value, 2^31 - 1 bytes.
 const max_lob: usize = (1 << 31) - 1;
 /// A non-rowset reply (login, a batch's messages, a bulk load's DONE) buffered whole.
@@ -939,7 +889,7 @@ const TdsCursor = struct {
                 0xAB, 0xE3, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
                 0x79 => try self.reader.skip(4),
                 0x81 => {
-                    try sql.setError(self.gpa, &self.conn.last_error, sql.one_result_set);
+                    try self.conn.wire.setError(sql.one_result_set);
                     return error.QueryFailed;
                 },
                 else => return error.TdsProtocol,
@@ -1216,7 +1166,7 @@ const TdsCursor = struct {
             const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
             const ascii = try self.gpa.alloc(u8, utf16.len / 2);
             for (ascii, 0..) |*c, k| c.* = utf16[k * 2];
-            sql.putError(self.gpa, &self.conn.last_error, ascii);
+            self.conn.wire.putError(ascii);
         }
         return error.QueryFailed;
     }
@@ -2238,22 +2188,17 @@ test "PLP and text values past SQL Server's 2 GiB limit are refused before room 
 }
 
 test "parseLoginResponse keeps the SSPI token beside the LOGINACK" {
-    var c: Conn = undefined;
-    c.gpa = std.testing.allocator;
-    c.pkt_payload = BULK_PKT_PAYLOAD;
-    c.sspi_reply = "";
-    c.msg = std.array_list.Managed(u8).init(std.testing.allocator);
-    defer c.msg.deinit();
-    c.last_error = "";
-    try c.msg.appendSlice("\xED\x06\x00ap-rep\xAD\x01\x00\x00");
+    var c: Conn = .{ .wire = .{ .gpa = std.testing.allocator, .stream = undefined, .msg = .init(std.testing.allocator) } };
+    defer c.wire.msg.deinit();
+    try c.wire.msg.appendSlice("\xED\x06\x00ap-rep\xAD\x01\x00\x00");
     try c.parseLoginResponse();
     try std.testing.expectEqualStrings("ap-rep", c.sspi_reply);
-    c.msg.clearRetainingCapacity();
-    try c.msg.appendSlice(&.{ 0xED, 2, 0, 'h', 'i' });
+    c.wire.msg.clearRetainingCapacity();
+    try c.wire.msg.appendSlice(&.{ 0xED, 2, 0, 'h', 'i' });
     try std.testing.expectError(error.LoginFailed, c.parseLoginResponse());
     try std.testing.expectEqualStrings("hi", c.sspi_reply);
-    c.msg.clearRetainingCapacity();
-    try c.msg.appendSlice(&.{ 0xED, 9, 0, 'x' });
+    c.wire.msg.clearRetainingCapacity();
+    try c.wire.msg.appendSlice(&.{ 0xED, 9, 0, 'x' });
     try std.testing.expectError(error.TdsProtocol, c.parseLoginResponse());
 }
 

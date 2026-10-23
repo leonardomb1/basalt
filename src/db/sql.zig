@@ -103,17 +103,6 @@ pub const Cursor = struct {
 
 pub const RowStep = enum { row, end };
 
-/// Stores `owned` as a connection's `last_error`, freeing the message it replaces.
-pub fn putError(gpa: std.mem.Allocator, slot: *[]const u8, owned: []const u8) void {
-    if (slot.len > 0) gpa.free(slot.*);
-    slot.* = owned;
-}
-
-/// `putError` with a copy of `msg`.
-pub fn setError(gpa: std.mem.Allocator, slot: *[]const u8, msg: []const u8) !void {
-    putError(gpa, slot, try gpa.dupe(u8, msg));
-}
-
 pub const one_result_set = "the query returned more than one result set; a read takes one — keep a single SELECT in the batch (statements before or after it are fine)";
 
 /// Rename a socket's `EndOfStream`/`ReadFailed`/`WriteFailed` to names the exit
@@ -127,10 +116,10 @@ pub fn onWire(e: anyerror) anyerror {
     };
 }
 
-/// `conn` needs `meta_arena`, `openCursor(sql)` and `last_error`. On open failure
+/// `conn` needs `meta_arena`, `openCursor(sql)` and a `wire`. On open failure
 /// the connection is left open for the caller to read `last_error` and close.
 pub fn openTextCursor(conn: anytype, sql_text: []const u8, vt: *const Cursor.VTable) !Cursor {
-    conn.meta_arena = std.heap.ArenaAllocator.init(conn.gpa);
+    conn.meta_arena = std.heap.ArenaAllocator.init(conn.wire.gpa);
     conn.openCursor(sql_text) catch |e| {
         conn.meta_arena.deinit();
         return e;
@@ -216,7 +205,7 @@ pub fn connVTable(comptime T: type) Conn.VTable {
         }.f,
         .last_error = struct {
             fn f(p: *anyopaque) []const u8 {
-                return @as(*T, @ptrCast(@alignCast(p))).last_error;
+                return @as(*T, @ptrCast(@alignCast(p))).wire.last_error;
             }
         }.f,
     };
@@ -250,7 +239,7 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
         }.f,
         .last_error = struct {
             fn f(p: *anyopaque) []const u8 {
-                return @as(*T, @ptrCast(@alignCast(p))).last_error;
+                return @as(*T, @ptrCast(@alignCast(p))).wire.last_error;
             }
         }.f,
     };
@@ -621,8 +610,8 @@ pub fn BulkSink(comptime Proto: type) type {
                 return;
             }
             self.sendSegment() catch |e| {
-                const rd = self.redial orelse return refused(self.errctx, Proto.dialect, self.conn.last_error, e);
-                if (!driver.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.last_error, e);
+                const rd = self.redial orelse return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
+                if (!driver.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
                 const fresh = try rd.dial(rd.ctx, self.gpa);
                 self.conn.close();
                 self.conn = @ptrCast(@alignCast(fresh.ptr));
@@ -635,8 +624,8 @@ pub fn BulkSink(comptime Proto: type) type {
         fn sendSegment(self: *Self) !void {
             const n = Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) catch |e| return onWire(e);
             if (n != self.seg_rows) {
-                if (self.conn.last_error.len == 0)
-                    self.conn.last_error = try std.fmt.allocPrint(self.gpa, "{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });
+                if (self.conn.wire.last_error.len == 0)
+                    try self.conn.wire.printError("{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });
                 return error.BulkCountMismatch;
             }
         }
@@ -1548,7 +1537,7 @@ test "bulk text format: tab/newline/backslash escaping and \\N nulls" {
 
 const FakeBulk = struct {
     const Connection = struct {
-        last_error: []const u8 = "",
+        wire: Wire = .{},
         fail_once: bool = false,
         sends: usize = 0,
         closed: bool = false,
@@ -1557,6 +1546,10 @@ const FakeBulk = struct {
         fn close(self: *Connection) void {
             self.closed = true;
         }
+    };
+    const Wire = struct {
+        last_error: []const u8 = "",
+        fn printError(_: *Wire, comptime _: []const u8, _: anytype) !void {}
     };
     const dialect: Dialect = .postgres;
     const stmt = "FAKE";
@@ -1656,14 +1649,4 @@ test "a string literal keeps a name from data inside it in every dialect" {
     try std.testing.expectEqualStrings("'x''); DROP TABLE t;--'", try Dialect.sqlserver.strLit(a, "x'); DROP TABLE t;--"));
     try std.testing.expectEqualStrings("'a\\b'", try Dialect.postgres.strLit(a, "a\\b"));
     try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
-}
-
-test "setError and putError free the message they replace" {
-    const gpa = std.testing.allocator;
-    var slot: []const u8 = "";
-    try setError(gpa, &slot, "first");
-    try setError(gpa, &slot, "second");
-    putError(gpa, &slot, try std.fmt.allocPrint(gpa, "third {d}", .{3}));
-    try std.testing.expectEqualStrings("third 3", slot);
-    putError(gpa, &slot, "");
 }

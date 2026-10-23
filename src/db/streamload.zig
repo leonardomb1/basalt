@@ -428,8 +428,8 @@ pub const StreamLoadSink = struct {
         const conn = try mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", self.cfg.tls);
         defer conn.close();
         conn.exec(stmt) catch |e| {
-            obs.logOr(self.logger, .err, "{s} DDL error: {s} (sql: {s})", .{ self.cfg.flavor.name(), conn.last_error, stmt });
-            if (self.cfg.errctx) |ec| ec.set("{s} refused `{s}`: {s}", .{ self.cfg.flavor.name(), stmt, conn.last_error });
+            obs.logOr(self.logger, .err, "{s} DDL error: {s} (sql: {s})", .{ self.cfg.flavor.name(), conn.wire.last_error, stmt });
+            if (self.cfg.errctx) |ec| ec.set("{s} refused `{s}`: {s}", .{ self.cfg.flavor.name(), stmt, conn.wire.last_error });
             return e;
         };
     }

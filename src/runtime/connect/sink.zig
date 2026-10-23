@@ -306,7 +306,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     const qt = try sql.quoteIdent(env.arena, info.dialect, w.target);
                     c.sqlConn().exec(try sql.createTableSql(env.arena, info.dialect, qt, schema, .append)) catch |e| {
                         defer c.close();
-                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                     };
                     const p = try env.arena.create(ReplacePlan);
                     p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
@@ -321,7 +321,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx) catch |e| {
                     defer c.close();
                     if (plan) |p| p.abort();
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.last_error }));
+                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                 };
                 const p = plan orelse return inner;
                 const rs = try env.arena.create(ReplaceSink);

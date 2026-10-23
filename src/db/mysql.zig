@@ -4,9 +4,6 @@
 //! loads, and as a query source. Network-tested only against a live server; the
 //! auth token math is unit-tested below.
 //!
-//! Reads go through a 64 KB socket buffer: each result row is its own packet, so
-//! unbuffered every row would cost two recv syscalls (header and body).
-//!
 //! The three-byte length header caps one wire packet at 16 MB - 1; a larger
 //! logical packet is a run of full packets ended by a short (possibly empty) one,
 //! on both read and write. Sequence numbers come back from `writePacket` rather
@@ -28,7 +25,7 @@ const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("../connect/driver.zig");
+const wire = @import("wire.zig");
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
@@ -40,18 +37,8 @@ const CLIENT_PLUGIN_AUTH = 0x00080000;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
 
-const SOCK_BUF = 64 * 1024;
-
 pub const Conn = struct {
-    gpa: std.mem.Allocator,
-    stream: std.net.Stream,
-    read_buf: [SOCK_BUF]u8 = undefined,
-    write_buf: [SOCK_BUF]u8 = undefined,
-    sr: std.net.Stream.Reader = undefined,
-    sw: std.net.Stream.Writer = undefined,
-    buf: std.array_list.Managed(u8),
-    last_error: []const u8 = "",
-    tls: ?*sql.TlsState = null,
+    wire: wire.Conn,
     meta_arena: std.heap.ArenaAllocator = undefined,
     cols: []MyCol = &.{},
     cur_schema: *types.Schema = undefined,
@@ -59,38 +46,30 @@ pub const Conn = struct {
     ld_seq: u8 = 0,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
-        driver.tuneSocket(stream.handle);
-        const self = try gpa.create(Conn);
-        self.* = .{ .gpa = gpa, .stream = stream, .buf = std.array_list.Managed(u8).init(gpa) };
-        self.sr = std.net.Stream.Reader.init(stream, &self.read_buf);
-        self.sw = std.net.Stream.Writer.init(stream, &self.write_buf);
+        const self = try wire.Conn.dial(Conn, gpa, host, port);
         errdefer self.close();
 
         const seq = try self.readPacket();
-        const hs = try self.parseHandshake(self.buf.items);
+        const hs = try self.parseHandshake(self.wire.msg.items);
 
         var rseq = seq + 1;
         if (tls_mode != .off) {
             try self.writeSslRequest(rseq, database);
-            const ts = try gpa.create(sql.TlsState);
-            errdefer gpa.destroy(ts);
-            try ts.start(gpa, self.sr.interface(), &self.sw.interface, host, tls_mode);
-            self.tls = ts;
+            try self.wire.startTls(host, tls_mode);
             rseq += 1;
         }
 
-        if (hs.plugin == .clear and password.len > 0 and self.tls == null) return self.clearRefused();
+        if (hs.plugin == .clear and password.len > 0 and self.wire.tls == null) return self.clearRefused();
         try self.writeHandshakeResponse(rseq, user, password, database, hs.salt, hs.plugin);
 
         while (true) {
             rseq = try self.readPacket();
-            const p = self.buf.items;
+            const p = self.wire.msg.items;
             if (p.len == 0) return error.MysqlProtocol;
             switch (p[0]) {
                 0x00 => break,
                 0xff => {
-                    try sql.setError(self.gpa, &self.last_error, errMessage(p));
+                    try self.wire.setError(errMessage(p));
                     return error.MysqlAuthFailed;
                 },
                 0xfe => {
@@ -107,7 +86,7 @@ pub const Conn = struct {
                             _ = try self.writePacket(rseq +% 1, &token);
                         },
                         .clear => {
-                            if (self.tls == null) return self.clearRefused();
+                            if (self.wire.tls == null) return self.clearRefused();
                             try self.writeClearPassword(rseq +% 1, password);
                         },
                     }
@@ -115,12 +94,12 @@ pub const Conn = struct {
                 0x01 => {
                     if (p.len >= 2 and p[1] == 3) continue;
                     if (p.len >= 2 and p[1] == 4) {
-                        if (self.tls == null) {
-                            try sql.setError(self.gpa, &self.last_error, "caching_sha2_password full auth needs `tls` (or a warmed server-side cache)");
+                        if (self.wire.tls == null) {
+                            try self.wire.setError("caching_sha2_password full auth needs `tls` (or a warmed server-side cache)");
                             return error.MysqlAuthFailed;
                         }
-                        const pw = try self.gpa.alloc(u8, password.len + 1);
-                        defer self.gpa.free(pw);
+                        const pw = try self.wire.gpa.alloc(u8, password.len + 1);
+                        defer self.wire.gpa.free(pw);
                         @memcpy(pw[0..password.len], password);
                         pw[password.len] = 0;
                         _ = try self.writePacket(rseq +% 1, pw);
@@ -136,16 +115,10 @@ pub const Conn = struct {
 
     /// Run a statement that returns no result set (DDL). Errors on an ERR packet.
     pub fn exec(self: *Conn, stmt: []const u8) !void {
-        const payload = try self.gpa.alloc(u8, stmt.len + 1);
-        defer self.gpa.free(payload);
-        payload[0] = 0x03;
-        @memcpy(payload[1..], stmt);
-        _ = try self.writePacket(0, payload);
-
-        _ = try self.readPacket();
-        const p = self.buf.items;
+        _ = try self.query(stmt);
+        const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xff) {
-            try sql.setError(self.gpa, &self.last_error, errMessage(p));
+            try self.wire.setError(errMessage(p));
             return error.MysqlQueryFailed;
         }
     }
@@ -153,16 +126,10 @@ pub const Conn = struct {
     /// Send the `LOAD DATA LOCAL INFILE` query and wait for the server's local infile
     /// request (first byte 0xFB); data then streams via `loadDataChunk` and `loadDataEnd`.
     pub fn loadDataStart(self: *Conn, cmd: []const u8) !void {
-        const payload = try self.gpa.alloc(u8, cmd.len + 1);
-        defer self.gpa.free(payload);
-        payload[0] = 0x03;
-        @memcpy(payload[1..], cmd);
-        _ = try self.writePacket(0, payload);
-
-        const rseq = try self.readPacket();
-        const p = self.buf.items;
+        const rseq = try self.query(cmd);
+        const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xff) {
-            try sql.setError(self.gpa, &self.last_error, errMessage(p));
+            try self.wire.setError(errMessage(p));
             return error.MysqlQueryFailed;
         }
         if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol;
@@ -179,31 +146,26 @@ pub const Conn = struct {
     pub fn loadDataEnd(self: *Conn) !u64 {
         _ = try self.writePacket(self.ld_seq, "");
         _ = try self.readPacket();
-        const p = self.buf.items;
+        const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xff) {
-            try sql.setError(self.gpa, &self.last_error, errMessage(p));
+            try self.wire.setError(errMessage(p));
             return error.MysqlQueryFailed;
         }
         return parseOkAffected(p) orelse error.MysqlProtocol;
     }
 
     pub fn close(self: *Conn) void {
-        if (self.last_error.len > 0) self.gpa.free(self.last_error);
-        if (self.tls) |t| t.deinit(self.gpa);
-        self.buf.deinit();
-        self.stream.close();
-        self.gpa.destroy(self);
+        self.wire.close(self);
     }
 
-    fn rd(self: *Conn) *std.Io.Reader {
-        return if (self.tls) |t| &t.client.reader else self.sr.interface();
-    }
-    fn wr(self: *Conn) *std.Io.Writer {
-        return if (self.tls) |t| &t.client.writer else &self.sw.interface;
-    }
-    fn flushOut(self: *Conn) !void {
-        if (self.tls) |t| try t.client.writer.flush();
-        try self.sw.interface.flush();
+    /// COM_QUERY with `stmt`, returning the sequence number of the server's first reply.
+    fn query(self: *Conn, stmt: []const u8) !u8 {
+        const payload = try self.wire.gpa.alloc(u8, stmt.len + 1);
+        defer self.wire.gpa.free(payload);
+        payload[0] = 0x03;
+        @memcpy(payload[1..], stmt);
+        _ = try self.writePacket(0, payload);
+        return self.readPacket();
     }
 
     pub fn sqlConn(self: *Conn) sql.Conn {
@@ -216,17 +178,11 @@ pub const Conn = struct {
 
     pub fn openCursor(self: *Conn, stmt: []const u8) !void {
         const ma = self.meta_arena.allocator();
-        const payload = try self.gpa.alloc(u8, stmt.len + 1);
-        defer self.gpa.free(payload);
-        payload[0] = 0x03;
-        @memcpy(payload[1..], stmt);
-        _ = try self.writePacket(0, payload);
-
-        _ = try self.readPacket();
-        const first = self.buf.items;
+        _ = try self.query(stmt);
+        const first = self.wire.msg.items;
         if (first.len == 0) return error.MysqlProtocol;
         if (first[0] == 0xff) {
-            try sql.setError(self.gpa, &self.last_error, errMessage(first));
+            try self.wire.setError(errMessage(first));
             return error.MysqlQueryFailed;
         }
         if (first[0] == 0x00 or first[0] == 0xfe) {
@@ -243,7 +199,7 @@ pub const Conn = struct {
         self.cols = try ma.alloc(MyCol, ncol);
         for (0..ncol) |k| {
             _ = try self.readPacket();
-            self.cols[k] = try parseColDef(ma, self.buf.items);
+            self.cols[k] = try parseColDef(ma, self.wire.msg.items);
         }
         _ = try self.readPacket();
 
@@ -259,10 +215,10 @@ pub const Conn = struct {
     /// appended), the end of the stream, or a server error.
     pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
-        const r = self.buf.items;
+        const r = self.wire.msg.items;
         if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
         if (r.len > 0 and r[0] == 0xff) {
-            try sql.setError(self.gpa, &self.last_error, errMessage(r));
+            try self.wire.setError(errMessage(r));
             return error.MysqlQueryFailed;
         }
         var ri: usize = 0;
@@ -275,7 +231,7 @@ pub const Conn = struct {
             else
                 sql.coerceText(text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
-                        sql.putError(self.gpa, &self.last_error, try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? }));
+                        try self.wire.printError("column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? });
                     return e;
                 };
             try builders[k].append(v);
@@ -289,13 +245,13 @@ pub const Conn = struct {
     /// once left the continuations queued, so a 20 MB `longtext` broke the query and then
     /// the socket.
     fn readPacket(self: *Conn) !u8 {
-        return readLogical(self.rd(), &self.buf, max_logical);
+        return readLogical(self.wire.rd(), &self.wire.msg, max_logical);
     }
 
     /// Writes `payload` as a packet run starting at `seq`, returning the next sequence
     /// number. Masking the length into three bytes instead desynchronised the server.
     fn writePacket(self: *Conn, seq: u8, payload: []const u8) !u8 {
-        const w = self.wr();
+        const w = self.wire.wr();
         var off: usize = 0;
         var s = seq;
         while (true) {
@@ -312,7 +268,7 @@ pub const Conn = struct {
             s +%= 1;
             if (n < max_payload) break;
         }
-        try self.flushOut();
+        try self.wire.flush();
         return s;
     }
 
@@ -350,14 +306,14 @@ pub const Conn = struct {
     fn capsFor(self: *Conn, database: []const u8) u32 {
         var caps: u32 = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_LONG_PASSWORD | CLIENT_LOCAL_FILES;
         if (database.len > 0) caps |= CLIENT_CONNECT_WITH_DB;
-        if (self.tls != null) caps |= CLIENT_SSL;
+        if (self.wire.tls != null) caps |= CLIENT_SSL;
         return caps;
     }
 
     /// The SSLRequest packet: the fixed 32-byte prefix of the handshake response. Its
     /// caps must match the full response sent after the TLS handshake.
     fn writeSslRequest(self: *Conn, seq: u8, database: []const u8) !void {
-        var out = std.array_list.Managed(u8).init(self.gpa);
+        var out = std.array_list.Managed(u8).init(self.wire.gpa);
         defer out.deinit();
         const w = out.writer();
         try w.writeInt(u32, self.capsFor(database) | CLIENT_SSL, .little);
@@ -368,8 +324,8 @@ pub const Conn = struct {
     }
 
     fn writeClearPassword(self: *Conn, seq: u8, password: []const u8) !void {
-        const pw = try self.gpa.alloc(u8, password.len + 1);
-        defer self.gpa.free(pw);
+        const pw = try self.wire.gpa.alloc(u8, password.len + 1);
+        defer self.wire.gpa.free(pw);
         @memcpy(pw[0..password.len], password);
         pw[password.len] = 0;
         _ = try self.writePacket(seq, pw);
@@ -379,14 +335,14 @@ pub const Conn = struct {
     /// over TLS: a server, or anyone between, asking for it on a plain connection
     /// is refused, as libmysqlclient refuses it unless told otherwise.
     fn clearRefused(self: *Conn) error{ MysqlAuthFailed, OutOfMemory } {
-        try sql.setError(self.gpa, &self.last_error, "the server asks for the password in clear text (mysql_clear_password) on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
+        try self.wire.setError("the server asks for the password in clear text (mysql_clear_password) on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
         return error.MysqlAuthFailed;
     }
 
     fn writeHandshakeResponse(self: *Conn, seq: u8, user: []const u8, password: []const u8, database: []const u8, salt: [20]u8, plugin: AuthPlugin) !void {
         const caps = self.capsFor(database);
 
-        var out = std.array_list.Managed(u8).init(self.gpa);
+        var out = std.array_list.Managed(u8).init(self.wire.gpa);
         defer out.deinit();
         const w = out.writer();
 

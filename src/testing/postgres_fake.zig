@@ -285,7 +285,7 @@ test "the fake server answers a table read, narrows by IN, refuses an unknown co
     const c2 = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off);
     defer c2.close();
     try std.testing.expectError(error.PgQueryFailed, c2.sqlConn().queryCursor("SELECT \"nope\" FROM t"));
-    try std.testing.expectEqualStrings("column \"nope\" does not exist", c2.last_error);
+    try std.testing.expectEqualStrings("column \"nope\" does not exist", c2.wire.last_error);
 
     const got = try srv.received(gpa);
     defer gpa.free(got);
