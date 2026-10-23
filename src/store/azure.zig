@@ -20,11 +20,13 @@
 //! If-Modified-Since, If-Match, If-None-Match, If-Unmodified-Since and Range, one
 //! per line. Any mistake there is an opaque 403.
 //!
-//! Writes stream as a block blob: one `block_size` buffer is staged per Put Block
-//! and `finish` commits the ordered list with Put Block List, so memory stays at
-//! one block (4 MiB blocks under Azure's 50,000-block limit cap an object at
-//! ~190 GiB). There is no abort: uncommitted blocks are invisible and Azure
-//! garbage-collects them, so dropping the writer without `finish` is the abort.
+//! Writes stream as a block blob: written bytes gather into one `block_size` buffer
+//! (`objstore.Upload`), each full one is staged with Put Block, and `finish`
+//! commits the ordered list with Put Block List. Memory stays at one block plus
+//! the block ids, as each request's own allocations are freed before the next
+//! (8 MiB blocks under Azure's 50,000-block limit cap an object at ~390 GiB).
+//! Uncommitted blocks are invisible and Azure garbage-collects them, so `abort`
+//! only frees the writer's client.
 //! Staging runs under `std.Io.Writer`, whose only error is `WriteFailed`, so the
 //! writer keeps the typed error (`last_status`) and Azure's message for the sink
 //! to re-raise.
@@ -257,12 +259,12 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     };
 }
 
-pub const block_size = 4 * 1024 * 1024;
+pub const block_size = 8 * 1024 * 1024;
 
 pub const BlockBlobWriter = struct {
     interface: std.Io.Writer,
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    up: objstore.Upload,
     blob: Blob,
     key: []const u8,
     block_ids: std.array_list.Managed([]const u8),
@@ -276,15 +278,15 @@ pub const BlockBlobWriter = struct {
 
     pub fn init(
         arena: std.mem.Allocator,
-        client: *std.http.Client,
+        client: ?*std.http.Client,
         blob: Blob,
         content_type: []const u8,
     ) !*BlockBlobWriter {
         const self = try arena.create(BlockBlobWriter);
         self.* = .{
-            .interface = .{ .vtable = &vtable, .buffer = try arena.alloc(u8, block_size) },
+            .interface = .{ .vtable = &vtable, .buffer = try arena.alloc(u8, 64 * 1024) },
             .arena = arena,
-            .client = client,
+            .up = try objstore.Upload.init(arena, client, block_size),
             .blob = blob,
             .key = try keyFromEnv(arena),
             .block_ids = std.array_list.Managed([]const u8).init(arena),
@@ -295,9 +297,12 @@ pub const BlockBlobWriter = struct {
     }
 
     pub fn put(self: *BlockBlobWriter, bytes: []const u8) std.Io.Writer.Error!usize {
-        if (bytes.len == 0) return 0;
-        self.stageBlock(bytes) catch return error.WriteFailed;
+        self.up.stage(bytes, self, stageBlock) catch return error.WriteFailed;
         return bytes.len;
+    }
+
+    pub fn abort(self: *BlockBlobWriter) void {
+        self.up.release();
     }
 
     /// Block IDs must all be the same length and base64-encoded; the commit list
@@ -315,34 +320,46 @@ pub const BlockBlobWriter = struct {
     /// fresh destination needs no setup step. Query params sign sorted: blockid, comp.
     fn stageBlock(self: *BlockBlobWriter, bytes: []const u8) !void {
         const id = try self.blockId(self.block_ids.items.len);
-        const id_enc = try objstore.uriEncode(self.arena, id, .encode_slash);
-        const url = try std.fmt.allocPrint(self.arena, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
+        const a = self.up.fresh();
+        const id_enc = try objstore.uriEncode(a, id, .encode_slash);
+        const url = try std.fmt.allocPrint(a, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
 
         const sign = Sign{
             .content_length = bytes.len,
             .query = &.{
-                try std.fmt.allocPrint(self.arena, "blockid:{s}", .{id}),
+                try std.fmt.allocPrint(a, "blockid:{s}", .{id}),
                 "comp:block",
             },
         };
+        try self.sendCreating(url, sign, bytes);
+        try self.block_ids.append(id);
+    }
 
-        self.send(url, sign, bytes) catch |e| switch (e) {
+    /// `send`, creating a missing container once and sending again, so a fresh
+    /// destination needs no setup step.
+    fn sendCreating(self: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8) !void {
+        self.send(url, sign, body) catch |e| switch (e) {
             Error.AzureContainerMissing => {
                 try self.createContainer();
-                try self.send(url, sign, bytes);
+                try self.send(url, sign, body);
             },
             else => return e,
         };
-        try self.block_ids.append(id);
     }
 
     /// Commits the staged blocks in order. Until this returns, the blob does not exist.
     /// A replay after a lost answer is harmless: `Latest` resolves an id against the
     /// committed list once the uncommitted one is gone, so the same list commits again.
     pub fn finish(self: *BlockBlobWriter) !void {
+        defer self.up.release();
         try self.interface.flush();
+        if (self.up.part_len > 0) {
+            try self.stageBlock(self.up.pending());
+            self.up.part_len = 0;
+        }
 
-        var body = std.array_list.Managed(u8).init(self.arena);
+        const a = self.up.fresh();
+        var body = std.array_list.Managed(u8).init(a);
         try body.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
         for (self.block_ids.items) |id| {
             try body.appendSlice("<Latest>");
@@ -351,13 +368,13 @@ pub const BlockBlobWriter = struct {
         }
         try body.appendSlice("</BlockList>");
 
-        const url = try std.fmt.allocPrint(self.arena, "{s}?comp=blocklist", .{self.blob.url});
+        const url = try std.fmt.allocPrint(a, "{s}?comp=blocklist", .{self.blob.url});
         const sign = Sign{
             .ms_headers = &.{.{ .name = "x-ms-blob-content-type", .value = self.content_type }},
             .content_length = body.items.len,
             .query = &.{"comp:blocklist"},
         };
-        try self.send(url, sign, body.items);
+        try self.sendCreating(url, sign, body.items);
     }
 
     /// Put Blob of `bytes` with `If-None-Match: *`: true when it made the blob,
@@ -367,10 +384,11 @@ pub const BlockBlobWriter = struct {
         var created = false;
         const Ctx = struct { w: *BlockBlobWriter, bytes: []const u8, created: *bool, made_container: bool = false };
         var ctx = Ctx{ .w = self, .bytes = bytes, .created = &created };
+        _ = self.up.fresh();
         try objstore.retry(self.policy(), &ctx, struct {
             fn attempt(c: *Ctx) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try signedHeaders(w.arena, w.blob.account, w.key, .{
+                const hdrs = try signedHeaders(w.up.alloc(), w.blob.account, w.key, .{
                     .method = "PUT",
                     .canonical_resource = w.blob.canonical_resource,
                     .ms_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
@@ -378,7 +396,7 @@ pub const BlockBlobWriter = struct {
                     .content_type = w.content_type,
                     .if_none_match = "*",
                 });
-                const r = try objstore.exchange(w.arena, w.client, .{ .method = .PUT, .url = w.blob.url, .headers = hdrs, .payload = c.bytes, .content_type = w.content_type });
+                const r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .PUT, .url = w.blob.url, .headers = hdrs, .payload = c.bytes, .content_type = w.content_type });
                 switch (r.code) {
                     200, 201 => c.created.* = true,
                     409, 412 => c.created.* = false,
@@ -408,14 +426,14 @@ pub const BlockBlobWriter = struct {
         try objstore.retry(self.policy(), Send{ .w = self, .url = url, .sign = sign, .body = body }, struct {
             fn attempt(c: Send) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try signedHeaders(w.arena, w.blob.account, w.key, .{
+                const hdrs = try signedHeaders(w.up.alloc(), w.blob.account, w.key, .{
                     .method = "PUT",
                     .canonical_resource = w.blob.canonical_resource,
                     .ms_headers = c.sign.ms_headers,
                     .content_length = c.sign.content_length,
                     .query = c.sign.query,
                 });
-                const r = try objstore.exchange(w.arena, w.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.body });
+                const r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.body });
                 if (r.code == 201 or r.code == 200) {
                     w.last_status = null;
                     return .done;
@@ -428,16 +446,16 @@ pub const BlockBlobWriter = struct {
     /// Create the container; 409 (already exists) counts as success.
     fn createContainer(self: *BlockBlobWriter) !void {
         const base = self.blob.url[0 .. self.blob.url.len - self.blob.path.len - 1];
-        const url = try std.fmt.allocPrint(self.arena, "{s}?restype=container", .{base});
+        const url = try std.fmt.allocPrint(self.up.alloc(), "{s}?restype=container", .{base});
         const canon = self.blob.canonical_resource[0 .. self.blob.canonical_resource.len - self.blob.path.len - 1];
 
-        const hdrs = try signedHeaders(self.arena, self.blob.account, self.key, .{
+        const hdrs = try signedHeaders(self.up.alloc(), self.blob.account, self.key, .{
             .method = "PUT",
             .canonical_resource = canon,
             .query = &.{"restype:container"},
         });
 
-        const r = try objstore.exchange(self.arena, self.client, .{ .method = .PUT, .url = url, .headers = hdrs, .payload = "" });
+        const r = try objstore.exchange(self.up.alloc(), self.up.client, .{ .method = .PUT, .url = url, .headers = hdrs, .payload = "" });
         if (r.code != 201 and r.code != 409) return self.fail(r.code, r.body);
     }
 
@@ -446,7 +464,7 @@ pub const BlockBlobWriter = struct {
     }
 
     fn fail(self: *BlockBlobWriter, code: u16, body: []const u8) Error {
-        self.last_error = objstore.describe(self.arena, code, body) catch "";
+        self.last_error = self.up.keepError(code, body);
         self.last_status = statusToError(code, body);
         return self.last_status.?;
     }
@@ -465,7 +483,7 @@ test "block ids are the same width at every block number" {
     var w = BlockBlobWriter{
         .interface = .{ .vtable = undefined, .buffer = &.{} },
         .arena = a,
-        .client = &client,
+        .up = .{ .client = &client },
         .blob = blob,
         .key = "",
         .block_ids = std.array_list.Managed([]const u8).init(a),
@@ -503,7 +521,7 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     var w = BlockBlobWriter{
         .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
         .arena = a,
-        .client = &client,
+        .up = .{ .client = &client },
         .blob = try parseUrl(a, "az://devstoreaccount1/c/f.csv", try srv.url(a, "")),
         .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
         .block_ids = std.array_list.Managed([]const u8).init(a),
@@ -520,6 +538,63 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     try std.testing.expectEqual(@as(usize, 5), srv.requests());
     try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
     try std.testing.expectEqualStrings(srv.line(3), srv.line(4));
+}
+
+fn testStagingWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *http_fake.FakeServer, buf: []u8, block: []u8) !BlockBlobWriter {
+    return .{
+        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = buf },
+        .arena = a,
+        .up = .{ .client = client, .part = block },
+        .blob = try parseUrl(a, "az://devstoreaccount1/c/f.csv", try srv.url(a, "")),
+        .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
+        .block_ids = std.array_list.Managed([]const u8).init(a),
+        .content_type = "text/csv",
+        .rand = std.Random.DefaultPrng.init(0),
+        .sleep = testSleep,
+    };
+}
+
+test "writes gather into whole blocks however they are chunked" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = http_fake.FakeServer.reply;
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&([_]?[]const u8{reply("201 Created", "", "")} ** 5));
+    defer srv.stop();
+    var buf: [8]u8 = undefined;
+    var block: [16]u8 = undefined;
+    var w = try testStagingWriter(a, &client, &srv, &buf, &block);
+    for (0..7) |_| try w.interface.writeAll("abcdefg");
+    try w.interface.writeAll("h");
+    try w.finish();
+    try std.testing.expectEqual(@as(usize, 4), w.block_ids.items.len);
+    try std.testing.expectEqual(@as(usize, 5), srv.requests());
+    try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
+}
+
+test "a long upload's memory does not grow with each block's request" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = http_fake.FakeServer.reply;
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&([_]?[]const u8{reply("201 Created", "", "")} ** 40));
+    defer srv.stop();
+    var buf: [8]u8 = undefined;
+    var block: [16]u8 = undefined;
+    var w = try testStagingWriter(a, &client, &srv, &buf, &block);
+    defer w.abort();
+    try w.block_ids.ensureTotalCapacity(64);
+    for (0..8) |_| try w.interface.writeAll("0123456789abcdef");
+    const early = ar.queryCapacity();
+    for (0..32) |_| try w.interface.writeAll("0123456789abcdef");
+    try std.testing.expectEqual(@as(usize, 40), w.block_ids.items.len);
+    try std.testing.expect(ar.queryCapacity() - early <= 32 * 64);
 }
 
 test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container is made once" {
@@ -542,7 +617,7 @@ test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container 
     var w = BlockBlobWriter{
         .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
         .arena = a,
-        .client = &client,
+        .up = .{ .client = &client },
         .blob = try parseUrl(a, "az://devstoreaccount1/c/_delta_log/0.json", try srv.url(a, "")),
         .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
         .block_ids = std.array_list.Managed([]const u8).init(a),
@@ -803,7 +878,7 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
     return statusToError(code, body);
 }
 
-fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
+fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
     return objstore.writer(try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type));
 }
 
@@ -811,15 +886,16 @@ fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.h
     var w = BlockBlobWriter{
         .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
         .arena = arena,
-        .client = client,
+        .up = .{ .client = client },
         .blob = objstore.cast(Blob, ptr).*,
         .key = try keyFromEnv(arena),
         .block_ids = std.array_list.Managed([]const u8).init(arena),
         .content_type = content_type,
         .rand = objstore.jitterPrng(),
     };
+    defer w.up.release();
     return w.putIfAbsent(bytes) catch |e| {
-        why.* = w.last_error;
+        why.* = arena.dupe(u8, w.last_error) catch "";
         return e;
     };
 }

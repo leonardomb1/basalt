@@ -30,10 +30,10 @@
 //! is chosen at run time from a URL string: a reader over `az://…` and one over
 //! `s3://…` are the same code path holding a different `Object`. A provider is
 //! one `Provider` const naming its scheme and five functions; adding one means
-//! writing that const and appending it to `providers`. A `Writer` dropped without
-//! `finish` is the abort, since staged blocks and uncompleted uploads are
-//! invisible to readers; `abort` exists only for destinations where an unfinished
-//! write is visible (an SFTP `.part` file). A read of a prefix that lists nothing
+//! writing that const and appending it to `providers`. An object `Writer` left
+//! without `finish` publishes nothing, since staged blocks and uncompleted uploads
+//! are invisible to readers; its `abort` only frees its client and request memory,
+//! while an SFTP one removes its visible `.part` file. A read of a prefix that lists nothing
 //! raises the provider's `empty_prefix` error, as it is almost always a typo.
 
 const std = @import("std");
@@ -286,6 +286,78 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, 
     return out;
 }
 
+/// What an upload writer holds beside its open-time arena, which keeps only what
+/// lasts the whole upload (block ids, part ETags): the part being gathered, the
+/// HTTP client (owned when the writer made it), and the arena of the request in
+/// flight, emptied before the next part, so memory stays flat however large the
+/// object grows.
+pub const Upload = struct {
+    client: *std.http.Client,
+    owns_client: bool = false,
+    req: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    part: []u8 = &.{},
+    part_len: usize = 0,
+    err_buf: [256]u8 = undefined,
+    released: bool = false,
+
+    /// Over `client`, or over a client of its own when null, freed by `release`.
+    pub fn init(arena: std.mem.Allocator, client: ?*std.http.Client, part_size: usize) !Upload {
+        const part = try arena.alloc(u8, part_size);
+        if (client) |c| return .{ .client = c, .part = part };
+        const c = try arena.create(std.http.Client);
+        c.* = http_client.initClient(std.heap.smp_allocator);
+        return .{ .client = c, .owns_client = true, .part = part };
+    }
+
+    /// Copies `bytes` in, handing each full part to `ship(w, part)`, so every part
+    /// but the last is exactly the buffer's size however the writer machinery chunks.
+    pub fn stage(self: *Upload, bytes: []const u8, w: anytype, comptime ship: anytype) !void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const n = @min(self.part.len - self.part_len, rest.len);
+            @memcpy(self.part[self.part_len..][0..n], rest[0..n]);
+            self.part_len += n;
+            rest = rest[n..];
+            if (self.part_len == self.part.len) {
+                try ship(w, self.part);
+                self.part_len = 0;
+            }
+        }
+    }
+
+    /// The part gathered so far.
+    pub fn pending(self: *Upload) []const u8 {
+        return self.part[0..self.part_len];
+    }
+
+    /// The request arena, emptied of the last request's allocations.
+    pub fn fresh(self: *Upload) std.mem.Allocator {
+        _ = self.req.reset(.{ .retain_with_limit = 64 * 1024 });
+        return self.req.allocator();
+    }
+
+    /// The request arena as it stands, for the steps of the request in flight.
+    pub fn alloc(self: *Upload) std.mem.Allocator {
+        return self.req.allocator();
+    }
+
+    /// `describe`'s text, kept in the writer so it outlives the request.
+    pub fn keepError(self: *Upload, code: u16, body: []const u8) []const u8 {
+        const msg = describe(self.req.allocator(), code, body) catch return "";
+        const n = @min(msg.len, self.err_buf.len);
+        @memcpy(self.err_buf[0..n], msg[0..n]);
+        return self.err_buf[0..n];
+    }
+
+    /// Once only: `abort` may follow a `finish` that failed.
+    pub fn release(self: *Upload) void {
+        if (self.released) return;
+        self.released = true;
+        self.req.deinit();
+        if (self.owns_client) self.client.deinit();
+    }
+};
+
 pub fn drain(comptime T: type) *const fn (*std.Io.Writer, []const []const u8, usize) std.Io.Writer.Error!usize {
     return struct {
         fn f(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -399,7 +471,7 @@ pub const Provider = struct {
         list_prefix: *const fn (arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8,
         request_headers: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, method: []const u8, range: []const u8) anyerror![]const std.http.Header,
         status_to_error: *const fn (code: u16, body: []const u8) anyerror,
-        open_writer: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) anyerror!Writer,
+        open_writer: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) anyerror!Writer,
         put_if_absent: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool,
     };
 };
@@ -421,7 +493,8 @@ pub const Object = struct {
         return self.provider.vtable.status_to_error(code, body);
     }
 
-    pub fn openWriter(self: Object, arena: std.mem.Allocator, client: *std.http.Client, content_type: []const u8) !Writer {
+    /// A null `client` has the writer make its own, freed on `finish` or `abort`.
+    pub fn openWriter(self: Object, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) !Writer {
         return self.provider.vtable.open_writer(self.ptr, arena, client, content_type);
     }
 
@@ -476,9 +549,7 @@ pub fn openRemote(arena: std.mem.Allocator, path: []const u8, content_type: []co
     if (sftp.isUrl(path)) return writer(try sftp.Upload.open(arena, path));
     if (smb.isUrl(path)) return writer(try smb.Upload.open(arena, path));
     if (!isUrl(path)) return null;
-    const client = try arena.create(std.http.Client);
-    client.* = http_client.initClient(arena);
-    return try (try parse(arena, path)).openWriter(arena, client, content_type);
+    return try (try parse(arena, path)).openWriter(arena, null, content_type);
 }
 
 pub fn writer(w: anytype) Writer {
