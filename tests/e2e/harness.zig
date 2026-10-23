@@ -140,3 +140,40 @@ pub fn expectFile(tmp: *std.testing.TmpDir, name: []const u8, want: []const u8) 
     defer alloc.free(got);
     try std.testing.expectEqualStrings(want, got);
 }
+
+/// Wraps the testing allocator, counting the bytes live at once across threads.
+pub const PeakAlloc = struct {
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    pub fn allocator(self: *PeakAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn grow(self: *PeakAlloc, n: usize) void {
+        const now = self.live.fetchAdd(n, .monotonic) + n;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
+    fn alloc(p: *anyopaque, n: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        const r = std.testing.allocator.rawAlloc(n, al, ra) orelse return null;
+        self.grow(n);
+        return r;
+    }
+    fn resize(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        if (!std.testing.allocator.rawResize(m, al, n, ra)) return false;
+        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
+        return true;
+    }
+    fn remap(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        const r = std.testing.allocator.rawRemap(m, al, n, ra) orelse return null;
+        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
+        return r;
+    }
+    fn free(p: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAlloc = @ptrCast(@alignCast(p));
+        std.testing.allocator.rawFree(m, al, ra);
+        _ = self.live.fetchSub(m.len, .monotonic);
+    }
+};

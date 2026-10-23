@@ -12,6 +12,7 @@ const exec = @import("harness.zig").exec;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const runScript = @import("harness.zig").runScript;
 const runScriptOpts = @import("harness.zig").runScriptOpts;
+const PeakAlloc = @import("harness.zig").PeakAlloc;
 
 test "SUM/AVG over an outer join's null fill, and integer sums that leave i64" {
     const alloc = std.testing.allocator;
@@ -555,43 +556,6 @@ test "past 64 key columns a NULL in one key is told apart from a NULL in another
         }
     }
 }
-
-/// Wraps the testing allocator, counting the bytes live at once across threads.
-const PeakAlloc = struct {
-    live: std.atomic.Value(usize) = .init(0),
-    peak: std.atomic.Value(usize) = .init(0),
-
-    fn allocator(self: *PeakAlloc) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-    fn grow(self: *PeakAlloc, n: usize) void {
-        const now = self.live.fetchAdd(n, .monotonic) + n;
-        _ = self.peak.fetchMax(now, .monotonic);
-    }
-    fn alloc(p: *anyopaque, n: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *PeakAlloc = @ptrCast(@alignCast(p));
-        const r = std.testing.allocator.rawAlloc(n, al, ra) orelse return null;
-        self.grow(n);
-        return r;
-    }
-    fn resize(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
-        const self: *PeakAlloc = @ptrCast(@alignCast(p));
-        if (!std.testing.allocator.rawResize(m, al, n, ra)) return false;
-        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
-        return true;
-    }
-    fn remap(p: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-        const self: *PeakAlloc = @ptrCast(@alignCast(p));
-        const r = std.testing.allocator.rawRemap(m, al, n, ra) orelse return null;
-        if (n > m.len) self.grow(n - m.len) else _ = self.live.fetchSub(m.len - n, .monotonic);
-        return r;
-    }
-    fn free(p: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
-        const self: *PeakAlloc = @ptrCast(@alignCast(p));
-        std.testing.allocator.rawFree(m, al, ra);
-        _ = self.live.fetchSub(m.len, .monotonic);
-    }
-};
 
 test "a sequential loop's GROUP BY and DISTINCT free their groups each row, so twenty rows peak as one does" {
     const alloc = std.testing.allocator;

@@ -515,10 +515,12 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
 
     if (hasFlagHint(stages[0].hints, "buffer")) {
-        var batches = std.array_list.Managed(Batch).init(arena);
+        var held = std.heap.ArenaAllocator.init(gpa);
+        defer held.deinit();
+        var batches = std.array_list.Managed(Batch).init(held.allocator());
         while (true) {
             if (aborting()) return error.Aborted;
-            const b = (try res.op.next(batch_arena.allocator())) orelse break;
+            const b = (try res.op.next(held.allocator())) orelse break;
             try batches.append(b);
         }
         for (env.sources.items[src_base..]) |sc| sc.close();
@@ -531,6 +533,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             if (aborting()) return error.Aborted;
             try snk.writeBatch(batch_arena.allocator(), b);
             stats.rows_out += b.len;
+            _ = batch_arena.reset(.retain_capacity);
         }
         snk_open = false;
         try snk.close();

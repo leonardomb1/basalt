@@ -18,6 +18,7 @@ const exec = @import("harness.zig").exec;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const PeakAlloc = @import("harness.zig").PeakAlloc;
 
 /// Points fd 2 at a file in `dir` until `end`, which restores it and returns what
 /// was written there — where `PRINT`, an `EXPLAIN` statement's plan and the run
@@ -1630,4 +1631,39 @@ test "functions inlined into each other past 1000 levels are refused by check an
         "CREATE FUNCTION f2(x) AS f1(x)" ++ body ++ ";\n" ++
         "SELECT f2(1) AS v;";
     try expectRefusedAlike(alloc, &tmp, script, "with its functions inlined, the expression nests more than 1000 levels deep");
+}
+
+test "a buffered read frees what it drained once written, so a loop's twenty rows peak as one does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("k,v\n");
+    for (0..20000) |i| try csv.writer().print("key_{d},{d}\n", .{ i, i });
+    try tmp.dir.writeFile(.{ .sub_path = "data.csv", .data = csv.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    var peaks: [2]usize = undefined;
+    for ([_]usize{ 1, 20 }, &peaks) |rows, *peak| {
+        var loop = std.array_list.Managed(u8).init(alloc);
+        defer loop.deinit();
+        try loop.appendSlice("i\n");
+        for (0..rows) |i| try loop.writer().print("{d}\n", .{i});
+        try tmp.dir.writeFile(.{ .sub_path = "loop.csv", .data = loop.items });
+        const script = try std.mem.replaceOwned(u8, alloc,
+            \\FOR EACH ROW OF (SELECT i FROM '$B/loop.csv') AS (i)
+            \\  LOAD INTO '$B/out.csv' AS SELECT k, v FROM '$B/data.csv' WITH (buffer);
+            \\END FOR;
+        , "$B", base);
+        defer alloc.free(script);
+        var pa = PeakAlloc{};
+        var diag: Diag = .{};
+        _ = try exec(pa.allocator(), script, .{ .threads = 1, .log = .{ .quiet = true } }, &diag);
+        peak.* = pa.peak.load(.monotonic);
+    }
+    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(csv.items, out);
+    try std.testing.expect(peaks[1] < peaks[0] * 2);
 }
