@@ -175,9 +175,7 @@ pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array
             _ = stages.orderedRemove(k);
             continue;
         }
-        var e = keep.items[0];
-        for (keep.items[1..]) |r| e = try self.mk(.{ .binary = .{ .op = .@"and", .l = e, .r = r } });
-        st.node = .{ .filter = e };
+        st.node = .{ .filter = (try self.andAll(keep.items)).? };
         k += 1;
     }
     for (cor, 0..) |c, ci| {

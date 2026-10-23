@@ -205,6 +205,8 @@ fn prepare(self: *Parser, cap: Captured, what: []const u8, residual_ok: bool) Er
     }
 
     var cc_n: usize = 0;
+    var outer_only = std.array_list.Managed(*ast.Expr).init(self.arena);
+    var residual = std.array_list.Managed(*ast.Expr).init(self.arena);
     var i: usize = 0;
     while (i < w.where_end) {
         const st = &w.stages.items[i];
@@ -228,7 +230,7 @@ fn prepare(self: *Parser, cap: Captured, what: []const u8, residual_ok: bool) Er
                 continue;
             }
             if (!residual_ok and !hasInner(outer, c)) {
-                w.outer_only = if (w.outer_only) |acc| try self.mk(.{ .binary = .{ .op = .@"and", .l = acc, .r = c } }) else c;
+                try outer_only.append(c);
                 continue;
             }
             if (!residual_ok) {
@@ -237,19 +239,18 @@ fn prepare(self: *Parser, cap: Captured, what: []const u8, residual_ok: bool) Er
                 const shown = try std.mem.replaceOwned(u8, self.arena, buf.items, " == ", " = ");
                 return self.fail(refPos(cap.refs, outer.first(c).?), "{s}: the correlated condition `{s}` is not an equality between a column of the subquery and one of the query around it — a scalar subquery correlates by `inner = outer` only; for a range or an inequality, join the two queries and aggregate with GROUP BY", .{ what, shown });
             }
-            const r = try hideInner(self, &w, c, &cc_n);
-            w.residual = if (w.residual) |acc| try self.mk(.{ .binary = .{ .op = .@"and", .l = acc, .r = r } }) else r;
+            try residual.append(try hideInner(self, &w, c, &cc_n));
         }
         if (keep.items.len == 0) {
             _ = w.stages.orderedRemove(i);
             w.where_end -= 1;
             continue;
         }
-        var e = keep.items[0];
-        for (keep.items[1..]) |r| e = try self.mk(.{ .binary = .{ .op = .@"and", .l = e, .r = r } });
-        st.node = .{ .filter = e };
+        st.node = .{ .filter = (try self.andAll(keep.items)).? };
         i += 1;
     }
+    w.outer_only = try self.andAll(outer_only.items);
+    w.residual = try self.andAll(residual.items);
     return w;
 }
 
@@ -599,16 +600,18 @@ pub fn lowerWhere(
     var where_names = std.array_list.Managed([]const u8).init(self.arena);
     for (scalars) |s| if (s.in_where) try where_names.appendSlice(s.hidden);
     if (remaining != null and where_names.items.len > 0) {
-        pre = null;
         var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
         try splitAnd(remaining.?, &conj);
+        var before = std.array_list.Managed(*ast.Expr).init(self.arena);
+        var after = std.array_list.Managed(*ast.Expr).init(self.arena);
         for (conj.items) |c| {
             const reads = for (where_names.items) |n| {
                 if (@import("window.zig").refsName(c, n)) break true;
             } else false;
-            const slot = if (reads) &post else &pre;
-            slot.* = if (slot.*) |acc| try self.mk(.{ .binary = .{ .op = .@"and", .l = acc, .r = c } }) else c;
+            try (if (reads) &after else &before).append(c);
         }
+        pre = try self.andAll(before.items);
+        post = try self.andAll(after.items);
     }
     if (pre) |e| try stages.append(.{ .node = .{ .filter = try self.stripExpr(e, aliases) }, .hints = &.{}, .pos = fpos });
     for (scalars) |s| {

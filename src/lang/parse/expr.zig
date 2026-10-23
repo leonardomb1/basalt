@@ -130,6 +130,13 @@ pub fn balanceChain(self: *Parser, e: *ast.Expr) Error!*ast.Expr {
     return self.buildBalanced(op, items);
 }
 
+/// The AND of `items`, balanced so a rewrite that regathers conjuncts keeps the depth
+/// at log n; null when there are none.
+pub fn andAll(self: *Parser, items: []const *ast.Expr) Error!?*ast.Expr {
+    if (items.len == 0) return null;
+    return try self.buildBalanced(.@"and", items);
+}
+
 pub fn buildBalanced(self: *Parser, op: ast.BinOp, items: []const *ast.Expr) Error!*ast.Expr {
     if (items.len == 1) return items[0];
     const mid = items.len / 2;

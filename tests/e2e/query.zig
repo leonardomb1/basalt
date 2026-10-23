@@ -2109,3 +2109,23 @@ test "a WHERE narrowed twice keeps every column of the surviving rows, those no 
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT s, c FROM '$B/w.csv' WHERE a < 10 AND a < 20;", 1, &.{});
     try expectFile(&tmp, "o.csv", want1.items);
 }
+
+test "a LEFT JOIN's ON with thousands of conjuncts stays shallow once split into keys, narrowing and residual" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "jl.csv", .data = "x,y\n1,1\n2,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "jr.csv", .data = "x,z\n1,9999999\n2,5\n" });
+    for ([_]bool{ false, true }) |both_sides| {
+        var q = std.array_list.Managed(u8).init(alloc);
+        defer q.deinit();
+        try q.appendSlice("LOAD INTO '$B/o.csv' AS SELECT a.x, b.z FROM '$B/jl.csv' a LEFT JOIN '$B/jr.csv' b ON a.x = b.x");
+        for (0..3000) |k| {
+            try q.appendSlice(" AND ");
+            try q.writer().print("{s}b.z > {d}", .{ if (both_sides) "a.y + " else "", k });
+        }
+        try q.append(';');
+        try checkAndRun(alloc, &tmp, q.items, 1, &.{});
+        try expectFile(&tmp, "o.csv", "x,z\n1,9999999\n2,\n");
+    }
+}

@@ -985,6 +985,7 @@ pub const Parser = struct {
     pub const deeperThan = @import("parse/expr.zig").deeperThan;
     pub const balanceChain = @import("parse/expr.zig").balanceChain;
     pub const buildBalanced = @import("parse/expr.zig").buildBalanced;
+    pub const andAll = @import("parse/expr.zig").andAll;
     pub const BinInfo = struct { op: ast.BinOp, lbp: u8 };
 
     pub const binInfo = @import("parse/expr.zig").binInfo;

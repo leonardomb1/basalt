@@ -984,7 +984,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var left_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var right_computed = std.array_list.Managed(ast.SelectItem).init(self.arena);
         var deferred = std.array_list.Managed(ast.DeferredKey).init(self.arena);
-        var residual: ?*ast.Expr = null;
+        var residual = std.array_list.Managed(*ast.Expr).init(self.arena);
         var using_sel: ?[]const ast.SelectItem = null;
         for (lateral_keys) |lk| {
             try left_keys.append(stripQual(lk.left, &aliases));
@@ -1012,14 +1012,14 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const on = try self.parseExpr();
             var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
             try splitAnd(on, &conj);
-            var narrow: ?*ast.Expr = null;
+            var narrow_l = std.array_list.Managed(*ast.Expr).init(self.arena);
             for (conj.items) |c| {
                 if (ast.hasSearch(c)) {
                     if (kind == .inner) {
                         try post_filters.append(c);
                     } else {
                         const e = try self.stripExpr(c, &aliases);
-                        residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                        try residual.append(e);
                     }
                     continue;
                 }
@@ -1091,21 +1091,22 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 const right_only = !sidesOf(c, rname).other;
                 if (right_only and (kind == .inner or kind == .left)) {
                     const e = try self.stripRightExpr(c, rname);
-                    narrow = if (narrow) |n| try self.mk(.{ .binary = .{ .op = .@"and", .l = n, .r = e } }) else e;
+                    try narrow_l.append(e);
                 } else if (kind == .inner) {
                     try post_filters.append(c);
                 } else {
                     const e = try self.stripExpr(c, &aliases);
-                    residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                    try residual.append(e);
                 }
             }
             if (left_keys.items.len == 0 and deferred.items.len == 0) {
                 for (post_filters.items) |c| {
                     const e = try self.stripExpr(c, &aliases);
-                    residual = if (residual) |r| try self.mk(.{ .binary = .{ .op = .@"and", .l = r, .r = e } }) else e;
+                    try residual.append(e);
                 }
                 post_filters.clearRetainingCapacity();
             }
+            const narrow = try self.andAll(narrow_l.items);
             if (narrow != null or right_computed.items.len > 0) {
                 const name = try self.freshName("__derived{d}_on");
                 var st = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -1139,7 +1140,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .right_keys = try right_keys.toOwnedSlice(),
                 .pins = try pins.toOwnedSlice(),
                 .deferred = try deferred.toOwnedSlice(),
-                .residual = residual,
+                .residual = try self.andAll(residual.items),
             } },
             .hints = try jhints.toOwnedSlice(),
             .pos = jpos,
