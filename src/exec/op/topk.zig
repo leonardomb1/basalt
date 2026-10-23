@@ -26,7 +26,6 @@ const Sort = @import("sort.zig").Sort;
 const Threshold = @import("../value.zig").Threshold;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
-const dupeValue = @import("aggregate.zig").dupeValue;
 const keyhash = @import("../keyhash.zig");
 const keytable = @import("../keytable.zig");
 const leadExact = @import("sort.zig").leadExact;
@@ -185,47 +184,48 @@ pub const TopK = struct {
     /// Each row's group, made when its key is new; none listed without partition keys,
     /// whose one group is 0.
     fn groupIds(self: *TopK, scratch: std.mem.Allocator, b: Batch) ![]const u32 {
-        const sa = self.state.allocator();
         if (self.part.len == 0) {
             if (self.groups.items.len == 0) try self.groups.append(self.gpa, .{});
             return &.{};
         }
         const gid = try scratch.alloc(u32, b.len);
         const l = try self.lookupOf();
+        const hashes = try scratch.alloc(u64, b.len);
         switch (l.store) {
             .fixed => |st| {
                 const e = try l.enc.?.encode(scratch, b.columns, b.len, self.interner(), false);
-                const hashes = try scratch.alloc(u64, b.len);
                 for (hashes, 0..) |*h, r| h.* = e.hash(r);
-                for (0..b.len) |r| {
-                    if (r + keytable.prefetch_ahead < b.len) l.table.prefetch(hashes[r + keytable.prefetch_ahead]);
-                    const key = e.key(r);
-                    const f = try l.table.getOrPut(hashes[r], key, st, @intCast(st.len));
-                    if (!f.found) {
-                        const nr = try st.push(hashes[r]);
-                        @memcpy(nr.keys, key.vals);
-                        nr.mask.* = key.mask;
-                        try self.groups.append(self.gpa, .{});
-                    }
-                    gid[r] = f.slot;
-                }
+                var v = GroupIds(FixedStore){ .self = self, .tb = &l.table, .st = st, .gid = gid };
+                try keytable.probe(FixedStore, .dupe, &keytable.Runs(i64).over(e.nk, &.{}, hashes, e.keys, e.masks), 0, b.len, &v);
             },
             .boxed => |st| {
-                const probe = try scratch.alloc(Value, self.part.len);
-                for (0..b.len) |r| {
+                const nk = self.part.len;
+                const probes = try scratch.alloc(Value, b.len * nk);
+                for (hashes, 0..) |*h, r| {
+                    const probe = probes[r * nk ..][0..nk];
                     for (self.part, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
-                    const h = keyhash.MultiKeyCtx.hash(.{}, probe);
-                    const f = try l.table.getOrPut(h, @as([]const Value, probe), st, @intCast(st.len));
-                    if (!f.found) {
-                        const nr = try st.push(h);
-                        for (nr.keys, probe) |*o, v| o.* = try dupeValue(sa, v);
-                        try self.groups.append(self.gpa, .{});
-                    }
-                    gid[r] = f.slot;
+                    h.* = keyhash.MultiKeyCtx.hash(.{}, probe);
                 }
+                var v = GroupIds(BoxedStore){ .self = self, .tb = &l.table, .st = st, .gid = gid };
+                try keytable.probe(BoxedStore, .dupe, &keytable.Runs(Value).over(nk, &.{}, hashes, probes, &.{}), 0, b.len, &v);
             },
         }
         return gid;
+    }
+
+    /// `groupIds`' side of `keytable.probe`: each row's group, a new key's made.
+    fn GroupIds(comptime Store: type) type {
+        return struct {
+            self: *TopK,
+            tb: *keytable.GroupTable,
+            st: *Store,
+            gid: []u32,
+
+            pub inline fn hit(c: *@This(), r: usize, _: u64, _: anytype, x: keytable.Hit(Store)) !void {
+                if (!x.found) try c.self.groups.append(c.self.gpa, .{});
+                c.gid[r] = x.slot;
+            }
+        };
     }
 
     fn lookupOf(self: *TopK) !*Lookup {

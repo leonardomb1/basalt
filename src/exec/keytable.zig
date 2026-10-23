@@ -157,13 +157,19 @@ pub inline fn partOf(h: u64) usize {
 /// partition nothing is copied: the accessors read the given arrays through the rows.
 pub fn Runs(comptime K: type) type {
     return struct {
-        starts: []u32,
+        starts: []const u32,
         rows: []const u32,
         hashes: []const u64,
         keys: []const K,
         masks: []const u64,
         nk: usize,
         laid: bool,
+
+        /// The given arrays read in place, item `d` being row `rows[d]` (row `d` when
+        /// `rows` is empty), with no partitions.
+        pub fn over(nk: usize, rows: []const u32, hashes: []const u64, keys: []const K, masks: []const u64) @This() {
+            return .{ .starts = &.{}, .rows = rows, .hashes = hashes, .keys = keys, .masks = masks, .nk = nk, .laid = false };
+        }
 
         pub fn init(a: std.mem.Allocator, nparts: usize, nk: usize, pof: []const u8, rows_in: []const u32, hashes_in: []const u64, keys_in: []const K, masks_in: []const u64) !@This() {
             const m = pof.len;
@@ -214,6 +220,104 @@ pub fn Runs(comptime K: type) type {
         pub inline fn key(self: @This(), d: usize) []const K {
             return self.keys[self.slot(d) * self.nk ..][0..self.nk];
         }
+
+        pub inline fn probeKey(self: @This(), d: usize) if (K == i64) FixedKey else []const K {
+            return if (K == i64) .{ .vals = self.key(d), .mask = self.mask(d) } else self.key(d);
+        }
+    };
+}
+
+/// Boxed keys read from columns `idx` of `cols` a row at a time into `buf`, for keys
+/// whose rows a table may alias: item `d` is row `rows[d]`, its hash `hashes` by row.
+pub const ValueRows = struct {
+    cols: []const column.Column,
+    idx: []const usize,
+    buf: []Value,
+    hashes: []const u64,
+    rows: []const u32,
+
+    pub inline fn row(self: ValueRows, d: usize) usize {
+        return self.rows[d];
+    }
+
+    pub inline fn hash(self: ValueRows, d: usize) u64 {
+        return self.hashes[self.rows[d]];
+    }
+
+    pub inline fn probeKey(self: ValueRows, d: usize) []const Value {
+        const r = self.rows[d];
+        for (self.idx, self.buf) |ci, *v| v.* = self.cols[ci].getValue(r);
+        return self.buf;
+    }
+};
+
+/// How a new record keeps a boxed key: the probe's values themselves (`alias`, for
+/// rows that outlive the table), copied into the store's allocator (`dupe`), or
+/// canonicalized and copied (`canon`). A fixed key's words are always copied.
+pub const KeyCopy = enum { alias, dupe, canon };
+
+/// What a probe hook settles for a row before its lookup: look it up (`probe`), take it
+/// as handled (`done`), or treat its key as absent (`miss`).
+pub const Early = enum { probe, done, miss };
+
+pub fn Hit(comptime Store: type) type {
+    return struct { rec: Store.Rec, slot: u32, found: bool };
+}
+
+/// The record holding `key` in `store` under `table`, pushed when new with its key
+/// kept as `copy` says. A bounded table that skips its lookup pushes a new record.
+pub inline fn upsert(table: *GroupTable, store: anytype, h: u64, key: anytype, comptime copy: KeyCopy) !Hit(@TypeOf(store.*)) {
+    const f = try table.getOrPut(h, key, store, @intCast(store.len));
+    const rec = if (f.found) store.at(f.slot) else try store.pushKey(h, key, copy);
+    return .{ .rec = rec, .slot = f.slot, .found = f.found };
+}
+
+/// The probe-or-insert loop every hash operator runs: items `lo..hi` of `items` (a
+/// `Runs` or `ValueRows`), each looked up in `v.table(h)` over `v.store(h)` (or the one
+/// table `v.tb` over `v.st`) with the slot `prefetch_ahead` items on prefetched. `v.early(r, key)`, when declared, settles
+/// row `r` first. Each row looked up then has `v.hit(r, h, key, hit)`, its record made
+/// by `upsert`. When `v` has a `frozen` field and it is set, nothing is inserted: a key
+/// not held, or a row `early` calls absent, has `v.miss(r, h)` instead.
+pub fn probe(comptime Store: type, comptime copy: KeyCopy, items: anytype, lo: usize, hi: usize, v: anytype) !void {
+    const V = @typeInfo(@TypeOf(v)).pointer.child;
+    const can_freeze = @hasField(V, "frozen");
+    for (lo..hi) |d| {
+        if (d + prefetch_ahead < hi) {
+            const ph = items.hash(d + prefetch_ahead);
+            tableOf(v, ph).prefetch(ph);
+        }
+        const r = items.row(d);
+        const h = items.hash(d);
+        const key = items.probeKey(d);
+        if (@hasDecl(V, "early")) switch (v.early(r, key)) {
+            .probe => {},
+            .done => continue,
+            .miss => {
+                if (can_freeze) try v.miss(r, h);
+                continue;
+            },
+        };
+        const t = tableOf(v, h);
+        const st: *Store = if (@hasDecl(V, "store")) v.store(h) else v.st;
+        if (can_freeze and v.frozen) {
+            if (t.find(h, key, st)) |slot| {
+                try v.hit(r, h, key, Hit(Store){ .rec = st.at(slot), .slot = slot, .found = true });
+            } else try v.miss(r, h);
+            continue;
+        }
+        try v.hit(r, h, key, try upsert(t, st, h, key, copy));
+    }
+}
+
+inline fn tableOf(v: anytype, h: u64) *GroupTable {
+    return if (@hasDecl(@typeInfo(@TypeOf(v)).pointer.child, "table")) v.table(h) else v.tb;
+}
+
+fn ownValue(a: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
+        else => v,
     };
 }
 
@@ -310,6 +414,13 @@ pub fn FixedStore(comptime P: type) type {
             self.len += 1;
             self.payload.clear(rec.tail);
             return rec;
+        }
+
+        pub fn pushKey(self: *@This(), h: u64, key: FixedKey, comptime _: KeyCopy) !Rec {
+            const nr = try self.push(h);
+            @memcpy(nr.keys, key.vals);
+            nr.mask.* = key.mask;
+            return nr;
         }
     };
 }
@@ -562,6 +673,20 @@ pub fn GroupStore(comptime P: type) type {
             self.len += 1;
             self.payload.clear(rec.tail);
             return rec;
+        }
+
+        pub fn pushKey(self: *@This(), h: u64, key: []const Value, comptime copy: KeyCopy) !Rec {
+            const nr = try self.push(h);
+            switch (copy) {
+                .alias => @memcpy(nr.keys, key),
+                .dupe => for (nr.keys, key) |*o, v| {
+                    o.* = try ownValue(self.recs.alloc, v);
+                },
+                .canon => for (nr.keys, key) |*o, v| {
+                    o.* = try ownValue(self.recs.alloc, keyhash.canonValue(v));
+                },
+            }
+            return nr;
         }
     };
 }
@@ -894,4 +1019,101 @@ test "a bounded table grows toward its max while its keys repeat, then clears" {
     try std.testing.expect(st_capped.len > 40);
     try std.testing.expect(capped.len < 40);
     try std.testing.expectEqual(@as(u32, 0), capped.skip);
+}
+
+/// A `probe` side for tests: each row's slot, a row of a missing key marked.
+fn TestSide(comptime Store: type) type {
+    return struct {
+        tb: *GroupTable,
+        st: *Store,
+        slots: []u32,
+        frozen: bool = false,
+        misses: usize = 0,
+
+        pub fn hit(c: *@This(), r: usize, _: u64, key: anytype, x: Hit(Store)) !void {
+            if (Store == FixedStore(NoPayload)) {
+                try std.testing.expectEqualSlices(i64, key.vals, x.rec.keys);
+                try std.testing.expectEqual(key.mask, x.rec.mask.*);
+            } else try std.testing.expect(keyhash.MultiKeyCtx.eql(.{}, key, x.rec.keys));
+            c.slots[r] = x.slot;
+        }
+
+        pub fn miss(c: *@This(), r: usize, _: u64) !void {
+            c.slots[r] = std.math.maxInt(u32);
+            c.misses += 1;
+        }
+    };
+}
+
+test "probe: two-column keys with NULLs just past each table bound keep one record a key, frozen tables miss new keys" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const payload = NoPayload{};
+    for ([_]usize{ 1 << 10, few_groups, Direct.len }) |bound| {
+        const nkeys = bound + 1;
+        const n = 2 * nkeys + 7;
+        const keys = try a.alloc(i64, 2 * n);
+        const masks = try a.alloc(u64, n);
+        const hashes = try a.alloc(u64, n);
+        for (0..n) |r| {
+            const k = (r * 7919) % nkeys;
+            keys[2 * r] = @intCast(k / 3);
+            keys[2 * r + 1] = if (k % 3 == 0) 0 else @intCast(k % 3);
+            masks[r] = if (k % 3 == 0) 2 else 0;
+            hashes[r] = fixedHash(keys[2 * r ..][0..2], masks[r]);
+        }
+        const runs = Runs(i64).over(2, &.{}, hashes, keys, masks);
+        var tb = try GroupTable.init(std.testing.allocator, 16);
+        defer tb.deinit();
+        var st = FixedStore(NoPayload).init(a, 2, &payload);
+        var side = TestSide(FixedStore(NoPayload)){ .tb = &tb, .st = &st, .slots = try a.alloc(u32, n) };
+        try probe(FixedStore(NoPayload), .alias, &runs, 0, n, &side);
+        try std.testing.expectEqual(nkeys, st.len);
+        for (0..n - nkeys) |r| try std.testing.expectEqual(side.slots[r], side.slots[r + nkeys]);
+
+        var bounded = try GroupTable.initBounded(std.testing.allocator, 1 << 10, 1 << 10);
+        defer bounded.deinit();
+        var bst = FixedStore(NoPayload).init(a, 2, &payload);
+        var bside = TestSide(FixedStore(NoPayload)){ .tb = &bounded, .st = &bst, .slots = try a.alloc(u32, n) };
+        try probe(FixedStore(NoPayload), .alias, &runs, 0, n, &bside);
+        try std.testing.expect(bst.len >= nkeys);
+
+        const held = try a.dupe(u32, side.slots);
+        for (0..n) |r| if (r % 2 == 0) {
+            keys[2 * r] += @intCast(bound);
+            hashes[r] = fixedHash(keys[2 * r ..][0..2], masks[r]);
+        };
+        side.frozen = true;
+        try probe(FixedStore(NoPayload), .alias, &runs, 0, n, &side);
+        try std.testing.expectEqual(nkeys, st.len);
+        try std.testing.expectEqual((n + 1) / 2, side.misses);
+        for (0..n) |r| if (r % 2 == 1) try std.testing.expectEqual(held[r], side.slots[r]);
+    }
+}
+
+test "probe: boxed string keys are copied once a key and found again" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const payload = NoPayload{};
+    const n = 3000;
+    const vals = try a.alloc(Value, 2 * n);
+    const hashes = try a.alloc(u64, n);
+    for (0..n) |r| {
+        vals[2 * r] = .{ .string = try std.fmt.allocPrint(a, "k{d}", .{r % 1025}) };
+        vals[2 * r + 1] = if (r % 1025 % 5 == 0) .null else .{ .float = if (r % 2 == 0) -0.0 else 0.0 };
+        hashes[r] = keyhash.MultiKeyCtx.hash(.{}, vals[2 * r ..][0..2]);
+    }
+    var tb = try GroupTable.init(std.testing.allocator, 16);
+    defer tb.deinit();
+    var st = GroupStore(NoPayload).init(a, 2, &payload);
+    var side = TestSide(GroupStore(NoPayload)){ .tb = &tb, .st = &st, .slots = try a.alloc(u32, n) };
+    try probe(GroupStore(NoPayload), .canon, &Runs(Value).over(2, &.{}, hashes, vals, &.{}), 0, n, &side);
+    try std.testing.expectEqual(@as(usize, 1025), st.len);
+    for (0..st.len) |i| {
+        const k = st.at(i).keys;
+        try std.testing.expect(k[0].string.ptr != vals[2 * i].string.ptr);
+        if (k[1] == .float) try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(k[1].float)));
+    }
 }

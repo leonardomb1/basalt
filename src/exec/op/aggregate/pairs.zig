@@ -18,7 +18,6 @@ const Kernel = @import("kernel.zig").Kernel;
 const Layout = @import("kernel.zig").Layout;
 const Value = @import("../../value.zig").Value;
 const column = @import("../../column.zig");
-const dupeValue = @import("funcs.zig").dupeValue;
 const eval = @import("../../eval.zig");
 const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
@@ -189,18 +188,26 @@ pub const Pairs = struct {
         if (self.kind != null) {
             const runs = try keytable.Runs(i64).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, keys, &.{});
             for (self.parts, 0..) |*part, p| {
-                const hi = runs.starts[p + 1];
-                for (runs.starts[p]..hi) |d| {
-                    if (d + keytable.prefetch_ahead < hi) part.table.prefetch(runs.hash(d + keytable.prefetch_ahead));
-                    try put(part, runs.hash(d), runs.key(d));
-                }
+                var v = Record(FixedStore){ .tb = &part.table, .st = part.store.fixed };
+                try keytable.probe(FixedStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
             }
         } else {
             const runs = try keytable.Runs(Value).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, probes, &.{});
             for (self.parts, 0..) |*part, p| {
-                for (runs.starts[p]..runs.starts[p + 1]) |d| try putBoxed(part, runs.hash(d), runs.key(d));
+                var v = Record(GroupStore){ .tb = &part.table, .st = part.store.boxed };
+                try keytable.probe(GroupStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
             }
         }
+    }
+
+    /// `add`'s side of `keytable.probe`: a pair only recorded.
+    fn Record(comptime S: type) type {
+        return struct {
+            tb: *GroupTable,
+            st: *S,
+
+            pub inline fn hit(_: *@This(), _: usize, _: u64, _: anytype, _: keytable.Hit(S)) !void {}
+        };
     }
 
     /// Which codes of dictionary `d` a global aggregate has paired already, kept while
@@ -222,22 +229,11 @@ pub const Pairs = struct {
     }
 
     fn put(part: *Part, h: u64, key: []const i64) !void {
-        const st = part.store.fixed;
-        const k = keytable.FixedKey{ .vals = key, .mask = 0 };
-        const f = try part.table.getOrPut(h, k, st, @intCast(st.len));
-        if (f.found) return;
-        const nr = try st.push(h);
-        nr.keys[0] = key[0];
-        if (key.len > 1) nr.keys[1] = key[1];
-        nr.mask.* = 0;
+        _ = try keytable.upsert(&part.table, part.store.fixed, h, keytable.FixedKey{ .vals = key, .mask = 0 }, .dupe);
     }
 
     fn putBoxed(part: *Part, h: u64, key: []const Value) !void {
-        const st = part.store.boxed;
-        const f = try part.table.getOrPut(h, key, st, @intCast(st.len));
-        if (f.found) return;
-        const nr = try st.push(h);
-        for (nr.keys, key) |*o, v| o.* = try dupeValue(part.alloc, v);
+        _ = try keytable.upsert(&part.table, part.store.boxed, h, key, .dupe);
     }
 
     /// Source partition `sp` of `src` into partition `dp`, each grouped pair's group

@@ -192,28 +192,39 @@ fn mergeOne(ctx: *MergeCtx, p: usize) !void {
     var table = try keytable.GroupTable.init(a, keytable.GroupTable.capFor(rows));
     const nk = ctx.keys.idx.len;
     if (ctx.keys.kinds != null) {
-        var st = keytable.FixedStore(keytable.NoPayload).init(a, nk, &no_payload);
-        for (ctx.items) |*item| for (item.pieces.items) |pc| for (pc.order[pc.starts[p]..pc.starts[p + 1]]) |r| {
-            const key = pc.enc.?.key(r);
-            const f = try table.getOrPut(pc.hashes[r], key, &st, @intCast(st.len));
-            if (f.found) continue;
-            const nr = try st.push(pc.hashes[r]);
-            @memcpy(nr.keys, key.vals);
-            nr.mask.* = key.mask;
-            pc.keep[r] = true;
+        var st = FixedStore.init(a, nk, &no_payload);
+        for (ctx.items) |*item| for (item.pieces.items) |pc| {
+            const e = pc.enc.?;
+            const order = pc.order[pc.starts[p]..pc.starts[p + 1]];
+            var v = KeepFirst(FixedStore){ .tb = &table, .st = &st, .keep = pc.keep };
+            try keytable.probe(FixedStore, .alias, &keytable.Runs(i64).over(nk, order, pc.hashes, e.keys, e.masks), 0, order.len, &v);
         };
     } else {
-        var st = keytable.GroupStore(keytable.NoPayload).init(a, nk, &no_payload);
+        var st = BoxedStore.init(a, nk, &no_payload);
         const probe = try a.alloc(Value, nk);
-        for (ctx.items) |*item| for (item.pieces.items) |pc| for (pc.order[pc.starts[p]..pc.starts[p + 1]]) |r| {
-            for (ctx.keys.idx, probe) |ci, *v| v.* = pc.batch.columns[ci].getValue(r);
-            const f = try table.getOrPut(pc.hashes[r], @as([]const Value, probe), &st, @intCast(st.len));
-            if (f.found) continue;
-            const nr = try st.push(pc.hashes[r]);
-            @memcpy(nr.keys, probe);
-            pc.keep[r] = true;
+        for (ctx.items) |*item| for (item.pieces.items) |pc| {
+            const order = pc.order[pc.starts[p]..pc.starts[p + 1]];
+            var v = KeepFirst(BoxedStore){ .tb = &table, .st = &st, .keep = pc.keep };
+            const vals = keytable.ValueRows{ .cols = pc.batch.columns, .idx = ctx.keys.idx, .buf = probe, .hashes = pc.hashes, .rows = order };
+            try keytable.probe(BoxedStore, .alias, &vals, 0, order.len, &v);
         };
     }
+}
+
+const FixedStore = keytable.FixedStore(keytable.NoPayload);
+const BoxedStore = keytable.GroupStore(keytable.NoPayload);
+
+/// `mergeOne`'s side of `keytable.probe`: the first row of each key kept.
+fn KeepFirst(comptime Store: type) type {
+    return struct {
+        tb: *keytable.GroupTable,
+        st: *Store,
+        keep: []bool,
+
+        pub inline fn hit(c: *@This(), r: usize, _: u64, _: anytype, x: keytable.Hit(Store)) !void {
+            if (!x.found) c.keep[r] = true;
+        }
+    };
 }
 
 const no_payload = keytable.NoPayload{};

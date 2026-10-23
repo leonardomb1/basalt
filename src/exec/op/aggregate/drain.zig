@@ -18,13 +18,11 @@ const Pairs = @import("pairs.zig").Pairs;
 const Rows = @import("kernel.zig").Rows;
 const inAggregate = @import("accumulate.zig").inAggregate;
 const Value = @import("../../value.zig").Value;
-const dupeValue = @import("../aggregate.zig").dupeValue;
 const few_groups = Aggregate.few_groups;
 const keyKindOf = Aggregate.keyKindOf;
 const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
 const Encoder = keytable.Encoder;
-const prefetch_ahead = Aggregate.prefetch_ahead;
 const spill_parts = @import("../spill_parts.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -184,6 +182,54 @@ fn foldRows(self: *Aggregate, pull: std.mem.Allocator, b: Batch, layout: *const 
     }
 }
 
+/// The fold's side of `keytable.probe`: each row's group record and partition noted,
+/// a new group given its ordinal, and once frozen a row of an absent key marked for
+/// its spill file.
+fn Fold(comptime Store: type) type {
+    return struct {
+        self: *Aggregate,
+        parts: []FoldPart(Store),
+        layout: *const Layout,
+        tails: []?[*]u8,
+        pidx: []u8,
+        dest: []u8,
+        frozen: bool,
+        direct: ?*Direct = null,
+        nspill: usize = 0,
+
+        pub inline fn table(c: *@This(), h: u64) *GroupTable {
+            return &c.parts[h >> part_shift].table;
+        }
+
+        pub inline fn store(c: *@This(), h: u64) *Store {
+            return c.parts[h >> part_shift].store;
+        }
+
+        pub inline fn early(c: *@This(), r: usize, key: anytype) keytable.Early {
+            if (Store != FixedStore) return .probe;
+            if (c.direct) |dr| if (dr.find(key)) |got| {
+                c.tails[r] = got.tail;
+                c.pidx[r] = got.part;
+                return .done;
+            };
+            return if (c.frozen and c.dest[r] != spill_parts.keep) .miss else .probe;
+        }
+
+        pub inline fn hit(c: *@This(), r: usize, h: u64, key: anytype, x: keytable.Hit(Store)) !void {
+            const pi: u8 = @intCast(h >> part_shift);
+            if (!x.found) c.layout.setOrd(x.rec.tail, x.slot);
+            c.tails[r] = x.rec.tail;
+            c.pidx[r] = pi;
+            if (Store == FixedStore and !c.frozen) if (c.direct) |dr| dr.note(key, x.rec.tail, pi);
+        }
+
+        pub inline fn miss(c: *@This(), r: usize, h: u64) !void {
+            c.dest[r] = c.self.destOf(h);
+            c.nspill += 1;
+        }
+    };
+}
+
 /// Fold with raw fixed-width keys. Floats group by number, not bits, as everywhere
 /// else (-0.0 split from 0.0 before). Below `few_groups` rows go in arrival order;
 /// past it a batch is walked a partition at a time so probes share a table.
@@ -231,48 +277,10 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         for (pof, live[0..m]) |*p, r| p.* = if (by_part) @intCast(hashes[r] >> part_shift) else 0;
         const runs = try keytable.Runs(i64).init(pull, if (by_part) fold_parts else 1, e.nk, pof, live[0..m], hashes, e.keys, e.masks);
 
-        var nspill: usize = 0;
-        for (0..m) |d| {
-            if (d + prefetch_ahead < m) {
-                const ph = runs.hash(d + prefetch_ahead);
-                parts[ph >> part_shift].table.prefetch(ph);
-            }
-            const ri = runs.row(d);
-            const h = runs.hash(d);
-            const key = Aggregate.FixedKey{ .vals = runs.key(d), .mask = runs.mask(d) };
-            if (direct) |*dr| if (dr.find(key)) |hit| {
-                tails[ri] = hit.tail;
-                pidx[ri] = hit.part;
-                continue;
-            };
-            const pi = h >> part_shift;
-            const part = &parts[pi];
-            if (frozen) {
-                const slot = if (dest[ri] == spill_parts.keep) part.table.find(h, key, part.store) else null;
-                if (slot) |sl| {
-                    tails[ri] = part.store.at(sl).tail;
-                    pidx[ri] = @intCast(pi);
-                } else {
-                    dest[ri] = self.destOf(h);
-                    nspill += 1;
-                }
-                continue;
-            }
-            const at: u32 = @intCast(part.store.len);
-            const f = try part.table.getOrPut(h, key, part.store, at);
-            const rec = if (f.found) part.store.at(f.slot) else blk: {
-                const nr = try part.store.push(h);
-                for (nr.keys, key.vals) |*o, v| o.* = v;
-                nr.mask.* = key.mask;
-                layout.setOrd(nr.tail, at);
-                break :blk nr;
-            };
-            tails[ri] = rec.tail;
-            pidx[ri] = @intCast(pi);
-            if (direct) |*dr| dr.note(key, rec.tail, @intCast(pi));
-        }
+        var fold = Fold(FixedStore){ .self = self, .parts = parts, .layout = layout, .tails = tails, .pidx = pidx, .dest = dest, .frozen = frozen, .direct = if (direct) |*d| d else null };
+        try keytable.probe(FixedStore, .alias, &runs, 0, m, &fold);
 
-        if (nspill > 0) try self.spillRows(pull, b, dest);
+        if (fold.nspill > 0) try self.spillRows(pull, b, dest);
         if (counts_only) {
             for (tails[0..b.len]) |t| {
                 const cs: [*]i64 = @ptrCast(@alignCast(t orelse continue));
@@ -330,7 +338,6 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         const hashes = try pull.alloc(u64, b.len);
         const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
         @memset(dest, spill_parts.keep);
-        var nspill: usize = 0;
 
         var r: usize = 0;
         while (r < b.len) : (r += 1) {
@@ -349,36 +356,9 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         for (all, 0..) |*x, i| x.* = @intCast(i);
         const runs = try keytable.Runs(Value).init(pull, fold_parts, nk, pof, all, hashes, probes, &.{});
 
-        for (0..b.len) |d| {
-            if (d + prefetch_ahead < b.len) {
-                const ph = runs.hash(d + prefetch_ahead);
-                parts[ph >> part_shift].table.prefetch(ph);
-            }
-            r = runs.row(d);
-            const h = runs.hash(d);
-            const probe = runs.key(d);
-            const pi = h >> part_shift;
-            const part = &parts[pi];
-            const rec = if (frozen) blk: {
-                const sl = part.table.find(h, probe, part.store) orelse {
-                    dest[r] = self.destOf(h);
-                    nspill += 1;
-                    continue;
-                };
-                break :blk part.store.at(sl);
-            } else blk: {
-                const at: u32 = @intCast(part.store.len);
-                const f = try part.table.getOrPut(h, probe, part.store, at);
-                if (f.found) break :blk part.store.at(f.slot);
-                const nr = try part.store.push(h);
-                for (probe, nr.keys) |v, *o| o.* = try dupeValue(part.alloc, keyhash.canonValue(v));
-                layout.setOrd(nr.tail, at);
-                break :blk nr;
-            };
-            tails[r] = rec.tail;
-            pidx[r] = @intCast(pi);
-        }
-        if (nspill > 0) try self.spillRows(pull, b, dest);
+        var fold = Fold(GroupStore){ .self = self, .parts = parts, .layout = layout, .tails = tails, .pidx = pidx, .dest = dest, .frozen = frozen };
+        try keytable.probe(GroupStore, .canon, &runs, 0, b.len, &fold);
+        if (fold.nspill > 0) try self.spillRows(pull, b, dest);
         try foldRows(self, pull, b, layout, tails, parts, pidx);
         _ = scratch.reset(.retain_capacity);
     }

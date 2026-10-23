@@ -20,7 +20,6 @@ const spill_parts = @import("spill_parts.zig");
 const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
-const dupeValue = @import("aggregate.zig").dupeValue;
 const keyhash = @import("../keyhash.zig");
 const keytable = @import("../keytable.zig");
 const lane_min = 1 << 14;
@@ -228,44 +227,23 @@ pub const Distinct = struct {
             const frozen = self.overBudget();
             const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
             @memset(dest, spill_parts.keep);
+            @memset(keep, false);
             var nspill: usize = 0;
             var kept: usize = 0;
             switch (seen.store) {
                 .fixed => |st| {
                     const e = try seen.enc.?.encode(pull, b.columns, b.len, self.interner(), frozen);
-                    @memset(keep, false);
-                    const rows = if (seen.direct) |*d| try d.misses(e, pull) else null;
-                    const n = if (rows) |rs| rs.len else b.len;
-                    const hashes: []u64 = if (rows == null) try pull.alloc(u64, n) else &.{};
-                    for (hashes, 0..) |*h, i| h.* = e.hash(i);
+                    const rows: []const u32 = if (seen.direct) |*d| try d.misses(e, pull) else &.{};
+                    const n = if (seen.direct != null) rows.len else b.len;
+                    const hashes = try pull.alloc(u64, b.len);
                     for (0..n) |i| {
-                        const r = if (rows) |rs| rs[i] else i;
-                        const key = e.key(r);
-                        var h: u64 = undefined;
-                        if (seen.direct) |*d| {
-                            if (d.lookup(key) != null) continue;
-                            h = e.hash(r);
-                        } else {
-                            h = hashes[i];
-                            if (i + keytable.prefetch_ahead < n) seen.table.prefetch(hashes[i + keytable.prefetch_ahead]);
-                        }
-                        if (frozen) {
-                            const known = !(e.absent.len > 0 and e.absent[r]) and seen.table.find(h, key, st) != null;
-                            if (!known) {
-                                dest[r] = spill_parts.partOf(h, self.spill_depth);
-                                nspill += 1;
-                            }
-                            continue;
-                        }
-                        const f = try seen.table.getOrPut(h, key, st, @intCast(st.len));
-                        if (f.found) continue;
-                        const nr = try st.push(h);
-                        @memcpy(nr.keys, key.vals);
-                        nr.mask.* = key.mask;
-                        if (seen.direct) |*d| d.note(key, nr.tail, 0);
-                        keep[r] = true;
-                        kept += 1;
+                        const r = if (seen.direct != null) rows[i] else i;
+                        hashes[r] = e.hash(r);
                     }
+                    var v = Dedup(FixedStore){ .seen = seen, .tb = &seen.table, .st = st, .keep = keep, .dest = dest, .frozen = frozen, .depth = self.spill_depth, .absent = e.absent };
+                    try keytable.probe(FixedStore, .dupe, &keytable.Runs(i64).over(e.nk, rows, hashes, e.keys, e.masks), 0, n, &v);
+                    nspill = v.nspill;
+                    kept = v.kept;
                 },
                 .boxed => |st| {
                     const nk = seen.key_idx.len;
@@ -276,23 +254,10 @@ pub const Distinct = struct {
                         for (seen.key_idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
                         hashes[r] = keyhash.MultiKeyCtx.hash(.{}, probe);
                     }
-                    for (0..b.len) |r| {
-                        const probe: []const Value = probes[r * nk ..][0..nk];
-                        if (frozen) {
-                            keep[r] = false;
-                            if (seen.table.find(hashes[r], probe, st) == null) {
-                                dest[r] = spill_parts.partOf(hashes[r], self.spill_depth);
-                                nspill += 1;
-                            }
-                            continue;
-                        }
-                        const f = try seen.table.getOrPut(hashes[r], probe, st, @intCast(st.len));
-                        keep[r] = !f.found;
-                        if (f.found) continue;
-                        const nr = try st.push(hashes[r]);
-                        for (nr.keys, probe) |*o, v| o.* = try dupeValue(self.state, v);
-                        kept += 1;
-                    }
+                    var v = Dedup(BoxedStore){ .seen = seen, .tb = &seen.table, .st = st, .keep = keep, .dest = dest, .frozen = frozen, .depth = self.spill_depth };
+                    try keytable.probe(BoxedStore, .dupe, &keytable.Runs(Value).over(nk, &.{}, hashes, probes, &.{}), 0, b.len, &v);
+                    nspill = v.nspill;
+                    kept = v.kept;
                 },
             }
             if (nspill > 0) try self.spillRows(pull, b, dest);
@@ -317,6 +282,40 @@ pub const Distinct = struct {
         return null;
     }
 };
+
+/// Dedup's side of `keytable.probe`: a row of a new key kept, and once frozen a row of
+/// an absent key marked for its spill file.
+fn Dedup(comptime Store: type) type {
+    return struct {
+        seen: *Distinct.Seen,
+        tb: *keytable.GroupTable,
+        st: *Store,
+        keep: []bool,
+        dest: []u8,
+        frozen: bool,
+        depth: u8,
+        absent: []const bool = &.{},
+        nspill: usize = 0,
+        kept: usize = 0,
+
+        pub inline fn early(c: *@This(), r: usize, key: anytype) keytable.Early {
+            if (Store == Distinct.FixedStore) if (c.seen.direct) |*d| if (d.lookup(key) != null) return .done;
+            return if (c.absent.len > 0 and c.absent[r]) .miss else .probe;
+        }
+
+        pub inline fn hit(c: *@This(), r: usize, _: u64, key: anytype, x: keytable.Hit(Store)) !void {
+            if (x.found) return;
+            if (Store == Distinct.FixedStore) if (c.seen.direct) |*d| d.note(key, x.rec.tail, 0);
+            c.keep[r] = true;
+            c.kept += 1;
+        }
+
+        pub inline fn miss(c: *@This(), r: usize, h: u64) !void {
+            c.dest[r] = spill_parts.partOf(h, c.depth);
+            c.nspill += 1;
+        }
+    };
+}
 
 fn newIn(a: std.mem.Allocator, v: anytype) !*@TypeOf(v) {
     const p = try a.create(@TypeOf(v));

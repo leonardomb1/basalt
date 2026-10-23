@@ -543,34 +543,29 @@ pub const JoinIndex = struct {
             pt.boxed = try b.alloc.create(keytable.GroupStore(Head));
             pt.boxed.* = .init(b.alloc, ix.keys.len, &head_payload);
             const nk = ix.keys.len;
-            var i = rows_.len;
-            while (i > 0) {
-                i -= 1;
-                if (i >= keytable.prefetch_ahead) pt.table.prefetch(b.hashes[rows_[i - keytable.prefetch_ahead]]);
-                const r = rows_[i];
-                const h = b.hashes[r];
-                if (b.enc) |e| {
-                    const key = e.key(r);
-                    const f = try pt.table.getOrPut(h, key, pt.fixed, @intCast(pt.fixed.len));
-                    const rec = if (f.found) pt.fixed.at(f.slot) else blk: {
-                        const nr = try pt.fixed.push(h);
-                        @memcpy(nr.keys, key.vals);
-                        nr.mask.* = key.mask;
-                        break :blk nr;
-                    };
-                    ix.link(Head.of(rec.tail), f.found, r);
-                } else {
-                    const v = b.vals[(b.nc + p) * nk ..][0..nk];
-                    for (ix.keys, v) |k, *x| x.* = ix.build_batch.columns[k].getValue(r);
-                    const f = try pt.table.getOrPut(h, @as([]const Value, v), pt.boxed, @intCast(pt.boxed.len));
-                    const rec = if (f.found) pt.boxed.at(f.slot) else blk: {
-                        const nr = try pt.boxed.push(h);
-                        @memcpy(nr.keys, v);
-                        break :blk nr;
-                    };
-                    ix.link(Head.of(rec.tail), f.found, r);
-                }
+            std.mem.reverse(u32, rows_);
+            if (b.enc) |e| {
+                var v = Link(keytable.FixedStore(Head)){ .ix = ix, .tb = &pt.table, .st = pt.fixed };
+                try keytable.probe(keytable.FixedStore(Head), .alias, &keytable.Runs(i64).over(nk, rows_, b.hashes, e.keys, e.masks), 0, rows_.len, &v);
+            } else {
+                var v = Link(keytable.GroupStore(Head)){ .ix = ix, .tb = &pt.table, .st = pt.boxed };
+                const vals = keytable.ValueRows{ .cols = ix.build_batch.columns, .idx = ix.keys, .buf = b.vals[(b.nc + p) * nk ..][0..nk], .hashes = b.hashes, .rows = rows_ };
+                try keytable.probe(keytable.GroupStore(Head), .alias, &vals, 0, rows_.len, &v);
             }
+        }
+
+        /// `fill`'s side of `keytable.probe`: each build row prepended to its key's
+        /// chain, the rows taken in reverse so a chain stays in build order.
+        fn Link(comptime Store: type) type {
+            return struct {
+                ix: *JoinIndex,
+                tb: *keytable.GroupTable,
+                st: *Store,
+
+                pub inline fn hit(c: *@This(), r: usize, _: u64, _: anytype, x: keytable.Hit(Store)) !void {
+                    c.ix.link(Head.of(x.rec.tail), x.found, r);
+                }
+            };
         }
     };
 
