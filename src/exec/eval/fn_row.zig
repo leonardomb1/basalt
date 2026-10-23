@@ -4,7 +4,6 @@ const Batch = @import("../batch.zig").Batch;
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const accNode = @import("row.zig").accNode;
-const addUnits = @import("time.zig").addUnits;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
 const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
@@ -12,12 +11,8 @@ const castValueTyped = @import("cast.zig").castValueTyped;
 const charWidth = @import("strings.zig").charWidth;
 const clip = @import("support.zig").clip;
 const compareValues = @import("support.zig").compareValues;
-const dateDiff = @import("time.zig").dateDiff;
-const daysFromCivil = @import("time.zig").daysFromCivil;
-const daysInMonth = @import("time.zig").daysInMonth;
 const eq = @import("support.zig").eq;
 const evalRow = @import("row.zig").evalRow;
-const extractField = @import("time.zig").extractField;
 const failWith = @import("support.zig").failWith;
 const json = @import("../json.zig");
 const jsonArrayArg = @import("row.zig").jsonArrayArg;
@@ -25,18 +20,11 @@ const jsonElementValue = @import("row.zig").jsonElementValue;
 const lambdaSlots = @import("row.zig").lambdaSlots;
 const literalOf = @import("row.zig").literalOf;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
-const mulI64 = @import("time.zig").mulI64;
 const reduceTypeAt = @import("row.zig").reduceTypeAt;
 const regex = @import("../regex.zig");
 const regexpFind = @import("support.zig").regexpFind;
 const regexErr = @import("support.zig").regexErr;
 const std = @import("std");
-const strftimeFmt = @import("time.zig").strftimeFmt;
-const strptimeFmt = @import("time.zig").strptimeFmt;
-const temporalMicros = @import("time.zig").temporalMicros;
-const timeUnit = @import("time.zig").timeUnit;
-const toI64 = @import("support.zig").toI64;
-const truncMicros = @import("time.zig").truncMicros;
 const valueToString = @import("format.zig").valueToString;
 const writeJsonValue = @import("row.zig").writeJsonValue;
 
@@ -169,17 +157,6 @@ pub const per_row = struct {
             try buf.appendSlice(try valueToString(arena, v));
         }
         return .{ .string = buf.items };
-    }
-
-    pub fn dateTruncExtract(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[1], batch, row);
-        if (v.isNull()) return .null;
-        const us = temporalMicros(v) orelse return error.TypeMismatch;
-        const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
-        return if (eq(c.name, "extract"))
-            Value{ .int = extractField(us, u) }
-        else
-            Value{ .timestamp = truncMicros(us, u) };
     }
 
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -406,88 +383,5 @@ pub const per_row = struct {
             .null => .null,
             .text => |t| .{ .string = t },
         };
-    }
-
-    pub fn dateAddDiff(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        if (c.args[0].* != .str_lit) return error.TypeMismatch;
-        const u = timeUnit(c.args[0].str_lit) orelse return error.TypeMismatch;
-        const a = try evalRow(arena, c.args[1], batch, row);
-        const b = try evalRow(arena, c.args[2], batch, row);
-        if (a.isNull() or b.isNull()) return .null;
-        if (eq(c.name, "date_add")) return try addUnits(b, u, toI64(a));
-        const a_us = temporalMicros(a) orelse return error.TypeMismatch;
-        const b_us = temporalMicros(b) orelse return error.TypeMismatch;
-        return Value{ .int = dateDiff(a_us, b_us, u) };
-    }
-
-    pub fn makeDate(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const yv = try evalRow(arena, c.args[0], batch, row);
-        const mv = try evalRow(arena, c.args[1], batch, row);
-        const dv = try evalRow(arena, c.args[2], batch, row);
-        if (yv.isNull() or mv.isNull() or dv.isNull()) return .null;
-        const y = toI64(yv);
-        const m = toI64(mv);
-        const d = toI64(dv);
-        const bad = "make_date: year {d}, month {d}, day {d} is not a date";
-        if (y < -1_000_000_000 or y > 1_000_000_000 or m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m)))
-            return failWith(error.CastFailed, bad, .{ y, m, d });
-        const days = daysFromCivil(y, @intCast(m), @intCast(d));
-        return Value{ .date = std.math.cast(i32, days) orelse return failWith(error.CastFailed, bad, .{ y, m, d }) };
-    }
-
-    pub fn epoch(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const us = temporalMicros(v) orelse return error.TypeMismatch;
-        return Value{ .int = @divFloor(us, 1_000_000) };
-    }
-
-    pub fn toTimestamp(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        return Value{ .timestamp = try epochMicros(v) };
-    }
-
-    /// Seconds since the epoch as microseconds, a fraction kept to the microsecond
-    /// as PostgreSQL's `to_timestamp` keeps it.
-    fn epochMicros(v: Value) EvalError!i64 {
-        switch (v) {
-            .float => |x| {
-                const us = @round(x * 1_000_000);
-                if (!std.math.isFinite(us) or @abs(us) > 9.2e18) return error.IntOverflow;
-                return @intFromFloat(us);
-            },
-            .decimal => |d| {
-                var q: i128 = d.unscaled;
-                var s: u8 = d.scale;
-                while (s < 6) : (s += 1) q = std.math.mul(i128, q, 10) catch return error.IntOverflow;
-                while (s > 6) : (s -= 1) q = @divTrunc(q + (if (s == 7) @as(i128, if (q < 0) -5 else 5) else 0), 10);
-                return std.math.cast(i64, q) orelse error.IntOverflow;
-            },
-            else => return mulI64(toI64(v), 1_000_000),
-        }
-    }
-
-    pub fn strftime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const fv = try evalRow(arena, c.args[1], batch, row);
-        if (fv.isNull()) return .null;
-        const us = temporalMicros(v) orelse return error.TypeMismatch;
-        return Value{ .string = try strftimeFmt(arena, us, try valueToString(arena, fv)) };
-    }
-
-    pub fn strptime(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const fv = try evalRow(arena, c.args[1], batch, row);
-        if (fv.isNull()) return .null;
-        const text = try valueToString(arena, v);
-        const fmt = try valueToString(arena, fv);
-        const us = strptimeFmt(text, fmt) orelse {
-            if (eq(c.name, "try_strptime")) return .null;
-            return failWith(error.CastFailed, "strptime: '{s}' is not a date in '{s}' (try_strptime gives null)", .{ clip(text), clip(fmt) });
-        };
-        return .{ .timestamp = us };
     }
 };

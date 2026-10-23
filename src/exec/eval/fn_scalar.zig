@@ -4,6 +4,7 @@
 
 const Cx = @import("scalar.zig").Cx;
 const Decimal = @import("../value.zig").Decimal;
+const pow10_i128 = @import("../value.zig").pow10_i128;
 const Numeric = @import("scalar.zig").Numeric;
 const Overload = @import("scalar.zig").Overload;
 const Type = @import("../../lang/types.zig").Type;
@@ -12,6 +13,9 @@ const ast = @import("../../lang/ast.zig");
 const roundDecimal = @import("cast.zig").roundDecimal;
 const roundHalfAway = @import("strings.zig").roundHalfAway;
 const roundOutScale = @import("cast.zig").roundOutScale;
+const time = @import("time.zig");
+const TimeUnit = time.TimeUnit;
+const clip = @import("support.zig").clip;
 const EvalError = @import("../eval.zig").EvalError;
 const caseMap = @import("strings.zig").caseMap;
 const caseMapInto = @import("strings.zig").caseMapInto;
@@ -334,7 +338,8 @@ pub fn Whole(comptime down: bool) type {
             return if (down) @floor(x) else @ceil(x);
         }
         pub fn dec(d: Decimal) Decimal {
-            const p = std.math.powi(i128, 10, d.scale) catch return .{ .unscaled = 0, .scale = 0 };
+            if (d.scale >= pow10_i128.len) return .{ .unscaled = 0, .scale = 0 };
+            const p = pow10_i128[d.scale];
             var q = @divTrunc(d.unscaled, p);
             if (@rem(d.unscaled, p) != 0) {
                 if (down and d.unscaled < 0) q -= 1;
@@ -407,6 +412,149 @@ const RoundDec = struct {
         return roundDecimal(d, digits orelse 0, roundOutScale(cx.call, d.scale)) orelse error.IntOverflow;
     }
 };
+
+/// `date_trunc`: a DATE or TIMESTAMP down to the start of its unit, as a TIMESTAMP.
+pub const DateTrunc = struct {
+    pub const args = .{ .unit, .temporal };
+    pub const result = .timestamp;
+    pub fn apply(_: Cx, u: TimeUnit, us: i64) EvalError!i64 {
+        return time.truncMicros(us, u);
+    }
+};
+
+pub const Extract = struct {
+    pub const args = .{ .unit, .temporal };
+    pub fn apply(_: Cx, u: TimeUnit, us: i64) EvalError!i64 {
+        return time.extractField(us, u);
+    }
+};
+
+pub const DateDiff = struct {
+    pub const args = .{ .unit, .temporal, .temporal };
+    pub const eval_all = true;
+    pub fn apply(_: Cx, u: TimeUnit, a: i64, b: i64) EvalError!i64 {
+        return time.dateDiff(a, b, u);
+    }
+};
+
+/// `date_add(unit, n, t)`: a DATE stays a DATE (a unit finer than a day is a
+/// TypeMismatch), a TIMESTAMP a TIMESTAMP.
+pub const DateAdd = Overload(struct {
+    pub const on = 2;
+    pub const variants = .{ DateAddDays, DateAddMicros };
+    pub fn pick(_: ast.Expr.Call, k: TypeKind) ?usize {
+        return switch (k) {
+            .date => 0,
+            .timestamp => 1,
+            else => null,
+        };
+    }
+});
+
+const DateAddDays = struct {
+    pub const args = .{ .unit, .int, .day };
+    pub const eval_all = true;
+    pub fn apply(_: Cx, u: TimeUnit, n: i64, d: i32) EvalError!i32 {
+        return time.addDays(d, u, n);
+    }
+};
+
+const DateAddMicros = struct {
+    pub const args = .{ .unit, .int, .micros };
+    pub const eval_all = true;
+    pub const result = .timestamp;
+    pub fn apply(_: Cx, u: TimeUnit, n: i64, us: i64) EvalError!i64 {
+        return time.addMicros(us, u, n);
+    }
+};
+
+pub const MakeDate = struct {
+    pub const args = .{ .int, .int, .int };
+    pub const eval_all = true;
+    pub fn apply(_: Cx, y: i64, m: i64, d: i64) EvalError!i32 {
+        const bad = "make_date: year {d}, month {d}, day {d} is not a date";
+        if (y < -1_000_000_000 or y > 1_000_000_000 or m < 1 or m > 12 or d < 1 or d > time.daysInMonth(y, @intCast(m)))
+            return failWith(error.CastFailed, bad, .{ y, m, d });
+        const days = time.daysFromCivil(y, @intCast(m), @intCast(d));
+        return std.math.cast(i32, days) orelse failWith(error.CastFailed, bad, .{ y, m, d });
+    }
+};
+
+/// Whole seconds since the epoch, rounded down.
+pub const Epoch = struct {
+    pub const args = .{.temporal};
+    pub fn apply(_: Cx, us: i64) EvalError!i64 {
+        return @divFloor(us, 1_000_000);
+    }
+};
+
+/// Seconds since the epoch as a TIMESTAMP, a fraction kept to the microsecond as
+/// PostgreSQL's `to_timestamp` keeps it; a value not a FLOAT or DECIMAL is read as
+/// an INT.
+pub const ToTimestamp = Overload(struct {
+    pub const variants = .{ ToTimestampFloat, ToTimestampDec, ToTimestampInt };
+    pub fn pick(_: ast.Expr.Call, k: TypeKind) ?usize {
+        return switch (k) {
+            .float => 0,
+            .decimal => 1,
+            else => 2,
+        };
+    }
+});
+
+const ToTimestampFloat = struct {
+    pub const args = .{.num};
+    pub const result = .timestamp;
+    pub fn apply(_: Cx, x: f64) EvalError!i64 {
+        const us = @round(x * 1_000_000);
+        if (!std.math.isFinite(us) or @abs(us) > 9.2e18) return error.IntOverflow;
+        return @intFromFloat(us);
+    }
+};
+
+const ToTimestampDec = struct {
+    pub const args = .{.dec};
+    pub const result = .timestamp;
+    pub fn apply(_: Cx, d: Decimal) EvalError!i64 {
+        var q: i128 = d.unscaled;
+        var s: u8 = d.scale;
+        while (s < 6) : (s += 1) q = std.math.mul(i128, q, 10) catch return error.IntOverflow;
+        while (s > 6) : (s -= 1) q = @divTrunc(q + (if (s == 7) @as(i128, if (q < 0) -5 else 5) else 0), 10);
+        return std.math.cast(i64, q) orelse error.IntOverflow;
+    }
+};
+
+const ToTimestampInt = struct {
+    pub const args = .{.int};
+    pub const result = .timestamp;
+    pub fn apply(_: Cx, x: i64) EvalError!i64 {
+        return time.mulI64(x, 1_000_000);
+    }
+};
+
+/// A literal format is checked when the script is.
+pub const Strftime = struct {
+    pub const args = .{ .temporal, .str };
+    pub const typed_last = true;
+    pub fn apply(cx: Cx, us: i64, fmt: []const u8) EvalError![]const u8 {
+        try time.strftimeInto(cx.buf, us, fmt);
+        return cx.written();
+    }
+};
+
+/// `try_strptime` (`lenient`) gives NULL where `strptime` fails.
+pub fn Strptime(comptime lenient: bool) type {
+    return struct {
+        pub const args = .{ .str, .str };
+        pub const result = .timestamp;
+        pub fn apply(_: Cx, text: []const u8, fmt: []const u8) EvalError!?i64 {
+            return time.strptimeFmt(text, fmt) orelse {
+                if (lenient) return null;
+                return failWith(error.CastFailed, "strptime: '{s}' is not a date in '{s}' (try_strptime gives null)", .{ clip(text), clip(fmt) });
+            };
+        }
+    };
+}
 
 pub const Power = struct {
     pub const args = .{ .num, .num };

@@ -106,8 +106,8 @@ const base = [_]Builtin{
     .{ .name = "sha256", .type_fn = typing.digest, .eval_fn = per_row.digest },
     .{ .name = "xxhash64", .type_fn = typing.digest, .eval_fn = per_row.digest },
     .{ .name = "concat_ws", .type_fn = typing.concatWs, .eval_fn = per_row.concatWs },
-    .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
-    .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = per_row.dateTruncExtract },
+    .{ .name = "date_trunc", .type_fn = typing.dateTruncExtract, .eval_fn = S(f.DateTrunc).eval, .vec_fn = S(f.DateTrunc).vec },
+    .{ .name = "extract", .type_fn = typing.dateTruncExtract, .eval_fn = S(f.Extract).eval, .vec_fn = S(f.Extract).vec },
     .{ .name = "upper", .type_fn = typing.unaryString, .eval_fn = S(f.CaseMap(true)).eval, .vec_fn = S(f.CaseMap(true)).vec },
     .{ .name = "lower", .type_fn = typing.unaryString, .eval_fn = S(f.CaseMap(false)).eval, .vec_fn = S(f.CaseMap(false)).vec },
     .{ .name = "length", .type_fn = typing.strlen, .eval_fn = S(f.Length(true)).eval, .vec_fn = S(f.Length(true)).vec },
@@ -144,14 +144,14 @@ const base = [_]Builtin{
     .{ .name = "strpos", .type_fn = typing.strpos, .eval_fn = S(f.Strpos).eval, .vec_fn = S(f.Strpos).vec },
     .{ .name = "repeat", .type_fn = typing.repeat, .eval_fn = S(f.Repeat).eval, .vec_fn = S(f.Repeat).vec },
     .{ .name = "reverse", .type_fn = typing.reverse, .eval_fn = S(f.Reverse).eval, .vec_fn = S(f.Reverse).vec },
-    .{ .name = "date_add", .type_fn = typing.dateAdd, .eval_fn = per_row.dateAddDiff },
-    .{ .name = "date_diff", .type_fn = typing.dateDiff, .eval_fn = per_row.dateAddDiff },
-    .{ .name = "make_date", .type_fn = typing.makeDate, .eval_fn = per_row.makeDate },
-    .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = per_row.epoch },
-    .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = per_row.toTimestamp },
-    .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = per_row.strftime },
-    .{ .name = "strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
-    .{ .name = "try_strptime", .type_fn = typing.strptime, .eval_fn = per_row.strptime },
+    .{ .name = "date_add", .type_fn = typing.dateAdd, .eval_fn = f.DateAdd.eval, .vec_fn = f.DateAdd.vec },
+    .{ .name = "date_diff", .type_fn = typing.dateDiff, .eval_fn = S(f.DateDiff).eval, .vec_fn = S(f.DateDiff).vec },
+    .{ .name = "make_date", .type_fn = typing.makeDate, .eval_fn = S(f.MakeDate).eval, .vec_fn = S(f.MakeDate).vec },
+    .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = S(f.Epoch).eval, .vec_fn = S(f.Epoch).vec },
+    .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = f.ToTimestamp.eval, .vec_fn = f.ToTimestamp.vec },
+    .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = S(f.Strftime).eval, .vec_fn = S(f.Strftime).vec },
+    .{ .name = "strptime", .type_fn = typing.strptime, .eval_fn = S(f.Strptime(false)).eval, .vec_fn = S(f.Strptime(false)).vec },
+    .{ .name = "try_strptime", .type_fn = typing.strptime, .eval_fn = S(f.Strptime(true)).eval, .vec_fn = S(f.Strptime(true)).vec },
     .{ .name = "unaccent", .type_fn = typing.unaryString, .eval_fn = S(f.Unaccent).eval, .vec_fn = S(f.Unaccent).vec },
     .{ .name = "strip_accents", .type_fn = typing.unaryString, .eval_fn = S(f.Unaccent).eval, .vec_fn = S(f.Unaccent).vec },
     .{ .name = "translate", .type_fn = typing.translate, .eval_fn = S(f.Translate).eval, .vec_fn = S(f.Translate).vec },
@@ -198,10 +198,19 @@ fn testBatch(a: std.mem.Allocator) !Batch {
     const fs = [_]?f64{ 2.5, -2.5, null, nan, -0.0, inf, -inf, 0.125, 1234.5678 };
     const ds = [_]?Decimal{ .{ .unscaled = 125, .scale = 2 }, .{ .unscaled = -15, .scale = 1 }, null, .{ .unscaled = 3, .scale = 0 }, .{ .unscaled = -5, .scale = 2 }, .{ .unscaled = 255, .scale = 2 }, .{ .unscaled = 5, .scale = 1 }, .{ .unscaled = -1235, .scale = 2 }, .{ .unscaled = 99999, .scale = 2 } };
     const ss = [_]?[]const u8{ "pear", null, "apple", "", "fig", "b", "zz", "b", "kiwi" };
+    const dts = [_]?i32{ 18000, -1, null, 0, 19357, -719162, 11016, 18321, 2932896 };
+    const ts = [_]?i64{ 1_600_000_123_456_789, -1, null, 0, 1_672_531_199_999_999, -62_135_596_800_000_000, 951_782_400_000_000, 1_000_000_000_000_000, 253_402_300_799_999_999 };
+    const us = [_]?[]const u8{ "2024-02-29", "2023-02-29", null, "1999-12-31", "abc", "", "2000-01-01", "20-1-1", "2024-13-01" };
     var fb = column.Builder.init(a, Type.init(.float).asNullable());
     var db = column.Builder.init(a, Type.decimal(10, 2).asNullable());
     var sb = column.Builder.init(a, Type.init(.string).asNullable());
-    for (fs, ds, ss) |x, d, s| {
+    var dtb = column.Builder.init(a, Type.init(.date).asNullable());
+    var tb = column.Builder.init(a, Type.init(.timestamp).asNullable());
+    var ub = column.Builder.init(a, Type.init(.string).asNullable());
+    for (fs, ds, ss, dts, ts, us) |x, d, s, dt, t, u| {
+        try dtb.append(if (dt) |v| .{ .date = v } else .null);
+        try tb.append(if (t) |v| .{ .timestamp = v } else .null);
+        try ub.append(if (u) |v| .{ .string = v } else .null);
         try fb.append(if (x) |v| .{ .float = v } else .null);
         try db.append(if (d) |v| .{ .decimal = v } else .null);
         try sb.append(if (s) |v| .{ .string = v } else .null);
@@ -215,8 +224,11 @@ fn testBatch(a: std.mem.Allocator) !Batch {
         .{ .name = "f", .ty = Type.init(.float).asNullable() },
         .{ .name = "d", .ty = Type.decimal(10, 2).asNullable() },
         .{ .name = "s", .ty = Type.init(.string).asNullable() },
+        .{ .name = "dt", .ty = Type.init(.date).asNullable() },
+        .{ .name = "t", .ty = Type.init(.timestamp).asNullable() },
+        .{ .name = "u", .ty = Type.init(.string).asNullable() },
     }) };
-    const cols = try a.alloc(column.Column, 7);
+    const cols = try a.alloc(column.Column, 10);
     cols[0] = try column.intColumn(a, &.{ 5, -7, null, 0, 3, -2, 1000, 3, -45 });
     cols[1] = try column.intColumn(a, &.{ 0, 3, 1, null, 3, -2, 2, 0, 7 });
     cols[2] = try column.intColumn(a, &.{ 1, null, 0, -1, 2, 3, 1, 0, -2 });
@@ -224,6 +236,9 @@ fn testBatch(a: std.mem.Allocator) !Batch {
     cols[4] = try fb.finish();
     cols[5] = try db.finish();
     cols[6] = try sb.finish();
+    cols[7] = try dtb.finish();
+    cols[8] = try tb.finish();
+    cols[9] = try ub.finish();
     return .{ .schema = schema, .columns = cols, .len = fs.len };
 }
 
@@ -247,5 +262,35 @@ test "numeric builtins: the kernels give the row forms' values, nulls, scales an
         "abs(m)",                  "mod(i, z)",      "round(i, 1 / z)", "nullif(i, 1.0)",
         "greatest(i, f)",          "greatest(i, d)", "nullif(f, i)",    "round(d, 40)",
         "if(z = 0, 0, mod(i, z))",
+    }, false);
+}
+
+test "temporal builtins: the kernels give the row forms' values, nulls and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try testBatch(a);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "date_trunc('year', t)",                                "date_trunc('month', t)",                        "date_trunc('week', t)",
+        "date_trunc('day', t)",                                 "date_trunc('hour', t)",                         "date_trunc('minute', t)",
+        "date_trunc('second', t)",                              "date_trunc('MONTH', dt)",                       "date_trunc('week', dt)",
+        "extract('year', t)",                                   "extract('month', dt)",                          "extract('week', t)",
+        "extract('week', dt)",                                  "extract('day', t)",                             "extract('hour', t)",
+        "extract('minute', t)",                                 "extract('second', t)",                          "extract('second', dt)",
+        "date_add('day', i, dt)",                               "date_add('month', g, dt)",                      "date_add('year', z, t)",
+        "date_add('hour', i, t)",                               "date_add('week', g, dt)",                       "date_add('second', i, t)",
+        "date_add('month', 1, t)",                              "date_diff('day', t, dt)",                       "date_diff('month', dt, t)",
+        "date_diff('week', t, t)",                              "date_diff('year', dt, date_add('day', i, dt))", "date_diff('hour', t, date_add('minute', i, t))",
+        "make_date(2000 + i, 1 + mod(abs(z), 12), 1 + abs(g))", "epoch(t)",                                      "epoch(dt)",
+        "to_timestamp(i)",                                      "to_timestamp(d)",                               "to_timestamp(if(f < 1e6 and f > -1e6, f, 0e0))",
+        "to_timestamp(1.2345675)",                              "strftime(t, '%Y-%m-%d %H:%M:%S')",              "strftime(dt, '%y/%m/%d %%')",
+        "strftime(t, s)",                                       "try_strptime(u, '%Y-%m-%d')",                   "try_strptime(s, u)",
+        "strptime('2020-02-02', '%Y-%m-%d')",                   "greatest(dt, date_add('day', 3, dt))",          "least(t, date_trunc('day', t))",
+    }, true);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "strptime(u, '%Y-%m-%d')",                                    "make_date(i, z, g)",                                        "make_date(nullif(z, 0), 1 / z, 1)",
+        "date_add('day', 1 / z, dt)",                                 "date_add('day', nullif(z, 0), date_add('day', 1 / z, dt))", "to_timestamp(f)",
+        "date_diff('day', nullif(t, t), date_add('day', 1 / z, dt))", "date_add('year', m, dt)",                                   "date_add('second', m, t)",
+        "strftime(t, concat('%', s))",                                "date_add('month', i * 100000000, dt)",
     }, false);
 }

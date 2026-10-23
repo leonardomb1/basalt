@@ -16,7 +16,8 @@
 //! variadic `F.bytes_if_any` returns BYTES when any argument is BYTES. `typeRule(F)`
 //! is the typing rule the arguments imply, `F.check` adding what literals must be.
 //! Every argument propagates NULL, the first NULL ending the row in argument order
-//! (`F.eval_all` evaluates every argument first); `F.variadic` instead takes any
+//! (`F.eval_all` evaluates every argument first, and it and `F.typed_last` read the
+//! arguments as their kinds only once all are evaluated); `F.variadic` instead takes any
 //! number of text arguments as one slice. `F.value_scale` keeps each DECIMAL result
 //! at the scale `apply` gave it. `Overload` picks one of several declarations by an
 //! argument's kind, and `Numeric` builds the one-number functions from their math.
@@ -62,6 +63,10 @@ const TypeCtx = @import("../eval.zig").TypeCtx;
 const TypeError = @import("../eval.zig").TypeError;
 const intish = @import("../eval.zig").intish;
 const numericish = @import("../eval.zig").numericish;
+const temporalish = @import("../eval.zig").temporalish;
+const TimeUnit = @import("time.zig").TimeUnit;
+const timeUnit = @import("time.zig").timeUnit;
+const temporalMicros = @import("time.zig").temporalMicros;
 
 pub const Arg = enum {
     str,
@@ -73,14 +78,17 @@ pub const Arg = enum {
     dec,
     day,
     micros,
+    temporal,
+    unit,
 
     fn Base(comptime a: Arg) type {
         return switch (a) {
             .str, .opt_str => []const u8,
-            .int, .exact_int, .opt_int, .micros => i64,
+            .int, .exact_int, .opt_int, .micros, .temporal => i64,
             .num => f64,
             .dec => Decimal,
             .day => i32,
+            .unit => TimeUnit,
         };
     }
 
@@ -214,6 +222,8 @@ fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base(
             .timestamp => |t| t,
             else => error.TypeMismatch,
         },
+        .temporal => temporalMicros(v) orelse error.TypeMismatch,
+        .unit => if (v == .string) timeUnit(v.string) orelse error.TypeMismatch else error.TypeMismatch,
     };
 }
 
@@ -225,14 +235,35 @@ fn Typed(comptime E: type) type {
     };
 }
 
+/// A DATE or TIMESTAMP argument across a batch, read as microseconds row by row.
+const Temporal = union(enum) {
+    days: Typed(i32),
+    micros: Typed(i64),
+};
+
 /// An argument across a batch as the kernel reads it, or null when absent.
 fn Operand(comptime a: Arg) type {
+    if (a == .unit) return ?TimeUnit;
+    if (a == .temporal) return ?Temporal;
     return if (a.text()) ?Str else if (a.typed()) ?Typed(a.Base()) else ?Num;
 }
 
 fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!Operand(a) {
     if (comptime a.text()) return asStr(v) orelse error.Unsupported;
     if (comptime a.typed()) return try typedArg(a, arena, v, n);
+    if (comptime a == .unit) return if (v == .scalar and v.scalar == .string) timeUnit(v.scalar.string) orelse error.Unsupported else error.Unsupported;
+    if (comptime a == .temporal) return switch (v) {
+        .col => |c| switch (c.ty.kind) {
+            .date => .{ .days = .{ .col = .{ .d = c.data.i32, .v = c.validity } } },
+            .timestamp => .{ .micros = .{ .col = .{ .d = c.data.i64, .v = c.validity } } },
+            else => error.Unsupported,
+        },
+        .scalar => |s| switch (s) {
+            .date => |d| .{ .days = .{ .scalar = d } },
+            .timestamp => |t| .{ .micros = .{ .scalar = t } },
+            else => error.Unsupported,
+        },
+    };
     const x = (try asNum(arena, v, n)) orelse return error.Unsupported;
     const int = x == .icol or x == .iscalar;
     const float = x == .fcol or x == .fscalar;
@@ -315,6 +346,8 @@ pub fn typeRule(comptime F: type) fn (*TypeCtx, ast.Expr.Call) TypeError!Type {
                     .dec => t.kind == .decimal or intish(t),
                     .day => t.kind == .date,
                     .micros => t.kind == .time or t.kind == .timestamp,
+                    .temporal => temporalish(t),
+                    .unit => c.args[i].* == .str_lit and timeUnit(c.args[i].str_lit) != null,
                 };
                 if (!ok and !t.unknown) return self.err("`{s}` argument {d} must be {s}, got {s}", .{ c.name, i + 1, argWord(a), @tagName(t.kind) });
                 if (t.nullable and !(i == 0 and nullFirst(F))) nullable = true;
@@ -333,6 +366,8 @@ fn argWord(comptime a: Arg) []const u8 {
         .dec => "a DECIMAL or INT",
         .day => "a DATE",
         .micros => "a TIME or TIMESTAMP",
+        .temporal => "a DATE or TIMESTAMP",
+        .unit => "a literal time unit",
     };
 }
 
@@ -349,6 +384,7 @@ pub fn Scalar(comptime F: type) type {
         pub fn evalWith(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize, given: []const ?Value) EvalError!Value {
             var buf = std.array_list.Managed(u8).init(arena);
             var cx = Cx{ .arena = arena, .buf = &buf, .call = c };
+            const late = comptime flag(F, "eval_all") or flag(F, "typed_last");
             var vals: [F.args.len]Value = undefined;
             if (comptime flag(F, "eval_all")) {
                 for (vals[0..@min(vals.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
@@ -365,10 +401,13 @@ pub fn Scalar(comptime F: type) type {
                         if (comptime i == 0 and nullFirst(F)) t[i] = null else return .null;
                     } else {
                         if (i == 0) cx.bytes = v == .bytes;
-                        t[i] = try rowArg(a, arena, v);
+                        if (late) vals[i] = v else t[i] = try rowArg(a, arena, v);
                     }
                 }
             }
+            if (late) inline for (comptime argsOf(F), 0..) |a, i| if (i < c.args.len) {
+                t[i] = try rowArg(a, arena, vals[i]);
+            };
             return wrap(try @call(.auto, F.apply, .{cx} ++ t), c);
         }
 
@@ -472,7 +511,19 @@ pub fn Scalar(comptime F: type) type {
                 .scalar => |x| x,
                 .col => |col| if (col.v.get(i)) col.d[i] else null,
             };
+            if (comptime a == .unit) return op;
+            if (comptime a == .temporal) return switch (op) {
+                .days => |d| @as(i64, typedAt(i32, d, i) orelse return null) * 86_400_000_000,
+                .micros => |us| typedAt(i64, us, i),
+            };
             return if (numValid(op, i)) numAt(a.Base(), op, i) else null;
+        }
+
+        inline fn typedAt(comptime E: type, op: Typed(E), i: usize) ?E {
+            return switch (op) {
+                .scalar => |x| x,
+                .col => |col| if (col.v.get(i)) col.d[i] else null,
+            };
         }
     };
 }

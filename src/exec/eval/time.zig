@@ -94,38 +94,35 @@ fn addMonthsToDays(days: i64, n: i64) i64 {
     return daysFromCivil(y, m, @min(c.d, daysInMonth(y, m)));
 }
 
-pub fn addUnits(v: Value, u: TimeUnit, n: i64) EvalError!Value {
-    switch (v) {
-        .date => |d0| {
-            const days: i64 = d0;
-            const nd = switch (u) {
-                .year => addMonthsToDays(days, try mulI64(n, 12)),
-                .month => addMonthsToDays(days, n),
-                .week => try addI64(days, try mulI64(n, 7)),
-                .day => try addI64(days, n),
-                .hour, .minute, .second => return error.TypeMismatch,
-            };
-            return .{ .date = std.math.cast(i32, nd) orelse return error.CastFailed };
+/// `n` units after the date `d0`; a unit finer than a day is a TypeMismatch.
+pub fn addDays(d0: i32, u: TimeUnit, n: i64) EvalError!i32 {
+    const days: i64 = d0;
+    const nd = switch (u) {
+        .year => addMonthsToDays(days, try mulI64(n, 12)),
+        .month => addMonthsToDays(days, n),
+        .week => try addI64(days, try mulI64(n, 7)),
+        .day => try addI64(days, n),
+        .hour, .minute, .second => return error.TypeMismatch,
+    };
+    return std.math.cast(i32, nd) orelse error.CastFailed;
+}
+
+/// `n` units after the timestamp `us`.
+pub fn addMicros(us: i64, u: TimeUnit, n: i64) EvalError!i64 {
+    return switch (u) {
+        .year, .month => blk: {
+            const day = @divFloor(us, 86_400_000_000);
+            const rem = us - day * 86_400_000_000;
+            const months = if (u == .year) try mulI64(n, 12) else n;
+            const shifted = try mulI64(addMonthsToDays(day, months), 86_400_000_000);
+            break :blk try addI64(shifted, rem);
         },
-        .timestamp => |us| {
-            const out: i64 = switch (u) {
-                .year, .month => blk: {
-                    const day = @divFloor(us, 86_400_000_000);
-                    const rem = us - day * 86_400_000_000;
-                    const months = if (u == .year) try mulI64(n, 12) else n;
-                    const shifted = try mulI64(addMonthsToDays(day, months), 86_400_000_000);
-                    break :blk try addI64(shifted, rem);
-                },
-                .week => try addI64(us, try mulI64(n, 7 * 86_400_000_000)),
-                .day => try addI64(us, try mulI64(n, 86_400_000_000)),
-                .hour => try addI64(us, try mulI64(n, 3_600_000_000)),
-                .minute => try addI64(us, try mulI64(n, 60_000_000)),
-                .second => try addI64(us, try mulI64(n, 1_000_000)),
-            };
-            return .{ .timestamp = out };
-        },
-        else => return error.TypeMismatch,
-    }
+        .week => try addI64(us, try mulI64(n, 7 * 86_400_000_000)),
+        .day => try addI64(us, try mulI64(n, 86_400_000_000)),
+        .hour => try addI64(us, try mulI64(n, 3_600_000_000)),
+        .minute => try addI64(us, try mulI64(n, 60_000_000)),
+        .second => try addI64(us, try mulI64(n, 1_000_000)),
+    };
 }
 
 /// DuckDB semantics: `year`/`month`/`week` count unit boundaries crossed, so
@@ -164,15 +161,14 @@ pub fn badStrftime(fmt: []const u8) ?[]const u8 {
     return null;
 }
 
-/// `strftime` over exactly `%Y %m %d %H %M %S %y %%`; any other directive is an
-/// error, never a silent passthrough.
-pub fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError![]const u8 {
+/// `strftime` over exactly `%Y %m %d %H %M %S %y %%`, appended to `out`; any other
+/// directive is an error, never a silent passthrough.
+pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) EvalError!void {
     const day = @divFloor(us, 86_400_000_000);
     const rem: u64 = @intCast(us - day * 86_400_000_000);
     const secs = rem / 1_000_000;
     const c = civilFromDays(day);
     const year: u32 = if (c.y < 0) 0 else @intCast(c.y);
-    var out = std.array_list.Managed(u8).init(arena);
     const w = out.writer();
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
@@ -194,7 +190,6 @@ pub fn strftimeFmt(arena: std.mem.Allocator, us: i64, fmt: []const u8) EvalError
             else => return error.CastFailed,
         }
     }
-    return try out.toOwnedSlice();
 }
 
 /// Numbers take up to their width in digits, `%y` pivots as POSIX does (69-99 are
