@@ -1265,41 +1265,22 @@ pub const Join = struct {
 
     fn stepPlain(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
         const p = &self.pending.?;
-        const arena = fresh(self.state, &self.batch_mem);
-        var lidx = std.array_list.Managed(usize).init(arena);
-        var ridx = std.array_list.Managed(usize).init(arena);
-        var rnull = std.array_list.Managed(bool).init(arena);
-        const fill_right = (self.kind == .left or self.kind == .full);
+        var o = Outs.init(fresh(self.state, &self.batch_mem), self.kind);
         const lb = p.lb;
         while (p.r < lb.len) {
             if (!p.started) self.startRow(ix, p);
             const r = p.r;
-            switch (self.kind) {
-                .semi => if (p.hit) try lidx.append(r),
-                .anti => {
-                    const unknown = self.null_aware and !p.empty and (ix.has_null_key or p.nulls[r]);
-                    if (!unknown and !p.hit) try lidx.append(r);
-                },
-                else => if (!p.hit) {
-                    if (fill_right) {
-                        try lidx.append(r);
-                        try ridx.append(0);
-                        try rnull.append(true);
-                    }
-                } else while (p.cur) |br| {
-                    if (lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len, false);
-                    try lidx.append(r);
-                    try ridx.append(br);
-                    if (fill_right) try rnull.append(false);
-                    if (self.matched) |m| m[br] = true;
-                    if (self.shared_matched) |sm| markShared(sm, br);
+            if (p.hit and o.emit_pairs) {
+                while (p.cur) |br| {
+                    if (o.lidx.items.len >= out_chunk) return self.gatherOuts(out, ix, lb, o);
+                    try o.pair(r, br, self.matched, self.shared_matched);
                     p.cur = ix.chainNext(br);
-                },
-            }
+                }
+            } else if (!(self.kind == .anti and self.null_aware and !p.empty and (ix.has_null_key or p.nulls[r]))) try o.finish(r, p.hit);
             self.nextRow(p);
         }
         self.pending = null;
-        return self.gatherOut(out, ix, lb, lidx.items, ridx.items, rnull.items, lidx.items.len, false);
+        return self.gatherOuts(out, ix, lb, o);
     }
 
     /// The plain step with a residual condition: key matches become candidate pairs,
@@ -1310,12 +1291,7 @@ pub const Join = struct {
     /// at `first_win` and doubles, and walked no further once it matched.
     fn stepResidual(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
         const p = &self.pending.?;
-        const arena = fresh(self.state, &self.batch_mem);
-        var o = Outs{
-            .lidx = std.array_list.Managed(usize).init(arena),
-            .ridx = std.array_list.Managed(usize).init(arena),
-            .rnull = std.array_list.Managed(bool).init(arena),
-        };
+        var o = Outs.init(fresh(self.state, &self.batch_mem), self.kind);
         const short = self.kind == .semi or self.kind == .anti;
         const lb = p.lb;
         if (p.cl.capacity == 0) try self.beginPairs(p);
@@ -1331,7 +1307,7 @@ pub const Join = struct {
                         p.cur = null;
                         break;
                     }
-                    if (o.lidx.items.len >= out_chunk) return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
+                    if (o.lidx.items.len >= out_chunk) return self.gatherOuts(out, ix, lb, o);
                 }
                 p.cl.appendAssumeCapacity(r);
                 p.cr.appendAssumeCapacity(br);
@@ -1341,16 +1317,10 @@ pub const Join = struct {
             self.nextRow(p);
         }
         try self.flushPairs(ix, p, &o);
-        while (p.fin < lb.len) : (p.fin += 1) try self.finishRow(p, &o, p.fin);
+        while (p.fin < lb.len) : (p.fin += 1) try o.finish(p.fin, p.hits[p.fin]);
         self.pending = null;
-        return self.gatherOut(out, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
+        return self.gatherOuts(out, ix, lb, o);
     }
-
-    const Outs = struct {
-        lidx: std.array_list.Managed(usize),
-        ridx: std.array_list.Managed(usize),
-        rnull: std.array_list.Managed(bool),
-    };
 
     /// An empty buffer of `pair_chunk` pairs in a reset `pair_mem`.
     fn beginPairs(self: *Join, p: *Pending) !void {
@@ -1366,36 +1336,71 @@ pub const Join = struct {
     fn flushPairs(self: *Join, ix: *JoinIndex, p: *Pending, o: *Outs) !void {
         const n = p.cl.items.len;
         if (n > 0) {
-            const pa = self.pair_mem.?.allocator();
-            const nl = p.lb.columns.len;
-            const cols = try pa.alloc(column.Column, nl + ix.build_batch.columns.len);
-            for (p.lb.columns, 0..) |c, i| cols[i] = try takeCol(pa, c, p.cl.items, &.{});
-            for (ix.build_batch.columns, 0..) |c, k| cols[nl + k] = try takeCol(pa, c, p.cr.items, &.{});
-            const pairs = Batch{ .schema = self.pair_schema.?, .columns = cols, .len = n };
-            const mask = eval.evalColumn(pa, self.residual.?, pairs, types.Type.init(.bool)) catch |e| {
-                if (self.err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
-                return e;
-            };
-            const fill_right = (self.kind == .left or self.kind == .full);
+            const mask = try evalPairs(self.pair_mem.?.allocator(), self.residual.?, self.pair_schema.?, p.lb, ix.build_batch, p.cl.items, p.cr.items, self.err);
             for (p.cl.items, p.cr.items, 0..) |r, br, i| {
-                while (p.fin < r) : (p.fin += 1) try self.finishRow(p, o, p.fin);
+                while (p.fin < r) : (p.fin += 1) try o.finish(p.fin, p.hits[p.fin]);
                 if (!(mask.validity.get(i) and mask.data.b[i])) continue;
                 p.hits[r] = true;
-                if (self.kind == .semi or self.kind == .anti) continue;
-                try o.lidx.append(r);
-                try o.ridx.append(br);
-                if (fill_right) try o.rnull.append(false);
-                if (self.matched) |m| m[br] = true;
-                if (self.shared_matched) |sm| markShared(sm, br);
+                try o.pair(r, br, self.matched, self.shared_matched);
             }
         }
         try self.beginPairs(p);
     }
 
-    /// Row `r`, its candidates all evaluated, as the join kind wants it.
-    fn finishRow(self: *Join, p: *Pending, o: *Outs, r: usize) !void {
-        const hit = p.hits[r];
-        switch (self.kind) {
+    /// right/full: after the probe ends, every unmatched build row with the left
+    /// columns null, in chunks.
+    fn drain(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
+        if (self.kind != .right and self.kind != .full) return null;
+        return drainUnmatched(arena, self.out_schema, self.left_schema, self.kind, ix.build_batch, self.matched orelse return null, &self.drain_pos);
+    }
+
+    fn gatherOut(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: ?Batch, lidx: []const usize, ridx: []const usize, rnull: []const bool, n: usize, same_rows: bool) anyerror!Batch {
+        return gatherRows(arena, self.out_schema, self.left_schema, self.kind, ix.build_batch, lb, lidx, ridx, rnull, n, same_rows);
+    }
+
+    fn gatherOuts(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch, o: Outs) anyerror!Batch {
+        return self.gatherOut(arena, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
+    }
+};
+
+/// The rows a join step outputs, as probe row, build row and, for an outer join,
+/// whether the build side is null: the rules every join kind keeps, hashed or
+/// nested loop.
+pub const Outs = struct {
+    lidx: std.array_list.Managed(usize),
+    ridx: std.array_list.Managed(usize),
+    rnull: std.array_list.Managed(bool),
+    kind: ast.JoinKind,
+    emit_pairs: bool,
+    fill_right: bool,
+
+    pub fn init(a: std.mem.Allocator, kind: ast.JoinKind) Outs {
+        return .{
+            .lidx = .init(a),
+            .ridx = .init(a),
+            .rnull = .init(a),
+            .kind = kind,
+            .emit_pairs = kind != .semi and kind != .anti,
+            .fill_right = kind == .left or kind == .full,
+        };
+    }
+
+    /// Probe row `r` matched build row `br`: the pair out, unless the join keeps
+    /// probe rows only, and `br` marked matched.
+    pub inline fn pair(o: *Outs, r: usize, br: usize, matched: ?[]bool, shared: ?[]std.atomic.Value(u64)) !void {
+        if (!o.emit_pairs) return;
+        try o.lidx.append(r);
+        try o.ridx.append(br);
+        if (o.fill_right) try o.rnull.append(false);
+        if (matched) |m| m[br] = true;
+        if (shared) |sm| markShared(sm, br);
+    }
+
+    /// Probe row `r` with every candidate tried: a semi join's row that matched, an
+    /// anti join's row that did not, a left or full join's that did not, its build
+    /// side null.
+    pub fn finish(o: *Outs, r: usize, hit: bool) !void {
+        switch (o.kind) {
             .semi => if (hit) try o.lidx.append(r),
             .anti => if (!hit) try o.lidx.append(r),
             .left, .full => if (!hit) {
@@ -1406,55 +1411,61 @@ pub const Join = struct {
             else => {},
         }
     }
-
-    /// right/full: after the probe ends, every unmatched build row with the left
-    /// columns null, in chunks.
-    fn drain(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
-        if (self.kind != .right and self.kind != .full) return null;
-        var ridx = std.array_list.Managed(usize).init(arena);
-        const matched = self.matched orelse return null;
-        while (self.drain_pos < ix.build_batch.len and ridx.items.len < drain_chunk) : (self.drain_pos += 1) {
-            if (!matched[self.drain_pos]) try ridx.append(self.drain_pos);
-        }
-        if (ridx.items.len == 0) return null;
-        return try self.gatherOut(arena, ix, null, &.{}, ridx.items, &.{}, ridx.items.len, false);
-    }
-
-    /// Assemble `n` output rows with one gather per column. `lb == null` marks the
-    /// outer drain, where the whole left side is null; `same_rows` that `lidx` is every
-    /// probe row once, in order, whose columns are then copied rather than gathered.
-    fn gatherOut(
-        self: *Join,
-        arena: std.mem.Allocator,
-        ix: *JoinIndex,
-        lb: ?Batch,
-        lidx: []const usize,
-        ridx: []const usize,
-        rnull: []const bool,
-        n: usize,
-        same_rows: bool,
-    ) anyerror!Batch {
-        const emit_right = (self.kind != .semi and self.kind != .anti);
-        const nleft = if (lb) |b| b.columns.len else self.left_schema.fields.len;
-        const nout = nleft + (if (emit_right) ix.build_batch.columns.len else @as(usize, 0));
-        const cols = try arena.alloc(column.Column, nout);
-
-        var i: usize = 0;
-        while (i < nleft) : (i += 1) {
-            cols[i] = if (lb) |b|
-                (if (same_rows) try column.copy(arena, b.columns[i]) else try takeCol(arena, b.columns[i], lidx, &.{}))
-            else
-                try nullColumn(arena, self.left_schema.fields[i].ty, n);
-        }
-        if (emit_right) {
-            var k: usize = 0;
-            while (k < ix.build_batch.columns.len) : (k += 1) {
-                cols[nleft + k] = try takeCol(arena, ix.build_batch.columns[k], ridx, rnull);
-            }
-        }
-        return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
-    }
 };
+
+/// The ON condition `cond` over the pairs of probe row `cl[i]` of `lb` and build row
+/// `cr[i]` of `build`, as rows of `pair_schema`: a pair holds where it is true.
+pub fn evalPairs(arena: std.mem.Allocator, cond: *const ast.Expr, pair_schema: *const types.Schema, lb: Batch, build: Batch, cl: []const usize, cr: []const usize, err: ?*ErrCtx) !column.Column {
+    const nl = lb.columns.len;
+    const cols = try arena.alloc(column.Column, nl + build.columns.len);
+    for (lb.columns, 0..) |c, i| cols[i] = try takeCol(arena, c, cl, &.{});
+    for (build.columns, 0..) |c, k| cols[nl + k] = try takeCol(arena, c, cr, &.{});
+    const pairs = Batch{ .schema = pair_schema, .columns = cols, .len = cl.len };
+    return eval.evalColumn(arena, cond, pairs, types.Type.init(.bool)) catch |e| {
+        if (err) |ec| ec.set("{s}: in the join's ON condition", .{failLabel(e)});
+        return e;
+    };
+}
+
+/// The next up to `drain_chunk` build rows `matched` does not mark, from `pos.*` on,
+/// the left columns null, as a right or full join ends; null once none is left.
+pub fn drainUnmatched(arena: std.mem.Allocator, out_schema: *const types.Schema, left_schema: *const types.Schema, kind: ast.JoinKind, build: Batch, matched: []const bool, pos: *usize) anyerror!?Batch {
+    var ridx = std.array_list.Managed(usize).init(arena);
+    while (pos.* < build.len and ridx.items.len < Join.drain_chunk) : (pos.* += 1) {
+        if (!matched[pos.*]) try ridx.append(pos.*);
+    }
+    if (ridx.items.len == 0) return null;
+    return try gatherRows(arena, out_schema, left_schema, kind, build, null, &.{}, ridx.items, &.{}, ridx.items.len, false);
+}
+
+/// `n` output rows with one gather per column. `lb == null` marks the outer drain,
+/// where the whole left side is null; `same_rows` that `lidx` is every probe row once,
+/// in order, whose columns are then copied rather than gathered.
+pub fn gatherRows(
+    arena: std.mem.Allocator,
+    out_schema: *const types.Schema,
+    left_schema: *const types.Schema,
+    kind: ast.JoinKind,
+    build: Batch,
+    lb: ?Batch,
+    lidx: []const usize,
+    ridx: []const usize,
+    rnull: []const bool,
+    n: usize,
+    same_rows: bool,
+) anyerror!Batch {
+    const emit_right = kind != .semi and kind != .anti;
+    const nleft = if (lb) |b| b.columns.len else left_schema.fields.len;
+    const cols = try arena.alloc(column.Column, nleft + if (emit_right) build.columns.len else 0);
+    for (cols[0..nleft], 0..) |*c, i| c.* = if (lb) |b|
+        (if (same_rows) try column.copy(arena, b.columns[i]) else try takeCol(arena, b.columns[i], lidx, &.{}))
+    else
+        try nullColumn(arena, left_schema.fields[i].ty, n);
+    if (emit_right) for (build.columns, cols[nleft..]) |c, *o| {
+        o.* = try takeCol(arena, c, ridx, rnull);
+    };
+    return .{ .schema = out_schema, .columns = cols, .len = n };
+}
 
 /// `slot`'s arena, made over `state` on first use and reset for this use.
 fn fresh(state: std.mem.Allocator, slot: *?std.heap.ArenaAllocator) std.mem.Allocator {

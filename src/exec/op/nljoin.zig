@@ -24,7 +24,8 @@
 
 const Batch = @import("../batch.zig").Batch;
 const ErrCtx = @import("../op.zig").ErrCtx;
-const JoinIndex = @import("join.zig").JoinIndex;
+const JoinIndex = join.JoinIndex;
+const join = @import("join.zig");
 const Op = @import("../op.zig").Op;
 const Scan = @import("../op.zig").Scan;
 const Stats = @import("../op.zig").Stats;
@@ -41,12 +42,10 @@ const fld = @import("../../testing/ast_util.zig").fld;
 const nullColumn = @import("join.zig").nullColumn;
 const op_mod = @import("../op.zig");
 const std = @import("std");
-const takeCol = @import("join.zig").takeCol;
 const testing = std.testing;
 const types = @import("../../lang/types.zig");
 
 pub const default_chunk: usize = 1 << 16;
-const drain_chunk = 4096;
 
 /// One side of a range: a left-side value and a right-side value compared in the
 /// ON, both written over the pair schema, with their types there.
@@ -399,20 +398,11 @@ pub const NLJoin = struct {
         const pass = try arena.alloc(bool, cl.items.len);
         @memset(pass, true);
         if (self.cond != null and cl.items.len > 0) {
-            const nl = lb.columns.len;
-            const cols = try arena.alloc(column.Column, nl + ix.build_batch.columns.len);
-            for (lb.columns, 0..) |col, i| cols[i] = try takeCol(arena, col, cl.items, &.{});
-            for (ix.build_batch.columns, 0..) |col, k| cols[nl + k] = try takeCol(arena, col, cr.items, &.{});
-            const pairs = Batch{ .schema = self.pair_schema.?, .columns = cols, .len = cl.items.len };
-            const mask = try self.evalOver(arena, self.cond.?, pairs, types.Type.init(.bool));
+            const mask = try join.evalPairs(arena, self.cond.?, self.pair_schema.?, lb, ix.build_batch, cl.items, cr.items, self.err);
             for (pass, 0..) |*p, i| p.* = mask.validity.get(i) and mask.data.b[i];
         }
 
-        const fill_right = self.kind == .left or self.kind == .full;
-        const pairs_out = self.kind != .semi and self.kind != .anti;
-        var lidx = std.array_list.Managed(usize).init(arena);
-        var ridx = std.array_list.Managed(usize).init(arena);
-        var rnull = std.array_list.Managed(bool).init(arena);
+        var o = join.Outs.init(arena, self.kind);
         const last = if (c.pos > 0) c.row + 1 else c.row;
         var hit = c.hit;
         var p: usize = 0;
@@ -421,57 +411,20 @@ pub const NLJoin = struct {
             while (p < cl.items.len and cl.items[p] == row) : (p += 1) {
                 if (!pass[p]) continue;
                 hit = true;
-                if (!pairs_out) continue;
-                try lidx.append(row);
-                try ridx.append(cr.items[p]);
-                if (fill_right) try rnull.append(false);
-                if (self.matched) |m| m[cr.items[p]] = true;
+                try o.pair(row, cr.items[p], self.matched, null);
             }
             if (row == c.row) break;
-            switch (self.kind) {
-                .semi => if (hit) try lidx.append(row),
-                .anti => if (!hit) try lidx.append(row),
-                else => if (!hit and fill_right) {
-                    try lidx.append(row);
-                    try ridx.append(0);
-                    try rnull.append(true);
-                },
-            }
+            try o.finish(row, hit);
             hit = false;
         }
         c.hit = hit;
-        return self.gather(out, ix, lb, lidx.items, ridx.items, rnull.items);
+        return join.gatherRows(out, self.out_schema, self.left_schema, self.kind, ix.build_batch, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
     }
 
     /// right/full: once the probe side ends, every build row nothing matched, the
     /// left columns null, in chunks.
     fn drain(self: *NLJoin, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
-        const matched = self.matched orelse return null;
-        var ridx = std.array_list.Managed(usize).init(arena);
-        while (self.drain_pos < ix.build_batch.len and ridx.items.len < drain_chunk) : (self.drain_pos += 1) {
-            if (!matched[self.drain_pos]) try ridx.append(self.drain_pos);
-        }
-        if (ridx.items.len == 0) return null;
-        return try self.gather(arena, ix, null, &.{}, ridx.items, &.{});
-    }
-
-    /// The output rows, one gather per column; `lb == null` is the drain, whose
-    /// left side is all null.
-    fn gather(self: *NLJoin, arena: std.mem.Allocator, ix: *JoinIndex, lb: ?Batch, lidx: []const usize, ridx: []const usize, rnull: []const bool) anyerror!Batch {
-        const n = if (lb != null) lidx.len else ridx.len;
-        const emit_right = self.kind != .semi and self.kind != .anti;
-        const nleft = self.left_schema.fields.len;
-        const cols = try arena.alloc(column.Column, nleft + if (emit_right) ix.build_batch.columns.len else 0);
-        for (0..nleft) |i| {
-            cols[i] = if (lb) |b|
-                try takeCol(arena, b.columns[i], lidx, &.{})
-            else
-                try nullColumn(arena, self.left_schema.fields[i].ty, n);
-        }
-        if (emit_right) for (ix.build_batch.columns, 0..) |col, k| {
-            cols[nleft + k] = try takeCol(arena, col, ridx, rnull);
-        };
-        return .{ .schema = self.out_schema, .columns = cols, .len = n };
+        return join.drainUnmatched(arena, self.out_schema, self.left_schema, self.kind, ix.build_batch, self.matched orelse return null, &self.drain_pos);
     }
 };
 
