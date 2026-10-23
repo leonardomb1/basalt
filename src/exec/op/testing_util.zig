@@ -31,6 +31,40 @@ pub const TestSource = struct {
     }
 };
 
+/// `count` key/value batches of `rows` rows each, built fresh in the arena each pull
+/// gives, as a real reader's are: keys run down from `count * rows`, values are
+/// 48-byte strings.
+pub const PullSource = struct {
+    schema_: types.Schema,
+    count: usize,
+    rows: usize,
+    idx: usize = 0,
+
+    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
+
+    fn schemaFn(p: *anyopaque) types.Schema {
+        return @as(*PullSource, @ptrCast(@alignCast(p))).schema_;
+    }
+    fn nextFn(p: *anyopaque, a: std.mem.Allocator) anyerror!?Batch {
+        const self: *PullSource = @ptrCast(@alignCast(p));
+        if (self.idx >= self.count) return null;
+        defer self.idx += 1;
+        const ints = try a.alloc(?i64, self.rows);
+        const strs = try a.alloc(?[]const u8, self.rows);
+        for (ints, strs, 0..) |*k, *s, r| {
+            const key = self.count * self.rows - (self.idx * self.rows + r);
+            k.* = @intCast(key);
+            s.* = try std.fmt.allocPrint(a, "{d:0>48}", .{key});
+        }
+        return try kvBatch(a, &self.schema_, ints, strs);
+    }
+    fn closeFn(_: *anyopaque) void {}
+
+    pub fn src(self: *PullSource) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
 pub fn lessStr(_: void, x: []const u8, y: []const u8) bool {
     return std.mem.lessThan(u8, x, y);
 }

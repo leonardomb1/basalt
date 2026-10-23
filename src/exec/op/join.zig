@@ -381,19 +381,21 @@ pub const JoinIndex = struct {
     /// A build at least this large is partitioned and filled in parallel.
     const parallel_min = 1 << 16;
 
-    /// Drain `build` into `pull`, materialize it in `state` and index `right_keys` on up
-    /// to `threads` threads.
+    /// Drain `build` into a scratch arena, materialize it in `state` and index
+    /// `right_keys` on up to `threads` threads; the drained batches are freed once
+    /// copied, so the build side is held once.
     pub fn create(
         state: std.mem.Allocator,
-        pull: std.mem.Allocator,
         build: Op,
         right_schema: *const types.Schema,
         right_keys: []const usize,
         cap: usize,
         threads: usize,
     ) anyerror!*JoinIndex {
+        var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer pull.deinit();
         var bytes: usize = 0;
-        const chunks = try drainBuild(pull, build, &bytes, cap);
+        const chunks = try drainBuild(pull.allocator(), build, &bytes, cap);
         return fromBatches(state, chunks, right_schema, right_keys, bytes, cap, threads);
     }
 
@@ -731,7 +733,7 @@ pub const Join = struct {
 
     pub fn next(self: *Join, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.push_build != null and !self.prefetched) try self.prefetch(arena);
-        const ix = (try self.ensureIndex(arena)) orelse return self.nextGrace(arena);
+        const ix = (try self.ensureIndex()) orelse return self.nextGrace(arena);
         if (self.push_probe) |kp| if (!self.probe_pushed) {
             self.probe_pushed = true;
             try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
@@ -822,10 +824,10 @@ pub const Join = struct {
     }
 
     /// The index, or null once the join has gone to grace mode.
-    fn ensureIndex(self: *Join, arena: std.mem.Allocator) anyerror!?*JoinIndex {
+    fn ensureIndex(self: *Join) anyerror!?*JoinIndex {
         if (self.grace != null) return null;
         const ix = self.index orelse blk: {
-            const made = (self.buildIndex(arena) catch |e| {
+            const made = (self.buildIndex() catch |e| {
                 if (self.err) |ec| {
                     if (self.null_aware and e == error.JoinBuildTooLarge)
                         notInTooLarge(ec, self.build_cap orelse op_mod.join_build_byte_cap)
@@ -871,10 +873,10 @@ pub const Join = struct {
     /// The in-memory index, or null after switching to grace mode. A join that may
     /// spill pulls its build side into a scratch arena, so what it held is freed
     /// once indexed or written out.
-    fn buildIndex(self: *Join, arena: std.mem.Allocator) anyerror!?*JoinIndex {
+    fn buildIndex(self: *Join) anyerror!?*JoinIndex {
         const build = self.build orelse return error.JoinHasNoBuildSide;
         const cap = self.build_cap orelse op_mod.join_build_byte_cap;
-        if (!self.mayGrace()) return try JoinIndex.create(self.state, arena, build, self.right_schema, self.right_keys, cap, self.threads);
+        if (!self.mayGrace()) return try JoinIndex.create(self.state, build, self.right_schema, self.right_keys, cap, self.threads);
         var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer pull.deinit();
         var held = std.array_list.Managed(Batch).init(pull.allocator());
@@ -2001,6 +2003,36 @@ test "join: cross emits bounded batches and keeps its build cap" {
         .build_cap = 8,
     };
     try testing.expectError(error.JoinBuildTooLarge, capped.next(a));
+}
+
+test "join: a cross or NOT IN build side is held once, not also in the caller's pull arena" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{1}, &.{"a"})};
+    for ([_]ast.JoinKind{ .cross, .anti }) |kind| {
+        var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+        var rps = @import("testing_util.zig").PullSource{ .schema_ = join_right_schema, .count = 64, .rows = 256 };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rps.src() };
+        var jn = Join{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_keys = if (kind == .cross) &.{} else &.{0},
+            .right_keys = if (kind == .cross) &.{} else &.{0},
+            .left_schema = &join_left_schema,
+            .right_schema = &join_right_schema,
+            .out_schema = if (kind == .cross) &join_both_schema else &join_left_schema,
+            .kind = kind,
+            .null_aware = kind == .anti,
+            .cross_chunk = 16,
+            .state = a,
+        };
+        var pull = std.heap.ArenaAllocator.init(testing.allocator);
+        defer pull.deinit();
+        _ = try jn.next(pull.allocator());
+        try testing.expect(pull.queryCapacity() < 256 * 1024);
+    }
 }
 
 test "join: a cross join stopped early holds its probe batch in the plan arena, which frees it" {

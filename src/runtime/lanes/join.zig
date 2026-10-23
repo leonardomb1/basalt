@@ -234,8 +234,6 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const final_schema = try mapChainSchema(env, suffix, out.*);
     const rp = analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
 
-    var build_arena = std.heap.ArenaAllocator.init(env.gpa);
-    defer build_arena.deinit();
     const cap = try laneJoinCap(env, j, join_hints);
     var build_root: ?profile.Id = null;
     var build_chain: ?op.Op = null;
@@ -243,7 +241,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
         indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, cap, &build_root)
     else blk: {
         build_chain = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
-        break :blk op.JoinIndex.create(arena, build_arena.allocator(), build_chain.?, right_schema, right_keys, cap, env.sort_threads);
+        break :blk op.JoinIndex.create(arena, build_chain.?, right_schema, right_keys, cap, env.sort_threads);
     };
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);

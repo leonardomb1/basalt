@@ -203,7 +203,7 @@ pub const NLJoin = struct {
     drain_pos: usize = 0,
 
     pub fn next(self: *NLJoin, arena: std.mem.Allocator) anyerror!?Batch {
-        const ix = try self.ensureBuild(arena);
+        const ix = try self.ensureBuild();
         while (true) {
             if (self.cur == null) {
                 if (self.probe_done) {
@@ -233,10 +233,10 @@ pub const NLJoin = struct {
         self.pair_mem = null;
     }
 
-    fn ensureBuild(self: *NLJoin, arena: std.mem.Allocator) anyerror!*JoinIndex {
+    fn ensureBuild(self: *NLJoin) anyerror!*JoinIndex {
         if (self.index) |ix| return ix;
         const build = self.build orelse return error.JoinHasNoBuildSide;
-        const ix = JoinIndex.create(self.state, arena, build, self.right_schema, &.{}, self.build_cap orelse op_mod.join_build_byte_cap, 1) catch |e| {
+        const ix = JoinIndex.create(self.state, build, self.right_schema, &.{}, self.build_cap orelse op_mod.join_build_byte_cap, 1) catch |e| {
             if (self.err) |ec| ec.set("{s}", .{failLabel(e)});
             return e;
         };
@@ -839,7 +839,7 @@ test "nljoin: the range path pairs a probe row with only the intervals that can 
         .range = try rangeOf(a, cond, nl_pair_schema, 2),
         .state = a,
     };
-    const ix = try jn.ensureBuild(a);
+    const ix = try jn.ensureBuild();
     const lb = (try lscan.next(a)).?;
     const spans = (try jn.spansFor(a, ix, lb)).?;
     try testing.expectEqual(@as(usize, 1), spans[0].hi - spans[0].lo);
