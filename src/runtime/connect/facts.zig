@@ -20,21 +20,21 @@ pub fn columnFacts(env: *Env, rd: ast.Read) !?*const pushdown.Facts {
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     const cache = env.facts_cache orelse return null;
-    cache.mu.lock();
-    defer cache.mu.unlock();
-    const ca = cache.arena.allocator();
-    const key = try std.fmt.allocPrint(ca, "{s}\x00{s}", .{ rd.connector, try qualStr(ca, rd.form.table) });
-    if (cache.map.get(key)) |f| return f;
-
-    const facts = try ca.create(pushdown.Facts);
-    facts.* = pushdown.Facts.init(ca);
-    try cache.map.put(key, facts);
-    probeFacts(env, ca, conn, info, rd.form.table.parts, facts) catch |e| {
-        if (e == error.OutOfMemory) return e;
-        facts.clearRetainingCapacity();
-        env.log.log(.debug, "catalog facts for {s}: not available ({s}); text comparisons stay in the engine", .{ key[rd.connector.len + 1 ..], @errorName(e) });
-    };
-    return facts;
+    const key = try std.fmt.allocPrint(env.arena, "{s}\x00{s}", .{ rd.connector, try qualStr(env.arena, rd.form.table) });
+    const Ask = struct { env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, name: []const u8 };
+    const ask = Ask{ .env = env, .conn = conn, .info = info, .parts = rd.form.table.parts, .name = key[rd.connector.len + 1 ..] };
+    return try cache.facts.get(cache, key, ask, struct {
+        fn compute(x: Ask, scratch: std.mem.Allocator) !*const pushdown.Facts {
+            const facts = try scratch.create(pushdown.Facts);
+            facts.* = pushdown.Facts.init(scratch);
+            probeFacts(x.env, scratch, x.conn, x.info, x.parts, facts) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                facts.clearRetainingCapacity();
+                x.env.log.log(.debug, "catalog facts for {s}: not available ({s}); text comparisons stay in the engine", .{ x.name, @errorName(e) });
+            };
+            return facts;
+        }
+    }.compute);
 }
 
 pub fn factsIfWanted(env: *Env, rd: ast.Read, dialect: sql.Dialect, stages: []const ast.Stage, schema: types.Schema, check_fields: bool, need: pushdown.Need) !?*const pushdown.Facts {

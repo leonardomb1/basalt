@@ -177,20 +177,76 @@ pub const RunOptions = struct {
     }
 };
 
+/// Catalog answers asked once per run and shared by parallel loop workers. Each is
+/// asked outside `mu`, so one table's round trip never holds up another's.
 pub const FactsCache = struct {
     mu: std.Thread.Mutex = .{},
+    settled: std.Thread.Condition = .{},
     arena: std.heap.ArenaAllocator,
-    map: std.StringHashMap(*const pushdown.Facts),
-    rows: std.StringHashMapUnmanaged(?u64) = .{},
+    facts: OnceMap(*const pushdown.Facts, adoptFacts) = .{},
+    rows: OnceMap(?u64, null) = .{},
 
     pub fn init(gpa: std.mem.Allocator) FactsCache {
-        return .{ .arena = std.heap.ArenaAllocator.init(gpa), .map = std.StringHashMap(*const pushdown.Facts).init(gpa) };
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
     }
     pub fn deinit(self: *FactsCache) void {
-        self.map.deinit();
         self.arena.deinit();
     }
 };
+
+/// Copies facts built in a private arena into the cache's.
+fn adoptFacts(f: *const pushdown.Facts, ca: std.mem.Allocator) error{OutOfMemory}!*const pushdown.Facts {
+    const out = try ca.create(pushdown.Facts);
+    out.* = pushdown.Facts.init(ca);
+    try out.ensureTotalCapacity(f.count());
+    var it = f.iterator();
+    while (it.next()) |e| out.putAssumeCapacity(try ca.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+    return out;
+}
+
+/// Answers computed at most once per key across threads: the first asker claims the
+/// key and computes outside the lock, askers of the same key wait for it, and other
+/// keys go ahead. A failed computation gives the key up, and the next waiter tries.
+/// `adopt` copies an answer out of the computation's private arena, which is gone
+/// once it is published; null keeps the answer as it is.
+pub fn OnceMap(comptime V: type, comptime adopt: ?fn (V, std.mem.Allocator) error{OutOfMemory}!V) type {
+    return struct {
+        map: std.StringHashMapUnmanaged(?V) = .{},
+
+        const Self = @This();
+
+        /// The answer under `key`, from `compute(ctx, scratch)` when no thread has one yet.
+        pub fn get(self: *Self, c: *FactsCache, key: []const u8, ctx: anytype, comptime compute: anytype) !V {
+            c.mu.lock();
+            defer c.mu.unlock();
+            while (self.map.get(key)) |slot| {
+                if (slot) |v| return v;
+                c.settled.wait(&c.mu);
+            }
+            const ca = c.arena.allocator();
+            try self.map.put(ca, try ca.dupe(u8, key), null);
+
+            c.mu.unlock();
+            var scratch = std.heap.ArenaAllocator.init(c.arena.child_allocator);
+            defer scratch.deinit();
+            const got = compute(ctx, scratch.allocator());
+            c.mu.lock();
+
+            defer c.settled.broadcast();
+            const v = keep(got, ca) catch |e| {
+                _ = self.map.remove(key);
+                return e;
+            };
+            self.map.getPtr(key).?.* = v;
+            return v;
+        }
+
+        fn keep(got: anytype, ca: std.mem.Allocator) !V {
+            const v = try got;
+            return if (adopt) |f| f(v, ca) else v;
+        }
+    };
+}
 
 pub const LoadDone = struct {
     ordinal: u64,
@@ -718,4 +774,100 @@ test "terminate: the first signal aborts the run, a second exits" {
     try std.testing.expect(terminate());
     try std.testing.expect(driver.aborting());
     try std.testing.expect(!terminate());
+}
+
+const OnceTest = struct {
+    asked: std.atomic.Value(u32) = .init(0),
+    b_asked: std.Thread.ResetEvent = .{},
+    claimed: std.Thread.ResetEvent = .{},
+    release: std.Thread.ResetEvent = .{},
+
+    fn slow(t: *OnceTest, _: std.mem.Allocator) error{}!?u64 {
+        _ = t.asked.fetchAdd(1, .monotonic);
+        t.claimed.set();
+        t.release.timedWait(5 * std.time.ns_per_s) catch {};
+        return 42;
+    }
+    fn waitsForB(t: *OnceTest, _: std.mem.Allocator) error{Timeout}!?u64 {
+        t.claimed.set();
+        try t.b_asked.timedWait(5 * std.time.ns_per_s);
+        return 1;
+    }
+    fn b(t: *OnceTest, _: std.mem.Allocator) error{}!?u64 {
+        t.b_asked.set();
+        return 2;
+    }
+    fn fails(t: *OnceTest, _: std.mem.Allocator) error{Unreachable}!?u64 {
+        t.claimed.set();
+        t.release.timedWait(5 * std.time.ns_per_s) catch {};
+        return error.Unreachable;
+    }
+};
+
+test "facts cache: one key is asked once while its other askers wait" {
+    var cache = FactsCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var t = OnceTest{};
+    var got: [4]?u64 = @splat(null);
+    const Run = struct {
+        fn go(c: *FactsCache, tt: *OnceTest, out: *?u64) void {
+            out.* = c.rows.get(c, "pg\x00t", tt, OnceTest.slow) catch null;
+        }
+    };
+    var threads: [4]std.Thread = undefined;
+    threads[0] = try std.Thread.spawn(.{}, Run.go, .{ &cache, &t, &got[0] });
+    try t.claimed.timedWait(5 * std.time.ns_per_s);
+    for (threads[1..], got[1..]) |*th, *g| th.* = try std.Thread.spawn(.{}, Run.go, .{ &cache, &t, g });
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    t.release.set();
+    for (threads) |th| th.join();
+    try std.testing.expectEqual(@as(u32, 1), t.asked.load(.monotonic));
+    for (got) |g| try std.testing.expectEqual(@as(?u64, 42), g);
+}
+
+test "facts cache: another key is asked while the first is still out" {
+    var cache = FactsCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var t = OnceTest{};
+    var a_err: ?anyerror = null;
+    const Run = struct {
+        fn go(c: *FactsCache, tt: *OnceTest, err: *?anyerror) void {
+            _ = c.rows.get(c, "pg\x00a", tt, OnceTest.waitsForB) catch |e| {
+                err.* = e;
+            };
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Run.go, .{ &cache, &t, &a_err });
+    try t.claimed.timedWait(5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(?u64, 2), try cache.rows.get(&cache, "pg\x00b", &t, OnceTest.b));
+    th.join();
+    try std.testing.expectEqual(@as(?anyerror, null), a_err);
+}
+
+test "facts cache: a failed ask gives its key to the next asker" {
+    var cache = FactsCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var t = OnceTest{};
+    var first: ?anyerror = null;
+    const Run = struct {
+        fn go(c: *FactsCache, tt: *OnceTest, err: *?anyerror) void {
+            _ = c.rows.get(c, "pg\x00t", tt, OnceTest.fails) catch |e| {
+                err.* = e;
+            };
+        }
+    };
+    const th = try std.Thread.spawn(.{}, Run.go, .{ &cache, &t, &first });
+    try t.claimed.timedWait(5 * std.time.ns_per_s);
+    const Release = struct {
+        fn go(tt: *OnceTest) void {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            tt.release.set();
+        }
+    };
+    const rel = try std.Thread.spawn(.{}, Release.go, .{&t});
+    try std.testing.expectEqual(@as(?u64, 42), try cache.rows.get(&cache, "pg\x00t", &t, OnceTest.slow));
+    th.join();
+    rel.join();
+    try std.testing.expectEqual(@as(?anyerror, error.Unreachable), first);
+    try std.testing.expectEqual(@as(u32, 1), t.asked.load(.monotonic));
 }

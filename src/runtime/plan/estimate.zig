@@ -140,17 +140,17 @@ pub fn sqlRows(env: *Env, rd: ast.Read) ?u64 {
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     const cache = env.facts_cache orelse return null;
-    cache.mu.lock();
-    defer cache.mu.unlock();
-    const ca = cache.arena.allocator();
-    const key = std.mem.join(ca, "\x00", &.{ rd.connector, std.mem.join(ca, ".", rd.form.table.parts) catch return null }) catch return null;
-    if (cache.rows.get(key)) |r| return r;
-    const got = askCatalog(env, conn, info, rd.form.table.parts) catch |e| blk: {
-        env.log.log(.debug, "row estimate for {s}: not available ({s})", .{ key[rd.connector.len + 1 ..], @errorName(e) });
-        break :blk null;
-    };
-    cache.rows.put(ca, key, got) catch {};
-    return got;
+    const key = std.mem.join(env.arena, "\x00", &.{ rd.connector, std.mem.join(env.arena, ".", rd.form.table.parts) catch return null }) catch return null;
+    const Ask = struct { env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, name: []const u8 };
+    const ask = Ask{ .env = env, .conn = conn, .info = info, .parts = rd.form.table.parts, .name = key[rd.connector.len + 1 ..] };
+    return cache.rows.get(cache, key, ask, struct {
+        fn compute(x: Ask, _: std.mem.Allocator) error{}!?u64 {
+            return askCatalog(x.env, x.conn, x.info, x.parts) catch |e| {
+                x.env.log.log(.debug, "row estimate for {s}: not available ({s})", .{ x.name, @errorName(e) });
+                return null;
+            };
+        }
+    }.compute) catch null;
 }
 
 fn askCatalog(env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8) !?u64 {
@@ -367,7 +367,7 @@ test "estimate: a SQL table whose catalog cannot be asked is unknown, asked once
 
     const rd = ast.Read{ .connector = "pg", .form = .{ .table = .{ .parts = &.{ "public", "t" } } } };
     try testing.expectEqual(@as(?u64, null), sqlRows(&env, rd));
-    try testing.expectEqual(@as(usize, 1), cache.rows.count());
+    try testing.expectEqual(@as(usize, 1), cache.rows.map.count());
     try testing.expectEqual(@as(?u64, null), sqlRows(&env, rd));
     try testing.expectEqual(@as(usize, 0), diag.msg.len);
     try testing.expect(!ofRead(&env, .{ .connector = "pg", .form = .{ .query = "SELECT 1" } }).known());
