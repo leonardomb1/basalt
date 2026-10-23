@@ -795,11 +795,7 @@ pub const Reader = struct {
             else => false,
         };
         if (fixed) {
-            std.debug.assert(off % 8 == 0);
-            const valid: column.Bitmap = if (cur.a.null_count == 0 or cur.bits.len == 0)
-                try column.Bitmap.initFull(arena, n)
-            else
-                .{ .bits = try arena.dupe(u8, cur.bits[off / 8 ..][0 .. (n + 7) / 8]), .len = n };
+            const valid = try windowValidity(arena, cur, off, n);
             const data: column.Column.Data = switch (f.kind) {
                 .int, .timestamp, .time => .{ .i64 = try copyAs(i64, arena, cur.data[off * 8 ..], n) },
                 .float => .{ .f64 = try copyAs(f64, arena, cur.data[off * 8 ..], n) },
@@ -831,6 +827,8 @@ pub const Reader = struct {
             };
             return .{ .ty = ty, .len = n, .validity = valid, .data = data };
         }
+        if (cur.dict) |d| if (d.len > 0) return dictColumn(arena, cur, d, ty, off, n);
+        if (try widened(arena, cur, off, n)) |data| return .{ .ty = ty, .len = n, .validity = try windowValidity(arena, cur, off, n), .data = data };
         var b = try column.Builder.initCapacity(arena, ty, n);
         for (off..off + n) |i| try b.append(try cur.value(arena, i));
         return b.finish();
@@ -1085,6 +1083,148 @@ fn copyAs(comptime T: type, arena: std.mem.Allocator, src: []const u8, n: usize)
     return out;
 }
 
+/// The validity of rows `off .. off + n`, copied as bytes since `off` is a multiple of eight.
+fn windowValidity(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) Error!column.Bitmap {
+    std.debug.assert(off % 8 == 0);
+    if (cur.a.null_count == 0 or cur.bits.len == 0) return column.Bitmap.initFull(arena, n);
+    return .{ .bits = try arena.dupe(u8, cur.bits[off / 8 ..][0 .. (n + 7) / 8]), .len = n };
+}
+
+/// The fixed-width kinds whose engine storage is not Arrow's own, converted in one
+/// typed pass per window; null for a kind with no such pass.
+fn widened(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) Error!?column.Column.Data {
+    const f = cur.f;
+    return switch (f.kind) {
+        .int => switch (f.bit_width) {
+            inline 8, 16, 32, 64 => |w| if (f.signed)
+                .{ .i64 = try widen(std.meta.Int(.signed, w), i64, arena, cur, off, n, ToInt(i64){}) }
+            else
+                .{ .i64 = try widen(std.meta.Int(.unsigned, w), i64, arena, cur, off, n, ToInt(i64){}) },
+            else => return Error.CorruptArrow,
+        },
+        .float => if (f.bit_width == 32) .{ .f64 = try widen(f32, f64, arena, cur, off, n, ToFloat{}) } else null,
+        .bool_ => .{ .b = try unpackBools(arena, cur, off, n) },
+        .decimal => .{ .dec = try widen(i128, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = f.scale }) },
+        .date_ms => .{ .i32 = try widen(i64, i32, arena, cur, off, n, DayOfMs{}) },
+        .timestamp, .duration, .time => switch (f.unit) {
+            inline else => |u| .{ .i64 = if (f.kind == .time and f.bit_width == 32)
+                try widen(i32, i64, arena, cur, off, n, Micros(u){})
+            else
+                try widen(i64, i64, arena, cur, off, n, Micros(u){}) },
+        },
+        else => null,
+    };
+}
+
+/// Rows `off .. off + n` of a little-endian buffer of `Src`, each through `conv.of`;
+/// a null row is `conv.zero()`, so what a writer left under it can never fail.
+fn widen(comptime Src: type, comptime Dst: type, arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize, conv: anytype) Error![]Dst {
+    const w = @sizeOf(Src);
+    if (cur.data.len < (off + n) * w) return Error.CorruptArrow;
+    const src = cur.data[off * w ..][0 .. n * w];
+    const out = try arena.alloc(Dst, n);
+    if (cur.a.null_count == 0 or cur.bits.len == 0) {
+        for (out, 0..) |*o, k| o.* = try conv.of(load(Src, src, k));
+    } else {
+        for (out, 0..) |*o, k| o.* = if (cur.isNull(off + k)) conv.zero() else try conv.of(load(Src, src, k));
+    }
+    return out;
+}
+
+fn load(comptime T: type, bytes: []const u8, k: usize) T {
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    return @bitCast(std.mem.readInt(U, bytes[k * @sizeOf(T) ..][0..@sizeOf(T)], .little));
+}
+
+fn ToInt(comptime Dst: type) type {
+    return struct {
+        fn of(_: @This(), x: anytype) Error!Dst {
+            return std.math.cast(Dst, x) orelse Error.ArrowIntOverflow;
+        }
+        fn zero(_: @This()) Dst {
+            return 0;
+        }
+    };
+}
+
+const ToFloat = struct {
+    fn of(_: ToFloat, x: f32) Error!f64 {
+        return x;
+    }
+    fn zero(_: ToFloat) f64 {
+        return 0;
+    }
+};
+
+const ToDec = struct {
+    scale: u8,
+    fn of(c: ToDec, x: i128) Error!column.Elem(.dec) {
+        return .{ .unscaled = x, .scale = c.scale };
+    }
+    fn zero(c: ToDec) column.Elem(.dec) {
+        return .{ .unscaled = 0, .scale = c.scale };
+    }
+};
+
+const DayOfMs = struct {
+    fn of(_: DayOfMs, x: i64) Error!i32 {
+        return std.math.cast(i32, @divFloor(x, 86_400_000)) orelse Error.CorruptArrow;
+    }
+    fn zero(_: DayOfMs) i32 {
+        return 0;
+    }
+};
+
+fn Micros(comptime u: Unit) type {
+    return struct {
+        fn of(_: @This(), x: anytype) Error!i64 {
+            return u.toMicros(x);
+        }
+        fn zero(_: @This()) i64 {
+            return 0;
+        }
+    };
+}
+
+/// A bit-packed boolean buffer as one `bool` per row, false under a null.
+fn unpackBools(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) Error![]bool {
+    if (cur.data.len < (off + n + 7) / 8) return Error.CorruptArrow;
+    const out = try arena.alloc(bool, n);
+    for (out, off..) |*o, i| o.* = (cur.data[i >> 3] >> @intCast(i & 7)) & 1 != 0 and !cur.isNull(i);
+    return out;
+}
+
+/// A dictionary-encoded window as its values, gathered from the dictionary by index;
+/// a null index row is null whatever the dictionary holds at index 0.
+fn dictColumn(arena: std.mem.Allocator, cur: *const Cursor, d: *const column.Column, ty: types.Type, off: usize, n: usize) !column.Column {
+    const db = cur.f.dict.?;
+    const ix = Index{ .len = d.len };
+    const idx = switch (db.index_bits) {
+        inline 8, 16, 32, 64 => |w| if (db.index_signed)
+            try widen(std.meta.Int(.signed, w), usize, arena, cur, off, n, ix)
+        else
+            try widen(std.meta.Int(.unsigned, w), usize, arena, cur, off, n, ix),
+        else => return Error.CorruptArrow,
+    };
+    var col = try column.permute(arena, d.*, idx);
+    col.ty = ty;
+    if (cur.a.null_count > 0 and cur.bits.len > 0) {
+        for (col.validity.bits, cur.bits[off / 8 ..][0..col.validity.bits.len]) |*o, v| o.* &= v;
+    }
+    return col;
+}
+
+const Index = struct {
+    len: usize,
+    fn of(c: Index, x: anytype) Error!usize {
+        const i = std.math.cast(usize, x) orelse return Error.CorruptArrow;
+        return if (i < c.len) i else Error.CorruptArrow;
+    }
+    fn zero(_: Index) usize {
+        return 0;
+    }
+};
+
 const source_vtable = driver.sourceVTable(Reader);
 
 fn dump(a: std.mem.Allocator, bytes: []const u8, want: ?[]const []const u8) ![]const u8 {
@@ -1134,6 +1274,41 @@ test "pyarrow files: LZ4 and ZSTD bodies, a chunked stream, every unit and neste
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("../testdata/pyarrow_lz4.feather"), &pyarrow_cols));
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("../testdata/pyarrow_zstd.feather"), &pyarrow_cols));
     try std.testing.expectEqualStrings(pyarrow_want, try dump(a, @embedFile("../testdata/pyarrow_stream.arrows"), &pyarrow_cols));
+}
+
+test "a batch past one window converts bools and decimals per window, nulls kept" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "b", .ty = types.Type.init(.bool).asNullable() },
+        .{ .name = "d", .ty = types.Type.decimal(10, 2).asNullable() },
+    };
+    const schema = types.Schema{ .fields = &fields };
+    const n = Reader.window_rows + 1003;
+    var bb = try column.Builder.initCapacity(a, fields[0].ty, n);
+    var db = try column.Builder.initCapacity(a, fields[1].ty, n);
+    for (0..n) |i| {
+        const x: i64 = @intCast(i);
+        try bb.append(if (i % 7 == 3) .null else .{ .bool = i % 3 == 0 });
+        try db.append(if (i % 11 == 5) .null else .{ .decimal = .{ .unscaled = x * 7 - 5000, .scale = 2 } });
+    }
+    var cols = [_]column.Column{ try bb.finish(), try db.finish() };
+    var out = std.Io.Writer.Allocating.init(a);
+    var sw = try @import("write.zig").StreamWriter.init(a, &out.writer, schema, &.{});
+    try sw.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = n });
+    try sw.finish();
+
+    const r = try Reader.openBytes(a, out.written(), null);
+    defer r.close();
+    var at: usize = 0;
+    while (try r.next(a)) |b| {
+        for (0..b.len) |i| for (b.columns, cols) |got, want| {
+            try std.testing.expectEqualDeep(want.getValue(at + i), got.getValue(i));
+        };
+        at += b.len;
+    }
+    try std.testing.expectEqual(n, at);
 }
 
 test "a projection reads only the columns asked for, in the file's order" {
