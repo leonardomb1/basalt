@@ -228,21 +228,29 @@ pub const State = struct {
 
     /// A file's identity in the log: its path resolved against the root, and its
     /// deletion vector's id. A path whose scheme basalt does not read keys as written.
-    fn key(self: *State, decoded: []const u8, dv: ?[]const u8) ![]const u8 {
-        const at = try fileKey(self.arena, self.key_root, decoded);
+    fn key(self: *State, a: std.mem.Allocator, decoded: []const u8, dv: ?[]const u8) ![]const u8 {
+        const at = try fileKey(a, self.key_root, decoded);
         const id = dv orelse return at;
-        return std.mem.concat(self.arena, u8, &.{ at, "\x00", id });
+        return std.mem.concat(a, u8, &.{ at, "\x00", id });
     }
 
+    /// Keeps `a`, copied: what it borrows (a commit line's parse, a checkpoint
+    /// batch) is freed once its line or batch is replayed.
     fn put(self: *State, a: Add) !void {
-        var x = a;
-        x.raw = a.path;
-        x.path = try table.percentDecode(self.arena, a.path);
-        try self.files.put(self.arena, try self.key(x.path, try jsonDv(self.arena, a.dv)), x);
+        const raw = try self.arena.dupe(u8, a.path);
+        const x = Add{
+            .path = try table.percentDecode(self.arena, raw),
+            .raw = raw,
+            .size = a.size,
+            .parts = if (a.parts) |v| try ownJson(self.arena, v, 2) else null,
+            .dv = if (a.dv) |v| try ownJson(self.arena, v, 2) else null,
+            .stats = if (a.stats) |t| try self.arena.dupe(u8, t) else null,
+        };
+        try self.files.put(self.arena, try self.key(self.arena, x.path, try jsonDv(self.arena, x.dv)), x);
     }
 
-    fn drop(self: *State, path: []const u8, dv: ?[]const u8) !void {
-        _ = self.files.swapRemove(try self.key(try table.percentDecode(self.arena, path), dv));
+    fn drop(self: *State, scratch: std.mem.Allocator, path: []const u8, dv: ?[]const u8) !void {
+        _ = self.files.swapRemove(try self.key(scratch, try table.percentDecode(scratch, path), dv));
     }
 
     fn protocol(self: *State, version: i64, writer: ?i64, features: ?std.json.Value, writer_features: ?std.json.Value) !void {
@@ -253,10 +261,10 @@ pub const State = struct {
     }
 
     fn meta(self: *State, id: ?[]const u8, schema: []const u8, parts: ?std.json.Value, config: ?std.json.Value) !void {
-        self.table_id = id;
-        self.schema_string = schema;
+        self.table_id = if (id) |x| try self.arena.dupe(u8, x) else null;
+        self.schema_string = try self.arena.dupe(u8, schema);
         self.part_cols = try strings(self.arena, parts);
-        self.config = if (config) |c| (if (c == .object) c else null) else null;
+        self.config = if (config) |c| (if (c == .object) try ownJson(self.arena, c, 2) else null) else null;
         self.mapping = null;
         if (self.config) |c| if (c.object.get("delta.columnMapping.mode")) |m| if (m == .string) {
             self.mapping = m.string;
@@ -280,10 +288,10 @@ pub const State = struct {
         return if (on) m else null;
     }
 
-    /// One commit line's action; unknown actions and fields are ignored, as the
-    /// protocol asks.
-    fn action(self: *State, line: []const u8) !void {
-        const v = std.json.parseFromSliceLeaky(std.json.Value, self.arena, line, .{}) catch
+    /// One commit line's action, parsed into `scratch`, which the caller frees
+    /// after it; unknown actions and fields are ignored, as the protocol asks.
+    fn action(self: *State, scratch: std.mem.Allocator, line: []const u8) !void {
+        const v = std.json.parseFromSliceLeaky(std.json.Value, scratch, line, .{}) catch
             return refuse("{s} has a commit in _delta_log/ holding a line that is not JSON", .{self.name});
         if (v != .object) return;
         var it = v.object.iterator();
@@ -302,7 +310,7 @@ pub const State = struct {
                     .stats = str(o.get("stats")),
                 });
             } else if (std.mem.eql(u8, k, "remove")) {
-                try self.drop(str(o.get("path")) orelse continue, try jsonDv(self.arena, o.get("deletionVector")));
+                try self.drop(scratch, str(o.get("path")) orelse continue, try jsonDv(scratch, o.get("deletionVector")));
             } else if (std.mem.eql(u8, k, "metaData")) {
                 try self.meta(str(o.get("id")), str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
             } else if (std.mem.eql(u8, k, "protocol")) {
@@ -316,10 +324,21 @@ pub const State = struct {
 
     /// One checkpoint file's rows, read through the Parquet reader: its `add`s are
     /// the files live at its version, its `remove`s tombstones a reader skips.
+    /// Each row group is decoded into memory freed once its rows are kept, and the
+    /// file map is sized for the rows up front, as an arena keeps every outgrown table.
     fn checkpoint(self: *State, url: []const u8) !void {
-        const r = try Reader.openProjected(self.arena, url, &checkpoint_columns);
+        var reader_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer reader_mem.deinit();
+        var batch_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer batch_mem.deinit();
+        const scratch = batch_mem.allocator();
+        const r = try Reader.openProjected(reader_mem.allocator(), url, &checkpoint_columns);
         defer r.close();
-        while (try r.next(self.arena)) |b| {
+        var rows: usize = 0;
+        for (r.md.row_groups) |g| rows +|= std.math.cast(usize, g.num_rows) orelse 0;
+        try self.files.ensureUnusedCapacity(self.arena, @min(rows, 1 << 22));
+        while (try r.next(scratch)) |b| {
+            defer _ = batch_mem.reset(.retain_capacity);
             const c_path = b.schema.indexOf("add.path");
             const c_size = b.schema.indexOf("add.size");
             const c_parts = b.schema.indexOf("add.partitionValues");
@@ -347,10 +366,10 @@ pub const State = struct {
                     const storage = cell(b, c_dv, i);
                     var dv: ?std.json.Value = null;
                     if (storage == .string) {
-                        var o = std.json.ObjectMap.init(self.arena);
-                        try o.put("storageType", .{ .string = try self.arena.dupe(u8, storage.string) });
+                        var o = std.json.ObjectMap.init(scratch);
+                        try o.put("storageType", .{ .string = storage.string });
                         const where = cell(b, c_dv_at, i);
-                        if (where == .string) try o.put("pathOrInlineDv", .{ .string = try self.arena.dupe(u8, where.string) });
+                        if (where == .string) try o.put("pathOrInlineDv", .{ .string = where.string });
                         const ints = [_]struct { ?usize, []const u8 }{ .{ c_dv_off, "offset" }, .{ c_dv_size, "sizeInBytes" }, .{ c_dv_card, "cardinality" } };
                         for (ints) |f| {
                             const v = cell(b, f[0], i);
@@ -360,28 +379,28 @@ pub const State = struct {
                     }
                     const stats = cell(b, c_stats, i);
                     try self.put(.{
-                        .path = try self.arena.dupe(u8, cell(b, c_path, i).string),
+                        .path = cell(b, c_path, i).string,
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
-                        .parts = try self.jsonOf(cell(b, c_parts, i)),
+                        .parts = jsonOf(scratch, cell(b, c_parts, i)),
                         .dv = dv,
-                        .stats = if (stats == .string) try self.arena.dupe(u8, stats.string) else null,
+                        .stats = if (stats == .string) stats.string else null,
                     });
                 }
                 if (cell(b, c_schema, i) == .string) {
                     const id = cell(b, c_id, i);
-                    try self.meta(if (id == .string) try self.arena.dupe(u8, id.string) else null, try self.arena.dupe(u8, cell(b, c_schema, i).string), try self.jsonOf(cell(b, c_pcols, i)), try self.jsonOf(cell(b, c_config, i)));
+                    try self.meta(if (id == .string) id.string else null, cell(b, c_schema, i).string, jsonOf(scratch, cell(b, c_pcols, i)), jsonOf(scratch, cell(b, c_config, i)));
                 }
                 if (cell(b, c_rv, i) == .int) {
                     const wv = cell(b, c_wv, i);
-                    try self.protocol(cell(b, c_rv, i).int, if (wv == .int) wv.int else null, try self.jsonOf(cell(b, c_feat, i)), try self.jsonOf(cell(b, c_wfeat, i)));
+                    try self.protocol(cell(b, c_rv, i).int, if (wv == .int) wv.int else null, jsonOf(scratch, cell(b, c_feat, i)), jsonOf(scratch, cell(b, c_wfeat, i)));
                 }
             }
         }
     }
 
-    fn jsonOf(self: *State, v: Value) !?std.json.Value {
+    fn jsonOf(a: std.mem.Allocator, v: Value) ?std.json.Value {
         if (v != .string) return null;
-        return std.json.parseFromSliceLeaky(std.json.Value, self.arena, v.string, .{}) catch null;
+        return std.json.parseFromSliceLeaky(std.json.Value, a, v.string, .{}) catch null;
     }
 
     /// Refuses a table whose reader version or features basalt does not honour, or
@@ -431,8 +450,33 @@ fn strings(arena: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
     const x = v orelse return &.{};
     if (x != .array) return &.{};
     var out = std.array_list.Managed([]const u8).init(arena);
-    for (x.array.items) |e| if (e == .string) try out.append(e.string);
+    for (x.array.items) |e| if (e == .string) try out.append(try arena.dupe(u8, e.string));
     return out.items;
+}
+
+/// `v` copied into `arena`, so it outlives the parse it came from. Kept action
+/// fields (partition values, a deletion vector, the configuration) are flat maps;
+/// nesting past `depth` is dropped.
+fn ownJson(arena: std.mem.Allocator, v: std.json.Value, depth: u8) !std.json.Value {
+    switch (v) {
+        .string => |s| return .{ .string = try arena.dupe(u8, s) },
+        .number_string => |s| return .{ .number_string = try arena.dupe(u8, s) },
+        .array => |xs| {
+            if (depth == 0) return .null;
+            var out = try std.json.Array.initCapacity(arena, xs.items.len);
+            for (xs.items) |x| out.appendAssumeCapacity(try ownJson(arena, x, depth - 1));
+            return .{ .array = out };
+        },
+        .object => |o| {
+            if (depth == 0) return .null;
+            var out = std.json.ObjectMap.init(arena);
+            try out.ensureTotalCapacity(o.count());
+            var it = o.iterator();
+            while (it.next()) |kv| out.putAssumeCapacity(try arena.dupe(u8, kv.key_ptr.*), try ownJson(arena, kv.value_ptr.*, depth - 1));
+            return .{ .object = out };
+        },
+        else => return v,
+    }
 }
 
 /// `schemaString` as the reader's columns: a struct's fields as dotted columns,
@@ -640,13 +684,20 @@ pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed
         while (k <= c.parts) : (k += 1) try st.checkpoint(files.get(k).?);
         if (st.v2) |f| return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint `{s}`), which basalt does not read", .{ name, folder.below(f, log_path) });
     }
+    var text_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer text_mem.deinit();
+    var line_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer line_mem.deinit();
     var v: u64 = if (from) |f| f.version + 1 else 0;
     while (v <= target) : (v += 1) {
-        const text = try table.readWhole(arena, log.commits.get(v).?);
+        _ = text_mem.reset(.retain_capacity);
+        const text = try table.readWhole(text_mem.allocator(), log.commits.get(v).?);
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             const t = std.mem.trim(u8, line, " \r\t");
-            if (t.len > 0) try st.action(t);
+            if (t.len == 0) continue;
+            _ = line_mem.reset(.retain_capacity);
+            try st.action(line_mem.allocator(), t);
         }
     }
     st.version = target;
@@ -730,19 +781,19 @@ test "a file is keyed by its resolved path and deletion vector, so line order in
     const rm_old = "{\"remove\":{\"path\":\"a.parquet\"}}";
     for ([_][2][]const u8{ .{ add_dv, rm_old }, .{ rm_old, add_dv } }) |order| {
         var st = State{ .arena = a, .name = "T", .key_root = "/t/" };
-        try st.action("{\"add\":{\"path\":\"a.parquet\",\"partitionValues\":{}}}");
-        for (order) |line| try st.action(line);
+        try st.action(a, "{\"add\":{\"path\":\"a.parquet\",\"partitionValues\":{}}}");
+        for (order) |line| try st.action(a, line);
         try testing.expectEqual(@as(usize, 1), st.files.count());
         try testing.expect(st.files.values()[0].dv != null);
-        try st.action("{\"remove\":{\"path\":\"a.parquet\",\"deletionVector\":" ++ dv ++ "}}");
+        try st.action(a, "{\"remove\":{\"path\":\"a.parquet\",\"deletionVector\":" ++ dv ++ "}}");
         try testing.expectEqual(@as(usize, 0), st.files.count());
     }
     var st = State{ .arena = a, .name = "T", .key_root = "/t/" };
-    try st.action("{\"add\":{\"path\":\"x%3D1/b.parquet\",\"partitionValues\":{}}}");
-    try st.action("{\"remove\":{\"path\":\"file:///t/x%3D1/b.parquet\"}}");
+    try st.action(a, "{\"add\":{\"path\":\"x%3D1/b.parquet\",\"partitionValues\":{}}}");
+    try st.action(a, "{\"remove\":{\"path\":\"file:///t/x%3D1/b.parquet\"}}");
     try testing.expectEqual(@as(usize, 0), st.files.count());
-    try st.action("{\"add\":{\"path\":\"hdfs://nn/t/c.parquet\",\"partitionValues\":{}}}");
-    try st.action("{\"remove\":{\"path\":\"hdfs://nn/t/c.parquet\"}}");
+    try st.action(a, "{\"add\":{\"path\":\"hdfs://nn/t/c.parquet\",\"partitionValues\":{}}}");
+    try st.action(a, "{\"remove\":{\"path\":\"hdfs://nn/t/c.parquet\"}}");
     try testing.expectEqual(@as(usize, 0), st.files.count());
 }
 
@@ -827,4 +878,51 @@ test "schemaString: primitives, a struct as dotted columns, array and map as JSO
     for (0..100_000) |_| try deep.appendSlice("}]}");
     try testing.expectError(table.Error.LakeTableRefused, schemaOf(a, "T", deep.items));
     try testing.expectEqualStrings("T has a schemaString nested deeper than 64 levels", eval.takeFailure(table.Error.LakeTableRefused).?);
+}
+
+test "replay keeps only what it needs: a checkpoint's batches and each commit's parse are freed, what it keeps is copied out" {
+    const dir = "../testdata/delta/dv-with-columnmapping/_delta_log/";
+    const log = [_]struct { []const u8, []const u8 }{
+        .{ "00000000000000000010.checkpoint.parquet", @embedFile(dir ++ "00000000000000000010.checkpoint.parquet") },
+        .{ "00000000000000000010.json", @embedFile(dir ++ "00000000000000000010.json") },
+        .{ "00000000000000000011.json", @embedFile(dir ++ "00000000000000000011.json") },
+        .{ "00000000000000000012.json", @embedFile(dir ++ "00000000000000000012.json") },
+        .{ "00000000000000000013.json", @embedFile(dir ++ "00000000000000000013.json") },
+        .{ "00000000000000000014.json", @embedFile(dir ++ "00000000000000000014.json") },
+        .{ "00000000000000000015.json", @embedFile(dir ++ "00000000000000000015.json") },
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("_delta_log");
+    for (log) |f| {
+        var buf: [96]u8 = undefined;
+        try tmp.dir.writeFile(.{ .sub_path = try std.fmt.bufPrint(&buf, "_delta_log/{s}", .{f[0]}), .data = f[1] });
+    }
+    const real = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(real);
+    const root = try std.mem.concat(testing.allocator, u8, &.{ real, "/" });
+    defer testing.allocator.free(root);
+
+    var counting = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var ar = std.heap.ArenaAllocator.init(counting.allocator());
+    defer ar.deinit();
+    const st = try snapshot(ar.allocator(), root, .{}, null);
+
+    try testing.expectEqual(@as(u64, 15), st.version);
+    try testing.expectEqualStrings("name", st.mappingMode().?);
+    try testing.expect(oneOf("deletionVectors", st.features) and oneOf("columnMapping", st.features));
+    try testing.expectEqual(@as(usize, 1), st.part_cols.len);
+    var dvs_seen: usize = 0;
+    for (st.files.values()) |f| {
+        const pv = f.parts.?.object.get("col-60c949ca-b8bc-4330-b931-b73fb4c60037").?;
+        try testing.expect(std.mem.indexOf(u8, f.path, pv.string) != null);
+        try testing.expect(std.mem.startsWith(u8, f.stats.?, "{\"numRecords\":"));
+        if (f.dv) |d| {
+            _ = try dvs.descriptor("T", f.path, d);
+            dvs_seen += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 15), st.files.count());
+    try testing.expect(dvs_seen > 0);
+    try testing.expect(counting.allocated_bytes - counting.freed_bytes < 160 * 1024);
 }
