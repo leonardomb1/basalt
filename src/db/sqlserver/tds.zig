@@ -574,8 +574,10 @@ pub const Conn = struct {
         try self.readBulkResponse();
     }
 
-    /// One packet of a bulk load into the socket's buffer, flushed only with the
-    /// last (EOM), so a segment goes out in as few writes as the buffer allows.
+    /// One packet of a bulk load into the socket's buffer. In the clear it is flushed
+    /// only with the last (EOM), so a segment goes out in as few writes as the buffer
+    /// allows; under TLS every packet is flushed, as SQL Server drops a TLS bulk load
+    /// whose packets were held back (`ConnectionIoFailed` in the volume test).
     pub fn bulkPacket(self: *Conn, status: u8, payload: []const u8) !void {
         var header: [8]u8 = .{ PKT_BULK, status, 0, 0, 0, 0, 0, 0 };
         const total: u16 = @intCast(payload.len + 8);
@@ -584,7 +586,7 @@ pub const Conn = struct {
         const w = self.wr();
         try w.writeAll(&header);
         try w.writeAll(payload);
-        if (status & STATUS_EOM != 0) try self.flushOut();
+        if (self.tls != null or status & STATUS_EOM != 0) try self.flushOut();
     }
 
     /// Returns the DONE row count, the server's word on how many rows actually landed.
