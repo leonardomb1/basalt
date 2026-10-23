@@ -223,7 +223,7 @@ test "EXPLAIN mid-script explains that query without running it" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
-test "EXPLAIN ANALYZE over an input read into memory first names that read, the in-memory scan and the load's sink" {
+test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan, and the load's sink" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -248,7 +248,14 @@ test "EXPLAIN ANALYZE over an input read into memory first names that read, the 
             .path = "), then serial\n",
             .scan = "  the window's input, in memory\n",
         },
+        .{
+            .q = "SELECT t.id, k.label FROM '$B/in.csv' t JOIN '$B/k.csv' k ON t.g = k.g",
+            .rows = "Rows read: 6.0K (6003)   Rows out: 3.6K (3600)   Path: csv parallel map+join, ",
+            .path = " chunks\n",
+            .scan = "<build> scan (#4)  csv ",
+        },
     };
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "g,label\na,A\nb,B\nc,C\n" });
     const sink_line = try std.fmt.allocPrint(alloc, "  Sink: csv {s}/never.csv, not written: EXPLAIN ANALYZE moves no data\n", .{base});
     defer alloc.free(sink_line);
     for (cases) |c| {
