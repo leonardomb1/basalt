@@ -253,7 +253,7 @@ pub const Lexer = struct {
             '+' => return self.make(.plus, self.src[start..self.i], line, col),
             '-' => {
                 if (self.i < self.src.len and self.src[self.i] == '>') {
-                    self.i += 1;
+                    _ = self.bump();
                     return self.make(.arrow, self.src[start..self.i], line, col);
                 }
                 return self.make(.minus, self.src[start..self.i], line, col);
@@ -402,6 +402,19 @@ test "sql lexer: block comments and operators" {
     try testing.expectEqual(token.Tag.ne, toks[3].tag);
     try testing.expectEqual(token.Tag.qq, toks[5].tag);
     try testing.expectEqual(token.Tag.qdot, toks[7].tag);
+}
+
+test "sql lexer: an arrow spans two columns, so the tokens after it keep their columns" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const toks = try tokenize(a, "x -> x + )");
+    try testing.expectEqual(token.Tag.arrow, toks[1].tag);
+    try testing.expectEqual(@as(u32, 3), toks[1].col);
+    try testing.expectEqual(@as(u32, 5), toks[1].end_col);
+    try testing.expectEqual(@as(u32, 6), toks[2].col);
+    try testing.expectEqual(@as(u32, 10), toks[4].col);
 }
 
 test "sql lexer: bitwise operators stay distinct from concat and comparisons" {
