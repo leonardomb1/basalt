@@ -54,7 +54,8 @@
 //! before `retry_statuses` is consulted.
 //!
 //! Resilience: transient failures (429/5xx, connection resets) retry in place
-//! `retries` times with exponential backoff and jitter, so one blip deep in a long
+//! `retries` times through `objstore.retry`, backing off from `retry_base_ms` with
+//! jitter, stretched to a `Retry-After` of up to a minute, so one blip deep in a long
 //! backfill does not restart the run. `retry_statuses` ("404,408") marks extra
 //! codes transient for APIs that misreport an outage; if they outlive the budget
 //! the run exits 75 so the control plane re-runs it. A socket failure that
@@ -62,8 +63,9 @@
 //! WriteFailed/ReadFailed, which must not count as transient globally (a CSV
 //! sink's disk-full is WriteFailed too). `progress_ms` emits a heartbeat.
 //!
-//! Deadlines and prefetch: `timeout_ms` bounds every page fetch, sequential or
-//! prefetched, by running it on a detached worker in a `Slot`; a black-holed
+//! Deadlines and prefetch: `timeout_ms` bounds every page fetch, its retries
+//! included, sequential, prefetched or replayed after a re-login, by running it on a
+//! detached worker in a `Slot`; a black-holed
 //! request surfaces as ConnectionTimedOut. The worker cannot be interrupted, so it
 //! is abandoned (bounded and counted) and frees itself if the server ever
 //! answers. That is why a slot reads only its own arena snapshot and the
@@ -101,6 +103,9 @@ const http_fake = @import("../testing/http_fake.zig");
 
 /// The most one response body may decode to, a page or a login reply.
 const max_page_bytes = 256 << 20;
+
+/// The longest a server's `Retry-After` stretches one wait between attempts.
+const max_retry_after_ms = 60_000;
 
 /// Adds to `bundle` each certificate the server presents that verifies against one
 /// already there, repeating to a fixpoint so order doesn't matter. Trusts nothing
@@ -748,51 +753,42 @@ pub const HttpSource = struct {
     }
 
     fn fetchPage(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
-        var attempt: i64 = 0;
-        while (true) {
-            return self.fetchOnce(arena, req) catch |e| {
-                attempt += 1;
-                if (isRetryableNet(e) and attempt <= self.opts.retries and !driver.aborting()) {
-                    std.Thread.sleep(retryDelayNs(self.opts.retry_base_ms, attempt));
-                    continue;
-                }
-                return mapTransport(e);
-            };
-        }
-    }
-
-    fn fetchOnce(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
         if (driver.aborting()) return error.Aborted;
-        return self.rawOrTimed(arena, req) catch |e| switch (e) {
-            error.TlsInitializationFailed => {
-                if (!self.tryRepair(req.url)) return e;
-                return self.rawOrTimed(arena, req);
-            },
-            error.HttpUnauthorized => {
-                const a = self.auth orelse return self.listedFallback(401, e);
-                if (!a.refresh(self.client)) return self.listedFallback(401, e);
-                return self.rawOrTimed(arena, req);
-            },
-            else => e,
-        };
+        return self.settle(arena, try self.spawnFetch(req), false);
     }
 
-    /// One attempt under the page deadline, through the slot machinery with a window
-    /// of one. The slot carries retries=0: fetchPage owns the sequential retry budget.
-    fn rawOrTimed(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
-        if (self.opts.timeout_ms <= 0) return self.fetchPageRaw(arena, req);
-        const slot = try self.spawnFetch(req, 0);
-        const url_copy = arena.dupe(u8, slot.url) catch "";
+    /// The one fetch path, sequential or prefetched: a slot's body once its worker has
+    /// run the retries under the page deadline. A 401 re-logs in and a TLS failure
+    /// repairs the CA bundle, each once, and is replayed as a fresh slot under its own
+    /// deadline and retries; 401 goes to re-login before `retry_statuses` applies.
+    fn settle(self: *HttpSource, arena: std.mem.Allocator, slot: *Slot, replay: bool) ![]const u8 {
         var red_buf: [512]u8 = undefined;
+        const shown = redactUrl(&red_buf, slot.url);
         self.awaitSlot(slot) catch |e| {
-            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, url_copy) });
+            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), shown });
             return e;
         };
         defer freeSlot(slot);
-        if (slot.err) |e| return e;
+        if (slot.err) |e| {
+            if (e == error.TlsInitializationFailed and !replay and self.tryRepair(slot.url)) return self.replayOf(arena, slot);
+            obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), shown });
+            return mapTransport(e);
+        }
+        if (slot.code == 401 and !replay) {
+            const a = self.auth orelse return self.listedFallback(401, self.raiseStatus(401, slot.url, slot.body));
+            if (slot.gen >= self.auth_gen) {
+                if (!a.refresh(self.client)) return self.listedFallback(401, self.raiseStatus(401, slot.url, slot.body));
+                self.auth_gen += 1;
+            }
+            return self.replayOf(arena, slot);
+        }
         if (slot.code == 204) return "";
         if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
-        return try arena.dupe(u8, slot.body);
+        return arena.dupe(u8, slot.body);
+    }
+
+    fn replayOf(self: *HttpSource, arena: std.mem.Allocator, slot: *Slot) ![]const u8 {
+        return self.settle(arena, try self.spawnFetch(.{ .url = slot.url, .body = slot.req_body }), true);
     }
 
     fn tryRepair(self: *HttpSource, url: []const u8) bool {
@@ -835,10 +831,10 @@ pub const HttpSource = struct {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const req = try self.pageReq(scratch.allocator());
-        return self.spawnFetch(req, self.opts.retries);
+        return self.spawnFetch(req);
     }
 
-    fn spawnFetch(self: *HttpSource, req: PageReq, retries: i64) !*Slot {
+    fn spawnFetch(self: *HttpSource, req: PageReq) !*Slot {
         const slot = try self.gpa.create(Slot);
         slot.* = .{
             .gpa = self.gpa,
@@ -849,7 +845,7 @@ pub const HttpSource = struct {
             .user_agent = userAgentOf(self.opts),
             .url = undefined,
             .gen = self.auth_gen,
-            .retries = retries,
+            .retries = self.opts.retries,
             .retry_base_ms = self.opts.retry_base_ms,
         };
         errdefer freeSlot(slot);
@@ -878,37 +874,42 @@ pub const HttpSource = struct {
         }
     }
 
+    /// One request of a slot. A 429, a 5xx or a listed status other than 401 is worth
+    /// another attempt; every status is kept for the consumer, a transport error is not.
+    /// An abandoned slot stops retrying, as nobody waits for it.
+    fn attempt(slot: *Slot) !objstore.Verdict {
+        if (slot.state.load(.acquire) == @intFromEnum(SlotState.abandoned)) return error.Aborted;
+        slot.code = 0;
+        const res = try objstore.exchange(slot.snap.allocator(), slot.client, .{
+            .method = if (slot.method_post) .POST else .GET,
+            .url = slot.url,
+            .headers = slot.hdrs[0..slot.nh],
+            .payload = slot.req_body,
+            .content_type = slot.content_type,
+            .user_agent = slot.user_agent,
+            .max_body = max_page_bytes,
+        });
+        slot.code = res.code;
+        slot.body = res.body;
+        const again = res.code == 429 or res.code >= 500 or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
+        if (!again) return .done;
+        const after: ?u64 = if (res.retry_after_ms) |ms| @min(ms, max_retry_after_ms) else null;
+        return .{ .failed = .{ .code = res.code, .err = error.HttpServerBusy, .retry_after_ms = after, .retriable = true } };
+    }
+
+    /// The retries `retries` and `retry_base_ms` ask for, unbounded in total sleep: the
+    /// page deadline bounds them.
     fn workerMain(slot: *Slot) void {
-        const sa = slot.snap.allocator();
-        var attempt: i64 = 0;
-        while (true) {
-            const res = objstore.exchange(sa, slot.client, .{
-                .method = if (slot.method_post) .POST else .GET,
-                .url = slot.url,
-                .headers = slot.hdrs[0..slot.nh],
-                .payload = slot.req_body,
-                .content_type = slot.content_type,
-                .user_agent = slot.user_agent,
-                .max_body = max_page_bytes,
-            }) catch |e| {
-                attempt += 1;
-                if (isRetryableNet(e) and attempt <= slot.retries and !driver.aborting()) {
-                    std.Thread.sleep(retryDelayNs(slot.retry_base_ms, attempt));
-                    continue;
-                }
-                slot.err = e;
-                break;
-            };
-            const code = res.code;
-            if ((code == 429 or code >= 500 or (code != 401 and statusListed(slot.retry_statuses, code))) and attempt < slot.retries and !driver.aborting()) {
-                attempt += 1;
-                std.Thread.sleep(retryDelayNs(slot.retry_base_ms, attempt));
-                continue;
-            }
-            slot.code = code;
-            slot.body = res.body;
-            break;
-        }
+        var prng = objstore.jitterPrng();
+        objstore.retry(.{
+            .rand = prng.random(),
+            .max_attempts = @intCast(@max(slot.retries, 0) + 1),
+            .base_ms = @intCast(@max(slot.retry_base_ms, 1)),
+            .max_shift = 6,
+            .budget_ms = std.math.maxInt(u64),
+        }, slot, attempt) catch |e| {
+            if (slot.code == 0) slot.err = e;
+        };
         if (slot.state.cmpxchgStrong(
             @intFromEnum(SlotState.running),
             @intFromEnum(SlotState.done),
@@ -978,31 +979,7 @@ pub const HttpSource = struct {
             self.done = true;
             return null;
         }
-        const slot = self.slots.orderedRemove(0);
-        const url_copy = arena.dupe(u8, slot.url) catch "";
-        var red_buf: [512]u8 = undefined;
-        self.awaitSlot(slot) catch |e| {
-            obs.logOr(self.logger, .warn, "page fetch abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, url_copy) });
-            return e;
-        };
-        defer freeSlot(slot);
-        if (slot.err) |e| {
-            obs.logOr(self.logger, .err, "page fetch failed ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, slot.url) });
-            return mapTransport(e);
-        }
-        if (slot.code == 401) {
-            const a = self.auth orelse return self.listedFallback(401, error.HttpUnauthorized);
-            if (slot.gen >= self.auth_gen) {
-                if (!a.refresh(self.client)) return self.listedFallback(401, error.HttpUnauthorized);
-                self.auth_gen += 1;
-            }
-            const body = self.fetchPageRaw(arena, .{ .url = slot.url, .body = slot.req_body }) catch |e|
-                return mapTransport(e);
-            return self.consumeBody(arena, body);
-        }
-        if (slot.code == 204) return self.finishEmpty();
-        if (slot.code != 200) return self.raiseStatus(slot.code, slot.url, slot.body);
-        return self.consumeBody(arena, try arena.dupe(u8, slot.body));
+        return self.consumeBody(arena, try self.settle(arena, self.slots.orderedRemove(0), false));
     }
 
     fn consumeBody(self: *HttpSource, arena: std.mem.Allocator, body: []const u8) !?Batch {
@@ -1021,32 +998,6 @@ pub const HttpSource = struct {
         return batch;
     }
 
-    fn fetchPageRaw(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
-        var hdrs = try arena.alloc(std.http.Header, self.headers.len + 1);
-        @memcpy(hdrs[0..self.headers.len], self.headers);
-        var nh = self.headers.len;
-        if (self.auth) |a| {
-            if (try a.ensure(self.client)) |h| {
-                hdrs[nh] = h;
-                nh += 1;
-            }
-        }
-        const res = try objstore.exchange(arena, self.client, .{
-            .method = if (self.opts.method == .post) .POST else .GET,
-            .url = req.url,
-            .headers = hdrs[0..nh],
-            .payload = req.body,
-            .content_type = self.contentType(),
-            .user_agent = userAgentOf(self.opts),
-            .max_body = max_page_bytes,
-        });
-        if (res.code == 204) return "";
-        if (res.code != 200) return self.raiseStatus(res.code, req.url, res.body);
-        return res.body;
-    }
-
-    /// The single status policy for every fetch path: 401 goes to session re-login
-    /// first, and only when auth declines does `listedFallback` apply.
     fn raiseStatus(self: *HttpSource, code: u16, url: []const u8, body: []const u8) anyerror {
         var ub: [512]u8 = undefined;
         const shown = redactUrl(&ub, url);
@@ -1190,26 +1141,8 @@ fn statusListed(list_opt: ?[]const u8, code: u16) bool {
     return false;
 }
 
-/// Worth an in-place retry. The socket set is the shared `driver.transientNet`,
-/// so the sql reconnect and http backoff layers can never drift apart.
-fn isRetryableNet(e: anyerror) bool {
-    return e == error.HttpServerBusy or driver.transientNet(e);
-}
-
 fn mapTransport(e: anyerror) anyerror {
-    if (e == error.HttpServerBusy) return e;
-    return if (driver.transientNet(e)) error.HttpTransportFailed else e;
-}
-
-/// base * 2^(attempt-1), with +-30% time-seeded jitter.
-fn retryDelayNs(base_ms: i64, attempt: i64) u64 {
-    const shift: u6 = @intCast(@min(@max(attempt - 1, 0), 6));
-    const base: u64 = @intCast(@max(base_ms, 1));
-    const d = base * (@as(u64, 1) << shift);
-    var x: u64 = @bitCast(std.time.microTimestamp());
-    x = x *% 6364136223846793005 +% 1442695040888963407;
-    const j = 70 + (x >> 33) % 61;
-    return d * j / 100 * std.time.ns_per_ms;
+    return if (objstore.transient(e)) error.HttpTransportFailed else e;
 }
 
 const source_vtable = driver.Source.VTable{ .schema = srcSchema, .next = srcNext, .close = srcClose };
@@ -1956,16 +1889,6 @@ test "withParam and appendParam pick the right separator" {
     try std.testing.expectEqualStrings("http://x/i?a=1&page=2", try withParam(a, "http://x/i?a=1", "page", "2"));
     try std.testing.expectEqualStrings("page=1", try appendParam(a, "", "page", "1"));
     try std.testing.expectEqualStrings("cmd=get&page=1", try appendParam(a, "cmd=get", "page", "1"));
-}
-
-test "retryDelayNs: exponential base doubling within the +-30% jitter band" {
-    const base_ms: i64 = 100;
-    const a1 = retryDelayNs(base_ms, 1);
-    try std.testing.expect(a1 >= 70 * std.time.ns_per_ms and a1 <= 130 * std.time.ns_per_ms);
-    const a3 = retryDelayNs(base_ms, 3);
-    try std.testing.expect(a3 >= 280 * std.time.ns_per_ms and a3 <= 520 * std.time.ns_per_ms);
-    const a99 = retryDelayNs(base_ms, 99);
-    try std.testing.expect(a99 >= 4480 * std.time.ns_per_ms and a99 <= 8320 * std.time.ns_per_ms);
 }
 
 test "a server-sent token or next URL that would break a header line is refused" {

@@ -81,26 +81,22 @@ pub fn transient(e: anyerror) bool {
 pub const max_attempts = 5;
 pub const budget_ms: u64 = 30_000;
 
-/// 500 ms doubling per attempt up to 8 s, plus up to 50% jitter.
-pub fn backoffMs(attempt: usize, rand: std.Random) u64 {
-    const base = @as(u64, 500) << @intCast(@min(attempt, 4));
-    return base + rand.uintLessThan(u64, base / 2 + 1);
-}
-
 /// `Retry-After` in delta-seconds; the HTTP-date form is left to the backoff.
 pub fn retryAfterMs(value: []const u8) ?u64 {
     const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
     return std.math.mul(u64, secs, std.time.ms_per_s) catch budget_ms;
 }
 
+/// Seeded from the OS, so lanes throttled in the same millisecond still draw different jitter.
 pub fn jitterPrng() std.Random.DefaultPrng {
-    return std.Random.DefaultPrng.init(@bitCast(std.time.milliTimestamp()));
+    return std.Random.DefaultPrng.init(std.crypto.random.int(u64));
 }
 
+/// `retriable` overrides the status rule, for a caller with its own list of codes.
 pub const Verdict = union(enum) {
     done,
     again,
-    failed: struct { code: u16, err: anyerror, retry_after_ms: ?u64 = null },
+    failed: struct { code: u16, err: anyerror, retry_after_ms: ?u64 = null, retriable: ?bool = null },
 };
 
 pub const Sleep = *const fn (ns: u64) void;
@@ -108,21 +104,31 @@ pub const Sleep = *const fn (ns: u64) void;
 pub const Policy = struct {
     rand: std.Random,
     sleep: Sleep = std.Thread.sleep,
+    max_attempts: usize = max_attempts,
+    base_ms: u64 = 500,
+    max_shift: u6 = 4,
+    budget_ms: u64 = budget_ms,
+
+    /// `base_ms` doubling per attempt, at most `max_shift` times, plus up to 50% jitter.
+    pub fn backoffMs(self: Policy, attempt: usize) u64 {
+        const base = self.base_ms *| (@as(u64, 1) << @intCast(@min(attempt, self.max_shift)));
+        return base +| self.rand.uintLessThan(u64, base / 2 + 1);
+    }
 };
 
-/// Runs `attemptFn(ctx)` until it reports `.done`, giving up on the first failure
-/// that is not transient, after `max_attempts`, once `budget_ms` of sleep is spent,
-/// or as soon as the run is aborting.
+/// The one retry loop of every HTTP caller: runs `attemptFn(ctx)` until it reports
+/// `.done`, giving up on the first failure that is not transient, after the policy's
+/// attempts, once its sleep budget is spent, or as soon as the run is aborting.
 pub fn retry(policy: Policy, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
     var slept: u64 = 0;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        var wait = backoffMs(attempt, policy.rand);
+        var wait = policy.backoffMs(attempt);
         const err = if (attemptFn(ctx)) |v| switch (v) {
             .done => return,
             .again => continue,
             .failed => |f| blk: {
-                if (!retriable(f.code)) return f.err;
+                if (!(f.retriable orelse retriable(f.code))) return f.err;
                 wait = @max(wait, f.retry_after_ms orelse 0);
                 break :blk f.err;
             },
@@ -130,8 +136,8 @@ pub fn retry(policy: Policy, ctx: anytype, comptime attemptFn: anytype) anyerror
             if (!transient(e)) return e;
             break :blk e;
         };
-        if (attempt + 1 >= max_attempts or slept >= budget_ms or driver.aborting()) return err;
-        wait = @min(wait, budget_ms - slept);
+        if (attempt + 1 >= policy.max_attempts or slept >= policy.budget_ms or driver.aborting()) return err;
+        wait = @min(wait, policy.budget_ms - slept);
         if (!pause(policy.sleep, wait)) return err;
         slept += wait;
     }
@@ -689,7 +695,7 @@ test "backoff doubles from 500 ms with up to 50% jitter, capped at 8 s; Retry-Af
         var above_base = false;
         for (0..64) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
-            const ms = backoffMs(i, prng.random());
+            const ms = (Policy{ .rand = prng.random() }).backoffMs(i);
             try std.testing.expect(ms >= base and ms <= base + base / 2);
             if (ms > base) above_base = true;
         }
@@ -698,7 +704,7 @@ test "backoff doubles from 500 ms with up to 50% jitter, capped at 8 s; Retry-Af
     for ([_]usize{ 5, 6, 12, 40 }) |attempt| {
         for (0..64) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
-            const ms = backoffMs(attempt, prng.random());
+            const ms = (Policy{ .rand = prng.random() }).backoffMs(attempt);
             try std.testing.expect(ms >= 8000 and ms <= 12000);
         }
     }
