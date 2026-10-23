@@ -3,6 +3,15 @@
 //! the row form and the vector kernel from it.
 
 const Cx = @import("scalar.zig").Cx;
+const Decimal = @import("../value.zig").Decimal;
+const Numeric = @import("scalar.zig").Numeric;
+const Overload = @import("scalar.zig").Overload;
+const Type = @import("../../lang/types.zig").Type;
+const TypeKind = @import("../../lang/types.zig").TypeKind;
+const ast = @import("../../lang/ast.zig");
+const roundDecimal = @import("cast.zig").roundDecimal;
+const roundHalfAway = @import("strings.zig").roundHalfAway;
+const roundOutScale = @import("cast.zig").roundOutScale;
 const EvalError = @import("../eval.zig").EvalError;
 const caseMap = @import("strings.zig").caseMap;
 const caseMapInto = @import("strings.zig").caseMapInto;
@@ -298,6 +307,104 @@ pub const Sqrt = struct {
     pub fn apply(_: Cx, x: f64) EvalError!?f64 {
         if (x < 0) return null;
         return @sqrt(x);
+    }
+};
+
+/// The INT `minInt` has no absolute value.
+pub const Abs = Numeric(struct {
+    pub fn int(x: i64) EvalError!i64 {
+        if (x == std.math.minInt(i64)) return error.IntOverflow;
+        return if (x < 0) -x else x;
+    }
+    pub fn float(x: f64) f64 {
+        return @abs(x);
+    }
+    pub fn dec(d: Decimal) Decimal {
+        return .{ .unscaled = if (d.unscaled < 0) -d.unscaled else d.unscaled, .scale = d.scale };
+    }
+});
+
+/// `floor` (`down`) and `ceil`: an INT as it is, a DECIMAL exactly to scale 0.
+pub fn Whole(comptime down: bool) type {
+    return Numeric(struct {
+        pub fn int(x: i64) i64 {
+            return x;
+        }
+        pub fn float(x: f64) f64 {
+            return if (down) @floor(x) else @ceil(x);
+        }
+        pub fn dec(d: Decimal) Decimal {
+            const p = std.math.powi(i128, 10, d.scale) catch return .{ .unscaled = 0, .scale = 0 };
+            var q = @divTrunc(d.unscaled, p);
+            if (@rem(d.unscaled, p) != 0) {
+                if (down and d.unscaled < 0) q -= 1;
+                if (!down and d.unscaled > 0) q += 1;
+            }
+            return .{ .unscaled = q, .scale = 0 };
+        }
+        pub fn decType(t: Type) Type {
+            return Type.decimal(@min(38, (t.precision -| t.scale) + 1), 0);
+        }
+    });
+}
+
+/// A FLOAT's sign is a FLOAT (NaN stays NaN), a DECIMAL's a DECIMAL(1,0), and any
+/// other value's an INT.
+pub const Sign = Numeric(struct {
+    pub fn int(x: i64) i64 {
+        return std.math.sign(x);
+    }
+    pub fn float(x: f64) f64 {
+        if (std.math.isNan(x)) return x;
+        return if (x > 0) 1 else if (x < 0) -1 else 0;
+    }
+    pub fn dec(d: Decimal) Decimal {
+        return .{ .unscaled = std.math.sign(d.unscaled), .scale = 0 };
+    }
+    pub fn decType(_: Type) Type {
+        return Type.decimal(1, 0);
+    }
+    pub fn other(x: f64) i64 {
+        return if (x > 0) 1 else if (x < 0) -1 else 0;
+    }
+});
+
+/// `round(x[, digits])`, half away from zero: an INT without digits as it is, with
+/// them a FLOAT; a DECIMAL exactly, at the scale `roundOutScale` gives each value.
+pub const Round = Overload(struct {
+    pub const variants = .{ RoundInt, RoundFloat, RoundDec };
+    pub fn pick(c: ast.Expr.Call, k: TypeKind) ?usize {
+        return switch (k) {
+            .int => if (c.args.len == 1) 0 else 1,
+            .float => 1,
+            .decimal => 2,
+            else => null,
+        };
+    }
+});
+
+const RoundInt = struct {
+    pub const args = .{ .exact_int, .opt_int };
+    pub fn apply(_: Cx, x: i64, _: ?i64) EvalError!i64 {
+        return x;
+    }
+};
+
+const RoundFloat = struct {
+    pub const args = .{ .num, .opt_int };
+    pub fn apply(_: Cx, x: f64, digits: ?i64) EvalError!f64 {
+        return roundHalfAway(x, digits orelse 0);
+    }
+};
+
+const RoundDec = struct {
+    pub const args = .{ .dec, .opt_int };
+    pub const value_scale = true;
+    pub fn resultType(c: ast.Expr.Call, arg: Type) Type {
+        return Type.decimal(arg.precision, roundOutScale(c, arg.scale));
+    }
+    pub fn apply(cx: Cx, d: Decimal, digits: ?i64) EvalError!Decimal {
+        return roundDecimal(d, digits orelse 0, roundOutScale(cx.call, d.scale)) orelse error.IntOverflow;
     }
 };
 

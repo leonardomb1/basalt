@@ -15,8 +15,11 @@
 //! to `apply` as null instead of ending the row, for an encoder that spells NULL. A
 //! variadic `F.bytes_if_any` returns BYTES when any argument is BYTES. `typeRule(F)`
 //! is the typing rule the arguments imply, `F.check` adding what literals must be.
-//! Every argument propagates NULL, the first NULL ending the row in argument order;
-//! `F.variadic` instead takes any number of text arguments as one slice.
+//! Every argument propagates NULL, the first NULL ending the row in argument order
+//! (`F.eval_all` evaluates every argument first); `F.variadic` instead takes any
+//! number of text arguments as one slice. `F.value_scale` keeps each DECIMAL result
+//! at the scale `apply` gave it. `Overload` picks one of several declarations by an
+//! argument's kind, and `Numeric` builds the one-number functions from their math.
 //!
 //! The row form reads an argument as SQL does for that kind: text through
 //! `valueToString` (so `upper(123)` is '123'), an INT through `toI64`, a number
@@ -99,11 +102,12 @@ pub const Arg = enum {
 };
 
 /// What `apply` sees besides its arguments: the arena, the buffer a text result is
-/// written to (from `mark` on; in a kernel, the output column itself), and whether
-/// the first argument is BYTES (`length` counts bytes then).
+/// written to (from `mark` on; in a kernel, the output column itself), whether the
+/// first argument is BYTES (`length` counts bytes then), and the call.
 pub const Cx = struct {
     arena: std.mem.Allocator,
     buf: *std.array_list.Managed(u8),
+    call: ast.Expr.Call,
     mark: usize = 0,
     bytes: bool = false,
 
@@ -158,13 +162,21 @@ fn kindOf(comptime F: type) types.TypeKind {
     };
 }
 
-/// The type of `F`'s result for this call.
-pub fn resultType(comptime F: type, c: ast.Expr.Call) Type {
-    if (@hasDecl(F, "resultType")) return F.resultType(c);
+/// The type of `F`'s result for this call. A `resultType(call, arg)` also reads the
+/// type of the argument an overload picked its variant by.
+pub fn resultType(comptime F: type, c: ast.Expr.Call, arg: ?Type) Type {
+    if (@hasDecl(F, "resultType")) {
+        if (comptime @typeInfo(@TypeOf(F.resultType)).@"fn".params.len == 2) return F.resultType(c, arg.?);
+        return F.resultType(c);
+    }
     return Type.init(kindOf(F));
 }
 
-fn toValue(comptime F: type, x: Payload(F), ty: Type) EvalError!Value {
+fn flag(comptime F: type, comptime name: []const u8) bool {
+    return @hasDecl(F, name) and @field(F, name);
+}
+
+fn toValue(comptime F: type, x: Payload(F), c: ast.Expr.Call) EvalError!Value {
     return switch (comptime kindOf(F)) {
         .string => .{ .string = x },
         .bytes => .{ .bytes = x },
@@ -174,7 +186,7 @@ fn toValue(comptime F: type, x: Payload(F), ty: Type) EvalError!Value {
         .float => .{ .float = x },
         .bool => .{ .bool = x },
         .date => .{ .date = x },
-        .decimal => .{ .decimal = try atScale(x, ty) },
+        .decimal => .{ .decimal = if (comptime flag(F, "value_scale")) x else try atScale(x, resultType(F, c, null)) },
         else => @compileError("unsupported scalar result"),
     };
 }
@@ -308,7 +320,7 @@ pub fn typeRule(comptime F: type) fn (*TypeCtx, ast.Expr.Call) TypeError!Type {
                 if (t.nullable and !(i == 0 and nullFirst(F))) nullable = true;
             };
             if (@hasDecl(F, "check")) try F.check(self, c);
-            return resultType(F, c).withNull(nullable);
+            return resultType(F, c, null).withNull(nullable);
         }
     }.rule;
 }
@@ -330,15 +342,25 @@ pub fn Scalar(comptime F: type) type {
         pub const vec = if (@hasDecl(F, "variadic")) vecMany else vecFixed;
 
         fn evalFixed(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+            return evalWith(arena, c, batch, row, &.{});
+        }
+
+        /// The row form, the arguments in `given` already evaluated (by an overload).
+        pub fn evalWith(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize, given: []const ?Value) EvalError!Value {
             var buf = std.array_list.Managed(u8).init(arena);
-            var cx = Cx{ .arena = arena, .buf = &buf };
+            var cx = Cx{ .arena = arena, .buf = &buf, .call = c };
+            var vals: [F.args.len]Value = undefined;
+            if (comptime flag(F, "eval_all")) {
+                for (vals[0..@min(vals.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
+                for (vals[0..@min(vals.len, c.args.len)]) |v| if (v.isNull()) return .null;
+            }
             var t: Args(F) = undefined;
             inline for (comptime argsOf(F), 0..) |a, i| {
                 if (i >= c.args.len) {
                     if (comptime !a.optional()) return error.TypeMismatch;
                     t[i] = null;
                 } else {
-                    const v = try evalRow(arena, c.args[i], batch, row);
+                    const v = if (comptime flag(F, "eval_all")) vals[i] else if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
                     if (v.isNull()) {
                         if (comptime i == 0 and nullFirst(F)) t[i] = null else return .null;
                     } else {
@@ -347,7 +369,7 @@ pub fn Scalar(comptime F: type) type {
                     }
                 }
             }
-            return wrap(try @call(.auto, F.apply, .{cx} ++ t), resultType(F, c));
+            return wrap(try @call(.auto, F.apply, .{cx} ++ t), c);
         }
 
         fn evalMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -360,31 +382,38 @@ pub fn Scalar(comptime F: type) type {
                 any_bytes = any_bytes or v == .bytes;
                 p.* = try valueToString(arena, v);
             }
-            const r = try F.apply(.{ .arena = arena, .buf = &buf }, parts);
+            const r = try F.apply(.{ .arena = arena, .buf = &buf, .call = c }, parts);
             if (comptime @hasDecl(F, "bytes_if_any")) if (any_bytes) return .{ .bytes = r };
-            return wrap(r, resultType(F, c));
+            return wrap(r, c);
         }
 
-        fn wrap(r: Result(F), ty: Type) EvalError!Value {
+        fn wrap(r: Result(F), c: ast.Expr.Call) EvalError!Value {
             if (@typeInfo(Result(F)) == .optional) {
-                return if (r) |x| toValue(F, x, ty) else .null;
+                return if (r) |x| toValue(F, x, c) else .null;
             }
-            return toValue(F, r, ty);
+            return toValue(F, r, c);
         }
 
         fn vecFixed(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+            return vecWith(arena, c, batch, &.{}, 0);
+        }
+
+        /// The kernel, the arguments in `given` already evaluated (by an overload,
+        /// which picked its variant by argument `on`).
+        pub fn vecWith(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, given: []const ?Vec, on: usize) VecError!Vec {
             const n = batch.len;
-            var out = try Out(Payload(F)).init(arena, n, resultType(F, c));
-            var cx = Cx{ .arena = arena, .buf = out.buf() };
+            var vecs: [F.args.len]?Vec = @splat(null);
+            for (vecs[0..@min(vecs.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalVec(arena, c.args[i], batch);
+            var out = try Out(Payload(F), flag(F, "value_scale")).init(arena, n, resultType(F, c, if (on < vecs.len) if (vecs[on]) |v| vecType(v) else null else null));
+            var cx = Cx{ .arena = arena, .buf = out.buf(), .call = c };
             var ops: OperandTuple(F) = undefined;
             inline for (comptime argsOf(F), 0..) |a, i| {
-                if (i >= c.args.len) {
-                    if (comptime !a.optional()) return error.Unsupported;
-                    ops[i] = null;
-                } else {
-                    const v = try evalVec(arena, c.args[i], batch);
+                if (vecs[i]) |v| {
                     if (i == 0) cx.bytes = isBytes(v);
                     ops[i] = try vecArg(a, arena, v, n);
+                } else {
+                    if (comptime !a.optional()) return error.Unsupported;
+                    ops[i] = null;
                 }
             }
             rows: for (0..n) |i| {
@@ -415,8 +444,8 @@ pub fn Scalar(comptime F: type) type {
         fn vecMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
             const n = batch.len;
             if (c.args.len == 0) return error.Unsupported;
-            var out = try Out(Payload(F)).init(arena, n, resultType(F, c));
-            var cx = Cx{ .arena = arena, .buf = out.buf() };
+            var out = try Out(Payload(F), false).init(arena, n, resultType(F, c, null));
+            var cx = Cx{ .arena = arena, .buf = out.buf(), .call = c };
             const ops = try arena.alloc(Str, c.args.len);
             for (c.args, ops) |e, *o| {
                 const v = try evalVec(arena, e, batch);
@@ -448,6 +477,114 @@ pub fn Scalar(comptime F: type) type {
     };
 }
 
+fn valueKind(v: Value) ?types.TypeKind {
+    return switch (v) {
+        .null => null,
+        inline else => |_, tag| @field(types.TypeKind, @tagName(tag)),
+    };
+}
+
+fn vecKind(v: Vec) ?types.TypeKind {
+    return switch (v) {
+        .col => |col| col.ty.kind,
+        .scalar => |s| valueKind(s),
+    };
+}
+
+/// The type of an evaluated argument: its column's, or a constant's own.
+pub fn vecType(v: Vec) Type {
+    return switch (v) {
+        .col => |col| col.ty,
+        .scalar => |s| switch (s) {
+            .null => Type.unknownNull(),
+            .decimal => |d| Type.decimal((ast.Expr.DecLit{ .unscaled = d.unscaled, .scale = d.scale }).precision(), d.scale),
+            else => Type.init(valueKind(s).?),
+        },
+    };
+}
+
+/// One function over several kinds of argument: `O.variants` are `Scalar`
+/// declarations with their arguments in the same places, and `O.pick(call, kind)`
+/// names the one for the kind of argument `O.on` (the first by default), null when
+/// none takes it: a TypeMismatch row by row, which the kernel leaves to the rows.
+/// The arguments up to `O.on` are evaluated once, in order, a NULL ending the row
+/// first (with `eval_all`, every argument is evaluated before NULL is looked at).
+pub fn Overload(comptime O: type) type {
+    const lead = O.variants[0];
+    const on = if (@hasDecl(O, "on")) O.on else 0;
+    return struct {
+        pub fn eval(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+            var given: [lead.args.len]?Value = @splat(null);
+            const upto = if (comptime flag(lead, "eval_all")) @min(given.len, c.args.len) else on + 1;
+            for (given[0..upto], 0..) |*g, i| {
+                const v = try evalRow(arena, c.args[i], batch, row);
+                if (v.isNull() and !flag(lead, "eval_all")) return .null;
+                g.* = v;
+            }
+            for (given[0..upto]) |g| if (g.?.isNull()) return .null;
+            const k = O.pick(c, valueKind(given[on].?).?) orelse return error.TypeMismatch;
+            inline for (O.variants, 0..) |F, i| if (i == k) return Scalar(F).evalWith(arena, c, batch, row, &given);
+            unreachable;
+        }
+
+        pub fn vec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+            var given: [lead.args.len]?Vec = @splat(null);
+            for (given[0..@min(given.len, c.args.len)], 0..) |*g, i| g.* = try evalVec(arena, c.args[i], batch);
+            const kind = vecKind(given[on].?) orelse return .{ .scalar = .null };
+            const k = O.pick(c, kind) orelse return error.Unsupported;
+            inline for (O.variants, 0..) |F, i| if (i == k) return Scalar(F).vecWith(arena, c, batch, &given, on);
+            unreachable;
+        }
+    };
+}
+
+/// A function of one number whose result has its argument's kind: `M.int`, `M.float`
+/// and `M.dec` are its math for each, and `M.other`, when present, takes any other
+/// value as `toF64` reads it (else such a value is a TypeMismatch). A DECIMAL
+/// keeps each value's own scale, its column typed by `M.decType` from the
+/// argument's (the same type by default).
+pub fn Numeric(comptime M: type) type {
+    const I = struct {
+        pub const args = .{.exact_int};
+        pub fn apply(_: Cx, x: i64) EvalError!i64 {
+            return M.int(x);
+        }
+    };
+    const Fl = struct {
+        pub const args = .{.num};
+        pub fn apply(_: Cx, x: f64) EvalError!f64 {
+            return M.float(x);
+        }
+    };
+    const D = struct {
+        pub const args = .{.dec};
+        pub const value_scale = true;
+        pub fn resultType(_: ast.Expr.Call, arg: Type) Type {
+            return if (@hasDecl(M, "decType")) M.decType(arg) else arg;
+        }
+        pub fn apply(_: Cx, d: Decimal) EvalError!Decimal {
+            return M.dec(d);
+        }
+    };
+    const Other = struct {
+        pub const args = .{.num};
+        pub fn apply(_: Cx, x: f64) EvalError!i64 {
+            return M.other(x);
+        }
+    };
+    return Overload(struct {
+        pub const variants = if (@hasDecl(M, "other")) .{ I, Fl, D, Other } else .{ I, Fl, D };
+        pub fn pick(_: ast.Expr.Call, k: types.TypeKind) ?usize {
+            return switch (k) {
+                .int => 0,
+                .float => 1,
+                .decimal => 2,
+                else => if (@hasDecl(M, "other")) 3 else null,
+            };
+        }
+    });
+}
+
 fn OperandTuple(comptime F: type) type {
     var fields: [F.args.len]type = undefined;
     for (argsOf(F), 0..) |a, i| fields[i] = Operand(a);
@@ -460,7 +597,7 @@ fn unsupported(e: anyerror) VecError {
 
 /// The column a kernel fills, by its result type. A text column is also the buffer
 /// `apply` writes to, so a result built there is committed where it lies.
-fn Out(comptime P: type) type {
+fn Out(comptime P: type, comptime keep_scale: bool) type {
     return switch (P) {
         []const u8 => struct {
             app: column.BytesAppender,
@@ -515,7 +652,7 @@ fn Out(comptime P: type) type {
                 return 0;
             }
             fn put(o: *@This(), i: usize, _: usize, x: P) !void {
-                o.f.d[i] = if (P == Decimal) try atScale(x, o.ty) else x;
+                o.f.d[i] = if (P == Decimal and !keep_scale) try atScale(x, o.ty) else x;
             }
             fn none(o: *@This(), i: usize, _: usize) !void {
                 o.f.setNull(i);

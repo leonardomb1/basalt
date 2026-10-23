@@ -68,6 +68,23 @@ const records = blk: {
 
 pub const max_str_bytes = 1 << 20;
 
+/// `mod(a, b)` is `a % b`, in both forms.
+const Mod = struct {
+    fn node(c: ast.Expr.Call) ast.Expr {
+        return .{ .binary = .{ .op = .mod, .l = c.args[0], .r = c.args[1] } };
+    }
+
+    fn eval(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        var e = node(c);
+        return @import("row.zig").evalRow(arena, &e, batch, row);
+    }
+
+    fn vec(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        var e = node(c);
+        return @import("vec.zig").evalVecNode(arena, &e, batch);
+    }
+};
+
 pub const Builtin = struct {
     name: []const u8,
     type_fn: *const fn (*TypeCtx, ast.Expr.Call) TypeError!Type,
@@ -108,17 +125,17 @@ const base = [_]Builtin{
     .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = S(f.Trim).eval, .vec_fn = S(f.Trim).vec },
     .{ .name = "substr", .type_fn = typing.substr, .eval_fn = S(f.Substr).eval, .vec_fn = S(f.Substr).vec },
     .{ .name = "replace", .type_fn = typing.replace, .eval_fn = S(f.Replace).eval, .vec_fn = S(f.Replace).vec },
-    .{ .name = "abs", .type_fn = typing.abs, .eval_fn = per_row.abs },
-    .{ .name = "floor", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
-    .{ .name = "ceil", .type_fn = typing.floorCeil, .eval_fn = per_row.floorCeil },
-    .{ .name = "round", .type_fn = typing.round, .eval_fn = per_row.round },
-    .{ .name = "mod", .type_fn = typing.mod, .eval_fn = per_row.mod },
+    .{ .name = "abs", .type_fn = typing.abs, .eval_fn = f.Abs.eval, .vec_fn = f.Abs.vec },
+    .{ .name = "floor", .type_fn = typing.floorCeil, .eval_fn = f.Whole(true).eval, .vec_fn = f.Whole(true).vec },
+    .{ .name = "ceil", .type_fn = typing.floorCeil, .eval_fn = f.Whole(false).eval, .vec_fn = f.Whole(false).vec },
+    .{ .name = "round", .type_fn = typing.round, .eval_fn = f.Round.eval, .vec_fn = f.Round.vec },
+    .{ .name = "mod", .type_fn = typing.mod, .eval_fn = Mod.eval, .vec_fn = Mod.vec },
     .{ .name = "power", .type_fn = typing.power, .eval_fn = S(f.Power).eval, .vec_fn = S(f.Power).vec },
     .{ .name = "sqrt", .type_fn = typing.sqrt, .eval_fn = S(f.Sqrt).eval, .vec_fn = S(f.Sqrt).vec },
-    .{ .name = "sign", .type_fn = typing.sign, .eval_fn = per_row.sign },
-    .{ .name = "nullif", .type_fn = typing.nullif, .eval_fn = per_row.nullif },
-    .{ .name = "greatest", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
-    .{ .name = "least", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast },
+    .{ .name = "sign", .type_fn = typing.sign, .eval_fn = f.Sign.eval, .vec_fn = f.Sign.vec },
+    .{ .name = "nullif", .type_fn = typing.nullif, .eval_fn = per_row.nullif, .vec_fn = vectorized.nullif },
+    .{ .name = "greatest", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast, .vec_fn = vectorized.Extreme(true).vec },
+    .{ .name = "least", .type_fn = typing.greatestLeast, .eval_fn = per_row.greatestLeast, .vec_fn = vectorized.Extreme(false).vec },
     .{ .name = "lpad", .type_fn = typing.pad, .eval_fn = S(f.Pad(true)).eval, .vec_fn = S(f.Pad(true)).vec },
     .{ .name = "rpad", .type_fn = typing.pad, .eval_fn = S(f.Pad(false)).eval, .vec_fn = S(f.Pad(false)).vec },
     .{ .name = "left", .type_fn = typing.leftRight, .eval_fn = S(f.End(true)).eval, .vec_fn = S(f.End(true)).vec },
@@ -168,4 +185,67 @@ pub fn lookupBuiltin(name: []const u8) ?*const Builtin {
     };
     const i = map.get(name) orelse return null;
     return &builtins[i];
+}
+
+const testing_util = @import("testing_util.zig");
+const column = @import("../column.zig");
+const types = @import("../../lang/types.zig");
+const Decimal = @import("../value.zig").Decimal;
+
+fn testBatch(a: std.mem.Allocator) !Batch {
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const fs = [_]?f64{ 2.5, -2.5, null, nan, -0.0, inf, -inf, 0.125, 1234.5678 };
+    const ds = [_]?Decimal{ .{ .unscaled = 125, .scale = 2 }, .{ .unscaled = -15, .scale = 1 }, null, .{ .unscaled = 3, .scale = 0 }, .{ .unscaled = -5, .scale = 2 }, .{ .unscaled = 255, .scale = 2 }, .{ .unscaled = 5, .scale = 1 }, .{ .unscaled = -1235, .scale = 2 }, .{ .unscaled = 99999, .scale = 2 } };
+    const ss = [_]?[]const u8{ "pear", null, "apple", "", "fig", "b", "zz", "b", "kiwi" };
+    var fb = column.Builder.init(a, Type.init(.float).asNullable());
+    var db = column.Builder.init(a, Type.decimal(10, 2).asNullable());
+    var sb = column.Builder.init(a, Type.init(.string).asNullable());
+    for (fs, ds, ss) |x, d, s| {
+        try fb.append(if (x) |v| .{ .float = v } else .null);
+        try db.append(if (d) |v| .{ .decimal = v } else .null);
+        try sb.append(if (s) |v| .{ .string = v } else .null);
+    }
+    const schema = try a.create(types.Schema);
+    schema.* = .{ .fields = try a.dupe(types.Schema.Field, &.{
+        .{ .name = "i", .ty = Type.init(.int).asNullable() },
+        .{ .name = "z", .ty = Type.init(.int).asNullable() },
+        .{ .name = "g", .ty = Type.init(.int).asNullable() },
+        .{ .name = "m", .ty = Type.init(.int) },
+        .{ .name = "f", .ty = Type.init(.float).asNullable() },
+        .{ .name = "d", .ty = Type.decimal(10, 2).asNullable() },
+        .{ .name = "s", .ty = Type.init(.string).asNullable() },
+    }) };
+    const cols = try a.alloc(column.Column, 7);
+    cols[0] = try column.intColumn(a, &.{ 5, -7, null, 0, 3, -2, 1000, 3, -45 });
+    cols[1] = try column.intColumn(a, &.{ 0, 3, 1, null, 3, -2, 2, 0, 7 });
+    cols[2] = try column.intColumn(a, &.{ 1, null, 0, -1, 2, 3, 1, 0, -2 });
+    cols[3] = try column.intColumn(a, &.{ std.math.minInt(i64), 1, 2, 3, 4, 5, 6, 7, 8 });
+    cols[4] = try fb.finish();
+    cols[5] = try db.finish();
+    cols[6] = try sb.finish();
+    return .{ .schema = schema, .columns = cols, .len = fs.len };
+}
+
+test "numeric builtins: the kernels give the row forms' values, nulls, scales and errors" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const batch = try testBatch(a);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "abs(i)",           "abs(f)",           "abs(d)",          "abs(-3)",          "abs(-1.50)",
+        "floor(i)",         "floor(f)",         "floor(d)",        "ceil(f)",          "ceil(d)",
+        "round(i)",         "round(i, 1)",      "round(f)",        "round(f, 1)",      "round(f, -1)",
+        "round(f, g)",      "round(d)",         "round(d, 1)",     "round(d, -1)",     "round(d, g)",
+        "round(d, 5)",      "round(i, g)",      "sign(i)",         "sign(f)",          "sign(d)",
+        "mod(i, 3)",        "mod(f, 2e0)",      "mod(d, 3)",       "mod(d, 0.4)",      "nullif(i, 3)",
+        "nullif(i, z)",     "nullif(f, f)",     "nullif(d, 1.25)", "nullif(s, 'b')",   "greatest(i, z)",
+        "least(i, z, 2)",   "greatest(f, 0e0)", "least(f, -1e0)",  "greatest(d, 1.5)", "least(i, null, z)",
+        "greatest(s, 'b')", "least(s, s)",      "greatest(d, d)",  "least(z, i, g)",   "greatest(null, i)",
+    }, true);
+    try testing_util.expectVecMatchesRows(a, batch, &.{
+        "abs(m)",                  "mod(i, z)",      "round(i, 1 / z)", "nullif(i, 1.0)",
+        "greatest(i, f)",          "greatest(i, d)", "nullif(f, i)",    "round(d, 40)",
+        "if(z = 0, 0, mod(i, z))",
+    }, false);
 }

@@ -1,11 +1,9 @@
 //! The row form of each built-in function.
 
 const Batch = @import("../batch.zig").Batch;
-const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const accNode = @import("row.zig").accNode;
-const arith = @import("row.zig").arith;
 const addUnits = @import("time.zig").addUnits;
 const ast = @import("../../lang/ast.zig");
 const bindParams = @import("row.zig").bindParams;
@@ -21,7 +19,6 @@ const eq = @import("support.zig").eq;
 const evalRow = @import("row.zig").evalRow;
 const extractField = @import("time.zig").extractField;
 const failWith = @import("support.zig").failWith;
-const isNum = @import("support.zig").isNum;
 const json = @import("../json.zig");
 const jsonArrayArg = @import("row.zig").jsonArrayArg;
 const jsonElementValue = @import("row.zig").jsonElementValue;
@@ -32,16 +29,12 @@ const mulI64 = @import("time.zig").mulI64;
 const reduceTypeAt = @import("row.zig").reduceTypeAt;
 const regex = @import("../regex.zig");
 const regexpFind = @import("support.zig").regexpFind;
-const roundDecimal = @import("cast.zig").roundDecimal;
-const roundHalfAway = @import("strings.zig").roundHalfAway;
 const regexErr = @import("support.zig").regexErr;
-const roundOutScale = @import("cast.zig").roundOutScale;
 const std = @import("std");
 const strftimeFmt = @import("time.zig").strftimeFmt;
 const strptimeFmt = @import("time.zig").strptimeFmt;
 const temporalMicros = @import("time.zig").temporalMicros;
 const timeUnit = @import("time.zig").timeUnit;
-const toF64 = @import("support.zig").toF64;
 const toI64 = @import("support.zig").toI64;
 const truncMicros = @import("time.zig").truncMicros;
 const valueToString = @import("format.zig").valueToString;
@@ -195,78 +188,6 @@ pub const per_row = struct {
             if (!v.isNull()) return v;
         }
         return .null;
-    }
-
-    pub fn abs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        switch (v) {
-            .int => |x| {
-                if (x == std.math.minInt(i64)) return error.IntOverflow;
-                return Value{ .int = if (x < 0) -x else x };
-            },
-            .float => |x| return Value{ .float = @abs(x) },
-            .decimal => |d| return Value{ .decimal = .{
-                .unscaled = if (d.unscaled < 0) -d.unscaled else d.unscaled,
-                .scale = d.scale,
-            } },
-            else => return error.TypeMismatch,
-        }
-    }
-
-    pub fn floorCeil(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        if (v == .int) return v;
-        if (!isNum(v)) return error.TypeMismatch;
-        if (v == .decimal) return Value{ .decimal = wholeDecimal(v.decimal, eq(c.name, "floor")) };
-        const x = toF64(v);
-        return Value{ .float = if (eq(c.name, "floor")) @floor(x) else @ceil(x) };
-    }
-
-    /// A decimal floored or ceiled to scale 0, exactly.
-    fn wholeDecimal(d: Decimal, down: bool) Decimal {
-        const p = std.math.powi(i128, 10, d.scale) catch return .{ .unscaled = 0, .scale = 0 };
-        var q = @divTrunc(d.unscaled, p);
-        if (@rem(d.unscaled, p) != 0) {
-            if (down and d.unscaled < 0) q -= 1;
-            if (!down and d.unscaled > 0) q += 1;
-        }
-        return .{ .unscaled = q, .scale = 0 };
-    }
-
-    pub fn round(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        if (!isNum(v)) return error.TypeMismatch;
-        var digits: i64 = 0;
-        if (c.args.len > 1) {
-            const dv = try evalRow(arena, c.args[1], batch, row);
-            if (dv.isNull()) return .null;
-            digits = toI64(dv);
-        }
-        if (v == .int and c.args.len == 1) return v;
-        if (v == .decimal) return Value{ .decimal = roundDecimal(v.decimal, digits, roundOutScale(c, v.decimal.scale)) orelse return error.IntOverflow };
-        return Value{ .float = roundHalfAway(toF64(v), digits) };
-    }
-
-    pub fn mod(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const a = try evalRow(arena, c.args[0], batch, row);
-        const b = try evalRow(arena, c.args[1], batch, row);
-        if (a.isNull() or b.isNull()) return .null;
-        return arith(.mod, a, b);
-    }
-
-    pub fn sign(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
-        const v = try evalRow(arena, c.args[0], batch, row);
-        if (v.isNull()) return .null;
-        const x = toF64(v);
-        const sg: i64 = if (x > 0) 1 else if (x < 0) -1 else 0;
-        return switch (v) {
-            .decimal => Value{ .decimal = .{ .unscaled = sg, .scale = 0 } },
-            .float => Value{ .float = if (std.math.isNan(x)) x else @floatFromInt(sg) },
-            else => Value{ .int = sg },
-        };
     }
 
     pub fn nullif(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {

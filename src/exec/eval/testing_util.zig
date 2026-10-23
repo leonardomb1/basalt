@@ -40,6 +40,10 @@ fn expectOne(a: std.mem.Allocator, batch: Batch, src: []const u8, vectorized: bo
         return;
     };
     if (!ty.unknown) try std.testing.expectEqual(ty.kind, col.ty.kind);
+    if (vectorized and !ty.unknown and ty.kind == .decimal) {
+        try std.testing.expectEqual(ty.precision, col.ty.precision);
+        try std.testing.expectEqual(ty.scale, col.ty.scale);
+    }
     for (0..batch.len) |i| {
         const want = try evalRow(a, e, batch, i);
         const got = col.getValue(i);

@@ -38,13 +38,17 @@ test "builtins: aggregates and unknown names are not scalar builtins" {
 
 test "builtins: exactly these lack a vectorized kernel" {
     const rowwise_only = [_][]const u8{
-        "regexp_replace", "date_trunc",     "extract",        "abs",         "floor",        "ceil",
-        "round",          "mod",            "sign",           "nullif",      "greatest",     "least",
-        "date_add",       "date_diff",      "make_date",      "epoch",       "to_timestamp", "strftime",
-        "json_get",       "json_filter",    "json_transform", "json_any",    "json_all",     "strptime",
-        "try_strptime",   "regexp_matches", "regexp_extract", "md5",         "sha256",       "xxhash64",
-        "concat_ws",      "json_object",    "json_array",     "from_base64", "json_reduce",  "chars",
-        "json_range",     "json_length",    "json_slice",     "json_concat",
+        "regexp_replace", "date_trunc",     "extract",
+        "date_add",       "date_diff",      "make_date",
+        "epoch",          "to_timestamp",   "strftime",
+        "json_get",       "json_filter",    "json_transform",
+        "json_any",       "json_all",       "strptime",
+        "try_strptime",   "regexp_matches", "regexp_extract",
+        "md5",            "sha256",         "xxhash64",
+        "concat_ws",      "json_object",    "json_array",
+        "from_base64",    "json_reduce",    "chars",
+        "json_range",     "json_length",    "json_slice",
+        "json_concat",
     };
     for (rowwise_only) |n| try std.testing.expect(lookup(n) != null);
     for (table) |b| {

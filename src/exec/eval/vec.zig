@@ -215,7 +215,7 @@ fn orInto(take: []bool, c: Vec) VecError!void {
 
 /// Per row, `t` where `take[i]` else `e`. A null scalar on either side is an
 /// all-null column of the other's type, so `IF(c, x, NULL)` stays vectorized.
-fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) VecError!Vec {
+pub fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) VecError!Vec {
     const n = take.len;
     const tn = t == .scalar and t.scalar.isNull();
     const en = e == .scalar and e.scalar.isNull();
@@ -324,24 +324,29 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
             if (try decOpCmpVec(arena, b, batch)) |v| return v;
             const l = try evalVec(arena, b.l, batch);
             const r = try evalVec(arena, b.r, batch);
-            if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
-            if (try intDecCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
-            if (try decColCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
-            if (try decCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
-            if (try asNum(arena, l, batch.len)) |ln| {
-                if (try asNum(arena, r, batch.len)) |rn| return numOpVec(arena, b.op, ln, rn, batch.len);
-            }
-            if (try dateCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
-            if (try temporalPair(arena, l, r, batch.len)) |tp| {
-                return numOpVec(arena, b.op, tp[0], tp[1], batch.len);
-            }
-            if (try dictCmpVec(arena, b.op, l, r, batch.len)) |v| return v;
-            if (asStr(l)) |ls| {
-                if (asStr(r)) |rs| return cmpStrVec(arena, b.op, ls, rs, batch.len);
-            }
-            return error.Unsupported;
+            return compareVecs(arena, b.op, l, r, batch.len);
         },
     }
+}
+
+/// `l op r` over evaluated operands, for a comparison `op`.
+pub fn compareVecs(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!Vec {
+    if (scalarNull(l) or scalarNull(r)) return .{ .scalar = .null };
+    if (try intDecCmpVec(arena, op, l, r, n)) |v| return v;
+    if (try decColCmpVec(arena, op, l, r, n)) |v| return v;
+    if (try decCmpVec(arena, op, l, r, n)) |v| return v;
+    if (try asNum(arena, l, n)) |ln| {
+        if (try asNum(arena, r, n)) |rn| return numOpVec(arena, op, ln, rn, n);
+    }
+    if (try dateCmpVec(arena, op, l, r, n)) |v| return v;
+    if (try temporalPair(arena, l, r, n)) |tp| {
+        return numOpVec(arena, op, tp[0], tp[1], n);
+    }
+    if (try dictCmpVec(arena, op, l, r, n)) |v| return v;
+    if (asStr(l)) |ls| {
+        if (asStr(r)) |rs| return cmpStrVec(arena, op, ls, rs, n);
+    }
+    return error.Unsupported;
 }
 
 fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
