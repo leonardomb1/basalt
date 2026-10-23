@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "version", @import("build.zig.zon").version);
+    const llvm = b.option(bool, "llvm", "Build the binary with the LLVM backend, whose debug info kcov reads") orelse false;
     const stats = b.option(bool, "stats", "Count key table probes and print them after a run") orelse false;
     opts.addOption(bool, "stats", stats);
 
@@ -36,6 +37,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "basalt",
         .root_module = exe_module,
+        .use_llvm = if (llvm) true else null,
     });
     b.installArtifact(exe);
 
