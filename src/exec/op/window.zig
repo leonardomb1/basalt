@@ -33,6 +33,7 @@
 
 const Batch = @import("../batch.zig").Batch;
 const ErrCtx = @import("../op.zig").ErrCtx;
+const Held = @import("sort.zig").Held;
 const KeyArr = @import("sort.zig").KeyArr;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
@@ -51,8 +52,6 @@ const aggFuncs = @import("aggregate/funcs.zig");
 const read = @import("aggregate/read.zig");
 const Ctx = aggFuncs.Ctx;
 const Moments = aggFuncs.Moments;
-const materializeAll = @import("../op.zig").materializeAll;
-const sortIdxThreads = @import("sort.zig").sortIdxThreads;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
@@ -70,6 +69,10 @@ pub const Window = struct {
     top_k: ?u64 = null,
     gpa: ?std.mem.Allocator = null,
     threads: usize = 1,
+    /// Rows per output batch, a multiple of 8.
+    batch_rows: usize = 1 << 16,
+    held: ?*Held = null,
+    fcols: []column.Column = &.{},
 
     pub const max_top_k: u64 = 1 << 19;
 
@@ -261,14 +264,13 @@ pub const Window = struct {
 
     /// The order key as RANGE offsets compare it, ascending (a DESC key negated): one
     /// number per sorted row, `null_at` marking the rows whose key is null.
-    fn rangeKeys(self: *Window, arena: std.mem.Allocator, all: Batch, idx: []const usize) !RangeKeys {
+    fn rangeKeys(self: *Window, arena: std.mem.Allocator, col: column.Column) !RangeKeys {
         const k = self.ord[0];
-        const col = all.columns[k.idx];
         const conv = self.range;
-        var rk = RangeKeys{ .float = conv.float, .null_at = try arena.alloc(bool, idx.len) };
-        if (conv.float) rk.floats = try arena.alloc(f64, idx.len) else rk.ints = try arena.alloc(i128, idx.len);
-        for (idx, 0..) |row, p| {
-            const v = col.getValue(row);
+        var rk = RangeKeys{ .float = conv.float, .null_at = try arena.alloc(bool, col.len) };
+        if (conv.float) rk.floats = try arena.alloc(f64, col.len) else rk.ints = try arena.alloc(i128, col.len);
+        for (0..col.len) |p| {
+            const v = col.getValue(p);
             rk.null_at[p] = v.isNull();
             if (v.isNull()) continue;
             if (conv.float) {
@@ -804,40 +806,81 @@ pub const Window = struct {
     }
 
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
+        errdefer self.release();
+        if (self.held) |h| return self.emit(arena, h);
         if (self.done) return null;
         self.done = true;
         if (self.top_k) |k| return self.topK(arena, k, self.gpa.?);
-        const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
-        const n = all.len;
+        const gpa = self.gpa orelse std.heap.page_allocator;
+        const h = try Held.create(gpa);
+        self.held = h;
+        while (try self.child.next(h.pull())) |b| try h.add(b);
+        if (h.rows == 0) {
+            self.release();
+            return null;
+        }
+        var work = std.heap.ArenaAllocator.init(gpa);
+        defer work.deinit();
+        self.fcols = try self.compute(work.allocator(), h);
+        return self.emit(arena, h);
+    }
 
-        const idx = try arena.alloc(usize, n);
-        for (idx, 0..) |*x, i| x.* = i;
+    /// Frees the input and function values held for a consumer that stopped pulling.
+    pub fn release(self: *Window) void {
+        if (self.held) |h| h.destroy();
+        self.held = null;
+        self.fcols = &.{};
+        self.done = true;
+    }
 
-        const arrs = try arena.alloc(KeyArr, self.part.len + self.ord.len);
-        for (self.part, 0..) |k, i| arrs[i] = try KeyArr.prepareThreads(arena, all.columns[k.idx], k, self.threads);
-        for (self.ord, 0..) |k, i| arrs[self.part.len + i] = try KeyArr.prepareThreads(arena, all.columns[k.idx], k, self.threads);
-        try sortIdxThreads(arena, idx, arrs, self.threads);
+    /// The next `batch_rows` input rows in window order with their function values,
+    /// gathered into `arena`; what is held is freed with the last.
+    fn emit(self: *Window, arena: std.mem.Allocator, h: *Held) !?Batch {
+        const ncols = self.in_schema.fields.len;
+        const lo = h.pos;
+        const cols = try arena.alloc(column.Column, self.out_schema.fields.len);
+        const n = try h.gather(arena, self.batch_rows, cols[0..ncols]);
+        for (self.fcols, cols[ncols..]) |f, *o| o.* = try column.copy(arena, try column.slice(arena, f, lo, n));
+        if (h.pos == h.refs.len) self.release();
+        return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+    }
 
-        const ncols = all.columns.len;
-        const cols = try arena.alloc(column.Column, ncols + self.funcs.len);
-        for (all.columns, 0..) |*col, ci| cols[ci] = try column.permuteThreads(arena, col.*, idx, self.threads);
-        const sorted_keys = try arena.alloc(KeyArr, arrs.len);
-        for (self.part, 0..) |k, i| sorted_keys[i] = try KeyArr.prepareThreads(arena, cols[k.idx], k, self.threads);
-        for (self.ord, 0..) |k, i| sorted_keys[self.part.len + i] = try KeyArr.prepareThreads(arena, cols[k.idx], k, self.threads);
-        const l = try layout(arena, n, sorted_keys[0..self.part.len], sorted_keys[self.part.len..], self.threads);
+    /// Orders `h`'s rows by partition and order keys and computes every function over
+    /// them, into `h`'s arena; the sorted copies of only the key and argument columns
+    /// and the frames are scratch in `work`.
+    fn compute(self: *Window, work: std.mem.Allocator, h: *Held) ![]column.Column {
+        const n = h.rows;
+        const keys = try work.alloc(Sort.Key, self.part.len + self.ord.len);
+        @memcpy(keys[0..self.part.len], self.part);
+        @memcpy(keys[self.part.len..], self.ord);
+        try h.order(keys, self.threads);
+
+        const sc = try work.alloc(?column.Column, self.in_schema.fields.len);
+        @memset(sc, null);
+        for (keys) |k| {
+            if (sc[k.idx] == null) sc[k.idx] = try h.sortedColumn(work, k.idx);
+        }
+        for (self.funcs) |f| if (f.arg) |ai| {
+            if (sc[ai] == null) sc[ai] = try h.sortedColumn(work, ai);
+        };
+        const sorted_keys = try work.alloc(KeyArr, keys.len);
+        for (keys, sorted_keys) |k, *x| x.* = try KeyArr.prepareThreads(work, sc[k.idx].?, k, self.threads);
+        const l = try layout(work, n, sorted_keys[0..self.part.len], sorted_keys[self.part.len..], self.threads);
 
         var rk: ?RangeKeys = null;
         for (self.funcs) |f| {
             if (f.frame.range and (f.frame.start == .preceding or f.frame.start == .following or f.frame.end == .preceding or f.frame.end == .following)) {
-                rk = try self.rangeKeys(arena, all, idx);
+                rk = try self.rangeKeys(work, sc[self.ord[0].idx].?);
                 break;
             }
         }
 
+        const ncols = self.in_schema.fields.len;
+        const fcols = try h.allocator().alloc(column.Column, self.funcs.len);
         for (self.funcs, 0..) |f, fi| {
             const out_ty = self.out_schema.fields[ncols + fi].ty;
-            var bd = try column.Builder.initCapacity(arena, out_ty, n);
-            const arg: ?column.Column = if (f.arg) |ai| cols[ai] else null;
+            var bd = try column.Builder.initCapacity(h.allocator(), out_ty, n);
+            const arg: ?column.Column = if (f.arg) |ai| sc[ai].? else null;
             switch (f.func) {
                 .win => |kind| switch (kind) {
                     .row_number, .rank, .dense_rank, .percent_rank => {
@@ -885,14 +928,14 @@ pub const Window = struct {
                         var cnt: []usize = &.{};
                         var nnpos: []usize = &.{};
                         if (f.ignore_nulls) {
-                            cnt = try arena.alloc(usize, n + 1);
+                            cnt = try work.alloc(usize, n + 1);
                             var c: usize = 0;
                             for (0..n) |p| {
                                 cnt[p] = c;
                                 if (!vc.getValue(p).isNull()) c += 1;
                             }
                             cnt[n] = c;
-                            nnpos = try arena.alloc(usize, c);
+                            nnpos = try work.alloc(usize, c);
                             c = 0;
                             for (0..n) |p| if (!vc.getValue(p).isNull()) {
                                 nnpos[c] = p;
@@ -900,7 +943,7 @@ pub const Window = struct {
                             };
                         }
                         var fr: ?Frames = null;
-                        if (kind != .lag and kind != .lead) fr = try frames(arena, l, f.frame, rk);
+                        if (kind != .lag and kind != .lead) fr = try frames(work, l, f.frame, rk);
                         for (0..n) |k| {
                             const ps = l.pstart[k];
                             const pe = l.pend[k];
@@ -944,18 +987,18 @@ pub const Window = struct {
                     },
                 },
                 .agg => |agg| {
-                    const fr = try frames(arena, l, f.frame, rk);
-                    const col: ?column.Column = if (arg) |x| try read.castText(arena, agg, out_ty, x) else null;
-                    const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = arena, .scratch = arena };
+                    const fr = try frames(work, l, f.frame, rk);
+                    const col: ?column.Column = if (arg) |x| try read.castText(work, agg, out_ty, x) else null;
+                    const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = work, .scratch = work };
                     slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, &bd) catch |e| {
                         if (e == error.IntOverflow and agg == .sum and out_ty.kind == .int) if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(e)});
                         return e;
                     };
                 },
             }
-            cols[ncols + fi] = try bd.finish();
+            fcols[fi] = try bd.finish();
         }
-        return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+        return fcols;
     }
 };
 
@@ -1184,9 +1227,15 @@ fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window
         .part = &[_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }},
         .ord = if (with_order) try a.dupe(Sort.Key, &[_]Sort.Key{.{ .idx = 1, .desc = dir.desc, .nulls_first = dir.nf }}) else &.{},
         .funcs = funcs,
+        .gpa = testing.allocator,
+        .batch_rows = 8,
     };
     var out = std.array_list.Managed(Batch).init(a);
-    while (try w.next(a)) |b| try out.append(b);
+    while (try w.next(a)) |b| {
+        try testing.expect(b.len <= 8);
+        try out.append(b);
+    }
+    try testing.expect(w.held == null);
     return out.toOwnedSlice();
 }
 
@@ -1305,6 +1354,47 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
         };
         try testing.expectEqual(n, at);
     };
+}
+
+test "window: output streams in bounded batches gathered from one held copy, freed early or at the end" {
+    const util = @import("testing_util.zig");
+    const funcs = [_]Window.Func{ .{ .func = .{ .win = .row_number } }, .{ .func = .{ .win = .lag }, .arg = 1 } };
+    const fields = [_]types.Schema.Field{
+        util.join_right_schema.fields[0],
+        util.join_right_schema.fields[1],
+        .{ .name = "rn", .ty = types.Type.init(.int) },
+        .{ .name = "lg", .ty = types.Type.init(.string).asNullable() },
+    };
+    const out_schema = types.Schema{ .fields = &fields };
+    const ord = [_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }};
+    for ([_]usize{ 3, std.math.maxInt(usize) }) |pulls| {
+        var src = util.PullSource{ .schema_ = util.join_right_schema, .count = 64, .rows = 256 };
+        var scan = Scan{ .src = src.src() };
+        var w = Window{ .child = .{ .scan = &scan }, .in_schema = &util.join_right_schema, .out_schema = &out_schema, .part = &.{}, .ord = &ord, .funcs = &funcs, .gpa = testing.allocator, .batch_rows = 1000 };
+        const top: Op = .{ .window = &w };
+        errdefer top.release();
+        var pull = std.heap.ArenaAllocator.init(testing.allocator);
+        defer pull.deinit();
+        var want: i64 = 1;
+        var n: usize = 0;
+        while (n < pulls) : (n += 1) {
+            _ = pull.reset(.retain_capacity);
+            const b = (try top.next(pull.allocator())) orelse break;
+            try testing.expect(b.len <= 1000);
+            for (0..b.len) |r| {
+                try testing.expectEqual(want, b.columns[0].getValue(r).int);
+                try testing.expectEqual(want, b.columns[2].getValue(r).int);
+                var buf: [48]u8 = undefined;
+                const prev = b.columns[3].getValue(r);
+                if (want == 1) try testing.expect(prev.isNull()) else try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d:0>48}", .{@as(u64, @intCast(want - 1))}), prev.string);
+                want += 1;
+            }
+            try testing.expect(pull.queryCapacity() < 256 * 1024);
+        }
+        if (pulls > 3) try testing.expectEqual(@as(i64, 64 * 256 + 1), want);
+        top.release();
+        try testing.expect(w.held == null);
+    }
 }
 
 test "window without ORDER BY: the default frame is the whole partition, a ROWS frame counts in input order" {

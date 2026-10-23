@@ -525,6 +525,60 @@ pub fn interleave(arena: std.mem.Allocator, srcs: []const Column, from: []const 
     return Column.derived(srcs[0].ty, rows.len, bm, try mapTag(srcs[0].data, Op{ .arena = arena, .srcs = srcs, .from = from, .rows = rows }));
 }
 
+/// The rows `refs` name, each a `.chunk` index into `srcs` and a `.row` in that chunk,
+/// in that order: one column gathered across many of `srcs[0]`'s storage. Dictionary
+/// views are dropped, as each chunk's differs.
+pub fn takeAcross(a: std.mem.Allocator, srcs: []const Column, refs: anytype) !Column {
+    var bm = try Bitmap.initFull(a, refs.len);
+    for (refs, 0..) |e, i| {
+        if (!srcs[e.chunk].validity.get(e.row)) bm.setValid(i, false);
+    }
+    const Refs = @TypeOf(refs);
+    const Op = struct {
+        a: std.mem.Allocator,
+        srcs: []const Column,
+        refs: Refs,
+        const ahead = 16;
+        pub fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            const out = try o.a.alloc(Elem(t), o.refs.len);
+            for (o.refs, out, 0..) |e, *x, i| {
+                if (i + ahead < o.refs.len) {
+                    const f = o.refs[i + ahead];
+                    @prefetch(&@field(o.srcs[f.chunk].data, @tagName(t))[f.row], .{});
+                }
+                x.* = @field(o.srcs[e.chunk].data, @tagName(t))[e.row];
+            }
+            return out;
+        }
+        pub fn bytes(o: @This()) !Bytes {
+            const parts = try o.a.alloc([]const u8, o.refs.len);
+            defer o.a.free(parts);
+            var span: usize = 0;
+            for (o.refs, parts, 0..) |e, *s, i| {
+                if (i + ahead < o.refs.len) {
+                    const f = o.refs[i + ahead];
+                    @prefetch(&o.srcs[f.chunk].data.bytes.offsets[f.row], .{});
+                }
+                s.* = o.srcs[e.chunk].data.bytes.at(e.row);
+                span += s.len;
+            }
+            const offsets = try o.a.alloc(i32, o.refs.len + 1);
+            const values = try o.a.alloc(u8, try checkSpan(span));
+            offsets[0] = 0;
+            var off: usize = 0;
+            for (parts, offsets[1..], 0..) |s, *end, i| {
+                if (i + ahead < parts.len) @prefetch(parts[i + ahead].ptr, .{});
+                @memcpy(values[off..][0..s.len], s);
+                off += s.len;
+                end.* = @intCast(off);
+            }
+            return .{ .offsets = offsets, .values = values };
+        }
+    };
+    const data = try mapTag(srcs[0].data, Op{ .a = a, .srcs = srcs, .refs = refs });
+    return Column.derived(srcs[0].ty, refs.len, bm, data);
+}
+
 /// Rows `start..start + n` of `c` as a view on its buffers, nothing copied: `start` is
 /// a multiple of 8 so the validity stays byte-aligned, byte offsets keep indexing the
 /// same values buffer, and a dictionary keeps its entries over a run of its codes.

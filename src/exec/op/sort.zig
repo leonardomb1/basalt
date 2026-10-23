@@ -28,7 +28,6 @@ const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
-const materializeAll = @import("../op.zig").materializeAll;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Filter = @import("../op.zig").Filter;
@@ -56,6 +55,7 @@ pub const Sort = struct {
     batch_rows: usize = 1 << 16,
     gpa: std.mem.Allocator = std.heap.page_allocator,
     merge: ?*Merge = null,
+    held: ?*Held = null,
     /// Sorted runs written to disk, kept past the merge for `EXPLAIN ANALYZE`.
     runs: usize = 0,
 
@@ -63,7 +63,8 @@ pub const Sort = struct {
     pub const Key = struct { idx: usize, desc: bool, nulls_first: bool };
 
     pub fn next(self: *Sort, arena: std.mem.Allocator) anyerror!?Batch {
-        errdefer self.dropMerge();
+        errdefer self.release();
+        if (self.held) |h| return self.emit(arena, h);
         if (self.merge) |m| {
             if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
             self.dropMerge();
@@ -72,16 +73,21 @@ pub const Sort = struct {
         if (self.done) return null;
         self.done = true;
         const space = self.space orelse {
-            const all = (try materializeAll(arena, self.child, self.in_schema)) orelse return null;
-            return try self.sortBatch(arena, all);
+            const h = try Held.create(self.gpa);
+            self.held = h;
+            while (try self.child.next(h.pull())) |b| try h.add(b);
+            return self.start(arena, h);
         };
         return self.external(arena, space);
     }
 
-    /// Drops a merge left unfinished by a consumer that stopped pulling: its files
-    /// are deleted, their disk charge given back and its memory freed.
+    /// Drops a merge or sorted input left unfinished by a consumer that stopped
+    /// pulling: its files are deleted, their disk charge given back and its memory
+    /// freed.
     pub fn release(self: *Sort) void {
         self.dropMerge();
+        if (self.held) |h| h.destroy();
+        self.held = null;
         self.done = true;
     }
 
@@ -91,11 +97,26 @@ pub const Sort = struct {
         self.merge = null;
     }
 
-    fn sortBatch(self: *Sort, arena: std.mem.Allocator, all: Batch) !Batch {
-        const s = try self.sorted(arena, all);
-        const outcols = try arena.alloc(column.Column, all.columns.len);
-        for (all.columns, 0..) |*col, ci| outcols[ci] = try column.permuteThreads(arena, col.*, s.idx, self.threads);
-        return Batch{ .schema = all.schema, .columns = outcols, .len = all.len };
+    /// Sorts the input `h` holds, which it takes, and hands out its first batch.
+    fn start(self: *Sort, arena: std.mem.Allocator, h: *Held) !?Batch {
+        self.held = h;
+        if (h.rows == 0) {
+            h.destroy();
+            self.held = null;
+            return null;
+        }
+        try h.order(self.keys, self.threads);
+        return self.emit(arena, h);
+    }
+
+    /// The next sorted rows of `h`, gathered into `arena`; `h` is freed with the last.
+    fn emit(self: *Sort, arena: std.mem.Allocator, h: *Held) !?Batch {
+        const b = try h.take(arena, self.in_schema, @max(self.batch_rows, 1));
+        if (h.pos == h.refs.len) {
+            h.destroy();
+            self.held = null;
+        }
+        return b;
     }
 
     fn sorted(self: *Sort, arena: std.mem.Allocator, all: Batch) !Sorted {
@@ -113,50 +134,41 @@ pub const Sort = struct {
     /// are merged into new ones until `fan_in` sources remain, and the final merge is
     /// left in `merge` for the following pulls.
     fn external(self: *Sort, arena: std.mem.Allocator, space: Space) !?Batch {
-        const held = try self.gpa.create(std.heap.ArenaAllocator);
-        held.* = std.heap.ArenaAllocator.init(self.gpa);
-        var held_owned = true;
-        defer if (held_owned) {
-            held.deinit();
-            self.gpa.destroy(held);
-        };
+        var h = try Held.create(self.gpa);
+        var h_owned = true;
+        defer if (h_owned) h.destroy();
         var paths = std.heap.ArenaAllocator.init(self.gpa);
         defer paths.deinit();
-        var chunks: std.ArrayListUnmanaged(Batch) = .empty;
-        defer chunks.deinit(self.gpa);
         var runs: std.ArrayListUnmanaged(spill.Run) = .empty;
         defer runs.deinit(self.gpa);
         var runs_owned = true;
         errdefer if (runs_owned) deleteRuns(runs.items);
 
-        var rows: usize = 0;
-        var bytes: usize = 0;
-        while (try self.child.next(held.allocator())) |b| {
-            if (b.len == 0) continue;
-            try chunks.append(self.gpa, b);
-            rows += b.len;
-            bytes += b.heapBytes();
-            if (bytes <= self.spill_at) continue;
-            const all = try concatChunks(held.allocator(), self.in_schema, chunks.items, rows, self.threads);
-            const s = try self.sorted(held.allocator(), all);
+        while (try self.child.next(h.pull())) |b| {
+            try h.add(b);
+            if (h.bytes <= self.spill_at) continue;
+            try h.order(self.keys, self.threads);
             try runs.ensureUnusedCapacity(self.gpa, 1);
-            runs.appendAssumeCapacity(try self.writeSorted(space, paths.allocator(), all, s.idx));
+            runs.appendAssumeCapacity(try self.writeSorted(space, paths.allocator(), h));
             self.runs += 1;
-            chunks.clearRetainingCapacity();
-            _ = held.reset(.retain_capacity);
-            rows = 0;
-            bytes = 0;
+            h.reset();
         }
 
         if (runs.items.len == 0) {
-            if (rows == 0) return null;
-            return try self.sortBatch(arena, try concatChunks(arena, self.in_schema, chunks.items, rows, self.threads));
+            h_owned = false;
+            return self.start(arena, h);
         }
 
         var mem: ?Merge.Mem = null;
-        if (rows > 0) {
-            const all = try concatChunks(held.allocator(), self.in_schema, chunks.items, rows, self.threads);
-            const s = try self.sorted(held.allocator(), all);
+        if (h.rows > 0) {
+            const last = try Held.create(self.gpa);
+            const all = concatChunks(last.allocator(), self.in_schema, h.chunks.items, h.rows, self.threads) catch |e| {
+                last.destroy();
+                return e;
+            };
+            h.destroy();
+            h = last;
+            const s = try self.sorted(h.allocator(), all);
             mem = .{ .cols = all.columns, .arrs = s.arrs, .idx = s.idx };
         }
         const fan_in = @max(self.fan_in, 2);
@@ -177,8 +189,8 @@ pub const Sort = struct {
         }
 
         runs_owned = false;
-        const give: ?*std.heap.ArenaAllocator = if (mem != null) held else null;
-        if (give != null) held_owned = false;
+        const give: ?*Held = if (mem != null) h else null;
+        if (give != null) h_owned = false;
         const m = try Merge.init(self.gpa, self.in_schema, self.keys, runs.items, mem, give);
         self.merge = m;
         if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
@@ -186,9 +198,9 @@ pub const Sort = struct {
         return null;
     }
 
-    /// Writes `all` in the order of `idx` as a run of `batch_rows`-row batches. The
-    /// run's path is copied into `paths`; the writer's buffer is freed on return.
-    fn writeSorted(self: *Sort, space: Space, paths: std.mem.Allocator, all: Batch, idx: []const usize) !spill.Run {
+    /// Writes `h`'s rows, ordered, as a run of `batch_rows`-row batches. The run's path
+    /// is copied into `paths`; the writer's buffer is freed on return.
+    fn writeSorted(self: *Sort, space: Space, paths: std.mem.Allocator, h: *Held) !spill.Run {
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
         defer tmp.deinit();
         var chunk = std.heap.ArenaAllocator.init(self.gpa);
@@ -196,14 +208,9 @@ pub const Sort = struct {
         var w = try spill.Writer.init(space, tmp.allocator(), self.in_schema, "sort");
         errdefer w.abort();
         const path = try paths.dupe(u8, w.path);
-        const cols = try tmp.allocator().alloc(column.Column, all.columns.len);
-        var lo: usize = 0;
-        while (lo < idx.len) {
-            const hi = @min(idx.len, lo + @max(self.batch_rows, 1));
+        while (true) {
             _ = chunk.reset(.retain_capacity);
-            for (all.columns, cols) |c, *o| o.* = try column.permute(chunk.allocator(), c, idx[lo..hi]);
-            try w.write(.{ .schema = self.in_schema, .columns = cols, .len = hi - lo });
-            lo = hi;
+            try w.write((try h.take(chunk.allocator(), self.in_schema, @max(self.batch_rows, 1))) orelse break);
         }
         var run = try w.finish();
         run.path = path;
@@ -235,6 +242,146 @@ pub const Sort = struct {
 
 const Sorted = struct { idx: []usize, arrs: []KeyArr };
 
+/// One row of a `Held` input: its chunk and its row there.
+const Ref = struct { row: u32, chunk: u32 };
+
+/// The input of a sort or window, pulled chunk by chunk into its own arena and kept
+/// as pulled: only the key columns are laid end to end to sort by. The sorted rows
+/// go out a batch at a time, each gathered once from the chunks into the caller's
+/// arena, so the input is held about once, not also concatenated and permuted whole.
+pub const Held = struct {
+    gpa: std.mem.Allocator,
+    ar: std.heap.ArenaAllocator,
+    /// Two arenas pulled into in turn, so the batch of the pull before stays valid
+    /// through the next, as a driver's are.
+    pulls: [2]std.heap.ArenaAllocator,
+    turn: u1 = 0,
+    chunks: std.ArrayListUnmanaged(Batch) = .empty,
+    rows: usize = 0,
+    bytes: usize = 0,
+    /// The rows in sorted order, set by `order`.
+    refs: []const Ref = &.{},
+    /// How many of `refs` `take` has handed out.
+    pos: usize = 0,
+
+    pub fn create(gpa: std.mem.Allocator) !*Held {
+        const h = try gpa.create(Held);
+        h.* = .{ .gpa = gpa, .ar = .init(gpa), .pulls = .{ .init(gpa), .init(gpa) } };
+        return h;
+    }
+
+    pub fn destroy(self: *Held) void {
+        const gpa = self.gpa;
+        self.ar.deinit();
+        for (&self.pulls) |*p| p.deinit();
+        gpa.destroy(self);
+    }
+
+    /// The arena the next batch is pulled into, before `add` copies it.
+    pub fn pull(self: *Held) std.mem.Allocator {
+        self.turn +%= 1;
+        _ = self.pulls[self.turn].reset(.retain_capacity);
+        return self.pulls[self.turn].allocator();
+    }
+
+    /// The arena the held rows live in, freed with them.
+    pub fn allocator(self: *Held) std.mem.Allocator {
+        return self.ar.allocator();
+    }
+
+    /// Keeps a copy of `b`, its buffers cut to its rows: a reader's batch can hold
+    /// spare capacity it grew into, which would otherwise be held along with it.
+    pub fn add(self: *Held, b: Batch) !void {
+        if (b.len == 0) return;
+        const a = self.ar.allocator();
+        try self.chunks.append(a, try b.deepCopy(a));
+        self.rows += b.len;
+        self.bytes += b.heapBytes();
+    }
+
+    /// Drops every row held, keeping the arena's capacity for the next.
+    pub fn reset(self: *Held) void {
+        _ = self.ar.reset(.retain_capacity);
+        self.chunks = .empty;
+        self.rows = 0;
+        self.bytes = 0;
+        self.refs = &.{};
+        self.pos = 0;
+    }
+
+    /// Column `ci` of every chunk laid end to end in `a`, or the one chunk's own.
+    fn whole(self: *Held, a: std.mem.Allocator, ci: usize, threads: usize) !column.Column {
+        const chunks = self.chunks.items;
+        if (chunks.len == 1) return chunks[0].columns[ci];
+        const per = try a.alloc(column.Column, chunks.len);
+        for (chunks, per) |b, *p| p.* = b.columns[ci];
+        return column.concatThreads(a, per, self.rows, threads);
+    }
+
+    /// Orders the rows by `keys`, ties in input order, into `refs`; `take` then hands
+    /// them out from the first. The key columns are laid end to end in a scratch
+    /// arena, freed once sorted.
+    pub fn order(self: *Held, keys: []const Sort.Key, threads: usize) !void {
+        var tmp = std.heap.ArenaAllocator.init(self.gpa);
+        defer tmp.deinit();
+        const t = tmp.allocator();
+        const idx = try self.ar.allocator().alloc(usize, self.rows);
+        for (idx, 0..) |*x, i| x.* = i;
+        const arrs = try t.alloc(KeyArr, keys.len);
+        for (keys, arrs) |k, *x| x.* = try KeyArr.prepareThreads(t, try self.whole(t, k.idx, threads), k, threads);
+        try sortIdxThreads(t, idx, arrs, threads);
+        const chunks = self.chunks.items;
+        const starts = try t.alloc(usize, chunks.len);
+        const chunk_of = try t.alloc(u32, self.rows);
+        var at: usize = 0;
+        for (chunks, starts, 0..) |b, *st, c| {
+            st.* = at;
+            @memset(chunk_of[at..][0..b.len], @intCast(c));
+            at += b.len;
+        }
+        const refs: []Ref = @as([*]Ref, @ptrCast(idx.ptr))[0..idx.len];
+        for (0..idx.len) |i| {
+            const g = idx[i];
+            const c = chunk_of[g];
+            refs[i] = .{ .chunk = c, .row = @intCast(g - starts[c]) };
+        }
+        self.refs = refs;
+        self.pos = 0;
+    }
+
+    /// Column `ci` of every row, in order, gathered into `a`.
+    pub fn sortedColumn(self: *Held, a: std.mem.Allocator, ci: usize) !column.Column {
+        const srcs = try a.alloc(column.Column, self.chunks.items.len);
+        for (srcs, self.chunks.items) |*s, b| s.* = b.columns[ci];
+        return column.takeAcross(a, srcs, self.refs);
+    }
+
+    /// Columns of the next up to `max_rows` ordered rows, gathered into `arena`, into
+    /// `out`; the rows' count, 0 once all are out.
+    pub fn gather(self: *Held, arena: std.mem.Allocator, max_rows: usize, out: []column.Column) !usize {
+        const hi = @min(self.refs.len, self.pos + max_rows);
+        const refs = self.refs[self.pos..hi];
+        if (refs.len == 0) return 0;
+        const chunks = self.chunks.items;
+        const srcs = try arena.alloc(column.Column, chunks.len);
+        for (out, 0..) |*o, ci| {
+            for (srcs, chunks) |*s, b| s.* = b.columns[ci];
+            o.* = try column.takeAcross(arena, srcs, refs);
+        }
+        self.pos = hi;
+        return refs.len;
+    }
+
+    /// The next up to `max_rows` ordered rows as a batch of `schema` in `arena`; null
+    /// once all are out.
+    pub fn take(self: *Held, arena: std.mem.Allocator, schema: *const types.Schema, max_rows: usize) !?Batch {
+        const cols = try arena.alloc(column.Column, schema.fields.len);
+        const n = try self.gather(arena, max_rows, cols);
+        if (n == 0) return null;
+        return .{ .schema = schema, .columns = cols, .len = n };
+    }
+};
+
 fn deleteRuns(runs: []const spill.Run) void {
     for (runs) |r| spill.discard(r);
 }
@@ -262,7 +409,7 @@ pub const Merge = struct {
     cursors: []Cursor,
     heap: []u32,
     live: usize = 0,
-    held: ?*std.heap.ArenaAllocator,
+    held: ?*Held,
 
     pub const Mem = struct { cols: []const column.Column, arrs: []const KeyArr, idx: []const usize };
 
@@ -319,10 +466,10 @@ pub const Merge = struct {
 
     /// Takes ownership of `runs`' files and of `held`, which backs `mem`; both are
     /// released by `deinit`, or here on failure.
-    pub fn init(gpa: std.mem.Allocator, schema: *const types.Schema, keys: []const Sort.Key, runs: []const spill.Run, mem: ?Mem, held: ?*std.heap.ArenaAllocator) !*Merge {
+    pub fn init(gpa: std.mem.Allocator, schema: *const types.Schema, keys: []const Sort.Key, runs: []const spill.Run, mem: ?Mem, held: ?*Held) !*Merge {
         const self = gpa.create(Merge) catch |e| {
             deleteRuns(runs);
-            freeHeld(gpa, held);
+            if (held) |h| h.destroy();
             return e;
         };
         self.* = .{ .gpa = gpa, .schema = schema, .keys = keys, .cursors = &.{}, .heap = &.{}, .held = held };
@@ -361,12 +508,6 @@ pub const Merge = struct {
         return self;
     }
 
-    fn freeHeld(gpa: std.mem.Allocator, held: ?*std.heap.ArenaAllocator) void {
-        const h = held orelse return;
-        h.deinit();
-        gpa.destroy(h);
-    }
-
     pub fn deinit(self: *Merge) void {
         for (self.cursors) |*c| {
             c.close(self.gpa);
@@ -374,7 +515,7 @@ pub const Merge = struct {
         }
         self.gpa.free(self.cursors);
         self.gpa.free(self.heap);
-        freeHeld(self.gpa, self.held);
+        if (self.held) |h| h.destroy();
         self.gpa.destroy(self);
     }
 
@@ -1374,6 +1515,39 @@ test "sort spill: input under the limit is sorted in memory without touching the
     const keys = [_]Sort.Key{ .{ .idx = 3, .desc = false, .nulls_first = false }, .{ .idx = 2, .desc = true, .nulls_first = true } };
     try expectSameRows(try drainSorted(a, batches, &keys, .{}), try drainSorted(a, batches, &keys, .{ .space = td.ds.space(), .spill_at = 1 << 30 }));
     try testing.expectEqual(@as(u64, 0), td.ds.used.load(.monotonic));
+}
+
+test "sort: the in-memory sort streams bounded batches gathered from its own copy, and frees it early or at the end" {
+    const util = @import("testing_util.zig");
+    const keys = [_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }};
+    const td = try SpillDir.init(std.math.maxInt(u64));
+    defer td.deinit();
+    for ([_]?Space{ null, td.ds.space() }) |space| for ([_]usize{ 3, std.math.maxInt(usize) }) |pulls| {
+        var src = util.PullSource{ .schema_ = util.join_right_schema, .count = 64, .rows = 256 };
+        var scan = Scan{ .src = src.src() };
+        var srt = Sort{ .child = .{ .scan = &scan }, .in_schema = &util.join_right_schema, .keys = &keys, .space = space, .spill_at = 1 << 30, .batch_rows = 1000, .gpa = testing.allocator };
+        const top: Op = .{ .sort = &srt };
+        errdefer top.release();
+        var pull = std.heap.ArenaAllocator.init(testing.allocator);
+        defer pull.deinit();
+        var want: i64 = 1;
+        var n: usize = 0;
+        while (n < pulls) : (n += 1) {
+            _ = pull.reset(.retain_capacity);
+            const b = (try top.next(pull.allocator())) orelse break;
+            try testing.expect(b.len <= 1000);
+            for (0..b.len) |r| {
+                try testing.expectEqual(want, b.columns[0].getValue(r).int);
+                var buf: [48]u8 = undefined;
+                try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d:0>48}", .{@as(u64, @intCast(want))}), b.columns[1].getValue(r).string);
+                want += 1;
+            }
+            try testing.expect(pull.queryCapacity() < 256 * 1024);
+        }
+        if (pulls > 3) try testing.expectEqual(@as(i64, 64 * 256 + 1), want);
+        top.release();
+        try testing.expect(srt.held == null);
+    };
 }
 
 test "sort spill: a consumer that stops early leaves no file, charge or memory once the tree is released" {

@@ -399,56 +399,10 @@ pub const TopK = struct {
 
     /// Column `ci` of the rows `refs` name, in that order, typed as the chunks hold it.
     fn take(self: *const TopK, a: std.mem.Allocator, refs: []const Entry, ci: usize) !column.Column {
-        const chunks = self.chunks.items;
-        const first = chunks[0].cols[ci];
-        var bm = try column.Bitmap.initFull(a, refs.len);
-        for (refs, 0..) |e, i| {
-            if (!chunks[e.chunk].cols[ci].validity.get(e.row)) bm.setValid(i, false);
-        }
-        const Op = struct {
-            a: std.mem.Allocator,
-            chunks: []const Chunk,
-            refs: []const Entry,
-            ci: usize,
-            const ahead = 16;
-            pub fn fixed(o: @This(), comptime t: column.Tag) ![]column.Elem(t) {
-                const out = try o.a.alloc(column.Elem(t), o.refs.len);
-                for (o.refs, out, 0..) |e, *x, i| {
-                    if (i + ahead < o.refs.len) {
-                        const f = o.refs[i + ahead];
-                        @prefetch(&@field(o.chunks[f.chunk].cols[o.ci].data, @tagName(t))[f.row], .{});
-                    }
-                    x.* = @field(o.chunks[e.chunk].cols[o.ci].data, @tagName(t))[e.row];
-                }
-                return out;
-            }
-            pub fn bytes(o: @This()) !column.Bytes {
-                const srcs = try o.a.alloc([]const u8, o.refs.len);
-                defer o.a.free(srcs);
-                var span: usize = 0;
-                for (o.refs, srcs, 0..) |e, *s, i| {
-                    if (i + ahead < o.refs.len) {
-                        const f = o.refs[i + ahead];
-                        @prefetch(&o.chunks[f.chunk].cols[o.ci].data.bytes.offsets[f.row], .{});
-                    }
-                    s.* = o.chunks[e.chunk].cols[o.ci].data.bytes.at(e.row);
-                    span += s.len;
-                }
-                const offsets = try o.a.alloc(i32, o.refs.len + 1);
-                const values = try o.a.alloc(u8, span);
-                offsets[0] = 0;
-                var off: usize = 0;
-                for (srcs, offsets[1..], 0..) |s, *end, i| {
-                    if (i + ahead < srcs.len) @prefetch(srcs[i + ahead].ptr, .{});
-                    @memcpy(values[off..][0..s.len], s);
-                    off += s.len;
-                    end.* = @intCast(off);
-                }
-                return .{ .offsets = offsets, .values = values };
-            }
-        };
-        const data = try column.mapTag(first.data, Op{ .a = a, .chunks = chunks, .refs = refs, .ci = ci });
-        return column.Column.derived(first.ty, refs.len, bm, data);
+        const srcs = try a.alloc(column.Column, self.chunks.items.len);
+        defer a.free(srcs);
+        for (srcs, self.chunks.items) |*s, c| s.* = c.cols[ci];
+        return column.takeAcross(a, srcs, refs);
     }
 
     /// Sorts `items`: when the head is the whole key, a large run by `sort.msdSort` on

@@ -278,6 +278,10 @@ pub const Op = union(enum) {
                 s.release();
                 s.child.release();
             },
+            .window => |w| {
+                w.release();
+                w.child.release();
+            },
             .join => |j| {
                 j.release();
                 j.probe.release();
@@ -653,28 +657,6 @@ pub fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize)
         outcols[ci] = try bld.finish();
     }
     return Batch{ .schema = b.schema, .columns = outcols, .len = take };
-}
-
-/// Drain `child` into one batch, or null for empty input. All chunks live in this
-/// one `next`'s arena, so typed buffers are concatenated without boxing or re-duping.
-pub fn materializeAll(arena: std.mem.Allocator, child: Op, schema: *const types.Schema) anyerror!?Batch {
-    var chunks = std.array_list.Managed(Batch).init(arena);
-    var total: usize = 0;
-    while (try child.next(arena)) |b| {
-        if (b.len == 0) continue;
-        try chunks.append(b);
-        total += b.len;
-    }
-    if (total == 0) return null;
-
-    const ncols = schema.fields.len;
-    const cols = try arena.alloc(column.Column, ncols);
-    const per = try arena.alloc(column.Column, chunks.items.len);
-    for (cols, 0..) |*out, ci| {
-        for (chunks.items, 0..) |b, k| per[k] = b.columns[ci];
-        out.* = try column.concat(arena, per, total);
-    }
-    return Batch{ .schema = schema, .columns = cols, .len = total };
 }
 
 const testing = std.testing;
