@@ -326,7 +326,7 @@ pub const Fit = struct {
             },
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
-                for (0..b.len) |_| try bd.append(val);
+                try bd.appendRepeated(val, b.len);
                 c.* = try bd.finish();
             },
         };

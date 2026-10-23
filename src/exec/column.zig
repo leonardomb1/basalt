@@ -836,6 +836,19 @@ pub const Builder = struct {
         self.rows = end;
     }
 
+    /// Records `count` null rows; the partial byte they end in keeps its later bits
+    /// set, as `pushValidRun` expects.
+    fn pushNullRun(self: *Builder, count: usize) !void {
+        const end = self.rows + count;
+        const need = (end + 7) / 8;
+        try self.bits.ensureTotalCapacity(need);
+        while (self.rows < end and self.rows & 7 != 0) : (self.rows += 1)
+            self.bits.items[self.rows >> 3] &= ~(@as(u8, 1) << @intCast(self.rows & 7));
+        while (self.bits.items.len < need) self.bits.appendAssumeCapacity(0);
+        if (end & 7 != 0 and self.rows < end) self.bits.items[need - 1] |= ~((@as(u8, 1) << @intCast(end & 7)) - 1);
+        self.rows = end;
+    }
+
     const BYTES_PER_ROW_HINT = 24;
 
     /// `init` with the buffers pre-sized for `rows`; otherwise the values buffer
@@ -1046,6 +1059,33 @@ pub const Builder = struct {
                 try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
             },
         }
+    }
+
+    /// `n` rows of `v`: the first converted as `append` does, the rest copied from
+    /// it in bulk, a byte value into one block reserved for all of them.
+    pub fn appendRepeated(self: *Builder, v: Value, n: usize) !void {
+        if (n == 0) return;
+        try self.append(v);
+        const k = n - 1;
+        if (k == 0) return;
+        const last = self.rows - 1;
+        const ok = (self.bits.items[last >> 3] >> @intCast(last & 7)) & 1 == 1;
+        switch (self.store) {
+            .bytes => |*l| {
+                const hi = l.values.items.len;
+                const lo: usize = if (l.ends.items.len > 1) @intCast(l.ends.items[l.ends.items.len - 2]) else 0;
+                const more = std.math.mul(usize, hi - lo, k) catch return error.OutOfMemory;
+                _ = try checkSpan(std.math.add(usize, hi, more) catch return error.OutOfMemory);
+                try l.values.ensureUnusedCapacity(more);
+                try l.ends.ensureUnusedCapacity(k);
+                for (0..k) |_| {
+                    l.values.appendSliceAssumeCapacity(l.values.items[lo..hi]);
+                    l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
+                }
+            },
+            inline else => |*l| try l.appendNTimes(l.items[l.items.len - 1], k),
+        }
+        if (ok) try self.pushValidRun(k) else try self.pushNullRun(k);
     }
 
     /// `else => 0` once swallowed decimals appended to a numeric column; a kind with
@@ -1478,4 +1518,45 @@ test "an int builder rounds a float or decimal as CAST does, and one no i64 hold
     try std.testing.expect(!c.validity.get(1) and !c.validity.get(2));
     try std.testing.expectEqual(@as(i64, 13), c.data.i64[3]);
     try std.testing.expectEqual(@as(i64, 7), c.data.i64[4]);
+}
+
+test "appendRepeated matches appending the value row by row, nulls and text included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { ty: types.Type, v: Value }{
+        .{ .ty = types.Type.init(.int).asNullable(), .v = .{ .int = 42 } },
+        .{ .ty = types.Type.init(.int).asNullable(), .v = .null },
+        .{ .ty = types.Type.init(.string).asNullable(), .v = .{ .string = "partition=7" } },
+        .{ .ty = types.Type.init(.string).asNullable(), .v = .null },
+        .{ .ty = types.Type.init(.date).asNullable(), .v = .{ .date = 19_000 } },
+    };
+    for (cases) |c| {
+        for ([_]usize{ 0, 1, 3, 8, 13, 70 }) |n| {
+            var got = Builder.init(a, c.ty);
+            var want = Builder.init(a, c.ty);
+            try got.append(.null);
+            try want.append(.null);
+            try got.appendRepeated(c.v, n);
+            for (0..n) |_| try want.append(c.v);
+            try got.append(c.v);
+            try want.append(c.v);
+            try got.append(.null);
+            try want.append(.null);
+            const g = try got.finish();
+            const w = try want.finish();
+            try std.testing.expectEqual(w.len, g.len);
+            for (0..w.len) |i| try std.testing.expect(eqlValue(w.getValue(i), g.getValue(i)));
+        }
+    }
+}
+
+fn eqlValue(x: Value, y: Value) bool {
+    if (x.isNull() or y.isNull()) return x.isNull() and y.isNull();
+    return switch (x) {
+        .string => |s| std.mem.eql(u8, s, y.string),
+        .int => |i| i == y.int,
+        .date => |d| d == y.date,
+        else => false,
+    };
 }
