@@ -317,8 +317,6 @@ pub const Merge = struct {
         }
     };
 
-    const Seg = struct { cols: []const column.Column, picks: std.ArrayListUnmanaged(usize) = .empty };
-
     /// Takes ownership of `runs`' files and of `held`, which backs `mem`; both are
     /// released by `deinit`, or here on failure.
     pub fn init(gpa: std.mem.Allocator, schema: *const types.Schema, keys: []const Sort.Key, runs: []const spill.Run, mem: ?Mem, held: ?*std.heap.ArenaAllocator) !*Merge {
@@ -415,18 +413,19 @@ pub const Merge = struct {
     pub fn next(self: *Merge, arena: std.mem.Allocator, max_rows: usize) !?Batch {
         if (self.live == 0) return null;
         for (self.cursors) |*c| c.seg = null;
-        var segs: std.ArrayListUnmanaged(Seg) = .empty;
+        var segs: std.ArrayListUnmanaged([]const column.Column) = .empty;
         const from = try arena.alloc(u32, max_rows);
+        const rows = try arena.alloc(usize, max_rows);
         var n: usize = 0;
         while (n < max_rows and self.live > 0) : (n += 1) {
             const c = &self.cursors[self.heap[0]];
             const s = c.seg orelse blk: {
-                try segs.append(arena, .{ .cols = try arena.dupe(column.Column, c.cols) });
+                try segs.append(arena, try arena.dupe(column.Column, c.cols));
                 const s: u32 = @intCast(segs.items.len - 1);
                 c.seg = s;
                 break :blk s;
             };
-            try segs.items[s].picks.append(arena, c.row());
+            rows[n] = c.row();
             from[n] = s;
             c.pos += 1;
             if (c.pos == c.len and !try c.load(self.keys)) {
@@ -435,43 +434,24 @@ pub const Merge = struct {
             }
             if (self.live > 0) self.siftDown(0);
         }
-        const out = try self.gather(arena, segs.items, from[0..n]);
+        const out = try self.gather(arena, segs.items, from[0..n], rows[0..n]);
         for (self.cursors) |*c| if (c.exhausted) c.close(self.gpa);
         return out;
     }
 
-    fn gather(self: *Merge, arena: std.mem.Allocator, segs: []const Seg, from: []const u32) !Batch {
-        const ncols = self.schema.fields.len;
-        const cols = try arena.alloc(column.Column, ncols);
+    /// Output row `i` is row `rows[i]` of segment `from[i]`, each copied once.
+    fn gather(self: *Merge, arena: std.mem.Allocator, segs: []const []const column.Column, from: []const u32, rows: []const usize) !Batch {
+        const cols = try arena.alloc(column.Column, self.schema.fields.len);
         if (segs.len == 1) {
-            for (cols, 0..) |*o, ci| o.* = try column.permute(arena, segs[0].cols[ci], segs[0].picks.items);
-            return .{ .schema = self.schema, .columns = cols, .len = from.len };
+            for (cols, segs[0]) |*o, c| o.* = try column.permute(arena, c, rows);
+            return .{ .schema = self.schema, .columns = cols, .len = rows.len };
         }
-        var in_order = true;
-        for (from[1..], from[0 .. from.len - 1]) |b, a| {
-            if (b < a) in_order = false;
-        }
-        var map: []usize = &.{};
-        if (!in_order) {
-            const at = try arena.alloc(usize, segs.len);
-            var off: usize = 0;
-            for (segs, at) |s, *x| {
-                x.* = off;
-                off += s.picks.items.len;
-            }
-            map = try arena.alloc(usize, from.len);
-            for (from, map) |s, *m| {
-                m.* = at[s];
-                at[s] += 1;
-            }
-        }
-        const subs = try arena.alloc(column.Column, segs.len);
+        const srcs = try arena.alloc(column.Column, segs.len);
         for (cols, 0..) |*o, ci| {
-            for (segs, subs) |s, *sub| sub.* = try column.permute(arena, s.cols[ci], s.picks.items);
-            const whole = try column.concat(arena, subs, from.len);
-            o.* = if (in_order) whole else try column.permute(arena, whole, map);
+            for (srcs, segs) |*x, s| x.* = s[ci];
+            o.* = try column.interleave(arena, srcs, from, rows);
         }
-        return .{ .schema = self.schema, .columns = cols, .len = from.len };
+        return .{ .schema = self.schema, .columns = cols, .len = rows.len };
     }
 };
 

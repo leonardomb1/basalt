@@ -486,6 +486,45 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
     return out;
 }
 
+/// Rows drawn from several columns of one type, each copied once: row `i` is row
+/// `rows[i]` of `srcs[from[i]]`, as a merge interleaves its sources.
+pub fn interleave(arena: std.mem.Allocator, srcs: []const Column, from: []const u32, rows: []const usize) !Column {
+    std.debug.assert(srcs.len > 0 and from.len == rows.len);
+    var bm = try Bitmap.initFull(arena, rows.len);
+    const nulls = for (srcs) |s| {
+        if (!s.validity.allSet(s.len)) break true;
+    } else false;
+    if (nulls) for (from, rows, 0..) |s, r, i| {
+        if (!srcs[s].validity.get(r)) bm.setValid(i, false);
+    };
+    const Op = struct {
+        arena: std.mem.Allocator,
+        srcs: []const Column,
+        from: []const u32,
+        rows: []const usize,
+        fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
+            const out = try o.arena.alloc(Elem(t), o.rows.len);
+            for (out, o.from, o.rows) |*x, s, r| x.* = @field(o.srcs[s].data, @tagName(t))[r];
+            return out;
+        }
+        fn bytes(o: @This()) !Bytes {
+            var span: usize = 0;
+            for (o.from, o.rows) |s, r| span += o.srcs[s].data.bytes.at(r).len;
+            const out = try allocData(o.arena, .bytes, o.rows.len, try checkSpan(span));
+            const b = out.bytes;
+            var off: usize = 0;
+            for (o.from, o.rows, b.offsets[1..]) |s, r, *end| {
+                const v = o.srcs[s].data.bytes.at(r);
+                @memcpy(b.values[off..][0..v.len], v);
+                off += v.len;
+                end.* = @intCast(off);
+            }
+            return b;
+        }
+    };
+    return Column.derived(srcs[0].ty, rows.len, bm, try mapTag(srcs[0].data, Op{ .arena = arena, .srcs = srcs, .from = from, .rows = rows }));
+}
+
 /// Rows `start..start + n` of `c` as a view on its buffers, nothing copied: `start` is
 /// a multiple of 8 so the validity stays byte-aligned, byte offsets keep indexing the
 /// same values buffer, and a dictionary keeps its entries over a run of its codes.
@@ -1096,6 +1135,33 @@ test "permute reorders values and validity" {
     try std.testing.expectEqual(@as(i64, 30), out.getValue(0).int);
     try std.testing.expectEqual(@as(i64, 10), out.getValue(1).int);
     try std.testing.expect(out.getValue(2).isNull());
+}
+
+test "interleave draws each row from its own source, values, strings and validity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ints = [_]Column{ try intColumn(a, &.{ 10, null, 30 }), try intColumn(a, &.{ 1, 2 }) };
+    const out = try interleave(a, &ints, &.{ 1, 0, 0, 1, 0 }, &.{ 1, 2, 1, 0, 0 });
+    try std.testing.expectEqual(@as(usize, 5), out.len);
+    try std.testing.expectEqual(@as(i64, 2), out.getValue(0).int);
+    try std.testing.expectEqual(@as(i64, 30), out.getValue(1).int);
+    try std.testing.expect(out.getValue(2).isNull());
+    try std.testing.expectEqual(@as(i64, 1), out.getValue(3).int);
+    try std.testing.expectEqual(@as(i64, 10), out.getValue(4).int);
+
+    const ty = types.Type.init(.string).asNullable();
+    var strs: [2]Column = undefined;
+    for (&strs, [_][]const ?[]const u8{ &.{ "a", null, "ccc" }, &.{ "", "dd" } }) |*s, vals| {
+        var b = Builder.init(a, ty);
+        for (vals) |v| try b.append(if (v) |x| .{ .string = x } else .null);
+        s.* = try b.finish();
+    }
+    const got = try interleave(a, &strs, &.{ 0, 1, 0, 1, 0 }, &.{ 2, 1, 0, 0, 1 });
+    const want = [_]?[]const u8{ "ccc", "dd", "a", "", null };
+    for (want, 0..) |w, i| {
+        if (w) |s| try std.testing.expectEqualStrings(s, got.getValue(i).string) else try std.testing.expect(got.getValue(i).isNull());
+    }
 }
 
 test "gather selects flagged rows preserving validity; all-false keep yields empty" {
