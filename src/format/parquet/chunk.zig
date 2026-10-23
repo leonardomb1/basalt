@@ -645,3 +645,23 @@ test "a PLAIN count the page body cannot hold is refused before it is allocated"
     try testing.expect(plainFits(.boolean, 0, 1, 8) and !plainFits(.boolean, 0, 1, 9));
     try testing.expect(!plainFits(.int96, 0, 23, 2));
 }
+
+test "a dictionary page's count is bounded by its body before the dictionary is sized" {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const body = [_]u8{ 1, 0, 0, 0, 'a', 1, 0, 0, 0, 'b' };
+    const pg: parquet.Page = .{ .header = .{ .ty = .dictionary_page, .num_values = 1 << 30 }, .data = &body, .next_offset = 0 };
+    const cast: Cast = .{ .ty = types.Type.init(.string).asNullable(), .tscale = .identity };
+    try testing.expectError(Error.CorruptParquetPage, readDict(fba.allocator(), pg, .{ .ty = .byte_array }, .{ .ty = .byte_array }, cast));
+}
+
+test "a footer's row count only hints the column's size, so a lying one fails on the pages, not the allocation" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const md = try parquet.parseFile(a, fx);
+    const g = md.row_groups[0];
+    if (readColumnChunk(a, fx, g.columns[0].meta.?, md.schema[1], 1 << 50, 1, 0)) |_| {
+        return error.TestUnexpectedResult;
+    } else |e| try testing.expect(e != error.OutOfMemory);
+}

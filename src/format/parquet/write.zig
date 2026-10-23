@@ -76,7 +76,7 @@ pub const Error = error{
 pub const row_group_rows = 100_000;
 
 /// A row group is also flushed once its columns reach this many bytes as PLAIN,
-/// parquet-mr's and Arrow's 128 MiB, so wide rows do not hold 100,000 rows' worth.
+/// so wide rows do not hold 100,000 rows' worth.
 pub const row_group_bytes = 128 << 20;
 
 pub const page_target_bytes = 1 << 20;
@@ -537,7 +537,8 @@ pub const Writer = struct {
     /// where the batch's bytes per row say `group_bytes` is reached, and each column
     /// encodes its rows of it in slices of `slice_rows`, after each of which a PLAIN
     /// column past `page_target_bytes` seals a page. A group that reached either cap
-    /// is flushed after the span, so wide rows overshoot the byte cap by about a row.
+    /// is flushed after the span. A batch whose rows are uneven can overshoot the
+    /// byte cap by up to the span, bytes the batch itself already holds.
     pub fn writeBatch(self: *Writer, arena: std.mem.Allocator, batch: Batch) !void {
         _ = arena;
         if (batch.len == 0) return;
@@ -2037,7 +2038,11 @@ fn capValue(a: std.mem.Allocator, c: usize, i: usize) !Value {
         1 => if (i % 7 == 0) .null else .{ .int = if (i < 3000) @as(i64, @intCast(i % 4)) else @as(i64, @intCast(i)) * 1_000_003 },
         2 => .{ .string = try std.fmt.allocPrint(a, "u{d}", .{i % 1000}) },
         3 => .{ .decimal = .{ .unscaled = @as(i128, @intCast(i % 1000)) * 99_999_999_999, .scale = 2 } },
-        4 => if (i == 5) .{ .string = try a.alloc(u8, (dict_max_bytes * 3) / 2) } else .{ .string = "x" },
+        4 => if (i == 5) .{ .string = blk: {
+            const big = try a.alloc(u8, (dict_max_bytes * 3) / 2);
+            @memset(big, 'z');
+            break :blk big;
+        } } else .{ .string = "x" },
         else => unreachable,
     };
 }
