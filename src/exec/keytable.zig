@@ -5,7 +5,8 @@
 //! ones), each record's tail a payload `P` with a `size` and a `clear`: an
 //! aggregate's states, or nothing for a set of keys. A direct table serves small
 //! integer keys. `GroupTable.find` probes without inserting, for a table frozen by
-//! spilling.
+//! spilling. `probe` is the one probe-or-insert loop over a batch's keys; an operator
+//! supplies only what a row does once its key is found, made or missed.
 
 const Decimal = @import("value.zig").Decimal;
 const Value = @import("value.zig").Value;
@@ -273,11 +274,12 @@ pub inline fn upsert(table: *GroupTable, store: anytype, h: u64, key: anytype, c
 }
 
 /// The probe-or-insert loop every hash operator runs: items `lo..hi` of `items` (a
-/// `Runs` or `ValueRows`), each looked up in `v.table(h)` over `v.store(h)` (or the one
-/// table `v.tb` over `v.st`) with the slot `prefetch_ahead` items on prefetched. `v.early(r, key)`, when declared, settles
-/// row `r` first. Each row looked up then has `v.hit(r, h, key, hit)`, its record made
-/// by `upsert`. When `v` has a `frozen` field and it is set, nothing is inserted: a key
-/// not held, or a row `early` calls absent, has `v.miss(r, h)` instead.
+/// `Runs` or `ValueRows`), each looked up in `v.table(h)` over `v.store(h)`, or the
+/// one table `v.tb` over `v.st`, with the slot `prefetch_ahead` items on prefetched.
+/// `v.early(r, key)`, when declared, settles row `r` first. Each row looked up then
+/// has `v.hit(r, h, key, hit)`, its record made by `upsert`. When `v` has a `frozen`
+/// field and it is set, nothing is inserted: a key not held, or a row `early` calls
+/// absent, has `v.miss(r, h)` instead.
 pub fn probe(comptime Store: type, comptime copy: KeyCopy, items: anytype, lo: usize, hi: usize, v: anytype) !void {
     const V = @typeInfo(@TypeOf(v)).pointer.child;
     const can_freeze = @hasField(V, "frozen");
