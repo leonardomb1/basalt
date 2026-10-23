@@ -524,7 +524,7 @@ pub fn Scalar(comptime F: type) type {
             };
             if (comptime a == .unit) return op;
             if (comptime a == .temporal) return switch (op) {
-                .days => |d| @as(i64, typedAt(i32, d, i) orelse return null) * 86_400_000_000,
+                .days => |d| @as(i64, typedAt(i32, d, i) orelse return null) *| 86_400_000_000,
                 .micros => |us| typedAt(i64, us, i),
             };
             return if (numValid(op, i)) numAt(a.Base(), op, i) else null;

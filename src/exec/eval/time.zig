@@ -19,37 +19,39 @@ pub fn timeUnit(name: []const u8) ?TimeUnit {
     return std.meta.stringToEnum(TimeUnit, std.ascii.lowerString(buf[0..name.len], name));
 }
 
+/// A DATE as its midnight's microseconds, saturating for one past about ±290,000
+/// years that no timestamp holds; a TIMESTAMP as itself.
 pub fn temporalMicros(v: Value) ?i64 {
     return switch (v) {
         .timestamp => |x| x,
-        .date => |x| @as(i64, x) * 86_400_000_000,
+        .date => |x| @as(i64, x) *| 86_400_000_000,
         else => null,
     };
 }
 
 pub fn truncMicros(us: i64, u: TimeUnit) i64 {
     const day = @divFloor(us, 86_400_000_000);
-    const rem = us - day * 86_400_000_000;
+    const rem = @mod(us, 86_400_000_000);
     return switch (u) {
         .second => us - @mod(rem, 1_000_000),
         .minute => us - @mod(rem, 60_000_000),
         .hour => us - @mod(rem, 3_600_000_000),
-        .day => day * 86_400_000_000,
-        .week => isoWeekStart(day) * 86_400_000_000,
+        .day => day *| 86_400_000_000,
+        .week => isoWeekStart(day) *| 86_400_000_000,
         .month => blk: {
             const c = civilFromDays(day);
-            break :blk daysFromCivil(c.y, c.m, 1) * 86_400_000_000;
+            break :blk daysFromCivil(c.y, c.m, 1) *| 86_400_000_000;
         },
         .year => blk: {
             const c = civilFromDays(day);
-            break :blk daysFromCivil(c.y, 1, 1) * 86_400_000_000;
+            break :blk daysFromCivil(c.y, 1, 1) *| 86_400_000_000;
         },
     };
 }
 
 pub fn extractField(us: i64, u: TimeUnit) i64 {
     const day = @divFloor(us, 86_400_000_000);
-    const rem = us - day * 86_400_000_000;
+    const rem = @mod(us, 86_400_000_000);
     const c = civilFromDays(day);
     return switch (u) {
         .year => c.y,
@@ -114,7 +116,7 @@ pub fn addMicros(us: i64, u: TimeUnit, n: i64) EvalError!i64 {
     return switch (u) {
         .year, .month => blk: {
             const day = @divFloor(us, 86_400_000_000);
-            const rem = us - day * 86_400_000_000;
+            const rem = @mod(us, 86_400_000_000);
             const months = if (u == .year) try mulI64(n, 12) else n;
             const shifted = try mulI64(try addMonthsToDays(day, months), 86_400_000_000);
             break :blk try addI64(shifted, rem);
@@ -142,10 +144,10 @@ pub fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
             const wb = isoWeekStart(@divFloor(b_us, 86_400_000_000));
             return @divExact(wb - wa, 7);
         },
-        .day => return @divTrunc(b_us - a_us, 86_400_000_000),
-        .hour => return @divTrunc(b_us - a_us, 3_600_000_000),
-        .minute => return @divTrunc(b_us - a_us, 60_000_000),
-        .second => return @divTrunc(b_us - a_us, 1_000_000),
+        .day => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 86_400_000_000)),
+        .hour => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 3_600_000_000)),
+        .minute => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 60_000_000)),
+        .second => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 1_000_000)),
     }
 }
 
@@ -167,7 +169,7 @@ pub fn badStrftime(fmt: []const u8) ?[]const u8 {
 /// directive is an error, never a silent passthrough.
 pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) EvalError!void {
     const day = @divFloor(us, 86_400_000_000);
-    const rem: u64 = @intCast(us - day * 86_400_000_000);
+    const rem: u64 = @intCast(@mod(us, 86_400_000_000));
     const secs = rem / 1_000_000;
     const c = civilFromDays(day);
     const year: u32 = if (c.y < 0) 0 else @intCast(c.y);
