@@ -83,6 +83,10 @@ pub fn readEntries(
 
 const ReadError = Error || parquet.Error || @import("../compress/codecs.zig").Error;
 
+/// A footer's row count only pre-sizes the column up to here, as levels compress
+/// so well that no byte count bounds it; a larger chunk grows as it is read.
+const capacity_hint_rows = 1 << 20;
+
 /// Every read of a chunk walks its pages here: `rows` values, or with `rows` null
 /// the chunk's `num_values` entries along with their levels. Pages holding more
 /// values than the row group's rows are corrupt, never cut to fit.
@@ -103,7 +107,7 @@ fn readPages(
         .defs = std.array_list.Managed(u32).init(arena),
     } else null;
 
-    var b = try column.Builder.initCapacity(arena, cast.ty, entries);
+    var b = try column.Builder.initCapacity(arena, cast.ty, @min(entries, capacity_hint_rows));
     var dict: ?Dict = null;
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
     if (at < base_offset) return Error.CorruptParquetPage;
@@ -172,6 +176,7 @@ var dict_ids = std.atomic.Value(u64).init(1);
 /// The dictionary page is PLAIN, so it goes through the same kernel as a data page.
 fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement, cast: Cast) Error!Dict {
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
+    if (!plainFits(meta.ty, elem.type_length orelse 0, pg.data.len, n)) return Error.CorruptParquetPage;
     var db = try column.Builder.initCapacity(arena, cast.ty, n);
     try pushPlain(arena, Rows{ .arena = arena, .b = &db, .defs = null, .max_def = 0 }, cast, meta.ty, elem.type_length orelse 0, pg.data, n);
     const col = try db.finish();
@@ -437,6 +442,7 @@ fn pushPlain(
     body: []const u8,
     n: usize,
 ) Error!void {
+    if (!plainFits(phys, type_length, body.len, n)) return Error.CorruptParquetPage;
     switch (phys) {
         .boolean => {
             if (body.len < (n + 7) / 8) return Error.CorruptParquetPage;
@@ -454,6 +460,20 @@ fn pushPlain(
         .fixed_len_byte_array => try pushBytes(sink, cast, try fixedByteArrays(arena, body, type_length, n)),
         else => return Error.UnsupportedParquetEncoding,
     }
+}
+
+/// Whether `len` bytes can hold `n` PLAIN values: each takes at least a bit
+/// (BOOLEAN), its width, or a BYTE_ARRAY's 4-byte length.
+fn plainFits(phys: parquet.PhysicalType, type_length: i32, len: usize, n: usize) bool {
+    const bits: usize = switch (phys) {
+        .boolean => 1,
+        .int32, .float, .byte_array => 32,
+        .int64, .double => 64,
+        .int96 => 96,
+        .fixed_len_byte_array => if (type_length > 0) 8 * @as(usize, @intCast(type_length)) else return true,
+        else => return true,
+    };
+    return n <= (len *| 8) / bits;
 }
 
 fn plain(comptime P: type, body: []const u8, n: usize) Error!Plain(P) {
@@ -610,4 +630,18 @@ test "ranged reads return the same values as an in-memory file" {
         try testing.expectEqual(want.len, got.columns[ci].len);
         for (0..want.len) |i| try testing.expectEqualDeep(want.getValue(i), got.columns[ci].getValue(i));
     }
+}
+
+test "a PLAIN count the page body cannot hold is refused before it is allocated" {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var v: Value = .null;
+    const cast: Cast = .{ .ty = types.Type.init(.string), .tscale = .identity };
+    const body = [_]u8{ 1, 0, 0, 0, 'a', 1, 0, 0, 0, 'b' };
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .byte_array, 0, &body, 1 << 30));
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .fixed_len_byte_array, 2, &body, 1 << 30));
+    try testing.expect(plainFits(.byte_array, 0, body.len, 2));
+    try testing.expect(!plainFits(.byte_array, 0, body.len, 3));
+    try testing.expect(plainFits(.boolean, 0, 1, 8) and !plainFits(.boolean, 0, 1, 9));
+    try testing.expect(!plainFits(.int96, 0, 23, 2));
 }

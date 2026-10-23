@@ -58,6 +58,7 @@ pub fn decompress(
         if (src.len != uncompressed_len) return Error.CorruptCompressedData;
         return arena.dupe(u8, src);
     }
+    try plausible(codec, src, uncompressed_len);
     const out = try arena.alloc(u8, uncompressed_len);
     switch (codec) {
         .snappy => try snappyBlock(src, out),
@@ -68,6 +69,20 @@ pub fn decompress(
         else => unreachable,
     }
     return out;
+}
+
+/// A declared size the bytes cannot produce is refused before it is allocated:
+/// Snappy states its length up front, and LZ4 expands at most 255:1.
+fn plausible(codec: Codec, src: []const u8, uncompressed_len: usize) Error!void {
+    switch (codec) {
+        .snappy => {
+            var i: usize = 0;
+            const declared = varint.read(src, &i) catch return Error.CorruptCompressedData;
+            if (declared != uncompressed_len) return Error.CorruptCompressedData;
+        },
+        .lz4, .lz4_raw => if (uncompressed_len > (src.len *| 255) +| 16) return Error.CorruptCompressedData,
+        else => {},
+    }
 }
 
 fn inflate(
@@ -642,4 +657,13 @@ test "snappy: chunked copies agree with a byte-at-a-time decode on random stream
         try snappyBlock(stream.items, out);
         try std.testing.expectEqualSlices(u8, want.items, out);
     }
+}
+
+test "a size the bytes cannot produce is refused before it is allocated" {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const huge: usize = (1 << 31) - 1;
+    try t.expectError(Error.CorruptCompressedData, decompress(fba.allocator(), .snappy, &.{ 0x05, 0x10, 'a', 'b', 'c', 'd', 'e' }, huge));
+    try t.expectError(Error.CorruptCompressedData, decompress(fba.allocator(), .lz4_raw, &.{ 0x50, 'a', 'b', 'c', 'd', 'e' }, huge));
+    try t.expectError(Error.CorruptCompressedData, decompress(fba.allocator(), .lz4, &.{ 0x50, 'a', 'b', 'c', 'd', 'e' }, huge));
 }
