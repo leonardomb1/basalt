@@ -87,7 +87,7 @@ pub const Conn = struct {
             const p = self.wire.msg.items;
             switch (t) {
                 'R' => {
-                    const code = try readI32(p, 0);
+                    const code = try authCode(p);
                     switch (code) {
                         0 => {},
                         3 => try self.sendPassword(password),
@@ -163,7 +163,7 @@ pub const Conn = struct {
         try init_msg.appendSlice(client_first);
         try self.writeMsg('p', init_msg.items);
 
-        if ((try self.readMsg()) != 'R' or (try readI32(self.wire.msg.items, 0)) != 11) return error.PgAuthFailed;
+        if ((try self.readMsg()) != 'R' or (try authCode(self.wire.msg.items)) != 11) return error.PgAuthFailed;
         const server_first = try a.dupe(u8, self.wire.msg.items[4..]);
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
@@ -193,7 +193,7 @@ pub const Conn = struct {
             try self.wire.setError(errMessage(self.wire.msg.items));
             return error.PgAuthFailed;
         }
-        if (t != 'R' or (try readI32(self.wire.msg.items, 0)) != 12) return error.PgAuthFailed;
+        if (t != 'R' or (try authCode(self.wire.msg.items)) != 12) return error.PgAuthFailed;
 
         const sv = scramAttr(self.wire.msg.items[4..], 'v') orelse return error.PgAuthFailed;
         var server_sig: [32]u8 = undefined;
@@ -370,22 +370,19 @@ const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
 
 fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
-    const raw_n = try readI16(p, 0);
+    var r: Body = .{ .p = p };
+    const raw_n = try r.int(i16);
     if (raw_n < 0) return error.PgProtocol;
     const n: usize = @intCast(raw_n);
-    var i: usize = 2;
     const cols = try arena.alloc(PgCol, n);
     const fields = try arena.alloc(types.Schema.Field, n);
     for (0..n) |k| {
-        const name = try readCStr(p, &i);
-        i += 4;
-        i += 2;
-        const oid = try readI32(p, i);
-        i += 4;
-        i += 2;
-        const typmod = try readI32(p, i);
-        i += 4;
-        i += 2;
+        const name = try r.cstr();
+        try r.skip(6);
+        const oid = try r.int(i32);
+        try r.skip(2);
+        const typmod = try r.int(i32);
+        try r.skip(2);
         const ty = pgType(oid, typmod);
         cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty };
         fields[k] = .{ .name = cols[k].name, .ty = ty };
@@ -394,26 +391,21 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
 }
 
 fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
-    const raw = try readI16(p, 0);
+    var r: Body = .{ .p = p };
+    const raw = try r.int(i16);
     if (raw < 0 or @as(usize, @intCast(raw)) != builders.len) return error.PgProtocol;
-    const n: usize = @intCast(raw);
-    var i: usize = 2;
-    for (0..n) |k| {
-        const len = try readI32(p, i);
-        i += 4;
+    for (builders, 0..) |*b, k| {
+        const len = try r.int(i32);
         if (len < 0) {
-            try builders[k].append(.null);
+            try b.append(.null);
         } else {
-            const ulen: usize = @intCast(len);
-            if (i + ulen > p.len) return error.PgProtocol;
-            const cell = p[i .. i + ulen];
+            const cell = try r.bytes(@intCast(len));
             const v = sql.coerceText(cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
                     try conn.wire.printError("column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell });
                 return e;
             };
-            try builders[k].append(v);
-            i += ulen;
+            try b.append(v);
         }
     }
 }
@@ -606,22 +598,12 @@ fn writeI32(w: anytype, v: u32) !void {
     try w.writeAll(&b);
 }
 
-fn readI16(p: []const u8, i: usize) !i16 {
-    if (i + 2 > p.len) return error.PgProtocol;
-    return std.mem.readInt(i16, p[i..][0..2], .big);
-}
-fn readI32(p: []const u8, i: usize) !i32 {
-    if (i + 4 > p.len) return error.PgProtocol;
-    return std.mem.readInt(i32, p[i..][0..4], .big);
-}
-/// A NUL-terminated string at `i`; one that starts past the payload or never
-/// ends is a protocol error.
-fn readCStr(p: []const u8, i: *usize) ![]const u8 {
-    const start = i.*;
-    if (start >= p.len) return error.PgProtocol;
-    const end = std.mem.indexOfScalarPos(u8, p, start, 0) orelse return error.PgProtocol;
-    i.* = end + 1;
-    return p[start..end];
+const Body = wire.Reader(.big, error.PgProtocol);
+
+/// The code an Authentication message leads with.
+fn authCode(p: []const u8) !i32 {
+    var r: Body = .{ .p = p };
+    return r.int(i32);
 }
 
 fn parseCopyCount(p: []const u8) ?u64 {

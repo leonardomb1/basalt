@@ -50,7 +50,7 @@ pub const Conn = struct {
         errdefer self.close();
 
         const seq = try self.readPacket();
-        const hs = try self.parseHandshake(self.wire.msg.items);
+        const hs = try parseHandshake(self.wire.msg.items);
 
         var rseq = seq + 1;
         if (tls_mode != .off) {
@@ -194,8 +194,8 @@ pub const Conn = struct {
             return;
         }
 
-        var ci: usize = 0;
-        const ncol = try columnCount(first, &ci);
+        var head: Pkt = .{ .p = first };
+        const ncol = try columnCount(&head);
         self.cols = try ma.alloc(MyCol, ncol);
         for (0..ncol) |k| {
             _ = try self.readPacket();
@@ -215,15 +215,15 @@ pub const Conn = struct {
     /// appended), the end of the stream, or a server error.
     pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
-        const r = self.wire.msg.items;
-        if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
-        if (r.len > 0 and r[0] == 0xff) {
-            try self.wire.setError(errMessage(r));
+        const p = self.wire.msg.items;
+        if (p.len > 0 and p[0] == 0xfe and p.len < 9) return .end;
+        if (p.len > 0 and p[0] == 0xff) {
+            try self.wire.setError(errMessage(p));
             return error.MysqlQueryFailed;
         }
-        var ri: usize = 0;
+        var r: Pkt = .{ .p = p };
         for (self.cols, 0..) |c, k| {
-            const text = try lenencStrOrNull(r, &ri);
+            const text = try lenencStrOrNull(&r);
             const v: Value = if (text == null)
                 .null
             else if (c.mtype == 0x10)
@@ -274,31 +274,21 @@ pub const Conn = struct {
 
     const Handshake = struct { salt: [20]u8, plugin: AuthPlugin };
 
-    fn parseHandshake(self: *Conn, p: []const u8) !Handshake {
-        _ = self;
-        if (p.len < 1 or p[0] != 10) return error.MysqlProtocol;
-        var i: usize = 1;
-        while (i < p.len and p[i] != 0) : (i += 1) {}
-        i += 1;
-        i += 4;
-        if (i + 8 > p.len) return error.MysqlProtocol;
+    /// Version, thread id, salt part 1, filler, capabilities, charset, status,
+    /// auth data length, reserved, salt part 2 and its NUL, then the plugin name.
+    fn parseHandshake(p: []const u8) !Handshake {
+        var r: Pkt = .{ .p = p };
+        if (try r.int(u8) != 10) return error.MysqlProtocol;
+        _ = try r.cstr();
+        try r.skip(4);
         var salt: [20]u8 = undefined;
-        @memcpy(salt[0..8], p[i .. i + 8]);
-        i += 8;
-        i += 1;
-        i += 2;
-        i += 1;
-        i += 2;
-        i += 2;
-        i += 1;
-        i += 10;
-        if (i + 12 > p.len) return error.MysqlProtocol;
-        @memcpy(salt[8..20], p[i .. i + 12]);
-        i += 13;
+        @memcpy(salt[0..8], try r.bytes(8));
+        try r.skip(19);
+        @memcpy(salt[8..20], try r.bytes(12));
         var plugin: AuthPlugin = .native;
-        if (i < p.len) {
-            const end = std.mem.indexOfScalarPos(u8, p, i, 0) orelse p.len;
-            plugin = pluginByName(p[i..end]) orelse .native;
+        if (r.left() > 1) {
+            try r.skip(1);
+            plugin = pluginByName(std.mem.sliceTo(r.rest(), 0)) orelse .native;
         }
         return .{ .salt = salt, .plugin = plugin };
     }
@@ -474,8 +464,8 @@ pub const LoadDataSink = sql.BulkSink(LoadDataProto);
 /// OK packet to affected-rows count (header 0x00, then affected_rows lenenc).
 fn parseOkAffected(p: []const u8) ?u64 {
     if (p.len < 2 or p[0] != 0x00) return null;
-    var i: usize = 1;
-    return lenencInt(p, &i) catch null;
+    var r: Pkt = .{ .p = p, .i = 1 };
+    return lenencInt(&r) catch null;
 }
 
 test "parseOkAffected: small and lenenc counts, non-OK header" {
@@ -540,33 +530,30 @@ test "a logical packet past its limit is refused before room is made for it" {
 }
 
 test "lenenc integers: inline, 2/3/8-byte forms, truncation errors" {
-    var i: usize = 0;
-    try std.testing.expectEqual(@as(u64, 0xfa), try lenencInt("\xfa", &i));
-    i = 0;
-    try std.testing.expectEqual(@as(u64, 0x1234), try lenencInt("\xfc\x34\x12", &i));
-    try std.testing.expectEqual(@as(usize, 3), i);
-    i = 0;
-    try std.testing.expectEqual(@as(u64, 0x010203), try lenencInt("\xfd\x03\x02\x01", &i));
-    i = 0;
-    try std.testing.expectEqual(
-        @as(u64, 0x0807060504030201),
-        try lenencInt("\xfe\x01\x02\x03\x04\x05\x06\x07\x08", &i),
-    );
-    i = 0;
-    try std.testing.expectError(error.MysqlProtocol, lenencInt("", &i));
-    i = 0;
-    try std.testing.expectError(error.MysqlProtocol, lenencInt("\xfc\x34", &i));
+    var r: Pkt = .{ .p = "\xfa" };
+    try std.testing.expectEqual(@as(u64, 0xfa), try lenencInt(&r));
+    r = .{ .p = "\xfc\x34\x12" };
+    try std.testing.expectEqual(@as(u64, 0x1234), try lenencInt(&r));
+    try std.testing.expectEqual(@as(usize, 3), r.i);
+    r = .{ .p = "\xfd\x03\x02\x01" };
+    try std.testing.expectEqual(@as(u64, 0x010203), try lenencInt(&r));
+    r = .{ .p = "\xfe\x01\x02\x03\x04\x05\x06\x07\x08" };
+    try std.testing.expectEqual(@as(u64, 0x0807060504030201), try lenencInt(&r));
+    r = .{ .p = "" };
+    try std.testing.expectError(error.MysqlProtocol, lenencInt(&r));
+    r = .{ .p = "\xfc\x34" };
+    try std.testing.expectError(error.MysqlProtocol, lenencInt(&r));
 }
 
 test "lenenc strings: value, 0xfb NULL marker, truncation" {
-    var i: usize = 0;
-    try std.testing.expectEqualStrings("abc", (try lenencStrOrNull("\x03abcrest", &i)).?);
-    try std.testing.expectEqual(@as(usize, 4), i);
-    i = 0;
-    try std.testing.expectEqual(@as(?[]const u8, null), try lenencStrOrNull("\xfb", &i));
-    try std.testing.expectEqual(@as(usize, 1), i);
-    i = 0;
-    try std.testing.expectError(error.MysqlProtocol, lenencStr("\x05ab", &i));
+    var r: Pkt = .{ .p = "\x03abcrest" };
+    try std.testing.expectEqualStrings("abc", (try lenencStrOrNull(&r)).?);
+    try std.testing.expectEqual(@as(usize, 4), r.i);
+    r = .{ .p = "\xfb" };
+    try std.testing.expectEqual(@as(?[]const u8, null), try lenencStrOrNull(&r));
+    try std.testing.expectEqual(@as(usize, 1), r.i);
+    r = .{ .p = "\x05ab" };
+    try std.testing.expectError(error.MysqlProtocol, lenencStr(&r));
 }
 
 test "ERR packet message extraction, with and without sql-state" {
@@ -619,23 +606,16 @@ const MyCol = struct {
 };
 
 fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
-    var i: usize = 0;
-    _ = try lenencStr(p, &i);
-    _ = try lenencStr(p, &i);
-    _ = try lenencStr(p, &i);
-    _ = try lenencStr(p, &i);
-    const name = try lenencStr(p, &i);
-    _ = try lenencStr(p, &i);
-    _ = try lenencInt(p, &i);
-    if (i + 10 > p.len) return error.MysqlProtocol;
-    const charset = std.mem.readInt(u16, p[i..][0..2], .little);
-    i += 2;
-    i += 4;
-    const mtype = p[i];
-    i += 1;
-    const flags = std.mem.readInt(u16, p[i..][0..2], .little);
-    i += 2;
-    const decimals = p[i];
+    var r: Pkt = .{ .p = p };
+    for (0..4) |_| _ = try lenencStr(&r);
+    const name = try lenencStr(&r);
+    _ = try lenencStr(&r);
+    _ = try lenencInt(&r);
+    const charset = try r.int(u16);
+    try r.skip(4);
+    const mtype = try r.int(u8);
+    const flags = try r.int(u16);
+    const decimals = try r.int(u8);
     return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals, flags, charset) };
 }
 
@@ -660,21 +640,21 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
 const max_columns = 1 << 16;
 
 /// A result set's column count, refused past `max_columns` before anything is sized by it.
-fn columnCount(p: []const u8, i: *usize) !usize {
-    const n = try lenencInt(p, i);
+fn columnCount(r: *Pkt) !usize {
+    const n = try lenencInt(r);
     if (n > max_columns) return error.MysqlProtocol;
     return @intCast(n);
 }
 
 test "a column count past the cap is refused" {
-    var i: usize = 0;
-    try std.testing.expectEqual(@as(usize, 3), try columnCount("\x03", &i));
-    i = 0;
-    try std.testing.expectEqual(@as(usize, 1 << 16), try columnCount("\xfd\x00\x00\x01", &i));
-    i = 0;
-    try std.testing.expectError(error.MysqlProtocol, columnCount("\xfd\x01\x00\x01", &i));
-    i = 0;
-    try std.testing.expectError(error.MysqlProtocol, columnCount("\xfe\xff\xff\xff\xff\xff\xff\xff\xff", &i));
+    var r: Pkt = .{ .p = "\x03" };
+    try std.testing.expectEqual(@as(usize, 3), try columnCount(&r));
+    r = .{ .p = "\xfd\x00\x00\x01" };
+    try std.testing.expectEqual(@as(usize, 1 << 16), try columnCount(&r));
+    r = .{ .p = "\xfd\x01\x00\x01" };
+    try std.testing.expectError(error.MysqlProtocol, columnCount(&r));
+    r = .{ .p = "\xfe\xff\xff\xff\xff\xff\xff\xff\xff" };
+    try std.testing.expectError(error.MysqlProtocol, columnCount(&r));
 }
 /// The largest `max_allowed_packet` MySQL accepts.
 const max_logical: usize = 1 << 30;
@@ -695,34 +675,28 @@ fn readLogical(r: *std.Io.Reader, buf: *std.array_list.Managed(u8), limit: usize
     }
 }
 
-fn lenencInt(buf: []const u8, i: *usize) !u64 {
-    if (i.* >= buf.len) return error.MysqlProtocol;
-    const b = buf[i.*];
-    i.* += 1;
+const Pkt = wire.Reader(.little, error.MysqlProtocol);
+
+fn lenencInt(r: *Pkt) !u64 {
+    const b = try r.int(u8);
     if (b < 0xfb) return b;
-    const nbytes: usize = if (b == 0xfc) 2 else if (b == 0xfd) 3 else 8;
-    if (i.* + nbytes > buf.len) return error.MysqlProtocol;
+    const raw = try r.bytes(if (b == 0xfc) 2 else if (b == 0xfd) 3 else 8);
     var v: u64 = 0;
-    for (0..nbytes) |k| v |= @as(u64, buf[i.* + k]) << @intCast(k * 8);
-    i.* += nbytes;
+    for (raw, 0..) |x, k| v |= @as(u64, x) << @intCast(k * 8);
     return v;
 }
 
-fn lenencStr(buf: []const u8, i: *usize) ![]const u8 {
-    const n = try lenencInt(buf, i);
-    if (n > buf.len - i.*) return error.MysqlProtocol;
-    const s = buf[i.*..][0..@intCast(n)];
-    i.* += @intCast(n);
-    return s;
+fn lenencStr(r: *Pkt) ![]const u8 {
+    return r.bytes(std.math.cast(usize, try lenencInt(r)) orelse return error.MysqlProtocol);
 }
 
-fn lenencStrOrNull(buf: []const u8, i: *usize) !?[]const u8 {
-    if (i.* >= buf.len) return error.MysqlProtocol;
-    if (buf[i.*] == 0xfb) {
-        i.* += 1;
+/// A lenenc string, or null for the 0xfb NULL marker.
+fn lenencStrOrNull(r: *Pkt) !?[]const u8 {
+    if (r.left() > 0 and r.p[r.i] == 0xfb) {
+        r.i += 1;
         return null;
     }
-    return try lenencStr(buf, i);
+    return try lenencStr(r);
 }
 
 /// Every parser here reads a packet body before authentication has proven anything
@@ -732,11 +706,11 @@ fn fuzzPackets(_: void, input: []const u8) anyerror!void {
     _ = errMessage(input);
     _ = parseAuthSwitch(input);
     _ = decodeBits(input);
-    var i: usize = 0;
-    while (i < input.len) {
-        const before = i;
-        _ = lenencStrOrNull(input, &i) catch break;
-        if (i == before) break;
+    var r: Pkt = .{ .p = input };
+    while (r.left() > 0) {
+        const before = r.i;
+        _ = lenencStrOrNull(&r) catch break;
+        if (r.i == before) break;
     }
 }
 

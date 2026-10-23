@@ -196,42 +196,23 @@ pub const Conn = struct {
         try self.scanResultTokens();
     }
 
-    /// Scan a response token stream in `self.wire.msg`, bounds-checked like
-    /// `parseLoginResponse`; an ERROR token sets `last_error` and returns QueryFailed.
+    /// Scan a reply's tokens; an ERROR token sets `last_error` and returns QueryFailed.
     fn scanResultTokens(self: *Conn) !void {
-        const p = self.wire.msg.items;
-        var i: usize = 0;
-        while (i < p.len) {
-            const token = p[i];
-            i += 1;
-            switch (token) {
-                0xAA => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
-                    return error.QueryFailed;
-                },
-                0xE3 => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.noteEnvChange(p[i + 2 .. i + 2 + len]);
-                    i += 2 + len;
-                },
-                0xAB, 0xA9, 0xA4, 0xA5 => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    i += 2 + rdU16(p, i);
-                },
-                0x79 => i += 4,
-                0xFD, 0xFE, 0xFF => {
-                    if (i + 12 > p.len) return error.TdsProtocol;
-                    if (parseDoneRowCount(token, p[i .. i + 12])) |n| self.last_done_count = n;
-                    i += 12;
-                },
-                else => break,
-            }
-        }
+        var r: Body = .{ .p = self.wire.msg.items };
+        while (try nextToken(&r)) |t| switch (t.id) {
+            0xAA => return self.failWith(t.body, error.QueryFailed),
+            0xE3 => self.noteEnvChange(t.body),
+            0xFD, 0xFE, 0xFF => if (parseDoneRowCount(t.id, t.body)) |n| {
+                self.last_done_count = n;
+            },
+            else => {},
+        };
+    }
+
+    /// The server's ERROR token text as `last_error`, then `e`.
+    fn failWith(self: *Conn, body: []const u8, comptime e: anytype) (@TypeOf(e) || std.mem.Allocator.Error) {
+        self.wire.putError(try errorText(self.wire.gpa, body));
+        return e;
     }
 
     /// The transaction descriptor a BEGIN TRANSACTION reports (ENVCHANGE type 8),
@@ -407,99 +388,32 @@ pub const Conn = struct {
     }
 
     /// The server's SSPI token (0xED), a US_VARBYTE security blob. Returns a slice into
-    /// `self.wire.msg`, valid until the next `readMessage`.
+    /// the message, valid until the next `readMessage`.
     fn sspiToken(self: *Conn) ![]const u8 {
-        const p = self.wire.msg.items;
-        var i: usize = 0;
-        while (i < p.len) {
-            const token = p[i];
-            i += 1;
-            if (i + 2 > p.len) return error.TdsProtocol;
-            const len = rdU16(p, i);
-            if (i + 2 + len > p.len) return error.TdsProtocol;
-            switch (token) {
-                0xED => return p[i + 2 .. i + 2 + len],
-                0xAA => {
-                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
-                    return error.LoginFailed;
-                },
-                0xAB, 0xE3 => i += 2 + len,
-                else => return error.TdsProtocol,
-            }
-        }
+        var r: Body = .{ .p = self.wire.msg.items };
+        while (try nextToken(&r)) |t| switch (t.id) {
+            0xED => return t.body,
+            0xAA => return self.failWith(t.body, error.LoginFailed),
+            else => {},
+        };
         return error.TdsProtocol;
     }
 
     /// Also notes the response's SSPI token, if any, in `sspi_reply`.
     fn parseLoginResponse(self: *Conn) !void {
-        const p = self.wire.msg.items;
-        var i: usize = 0;
+        var r: Body = .{ .p = self.wire.msg.items };
         var ok = false;
         self.sspi_reply = "";
-        while (i < p.len) {
-            const token = p[i];
-            i += 1;
-            switch (token) {
-                0xAD => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    i += 2 + len;
-                    ok = true;
-                },
-                0xAA => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.wire.putError(try self.decodeError(p[i + 2 .. i + 2 + len]));
-                    return error.LoginFailed;
-                },
-                0xAB => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    i += 2 + rdU16(p, i);
-                },
-                0xED => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    if (i + 2 + len > p.len) return error.TdsProtocol;
-                    self.sspi_reply = p[i + 2 .. i + 2 + len];
-                    i += 2 + len;
-                },
-                0xE3 => {
-                    if (i + 2 > p.len) return error.TdsProtocol;
-                    const len = rdU16(p, i);
-                    if (i + 2 + len > p.len) return error.TdsProtocol;
-                    if (parseEnvPacketSize(p[i + 2 .. i + 2 + len])) |sz| self.pkt_payload = sz - 8;
-                    i += 2 + len;
-                },
-                0xEE => {
-                    if (i + 4 > p.len) return error.TdsProtocol;
-                    i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
-                },
-                0xAE => {
-                    while (i < p.len) {
-                        const fid = p[i];
-                        i += 1;
-                        if (fid == 0xFF) break;
-                        if (i + 4 > p.len) return error.TdsProtocol;
-                        i += 4 + std.mem.readInt(u32, p[i..][0..4], .little);
-                    }
-                },
-                0xFD, 0xFE, 0xFF => i += 12,
-                0x79 => i += 4,
-                else => break,
-            }
-        }
+        while (try nextToken(&r)) |t| switch (t.id) {
+            0xAD => ok = true,
+            0xAA => return self.failWith(t.body, error.LoginFailed),
+            0xED => self.sspi_reply = t.body,
+            0xE3 => if (parseEnvPacketSize(t.body)) |sz| {
+                self.pkt_payload = sz - 8;
+            },
+            else => {},
+        };
         if (!ok) return error.LoginFailed;
-    }
-
-    /// ERROR token body: Number(4) State(1) Class(1) MsgLen(2) Msg(UTF16)...
-    fn decodeError(self: *Conn, body: []const u8) ![]const u8 {
-        if (body.len < 8) return try self.wire.gpa.dupe(u8, "tds login error");
-        const msglen: usize = rdU16(body, 6);
-        const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
-        const out = try self.wire.gpa.alloc(u8, utf16.len / 2);
-        for (out, 0..) |*c, k| c.* = utf16[k * 2];
-        return out;
     }
 
     fn sendBatch(self: *Conn, stmt: []const u8) !void {
@@ -1161,14 +1075,7 @@ const TdsCursor = struct {
         const len = try self.reader.readU16();
         const body = try self.reader.readSlice(self.gpa, len);
         defer self.gpa.free(body);
-        if (body.len >= 8) {
-            const msglen = rdU16(body, 6);
-            const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
-            const ascii = try self.gpa.alloc(u8, utf16.len / 2);
-            for (ascii, 0..) |*c, k| c.* = utf16[k * 2];
-            self.conn.wire.putError(ascii);
-        }
-        return error.QueryFailed;
+        return self.conn.failWith(body, error.QueryFailed);
     }
 
     fn closeCursor(self: *TdsCursor) void {
@@ -1427,8 +1334,8 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
                 return (date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300);
             },
             4 => {
-                const days: i64 = @intCast(rdU16(bytes, 0));
-                const mins: i64 = @intCast(rdU16(bytes, 2));
+                const days: i64 = std.mem.readInt(u16, bytes[0..2], .little);
+                const mins: i64 = std.mem.readInt(u16, bytes[2..4], .little);
                 return (days - 25567) * 86_400_000_000 + mins * 60_000_000;
             },
             else => return error.MalformedTdsValue,
@@ -2145,8 +2052,42 @@ fn addField(fixed: []u8, ib_pos: usize, s: []const u8, vd: *std.array_list.Manag
     std.mem.writeInt(u16, fixed[ib_pos + 2 ..][0..2], @intCast(s.len), .little);
 }
 
-fn rdU16(buf: []const u8, i: usize) usize {
-    return @as(usize, buf[i]) | (@as(usize, buf[i + 1]) << 8);
+const Body = wire.Reader(.little, error.TdsProtocol);
+
+const Token = struct { id: u8, body: []const u8 };
+
+/// The next token of a reply that carries no rows, framed by its kind's length
+/// rule; null at the end of the message or at a token kind not framed here.
+fn nextToken(r: *Body) Body.Error!?Token {
+    if (r.left() == 0) return null;
+    const id = try r.int(u8);
+    const body = switch (id) {
+        0xAA, 0xAB, 0xAD, 0xED, 0xE3, 0xA9, 0xA4, 0xA5 => try r.bytes(try r.int(u16)),
+        0xEE => try r.bytes(try r.int(u32)),
+        0x79 => try r.bytes(4),
+        0xFD, 0xFE, 0xFF => try r.bytes(12),
+        0xAE => try featureExtAck(r),
+        else => return null,
+    };
+    return .{ .id = id, .body = body };
+}
+
+/// FEATUREEXTACK: (feature id, u32 length, data) entries up to a 0xFF terminator.
+fn featureExtAck(r: *Body) Body.Error![]const u8 {
+    const start = r.i;
+    while (try r.int(u8) != 0xFF) try r.skip(try r.int(u32));
+    return r.p[start..r.i];
+}
+
+/// ERROR token body: Number(4) State(1) Class(1) MsgLen(2) Msg(UTF-16), kept as its
+/// low bytes.
+fn errorText(gpa: std.mem.Allocator, body: []const u8) ![]const u8 {
+    if (body.len < 8) return gpa.dupe(u8, "the server sent a malformed error");
+    const msglen: usize = std.mem.readInt(u16, body[6..8], .little);
+    const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
+    const out = try gpa.alloc(u8, utf16.len / 2);
+    for (out, 0..) |*c, k| c.* = utf16[k * 2];
+    return out;
 }
 
 test "PLP and text values past SQL Server's 2 GiB limit are refused before room is made for them" {
