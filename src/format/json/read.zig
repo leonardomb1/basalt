@@ -102,10 +102,15 @@ pub const Rows = struct {
     schema: types.Schema,
     index: std.StringHashMapUnmanaged(usize) = .empty,
     builders: []column.Builder,
+    vals: []?[]const u8,
     len: usize = 0,
 
     pub fn init(arena: std.mem.Allocator, schema: types.Schema, capacity: usize) Error!Rows {
-        var r = Rows{ .schema = schema, .builders = try arena.alloc(column.Builder, schema.fields.len) };
+        var r = Rows{
+            .schema = schema,
+            .builders = try arena.alloc(column.Builder, schema.fields.len),
+            .vals = try arena.alloc(?[]const u8, schema.fields.len),
+        };
         for (r.builders, schema.fields, 0..) |*b, f, i| {
             b.* = try column.Builder.initCapacity(arena, f.ty, @max(capacity, 1));
             try r.index.put(arena, f.name, i);
@@ -114,18 +119,23 @@ pub const Rows = struct {
     }
 
     /// Appends one validated row: each column's key, the last of its name, read as its
-    /// column's type, NULL when absent or unreadable.
+    /// column's type, NULL when absent or unreadable. Rows mostly repeat one key order,
+    /// so each key is first tried as the column after the last one matched.
     pub fn add(self: *Rows, arena: std.mem.Allocator, row: []const u8) Error!void {
-        const vals = try arena.alloc(?[]const u8, self.builders.len);
+        const vals = self.vals;
+        const fields = self.schema.fields;
         @memset(vals, null);
         if (row[0] == '{') {
             var m = jt.Members.root(row);
+            var at: usize = 0;
             while (m.next()) |mem| {
                 const key = try jt.decodeString(arena, mem.key);
-                if (self.index.get(key)) |ci| vals[ci] = mem.value;
+                const ci = if (at < fields.len and std.mem.eql(u8, fields[at].name, key)) at else self.index.get(key) orelse continue;
+                vals[ci] = mem.value;
+                at = ci + 1;
             }
         }
-        for (self.builders, vals, self.schema.fields) |*b, raw, f| try b.append(try read(arena, raw, f.ty));
+        for (self.builders, vals, fields) |*b, raw, f| try b.append(try read(arena, raw, f.ty));
         self.len += 1;
     }
 

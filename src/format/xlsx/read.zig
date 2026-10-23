@@ -525,7 +525,7 @@ pub const Reader = struct {
                 const col: u32 = self.c0 + @as(u32, @intCast(i));
                 while (slot < cells.len and cells[slot].col < col) slot += 1;
                 const c: Cell = if (slot < cells.len and cells[slot].col == col) cells[slot] else .{ .col = col, .kind = .empty };
-                try b.append(try self.convert(arena, c, k));
+                try b.append(try self.convert(self.row_arena.allocator(), c, k));
             }
         }
         if (self.next_row > self.last_row) self.done = true;
@@ -535,10 +535,11 @@ pub const Reader = struct {
         return Batch{ .schema = &self.schema, .columns = cols, .len = rows };
     }
 
-    fn convert(self: *Reader, arena: std.mem.Allocator, c: Cell, k: types.TypeKind) !Value {
+    /// A cell as its column's value; text rendered into `scratch`, which outlives the append.
+    fn convert(self: *Reader, scratch: std.mem.Allocator, c: Cell, k: types.TypeKind) !Value {
         if (c.kind == .empty or c.kind == .err) return .null;
         return switch (k) {
-            .string => .{ .string = try arena.dupe(u8, try renderText(arena, c, self.date1904)) },
+            .string => .{ .string = try renderText(scratch, c, self.date1904) },
             .bool => if (c.kind == .boolean) Value{ .bool = c.num != 0 } else error.XlsxChanged,
             .int => if (c.kind == .number) Value{ .int = @intFromFloat(c.num) } else error.XlsxChanged,
             .float => if (c.kind == .number) Value{ .float = c.num } else error.XlsxChanged,

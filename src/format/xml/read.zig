@@ -113,13 +113,10 @@ pub const Reader = struct {
     /// Notes each path below `n` (`items/item`) where a name repeats among siblings, so
     /// it is an array in every row, one item or many, as the sample showed it.
     fn noteArrays(self: *Reader, arena: std.mem.Allocator, n: *const Node, path: []const u8) !void {
-        for (n.children, 0..) |c, i| {
-            const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, c.name });
-            for (n.children[i + 1 ..]) |o| if (std.mem.eql(u8, o.name, c.name)) {
-                try self.arrays.put(arena, sub, {});
-                break;
-            };
-            try self.noteArrays(arena, c, sub);
+        for (try groupByName(arena, n.children)) |group| {
+            const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, group[0].name });
+            if (group.len > 1) try self.arrays.put(arena, sub, {});
+            for (group) |c| try self.noteArrays(arena, c, sub);
         }
     }
 
@@ -156,27 +153,20 @@ pub const Reader = struct {
             try writeKey(w, "@", a.name);
             try writeString(w, a.value);
         }
-        for (n.children, 0..) |c, i| {
-            const dup = for (n.children[0..i]) |p| {
-                if (std.mem.eql(u8, p.name, c.name)) break true;
-            } else false;
-            if (dup) continue;
-            var count: usize = 0;
-            for (n.children[i..]) |o| count += @intFromBool(std.mem.eql(u8, o.name, c.name));
+        for (try groupByName(arena, n.children)) |group| {
+            const c = group[0];
             const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, c.name });
             try sep(w, &first);
             try writeKey(w, "", c.name);
-            if (count == 1 and !self.arrays.contains(sub)) {
+            if (group.len == 1 and !self.arrays.contains(sub)) {
                 try self.writeJson(arena, w, c, sub);
                 continue;
             }
             try w.writeByte('[');
-            var k: usize = 0;
-            for (n.children[i..]) |o| if (std.mem.eql(u8, o.name, c.name)) {
+            for (group, 0..) |o, k| {
                 if (k > 0) try w.writeByte(',');
                 try self.writeJson(arena, w, o, sub);
-                k += 1;
-            };
+            }
             try w.writeByte(']');
         }
         if (n.text.len > 0 and (n.children.len == 0 or !blank(n.text))) {
@@ -322,15 +312,10 @@ pub const Reader = struct {
         for (attrs) |a| try cells.append(.{ .kind = .attr, .name = a.name, .value = a.value });
         if (o.self_closing) return cells.items;
         const node = try self.readBody(arena, name, attrs, false, 0);
-        for (node.children, 0..) |child, i| {
-            const dup = for (node.children[0..i]) |p| {
-                if (std.mem.eql(u8, p.name, child.name)) break true;
-            } else false;
-            if (dup) continue;
-            var group = std.array_list.Managed(*const Node).init(arena);
-            for (node.children[i..]) |sib| if (std.mem.eql(u8, sib.name, child.name)) try group.append(sib);
-            try cells.append(.{ .kind = .elem, .name = child.name, .group = group.items });
-            if (group.items.len == 1 and child.children.len == 0)
+        for (try groupByName(arena, node.children)) |group| {
+            const child = group[0];
+            try cells.append(.{ .kind = .elem, .name = child.name, .group = group });
+            if (group.len == 1 and child.children.len == 0)
                 for (child.attrs) |a| try cells.append(.{ .kind = .child_attr, .name = try std.fmt.allocPrint(arena, "{s}@{s}", .{ child.name, a.name }), .value = a.value });
         }
         if (node.text.len > 0 and (node.children.len == 0 or !blank(node.text)))
@@ -476,6 +461,48 @@ pub const Reader = struct {
 
 /// XML files read as one table (`files.Files`).
 pub const Files = @import("../files.zig").Files(Reader, Options);
+
+/// `children` grouped by name, in the order each name first appears: a few are
+/// matched pairwise, many through a map, so a wide row costs linear time.
+fn groupByName(arena: std.mem.Allocator, children: []const *const Node) ![]const []const *const Node {
+    const gid = try arena.alloc(u32, children.len);
+    var firsts: std.ArrayListUnmanaged(u32) = .empty;
+    var map: std.StringHashMapUnmanaged(u32) = .empty;
+    const hashed = children.len > 16;
+    for (children, gid, 0..) |c, *g, i| {
+        if (hashed) {
+            const gop = try map.getOrPut(arena, c.name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = @intCast(firsts.items.len);
+                try firsts.append(arena, @intCast(i));
+            }
+            g.* = gop.value_ptr.*;
+            continue;
+        }
+        g.* = for (firsts.items, 0..) |f, k| {
+            if (std.mem.eql(u8, children[f].name, c.name)) break @intCast(k);
+        } else blk: {
+            try firsts.append(arena, @intCast(i));
+            break :blk @intCast(firsts.items.len - 1);
+        };
+    }
+    const fill = try arena.alloc(u32, firsts.items.len);
+    @memset(fill, 0);
+    for (gid) |g| fill[g] += 1;
+    const slots = try arena.alloc(*const Node, children.len);
+    const groups = try arena.alloc([]*const Node, firsts.items.len);
+    var at: usize = 0;
+    for (groups, fill) |*g, *n| {
+        g.* = slots[at..][0..n.*];
+        at += n.*;
+        n.* = 0;
+    }
+    for (children, gid) |c, g| {
+        groups[g][fill[g]] = c;
+        fill[g] += 1;
+    }
+    return groups;
+}
 
 fn keyOf(arena: std.mem.Allocator, kind: Kind, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "{c}{s}", .{ @as(u8, switch (kind) {
