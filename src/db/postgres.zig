@@ -282,13 +282,13 @@ pub const Conn = struct {
 
     /// One backend message, classified for `sql.fetchTextBatch`: a DataRow
     /// (values appended), ReadyForQuery (end), or a server error.
-    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
+    pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         while (true) {
             const t = try self.readMsg();
             const p = self.payload.items;
             switch (t) {
                 'D' => {
-                    try parseDataRow(self, arena, p, builders);
+                    try parseDataRow(self, p, builders);
                     return .row;
                 },
                 'Z' => return .end,
@@ -431,7 +431,7 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
     return .{ .cols = cols, .fields = fields };
 }
 
-fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: []column.Builder) !void {
+fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
     const raw = try readI16(p, 0);
     if (raw < 0 or @as(usize, @intCast(raw)) != builders.len) return error.PgProtocol;
     const n: usize = @intCast(raw);
@@ -445,7 +445,7 @@ fn parseDataRow(conn: *Conn, arena: std.mem.Allocator, p: []const u8, builders: 
             const ulen: usize = @intCast(len);
             if (i + ulen > p.len) return error.PgProtocol;
             const cell = p[i .. i + ulen];
-            const v = sql.coerceText(arena, cell, conn.cols[k].engine_type) catch |e| {
+            const v = sql.coerceText(cell, conn.cols[k].engine_type) catch |e| {
                 if (e == error.UnparseableNumber)
                     sql.putError(conn.gpa, &conn.last_error, try std.fmt.allocPrint(conn.gpa, "column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell }));
                 return e;

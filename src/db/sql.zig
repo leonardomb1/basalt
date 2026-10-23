@@ -460,8 +460,10 @@ pub const Sink = struct {
     table: []const u8,
     schema: types.Schema,
     mode: ast.WriteMode,
-    rows: std.array_list.Managed([]const u8),
-    tuple_arena: std.heap.ArenaAllocator,
+    stmt: std.array_list.Managed(u8),
+    head_len: usize,
+    tail: []const u8,
+    pending: usize = 0,
     flush_rows: usize,
     errctx: ?*op.ErrCtx = null,
     redial: ?Redial = null,
@@ -474,6 +476,14 @@ pub const Sink = struct {
         errdefer freeSchema(gpa, owned);
         const qtable = try quoteIdent(gpa, dialect, table_name);
         errdefer gpa.free(qtable);
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const parts = try statementParts(aa.allocator(), dialect, qtable, schema, mode);
+        var stmt = std.array_list.Managed(u8).init(gpa);
+        errdefer stmt.deinit();
+        try stmt.appendSlice(parts.head);
+        const tail = try gpa.dupe(u8, parts.tail);
+        errdefer gpa.free(tail);
         self.* = .{
             .gpa = gpa,
             .conn = conn,
@@ -481,16 +491,13 @@ pub const Sink = struct {
             .table = qtable,
             .schema = owned,
             .mode = mode,
-            .rows = std.array_list.Managed([]const u8).init(gpa),
-            .tuple_arena = std.heap.ArenaAllocator.init(gpa),
+            .stmt = stmt,
+            .head_len = parts.head.len,
+            .tail = tail,
             .flush_rows = flushRowsFor(dialect),
             .redial = redial,
         };
-        errdefer self.rows.deinit();
-        errdefer self.tuple_arena.deinit();
 
-        var aa = std.heap.ArenaAllocator.init(gpa);
-        defer aa.deinit();
         const ddl = try createTableSql(aa.allocator(), dialect, self.table, schema, mode);
         try conn.exec(ddl);
         return self;
@@ -500,21 +507,22 @@ pub const Sink = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
-    pub fn writeBatch(self: *Sink, arena: std.mem.Allocator, batch: Batch) !void {
-        var r: usize = 0;
-        while (r < batch.len) : (r += 1) {
-            const tuple = try serializeRow(self.tuple_arena.allocator(), self.dialect, batch, r);
-            try self.rows.append(tuple);
-            if (self.rows.items.len >= self.flush_rows) try self.flush();
+    /// Each row's tuple is appended straight into the pending statement, after its head.
+    pub fn writeBatch(self: *Sink, _: std.mem.Allocator, batch: Batch) !void {
+        switch (self.dialect) {
+            inline else => |d| for (0..batch.len) |r| {
+                if (self.pending > 0) try self.stmt.append(',');
+                try writeRow(d, &self.stmt, batch, r);
+                self.pending += 1;
+                if (self.pending >= self.flush_rows) try self.flush();
+            },
         }
-        _ = arena;
     }
 
     fn flush(self: *Sink) !void {
-        if (self.rows.items.len == 0) return;
-        var aa = std.heap.ArenaAllocator.init(self.gpa);
-        defer aa.deinit();
-        const stmt = try buildStatement(aa.allocator(), self.dialect, self.table, self.schema, self.mode, self.rows.items);
+        if (self.pending == 0) return;
+        try self.stmt.appendSlice(self.tail);
+        const stmt = self.stmt.items;
         self.conn.exec(stmt) catch |e| {
             const rd = self.redial orelse return refused(self.errctx, self.dialect, self.conn.lastError(), e);
             if (!driver.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
@@ -525,8 +533,8 @@ pub const Sink = struct {
             self.conn_alive = true;
             try self.conn.exec(stmt);
         };
-        self.rows.clearRetainingCapacity();
-        _ = self.tuple_arena.reset(.retain_capacity);
+        self.stmt.shrinkRetainingCapacity(self.head_len);
+        self.pending = 0;
     }
 
     pub fn close(self: *Sink) !void {
@@ -540,8 +548,8 @@ pub const Sink = struct {
 
     fn teardown(self: *Sink) void {
         if (self.conn_alive) self.conn.close();
-        self.rows.deinit();
-        self.tuple_arena.deinit();
+        self.stmt.deinit();
+        self.gpa.free(self.tail);
         freeSchema(self.gpa, self.schema);
         self.gpa.free(self.table);
         self.gpa.destroy(self);
@@ -780,17 +788,19 @@ fn findField(schema: types.Schema, name: []const u8) ?types.Schema.Field {
     return null;
 }
 
-fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, rows: []const []const u8) ![]const u8 {
+/// What a statement holds before and after its comma-separated tuples.
+const Parts = struct { head: []const u8, tail: []const u8 };
+
+fn statementParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode) !Parts {
     const cols = try colList(arena, dialect, schema);
-    const values = try std.mem.join(arena, ",", rows);
 
     if (dialect == .sqlserver and mode == .upsert) {
-        return buildMerge(arena, dialect, qtable, schema, mode.upsert.keys, cols, values);
+        return mergeParts(arena, dialect, qtable, schema, mode.upsert.keys, cols);
     }
 
+    const head = try std.fmt.allocPrint(arena, "INSERT INTO {s} ({s}) VALUES ", .{ qtable, cols });
     var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
-    try w.print("INSERT INTO {s} ({s}) VALUES {s}", .{ qtable, cols, values });
 
     switch (mode) {
         .upsert => |u| switch (dialect) {
@@ -807,13 +817,14 @@ fn buildStatement(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
         },
         else => {},
     }
-    return buf.toOwnedSlice();
+    return .{ .head = head, .tail = try buf.toOwnedSlice() };
 }
 
-fn buildMerge(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, keys: []const []const u8, cols: []const u8, values: []const u8) ![]const u8 {
+fn mergeParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, keys: []const []const u8, cols: []const u8) !Parts {
+    const head = try std.fmt.allocPrint(arena, "MERGE INTO {s} AS T USING (VALUES ", .{qtable});
     var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
-    try w.print("MERGE INTO {s} AS T USING (VALUES {s}) AS S ({s}) ON ", .{ qtable, values, cols });
+    try w.print(") AS S ({s}) ON ", .{cols});
     for (keys, 0..) |k, i| {
         if (i > 0) try w.writeAll(" AND ");
         const qk = try quoteName(arena, dialect, k);
@@ -827,7 +838,7 @@ fn buildMerge(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, sc
         try w.print("S.{s}", .{try quoteName(arena, dialect, f.name)});
     }
     try w.writeAll(");");
-    return buf.toOwnedSlice();
+    return .{ .head = head, .tail = try buf.toOwnedSlice() };
 }
 
 fn writeUpdateSet(w: anytype, arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema, keys: []const []const u8, src_prefix: []const u8) !void {
@@ -870,16 +881,21 @@ fn quoteNames(arena: std.mem.Allocator, dialect: Dialect, names: []const []const
     return buf.toOwnedSlice();
 }
 
-fn serializeRow(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usize) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(gpa);
+/// Row `row` of `batch` as a `(...)` tuple of literals, appended to `buf`.
+fn writeRow(comptime dialect: Dialect, buf: *std.array_list.Managed(u8), batch: Batch, row: usize) !void {
     try buf.append('(');
     for (batch.columns, 0..) |*c, i| {
         if (i > 0) try buf.append(',');
-        switch (dialect) {
-            inline else => |d| try celltext.write(buf.writer(), c, row, Literal(d){}),
-        }
+        try celltext.write(buf.writer(), c, row, Literal(dialect){});
     }
     try buf.append(')');
+}
+
+fn serializeRow(gpa: std.mem.Allocator, dialect: Dialect, batch: Batch, row: usize) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(gpa);
+    switch (dialect) {
+        inline else => |d| try writeRow(d, &buf, batch, row),
+    }
     return buf.toOwnedSlice();
 }
 
@@ -1033,7 +1049,9 @@ fn writeQuotedName(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []c
 
 const nameIn = ast.nameIn;
 
-pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !Value {
+/// A text cell typed as `ty`; a string is returned as the wire's own bytes, which the
+/// caller appends before reading the next packet.
+pub fn coerceText(text: ?[]const u8, ty: types.Type) !Value {
     const t = text orelse return .null;
     return switch (ty.kind) {
         .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.UnparseableNumber },
@@ -1042,7 +1060,7 @@ pub fn coerceText(arena: std.mem.Allocator, text: ?[]const u8, ty: types.Type) !
         .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
         .date => if (zeroDate(t)) .null else .{ .date = std.math.cast(i32, parseDateText(t) orelse return error.UnparseableNumber) orelse return error.UnparseableNumber },
         .timestamp => if (zeroDate(t)) .null else .{ .timestamp = parseDatetimeText(t) orelse return error.UnparseableNumber },
-        else => .{ .string = try arena.dupe(u8, t) },
+        else => .{ .string = t },
     };
 }
 
@@ -1164,18 +1182,17 @@ fn parseDatetimeText(t: []const u8) ?i64 {
 }
 
 test "text dates: the real ones read, BC and five-digit years included; no date reads as a made-up one" {
-    const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(i32, 0), (try coerceText(a, "1970-01-01", types.Type.init(.date))).date);
-    try std.testing.expectEqual(@as(i32, 19727), (try coerceText(a, "2024-01-05", types.Type.init(.date))).date);
-    try std.testing.expectEqual(eval.daysFromCivil(-43, 3, 15), (try coerceText(a, "0044-03-15 BC", types.Type.init(.date))).date);
-    try std.testing.expectEqual(eval.daysFromCivil(10000, 1, 1), (try coerceText(a, "10000-01-01", types.Type.init(.date))).date);
-    try std.testing.expect((try coerceText(a, "0000-00-00", types.Type.init(.date))).isNull());
-    try std.testing.expect((try coerceText(a, "0000-00-00 00:00:00", types.Type.init(.timestamp))).isNull());
+    try std.testing.expectEqual(@as(i32, 0), (try coerceText("1970-01-01", types.Type.init(.date))).date);
+    try std.testing.expectEqual(@as(i32, 19727), (try coerceText("2024-01-05", types.Type.init(.date))).date);
+    try std.testing.expectEqual(eval.daysFromCivil(-43, 3, 15), (try coerceText("0044-03-15 BC", types.Type.init(.date))).date);
+    try std.testing.expectEqual(eval.daysFromCivil(10000, 1, 1), (try coerceText("10000-01-01", types.Type.init(.date))).date);
+    try std.testing.expect((try coerceText("0000-00-00", types.Type.init(.date))).isNull());
+    try std.testing.expect((try coerceText("0000-00-00 00:00:00", types.Type.init(.timestamp))).isNull());
     for ([_][]const u8{ "infinity", "-infinity", "2024-13-01", "2024-02-30", "24-01-05", "2024/01/05", "" }) |bad| {
-        try std.testing.expectError(error.UnparseableNumber, coerceText(a, bad, types.Type.init(.date)));
+        try std.testing.expectError(error.UnparseableNumber, coerceText(bad, types.Type.init(.date)));
     }
-    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "infinity", types.Type.init(.timestamp)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "2024-01-05 5:00", types.Type.init(.timestamp)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText("infinity", types.Type.init(.timestamp)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText("2024-01-05 5:00", types.Type.init(.timestamp)));
     try std.testing.expectEqual(parseDatetimeText("2024-01-05 00:00:00").?, parseDatetimeText("2024-01-05").?);
 }
 
@@ -1210,7 +1227,7 @@ test "create table + upsert SQL (postgres)" {
     try std.testing.expect(std.mem.indexOf(u8, ddl, "\"id\" BIGINT NOT NULL") != null);
     try std.testing.expect(std.mem.indexOf(u8, ddl, "PRIMARY KEY (\"id\")") != null);
 
-    const stmt = try buildStatement(a, .postgres, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, &.{ "(1,'a')", "(2,'b')" });
+    const stmt = try testStatement(a, .postgres, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, "(1,'a'),(2,'b')");
     try std.testing.expect(std.mem.indexOf(u8, stmt, "INSERT INTO \"people\" (\"id\",\"name\") VALUES (1,'a'),(2,'b')") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "ON CONFLICT (\"id\") DO UPDATE SET \"name\"=EXCLUDED.\"name\"") != null);
 }
@@ -1230,15 +1247,12 @@ test "create table (sqlserver): non-key columns are explicit NULL, keys NOT NULL
 }
 
 test "coerceText: bad numeric text errors instead of silently zeroing" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqual(@as(i64, 42), (try coerceText(a, "42", types.Type.init(.int))).int);
-    try std.testing.expectEqual(@as(i64, 7), (try coerceText(a, " 7 ", types.Type.init(.int))).int);
-    try std.testing.expect((try coerceText(a, null, types.Type.init(.int))).isNull());
-    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "abc", types.Type.init(.int)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "", types.Type.init(.int)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText(a, "1.2.3", types.Type.init(.float)));
+    try std.testing.expectEqual(@as(i64, 42), (try coerceText("42", types.Type.init(.int))).int);
+    try std.testing.expectEqual(@as(i64, 7), (try coerceText(" 7 ", types.Type.init(.int))).int);
+    try std.testing.expect((try coerceText(null, types.Type.init(.int))).isNull());
+    try std.testing.expectError(error.UnparseableNumber, coerceText("abc", types.Type.init(.int)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText("", types.Type.init(.int)));
+    try std.testing.expectError(error.UnparseableNumber, coerceText("1.2.3", types.Type.init(.float)));
 }
 
 test "upsert SQL (mysql): ON DUPLICATE KEY UPDATE with VALUES()" {
@@ -1250,7 +1264,7 @@ test "upsert SQL (mysql): ON DUPLICATE KEY UPDATE with VALUES()" {
         .{ .name = "name", .ty = types.Type.init(.string) },
     } };
     const qt = try quoteIdent(a, .mysql, "people");
-    const stmt = try buildStatement(a, .mysql, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, &.{"(1,'a')"});
+    const stmt = try testStatement(a, .mysql, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, "(1,'a')");
     try std.testing.expect(std.mem.indexOf(u8, stmt, "INSERT INTO `people` (`id`,`name`) VALUES (1,'a')") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "ON DUPLICATE KEY UPDATE `name`=VALUES(`name`)") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "`id`=VALUES") == null);
@@ -1265,7 +1279,7 @@ test "upsert SQL (sqlserver): MERGE keyed on T/S join, keys excluded from UPDATE
         .{ .name = "name", .ty = types.Type.init(.string) },
     } };
     const qt = try quoteIdent(a, .sqlserver, "dbo.people");
-    const stmt = try buildStatement(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, &.{"(1,'a')"});
+    const stmt = try testStatement(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } }, "(1,'a')");
     try std.testing.expect(std.mem.indexOf(u8, stmt, "MERGE INTO [dbo].[people] AS T USING (VALUES (1,'a')) AS S ([id],[name]) ON T.[id]=S.[id]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "WHEN MATCHED THEN UPDATE SET [name]=S.[name]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stmt, "WHEN NOT MATCHED THEN INSERT ([id],[name]) VALUES (S.[id],S.[name])") != null);
@@ -1308,8 +1322,53 @@ test "create table and insert quote odd column names whole" {
     const ddl = try createTableSql(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"i]d"} } });
     try std.testing.expect(std.mem.startsWith(u8, ddl, "IF OBJECT_ID(N'[o''brien]', N'U') IS NULL CREATE TABLE [o'brien] ("));
     try std.testing.expect(std.mem.indexOf(u8, ddl, "[i]]d] BIGINT NOT NULL,[x.y] NVARCHAR(4000) NULL, PRIMARY KEY ([i]]d])") != null);
-    const stmt = try buildStatement(a, .postgres, try quoteIdent(a, .postgres, "t"), schema, .append, &.{"(1,'a')"});
+    const stmt = try testStatement(a, .postgres, try quoteIdent(a, .postgres, "t"), schema, .append, "(1,'a')");
     try std.testing.expectEqualStrings("INSERT INTO \"t\" (\"i]d\",\"x.y\") VALUES (1,'a')", stmt);
+}
+
+test "the INSERT sink appends tuples into one statement, flushed every flush_rows and at close" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Fake = struct {
+        a: std.mem.Allocator,
+        seen: std.ArrayListUnmanaged([]const u8) = .empty,
+        fn queryCursor(_: *anyopaque, _: []const u8) anyerror!Cursor {
+            return error.Unsupported;
+        }
+        fn exec(p: *anyopaque, s: []const u8) anyerror!void {
+            const f: *@This() = @ptrCast(@alignCast(p));
+            try f.seen.append(f.a, try f.a.dupe(u8, s));
+        }
+        fn close(_: *anyopaque) void {}
+        const vt = Conn.VTable{ .queryCursor = queryCursor, .exec = exec, .close = close };
+    };
+    var fake = Fake{ .a = a };
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int).asNullable() },
+        .{ .name = "name", .ty = types.Type.init(.string).asNullable() },
+    } };
+    var ids = [_]?i64{ 1, 2, null };
+    var nb = column.Builder.init(a, schema.fields[1].ty);
+    for ([_]Value{ .{ .string = "a" }, .null, .{ .string = "c'd" } }) |v| try nb.append(v);
+    var cols = [_]column.Column{ try column.intColumn(a, &ids), try nb.finish() };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 3 };
+
+    const s = try Sink.open(gpa, .{ .ptr = &fake, .vtable = &Fake.vt }, .postgres, "t", schema, .{ .upsert = .{ .keys = &.{"id"} } }, null);
+    s.flush_rows = 4;
+    try s.writeBatch(a, batch);
+    try s.writeBatch(a, batch);
+    try s.close();
+    const tail = " ON CONFLICT (\"id\") DO UPDATE SET \"name\"=EXCLUDED.\"name\"";
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    try std.testing.expectEqualStrings("INSERT INTO \"t\" (\"id\",\"name\") VALUES (1,'a'),(2,NULL),(NULL,'c''d'),(1,'a')" ++ tail, fake.seen.items[1]);
+    try std.testing.expectEqualStrings("INSERT INTO \"t\" (\"id\",\"name\") VALUES (2,NULL),(NULL,'c''d')" ++ tail, fake.seen.items[2]);
+}
+
+fn testStatement(a: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, mode: ast.WriteMode, values: []const u8) ![]const u8 {
+    const p = try statementParts(a, dialect, qtable, schema, mode);
+    return std.mem.concat(a, u8, &.{ p.head, values, p.tail });
 }
 
 fn literalOf(a: std.mem.Allocator, dialect: Dialect, kind: types.TypeKind, v: Value) ![]const u8 {
@@ -1437,25 +1496,21 @@ test "COPY and LOAD DATA text of every kind" {
 }
 
 test "coerceText parses bools, dates, timestamps, and decimals" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
+    try std.testing.expect((try coerceText("t", types.Type.init(.bool))).bool);
+    try std.testing.expect((try coerceText("1", types.Type.init(.bool))).bool);
+    try std.testing.expect((try coerceText("Yes", types.Type.init(.bool))).bool);
+    try std.testing.expect(!(try coerceText("false", types.Type.init(.bool))).bool);
+    try std.testing.expect(!(try coerceText("0", types.Type.init(.bool))).bool);
 
-    try std.testing.expect((try coerceText(a, "t", types.Type.init(.bool))).bool);
-    try std.testing.expect((try coerceText(a, "1", types.Type.init(.bool))).bool);
-    try std.testing.expect((try coerceText(a, "Yes", types.Type.init(.bool))).bool);
-    try std.testing.expect(!(try coerceText(a, "false", types.Type.init(.bool))).bool);
-    try std.testing.expect(!(try coerceText(a, "0", types.Type.init(.bool))).bool);
-
-    try std.testing.expectEqual(@as(i64, 19723), (try coerceText(a, "2024-01-01", types.Type.init(.date))).date);
-    try std.testing.expectEqual(@as(i64, 11016), (try coerceText(a, "2000-02-29", types.Type.init(.date))).date);
+    try std.testing.expectEqual(@as(i64, 19723), (try coerceText("2024-01-01", types.Type.init(.date))).date);
+    try std.testing.expectEqual(@as(i64, 11016), (try coerceText("2000-02-29", types.Type.init(.date))).date);
     try std.testing.expectEqual(
         @as(i64, 19723 * 86_400_000_000 + (1 * 3600 + 2 * 60 + 3) * 1_000_000),
-        (try coerceText(a, "2024-01-01 01:02:03", types.Type.init(.timestamp))).timestamp,
+        (try coerceText("2024-01-01 01:02:03", types.Type.init(.timestamp))).timestamp,
     );
-    try std.testing.expectEqual(@as(i64, 19723 * 86_400_000_000), (try coerceText(a, "2024-01-01", types.Type.init(.timestamp))).timestamp);
+    try std.testing.expectEqual(@as(i64, 19723 * 86_400_000_000), (try coerceText("2024-01-01", types.Type.init(.timestamp))).timestamp);
 
-    const d = (try coerceText(a, "-12.345", types.Type.decimal(10, 3))).decimal;
+    const d = (try coerceText("-12.345", types.Type.decimal(10, 3))).decimal;
     try std.testing.expectEqual(@as(i128, -12345), d.unscaled);
     try std.testing.expectEqual(@as(u8, 3), d.scale);
 }

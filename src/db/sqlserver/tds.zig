@@ -565,10 +565,7 @@ pub const Conn = struct {
         @memcpy(payload.items[10..18], &self.txn_desc);
         const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, stmt);
         defer self.gpa.free(u16s);
-        for (u16s) |u| {
-            try payload.append(@intCast(u & 0xff));
-            try payload.append(@intCast(u >> 8));
-        }
+        try payload.appendSlice(std.mem.sliceAsBytes(u16s));
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
 
@@ -577,6 +574,8 @@ pub const Conn = struct {
         try self.readBulkResponse();
     }
 
+    /// One packet of a bulk load into the socket's buffer, flushed only with the
+    /// last (EOM), so a segment goes out in as few writes as the buffer allows.
     pub fn bulkPacket(self: *Conn, status: u8, payload: []const u8) !void {
         var header: [8]u8 = .{ PKT_BULK, status, 0, 0, 0, 0, 0, 0 };
         const total: u16 = @intCast(payload.len + 8);
@@ -585,7 +584,7 @@ pub const Conn = struct {
         const w = self.wr();
         try w.writeAll(&header);
         try w.writeAll(payload);
-        try self.flushOut();
+        if (status & STATUS_EOM != 0) try self.flushOut();
     }
 
     /// Returns the DONE row count, the server's word on how many rows actually landed.
@@ -956,6 +955,7 @@ const TdsCursor = struct {
             var d = try self.parseTypeInfo();
             d.plain_text = d.engine_type.kind == .string and !d.is_unicode and !d.is_guid and !d.is_binary and
                 (d.kind == .bytelen or d.kind == .ushortlen);
+            d.unicode_text = d.engine_type.kind == .string and d.is_unicode and !d.is_guid and !d.is_binary;
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
             d.name = try utf16ToUtf8(ma, nbytes);
@@ -1139,6 +1139,14 @@ const TdsCursor = struct {
                 try self.readPlainText(&builders[ci], col);
                 continue;
             }
+            if (col.unicode_text) {
+                const raw = (try self.readRaw(arena, col)) orelse {
+                    try builders[ci].append(.null);
+                    continue;
+                };
+                try appendUtf16(&builders[ci], raw);
+                continue;
+            }
             try builders[ci].append(try self.readColumnValue(arena, col));
         }
     }
@@ -1168,29 +1176,31 @@ const TdsCursor = struct {
     }
 
     fn readColumnValue(self: *TdsCursor, arena: std.mem.Allocator, col: ColumnDesc) !Value {
+        return decodeValue(arena, col, (try self.readRaw(arena, col)) orelse return .null);
+    }
+
+    /// A cell's bytes as the wire holds them, null for NULL; a short one is in the
+    /// cell buffer until the next read.
+    fn readRaw(self: *TdsCursor, arena: std.mem.Allocator, col: ColumnDesc) !?[]const u8 {
         switch (col.kind) {
-            .fixed => return decodeValue(arena, col, try self.readCell(col.fixed_len)),
+            .fixed => return try self.readCell(col.fixed_len),
             .bytelen => {
                 const len: usize = try self.reader.readByte();
-                if (len == 0) return .null;
-                return decodeValue(arena, col, try self.readCell(len));
+                if (len == 0) return null;
+                return try self.readCell(len);
             },
             .ushortlen => {
                 const len = try self.reader.readU16();
-                if (len == 0xFFFF) return .null;
-                return decodeValue(arena, col, try self.readCell(len));
+                if (len == 0xFFFF) return null;
+                return try self.readCell(len);
             },
-            .plp => {
-                const bytes = (try self.reader.readPlp(arena)) orelse return .null;
-                return decodeValue(arena, col, bytes);
-            },
+            .plp => return self.reader.readPlp(arena),
             .textptr => {
                 const ptrlen = try self.reader.readByte();
-                if (ptrlen == 0) return .null;
+                if (ptrlen == 0) return null;
                 try self.reader.skip(@as(usize, ptrlen) + 8);
                 const dlen = try self.reader.readU32();
-                const bytes = try self.reader.readLob(arena, dlen);
-                return decodeValue(arena, col, bytes);
+                return try self.reader.readLob(arena, dlen);
             },
         }
     }
@@ -1247,10 +1257,7 @@ const BulkProto = struct {
             const name16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, f.name);
             defer gpa.free(name16);
             try w.writeByte(@intCast(name16.len));
-            for (name16) |u| {
-                try w.writeByte(@intCast(u & 0xff));
-                try w.writeByte(@intCast(u >> 8));
-            }
+            try w.writeAll(std.mem.sliceAsBytes(name16));
         }
     }
 
@@ -1275,11 +1282,7 @@ const BulkProto = struct {
                     if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
                 }
                 try writeU16(w, @intCast(blen));
-                var k: usize = 0;
-                while (k * 2 < blen) : (k += 1) {
-                    try w.writeByte(@intCast(u16s[k] & 0xff));
-                    try w.writeByte(@intCast(u16s[k] >> 8));
-                }
+                try w.writeAll(std.mem.sliceAsBytes(u16s[0 .. blen / 2]));
             }
         }
     }
@@ -1396,6 +1399,7 @@ const ColumnDesc = struct {
     is_binary: bool = false,
     is_money: bool = false,
     plain_text: bool = false,
+    unicode_text: bool = false,
 };
 
 fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
@@ -1627,31 +1631,43 @@ fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
 /// once made every emoji `??`); only an unpaired half becomes `?`. The wire buffer is
 /// byte-aligned, so std's `[]const u16` helpers do not apply.
 fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(arena);
+    const out = try arena.alloc(u8, bytes.len / 2 * 3);
+    return arena.realloc(out, utf16Encode(out, bytes));
+}
+
+/// A UTF-16LE cell transcoded straight into a string column, with no copy between.
+fn appendUtf16(b: *column.Builder, bytes: []const u8) !void {
+    return b.commitBytes(utf16Encode(try b.reserveBytes(bytes.len / 2 * 3), bytes));
+}
+
+/// `bytes` as UTF-8 into `out`, which has room for three bytes per code unit (a
+/// pair's four bytes are two units' worth); returns the length written.
+fn utf16Encode(out: []u8, bytes: []const u8) usize {
+    var o: usize = 0;
     var k: usize = 0;
     while (k + 1 < bytes.len) : (k += 2) {
         var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
+        if (cp < 0x80) {
+            out[o] = @intCast(cp);
+            o += 1;
+            continue;
+        }
         if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
-            if (k + 3 >= bytes.len) {
-                try out.append('?');
-                continue;
-            }
-            const lo = @as(u16, bytes[k + 2]) | (@as(u16, bytes[k + 3]) << 8);
+            const lo: u16 = if (k + 3 < bytes.len) @as(u16, bytes[k + 2]) | (@as(u16, bytes[k + 3]) << 8) else 0;
             if (!std.unicode.utf16IsLowSurrogate(lo)) {
-                try out.append('?');
+                out[o] = '?';
+                o += 1;
                 continue;
             }
             cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
             k += 2;
         }
-        var tmp: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cp, &tmp) catch {
-            try out.append('?');
-            continue;
+        o += std.unicode.utf8Encode(cp, out[o..]) catch blk: {
+            out[o] = '?';
+            break :blk 1;
         };
-        try out.appendSlice(tmp[0..n]);
     }
-    return out.toOwnedSlice();
+    return o;
 }
 
 test "bytes to hex string" {
@@ -1776,7 +1792,7 @@ test "rows split across packets of every small size decode as each cell decoded 
         .{ .tds_type = 0xA7, .engine_type = strT, .kind = .ushortlen, .plain_text = true },
         .{ .tds_type = 0x2F, .engine_type = strT, .kind = .bytelen, .plain_text = true },
         .{ .tds_type = 0x6C, .engine_type = types.Type.decimal(14, 2).asNullable(), .kind = .bytelen, .scale = 2 },
-        .{ .tds_type = 0xE7, .engine_type = strT, .kind = .ushortlen, .is_unicode = true },
+        .{ .tds_type = 0xE7, .engine_type = strT, .kind = .ushortlen, .is_unicode = true, .unicode_text = true },
         .{ .tds_type = 0x3E, .engine_type = types.Type.init(.float).asNullable(), .kind = .fixed, .fixed_len = 8 },
     };
     var prng = std.Random.DefaultPrng.init(0x7d5);
@@ -1808,7 +1824,7 @@ test "rows split across packets of every small size decode as each cell decoded 
                 raw[8] = 0;
             }
             if (col.is_unicode) for (0..len / 2) |k| {
-                raw[2 * k + 1] = 0;
+                if (rnd.uintLessThan(u8, 4) != 0) raw[2 * k + 1] = 0;
             };
             const is_null = col.kind != .fixed and rnd.uintLessThan(u8, 8) == 0;
             switch (col.kind) {

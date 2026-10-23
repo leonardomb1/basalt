@@ -257,7 +257,7 @@ pub const Conn = struct {
 
     /// One result-set packet, classified for `sql.fetchTextBatch`: a row (values
     /// appended), the end of the stream, or a server error.
-    pub fn nextRow(self: *Conn, arena: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
+    pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
         const r = self.buf.items;
         if (r.len > 0 and r[0] == 0xfe and r.len < 9) return .end;
@@ -273,7 +273,7 @@ pub const Conn = struct {
             else if (c.mtype == 0x10)
                 .{ .int = decodeBits(text.?) }
             else
-                sql.coerceText(arena, text, c.engine_type) catch |e| {
+                sql.coerceText(text, c.engine_type) catch |e| {
                     if (e == error.UnparseableNumber)
                         sql.putError(self.gpa, &self.last_error, try std.fmt.allocPrint(self.gpa, "column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? }));
                     return e;
