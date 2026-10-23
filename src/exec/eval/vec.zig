@@ -1673,9 +1673,9 @@ test "float comparisons on the vector lanes order NaN and signed zero as the row
     var cols = [_]column.Column{ try fb.finish(), try gb.finish(), x };
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = fs.len };
     try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{
-        "f < g",     "f <= g",    "f = g",        "f <> g",      "f > g",  "f >= g",
-        "f = 0e0",   "f < 0e0",   "0.5e0 >= f",   "f > x",       "x <= f", "x = f",
-        "x < 2",     "2 >= x",    "f = 0.0 / 0e0", "1e0 < 2",
+        "f < g",   "f <= g",  "f = g",         "f <> g",  "f > g",  "f >= g",
+        "f = 0e0", "f < 0e0", "0.5e0 >= f",    "f > x",   "x <= f", "x = f",
+        "x < 2",   "2 >= x",  "f = 0.0 / 0e0", "1e0 < 2",
     }, true);
 }
 
