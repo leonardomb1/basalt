@@ -17,10 +17,10 @@ const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const folder = @import("../../connect/folder.zig");
-const forHintName = @import("../env.zig").forHintName;
 const ftp = @import("../../store/ftp.zig");
 const gen = @import("../../connect/gen.zig");
 const guardFileFormat = @import("sink.zig").guardFileFormat;
+const hintedWhere = @import("sql_read.zig").hintedWhere;
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const http_client = @import("../../net/http_client.zig");
 const pathFail = @import("../env.zig").pathFail;
@@ -403,14 +403,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, rd.connector, "read"));
     var rd_eff = rd;
-    if (forHintName(hints, "where")) |wh| {
-        if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
-            rd_eff.where = if (rd.where.len > 0)
-                try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
-            else
-                wh;
-        }
-    }
+    rd_eff.where = try hintedWhere(env.arena, rd, hints);
     if (rd_eff.where.len > 0 and !std.mem.eql(u8, conn.connector, "http"))
         if (env.scan) |t| driver.ScanTally.add(&t.sql_filters, 1);
     if (std.mem.eql(u8, conn.connector, "http")) {

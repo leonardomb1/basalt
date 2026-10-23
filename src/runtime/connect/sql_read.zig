@@ -247,16 +247,19 @@ pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     if (!pushableRead(info.dialect, rd)) return null;
-    if (forHintName(stage.hints, "where")) |wh| {
-        if (wh.len > 0 and !std.mem.eql(u8, wh, rd.where)) {
-            rd.where = if (rd.where.len > 0)
-                try std.fmt.allocPrint(env.arena, "({s}) AND ({s})", .{ wh, rd.where })
-            else
-                wh;
-        }
-    }
+    rd.where = try hintedWhere(env.arena, rd, stage.hints);
     const cfg = try resolveDbConfig(env, conn, info.port);
     return try sqlDescFor(env, info.kind, info.dialect, cfg, try readSql(env, rd), rd);
+}
+
+/// The read's WHERE with a `where` hint (a pushed-down filter) AND-ed on, unless
+/// the hint is that same WHERE. The split lanes and the serial read both take it
+/// from here, so they never read different rows.
+pub fn hintedWhere(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
+    const wh = forHintName(hints, "where") orelse return rd.where;
+    if (wh.len == 0 or std.mem.eql(u8, wh, rd.where)) return rd.where;
+    if (rd.where.len == 0) return wh;
+    return std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ wh, rd.where });
 }
 
 const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null, kind: ?split.KeyKind = null };
