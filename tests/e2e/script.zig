@@ -223,6 +223,55 @@ test "EXPLAIN mid-script explains that query without running it" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
+test "EXPLAIN ANALYZE over an input read into memory first names that read, the in-memory scan and the load's sink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,g,v\n");
+    for (0..6000) |i| try input.writer().print("{d},{c},{d}\n", .{ i, "abcde"[i % 5], i % 10 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const cases = [_]struct { q: []const u8, rows: []const u8, path: []const u8, scan: []const u8 }{
+        .{
+            .q = "WITH t AS (SELECT g, SUM(v) AS s FROM '$B/in.csv' GROUP BY g) SELECT g, s FROM t ORDER BY g",
+            .rows = "Rows read: 6.0K (6000)   Rows out: 5   Path: t read into memory first (csv parallel aggregate, ",
+            .path = "), then serial\n",
+            .scan = "  t, in memory\n",
+        },
+        .{
+            .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'",
+            .rows = "Rows read: 6.0K (6000)   Rows out: 6.0K (6000)   Path: the window's input read into memory first (csv parallel map, ",
+            .path = "), then serial\n",
+            .scan = "  the window's input, in memory\n",
+        },
+    };
+    const sink_line = try std.fmt.allocPrint(alloc, "  Sink: csv {s}/never.csv, not written: EXPLAIN ANALYZE moves no data\n", .{base});
+    defer alloc.free(sink_line);
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var rdiag: Diag = .{};
+        var cap = try StderrCapture.begin(tmp.dir);
+        const res = exec(alloc, script, .{ .threads = 4, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const prof = try cap.end(alloc);
+        defer alloc.free(prof);
+        _ = try res;
+        errdefer std.debug.print("{s}\n", .{prof});
+        try std.testing.expect(std.mem.startsWith(u8, prof, "Summary\n"));
+        const at = std.mem.indexOf(u8, prof, c.rows) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, prof[at..], c.path) != null);
+        try std.testing.expect(std.mem.indexOf(u8, prof, sink_line) != null);
+        try std.testing.expect(std.mem.indexOf(u8, prof, c.scan) != null);
+        try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
+    }
+}
+
 test "for-each over a JSON array param iterates and binds fields by name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
