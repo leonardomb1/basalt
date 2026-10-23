@@ -26,7 +26,7 @@
 
 const std = @import("std");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
-const objstore = @import("objstore.zig");
+const remotefs = @import("remotefs.zig");
 const ssh = @import("../net/ssh.zig");
 
 pub const Error = error{
@@ -92,87 +92,14 @@ pub const Conn = struct {
     host_key: ?[]const u8 = null,
 };
 
-var registry_mtx: std.Thread.Mutex = .{};
-var registry: std.StringHashMapUnmanaged(Conn) = .empty;
+const Names = remotefs.Registry(Conn, false);
 
-/// Make `sftp://name/…` reach the server `c` describes. Process-wide, as the pool
-/// is; a later registration of a name replaces the earlier one. Strings are copied.
-pub fn register(name: []const u8, c: Conn) !void {
-    const gpa = std.heap.page_allocator;
-    registry_mtx.lock();
-    defer registry_mtx.unlock();
-    var owned = c;
-    inline for (.{ "host", "user", "password", "key_file", "key_passphrase", "known_hosts", "host_key" }) |f| {
-        const v = @field(c, f);
-        if (@TypeOf(v) == []const u8) {
-            @field(owned, f) = try gpa.dupe(u8, v);
-        } else if (v) |s| @field(owned, f) = try gpa.dupe(u8, s);
-    }
-    const key = try gpa.dupe(u8, name);
-    try registry.put(gpa, key, owned);
-}
-
-pub const Target = struct {
-    cfg: ssh.Config,
-    path: []const u8,
-};
-
-/// The host may name a registered connection; otherwise the user is the URL's or
-/// `$USER`, the password `SFTP_PASSWORD`, the key `~/.ssh/id_ed25519` if present.
-/// `/~/x` is `x` under the login's home, as curl reads it; other paths are absolute.
-pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
-    if (!isUrl(url)) return error.NotSftpUrl;
-    const rest = url["sftp://".len..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSftpUrl;
-    var auth = rest[0..slash];
-    var path = rest[slash..];
-    if (std.mem.startsWith(u8, path, "/~/")) path = path[3..];
-    var user: ?[]const u8 = null;
-    if (std.mem.lastIndexOfScalar(u8, auth, '@')) |at| {
-        user = auth[0..at];
-        auth = auth[at + 1 ..];
-    }
-    var host = auth;
-    var port: ?u16 = null;
-    if (std.mem.lastIndexOfScalar(u8, auth, ':')) |c| {
-        host = auth[0..c];
-        port = std.fmt.parseInt(u16, auth[c + 1 ..], 10) catch return error.NotSftpUrl;
-    }
-    if (host.len == 0) return error.NotSftpUrl;
-
-    registry_mtx.lock();
-    const named = registry.get(host);
-    registry_mtx.unlock();
-    if (named) |c| return .{ .path = path, .cfg = .{
-        .host = c.host,
-        .port = port orelse c.port,
-        .user = user orelse c.user orelse std.posix.getenv("USER") orelse "root",
-        .password = c.password,
-        .key_file = c.key_file,
-        .key_passphrase = c.key_passphrase,
-        .known_hosts = c.known_hosts,
-        .host_key = c.host_key,
-    } };
-
-    var key_file: ?[]const u8 = null;
-    if (std.posix.getenv("HOME")) |home| {
-        const kf = try std.fmt.allocPrint(arena, "{s}/.ssh/id_ed25519", .{home});
-        if (std.fs.cwd().access(kf, .{})) |_| key_file = kf else |_| {}
-    }
-    return .{ .path = path, .cfg = .{
-        .host = host,
-        .port = port orelse 22,
-        .user = user orelse std.posix.getenv("USER") orelse "root",
-        .password = std.posix.getenv("SFTP_PASSWORD"),
-        .key_file = key_file,
-    } };
-}
+/// Make `sftp://name/…` reach the server `c` describes.
+pub const register = Names.put;
 
 pub const Client = struct {
     gpa: std.mem.Allocator,
     ssh: *ssh.Session,
-    key: []const u8,
-    idle_since: i64 = 0,
     next_id: u32 = 1,
     inbuf: std.array_list.Managed(u8),
     consumed: usize = 0,
@@ -182,12 +109,12 @@ pub const Client = struct {
     posix_rename: bool = false,
     why: std.array_list.Managed(u8),
 
-    fn open(gpa: std.mem.Allocator, cfg: ssh.Config, key: []const u8) !*Client {
+    fn open(gpa: std.mem.Allocator, cfg: ssh.Config) !*Client {
         const session = try ssh.Session.connect(gpa, cfg);
         errdefer session.close();
         try session.openSubsystem("sftp");
         const self = try gpa.create(Client);
-        self.* = .{ .gpa = gpa, .ssh = session, .key = try gpa.dupe(u8, key), .inbuf = .init(gpa), .out = .init(gpa), .why = .init(gpa) };
+        self.* = .{ .gpa = gpa, .ssh = session, .inbuf = .init(gpa), .out = .init(gpa), .why = .init(gpa) };
         errdefer self.destroy();
         var b = ssh.Buf.init(gpa);
         defer b.deinit();
@@ -230,7 +157,6 @@ pub const Client = struct {
         self.inbuf.deinit();
         self.out.deinit();
         self.why.deinit();
-        self.gpa.free(self.key);
         self.gpa.destroy(self);
     }
 
@@ -238,8 +164,10 @@ pub const Client = struct {
         return if (self.why.items.len > 0) self.why.items else self.ssh.lastError();
     }
 
-    /// Start a request of `kind`: its length is patched in by `finish`.
+    /// Start a request of `kind`, with no reason kept from an earlier one: its length
+    /// is patched in by `finish`.
     fn begin(self: *Client, kind: u8) !u32 {
+        self.why.clearRetainingCapacity();
         self.out.list.clearRetainingCapacity();
         try self.out.u32be(0);
         try self.out.byte(kind);
@@ -452,9 +380,7 @@ pub const Client = struct {
         return self.statusOf(try self.replyFor(id));
     }
 
-    pub const Entry = struct { name: []const u8, size: u64, regular: bool, dir: bool = false };
-
-    fn listDir(self: *Client, arena: std.mem.Allocator, path: []const u8) ![]Entry {
+    fn listDir(self: *Client, arena: std.mem.Allocator, path: []const u8) ![]remotefs.Entry {
         const id = try self.begin(fxp.opendir);
         try self.out.str(path);
         try self.finish();
@@ -465,7 +391,7 @@ pub const Client = struct {
         }
         var hc = ssh.Cursor{ .s = r[5..] };
         const handle = try arena.dupe(u8, try hc.str());
-        var out = std.array_list.Managed(Entry).init(arena);
+        var out = std.array_list.Managed(remotefs.Entry).init(arena);
         while (true) {
             const rid = try self.begin(fxp.readdir);
             try self.out.str(handle);
@@ -484,11 +410,9 @@ pub const Client = struct {
                 const name = try c.str();
                 _ = try c.str();
                 const a = try readAttrs(&c);
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
                 try out.append(.{
                     .name = try arena.dupe(u8, name),
-                    .size = a.size orelse 0,
-                    .regular = if (a.perms) |p| (p & 0o170000) == 0o100000 else true,
+                    .file = if (a.perms) |p| (p & 0o170000) == 0o100000 else true,
                     .dir = if (a.perms) |p| (p & 0o170000) == 0o040000 else false,
                 });
             }
@@ -523,274 +447,167 @@ fn readAttrs(c: *ssh.Cursor) !Attrs {
     return a;
 }
 
-var pool_mtx: std.Thread.Mutex = .{};
-var pool: std.ArrayListUnmanaged(*Client) = .empty;
-
-/// A session is reused only for the same login and the same trust: a connection
-/// with another key or pin must not inherit a session the first one's checks let through.
-fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
-    var h = std.hash.Wyhash.init(0);
-    inline for (.{ "password", "key_file", "key_passphrase", "known_hosts", "host_key" }) |f| {
-        const v = @field(cfg, f) orelse "";
-        h.update(std.mem.asBytes(&v.len));
-        h.update(v);
-        h.update(&[_]u8{@intFromBool(@field(cfg, f) != null)});
-    }
-    return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
-}
-
-pub fn checkout(cfg: ssh.Config) !*Client {
-    ssh.clearFailure();
-    last_error.clear();
-    var kb: [512]u8 = undefined;
-    const key = poolKey(&kb, cfg);
-    while (takePooled(key)) |c| {
-        if (alive(c)) return c;
-        c.destroy();
-    }
-    return Client.open(std.heap.page_allocator, cfg, key);
-}
-
-fn takePooled(key: []const u8) ?*Client {
-    pool_mtx.lock();
-    defer pool_mtx.unlock();
-    var i = pool.items.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, pool.items[i].key, key)) return pool.swapRemove(i);
-    }
-    return null;
-}
-
-/// A session idle for a while may have been dropped by the server or a NAT; one
-/// stat of the home directory tells before a load trips on it.
-fn alive(c: *Client) bool {
-    if (std.time.milliTimestamp() - c.idle_since < 15_000) return true;
-    const id = c.begin(fxp.stat) catch return false;
-    c.out.str(".") catch return false;
-    c.finish() catch return false;
-    const r = c.replyFor(id) catch return false;
-    return r[0] == fxp.attrs or r[0] == fxp.status;
-}
-
-/// Hand a session back for the next opener; a broken one is closed instead.
-pub fn checkin(c: *Client, healthy: bool) void {
-    if (!healthy) {
-        c.destroy();
-        return;
-    }
-    c.why.clearRetainingCapacity();
-    c.idle_since = std.time.milliTimestamp();
-    pool_mtx.lock();
-    defer pool_mtx.unlock();
-    pool.append(std.heap.page_allocator, c) catch c.destroy();
-}
-
 threadlocal var last_error: ThreadNote(512) = .{};
 
 pub fn lastError() []const u8 {
     return last_error.get();
 }
 
-pub const File = struct {
-    client: *Client,
-    handle: []const u8,
-    size: u64,
-    healthy: bool = true,
-
-    pub fn open(arena: std.mem.Allocator, url: []const u8) !*File {
-        const t = try resolve(arena, url);
-        const c = checkout(t.cfg) catch |e| {
-            last_error.set(sshWhy(e, t.cfg));
-            return e;
-        };
-        const handle = c.openHandle(t.path, flags.read) catch |e| {
-            last_error.set(c.lastError());
-            checkin(c, isProtocolOk(e));
-            return e;
-        };
-        const size = c.sizeOf(handle, t.path) catch |e| {
-            last_error.set(c.lastError());
-            c.closeHandle(handle) catch {};
-            c.gpa.free(handle);
-            checkin(c, isProtocolOk(e));
-            return e;
-        };
-        const self = try arena.create(File);
-        self.* = .{ .client = c, .handle = handle, .size = size };
-        return self;
-    }
-
-    pub fn read(self: *File, arena: std.mem.Allocator, off: u64, len: usize) ![]const u8 {
-        const buf = try arena.alloc(u8, len);
-        const n = self.client.readRange(self.handle, off, buf) catch |e| {
-            self.healthy = isProtocolOk(e);
-            return e;
-        };
-        if (n != len) return error.EndOfStream;
-        return buf;
-    }
-
-    /// For `Stream`: any failed read leaves the session unhealthy.
-    pub fn readChunk(self: *File, off: u64, buf: []u8) !usize {
-        return self.client.readRange(self.handle, off, buf) catch |e| {
-            self.healthy = false;
-            return e;
-        };
-    }
-
-    pub fn close(self: *File) void {
-        if (self.healthy) self.client.closeHandle(self.handle) catch {
-            self.healthy = false;
-        };
-        self.client.gpa.free(self.handle);
-        checkin(self.client, self.healthy);
-    }
-};
-
+const Fs = remotefs.RemoteFs(Proto);
+pub const File = Fs.File;
 /// Fetches 1 MiB at a time (32 reads in flight): fetching only the reader's 64 KiB
 /// kept two reads in flight and streamed CSV at a quarter of a Parquet read's speed.
-pub const Stream = objstore.ChunkStream(File, 1 << 20);
+pub const Stream = Fs.Stream;
+pub const Upload = Fs.Upload;
+pub const listPrefix = Fs.listPrefix;
 
-pub const Upload = struct {
-    const upload_vtable = std.Io.Writer.VTable{ .drain = objstore.drain(Upload) };
+const Proto = struct {
+    pub const Link = Client;
+    pub const Login = ssh.Config;
+    pub const Handle = struct { id: []const u8, size: u64 = 0, open: bool = true };
+    pub const Target = struct { cfg: ssh.Config, path: []const u8 };
+    pub const stream_chunk = 1 << 20;
+    pub const upload_buffer = 1 << 20;
 
-    client: *Client,
-    handle: []const u8,
-    path: []const u8,
-    part: []const u8,
-    at: u64 = 0,
-    interface: std.Io.Writer,
-    last_status: ?anyerror = null,
-    last_error: []const u8 = "",
-    err_buf: [256]u8 = undefined,
-    closed: bool = false,
-    done: bool = false,
+    /// The host may name a registered connection; otherwise the user is the URL's or
+    /// `$USER`, the password `SFTP_PASSWORD`, the key `~/.ssh/id_ed25519` if present.
+    /// `/~/x` is `x` under the login's home, as curl reads it; other paths are absolute.
+    pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
+        if (!isUrl(url)) return error.NotSftpUrl;
+        const rest = url["sftp://".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSftpUrl;
+        const a = remotefs.authority(rest[0..slash]) orelse return error.NotSftpUrl;
+        var path = rest[slash..];
+        if (std.mem.startsWith(u8, path, "/~/")) path = path[3..];
+        const user = a.userinfo orelse std.posix.getenv("USER") orelse "root";
+        if (Names.get(a.host)) |c| return .{ .path = path, .cfg = .{
+            .host = c.host,
+            .port = a.port orelse c.port,
+            .user = a.userinfo orelse c.user orelse user,
+            .password = c.password,
+            .key_file = c.key_file,
+            .key_passphrase = c.key_passphrase,
+            .known_hosts = c.known_hosts,
+            .host_key = c.host_key,
+        } };
+        var key_file: ?[]const u8 = null;
+        if (std.posix.getenv("HOME")) |home| {
+            const kf = try std.fmt.allocPrint(arena, "{s}/.ssh/id_ed25519", .{home});
+            if (std.fs.cwd().access(kf, .{})) |_| key_file = kf else |_| {}
+        }
+        return .{ .path = path, .cfg = .{
+            .host = a.host,
+            .port = a.port orelse 22,
+            .user = user,
+            .password = std.posix.getenv("SFTP_PASSWORD"),
+            .key_file = key_file,
+        } };
+    }
 
-    pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
-        const t = try resolve(arena, url);
-        const c = checkout(t.cfg) catch |e| {
-            last_error.set(sshWhy(e, t.cfg));
+    /// A session is reused only for the same login and the same trust: a connection
+    /// with another key or pin must not inherit a session the first one's checks let through.
+    pub fn poolKey(buf: []u8, cfg: ssh.Config) []const u8 {
+        var h = std.hash.Wyhash.init(0);
+        inline for (.{ "password", "key_file", "key_passphrase", "known_hosts", "host_key" }) |f| {
+            const v = @field(cfg, f) orelse "";
+            h.update(std.mem.asBytes(&v.len));
+            h.update(v);
+            h.update(&[_]u8{@intFromBool(@field(cfg, f) != null)});
+        }
+        return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
+    }
+
+    pub fn clearNotes() void {
+        ssh.clearFailure();
+        last_error.clear();
+    }
+
+    pub fn connect(cfg: ssh.Config) !*Client {
+        return Client.open(std.heap.page_allocator, cfg) catch |e| {
+            last_error.set(sshWhy(e, cfg));
             return e;
         };
-        const part = try std.fmt.allocPrint(arena, "{s}.part", .{t.path});
-        const handle = c.openHandle(part, flags.write | flags.creat | flags.trunc) catch |e| {
-            last_error.set(c.lastError());
-            checkin(c, isProtocolOk(e));
-            return e;
-        };
-        const self = try arena.create(Upload);
-        self.* = .{
-            .client = c,
-            .handle = handle,
-            .path = t.path,
-            .part = part,
-            .interface = .{ .buffer = try arena.alloc(u8, 1 << 20), .vtable = &upload_vtable },
-        };
-        return self;
     }
 
-    pub fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
-        if (bytes.len == 0) return 0;
-        self.client.writeRange(self.handle, self.at, bytes) catch |e| {
-            self.last_status = e;
-            self.keepError();
-            return error.WriteFailed;
+    /// One stat of the home directory.
+    pub fn ping(c: *Client) bool {
+        const id = c.begin(fxp.stat) catch return false;
+        c.out.str(".") catch return false;
+        c.finish() catch return false;
+        const r = c.replyFor(id) catch return false;
+        return r[0] == fxp.attrs or r[0] == fxp.status;
+    }
+
+    pub fn destroy(c: *Client) void {
+        c.destroy();
+    }
+
+    /// A file or directory error keeps the session usable; a transport error does not.
+    pub fn protocolOk(e: anyerror) bool {
+        return switch (e) {
+            error.SftpNoSuchFile, error.SftpPermissionDenied, error.SftpFailure, error.SftpUnsupported, error.EndOfStream => true,
+            else => false,
         };
-        self.at += bytes.len;
-        return bytes.len;
     }
 
-    pub fn finish(self: *Upload) !void {
-        if (self.done) return;
-        self.commit() catch |e| {
-            self.abort();
-            return e;
-        };
-        self.release();
+    pub fn why(c: *Client) []const u8 {
+        return c.lastError();
     }
 
-    fn commit(self: *Upload) !void {
-        self.interface.flush() catch |e| return self.last_status orelse e;
-        self.client.closeHandle(self.handle) catch |e| return self.fail(e);
-        self.closed = true;
-        self.client.rename(self.part, self.path) catch |e| return self.fail(e);
-    }
-
-    fn fail(self: *Upload, e: anyerror) anyerror {
-        self.last_status = e;
-        self.keepError();
+    /// `e`, its reason kept on the thread before anything else is asked of the session.
+    fn noted(c: *Client, e: anyerror) anyerror {
+        last_error.set(c.lastError());
         return e;
     }
 
-    /// The client's reason, copied: its buffer is reused once the session goes back.
-    fn keepError(self: *Upload) void {
-        const why = self.client.lastError();
-        const n = @min(why.len, self.err_buf.len);
-        @memcpy(self.err_buf[0..n], why[0..n]);
-        self.last_error = self.err_buf[0..n];
+    pub fn openRead(c: *Client, t: Target) !Handle {
+        const id = c.openHandle(t.path, flags.read) catch |e| return noted(c, e);
+        const size = c.sizeOf(id, t.path) catch |e| {
+            const err = noted(c, e);
+            c.closeHandle(id) catch {};
+            c.gpa.free(id);
+            return err;
+        };
+        return .{ .id = id, .size = size };
     }
 
-    pub fn abort(self: *Upload) void {
-        if (self.done) return;
-        if (!self.closed) self.client.closeHandle(self.handle) catch {};
-        self.client.remove(self.part) catch {};
-        self.release();
+    pub fn openWrite(c: *Client, _: Target, part: []const u8) !Handle {
+        return .{ .id = c.openHandle(part, flags.write | flags.creat | flags.trunc) catch |e| return noted(c, e) };
     }
 
-    fn release(self: *Upload) void {
-        self.done = true;
-        self.client.gpa.free(self.handle);
-        checkin(self.client, if (self.last_status) |e| isProtocolOk(e) else true);
+    pub fn readAt(c: *Client, h: Handle, off: u64, buf: []u8) !usize {
+        return c.readRange(h.id, off, buf);
+    }
+
+    pub fn writeAt(c: *Client, h: Handle, off: u64, data: []const u8) !void {
+        return c.writeRange(h.id, off, data);
+    }
+
+    pub fn closeHandle(c: *Client, h: Handle) !void {
+        return c.closeHandle(h.id);
+    }
+
+    pub fn freeHandle(c: *Client, h: Handle) void {
+        c.gpa.free(h.id);
+    }
+
+    pub fn commit(c: *Client, h: *Handle, part: []const u8, path: []const u8) !void {
+        try c.closeHandle(h.id);
+        h.open = false;
+        try c.rename(part, path);
+    }
+
+    pub fn discard(c: *Client, h: *Handle, part: []const u8) void {
+        if (h.open) c.closeHandle(h.id) catch {};
+        c.remove(part) catch {};
+    }
+
+    pub fn listDir(c: *Client, arena: std.mem.Allocator, t: Target, rel: []const u8) ![]const remotefs.Entry {
+        const top = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
+        const dir = if (rel.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ top, rel }) else if (top.len == 0) "." else top;
+        return c.listDir(arena, dir) catch |e| return noted(c, e);
     }
 };
-
-/// How deep a folder read descends; a server whose listing loops (a folder that
-/// lists itself) is cut off here rather than walked forever.
-const max_walk_depth = 32;
-
-/// The regular files under `url` (ending in `/`) as `/`-separated paths relative to
-/// it, subfolders included but not those starting `_` or `.`, in server order.
-pub fn listPrefix(arena: std.mem.Allocator, url: []const u8) ![]const []const u8 {
-    const t = try resolve(arena, url);
-    const c = checkout(t.cfg) catch |e| {
-        last_error.set(sshWhy(e, t.cfg));
-        return e;
-    };
-    var healthy = true;
-    defer checkin(c, healthy);
-    const top = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
-    var names = std.array_list.Managed([]const u8).init(arena);
-    var todo = std.array_list.Managed([]const u8).init(arena);
-    try todo.append("");
-    while (todo.pop()) |rel| {
-        const dir = if (rel.len == 0) (if (top.len == 0) "." else top) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ top, rel });
-        const entries = c.listDir(arena, dir) catch |e| {
-            last_error.set(c.lastError());
-            healthy = isProtocolOk(e);
-            return e;
-        };
-        if (std.mem.count(u8, rel, "/") >= max_walk_depth) return error.FolderTooDeep;
-        for (entries) |en| {
-            if (en.name.len == 0 or std.mem.indexOfAny(u8, en.name, "/\\") != null) continue;
-            if (std.mem.eql(u8, en.name, ".") or std.mem.eql(u8, en.name, "..")) continue;
-            const sub = if (rel.len == 0) en.name else try std.fmt.allocPrint(arena, "{s}/{s}", .{ rel, en.name });
-            if (en.dir) {
-                if (en.name[0] != '_' and en.name[0] != '.') try todo.append(sub);
-            } else if (en.regular) try names.append(sub);
-        }
-        if (names.items.len > 1_000_000) return error.FolderTooLarge;
-    }
-    return names.items;
-}
-
-/// A file or directory error keeps the session usable; a transport error does not.
-fn isProtocolOk(e: anyerror) bool {
-    return switch (e) {
-        error.SftpNoSuchFile, error.SftpPermissionDenied, error.SftpFailure, error.SftpUnsupported, error.EndOfStream => true,
-        else => false,
-    };
-}
 
 threadlocal var why_buf: [600]u8 = undefined;
 
@@ -806,15 +623,15 @@ test "sftp URLs: user, port, home-relative, registered names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const t = try resolve(a, "sftp://ana@files.example.com:2222/in/x.csv");
+    const t = try Proto.resolve(a, "sftp://ana@files.example.com:2222/in/x.csv");
     try std.testing.expectEqualStrings("files.example.com", t.cfg.host);
     try std.testing.expectEqual(@as(u16, 2222), t.cfg.port);
     try std.testing.expectEqualStrings("ana", t.cfg.user);
     try std.testing.expectEqualStrings("/in/x.csv", t.path);
-    try std.testing.expectEqualStrings("x.csv", (try resolve(a, "sftp://h/~/x.csv")).path);
-    try std.testing.expectError(error.NotSftpUrl, resolve(a, "sftp://nohostpath"));
+    try std.testing.expectEqualStrings("x.csv", (try Proto.resolve(a, "sftp://h/~/x.csv")).path);
+    try std.testing.expectError(error.NotSftpUrl, Proto.resolve(a, "sftp://nohostpath"));
     try register("bank_t", .{ .host = "sftp.bank.example", .port = 2200, .user = "u1", .password = "p" });
-    const b = try resolve(a, "sftp://bank_t/ret/a.ret");
+    const b = try Proto.resolve(a, "sftp://bank_t/ret/a.ret");
     try std.testing.expectEqualStrings("sftp.bank.example", b.cfg.host);
     try std.testing.expectEqual(@as(u16, 2200), b.cfg.port);
     try std.testing.expectEqualStrings("u1", b.cfg.user);

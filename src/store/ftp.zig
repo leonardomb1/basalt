@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const remotefs = @import("remotefs.zig");
 const percentDecode = @import("../net/percent.zig").decode;
 
 pub const default_port = 21;
@@ -45,55 +46,29 @@ pub const Conn = struct {
     password: ?[]const u8 = null,
 };
 
-var registry_mtx: std.Thread.Mutex = .{};
-var registry: std.StringHashMapUnmanaged(Conn) = .empty;
+const Names = remotefs.Registry(Conn, false);
 
-/// Make `ftp://name/…` reach the server `c` describes. Process-wide, as sftp's
-/// are; a later registration of a name replaces the earlier one. Strings are copied.
-pub fn register(name: []const u8, c: Conn) !void {
-    const gpa = std.heap.page_allocator;
-    registry_mtx.lock();
-    defer registry_mtx.unlock();
-    var owned = c;
-    owned.host = try gpa.dupe(u8, c.host);
-    if (c.user) |u| owned.user = try gpa.dupe(u8, u);
-    if (c.password) |p| owned.password = try gpa.dupe(u8, p);
-    const gop = try registry.getOrPut(gpa, name);
-    if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, name);
-    gop.value_ptr.* = owned;
-}
-
-fn registered(name: []const u8) ?Conn {
-    registry_mtx.lock();
-    defer registry_mtx.unlock();
-    return registry.get(name);
-}
+/// Make `ftp://name/…` reach the server `c` describes.
+pub const register = Names.put;
 
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
     if (!isUrl(url)) return error.InvalidFtpUrl;
     const rest = url["ftp://".len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    var authority = rest[0..slash];
+    const a = remotefs.authority(rest[0..slash]) orelse return error.InvalidFtpUrl;
     const path = try percentDecode(arena, if (slash < rest.len) rest[slash..] else "/");
 
     var user: ?[]const u8 = null;
     var pass: ?[]const u8 = null;
-    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
-        const info = authority[0..at];
-        authority = authority[at + 1 ..];
+    if (a.userinfo) |info| {
         if (std.mem.indexOfScalar(u8, info, ':')) |c| {
             user = try percentDecode(arena, info[0..c]);
             pass = try percentDecode(arena, info[c + 1 ..]);
         } else user = try percentDecode(arena, info);
     }
-    var host = authority;
-    var port: ?u16 = null;
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
-        host = authority[0..c];
-        port = std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return error.InvalidFtpUrl;
-    }
-    if (host.len == 0) return error.InvalidFtpUrl;
-    if (registered(host)) |c| return .{
+    const host = a.host;
+    const port = a.port;
+    if (Names.get(host)) |c| return .{
         .host = c.host,
         .port = port orelse c.port,
         .user = user orelse c.user orelse "anonymous",
@@ -258,12 +233,10 @@ pub const Session = struct {
         return body.items;
     }
 
-    pub const Entry = struct { name: []const u8, dir: bool };
-
     /// What folder `path` holds, without `.` or `..`: by MLSD, whose lines say
     /// which entry is a folder, else by NLST with a `CWD` to each name to tell.
-    pub fn entries(self: *Session, arena: std.mem.Allocator, path: []const u8) ![]const Entry {
-        var out = std.array_list.Managed(Entry).init(arena);
+    pub fn entries(self: *Session, arena: std.mem.Allocator, path: []const u8) ![]const remotefs.Entry {
+        var out = std.array_list.Managed(remotefs.Entry).init(arena);
         mlsd: {
             const data = self.transfer("MLSD", path) catch |e| switch (e) {
                 error.FtpRefused => break :mlsd,
@@ -283,11 +256,12 @@ pub const Session = struct {
         while (it.next()) |raw| {
             const name = std.fs.path.basenamePosix(std.mem.trimRight(u8, raw, "/"));
             if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            try out.append(.{ .name = name, .dir = false });
+            try out.append(.{ .name = name, .dir = false, .file = true });
         }
         for (out.items) |*en| {
             const r = try self.command("CWD {s}{s}", .{ path, en.name });
             en.dir = r.code == 250;
+            en.file = !en.dir;
         }
         return out.items;
     }
@@ -296,7 +270,7 @@ pub const Session = struct {
 /// A file or folder in an MLSD listing (`type=file;size=12; name`); `cdir`,
 /// `pdir` and links are left out, and so is a name that is not one path part
 /// (`a/../x`, `..`, a NUL), which would land outside the download folder.
-pub fn mlsdEntry(line: []const u8) ?Session.Entry {
+pub fn mlsdEntry(line: []const u8) ?remotefs.Entry {
     const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return null;
     const name = line[sp + 1 ..];
     if (name.len == 0 or std.mem.indexOfAny(u8, name, "/\\\x00") != null) return null;
@@ -305,8 +279,8 @@ pub fn mlsdEntry(line: []const u8) ?Session.Entry {
     while (facts.next()) |f| {
         if (f.len < 5 or !std.ascii.eqlIgnoreCase(f[0..5], "type=")) continue;
         const t = f[5..];
-        if (std.ascii.eqlIgnoreCase(t, "file")) return .{ .name = name, .dir = false };
-        if (std.ascii.eqlIgnoreCase(t, "dir")) return .{ .name = name, .dir = true };
+        if (std.ascii.eqlIgnoreCase(t, "file")) return .{ .name = name, .dir = false, .file = true };
+        if (std.ascii.eqlIgnoreCase(t, "dir")) return .{ .name = name, .dir = true, .file = false };
         return null;
     }
     return null;
@@ -386,12 +360,16 @@ fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const s = try Session.open(gpa, u);
     defer s.close();
     const result = if (url[url.len - 1] == '/') blk: {
-        var files = std.array_list.Managed(Remote).init(arena);
-        try walk(s, arena, u.path, "", 0, &files);
-        for (files.items) |f| {
-            const dest = try std.fs.path.join(arena, &.{ sub, f.rel });
+        var lister = Lister{ .s = s, .arena = arena, .top = u.path };
+        const rels = remotefs.walk(arena, &lister, .{ .max_files = max_folder_files, .skip_hidden_files = true }) catch |e| return switch (e) {
+            error.FolderTooDeep => note(error.FtpFolderTooDeep, "the folder nests more than 32 levels deep"),
+            error.FolderTooLarge => note(error.FtpFolderTooLarge, "the folder holds more than 10000 files; read a subfolder or a file"),
+            else => e,
+        };
+        for (rels) |rel| {
+            const dest = try std.fs.path.join(arena, &.{ sub, rel });
             if (std.fs.path.dirname(dest)) |d| try std.fs.cwd().makePath(d);
-            try download(s, f.remote, dest);
+            try download(s, try std.mem.concat(arena, u8, &.{ u.path, rel }), dest);
         }
         break :blk try std.fmt.allocPrint(arena, "{s}/", .{sub});
     } else blk: {
@@ -407,27 +385,19 @@ fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
 /// A folder read fetches at most this many files, so a URL one level too high
 /// fails fast rather than copying a whole public archive.
 pub const max_folder_files = 10_000;
-const max_depth = 32;
 
-const Remote = struct { remote: []const u8, rel: []const u8 };
+/// Folder `top` (ending in `/`) for `remotefs.walk`, hidden files skipped too, as
+/// a folder read would not read them.
+const Lister = struct {
+    s: *Session,
+    arena: std.mem.Allocator,
+    top: []const u8,
 
-/// Every file under folder `dir` (ending in `/`), subfolders included, skipping
-/// names that start with `_` or `.` as every folder read does.
-fn walk(s: *Session, arena: std.mem.Allocator, dir: []const u8, rel: []const u8, depth: usize, out: *std.array_list.Managed(Remote)) anyerror!void {
-    if (depth > max_depth) return note(error.FtpFolderTooDeep, "the folder nests more than 32 levels deep");
-    for (try s.entries(arena, dir)) |en| {
-        if (en.name[0] == '_' or en.name[0] == '.') continue;
-        const remote = try std.mem.concat(arena, u8, &.{ dir, en.name });
-        const r = try std.mem.concat(arena, u8, &.{ rel, en.name });
-        if (en.dir) {
-            try walk(s, arena, try std.mem.concat(arena, u8, &.{ remote, "/" }), try std.mem.concat(arena, u8, &.{ r, "/" }), depth + 1, out);
-        } else {
-            if (out.items.len == max_folder_files)
-                return note(error.FtpFolderTooLarge, "the folder holds more than 10000 files; read a subfolder or a file");
-            try out.append(.{ .remote = remote, .rel = r });
-        }
+    pub fn list(self: *Lister, rel: []const u8) ![]const remotefs.Entry {
+        const dir = if (rel.len == 0) self.top else try std.mem.concat(self.arena, u8, &.{ self.top, rel, "/" });
+        return self.s.entries(self.arena, dir);
     }
-}
+};
 
 fn note(e: anyerror, text: []const u8) anyerror {
     last_err.set(text);
@@ -528,11 +498,11 @@ test "an MLSD line is a file or a folder by its type fact; the current and paren
     try std.testing.expectEqualStrings("dados 2026.csv", f.name);
     try std.testing.expect(!f.dir);
     try std.testing.expect(mlsdEntry("modify=1;Type=DIR; sub").?.dir);
-    try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("type=cdir; ."));
-    try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("type=pdir; .."));
-    try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry("garbage"));
+    try std.testing.expectEqual(@as(?remotefs.Entry, null), mlsdEntry("type=cdir; ."));
+    try std.testing.expectEqual(@as(?remotefs.Entry, null), mlsdEntry("type=pdir; .."));
+    try std.testing.expectEqual(@as(?remotefs.Entry, null), mlsdEntry("garbage"));
     for ([_][]const u8{ "type=file; a/../../../home/u/.ssh/authorized_keys", "type=file; ..", "type=dir; .", "type=file; a\\b", "type=file; a\x00b" }) |line| {
-        try std.testing.expectEqual(@as(?Session.Entry, null), mlsdEntry(line));
+        try std.testing.expectEqual(@as(?remotefs.Entry, null), mlsdEntry(line));
     }
 }
 
