@@ -347,14 +347,73 @@ fn binaryVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecErro
 fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
     const int_lane = isIntNum(l) and isIntNum(r);
     switch (op) {
-        inline .add, .sub, .mul, .div, .mod, .eq, .ne, .lt, .le, .gt, .ge => |cop| {
+        inline .add, .sub, .mul, .div, .mod => |cop| {
             return if (int_lane)
                 numOpVecT(i64, cop, arena, l, r, n)
             else
                 numOpVecT(f64, cop, arena, l, r, n);
         },
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| {
+            return if (int_lane)
+                cmpVecT(i64, cop, arena, l, r, n)
+            else
+                cmpVecT(f64, cop, arena, l, r, n);
+        },
         else => unreachable,
     }
+}
+
+/// One side of a comparison as `T` lanes: a column's values (an INT column widened
+/// once for the float lane) or a constant.
+fn Lane(comptime T: type) type {
+    return union(enum) { col: []const T, one: T };
+}
+
+fn laneOf(comptime T: type, arena: std.mem.Allocator, x: Num, n: usize) VecError!Lane(T) {
+    return switch (x) {
+        .icol => |c| if (T == i64) .{ .col = c.d } else blk: {
+            const out = try arena.alloc(f64, n);
+            for (out, c.d[0..n]) |*o, v| o.* = @floatFromInt(v);
+            break :blk .{ .col = out };
+        },
+        .fcol => |c| if (T == f64) .{ .col = c.d } else unreachable,
+        .iscalar, .fscalar => .{ .one = numAt(T, x, 0) },
+    };
+}
+
+fn numValidity(x: Num) ?Bitmap {
+    return switch (x) {
+        .icol => |c| c.v,
+        .fcol => |c| c.v,
+        else => null,
+    };
+}
+
+/// `op` over every row, null rows included (a comparison cannot fail), with the
+/// operands' validity adopted as the result's.
+fn cmpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator, l: Num, r: Num, n: usize) VecError!Vec {
+    const bm = try Bitmap.initFull(arena, n);
+    for ([_]?Bitmap{ numValidity(l), numValidity(r) }) |v| if (v) |src| for (bm.bits, src.bits[0..bm.bits.len]) |*o, x| {
+        o.* &= x;
+    };
+    var f = try Filled(bool).masked(arena, n, bm);
+    switch (try laneOf(T, arena, l, n)) {
+        .col => |a| switch (try laneOf(T, arena, r, n)) {
+            .col => |b| for (f.d, a[0..n], b[0..n]) |*o, x, y| {
+                o.* = cmpLane(T, op, x, y);
+            },
+            .one => |y| for (f.d, a[0..n]) |*o, x| {
+                o.* = cmpLane(T, op, x, y);
+            },
+        },
+        .one => |x| switch (try laneOf(T, arena, r, n)) {
+            .col => |b| for (f.d, b[0..n]) |*o, y| {
+                o.* = cmpLane(T, op, x, y);
+            },
+            .one => |y| @memset(f.d, cmpLane(T, op, x, y)),
+        },
+    }
+    return f.finish(Type.init(.bool));
 }
 
 /// Applies `op` elementwise over operands widened to comptime `T`. All-valid
@@ -457,8 +516,7 @@ fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
     };
 }
 
-/// Div/mod raise on a zero divisor and int add/sub/mul on overflow; f64
-/// compares through `orderF64`, since `std.math.order` is `unreachable` on NaN.
+/// Div/mod raise on a zero divisor and int add/sub/mul on overflow.
 inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
     return switch (op) {
         .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
@@ -466,7 +524,35 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
         .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
         .div => if (T == i64) intDiv(a, d) else if (d == 0) error.DivByZero else a / d,
         .mod => if (T == i64) intRem(a, d) else if (d == 0) error.DivByZero else @rem(a, d),
-        .eq, .ne, .lt, .le, .gt, .ge => cmpResult(op, if (T == f64) orderF64(a, d) else std.math.order(a, d)),
+        .eq, .ne, .lt, .le, .gt, .ge => cmpLane(T, op, a, d),
+        else => unreachable,
+    };
+}
+
+/// A comparison without branches. f64 follows `orderF64`'s total order, where NaN
+/// equals NaN and sorts above every number, so the lanes vectorize.
+inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
+    if (T != f64) return switch (op) {
+        .eq => a == d,
+        .ne => a != d,
+        .lt => a < d,
+        .le => a <= d,
+        .gt => a > d,
+        .ge => a >= d,
+        else => unreachable,
+    };
+    const an = std.math.isNan(a);
+    const dn = std.math.isNan(d);
+    const eq = (a == d) | (an & dn);
+    const lt = (a < d) | (!an & dn);
+    const gt = (a > d) | (an & !dn);
+    return switch (op) {
+        .eq => eq,
+        .ne => !eq,
+        .lt => lt,
+        .le => !gt,
+        .gt => gt,
+        .ge => !lt,
         else => unreachable,
     };
 }
@@ -1514,6 +1600,35 @@ test "vectorized kernels match the rowwise evaluator" {
             }
         }
     }
+}
+
+test "float comparisons on the vector lanes order NaN and signed zero as the row path does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const fs = [_]?f64{ nan, -0.0, 0.0, 1.5, null, nan, -inf, 2 };
+    const gs = [_]?f64{ nan, 0.0, nan, 1.5, 2, -inf, nan, null };
+    var fb = column.Builder.init(a, Type.init(.float).asNullable());
+    var gb = column.Builder.init(a, Type.init(.float).asNullable());
+    for (fs, gs) |f, g| {
+        try fb.append(if (f) |x| .{ .float = x } else .null);
+        try gb.append(if (g) |x| .{ .float = x } else .null);
+    }
+    const x = try column.intColumn(a, &.{ 1, 0, 0, 2, 3, null, 7, 2 });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "f", .ty = Type.init(.float).asNullable() },
+        .{ .name = "g", .ty = Type.init(.float).asNullable() },
+        .{ .name = "x", .ty = Type.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ try fb.finish(), try gb.finish(), x };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = fs.len };
+    try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{
+        "f < g",     "f <= g",    "f = g",        "f <> g",      "f > g",  "f >= g",
+        "f = 0e0",   "f < 0e0",   "0.5e0 >= f",   "f > x",       "x <= f", "x = f",
+        "x < 2",     "2 >= x",    "f = 0.0 / 0e0", "1e0 < 2",
+    }, true);
 }
 
 test "vectorized string kernels match the rowwise evaluator" {
