@@ -582,3 +582,307 @@ fn intPredHolds(pred_in: []const u8, id: i64) bool {
     }
     return id >= lo and (hi == null or id < hi.?);
 }
+
+/// A test connection answering every query with one batch of `rows`, or none,
+/// recording each query's text and every open and close.
+const FakeConn = struct {
+    arena: std.mem.Allocator,
+    rows: []const []const Value = &.{},
+    no_batch: bool = false,
+    fail_open: bool = false,
+    fail_query: bool = false,
+    served: bool = false,
+    queries: std.ArrayListUnmanaged([]const u8) = .empty,
+    opens: usize = 0,
+    conn_closes: usize = 0,
+    cursor_closes: usize = 0,
+
+    const conn_vt = sql.Conn.VTable{ .queryCursor = queryCursor, .exec = exec, .close = closeConn };
+    const cursor_vt = sql.Cursor.VTable{ .schema = schema, .nextBatch = nextBatch, .close = closeCursor };
+
+    fn prober(self: *FakeConn) Prober {
+        return .{ .ctx = self, .openFn = open };
+    }
+
+    fn open(ctx: *anyopaque) anyerror!Conn {
+        const self: *FakeConn = @ptrCast(@alignCast(ctx));
+        if (self.fail_open) return error.ConnectionRefused;
+        self.opens += 1;
+        self.served = false;
+        return .{ .ptr = self, .vtable = &conn_vt };
+    }
+
+    fn queryCursor(p: *anyopaque, q: []const u8) anyerror!sql.Cursor {
+        const self: *FakeConn = @ptrCast(@alignCast(p));
+        try self.queries.append(self.arena, try self.arena.dupe(u8, q));
+        if (self.fail_query) return error.QueryFailed;
+        return .{ .ptr = self, .vtable = &cursor_vt };
+    }
+
+    fn exec(_: *anyopaque, _: []const u8) anyerror!void {}
+
+    fn closeConn(p: *anyopaque) void {
+        const self: *FakeConn = @ptrCast(@alignCast(p));
+        self.conn_closes += 1;
+    }
+
+    fn schema(_: *anyopaque) @import("../lang/types.zig").Schema {
+        return .{ .fields = &.{} };
+    }
+
+    fn closeCursor(p: *anyopaque) void {
+        const self: *FakeConn = @ptrCast(@alignCast(p));
+        self.cursor_closes += 1;
+    }
+
+    fn nextBatch(p: *anyopaque, arena: std.mem.Allocator) anyerror!?@import("../exec/batch.zig").Batch {
+        const self: *FakeConn = @ptrCast(@alignCast(p));
+        if (self.no_batch or self.served) return null;
+        self.served = true;
+        const types = @import("../lang/types.zig");
+        const column = @import("../exec/column.zig");
+        const ncols: usize = if (self.rows.len == 0) 3 else self.rows[0].len;
+        const fields = try arena.alloc(types.Schema.Field, ncols);
+        const cols = try arena.alloc(column.Column, ncols);
+        for (0..ncols) |c| {
+            var kind: types.TypeKind = .int;
+            for (self.rows) |r| if (!r[c].isNull()) {
+                kind = switch (r[c]) {
+                    .string => .string,
+                    .date => .date,
+                    .timestamp => .timestamp,
+                    else => .int,
+                };
+                break;
+            };
+            const ty = types.Type.init(kind).asNullable();
+            fields[c] = .{ .name = "c", .ty = ty };
+            var b = column.Builder.init(arena, ty);
+            for (self.rows) |r| try b.append(r[c]);
+            cols[c] = try b.finish();
+        }
+        const sch = try arena.create(types.Schema);
+        sch.* = .{ .fields = fields };
+        return .{ .schema = sch, .columns = cols, .len = self.rows.len };
+    }
+};
+
+test "plan probes the key's bounds and slices them per kind, the NULL keys in slice 0" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+
+    var f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = 1 }, .{ .int = 1000 } }} };
+    const p = (try plan(a, f.prober(), .postgres, base, .{ .col = "id", .kind = .int }, 4)).?;
+    try std.testing.expectEqualStrings("SELECT MIN(\"id\") AS lo, MAX(\"id\") AS hi FROM (SELECT * FROM t) _b", f.queries.items[0]);
+    try std.testing.expectEqual(KeyKind.int, p.key.kind);
+    try std.testing.expectEqualStrings(base, p.base_sql);
+    const want_int = [_][]const u8{
+        "((\"id\" >= 1 AND \"id\" < 251) OR \"id\" IS NULL)",
+        "\"id\" >= 251 AND \"id\" < 501",
+        "\"id\" >= 501 AND \"id\" < 751",
+        "\"id\" >= 751",
+    };
+    try std.testing.expectEqual(want_int.len, p.predicates.len);
+    for (want_int, p.predicates) |w, g| try std.testing.expectEqualStrings(w, g);
+    try std.testing.expectEqual(@as(usize, 1), f.cursor_closes);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = 19723 }, .{ .date = 19725 } }} };
+    const pd = (try plan(a, f.prober(), .sqlserver, base, .{ .col = "d", .kind = .date }, 8)).?;
+    try std.testing.expectEqualStrings("SELECT MIN([d]) AS lo, MAX([d]) AS hi FROM (SELECT * FROM t) _b", f.queries.items[0]);
+    const want_date = [_][]const u8{
+        "(([d] >= '2024-01-01' AND [d] < '2024-01-02') OR [d] IS NULL)",
+        "[d] >= '2024-01-02' AND [d] < '2024-01-03'",
+        "[d] >= '2024-01-03'",
+    };
+    try std.testing.expectEqual(want_date.len, pd.predicates.len);
+    for (want_date, pd.predicates) |w, g| try std.testing.expectEqualStrings(w, g);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = -5 }, .{ .int = 5 } }} };
+    const pa = (try plan(a, f.prober(), .mysql, base, .{ .col = "k", .kind = .auto }, 2)).?;
+    try std.testing.expectEqual(KeyKind.int, pa.key.kind);
+    try std.testing.expectEqualStrings("((`k` >= -5 AND `k` < 1) OR `k` IS NULL)", pa.predicates[0]);
+    try std.testing.expectEqualStrings("`k` >= 1", pa.predicates[1]);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .timestamp = 19723 * 86_400_000_000 + 5 }, .{ .timestamp = 19724 * 86_400_000_000 + 7 } }} };
+    const pt = (try plan(a, f.prober(), .postgres, base, .{ .col = "ts", .kind = .auto }, 4)).?;
+    try std.testing.expectEqual(KeyKind.date, pt.key.kind);
+    try std.testing.expectEqual(@as(usize, 2), pt.predicates.len);
+    try std.testing.expectEqualStrings("((\"ts\" >= '2024-01-01' AND \"ts\" < '2024-01-02') OR \"ts\" IS NULL)", pt.predicates[0]);
+    try std.testing.expectEqualStrings("\"ts\" >= '2024-01-02'", pt.predicates[1]);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{.{ .int = 1 }}} };
+    const pu = (try plan(a, f.prober(), .postgres, base, .{ .col = "u", .kind = .uuid }, 2)).?;
+    try std.testing.expectEqualStrings("SELECT 1 FROM (SELECT * FROM t) _e LIMIT 1", f.queries.items[0]);
+    try std.testing.expectEqualStrings("(\"u\" < '80000000-0000-0000-0000-000000000000' OR \"u\" IS NULL)", pu.predicates[0]);
+    try std.testing.expectEqualStrings("\"u\" >= '80000000-0000-0000-0000-000000000000'", pu.predicates[1]);
+}
+
+test "plan stays serial when the bounds probe finds nothing to slice" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+    const Case = struct { rows: []const []const Value = &.{}, kind: KeyKind, no_batch: bool = false, fail_open: bool = false, fail_query: bool = false };
+    const cases = [_]Case{
+        .{ .kind = .int, .rows = &.{&.{ .{ .int = 7 }, .{ .int = 7 } }} },
+        .{ .kind = .int, .rows = &.{&.{ .null, .null }} },
+        .{ .kind = .int, .rows = &.{&.{ .{ .string = "a" }, .{ .string = "z" } }} },
+        .{ .kind = .int, .rows = &.{} },
+        .{ .kind = .int, .no_batch = true },
+        .{ .kind = .int, .fail_open = true },
+        .{ .kind = .int, .fail_query = true },
+        .{ .kind = .date, .rows = &.{&.{ .{ .date = 9 }, .{ .date = 9 } }} },
+        .{ .kind = .date, .rows = &.{&.{ .{ .string = "2024-01-01" }, .{ .date = 9 } }} },
+        .{ .kind = .date, .rows = &.{} },
+        .{ .kind = .date, .no_batch = true },
+        .{ .kind = .date, .fail_open = true },
+        .{ .kind = .date, .fail_query = true },
+        .{ .kind = .auto, .rows = &.{&.{ .{ .int = 3 }, .{ .int = 2 } }} },
+        .{ .kind = .auto, .rows = &.{&.{ .{ .date = 10 }, .{ .date = 10 } }} },
+        .{ .kind = .auto, .rows = &.{&.{ .{ .string = "a" }, .{ .string = "b" } }} },
+        .{ .kind = .auto, .rows = &.{&.{ .null, .{ .int = 1 } }} },
+        .{ .kind = .auto, .rows = &.{} },
+        .{ .kind = .auto, .no_batch = true },
+        .{ .kind = .auto, .fail_open = true },
+        .{ .kind = .auto, .fail_query = true },
+        .{ .kind = .uuid, .no_batch = true },
+        .{ .kind = .uuid, .rows = &.{} },
+    };
+    for (cases, 0..) |cs, i| {
+        var f = FakeConn{ .arena = a, .rows = cs.rows, .no_batch = cs.no_batch, .fail_open = cs.fail_open, .fail_query = cs.fail_query };
+        const got = try plan(a, f.prober(), .postgres, base, .{ .col = "k", .kind = cs.kind }, 4);
+        if (got != null) {
+            std.debug.print("case {d} split into {d}\n", .{ i, got.?.predicates.len });
+            return error.TestUnexpectedResult;
+        }
+        if (cs.fail_query) try std.testing.expectEqual(@as(usize, 1), f.conn_closes);
+    }
+}
+
+test "a uuid split whose emptiness probe fails still fans out" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_]bool{ true, false }) |fail_open| {
+        var f = FakeConn{ .arena = a, .fail_open = fail_open, .fail_query = !fail_open };
+        const p = (try plan(a, f.prober(), .postgres, "SELECT * FROM t", .{ .col = "u", .kind = .uuid }, 3)).?;
+        try std.testing.expectEqual(@as(usize, 3), p.predicates.len);
+        try std.testing.expectEqualStrings("\"u\" >= '55555555-5555-5555-5555-555555555555' AND \"u\" < 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'", p.predicates[1]);
+    }
+}
+
+test "range slicing: the full i64 span is computed in i128, a one-value span is one slice" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const wide = try intRangePreds(a, .postgres, "id", std.math.minInt(i64), std.math.maxInt(i64), 4);
+    const want = [_][]const u8{
+        "((\"id\" >= -9223372036854775808 AND \"id\" < -4611686018427387904) OR \"id\" IS NULL)",
+        "\"id\" >= -4611686018427387904 AND \"id\" < 0",
+        "\"id\" >= 0 AND \"id\" < 4611686018427387904",
+        "\"id\" >= 4611686018427387904",
+    };
+    try std.testing.expectEqual(want.len, wide.len);
+    for (want, wide) |w, g| try std.testing.expectEqualStrings(w, g);
+    for ([_]i64{ std.math.minInt(i64), -1, 0, std.math.maxInt(i64) }) |id| {
+        var hits: usize = 0;
+        for (wide) |p| if (intPredHolds(p, id)) {
+            hits += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+
+    const one = try intRangePreds(a, .sqlserver, "id", 5, 5, 4);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("([id] >= 5 OR [id] IS NULL)", one[0]);
+    const one_day = try dateRangePreds(a, .mysql, "d", 19723, 19723, 4);
+    try std.testing.expectEqual(@as(usize, 1), one_day.len);
+    try std.testing.expectEqualStrings("(`d` >= '2024-01-01' OR `d` IS NULL)", one_day[0]);
+}
+
+test "wrap and wrapProjected put the split predicate and a pushed filter around the base" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("SELECT * FROM (SELECT * FROM t) _split WHERE id >= 5", try wrap(a, "SELECT * FROM t", "id >= 5"));
+    try std.testing.expectEqualStrings(
+        "SELECT \"a\", \"b\" FROM (SELECT * FROM t) _split WHERE id >= 5 AND (c > 1 OR c IS NULL)",
+        try wrapProjected(a, "SELECT * FROM t", "\"a\", \"b\"", "id >= 5", "c > 1 OR c IS NULL"),
+    );
+}
+
+test "introspectKey reads a single-column primary key's name, kind and row estimate" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const kinds = [_]struct { typ: []const u8, kind: ?KeyKind }{
+        .{ .typ = "int8", .kind = .int },
+        .{ .typ = "bigserial", .kind = .int },
+        .{ .typ = "mediumint", .kind = .int },
+        .{ .typ = "timestamptz", .kind = .date },
+        .{ .typ = "datetime2", .kind = .date },
+        .{ .typ = "smalldatetime", .kind = .date },
+        .{ .typ = "uuid", .kind = .uuid },
+        .{ .typ = "uniqueidentifier", .kind = .uuid },
+        .{ .typ = "varchar", .kind = null },
+        .{ .typ = "numeric", .kind = null },
+    };
+    for (kinds) |k| {
+        var f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .string = "id" }, .{ .string = k.typ }, .{ .int = 3_000_000 } }} };
+        const got = try introspectKey(a, f.prober(), .postgres, &.{ "public", "t" });
+        if (k.kind) |want| {
+            try std.testing.expectEqualStrings("id", got.?.key.col);
+            try std.testing.expectEqual(want, got.?.key.kind);
+            try std.testing.expectEqual(@as(i64, 3_000_000), got.?.est_rows);
+        } else try std.testing.expectEqual(@as(?KeyInfo, null), got);
+    }
+
+    var f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .string = "id" }, .{ .string = "int" }, .null }} };
+    try std.testing.expectEqual(@as(i64, 0), (try introspectKey(a, f.prober(), .mysql, &.{ "db", "t" })).?.est_rows);
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = 'db' AND k.TABLE_NAME = 't'") != null);
+
+    f = FakeConn{ .arena = a, .rows = &.{ &.{ .{ .string = "a" }, .{ .string = "int" }, .{ .int = 9 } }, &.{ .{ .string = "b" }, .{ .string = "int" }, .{ .int = 9 } } } };
+    try std.testing.expectEqual(@as(?KeyInfo, null), try introspectKey(a, f.prober(), .sqlserver, &.{ "dbo", "t" }));
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID('[dbo].[t]') AND i.is_primary_key = 1") != null);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{ .null, .{ .string = "int" }, .{ .int = 9 } }} };
+    try std.testing.expectEqual(@as(?KeyInfo, null), try introspectKey(a, f.prober(), .postgres, &.{"t"}));
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE i.indrelid = '\"t\"'::regclass AND i.indisprimary") != null);
+
+    for ([_]FakeConn{
+        .{ .arena = a, .no_batch = true },
+        .{ .arena = a, .fail_open = true },
+        .{ .arena = a, .fail_query = true },
+    }) |base| {
+        f = base;
+        try std.testing.expectEqual(@as(?KeyInfo, null), try introspectKey(a, f.prober(), .starrocks, &.{ "db", "t" }));
+    }
+    try std.testing.expectEqual(@as(usize, 1), f.conn_closes);
+}
+
+test "introspectPkCols lists every key column in order, empty when the probe cannot run" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var f = FakeConn{ .arena = a, .rows = &.{ &.{.{ .string = "tenant" }}, &.{.null}, &.{.{ .string = "id" }} } };
+    const cols = try introspectPkCols(a, f.prober(), .sqlserver, &.{ "dbo", "t" });
+    try std.testing.expectEqual(@as(usize, 2), cols.len);
+    try std.testing.expectEqualStrings("tenant", cols[0]);
+    try std.testing.expectEqualStrings("id", cols[1]);
+    try std.testing.expect(std.mem.endsWith(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID('[dbo].[t]') AND i.is_primary_key = 1\nORDER BY ic.key_ordinal"));
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{.{ .string = "id" }}} };
+    _ = try introspectPkCols(a, f.prober(), .postgres, &.{ "s", "t" });
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE i.indrelid = '\"s\".\"t\"'::regclass AND i.indisprimary") != null);
+    f = FakeConn{ .arena = a, .rows = &.{&.{.{ .string = "id" }}} };
+    _ = try introspectPkCols(a, f.prober(), .doris, &.{"t"});
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = 't'") != null);
+
+    f = FakeConn{ .arena = a, .fail_open = true };
+    try std.testing.expectEqual(@as(usize, 0), (try introspectPkCols(a, f.prober(), .mysql, &.{ "db", "t" })).len);
+    f = FakeConn{ .arena = a, .fail_query = true };
+    try std.testing.expectEqual(@as(usize, 0), (try introspectPkCols(a, f.prober(), .mysql, &.{ "db", "t" })).len);
+    try std.testing.expectEqual(@as(usize, 1), f.conn_closes);
+}
