@@ -454,10 +454,12 @@ pub const Filter = struct {
     }
 
     pub fn transform(self: *Filter, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
-        return self.filterInto(arena, arena, b);
+        return self.filterInto(arena, null, b);
     }
 
-    fn filterInto(self: *Filter, out: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch) anyerror!Batch {
+    /// With no `scratch`, the batch and the evaluation live in `out`, so a batch that
+    /// keeps every row passes through uncopied.
+    fn filterInto(self: *Filter, out: std.mem.Allocator, scratch: ?std.mem.Allocator, b: Batch) anyerror!Batch {
         return applyFilter(out, scratch, b, self.pred) catch |e| {
             if (self.err) |ec| ec.set("{s}: in filter predicate", .{failLabel(e)});
             return e;
@@ -535,7 +537,8 @@ pub const Limit = struct {
 /// already found false (the batch not narrowed) that fails is evaluated again over
 /// the others only, so an error comes from exactly the rows the row evaluator's
 /// short-circuit reaches.
-fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
+fn applyFilter(arena: std.mem.Allocator, scratch_opt: ?std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
+    const scratch = scratch_opt orelse arena;
     var conj = std.array_list.Managed(*const ast.Expr).init(scratch);
     try conjuncts(&conj, pred);
     var cur = b;
@@ -552,6 +555,7 @@ fn applyFilter(arena: std.mem.Allocator, scratch: std.mem.Allocator, b: Batch, p
     }
     const kept = try m.finish(scratch, cur.len);
     if (m.alive) |k| if (kept < cur.len) return gatherBatch(arena, cur, k, kept);
+    if (scratch_opt == null) return cur;
     const outcols = try arena.alloc(column.Column, cur.columns.len);
     for (cur.columns, outcols) |c, *o| o.* = try column.copy(arena, c);
     return Batch{ .schema = b.schema, .columns = outcols, .len = cur.len };
@@ -700,6 +704,28 @@ test "filter keeps only known-true rows: null predicate drops the row (3VL)" {
     var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &two } };
     var flt = Filter{ .child = .{ .scan = &scan }, .pred = &pred, .back = a };
     try testing.expectEqualDeep(@as([]const ?i64, &.{ 5, 3 }), try drainInts(a, .{ .filter = &flt }));
+}
+
+test "a filter stage that keeps every row passes its batch through; one that drops rows gathers" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const b = try intBatch(a, &int_schema, &.{ 4, 5, 3 });
+    var fx = ast.Expr{ .field = .{ .parts = &[_][]const u8{"x"} } };
+    var two = ast.Expr{ .int_lit = 2 };
+    var pred = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &two } };
+    var flt = Filter{ .child = undefined, .pred = &pred, .back = a };
+    const kept = try flt.transform(a, b);
+    try testing.expectEqual(b.columns.ptr, kept.columns.ptr);
+    try testing.expectEqual(@as(usize, 3), kept.len);
+
+    var four = ast.Expr{ .int_lit = 4 };
+    var some = ast.Expr{ .binary = .{ .op = .gt, .l = &fx, .r = &four } };
+    flt.pred = &some;
+    const cut = try flt.transform(a, b);
+    try testing.expectEqual(@as(usize, 1), cut.len);
+    try testing.expectEqual(@as(i64, 5), cut.columns[0].data.i64[0]);
 }
 
 test "filter scratch is backed by the plan arena, so it dies with the plan" {
