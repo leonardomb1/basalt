@@ -31,6 +31,67 @@ test "parallel map keeps file order: a threaded load writes the rows a serial on
     }
 }
 
+test "a file read into memory first: an aggregating CTE, a window's or a full sort's input, -j 4 writes what -j 1 does" {
+    const alloc = std.testing.allocator;
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,g,v\n");
+    for (0..6000) |i| try input.writer().print("{d},{c},{d}\n", .{ i, "abcde"[(i * 7) % 5], @as(i64, @intCast((i * 37) % 201)) - 100 });
+    const cases = [_]struct { q: []const u8, head: []const u8 }{
+        .{
+            .q = "WITH t AS (SELECT g, SUM(v) AS s, COUNT(*) AS n FROM '$IN' GROUP BY g) SELECT g, s, n FROM t ORDER BY g",
+            .head = "g,s,n\na,",
+        },
+        .{
+            .q = "WITH r AS (SELECT id, g, v FROM '$IN') SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id) AS rn FROM r WHERE id % 3 = 0 ORDER BY id",
+            .head = "id,rn\n0,",
+        },
+        .{
+            .q = "SELECT id, g, SUM(v) OVER (PARTITION BY g) AS s FROM '$IN'",
+            .head = "id,g,s\n0,a,",
+        },
+        .{
+            .q = "SELECT id, SUM(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM '$IN'",
+            .head = "id,s\n0,-100\n1,-163\n2,-189\n3,-78\n",
+        },
+        .{
+            .q = "SELECT id, v FROM '$IN' WHERE id % 2 = 0 ORDER BY v DESC, id",
+            .head = "id,v\n38,100\n",
+        },
+    };
+    for (cases) |c| {
+        var t1 = std.testing.tmpDir(.{});
+        defer t1.cleanup();
+        const serial = try runCsvThreaded(alloc, &t1, input.items, c.q, 1);
+        defer alloc.free(serial);
+        var t4 = std.testing.tmpDir(.{});
+        defer t4.cleanup();
+        const lanes = try runCsvThreaded(alloc, &t4, input.items, c.q, 4);
+        defer alloc.free(lanes);
+        try std.testing.expect(std.mem.startsWith(u8, serial, c.head));
+        try std.testing.expectEqualStrings(serial, lanes);
+    }
+}
+
+test "WITH (buffer) drains the source before the sink opens, so a load may rewrite its own input" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for ([_]usize{ 1, 4 }) |threads| {
+        try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g,v\n1,a,10\n2,b,20\n3,a,30\n4,b,5\n" });
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/in.csv' AS SELECT id, v * 2 AS v FROM '{0s}/in.csv' WITH (buffer) WHERE v > 5 ORDER BY id DESC;", .{base});
+        defer alloc.free(script);
+        var diag: Diag = .{};
+        const stats = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &diag);
+        try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
+        const out = try tmp.dir.readFileAlloc(alloc, "in.csv", 1 << 16);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("id,v\n3,60\n2,40\n1,20\n", out);
+    }
+}
+
 test "parallel load into parquet: lanes encode row groups, the file keeps every row in order" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
