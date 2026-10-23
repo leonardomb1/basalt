@@ -413,8 +413,9 @@ const RoundDec = struct {
     pub fn resultType(c: ast.Expr.Call, arg: Type) Type {
         return Type.decimal(arg.precision, roundOutScale(c, arg.scale));
     }
+    /// Digits past ±39 round as ±39 do (nothing, or to zero), so no count overflows.
     pub fn apply(cx: Cx, d: Decimal, digits: ?i64) EvalError!Decimal {
-        return roundDecimal(d, digits orelse 0, roundOutScale(cx.call, d.scale)) orelse error.IntOverflow;
+        return roundDecimal(d, std.math.clamp(digits orelse 0, -39, 39), roundOutScale(cx.call, d.scale)) orelse error.IntOverflow;
     }
 };
 

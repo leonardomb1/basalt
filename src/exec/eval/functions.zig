@@ -248,20 +248,22 @@ test "numeric builtins: the kernels give the row forms' values, nulls, scales an
     const a = ar.allocator();
     const batch = try testBatch(a);
     try testing_util.expectVecMatchesRows(a, batch, &.{
-        "abs(i)",           "abs(f)",           "abs(d)",          "abs(-3)",          "abs(-1.50)",
-        "floor(i)",         "floor(f)",         "floor(d)",        "ceil(f)",          "ceil(d)",
-        "round(i)",         "round(i, 1)",      "round(f)",        "round(f, 1)",      "round(f, -1)",
-        "round(f, g)",      "round(d)",         "round(d, 1)",     "round(d, -1)",     "round(d, g)",
-        "round(d, 5)",      "round(i, g)",      "sign(i)",         "sign(f)",          "sign(d)",
-        "mod(i, 3)",        "mod(f, 2e0)",      "mod(d, 3)",       "mod(d, 0.4)",      "nullif(i, 3)",
-        "nullif(i, z)",     "nullif(f, f)",     "nullif(d, 1.25)", "nullif(s, 'b')",   "greatest(i, z)",
-        "least(i, z, 2)",   "greatest(f, 0e0)", "least(f, -1e0)",  "greatest(d, 1.5)", "least(i, null, z)",
-        "greatest(s, 'b')", "least(s, s)",      "greatest(d, d)",  "least(z, i, g)",   "greatest(null, i)",
+        "abs(i)",            "abs(f)",           "abs(d)",          "abs(-3)",           "abs(-1.50)",
+        "floor(i)",          "floor(f)",         "floor(d)",        "ceil(f)",           "ceil(d)",
+        "round(i)",          "round(i, 1)",      "round(f)",        "round(f, 1)",       "round(f, -1)",
+        "round(f, g)",       "round(d)",         "round(d, 1)",     "round(d, -1)",      "round(d, g)",
+        "round(d, 5)",       "round(i, g)",      "sign(i)",         "sign(f)",           "sign(d)",
+        "mod(i, 3)",         "mod(f, 2e0)",      "mod(d, 3)",       "mod(d, 0.4)",       "nullif(i, 3)",
+        "nullif(i, z)",      "nullif(f, f)",     "nullif(d, 1.25)", "nullif(s, 'b')",    "greatest(i, z)",
+        "least(i, z, 2)",    "greatest(f, 0e0)", "least(f, -1e0)",  "greatest(d, 1.5)",  "least(i, null, z)",
+        "greatest(s, 'b')",  "least(s, s)",      "greatest(d, d)",  "least(z, i, g)",    "greatest(null, i)",
+        "greatest(d, 0.50)", "least(0.50, d)",   "nullif(d, 0.50)", "greatest(0.50, d)", "least(d, 0.50, 0.5)",
     }, true);
     try testing_util.expectVecMatchesRows(a, batch, &.{
-        "abs(m)",                  "mod(i, z)",      "round(i, 1 / z)", "nullif(i, 1.0)",
-        "greatest(i, f)",          "greatest(i, d)", "nullif(f, i)",    "round(d, 40)",
-        "if(z = 0, 0, mod(i, z))",
+        "abs(m)",                               "mod(i, z)",                 "round(i, 1 / z)",           "nullif(i, 1.0)",
+        "greatest(i, f)",                       "greatest(i, d)",            "nullif(f, i)",              "round(d, 40)",
+        "if(z = 0, 0, mod(i, z))",              "if(m > 0, round(d, m), d)", "if(m > 0, round(f, m), f)", "if(m > 0, date_add('month', m, dt), dt)",
+        "if(m > 0, date_add('year', m, t), t)",
     }, false);
 }
 

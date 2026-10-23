@@ -86,10 +86,12 @@ pub fn daysInMonth(y: i64, m: u32) u32 {
 
 /// Adds `n` calendar months, clamping the day to the target month's length;
 /// the clamp is not remembered (Jan 31 +1 is Feb 29, +2 is Mar 29), as Postgres does.
-fn addMonthsToDays(days: i64, n: i64) i64 {
+/// A year past ±6,000,000, which neither a DATE nor a TIMESTAMP holds, is a CastFailed.
+fn addMonthsToDays(days: i64, n: i64) EvalError!i64 {
     const c = civilFromDays(days);
-    const total = c.y * 12 + @as(i64, c.m) - 1 + n;
+    const total = try addI64(c.y * 12 + @as(i64, c.m) - 1, n);
     const y = @divFloor(total, 12);
+    if (y < -6_000_000 or y > 6_000_000) return error.CastFailed;
     const m: u32 = @intCast(@mod(total, 12) + 1);
     return daysFromCivil(y, m, @min(c.d, daysInMonth(y, m)));
 }
@@ -98,8 +100,8 @@ fn addMonthsToDays(days: i64, n: i64) i64 {
 pub fn addDays(d0: i32, u: TimeUnit, n: i64) EvalError!i32 {
     const days: i64 = d0;
     const nd = switch (u) {
-        .year => addMonthsToDays(days, try mulI64(n, 12)),
-        .month => addMonthsToDays(days, n),
+        .year => try addMonthsToDays(days, try mulI64(n, 12)),
+        .month => try addMonthsToDays(days, n),
         .week => try addI64(days, try mulI64(n, 7)),
         .day => try addI64(days, n),
         .hour, .minute, .second => return error.TypeMismatch,
@@ -114,7 +116,7 @@ pub fn addMicros(us: i64, u: TimeUnit, n: i64) EvalError!i64 {
             const day = @divFloor(us, 86_400_000_000);
             const rem = us - day * 86_400_000_000;
             const months = if (u == .year) try mulI64(n, 12) else n;
-            const shifted = try mulI64(addMonthsToDays(day, months), 86_400_000_000);
+            const shifted = try mulI64(try addMonthsToDays(day, months), 86_400_000_000);
             break :blk try addI64(shifted, rem);
         },
         .week => try addI64(us, try mulI64(n, 7 * 86_400_000_000)),
