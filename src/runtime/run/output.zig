@@ -169,8 +169,10 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     inner[b.stages.len] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = b.pos };
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
+    const outer_name = env.sink_name;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
+    defer env.sink_name = outer_name;
     var scratch: Stats = .{};
     var delegated = false;
     {
@@ -258,8 +260,10 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
 
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
+    const outer_name = env.sink_name;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
+    defer env.sink_name = outer_name;
     var scratch: Stats = .{};
     var delegated = false;
     {
@@ -377,6 +381,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     var head_stages = stages;
     var inlined: usize = 0;
     while (head_stages[0].node == .ref and inlined < 16) : (inlined += 1) {
+        if (env.materialized.contains(head_stages[0].node.ref)) break;
         const b = env.bindings.get(head_stages[0].node.ref) orelse break;
         if (b.stages.len == 0) break;
         const joined = try arena.alloc(ast.Stage, b.stages.len + head_stages.len - 1);

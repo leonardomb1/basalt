@@ -73,6 +73,45 @@ test "a file read into memory first: an aggregating CTE, a window's or a full so
     }
 }
 
+test "an input read into memory first is read once, and the run still names the load's own sink" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,g,v\n");
+    for (0..6000) |i| try input.writer().print("{d},{c},{d}\n", .{ i, "abcde"[i % 5], i % 10 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{
+            .q = "WITH t AS (SELECT g, SUM(v) AS s FROM '$B/in.csv' GROUP BY g) SELECT g, s FROM t WHERE s > 0 ORDER BY g",
+            .want = "g,s\na,3000\nb,4200\nc,5400\nd,6600\ne,7800\n",
+        },
+        .{
+            .q = "WITH t AS (SELECT * FROM '$B/in.csv') SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM t ORDER BY id LIMIT 5",
+            .want = "id,s\n0,3000\n1,4200\n2,5400\n3,6600\n4,7800\n",
+        },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        for ([_]usize{ 1, 4 }) |threads| {
+            var diag: Diag = .{};
+            var summary: basalt.obs.Summary = .{ .run_id = 0 };
+            _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true }, .summary_out = &summary }, &diag);
+            try std.testing.expectEqual(@as(u64, 6000), summary.rows_read);
+            try std.testing.expectEqualStrings("csv", summary.sink);
+            const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 16);
+            defer alloc.free(out);
+            try std.testing.expectEqualStrings(c.want, out);
+        }
+    }
+}
+
 test "WITH (buffer) drains the source before the sink opens, so a load may rewrite its own input" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
