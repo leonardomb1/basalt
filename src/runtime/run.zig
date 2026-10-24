@@ -127,7 +127,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
 
-    try checkFirst(arena, raw_program, opts, diag);
+    try checkFirst(gpa, raw_program, opts, diag);
 
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
@@ -288,8 +288,13 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
 /// The whole script through `check`'s analysis before anything runs, so a run
 /// refuses what `check` refuses, and a statement's static error stops the run
-/// before an earlier statement has written anything.
-fn checkFirst(arena: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !void {
+/// before an earlier statement has written anything. The analysis gets its own
+/// arena, freed on return: it replays a local Delta log the run replays again,
+/// and nothing it builds outlives it, its refusal copied into `diag`.
+fn checkFirst(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !void {
+    var analysis_arena = std.heap.ArenaAllocator.init(gpa);
+    defer analysis_arena.deinit();
+    const arena = analysis_arena.allocator();
     const overrides = try arena.alloc(analyze.ParamOverride, opts.params.len);
     for (opts.params, overrides) |kv, *o| o.* = .{ .name = kv.key, .value = kv.val };
     var adiag = analyze.Diag{};
@@ -640,4 +645,25 @@ test {
     _ = @import("run/explain.zig");
     _ = @import("run/output.zig");
     _ = @import("run/params.zig");
+}
+
+test "checkFirst frees its analysis, a local Delta log's replay included, before the run builds its plan" {
+    const sql_parser = @import("../lang/sql_parser.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("t/_delta_log");
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000000.json", .data = 
+        \\{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+        \\{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":0}}
+        \\{"add":{"path":"a.parquet","partitionValues":{},"modificationTime":0,"dataChange":true}}
+    });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/t/';", .{ base, base });
+    var pd: sql_parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try sql_parser.parseSource(a, script, &pd);
+    var diag: Diag = .{};
+    try checkFirst(std.testing.allocator, prog, .{}, &diag);
 }
