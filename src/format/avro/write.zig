@@ -22,6 +22,7 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
+const Column = @import("../../exec/column.zig").Column;
 const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
 const driver = @import("../../connect/driver.zig");
@@ -107,7 +108,9 @@ pub const Writer = struct {
         if (batch.len == 0) return "";
         var body = std.array_list.Managed(u8).init(arena);
         try body.ensureTotalCapacity(batch.len * (batch.columns.len * 9 + 1));
-        for (0..batch.len) |r| for (batch.columns, self.schema.fields) |*col, f| try encode(&body, col.getValue(r), f);
+        const encoders = try arena.alloc(Encoder, batch.columns.len);
+        for (encoders, batch.columns) |*e, c| e.* = encoderFor(c.data);
+        for (0..batch.len) |r| for (batch.columns, self.schema.fields, encoders) |*col, f, enc| try enc(&body, col, r, f);
         const data = try compress(arena, self.codec, body.items);
         var out = std.array_list.Managed(u8).init(arena);
         try out.ensureTotalCapacity(data.len + 36);
@@ -165,20 +168,28 @@ fn bytesOf(out: *std.array_list.Managed(u8), s: []const u8) !void {
     try out.appendSlice(s);
 }
 
-/// One cell as its union: branch 0 for NULL, else branch 1 and the value.
-fn encode(out: *std.array_list.Managed(u8), v: Value, f: types.Schema.Field) !void {
-    if (v == .null) return out.append(0);
-    try out.append(2);
-    switch (v) {
-        .null => unreachable,
-        .bool => |b| try out.append(@intFromBool(b)),
-        .int => |x| try long(out, x),
-        .float => |x| try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(x)))),
-        .string, .bytes => |s| try bytesOf(out, s),
-        .date => |d| try long(out, d),
-        .time, .timestamp => |x| try long(out, x),
-        .decimal => |d| try decimalBytes(out, d, f),
-    }
+/// One cell of a column as its union: branch 0 for NULL, else branch 1 and the value.
+const Encoder = *const fn (out: *std.array_list.Managed(u8), col: *const Column, row: usize, f: types.Schema.Field) anyerror!void;
+
+/// The encoder of a column's storage, one instantiated per storage at compile time,
+/// reading the typed slice itself rather than a `Value` per cell.
+fn encoderFor(data: Column.Data) Encoder {
+    return switch (data) {
+        inline else => |_, t| &struct {
+            fn f(out: *std.array_list.Managed(u8), col: *const Column, row: usize, fld: types.Schema.Field) anyerror!void {
+                if (!col.validity.get(row)) return out.append(0);
+                try out.append(2);
+                switch (t) {
+                    .b => try out.append(@intFromBool(col.data.b[row])),
+                    .i32 => try long(out, col.data.i32[row]),
+                    .i64 => try long(out, col.data.i64[row]),
+                    .f64 => try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(col.data.f64[row])))),
+                    .bytes => try bytesOf(out, col.data.bytes.at(row)),
+                    .dec => try decimalBytes(out, col.data.dec[row], fld),
+                }
+            }
+        }.f,
+    };
 }
 
 /// A decimal restated at the column's scale, as Parquet's writer restates it, in the
