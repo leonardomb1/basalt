@@ -1,7 +1,7 @@
 //! Minimal PostgreSQL v3 wire-protocol client: startup, auth (trust/cleartext/
 //! md5/SCRAM-SHA-256), simple Query, COPY FROM STDIN, and RowDescription/DataRow
 //! parsing into a batch. Values arrive in text format, so the shared
-//! `sql.coerceText` does the typing. Exposes the `sql.Conn` interface.
+//! `cell.wire` does the typing. Exposes the `sql.Conn` interface.
 //!
 //! Everything read off the wire is bounds-checked before use. Past bugs: a short
 //! md5 reply hashed adjacent heap into a digest sent to the server, and a DataRow
@@ -15,6 +15,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
+const cell = @import("../exec/cell.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("sql.zig");
 const wire = @import("wire.zig");
@@ -366,7 +367,7 @@ fn readMessage(r: *std.Io.Reader, payload: *std.array_list.Managed(u8)) !u8 {
 const sql_vtable = sql.connVTable(Conn);
 const cursor_vtable = sql.textCursorVTable(Conn);
 
-const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type };
+const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type, conv: cell.Converter };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
 
 fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
@@ -384,7 +385,7 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
         const typmod = try r.int(i32);
         try r.skip(2);
         const ty = pgType(oid, typmod);
-        cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty };
+        cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty, .conv = cell.converter(ty.kind, cell.wire) };
         fields[k] = .{ .name = cols[k].name, .ty = ty };
     }
     return .{ .cols = cols, .fields = fields };
@@ -394,19 +395,18 @@ fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
     var r: Body = .{ .p = p };
     const raw = try r.int(i16);
     if (raw < 0 or @as(usize, @intCast(raw)) != builders.len) return error.PgProtocol;
-    for (builders, 0..) |*b, k| {
+    for (builders, conn.cols) |*b, c| {
         const len = try r.int(i32);
         if (len < 0) {
-            try b.append(.null);
-        } else {
-            const cell = try r.bytes(@intCast(len));
-            const v = sql.coerceText(cell, conn.cols[k].engine_type) catch |e| {
-                if (e == error.UnparseableNumber)
-                    try conn.wire.printError("column \"{s}\": unparseable {s} value \"{s}\"", .{ conn.cols[k].name, @tagName(conn.cols[k].engine_type.kind), cell });
-                return e;
-            };
-            try b.append(v);
+            try b.appendNull();
+            continue;
         }
+        const text = try r.bytes(@intCast(len));
+        c.conv(b, text) catch |e| {
+            if (e == error.UnparseableNumber)
+                try conn.wire.printError("column \"{s}\": unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text });
+            return e;
+        };
     }
 }
 

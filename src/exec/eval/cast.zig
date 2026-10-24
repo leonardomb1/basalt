@@ -10,7 +10,7 @@ const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const pow10_i128 = @import("../value.zig").pow10_i128;
 const pow10_i256 = @import("../value.zig").pow10_i256;
-const sql = @import("../../db/sql.zig");
+const cell = @import("../cell.zig");
 const std = @import("std");
 const clip = @import("support.zig").clip;
 const decimalOverflow = @import("support.zig").decimalOverflow;
@@ -35,14 +35,10 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
 pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
     const s = trim(text);
     const want: u8 = if (ty.kind == .decimal) ty.scale else 0;
-    const d: Decimal = switch (sql.parseDecimalText(s) orelse {
+    const d: Decimal = cell.decimal(s) orelse {
         if (parseFloatStrict(s) != null)
             return failWith(error.CastFailed, "SUM: '{s}' is not an exact number; sum CAST(x AS FLOAT) to add it as a float", .{clip(s)});
         return failWith(error.CastFailed, "SUM: '{s}' is not a number", .{clip(s)});
-    }) {
-        .decimal => |x| x,
-        .int => |x| .{ .unscaled = x, .scale = 0 },
-        else => return error.CastFailed,
     };
     if (d.scale > want and @rem(d.unscaled, pow10_i128[d.scale - want]) != 0) {
         if (want == 0)
@@ -65,11 +61,7 @@ pub fn asDecimalValue(v: Value) ?Decimal {
         .int => |x| .{ .unscaled = x, .scale = 0 },
         .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
         .float => |x| floatToDecimal(x),
-        .string, .bytes => |str| switch (sql.parseDecimalText(trim(str)) orelse return null) {
-            .decimal => |x| x,
-            .int => |x| Decimal{ .unscaled = x, .scale = 0 },
-            else => null,
-        },
+        .string, .bytes => |str| cell.decimal(trim(str)),
         else => null,
     };
 }

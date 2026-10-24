@@ -23,6 +23,7 @@ const std = @import("std");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
+const cell = @import("../exec/cell.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
 const wire = @import("wire.zig");
@@ -222,19 +223,20 @@ pub const Conn = struct {
             return error.MysqlQueryFailed;
         }
         var r: Pkt = .{ .p = p };
-        for (self.cols, 0..) |c, k| {
-            const text = try lenencStrOrNull(&r);
-            const v: Value = if (text == null)
-                .null
-            else if (c.mtype == 0x10)
-                .{ .int = decodeBits(text.?) }
-            else
-                sql.coerceText(text, c.engine_type) catch |e| {
-                    if (e == error.UnparseableNumber)
-                        try self.wire.printError("column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text.? });
-                    return e;
-                };
-            try builders[k].append(v);
+        for (self.cols, builders) |c, *b| {
+            const text = try lenencStrOrNull(&r) orelse {
+                try b.appendNull();
+                continue;
+            };
+            if (c.mtype == 0x10) {
+                try b.appendInt(decodeBits(text));
+                continue;
+            }
+            c.conv(b, text) catch |e| {
+                if (e == error.UnparseableNumber)
+                    try self.wire.printError("column `{s}`: unparseable {s} value \"{s}\"", .{ c.name, @tagName(c.engine_type.kind), text });
+                return e;
+            };
         }
         return .row;
     }
@@ -603,6 +605,7 @@ const MyCol = struct {
     mtype: u8,
     decimals: u8,
     engine_type: types.Type,
+    conv: cell.Converter,
 };
 
 fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
@@ -616,7 +619,8 @@ fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     const mtype = try r.int(u8);
     const flags = try r.int(u16);
     const decimals = try r.int(u8);
-    return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = engineTypeFor(mtype, decimals, flags, charset) };
+    const ty = engineTypeFor(mtype, decimals, flags, charset);
+    return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = ty, .conv = cell.converter(ty.kind, cell.wire) };
 }
 
 /// `flags & 0x20` is UNSIGNED_FLAG; charset 63 is `binary`.

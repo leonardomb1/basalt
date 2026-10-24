@@ -29,7 +29,7 @@
 //! double-writes. Flushes already committed stay on abort; downstream dedup owns
 //! exactly-once (see split.zig).
 //!
-//! Text from the wire is typed by `coerceText`. A cell that does not parse as its
+//! Text from the wire is typed by `cell.wire`. A cell that does not parse as its
 //! numeric type is an error, never a quiet 0 or a different number.
 
 const std = @import("std");
@@ -41,7 +41,6 @@ const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
 const eval = @import("../exec/eval.zig");
-const daysInMonth = @import("../exec/eval/time.zig").daysInMonth;
 const driver = @import("../connect/driver.zig");
 const ast = @import("../lang/ast.zig");
 
@@ -1196,170 +1195,6 @@ fn writeQuotedName(buf: *std.array_list.Managed(u8), dialect: Dialect, name: []c
 
 const nameIn = ast.nameIn;
 
-/// A text cell typed as `ty`; a string is returned as the wire's own bytes, which the
-/// caller appends before reading the next packet.
-pub fn coerceText(text: ?[]const u8, ty: types.Type) !Value {
-    const t = text orelse return .null;
-    return switch (ty.kind) {
-        .int => .{ .int = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.UnparseableNumber },
-        .float => .{ .float = std.fmt.parseFloat(f64, t) catch return error.UnparseableNumber },
-        .decimal => parseDecimalText(t) orelse return error.UnparseableNumber,
-        .bool => .{ .bool = t.len > 0 and (t[0] == '1' or t[0] == 't' or t[0] == 'T' or t[0] == 'y' or t[0] == 'Y') },
-        .date => if (zeroDate(t)) .null else .{ .date = std.math.cast(i32, parseDateText(t) orelse return error.UnparseableNumber) orelse return error.UnparseableNumber },
-        .timestamp => if (zeroDate(t)) .null else .{ .timestamp = parseDatetimeText(t) orelse return error.UnparseableNumber },
-        else => .{ .string = t },
-    };
-}
-
-/// A decimal literal: optional sign, digits, at most one `.`, at least one digit, else
-/// null. It once skipped unknown characters, so `'1000,00'` read as 100000.00 and
-/// `'abc'` as 0; comma-decimal data must be rewritten with `replace(x, ',', '.')`.
-pub fn parseDecimalText(t: []const u8) ?Value {
-    var s = t;
-    var neg = false;
-    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
-        neg = s[0] == '-';
-        s = s[1..];
-    }
-    if (s.len == 0) return null;
-
-    var unscaled: i128 = 0;
-    var scale: u8 = 0;
-    var digits: usize = 0;
-    var after_dot = false;
-    for (s) |c| {
-        if (c == '.') {
-            if (after_dot) return null;
-            after_dot = true;
-            continue;
-        }
-        if (c < '0' or c > '9') return null;
-        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
-        unscaled = std.math.add(i128, unscaled, c - '0') catch return null;
-        digits += 1;
-        if (after_dot) scale += 1;
-    }
-    if (digits == 0) return null;
-    return .{ .decimal = .{ .unscaled = if (neg) -unscaled else unscaled, .scale = scale } };
-}
-
-test "parseDecimalText rejects what it cannot read instead of inventing a number" {
-    try std.testing.expectEqual(@as(i128, 100000), parseDecimalText("1000.00").?.decimal.unscaled);
-    try std.testing.expectEqual(@as(u8, 2), parseDecimalText("1000.00").?.decimal.scale);
-    try std.testing.expectEqual(@as(i128, -5), parseDecimalText("-5").?.decimal.unscaled);
-    try std.testing.expectEqual(@as(i128, 7), parseDecimalText("+7").?.decimal.unscaled);
-    try std.testing.expectEqual(@as(i128, 25), parseDecimalText(".25").?.decimal.unscaled);
-
-    try std.testing.expect(parseDecimalText("1000,00") == null);
-    try std.testing.expect(parseDecimalText("1.234,56") == null);
-    try std.testing.expect(parseDecimalText("1,2,3") == null);
-    try std.testing.expect(parseDecimalText("abc") == null);
-    try std.testing.expect(parseDecimalText("1.2.3") == null);
-    try std.testing.expect(parseDecimalText("12 34") == null);
-    try std.testing.expect(parseDecimalText("") == null);
-    try std.testing.expect(parseDecimalText("-") == null);
-    try std.testing.expect(parseDecimalText("R$ 10") == null);
-}
-
-const DateText = struct { days: i64, rest: []const u8 };
-
-/// `YYYY-MM-DD` at the start of `t`, the year four digits or more and a ` BC` at the
-/// end of `t` taken as its era; the month and day must exist. Null for anything
-/// else, `infinity` included, so a value no date can hold fails rather than reads
-/// as 1970-01-01.
-fn dateText(t: []const u8) ?DateText {
-    const bc = std.mem.endsWith(u8, t, " BC");
-    const body = if (bc) t[0 .. t.len - 3] else t;
-    var i: usize = 0;
-    while (i < body.len and i < 7 and std.ascii.isDigit(body[i])) i += 1;
-    if (i < 4 or body.len < i + 6 or body[i] != '-' or body[i + 3] != '-') return null;
-    for ([_]usize{ i + 1, i + 2, i + 4, i + 5 }) |k| if (!std.ascii.isDigit(body[k])) return null;
-    var y = atoiN(body[0..i]);
-    const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
-    const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
-    if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
-    if (bc) y = 1 - y;
-    return .{ .days = eval.daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
-}
-
-/// MySQL's zero date (`0000-00-00`, with or without a time), which stands for no
-/// date: it reads as NULL, as Connector/J's `zeroDateTimeBehavior=convertToNull` does.
-fn zeroDate(t: []const u8) bool {
-    return std.mem.startsWith(u8, t, "0000-00-00");
-}
-
-fn parseDateText(t: []const u8) ?i64 {
-    const dt = dateText(t) orelse return null;
-    if (dt.rest.len > 0) return null;
-    return dt.days;
-}
-
-/// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
-/// second identical, collapsing distinct rows and unsettling ORDER BY. A trailing
-/// offset (`-03`, `+05:45`, ` +00:00`), as a `timestamptz` prints in the session's
-/// zone, is folded into UTC, so a value reads the same whatever that zone is. A
-/// date alone is its midnight; a malformed time is null, never zero.
-fn parseDatetimeText(t: []const u8) ?i64 {
-    const dt = dateText(t) orelse return null;
-    const r = dt.rest;
-    if (r.len == 0) return dt.days * 86_400_000_000;
-    if (r.len < 9 or (r[0] != ' ' and r[0] != 'T') or r[3] != ':' or r[6] != ':') return null;
-    for ([_]usize{ 1, 2, 4, 5, 7, 8 }) |k| if (!std.ascii.isDigit(r[k])) return null;
-    var secs: i64 = atoiN(r[1..3]) * 3600 + atoiN(r[4..6]) * 60 + atoiN(r[7..9]);
-    var frac: i64 = 0;
-    var i: usize = 9;
-    if (r.len > 10 and r[9] == '.') {
-        i = 10;
-        var scale: i64 = 100_000;
-        while (i < r.len and r[i] >= '0' and r[i] <= '9') : (i += 1) {
-            if (scale > 0) frac += @as(i64, r[i] - '0') * scale;
-            scale = @divTrunc(scale, 10);
-        }
-    }
-    if (i < r.len and r[i] == ' ') i += 1;
-    if (i + 3 <= r.len and (r[i] == '+' or r[i] == '-')) {
-        const sign: i64 = if (r[i] == '-') -1 else 1;
-        var off = atoiN(r[i + 1 .. i + 3]) * 3600;
-        var j = i + 3;
-        if (j < r.len and r[j] == ':') j += 1;
-        if (j + 2 <= r.len) off += atoiN(r[j .. j + 2]) * 60;
-        secs -= sign * off;
-    }
-    return dt.days * 86_400_000_000 + secs * 1_000_000 + frac;
-}
-
-test "text dates: the real ones read, BC and five-digit years included; no date reads as a made-up one" {
-    try std.testing.expectEqual(@as(i32, 0), (try coerceText("1970-01-01", types.Type.init(.date))).date);
-    try std.testing.expectEqual(@as(i32, 19727), (try coerceText("2024-01-05", types.Type.init(.date))).date);
-    try std.testing.expectEqual(eval.daysFromCivil(-43, 3, 15), (try coerceText("0044-03-15 BC", types.Type.init(.date))).date);
-    try std.testing.expectEqual(eval.daysFromCivil(10000, 1, 1), (try coerceText("10000-01-01", types.Type.init(.date))).date);
-    try std.testing.expect((try coerceText("0000-00-00", types.Type.init(.date))).isNull());
-    try std.testing.expect((try coerceText("0000-00-00 00:00:00", types.Type.init(.timestamp))).isNull());
-    for ([_][]const u8{ "infinity", "-infinity", "2024-13-01", "2024-02-30", "24-01-05", "2024/01/05", "" }) |bad| {
-        try std.testing.expectError(error.UnparseableNumber, coerceText(bad, types.Type.init(.date)));
-    }
-    try std.testing.expectError(error.UnparseableNumber, coerceText("infinity", types.Type.init(.timestamp)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText("2024-01-05 5:00", types.Type.init(.timestamp)));
-    try std.testing.expectEqual(parseDatetimeText("2024-01-05 00:00:00").?, parseDatetimeText("2024-01-05").?);
-}
-
-test "parseDatetimeText folds a timestamptz offset into UTC" {
-    const base = parseDatetimeText("2024-01-05 05:00:00").?;
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 02:00:00-03").?);
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 10:45:00+05:45").?);
-    try std.testing.expectEqual(base, parseDatetimeText("2024-01-05 05:00:00 +00:00").?);
-    try std.testing.expectEqual(base + 250_000, parseDatetimeText("2024-01-05 02:00:00.25-03").?);
-    try std.testing.expectEqual(base + 123_456, parseDatetimeText("2024-01-05 05:00:00.1234567").?);
-}
-
-fn atoiN(s: []const u8) i64 {
-    var v: i64 = 0;
-    for (s) |c| {
-        if (c >= '0' and c <= '9') v = v * 10 + (c - '0');
-    }
-    return v;
-}
-
 test "create table + upsert SQL (postgres)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1391,15 +1226,6 @@ test "create table (sqlserver): non-key columns are explicit NULL, keys NOT NULL
     const ddl = try createTableSql(a, .sqlserver, qt, schema, .{ .upsert = .{ .keys = &.{"id"} } });
     try std.testing.expect(std.mem.indexOf(u8, ddl, "[id] BIGINT NOT NULL") != null);
     try std.testing.expect(std.mem.indexOf(u8, ddl, "[name] NVARCHAR(4000) NULL") != null);
-}
-
-test "coerceText: bad numeric text errors instead of silently zeroing" {
-    try std.testing.expectEqual(@as(i64, 42), (try coerceText("42", types.Type.init(.int))).int);
-    try std.testing.expectEqual(@as(i64, 7), (try coerceText(" 7 ", types.Type.init(.int))).int);
-    try std.testing.expect((try coerceText(null, types.Type.init(.int))).isNull());
-    try std.testing.expectError(error.UnparseableNumber, coerceText("abc", types.Type.init(.int)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText("", types.Type.init(.int)));
-    try std.testing.expectError(error.UnparseableNumber, coerceText("1.2.3", types.Type.init(.float)));
 }
 
 test "upsert SQL (mysql): ON DUPLICATE KEY UPDATE with VALUES()" {
@@ -1643,26 +1469,6 @@ test "COPY and LOAD DATA text of every kind" {
     try celltext.expectGolden(&want, try goldenBulkText(a, .{}));
     want[0] = "1\n0\n\\N\n";
     try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bool_true = "1", .bool_false = "0" }));
-}
-
-test "coerceText parses bools, dates, timestamps, and decimals" {
-    try std.testing.expect((try coerceText("t", types.Type.init(.bool))).bool);
-    try std.testing.expect((try coerceText("1", types.Type.init(.bool))).bool);
-    try std.testing.expect((try coerceText("Yes", types.Type.init(.bool))).bool);
-    try std.testing.expect(!(try coerceText("false", types.Type.init(.bool))).bool);
-    try std.testing.expect(!(try coerceText("0", types.Type.init(.bool))).bool);
-
-    try std.testing.expectEqual(@as(i64, 19723), (try coerceText("2024-01-01", types.Type.init(.date))).date);
-    try std.testing.expectEqual(@as(i64, 11016), (try coerceText("2000-02-29", types.Type.init(.date))).date);
-    try std.testing.expectEqual(
-        @as(i64, 19723 * 86_400_000_000 + (1 * 3600 + 2 * 60 + 3) * 1_000_000),
-        (try coerceText("2024-01-01 01:02:03", types.Type.init(.timestamp))).timestamp,
-    );
-    try std.testing.expectEqual(@as(i64, 19723 * 86_400_000_000), (try coerceText("2024-01-01", types.Type.init(.timestamp))).timestamp);
-
-    const d = (try coerceText("-12.345", types.Type.decimal(10, 3))).decimal;
-    try std.testing.expectEqual(@as(i128, -12345), d.unscaled);
-    try std.testing.expectEqual(@as(u8, 3), d.scale);
 }
 
 test "bulk text format: tab/newline/backslash escaping and \\N nulls" {
