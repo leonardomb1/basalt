@@ -32,8 +32,9 @@
 //! one `Provider` const naming its scheme and five functions; adding one means
 //! writing that const and appending it to `providers`. An object `Writer` left
 //! without `finish` publishes nothing, since staged blocks and uncompleted uploads
-//! are invisible to readers; its `abort` only frees its client and request
-//! memory, while an SFTP one removes its visible `.part` file. A read of a prefix
+//! are invisible to readers; its `abort` frees its client and request memory, an
+//! S3 one also aborts its multipart upload, and an SFTP one removes its visible
+//! `.part` file. A read of a prefix
 //! that lists nothing raises the provider's `empty_prefix` error, as it is almost
 //! always a typo.
 

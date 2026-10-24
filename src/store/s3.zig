@@ -26,11 +26,12 @@
 //! Parts are gathered whole (`objstore.Upload`) rather than staged from drain
 //! chunks, as S3 rejects a non-final part under 5 MiB, and each request's memory
 //! is freed before the next part. 8 MiB parts under the 10,000-part limit cap an
-//! object at ~78 GiB. Until `finish` returns the object does not exist; `abort`
-//! frees only the writer's client, leaving an invisible upload that S3
-//! garbage-collects under a bucket lifecycle rule (no AbortMultipartUpload is
-//! sent). Staging runs under `std.Io.Writer`, whose only error is `WriteFailed`,
-//! so the writer keeps the typed error (`last_status`) and S3's message for the
+//! object at ~78 GiB. Until `finish` returns the object does not exist; `abort`,
+//! or a `finish` that fails, sends AbortMultipartUpload once an upload was started
+//! so its parts stop being billed, best effort: the abort's own failure is dropped
+//! and never replaces the error that caused it, leaving at worst an invisible
+//! upload for a bucket lifecycle rule. Staging runs under `std.Io.Writer`, whose
+//! only error is `WriteFailed`, so the writer keeps the typed error (`last_status`) and S3's message for the
 //! sink to re-raise.
 //!
 //! `S3EmptyPrefix` is kept distinct from an empty object because its usual cause is
@@ -527,9 +528,42 @@ pub const MultipartWriter = struct {
         return bytes.len;
     }
 
-    /// Frees the client and request memory; the upload itself stays invisible.
+    /// Aborts the multipart upload, if one was started, then frees the client and
+    /// request memory.
     pub fn abort(self: *MultipartWriter) void {
+        self.abortUpload();
         self.up.release();
+    }
+
+    /// AbortMultipartUpload, best effort and before `release`: its failure is
+    /// dropped without touching `last_error` or `last_status`, which hold the cause
+    /// of the abort. NoSuchUpload counts as aborted.
+    fn abortUpload(self: *MultipartWriter) void {
+        if (self.upload_id == null or self.up.released) return;
+        self.sendAbort() catch {};
+    }
+
+    fn sendAbort(self: *MultipartWriter) !void {
+        const a = self.up.fresh();
+        const q = [_][]const u8{
+            try std.fmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
+        };
+        const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8 };
+        const ctx = Ctx{
+            .w = self,
+            .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ self.obj.url, q[0] }),
+            .q = try a.dupe([]const u8, &q),
+        };
+        try objstore.retry(self.policy(), ctx, struct {
+            fn attempt(c: Ctx) !objstore.Verdict {
+                const w = c.w;
+                const hdrs = try w.signed("DELETE", w.obj.uri_path, c.q, empty_payload_hash, null);
+                const r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .DELETE, .url = c.url, .headers = hdrs });
+                const e = statusToError(r.code, r.body);
+                if (r.code == 204 or r.code == 200 or e == Error.S3UploadMissing) return .done;
+                return r.failed(e);
+            }
+        }.attempt);
     }
 
     /// CreateMultipartUpload, once. The URL says `?uploads` and the canonical query
@@ -667,9 +701,11 @@ pub const MultipartWriter = struct {
     /// part and CompleteMultipartUpload. A 200 carrying `<Error>` is documented S3
     /// behaviour under internal faults and is retried as a failure. A replay whose
     /// predecessor's answer was lost may meet NoSuchUpload because that one
-    /// completed; it counts as done when the object is there (`landed`).
+    /// completed; it counts as done when the object is there (`landed`). A failure
+    /// aborts the upload, as nothing can complete it after `release`.
     pub fn finish(self: *MultipartWriter) !void {
         defer self.up.release();
+        errdefer self.abortUpload();
         try self.interface.flush();
         if (self.upload_id == null) return self.singlePut(self.up.pending());
         if (self.up.part_len > 0) {
@@ -1087,9 +1123,9 @@ test "a complete whose answer was lost counts as done only when the object it ma
     const Case = struct { replies: []const ?[]const u8, ok: bool, requests: usize };
     const cases = [_]Case{
         .{ .replies = &.{ reply_reset, reply_no_upload, head_ok }, .ok = true, .requests = 3 },
-        .{ .replies = &.{ reply_reset, reply_no_upload, head_missing }, .ok = false, .requests = 3 },
-        .{ .replies = &.{ reply_reset, reply_no_upload, head_other }, .ok = false, .requests = 3 },
-        .{ .replies = &.{reply_no_upload}, .ok = false, .requests = 1 },
+        .{ .replies = &.{ reply_reset, reply_no_upload, head_missing, reply_no_upload }, .ok = false, .requests = 4 },
+        .{ .replies = &.{ reply_reset, reply_no_upload, head_other, reply_no_upload }, .ok = false, .requests = 4 },
+        .{ .replies = &.{ reply_no_upload, reply_no_upload }, .ok = false, .requests = 2 },
     };
     for (cases) |c| {
         var srv: http_fake.FakeServer = undefined;
@@ -1100,7 +1136,56 @@ test "a complete whose answer was lost counts as done only when the object it ma
         if (c.ok) try w.finish() else try std.testing.expectError(Error.S3UploadMissing, w.finish());
         try std.testing.expectEqual(c.requests, srv.requests());
         try std.testing.expect(std.mem.startsWith(u8, srv.line(0), "POST /lake/out.csv?uploadId=up1 "));
-        if (c.requests == 3) try std.testing.expect(std.mem.startsWith(u8, srv.line(2), "HEAD /lake/out.csv "));
+        if (c.requests >= 3) try std.testing.expect(std.mem.startsWith(u8, srv.line(2), "HEAD /lake/out.csv "));
+        if (!c.ok) try std.testing.expect(std.mem.startsWith(u8, srv.line(c.requests - 1), "DELETE /lake/out.csv?uploadId=up1 "));
+    }
+}
+
+test "abort sends a signed AbortMultipartUpload for a started upload and keeps the error that caused it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    {
+        var srv: http_fake.FakeServer = undefined;
+        try srv.start(&.{
+            reply("403 Forbidden", "", "<Error><Code>AccessDenied</Code><Message>denied</Message></Error>"),
+            reply("500 Internal Server Error", "", "<Error><Code>InternalError</Code></Error>"),
+            reply("204 No Content", "", ""),
+        });
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        try std.testing.expectError(Error.S3AuthFailed, w.uploadPart("hello"));
+        w.abort();
+        w.abort();
+        try std.testing.expectEqual(@as(usize, 3), srv.requests());
+        try std.testing.expectEqualStrings("DELETE /lake/out.csv?uploadId=up1 HTTP/1.1", srv.line(1));
+        try std.testing.expectEqualStrings(srv.line(1), srv.line(2));
+        try std.testing.expect(std.mem.indexOf(u8, srv.headOf(1), "Authorization: AWS4-HMAC-SHA256 ") != null);
+        try std.testing.expectEqual(Error.S3AuthFailed, w.last_status.?);
+        try std.testing.expect(std.mem.indexOf(u8, w.last_error, "AccessDenied") != null);
+    }
+    {
+        var srv: http_fake.FakeServer = undefined;
+        try srv.start(&.{
+            reply("403 Forbidden", "", "<Error><Code>AccessDenied</Code></Error>"),
+        });
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        try std.testing.expectError(Error.S3AuthFailed, w.uploadPart("hello"));
+        w.abort();
+        try std.testing.expectEqual(@as(usize, 2), srv.requests());
+        try std.testing.expectEqual(Error.S3AuthFailed, w.last_status.?);
+    }
+    {
+        var srv: http_fake.FakeServer = undefined;
+        try srv.start(&.{});
+        defer srv.stop();
+        var w = try testWriter(a, &client, &srv);
+        w.upload_id = null;
+        w.abort();
+        try std.testing.expectEqual(@as(usize, 0), srv.requests());
     }
 }
 
