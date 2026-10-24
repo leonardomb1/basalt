@@ -19,6 +19,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const column = @import("../../exec/column.zig");
+const cell = @import("../../exec/cell.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const jt = @import("../../exec/json.zig");
@@ -102,17 +103,29 @@ pub const Rows = struct {
     schema: types.Schema,
     index: std.StringHashMapUnmanaged(usize) = .empty,
     builders: []column.Builder,
+    fast: []Fast,
     vals: []?[]const u8,
     len: usize = 0,
+
+    /// A column's shortcut, chosen once from its type: a plain number or a literal
+    /// appended as `read` would append it, without the `Value` and cast between.
+    const Fast = enum { none, int, float, bool };
 
     pub fn init(arena: std.mem.Allocator, schema: types.Schema, capacity: usize) Error!Rows {
         var r = Rows{
             .schema = schema,
             .builders = try arena.alloc(column.Builder, schema.fields.len),
+            .fast = try arena.alloc(Fast, schema.fields.len),
             .vals = try arena.alloc(?[]const u8, schema.fields.len),
         };
-        for (r.builders, schema.fields, 0..) |*b, f, i| {
+        for (r.builders, r.fast, schema.fields, 0..) |*b, *fa, f, i| {
             b.* = try column.Builder.initCapacity(arena, f.ty, @max(capacity, 1));
+            fa.* = switch (f.ty.kind) {
+                .int => .int,
+                .float => .float,
+                .bool => .bool,
+                else => .none,
+            };
             try r.index.put(arena, f.name, i);
         }
         return r;
@@ -135,8 +148,31 @@ pub const Rows = struct {
                 at = ci + 1;
             }
         }
-        for (self.builders, vals, fields) |*b, raw, f| try b.append(try read(arena, raw, f.ty));
+        for (self.builders, vals, fields, self.fast) |*b, raw, f, fa| {
+            if (raw) |t| if (try appendFast(b, fa, t)) continue;
+            try b.append(try read(arena, raw, f.ty));
+        }
         self.len += 1;
+    }
+
+    /// Appends `raw` by its column's shortcut when it is the plain case the shortcut
+    /// reads exactly as `read` would; false leaves it to `read`.
+    fn appendFast(b: *column.Builder, fa: Fast, raw: []const u8) Error!bool {
+        switch (fa) {
+            .none => return false,
+            .int => b.appendInt(cell.intFast(raw) orelse return false) catch return error.OutOfMemory,
+            .float => {
+                const x = cell.floatFast(raw) orelse return false;
+                if (x == 0) return false;
+                b.appendFloat(x) catch return error.OutOfMemory;
+            },
+            .bool => b.appendAs(.b, switch (raw[0]) {
+                't' => true,
+                'f' => false,
+                else => return false,
+            }) catch return error.OutOfMemory,
+        }
+        return true;
     }
 
     pub fn finish(self: *Rows, arena: std.mem.Allocator, schema: *const types.Schema) Error!Batch {
@@ -602,4 +638,45 @@ test "a folder whose later file cannot be opened fails once and frees each reade
     defer f.close();
     try std.testing.expect((try f.next(a)) != null);
     try std.testing.expectError(error.FileNotFound, f.next(a));
+}
+
+test "the column shortcuts append exactly what the general path does, whenever they take a value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x15_0a);
+    const r = prng.random();
+    const alphabet = "0123456789000-.eE+";
+    const edges = [_][]const u8{ "0", "-0", "007", "9223372036854775807", "-9223372036854775808", "123456789012345678", "1234567890123456", "0.1", "-0.0", "1e5", "2.50", "true", "false", "null", "\"9\"" };
+    var taken: usize = 0;
+    for (0..200_000 + edges.len) |n| {
+        const raw = if (n < edges.len) edges[n] else blk: {
+            const t = try a.alloc(u8, 1 + r.uintLessThan(usize, 20));
+            for (t) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+            break :blk t;
+        };
+        for ([_]Rows.Fast{ .int, .float, .bool }) |fa| {
+            const ty = types.Type.init(switch (fa) {
+                .int => .int,
+                .float => .float,
+                else => .bool,
+            }).asNullable();
+            var fast = column.Builder.init(a, ty);
+            if (!try Rows.appendFast(&fast, fa, raw)) continue;
+            taken += 1;
+            var slow = column.Builder.init(a, ty);
+            try slow.append(try Rows.read(a, raw, ty));
+            const want = (try slow.finish()).getValue(0);
+            const got = (try fast.finish()).getValue(0);
+            const same = switch (want) {
+                .float => |x| got == .float and @as(u64, @bitCast(x)) == @as(u64, @bitCast(got.float)),
+                else => std.meta.eql(want, got),
+            };
+            if (!same) {
+                std.debug.print("{s} `{s}`: general {any}, shortcut {any}\n", .{ @tagName(fa), raw, want, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    try testing.expect(taken > 10_000);
 }
