@@ -51,7 +51,8 @@
 //!                        token_path defaults to access_token, prefix to "Bearer ".
 //! Session kinds (login_json, oauth2) re-login and retry the page once on a 401,
 //! so server-side session expiry mid-pull heals itself. A 401 goes to re-login
-//! before `retry_statuses` is consulted.
+//! before `retry_statuses` is consulted. A login request runs like a page, under
+//! its deadline and retries.
 //!
 //! Resilience: transient failures (429/5xx, connection resets) retry in place
 //! `retries` times through `objstore.retry`, backing off from `retry_base_ms` with
@@ -63,9 +64,9 @@
 //! WriteFailed/ReadFailed, which must not count as transient globally (a CSV
 //! sink's disk-full is WriteFailed too). `progress_ms` emits a heartbeat.
 //!
-//! Deadlines and prefetch: `timeout_ms` bounds every page fetch, its retries
-//! included, sequential, prefetched or replayed after a re-login, by running it on a
-//! detached worker in a `Slot`; a black-holed
+//! Deadlines and prefetch: `timeout_ms` bounds every page fetch and login, its
+//! retries included, sequential, prefetched or replayed after a re-login, by running
+//! it on a detached worker in a `Slot`; a black-holed
 //! request surfaces as ConnectionTimedOut. The worker cannot be interrupted, so it
 //! is abandoned (bounded and counted) and frees itself if the server ever
 //! answers. That is why a slot reads only its own arena snapshot and the
@@ -244,7 +245,9 @@ pub const AuthState = struct {
     header: ?std.http.Header = null,
     logger: ?*obs.Logger = null,
 
-    pub fn ensure(self: *AuthState, client: *std.http.Client) !?std.http.Header {
+    /// The header every request carries, logging in through `src` the first time a
+    /// session kind needs a token.
+    pub fn ensure(self: *AuthState, src: *HttpSource) !?std.http.Header {
         if (self.header) |h| return h;
         switch (self.cc.auth) {
             .none => return null,
@@ -260,23 +263,14 @@ pub const AuthState = struct {
                 self.header = .{ .name = "Authorization", .value = try std.fmt.allocPrint(self.arena, "Basic {s}", .{b64}) };
             },
             .header => self.header = .{ .name = self.cc.header_name, .value = self.cc.header_value },
-            .login_json, .oauth2 => try self.login(client),
+            .login_json, .oauth2 => try src.login(self),
         }
         return self.header;
     }
 
-    pub fn refresh(self: *AuthState, client: *std.http.Client) bool {
-        switch (self.cc.auth) {
-            .login_json, .oauth2 => {
-                self.header = null;
-                self.login(client) catch return false;
-                return true;
-            },
-            else => return false,
-        }
-    }
+    const LoginReq = struct { url: []const u8, payload: []const u8, content_type: []const u8 };
 
-    fn login(self: *AuthState, client: *std.http.Client) !void {
+    fn loginRequest(self: *AuthState) !LoginReq {
         const arena = self.arena;
         const is_oauth = self.cc.auth == .oauth2;
         var content_type: []const u8 = undefined;
@@ -295,22 +289,20 @@ pub const AuthState = struct {
             for (self.cc.body) |kv| try map.put(kv.key, .{ .string = kv.value });
             payload = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = map }, .{});
         }
+        return .{ .url = self.cc.login_url, .payload = payload, .content_type = content_type };
+    }
 
-        const res = try objstore.exchange(arena, client, .{
-            .method = .POST,
-            .url = self.cc.login_url,
-            .payload = payload,
-            .content_type = content_type,
-            .max_body = max_page_bytes,
-        });
-        const code = res.code;
+    /// Takes the token out of the login response, copying all it keeps into the arena.
+    fn acceptLogin(self: *AuthState, code: u16, res_body: []const u8) !void {
+        const arena = self.arena;
+        const is_oauth = self.cc.auth == .oauth2;
         if (code != 200) {
-            const b = res.body;
+            const b = res_body;
             var ub: [512]u8 = undefined;
             obs.logOr(self.logger, .err, "login http {d} from {s}: {f}", .{ code, redactUrl(&ub, self.cc.login_url), std.zig.fmtString(b[0..@min(b.len, 300)]) });
             return statusError(code);
         }
-        const body = std.mem.trim(u8, res.body, " \t\r\n");
+        const body = std.mem.trim(u8, res_body, " \t\r\n");
         if (body.len == 0) return error.LoginTokenMissing;
         try jt.validate(arena, body);
         const path = if (self.cc.token_path.len > 0)
@@ -777,7 +769,7 @@ pub const HttpSource = struct {
         if (slot.code == 401 and !replay) {
             const a = self.auth orelse return self.listedFallback(401, self.raiseStatus(401, slot.url, slot.body));
             if (slot.gen >= self.auth_gen) {
-                if (!a.refresh(self.client)) return self.listedFallback(401, self.raiseStatus(401, slot.url, slot.body));
+                if (!try self.relogin(a)) return self.listedFallback(401, self.raiseStatus(401, slot.url, slot.body));
                 self.auth_gen += 1;
             }
             return self.replayOf(arena, slot);
@@ -839,14 +831,52 @@ pub const HttpSource = struct {
         return self.spawnFetch(req);
     }
 
+    /// A login request, run like a page: on a slot's worker under the page deadline
+    /// and the same retries, so a black-holed token endpoint is ConnectionTimedOut.
+    fn login(self: *HttpSource, a: *AuthState) anyerror!void {
+        const req = try a.loginRequest();
+        const slot = try self.spawnSlotFor(.{ .url = req.url, .body = req.payload }, true, req.content_type, false);
+        var red_buf: [512]u8 = undefined;
+        self.awaitSlot(slot) catch |e| {
+            obs.logOr(self.logger, .warn, "login abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, req.url) });
+            return e;
+        };
+        defer freeSlot(slot);
+        if (slot.err) |e| {
+            obs.logOr(self.logger, .err, "login failed ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, req.url) });
+            return mapTransport(e);
+        }
+        return a.acceptLogin(slot.code, slot.body);
+    }
+
+    /// Logs in again after a 401: false when the auth kind has no session or the
+    /// login is refused, while a login that timed out or was aborted fails the read.
+    fn relogin(self: *HttpSource, a: *AuthState) !bool {
+        switch (a.cc.auth) {
+            .login_json, .oauth2 => {},
+            else => return false,
+        }
+        a.header = null;
+        self.login(a) catch |e| switch (e) {
+            error.ConnectionTimedOut, error.Aborted => return e,
+            else => return false,
+        };
+        return true;
+    }
+
     fn spawnFetch(self: *HttpSource, req: PageReq) !*Slot {
+        return self.spawnSlotFor(req, self.opts.method == .post, self.contentType(), true);
+    }
+
+    /// A page carries the source's headers and auth; a login carries neither.
+    fn spawnSlotFor(self: *HttpSource, req: PageReq, post: bool, content_type: ?[]const u8, page: bool) !*Slot {
         const slot = try self.gpa.create(Slot);
         slot.* = .{
             .gpa = self.gpa,
             .snap = std.heap.ArenaAllocator.init(self.gpa),
             .client = self.client,
-            .method_post = self.opts.method == .post,
-            .content_type = self.contentType(),
+            .method_post = post,
+            .content_type = content_type,
             .user_agent = userAgentOf(self.opts),
             .url = undefined,
             .gen = self.auth_gen,
@@ -858,7 +888,7 @@ pub const HttpSource = struct {
         slot.user_agent = try sa.dupe(u8, slot.user_agent);
         slot.url = try sa.dupe(u8, req.url);
         if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
-        try self.snapshotInto(slot);
+        if (page) try self.snapshotInto(slot);
         var th = try std.Thread.spawn(.{}, workerMain, .{slot});
         th.detach();
         return slot;
@@ -872,7 +902,7 @@ pub const HttpSource = struct {
             slot.nh += 1;
         }
         if (self.auth) |a| {
-            if (try a.ensure(self.client)) |h| {
+            if (try a.ensure(self)) |h| {
                 slot.hdrs[slot.nh] = .{ .name = try sa.dupe(u8, h.name), .value = try sa.dupe(u8, h.value) };
                 slot.nh += 1;
             }
@@ -1792,6 +1822,34 @@ test "a page replayed after a re-login times out like any page" {
         .login_url = "/login",
     }, "/items", .{ .retries = 0, .timeout_ms = 400 }));
     try std.testing.expect(std.time.milliTimestamp() - started < 5_000);
+}
+
+test "a black-holed login, first or after a 401, times out instead of hanging the read" {
+    var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const login_ok = "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n\"tok-A\"";
+    const expired = "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const cases = [_][]const []const u8{ &.{}, &.{ login_ok, expired } };
+    for (cases) |replies| {
+        var listener = try http_fake.listen(128);
+        defer listener.deinit();
+        hang_released.store(false, .seq_cst);
+        const th = try std.Thread.spawn(.{}, serveThenHang, .{ &listener, replies });
+        defer th.join();
+        defer hang_released.store(true, .seq_cst);
+
+        const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+        const started = std.time.milliTimestamp();
+        try std.testing.expectError(error.ConnectionTimedOut, HttpSource.openConn(a, std.heap.page_allocator, .{
+            .base_url = base,
+            .auth = .login_json,
+            .login_url = "/login",
+        }, "/items", .{ .retries = 0, .timeout_ms = 400 }));
+        const waited = std.time.milliTimestamp() - started;
+        try std.testing.expect(waited >= 350 and waited < 5_000);
+    }
 }
 
 test "joinUrl and encodeSpaces" {
