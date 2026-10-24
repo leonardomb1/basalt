@@ -10,6 +10,7 @@ pub const lists_v1_parquet = @embedFile("lists_v1.parquet");
 pub const lists_v2_parquet = @embedFile("lists_v2.parquet");
 pub const delta_rs_checkpoint_parquet = @embedFile("delta_rs_checkpoint.parquet");
 pub const mapped_nested_parquet = @embedFile("mapped_nested.parquet");
+pub const avro_orders_snappy = @embedFile("avro/orders_snappy.avro");
 
 /// Small Delta tables written by Spark (`delta/README.md`), each file as its path
 /// under `delta/` and its bytes.
