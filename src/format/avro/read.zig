@@ -740,3 +740,93 @@ test "counts past what a block holds, a decompression bomb and a value nested to
     const ok = try readAll(a, try file(a, list, "null", 1, deep.items));
     try testing.expect(std.mem.startsWith(u8, ok.rows[0][0].string, "{\"next\":{\"next\":"));
 }
+
+const tu = @import("testing_util.zig");
+
+const fixtures = [_][]const u8{
+    @embedFile("../testdata/avro/orders_null.avro"),
+    @embedFile("../testdata/avro/orders_deflate.avro"),
+    @embedFile("../testdata/avro/orders_snappy.avro"),
+    @embedFile("../testdata/avro/orders_zstandard.avro"),
+};
+
+test "fuzz: random schemas and datums read every row, alike under every codec" {
+    for (0..tu.iters(300)) |seed| {
+        var ar = std.heap.ArenaAllocator.init(testing.allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var prng = std.Random.DefaultPrng.init(0xa5_0000 + seed);
+        var g = tu.Gen{ .r = prng.random(), .a = a };
+        const rows = g.r.uintLessThan(usize, 24);
+        const f = try tu.randomFile(&g, .null, rows);
+        const want = dump(a, f.bytes) catch |e| {
+            std.debug.print("seed {d}: {s} ({s})\nschema {s}\n", .{ seed, @errorName(e), eval.takeFailure(e) orelse "", f.schema_json });
+            return e;
+        };
+        const got_rows = (try readAll(a, f.bytes)).rows.len;
+        try testing.expectEqual(rows, got_rows);
+        for ([_]Codec{ .deflate, .snappy }) |codec| {
+            const other = try tu.file(a, f.schema_json, codec, f.blocks);
+            try testing.expectEqualStrings(want, try dump(a, other));
+        }
+    }
+}
+
+fn readAny(bytes: []const u8) void {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    _ = readAll(ar.allocator(), bytes) catch return;
+}
+
+fn fuzzOne(_: void, input: []const u8) anyerror!void {
+    readAny(input);
+}
+
+test "fuzz: corrupted blocks, headers and schemas never crash, leak or hang the reader" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xbad_a5);
+    const r = prng.random();
+    var corpus = std.array_list.Managed([]const u8).init(a);
+    try corpus.appendSlice(&fixtures);
+    var g = tu.Gen{ .r = r, .a = a };
+    for (0..24) |i| try corpus.append((try tu.randomFile(&g, @enumFromInt(i % 3), 1 + r.uintLessThan(usize, 12))).bytes);
+    for (0..tu.iters(2000)) |_| {
+        var it = std.heap.ArenaAllocator.init(testing.allocator);
+        defer it.deinit();
+        const base = corpus.items[r.uintLessThan(usize, corpus.items.len)];
+        readAny(try tu.mutateBody(r, it.allocator(), base, try tu.headerLen(it.allocator(), base)));
+    }
+    try @import("../../testing/fuzzutil.zig").pound(fuzzOne, corpus.items[0..4]);
+    for (0..tu.iters(2000)) |_| {
+        var it = std.heap.ArenaAllocator.init(testing.allocator);
+        defer it.deinit();
+        const ia = it.allocator();
+        var text = std.array_list.Managed(u8).init(ia);
+        try text.appendSlice(try g.top());
+        for (0..1 + r.uintLessThan(usize, 3)) |_| {
+            if (text.items.len == 0) break;
+            const at = r.uintLessThan(usize, text.items.len);
+            switch (r.uintLessThan(u8, 3)) {
+                0 => text.items[at] = "{}[]\",:01-9aZ"[r.uintLessThan(usize, 14)],
+                1 => _ = text.orderedRemove(at),
+                else => text.items.len = at,
+            }
+        }
+        const root = schema_mod.parse(ia, text.items) catch continue;
+        _ = schema_mod.plan(ia, root) catch continue;
+    }
+}
+
+test "fuzz: arbitrary bytes behind a valid header never crash the reader" {
+    try std.testing.fuzz({}, struct {
+        fn f(_: void, input: []const u8) anyerror!void {
+            var ar = std.heap.ArenaAllocator.init(testing.allocator);
+            defer ar.deinit();
+            const a = ar.allocator();
+            const head = fixtures[0][0..try tu.headerLen(a, fixtures[0])];
+            readAny(try std.mem.concat(a, u8, &.{ head, input }));
+        }
+    }.f, .{});
+}

@@ -202,7 +202,7 @@ fn decimalTooWide(f: types.Schema.Field, p: u8) anyerror {
     return stream.explainf(error.AvroDecimalOverflow, "a value of column `{s}` does not fit its DECIMAL({d},{d})", .{ f.name, p, f.ty.scale });
 }
 
-fn compress(arena: std.mem.Allocator, codec: Codec, body: []const u8) ![]const u8 {
+pub fn compress(arena: std.mem.Allocator, codec: Codec, body: []const u8) ![]const u8 {
     switch (codec) {
         .null => return body,
         .deflate => {
@@ -340,4 +340,91 @@ test "a decimal is written in the fewest bytes, restated at its column's scale" 
     var out = std.array_list.Managed(u8).init(a);
     try testing.expectError(error.AvroDecimalOverflow, decimalBytes(&out, .{ .unscaled = 1000, .scale = 0 }, .{ .name = "d", .ty = types.Type.decimal(3, 0) }));
     try decimalBytes(&out, .{ .unscaled = 999, .scale = 0 }, .{ .name = "d", .ty = types.Type.decimal(3, 0) });
+}
+
+fn randomValue(r: std.Random, a: std.mem.Allocator, ty: types.Type) !Value {
+    if (r.uintLessThan(u8, 6) == 0) return .null;
+    const edge = r.uintLessThan(u8, 4) == 0;
+    return switch (ty.kind) {
+        .bool => .{ .bool = r.boolean() },
+        .int => .{ .int = if (edge) (if (r.boolean()) std.math.minInt(i64) else std.math.maxInt(i64)) else r.int(i64) >> r.int(u6) },
+        .float => .{ .float = if (edge) ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), -0.0, 5e-324 })[r.uintLessThan(usize, 5)] else @bitCast(r.int(u64)) },
+        .decimal => blk: {
+            const bound = pow10_i128[ty.precision];
+            const v: i128 = if (edge) (if (r.boolean()) bound - 1 else 1 - bound) else @rem(@as(i128, @bitCast(r.int(u128))), bound);
+            break :blk .{ .decimal = .{ .unscaled = v, .scale = ty.scale } };
+        },
+        .string, .bytes => blk: {
+            const s = try a.alloc(u8, r.uintLessThan(usize, 40));
+            r.bytes(s);
+            break :blk if (ty.kind == .string) Value{ .string = s } else Value{ .bytes = s };
+        },
+        .date => .{ .date = if (edge) std.math.minInt(i32) + 1 else r.int(i32) },
+        .time => .{ .time = r.intRangeLessThan(i64, 0, 86_400_000_000) },
+        .timestamp => .{ .timestamp = if (edge) (if (r.boolean()) std.math.minInt(i64) else std.math.maxInt(i64)) else r.int(i64) },
+        .array, .@"struct" => unreachable,
+    };
+}
+
+test "fuzz: random tables of every type round-trip through each codec, any batch split" {
+    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp };
+    for (0..@import("testing_util.zig").iters(150)) |seed| {
+        var ar = std.heap.ArenaAllocator.init(testing.allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var prng = std.Random.DefaultPrng.init(0xa5_e000 + seed);
+        const r = prng.random();
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const fields = try a.alloc(types.Schema.Field, 1 + r.uintLessThan(usize, 6));
+        for (fields, 0..) |*f, i| {
+            const k = kinds[r.uintLessThan(usize, kinds.len)];
+            const p = 1 + r.uintLessThan(u8, 38);
+            f.* = .{ .name = try std.fmt.allocPrint(a, "c_{d}", .{i}), .ty = (if (k == .decimal) types.Type.decimal(p, r.uintAtMost(u8, p)) else types.Type.init(k)).asNullable() };
+        }
+        const sch = try a.create(types.Schema);
+        sch.* = .{ .fields = fields };
+        const nbatches = r.uintLessThan(usize, 4);
+        const batches = try a.alloc(Batch, nbatches);
+        var total: usize = 0;
+        for (batches) |*b| {
+            const n = 1 + r.uintLessThan(usize, 50);
+            const cols = try a.alloc(@import("../../exec/column.zig").Column, fields.len);
+            for (cols, fields) |*c, f| {
+                var bld = @import("../../exec/column.zig").Builder.init(a, f.ty);
+                for (0..n) |_| try bld.append(try randomValue(r, a, f.ty));
+                c.* = try bld.finish();
+            }
+            b.* = .{ .schema = sch, .columns = cols, .len = n };
+            total += n;
+        }
+        const codec = ([_]Codec{ .null, .deflate, .snappy })[r.uintLessThan(usize, 3)];
+        const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "p.avro" });
+        const w = try Writer.open(a, path, sch.*, codec);
+        for (batches) |b| try w.writeBatch(a, b);
+        try w.close();
+        const f = try read.Files.open(a, testing.allocator, &.{path}, .{ .batch_rows = 1 + r.uintLessThan(usize, 64) });
+        defer f.close();
+        for (sch.fields, f.schema.fields) |x, y| try testing.expect(types.Type.eql(x.ty, y.ty));
+        var bi: usize = 0;
+        var at: usize = 0;
+        var seen: usize = 0;
+        while (try f.next(a)) |got| {
+            for (0..got.len) |row| {
+                while (at == batches[bi].len) {
+                    bi += 1;
+                    at = 0;
+                }
+                for (batches[bi].columns, got.columns, sch.fields) |want, back, fld| {
+                    if (!same(want.getValue(at), back.getValue(row), fld.ty)) {
+                        std.debug.print("seed {d} {s}: wrote {any}, read {any}\n", .{ seed, fld.name, want.getValue(at), back.getValue(row) });
+                        return error.TestUnexpectedResult;
+                    }
+                }
+                at += 1;
+                seen += 1;
+            }
+        }
+        try testing.expectEqual(total, seen);
+    }
 }
