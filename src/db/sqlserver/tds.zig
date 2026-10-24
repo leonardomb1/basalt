@@ -47,6 +47,8 @@ const column = @import("../../exec/column.zig");
 const celltext = @import("../../exec/celltext.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
+const Decimal = @import("../../exec/value.zig").Decimal;
+const cell = @import("../../exec/cell.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -819,9 +821,7 @@ const TdsCursor = struct {
         for (0..count) |k| {
             try self.reader.skip(6);
             var d = try self.parseTypeInfo();
-            d.plain_text = d.engine_type.kind == .string and !d.is_unicode and !d.is_guid and !d.is_binary and
-                (d.kind == .bytelen or d.kind == .ushortlen);
-            d.unicode_text = d.engine_type.kind == .string and d.is_unicode and !d.is_guid and !d.is_binary;
+            d.decode = decodeOf(d);
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
             d.name = try utf16ToUtf8(ma, nbytes);
@@ -996,24 +996,20 @@ const TdsCursor = struct {
                 break :blk self.nullbuf[0..nbytes];
             } else try self.reader.readSlice(arena, nbytes);
         }
-        for (self.cols, 0..) |col, ci| {
+        for (self.cols, builders, 0..) |col, *b, ci| {
             if (nbc and (nullbits[ci / 8] >> @intCast(ci % 8)) & 1 != 0) {
-                try builders[ci].append(.null);
+                try b.appendNull();
                 continue;
             }
-            if (col.plain_text) {
-                try self.readPlainText(&builders[ci], col);
+            if (col.decode == .plain_text) {
+                try self.readPlainText(b, col);
                 continue;
             }
-            if (col.unicode_text) {
-                const raw = (try self.readRaw(arena, col)) orelse {
-                    try builders[ci].append(.null);
-                    continue;
-                };
-                try appendUtf16(&builders[ci], raw);
+            const raw = (try self.readRaw(arena, col)) orelse {
+                try b.appendNull();
                 continue;
-            }
-            try builders[ci].append(try self.readColumnValue(arena, col));
+            };
+            try appendCell(b, col, raw, arena);
         }
     }
 
@@ -1035,14 +1031,10 @@ const TdsCursor = struct {
     }
 
     /// Fixed and length-prefixed cells, never longer than the cell buffer, are read
-    /// into it; `decodeValue` copies whatever it keeps.
+    /// into it; `appendRaw` copies whatever it keeps.
     fn readCell(self: *TdsCursor, len: usize) ![]u8 {
         try self.reader.readBytes(self.cell[0..len]);
         return self.cell[0..len];
-    }
-
-    fn readColumnValue(self: *TdsCursor, arena: std.mem.Allocator, col: ColumnDesc) !Value {
-        return decodeValue(arena, col, (try self.readRaw(arena, col)) orelse return .null);
     }
 
     /// A cell's bytes as the wire holds them, null for NULL; a short one is in the
@@ -1257,26 +1249,57 @@ const ColumnDesc = struct {
     is_guid: bool = false,
     is_binary: bool = false,
     is_money: bool = false,
-    plain_text: bool = false,
-    unicode_text: bool = false,
+    decode: Decode = .raw_text,
 };
 
-fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Value {
+/// How a column's cells reach its builder, chosen once from its metadata
+/// (`decodeOf`); each is an `appendRaw` instantiated at compile time.
+/// `plain_text` is a varchar read from the packet straight into its column.
+const Decode = enum { int, bool, float, decimal, money, date, time, datetime, plain_text, win1252, unicode_text, guid, hex, bytes, raw_text };
+
+fn decodeOf(d: ColumnDesc) Decode {
     return switch (d.engine_type.kind) {
-        .int => .{ .int = readIntLE(bytes) },
-        .bool => .{ .bool = bytes.len > 0 and bytes[0] != 0 },
-        .float => .{ .float = if (bytes.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(bytes)))))) else @bitCast(readULE(bytes)) },
-        .decimal => if (d.is_money) try decodeMoney(bytes) else try decodeDecimal(d, bytes),
-        .string => .{ .string = if (d.is_guid) try formatGuid(arena, bytes) else if (d.is_binary) try bytesToHex(arena, bytes) else if (d.is_unicode) try utf16ToUtf8(arena, bytes) else try win1252ToUtf8(arena, bytes) },
-        .bytes => .{ .bytes = try arena.dupe(u8, bytes) },
-        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(bytes))) - 719162)) |days|
-            .{ .date = days }
-        else
-            .null,
-        .time => .{ .time = try decodeTime(d, bytes) },
-        .timestamp => .{ .timestamp = try decodeDateTime(d, bytes) },
-        else => .{ .string = try arena.dupe(u8, bytes) },
+        .int => .int,
+        .bool => .bool,
+        .float => .float,
+        .decimal => if (d.is_money) .money else .decimal,
+        .date => .date,
+        .time => .time,
+        .timestamp => .datetime,
+        .string => if (d.is_guid) .guid else if (d.is_binary) .hex else if (d.is_unicode) .unicode_text else if (d.kind == .bytelen or d.kind == .ushortlen) .plain_text else .win1252,
+        .bytes => .bytes,
+        else => .raw_text,
     };
+}
+
+/// A cell's wire bytes into its column's storage as `c` decodes them, with no
+/// `Value` between.
+fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const u8, arena: std.mem.Allocator) !void {
+    switch (c) {
+        .int => try b.appendInt(readIntLE(raw)),
+        .bool => try b.appendAs(.b, raw.len > 0 and raw[0] != 0),
+        .float => try b.appendFloat(if (raw.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(raw)))))) else @bitCast(readULE(raw))),
+        .decimal => try b.appendAs(.dec, try decodeDecimal(d, raw)),
+        .money => try b.appendAs(.dec, try decodeMoney(raw)),
+        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(raw))) - 719162)) |days| try b.appendAs(.i32, days) else try b.appendNull(),
+        .time => try b.appendInt(try decodeTime(d, raw)),
+        .datetime => try b.appendInt(try decodeDateTime(d, raw)),
+        .plain_text, .win1252 => {
+            if (isAscii(raw)) return b.appendStr(raw);
+            return b.commitBytes(win1252Encode(try b.reserveBytes(win1252Len(raw)), raw));
+        },
+        .unicode_text => try appendUtf16(b, raw),
+        .guid => try b.appendStr(try formatGuid(arena, raw)),
+        .hex => try b.appendStr(try bytesToHex(arena, raw)),
+        .bytes, .raw_text => try b.appendStr(raw),
+    }
+}
+
+/// `appendRaw` for a column whose decode is known only at run time.
+fn appendCell(b: *column.Builder, d: ColumnDesc, raw: []const u8, arena: std.mem.Allocator) !void {
+    switch (d.decode) {
+        inline else => |c| try appendRaw(c, b, d, raw, arena),
+    }
 }
 
 /// A value body whose length its type cannot have. It fails the read rather than
@@ -1284,18 +1307,16 @@ fn decodeValue(arena: std.mem.Allocator, d: ColumnDesc, bytes: []const u8) !Valu
 const MalformedValue = error{MalformedTdsValue};
 
 /// DECIMALN: a sign byte, then a 4, 8, 12 or 16-byte little-endian magnitude.
-fn decodeDecimal(d: ColumnDesc, bytes: []const u8) MalformedValue!Value {
+fn decodeDecimal(d: ColumnDesc, bytes: []const u8) MalformedValue!Decimal {
     switch (bytes.len) {
         5, 9, 13, 17 => {},
         else => return error.MalformedTdsValue,
     }
-    var mag: u128 = 0;
-    for (bytes[1..], 0..) |b, k| mag |= @as(u128, b) << @intCast(k * 8);
-    const m = std.math.cast(i128, mag) orelse return error.MalformedTdsValue;
-    return .{ .decimal = .{ .unscaled = if (bytes[0] == 1) m else -m, .scale = d.scale } };
+    const v = cell.signMagnitudeDecimal(bytes[0] == 1, bytes[1..]) orelse return error.MalformedTdsValue;
+    return .{ .unscaled = v, .scale = d.scale };
 }
 
-fn decodeMoney(bytes: []const u8) MalformedValue!Value {
+fn decodeMoney(bytes: []const u8) MalformedValue!Decimal {
     const unscaled: i64 = switch (bytes.len) {
         4 => std.mem.readInt(i32, bytes[0..4], .little),
         8 => blk: {
@@ -1305,7 +1326,7 @@ fn decodeMoney(bytes: []const u8) MalformedValue!Value {
         },
         else => return error.MalformedTdsValue,
     };
-    return .{ .decimal = .{ .unscaled = unscaled, .scale = 4 } };
+    return .{ .unscaled = unscaled, .scale = 4 };
 }
 
 /// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.
@@ -1500,19 +1521,33 @@ fn appendUtf16(b: *column.Builder, bytes: []const u8) !void {
 }
 
 /// `bytes` as UTF-8 into `out`, which has room for three bytes per code unit (a
-/// pair's four bytes are two units' worth); returns the length written.
+/// pair's four bytes are two units' worth); returns the length written. Eight
+/// units that are all ASCII, the common run, are narrowed at once.
 fn utf16Encode(out: []u8, bytes: []const u8) usize {
+    const V = @Vector(16, u8);
+    const ascii_mask: V = @bitCast([_]u8{ 0x80, 0xFF } ** 8);
+    const lows = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
     var o: usize = 0;
     var k: usize = 0;
-    while (k + 1 < bytes.len) : (k += 2) {
+    while (k + 1 < bytes.len) {
+        if (k + 16 <= bytes.len) {
+            const v: V = bytes[k..][0..16].*;
+            if (@reduce(.Or, v & ascii_mask) == 0) {
+                out[o..][0..8].* = @shuffle(u8, v, undefined, lows);
+                o += 8;
+                k += 16;
+                continue;
+            }
+        }
         var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
+        k += 2;
         if (cp < 0x80) {
             out[o] = @intCast(cp);
             o += 1;
             continue;
         }
         if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
-            const lo: u16 = if (k + 3 < bytes.len) @as(u16, bytes[k + 2]) | (@as(u16, bytes[k + 3]) << 8) else 0;
+            const lo: u16 = if (k + 1 < bytes.len) @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8) else 0;
             if (!std.unicode.utf16IsLowSurrogate(lo)) {
                 out[o] = '?';
                 o += 1;
@@ -1610,7 +1645,7 @@ test "a rowset cut off before its DONE, by a closed socket, an early EOM or an u
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
-    var cols = [_]ColumnDesc{.{ .tds_type = 0x38, .engine_type = types.Type.init(.int).asNullable(), .kind = .fixed, .fixed_len = 4 }};
+    var cols = [_]ColumnDesc{.{ .tds_type = 0x38, .engine_type = types.Type.init(.int).asNullable(), .kind = .fixed, .fixed_len = 4, .decode = .int }};
     const row = [_]u8{ 0xD1, 7, 0, 0, 0 };
     const whole = try framePackets(a, &(row ++ row ++ done_final), 64);
     const closed = whole[0 .. 8 + row.len];
@@ -1648,12 +1683,13 @@ test "rows split across packets of every small size decode as each cell decoded 
     const strT = types.Type.init(.string).asNullable();
     var cols = [_]ColumnDesc{
         .{ .tds_type = 0x38, .engine_type = types.Type.init(.int).asNullable(), .kind = .fixed, .fixed_len = 4 },
-        .{ .tds_type = 0xA7, .engine_type = strT, .kind = .ushortlen, .plain_text = true },
-        .{ .tds_type = 0x2F, .engine_type = strT, .kind = .bytelen, .plain_text = true },
+        .{ .tds_type = 0xA7, .engine_type = strT, .kind = .ushortlen },
+        .{ .tds_type = 0x2F, .engine_type = strT, .kind = .bytelen },
         .{ .tds_type = 0x6C, .engine_type = types.Type.decimal(14, 2).asNullable(), .kind = .bytelen, .scale = 2 },
-        .{ .tds_type = 0xE7, .engine_type = strT, .kind = .ushortlen, .is_unicode = true, .unicode_text = true },
+        .{ .tds_type = 0xE7, .engine_type = strT, .kind = .ushortlen, .is_unicode = true },
         .{ .tds_type = 0x3E, .engine_type = types.Type.init(.float).asNullable(), .kind = .fixed, .fixed_len = 8 },
     };
+    for (&cols) |*c| c.decode = decodeOf(c.*);
     var prng = std.Random.DefaultPrng.init(0x7d5);
     const rnd = prng.random();
     const rows = 60;
@@ -1667,9 +1703,9 @@ test "rows split across packets of every small size decode as each cell decoded 
             nulls = rnd.int(u8) & 0x3F;
             try payload.append(nulls);
         }
-        for (&cols, row, 0..) |col, *cell, ci| {
+        for (&cols, row, 0..) |col, *want_cell, ci| {
             if (nulls >> @intCast(ci) & 1 != 0) {
-                cell.* = .null;
+                want_cell.* = .null;
                 continue;
             }
             var raw: [64]u8 = undefined;
@@ -1696,11 +1732,11 @@ test "rows split across packets of every small size decode as each cell decoded 
                 },
             }
             if (is_null or (col.kind == .bytelen and len == 0)) {
-                cell.* = .null;
+                want_cell.* = .null;
                 continue;
             }
             try payload.appendSlice(raw[0..len]);
-            cell.* = try decodeValue(a, col, raw[0..len]);
+            want_cell.* = try cellValue(a, col, raw[0..len]);
         }
     }
     try payload.appendSlice(&done_final);
@@ -1738,10 +1774,10 @@ test "readIntLE sign-extends every TDS integer width" {
 test "decodeDecimal: sign byte + little-endian magnitude at the column scale" {
     const d = ColumnDesc{ .tds_type = 0x6C, .engine_type = types.Type.decimal(10, 2).asNullable(), .kind = .bytelen, .scale = 2 };
     const pos = try decodeDecimal(d, &.{ 1, 0x39, 0x30, 0, 0 });
-    try std.testing.expectEqual(@as(i128, 12345), pos.decimal.unscaled);
-    try std.testing.expectEqual(@as(u8, 2), pos.decimal.scale);
+    try std.testing.expectEqual(@as(i128, 12345), pos.unscaled);
+    try std.testing.expectEqual(@as(u8, 2), pos.scale);
     const neg = try decodeDecimal(d, &.{ 0, 0x39, 0x30, 0, 0 });
-    try std.testing.expectEqual(@as(i128, -12345), neg.decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, -12345), neg.unscaled);
 }
 
 test "a body of a length its type cannot have is an error, never a cut-off value or a 1970 date" {
@@ -1766,9 +1802,9 @@ test "a body of a length its type cannot have is an error, never a cut-off value
     var widest: [17]u8 = undefined;
     widest[0] = 1;
     std.mem.writeInt(i128, widest[1..17], max38, .little);
-    try std.testing.expectEqual(max38, (try decodeDecimal(dec, &widest)).decimal.unscaled);
+    try std.testing.expectEqual(max38, (try decodeDecimal(dec, &widest)).unscaled);
     widest[0] = 0;
-    try std.testing.expectEqual(-max38, (try decodeDecimal(dec, &widest)).decimal.unscaled);
+    try std.testing.expectEqual(-max38, (try decodeDecimal(dec, &widest)).unscaled);
 
     var long: [40]u8 = undefined;
     @memset(&long, 0xFF);
@@ -1781,22 +1817,22 @@ test "a body of a length its type cannot have is an error, never a cut-off value
 }
 
 test "decodeMoney: ten-thousandths, high word first for the 8-byte form" {
-    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 8))).decimal.unscaled);
-    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 4))).decimal.unscaled);
-    try std.testing.expectEqual(@as(u8, 4), (try decodeMoney(&(.{0xFF} ** 8))).decimal.scale);
+    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 8))).unscaled);
+    try std.testing.expectEqual(@as(i128, -1), (try decodeMoney(&(.{0xFF} ** 4))).unscaled);
+    try std.testing.expectEqual(@as(u8, 4), (try decodeMoney(&(.{0xFF} ** 8))).scale);
 
     var b: [8]u8 = undefined;
     std.mem.writeInt(i32, b[0..4], 0x7FFFFFFF, .little);
     std.mem.writeInt(u32, b[4..8], 0xFFFFFFFF, .little);
-    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), (try decodeMoney(&b)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), (try decodeMoney(&b)).unscaled);
 
     std.mem.writeInt(i32, b[0..4], 0, .little);
     std.mem.writeInt(u32, b[4..8], 10000, .little);
-    try std.testing.expectEqual(@as(i128, 10000), (try decodeMoney(&b)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, 10000), (try decodeMoney(&b)).unscaled);
 
     var b4: [4]u8 = undefined;
     std.mem.writeInt(i32, &b4, std.math.minInt(i32), .little);
-    try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), (try decodeMoney(&b4)).decimal.unscaled);
+    try std.testing.expectEqual(@as(i128, std.math.minInt(i32)), (try decodeMoney(&b4)).unscaled);
 }
 
 test "decodeTime: 10^-scale seconds since midnight to micros" {
@@ -2232,7 +2268,7 @@ fn fuzzCell(_: void, input: []const u8) anyerror!void {
     const flags = input[1];
     var ty = types.Type.init(kind);
     ty.scale = flags % 8;
-    const d = ColumnDesc{
+    var d = ColumnDesc{
         .tds_type = input[0],
         .engine_type = ty,
         .kind = .bytelen,
@@ -2242,11 +2278,19 @@ fn fuzzCell(_: void, input: []const u8) anyerror!void {
         .is_binary = flags & 4 != 0,
         .is_money = flags & 8 != 0,
     };
+    d.decode = decodeOf(d);
     var mem: [256 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&mem);
     var arena = std.heap.ArenaAllocator.init(fba.allocator());
     defer arena.deinit();
-    _ = decodeValue(arena.allocator(), d, input[2..]) catch return;
+    _ = cellValue(arena.allocator(), d, input[2..]) catch return;
+}
+
+/// One cell's bytes through its column's decode, as a run appends them, read back.
+fn cellValue(a: std.mem.Allocator, d: ColumnDesc, raw: []const u8) !Value {
+    var b = column.Builder.init(a, d.engine_type);
+    try appendCell(&b, d, raw, a);
+    return (try b.finish()).getValue(0);
 }
 
 const fuzzCell_corpus = [_][]const u8{
@@ -2259,4 +2303,29 @@ const fuzzCell_corpus = [_][]const u8{
 test "fuzz: row cell decode survives arbitrary bytes" {
     try std.testing.fuzz({}, fuzzCell, .{ .corpus = &fuzzCell_corpus });
     try @import("../../testing/fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
+}
+
+test "utf16Encode matches std on valid UTF-16 at every alignment, ASCII runs narrowed eight at a time" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x16_16);
+    const r = prng.random();
+    const pool = [_]u21{ 'a', 'Z', '0', ' ', '~', 0x7F, 0xE7, 0xE3, 0x20AC, 0x4E2D, 0xFFFD, 0x1F600, 0x10FFFF };
+    for (0..20_000) |_| {
+        var units = std.array_list.Managed(u16).init(a);
+        const n = r.uintLessThan(usize, 48);
+        for (0..n) |_| {
+            const cp: u21 = if (r.uintLessThan(u8, 4) != 0) r.intRangeAtMost(u21, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)];
+            if (cp >= 0x10000) {
+                const v = cp - 0x10000;
+                try units.append(@intCast(0xD800 + (v >> 10)));
+                try units.append(@intCast(0xDC00 + (v & 0x3FF)));
+            } else try units.append(@intCast(cp));
+        }
+        const bytes = std.mem.sliceAsBytes(units.items);
+        const want = try std.unicode.utf16LeToUtf8Alloc(a, units.items);
+        const out = try a.alloc(u8, bytes.len / 2 * 3);
+        try std.testing.expectEqualStrings(want, out[0..utf16Encode(out, bytes)]);
+    }
 }
