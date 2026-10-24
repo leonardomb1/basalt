@@ -9,6 +9,11 @@
 //! column's type and appends it straight into the builder's storage, one
 //! instantiated per type and rules at compile time, so the per-cell work is the
 //! parse and a typed append with no `Value` between them.
+//!
+//! Binary cells share less, since each wire lays its numbers out its own way, but
+//! a decimal's unscaled integer comes in two layouts that several readers decode:
+//! big-endian two's complement (Avro, Parquet) and a sign beside a little-endian
+//! magnitude (SQL Server's TDS).
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -222,6 +227,43 @@ pub fn decimal(t: []const u8) ?Decimal {
     return .{ .unscaled = if (neg) -unscaled else unscaled, .scale = scale };
 }
 
+/// A big-endian two's complement integer as an unscaled decimal; null when it is
+/// wider than an i128 holds. Eight bytes or fewer take a 64-bit path.
+pub fn bigEndianDecimal(b: []const u8) ?i128 {
+    if (b.len == 0) return 0;
+    const neg = b[0] & 0x80 != 0;
+    if (b.len <= 8) {
+        var acc: u64 = if (neg) std.math.maxInt(u64) else 0;
+        for (b) |x| acc = (acc << 8) | x;
+        return @as(i64, @bitCast(acc));
+    }
+    var start: usize = 0;
+    if (b.len > 16) {
+        start = b.len - 16;
+        for (b[0..start]) |x| if (x != (if (neg) @as(u8, 0xFF) else 0)) return null;
+        if ((b[start] & 0x80 != 0) != neg) return null;
+    }
+    var acc: u128 = if (neg) std.math.maxInt(u128) else 0;
+    for (b[start..]) |x| acc = (acc << 8) | x;
+    return @bitCast(acc);
+}
+
+/// A sign beside a little-endian magnitude as an unscaled decimal; null when the
+/// magnitude is wider than an i128 holds.
+pub fn signMagnitudeDecimal(positive: bool, mag: []const u8) ?i128 {
+    if (mag.len > 16) return null;
+    var u: u128 = 0;
+    for (mag, 0..) |b, k| u |= @as(u128, b) << @intCast(k * 8);
+    const m = std.math.cast(i128, u) orelse return null;
+    return if (positive) m else -m;
+}
+
+/// Whether an unscaled decimal has at most `precision` digits.
+pub fn withinPrecision(v: i128, precision: u8) bool {
+    const bound = @import("value.zig").pow10_i128[precision];
+    return v < bound and v > -bound;
+}
+
 const DateText = struct { days: i64, rest: []const u8 };
 
 /// `YYYY-MM-DD` at the start of `t`, the year four digits or more and a ` BC` at the
@@ -298,6 +340,23 @@ fn atoiN(s: []const u8) i64 {
 }
 
 const testing = std.testing;
+
+test "binary decimals: both layouts at every width, too wide refused" {
+    const Case = struct { []const u8, ?i128 };
+    const be = [_]Case{
+        .{ &.{}, 0 },                                            .{ &.{0x7F}, 127 },
+        .{ &.{0x80}, -128 },                                     .{ &.{ 0x00, 0x80 }, 128 },
+        .{ &.{ 0xFF, 0x7F }, -129 },                             .{ &(.{0xFF} ** 8), -1 },
+        .{ &(.{0x00} ++ .{0xFF} ** 8), 0xFFFF_FFFF_FFFF_FFFF },  .{ &(.{0xFF} ** 20), -1 },
+        .{ &(.{0x7F} ++ .{0xFF} ** 15), std.math.maxInt(i128) }, .{ &(.{ 0x01, 0x00 } ++ .{0x00} ** 15), null },
+    };
+    for (be) |c| try testing.expectEqual(c[1], bigEndianDecimal(c[0]));
+    try testing.expectEqual(@as(?i128, 12345), signMagnitudeDecimal(true, &.{ 0x39, 0x30, 0, 0 }));
+    try testing.expectEqual(@as(?i128, -12345), signMagnitudeDecimal(false, &.{ 0x39, 0x30, 0, 0 }));
+    try testing.expectEqual(@as(?i128, null), signMagnitudeDecimal(true, &(.{0xFF} ** 16)));
+    try testing.expectEqual(@as(?i128, null), signMagnitudeDecimal(true, &(.{0x00} ** 17)));
+    try testing.expect(withinPrecision(999, 3) and !withinPrecision(1000, 3) and !withinPrecision(-1000, 3));
+}
 
 test "intFast agrees with std and declines what it cannot prove" {
     for ([_][]const u8{ "0", "7", "-7", "123456789012345678", "-123456789012345678", "007" }) |s| {

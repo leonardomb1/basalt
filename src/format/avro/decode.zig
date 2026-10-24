@@ -17,8 +17,8 @@
 const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
-const pow10_i128 = @import("../../exec/value.zig").pow10_i128;
 const column = @import("../../exec/column.zig");
+const cell = @import("../../exec/cell.zig");
 const eval = @import("../../exec/eval.zig");
 const format = @import("../../exec/eval/format.zig");
 const celltext = @import("../../exec/celltext.zig");
@@ -122,30 +122,11 @@ pub const Cursor = struct {
     }
 };
 
-/// A two's complement big-endian integer as an unscaled decimal; one with more
-/// digits than `precision` is corrupt.
+/// A two's complement big-endian integer as an unscaled decimal; one wider than
+/// an i128 or with more digits than `precision` is corrupt.
 pub fn unscaledOf(b: []const u8, precision: u8) Error!i128 {
-    if (b.len == 0) return 0;
-    if (b.len <= 8 and precision <= 18) {
-        var acc: u64 = if (b[0] & 0x80 != 0) std.math.maxInt(u64) else 0;
-        for (b) |x| acc = (acc << 8) | x;
-        const v: i64 = @bitCast(acc);
-        const bound: i64 = @intCast(pow10_i128[precision]);
-        if (v >= bound or v <= -bound) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
-        return v;
-    }
-    const neg = b[0] & 0x80 != 0;
-    var start: usize = 0;
-    if (b.len > 16) {
-        start = b.len - 16;
-        for (b[0..start]) |x| if (x != (if (neg) @as(u8, 0xFF) else 0)) return corrupt("a decimal wider than its precision", .{});
-        if ((b[start] & 0x80 != 0) != neg) return corrupt("a decimal wider than its precision", .{});
-    }
-    var acc: u128 = if (neg) std.math.maxInt(u128) else 0;
-    for (b[start..]) |x| acc = (acc << 8) | x;
-    const v: i128 = @bitCast(acc);
-    const bound = pow10_i128[precision];
-    if (v >= bound or v <= -bound) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
+    const v = cell.bigEndianDecimal(b) orelse return corrupt("a decimal wider than its precision", .{});
+    if (!cell.withinPrecision(v, precision)) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
     return v;
 }
 
