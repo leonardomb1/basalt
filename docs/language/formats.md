@@ -453,6 +453,75 @@ with the column named. Only the first stream of a
 `.arrows` holding several is read. An Arrow read is one lane; `-j` does not
 split it yet.
 
+## Avro
+
+`FROM 'events.avro'` reads an Avro object container file, the format Kafka
+Connect, Spark and Hadoop jobs leave behind. A folder of `.avro` files reads as one
+table, stdin reads one `WITH (format = 'avro')`, and objects, SFTP, SMB, URLs, a
+`.avro.gz` and a zip member work as for CSV. The schema in the file's header fixes
+the columns, so nothing is sampled: the top record's fields are the columns, a
+nested record's fields read as flat dotted columns (`addr.city`) as a Parquet
+struct's do, and a file whose schema is not a record reads as one column, `value`.
+
+```sql
+SELECT status, count(*) AS n, sum(amount) AS total
+FROM 'orders.avro'
+WHERE "addr.city" = 'Lisboa'
+GROUP BY status;
+```
+
+`boolean` reads as `bool`, `int` and `long` as `int`, `float` and `double` as
+`float`, `string` and `enum` as `string`, `bytes` and `fixed` as `bytes`. The
+logical types read as basalt's own: `date` as `date`, `time-millis` and
+`time-micros` as `time`, `timestamp-*` and `local-timestamp-*` in any unit as
+`timestamp` (nanoseconds floor to the microsecond, and a UTC timestamp reads as
+its UTC wall-clock), `decimal` on `bytes` or `fixed` as `decimal(p,s)`, `uuid` as
+`string`. A decimal wider than 38 digits is refused naming its field rather than
+read inexactly. A union of `null` and one type is that type, nullable; a union of
+numbers only is `int`, or `float` once a float is among them, and one of strings
+and enums is `string`. Arrays, maps, a record that names itself and any other
+union read as one `string` column of JSON text, so `json_get` and `JSON_EACH`
+reach inside them: bytes as base64, dates and decimals as quoted text. A `null`
+branch of any union is a SQL `NULL`, never the text `null`.
+
+Blocks compressed with `null`, `deflate`, `snappy` (its CRC checked) or
+`zstandard` are read; `bzip2` and `xz` are refused naming the codec. Each block's
+sync marker is checked against the header's, and a block whose bytes do not hold
+exactly the objects it claims, a value running past its block, a union branch or
+enum symbol out of range, or a decimal with more digits than its precision fails
+the read, never a shorter table. A later file of a folder reads into the first
+one's columns by name: a column it lacks is `NULL`, one the first lacks is dropped,
+and one of another type is widened (`int` into `float` or `decimal`) or refused
+naming the column. An Avro read streams block by block on one lane.
+
+`LOAD INTO 'orders.avro'` (or `WITH (format = 'avro')`) writes a container file
+whose schema is one record, `row`, with a field per column, each a union of `null`
+and its type so that any column may hold `NULL`: `bool` as `boolean`, `int` as
+`long`, `float` as `double`, `string` and `bytes` as themselves, `decimal(p,s)` as
+`bytes` with the `decimal` logical type, `date` as `date`, `time` as `time-micros`
+and `timestamp` as `local-timestamp-micros`, since basalt's timestamps carry no
+timezone. A reader older than Avro 1.10's `local-timestamp-micros` (DuckDB's
+`avro` extension among them) refuses a file holding a `timestamp` column, and
+DuckDB reads a `bytes` decimal as a blob; cast either to text first when DuckDB
+reads the file.
+
+```sql
+LOAD INTO 'orders.avro' WITH (compression = 'snappy') AS
+SELECT id, cliente, CAST(total AS DECIMAL(12,2)) AS total, dia FROM 'orders.csv';
+```
+
+Blocks are `deflate`, the one codec besides none every reader must support,
+unless `compression` names `snappy` or `none`; zstandard is read but not written.
+Each batch is one block, encoded and compressed on its lane, so `-j` spreads the
+work and only finished blocks are written in turn. A column name Avro does not
+allow (letters, digits and `_`, not starting with a digit, so not a flattened
+`addr.city`) and an array or struct column are refused naming the column; rename
+one with `AS`. A decimal is written at its column's scale, rounded as Parquet's
+writer rounds it, and one with more digits than its column's precision fails the
+write naming the column. The file goes to a local path, an object store, SFTP or
+SMB; `APPEND` and a `.avro.gz` name are refused, as the header fixes the schema
+and the sync marker every block repeats, and the blocks compress themselves.
+
 ## Parquet types
 
 A parquet column's type comes from its `LogicalType` annotation when the writer

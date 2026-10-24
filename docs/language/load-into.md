@@ -23,6 +23,8 @@ AS
   built this way must end in a literal extension, which picks the writer.
 - `LOAD INTO '/out/x.xlsx'` writes an Excel workbook of one sheet, `WITH (sheet =
   'Name')` naming it ([Writing Excel](formats.md#writing-excel)); `REPLACE` only.
+- `LOAD INTO '/out/x.avro'` writes an Avro object container file, each column a
+  nullable field ([Avro](formats.md#avro)); `REPLACE` only.
 - A folder target (`LOAD INTO 's3://lake/sales/'`, ending in `/`) is a Delta
   table, written as a table target: `APPEND` by default, `REPLACE`, or `UPSERT`
   (copy-on-write, in one commit); `WITH (format = 'delta')` creates it when the
@@ -32,7 +34,8 @@ AS
 - `UPSERT` needs a table to merge into; on a file target it is a plan-time error.
 - `WITH (...)` on a `LOAD INTO` takes `delimiter` (or `delim`) and `format`
   (a file), `sheet` (an Excel file), `compression` (a Parquet file or a Delta
-  table's data files: `snappy`, `gzip` or `none`), `partition_by` (a Delta table
+  table's data files: `snappy`, `gzip` or `none`; an Avro file's blocks:
+  `deflate`, `snappy` or `none`), `partition_by` (a Delta table
   a write creates), `array` (a JSON file: one top-level array instead of a row
   a line), `root` and `row` (an XML file's element names), `newline` and
   `encoding` (a `format = 'records'` file, [Records](formats.md#records)) and
