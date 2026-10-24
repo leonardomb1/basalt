@@ -240,11 +240,6 @@ fn appendDataPage(
             body = body[4 + len ..];
         }
     }
-    if (levels) |lv| {
-        if (reps) |r| try lv.reps.appendSlice(r) else try lv.reps.appendNTimes(0, n);
-        if (defs) |d| try lv.defs.appendSlice(d) else try lv.defs.appendNTimes(max_def, n);
-    }
-
     var present: usize = n;
     if (defs) |d| {
         present = 0;
@@ -291,6 +286,10 @@ fn appendDataPage(
             try pushDict(rows, cast, d, idx);
         },
         else => return Error.UnsupportedParquetEncoding,
+    }
+    if (levels) |lv| {
+        if (reps) |r| try lv.reps.appendSlice(r) else try lv.reps.appendNTimes(0, n);
+        if (defs) |d| try lv.defs.appendSlice(d) else try lv.defs.appendNTimes(max_def, n);
     }
     return n;
 }
@@ -661,4 +660,17 @@ test "a footer's row count only hints the column's size, so a lying one fails on
     if (readColumnChunk(a, fx, g.columns[0].meta.?, md.schema[1], 1 << 50, 1, 0)) |_| {
         return error.TestUnexpectedResult;
     } else |e| try testing.expect(e != error.OutOfMemory);
+}
+
+test "a nested leaf's page with no level streams pads its levels only after its values prove the count" {
+    var buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var levels: Levels = .{ .reps = std.array_list.Managed(u32).init(a), .defs = std.array_list.Managed(u32).init(a) };
+    const cast: Cast = .{ .ty = types.Type.init(.int).asNullable(), .tscale = .identity };
+    var b = column.Builder.init(a, cast.ty);
+    const body = [_]u8{ 1, 0, 0, 0, 2, 0, 0, 0 };
+    const pg: parquet.Page = .{ .header = .{ .ty = .data_page_v2, .num_values = 1 << 30, .encoding = .plain }, .data = &body, .next_offset = 0 };
+    try testing.expectError(Error.CorruptParquetPage, appendDataPage(a, &b, pg, .{ .ty = .int32 }, .{ .ty = .int32 }, cast, 0, null, 0, &levels));
+    try testing.expectEqual(@as(usize, 0), levels.reps.items.len);
 }
