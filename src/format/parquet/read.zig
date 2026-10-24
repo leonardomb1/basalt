@@ -281,7 +281,8 @@ pub const Reader = struct {
     }
 
     /// One row group per call. Empty groups are skipped, since a zero-row batch reads
-    /// as end-of-stream downstream.
+    /// as end-of-stream downstream. A deletion mask is sized only once the columns
+    /// have decoded, as only they prove the footer's row count.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
         const last = self.rg_end orelse self.md.row_groups.len;
         while (self.rg < last) {
@@ -305,14 +306,13 @@ pub const Reader = struct {
                     continue;
                 }
             }
-            var keep: ?[]bool = null;
+            var gone: ?*const roaring.Bitmap = null;
             var kept = rows;
             if (self.deletes) |d| {
-                const k = try arena.alloc(bool, rows);
-                @memset(k, true);
-                const n = (try self.deletedRows(d)).clear(self.firsts[gi], k);
+                const bm = try self.deletedRows(d);
+                const n = bm.count(self.firsts[gi], rows);
                 if (n == rows) continue;
-                if (n > 0) keep = k;
+                if (n > 0) gone = bm;
                 kept = rows - n;
             }
             if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g);
@@ -343,7 +343,12 @@ pub const Reader = struct {
                     cols[ci] = try assembleNested(arena, &n.root, entries, rows);
                 },
             };
-            if (keep) |k| try column.gatherColumns(arena, cols, cols, k, kept);
+            if (gone) |bm| if (cols.len > 0) {
+                const k = try arena.alloc(bool, rows);
+                @memset(k, true);
+                _ = bm.clear(self.firsts[gi], k);
+                try column.gatherColumns(arena, cols, cols, k, kept);
+            };
             const b = Batch{ .schema = &self.schema, .columns = cols, .len = kept };
             return if (self.fit) |f| try f.apply(arena, b) else b;
         }
@@ -539,6 +544,36 @@ test "data page v2 with DELTA encodings decodes to the same values as v1" {
     try testing.expectEqualStrings("row-59", b.columns[1].getValue(59).string);
     try testing.expectEqual(@as(f64, 88.5), b.columns[2].getValue(59).float);
     try testing.expectEqual(true, b.columns[3].getValue(0).bool);
+}
+
+fn deleteRow5(_: *const anyopaque, _: std.mem.Allocator, _: u64) anyerror!roaring.Bitmap {
+    const row5 = [_]roaring.Container{.{ .high = 0, .kind = .array, .data = &.{ 5, 0 } }};
+    return .{ .containers = &row5, .cardinality = 1, .end = 6 };
+}
+
+test "deleted rows drop out, and a footer's row count is trusted for their mask only once the columns hold it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "v2.parquet" });
+    try tmp.dir.writeFile(.{ .sub_path = "v2.parquet", .data = fx_v2 });
+    const deletes: Deletes = .{ .ctx = undefined, .load = deleteRow5 };
+
+    const r = try Reader.open(a, path);
+    r.deletes = deletes;
+    const b = (try r.next(a)).?;
+    try testing.expectEqual(@as(usize, 59), b.len);
+    try testing.expectEqual(@as(i64, 4), b.columns[0].getValue(4).int);
+    try testing.expectEqual(@as(i64, 6), b.columns[0].getValue(5).int);
+
+    const lying = try Reader.open(a, path);
+    lying.deletes = deletes;
+    @constCast(lying.md.row_groups)[0].num_rows = 1 << 47;
+    try testing.expectError(Error.CorruptParquetPage, lying.next(a));
 }
 
 test "projection keeps only the named columns and never drops all of them" {

@@ -13,6 +13,7 @@ const TemporalScale = @import("logical.zig").TemporalScale;
 const assembleLists = @import("nested.zig").assembleLists;
 const basaltType = @import("logical.zig").basaltType;
 const bitWidth = @import("encoding.zig").bitWidth;
+const capacity_hint = @import("encoding.zig").capacity_hint;
 const column = @import("../../exec/column.zig");
 const decodeByteStreamSplit = @import("encoding.zig").decodeByteStreamSplit;
 const decodeDeltaBinaryPacked = @import("encoding.zig").decodeDeltaBinaryPacked;
@@ -83,10 +84,6 @@ pub fn readEntries(
 
 const ReadError = Error || parquet.Error || @import("../compress/codecs.zig").Error;
 
-/// A footer's row count only pre-sizes the column up to here, as levels compress
-/// so well that no byte count bounds it; a larger chunk grows as it is read.
-const capacity_hint_rows = 1 << 20;
-
 /// Every read of a chunk walks its pages here: `rows` values, or with `rows` null
 /// the chunk's `num_values` entries along with their levels. Pages holding more
 /// values than the row group's rows are corrupt, never cut to fit.
@@ -107,7 +104,7 @@ fn readPages(
         .defs = std.array_list.Managed(u32).init(arena),
     } else null;
 
-    var b = try column.Builder.initCapacity(arena, cast.ty, @min(entries, capacity_hint_rows));
+    var b = try column.Builder.initCapacity(arena, cast.ty, @min(entries, capacity_hint));
     var dict: ?Dict = null;
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
     if (at < base_offset) return Error.CorruptParquetPage;

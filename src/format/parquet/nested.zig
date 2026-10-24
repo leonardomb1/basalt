@@ -6,6 +6,7 @@ const Error = @import("read.zig").Error;
 const ListShape = @import("schema.zig").ListShape;
 const RootRef = @import("schema.zig").RootRef;
 const Value = @import("../../exec/value.zig").Value;
+const capacity_hint = @import("encoding.zig").capacity_hint;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
 const parquet = @import("footer.zig");
@@ -294,7 +295,7 @@ pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []c
         try list.append(e.reps.len);
         st.* = list.items;
     }
-    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), rows);
+    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), @min(rows, capacity_hint));
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
     const spans = try arena.alloc(Span, entries.len);
@@ -328,7 +329,7 @@ pub fn assembleLists(
 ) Error!column.Column {
     if (reps.len != defs.len or reps.len != elems.len) return Error.CorruptParquetPage;
     const depth = shape.rep_def.len;
-    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), rows);
+    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), @min(rows, capacity_hint));
     var buf = std.array_list.Managed(u8).init(arena);
     var open: usize = 0;
     var in_row = false;
@@ -429,4 +430,17 @@ test "assembleNested: leaves that disagree, or a row count that does not match, 
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb3 }, 4));
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb }, 5));
     try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ea}, 4));
+}
+
+test "assembleLists: a row count past the levels read is a corrupt page, not an allocation" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var eb = try column.Builder.initCapacity(a, types.Type.init(.int).asNullable(), 1);
+    try eb.append(.{ .int = 7 });
+    const elems = try eb.finish();
+    const shape: ListShape = .{ .rep_def = &.{1} };
+    const one = try assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1);
+    try testing.expectEqualStrings("[7]", one.getValue(0).string);
+    try testing.expectError(Error.CorruptParquetPage, assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1 << 47));
 }

@@ -41,8 +41,18 @@ pub const Bitmap = struct {
     /// Marks false each row of `[base, base + keep.len)` the bitmap holds, returning
     /// how many it marked.
     pub fn clear(self: *const Bitmap, base: u64, keep: []bool) usize {
-        if (keep.len == 0) return 0;
-        const last = base + keep.len - 1;
+        return self.walk(base, keep.len, keep);
+    }
+
+    /// How many rows of `[base, base + len)` the bitmap holds, marking nothing, so
+    /// a caller can learn a range is wholly deleted before it sizes a mask for it.
+    pub fn count(self: *const Bitmap, base: u64, len: usize) usize {
+        return self.walk(base, len, null);
+    }
+
+    fn walk(self: *const Bitmap, base: u64, len: usize, keep: ?[]bool) usize {
+        if (len == 0 or base >= self.end) return 0;
+        const last = base +| (len - 1);
         var lo: usize = 0;
         var hi: usize = self.containers.len;
         while (lo < hi) {
@@ -61,7 +71,7 @@ pub const Bitmap = struct {
                     while (i < c.data.len) : (i += 2) {
                         const v = std.mem.readInt(u16, c.data[i..][0..2], .little);
                         if (v < from or v > to) continue;
-                        keep[@intCast(at + v - base)] = false;
+                        if (keep) |k| k[@intCast(at + v - base)] = false;
                         n += 1;
                     }
                 },
@@ -73,7 +83,7 @@ pub const Bitmap = struct {
                         const a = @max(s, from);
                         const b = @min(e, to);
                         if (a > b) continue;
-                        @memset(keep[@intCast(at + a - base)..][0 .. b - a + 1], false);
+                        if (keep) |k| @memset(k[@intCast(at + a - base)..][0 .. b - a + 1], false);
                         n += b - a + 1;
                     }
                 },
@@ -84,7 +94,7 @@ pub const Bitmap = struct {
                         while (bits != 0) : (bits &= bits - 1) {
                             const v = w * 64 + @ctz(bits);
                             if (v < from or v > to) continue;
-                            keep[@intCast(at + v - base)] = false;
+                            if (keep) |k| k[@intCast(at + v - base)] = false;
                             n += 1;
                         }
                     }

@@ -51,25 +51,31 @@ pub fn bitWidth(max: u32) u6 {
     return @intCast(32 - @clz(max));
 }
 
+/// The most values a count read off the file reserves before any are decoded:
+/// RLE runs and levels compress so well that no byte count bounds a legitimate
+/// count, so past this the output grows only as values actually arrive.
+pub const capacity_hint = 1 << 20;
+
 /// RLE/bit-packed hybrid: each run's varint header has its low bit set for
 /// `(header >> 1) * 8` bit-packed values, clear for an RLE run of `header >> 1`
 /// copies. Run counts are checked before they are multiplied, as they can wrap.
+/// `count` only pre-sizes the output up to `capacity_hint`; each run then
+/// reserves what it yields, so a short page claiming billions fails cheaply.
 pub fn decodeRleHybrid(
     arena: std.mem.Allocator,
     src: []const u8,
     width: u6,
     count: usize,
 ) Error![]u32 {
-    const out = try arena.alloc(u32, count);
-    if (count == 0) return out;
+    var out: std.ArrayList(u32) = try .initCapacity(arena, @min(count, capacity_hint));
     if (width == 0) {
-        @memset(out, 0);
-        return out;
+        @memset(try out.addManyAsSlice(arena, count), 0);
+        return out.toOwnedSlice(arena);
     }
 
     var pos: usize = 0;
-    var n: usize = 0;
-    while (n < count) {
+    while (out.items.len < count) {
+        const left = count - out.items.len;
         const header = try readVarint(src, &pos);
         if (header & 1 == 1) {
             const groups = std.math.cast(usize, header >> 1) orelse return Error.CorruptParquetPage;
@@ -77,21 +83,20 @@ pub fn decodeRleHybrid(
             if (bytes > src.len - pos) return Error.CorruptParquetPage;
             const vals = groups * 8;
             const run = src[pos..][0..bytes];
-            const take = @min(vals, count - n);
+            const dst = try out.addManyAsSlice(arena, @min(vals, left));
             const mask = (@as(u64, 1) << width) - 1;
             var i: usize = switch (width) {
-                inline 1...32 => |w| unpackGroups(w, run, out[n..][0..take]),
+                inline 1...32 => |w| unpackGroups(w, run, dst),
                 else => 0,
             };
-            while (width <= 32 and i < take) : (i += 1) {
+            while (width <= 32 and i < dst.len) : (i += 1) {
                 const bit = i * width;
                 const byte = bit >> 3;
                 if (byte + 8 > run.len) break;
-                out[n + i] = @intCast((std.mem.readInt(u64, run[byte..][0..8], .little) >> @intCast(bit & 7)) & mask);
+                dst[i] = @intCast((std.mem.readInt(u64, run[byte..][0..8], .little) >> @intCast(bit & 7)) & mask);
             }
             var br = BitReader{ .buf = run, .bit_pos = i * width };
-            while (i < take) : (i += 1) out[n + i] = @intCast(try br.read(width));
-            n += take;
+            while (i < dst.len) : (i += 1) dst[i] = @intCast(try br.read(width));
             pos += bytes;
         } else {
             const run: usize = @intCast(header >> 1);
@@ -101,12 +106,10 @@ pub fn decodeRleHybrid(
             var v: u32 = 0;
             for (0..vb) |k| v |= @as(u32, src[pos + k]) << @intCast(8 * k);
             pos += vb;
-            const take = @min(run, count - n);
-            @memset(out[n..][0..take], v);
-            n += take;
+            @memset(try out.addManyAsSlice(arena, @min(run, left)), v);
         }
     }
-    return out;
+    return out.toOwnedSlice(arena);
 }
 
 /// The whole groups of eight `w`-bit values at the start of a bit-packed run, each
@@ -155,6 +158,17 @@ fn deltaHeader(src: []const u8, pos: *usize) Error!DeltaHeader {
     return .{ .miniblocks = @intCast(miniblocks), .per_mini = @intCast(block_size / miniblocks), .total = @intCast(total), .first = first };
 }
 
+/// The output for `count` values of a stream whose header is `h` and whose blocks
+/// fill the `rest` bytes after it. A count past the header's total is corrupt, as
+/// is one more than the blocks could hold if every miniblock had width zero (each
+/// block spends a min-delta byte and a width byte per miniblock); what passes is
+/// reserved up to `capacity_hint` and grows per miniblock.
+fn deltaOutput(arena: std.mem.Allocator, h: DeltaHeader, rest: usize, count: usize) Error!std.ArrayList(i64) {
+    const reach = 1 +| (rest / (1 + h.miniblocks)) *| (h.miniblocks * h.per_mini);
+    if (count > h.total or count > reach) return Error.CorruptParquetPage;
+    return .initCapacity(arena, @min(count, capacity_hint));
+}
+
 /// DELTA_BINARY_PACKED: `<block size> <miniblocks> <count> <first>`, then per block
 /// `<min delta> <widths> <miniblocks>`. Running sums desync on any miscount, so
 /// every bound is checked; a width byte over 64 is corrupt (it was once a panic).
@@ -167,42 +181,34 @@ pub fn decodeDeltaBinaryPacked(
     const h = try deltaHeader(src, &pos);
     const miniblocks = h.miniblocks;
     const per_mini = h.per_mini;
-    const total = h.total;
     var value: i64 = h.first;
 
-    const want = @min(count, total);
-    const out = try arena.alloc(i64, count);
-    if (count == 0) return out;
+    var out = try deltaOutput(arena, h, src.len - pos, count);
+    if (count == 0) return out.toOwnedSlice(arena);
+    try out.append(arena, value);
 
-    var n: usize = 0;
-    out[n] = value;
-    n += 1;
-
-    while (n < want) {
+    while (out.items.len < count) {
         const min_delta = try readZigZagAt(src, &pos);
         if (miniblocks > src.len - pos) return Error.CorruptParquetPage;
         const widths = src[pos..][0..miniblocks];
         pos += miniblocks;
 
         for (widths) |w| {
-            if (n >= want) break;
+            if (out.items.len >= count) break;
             if (w > 64) return Error.CorruptParquetPage;
             const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
             if (pos + bytes > src.len) return Error.CorruptParquetPage;
             var br = BitReader{ .buf = src[pos..][0..bytes] };
-            for (0..per_mini) |_| {
-                if (n >= want) break;
+            for (try out.addManyAsSlice(arena, @min(per_mini, count - out.items.len))) |*o| {
                 const raw: i64 = @bitCast(try br.read(width));
                 value +%= min_delta +% raw;
-                out[n] = value;
-                n += 1;
+                o.* = value;
             }
             pos += bytes;
         }
     }
-    while (n < count) : (n += 1) out[n] = value;
-    return out;
+    return out.toOwnedSlice(arena);
 }
 
 fn readZigZagAt(src: []const u8, pos: *usize) Error!i64 {
@@ -292,17 +298,11 @@ fn decodeDeltaBinaryPackedTracking(
     const h = try deltaHeader(src, &pos);
     const miniblocks = h.miniblocks;
     const per_mini = h.per_mini;
-    const total = h.total;
     var value: i64 = h.first;
 
-    const out = try arena.alloc(i64, count);
-    const want = @min(count, total);
-    var n: usize = 0;
-    if (count > 0) {
-        out[n] = value;
-        n += 1;
-    }
-    while (n < want) {
+    var out = try deltaOutput(arena, h, src.len - pos, count);
+    if (count > 0) try out.append(arena, value);
+    while (out.items.len < count) {
         const min_delta = try readZigZagAt(src, &pos);
         if (miniblocks > src.len - pos) return Error.CorruptParquetPage;
         const widths = src[pos..][0..miniblocks];
@@ -312,22 +312,19 @@ fn decodeDeltaBinaryPackedTracking(
             const width: u7 = @intCast(w);
             const bytes = (per_mini * @as(usize, width) + 7) / 8;
             if (pos + bytes > src.len) return Error.CorruptParquetPage;
-            if (n < want) {
+            if (out.items.len < count) {
                 var br = BitReader{ .buf = src[pos..][0..bytes] };
-                for (0..per_mini) |_| {
-                    if (n >= want) break;
+                for (try out.addManyAsSlice(arena, @min(per_mini, count - out.items.len))) |*o| {
                     const raw: i64 = @bitCast(try br.read(width));
                     value +%= min_delta +% raw;
-                    out[n] = value;
-                    n += 1;
+                    o.* = value;
                 }
             }
             pos += bytes;
         }
     }
-    while (n < count) : (n += 1) out[n] = value;
     end.* = pos;
-    return out;
+    return out.toOwnedSlice(arena);
 }
 
 /// BYTE_STREAM_SPLIT: every value's first byte, then every second byte, and so
@@ -484,11 +481,8 @@ test "decodeDeltaByteArray: values share one buffer, and a page claiming far mor
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const prefixes = [_]u8{ 0x80, 0x01, 0x04, 0x02, 0x00, 0x80, 0x40, 0, 0, 0, 0 };
-    const suffixes = [_]u8{ 0x80, 0x01, 0x04, 0x02, 0x80, 0x40, 0xFF, 0x3F, 0, 0, 0, 0 };
-    const page = prefixes ++ suffixes ++ [_]u8{'x'} ** 4096;
 
-    const vals = try decodeDeltaByteArray(a, &page, 100);
+    const vals = try decodeDeltaByteArray(a, try repeatedValuePage(a, 100), 100);
     try testing.expectEqual(@as(usize, 100), vals.len);
     for (vals, 0..) |v, i| {
         try testing.expectEqual(@as(usize, 4096), v.len);
@@ -496,5 +490,95 @@ test "decodeDeltaByteArray: values share one buffer, and a page claiming far mor
         try testing.expectEqual(vals[0].ptr + i * 4096, v.ptr);
     }
 
-    try testing.expectError(Error.CorruptParquetPage, decodeDeltaByteArray(a, &page, 20_000));
+    try testing.expectError(Error.CorruptParquetPage, decodeDeltaByteArray(a, try repeatedValuePage(a, 20_000), 20_000));
+}
+
+/// A DELTA_BYTE_ARRAY page of `n` copies of one 4096-byte value: the first
+/// spelled out, every later one its whole prefix shared and no suffix.
+fn repeatedValuePage(a: std.mem.Allocator, n: usize) ![]const u8 {
+    const prefixes = try a.alloc(i64, n - 1);
+    @memset(prefixes, 0);
+    prefixes[0] = 4096;
+    const suffixes = try a.alloc(i64, n - 1);
+    @memset(suffixes, 0);
+    suffixes[0] = -4096;
+    return std.mem.concat(a, u8, &.{ try deltaStream(a, 0, prefixes), try deltaStream(a, 4096, suffixes), &([_]u8{'x'} ** 4096) });
+}
+
+/// A DELTA_BINARY_PACKED stream of `first` then the values `deltas` step to, one
+/// 128-value miniblock per block, for tests too long to spell out by hand.
+fn deltaStream(a: std.mem.Allocator, first: i64, deltas: []const i64) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(a);
+    try varint.write(&out, 128);
+    try varint.write(&out, 1);
+    try varint.write(&out, deltas.len + 1);
+    try varint.write(&out, varint.zigzag(first));
+    var at: usize = 0;
+    while (at < deltas.len) : (at += 128) {
+        const blk = deltas[at..@min(at + 128, deltas.len)];
+        const min = std.mem.min(i64, blk);
+        var top: u64 = 0;
+        for (blk) |d| top = @max(top, @as(u64, @bitCast(d -% min)));
+        const width: usize = 64 - @clz(top);
+        try varint.write(&out, varint.zigzag(min));
+        try out.append(@intCast(width));
+        const bytes = try out.addManyAsSlice(128 * width / 8);
+        @memset(bytes, 0);
+        for (blk, 0..) |d, i| {
+            const raw: u64 = @bitCast(d -% min);
+            for (0..width) |b| {
+                const bit = i * width + b;
+                if ((raw >> @intCast(b)) & 1 == 1) bytes[bit / 8] |= @as(u8, 1) << @intCast(bit % 8);
+            }
+        }
+    }
+    return out.items;
+}
+
+test "decodeRleHybrid: a short stream claiming more values than memory holds is corrupt, not an allocation" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(a, &[_]u8{ 0x02, 0x01 }, 1, 1 << 47));
+    try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(a, &[_]u8{0x03}, 1, 1 << 47));
+}
+
+test "decodeRleHybrid: runs past the capacity hint still decode whole" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const n = capacity_hint * 2 + 8;
+    var src = std.array_list.Managed(u8).init(a);
+    try varint.write(&src, (capacity_hint * 2) << 1);
+    try src.append(0x01);
+    try src.appendSlice(&.{ 0x03, 0b10110010 });
+    const got = try decodeRleHybrid(a, src.items, 1, n);
+    try testing.expectEqual(n, got.len);
+    try testing.expect(std.mem.allEqual(u32, got[0 .. n - 8], 1));
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 0, 1, 1, 0, 1 }, got[n - 8 ..]);
+}
+
+test "decodeDeltaBinaryPacked: a count past the header's total, or past what the blocks can hold, is corrupt before any allocation" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const one = [_]u8{ 0x80, 0x01, 0x04, 0x01, 0x0e };
+    try testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(a, &one, 2));
+    try testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(a, &one, 1 << 47));
+
+    var claims = std.array_list.Managed(u8).init(a);
+    try claims.appendSlice(&.{ 0x80, 0x01, 0x04 });
+    try varint.write(&claims, 1 << 47);
+    try claims.appendSlice(&.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 });
+    try testing.expectError(Error.CorruptParquetPage, decodeDeltaBinaryPacked(a, claims.items, 1 << 47));
+
+    const deltas = try a.alloc(i64, capacity_hint * 2);
+    for (deltas, 0..) |*d, i| d.* = @intCast(i % 3);
+    const long = try decodeDeltaBinaryPacked(a, try deltaStream(a, 5, deltas), deltas.len + 1);
+    try testing.expectEqual(deltas.len + 1, long.len);
+    var sum: i64 = 5;
+    for (deltas, long[1..]) |d, v| {
+        sum += d;
+        try testing.expectEqual(sum, v);
+    }
 }
