@@ -996,6 +996,20 @@ pub const Builder = struct {
         try l.values.appendSlice(s);
         try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
     }
+    pub fn appendAs(self: *Builder, comptime t: Tag, x: Elem(t)) !void {
+        try self.pushValid(true);
+        try @field(self.store, @tagName(t)).append(x);
+    }
+    /// `appendAs` for a builder `initCapacity` sized for this row, checked only by
+    /// the list's own assertion in safe builds.
+    pub fn appendAsAssumeCapacity(self: *Builder, comptime t: Tag, x: Elem(t)) void {
+        if (self.rows & 7 == 0) self.bits.appendAssumeCapacity(0xFF);
+        self.rows += 1;
+        @field(self.store, @tagName(t)).appendAssumeCapacity(x);
+    }
+    pub fn appendNull(self: *Builder) !void {
+        try self.append(.null);
+    }
 
     /// Room for `n` more bytes of a bytes column's next value, which a producer
     /// fills in place and then records with `commitBytes`.

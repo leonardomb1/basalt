@@ -50,6 +50,7 @@ pub const lake = @import("format/lake/table.zig");
 pub const arrowread = @import("format/arrow/read.zig");
 pub const avroschema = @import("format/avro/schema.zig");
 pub const avroread = @import("format/avro/read.zig");
+pub const avrodecode = @import("format/avro/decode.zig");
 pub const avrowrite = @import("format/avro/write.zig");
 pub const xlsx = @import("format/xlsx/read.zig");
 pub const xml = @import("format/xml/token.zig");

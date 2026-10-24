@@ -1,8 +1,8 @@
 //! Avro object container files as rows — `FROM 'x.avro'`, a folder of them, stdin,
 //! or any path a stream reaches (`stream.zig`: object stores, SFTP, HTTP, a `.gz` or
 //! a zip member). The header's schema fixes the columns (`schema.zig`), and the file
-//! is read front to back, one block at a time: each block's objects are decoded
-//! straight into column builders, never into a tree of values.
+//! is read front to back, one block at a time: each block's objects run through the
+//! program `decode.zig` compiled from that schema, straight into column builders.
 //!
 //! A block is checked as the spec frames it: its object count and byte size, the
 //! 16-byte sync marker the header chose after it, and, for `snappy`, the CRC-32 of
@@ -24,17 +24,14 @@
 //! FLOAT or DECIMAL) and refused naming the column when it cannot.
 
 const Batch = @import("../../exec/batch.zig").Batch;
-const Value = @import("../../exec/value.zig").Value;
 const column = @import("../../exec/column.zig");
 const codecs = @import("../compress/codecs.zig");
 const driver = @import("../../connect/driver.zig");
-const eval = @import("../../exec/eval.zig");
-const jsonwrite = @import("../json/write.zig");
+const decode = @import("decode.zig");
 const schema_mod = @import("schema.zig");
 const std = @import("std");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
-const pow10_i128 = @import("../../exec/value.zig").pow10_i128;
 const varint = @import("../varint.zig");
 
 pub const Node = schema_mod.Node;
@@ -48,7 +45,7 @@ pub const magic = "Obj\x01";
 const max_block = 1 << 30;
 const max_ratio = 64;
 const max_meta = 64 << 20;
-const max_empty = 1 << 16;
+const max_empty = decode.max_empty;
 
 pub const Options = struct {
     batch_rows: usize = 4096,
@@ -63,13 +60,8 @@ pub const Header = struct {
     sync: [16]u8,
 };
 
-fn corrupt(comptime fmt: []const u8, args: anytype) Error {
-    return @errorCast(stream.explainf(error.CorruptAvro, fmt, args));
-}
-
-fn unsupported(comptime fmt: []const u8, args: anytype) Error {
-    return @errorCast(stream.explainf(error.UnsupportedAvro, fmt, args));
-}
+const corrupt = decode.corrupt;
+const unsupported = decode.unsupported;
 
 fn ended(e: std.Io.Reader.Error, comptime what: []const u8) Error {
     return switch (e) {
@@ -132,84 +124,7 @@ pub fn readHeader(arena: std.mem.Allocator, in: *std.Io.Reader) Error!Header {
     return .{ .schema_text = schema_text orelse return corrupt("the header has no `avro.schema`", .{}), .codec = codec, .sync = sync };
 }
 
-const Cursor = struct {
-    buf: []const u8 = &.{},
-    pos: usize = 0,
-
-    fn short() Error {
-        return corrupt("a value runs past the end of its block", .{});
-    }
-
-    fn long(c: *Cursor) Error!i64 {
-        return varint.unzigzag(varint.read(c.buf, &c.pos) catch return short());
-    }
-
-    fn int(c: *Cursor) Error!i32 {
-        const v = try c.long();
-        return std.math.cast(i32, v) orelse corrupt("an int holds {d}, past 32 bits", .{v});
-    }
-
-    fn take(c: *Cursor, n: usize) Error![]const u8 {
-        if (n > c.buf.len - c.pos) return short();
-        defer c.pos += n;
-        return c.buf[c.pos..][0..n];
-    }
-
-    fn bytes(c: *Cursor) Error![]const u8 {
-        const n = try c.long();
-        if (n < 0) return corrupt("a negative length {d}", .{n});
-        return c.take(std.math.cast(usize, n) orelse return short());
-    }
-
-    fn boolean(c: *Cursor) Error!bool {
-        const b = (try c.take(1))[0];
-        if (b > 1) return corrupt("a boolean holds byte {d}", .{b});
-        return b == 1;
-    }
-
-    fn float(c: *Cursor) Error!f64 {
-        return @as(f32, @bitCast(std.mem.readInt(u32, (try c.take(4))[0..4], .little)));
-    }
-
-    fn double(c: *Cursor) Error!f64 {
-        return @bitCast(std.mem.readInt(u64, (try c.take(8))[0..8], .little));
-    }
-
-    /// The item count of an array or map block, its byte size skipped when negative.
-    /// Each item of a type that takes bytes takes at least one, so a count past the
-    /// bytes left is corrupt; one of a type that may take none is capped.
-    fn blockCount(c: *Cursor, items: *const Node) Error!usize {
-        var n = try c.long();
-        if (n < 0) {
-            n = -%n;
-            _ = try c.long();
-        }
-        const k = std.math.cast(usize, n) orelse return short();
-        if (k > (if (schema_mod.zeroWidth(items)) max_empty else c.buf.len - c.pos)) return corrupt("an array or map claims {d} items its block cannot hold", .{k});
-        return k;
-    }
-};
-
-/// A two's complement big-endian integer as a decimal at `scale`; one with more
-/// digits than `precision` is corrupt.
-pub fn decimalOf(b: []const u8, precision: u8, scale: u8) Error!Value {
-    if (b.len == 0) return .{ .decimal = .{ .unscaled = 0, .scale = scale } };
-    const neg = b[0] & 0x80 != 0;
-    var start: usize = 0;
-    if (b.len > 16) {
-        start = b.len - 16;
-        for (b[0..start]) |x| if (x != (if (neg) @as(u8, 0xFF) else 0)) return corrupt("a decimal wider than its precision", .{});
-        if ((b[start] & 0x80 != 0) != neg) return corrupt("a decimal wider than its precision", .{});
-    }
-    var acc: u128 = if (neg) std.math.maxInt(u128) else 0;
-    for (b[start..]) |x| acc = (acc << 8) | x;
-    const v: i128 = @bitCast(acc);
-    const bound = pow10_i128[precision];
-    if (v >= bound or v <= -bound) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
-    return .{ .decimal = .{ .unscaled = v, .scale = scale } };
-}
-
-const Route = struct { to: ?usize = null, cast: bool = false };
+pub const decimalOf = decode.decimalOf;
 
 pub const Reader = struct {
     arena: std.mem.Allocator,
@@ -218,24 +133,24 @@ pub const Reader = struct {
     opts: Options,
     header: Header,
     root: *const Node,
-    step: schema_mod.Step,
     own: types.Schema,
     schema: types.Schema,
-    routes: []Route,
     absent: []usize,
+    m: decode.Machine,
     raw: std.ArrayListUnmanaged(u8) = .empty,
     dec: std.Io.Writer.Allocating,
-    text: std.Io.Writer.Allocating,
     blk: std.heap.ArenaAllocator,
-    cur: Cursor = .{},
     left: u64 = 0,
-    builders: []column.Builder = &.{},
     done: bool = false,
 
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, in: *std.Io.Reader, opts: Options) Error!*Reader {
         const header = try readHeader(arena, in);
         const root = try schema_mod.parse(arena, header.schema_text);
         const p = try schema_mod.plan(arena, root);
+        const table = opts.schema orelse p.schema;
+        const routes = try arena.alloc(decode.Route, p.schema.fields.len);
+        const absent = try route(arena, p.schema, table, routes, opts.source_name);
+        const prog = try decode.compile(arena, p, routes);
         const self = try arena.create(Reader);
         self.* = .{
             .arena = arena,
@@ -244,46 +159,44 @@ pub const Reader = struct {
             .opts = opts,
             .header = header,
             .root = root,
-            .step = p.step,
             .own = p.schema,
-            .schema = opts.schema orelse p.schema,
-            .routes = try arena.alloc(Route, p.schema.fields.len),
-            .absent = &.{},
+            .schema = table,
+            .absent = absent,
+            .m = .init(gpa, prog, table, opts.source_name),
             .dec = .init(gpa),
-            .text = .init(gpa),
             .blk = .init(gpa),
         };
-        errdefer self.close();
-        try self.route();
         return self;
     }
 
-    /// Each of this file's columns to the one of the table it fills, by name.
-    fn route(self: *Reader) Error!void {
-        const out = self.schema;
-        var covered = try self.arena.alloc(bool, out.fields.len);
+    /// Each of this file's columns to the one of the table it fills, by name; the
+    /// table's columns no file column fills.
+    fn route(arena: std.mem.Allocator, own: types.Schema, out: types.Schema, routes: []decode.Route, source_name: []const u8) Error![]usize {
+        var covered = try arena.alloc(bool, out.fields.len);
         @memset(covered, false);
-        for (self.own.fields, self.routes) |f, *r| {
+        for (own.fields, routes) |f, *r| {
             const to = out.indexOf(f.name) orelse {
                 r.* = .{};
                 continue;
             };
             const want = out.fields[to].ty;
             if (!types.Type.eql(f.ty, want) and !types.Type.canWiden(f.ty.kind, want.kind))
-                return unsupported("`{s}`: column `{s}` is {s} here but {s} in the first file", .{ self.opts.source_name, f.name, try f.ty.name(self.arena), try want.name(self.arena) });
+                return unsupported("`{s}`: column `{s}` is {s} here but {s} in the first file", .{ source_name, f.name, try f.ty.name(arena), try want.name(arena) });
             r.* = .{ .to = to, .cast = !types.Type.eql(f.ty, want) };
             covered[to] = true;
         }
         var absent = std.ArrayListUnmanaged(usize).empty;
-        for (covered, 0..) |c, i| if (!c) try absent.append(self.arena, i);
-        self.absent = absent.items;
+        for (covered, 0..) |c, i| if (!c) try absent.append(arena, i);
+        return absent.items;
     }
 
     pub fn next(self: *Reader, arena: std.mem.Allocator) Error!?Batch {
         if (self.done) return null;
         const fields = self.schema.fields;
-        self.builders = try arena.alloc(column.Builder, fields.len);
-        for (self.builders, fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, self.opts.batch_rows);
+        const builders = try arena.alloc(column.Builder, fields.len);
+        for (builders, fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, self.opts.batch_rows);
+        self.m.out = builders;
+        const cur = &self.m.cur;
         var n: usize = 0;
         while (n < self.opts.batch_rows) {
             if (self.left == 0) {
@@ -293,16 +206,16 @@ pub const Reader = struct {
                 }
                 continue;
             }
-            try self.run(arena, self.step);
-            for (self.absent) |i| try self.builders[i].append(.null);
+            try self.m.row(arena);
+            for (self.absent) |i| try builders[i].appendNull();
             self.left -= 1;
             n += 1;
-            if (self.left == 0 and self.cur.pos != self.cur.buf.len)
-                return corrupt("a block holds {d} bytes past its last object", .{self.cur.buf.len - self.cur.pos});
+            if (self.left == 0 and cur.pos != cur.buf.len)
+                return corrupt("a block holds {d} bytes past its last object", .{cur.buf.len - cur.pos});
         }
         if (n == 0) return null;
         const cols = try arena.alloc(column.Column, fields.len);
-        for (self.builders, cols) |*b, *c| c.* = try b.finish();
+        for (builders, cols) |*b, *c| c.* = try b.finish();
         return .{ .schema = &self.schema, .columns = cols, .len = n };
     }
 
@@ -320,9 +233,9 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, sync, &self.header.sync))
             return corrupt("a block's sync marker is not the header's: the file is corrupt or two files were joined", .{});
         _ = self.blk.reset(.retain_capacity);
-        self.cur = .{ .buf = try self.decompress(self.raw.items) };
+        self.m.cur = .{ .buf = try self.decompress(self.raw.items) };
         self.left = @intCast(count);
-        if (count == 0 and self.cur.buf.len != 0) return corrupt("a block of no objects holds {d} bytes", .{self.cur.buf.len});
+        if (count == 0 and self.m.cur.buf.len != 0) return corrupt("a block of no objects holds {d} bytes", .{self.m.cur.buf.len});
         return true;
     }
 
@@ -374,142 +287,10 @@ pub const Reader = struct {
         }
     }
 
-    fn emit(self: *Reader, arena: std.mem.Allocator, col: usize, v: Value) Error!void {
-        const r = self.routes[col];
-        const to = r.to orelse return;
-        const val = if (r.cast and v != .null) eval.castValueTyped(arena, v, self.schema.fields[to].ty) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return unsupported("`{s}`: a value of column `{s}` does not fit the first file's {s}", .{ self.opts.source_name, self.own.fields[col].name, try self.schema.fields[to].ty.name(self.arena) }),
-        } else v;
-        try self.builders[to].append(val);
-    }
-
-    fn run(self: *Reader, arena: std.mem.Allocator, step: schema_mod.Step) Error!void {
-        switch (step) {
-            .leaf => |t| try self.emit(arena, t.col, try self.value(t.node)),
-            .text => |t| {
-                self.text.clearRetainingCapacity();
-                try self.json(arena, t.node, &self.text.writer);
-                try self.emit(arena, t.col, .{ .string = self.text.written() });
-            },
-            .record => |steps| for (steps) |s| try self.run(arena, s),
-            .choice => |c| {
-                const i = try self.cur.long();
-                if (i < 0 or i >= c.branches.len) return corrupt("a union branch {d} of {d}", .{ i, c.branches.len });
-                switch (c.branches[@intCast(i)]) {
-                    .nulls => for (c.lo..c.hi) |col| try self.emit(arena, col, .null),
-                    else => |b| try self.run(arena, b),
-                }
-            },
-            .nulls => unreachable,
-        }
-    }
-
-    fn value(self: *Reader, n: *const Node) Error!Value {
-        const c = &self.cur;
-        return switch (n.kind) {
-            .null => .null,
-            .boolean => .{ .bool = try c.boolean() },
-            .int => blk: {
-                const x = try c.int();
-                break :blk switch (n.logical) {
-                    .date => .{ .date = x },
-                    .time_millis => .{ .time = @as(i64, x) * 1000 },
-                    else => .{ .int = x },
-                };
-            },
-            .long => blk: {
-                const x = try c.long();
-                break :blk switch (n.logical) {
-                    .time_micros => .{ .time = x },
-                    .timestamp_millis => .{ .timestamp = std.math.mul(i64, x, 1000) catch return corrupt("a timestamp-millis {d} past the range basalt holds", .{x}) },
-                    .timestamp_micros => .{ .timestamp = x },
-                    .timestamp_nanos => .{ .timestamp = @divFloor(x, 1000) },
-                    else => .{ .int = x },
-                };
-            },
-            .float => .{ .float = try c.float() },
-            .double => .{ .float = try c.double() },
-            .string => .{ .string = try c.bytes() },
-            .@"enum" => blk: {
-                const i = try c.long();
-                if (i < 0 or i >= n.symbols.len) return corrupt("an enum symbol {d} of {d}", .{ i, n.symbols.len });
-                break :blk .{ .string = n.symbols[@intCast(i)] };
-            },
-            .bytes, .fixed => blk: {
-                const b = if (n.kind == .bytes) try c.bytes() else try c.take(n.size);
-                break :blk if (n.logical == .decimal) try decimalOf(b, n.precision, n.scale) else .{ .bytes = b };
-            },
-            .record, .array, .map, .@"union" => unreachable,
-        };
-    }
-
-    /// The value at the cursor as compact JSON, as basalt's JSON writer writes one.
-    fn json(self: *Reader, arena: std.mem.Allocator, n: *const Node, w: *std.Io.Writer) Error!void {
-        return self.jsonAt(arena, n, w, 0);
-    }
-
-    fn jsonAt(self: *Reader, arena: std.mem.Allocator, n: *const Node, w: *std.Io.Writer, depth: usize) Error!void {
-        if (depth > schema_mod.max_depth) return corrupt("a value nests deeper than {d}", .{schema_mod.max_depth});
-        const c = &self.cur;
-        switch (n.kind) {
-            .record => {
-                try put(w, "{");
-                for (n.fields, 0..) |f, i| {
-                    if (i > 0) try put(w, ",");
-                    try quoted(w, f.name);
-                    try put(w, ":");
-                    try self.jsonAt(arena, f.node, w, depth + 1);
-                }
-                try put(w, "}");
-            },
-            .array, .map => {
-                try put(w, if (n.kind == .array) "[" else "{");
-                var first = true;
-                while (true) {
-                    const k = try c.blockCount(n.items.?);
-                    if (k == 0) break;
-                    for (0..k) |_| {
-                        if (!first) try put(w, ",");
-                        first = false;
-                        if (n.kind == .map) {
-                            try quoted(w, try c.bytes());
-                            try put(w, ":");
-                        }
-                        try self.jsonAt(arena, n.items.?, w, depth + 1);
-                    }
-                }
-                try put(w, if (n.kind == .array) "]" else "}");
-            },
-            .@"union" => {
-                const i = try c.long();
-                if (i < 0 or i >= n.branches.len) return corrupt("a union branch {d} of {d}", .{ i, n.branches.len });
-                try self.jsonAt(arena, n.branches[@intCast(i)], w, depth + 1);
-            },
-            else => switch (try self.value(n)) {
-                .null => try put(w, "null"),
-                .bool => |b| try put(w, if (b) "true" else "false"),
-                .int => |x| w.print("{d}", .{x}) catch return error.OutOfMemory,
-                .float => |x| if (std.math.isFinite(x)) (w.print("{d}", .{x}) catch return error.OutOfMemory) else try put(w, "null"),
-                .string => |s| try quoted(w, s),
-                .bytes => |s| {
-                    try put(w, "\"");
-                    std.base64.standard.Encoder.encodeWriter(w, s) catch return error.OutOfMemory;
-                    try put(w, "\"");
-                },
-                else => |v| {
-                    try put(w, "\"");
-                    try put(w, eval.valueToString(arena, v) catch return error.OutOfMemory);
-                    try put(w, "\"");
-                },
-            },
-        }
-    }
-
     pub fn close(self: *Reader) void {
         self.raw.deinit(self.gpa);
         self.dec.deinit();
-        self.text.deinit();
+        self.m.deinit();
         self.blk.deinit();
     }
 
@@ -535,20 +316,12 @@ pub const Reader = struct {
     }
 };
 
-fn put(w: *std.Io.Writer, s: []const u8) Error!void {
-    w.writeAll(s) catch return error.OutOfMemory;
-}
-
-fn quoted(w: *std.Io.Writer, s: []const u8) Error!void {
-    try put(w, "\"");
-    jsonwrite.writeEscaped(w, s) catch return error.OutOfMemory;
-    try put(w, "\"");
-}
-
 /// Avro files read as one table (`files.Files`).
 pub const Files = @import("../files.zig").Files(Reader, Options);
 
 const testing = std.testing;
+const Value = @import("../../exec/value.zig").Value;
+const eval = @import("../../exec/eval.zig");
 
 fn readAll(a: std.mem.Allocator, bytes: []const u8) !struct { schema: types.Schema, rows: []const []const Value } {
     var in = std.Io.Reader.fixed(bytes);
@@ -829,4 +602,15 @@ test "fuzz: arbitrary bytes behind a valid header never crash the reader" {
             readAny(try std.mem.concat(a, u8, &.{ head, input }));
         }
     }.f, .{});
+}
+
+test "a union of INT and FLOAT branches reads every branch into its FLOAT column, a dropped column still checked" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const got = try readAll(a, try file(a, "{\"type\":\"record\",\"name\":\"r\",\"fields\":[{\"name\":\"x\",\"type\":[\"int\",\"double\",\"null\"]}]}", "null", 3, &.{ 0x00, 0x06, 0x02, 0, 0, 0, 0, 0, 0, 0xF8, 0x3F, 0x04 }));
+    try testing.expectEqual(types.TypeKind.float, got.schema.fields[0].ty.kind);
+    try testing.expectEqual(@as(f64, 3), got.rows[0][0].float);
+    try testing.expectEqual(@as(f64, 1.5), got.rows[1][0].float);
+    try testing.expect(got.rows[2][0].isNull());
 }
