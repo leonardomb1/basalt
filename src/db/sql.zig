@@ -1075,7 +1075,7 @@ fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
     for (s) |ch| {
         if (ch == '\'') {
             try w.writeAll("''");
-        } else if (ch == '\\' and dialect == .mysql) {
+        } else if (ch == '\\' and dialect.mysqlWire()) {
             try w.writeAll("\\\\");
         } else {
             try w.writeByte(ch);
@@ -1535,6 +1535,8 @@ test "INSERT literals: dialect-specific escaping, bools, bytes, null" {
     const a = ar.allocator();
     try std.testing.expectEqualStrings("'c:\\\\tmp'", try literalOf(a, .mysql, .string, .{ .string = "c:\\tmp" }));
     try std.testing.expectEqualStrings("'c:\\tmp'", try literalOf(a, .postgres, .string, .{ .string = "c:\\tmp" }));
+    try std.testing.expectEqualStrings("'c:\\\\tmp'", try literalOf(a, .starrocks, .string, .{ .string = "c:\\tmp" }));
+    try std.testing.expectEqualStrings("'c:\\\\tmp'", try literalOf(a, .doris, .string, .{ .string = "c:\\tmp" }));
     try std.testing.expectEqualStrings("1", try literalOf(a, .sqlserver, .bool, .{ .bool = true }));
     try std.testing.expectEqualStrings("FALSE", try literalOf(a, .postgres, .bool, .{ .bool = false }));
     try std.testing.expectEqualStrings("'\\x01ab'", try literalOf(a, .postgres, .bytes, .{ .bytes = "\x01\xab" }));
