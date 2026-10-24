@@ -9,7 +9,7 @@
 const std = @import("std");
 const stream = @import("stream.zig");
 
-pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, delta };
+pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, delta, avro };
 
 /// How a read splits across lanes: by row group anywhere, by byte range of a local
 /// uncompressed file, or not at all.
@@ -146,6 +146,19 @@ pub const table = [_]Format{
         .read_keys = &.{ "format", "version" },
         .write = .{},
         .write_keys = &.{ "format", "partition_by", "compression" },
+    },
+    .{
+        .tag = .avro,
+        .label = "Avro",
+        .read_what = "an Avro read",
+        .names = &.{"avro"},
+        .exts = &.{".avro"},
+        .folder_exts = &.{".avro"},
+        .lanes = .serial,
+        .stdin = true,
+        .read_keys = &.{"format"},
+        .write = .{ .gzip_refused = "Avro compresses its own blocks, so it is written without a `.gz`/`.zst` suffix; name the codec with `compression`", .append_refused = "an Avro file's header fixes its schema and sync marker, so appending means reading it back first" },
+        .write_keys = &.{ "format", "compression" },
     },
 };
 
@@ -322,13 +335,14 @@ test "formats: tags index the table, names and extensions resolve, lists are gen
     try std.testing.expect(ofPath("x.yaml") == null);
     try std.testing.expect(inFolder(of(.csv), "d/a.tsv.zst"));
     try std.testing.expect(!inFolder(of(.csv), "d/a.json"));
-    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta", names_list);
+    try std.testing.expectEqualStrings("csv, parquet, arrow, ipc, feather, xlsx, excel, json, ndjson, jsonl, xml, records, delta, avro", names_list);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "Delta") == null);
     try std.testing.expect(of(.delta).write_refused == null);
     try std.testing.expectEqual(FileFormat.records, byName("Records").?.tag);
     try std.testing.expect(readRefused(.records) != null and readRefused(.csv) == null);
     try std.testing.expect(std.mem.indexOf(u8, handled_list, "records") == null);
-    try std.testing.expect(std.mem.endsWith(u8, handled_list, "JSON (`.json`, `.ndjson`, `.jsonl`) and XML (`.xml`), a CSV, JSON or XML file optionally `.gz`/`.zst` compressed or inside a `.zip`"));
-    try std.testing.expectEqualStrings("CSV, JSON or XML", stdin_labels);
-    try std.testing.expectEqualStrings("CSV, Parquet, JSON or XML", folder_labels);
+    try std.testing.expect(std.mem.endsWith(u8, handled_list, "XML (`.xml`) and Avro (`.avro`), a CSV, JSON, XML or Avro file optionally `.gz`/`.zst` compressed or inside a `.zip`"));
+    try std.testing.expectEqualStrings("CSV, JSON, XML or Avro", stdin_labels);
+    try std.testing.expectEqualStrings("CSV, Parquet, JSON, XML or Avro", folder_labels);
+    try std.testing.expectEqual(FileFormat.avro, ofPath("s3://b/x.AVRO").?);
 }

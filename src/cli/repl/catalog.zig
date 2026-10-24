@@ -292,7 +292,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         q = close + 1;
         if (q >= cursor and open < cursor) continue;
         const lit = text[open..q];
-        const file_like = for ([_][]const u8{ ".csv'", ".parquet'", ".gz'", ".zst'", ".arrow'", ".arrows'", ".feather'", ".ipc'" }) |ext| {
+        const file_like = for ([_][]const u8{ ".csv'", ".parquet'", ".gz'", ".zst'", ".arrow'", ".arrows'", ".feather'", ".ipc'", ".avro'" }) |ext| {
             if (std.ascii.endsWithIgnoreCase(lit, ext)) break true;
         } else false;
         if (file_like)

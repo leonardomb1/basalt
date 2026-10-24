@@ -183,10 +183,12 @@ fn usage(w: anytype) !void {
         \\             WITH (sheet = 'Name'), reads also range = 'B3:F200',
         \\             header = false), JSON (.json, .ndjson, .jsonl;
         \\             WITH (items = 'data.rows') on a read, WITH (array = true)
-        \\             on a write for one array, not NDJSON) and XML (.xml; WITH
+        \\             on a write for one array, not NDJSON), XML (.xml; WITH
         \\             (row = 'Item') on a read, (root = .., row = ..) on a write)
+        \\             and Avro (.avro, read and written; WITH (compression =
+        \\             'deflate'|'snappy'|'none') on a write)
         \\             — the extension picks the format; another needs WITH (format
-        \\             = 'csv'|'parquet'|'arrow'|'json'|'ndjson'|'xml').
+        \\             = 'csv'|'parquet'|'arrow'|'json'|'ndjson'|'xml'|'avro').
         \\             WITH (delimiter = ';', encoding = 'latin1') for non-comma,
         \\             non-UTF-8 CSV (also cp1252; delimiter works on a sink too).
         \\             WITH (format = 'records', newline = 'crlf') writes one
@@ -196,8 +198,8 @@ fn usage(w: anytype) !void {
         \\             LOAD INTO 'folder/' appends to it, REPLACEs it, or
         \\             UPSERT ON (k) [PARTIAL COLS (c)] merges rows into it; WITH
         \\             (format = 'delta', partition_by = 'c') creates one
-        \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML WITH (format = 'xml'),
-        \\             piped in; not when the script itself comes from stdin
+        \\  stdin      FROM STDIN reads CSV, or JSON/NDJSON/XML/Avro WITH (format =
+        \\             'avro'), piped in; not when the script itself comes from stdin
         \\  archives   file.csv.gz / .csv.zst stream through the codec;
         \\             'archive.zip :: inner.csv' reads one member (`::` optional
         \\             when the zip holds one file). Neither is splittable, so

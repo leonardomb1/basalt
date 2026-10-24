@@ -7,6 +7,7 @@ const DiscardSink = @import("../connect.zig").DiscardSink;
 const Env = @import("../env.zig").Env;
 const jsonwrite = @import("../../format/json/write.zig");
 const xmlwrite = @import("../../format/xml/write.zig");
+const avrowrite = @import("../../format/avro/write.zig");
 const recordswrite = @import("../../format/records/write.zig");
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDriver = @import("../connect.zig").SqlDriver;
@@ -268,6 +269,13 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.sort_threads, .err = env.errctx }) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 return ds.sink();
+            },
+            .avro => |codec| {
+                const aw = avrowrite.Writer.open(env.arena, w.target, schema, codec) catch |e| switch (e) {
+                    error.AvroUnsupportedType, error.AvroBadName, error.AvroCodecUnsupported => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Avro `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                };
+                return aw.sink();
             },
             .records => |opts| {
                 const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|

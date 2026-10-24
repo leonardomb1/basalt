@@ -5,6 +5,8 @@
 const Diag = @import("../analyze.zig").Diag;
 const Error = @import("../analyze.zig").Error;
 const arrowread = @import("../../format/arrow/read.zig");
+const avroread = @import("../../format/avro/read.zig");
+const avrowrite = @import("../../format/avro/write.zig");
 const ast = @import("../../lang/ast.zig");
 const pqcodec = @import("../../format/compress/codecs.zig");
 const csv = @import("../../format/csv.zig");
@@ -125,20 +127,35 @@ pub fn deltaTarget(w: ast.Write, hints: []const ast.Hint) bool {
 }
 
 /// A Parquet sink's page codec, `compression = 'snappy' | 'gzip' | 'none'`, snappy
-/// when unset; a Delta table's data files take it too. Any other target refuses
-/// the key: a CSV file takes its codec from a `.gz` suffix.
+/// when unset; a Delta table's data files take it too, and an Avro file reads the
+/// key as `avroCodecFromHints` does. Any other target refuses it: a CSV file takes
+/// its codec from a `.gz` suffix.
 pub fn parquetCodecFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!pqcodec.Codec {
     const s = hintText(hints, "compression") orelse return .snappy;
     const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
     const fmt = if (file) try writeFormat(w, hints, diag) else null;
     if (!file)
-        return fail(diag, "`compression` applies to a Parquet file target only; a starrocks or doris load is compressed by the connection's `compression` option", .{});
+        return fail(diag, "`compression` applies to a Parquet or Avro file target only; a starrocks or doris load is compressed by the connection's `compression` option", .{});
+    if (fmt == .avro) return .snappy;
     if (fmt != .parquet and fmt != .delta)
-        return fail(diag, "`compression` applies to a Parquet file target only; a CSV file is gzipped by a `.gz` suffix", .{});
+        return fail(diag, "`compression` applies to a Parquet or Avro file target only; a CSV file is gzipped by a `.gz` suffix", .{});
     if (std.ascii.eqlIgnoreCase(s, "snappy")) return .snappy;
     if (std.ascii.eqlIgnoreCase(s, "gzip")) return .gzip;
     if (std.ascii.eqlIgnoreCase(s, "none")) return .uncompressed;
     return fail(diag, "unknown Parquet compression `{s}` (snappy, gzip, none)", .{s});
+}
+
+/// An Avro sink's block codec, `compression = 'deflate' | 'snappy' | 'none'`,
+/// deflate when unset, the one codec besides none that every Avro reader must read.
+/// Only an Avro target reads this; `parquetCodecFromHints` refuses the key elsewhere.
+pub fn avroCodecFromHints(hints: []const ast.Hint, diag: *Diag) Error!avrowrite.Codec {
+    const s = hintText(hints, "compression") orelse return .deflate;
+    if (std.ascii.eqlIgnoreCase(s, "deflate")) return .deflate;
+    if (std.ascii.eqlIgnoreCase(s, "snappy")) return .snappy;
+    if (std.ascii.eqlIgnoreCase(s, "none") or std.ascii.eqlIgnoreCase(s, "null")) return .null;
+    if (std.ascii.eqlIgnoreCase(s, "zstandard") or std.ascii.eqlIgnoreCase(s, "zstd"))
+        return fail(diag, "basalt reads zstandard Avro blocks but does not write them (deflate, snappy, none)", .{});
+    return fail(diag, "unknown Avro compression `{s}` (deflate, snappy, none)", .{s});
 }
 
 /// How a REPLACE into a database table clears the target at its cutover,
@@ -207,6 +224,7 @@ pub const WriteOptions = union(FileFormat) {
     xml: xmlwrite.Names,
     records: recordswrite.Options,
     delta: DeltaOptions,
+    avro: avrowrite.Codec,
 };
 
 /// A Delta write's data file codec and, for a table it creates, its partition
@@ -246,6 +264,7 @@ pub fn writeOptions(arena: std.mem.Allocator, w: ast.Write, hints: []const ast.H
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
         .delta => .{ .delta = .{ .codec = codec, .partition_by = try partitionBy(arena, hints, diag) } },
+        .avro => .{ .avro = try avroCodecFromHints(hints, diag) },
     };
 }
 
@@ -472,6 +491,11 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
                 if (files.len == 0) return null;
                 return xmlSchema(arena, files, hints, rd.text_cols);
             }
+            if (explicit == .avro or (explicit == null and std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .avro }))) {
+                const files = folder.only(arena, all, .avro) catch return null;
+                if (files.len == 0) return null;
+                return avroSchema(arena, files);
+            }
             if (explicit != null and explicit.? != .parquet) return null;
             if (explicit == null and !std.meta.eql(folder.kindOf(all), folder.Verdict{ .kind = .parquet })) return null;
             const files = folder.only(arena, all, .parquet) catch return null;
@@ -503,6 +527,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         }
         if (readFormat(rd.form.path, explicit) == .json) return jsonSchema(arena, &.{rd.form.path}, hints);
         if (readFormat(rd.form.path, explicit) == .xml) return xmlSchema(arena, &.{rd.form.path}, hints, rd.text_cols);
+        if (readFormat(rd.form.path, explicit) == .avro) return avroSchema(arena, &.{rd.form.path});
         var hdiag = Diag{};
         var d = dialectFromHints(hints, &hdiag) catch return null;
         d.text = rd.text_cols;
@@ -532,6 +557,12 @@ pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const a
 fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) ?types.Schema {
     var d = Diag{};
     const f = xmlread.Files.open(arena, arena, files, xmlOptions(hints, text, &d) catch return null) catch return null;
+    defer f.close();
+    return f.schema;
+}
+
+fn avroSchema(arena: std.mem.Allocator, files: []const []const u8) ?types.Schema {
+    const f = avroread.Files.open(arena, arena, files, .{}) catch return null;
     defer f.close();
     return f.schema;
 }

@@ -8,6 +8,7 @@ const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
 const arrowread = @import("../../format/arrow/read.zig");
+const avroread = @import("../../format/avro/read.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
@@ -282,6 +283,21 @@ fn openJson(env: *Env, path: []const u8, files: []const []const u8, hints: []con
     return f.source();
 }
 
+/// Avro files as one table, `path` naming them in messages.
+fn openAvro(env: *Env, path: []const u8, files: []const []const u8) !driver.Source {
+    const f = avroread.Files.open(env.arena, env.gpa, files, .{}) catch |e| return avroOpenFailed(env, path, e);
+    return f.source();
+}
+
+fn avroOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
+    const why = switch (e) {
+        error.NotAvro => "not an Avro object container file",
+        error.CorruptAvro, error.UnsupportedAvro, error.BadAvroSchema => eval.takeFailure(e) orelse @errorName(e),
+        else => try pathFail(env.arena, path, e),
+    };
+    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Avro `{s}` ({s})", .{ path, why }));
+}
+
 /// XML files as one table, `path` naming them in messages.
 fn openXml(env: *Env, path: []const u8, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) !driver.Source {
     var odiag = analyze.Diag{};
@@ -324,6 +340,10 @@ fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver
         const f = xmlread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| return xmlOpenFailed(env, "stdin", e);
         return f.source();
     }
+    if (want == .avro) {
+        const f = avroread.Files.on(env.arena, env.gpa, s, &.{}, .{}) catch |e| return avroOpenFailed(env, "stdin", e);
+        return f.source();
+    }
     var ddiag = analyze.Diag{};
     const d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
     const r = csv.CsvReader.openStream(env.arena, s, d) catch |e| {
@@ -362,6 +382,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .parquet => return (try openParquetFolder(env, rd.form.path, f, null)).source(),
             .json => return openJson(env, rd.form.path, f.files, hints),
             .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
+            .avro => return openAvro(env, rd.form.path, f.files),
             .csv => {},
             .arrow, .xlsx, .records, .delta => unreachable,
         };
@@ -376,6 +397,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
             .xlsx => return openXlsx(env, rd.form.path, hints),
             .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
             .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
+            .avro => return openAvro(env, rd.form.path, &.{rd.form.path}),
             .records, .delta => unreachable,
             .csv => {},
         }
