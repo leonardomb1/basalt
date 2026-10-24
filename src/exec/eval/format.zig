@@ -67,7 +67,7 @@ pub fn writeTime(w: anytype, t: i64) !void {
 
 pub fn writeTimestamp(w: anytype, micros: i64) !void {
     const days = @divFloor(micros, 86_400_000_000);
-    const us: u64 = @intCast(micros - days * 86_400_000_000);
+    const us: u64 = @intCast(@mod(micros, 86_400_000_000));
     const secs = us / 1_000_000;
     const frac = us % 1_000_000;
     const c = civilFromDays(days);
@@ -240,6 +240,15 @@ test "dates and timestamps before year 0 print with a sign instead of trapping" 
     try w.writeByte('|');
     try writeDate(&w, -719_530);
     try std.testing.expectEqualStrings("-0768-02-04 -0768-02-04 00:00:00.000001|-0001-12-31|-0001-12-30", w.buffered());
+}
+
+test "the earliest and latest timestamps an INT holds print instead of trapping" {
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeTimestamp(&w, std.math.minInt(i64));
+    try w.writeByte('|');
+    try writeTimestamp(&w, std.math.maxInt(i64));
+    try std.testing.expectEqualStrings("-290308-12-21 19:59:05.224192|294247-01-10 04:00:54.775807", w.buffered());
 }
 
 test "format temporal values for text sinks" {
