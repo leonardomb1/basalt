@@ -962,7 +962,9 @@ fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
 }
 
 /// `narrow`: both sides fit i64, so a product is one widening multiply that
-/// cannot pass 38 digits.
+/// cannot pass 38 digits. Otherwise a product whose two elements each fit i64,
+/// as every DECIMAL of 18 digits or fewer does, takes that multiply too, row by
+/// row; only a wider pair pays the overflow-checked 128-bit one.
 fn decLoop(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: DecLane, sink: anytype, valid: Bitmap, any: bool) VecError!void {
     const limit: u128 = @intCast(pow10_i128[max_digits]);
     const la = ln.a;
@@ -971,14 +973,21 @@ fn decLoop(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptim
     for (0..valid.len) |i| {
         if (any and !valid.get(i)) continue;
         if (laneAt(op, lk, la, i)) |a| if (laneAt(op, rk, lb, i)) |b| {
+            var small = narrow;
             const u: ?i128 = switch (op) {
                 .add => addOrNull(a, b),
                 .sub => subOrNull(a, b),
-                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else mulOrNull(a, b),
+                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else blk: {
+                    if (std.math.cast(i64, a)) |x| if (std.math.cast(i64, b)) |y| {
+                        small = true;
+                        break :blk @as(i128, x) * y;
+                    };
+                    break :blk mulOrNull(a, b);
+                },
                 .mod => if (b == 0 or b == -1) null else @rem(a, b),
                 else => unreachable,
             };
-            if (u) |x| if (narrow or @abs(x) < limit) {
+            if (u) |x| if (small or @abs(x) < limit) {
                 try sink.put(i, .{ .unscaled = x, .scale = s });
                 continue;
             };
