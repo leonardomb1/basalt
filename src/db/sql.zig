@@ -1576,6 +1576,7 @@ test "INSERT literals of every kind, in every dialect" {
     const stamps = "('1970-01-01 00:00:00') ('2024-01-01 00:00:00.123456') ('1969-12-31 23:59:59.999999') ('0001-01-01 00:00:00') (NULL)";
     const nested = "(NULL) (NULL)";
     const rows = "(1,'a b',2.50) (NULL,NULL,NULL) (-2,'',-0.1)";
+    const wire_strings = "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\\\slash\\\\') ('a\\\\Nb') ('\\\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)";
     const want = [_]struct { Dialect, [11][]const u8 }{
         .{ .postgres, .{
             words,
@@ -1595,7 +1596,7 @@ test "INSERT literals of every kind, in every dialect" {
             ints,
             floats,
             decimals,
-            "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\\\slash\\\\') ('a\\\\Nb') ('\\\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)",
+            wire_strings,
             hex,
             dates,
             times,
@@ -1604,8 +1605,8 @@ test "INSERT literals of every kind, in every dialect" {
             rows,
         } },
         .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
-        .{ .starrocks, .{ words, ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
-        .{ .doris, .{ words, ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
+        .{ .starrocks, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
+        .{ .doris, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
     };
     try std.testing.expectEqual(std.enums.values(Dialect).len, want.len);
     for (want) |x| try celltext.expectGolden(&x[1], try goldenLiterals(a, x[0]));
