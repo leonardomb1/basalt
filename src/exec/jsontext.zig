@@ -13,6 +13,7 @@
 const std = @import("std");
 const celltext = @import("celltext.zig");
 const format = @import("eval/format.zig");
+const decimal = @import("decimal.zig");
 const Value = @import("value.zig").Value;
 
 const Writer = std.Io.Writer;
@@ -81,10 +82,10 @@ pub fn scalar(w: *Writer, v: Value, comptime style: Style) Writer.Error!void {
         .int => |x| try format.writeInt(w, x),
         .float => |x| if (std.math.isFinite(x)) try celltext.writeFloat(w, x) else try w.writeAll("null"),
         .decimal => |d| switch (style.decimal) {
-            .number => try format.writeDecimal(w, d.unscaled, d.scale),
+            .number => try decimal.writeDecimal(w, d.unscaled, d.scale),
             .string => {
                 try w.writeByte('"');
-                try format.writeDecimal(w, d.unscaled, d.scale);
+                try decimal.writeDecimal(w, d.unscaled, d.scale);
                 try w.writeByte('"');
             },
         },

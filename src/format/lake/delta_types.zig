@@ -15,6 +15,7 @@
 const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
 const cast = @import("../../exec/eval/cast.zig");
+const decimal = @import("../../exec/decimal.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const pqwrite = @import("../parquet/write.zig");
 const table = @import("table.zig");
@@ -226,8 +227,8 @@ pub fn partitionText(arena: std.mem.Allocator, phys: pqwrite.Physical, scale: u8
         .date => |d| try writeDate(w, d),
         .timestamp => |us| try writeTimestamp(w, us, phys.utc, false),
         .decimal => |d| {
-            const r = cast.rescaleTo(d, scale) orelse return Error.DeltaValueOutOfRange;
-            try fmtnum.writeDecimal(w, r.unscaled, r.scale);
+            const r = decimal.rescaleTo(d, scale) orelse return Error.DeltaValueOutOfRange;
+            try decimal.writeDecimal(w, r.unscaled, r.scale);
         },
         else => return Error.DeltaValueOutOfRange,
     }
@@ -260,7 +261,7 @@ pub fn statText(arena: std.mem.Allocator, phys: pqwrite.Physical, v: Value, whic
             if (!std.math.isFinite(f)) return null;
             try writeDouble(w, f, phys.float32);
         },
-        .decimal => |d| try fmtnum.writeDecimal(w, d.unscaled, d.scale),
+        .decimal => |d| try decimal.writeDecimal(w, d.unscaled, d.scale),
         .date => |d| {
             try w.writeByte('"');
             writeDate(w, d) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;

@@ -12,7 +12,7 @@ const column = @import("column.zig");
 const value = @import("value.zig");
 
 const Decimal = value.Decimal;
-const pow10_i128 = value.pow10_i128;
+const pow10_i128 = @import("decimal.zig").pow10_i128;
 
 /// A spelling that reads as one truth value. Input matches when it is a prefix of
 /// `text` at least `min` bytes long, so `min == text.len` is a whole-word match.
@@ -354,7 +354,7 @@ const dec_corpus = [_]Decimal{
 };
 
 test "decimalToInt half_away is the CAST(decimal AS INT) path" {
-    const rescaleTo = @import("eval/cast.zig").rescaleTo;
+    const rescaleTo = @import("decimal.zig").rescaleTo;
     for (dec_corpus) |d| {
         const want: ?i64 = if (rescaleTo(d, 0)) |z| std.math.cast(i64, z.unscaled) else null;
         try testing.expectEqual(want, decimalToInt(d, .half_away));
