@@ -983,7 +983,7 @@ pub const CsvWriter = struct {
             if (try self.out.lastByte(arena, path)) |last| {
                 header = false;
                 newline = last != '\n';
-                try checkAppendHeader(arena, path, try appendHeader(arena, self.out.localFile().?, splitCodec(path).codec), schema, dialect);
+                try checkAppendHeader(arena, path, try appendHeader(arena, path, self.out.localFile().?, splitCodec(path).codec, dialect.delim), schema, dialect);
             }
         }
         try self.out.compress(path);
@@ -1001,8 +1001,10 @@ pub const CsvWriter = struct {
     }
 
     /// The header record of the file an append extends, read from its start; a `.gz`
-    /// is read through its decoder.
-    fn appendHeader(arena: std.mem.Allocator, file: std.fs.File, codec: Codec) ![]const u8 {
+    /// is read through its decoder. A quote opens a field only at its start, as the
+    /// reader decides; a line past the read buffer is gathered and a header past
+    /// `MAX_RECORD` is refused, as the reader's limits are.
+    fn appendHeader(arena: std.mem.Allocator, path: []const u8, file: std.fs.File, codec: Codec, delim: u8) ![]const u8 {
         const buf = try arena.alloc(u8, LINE_BUF);
         var fr = file.reader(buf);
         var gz: Gunzip = undefined;
@@ -1014,20 +1016,47 @@ pub const CsvWriter = struct {
         var head = std.array_list.Managed(u8).init(arena);
         var in_q = false;
         while (true) {
-            const got = r.peekGreedy(1) catch |e| switch (e) {
-                error.EndOfStream => return head.items,
+            const line = (try appendLine(r, &head, path, in_q)) orelse {
+                if (in_q) return explainf(error.CsvUnterminatedQuote, "`{s}`: the header's quote is never closed", .{path});
+                return head.items;
+            };
+            in_q = quotesOpen(line, delim, in_q);
+            if (!in_q) return head.items;
+        }
+    }
+
+    /// One more physical line of the header appended to `head` after a `\n` when it
+    /// continues a record, gathered past the read buffer as the reader's `takeLong`
+    /// does; null at the end of the stream.
+    fn appendLine(r: *std.Io.Reader, head: *std.array_list.Managed(u8), path: []const u8, in_q: bool) !?[]const u8 {
+        const mark = head.items.len;
+        if (mark > 0) try head.append('\n');
+        const start = head.items.len;
+        while (true) {
+            const part = r.takeDelimiter('\n') catch |e| switch (e) {
+                error.StreamTooLong => {
+                    const held = r.buffered();
+                    if (head.items.len + held.len >= MAX_RECORD) return headerTooLong(path, in_q);
+                    try head.appendSlice(held);
+                    r.toss(held.len);
+                    continue;
+                },
                 else => |x| return x,
             };
-            for (got, 0..) |c, k| {
-                if (c == '"') in_q = !in_q;
-                if (c == '\n' and !in_q) {
-                    try head.appendSlice(got[0..k]);
-                    return head.items;
-                }
+            if (part) |p| {
+                if (head.items.len + p.len >= MAX_RECORD) return headerTooLong(path, in_q);
+                try head.appendSlice(p);
+            } else if (head.items.len == start) {
+                head.shrinkRetainingCapacity(mark);
+                return null;
             }
-            try head.appendSlice(got);
-            r.toss(got.len);
+            return head.items[start..];
         }
+    }
+
+    fn headerTooLong(path: []const u8, in_q: bool) anyerror {
+        if (in_q) return explainf(error.CsvRecordTooLong, "`{s}`: the header runs past {d} MiB without closing its quote — is a quote left open?", .{ path, MAX_RECORD >> 20 });
+        return explainf(error.CsvRecordTooLong, "`{s}`: the header line is longer than {d} MiB — is it a CSV?", .{ path, MAX_RECORD >> 20 });
     }
 
     fn checkAppendHeader(arena: std.mem.Allocator, path: []const u8, line: []const u8, schema: types.Schema, d: Dialect) !void {
@@ -1146,9 +1175,11 @@ pub fn writeField(w: anytype, s: []const u8, delim: u8) !void {
 }
 
 /// An empty string is quoted, since unquoted empty is how the reader spells null;
-/// emitting it bare once turned `""` into NULL on the next read.
+/// emitting it bare once turned `""` into NULL on the next read. A leading or
+/// trailing space or tab is quoted too, as the header reader trims a bare name.
 fn needsQuote(s: []const u8, delim: u8) bool {
     if (s.len == 0) return true;
+    if (s[0] == ' ' or s[0] == '\t' or s[s.len - 1] == ' ' or s[s.len - 1] == '\t') return true;
     for (s) |c| {
         if (c == delim or c == '"' or c == '\n' or c == '\r') return true;
     }
@@ -1297,7 +1328,13 @@ test "writeField quotes exactly the fields that need it, doubling quotes" {
     try writeField(buf.writer(), "line\nbreak", ',');
     try buf.append('|');
     try writeField(buf.writer(), "", ',');
-    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"", buf.items);
+    try buf.append('|');
+    try writeField(buf.writer(), " lead", ',');
+    try buf.append('|');
+    try writeField(buf.writer(), "trail\t", ',');
+    try buf.append('|');
+    try writeField(buf.writer(), "in side", ',');
+    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"|\" lead\"|\"trail\t\"|in side", buf.items);
 }
 
 test "quoted values and an empty string survive a write/read round-trip, the empty string distinct from null" {
@@ -1988,6 +2025,75 @@ test "csv writer: an append ends a last line first, keeps the header it finds, w
     try std.testing.expectEqualStrings("b,a\nx,1\n", try tmp.dir.readFileAlloc(a, "m.csv", 1024));
 }
 
+test "csv writer: an append reads back a header with an edge space or a mid-field quote" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const append = struct {
+        fn run(al: std.mem.Allocator, path: []const u8, s: types.Schema, b: Batch) !void {
+            const w = try CsvWriter.open(al, path, s, .append, .{});
+            try w.writeBatch(al, b);
+            try w.close();
+        }
+    }.run;
+
+    const sp = try typedSchema(a, &.{ " a", "b\t" }, &.{ .int, .int });
+    const sp_batch = try parseSlice(a, &sp, "1,2\n");
+    const sp_path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "sp.csv" });
+    try append(a, sp_path, sp, sp_batch);
+    try append(a, sp_path, sp, sp_batch);
+    try std.testing.expectEqualStrings("\" a\",\"b\t\"\n1,2\n1,2\n", try tmp.dir.readFileAlloc(a, "sp.csv", 1024));
+
+    const q = try typedSchema(a, &.{ "a\"b", "c" }, &.{ .int, .int });
+    try tmp.dir.writeFile(.{ .sub_path = "q.csv", .data = "a\"b,c\n1,2\n" });
+    try append(a, try tmp.dir.realpathAlloc(a, "q.csv"), q, try parseSlice(a, &q, "3,4\n"));
+    try std.testing.expectEqualStrings("a\"b,c\n1,2\n3,4\n", try tmp.dir.readFileAlloc(a, "q.csv", 1024));
+
+    const ml = try typedSchema(a, &.{ "x\ny", "z" }, &.{ .int, .int });
+    try tmp.dir.writeFile(.{ .sub_path = "ml.csv", .data = "\"x\ny\",z\n1,2\n" });
+    try append(a, try tmp.dir.realpathAlloc(a, "ml.csv"), ml, try parseSlice(a, &ml, "3,4\n"));
+    try std.testing.expectEqualStrings("\"x\ny\",z\n1,2\n3,4\n", try tmp.dir.readFileAlloc(a, "ml.csv", 1024));
+
+    const long = try a.alloc(u8, LINE_BUF + 16);
+    @memset(long, 'h');
+    long[0] = '"';
+    try tmp.dir.writeFile(.{ .sub_path = "open.csv", .data = long });
+    try std.testing.expectError(error.CsvUnterminatedQuote, append(a, try tmp.dir.realpathAlloc(a, "open.csv"), q, try parseSlice(a, &q, "3,4\n")));
+    _ = eval.takeFailure(error.CsvUnterminatedQuote);
+}
+
+test "csv writer: an append reads a header longer than the read buffer, bare or with a quoted newline" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const append = struct {
+        fn run(al: std.mem.Allocator, path: []const u8, s: types.Schema, b: Batch) !void {
+            const w = try CsvWriter.open(al, path, s, .append, .{});
+            try w.writeBatch(al, b);
+            try w.close();
+        }
+    }.run;
+
+    const name = try a.alloc(u8, 2 * LINE_BUF + 7);
+    @memset(name, 'h');
+    const bare = try typedSchema(a, &.{ name, "c" }, &.{ .int, .int });
+    const bare_file = try std.mem.concat(a, u8, &.{ name, ",c\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "bare.csv", .data = bare_file });
+    try append(a, try tmp.dir.realpathAlloc(a, "bare.csv"), bare, try parseSlice(a, &bare, "3,4\n"));
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ bare_file, "3,4\n" }), try tmp.dir.readFileAlloc(a, "bare.csv", 4 * LINE_BUF));
+
+    const nl_name = try std.mem.concat(a, u8, &.{ "x\n", name });
+    const nl = try typedSchema(a, &.{ nl_name, "c" }, &.{ .int, .int });
+    const nl_file = try std.mem.concat(a, u8, &.{ "\"x\n", name, "\",c\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "nl.csv", .data = nl_file });
+    try append(a, try tmp.dir.realpathAlloc(a, "nl.csv"), nl, try parseSlice(a, &nl, "3,4\n"));
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ nl_file, "3,4\n" }), try tmp.dir.readFileAlloc(a, "nl.csv", 4 * LINE_BUF));
+}
+
 test "csv writer: renderBatch produces exactly what writeBatch writes" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -2039,7 +2145,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2052,7 +2158,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2065,7 +2171,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "\"0.1\"\n0\n-0\n\"" ++ tiny ++ "\"\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n-inf\n\n",
             "\"123.45\"\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
@@ -2078,7 +2184,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n\"-1\"\n\"-9223372036854775808\"\n9223372036854775807\n\n",
             "0.1\n0\n\"-0\"\n" ++ tiny ++ "\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n\"-inf\"\n\n",
             "123.45\n\"-0.0007\"\n5\n0.12345\n\"-18446744073709.551615\"\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2091,7 +2197,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
@@ -2104,7 +2210,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2117,7 +2223,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "\"0\"\n-1\n\"-9223372036854775808\"\n\"9223372036854775807\"\n\n",
             "\"0.1\"\n\"0\"\n\"-0\"\n\"" ++ tiny ++ "\"\n\"1000000000000000000000\"\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n23:59:59.999999\n\n",
