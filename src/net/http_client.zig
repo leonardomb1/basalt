@@ -340,31 +340,7 @@ pub const AuthState = struct {
 
 /// `url` as logs and messages show it: without a `user:pass@` and with each query
 /// value replaced by `...`, as either may hold a credential.
-pub fn redactUrl(buf: []u8, url: []const u8) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    var rest = url;
-    if (std.mem.indexOf(u8, rest, "://")) |at| {
-        w.writeAll(rest[0 .. at + 3]) catch return "(url)";
-        rest = rest[at + 3 ..];
-        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-        if (std.mem.lastIndexOfScalar(u8, rest[0..host_end], '@')) |amp| rest = rest[amp + 1 ..];
-    }
-    const q = std.mem.indexOfScalar(u8, rest, '?') orelse {
-        w.writeAll(rest) catch return "(url)";
-        return w.buffered();
-    };
-    w.writeAll(rest[0 .. q + 1]) catch return "(url)";
-    var it = std.mem.splitScalar(u8, rest[q + 1 ..], '&');
-    var first = true;
-    while (it.next()) |kv| {
-        if (!first) w.writeByte('&') catch return "(url)";
-        first = false;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
-        w.writeAll(kv[0..eq]) catch return "(url)";
-        if (eq < kv.len) w.writeAll("=...") catch return "(url)";
-    }
-    return w.buffered();
-}
+pub const redactUrl = scheme.shown;
 
 /// Whether a server-sent value can go into a header or request line as is: a CR,
 /// LF or NUL in it would end the line and start one the server chose.
