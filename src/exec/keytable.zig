@@ -796,6 +796,18 @@ pub const Encoded = struct {
     }
 };
 
+pub const Meet = struct { want: types.TypeKind, kind: ?keyhash.KeyKind };
+
+/// The words a build key column of `build` stands for against a probe column of
+/// `other` (null: unknown, the build's own). An INT meeting a FLOAT keys as the float
+/// it compares as under `keyhash.valueEq`, so the result does not depend on which
+/// side is built.
+pub fn meetKind(build: types.TypeKind, other: ?types.TypeKind) Meet {
+    const p = other orelse build;
+    if ((build == .int and p == .float) or (build == .float and p == .int)) return .{ .want = .float, .kind = .f64k };
+    return .{ .want = build, .kind = keyhash.keyKindOf(build) };
+}
+
 /// Key columns (`cols`, each of `kinds`, from `keyhash.keyKindOf`) encoded a column at
 /// a time: ints, dates and booleans as their value, floats by `keyhash.floatWord`,
 /// strings by their interned id. A NULL is word 0 with its bit set in the mask. A

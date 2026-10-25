@@ -182,7 +182,7 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
-fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, cap: usize, root: *?profile.Id) !*op.JoinIndex {
+fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
     const nitems = split.count(env.sort_threads);
     const parts = try arena.alloc(BuildPart, nitems);
@@ -194,7 +194,7 @@ fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const a
     root.* = ctx.root;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);
-    return op.JoinIndex.fromBatches(arena, chunks.items, right_schema, right_keys, ctx.bytes.load(.monotonic), cap, env.sort_threads);
+    return op.JoinIndex.fromBatchesMeeting(arena, chunks.items, right_schema, right_keys, left_kinds, ctx.bytes.load(.monotonic), cap, env.sort_threads);
 }
 
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
@@ -230,6 +230,9 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const out = try schemaPtr(arena, jp.schema);
     const right_schema = try schemaPtr(arena, rsch);
     const right_keys = try planKeys(arena, jp, "rk");
+    const left_keys = try planKeys(arena, jp, "lk");
+    const left_kinds = try arena.alloc(types.TypeKind, left_keys.len);
+    for (left_kinds, left_keys) |*x, k| x.* = lsch.fields[k].ty.kind;
 
     const final_schema = try mapChainSchema(env, suffix, out.*);
     const rp = analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
@@ -238,10 +241,10 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     var build_root: ?profile.Id = null;
     var build_chain: ?op.Op = null;
     const built = if (split) |*sp|
-        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, cap, &build_root)
+        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, left_kinds, cap, &build_root)
     else blk: {
         build_chain = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
-        break :blk op.JoinIndex.create(arena, build_chain.?, right_schema, right_keys, cap, env.sort_threads);
+        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, right_schema, right_keys, left_kinds, cap, env.sort_threads);
     };
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
@@ -266,7 +269,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     return .{
         .lane = .{
             .index = index,
-            .left_keys = try planKeys(arena, jp, "lk"),
+            .left_keys = left_keys,
             .right_keys = right_keys,
             .probe_prep = prep.left,
             .left_key_names = prep.join.left_keys,

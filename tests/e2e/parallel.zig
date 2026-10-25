@@ -605,6 +605,49 @@ test "parallel join: inner join over CSV chunks matches the serial driver" {
     try std.testing.expect(std.mem.endsWith(u8, par, "\n1995,Apple\n1996,Banana\n1997,Cherry\n"));
 }
 
+test "parallel join: an int key meets a float key near 2^53 as a float on lanes, whichever side is built" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,k\n");
+    for (0..2000) |i| {
+        if (i % 5 == 0) try in.writer().print("{d},9007199254740992\n", .{i}) else try in.writer().print("{d},{d}\n", .{ i, i });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    try tmp.dir.writeFile(.{ .sub_path = "lookup.csv", .data = "k\n9007199254740993\n7\n" });
+
+    for ([_][2][]const u8{ .{ "INT", "FLOAT" }, .{ "FLOAT", "INT" } }) |c| {
+        const body = try std.fmt.allocPrint(alloc, "WITH l AS (SELECT CAST(k AS {s}) AS lk FROM '$LOOKUP') " ++
+            "SELECT t.id FROM '$IN' t JOIN l ON CAST(t.k AS {s}) = l.lk", .{ c[1], c[0] });
+        defer alloc.free(body);
+        var lanes: usize = 0;
+        const par = try runJoinLanes(alloc, &tmp, body, 4, &lanes);
+        defer alloc.free(par);
+        try std.testing.expect(lanes > 1);
+        try std.testing.expectEqual(@as(usize, 402), std.mem.count(u8, par, "\n"));
+    }
+
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    try tmp.dir.makeDir("lk");
+    const load = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/lk/a.parquet' AS SELECT CAST(k AS INT) AS ik, CAST(k AS FLOAT) AS fk FROM '{s}/lookup.csv' WHERE CAST(k AS INT) <> 7;" ++
+        "LOAD INTO '{s}/lk/b.parquet' AS SELECT CAST(k AS INT) AS ik, CAST(k AS FLOAT) AS fk FROM '{s}/lookup.csv' WHERE CAST(k AS INT) = 7;", .{ base, base, base, base });
+    defer alloc.free(load);
+    var rdiag: Diag = .{};
+    _ = try exec(alloc, load, .{ .threads = 1 }, &rdiag);
+    for ([_][2][]const u8{ .{ "INT", "fk" }, .{ "FLOAT", "ik" } }) |c| {
+        const body = try std.fmt.allocPrint(alloc, "WITH l AS (SELECT * FROM '{s}/lk/') SELECT t.id FROM '$IN' t JOIN l ON CAST(t.k AS {s}) = l.{s}", .{ base, c[0], c[1] });
+        defer alloc.free(body);
+        var lanes: usize = 0;
+        const par = try runJoinLanes(alloc, &tmp, body, 4, &lanes);
+        defer alloc.free(par);
+        try std.testing.expect(lanes > 1);
+        try std.testing.expectEqual(@as(usize, 402), std.mem.count(u8, par, "\n"));
+    }
+}
+
 test "parallel join: left join keeps unmatched probe rows on every lane" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
