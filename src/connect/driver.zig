@@ -127,10 +127,23 @@ pub fn tuneSocket(handle: std.posix.socket_t) void {
     }
 }
 
-/// The socket-level transient set for connector retry layers. Run-level exit codes
-/// do not use it: WriteFailed/ReadFailed/EndOfStream are ambient std.Io errors there
-/// (a disk-full CSV write is not transient), so connectors rename them at the site.
-pub fn transientNet(e: anyerror) bool {
+/// A TCP connection to `host:port`, tuned by `tuneSocket`: the one way a connector
+/// opens a socket.
+pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16) !std.net.Stream {
+    const stream = try std.net.tcpConnectToHost(gpa, host, port);
+    tuneSocket(stream.handle);
+    return stream;
+}
+
+/// What kind of failure an error is, for the two retry levels. `net`: the socket
+/// failed, transient everywhere. `wire`: an ambient std.Io error a connector raised
+/// mid-exchange, transient only at the connector (a disk-full CSV write is not).
+/// `lookup`: DNS does not know the host yet, transient for the run only. `busy`: a
+/// server said to come back later, transient for the run (a connector's own loop
+/// retries by status). `other`: never transient.
+pub const Class = enum { net, wire, lookup, busy, other };
+
+pub fn classify(e: anyerror) Class {
     return switch (e) {
         error.ConnectionRefused,
         error.ConnectionTimedOut,
@@ -138,16 +151,68 @@ pub fn transientNet(e: anyerror) bool {
         error.NetworkUnreachable,
         error.HostUnreachable,
         error.BrokenPipe,
+        error.TemporaryNameServerFailure,
+        error.ServerClosedConnection,
+        error.ConnectionIoFailed,
+        => .net,
         error.EndOfStream,
         error.ReadFailed,
         error.WriteFailed,
         error.UnexpectedConnectFailure,
-        error.TemporaryNameServerFailure,
-        error.ServerClosedConnection,
-        error.ConnectionIoFailed,
-        => true,
+        => .wire,
+        error.NameServerFailure,
+        error.HostLacksNetworkAddresses,
+        error.UnknownHostName,
+        => .lookup,
+        error.HttpServerBusy,
+        error.FtpServerBusy,
+        error.HttpTransportFailed,
+        error.S3Throttled,
+        error.AzureThrottled,
+        => .busy,
+        else => .other,
+    };
+}
+
+/// The socket-level transient set for connector retry layers.
+pub fn transientNet(e: anyerror) bool {
+    return switch (classify(e)) {
+        .net, .wire => true,
+        .lookup, .busy, .other => false,
+    };
+}
+
+/// The run-level transient set, behind exit code 75: an unknown host counts, since
+/// DNS may not know a host that is still coming up.
+pub fn transientRun(e: anyerror) bool {
+    return switch (classify(e)) {
+        .net, .lookup, .busy => true,
+        .wire, .other => false,
+    };
+}
+
+/// The HTTP statuses a connector's retry loop retries: timeouts, throttling and
+/// gateways. `http_client.statusError` still counts 501 and 505+ and not 408 (D12).
+pub fn transientStatus(code: u16) bool {
+    return switch (code) {
+        408, 429, 500, 502, 503, 504 => true,
         else => false,
     };
+}
+
+/// A connector failure as `{layer}: {Err}: {note}`, the note being the server's own
+/// words; the note part is left out when there is none, the layer part when `layer`
+/// is empty.
+pub fn connectorNote(w: *std.Io.Writer, layer: []const u8, e: anyerror, note: []const u8) std.Io.Writer.Error!void {
+    if (layer.len > 0) try w.print("{s}: ", .{layer});
+    try w.writeAll(@errorName(e));
+    if (note.len > 0) try w.print(": {s}", .{note});
+}
+
+pub fn connectorNoteAlloc(arena: std.mem.Allocator, layer: []const u8, e: anyerror, note: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    connectorNote(&out.writer, layer, e, note) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 pub const FileMode = enum { truncate, append };
@@ -304,4 +369,118 @@ pub fn sinkVTable(comptime T: type) Sink.VTable {
             }
         }.f,
     };
+}
+
+const testing = std.testing;
+
+const error_corpus = [_]anyerror{
+    error.ConnectionRefused,  error.ConnectionTimedOut,       error.ConnectionResetByPeer,      error.NetworkUnreachable,
+    error.HostUnreachable,    error.BrokenPipe,               error.EndOfStream,                error.ReadFailed,
+    error.WriteFailed,        error.UnexpectedConnectFailure, error.TemporaryNameServerFailure, error.ServerClosedConnection,
+    error.ConnectionIoFailed, error.NameServerFailure,        error.HostLacksNetworkAddresses,  error.UnknownHostName,
+    error.HttpServerBusy,     error.FtpServerBusy,            error.HttpTransportFailed,        error.S3Throttled,
+    error.AzureThrottled,     error.HttpConnectionClosing,    error.WouldBlock,                 error.OutOfMemory,
+    error.PlanFailed,         error.S3RequestFailed,          error.AzureRequestFailed,         error.HttpRequestFailed,
+    error.LoginFailed,        error.Aborted,                  error.AccessDenied,               error.FileNotFound,
+};
+
+fn oldTransientNet(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.UnexpectedConnectFailure,
+        error.TemporaryNameServerFailure,
+        error.ServerClosedConnection,
+        error.ConnectionIoFailed,
+        => true,
+        else => false,
+    };
+}
+
+fn oldIsTransient(e: anyerror) bool {
+    return switch (e) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.BrokenPipe,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.HostLacksNetworkAddresses,
+        error.UnknownHostName,
+        error.HttpServerBusy,
+        error.FtpServerBusy,
+        error.HttpTransportFailed,
+        error.ServerClosedConnection,
+        error.ConnectionIoFailed,
+        error.S3Throttled,
+        error.AzureThrottled,
+        => true,
+        else => false,
+    };
+}
+
+test "classify: transientNet keeps its socket set and transientRun matches the run's isTransient" {
+    const env = @import("../runtime/env.zig");
+    for (error_corpus) |e| {
+        try testing.expectEqual(oldTransientNet(e), transientNet(e));
+        try testing.expectEqual(oldIsTransient(e), transientRun(e));
+        try testing.expectEqual(env.isTransient(e), transientRun(e));
+    }
+    try testing.expectEqual(Class.wire, classify(error.EndOfStream));
+    try testing.expectEqual(Class.lookup, classify(error.UnknownHostName));
+    try testing.expectEqual(Class.busy, classify(error.S3Throttled));
+    try testing.expectEqual(Class.other, classify(error.HttpConnectionClosing));
+}
+
+test "transientStatus is the object stores' set; HTTP() differs on 408, 501 and 505+ until D12" {
+    const http_client = @import("../net/http_client.zig");
+    const objstore = @import("../store/objstore.zig");
+    var differ: std.ArrayList(u16) = .empty;
+    defer differ.deinit(testing.allocator);
+    var code: u16 = 100;
+    while (code < 600) : (code += 1) {
+        try testing.expectEqual(objstore.retriable(code), transientStatus(code));
+        const busy = http_client.statusError(code) == error.HttpServerBusy;
+        if (busy != transientStatus(code)) try differ.append(testing.allocator, code);
+    }
+    try testing.expectEqual(@as(usize, 2 + 95), differ.items.len);
+    try testing.expectEqual(@as(u16, 408), differ.items[0]);
+    try testing.expectEqual(@as(u16, 501), differ.items[1]);
+    for (differ.items[2..], 505..) |c, want| try testing.expectEqual(@as(u16, @intCast(want)), c);
+}
+
+test "connectorNote: layer, error and the server's words, each part left out when empty" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings("sftp: ConnectionResetByPeer: kex failed", try connectorNoteAlloc(a, "sftp", error.ConnectionResetByPeer, "kex failed"));
+    try testing.expectEqualStrings("smb: SmbFailed", try connectorNoteAlloc(a, "smb", error.SmbFailed, ""));
+    try testing.expectEqualStrings("LoginFailed: Login failed for user 'x'.", try connectorNoteAlloc(a, "", error.LoginFailed, "Login failed for user 'x'."));
+    try testing.expectEqualStrings("LoginFailed", try connectorNoteAlloc(a, "", error.LoginFailed, ""));
+    var buf: [12]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectError(error.WriteFailed, connectorNote(&w, "sftp", error.EndOfStream, "x"));
+}
+
+test "dial connects and tunes the socket: no Nagle, keepalive on" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const stream = try dial(testing.allocator, "127.0.0.1", server.listen_address.getPort());
+    defer stream.close();
+    var one: c_int = 0;
+    try std.posix.getsockopt(stream.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
+    try testing.expect(one != 0);
+    one = 0;
+    try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&one));
+    try testing.expect(one != 0);
 }

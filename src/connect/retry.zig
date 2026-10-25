@@ -20,13 +20,7 @@ pub const max_attempts = 5;
 pub const budget_ms: u64 = 30_000;
 pub const slice_ms: u64 = 100;
 
-/// The HTTP statuses the object stores retry: timeouts, throttling and gateways.
-pub fn retriable(code: u16) bool {
-    return switch (code) {
-        408, 429, 500, 502, 503, 504 => true,
-        else => false,
-    };
-}
+pub const retriable = driver.transientStatus;
 
 /// A request that died on the wire: the socket set every connector shares, plus a
 /// server that closed the connection instead of answering.
