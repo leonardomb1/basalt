@@ -64,8 +64,8 @@ pub fn terminate() bool {
     return true;
 }
 
-/// Connection and network failures, worth a retry. An unknown host is not:
-/// it is usually a typo.
+/// Connection, network and throttling failures, worth a retry. An unknown host
+/// counts too: DNS may not know a host that is still coming up.
 pub fn isTransient(e: anyerror) bool {
     return switch (e) {
         error.ConnectionRefused,
@@ -83,6 +83,8 @@ pub fn isTransient(e: anyerror) bool {
         error.HttpTransportFailed,
         error.ServerClosedConnection,
         error.ConnectionIoFailed,
+        error.S3Throttled,
+        error.AzureThrottled,
         => true,
         else => false,
     };
@@ -767,6 +769,12 @@ pub fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, h.key, key) and h.value == .ident) return h.value.ident;
     }
     return null;
+}
+
+test "isTransient: object-store throttling is worth a retry" {
+    try std.testing.expect(isTransient(error.S3Throttled));
+    try std.testing.expect(isTransient(error.AzureThrottled));
+    try std.testing.expect(!isTransient(error.OutOfMemory));
 }
 
 test "terminate: the first signal aborts the run, a second exits" {
