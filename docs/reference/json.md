@@ -9,8 +9,10 @@ a REST response's nested object. These functions build and take them apart;
 
 `JSON_OBJECT(k1, v1, …)`, `JSON_ARRAY(v1, …)` — build a JSON document, for an
 HTTP request body or a nested column: numbers and booleans as themselves, text
-as a JSON string, a null as `null` (the result itself is never null), and a
-NaN or infinity as `null` too, since JSON has neither. Text
+as a JSON string, `BYTES` as a base64 string (as the JSON writer writes them;
+`from_base64` turns it back), dates, times and timestamps as their ISO text, a
+null as `null` (the result itself is never null), and a NaN or infinity as
+`null` too, since JSON has neither. Text
 that is a JSON object or array — another `json_object`, or what `json_get`
 returned — goes in as that object or array, so
 `json_object('id', id, 'tags', json_array(a, b))` nests. A null key fails

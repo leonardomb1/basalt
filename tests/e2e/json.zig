@@ -126,3 +126,17 @@ test "STDIN is refused when stdin carries something else" {
     try std.testing.expectError(error.PlanFailed, run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag));
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "FROM STDIN needs stdin free") != null);
 }
+
+test "D8: a BYTES value is the same base64 at the top of a JSON row and nested in json_object" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.ndjson' AS SELECT x'01FF61' AS b, json_object('b', x'01FF61') AS j;", 1, &.{});
+    const got = try tmp.dir.readFileAlloc(alloc, "out.ndjson", 1 << 20);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("{\"b\":\"Af9h\",\"j\":\"{\\\"b\\\":\\\"Af9h\\\"}\"}\n", got);
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT hex(from_base64(json_get(j, 'b'))) AS h FROM '$B/out.ndjson';", 1, &.{});
+    const back = try out(alloc, &tmp);
+    defer alloc.free(back);
+    try std.testing.expectEqualStrings("h\n01FF61\n", back);
+}

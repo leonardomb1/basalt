@@ -8,7 +8,8 @@
 //! bytes other than `\n`, `\r` and `\t` are written as `\u00XX` (std.json writes
 //! `\b` and `\f`; both spellings decode to the same string). Non-finite floats are
 //! null, floats take `celltext.writeFloat`, temporal values ride as ISO text and
-//! bytes as base64 unless a `Style` says otherwise.
+//! bytes as base64 everywhere, nested values and object keys included, so no byte
+//! is lost to the UTF-8 repair.
 
 const std = @import("std");
 const celltext = @import("celltext.zig");
@@ -59,19 +60,17 @@ fn escapeValid(w: *Writer, s: []const u8) Writer.Error!void {
 }
 
 /// How `scalar` spells the kinds whose JSON shape is a choice: a decimal as a bare
-/// number or a string, bytes as base64 or as their own text (repaired).
+/// number or a string.
 pub const Style = struct {
     decimal: enum { number, string } = .string,
-    bytes: enum { base64, text } = .base64,
 };
 
-/// The shape of the JSON writer and of Avro's nested JSON: decimals as strings,
-/// bytes as base64.
+/// The shape of the JSON writer and of Avro's nested JSON: decimals as strings.
 pub const typed: Style = .{};
 
-/// The shape nested values take today in `json_object`/`writeJsonValue`, Arrow's
-/// `Cursor.json` and Parquet's `jsonValue`: decimals as bare numbers, bytes as text.
-pub const nested: Style = .{ .decimal = .number, .bytes = .text };
+/// The shape nested values take in `json_object`/`writeJsonValue`, Arrow's
+/// `Cursor.json` and Parquet's `jsonValue`: decimals as bare numbers.
+pub const nested: Style = .{ .decimal = .number };
 
 /// `v` as one JSON scalar: null, a boolean, a number, or a string for text and
 /// the temporal kinds.
@@ -90,14 +89,7 @@ pub fn scalar(w: *Writer, v: Value, comptime style: Style) Writer.Error!void {
             },
         },
         .string => |s| try string(w, s),
-        .bytes => |s| switch (style.bytes) {
-            .text => try string(w, s),
-            .base64 => {
-                try w.writeByte('"');
-                try std.base64.standard.Encoder.encodeWriter(w, s);
-                try w.writeByte('"');
-            },
-        },
+        .bytes => |s| try base64(w, s),
         .date => |x| {
             try w.writeByte('"');
             try format.writeDate(w, x);
@@ -116,6 +108,27 @@ pub fn scalar(w: *Writer, v: Value, comptime style: Style) Writer.Error!void {
     }
 }
 
+/// `s` as a quoted base64 string, the one JSON spelling of BYTES.
+pub fn base64(w: *Writer, s: []const u8) Writer.Error!void {
+    try w.writeByte('"');
+    try std.base64.standard.Encoder.encodeWriter(w, s);
+    try w.writeByte('"');
+}
+
+/// The text a map key of value `v` takes as an object key: bytes as base64, as a
+/// value would be, so distinct binary keys stay distinct; `null` as "null"; any
+/// other kind as its SQL text.
+pub fn keyText(arena: std.mem.Allocator, v: Value) error{OutOfMemory}![]const u8 {
+    return switch (v) {
+        .null => "null",
+        .bytes => |s| blk: {
+            const out = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(s.len));
+            break :blk std.base64.standard.Encoder.encode(out, s);
+        },
+        else => format.valueToString(arena, v),
+    };
+}
+
 /// The `celltext.write` policy for JSON: decimals and temporals ride as strings,
 /// non-finite floats as null and bytes as base64.
 pub const Text = struct {
@@ -132,9 +145,7 @@ pub const Text = struct {
     }
 
     pub fn bytes(_: Text, out: *Writer, s: []const u8) !void {
-        try out.writeByte('"');
-        try std.base64.standard.Encoder.encodeWriter(out, s);
-        try out.writeByte('"');
+        try base64(out, s);
     }
 
     pub fn float(_: Text, out: *Writer, x: f64) !void {
@@ -296,9 +307,9 @@ test "jsontext scalar: every Value kind in both styles" {
         .{ .v = .{ .string = "say \"hi\"\n" }, .typed = "\"say \\\"hi\\\"\\n\"", .nested = "\"say \\\"hi\\\"\\n\"" },
         .{ .v = .{ .string = "\xff" }, .typed = "\"" ++ replacement ++ "\"", .nested = "\"" ++ replacement ++ "\"" },
         .{ .v = .{ .bytes = "" }, .typed = "\"\"", .nested = "\"\"" },
-        .{ .v = .{ .bytes = "plain" }, .typed = "\"cGxhaW4=\"", .nested = "\"plain\"" },
-        .{ .v = .{ .bytes = "\x01\x02 \\ \t\n\"" }, .typed = "\"AQIgXCAJCiI=\"", .nested = "\"\\u0001\\u0002 \\\\ \\t\\n\\\"\"" },
-        .{ .v = .{ .bytes = "\xff\x00" }, .typed = "\"/wA=\"", .nested = "\"" ++ replacement ++ "\\u0000\"" },
+        .{ .v = .{ .bytes = "plain" }, .typed = "\"cGxhaW4=\"", .nested = "\"cGxhaW4=\"" },
+        .{ .v = .{ .bytes = "\x01\x02 \\ \t\n\"" }, .typed = "\"AQIgXCAJCiI=\"", .nested = "\"AQIgXCAJCiI=\"" },
+        .{ .v = .{ .bytes = "\xff\x00" }, .typed = "\"/wA=\"", .nested = "\"/wA=\"" },
         .{ .v = .{ .date = 0 }, .typed = "\"1970-01-01\"", .nested = "\"1970-01-01\"" },
         .{ .v = .{ .date = 19723 }, .typed = "\"2024-01-01\"", .nested = "\"2024-01-01\"" },
         .{ .v = .{ .date = std.math.minInt(i32) }, .typed = "\"-5877641-06-23\"", .nested = "\"-5877641-06-23\"" },
@@ -348,6 +359,36 @@ test "jsontext scalar(nested) pins eval writeJsonValue on valid text, the copy W
     want = Writer.Allocating.init(a);
     try row.writeJsonValue(a, .{ .string = "\x08" }, &want.writer);
     try testing.expectEqualStrings("\"\\u0008\"", want.written());
+}
+
+test "D8: BYTES nested in JSON are base64 on every path and decode back to the same bytes" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xd8);
+    const rand = prng.random();
+    var in: [40]u8 = undefined;
+    for (0..500) |_| {
+        const n = rand.uintLessThan(usize, in.len);
+        rand.bytes(in[0..n]);
+        inline for (.{ typed, nested }) |style| {
+            var w = Writer.Allocating.init(a);
+            try scalar(&w.writer, .{ .bytes = in[0..n] }, style);
+            const s = try std.json.parseFromSliceLeaky([]const u8, a, w.written(), .{});
+            const back = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(s));
+            try std.base64.standard.Decoder.decode(back, s);
+            try testing.expectEqualSlices(u8, in[0..n], back);
+        }
+        var w = Writer.Allocating.init(a);
+        try base64(&w.writer, in[0..n]);
+        try testing.expectEqualStrings(w.written()[1 .. w.written().len - 1], try keyText(a, .{ .bytes = in[0..n] }));
+    }
+    try testing.expectEqualStrings("/w==", try keyText(a, .{ .bytes = "\xff" }));
+    try testing.expectEqualStrings("/g==", try keyText(a, .{ .bytes = "\xfe" }));
+    try testing.expectEqualStrings("null", try keyText(a, .null));
+    try testing.expectEqualStrings("k\xff", try keyText(a, .{ .string = "k\xff" }));
+    try testing.expectEqualStrings("7", try keyText(a, .{ .int = 7 }));
+    try testing.expectEqualStrings("2024-01-01", try keyText(a, .{ .date = 19723 }));
 }
 
 test "jsontext Text renders the celltext golden batches as json/write Text does" {
