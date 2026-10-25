@@ -468,6 +468,23 @@ test "Delta write: a failed run deletes its data files and the folders it made; 
     try testing.expectEqual(@as(usize, 1), files);
 }
 
+test "Delta write: a key or column NULL through a whole JSON or CSV file creates a string column; a bare NULL is refused" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "n.json", .data = "[{\"id\":1,\"x\":null},{\"id\":2}]" });
+    try tmp.dir.writeFile(.{ .sub_path = "n.csv", .data = "id,x\n1,\n2,\n" });
+    for ([_][]const u8{ "json", "csv" }) |ext| {
+        try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/{s}/' WITH (format = 'delta') AS SELECT * FROM '$B/n.{s}';", .{ ext, ext }), 1);
+        const v0 = try logFile(a, &tmp, ext, 0);
+        try testing.expect(std.mem.indexOf(u8, v0, "{\\\"name\\\":\\\"x\\\",\\\"type\\\":\\\"string\\\",\\\"nullable\\\":true") != null);
+        try testing.expectEqualStrings("id,x\n1,\n2,\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT id, x FROM '$B/{s}/' ORDER BY id", .{ext})));
+    }
+    try runRefuses(a, &tmp, "LOAD INTO '$B/b/' WITH (format = 'delta') AS SELECT id, NULL AS n FROM '$B/a.csv';", "column `n` has no type (a bare NULL)");
+}
+
 test "Delta write: a column name that is not UTF-8 is refused, at create and at append" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

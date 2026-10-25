@@ -298,9 +298,11 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
     return p;
 }
 
-/// A basalt column as a new table's column.
+/// A basalt column as a new table's column. A column a whole input held only NULLs
+/// in (`Type.nullColumn`) is created as its `sinkType`, a nullable string; a bare
+/// NULL has no type to create.
 fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, src: usize) !Col {
-    const t = f.ty;
+    const t = if (f.ty.unknown and f.ty.kind == .string) f.ty.sinkType() else f.ty;
     if (t.unknown) return refuse("column `{s}` has no type (a bare NULL); CAST it to the type {s} should hold", .{ f.name, name });
     switch (t.kind) {
         .decimal => {
