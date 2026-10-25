@@ -25,6 +25,7 @@ const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
+const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
@@ -114,9 +115,7 @@ fn distinctWorker(ctx: *DistinctCtx, lane_idx: usize) void {
     const in = keytable.Interner{ .table = ctx.strs, .cache = &lane.cache, .alloc = lane.arena.allocator() };
     lane.mem.init();
     defer lane.mem.deinit();
-    while (!ctx.queue.failed.load(.seq_cst)) {
-        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-        if (i >= ctx.queue.nitems) return;
+    while (ctx.queue.take()) |i| {
         _ = lane.mem.work.reset(.retain_capacity);
         _ = lane.mem.batch.reset(.retain_capacity);
         const span = trace.begin("distinct item", i);
@@ -331,10 +330,9 @@ pub fn runParallelDistinct(
     }
 
     const snk = try openTailSink(env, w, tail, row_schema.*);
-    writeTail(env, snk, merged, row_schema.*, tail, stats, .distinct) catch |e| {
-        snk.abort();
-        return e;
-    };
-    try snk.close();
+    var guard = SinkGuard.init(snk);
+    defer guard.abort();
+    try writeTail(env, snk, merged, row_schema.*, tail, stats, .distinct);
+    try guard.close();
     return true;
 }

@@ -44,6 +44,7 @@ const profile = @import("../../exec/profile.zig");
 const pushdown = @import("../pushdown.zig");
 const resolveLaneJoins = @import("join.zig").resolveLaneJoins;
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
+const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
@@ -496,12 +497,11 @@ pub const MorselSource = struct {
 
     fn nextIndex(self: *MorselSource) ?usize {
         if (self.fixed) |*f| {
-            if (f.next >= self.m.queue.nitems) return null;
+            if (self.m.queue.failed.load(.seq_cst) or f.next >= self.m.queue.nitems) return null;
             defer f.next += f.step;
             return f.next;
         }
-        const i = self.m.queue.next.fetchAdd(1, .seq_cst);
-        return if (i >= self.m.queue.nitems) null else i;
+        return self.m.queue.take();
     }
 
     fn schemaFn(ptr: *anyopaque) types.Schema {
@@ -516,7 +516,7 @@ pub const MorselSource = struct {
                 self.cur = null;
                 self.span.end();
             }
-            const i = (if (self.m.queue.failed.load(.seq_cst)) null else self.nextIndex()) orelse {
+            const i = self.nextIndex() orelse {
                 self.slicer.deinit();
                 return null;
             };
@@ -700,8 +700,8 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     };
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
+    var guard = SinkGuard.init(snk);
+    defer guard.abort();
     const t_emit0 = std.time.Instant.now() catch unreachable;
     const emit_span = trace.begin("aggregate emit and write", 0);
     try writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats);
@@ -717,8 +717,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
         for (lane_joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
         p.path = try std.fmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
     }
-    snk_open = false;
-    try snk.close();
+    try guard.close();
     return true;
 }
 
@@ -915,8 +914,8 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const t_emit0 = std.time.Instant.now() catch unreachable;
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
+    var guard = SinkGuard.init(snk);
+    defer guard.abort();
     try writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats);
     if (env.profile) |p| {
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
@@ -924,8 +923,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
         p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
         try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
-    snk_open = false;
-    try snk.close();
+    try guard.close();
     return true;
 }
 

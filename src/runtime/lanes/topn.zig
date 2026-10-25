@@ -21,6 +21,7 @@ const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
+const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
@@ -223,13 +224,12 @@ pub fn runParallelTopN(
     }
 
     const snk = try openTailSink(env, w, &.{}, row_schema.*);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
+    var guard = SinkGuard.init(snk);
+    defer guard.abort();
     if (top) |b| {
         try snk.writeBatch(arena, b);
         stats.rows_out += b.len;
     }
-    snk_open = false;
-    try snk.close();
+    try guard.close();
     return true;
 }

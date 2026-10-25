@@ -7,6 +7,7 @@ const ast = @import("../../lang/ast.zig");
 const buildPipeline = @import("../plan.zig").buildPipeline;
 const buildProject = @import("../plan.zig").buildProject;
 const buildStage = @import("../plan.zig").buildStage;
+const conform = @import("../../lang/conform.zig");
 const discoverRows = @import("discover.zig").discoverRows;
 const discoverRowsPipeline = @import("discover.zig").discoverRowsPipeline;
 const dupeSchema = @import("../connect.zig").dupeSchema;
@@ -141,42 +142,68 @@ pub fn unionCanon(env: *Env, specs: []const UnionSpec, schemas: []const types.Sc
         return planErr(env.diag, (try analyze.unionCanonProblem(env.arena, c, names)).?);
     };
     const canon = @constCast((try dropExcept(env.arena, schemas[0], except)).fields);
-    for (schemas[1..]) |sch| {
-        for (canon) |*f| {
-            const other = sch.indexOf(f.name) orelse continue;
-            const ot = sch.fields[other].ty;
-            f.ty = types.Type.unify(f.ty, ot) orelse return planErr(env.diag, try std.fmt.allocPrint(
-                env.arena,
-                "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
-                .{ f.name, @tagName(f.ty.kind), @tagName(ot.kind) },
-            ));
-        }
-    }
+    if (try unifyByName(env.arena, canon, schemas[1..])) |why| return planErr(env.diag, why);
     return .{ .fields = canon };
+}
+
+/// Widens each of `canon`'s columns to the common type of the same-named column of
+/// every schema in `rest` (`conform.Policy.union_by_name`); the problem, if any.
+fn unifyByName(arena: std.mem.Allocator, canon: []types.Schema.Field, rest: []const types.Schema) !?[]const u8 {
+    for (rest) |sch| switch (try conform.conform(arena, .{ .fields = canon }, sch, conform.Policy.union_by_name, null)) {
+        .cols => |cols| for (canon, cols) |*f, c| {
+            f.ty = c.ty;
+        },
+        .problem => |p| return try std.fmt.allocPrint(
+            arena,
+            "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
+            .{ p.type.name, @tagName(p.type.want.kind), @tagName(p.type.got.kind) },
+        ),
+    };
+    return null;
 }
 
 /// A positional `UNION`: the first branch's names, each column widened across
 /// branches. Column counts must agree; padding would misalign later columns.
 fn positionalCanon(env: *Env, schemas: []const types.Schema, set: ast.SetOp) !types.Schema {
+    const canon = try dupeSchema(env.arena, schemas[0]);
+    if (try unifyByPosition(env.arena, @constCast(canon.fields), schemas[1..], set)) |why| return planErr(env.diag, why);
+    return canon;
+}
+
+/// `unifyByName` by position (`conform.Policy.union_positional`), `rest` being the
+/// branches after the first.
+fn unifyByPosition(arena: std.mem.Allocator, canon: []types.Schema.Field, rest: []const types.Schema, set: ast.SetOp) !?[]const u8 {
     const op_name = setOpName(set);
     const hint: []const u8 = if (set == .union_all) " (`UNION ALL BY NAME` matches them by name)" else "";
-    const canon = try dupeSchema(env.arena, schemas[0]);
-    const fields = @constCast(canon.fields);
-    for (schemas[1..], 2..) |sch, n| {
-        if (sch.fields.len != fields.len) return planErr(env.diag, try std.fmt.allocPrint(
-            env.arena,
-            "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
-            .{ op_name, n, sch.fields.len, fields.len, op_name, hint },
-        ));
-        for (fields, sch.fields, 1..) |*f, of, col| {
-            f.ty = types.Type.unify(f.ty, of.ty) orelse return planErr(env.diag, try std.fmt.allocPrint(
-                env.arena,
+    for (rest, 2..) |sch, n| switch (try conform.conform(arena, .{ .fields = canon }, sch, conform.Policy.union_positional, null)) {
+        .cols => |cols| for (canon, cols) |*f, c| {
+            f.ty = c.ty;
+        },
+        .problem => |p| return switch (p) {
+            .count => |c| try std.fmt.allocPrint(
+                arena,
+                "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
+                .{ op_name, n, c.got, c.want, op_name, hint },
+            ),
+            .type => |t| try std.fmt.allocPrint(
+                arena,
                 "{s}: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
-                .{ op_name, col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },
-            ));
-        }
+                .{ op_name, (try columnOf(arena, canon, sch)) + 1, t.name, @tagName(t.want.kind), @tagName(t.got.kind), n },
+            ),
+            else => unreachable,
+        },
+    };
+    return null;
+}
+
+/// Where `conform` stopped on a positional type problem: the first column that has
+/// one on its own (equal counts are already known).
+fn columnOf(arena: std.mem.Allocator, canon: []const types.Schema.Field, sch: types.Schema) !usize {
+    for (0..canon.len) |k| {
+        const one = try conform.conform(arena, .{ .fields = canon[k..][0..1] }, .{ .fields = sch.fields[k..][0..1] }, conform.Policy.union_positional, null);
+        if (one == .problem) return k;
     }
-    return canon;
+    unreachable;
 }
 
 pub fn setOpName(set: ast.SetOp) []const u8 {
@@ -428,4 +455,99 @@ test "deriveSubstr clamps a length past the end, however large" {
     try std.testing.expectEqualStrings("bcd", deriveSubstr("abcd", "2,18446744073709551615").?);
     try std.testing.expectEqualStrings("bc", deriveSubstr("abcd", "2,2").?);
     try std.testing.expect(deriveSubstr("abcd", "5,1") == null);
+}
+
+/// The union canon folds as they were before `conform`, kept as the oracle.
+const OldCanon = struct {
+    fn byName(arena: std.mem.Allocator, canon: []types.Schema.Field, rest: []const types.Schema) !?[]const u8 {
+        for (rest) |sch| {
+            for (canon) |*f| {
+                const other = sch.indexOf(f.name) orelse continue;
+                const ot = sch.fields[other].ty;
+                f.ty = types.Type.unify(f.ty, ot) orelse return try std.fmt.allocPrint(
+                    arena,
+                    "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
+                    .{ f.name, @tagName(f.ty.kind), @tagName(ot.kind) },
+                );
+            }
+        }
+        return null;
+    }
+
+    fn byPosition(arena: std.mem.Allocator, fields: []types.Schema.Field, rest: []const types.Schema, set: ast.SetOp) !?[]const u8 {
+        const op_name = setOpName(set);
+        const hint: []const u8 = if (set == .union_all) " (`UNION ALL BY NAME` matches them by name)" else "";
+        for (rest, 2..) |sch, n| {
+            if (sch.fields.len != fields.len) return try std.fmt.allocPrint(
+                arena,
+                "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
+                .{ op_name, n, sch.fields.len, fields.len, op_name, hint },
+            );
+            for (fields, sch.fields, 1..) |*f, of, col| {
+                f.ty = types.Type.unify(f.ty, of.ty) orelse return try std.fmt.allocPrint(
+                    arena,
+                    "{s}: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
+                    .{ op_name, col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },
+                );
+            }
+        }
+        return null;
+    }
+};
+
+fn expectSameFields(want: []const types.Schema.Field, got: []const types.Schema.Field) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try std.testing.expectEqualStrings(w.name, g.name);
+        try std.testing.expectEqual(w.ty.kind, g.ty.kind);
+        try std.testing.expectEqual(w.ty.nullable, g.ty.nullable);
+        try std.testing.expectEqual(w.ty.unknown, g.ty.unknown);
+        try std.testing.expectEqual(w.ty.precision, g.ty.precision);
+        try std.testing.expectEqual(w.ty.scale, g.ty.scale);
+    }
+}
+
+test "union canon through conform equals the old folds: types, messages and the column a positional problem names" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const T = types.Type;
+    const pool = [_]T{
+        T.init(.bool),      T.init(.int),     T.init(.int).asNullable(),                          T.init(.float),
+        T.init(.string),    T.init(.bytes),   T.init(.date),                                      T.init(.timestamp),
+        T.decimal(10, 2),   T.decimal(12, 4), T.decimal(38, 0),                                   T.unknownNull(),
+        T.nullColumn(true), T.init(.time),    .{ .kind = .string, .nullable = true, .scale = 2 },
+    };
+    const names = [_][]const u8{ "a", "b", "c", "a", "d" };
+    var prng = std.Random.DefaultPrng.init(0x756e696f6e);
+    const rand = prng.random();
+    for (0..4000) |_| {
+        const nbranch = 1 + rand.uintLessThan(usize, 4);
+        const width = rand.uintLessThan(usize, 4);
+        const schemas = try a.alloc(types.Schema, nbranch);
+        for (schemas) |*s| {
+            const w = if (rand.uintLessThan(u8, 5) == 0) rand.uintLessThan(usize, 4) else width;
+            const fs = try a.alloc(types.Schema.Field, w);
+            for (fs) |*f| f.* = .{ .name = names[rand.uintLessThan(usize, names.len)], .ty = pool[rand.uintLessThan(usize, pool.len)] };
+            s.* = .{ .fields = fs };
+        }
+        const old_n = try a.dupe(types.Schema.Field, schemas[0].fields);
+        const new_n = try a.dupe(types.Schema.Field, schemas[0].fields);
+        const om = try OldCanon.byName(a, old_n, schemas[1..]);
+        const nm = try unifyByName(a, new_n, schemas[1..]);
+        if (om) |m| try std.testing.expectEqualStrings(m, nm.?) else {
+            try std.testing.expect(nm == null);
+            try expectSameFields(old_n, new_n);
+        }
+        for ([_]ast.SetOp{ .union_all, .intersect, .except }) |set| {
+            const old_p = try a.dupe(types.Schema.Field, schemas[0].fields);
+            const new_p = try a.dupe(types.Schema.Field, schemas[0].fields);
+            const om_p = try OldCanon.byPosition(a, old_p, schemas[1..], set);
+            const nm_p = try unifyByPosition(a, new_p, schemas[1..], set);
+            if (om_p) |m| try std.testing.expectEqualStrings(m, nm_p.?) else {
+                try std.testing.expect(nm_p == null);
+                try expectSameFields(old_p, new_p);
+            }
+        }
+    }
 }

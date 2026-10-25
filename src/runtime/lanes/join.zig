@@ -151,9 +151,7 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
     defer if (held) |h| h.r.close();
     var item = ReaderSource{ .r = undefined, .schema_ = m.src_schema, .own = false };
     defer item.slicer.deinit();
-    while (!ctx.queue.failed.load(.seq_cst)) {
-        const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-        if (i >= ctx.queue.nitems) return;
+    while (ctx.queue.take()) |i| {
         _ = mem.work.reset(.retain_capacity);
         const r = (try openItem(m, keep.allocator(), &held, i)) orelse continue;
         item.r = r;

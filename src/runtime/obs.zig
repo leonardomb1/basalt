@@ -27,6 +27,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const driver = @import("../connect/driver.zig");
+const jsontext = @import("../exec/jsontext.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 
@@ -79,7 +80,7 @@ pub const Logger = struct {
         var buf: [512]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
         w.print("{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"progress\",\"target\":", .{ std.time.milliTimestamp(), self.run_id }) catch return;
-        std.json.Stringify.encodeJsonString(ev.target, .{}, &w) catch return;
+        jsontext.string(&w, ev.target) catch return;
         w.print(",\"rows\":{d},\"rows_per_sec\":{d},\"elapsed_ms\":{d}", .{ ev.rows, ev.rows_per_sec, ev.elapsed_ms }) catch return;
         if (ev.loop_total > 0) w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ ev.loop_done, ev.loop_total }) catch return;
         w.writeAll("}\n") catch return;
@@ -109,7 +110,7 @@ pub const Logger = struct {
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
             w.print("{{\"ts\":{d},\"level\":\"print\",\"run_id\":{d},\"msg\":\"", .{ std.time.milliTimestamp(), self.run_id }) catch return;
-            writeEscaped(&w, msg) catch return;
+            jsontext.chars(&w, msg) catch return;
             w.writeAll("\"}\n") catch return;
         } else {
             w.print("{s}\n", .{msg}) catch return;
@@ -163,7 +164,7 @@ pub const Logger = struct {
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) {
             w.print("{{\"ts\":{d},\"level\":\"{s}\",\"run_id\":{d},\"msg\":\"", .{ std.time.milliTimestamp(), level.label(), self.run_id }) catch return;
-            writeEscaped(&w, msg) catch return;
+            jsontext.chars(&w, msg) catch return;
             w.writeAll("\"}\n") catch return;
         } else {
             w.print("{s}: {s}\n", .{ level.label(), msg }) catch return;
@@ -484,11 +485,11 @@ pub const Item = struct {
 
     fn renderJson(self: Item, w: *std.Io.Writer, run_id: u64) !void {
         try w.print("{{\"ts\":{d},\"level\":\"info\",\"run_id\":{d},\"event\":\"{s}\",\"target\":\"", .{ std.time.milliTimestamp(), run_id, if (self.reason == null) "load_complete" else "load_failed" });
-        try writeEscaped(w, self.target);
+        try jsontext.chars(w, self.target);
         try w.print("\",\"rows_written\":{d},\"elapsed_ms\":{d}", .{ self.rows, self.elapsed_ms });
         if (self.reason) |why| {
             try w.writeAll(",\"reason\":\"");
-            try writeEscaped(w, why);
+            try jsontext.chars(w, why);
             try w.writeByte('"');
         }
         try w.writeAll("}\n");
@@ -567,16 +568,21 @@ pub const Summary = struct {
     }
 
     /// `status` is `partial` once any load or `FOR EACH` item failed.
-    pub fn renderJson(self: Summary, w: anytype) !void {
+    pub fn renderJson(self: Summary, w: *std.Io.Writer) !void {
         const status = if (self.partial or self.loads_failed > 0) "partial" else "ok";
         try w.print("{{\"status\":\"{s}\",\"run_id\":{d},", .{ status, self.run_id });
         try self.renderJsonFields(w);
     }
 
-    fn renderJsonFields(self: Summary, w: anytype) !void {
+    fn renderJsonFields(self: Summary, w: *std.Io.Writer) !void {
+        try jsontext.key(w, "source");
+        try jsontext.string(w, self.source);
+        try w.writeByte(',');
+        try jsontext.key(w, "sink");
+        try jsontext.string(w, self.sink);
         try w.print(
-            "\"source\":\"{s}\",\"sink\":\"{s}\",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}",
-            .{ self.source, self.sink, self.rows_read, self.rows_written, self.elapsed_ms, self.rate(), self.loads, self.loads_failed },
+            ",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"rows_per_sec\":{d},\"loads\":{d},\"loads_failed\":{d}",
+            .{ self.rows_read, self.rows_written, self.elapsed_ms, self.rate(), self.loads, self.loads_failed },
         );
         const p = self.pushdown;
         if (p.any()) try w.print(
@@ -612,10 +618,6 @@ pub const CountingSource = struct {
         self.inner.close();
     }
 };
-
-fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
-    return std.json.Stringify.encodeJsonStringChars(s, .{}, w);
-}
 
 test "progress line: counts, rate and clock, and a label that gives way to the width" {
     var buf: [512]u8 = undefined;
@@ -654,14 +656,16 @@ test "Level.parse" {
     try std.testing.expect(Level.parse("nope") == null);
 }
 
-test "writeEscaped: quotes, backslashes and control characters are escaped" {
+test "JSON log message: quotes, backslashes and control characters are escaped; \\b and \\f as \\u00XX" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("log", .{ .read = true });
+    defer f.close();
+    var lg = Logger{ .file = f, .json = true, .min = .info, .run_id = 1 };
+    lg.script("a\"b\nc\\d\t\r\x01\x08\x0c");
     var buf: [256]u8 = undefined;
-    var fbw = std.Io.Writer.fixed(&buf);
-    const w = &fbw;
-    try w.writeAll("{\"msg\":\"");
-    try writeEscaped(w, "a\"b\nc\\d\t\r\x01\x08\x0c");
-    try w.writeAll("\"}");
-    try std.testing.expectEqualStrings("{\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\\b\\f\"}", w.buffered());
+    const line = try readLog(f, &buf);
+    try std.testing.expect(std.mem.endsWith(u8, line, ",\"msg\":\"a\\\"b\\nc\\\\d\\t\\r\\u0001\\u0008\\u000c\"}\n"));
 }
 
 test "summary renderJson: one status-ok object with every metric field" {
@@ -885,6 +889,37 @@ test "Logger.script, summary and item: a text line or one NDJSON object, nothing
         try std.testing.expectEqualStrings(wl_.level, o.get("level").?.string);
         try std.testing.expectEqualStrings(wl_.val, o.get(wl_.key).?.string);
         try std.testing.expectEqual(@as(i64, 4), o.get("run_id").?.integer);
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "JSON logs: every line parses, invalid UTF-8 in a message, target, reason or label repaired to U+FFFD" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [4096]u8 = undefined;
+    const jf = try tmp.dir.createFile("json", .{ .read = true });
+    defer jf.close();
+    var jl = Logger{ .file = jf, .json = true, .min = .info, .run_id = 5 };
+    jl.script("caf\xe9");
+    jl.log(.info, "bad byte {s}", .{"\xff"});
+    try std.testing.expect(jl.item(.{ .target = "t\xc3.csv", .reason = "r\x80" }));
+    jl.progressEvent(.{ .target = "p\xfe", .rows = 1, .rows_per_sec = 1, .elapsed_ms = 1 });
+    jl.summary(.{ .run_id = 5, .source = "my\"src", .sink = "s\xff" });
+    const out = try readLog(jf, &buf);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, out, "\n"), '\n');
+    const want = [_]struct { key: []const u8, val: []const u8 }{
+        .{ .key = "msg", .val = "caf\u{FFFD}" },
+        .{ .key = "msg", .val = "bad byte \u{FFFD}" },
+        .{ .key = "reason", .val = "r\u{FFFD}" },
+        .{ .key = "target", .val = "p\u{FFFD}" },
+        .{ .key = "sink", .val = "s\u{FFFD}" },
+    };
+    for (want) |w| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, it.next().?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(w.val, parsed.value.object.get(w.key).?.string);
+        if (parsed.value.object.get("source")) |src| try std.testing.expectEqualStrings("my\"src", src.string);
     }
     try std.testing.expect(it.next() == null);
 }

@@ -21,6 +21,7 @@ const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const std = @import("std");
 const table_builtins = @import("../../connect/table_builtins.zig");
+const textconv = @import("../../exec/textconv.zig");
 const replace = @import("../../db/replace.zig");
 const types = @import("../../lang/types.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
@@ -194,7 +195,7 @@ pub fn hintBool(hints: []const ast.Hint, key: []const u8, diag: *Diag) Error!?bo
         return switch (h.value) {
             .flag => true,
             .int => |n| n != 0,
-            .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else fail(diag, "`{s}` is true or false, not `{s}`", .{ key, s }),
+            .str, .ident => |s| textconv.boolText(textconv.Words.hint, s) orelse fail(diag, "`{s}` is true or false, not `{s}`", .{ key, s }),
         };
     }
     return null;

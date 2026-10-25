@@ -49,6 +49,7 @@ const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
 const decimal = @import("../exec/decimal.zig");
 const eval = @import("../exec/eval.zig");
+const textconv = @import("../exec/textconv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
 const ftp = @import("../store/ftp.zig");
@@ -178,11 +179,7 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .null => null,
         .int => |n| if (n < 0) fail(diag, "{s} must not be negative, got {d}", .{ what, n }) else @intCast(n),
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
-        .float => |f| blk: {
-            if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) break :blk fail(diag, "{s} {d} is out of range", .{ what, f });
-            const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
-            break :blk roundedRows(diag, what, @intFromFloat(r));
-        },
+        .float => |f| roundedRows(diag, what, textconv.floatToInt(f, .half_even) orelse return fail(diag, "{s} {d} is out of range", .{ what, f })),
         .decimal => |d| blk: {
             const q = decimal.roundWhole(d) orelse break :blk fail(diag, "{s} is out of range", .{what});
             break :blk roundedRows(diag, what, q);
@@ -696,10 +693,7 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
 /// or null when it does; `check` and the run both word the error from it.
 pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?[]const u8 {
     const ok = switch (ty.kind) {
-        .int => if (std.fmt.parseInt(i64, text, 10)) |_| true else |_| false,
-        .float => if (std.fmt.parseFloat(f64, text)) |_| true else |_| false,
-        .bool => std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false"),
-        .date, .time, .timestamp, .decimal => if (eval.castValueTyped(arena, .{ .string = text }, ty)) |_| true else |_| false,
+        .int, .float, .bool, .date, .time, .timestamp, .decimal => paramFromText(arena, ty, text) != null,
         else => true,
     };
     if (ok) return null;
@@ -714,11 +708,22 @@ pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const 
     };
 }
 
+/// A PARAM's text as its declared type, null when it does not read as one: a number,
+/// date, time, timestamp or decimal as `CAST(text AS ty)` reads it, a BOOL only as
+/// `true` or `false`. Null for the kinds bound as text or not from text at all.
+pub fn paramFromText(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?Value {
+    return switch (ty.kind) {
+        .bool => .{ .bool = textconv.boolText(textconv.Words.exact, text) orelse return null },
+        .int, .float, .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = text }, ty) catch null,
+        else => null,
+    };
+}
+
 fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error!?*const ast.Expr {
     return switch (ty.kind) {
-        .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
-        .float => mk(arena, .{ .float_lit = std.fmt.parseFloat(f64, raw) catch return null }),
-        .bool => mk(arena, .{ .bool_lit = std.mem.eql(u8, raw, "true") }),
+        .int => mk(arena, .{ .int_lit = (paramFromText(arena, ty, raw) orelse return null).int }),
+        .float => mk(arena, .{ .float_lit = (paramFromText(arena, ty, raw) orelse return null).float }),
+        .bool => mk(arena, .{ .bool_lit = (paramFromText(arena, ty, raw) orelse return null).bool }),
         .string, .bytes => mk(arena, .{ .str_lit = raw }),
         .date, .time, .timestamp, .decimal => typedParam(arena, ty, try mk(arena, .{ .str_lit = raw })),
         else => null,
@@ -2013,6 +2018,31 @@ const parser = @import("../lang/sql_parser.zig");
 pub fn parse(a: std.mem.Allocator, src: []const u8) !ast.Program {
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     return parser.parseSource(a, src, &pd);
+}
+
+test "a float LIMIT rounds half to even through textconv.floatToInt as the old formula did" {
+    const old = struct {
+        fn rows(f: f64) ?i64 {
+            if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) return null;
+            const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
+            return @intFromFloat(r);
+        }
+    };
+    const specials = [_]f64{ 0, -0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.49999999999999994, 4503599627370495.5, 4503599627370497, 9007199254740994, 0x1p62, 0x1p63, -0x1p63 + 1024, 1e300, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 9.223372036854775e18 };
+    for (specials) |f| try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+    try std.testing.expectEqual(@as(?i64, null), old.rows(-0x1p63));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), textconv.floatToInt(-0x1p63, .half_even));
+    var prng = std.Random.DefaultPrng.init(0x6c696d6974);
+    const rand = prng.random();
+    for (0..20000) |_| {
+        const f = switch (rand.uintLessThan(u8, 3)) {
+            0 => (rand.float(f64) - 0.5) * 1000,
+            1 => @as(f64, @floatFromInt(rand.intRangeAtMost(i32, -100000, 100000))) / 2,
+            else => @as(f64, @bitCast(rand.int(u64))),
+        };
+        if (f == -0x1p63) continue;
+        try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+    }
 }
 
 test {

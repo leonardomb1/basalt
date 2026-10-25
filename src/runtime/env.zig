@@ -649,13 +649,35 @@ fn pathLayer(path: []const u8) []const u8 {
 
 pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]const u8 {
     if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
-    if (sftp.isUrl(path)) if (sftp.lastError().len > 0)
-        return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), sftp.lastError() });
-    if (smb.isUrl(path)) if (smb.lastError().len > 0)
-        return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), smb.lastError() });
-    if (ftp.isUrl(path)) if (ftp.lastError().len > 0)
-        return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ pathLayer(path), @errorName(e), ftp.lastError() });
+    if (connectorNote(e, path)) |n| return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why });
     return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
+}
+
+/// A file connector's own words for its last failure on this thread and the layer it
+/// is, both shown as `layer: Error: words`.
+pub const ConnectorNote = struct { layer: []const u8, why: []const u8 };
+
+/// The note for `e`: from the connector `path` names when there is a path, else from
+/// the one the error's name belongs to (a lane reports without its path); null when
+/// that connector kept no words.
+pub fn connectorNote(e: anyerror, path: ?[]const u8) ?ConnectorNote {
+    const Which = enum { sftp, smb, ftp, none };
+    const which: Which = if (path) |p|
+        (if (sftp.isUrl(p)) .sftp else if (smb.isUrl(p)) .smb else if (ftp.isUrl(p)) .ftp else .none)
+    else blk: {
+        const name = @errorName(e);
+        if (std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) break :blk .sftp;
+        if (std.mem.startsWith(u8, name, "Smb")) break :blk .smb;
+        break :blk .none;
+    };
+    const why = switch (which) {
+        .sftp => sftp.lastError(),
+        .smb => smb.lastError(),
+        .ftp => ftp.lastError(),
+        .none => return null,
+    };
+    if (why.len == 0) return null;
+    return .{ .layer = @tagName(which), .why = why };
 }
 
 /// `512MB`, `8GB`, `2GiB`, `64k` or a bare byte count, case-insensitive; every
@@ -775,6 +797,16 @@ test "isTransient: object-store throttling is worth a retry" {
     try std.testing.expect(isTransient(error.S3Throttled));
     try std.testing.expect(isTransient(error.AzureThrottled));
     try std.testing.expect(!isTransient(error.OutOfMemory));
+}
+
+test "connectorNote: none for a local path, an error no file connector names, or a connector with no words; pathFail then names the layer" {
+    try std.testing.expect(connectorNote(error.FileNotFound, "data/x.csv") == null);
+    try std.testing.expect(connectorNote(error.OutOfMemory, null) == null);
+    try std.testing.expect(connectorNote(error.ConnectionResetByPeer, null) == null);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectEqualStrings("local file: FileNotFound", try pathFail(ar.allocator(), "data/x.csv", error.FileNotFound));
+    try std.testing.expectEqualStrings("s3 object: S3Throttled", try pathFail(ar.allocator(), "s3://b/k", error.S3Throttled));
 }
 
 test "terminate: the first signal aborts the run, a second exits" {
