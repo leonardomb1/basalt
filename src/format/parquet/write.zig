@@ -72,6 +72,7 @@ pub const Error = error{
     AppendNotSupported,
     UnsupportedParquetDecimal,
     ParquetValueOutOfRange,
+    ParquetNullInRequired,
 } || std.mem.Allocator.Error || codec.Error;
 
 pub const row_group_rows = 100_000;
@@ -487,7 +488,7 @@ pub const Writer = struct {
         const arena = mem.allocator();
         const maps = try arena.alloc(Mapping, schema.fields.len);
         for (schema.fields, maps, 0..) |f, *m, i| {
-            m.* = try mapPhysical(f.ty, if (i < phys.len) phys[i] else .{});
+            m.* = try mapPhysical(f.ty.sinkType(), if (i < phys.len) phys[i] else .{});
             m.optional = f.ty.nullable;
         }
 
@@ -1218,6 +1219,7 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
 fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
     try cb.defs.append(if (v == .null) 0 else 1);
     if (v == .null) {
+        if (!m.optional) return Error.ParquetNullInRequired;
         cb.nulls += 1;
         return;
     }
@@ -1257,6 +1259,7 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
     var nan = false;
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
+            if (!optional) return Error.ParquetNullInRequired;
             cb.defs.appendAssumeCapacity(0);
             cb.nulls += 1;
             continue;
@@ -1303,6 +1306,7 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
     var any = false;
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
+            if (!m.optional) return Error.ParquetNullInRequired;
             cb.defs.appendAssumeCapacity(0);
             cb.nulls += 1;
             continue;
@@ -1350,6 +1354,7 @@ fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: col
     var mx: ?[]const u8 = null;
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
+            if (!optional) return Error.ParquetNullInRequired;
             cb.defs.appendAssumeCapacity(0);
             cb.nulls += 1;
             continue;
@@ -2196,4 +2201,46 @@ test "a moderate write is one row group, whether written directly or through a u
         try testing.expectEqual(@as(usize, 1), md.row_groups.len);
         try testing.expectEqual(@as(i64, n), md.row_groups[0].num_rows);
     }
+}
+
+test "a NULL in a REQUIRED column fails the write instead of writing a short page" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const kinds = [_]types.Type{ types.Type.init(.int), types.Type.init(.float), types.Type.init(.date), types.Type.init(.string), types.Type.decimal(10, 2), types.Type.init(.bool) };
+    for (kinds, 0..) |t, k| {
+        const path = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "req{d}.parquet", .{k}) });
+        const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = t }} };
+        var w = try Writer.open(a, path, schema, .snappy, .truncate);
+        defer w.abort();
+        var xs = try column.Builder.initCapacity(a, t.asNullable(), 2);
+        try xs.append(.null);
+        try xs.append(.null);
+        var cols = [_]column.Column{try xs.finish()};
+        try testing.expectError(Error.ParquetNullInRequired, w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 }));
+    }
+}
+
+test "a column of unknown type (a bare NULL) is written as a nullable string, not BOOLEAN" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "null.parquet" });
+    const schema = types.Schema{ .fields = &.{.{ .name = "n", .ty = types.Type.unknownNull() }} };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    var xs = try column.Builder.initCapacity(a, schema.fields[0].ty, 1);
+    try xs.append(.null);
+    var cols = [_]column.Column{try xs.finish()};
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 1 });
+    try w.close();
+    const r = try pqdecode.Reader.open(a, path);
+    defer r.close();
+    try testing.expectEqual(types.TypeKind.string, r.schema.fields[0].ty.kind);
+    try testing.expect(r.schema.fields[0].ty.nullable);
 }
