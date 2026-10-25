@@ -60,44 +60,6 @@ pub const Decimal = struct {
     }
 };
 
-/// A DECIMAL of at most 18 digits as its column stores it (`column.Column.Data.dec64`):
-/// the unscaled value alone, at the scale the column's type names. A type of its own,
-/// not `i64`, so code generic over storage cannot read it as an integer by accident.
-pub const Dec64 = enum(i64) {
-    _,
-
-    pub const max_precision = 18;
-
-    pub inline fn of(u: i64) Dec64 {
-        return @enumFromInt(u);
-    }
-
-    pub inline fn int(self: Dec64) i64 {
-        return @intFromEnum(self);
-    }
-
-    pub inline fn at(self: Dec64, scale: u8) Decimal {
-        return .{ .unscaled = self.int(), .scale = scale };
-    }
-
-    /// `d` stored at `scale`: raised exactly, or lowered only when no digit is lost;
-    /// null when it would round or not fit.
-    pub fn fit(d: Decimal, scale: u8) ?Dec64 {
-        var u = d.unscaled;
-        if (d.scale < scale) {
-            const diff = scale - d.scale;
-            if (diff >= pow10_i128.len) return if (u == 0) of(0) else null;
-            u = std.math.mul(i128, u, pow10_i128[diff]) catch return null;
-        } else if (d.scale > scale) {
-            const diff = d.scale - scale;
-            if (diff >= pow10_i128.len) return if (u == 0) of(0) else null;
-            if (@rem(u, pow10_i128[diff]) != 0) return null;
-            u = @divExact(u, pow10_i128[diff]);
-        }
-        return of(std.math.cast(i64, u) orelse return null);
-    }
-};
-
 pub const pow10_i128 = blk: {
     var t: [39]i128 = undefined;
     var r: i128 = 1;
@@ -160,16 +122,3 @@ pub const Value = union(enum) {
         return self == .null;
     }
 };
-
-test "Dec64.fit moves a decimal to a scale only when no digit is lost and an i64 holds it" {
-    const D = Decimal;
-    try std.testing.expectEqual(@as(i64, 150), Dec64.fit(D{ .unscaled = 15, .scale = 1 }, 2).?.int());
-    try std.testing.expectEqual(@as(i64, 15), Dec64.fit(D{ .unscaled = 1500, .scale = 3 }, 1).?.int());
-    try std.testing.expectEqual(@as(i64, -7), Dec64.fit(D{ .unscaled = -7, .scale = 0 }, 0).?.int());
-    try std.testing.expect(Dec64.fit(D{ .unscaled = 1505, .scale = 3 }, 2) == null);
-    try std.testing.expect(Dec64.fit(D{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 1) == null);
-    try std.testing.expect(Dec64.fit(D{ .unscaled = @as(i128, std.math.maxInt(i64)) + 1, .scale = 2 }, 2) == null);
-    try std.testing.expectEqual(@as(i64, 0), Dec64.fit(D{ .unscaled = 0, .scale = 60 }, 2).?.int());
-    try std.testing.expect(Dec64.fit(D{ .unscaled = 1, .scale = 0 }, 60) == null);
-    try std.testing.expectEqual(D{ .unscaled = 1234, .scale = 2 }, Dec64.of(1234).at(2));
-}

@@ -9,7 +9,6 @@ const VecError = @import("vec.zig").VecError;
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const mkCol = @import("vec.zig").mkCol;
-const sameLayout = @import("vec.zig").sameLayout;
 const std = @import("std");
 const strArg = @import("vec.zig").strArg;
 const strAt = @import("vec.zig").strAt;
@@ -64,7 +63,7 @@ pub const vectorized = struct {
         const k = kindOf(a) orelse return error.Unsupported;
         if (kindOf(b) != k) return error.Unsupported;
         const take = try holds(arena, try compareVecs(arena, .eq, a, b, batch.len), batch.len);
-        return try typed(try pickVec(arena, take, .{ .scalar = .null }, a), vecType(a).asNullable());
+        return typed(try pickVec(arena, take, .{ .scalar = .null }, a), vecType(a).asNullable());
     }
 
     /// The first of the greatest (or least) non-null arguments, for arguments of one
@@ -89,20 +88,16 @@ pub const vectorized = struct {
                     for (wins, 0..) |*w, i| w.* = validAt(v, i) and (w.* or !validAt(cur, i));
                     acc = try pickVec(arena, wins, v, cur);
                 }
-                return try typed(acc orelse return .{ .scalar = .null }, ty.?.asNullable());
+                return typed(acc orelse return .{ .scalar = .null }, ty.?.asNullable());
             }
         };
     }
 };
 
-/// `v` with its column typed `ty`, as the typing rule types it; a DECIMAL column
-/// stored otherwise than `ty` stores one declines, and runs row by row.
-fn typed(v: Vec, ty: Type) VecError!Vec {
+/// `v` with its column typed `ty`, as the typing rule types it.
+fn typed(v: Vec, ty: Type) Vec {
     var out = v;
-    if (out == .col) {
-        if (ty.kind == .decimal and !sameLayout(out.col.ty, std.meta.activeTag(out.col.data), ty)) return error.Unsupported;
-        out.col.ty = ty;
-    }
+    if (out == .col) out.col.ty = ty;
     return out;
 }
 

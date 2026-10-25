@@ -3,7 +3,6 @@
 //! function with no vector form) falls back to the row evaluator for that node.
 
 const Batch = @import("../batch.zig").Batch;
-const Dec64 = @import("../value.zig").Dec64;
 const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
@@ -54,7 +53,7 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
         error.OutOfMemory => return error.OutOfMemory,
     };
     return switch (v) {
-        .col => |c| if (numericDrift(c.ty, out_ty) or decimalDrift(c, out_ty)) rebuildAs(arena, c, out_ty) else c,
+        .col => |c| if (numericDrift(c.ty, out_ty)) rebuildAs(arena, c, out_ty) else c,
         .scalar => |s| broadcastScalar(arena, s, out_ty, batch.len),
     };
 }
@@ -63,20 +62,6 @@ pub fn evalColumn(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch,
 /// `coalesce(f, 0.5)` over a FLOAT `f` that is null all batch holds decimals.
 fn numericDrift(have: Type, want: Type) bool {
     return !want.unknown and have.kind != want.kind and have.kind.isNumeric() and want.kind.isNumeric();
-}
-
-/// Whether a DECIMAL column is stored otherwise than its expression's type stores
-/// one: another layout (`dec64` against `dec`), or `dec64` at another scale.
-fn decimalDrift(c: Column, want: Type) bool {
-    if (want.unknown or c.ty.kind != .decimal or want.kind != .decimal) return false;
-    return !sameLayout(c.ty, std.meta.activeTag(c.data), want);
-}
-
-/// Whether a DECIMAL stored as `tag` at type `have` reads the same as one of type
-/// `want`: one layout, and for `dec64` one scale, so the elements move as they are.
-pub fn sameLayout(have: Type, tag: column.Tag, want: Type) bool {
-    const w = column.storageOf(want);
-    return tag == w and (w != .dec64 or have.scale == want.scale);
 }
 
 fn rebuildAs(arena: std.mem.Allocator, c: Column, ty: Type) EvalError!Column {
@@ -235,24 +220,12 @@ pub fn pickVec(arena: std.mem.Allocator, take: []const bool, t: Vec, e: Vec) Vec
     const tn = t == .scalar and t.scalar.isNull();
     const en = e == .scalar and e.scalar.isNull();
     if (tn and en) return .{ .scalar = .null };
-    const tc = if (tn) null else (try realizeBeside(arena, t, e, n)) orelse return error.Unsupported;
-    const ec = if (en) null else (try realizeBeside(arena, e, t, n)) orelse return error.Unsupported;
+    const tc = if (tn) null else (try realize(arena, t, n)) orelse return error.Unsupported;
+    const ec = if (en) null else (try realize(arena, e, n)) orelse return error.Unsupported;
     const tcol = tc orelse try broadcastScalar(arena, .null, ec.?.ty.asNullable(), n);
     const ecol = ec orelse try broadcastScalar(arena, .null, tc.?.ty.asNullable(), n);
     if (tcol.ty.kind != ecol.ty.kind) return error.Unsupported;
-    if (tcol.ty.kind == .decimal and !sameLayout(tcol.ty, std.meta.activeTag(tcol.data), ecol.ty)) return error.Unsupported;
     return mergeCols(arena, take, tcol, ecol);
-}
-
-/// `v` as a column; a decimal constant beside a decimal column takes that column's
-/// type, so the two merge element by element, when it fits it exactly.
-fn realizeBeside(arena: std.mem.Allocator, v: Vec, other: Vec, n: usize) VecError!?Column {
-    if (v == .scalar and v.scalar == .decimal and other == .col and other.col.ty.kind == .decimal)
-        return broadcastScalar(arena, v.scalar, other.col.ty, n) catch |e| switch (e) {
-            error.IntOverflow => return null,
-            else => |x| return x,
-        };
-    return realize(arena, v, n);
 }
 
 pub fn strArg(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch) VecError!Str {
@@ -862,14 +835,7 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
             .float => Num{ .fcol = .{ .d = c.data.f64, .v = c.validity } },
             .decimal => blk: {
                 const out = try arena.alloc(f64, n);
-                switch (c.data) {
-                    .dec64 => |ds| for (ds, 0..) |d, i| {
-                        out[i] = d.at(c.ty.scale).keyF64();
-                    },
-                    else => for (c.data.dec, 0..) |d, i| {
-                        out[i] = d.keyF64();
-                    },
-                }
+                for (c.data.dec, 0..) |d, i| out[i] = d.keyF64();
                 break :blk Num{ .fcol = .{ .d = out, .v = c.validity } };
             },
             else => null,
@@ -881,14 +847,7 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
 /// not its case, and the float kernels take over.
 fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
-    const bm = try bothValid(arena, l, r, n);
-    if (column.isDec64(ty)) {
-        var f = try Filled(Dec64).masked(arena, n, bm);
-        var sink = StoreSink{ .out64 = f.d, .scale = ty.scale };
-        try decApply(op, l, r, &sink, f.bm, f.any);
-        return f.finish(ty);
-    }
-    var f = try Filled(Decimal).masked(arena, n, bm);
+    var f = try Filled(Decimal).masked(arena, n, try bothValid(arena, l, r, n));
     var sink = StoreSink{ .out = f.d };
     try decApply(op, l, r, &sink, f.bm, f.any);
     return f.finish(ty);
@@ -929,29 +888,11 @@ fn bothValid(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!Bitmap
     return bm;
 }
 
-/// The values of a result column: into `out`, or for a `dec64` type into `out64`
-/// at its scale, one sink for both so the lanes are generated once. A value off
-/// the scale (one `decimalOp` gave back off the lanes) fails, and the row path
-/// rechecks it.
 const StoreSink = struct {
-    out: []Decimal = &.{},
-    out64: []Dec64 = &.{},
-    scale: u8 = 0,
+    out: []Decimal,
 
     inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
-        if (self.out64.len == 0) {
-            self.out[i] = d;
-            return;
-        }
-        if (d.scale == self.scale) if (std.math.cast(i64, d.unscaled)) |u| {
-            self.out64[i] = .of(u);
-            return;
-        };
-        self.out64[i] = try fitOrFail(d, self.scale);
-    }
-
-    noinline fn fitOrFail(d: Decimal, scale: u8) VecError!Dec64 {
-        return Dec64.fit(d, scale) orelse error.IntOverflow;
+        self.out[i] = d;
     }
 };
 
@@ -967,15 +908,12 @@ fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bo
     };
 }
 
-/// An operand's lane: `int` for i64 elements at one scale (an INT column at 0, a
-/// `dec64` column at its type's), `dec` for decimals each carrying a scale, `one`
-/// for a constant.
 const Side = enum { int, dec, one };
 
 fn sideOf(v: Vec) Side {
     return switch (v) {
         .scalar => .one,
-        .col => |c| if (c.ty.kind == .int or c.data == .dec64) .int else .dec,
+        .col => |c| if (c.ty.kind == .int) .int else .dec,
     };
 }
 
@@ -1019,11 +957,7 @@ const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{},
 fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
     return switch (v) {
         .scalar => .{ .scale = scale, .f = f, .c = c },
-        .col => |col| switch (col.data) {
-            .i64 => |d| .{ .ints = d, .scale = scale, .f = f, .c = c },
-            .dec64 => |d| .{ .ints = @ptrCast(d), .scale = scale, .f = f, .c = c },
-            else => .{ .decs = col.data.dec, .scale = scale, .f = f, .c = c },
-        },
+        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = col.data.dec, .scale = scale, .f = f, .c = c },
     };
 }
 
@@ -1226,17 +1160,6 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     const c = col.col;
     const pick = cmpBound(op, flip, d, c.ty.scale, std.math.minInt(i128)) orelse return null;
     var f = try Filled(bool).masked(arena, n, try copyBits(arena, c.validity, n));
-    if (c.data == .dec64) {
-        const b = std.math.cast(i64, pick.bound) orelse @as(i64, if (pick.bound < 0) std.math.minInt(i64) else std.math.maxInt(i64));
-        const exact = b == pick.bound;
-        switch (pick.op) {
-            inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec64[0..n], f.d) |x, *o| {
-                o.* = if (exact) cmpLane(i64, cop, x.int(), b) else cmpResult(cop, std.math.order(@as(i128, x.int()), pick.bound));
-            },
-            else => unreachable,
-        }
-        return f.finish(Type.init(.bool));
-    }
     switch (pick.op) {
         inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec[0..n], f.d) |x, *o| {
             o.* = if (x.scale == c.ty.scale)
@@ -1280,12 +1203,10 @@ inline fn vecValid(v: Vec, i: usize) bool {
     };
 }
 
-/// Row `i` of an operand as a decimal; out of line, since only the row-at-a-time
-/// fallbacks of the generated lanes call it.
-noinline fn decAt(v: Vec, i: usize) Decimal {
+inline fn decAt(v: Vec, i: usize) Decimal {
     return switch (v) {
         .scalar => |s| asDecimal(s).?,
-        .col => |c| if (c.ty.kind == .decimal) c.decAt(i) else Decimal{ .unscaled = c.data.i64[i], .scale = 0 },
+        .col => |c| if (c.ty.kind == .decimal) c.data.dec[i] else Decimal{ .unscaled = c.data.i64[i], .scale = 0 },
     };
 }
 
@@ -1450,7 +1371,7 @@ pub fn Filled(comptime T: type) type {
         any: bool = false,
         zero_masked: bool = false,
 
-        const zero: T = if (T == Decimal) .{ .unscaled = 0, .scale = 0 } else if (T == Dec64) .of(0) else std.mem.zeroes(T);
+        const zero: T = if (T == Decimal) .{ .unscaled = 0, .scale = 0 } else std.mem.zeroes(T);
 
         pub fn init(arena: std.mem.Allocator, n: usize) VecError!@This() {
             return .{ .d = try arena.alloc(T, n), .bm = try Bitmap.initFull(arena, n) };
@@ -1477,7 +1398,6 @@ pub fn Filled(comptime T: type) type {
                 i64 => .{ .i64 = self.d },
                 f64 => .{ .f64 = self.d },
                 Decimal => .{ .dec = self.d },
-                Dec64 => .{ .dec64 = self.d },
                 else => @compileError("no column of this type"),
             };
             return mkCol(ty.withNull(self.any), self.d.len, self.bm, data);
@@ -2092,61 +2012,6 @@ test "decFold declines a non-decimal expression before evaluating it" {
     const got = (try testSum(a, try parser.parseExprStr(a, "-1.25 - x", &diag), batch, 2)).?;
     try std.testing.expectEqual(@as(usize, 2), got.nvalid);
     try std.testing.expectEqual(@as(i256, -(@as(i256, std.math.maxInt(i64)) + 2) * 100 - 250), got.sum);
-}
-
-test "dec64 columns on the vector lanes match the row path, and results of 18 digits or fewer stay dec64" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const schema = types.Schema{ .fields = &.{
-        .{ .name = "x", .ty = Type.init(.int).asNullable() },
-        .{ .name = "d", .ty = Type.decimal(12, 2).asNullable() },
-        .{ .name = "e", .ty = Type.decimal(10, 3).asNullable() },
-        .{ .name = "w", .ty = Type.decimal(30, 2).asNullable() },
-    } };
-    var prng = std.Random.DefaultPrng.init(0xd64);
-    const rnd = prng.random();
-    const exprs = [_][]const u8{
-        "d + e",     "d - e",       "e - d",                             "d * e",          "d % e",          "d * 2",        "d + x",   "x * d",
-        "d - 1.005", "0.5 * e",     "d + w",                             "w - e",          "d * w",          "d > 2.5",      "2.5 < d", "d = 1.5",
-        "e <> 1.25", "d >= x",      "e <= -0.001",                       "d < e",          "d * 0.5 > 100",  "d + e < -3.5", "-d",      "d / e",
-        "abs(d)",    "round(d, 1)", "CASE WHEN x > 0 THEN d ELSE e END", "coalesce(d, e)", "greatest(d, e)", "nullif(d, e)",
-    };
-    const n = 200;
-    var xs: [n]?i64 = undefined;
-    var bs = [_]column.Builder{ column.Builder.init(a, schema.fields[1].ty), column.Builder.init(a, schema.fields[2].ty), column.Builder.init(a, schema.fields[3].ty) };
-    const scales = [_]u8{ 2, 3, 2 };
-    const tops = [_]i128{ 999_999_999_999, 9_999_999_999, 999_999_999_999_999_999_999 };
-    for (0..n) |i| {
-        xs[i] = if (rnd.uintLessThan(u8, 9) == 0) null else rnd.intRangeAtMost(i64, -50_000, 50_000);
-        for (&bs, scales, tops) |*b, sc, top| {
-            if (rnd.uintLessThan(u8, 9) == 0) {
-                try b.append(.null);
-            } else try b.append(.{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -top, top), .scale = sc } });
-        }
-    }
-    var cols = [_]column.Column{ try column.intColumn(a, &xs), try bs[0].finish(), try bs[1].finish(), try bs[2].finish() };
-    try std.testing.expect(cols[1].data == .dec64 and cols[2].data == .dec64 and cols[3].data == .dec);
-    const batch = Batch{ .schema = &schema, .columns = &cols, .len = n };
-    for (exprs) |src| {
-        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const e = try parser.parseExprStr(a, src, &diag);
-        var ctx = TypeCtx{ .schema = schema, .arena = a };
-        const ty = try ctx.typeOf(e);
-        const got = try evalColumn(a, e, batch, ty);
-        column.assertLayout(got);
-        for (0..n) |i| {
-            const want = try evalRow(a, e, batch, i);
-            const have = got.getValue(i);
-            try std.testing.expectEqual(want.isNull(), have.isNull());
-            switch (want) {
-                .null => {},
-                .bool => |w| try std.testing.expectEqual(w, have.bool),
-                .decimal => |w| try std.testing.expectEqual(std.math.Order.eq, w.order(have.decimal)),
-                else => return error.TestUnexpectedResult,
-            }
-        }
-    }
 }
 
 test "decimal arithmetic and comparisons on the vector lanes match the row path, values and errors" {

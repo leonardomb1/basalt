@@ -320,7 +320,10 @@ pub const Fit = struct {
     pub fn apply(self: *const Fit, arena: std.mem.Allocator, b: Batch) !Batch {
         const cols = try arena.alloc(column.Column, self.outs.len);
         for (cols, self.outs, self.schema.fields) |*c, o, f| switch (o) {
-            .column => |k| c.* = try column.retype(arena, b.columns[k], f.ty),
+            .column => |k| {
+                c.* = b.columns[k];
+                c.ty = f.ty;
+            },
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
                 try bd.appendRepeated(val, b.len);

@@ -1104,10 +1104,7 @@ fn widened(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) E
         },
         .float => if (f.bit_width == 32) .{ .f64 = try widen(f32, f64, arena, cur, off, n, ToFloat{}) } else null,
         .bool_ => .{ .b = try unpackBools(arena, cur, off, n) },
-        .decimal => if (f.precision >= 1 and f.precision <= column.Elem(.dec64).max_precision)
-            .{ .dec64 = try widen(i128, column.Elem(.dec64), arena, cur, off, n, ToDec64{}) }
-        else
-            .{ .dec = try widen(i128, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = f.scale }) },
+        .decimal => .{ .dec = try widen(i128, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = f.scale }) },
         .date_ms => .{ .i32 = try widen(i64, i32, arena, cur, off, n, DayOfMs{}) },
         .timestamp, .duration, .time => switch (f.unit) {
             inline else => |u| .{ .i64 = if (f.kind == .time and f.bit_width == 32)
@@ -1166,17 +1163,6 @@ const ToDec = struct {
     }
     fn zero(c: ToDec) column.Elem(.dec) {
         return .{ .unscaled = 0, .scale = c.scale };
-    }
-};
-
-/// A decimal of 18 digits or fewer, which an i64 holds; a wider one in a file that
-/// declared it so fails.
-const ToDec64 = struct {
-    fn of(_: ToDec64, x: i128) Error!column.Elem(.dec64) {
-        return .of(std.math.cast(i64, x) orelse return Error.ArrowIntOverflow);
-    }
-    fn zero(_: ToDec64) column.Elem(.dec64) {
-        return .of(0);
     }
 };
 

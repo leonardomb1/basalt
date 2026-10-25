@@ -299,13 +299,9 @@ pub const Merge = struct {
             return out;
         }
         if (c.ty.kind != .decimal) return out;
-        const same = switch (in.data) {
-            .dec64 => column.isDec64(c.ty) and in.ty.scale == c.ty.scale,
-            .dec => !column.isDec64(c.ty) and for (in.data.dec[0..b.len], 0..) |d, r| {
-                if (in.validity.get(r) and d.scale != c.ty.scale) break false;
-            } else true,
-            else => false,
-        };
+        const same = for (in.data.dec[0..b.len], 0..) |d, r| {
+            if (in.validity.get(r) and d.scale != c.ty.scale) break false;
+        } else true;
         if (same) return out;
         var bd = try column.Builder.initCapacity(t, c.ty.asNullable(), b.len);
         for (0..b.len) |r| {

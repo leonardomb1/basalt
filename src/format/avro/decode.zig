@@ -16,7 +16,6 @@
 
 const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
-const Dec64 = @import("../../exec/value.zig").Dec64;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const column = @import("../../exec/column.zig");
 const cell = @import("../../exec/cell.zig");
@@ -153,8 +152,6 @@ pub const Code = enum(u8) {
     @"enum",
     dec_bytes,
     dec_fixed,
-    dec64_bytes,
-    dec64_fixed,
     text,
     slow,
     choice,
@@ -168,7 +165,6 @@ pub const Code = enum(u8) {
             .float, .double => .f64,
             .bytes, .fixed, .@"enum" => .bytes,
             .dec_bytes, .dec_fixed => .dec,
-            .dec64_bytes, .dec64_fixed => .dec64,
             .null, .text, .slow, .choice => null,
         };
     }
@@ -252,15 +248,10 @@ const Compiler = struct {
     }
 
     /// The op for a typed leaf; `slow` when its column holds another type, as a
-    /// union of INT and FLOAT branches does, or a decimal another file declared at
-    /// a scale or width its `dec64` column does not take, or when the table casts
-    /// the column.
+    /// union of INT and FLOAT branches does, or when the table casts the column.
     fn leaf(self: *Compiler, n: *const Node, own: usize) Error!Op {
         const col = self.colOf(own);
-        const want = self.own.fields[own].ty;
-        const narrow = column.isDec64(want);
-        const off_layout = narrow and (n.scale != want.scale or n.precision == 0 or n.precision > Dec64.max_precision);
-        if (self.routes[own].cast or schema.leafType(n).?.kind != want.kind or off_layout)
+        if (self.routes[own].cast or schema.leafType(n).?.kind != self.own.fields[own].ty.kind)
             return .{ .code = .slow, .col = col, .a = try self.node(n) };
         const dec = (@as(u32, n.precision) << 8) | n.scale;
         return switch (n.kind) {
@@ -279,8 +270,8 @@ const Compiler = struct {
             .float => .{ .code = .float, .col = col },
             .double => .{ .code = .double, .col = col },
             .string => .{ .code = .bytes, .col = col },
-            .bytes => if (n.logical == .decimal) .{ .code = if (narrow) .dec64_bytes else .dec_bytes, .col = col, .a = dec } else .{ .code = .bytes, .col = col },
-            .fixed => if (n.logical == .decimal) .{ .code = if (narrow) .dec64_fixed else .dec_fixed, .col = col, .a = dec | (@as(u32, @intCast(n.size)) << 16) } else .{ .code = .fixed, .col = col, .b = @intCast(n.size) },
+            .bytes => if (n.logical == .decimal) .{ .code = .dec_bytes, .col = col, .a = dec } else .{ .code = .bytes, .col = col },
+            .fixed => if (n.logical == .decimal) .{ .code = .dec_fixed, .col = col, .a = dec | (@as(u32, @intCast(n.size)) << 16) } else .{ .code = .fixed, .col = col, .b = @intCast(n.size) },
             .@"enum" => .{ .code = .@"enum", .col = col, .a = try self.node(n) },
             .record, .array, .map, .@"union" => unreachable,
         };
@@ -401,7 +392,6 @@ pub const Machine = struct {
             .f64 => f64,
             .bytes => []const u8,
             .dec => Decimal,
-            .dec64 => Dec64,
         };
     }
 
@@ -434,11 +424,6 @@ pub const Machine = struct {
                 const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
                 break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
             },
-            .dec64_bytes, .dec64_fixed => blk: {
-                const d = op.decimal();
-                const raw = if (c == .dec64_bytes) try cur.bytes() else try cur.take(d.size);
-                break :blk .of(@intCast(try unscaledOf(raw, d.precision)));
-            },
             .text, .slow, .choice => comptime unreachable,
         };
     }
@@ -452,10 +437,7 @@ pub const Machine = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return unsupported("`{s}`: a value of column `{s}` does not fit the first file's {s}", .{ m.source_name, m.table.fields[op.col].name, try ty.name(arena) }),
         };
-        m.out[op.col].append(cast) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.IntOverflow => return unsupported("`{s}`: a value of column `{s}` does not fit the first file's {s}", .{ m.source_name, m.table.fields[op.col].name, try ty.name(arena) }),
-        };
+        try m.out[op.col].append(cast);
     }
 
     /// The value at the cursor as a `Value`, for JSON text and a cast.

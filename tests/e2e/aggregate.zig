@@ -282,9 +282,9 @@ test "DECIMAL MIN/MAX/AVG and INT MIN/MAX: exact order across scales, nulls skip
     const cases = [_]struct { q: []const u8, want: []const u8 }{
         .{
             .q = "SELECT g, MIN(d) AS mn, MAX(d) AS mx, AVG(d) AS av, MIN(n) AS ni, MAX(n) AS nx FROM (SELECT g, n, " ++ d ++ " AS d FROM '$IN') x GROUP BY g ORDER BY g",
-            .want = "g,mn,mx,av,ni,nx\na,-3.500,1.250,-1.125,-2,4\nb,2.125,10.000,6.0625,7,9\nc,,,,,\n",
+            .want = "g,mn,mx,av,ni,nx\na,-3.500,1.250,-1.125,-2,4\nb,2.125,10.0,6.0625,7,9\nc,,,,,\n",
         },
-        .{ .q = "SELECT MIN(d) AS mn, MAX(d) AS mx, AVG(d) AS av FROM (SELECT " ++ d ++ " AS d FROM '$IN') x", .want = "mn,mx,av\n-3.500,10.000,2.46875\n" },
+        .{ .q = "SELECT MIN(d) AS mn, MAX(d) AS mx, AVG(d) AS av FROM (SELECT " ++ d ++ " AS d FROM '$IN') x", .want = "mn,mx,av\n-3.500,10.0,2.46875\n" },
         .{ .q = "SELECT MIN(d) AS mn, AVG(d) AS av FROM (SELECT CAST(v AS DECIMAL(12,3)) AS d FROM '$IN' WHERE v IS NULL) x", .want = "mn,av\n,\n" },
     };
     for (cases) |c| {

@@ -150,10 +150,7 @@ pub const Rows = struct {
         }
         for (self.builders, vals, fields, self.fast) |*b, raw, f, fa| {
             if (raw) |t| if (try appendFast(b, fa, t)) continue;
-            b.append(try read(arena, raw, f.ty)) catch |e| return switch (e) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.IntOverflow => error.InvalidJson,
-            };
+            try b.append(try read(arena, raw, f.ty));
         }
         self.len += 1;
     }

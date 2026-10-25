@@ -22,7 +22,6 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const par = @import("par.zig");
-const failWith = @import("eval/support.zig").failWith;
 
 const Value = value.Value;
 
@@ -668,47 +667,17 @@ pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, t
 
 pub const Tag = std.meta.Tag(Column.Data);
 
-/// The storage a column of type `ty` holds: the one type-to-storage mapping, which
-/// `Builder`, `Column.getValue` and the aggregate kernels derive theirs from. A
-/// DECIMAL of 1 to 18 digits keeps only its unscaled value, at the type's scale
-/// (`dec64`, eight bytes); a wider one, or one of no stated precision whose values
-/// each carry a scale (PostgreSQL's NUMERIC), keeps both (`dec`).
-pub fn storageOf(ty: types.Type) Tag {
-    return switch (ty.kind) {
+/// The storage a column of `kind` holds: the one kind-to-storage mapping, which
+/// `Builder`, `Column.getValue` and the aggregate kernels derive theirs from.
+pub fn storageOf(kind: types.TypeKind) Tag {
+    return switch (kind) {
         .bool => .b,
         .date => .i32,
         .int, .time, .timestamp => .i64,
         .float => .f64,
-        .decimal => if (isDec64(ty)) .dec64 else .dec,
+        .decimal => .dec,
         .string, .bytes, .array, .@"struct" => .bytes,
     };
-}
-
-/// Panics when a DECIMAL column is stored otherwise than its type says, which would
-/// read its elements at the wrong width or scale; debug builds check every batch
-/// operators hand on.
-pub fn assertLayout(c: Column) void {
-    if (c.ty.kind != .decimal or c.ty.unknown) return;
-    const want = storageOf(c.ty);
-    if (std.meta.activeTag(c.data) != want) std.debug.panic("decimal({d},{d}) column stored as {s}, not {s}", .{ c.ty.precision, c.ty.scale, @tagName(c.data), @tagName(want) });
-}
-
-/// `c` typed `ty`, a type of its kind: relabeled when a DECIMAL's storage and scale
-/// read the same under both, rebuilt otherwise (a decimal(18,2) column read as
-/// decimal(20,2) moves from `dec64` to `dec`).
-pub fn retype(arena: std.mem.Allocator, c: Column, ty: types.Type) !Column {
-    var out = c;
-    out.ty = ty;
-    if (c.ty.kind != .decimal or ty.kind != .decimal) return out;
-    const t = storageOf(ty);
-    if (std.meta.activeTag(c.data) == t and (t != .dec64 or c.ty.scale == ty.scale)) return out;
-    var b = try Builder.initCapacity(arena, ty, c.len);
-    for (0..c.len) |i| try b.append(c.getValue(i));
-    return b.finish();
-}
-
-pub fn isDec64(ty: types.Type) bool {
-    return ty.kind == .decimal and ty.precision >= 1 and ty.precision <= value.Dec64.max_precision;
 }
 
 /// The element type of a fixed-width storage.
@@ -762,36 +731,17 @@ pub const Column = struct {
         i64: []i64,
         f64: []f64,
         dec: []value.Decimal,
-        dec64: []value.Dec64,
         bytes: Bytes,
     };
 
     pub fn getValue(self: Column, i: usize) Value {
         if (!self.validity.get(i)) return .null;
-        return switch (self.data) {
-            .b => |d| .{ .bool = d[i] },
-            .i32 => |d| .{ .date = d[i] },
-            .i64 => |d| switch (self.ty.kind) {
-                .time => .{ .time = d[i] },
-                .timestamp => .{ .timestamp = d[i] },
-                else => .{ .int = d[i] },
+        return switch (self.ty.kind) {
+            .array, .@"struct" => .null,
+            inline else => |k| blk: {
+                const t = comptime storageOf(k);
+                break :blk @unionInit(Value, @tagName(k), if (t == .bytes) self.data.bytes.at(i) else @field(self.data, @tagName(t))[i]);
             },
-            .f64 => |d| .{ .float = d[i] },
-            .dec => |d| .{ .decimal = d[i] },
-            .dec64 => |d| .{ .decimal = d[i].at(self.ty.scale) },
-            .bytes => |d| switch (self.ty.kind) {
-                .array, .@"struct" => .null,
-                .bytes => .{ .bytes = d.at(i) },
-                else => .{ .string = d.at(i) },
-            },
-        };
-    }
-
-    /// Row `i` of a DECIMAL column, whichever storage holds it.
-    pub inline fn decAt(self: Column, i: usize) value.Decimal {
-        return switch (self.data) {
-            .dec64 => |d| d[i].at(self.ty.scale),
-            else => self.data.dec[i],
         };
     }
 
@@ -823,7 +773,6 @@ pub const Builder = struct {
         i64: std.array_list.Managed(i64),
         f64: std.array_list.Managed(f64),
         dec: std.array_list.Managed(value.Decimal),
-        dec64: std.array_list.Managed(value.Dec64),
         bytes: BytesStore,
     };
 
@@ -832,7 +781,7 @@ pub const Builder = struct {
             .values = std.array_list.Managed(u8).init(arena),
             .ends = std.array_list.Managed(i32).init(arena),
         } };
-        const store: Store = switch (storageOf(ty)) {
+        const store: Store = switch (storageOf(ty.kind)) {
             .bytes => bytes_store,
             inline else => |t| @unionInit(Store, @tagName(t), std.array_list.Managed(Elem(t)).init(arena)),
         };
@@ -1058,30 +1007,8 @@ pub const Builder = struct {
         self.rows += 1;
         @field(self.store, @tagName(t)).appendAssumeCapacity(x);
     }
-    /// A decimal into whichever store the column's type has: as it is, or at the
-    /// type's scale for `dec64`, failing as `append` does when it does not fit.
-    pub fn appendDecimal(self: *Builder, d: value.Decimal) error{ OutOfMemory, IntOverflow }!void {
-        switch (self.store) {
-            .dec => |*l| {
-                try self.pushValid(true);
-                try l.append(d);
-            },
-            .dec64 => |*l| {
-                const x = if (d.scale == self.ty.scale) if (std.math.cast(i64, d.unscaled)) |u| value.Dec64.of(u) else null else null;
-                const y = x orelse try self.asDec64(.{ .decimal = d });
-                try self.pushValid(true);
-                try l.append(y);
-            },
-            else => try self.append(.{ .decimal = d }),
-        }
-    }
-
-    pub fn appendNull(self: *Builder) error{OutOfMemory}!void {
-        try self.pushValid(false);
-        switch (self.store) {
-            .bytes => |*l| try l.ends.append(@intCast(l.values.items.len)),
-            inline else => |*l| try l.append(std.mem.zeroes(@TypeOf(l.items[0]))),
-        }
+    pub fn appendNull(self: *Builder) !void {
+        try self.append(.null);
     }
 
     /// Room for `n` more bytes of a bytes column's next value, which a producer
@@ -1109,7 +1036,6 @@ pub const Builder = struct {
             .i64 => |*l| try l.append(int orelse 0),
             .f64 => |*l| try l.append(if (ok) self.asF64(v) else 0),
             .dec => |*l| try l.append(self.asDec(v)),
-            .dec64 => |*l| try l.append(if (ok) try self.asDec64(v) else .of(0)),
             .bytes => |*l| {
                 if (ok) try l.values.appendSlice(self.asBytes(v));
                 try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
@@ -1169,15 +1095,6 @@ pub const Builder = struct {
             .int => |x| .{ .unscaled = x, .scale = 0 },
             else => .{ .unscaled = 0, .scale = self.ty.scale },
         };
-    }
-
-    /// A value at the column's scale, as `dec64` stores it. An INT or a decimal of
-    /// another scale moves to it exactly; one that would round or overflow fails,
-    /// since the column's type promised it fits.
-    /// Out of line, as `append` is inlined into the hot loops of every reader.
-    noinline fn asDec64(self: *Builder, v: Value) error{IntOverflow}!value.Dec64 {
-        const d = self.asDec(v);
-        return value.Dec64.fit(d, self.ty.scale) orelse @errorCast(failWith(error.IntOverflow, "decimal value at scale {d} does not fit DECIMAL({d},{d}) exactly", .{ d.scale, self.ty.precision, self.ty.scale }));
     }
 
     /// The missing `.decimal` arm once made `ROUND(AVG(CAST(x AS DECIMAL(p,s))), n)`
@@ -1631,37 +1548,4 @@ fn eqlValue(x: Value, y: Value) bool {
         .date => |d| d == y.date,
         else => false,
     };
-}
-
-test "a DECIMAL of 18 digits or fewer is stored as dec64 at its scale; others, or retyped past 18, as dec" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqual(Tag.dec64, storageOf(types.Type.decimal(18, 4)));
-    try std.testing.expectEqual(Tag.dec, storageOf(types.Type.decimal(19, 4)));
-    try std.testing.expectEqual(Tag.dec, storageOf(types.Type.decimal(0, 2)));
-
-    var b = Builder.init(a, types.Type.decimal(10, 2).asNullable());
-    try b.append(.{ .decimal = .{ .unscaled = 15, .scale = 1 } });
-    try b.append(.{ .int = 7 });
-    try b.append(.null);
-    try b.appendDecimal(.{ .unscaled = -250, .scale = 2 });
-    try std.testing.expectError(error.IntOverflow, b.append(.{ .decimal = .{ .unscaled = 1005, .scale = 3 } }));
-    try std.testing.expectError(error.IntOverflow, b.appendDecimal(.{ .unscaled = 1, .scale = 3 }));
-    const c = try b.finish();
-    try std.testing.expect(c.data == .dec64);
-    try std.testing.expectEqual(@as(usize, 4), c.len);
-    try std.testing.expectEqual(value.Decimal{ .unscaled = 150, .scale = 2 }, c.getValue(0).decimal);
-    try std.testing.expectEqual(value.Decimal{ .unscaled = 700, .scale = 2 }, c.decAt(1));
-    try std.testing.expect(c.getValue(2) == .null);
-    try std.testing.expectEqual(value.Decimal{ .unscaled = -250, .scale = 2 }, c.getValue(3).decimal);
-
-    const same = try retype(a, c, types.Type.decimal(12, 2));
-    try std.testing.expect(same.data.dec64.ptr == c.data.dec64.ptr);
-    const finer = try retype(a, c, types.Type.decimal(12, 3));
-    try std.testing.expectEqual(value.Decimal{ .unscaled = 1500, .scale = 3 }, finer.getValue(0).decimal);
-    const w = try retype(a, c, types.Type.decimal(20, 2));
-    try std.testing.expect(w.data == .dec);
-    try std.testing.expectEqual(value.Decimal{ .unscaled = 700, .scale = 2 }, w.getValue(1).decimal);
-    try std.testing.expect(w.getValue(2) == .null);
 }
