@@ -46,6 +46,7 @@ pub const tds = @import("db/sqlserver/tds.zig");
 pub const mysql = @import("db/mysql.zig");
 pub const postgres = @import("db/postgres.zig");
 pub const wire = @import("db/wire.zig");
+pub const typemap = @import("db/typemap.zig");
 pub const http_client = @import("net/http_client.zig");
 pub const aad = @import("db/sqlserver/aad.zig");
 pub const ntlm = @import("net/auth/ntlm.zig");
