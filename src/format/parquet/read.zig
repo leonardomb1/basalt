@@ -13,7 +13,7 @@
 //!
 //! Types come from the LogicalType when the writer gave one, else the legacy
 //! ConvertedType. TIME and TIMESTAMP are stored in millis, micros or nanos and
-//! always read as micros (`TemporalScale`): ignoring the unit once read millisecond
+//! always read as micros (`civil.Tick`): ignoring the unit once read millisecond
 //! timestamps as 1970. Nanos floor-divide, which is monotone, so statistics-based
 //! pruning stays sound after conversion.
 //!
@@ -68,6 +68,7 @@ const fuzzKernels = @import("testing_util.zig").fuzzKernels;
 const fuzzKernels_corpus = @import("testing_util.zig").fuzzKernels_corpus;
 const fx_v2 = @import("testing_util.zig").fx_v2;
 const readAllText = @import("testing_util.zig").readAllText;
+const conform = @import("../../lang/conform.zig");
 
 pub const Error = error{
     CorruptParquetPage,
@@ -85,8 +86,7 @@ pub const decodeDeltaBinaryPacked = @import("encoding.zig").decodeDeltaBinaryPac
 pub const decodeDeltaLengthByteArray = @import("encoding.zig").decodeDeltaLengthByteArray;
 pub const decodeDeltaByteArray = @import("encoding.zig").decodeDeltaByteArray;
 pub const decodeByteStreamSplit = @import("encoding.zig").decodeByteStreamSplit;
-pub const TemporalScale = @import("logical.zig").TemporalScale;
-pub const temporalScale = @import("logical.zig").temporalScale;
+pub const temporalTick = @import("logical.zig").temporalTick;
 pub const basaltType = @import("logical.zig").basaltType;
 pub const Leaf = @import("schema.zig").Leaf;
 pub const ListShape = @import("schema.zig").ListShape;
@@ -445,34 +445,15 @@ pub const Reader = struct {
 };
 
 /// How a folder file's columns differ from the first file's, in words; null when
-/// they do not. Nullability is not compared. `requested` is the projection, so a
-/// column one file stands in with (a projection it holds none of) is not blamed.
+/// they do not (`conform.Policy.parquet_folder`). Nullability is not compared.
+/// `requested` is the projection, so a column one file stands in with (a
+/// projection it holds none of) is not blamed.
 pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema, requested: ?[]const []const u8) ?[]const u8 {
-    for (want.fields, 0..) |w, k| {
-        if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
-        const g = got.fields[k];
-        if (!std.mem.eql(u8, w.name, g.name)) {
-            for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
-                return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
-            const asked = if (requested) |r| for (r) |n| {
-                if (std.mem.eql(u8, n, g.name)) break true;
-            } else false else true;
-            if (asked) for (want.fields) |o| {
-                if (std.mem.eql(u8, o.name, g.name)) break;
-            } else return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
-            return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
-        }
-        if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
-            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, typeName(arena, g.ty), typeName(arena, w.ty) }) catch "a column has another type";
-    }
-    if (got.fields.len > want.fields.len)
-        return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
-    return null;
-}
-
-fn typeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
-    if (t.kind != .decimal) return @tagName(t.kind);
-    return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
+    const out = conform.conform(arena, want, got, conform.Policy.parquet_folder, requested) catch return "its columns differ";
+    return switch (out) {
+        .cols => null,
+        .problem => |p| conform.describe(arena, p),
+    };
 }
 
 test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 is an error naming the column" {
@@ -712,4 +693,67 @@ test {
     _ = @import("schema.zig");
     _ = @import("stats.zig");
     _ = @import("testing_util.zig");
+}
+
+/// The folder check before `conform.Policy.parquet_folder`, kept as the oracle.
+fn oldSchemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema, requested: ?[]const []const u8) ?[]const u8 {
+    for (want.fields, 0..) |w, k| {
+        if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+        const g = got.fields[k];
+        if (!std.mem.eql(u8, w.name, g.name)) {
+            for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
+                return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+            const asked = if (requested) |r| for (r) |n| {
+                if (std.mem.eql(u8, n, g.name)) break true;
+            } else false else true;
+            if (asked) for (want.fields) |o| {
+                if (std.mem.eql(u8, o.name, g.name)) break;
+            } else return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
+            return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+        }
+        if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
+            return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, oldTypeName(arena, g.ty), oldTypeName(arena, w.ty) }) catch "a column has another type";
+    }
+    if (got.fields.len > want.fields.len)
+        return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
+    return null;
+}
+
+fn oldTypeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
+    if (t.kind != .decimal) return @tagName(t.kind);
+    return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
+}
+
+test "schemaMismatch on conform gives the old check's verdict and words on every pair" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const T = types.Type;
+    const F = types.Schema.Field;
+    const i = T.init(.int);
+    const schemas = [_]types.Schema{
+        .{ .fields = &.{} },
+        .{ .fields = &[_]F{.{ .name = "id", .ty = i }} },
+        .{ .fields = &[_]F{.{ .name = "id", .ty = i.asNullable() }} },
+        .{ .fields = &[_]F{.{ .name = "id", .ty = T.init(.string) }} },
+        .{ .fields = &[_]F{.{ .name = "x", .ty = i }} },
+        .{ .fields = &[_]F{ .{ .name = "id", .ty = i }, .{ .name = "x", .ty = i } } },
+        .{ .fields = &[_]F{ .{ .name = "x", .ty = i }, .{ .name = "id", .ty = i } } },
+        .{ .fields = &[_]F{ .{ .name = "id", .ty = i }, .{ .name = "y", .ty = i } } },
+        .{ .fields = &[_]F{ .{ .name = "id", .ty = i }, .{ .name = "x", .ty = i }, .{ .name = "y", .ty = i } } },
+        .{ .fields = &[_]F{ .{ .name = "y", .ty = i }, .{ .name = "x", .ty = i } } },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = T.decimal(10, 2) }} },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = T.decimal(12, 2) }} },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = T.decimal(10, 3) }} },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = .{ .kind = .string, .scale = 2 } }} },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = T.nullColumn(true) }} },
+        .{ .fields = &[_]F{.{ .name = "d", .ty = T.unknownNull() }} },
+    };
+    const askeds = [_]?[]const []const u8{ null, &.{}, &.{"id"}, &.{"x"}, &.{"y"}, &.{ "id", "x" }, &.{ "x", "y" }, &.{"d"} };
+    for (schemas) |want| for (schemas) |got| for (askeds) |asked| {
+        const old = oldSchemaMismatch(a, want, got, asked);
+        const new = schemaMismatch(a, want, got, asked);
+        try testing.expectEqual(old == null, new == null);
+        if (old) |o| try testing.expectEqualStrings(o, new.?);
+    };
 }

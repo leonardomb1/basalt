@@ -9,7 +9,6 @@ const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
 const Levels = @import("nested.zig").Levels;
 const ListShape = @import("schema.zig").ListShape;
-const TemporalScale = @import("logical.zig").TemporalScale;
 const assembleLists = @import("nested.zig").assembleLists;
 const basaltType = @import("logical.zig").basaltType;
 const bitWidth = @import("encoding.zig").bitWidth;
@@ -21,13 +20,13 @@ const decodeDeltaByteArray = @import("encoding.zig").decodeDeltaByteArray;
 const decodeDeltaLengthByteArray = @import("encoding.zig").decodeDeltaLengthByteArray;
 const decodeRleHybrid = @import("encoding.zig").decodeRleHybrid;
 const int96ToMicros = @import("encoding.zig").int96ToMicros;
+const civil = @import("../../exec/civil.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
-const temporalScale = @import("logical.zig").temporalScale;
+const temporalTick = @import("logical.zig").temporalTick;
 const types = @import("../../lang/types.zig");
 const unscaledOf = @import("logical.zig").unscaledOf;
 const unsignedBits = @import("logical.zig").unsignedBits;
-const asUnsigned = @import("logical.zig").asUnsigned;
 const eval = @import("../../exec/eval.zig");
 const Reader = @import("read.zig").Reader;
 const fx = @import("testing_util.zig").fx;
@@ -97,7 +96,7 @@ fn readPages(
     max_rep: u32,
     base_offset: u64,
 ) ReadError!struct { vals: column.Column, levels: ?Levels } {
-    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tscale = temporalScale(elem) };
+    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tick = temporalTick(elem) };
     const entries = rows orelse std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
     var levels: ?Levels = if (rows == null) .{
         .reps = std.array_list.Managed(u32).init(arena),
@@ -147,7 +146,7 @@ fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) Error!void {
     const bits = unsignedBits(elem) orelse return;
     for (col.data.i64, 0..) |*x, i| {
         if (!col.validity.get(i)) continue;
-        x.* = asUnsigned(bits, x.*) orelse {
+        x.* = types.unsignedOf(bits, x.*) orelse {
             var buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` holds the UINT64 {d}, past 2^63-1, the largest basalt int", .{ elem.name, @as(u64, @bitCast(x.*)) }) catch "a parquet UINT64 past 2^63-1";
             return @errorCast(eval.explain(Error.ParquetIntOverflow, msg));
@@ -298,14 +297,20 @@ fn appendDataPage(
 /// the kernel runs. Ints widen to i64 before they arrive.
 const Cast = struct {
     ty: types.Type,
-    tscale: TemporalScale,
+    tick: civil.Tick,
 
     fn same(_: Cast, x: anytype) @TypeOf(x) {
         return x;
     }
 
-    fn scaled(c: Cast, x: i64) i64 {
-        return c.tscale.apply(x);
+    /// A count of `t` as micros, one function per unit so the page loop has no
+    /// branch on it.
+    fn micros(comptime t: civil.Tick) fn (Cast, i64) i64 {
+        return struct {
+            fn f(_: Cast, x: i64) i64 {
+                return t.toMicros(x, .saturate);
+            }
+        }.f;
     }
 
     fn date(_: Cast, x: i64) i32 {
@@ -378,7 +383,7 @@ const One = struct {
 /// page kernel so pruning and scans agree: the first PLAIN value of `raw`, except a
 /// BYTE_ARRAY statistic, which is the value's bytes with no length prefix.
 pub fn plainValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: []const u8) Error!Value {
-    const cast: Cast = .{ .ty = try basaltType(elem), .tscale = temporalScale(elem) };
+    const cast: Cast = .{ .ty = try basaltType(elem), .tick = temporalTick(elem) };
     var slot: [1][]const u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&slot));
     var v: Value = .null;
@@ -401,10 +406,10 @@ fn landed(e: anytype) Error {
 fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
     return switch (cast.ty.kind) {
         .int => sink.put(i64, cast, Cast.same, src, n),
-        .time, .timestamp => if (cast.tscale.isIdentity())
-            sink.put(i64, cast, Cast.same, src, n)
-        else
-            sink.put(i64, cast, Cast.scaled, src, n),
+        .time, .timestamp => switch (cast.tick) {
+            .us => sink.put(i64, cast, Cast.same, src, n),
+            inline else => |t| sink.put(i64, cast, Cast.micros(t), src, n),
+        },
         .date => sink.put(i32, cast, Cast.date, src, n),
         .decimal => sink.put(Decimal, cast, Cast.decimal, src, n),
         .bool => sink.put(bool, cast, Cast.truthy, src, n),
@@ -633,7 +638,7 @@ test "a PLAIN count the page body cannot hold is refused before it is allocated"
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     var v: Value = .null;
-    const cast: Cast = .{ .ty = types.Type.init(.string), .tscale = .identity };
+    const cast: Cast = .{ .ty = types.Type.init(.string), .tick = .us };
     const body = [_]u8{ 1, 0, 0, 0, 'a', 1, 0, 0, 0, 'b' };
     try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .byte_array, 0, &body, 1 << 30));
     try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .fixed_len_byte_array, 2, &body, 1 << 30));
@@ -648,7 +653,7 @@ test "a dictionary page's count is bounded by its body before the dictionary is 
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const body = [_]u8{ 1, 0, 0, 0, 'a', 1, 0, 0, 0, 'b' };
     const pg: parquet.Page = .{ .header = .{ .ty = .dictionary_page, .num_values = 1 << 30 }, .data = &body, .next_offset = 0 };
-    const cast: Cast = .{ .ty = types.Type.init(.string).asNullable(), .tscale = .identity };
+    const cast: Cast = .{ .ty = types.Type.init(.string).asNullable(), .tick = .us };
     try testing.expectError(Error.CorruptParquetPage, readDict(fba.allocator(), pg, .{ .ty = .byte_array }, .{ .ty = .byte_array }, cast));
 }
 
@@ -668,7 +673,7 @@ test "a nested leaf's page with no level streams pads its levels only after its 
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const a = fba.allocator();
     var levels: Levels = .{ .reps = std.array_list.Managed(u32).init(a), .defs = std.array_list.Managed(u32).init(a) };
-    const cast: Cast = .{ .ty = types.Type.init(.int).asNullable(), .tscale = .identity };
+    const cast: Cast = .{ .ty = types.Type.init(.int).asNullable(), .tick = .us };
     var b = column.Builder.init(a, cast.ty);
     const body = [_]u8{ 1, 0, 0, 0, 2, 0, 0, 0 };
     const pg: parquet.Page = .{ .header = .{ .ty = .data_page_v2, .num_values = 1 << 30, .encoding = .plain }, .data = &body, .next_offset = 0 };
