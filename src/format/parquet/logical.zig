@@ -5,6 +5,7 @@ const Error = @import("read.zig").Error;
 const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const civil = @import("../../exec/civil.zig");
 
 pub const conv_utf8 = 0;
 pub const conv_decimal = 5;
@@ -25,40 +26,26 @@ const conv_bson = 20;
 const logical = @import("testing_util.zig").logical;
 const testing = std.testing;
 
-pub const TemporalScale = struct {
-    mul: i64 = 1,
-    div: i64 = 1,
-
-    pub const identity: TemporalScale = .{};
-
-    pub fn isIdentity(self: TemporalScale) bool {
-        return self.mul == 1 and self.div == 1;
-    }
-
-    pub fn apply(self: TemporalScale, x: i64) i64 {
-        const m = std.math.mul(i64, x, self.mul) catch
-            return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
-        return if (self.div == 1) m else @divFloor(m, self.div);
-    }
-
-    fn of(unit: parquet.TimeUnit) TemporalScale {
-        return switch (unit) {
-            .millis => .{ .mul = 1000 },
-            .micros => .identity,
-            .nanos => .{ .div = 1000 },
-        };
-    }
-};
-
-pub fn temporalScale(e: parquet.SchemaElement) TemporalScale {
+/// The unit a TIME or TIMESTAMP column counts in, which the page kernel reads as
+/// micros through `civil.Tick.toMicros(.saturate)`: the logical type's, else a
+/// millisecond converted type's, else micros.
+pub fn temporalTick(e: parquet.SchemaElement) civil.Tick {
     if (e.logical_type) |lt| switch (lt) {
-        .time, .timestamp => |tt| return TemporalScale.of(tt.unit),
+        .time, .timestamp => |tt| return tickOf(tt.unit),
         else => {},
     };
-    const c = e.converted_type orelse return .identity;
+    const c = e.converted_type orelse return .us;
     return switch (c) {
-        conv_time_millis, conv_timestamp_millis => .{ .mul = 1000 },
-        else => .identity,
+        conv_time_millis, conv_timestamp_millis => .ms,
+        else => .us,
+    };
+}
+
+fn tickOf(unit: parquet.TimeUnit) civil.Tick {
+    return switch (unit) {
+        .millis => .ms,
+        .micros => .us,
+        .nanos => .ns,
     };
 }
 
@@ -93,7 +80,7 @@ fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?type
             }),
             else => null,
         },
-        .integer => if (phys == .int32 or phys == .int64) types.Type.init(.int) else null,
+        .integer => if (phys == .int32 or phys == .int64) intType(e) else null,
         .uuid, .other => null,
     };
 }
@@ -108,7 +95,7 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
                 if (c == conv_time_millis) break :blk types.Type.init(.time);
                 if (c == conv_decimal) break :blk decimalOf(e);
             }
-            break :blk types.Type.init(.int);
+            break :blk intType(e);
         },
         .int64 => blk: {
             if (conv) |c| {
@@ -117,7 +104,7 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
                 if (c == conv_time_micros) break :blk types.Type.init(.time);
                 if (c == conv_decimal) break :blk decimalOf(e);
             }
-            break :blk types.Type.init(.int);
+            break :blk intType(e);
         },
         .float, .double => types.Type.init(.float),
         .int96 => types.Type.init(.timestamp),
@@ -149,16 +136,15 @@ pub fn unsignedBits(e: parquet.SchemaElement) ?u8 {
     };
 }
 
-/// The unsigned value a physical int holds, or null for a UINT64 past 2^63-1.
-pub fn asUnsigned(bits: u8, x: i64) ?i64 {
-    const u: u64 = @bitCast(x);
-    return switch (bits) {
-        8 => @as(u8, @truncate(u)),
-        16 => @as(u16, @truncate(u)),
-        32 => @as(u32, @truncate(u)),
-        else => std.math.cast(i64, u),
-    };
+/// An integer column's type: an unsigned one is an INT whose values past 2^63-1
+/// are refused when read (`readUnsigned`).
+fn intType(e: parquet.SchemaElement) types.Type {
+    const bits = unsignedBits(e) orelse return types.Type.init(.int);
+    return types.unsignedType(bits, .int_checked);
 }
+
+/// `types.unsignedOf`, kept under its old name for the oracle test in lang/types.zig.
+pub const asUnsigned = types.unsignedOf;
 
 fn decimalOf(e: parquet.SchemaElement) types.Type {
     const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
@@ -207,14 +193,36 @@ test "unsigned columns read their stored value, a UINT64 past 2^63-1 none" {
     try testing.expectEqual(@as(?i64, null), asUnsigned(64, -1));
 }
 
-test "temporal scale converts millisecond columns and leaves micros alone" {
-    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 9 }));
-    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(.{ .converted_type = 7 }));
-    try testing.expectEqual(TemporalScale.identity, temporalScale(.{ .converted_type = 10 }));
-    try testing.expectEqual(TemporalScale.identity, temporalScale(.{}));
+fn micros(t: civil.Tick, x: i64) i64 {
+    return t.toMicros(x, .saturate);
+}
 
-    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), (TemporalScale{ .mul = 1000 }).apply(1_583_298_367_123));
-    try testing.expectEqual(@as(i64, 1_583_298_367_123), TemporalScale.identity.apply(1_583_298_367_123));
+test "temporal tick converts millisecond columns and leaves micros alone" {
+    try testing.expectEqual(civil.Tick.ms, temporalTick(.{ .converted_type = 9 }));
+    try testing.expectEqual(civil.Tick.ms, temporalTick(.{ .converted_type = 7 }));
+    try testing.expectEqual(civil.Tick.us, temporalTick(.{ .converted_type = 10 }));
+    try testing.expectEqual(civil.Tick.us, temporalTick(.{}));
+
+    try testing.expectEqual(@as(i64, 1_583_298_367_123_000), micros(.ms, 1_583_298_367_123));
+    try testing.expectEqual(@as(i64, 1_583_298_367_123), micros(.us, 1_583_298_367_123));
+}
+
+test "civil.Tick saturating micros equal the old TemporalScale on every unit and edge" {
+    const old = struct {
+        fn oldScaleApply(mul: i64, div: i64, x: i64) i64 {
+            const m = std.math.mul(i64, x, mul) catch
+                return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+            return if (div == 1) m else @divFloor(m, div);
+        }
+    };
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    const xs = [_]i64{ 0, 1, -1, 999, -999, 1000, -1000, 1001, -1001, 1999, -1_001, max, min, max - 1, min + 1, max / 1000, max / 1000 + 1, max / 1000 - 1, min / 1000, min / 1000 - 1, min / 1000 + 1, max / 10, 1_583_298_367_123, -1_583_298_367_123 };
+    const units = [_]struct { parquet.TimeUnit, i64, i64 }{ .{ .millis, 1000, 1 }, .{ .micros, 1, 1 }, .{ .nanos, 1, 1000 } };
+    for (units) |u| for (xs) |x| {
+        const e = logical(.int64, .{ .timestamp = .{ .unit = u[0] } });
+        try testing.expectEqual(old.oldScaleApply(u[1], u[2], x), micros(temporalTick(e), x));
+    };
 }
 
 test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
@@ -226,32 +234,31 @@ test "a LogicalType-only TIMESTAMP reads as timestamp in every unit" {
     }) |c| {
         const e = logical(.int64, .{ .timestamp = .{ .unit = c[0] } });
         try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(e)).kind);
-        try testing.expectEqual(want, temporalScale(e).apply(c[1]));
+        try testing.expectEqual(want, micros(temporalTick(e), c[1]));
     }
     const utc = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .nanos } });
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(utc)).kind);
 }
 
-test "nanoseconds floor to micros, including before 1970" {
-    const ns = TemporalScale{ .div = 1000 };
-    try testing.expectEqual(@as(i64, 1), ns.apply(1_999));
-    try testing.expectEqual(@as(i64, -1), ns.apply(-1));
-    try testing.expectEqual(@as(i64, -2), ns.apply(-1_001));
-    const ms = TemporalScale{ .mul = 1000 };
-    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), ms.apply(std.math.maxInt(i64) / 10));
+test "nanoseconds floor to micros, including before 1970; millis past i64 saturate (D2 pending)" {
+    try testing.expectEqual(@as(i64, 1), micros(.ns, 1_999));
+    try testing.expectEqual(@as(i64, -1), micros(.ns, -1));
+    try testing.expectEqual(@as(i64, -2), micros(.ns, -1_001));
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), micros(.ms, std.math.maxInt(i64) / 10));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), micros(.ms, std.math.minInt(i64) / 1000 - 1));
 }
 
 test "a LogicalType-only TIME reads as time in millis and micros" {
     const want: i64 = 3_720_000_000;
     const ms = logical(.int32, .{ .time = .{ .unit = .millis } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(ms)).kind);
-    try testing.expectEqual(want, temporalScale(ms).apply(want / 1000));
+    try testing.expectEqual(want, micros(temporalTick(ms), want / 1000));
     const us = logical(.int64, .{ .time = .{ .unit = .micros } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(us)).kind);
-    try testing.expectEqual(want, temporalScale(us).apply(want));
+    try testing.expectEqual(want, micros(temporalTick(us), want));
     const ns = logical(.int64, .{ .time = .{ .unit = .nanos } });
     try testing.expectEqual(types.TypeKind.time, (try basaltType(ns)).kind);
-    try testing.expectEqual(want, temporalScale(ns).apply(want * 1000));
+    try testing.expectEqual(want, micros(temporalTick(ns), want * 1000));
 }
 
 test "LogicalType DATE, DECIMAL, STRING and INTEGER map without a ConvertedType" {
@@ -271,7 +278,7 @@ test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" 
     var both = logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .millis } });
     both.converted_type = 9;
     try testing.expectEqual(types.TypeKind.timestamp, (try basaltType(both)).kind);
-    try testing.expectEqual(TemporalScale{ .mul = 1000 }, temporalScale(both));
+    try testing.expectEqual(civil.Tick.ms, temporalTick(both));
 
     var dec = logical(.int64, .{ .decimal = .{ .scale = 4, .precision = 18 } });
     dec.converted_type = 5;

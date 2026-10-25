@@ -3,6 +3,7 @@
 
 const Error = @import("read.zig").Error;
 const std = @import("std");
+const civil = @import("../../exec/civil.zig");
 const testing = std.testing;
 const varint = @import("../varint.zig");
 
@@ -135,11 +136,11 @@ fn readVarint(src: []const u8, pos: *usize) Error!u64 {
     return varint.read(src, pos) catch Error.CorruptParquetPage;
 }
 
-/// INT96: Julian day (2440588 is 1970-01-01) plus nanoseconds of day. Saturates,
-/// since a u32 Julian day of micros overflows i64 on a corrupt file.
+/// INT96: Julian day (`civil.epoch.julian_unix` is 1970-01-01) plus nanoseconds of
+/// day. Saturates, since a u32 Julian day of micros overflows i64 on a corrupt file.
 pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) i64 {
-    const days: i64 = @as(i64, julian_day) - 2_440_588;
-    return (days *| 86_400_000_000) +| @as(i64, @intCast(nanos_of_day / 1000));
+    const days: i64 = @as(i64, julian_day) - civil.epoch.julian_unix;
+    return civil.dayMicros(days) +| @as(i64, @intCast(nanos_of_day / 1000));
 }
 
 const DeltaHeader = struct { miniblocks: usize, per_mini: usize, total: usize, first: i64 };
@@ -382,6 +383,7 @@ test "a truncated hybrid stream errors rather than reading past the page" {
 }
 
 test "int96 converts Julian day plus nanoseconds to epoch micros" {
+    try testing.expectEqual(@as(i64, 2_440_588), civil.epoch.julian_unix);
     try testing.expectEqual(@as(i64, 0), int96ToMicros(2_440_588, 0));
     try testing.expectEqual(@as(i64, 1_000_000), int96ToMicros(2_440_588, 1_000_000_000));
     try testing.expectEqual(@as(i64, 86_400_000_000), int96ToMicros(2_440_589, 0));

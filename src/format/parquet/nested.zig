@@ -9,6 +9,7 @@ const Value = @import("../../exec/value.zig").Value;
 const capacity_hint = @import("encoding.zig").capacity_hint;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -167,7 +168,7 @@ const Assembler = struct {
                 const s = spans[n.first_leaf];
                 if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
                 const e = self.entries[n.first_leaf];
-                try jsonValue(self.arena, self.out, if (e.defs[s.lo] < n.max_def) .null else e.vals.getValue(s.lo));
+                try jsonValue(self.out, if (e.defs[s.lo] < n.max_def) .null else e.vals.getValue(s.lo));
             },
             .group => try self.object(n, spans),
             .list => try self.array(&n.children[0], spans, elementOf(&n.children[0], false)),
@@ -182,7 +183,7 @@ const Assembler = struct {
             if (isHidden(c.name)) continue;
             if (!first) try self.out.append(',');
             first = false;
-            try appendJsonString(self.arena, self.out, c.name);
+            try appendJson(self.out, jsontext.string, .{c.name});
             try self.out.append(':');
             try self.field(c, spans);
         }
@@ -253,7 +254,7 @@ const Assembler = struct {
                 const kv_val = if (e.defs[s.lo] < key.max_def) Value.null else e.vals.getValue(s.lo);
                 try kbuf.appendSlice(if (kv_val == .null) "null" else try eval.valueToString(self.arena, kv_val));
             } else try ka.field(key, sub);
-            try appendJsonString(self.arena, self.out, kbuf.items);
+            try appendJson(self.out, jsontext.string, .{kbuf.items});
             try self.out.append(':');
             try self.field(&kv.children[1], sub);
         }
@@ -279,10 +280,15 @@ const Assembler = struct {
     }
 };
 
-fn appendJsonString(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), s: []const u8) Error!void {
-    var aw = std.Io.Writer.Allocating.init(arena);
-    std.json.Stringify.encodeJsonString(s, .{}, &aw.writer) catch return error.OutOfMemory;
-    try buf.appendSlice(aw.written());
+/// `f(w, args...)` appended to `buf`, through a writer lent `buf`'s own memory.
+fn appendJson(buf: *std.array_list.Managed(u8), comptime f: anytype, args: anytype) Error!void {
+    const gpa = buf.allocator;
+    var list = buf.moveToUnmanaged();
+    var aw = std.Io.Writer.Allocating.fromArrayList(gpa, &list);
+    const r = @call(.auto, f, .{&aw.writer} ++ args);
+    list = aw.toArrayList();
+    buf.* = list.toManaged(gpa);
+    r catch return error.OutOfMemory;
 }
 
 pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []const Entries, rows: usize) anyerror!column.Column {
@@ -360,7 +366,7 @@ pub fn assembleLists(
         while (true) {
             if (d < shape.rep_def[lvl - 1]) break;
             if (lvl == depth) {
-                try jsonValue(arena, &buf, if (d < max_def) .null else elems.getValue(i));
+                try jsonValue(&buf, if (d < max_def) .null else elems.getValue(i));
                 break;
             }
             if (d + 1 < shape.rep_def[lvl]) {
@@ -390,19 +396,10 @@ fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usiz
     buf.clearRetainingCapacity();
 }
 
-fn jsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
-    switch (v) {
-        .null => try buf.appendSlice("null"),
-        .int => |x| try buf.writer().print("{d}", .{x}),
-        .bool => |x| try buf.appendSlice(if (x) "true" else "false"),
-        .float => |x| if (std.math.isFinite(x)) try buf.writer().print("{d}", .{x}) else try buf.appendSlice("null"),
-        .decimal => try buf.appendSlice(eval.valueToString(arena, v) catch return error.OutOfMemory),
-        else => {
-            var aw = std.Io.Writer.Allocating.init(arena);
-            std.json.Stringify.encodeJsonString(eval.valueToString(arena, v) catch return error.OutOfMemory, .{}, &aw.writer) catch return error.OutOfMemory;
-            try buf.appendSlice(aw.written());
-        },
-    }
+/// A leaf value as JSON in the nested shape (`jsontext.nested`): decimals bare,
+/// bytes as their text.
+fn jsonValue(buf: *std.array_list.Managed(u8), v: Value) Error!void {
+    return appendJson(buf, jsontext.scalar, .{ v, jsontext.nested });
 }
 
 test "assembleNested: leaves that disagree, or a row count that does not match, are a corrupt page" {
@@ -443,4 +440,106 @@ test "assembleLists: a row count past the levels read is a corrupt page, not an 
     const one = try assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1);
     try testing.expectEqualStrings("[7]", one.getValue(0).string);
     try testing.expectError(Error.CorruptParquetPage, assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1 << 47));
+}
+
+fn newJson(a: std.mem.Allocator, v: Value) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(a);
+    try jsonValue(&buf, v);
+    return buf.items;
+}
+
+test "jsonValue on jsontext.scalar writes what the old encoder did for valid text and every other kind" {
+    const old = struct {
+        fn oldJsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
+            switch (v) {
+                .null => try buf.appendSlice("null"),
+                .int => |x| try buf.writer().print("{d}", .{x}),
+                .bool => |x| try buf.appendSlice(if (x) "true" else "false"),
+                .float => |x| if (std.math.isFinite(x)) try buf.writer().print("{d}", .{x}) else try buf.appendSlice("null"),
+                .decimal => try buf.appendSlice(eval.valueToString(arena, v) catch return error.OutOfMemory),
+                else => {
+                    var aw = std.Io.Writer.Allocating.init(arena);
+                    std.json.Stringify.encodeJsonString(eval.valueToString(arena, v) catch return error.OutOfMemory, .{}, &aw.writer) catch return error.OutOfMemory;
+                    try buf.appendSlice(aw.written());
+                },
+            }
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const D = @import("../../exec/value.zig").Decimal;
+    const vals = [_]Value{
+        .null,
+        .{ .bool = true },
+        .{ .bool = false },
+        .{ .int = 0 },
+        .{ .int = -1 },
+        .{ .int = std.math.maxInt(i64) },
+        .{ .int = std.math.minInt(i64) },
+        .{ .float = 0.0 },
+        .{ .float = -0.0 },
+        .{ .float = 1.5 },
+        .{ .float = -2.25 },
+        .{ .float = 0.1 },
+        .{ .float = 1.0 / 3.0 },
+        .{ .float = 1e15 },
+        .{ .float = 999999999999999.9 },
+        .{ .float = 1e-6 },
+        .{ .float = 9.999999e-7 },
+        .{ .float = 123456789.123 },
+        .{ .float = 1e300 },
+        .{ .float = -1e-300 },
+        .{ .float = 5e-324 },
+        .{ .float = std.math.floatMax(f64) },
+        .{ .float = 9007199254740993.0 },
+        .{ .float = 0.30000000000000004 },
+        .{ .float = std.math.nan(f64) },
+        .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) },
+        .{ .decimal = D{ .unscaled = 12345, .scale = 2 } },
+        .{ .decimal = D{ .unscaled = -5, .scale = 3 } },
+        .{ .decimal = D{ .unscaled = 7, .scale = 0 } },
+        .{ .string = "" },
+        .{ .string = "plain" },
+        .{ .string = "q\"b\\s/\n\r\t\x01\x1f\x7f" },
+        .{ .string = "a\u{e7}\u{e3}o \u{1F600}" },
+        .{ .bytes = "raw" },
+        .{ .date = 0 },
+        .{ .date = -719_162 },
+        .{ .date = 2_932_896 },
+        .{ .time = 0 },
+        .{ .time = 86_399_999_999 },
+        .{ .timestamp = 0 },
+        .{ .timestamp = -1 },
+        .{ .timestamp = 1_583_298_367_123_456 },
+    };
+    for (vals) |v| {
+        var want = std.array_list.Managed(u8).init(a);
+        try old.oldJsonValue(a, &want, v);
+        try testing.expectEqualStrings(want.items, try newJson(a, v));
+    }
+    var x: f64 = 1e-8;
+    while (x < 1e17) : (x *= 1.37) for ([_]f64{ x, -x, x + 0.1, @round(x) }) |f| {
+        var want = std.array_list.Managed(u8).init(a);
+        try old.oldJsonValue(a, &want, .{ .float = f });
+        try testing.expectEqualStrings(want.items, try newJson(a, .{ .float = f }));
+    };
+}
+
+test "a nested leaf string holding invalid UTF-8 is valid JSON, each bad byte a U+FFFD" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const got = try newJson(a, .{ .string = "a\xffb" });
+    try testing.expectEqualStrings("\"a\u{FFFD}b\"", got);
+    try testing.expectEqualStrings("a\u{FFFD}b", try std.json.parseFromSliceLeaky([]const u8, a, got, .{}));
+}
+
+test "nested BYTES stay their text, not base64 (D8 pending); \\b and \\f are spelled \\u00XX" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings("\"\\u0001ab\"", try newJson(a, .{ .bytes = "\x01ab" }));
+    try testing.expectEqualStrings("\"\\u0008\\u000c\"", try newJson(a, .{ .string = "\x08\x0c" }));
 }
