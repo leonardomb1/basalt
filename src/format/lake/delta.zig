@@ -25,6 +25,7 @@ const Layout = @import("../parquet/fit.zig").Layout;
 const Mapping = @import("../parquet/fit.zig").Mapping;
 const Reader = @import("../parquet/read.zig").Reader;
 const Value = @import("../../exec/value.zig").Value;
+const dtypes = @import("delta_types.zig");
 const dvs = @import("delta_dv.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
@@ -516,16 +517,16 @@ fn mapType(arena: std.mem.Allocator, name: []const u8, by: Mapping.By, col: []co
         kids[1] = try mapType(arena, name, by, col, t.object.get("valueType") orelse .null, depth + 1);
         return .{ .kind = .map, .children = kids };
     }
-    const fields = t.object.get("fields") orelse return .{};
-    if (fields != .array) return .{};
+    const fields = switch (try dtypes.fields(arena, t, .lenient)) {
+        .fields => |fs| fs,
+        .problem => return .{},
+    };
     var kids = std.array_list.Managed(Mapping.Node).init(arena);
-    for (fields.array.items) |f| {
-        if (f != .object) continue;
-        const fname = str(f.object.get("name")) orelse continue;
+    for (fields) |f| {
+        const fname = f.name;
         const full = if (col.len == 0) fname else try std.mem.concat(arena, u8, &.{ col, ".", fname });
-        const md = f.object.get("metadata");
-        const meta = if (md) |x| (if (x == .object) x.object else null) else null;
-        var n = try mapType(arena, name, by, full, f.object.get("type") orelse .null, depth + 1);
+        const meta = f.metadata;
+        var n = try mapType(arena, name, by, full, f.ty, depth + 1);
         n.name = fname;
         n.physical = (if (meta) |o| str(o.get("delta.columnMapping.physicalName")) else null) orelse "";
         if (meta) |o| if (o.get("delta.columnMapping.id")) |id| if (id == .integer and id.integer >= 0 and id.integer <= std.math.maxInt(i32)) {
@@ -542,13 +543,16 @@ fn mapType(arena: std.mem.Allocator, name: []const u8, by: Mapping.By, col: []co
 
 fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Managed(types.Schema.Field), prefix: []const u8, v: std.json.Value, depth: usize) !void {
     if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
-    const fields = if (v == .object) v.object.get("fields") else null;
-    if (fields == null or fields.? != .array) return refuse("{s} has a schemaString that is not a struct of fields", .{name});
-    for (fields.?.array.items) |f| {
-        if (f != .object) continue;
-        const fname = str(f.object.get("name")) orelse return refuse("{s} has a schemaString field with no name", .{name});
-        const full = try std.mem.concat(arena, u8, &.{ prefix, fname });
-        const t = f.object.get("type") orelse return refuse("{s} has a column `{s}` with no type", .{ name, full });
+    const fields = switch (try dtypes.fields(arena, v, .reading)) {
+        .fields => |fs| fs,
+        .problem => |p| return switch (p) {
+            .nameless => refuse("{s} has a schemaString field with no name", .{name}),
+            .not_struct, .not_object => refuse("{s} has a schemaString that is not a struct of fields", .{name}),
+        },
+    };
+    for (fields) |f| {
+        const full = try std.mem.concat(arena, u8, &.{ prefix, f.name });
+        const t = f.ty;
         switch (t) {
             .string => |s| try out.append(.{ .name = full, .ty = (try primitive(name, full, s)).asNullable() }),
             .object => |o| {
@@ -565,23 +569,8 @@ fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Ma
 }
 
 fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
-    const T = types.Type;
-    if (oneOf(t, &.{ "string", "void" })) return T.init(.string);
-    if (oneOf(t, &.{ "long", "integer", "short", "byte" })) return T.init(.int);
-    if (oneOf(t, &.{ "float", "double" })) return T.init(.float);
-    if (std.mem.eql(u8, t, "boolean")) return T.init(.bool);
-    if (std.mem.eql(u8, t, "binary")) return T.init(.bytes);
-    if (std.mem.eql(u8, t, "date")) return T.init(.date);
-    if (oneOf(t, &.{ "timestamp", "timestamp_ntz" })) return T.init(.timestamp);
-    if (std.mem.eql(u8, t, "decimal")) return T.decimal(10, 0);
-    if (std.mem.startsWith(u8, t, "decimal(") and std.mem.endsWith(u8, t, ")")) {
-        const inner = t["decimal(".len .. t.len - 1];
-        var it = std.mem.splitScalar(u8, inner, ',');
-        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 0;
-        const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 255;
-        if (p >= 1 and p <= 38 and s <= p) return T.decimal(p, s);
-    }
-    return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, t });
+    return dtypes.scalarType(t, .read) orelse
+        refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, t });
 }
 
 /// `root`'s table at `at`; `listed` is `_delta_log/`'s listing when detection
@@ -925,4 +914,44 @@ test "replay keeps only what it needs: a checkpoint's batches and each commit's 
     try testing.expectEqual(@as(usize, 15), st.files.count());
     try testing.expect(dvs_seen > 0);
     try testing.expect(counting.allocated_bytes - counting.freed_bytes < 160 * 1024);
+}
+
+fn oldPrimitive(t: []const u8) ?types.Type {
+    const T = types.Type;
+    if (oneOf(t, &.{ "string", "void" })) return T.init(.string);
+    if (oneOf(t, &.{ "long", "integer", "short", "byte" })) return T.init(.int);
+    if (oneOf(t, &.{ "float", "double" })) return T.init(.float);
+    if (std.mem.eql(u8, t, "boolean")) return T.init(.bool);
+    if (std.mem.eql(u8, t, "binary")) return T.init(.bytes);
+    if (std.mem.eql(u8, t, "date")) return T.init(.date);
+    if (oneOf(t, &.{ "timestamp", "timestamp_ntz" })) return T.init(.timestamp);
+    if (std.mem.eql(u8, t, "decimal")) return T.decimal(10, 0);
+    if (std.mem.startsWith(u8, t, "decimal(") and std.mem.endsWith(u8, t, ")")) {
+        const inner = t["decimal(".len .. t.len - 1];
+        var it = std.mem.splitScalar(u8, inner, ',');
+        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 0;
+        const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 255;
+        if (p >= 1 and p <= 38 and s <= p) return T.decimal(p, s);
+    }
+    return null;
+}
+
+test "schemaString primitives from delta_types read as the reader's old table did" {
+    const names = [_][]const u8{
+        "long",           "integer",        "short",          "byte",           "double",        "float",          "boolean",
+        "string",         "binary",         "date",           "timestamp",      "timestamp_ntz", "void",           "variant",
+        "Long",           "",               "interval",       "timestamp_tz",   "decimal",       "decimal(10,2)",  "decimal( 10 , 2 )",
+        "decimal(38,38)", "decimal(1,0)",   "decimal(5,2,9)", "decimal(10)",    "decimal(,2)",   "decimal(39,0)",  "decimal(5,6)",
+        "decimal(0,0)",   "decimal()",      "decimal(10,2",   "decimal(-1,0)",  "decimal(a,b)",  "decimal(256,0)", "Decimal(10,2)",
+        "decimal(10,)",   "decimal(3,255)", "decimal(+5,2)",  "decimal(05,02)",
+    };
+    for (names) |t| {
+        const old = oldPrimitive(t);
+        const new = primitive("T", "c", t) catch |e| {
+            try testing.expect(old == null);
+            _ = eval.takeFailure(e);
+            continue;
+        };
+        try testing.expectEqual(old.?.asNullable(), new.asNullable());
+    }
 }

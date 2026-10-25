@@ -37,6 +37,7 @@ const decimal = @import("../../exec/decimal.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
+const dtypes = @import("delta_types.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
@@ -64,9 +65,6 @@ pub const Opts = struct {
 const tag_name = "\x00file";
 const row_name = "\x00row";
 
-/// A file statistic's string as long as this may be cut short, so it bounds nothing.
-const stat_cut = 32;
-
 /// The span of an UPSERT's keys: per key column its name and type, whether it
 /// partitions the table, and the smallest and largest incoming value. A key of a
 /// 4-byte `float` column is held as its 4-byte value, and so is a partition value
@@ -92,12 +90,10 @@ pub const Bounds = struct {
 
     /// Whether a file with these partition values and statistics may hold a key
     /// within the bounds: false only when some key column's values provably lie
-    /// outside them (or are all NULL).
+    /// outside them (or are all NULL). A writer may leave NaN out of a float
+    /// column's statistics, so a NaN key is never ruled out by them.
     pub fn mayHold(self: *const Bounds, arena: std.mem.Allocator, parts: ?std.json.Value, stats_text: ?[]const u8) !bool {
-        var stats: ?std.json.ObjectMap = null;
-        if (stats_text) |t| if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{ .parse_numbers = false })) |v| {
-            if (v == .object) stats = v.object;
-        } else |_| {};
+        const stats: ?std.json.ObjectMap = if (stats_text) |t| dtypes.parseStats(arena, t) else null;
         for (self.names, self.tys, self.part, self.lo, self.hi, 0..) |name, ty, is_part, lo, hi, j| {
             if (lo == .null) continue;
             if (is_part) {
@@ -111,9 +107,10 @@ pub const Bounds = struct {
                 continue;
             }
             const s = stats orelse continue;
-            if (allNull(s, name)) return false;
-            if (try statValue(arena, s, "maxValues", name, ty)) |x| if (before(self.narrowed(j, x), lo)) return false;
-            if (try statValue(arena, s, "minValues", name, ty)) |x| if (before(hi, self.narrowed(j, x))) return false;
+            if (dtypes.allNull(s, name)) return false;
+            if (hi == .float and std.math.isNan(hi.float)) continue;
+            if (try dtypes.statValue(arena, s, .max, name, ty)) |x| if (before(self.narrowed(j, x), lo)) return false;
+            if (try dtypes.statValue(arena, s, .min, name, ty)) |x| if (before(hi, self.narrowed(j, x))) return false;
         }
         return true;
     }
@@ -135,40 +132,6 @@ fn own(a: std.mem.Allocator, v: Value) !Value {
         .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
         else => v,
     };
-}
-
-fn numText(v: std.json.Value) ?[]const u8 {
-    return switch (v) {
-        .number_string, .string => |s| s,
-        else => null,
-    };
-}
-
-/// Whether a file's statistics say every value of `name` is NULL.
-fn allNull(s: std.json.ObjectMap, name: []const u8) bool {
-    const n = numText(s.get("numRecords") orelse return false) orelse return false;
-    const nc = s.get("nullCount") orelse return false;
-    if (nc != .object) return false;
-    const c = numText(nc.object.get(name) orelse return false) orelse return false;
-    const rows = std.fmt.parseInt(u64, n, 10) catch return false;
-    return rows > 0 and (std.fmt.parseInt(u64, c, 10) catch return false) == rows;
-}
-
-/// A file's `minValues` or `maxValues` entry for `name` as a value of `ty`, null
-/// when absent or when it may not bound the column: a string as long as a writer
-/// may cut one to. A timestamp is kept to milliseconds, so a maximum is widened by
-/// the rest of its millisecond.
-fn statValue(arena: std.mem.Allocator, s: std.json.ObjectMap, which: []const u8, name: []const u8, ty: types.Type) !?Value {
-    const m = s.get(which) orelse return null;
-    if (m != .object) return null;
-    const text = numText(m.object.get(name) orelse return null) orelse return null;
-    const is_max = std.mem.eql(u8, which, "maxValues");
-    if (ty.kind == .string and is_max and text.len >= stat_cut) return null;
-    if (ty.kind == .bytes) return null;
-    const v = (try table.partitionValue(arena, text, ty)) orelse return null;
-    if (v == .float and std.math.isNan(v.float)) return null;
-    if (is_max and v == .timestamp) return .{ .timestamp = v.timestamp + 999 };
-    return v;
 }
 
 /// The files an UPSERT rewrote and the ones it read, for its commit.
@@ -739,6 +702,28 @@ test "bounds: partition values and statistics rule a file out only when provably
     const str = Bounds{ .names = &.{"s"}, .tys = &.{types.Type.init(.string)}, .part = &.{false}, .lo = &slo, .hi = &shi };
     try testing.expect(!try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"abc\"}}"));
     try testing.expect(try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"" ++ "a" ** 32 ++ "\"}}"));
+}
+
+test "bounds: a NaN key is never ruled out by statistics a writer may have left NaN out of" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nan = std.math.nan(f64);
+    const stats = "{\"numRecords\":2,\"minValues\":{\"f\":1.0},\"maxValues\":{\"f\":1.0},\"nullCount\":{\"f\":0}}";
+    var lo = [_]Value{.{ .float = nan }};
+    var hi = [_]Value{.{ .float = nan }};
+    const all_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo, .hi = &hi };
+    try testing.expect(try all_nan.mayHold(a, null, stats));
+    var lo5 = [_]Value{.{ .float = 5 }};
+    const some_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo5, .hi = &hi };
+    try testing.expect(try some_nan.mayHold(a, null, stats));
+    try testing.expect(!try some_nan.mayHold(a, null, "{\"numRecords\":2,\"nullCount\":{\"f\":2}}"));
+    var hi5 = [_]Value{.{ .float = 5 }};
+    const no_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo5, .hi = &hi5 };
+    try testing.expect(!try no_nan.mayHold(a, null, stats));
+    const part = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .lo = &lo5, .hi = &hi };
+    try testing.expect(!try part.mayHold(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"f\":\"1.0\"}", .{}), null));
+    try testing.expect(try part.mayHold(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"f\":\"NaN\"}", .{}), null));
 }
 
 const TestRows = struct {

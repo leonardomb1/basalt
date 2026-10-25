@@ -33,6 +33,7 @@ const eval = @import("../../exec/eval.zig");
 const objstore = @import("../../store/objstore.zig");
 const http_client = @import("../../net/http_client.zig");
 const table = @import("table.zig");
+const uuids = @import("../uuid.zig");
 const testing = std.testing;
 
 pub const Error = error{ DeltaCommitConflict, DeltaStoreUnsafe, DeltaCommitUnknown, DeltaCommitUnsynced };
@@ -183,23 +184,7 @@ fn explainStore(e: anyerror, at: []const u8, why: []const u8) anyerror {
 
 /// A random (version 4) UUID, as text.
 pub fn uuid() [36]u8 {
-    var b: [16]u8 = undefined;
-    std.crypto.random.bytes(&b);
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    const hex = "0123456789abcdef";
-    var out: [36]u8 = undefined;
-    var o: usize = 0;
-    for (b, 0..) |x, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[o] = '-';
-            o += 1;
-        }
-        out[o] = hex[x >> 4];
-        out[o + 1] = hex[x & 15];
-        o += 2;
-    }
-    return out;
+    return uuids.text(&uuids.v4(), .canonical);
 }
 
 /// What a winning commit did, as far as the conflict rules ask.
@@ -505,6 +490,27 @@ test "local commit: an append read at version 0 moves past a winner already on d
     try testing.expectEqual(@as(u64, 2), try commit(a, ts.store(), "T", testCommit(.append, 0, "T")));
     try testing.expectError(Error.DeltaCommitConflict, commit(a, ts.store(), "T", testCommit(.replace, 1, "T2")));
     _ = eval.takeFailure(Error.DeltaCommitConflict);
+}
+
+test "uuid: format/uuid's canonical text equals the old hex loop" {
+    var prng = std.Random.DefaultPrng.init(0x0DE17A);
+    for (0..1000) |_| {
+        var b: [16]u8 = undefined;
+        prng.random().bytes(&b);
+        const hex = "0123456789abcdef";
+        var old: [36]u8 = undefined;
+        var o: usize = 0;
+        for (b, 0..) |x, i| {
+            if (i == 4 or i == 6 or i == 8 or i == 10) {
+                old[o] = '-';
+                o += 1;
+            }
+            old[o] = hex[x >> 4];
+            old[o + 1] = hex[x & 15];
+            o += 2;
+        }
+        try testing.expectEqualStrings(&old, &uuids.text(&b, .canonical));
+    }
 }
 
 test "uuid: version 4, variant bits, lower-case hex" {

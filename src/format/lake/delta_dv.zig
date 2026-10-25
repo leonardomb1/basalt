@@ -17,6 +17,7 @@ const Bytes = @import("../bytes.zig").Bytes;
 const Deletes = @import("../parquet/fit.zig").Deletes;
 const roaring = @import("roaring.zig");
 const table = @import("table.zig");
+const uuids = @import("../uuid.zig");
 const testing = std.testing;
 
 const refuse = table.refuse;
@@ -150,9 +151,8 @@ pub fn location(arena: std.mem.Allocator, root: []const u8, d: Descriptor) ![]co
     const prefix = d.where[0 .. d.where.len - uuid_len];
     const u = (try z85(arena, d.where[d.where.len - uuid_len ..])) orelse
         return refuse("deletion vector path `{s}` does not end in a Z85 UUID", .{d.where});
-    const hex = std.fmt.bytesToHex(u[0..16].*, .lower);
-    return std.fmt.allocPrint(arena, "{s}{s}{s}deletion_vector_{s}-{s}-{s}-{s}-{s}.bin", .{
-        root, prefix, if (prefix.len > 0) "/" else "", hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32],
+    return std.fmt.allocPrint(arena, "{s}{s}{s}deletion_vector_{s}.bin", .{
+        root, prefix, if (prefix.len > 0) "/" else "", &uuids.text(u[0..16], .canonical),
     });
 }
 
