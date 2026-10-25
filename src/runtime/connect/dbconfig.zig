@@ -8,7 +8,7 @@ const aad = @import("../../db/sqlserver/aad.zig");
 const ast = @import("../../lang/ast.zig");
 const env_mod = @import("../env.zig");
 const eqlAny = @import("../env.zig").eqlAny;
-const evalCfgInt = @import("register.zig").evalCfgInt;
+const evalCfgIntIn = @import("register.zig").evalCfgIntIn;
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const krb5 = @import("../../net/auth/krb5.zig");
 const ntlm = @import("../../net/auth/ntlm.zig");
@@ -124,12 +124,12 @@ pub fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerr
 
 const EnvCfg = struct {
     env: *Env,
+    connector: []const u8,
     pub fn str(self: EnvCfg, e: *const ast.Expr) !?[]const u8 {
         return try evalCfgStr(self.env, e);
     }
     pub fn port(self: EnvCfg, e: *const ast.Expr) !?u16 {
-        const p: u16 = @intCast(try evalCfgInt(self.env, e));
-        return p;
+        return try evalCfgIntIn(u16, self.env, e, self.connector, "port");
     }
     pub fn tls(self: EnvCfg, v: []const u8) !sql.TlsMode {
         return std.meta.stringToEnum(sql.TlsMode, v) orelse
@@ -142,7 +142,7 @@ const EnvCfg = struct {
 };
 
 pub fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
-    const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env });
+    const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env, .connector = conn.connector });
     if (cfg.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     if (cfg.auth == .kerberos and cfg.realm.len == 0 and std.mem.indexOfScalar(u8, cfg.user, '@') == null)
         return planErr(env.diag, try options.sqlRealmMsg(env.arena, conn.name));

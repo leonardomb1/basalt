@@ -23,7 +23,7 @@ const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
 const eqlAny = @import("../env.zig").eqlAny;
 const evalCfgBool = @import("register.zig").evalCfgBool;
-const evalCfgInt = @import("register.zig").evalCfgInt;
+const evalCfgIntIn = @import("register.zig").evalCfgIntIn;
 const evalCfgStr = @import("register.zig").evalCfgStr;
 const mem_connector = @import("../connect.zig").mem_connector;
 const obs = @import("../obs.zig");
@@ -348,7 +348,7 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
         if (eqlAny(k, &.{ "host", "fe_host" })) {
             cfg.fe_host = try evalCfgStr(env, attr.value);
         } else if (eqlAny(k, &.{ "port", "fe_port" })) {
-            cfg.fe_port = @intCast(try evalCfgInt(env, attr.value));
+            cfg.fe_port = try evalCfgIntIn(u16, env, attr.value, conn.connector, k);
         } else if (eqlAny(k, &.{ "be_url", "load_url" })) {
             cfg.load_url = try evalCfgStr(env, attr.value);
         } else if (std.mem.eql(u8, k, "database")) {
@@ -360,9 +360,9 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
         } else if (std.mem.eql(u8, k, "tls")) {
             cfg.tls = std.meta.stringToEnum(sql.TlsMode, try evalCfgStr(env, attr.value)) orelse return planErr(env.diag, env_mod.tls_values_msg);
         } else if (std.mem.eql(u8, k, "buckets")) {
-            cfg.buckets = @intCast(try evalCfgInt(env, attr.value));
+            cfg.buckets = try evalCfgIntIn(u32, env, attr.value, conn.connector, k);
         } else if (std.mem.eql(u8, k, "replication_num")) {
-            cfg.replication_num = @intCast(try evalCfgInt(env, attr.value));
+            cfg.replication_num = try evalCfgIntIn(u32, env, attr.value, conn.connector, k);
         } else if (std.mem.eql(u8, k, "auto_create")) {
             cfg.auto_create = try evalCfgBool(env, attr.value);
         } else if (std.mem.eql(u8, k, "label_prefix")) {
@@ -380,4 +380,66 @@ pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamlo
     if (cfg.database.len == 0) return planErr(env.diag, try options.needsDatabaseMsg(env.arena, flavor.name()));
     if (env.sink_label_prefix) |lp| cfg.label_prefix = lp;
     return cfg;
+}
+
+const CfgCase = struct { key: []const u8, value: ast.Expr, msg: []const u8 };
+
+test "a connection's int options outside their type and a non-bool auto_create are refused, not truncated" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Value = @import("../../exec/value.zig").Value;
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    var sources = std.array_list.Managed(driver.Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    var db = ast.Expr{ .str_lit = "d" };
+    var host = ast.Expr{ .str_lit = "h" };
+    const refused = [_]CfgCase{
+        .{ .key = "fe_port", .value = .{ .int_lit = 70000 }, .msg = "starrocks connection `fe_port` is out of range" },
+        .{ .key = "port", .value = .{ .str_lit = "-1" }, .msg = "starrocks connection `port` is out of range" },
+        .{ .key = "buckets", .value = .{ .int_lit = -1 }, .msg = "starrocks connection `buckets` is out of range" },
+        .{ .key = "replication_num", .value = .{ .int_lit = 1 << 40 }, .msg = "starrocks connection `replication_num` is out of range" },
+        .{ .key = "auto_create", .value = .{ .str_lit = "yes" }, .msg = options.bool_cfg_msg },
+    };
+    for (refused) |c| {
+        var v = c.value;
+        const conn = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+            .{ .key = "database", .value = &db, .pos = pos },
+            .{ .key = c.key, .value = &v, .pos = pos },
+        } };
+        diag = .{};
+        try std.testing.expectError(error.PlanFailed, resolveStreamLoadConfig(&env, conn, .starrocks));
+        try std.testing.expectEqualStrings(c.msg, diag.msg);
+    }
+
+    for ([_]struct { []const u8, bool }{ .{ "TRUE", true }, .{ "False", false }, .{ "true", true } }) |c| {
+        var v = ast.Expr{ .str_lit = c[0] };
+        const conn = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+            .{ .key = "database", .value = &db, .pos = pos },
+            .{ .key = "auto_create", .value = &v, .pos = pos },
+        } };
+        try std.testing.expectEqual(c[1], (try resolveStreamLoadConfig(&env, conn, .starrocks)).auto_create);
+    }
+
+    for ([_]ast.Expr{ .{ .int_lit = 70000 }, .{ .int_lit = -1 }, .{ .str_lit = "65536" } }) |p| {
+        var v = p;
+        const conn = ast.Connection{ .name = "pg", .connector = "postgres", .pos = pos, .config = &.{
+            .{ .key = "host", .value = &host, .pos = pos },
+            .{ .key = "port", .value = &v, .pos = pos },
+        } };
+        diag = .{};
+        try std.testing.expectError(error.PlanFailed, resolveDbConfig(&env, conn, 5432));
+        try std.testing.expectEqualStrings("postgres connection `port` is out of range", diag.msg);
+    }
 }
