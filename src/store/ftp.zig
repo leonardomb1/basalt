@@ -19,15 +19,17 @@
 //! permanent (550 is a missing file); both carry the server's text in `lastError`.
 
 const std = @import("std");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const driver = @import("../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
+const scheme = @import("scheme.zig");
 const percentDecode = @import("../net/percent.zig").decode;
 
 pub const default_port = 21;
 const timeout_s = 60;
 
 pub fn isUrl(path: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(path, "ftp://");
+    return scheme.of(path) == .ftp;
 }
 
 pub const Url = struct {
@@ -53,19 +55,14 @@ pub const register = Names.put;
 
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
     if (!isUrl(url)) return error.InvalidFtpUrl;
-    const rest = url["ftp://".len..];
+    const rest = scheme.Scheme.rest(url);
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const a = remotefs.authority(rest[0..slash]) orelse return error.InvalidFtpUrl;
     const path = try percentDecode(arena, if (slash < rest.len) rest[slash..] else "/");
 
-    var user: ?[]const u8 = null;
-    var pass: ?[]const u8 = null;
-    if (a.userinfo) |info| {
-        if (std.mem.indexOfScalar(u8, info, ':')) |c| {
-            user = try percentDecode(arena, info[0..c]);
-            pass = try percentDecode(arena, info[c + 1 ..]);
-        } else user = try percentDecode(arena, info);
-    }
+    const info: ?scheme.Userinfo = if (a.userinfo) |s| try scheme.Userinfo.parse(arena, s, .{}) else null;
+    const user = if (info) |i| i.user else null;
+    const pass = if (info) |i| i.password else null;
     const host = a.host;
     const port = a.port;
     if (Names.get(host)) |c| return .{
@@ -103,7 +100,9 @@ fn refusal(code: u16, text: []const u8) anyerror {
     return error.FtpRefused;
 }
 
-fn setTimeout(handle: std.posix.socket_t) void {
+/// `driver.tuneSocket`, plus read and write timeouts so a silent server fails the call.
+fn tune(handle: std.posix.socket_t) void {
+    driver.tuneSocket(handle);
     const tv = std.posix.timeval{ .sec = timeout_s, .usec = 0 };
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
@@ -124,7 +123,7 @@ pub const Session = struct {
     pub fn open(gpa: std.mem.Allocator, u: Url) !*Session {
         const stream = try std.net.tcpConnectToHost(gpa, u.host, u.port);
         errdefer stream.close();
-        setTimeout(stream.handle);
+        tune(stream.handle);
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .host = u.host, .stream = stream };
@@ -187,7 +186,7 @@ pub const Session = struct {
             break :blk pasvPort(p.text) orelse return error.FtpProtocol;
         };
         const s = try std.net.tcpConnectToHost(self.gpa, self.host, port);
-        setTimeout(s.handle);
+        tune(s.handle);
         return s;
     }
 

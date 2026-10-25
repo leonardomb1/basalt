@@ -32,8 +32,11 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const driver = @import("../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
+const scheme = @import("scheme.zig");
+const utf16 = @import("../format/utf16.zig");
 const ntlm = @import("../net/auth/ntlm.zig");
 const krb5 = @import("../net/auth/krb5.zig");
 const spnego = @import("../net/auth/spnego.zig");
@@ -211,6 +214,7 @@ pub const Session = struct {
         errdefer gpa.free(own.user);
         const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e|
             return fail(error.SmbDisconnected, "cannot reach {s}:{d}: {s}", .{ cfg.host, cfg.port, @errorName(e) });
+        driver.tuneSocket(stream.handle);
         self.* = .{
             .gpa = gpa,
             .stream = stream,
@@ -674,7 +678,7 @@ pub const Session = struct {
 
         const unc = std.fmt.allocPrint(self.gpa, "\\\\{s}\\{s}", .{ self.cfg.host, share }) catch return error.SmbFailure;
         defer self.gpa.free(unc);
-        const path = utf16(self.gpa, unc) catch return error.SmbFailure;
+        const path = utf16.encodeLeAlloc(self.gpa, unc) catch return error.SmbFailure;
         defer self.gpa.free(path);
         var b = std.array_list.Managed(u8).init(self.gpa);
         defer b.deinit();
@@ -712,7 +716,7 @@ pub const Session = struct {
     /// SMB2 CREATE ([MS-SMB2] 2.2.13); `path` uses backslashes from the share's root.
     pub fn open(self: *Session, share: []const u8, path: []const u8, access: u32, disposition: u32, options: u32) Error!Handle {
         const t = try self.tree(share);
-        const name = utf16(self.gpa, path) catch return error.SmbFailure;
+        const name = utf16.encodeLeAlloc(self.gpa, path) catch return error.SmbFailure;
         defer self.gpa.free(name);
         var b = std.array_list.Managed(u8).init(self.gpa);
         defer b.deinit();
@@ -896,7 +900,7 @@ pub const Session = struct {
                 const attrs = std.mem.readInt(u32, buf[at + 56 ..][0..4], .little);
                 const nlen = std.mem.readInt(u32, buf[at + 60 ..][0..4], .little);
                 if (at + 64 + nlen > buf.len) break;
-                const name = utf8(arena, buf[at + 64 ..][0..nlen]) catch return error.SmbFailure;
+                const name = utf16.decodeLeAlloc(.replacement, arena, buf[at + 64 ..][0..nlen]) catch return error.SmbFailure;
                 const dir = attrs & attr_directory != 0;
                 out.append(.{ .name = name, .dir = dir, .file = !dir }) catch return error.SmbFailure;
                 if (next == 0) break;
@@ -925,7 +929,7 @@ pub const Session = struct {
 
     /// Renames to `to`, relative to the share's root, replacing any file there.
     pub fn rename(self: *Session, h: Handle, to: []const u8) Error!void {
-        const name = utf16(self.gpa, to) catch return error.SmbFailure;
+        const name = utf16.encodeLeAlloc(self.gpa, to) catch return error.SmbFailure;
         defer self.gpa.free(name);
         var b = std.array_list.Managed(u8).init(self.gpa);
         defer b.deinit();
@@ -954,7 +958,7 @@ pub const Session = struct {
 };
 
 pub fn isUrl(path: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(path, "smb://");
+    return scheme.of(path) == .smb;
 }
 
 pub const Conn = struct {
@@ -993,20 +997,19 @@ const Proto = struct {
     pub const stream_chunk = 4 << 20;
     pub const upload_buffer = 4 << 20;
 
-    /// `smb://[[domain;]user@]host[:port]/share/path`. Without a registered name the
-    /// user is the URL's, `SMB_USER` or `$USER`; password `SMB_PASSWORD`, domain `SMB_DOMAIN`.
+    /// `smb://[[domain;]user[:password]@]host[:port]/share/path`, each userinfo part
+    /// percent-decoded. Without a registered name the user is the URL's, `SMB_USER`
+    /// or `$USER`; password the URL's or `SMB_PASSWORD`, domain the URL's or `SMB_DOMAIN`.
     pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
         if (!isUrl(url)) return error.NotSmbUrl;
-        const rest = url["smb://".len..];
+        const rest = scheme.Scheme.rest(url);
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSmbUrl;
         const a = remotefs.authority(rest[0..slash]) orelse return error.NotSmbUrl;
         var path = std.mem.trimLeft(u8, rest[slash..], "/");
-        var user = a.userinfo;
-        var domain: ?[]const u8 = null;
-        if (user) |u| if (std.mem.indexOfScalar(u8, u, ';')) |semi| {
-            domain = u[0..semi];
-            user = u[semi + 1 ..];
-        };
+        const info: ?scheme.Userinfo = if (a.userinfo) |s| try scheme.Userinfo.parse(arena, s, .{ .domain = true }) else null;
+        const user = if (info) |i| i.user else null;
+        const pass = if (info) |i| i.password else null;
+        const domain = if (info) |i| i.domain else null;
 
         var cfg: Config = undefined;
         var share: []const u8 = undefined;
@@ -1015,7 +1018,7 @@ const Proto = struct {
                 .host = c.host,
                 .port = a.port orelse c.port,
                 .user = user orelse c.user orelse std.posix.getenv("USER") orelse "",
-                .password = c.password orelse "",
+                .password = pass orelse c.password orelse "",
                 .domain = domain orelse c.domain orelse "",
                 .realm = c.realm orelse "",
                 .kdc = c.kdc orelse "",
@@ -1028,7 +1031,7 @@ const Proto = struct {
                 .host = a.host,
                 .port = a.port orelse 445,
                 .user = user orelse std.posix.getenv("SMB_USER") orelse std.posix.getenv("USER") orelse "",
-                .password = std.posix.getenv("SMB_PASSWORD") orelse "",
+                .password = pass orelse std.posix.getenv("SMB_PASSWORD") orelse "",
                 .domain = domain orelse std.posix.getenv("SMB_DOMAIN") orelse "",
                 .realm = std.posix.getenv("SMB_REALM") orelse "",
                 .kdc = std.posix.getenv("SMB_KDC") orelse "",
@@ -1263,30 +1266,61 @@ fn put64(b: *std.array_list.Managed(u8), v: u64) void {
     b.appendSlice(&x) catch {};
 }
 
-fn utf16(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
-    const w = try std.unicode.utf8ToUtf16LeAlloc(gpa, s);
-    defer gpa.free(w);
-    const out = try gpa.alloc(u8, w.len * 2);
-    for (w, 0..) |c, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], c, .little);
-    return out;
-}
-
-/// Decodes a UTF-16LE name; an unpaired surrogate becomes U+FFFD so one odd name cannot fail a listing.
-fn utf8(arena: std.mem.Allocator, le: []const u8) ![]const u8 {
-    const w = try arena.alloc(u16, le.len / 2);
-    @memcpy(std.mem.sliceAsBytes(w), le[0 .. w.len * 2]);
-    return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf16Le(w)});
-}
-
 test "smb: a name with a lone surrogate decodes with U+FFFD, a paired one round-trips" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const lone = [_]u8{ 'a', 0, 0x00, 0xD8, 'b', 0, 0x00, 0xDC };
-    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}", try utf8(arena, &lone));
-    const le = try utf16(std.testing.allocator, "x\u{1F600}y");
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}", try utf16.decodeLeAlloc(.replacement, arena, &lone));
+    const le = try utf16.encodeLeAlloc(std.testing.allocator, "x\u{1F600}y");
     defer std.testing.allocator.free(le);
-    try std.testing.expectEqualStrings("x\u{1F600}y", try utf8(arena, le));
+    try std.testing.expectEqualStrings("x\u{1F600}y", try utf16.decodeLeAlloc(.replacement, arena, le));
+}
+
+test "smb: names encode and decode through format/utf16 exactly as through std.unicode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Old = struct {
+        fn encode(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+            const w = try std.unicode.utf8ToUtf16LeAlloc(gpa, s);
+            defer gpa.free(w);
+            const out = try gpa.alloc(u8, w.len * 2);
+            for (w, 0..) |c, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], c, .little);
+            return out;
+        }
+        fn decode(a: std.mem.Allocator, le: []const u8) ![]const u8 {
+            const w = try a.alloc(u16, le.len / 2);
+            @memcpy(std.mem.sliceAsBytes(w), le[0 .. w.len * 2]);
+            return std.fmt.allocPrint(a, "{f}", .{std.unicode.fmtUtf16Le(w)});
+        }
+    };
+    const texts = [_][]const u8{
+        "",                      "a",                              "dir\\file.csv",                    "Pedidos_Ação ñ ü",
+        "x\u{1F600}y\u{10FFFF}", "\u{FFFD}\u{FEFF}\u{7FF}\u{800}", "0123456789abcdef0123456789abcdef", "\xff",
+        "a\xc0\xafb",            "\xed\xa0\x80",                   "\xed\xb0\x80x",                    "\xf4\x90\x80\x80",
+        "\xe0\x80\x80",          "abc\xc3",                        "\xf0\x9f\x98",                     "0123456789abcdef\xe2\x82",
+    };
+    for (texts) |s| {
+        const old = Old.encode(arena, s);
+        const new = utf16.encodeLeAlloc(arena, s);
+        if (old) |o| try std.testing.expectEqualSlices(u8, o, try new) else |e| try std.testing.expectError(e, new);
+    }
+    var prng = std.Random.DefaultPrng.init(3);
+    const r = prng.random();
+    var buf: [41]u8 = undefined;
+    for (0..20_000) |_| {
+        const n = r.uintLessThan(usize, buf.len + 1);
+        for (buf[0..n]) |*b| b.* = switch (r.uintLessThan(u8, 6)) {
+            0 => 0xD8 + r.uintLessThan(u8, 8),
+            1 => 0,
+            2 => 'a',
+            else => r.int(u8),
+        };
+        try std.testing.expectEqualStrings(try Old.decode(arena, buf[0..n]), try utf16.decodeLeAlloc(.replacement, arena, buf[0..n]));
+        const text = try Old.decode(arena, buf[0..n]);
+        try std.testing.expectEqualSlices(u8, try Old.encode(arena, text), try utf16.encodeLeAlloc(arena, text));
+    }
 }
 
 test "smb: AES-128-CCM seals and opens, and refuses a tampered message" {
@@ -1364,6 +1398,23 @@ test "smb URLs: share, domain, port, registered names" {
     try std.testing.expectEqualStrings("svc", n.cfg.user);
     try std.testing.expectEqualStrings("data", n.share);
     try std.testing.expectEqualStrings("2026\\out.parquet", n.path);
+}
+
+test "smb URLs: domain;user:password split and decoded, in any scheme case" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = try Proto.resolve(a, "SMB://d;u:pw@unregistered-host.invalid/share/x");
+    try std.testing.expectEqualStrings("d", t.cfg.domain);
+    try std.testing.expectEqualStrings("u", t.cfg.user);
+    try std.testing.expectEqualStrings("pw", t.cfg.password);
+    const enc = try Proto.resolve(a, "smb://c%3Bx;a%40corp:p%3Aw@unregistered-host.invalid/share/x");
+    try std.testing.expectEqualStrings("c;x", enc.cfg.domain);
+    try std.testing.expectEqualStrings("a@corp", enc.cfg.user);
+    try std.testing.expectEqualStrings("p:w", enc.cfg.password);
+    try register("FS_PW", .{ .host = "fs.corp.example", .user = "svc", .password = "conf", .share = "data" });
+    try std.testing.expectEqualStrings("url", (try Proto.resolve(a, "smb://u:url@fs_pw/x")).cfg.password);
+    try std.testing.expectEqualStrings("conf", (try Proto.resolve(a, "smb://u@fs_pw/x")).cfg.password);
 }
 
 test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {

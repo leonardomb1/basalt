@@ -42,9 +42,10 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const xml = @import("../format/xml/token.zig");
-const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
+const civil = @import("../exec/civil.zig");
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";
 pub const env_secret = "AWS_SECRET_ACCESS_KEY";
@@ -79,7 +80,7 @@ pub const Obj = struct {
 };
 
 pub fn isUrl(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "s3://");
+    return scheme.of(s) == .s3;
 }
 
 /// Why the bucket in this `s3://` URL cannot name a bucket, or null. Checked at plan
@@ -87,7 +88,7 @@ pub fn isUrl(s: []const u8) bool {
 /// the DNS rules AWS and MinIO share, the rest left to the service's own message.
 pub fn bucketNameError(url: []const u8) ?[]const u8 {
     if (!isUrl(url)) return null;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const bucket = std.mem.sliceTo(rest, '/');
     if (bucket.len < 3 or bucket.len > 63)
         return "a bucket name is 3 to 63 characters";
@@ -145,13 +146,8 @@ pub fn credsFromEnv(arena: std.mem.Allocator) !Creds {
 /// The authority (host[:port]) of an endpoint URL, which is the Host that
 /// std.http.Client sends and so the one that must be signed.
 fn authorityOf(endpoint: []const u8) ![]const u8 {
-    const after = if (std.mem.startsWith(u8, endpoint, "https://"))
-        endpoint["https://".len..]
-    else if (std.mem.startsWith(u8, endpoint, "http://"))
-        endpoint["http://".len..]
-    else
-        return Error.S3BadUrl;
-    const host = std.mem.sliceTo(after, '/');
+    if (!scheme.of(endpoint).has(.http)) return Error.S3BadUrl;
+    const host = std.mem.sliceTo(scheme.Scheme.rest(endpoint), '/');
     if (host.len == 0) return Error.S3BadUrl;
     return host;
 }
@@ -160,7 +156,7 @@ fn authorityOf(endpoint: []const u8) ![]const u8 {
 /// selects virtual-host style, non-null path-style against that endpoint.
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Obj {
     if (!isUrl(url)) return Error.S3BadUrl;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
     const bucket = rest[0..b_end];
     const key = rest[b_end + 1 ..];
@@ -185,7 +181,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
 /// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.S3BadUrl;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
     const bucket = rest[0..b_end];
     if (bucket.len == 0) return Error.S3BadUrl;
@@ -195,12 +191,9 @@ pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []cons
 /// `20130524T000000Z`, the x-amz-date instant; its first 8 characters are the
 /// credential-scope date.
 pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
-    const days = @divFloor(epoch_secs, 86400);
-    const secs: u32 = @intCast(epoch_secs - days * 86400);
-    const c = civilFromDays(days);
-    return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
-    });
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    civil.writeLayout(&aw.writer, epoch_secs * civil.us_per_sec, .amz) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 pub fn payloadHash(arena: std.mem.Allocator, payload: []const u8) ![]const u8 {
@@ -355,7 +348,9 @@ fn signedHeaders(arena: std.mem.Allocator, creds: Creds, r: Request) ![]const st
     return out.toOwnedSlice();
 }
 
-/// Maps a status plus S3's error code onto a distinct Zig error.
+/// Maps a status plus S3's error code onto a distinct Zig error. Every status the
+/// retry loop replays as an outage (429 and the 5xx gateways) is `S3Throttled`, so a
+/// run that exhausts its retries on one exits as transient; 408 and 501 are not (D12).
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "NoSuchBucket")) return Error.S3BucketMissing;
@@ -370,7 +365,7 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     return switch (code) {
         401, 403 => Error.S3AuthFailed,
         404 => Error.S3BucketMissing,
-        429, 503 => Error.S3Throttled,
+        429, 500, 502, 503, 504 => Error.S3Throttled,
         else => Error.S3RequestFailed,
     };
 }
@@ -1205,7 +1200,7 @@ test "multipartEtag is the MD5 of the binary part MD5s plus the part count" {
 }
 
 pub const provider = objstore.Provider{
-    .scheme = "s3://",
+    .scheme = .s3,
     .empty_prefix = Error.S3EmptyPrefix,
     .vtable = &.{
         .parse = vtParse,
@@ -1282,4 +1277,43 @@ test "putIfAbsent: 200 creates, 412 and 409 find one there, a 503 is retried, a 
     try std.testing.expect(!try w.putIfAbsent("{}"));
     try std.testing.expectError(Error.S3ConditionalWriteUnsupported, w.putIfAbsent("{}"));
     try std.testing.expectEqualStrings("PUT /lake/out.csv HTTP/1.1", srv.line(0));
+}
+
+test "a retried-out 5xx gateway is S3Throttled, which a run exits on as transient; 408 and 501 stay RequestFailed (D12)" {
+    for ([_]u16{ 429, 500, 502, 503, 504 }) |c| {
+        try std.testing.expectEqual(Error.S3Throttled, statusToError(c, ""));
+        try std.testing.expectEqual(Error.S3Throttled, statusToError(c, "<Error><Code>InternalError</Code></Error>"));
+    }
+    for ([_]u16{ 400, 405, 408, 409, 412, 418, 501, 505, 599 }) |c| try std.testing.expectEqual(Error.S3RequestFailed, statusToError(c, ""));
+    for (0..600) |c| {
+        const e = statusToError(@intCast(c), "");
+        if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.S3Throttled, e);
+        if (e == Error.S3Throttled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    }
+}
+
+test "amzDate on civil's Layout writes exactly what the hand-rolled one did, years 0000 to 99999" {
+    const Old = struct {
+        fn amz(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+            const days = @divFloor(epoch_secs, 86400);
+            const secs: u32 = @intCast(epoch_secs - days * 86400);
+            const c = civil.civilFromDays(days);
+            return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+                @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+            });
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lo: i64 = civil.daysFromCivil(0, 1, 1) * 86400;
+    const hi: i64 = civil.daysFromCivil(100000, 1, 1) * 86400 - 1;
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const edges = [_]i64{ lo, -1, 0, 1, 86399, 951782400, 1369353600, 253402300799, 253402300800, hi };
+    for (0..100_000 + edges.len) |i| {
+        const t = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, lo, hi);
+        _ = ar.reset(.retain_capacity);
+        try std.testing.expectEqualStrings(try Old.amz(a, t), try amzDate(a, t));
+    }
 }

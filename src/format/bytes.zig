@@ -5,6 +5,7 @@
 
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
+const scheme = @import("../store/scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
@@ -13,9 +14,7 @@ const testing = std.testing;
 
 /// Whether `path` is read over HTTP: a URL or an object-store path.
 pub fn isRemote(path: []const u8) bool {
-    return objstore.isUrl(path) or
-        std.mem.startsWith(u8, path, "http://") or
-        std.mem.startsWith(u8, path, "https://");
+    return scheme.of(path).has(.http_ranged);
 }
 
 /// Whether `len` bytes at `off` lie within `total`, without the sum that a huge
@@ -203,7 +202,7 @@ pub const Remote = struct {
     ) !objstore.Response {
         return self.retrying(arena, method, range_hdr) catch |e| switch (e) {
             error.TlsInitializationFailed => {
-                if (!self.repair()) return e;
+                if (!http_client.repairOnce(self.client, &self.repaired, self.url)) return e;
                 return self.retrying(arena, method, range_hdr);
             },
             else => e,
@@ -265,16 +264,6 @@ pub const Remote = struct {
         if (self.object) |o| return o.statusToError(code, body);
         return http_client.statusError(code);
     }
-
-    fn repair(self: *Remote) bool {
-        if (self.repaired) return false;
-        self.repaired = true;
-        const uri = std.Uri.parse(self.url) catch return false;
-        const h = http_client.uriHost(uri) orelse return false;
-        if (!http_client.repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
-        self.client.next_https_rescan_certs = false;
-        return true;
-    }
 };
 
 test "remote paths are recognised, local ones left alone" {
@@ -283,6 +272,21 @@ test "remote paths are recognised, local ones left alone" {
     try testing.expect(isRemote("az://acct/ctr/a.parquet"));
     try testing.expect(!isRemote("/data/a.parquet"));
     try testing.expect(!isRemote("a.parquet"));
+}
+
+test "an HTTP:// URL in capitals is fetched, not opened as a local file" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var srv: http_fake.RangeServer = undefined;
+    try srv.start("0123456789", false);
+    defer srv.stop();
+    const lower = try srv.url(a, "/x.parquet");
+    const url = try std.mem.concat(a, u8, &.{ "HTTP", lower["http".len..] });
+    try testing.expect(isRemote(url));
+    const r = try Remote.open(a, url);
+    try testing.expectEqual(@as(u64, 10), r.total);
+    try testing.expectEqualStrings("3456", try r.read(a, 3, 4));
 }
 
 test "a Bytes range refuses to read past the end" {

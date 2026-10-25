@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
-const civilFromDays = @import("../../exec/eval/time.zig").civilFromDays;
+const civil = @import("../../exec/civil.zig");
 
 pub const Error = error{
     KrbProtocol,
@@ -394,12 +394,13 @@ const B = struct {
 };
 
 fn kerberosTime(buf: *[15]u8, unix: i64) []const u8 {
-    const days = @divFloor(unix, 86400);
-    const secs: u64 = @intCast(unix - days * 86400);
-    const c = civilFromDays(days);
-    return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{ @as(u64, @intCast(c.y)), c.m, c.d, secs / 3600, (secs / 60) % 60, secs % 60 }) catch unreachable;
+    var w = std.Io.Writer.fixed(buf);
+    civil.writeLayout(&w, unix * civil.us_per_sec, .kerberos) catch unreachable;
+    return w.buffered();
 }
 
+/// A KerberosTime `YYYYMMDDHHMMSSZ` as Unix seconds, 0 when it is too short or its
+/// month is not one.
 fn parseTime(s: []const u8) i64 {
     if (s.len < 15) return 0;
     const n = struct {
@@ -407,16 +408,9 @@ fn parseTime(s: []const u8) i64 {
             return std.fmt.parseInt(i64, t, 10) catch 0;
         }
     }.f;
-    const y = n(s[0..4]);
     const mo = n(s[4..6]);
-    const d = n(s[6..8]);
-    const yy = if (mo <= 2) y - 1 else y;
-    const era = @divFloor(if (yy >= 0) yy else yy - 399, 400);
-    const yoe = yy - era * 400;
-    const mp = if (mo > 2) mo - 3 else mo + 9;
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    const days = era * 146097 + doe - 719468;
+    if (mo < 1 or mo > 12) return 0;
+    const days = civil.daysFromCivil(n(s[0..4]), @intCast(mo), 1) + n(s[6..8]) - 1;
     return days * 86400 + n(s[8..10]) * 3600 + n(s[10..12]) * 60 + n(s[12..14]);
 }
 
@@ -1128,4 +1122,73 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
         gpa.free(st.realm);
     }
     try std.testing.expect(st.end > std.time.timestamp());
+}
+
+/// The KerberosTime writer and reader before they moved onto exec/civil.zig, the
+/// oracle the civil versions must match.
+const OldTime = struct {
+    fn write(buf: *[15]u8, unix: i64) []const u8 {
+        const days = @divFloor(unix, 86400);
+        const secs: u64 = @intCast(unix - days * 86400);
+        const c = civil.civilFromDays(days);
+        return std.fmt.bufPrint(buf, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}Z", .{ @as(u64, @intCast(c.y)), c.m, c.d, secs / 3600, (secs / 60) % 60, secs % 60 }) catch unreachable;
+    }
+
+    fn parse(s: []const u8) i64 {
+        if (s.len < 15) return 0;
+        const n = struct {
+            fn f(t: []const u8) i64 {
+                return std.fmt.parseInt(i64, t, 10) catch 0;
+            }
+        }.f;
+        const y = n(s[0..4]);
+        const mo = n(s[4..6]);
+        const d = n(s[6..8]);
+        const yy = if (mo <= 2) y - 1 else y;
+        const era = @divFloor(if (yy >= 0) yy else yy - 399, 400);
+        const yoe = yy - era * 400;
+        const mp = if (mo > 2) mo - 3 else mo + 9;
+        const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+        const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+        const days = era * 146097 + doe - 719468;
+        return days * 86400 + n(s[8..10]) * 3600 + n(s[10..12]) * 60 + n(s[12..14]);
+    }
+};
+
+test "krb5: KerberosTime on civil writes and reads exactly as before over years 0000-9999" {
+    const lo: i64 = civil.daysFromCivil(0, 1, 1) * 86400;
+    const hi: i64 = civil.daysFromCivil(10000, 1, 1) * 86400 - 1;
+    var prng = std.Random.DefaultPrng.init(42);
+    const r = prng.random();
+    const edges = [_]i64{ lo, lo + 1, -1, 0, 1, 86399, 86400, 951782400, 951868799, 1791220049, hi - 1, hi };
+    for (0..200_000 + edges.len) |i| {
+        const t = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, lo, hi);
+        var a: [15]u8 = undefined;
+        var b: [15]u8 = undefined;
+        const got = kerberosTime(&a, t);
+        try std.testing.expectEqualStrings(OldTime.write(&b, t), got);
+        try std.testing.expectEqual(OldTime.parse(got), parseTime(got));
+        try std.testing.expectEqual(t, parseTime(got));
+    }
+}
+
+test "krb5: malformed KerberosTime reads as before for a real month; a month out of range or a signed year is pinned" {
+    const same = [_][]const u8{
+        "20261005170729Z",     "20260100000000Z", "20260199000000Z", "2026010-1000000Z", "20260229000000Z",
+        "20250229000000Z",     "20261231999999Z", "00000101000000Z", "00000228000000Z",  "00000301000000Z",
+        "abcd0101000000Z",     "202601ab000000Z", "2026010100xx00Z", "20260101000000",   "+0260101000000Z",
+        "20260101000000Zjunk", "2_260101000000Z", "-0010301000000Z",
+    };
+    for (same) |s| try std.testing.expectEqual(OldTime.parse(s), parseTime(s));
+    for ([_][]const u8{ "", "2026", "20261005170729" }) |s| try std.testing.expectEqual(@as(i64, 0), parseTime(s));
+    const pinned = [_][]const u8{ "20260+01000000Z", "20260000000000Z", "20261300000000Z", "2026-1010000000Z", "2026ab01000000Z", "20269901000000Z" };
+    for (pinned) |s| {
+        try std.testing.expectEqual(@as(i64, 0), parseTime(s));
+        try std.testing.expect(OldTime.parse(s) != 0);
+    }
+    for ([_][]const u8{ "-0010101000000Z", "-9990615000000Z", "-4000301000000Z" }) |s| {
+        const d = civil.daysFromCivil(std.fmt.parseInt(i64, s[0..4], 10) catch unreachable, std.fmt.parseInt(u32, s[4..6], 10) catch unreachable, std.fmt.parseInt(u32, s[6..8], 10) catch unreachable);
+        try std.testing.expectEqual(d * 86400, parseTime(s));
+        try std.testing.expect(OldTime.parse(s) != parseTime(s));
+    }
 }

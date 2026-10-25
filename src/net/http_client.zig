@@ -100,6 +100,7 @@ const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
 const percent = @import("percent.zig");
+const scheme = @import("../store/scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 
 /// The most one response body may decode to, a page or a login reply.
@@ -137,6 +138,23 @@ pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bund
         }
     }
     return added_any;
+}
+
+/// After a failed TLS handshake, grows `client`'s CA bundle from the chain `uri`'s
+/// host presents (see `repairBundle`); true when a replay may now succeed.
+pub fn repairClient(client: *std.http.Client, uri: std.Uri) bool {
+    const h = uriHost(uri) orelse return false;
+    if (!repairBundle(client.allocator, &client.ca_bundle, h, uri.port orelse 443)) return false;
+    client.next_https_rescan_certs = false;
+    return true;
+}
+
+/// `repairClient` for `url`, at most once per `done` flag, which it sets.
+pub fn repairOnce(client: *std.http.Client, done: *bool, url: []const u8) bool {
+    if (done.*) return false;
+    done.* = true;
+    const uri = std.Uri.parse(url) catch return false;
+    return repairClient(client, uri);
 }
 
 /// Captures the chain a server presents over an unverified handshake. SNI and the
@@ -322,31 +340,7 @@ pub const AuthState = struct {
 
 /// `url` as logs and messages show it: without a `user:pass@` and with each query
 /// value replaced by `...`, as either may hold a credential.
-pub fn redactUrl(buf: []u8, url: []const u8) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    var rest = url;
-    if (std.mem.indexOf(u8, rest, "://")) |at| {
-        w.writeAll(rest[0 .. at + 3]) catch return "(url)";
-        rest = rest[at + 3 ..];
-        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-        if (std.mem.lastIndexOfScalar(u8, rest[0..host_end], '@')) |amp| rest = rest[amp + 1 ..];
-    }
-    const q = std.mem.indexOfScalar(u8, rest, '?') orelse {
-        w.writeAll(rest) catch return "(url)";
-        return w.buffered();
-    };
-    w.writeAll(rest[0 .. q + 1]) catch return "(url)";
-    var it = std.mem.splitScalar(u8, rest[q + 1 ..], '&');
-    var first = true;
-    while (it.next()) |kv| {
-        if (!first) w.writeByte('&') catch return "(url)";
-        first = false;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
-        w.writeAll(kv[0..eq]) catch return "(url)";
-        if (eq < kv.len) w.writeAll("=...") catch return "(url)";
-    }
-    return w.buffered();
-}
+pub const redactUrl = scheme.shown;
 
 /// Whether a server-sent value can go into a header or request line as is: a CR,
 /// LF or NUL in it would end the line and start one the server chose.
@@ -365,7 +359,7 @@ pub const formEncode = percent.encode;
 
 pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]const u8 {
     if (path.len == 0) return base;
-    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return path;
+    if (scheme.of(path).has(.http)) return path;
     const b = std.mem.trimRight(u8, base, "/");
     const sep: []const u8 = if (path.len > 0 and path[0] == '/') "" else "/";
     return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ b, sep, path });
@@ -693,7 +687,7 @@ pub const HttpSource = struct {
                     self.done = true;
                     return;
                 }
-                if (std.mem.startsWith(u8, tok, "http://") or std.mem.startsWith(u8, tok, "https://")) {
+                if (scheme.of(tok).has(.http)) {
                     if (!lineSafe(tok)) return eval.explain(error.BadHeaderValue, "the response's next-page URL holds a line break or NUL, which would inject into the request");
                     if (!objstore.sameOrigin(self.base_url, tok)) return eval.explain(error.HttpCrossOriginPage, "the response's next-page URL is on another host or scheme than the first page's, and this read's headers and login go only to its own");
                     self.next_url = try self.arena.dupe(u8, tok);
@@ -789,13 +783,7 @@ pub const HttpSource = struct {
     }
 
     fn tryRepair(self: *HttpSource, url: []const u8) bool {
-        if (self.repaired) return false;
-        self.repaired = true;
-        const uri = std.Uri.parse(url) catch return false;
-        const h = uriHost(uri) orelse return false;
-        if (!repairBundle(self.client.allocator, &self.client.ca_bundle, h, uri.port orelse 443)) return false;
-        self.client.next_https_rescan_certs = false;
-        return true;
+        return repairOnce(self.client, &self.repaired, url);
     }
 
     fn prefetchOn(self: *HttpSource) bool {
@@ -926,7 +914,7 @@ pub const HttpSource = struct {
         });
         slot.code = res.code;
         slot.body = res.body;
-        const again = res.code == 429 or res.code >= 500 or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
+        const again = busyStatus(res.code) or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
         if (!again) return .done;
         const after: ?u64 = if (res.retry_after_ms) |ms| @min(ms, max_retry_after_ms) else null;
         return .{ .failed = .{ .code = res.code, .err = error.HttpServerBusy, .retry_after_ms = after, .retriable = true } };
@@ -1152,10 +1140,16 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return buf.toOwnedSlice();
 }
 
+/// The statuses `HTTP()` replays and reports as `HttpServerBusy`: 429 and every 5xx.
+/// Not objstore's list, which adds 408 and leaves out 501 and 505+ (D12).
+fn busyStatus(code: u16) bool {
+    return code == 429 or code >= 500;
+}
+
 /// Maps a non-200 status to a named error, distinct per fix: 429/5xx are worth a
 /// control-plane retry (exit 75), 401 is an expired token, 400 a rejected request.
 pub fn statusError(code: u16) anyerror {
-    if (code == 429 or code >= 500) return error.HttpServerBusy;
+    if (busyStatus(code)) return error.HttpServerBusy;
     return switch (code) {
         400 => error.HttpBadRequest,
         401 => error.HttpUnauthorized,
@@ -2007,4 +2001,26 @@ test "a URL in a log or message keeps no login and no query values" {
     try std.testing.expectEqualStrings("https://api.example.com/v1/x?api_key=...&page=...", redactUrl(&buf, "https://user:secret@api.example.com/v1/x?api_key=abc&page=2"));
     try std.testing.expectEqualStrings("http://h/p", redactUrl(&buf, "http://h/p"));
     try std.testing.expectEqualStrings("http://h/p?flag", redactUrl(&buf, "http://h/p?flag"));
+}
+
+test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
+    var client = std.http.Client{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    var done = false;
+    try std.testing.expect(!repairOnce(&client, &done, "not a url"));
+    try std.testing.expect(done);
+    try std.testing.expect(!repairOnce(&client, &done, "https://127.0.0.1:1/x"));
+    var fresh = false;
+    try std.testing.expect(!repairOnce(&client, &fresh, "file:///x"));
+    try std.testing.expect(fresh);
+    try std.testing.expectEqual(@as(usize, 0), client.ca_bundle.bytes.items.len);
+}
+
+test "pinned for D12: HTTP() and objstore retry the same statuses except 408, 501 and 505+" {
+    for (100..600) |c| {
+        const code: u16 = @intCast(c);
+        const differs = code == 408 or code == 501 or code >= 505;
+        try std.testing.expectEqual(differs, busyStatus(code) != objstore.retriable(code));
+        try std.testing.expectEqual(busyStatus(code), statusError(code) == error.HttpServerBusy);
+    }
 }

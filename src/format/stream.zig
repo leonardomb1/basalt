@@ -16,6 +16,7 @@ const std = @import("std");
 const eval = @import("../exec/eval.zig");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
+const scheme = @import("../store/scheme.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const zipsrc = @import("compress/zip.zig");
@@ -58,7 +59,7 @@ pub fn dataName(path: []const u8) []const u8 {
 
 /// Whether `path` is fetched over HTTP: an `http(s)://` URL or an object-store one.
 pub fn isUrl(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://") or objstore.isRemote(path);
+    return scheme.of(path).has(.streamed);
 }
 
 /// Not `ContentEncoding.minBufferCapacity()`, which gives zstd only its window:
@@ -256,7 +257,7 @@ pub const Stream = struct {
             req_url = obj.url;
             extra = try obj.getHeaders(arena);
         }
-        const uri = std.Uri.parse(req_url) catch return error.InvalidUrl;
+        const uri = scheme.parseUri(req_url) catch return error.InvalidUrl;
         var prng = objstore.jitterPrng();
         var opening: HttpOpen = .{ .arena = arena, .hf = hf, .uri = uri, .extra = extra };
         try objstore.retry(.{ .rand = prng.random() }, &opening, HttpOpen.attempt);
@@ -285,9 +286,7 @@ pub const Stream = struct {
             const hf = self.hf;
             startHttp(hf, self.uri, self.extra) catch |e| switch (e) {
                 error.TlsInitializationFailed => {
-                    const h = http_client.uriHost(self.uri) orelse return e;
-                    if (!http_client.repairBundle(self.arena, &hf.client.ca_bundle, h, self.uri.port orelse 443)) return e;
-                    hf.client.next_https_rescan_certs = false;
+                    if (!http_client.repairClient(&hf.client, self.uri)) return e;
                     try startHttp(hf, self.uri, self.extra);
                 },
                 else => return e,

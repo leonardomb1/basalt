@@ -27,7 +27,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const driver = @import("../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Sha512 = crypto.hash.sha2.Sha512;
@@ -387,7 +388,8 @@ pub const Session = struct {
         var owned = cfg;
         const text = try ownConfig(gpa, &owned);
         errdefer gpa.free(text);
-        const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e| return e;
+        const stream = try std.net.tcpConnectToHost(gpa, cfg.host, cfg.port);
+        driver.tuneSocket(stream.handle);
         self.* = .{
             .gpa = gpa,
             .stream = stream,

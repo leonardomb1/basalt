@@ -27,6 +27,7 @@
 const std = @import("std");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
+const scheme = @import("scheme.zig");
 const ssh = @import("../net/ssh.zig");
 
 pub const Error = error{
@@ -78,7 +79,7 @@ const status = struct {
 const inflight = 32;
 
 pub fn isUrl(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "sftp://");
+    return scheme.of(path) == .sftp;
 }
 
 pub const Conn = struct {
@@ -470,21 +471,25 @@ const Proto = struct {
     pub const upload_buffer = 1 << 20;
 
     /// The host may name a registered connection; otherwise the user is the URL's or
-    /// `$USER`, the password `SFTP_PASSWORD`, the key `~/.ssh/id_ed25519` if present.
+    /// `$USER`, the password the URL's or `SFTP_PASSWORD`, the key `~/.ssh/id_ed25519`
+    /// if present. A URL's `user[:password]` is percent-decoded.
     /// `/~/x` is `x` under the login's home, as curl reads it; other paths are absolute.
     pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
         if (!isUrl(url)) return error.NotSftpUrl;
-        const rest = url["sftp://".len..];
+        const rest = scheme.Scheme.rest(url);
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSftpUrl;
         const a = remotefs.authority(rest[0..slash]) orelse return error.NotSftpUrl;
         var path = rest[slash..];
         if (std.mem.startsWith(u8, path, "/~/")) path = path[3..];
-        const user = a.userinfo orelse std.posix.getenv("USER") orelse "root";
+        const info: ?scheme.Userinfo = if (a.userinfo) |s| try scheme.Userinfo.parse(arena, s, .{}) else null;
+        const url_user = if (info) |i| i.user else null;
+        const url_pass = if (info) |i| i.password else null;
+        const user = url_user orelse std.posix.getenv("USER") orelse "root";
         if (Names.get(a.host)) |c| return .{ .path = path, .cfg = .{
             .host = c.host,
             .port = a.port orelse c.port,
-            .user = a.userinfo orelse c.user orelse user,
-            .password = c.password,
+            .user = url_user orelse c.user orelse user,
+            .password = url_pass orelse c.password,
             .key_file = c.key_file,
             .key_passphrase = c.key_passphrase,
             .known_hosts = c.known_hosts,
@@ -499,7 +504,7 @@ const Proto = struct {
             .host = a.host,
             .port = a.port orelse 22,
             .user = user,
-            .password = std.posix.getenv("SFTP_PASSWORD"),
+            .password = url_pass orelse std.posix.getenv("SFTP_PASSWORD"),
             .key_file = key_file,
         } };
     }
@@ -635,6 +640,25 @@ test "sftp URLs: user, port, home-relative, registered names" {
     try std.testing.expectEqualStrings("sftp.bank.example", b.cfg.host);
     try std.testing.expectEqual(@as(u16, 2200), b.cfg.port);
     try std.testing.expectEqualStrings("u1", b.cfg.user);
+}
+
+test "sftp URLs: user and password split at the colon and decoded, in any scheme case" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = try Proto.resolve(a, "SFTP://u:pw@unregistered-host.invalid/data/x");
+    try std.testing.expectEqualStrings("unregistered-host.invalid", t.cfg.host);
+    try std.testing.expectEqualStrings("u", t.cfg.user);
+    try std.testing.expectEqualStrings("pw", t.cfg.password.?);
+    try std.testing.expectEqualStrings("/data/x", t.path);
+    const enc = try Proto.resolve(a, "sftp://a%40corp:p%3Aw%40@unregistered-host.invalid/x");
+    try std.testing.expectEqualStrings("a@corp", enc.cfg.user);
+    try std.testing.expectEqualStrings("p:w@", enc.cfg.password.?);
+    try register("bank_pw", .{ .host = "sftp.bank.example", .user = "u1", .password = "conf" });
+    const r = try Proto.resolve(a, "sftp://u2:url@bank_pw/x");
+    try std.testing.expectEqualStrings("u2", r.cfg.user);
+    try std.testing.expectEqualStrings("url", r.cfg.password.?);
+    try std.testing.expectEqualStrings("conf", (try Proto.resolve(a, "sftp://u2@bank_pw/x")).cfg.password.?);
 }
 
 test "live: upload, list, read back whole, by range and streaming; an aborted upload leaves nothing (BASALT_SSH_TEST_PORT)" {

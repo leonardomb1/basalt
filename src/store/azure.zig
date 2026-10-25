@@ -39,8 +39,9 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
-const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
+const civil = @import("../exec/civil.zig");
 
 pub const api_version = "2021-08-06";
 
@@ -69,7 +70,7 @@ pub const Blob = struct {
 };
 
 pub fn isUrl(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "az://");
+    return scheme.of(s) == .az;
 }
 
 /// Splits `az://account/container/path...`; the container is the first segment.
@@ -77,7 +78,7 @@ pub fn isUrl(s: []const u8) bool {
 /// resource, not just the URL (see `canonicalResource`).
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Blob {
     if (!isUrl(url)) return Error.AzureBadUrl;
-    const rest = url["az://".len..];
+    const rest = scheme.Scheme.rest(url);
 
     const a_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.AzureBadUrl;
     const account = rest[0..a_end];
@@ -131,21 +132,9 @@ pub fn keyFromEnv(arena: std.mem.Allocator) ![]const u8 {
 
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, the only date format Shared Key accepts.
 pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
-    const days = @divFloor(epoch_secs, 86400);
-    const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
-    const c = civilFromDays(days);
-    const dow: usize = @intCast(@mod(days + 4, 7));
-    const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    return std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        day_names[dow],
-        c.d,
-        mon_names[c.m - 1],
-        @as(u32, @intCast(c.y)),
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-    });
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    civil.writeRfc1123(&aw.writer, epoch_secs) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 pub const MsHeader = struct { name: []const u8, value: []const u8 };
@@ -243,7 +232,9 @@ fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8,
     return out.toOwnedSlice();
 }
 
-/// Maps a status plus Azure's error code onto a distinct Zig error.
+/// Maps a status plus Azure's error code onto a distinct Zig error. Every status
+/// the retry loop replays as an outage (429 and the 5xx gateways) is `AzureThrottled`,
+/// so a run that exhausts its retries on one exits as transient; 408 and 501 are not (D12).
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "AuthenticationFailed")) return Error.AzureAuthFailed;
@@ -254,7 +245,7 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     return switch (code) {
         401, 403 => Error.AzureAuthFailed,
         404 => Error.AzureContainerMissing,
-        429, 503 => Error.AzureThrottled,
+        429, 500, 502, 503, 504 => Error.AzureThrottled,
         else => Error.AzureRequestFailed,
     };
 }
@@ -823,7 +814,7 @@ test "statusToError distinguishes causes instead of one catch-all" {
 /// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { account: []const u8, container: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.AzureBadUrl;
-    const rest = url["az://".len..];
+    const rest = scheme.Scheme.rest(url);
     const a_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.AzureBadUrl;
     const account = rest[0..a_end];
     const after = rest[a_end + 1 ..];
@@ -844,7 +835,7 @@ test "prefix URLs may have an empty prefix" {
 }
 
 pub const provider = objstore.Provider{
-    .scheme = "az://",
+    .scheme = .az,
     .empty_prefix = Error.AzureEmptyPrefix,
     .vtable = &.{
         .parse = vtParse,
@@ -898,4 +889,48 @@ fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.h
         why.* = arena.dupe(u8, w.last_error) catch "";
         return e;
     };
+}
+
+test "a retried-out 5xx gateway is AzureThrottled, which a run exits on as transient; 408 and 501 stay RequestFailed (D12)" {
+    for ([_]u16{ 429, 500, 502, 503, 504 }) |c| {
+        try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, ""));
+        try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, "<Error><Code>InternalError</Code></Error>"));
+    }
+    for ([_]u16{ 400, 405, 408, 409, 412, 418, 501, 505, 599 }) |c| try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(c, ""));
+    for (0..600) |c| {
+        const e = statusToError(@intCast(c), "");
+        if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.AzureThrottled, e);
+        if (e == Error.AzureThrottled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    }
+}
+
+test "rfc1123 on civil writes exactly what the hand-rolled one did, years 0000 to 99999" {
+    const Old = struct {
+        fn rfc(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+            const days = @divFloor(epoch_secs, 86400);
+            const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
+            const c = civil.civilFromDays(days);
+            const dow: usize = @intCast(@mod(days + 4, 7));
+            const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+            const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+            return std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+                day_names[dow],          c.d,                mon_names[c.m - 1],
+                @as(u32, @intCast(c.y)), secs_of_day / 3600, (secs_of_day % 3600) / 60,
+                secs_of_day % 60,
+            });
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lo: i64 = civil.daysFromCivil(0, 1, 1) * 86400;
+    const hi: i64 = civil.daysFromCivil(100000, 1, 1) * 86400 - 1;
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    const edges = [_]i64{ lo, -1, 0, 1, 86399, 784111777, 951782400, 253402300799, 253402300800, hi };
+    for (0..100_000 + edges.len) |i| {
+        const t = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, lo, hi);
+        _ = ar.reset(.retain_capacity);
+        try std.testing.expectEqualStrings(try Old.rfc(a, t), try rfc1123(a, t));
+    }
 }
