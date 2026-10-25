@@ -13,6 +13,7 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const celltext = @import("../../exec/celltext.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const driver = @import("../../connect/driver.zig");
 const Output = @import("../output.zig").Output;
 
@@ -44,9 +45,7 @@ pub const Writer = struct {
         const keys = try arena.alloc([]const u8, schema.fields.len);
         for (schema.fields, keys) |f, *k| {
             var aw = std.Io.Writer.Allocating.init(arena);
-            try aw.writer.writeByte('"');
-            try writeEscaped(&aw.writer, f.name);
-            try aw.writer.writeAll("\":");
+            try jsontext.key(&aw.writer, f.name);
             k.* = aw.writer.buffered();
         }
         const self = try arena.create(Writer);
@@ -110,41 +109,29 @@ pub const Writer = struct {
     const vtable = driver.sinkVTable(Writer);
 };
 
-/// The `celltext.write` policy for JSON: decimals and temporals ride as strings,
-/// non-finite floats as null and bytes as base64.
-pub const Text = struct {
-    pub const null_text = "null";
-    pub const bool_true = "true";
-    pub const bool_false = "false";
-    pub const quote_decimal = "\"";
-    pub const quote_temporal = "\"";
+/// The `celltext.write` policy for JSON rows (`jsontext.Text`).
+pub const Text = jsontext.Text;
 
-    pub fn string(_: Text, out: *std.Io.Writer, s: []const u8) !void {
-        try out.writeByte('"');
-        try writeEscaped(out, s);
-        try out.writeByte('"');
-    }
+/// `s` as the inside of a JSON string, repaired to UTF-8 first (`jsontext.chars`).
+pub const writeEscaped = jsontext.chars;
 
-    pub fn bytes(_: Text, out: *std.Io.Writer, s: []const u8) !void {
-        try out.writeByte('"');
-        try std.base64.standard.Encoder.encodeWriter(out, s);
-        try out.writeByte('"');
-    }
-
-    pub fn float(_: Text, out: *std.Io.Writer, x: f64) !void {
-        if (std.math.isFinite(x)) return out.print("{d}", .{x});
-        return out.writeAll("null");
-    }
-};
-
-/// `s` as the inside of a JSON string, repaired to UTF-8 first when it is not.
-pub fn writeEscaped(out: *std.Io.Writer, s: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(s)) return escapeValid(out, s);
-    var runs = celltext.Utf8Runs{ .s = s };
-    while (runs.next()) |t| try escapeValid(out, t);
+test "json escape covers quotes, backslash, control bytes and invalid UTF-8" {
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeEscaped(&w, "a\"b\\c\nd\x01");
+    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\u0001", w.buffered());
+    w = std.Io.Writer.fixed(&buf);
+    try writeEscaped(&w, "caf\xe9\t\"");
+    try std.testing.expectEqualStrings("caf\u{FFFD}\\t\\\"", w.buffered());
 }
 
-fn escapeValid(out: *std.Io.Writer, s: []const u8) !void {
+fn oracleEscaped(out: *std.Io.Writer, s: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(s)) return oracleEscapeValid(out, s);
+    var runs = celltext.Utf8Runs{ .s = s };
+    while (runs.next()) |t| try oracleEscapeValid(out, t);
+}
+
+fn oracleEscapeValid(out: *std.Io.Writer, s: []const u8) !void {
     var start: usize = 0;
     for (s, 0..) |c, i| {
         const esc: []const u8 = switch (c) {
@@ -163,14 +150,56 @@ fn escapeValid(out: *std.Io.Writer, s: []const u8) !void {
     try out.writeAll(s[start..]);
 }
 
-test "json escape covers quotes, backslash, control bytes and invalid UTF-8" {
-    var buf: [128]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try writeEscaped(&w, "a\"b\\c\nd\x01");
-    try std.testing.expectEqualStrings("a\\\"b\\\\c\\nd\\u0001", w.buffered());
-    w = std.Io.Writer.fixed(&buf);
-    try writeEscaped(&w, "caf\xe9\t\"");
-    try std.testing.expectEqualStrings("caf\u{FFFD}\\t\\\"", w.buffered());
+const OracleText = struct {
+    pub const null_text = "null";
+    pub const bool_true = "true";
+    pub const bool_false = "false";
+    pub const quote_decimal = "\"";
+    pub const quote_temporal = "\"";
+
+    pub fn string(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
+        try out.writeByte('"');
+        try oracleEscaped(out, s);
+        try out.writeByte('"');
+    }
+
+    pub fn bytes(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
+        try out.writeByte('"');
+        try std.base64.standard.Encoder.encodeWriter(out, s);
+        try out.writeByte('"');
+    }
+
+    pub fn float(_: OracleText, out: *std.Io.Writer, x: f64) !void {
+        if (std.math.isFinite(x)) return out.print("{d}", .{x});
+        return out.writeAll("null");
+    }
+};
+
+test "the jsontext escaper, key and Text policy equal the copies this file held" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x15_0b);
+    const r = prng.random();
+    var in: [48]u8 = undefined;
+    for (0..4000) |it| {
+        const n = r.uintLessThan(usize, in.len);
+        for (in[0..n]) |*c| c.* = if (it % 2 == 0) r.int(u8) else r.uintLessThan(u8, 0x80);
+        var want = std.Io.Writer.Allocating.init(a);
+        try want.writer.writeByte('"');
+        try oracleEscaped(&want.writer, in[0..n]);
+        try want.writer.writeAll("\":");
+        var got = std.Io.Writer.Allocating.init(a);
+        try jsontext.key(&got.writer, in[0..n]);
+        try std.testing.expectEqualStrings(want.written(), got.written());
+    }
+    for (try celltext.goldenBatches(a)) |batch| for (batch.columns) |*col| for (0..batch.len) |row| {
+        var want = std.Io.Writer.Allocating.init(a);
+        try celltext.write(&want.writer, col, row, OracleText{});
+        var got = std.Io.Writer.Allocating.init(a);
+        try celltext.write(&got.writer, col, row, Text{});
+        try std.testing.expectEqualStrings(want.written(), got.written());
+    };
 }
 
 test "JSON rows of every kind, NDJSON and as one array" {

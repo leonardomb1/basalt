@@ -86,37 +86,101 @@ const cp037_to_unicode = [256]u21{
     0x0038, 0x0039, 0x00B3, 0x00DB, 0x00DC, 0x00D9, 0x00DA, 0x009F,
 };
 
+/// What a byte a charset leaves undefined (five in windows-1252) decodes to: U+FFFD,
+/// or the C1 control of the same number, as SQL Server and Windows decode them.
+pub const Undefined = enum { replacement, c1 };
+
 /// The code point one byte of a single-byte charset stands for.
-fn codePoint(cs: Charset, c: u8) u21 {
+fn codePoint(cs: Charset, comptime undef: Undefined, c: u8) u21 {
     return switch (cs) {
         .utf8, .latin1 => c,
-        .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] == 0) 0xFFFD else cp1252_high[c - 0x80],
+        .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] != 0) cp1252_high[c - 0x80] else switch (undef) {
+            .replacement => 0xFFFD,
+            .c1 => c,
+        },
         .cp037 => cp037_to_unicode[c],
     };
+}
+
+/// One byte's character as UTF-8, at most three bytes.
+pub const Seq = struct { len: u8, bytes: [3]u8 };
+
+/// Each byte of single-byte charset `cs` as its UTF-8 sequence, built at compile time.
+pub fn utf8Table(comptime cs: Charset, comptime undef: Undefined) *const [256]Seq {
+    comptime std.debug.assert(cs != .utf8);
+    return &struct {
+        const table: [256]Seq = blk: {
+            @setEvalBranchQuota(20_000);
+            var t: [256]Seq = undefined;
+            for (&t, 0..) |*e, b| {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(codePoint(cs, undef, @intCast(b)), &buf) catch unreachable;
+                e.* = .{ .len = n, .bytes = buf[0..3].* };
+            }
+            break :blk t;
+        };
+    }.table;
+}
+
+fn asciiCompatible(comptime cs: Charset) bool {
+    return cs != .cp037;
+}
+
+/// The length of `src` in `cs` decoded to UTF-8.
+pub fn decodedLen(comptime cs: Charset, comptime undef: Undefined, src: []const u8) usize {
+    const t = utf8Table(cs, undef);
+    var n: usize = 0;
+    for (src) |b| n += if (asciiCompatible(cs) and b < 0x80) 1 else t[b].len;
+    return n;
+}
+
+/// `src` in `cs` as UTF-8 into `dst`, which holds at least `decodedLen(cs, undef,
+/// src)`; returns that length.
+pub fn decodeInto(comptime cs: Charset, comptime undef: Undefined, dst: []u8, src: []const u8) usize {
+    const t = utf8Table(cs, undef);
+    var o: usize = 0;
+    for (src) |b| {
+        if (asciiCompatible(cs) and b < 0x80) {
+            dst[o] = b;
+            o += 1;
+        } else {
+            const e = t[b];
+            @memcpy(dst[o..][0..e.len], e.bytes[0..e.len]);
+            o += e.len;
+        }
+    }
+    return o;
+}
+
+/// Whether every byte is below 0x80, sixteen bytes at a time.
+pub fn isAscii(bytes: []const u8) bool {
+    const V = @Vector(16, u8);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 16 <= bytes.len) : (i += 16) acc |= @as(V, bytes[i..][0..16].*);
+    var tail: u8 = @reduce(.Or, acc);
+    for (bytes[i..]) |b| tail |= b;
+    return tail < 0x80;
 }
 
 /// `bytes` in `cs` as UTF-8: invalid UTF-8 repaired, each single-byte character mapped;
 /// `bytes` itself when it needs no change.
 pub fn decode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const u8 {
-    if (cs == .utf8) {
-        if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
-        var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len + 8);
-        var runs = celltext.Utf8Runs{ .s = bytes };
-        while (runs.next()) |t| try out.appendSlice(t);
-        return out.items;
+    switch (cs) {
+        .utf8 => {
+            if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
+            var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len + 8);
+            var runs = celltext.Utf8Runs{ .s = bytes };
+            while (runs.next()) |t| try out.appendSlice(t);
+            return out.items;
+        },
+        inline else => |c| {
+            if (asciiCompatible(c) and isAscii(bytes)) return bytes;
+            const out = try arena.alloc(u8, decodedLen(c, .replacement, bytes));
+            _ = decodeInto(c, .replacement, out, bytes);
+            return out;
+        },
     }
-    if (cs != .cp037) {
-        for (bytes) |c| {
-            if (c >= 0x80) break;
-        } else return bytes;
-    }
-    var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len * 3);
-    var buf: [4]u8 = undefined;
-    for (bytes) |c| {
-        const n = std.unicode.utf8Encode(codePoint(cs, c), &buf) catch unreachable;
-        out.appendSliceAssumeCapacity(buf[0..n]);
-    }
-    return out.items;
 }
 
 /// UTF-8 `text` as `cs` bytes; `text` itself for UTF-8. A character `cs` cannot hold
@@ -162,4 +226,118 @@ test "charsets decode and encode back, refusing what they cannot hold" {
     try std.testing.expectEqualStrings("a\u{FFFD}", try decode(a, .utf8, "a\xff"));
     try std.testing.expectEqual(Charset.cp037, Charset.parse("EBCDIC").?);
     try std.testing.expectEqual(Charset.latin1, Charset.parse("ISO-8859-1").?);
+}
+
+fn oracleCodePoint(cs: Charset, c: u8) u21 {
+    return switch (cs) {
+        .utf8, .latin1 => c,
+        .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] == 0) 0xFFFD else cp1252_high[c - 0x80],
+        .cp037 => cp037_to_unicode[c],
+    };
+}
+
+fn oracleDecode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const u8 {
+    if (cs == .utf8) {
+        if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
+        var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len + 8);
+        var runs = celltext.Utf8Runs{ .s = bytes };
+        while (runs.next()) |t| try out.appendSlice(t);
+        return out.items;
+    }
+    if (cs != .cp037) {
+        for (bytes) |c| {
+            if (c >= 0x80) break;
+        } else return bytes;
+    }
+    var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len * 3);
+    var buf: [4]u8 = undefined;
+    for (bytes) |c| {
+        const n = std.unicode.utf8Encode(oracleCodePoint(cs, c), &buf) catch unreachable;
+        out.appendSliceAssumeCapacity(buf[0..n]);
+    }
+    return out.items;
+}
+
+fn tdsCp1252High(b: u8) u21 {
+    return switch (b) {
+        0x80 => 0x20AC,
+        0x82 => 0x201A,
+        0x83 => 0x0192,
+        0x84 => 0x201E,
+        0x85 => 0x2026,
+        0x86 => 0x2020,
+        0x87 => 0x2021,
+        0x88 => 0x02C6,
+        0x89 => 0x2030,
+        0x8A => 0x0160,
+        0x8B => 0x2039,
+        0x8C => 0x0152,
+        0x8E => 0x017D,
+        0x91 => 0x2018,
+        0x92 => 0x2019,
+        0x93 => 0x201C,
+        0x94 => 0x201D,
+        0x95 => 0x2022,
+        0x96 => 0x2013,
+        0x97 => 0x2014,
+        0x98 => 0x02DC,
+        0x99 => 0x2122,
+        0x9A => 0x0161,
+        0x9B => 0x203A,
+        0x9C => 0x0153,
+        0x9E => 0x017E,
+        0x9F => 0x0178,
+        else => b,
+    };
+}
+
+test "decode by table equals the per-byte encoder it replaced, every byte and a random corpus" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*b, i| b.* = @intCast(i);
+    var prng = std.Random.DefaultPrng.init(0x1252);
+    const r = prng.random();
+    var buf: [96]u8 = undefined;
+    for ([_]Charset{ .utf8, .latin1, .cp1252, .cp037 }) |cs| {
+        for (0..256) |i| try std.testing.expectEqualStrings(try oracleDecode(a, cs, all[i .. i + 1]), try decode(a, cs, all[i .. i + 1]));
+        try std.testing.expectEqualStrings(try oracleDecode(a, cs, &all), try decode(a, cs, &all));
+        try std.testing.expectEqualStrings("", try decode(a, cs, ""));
+        for (0..3000) |it| {
+            const n = r.uintLessThan(usize, buf.len + 1);
+            for (buf[0..n]) |*b| b.* = if (it % 2 == 0) r.int(u8) else r.uintLessThan(u8, 0x80);
+            try std.testing.expectEqualStrings(try oracleDecode(a, cs, buf[0..n]), try decode(a, cs, buf[0..n]));
+        }
+    }
+}
+
+test "cp1252 with C1 undefined bytes equals SQL Server's table; the default policy gives U+FFFD" {
+    const t = utf8Table(.cp1252, .c1);
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        var want: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(if (b < 0x80) b else tdsCp1252High(b), &want);
+        try std.testing.expectEqualSlices(u8, want[0..n], t[b].bytes[0..t[b].len]);
+    }
+    var out: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("\xc2\x81a", out[0..decodeInto(.cp1252, .c1, &out, "\x81a")]);
+    try std.testing.expectEqualStrings("\u{FFFD}a", out[0..decodeInto(.cp1252, .replacement, &out, "\x81a")]);
+    try std.testing.expectEqual(@as(usize, 3), decodedLen(.cp1252, .c1, "\x81a"));
+    try std.testing.expectEqual(@as(usize, 4), decodedLen(.cp1252, .replacement, "\x81a"));
+}
+
+test "isAscii agrees with a byte loop at every length and position of a high byte" {
+    var buf: [80]u8 = undefined;
+    @memset(&buf, 'a');
+    for (0..buf.len + 1) |len| {
+        try std.testing.expect(isAscii(buf[0..len]));
+        for (0..len) |at| {
+            buf[at] = 0x80;
+            try std.testing.expect(!isAscii(buf[0..len]));
+            buf[at] = 0x7F;
+            try std.testing.expect(isAscii(buf[0..len]));
+            buf[at] = 'a';
+        }
+    }
 }

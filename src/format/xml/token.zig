@@ -284,10 +284,7 @@ pub fn decodeInto(out: *std.array_list.Managed(u8), raw: []const u8, ooxml: bool
         const ent = raw[i + 1 .. semi];
         i = semi + 1;
         if (ent.len > 1 and ent[0] == '#') {
-            const cp = if (ent[1] == 'x' or ent[1] == 'X')
-                hex.int(u21, ent[2..]) orelse return error.BadXml
-            else
-                std.fmt.parseInt(u21, ent[1..], 10) catch return error.BadXml;
+            const cp = (if (ent[1] == 'x' or ent[1] == 'X') hex.int(u21, ent[2..]) else decimalRef(ent[1..])) orelse return error.BadXml;
             try appendCodepoint(out, cp);
         } else if (std.mem.eql(u8, ent, "amp")) {
             try out.append('&');
@@ -333,8 +330,14 @@ pub fn unescapeOoxml(out: *std.array_list.Managed(u8), start: usize) void {
 /// the `_` of any text this matches, so no literal text decodes as an escape.
 pub fn ooxmlEscape(s: []const u8) ?u21 {
     if (s.len < 7 or s[0] != '_' or s[1] != 'x' or s[6] != '_') return null;
-    for (s[2..6]) |c| if (!std.ascii.isHex(c)) return null;
-    return std.fmt.parseInt(u21, s[2..6], 16) catch null;
+    return hex.int(u21, s[2..6]);
+}
+
+/// The code point a decimal character reference spells, digits only; null otherwise.
+fn decimalRef(s: []const u8) ?u21 {
+    if (s.len == 0) return null;
+    for (s) |c| if (!std.ascii.isDigit(c)) return null;
+    return std.fmt.parseInt(u21, s, 10) catch null;
 }
 
 fn appendCodepoint(out: *std.array_list.Managed(u8), cp: u21) Error!void {
@@ -388,4 +391,16 @@ test "decode: a hex character reference takes hex digits only, with no sign or `
         errdefer std.debug.print("in `{s}`\n", .{bad});
         try std.testing.expectError(error.BadXml, decodeInto(&out, bad, false));
     }
+}
+
+test "decode: a character reference is digits only, no sign or underscore" {
+    var out = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer out.deinit();
+    for ([_][]const u8{ "&#x4_1;", "&#x+41;", "&#x-41;", "&#x;", "&#6_5;", "&#+65;", "&#-65;", "&#;", "&#x 41;", "&#x110000000;" }) |bad| {
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.BadXml, decodeInto(&out, bad, false));
+    }
+    out.clearRetainingCapacity();
+    try decodeInto(&out, "&#x41;&#X0062;&#99;&#0000100;", false);
+    try std.testing.expectEqualStrings("Abcd", out.items);
 }

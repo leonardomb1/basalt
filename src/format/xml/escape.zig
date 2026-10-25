@@ -14,6 +14,7 @@
 const std = @import("std");
 const celltext = @import("../../exec/celltext.zig");
 const token = @import("token.zig");
+const hex = @import("../hex.zig");
 
 pub const Mode = struct { ooxml: bool = false, attr: bool = false };
 
@@ -119,11 +120,7 @@ fn decodedAt(s: []const u8) ?Decoded {
     if (s.len < 7 or s[0] != '_' or s[1] != 'x') return null;
     inline for (.{ 4, 8 }) |n| {
         if (s.len >= n + 3 and s[n + 2] == '_') {
-            const hex = s[2 .. n + 2];
-            const all_hex = for (hex) |h| {
-                if (!std.ascii.isHex(h)) break false;
-            } else true;
-            if (all_hex) if (std.fmt.parseInt(u21, hex, 16)) |cp| return .{ .cp = cp, .len = n + 3 } else |_| {};
+            if (hex.int(u21, s[2 .. n + 2])) |cp| return .{ .cp = cp, .len = n + 3 };
         }
     }
     return null;
@@ -176,5 +173,45 @@ test "names are encoded as FOR XML does and decode back" {
         try name(&w, c[0]);
         try std.testing.expectEqualStrings(c[1], w.buffered());
         try std.testing.expectEqualStrings(c[0], try decodeName(a, c[1]));
+    }
+}
+
+fn oracleDecodedAt(s: []const u8) ?Decoded {
+    if (s.len < 7 or s[0] != '_' or s[1] != 'x') return null;
+    inline for (.{ 4, 8 }) |n| {
+        if (s.len >= n + 3 and s[n + 2] == '_') {
+            const digits = s[2 .. n + 2];
+            const all_hex = for (digits) |h| {
+                if (!std.ascii.isHex(h)) break false;
+            } else true;
+            if (all_hex) if (std.fmt.parseInt(u21, digits, 16)) |cp| return .{ .cp = cp, .len = n + 3 } else |_| {};
+        }
+    }
+    return null;
+}
+
+fn oracleOoxmlEscape(s: []const u8) ?u21 {
+    if (s.len < 7 or s[0] != '_' or s[1] != 'x' or s[6] != '_') return null;
+    for (s[2..6]) |c| if (!std.ascii.isHex(c)) return null;
+    return std.fmt.parseInt(u21, s[2..6], 16) catch null;
+}
+
+test "the _xHHHH_ recognizers on format/hex equal their parseInt bodies" {
+    var prng = std.Random.DefaultPrng.init(0x5f78);
+    const r = prng.random();
+    const alphabet = "_x0123456789abcdefABCDEFg+- ";
+    var buf: [14]u8 = undefined;
+    for (0..200_000) |_| {
+        const n = r.uintAtMost(usize, buf.len);
+        for (buf[0..n]) |*c| c.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        if (n >= 2 and r.boolean()) {
+            buf[0] = '_';
+            buf[1] = 'x';
+        }
+        for ([_]usize{ 6, 10 }) |at| if (n > at and r.boolean()) {
+            buf[at] = '_';
+        };
+        try std.testing.expectEqual(oracleDecodedAt(buf[0..n]), decodedAt(buf[0..n]));
+        try std.testing.expectEqual(oracleOoxmlEscape(buf[0..n]), token.ooxmlEscape(buf[0..n]));
     }
 }

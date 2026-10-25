@@ -8,9 +8,12 @@
 //! met, each typed from the values it took there, NULLs aside: integers INT, any
 //! float FLOAT, booleans BOOL, strings, nested objects and arrays, or a mix of kinds,
 //! STRING, nested values as compact JSON text. A key never seen with a value is a
-//! STRING. Every row, sampled or later, is read into those columns as `CAST` reads a
-//! value (`Rows`): a key missing from a row is NULL, a key not among the columns is
-//! dropped, and a value its column cannot read is NULL rather than a guess.
+//! STRING, of unknown type when the sample read the whole input, so it unifies with
+//! any type as a CSV column of NULLs does (`Type.nullColumn`); the first of several
+//! files is not the whole input. Every row, sampled or later, is read into those
+//! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, a key
+//! not among the columns is dropped, and a value its column cannot read is NULL
+//! rather than a guess.
 //!
 //! The input streams: values are cut out of a buffer that holds about one batch of
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
@@ -38,14 +41,18 @@ pub const Options = struct {
     batch_rows: usize = 2048,
     chunk: usize = 64 << 10,
     schema: ?types.Schema = null,
+    /// Whether this input is all that is read, so a sample that reaches its end has
+    /// seen every row; false for the first of several files.
+    alone: bool = true,
 };
 
 pub const Infer = struct {
     names: std.ArrayListUnmanaged([]const u8) = .empty,
-    kinds: std.ArrayListUnmanaged(Kind) = .empty,
+    samples: std.ArrayListUnmanaged(types.Sample) = .empty,
     index: std.StringHashMapUnmanaged(usize) = .empty,
-
-    const Kind = enum { none, boolean, int, float, text };
+    /// Whether the noted rows are the whole input, so a key never seen with a value
+    /// is of unknown type (`Type.nullColumn`).
+    whole: bool = false,
 
     /// Notes one row's keys and value kinds.
     pub fn note(self: *Infer, arena: std.mem.Allocator, row: []const u8) Error!void {
@@ -58,18 +65,19 @@ pub const Infer = struct {
                 gop.key_ptr.* = try arena.dupe(u8, key);
                 gop.value_ptr.* = self.names.items.len;
                 try self.names.append(arena, gop.key_ptr.*);
-                try self.kinds.append(arena, .none);
+                try self.samples.append(arena, .none);
             }
-            const k = &self.kinds.items[gop.value_ptr.*];
-            k.* = widen(k.*, kindOf(mem.value));
+            const s = &self.samples.items[gop.value_ptr.*];
+            if (kindOf(mem.value)) |k| s.* = types.widenSample(s.*, k);
         }
     }
 
-    fn kindOf(raw: []const u8) Kind {
+    /// A value's kind, null for JSON null; strings and nested values are text.
+    fn kindOf(raw: []const u8) ?types.TypeKind {
         return switch (raw[0]) {
-            'n' => .none,
-            't', 'f' => .boolean,
-            '"', '{', '[' => .text,
+            'n' => null,
+            't', 'f' => .bool,
+            '"', '{', '[' => .string,
             else => switch (jt.number(raw)) {
                 .int => .int,
                 .float, .text => .float,
@@ -77,23 +85,11 @@ pub const Infer = struct {
         };
     }
 
-    fn widen(a: Kind, b: Kind) Kind {
-        if (a == .none) return b;
-        if (b == .none or a == b) return a;
-        if ((a == .int and b == .float) or (a == .float and b == .int)) return .float;
-        return .text;
-    }
-
     pub fn schema(self: *const Infer, arena: std.mem.Allocator) Error!types.Schema {
         const fields = try arena.alloc(types.Schema.Field, self.names.items.len);
-        for (fields, self.names.items, self.kinds.items) |*f, n, k| f.* = .{
+        for (fields, self.names.items, self.samples.items) |*f, n, s| f.* = .{
             .name = n,
-            .ty = types.Type.init(switch (k) {
-                .boolean => .bool,
-                .int => .int,
-                .float => .float,
-                .none, .text => .string,
-            }).asNullable(),
+            .ty = if (s.kind()) |k| types.Type.init(k).asNullable() else types.Type.nullColumn(self.whole),
         };
         return .{ .fields = fields };
     }
@@ -448,7 +444,10 @@ pub const Reader = struct {
         var held = std.array_list.Managed([]const u8).init(arena);
         try held.appendSlice(self.held);
         while (held.items.len < opts.sample) {
-            const row = (try self.nextRow(arena)) orelse break;
+            const row = (try self.nextRow(arena)) orelse {
+                infer.whole = opts.alone;
+                break;
+            };
             try held.append(try arena.dupe(u8, row));
         }
         for (held.items) |row| try infer.note(arena, row);
@@ -511,8 +510,22 @@ pub const Reader = struct {
     }
 };
 
-/// JSON files read as one table (`files.Files`).
-pub const Files = @import("../files.zig").Files(Reader, Options);
+/// JSON files read as one table (`files.Files`); the first of several is not `alone`.
+pub const Files = struct {
+    const Table = @import("../files.zig").Files(Reader, Options);
+
+    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !*Table {
+        var o = opts;
+        o.alone = opts.alone and files.len <= 1;
+        return Table.open(arena, gpa, files, o);
+    }
+
+    pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *stream.Stream, rest: []const []const u8, opts: Options) !*Table {
+        var o = opts;
+        o.alone = opts.alone and rest.len == 0;
+        return Table.on(arena, gpa, s, rest, o);
+    }
+};
 
 const testing = std.testing;
 
@@ -576,6 +589,94 @@ test "columns come from the sampled rows: keys in first-met order, types widened
     try testing.expectEqualStrings("true", got.rows[1][2].string);
     try testing.expectEqualStrings("[1,2]", got.rows[2][3].string);
     try testing.expect(got.rows[3][0].isNull());
+}
+
+test "a key with no value is of unknown type only when the sample read the whole input" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const text = "{\"k\":1,\"n\":null}\n{\"k\":2}\n";
+    const Case = struct { doc: []const u8, o: Options, unknown: bool };
+    const cases = [_]Case{
+        .{ .doc = text, .o = .{}, .unknown = true },
+        .{ .doc = text, .o = .{ .sample = 3 }, .unknown = true },
+        .{ .doc = text, .o = .{ .sample = 2 }, .unknown = false },
+        .{ .doc = text, .o = .{ .alone = false }, .unknown = false },
+        .{ .doc = text, .o = .{ .sample = 1 }, .unknown = false },
+        .{ .doc = "[{\"k\":1,\"n\":null},{\"k\":2}]", .o = .{}, .unknown = true },
+        .{ .doc = "{\"rows\":[{\"k\":1,\"n\":null},{\"k\":2}]}", .o = .{ .items = "rows" }, .unknown = true },
+        .{ .doc = "{\"rows\":{\"k\":1,\"n\":null}}", .o = .{ .items = "rows" }, .unknown = true },
+    };
+    for (cases) |c| {
+        const n = (try readAll(a, c.doc, c.o)).schema.fields[1].ty;
+        try testing.expectEqual(types.TypeKind.string, n.kind);
+        try testing.expect(n.nullable);
+        try testing.expectEqual(c.unknown, n.unknown);
+    }
+    try testing.expect(!(try schemaOf(a, &.{"{\"n\":null}"}, 8)).fields[0].ty.unknown);
+}
+
+fn oracleInferKinds(arena: std.mem.Allocator, rows: []const []const u8) ![]const types.TypeKind {
+    const Kind = enum { none, boolean, int, float, text };
+    var names = std.StringArrayHashMap(Kind).init(arena);
+    for (rows) |row| {
+        if (row[0] != '{') continue;
+        var m = jt.Members.root(row);
+        while (m.next()) |mem| {
+            const gop = try names.getOrPut(try jt.decodeString(arena, mem.key));
+            if (!gop.found_existing) gop.value_ptr.* = .none;
+            const b: Kind = switch (mem.value[0]) {
+                'n' => .none,
+                't', 'f' => .boolean,
+                '"', '{', '[' => .text,
+                else => switch (jt.number(mem.value)) {
+                    .int => .int,
+                    .float, .text => .float,
+                },
+            };
+            const x = gop.value_ptr.*;
+            gop.value_ptr.* = if (x == .none) b else if (b == .none or x == b) x else if ((x == .int and b == .float) or (x == .float and b == .int)) .float else .text;
+        }
+    }
+    const out = try arena.alloc(types.TypeKind, names.count());
+    for (names.values(), out) |k, *o| o.* = switch (k) {
+        .boolean => .bool,
+        .int => .int,
+        .float => .float,
+        .none, .text => .string,
+    };
+    return out;
+}
+
+test "Infer on widenSample types every key as the lattice it replaced did" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x1f_e5);
+    const r = prng.random();
+    const vals = [_][]const u8{ "null", "true", "false", "1", "-7", "2.5", "1e3", "18446744073709551616", "\"s\"", "\"\"", "{\"x\":1}", "[1]", "[]" };
+    const keys = [_][]const u8{ "a", "b", "c", "d" };
+    var rows: [6][]const u8 = undefined;
+    for (0..20_000) |_| {
+        const nrows = 1 + r.uintLessThan(usize, rows.len);
+        for (rows[0..nrows]) |*row| {
+            var t = std.Io.Writer.Allocating.init(a);
+            try t.writer.writeByte('{');
+            for (0..r.uintLessThan(usize, keys.len + 1)) |i| {
+                if (i > 0) try t.writer.writeByte(',');
+                try t.writer.print("\"{s}\":{s}", .{ keys[r.uintLessThan(usize, keys.len)], vals[r.uintLessThan(usize, vals.len)] });
+            }
+            try t.writer.writeByte('}');
+            row.* = t.written();
+        }
+        const want = try oracleInferKinds(a, rows[0..nrows]);
+        const got = try schemaOf(a, rows[0..nrows], nrows);
+        try testing.expectEqual(want.len, got.fields.len);
+        for (want, got.fields) |k, f| {
+            try testing.expectEqual(k, f.ty.kind);
+            try testing.expect(f.ty.nullable and !f.ty.unknown);
+        }
+    }
 }
 
 test "a value its column cannot read is NULL; strings and escaped keys decode" {
