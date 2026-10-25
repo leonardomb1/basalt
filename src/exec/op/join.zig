@@ -896,9 +896,7 @@ pub const Join = struct {
         return @max(self.spill_at, self.build_cap orelse op_mod.join_build_byte_cap);
     }
 
-    /// The in-memory index, or null after switching to grace mode. A join that may
-    /// spill pulls its build side into a scratch arena, so what it held is freed
-    /// once indexed or written out.
+    /// The probe's key column kinds, which the build keys meet; worked out once.
     fn probeKinds(self: *Join) ![]const types.TypeKind {
         if (self.probe_kinds) |p| return p;
         const p = try self.state.alloc(types.TypeKind, self.left_keys.len);
@@ -907,6 +905,9 @@ pub const Join = struct {
         return p;
     }
 
+    /// The in-memory index, or null after switching to grace mode. A join that may
+    /// spill pulls its build side into a scratch arena, so what it held is freed
+    /// once indexed or written out.
     fn buildIndex(self: *Join) anyerror!?*JoinIndex {
         const build = self.build orelse return error.JoinHasNoBuildSide;
         const cap = self.build_cap orelse op_mod.join_build_byte_cap;
