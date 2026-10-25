@@ -4,7 +4,8 @@
 //!
 //! Shared pieces: the XML tag scraping both REST APIs need, the error-body parser
 //! (`<Code>`/`<Message>`, shown as `Code: Message (HTTP nnn)` instead of a bare
-//! status), the retry policy, the `std.Io.Writer` drain adapter for a streaming
+//! status), the retry policy (re-exported from connect/retry.zig), the
+//! `std.Io.Writer` drain adapter for a streaming
 //! upload, and the paginated listing loop. Signing stays per provider: Shared Key
 //! and SigV4 have nothing in common past "put a header on the request", and query
 //! parameter names and encoding stay with each provider's page function because
@@ -42,6 +43,7 @@ const std = @import("std");
 const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
 const driver = @import("../connect/driver.zig");
+const retry_mod = @import("../connect/retry.zig");
 const http_client = @import("../net/http_client.zig");
 const percent = @import("../net/percent.zig");
 const FakeServer = @import("../testing/http_fake.zig").FakeServer;
@@ -66,95 +68,16 @@ pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const 
     return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
 }
 
-pub fn retriable(code: u16) bool {
-    return switch (code) {
-        408, 429, 500, 502, 503, 504 => true,
-        else => false,
-    };
-}
-
-/// A request that died on the wire: the socket set every connector shares, plus a
-/// server that closed the connection instead of answering.
-pub fn transient(e: anyerror) bool {
-    return driver.transientNet(e) or e == error.HttpConnectionClosing;
-}
-
-pub const max_attempts = 5;
-pub const budget_ms: u64 = 30_000;
-
-/// `Retry-After` in delta-seconds; the HTTP-date form is left to the backoff.
-pub fn retryAfterMs(value: []const u8) ?u64 {
-    const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
-    return std.math.mul(u64, secs, std.time.ms_per_s) catch budget_ms;
-}
-
-/// Seeded from the OS, so lanes throttled in the same millisecond still draw different jitter.
-pub fn jitterPrng() std.Random.DefaultPrng {
-    return std.Random.DefaultPrng.init(std.crypto.random.int(u64));
-}
-
-/// `retriable` overrides the status rule, for a caller with its own list of codes.
-pub const Verdict = union(enum) {
-    done,
-    again,
-    failed: struct { code: u16, err: anyerror, retry_after_ms: ?u64 = null, retriable: ?bool = null },
-};
-
-pub const Sleep = *const fn (ns: u64) void;
-
-pub const Policy = struct {
-    rand: std.Random,
-    sleep: Sleep = std.Thread.sleep,
-    max_attempts: usize = max_attempts,
-    base_ms: u64 = 500,
-    max_shift: u6 = 4,
-    budget_ms: u64 = budget_ms,
-
-    /// `base_ms` doubling per attempt, at most `max_shift` times, plus up to 50% jitter.
-    pub fn backoffMs(self: Policy, attempt: usize) u64 {
-        const base = self.base_ms *| (@as(u64, 1) << @intCast(@min(attempt, self.max_shift)));
-        return base +| self.rand.uintLessThan(u64, base / 2 + 1);
-    }
-};
-
-/// The one retry loop of every HTTP caller: runs `attemptFn(ctx)` until it reports
-/// `.done`, giving up on the first failure that is not transient, after the policy's
-/// attempts, once its sleep budget is spent, or as soon as the run is aborting.
-pub fn retry(policy: Policy, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
-    var slept: u64 = 0;
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
-        var wait = policy.backoffMs(attempt);
-        const err = if (attemptFn(ctx)) |v| switch (v) {
-            .done => return,
-            .again => continue,
-            .failed => |f| blk: {
-                if (!(f.retriable orelse retriable(f.code))) return f.err;
-                wait = @max(wait, f.retry_after_ms orelse 0);
-                break :blk f.err;
-            },
-        } else |e| blk: {
-            if (!transient(e)) return e;
-            break :blk e;
-        };
-        if (attempt + 1 >= policy.max_attempts or slept >= policy.budget_ms or driver.aborting()) return err;
-        wait = @min(wait, policy.budget_ms - slept);
-        if (!pause(policy.sleep, wait)) return err;
-        slept += wait;
-    }
-}
-
-/// Sleeps `ms` in short slices; false as soon as the run starts aborting.
-fn pause(sleep: Sleep, ms: u64) bool {
-    var left = ms;
-    while (left > 0) {
-        const step: u64 = @min(left, 100);
-        sleep(step * std.time.ns_per_ms);
-        left -= step;
-        if (driver.aborting()) return false;
-    }
-    return true;
-}
+pub const retriable = retry_mod.retriable;
+pub const transient = retry_mod.transient;
+pub const max_attempts = retry_mod.max_attempts;
+pub const budget_ms = retry_mod.budget_ms;
+pub const retryAfterMs = retry_mod.retryAfterMs;
+pub const jitterPrng = retry_mod.jitterPrng;
+pub const Verdict = retry_mod.Verdict;
+pub const Sleep = retry_mod.Sleep;
+pub const Policy = retry_mod.Policy;
+pub const retry = retry_mod.retry;
 
 pub const Response = struct {
     code: u16,
@@ -682,131 +605,145 @@ test "a listing page gives every item, entities decoded, and nothing else" {
     try std.testing.expectEqualStrings("p/c&d.csv", amp[1]);
 }
 
-test "retry policy: transport failures, 408, 429 and 5xx gateways retry; other 4xx do not" {
-    for ([_]u16{ 408, 429, 500, 502, 503, 504 }) |c| try std.testing.expect(retriable(c));
-    for ([_]u16{ 200, 201, 206, 400, 401, 403, 404, 409, 412, 501 }) |c| try std.testing.expect(!retriable(c));
-    try std.testing.expect(transient(error.ConnectionResetByPeer) and transient(error.HttpConnectionClosing));
-    try std.testing.expect(transient(error.ConnectionRefused) and transient(error.EndOfStream));
-    try std.testing.expect(!transient(error.S3AuthFailed) and !transient(error.OutOfMemory));
-}
-
-test "backoff doubles from 500 ms with up to 50% jitter, capped at 8 s; Retry-After reads delta-seconds" {
-    for (0..5) |i| {
-        const base = @as(u64, 500) << @intCast(i);
-        var above_base = false;
-        for (0..64) |seed| {
-            var prng = std.Random.DefaultPrng.init(seed);
-            const ms = (Policy{ .rand = prng.random() }).backoffMs(i);
-            try std.testing.expect(ms >= base and ms <= base + base / 2);
-            if (ms > base) above_base = true;
-        }
-        try std.testing.expect(above_base);
-    }
-    for ([_]usize{ 5, 6, 12, 40 }) |attempt| {
-        for (0..64) |seed| {
-            var prng = std.Random.DefaultPrng.init(seed);
-            const ms = (Policy{ .rand = prng.random() }).backoffMs(attempt);
-            try std.testing.expect(ms >= 8000 and ms <= 12000);
-        }
-    }
-    try std.testing.expectEqual(@as(?u64, 7000), retryAfterMs("7"));
-    try std.testing.expectEqual(@as(?u64, 0), retryAfterMs(" 0 "));
-    try std.testing.expectEqual(@as(?u64, null), retryAfterMs("Wed, 21 Oct 2015 07:28:00 GMT"));
-}
-
-const Scripted = struct {
-    codes: []const u16,
-    calls: usize = 0,
-    retry_after_ms: ?u64 = null,
-
-    var slept_ms: u64 = 0;
-
-    /// 0 fixes the cause itself (`.again`), 1 is a reset connection, 2 a local
-    /// non-transient failure, 200 success, anything else that status.
-    fn attempt(self: *Scripted) !Verdict {
-        const code = self.codes[@min(self.calls, self.codes.len - 1)];
-        self.calls += 1;
+/// objstore's own retry loop before it moved to connect/retry.zig, kept as the
+/// oracle the re-exported one must match call for call and sleep for sleep.
+const Oracle = struct {
+    fn retriableOld(code: u16) bool {
         return switch (code) {
-            0 => .again,
-            1 => error.ConnectionResetByPeer,
-            2 => error.OutOfMemory,
-            200 => .done,
-            else => .{ .failed = .{ .code = code, .err = error.Scripted, .retry_after_ms = self.retry_after_ms } },
+            408, 429, 500, 502, 503, 504 => true,
+            else => false,
         };
     }
-    fn noSleep(ns: u64) void {
-        slept_ms += ns / std.time.ns_per_ms;
+
+    fn transientOld(e: anyerror) bool {
+        return driver.transientNet(e) or e == error.HttpConnectionClosing;
     }
-    fn abortingSleep(ns: u64) void {
-        noSleep(ns);
-        driver.requestAbort();
+
+    fn retryAfterOld(value: []const u8) ?u64 {
+        const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
+        return std.math.mul(u64, secs, std.time.ms_per_s) catch 30_000;
     }
+
+    fn backoffOld(rand: std.Random, attempt: usize) u64 {
+        const base = @as(u64, 500) *| (@as(u64, 1) << @intCast(@min(attempt, 4)));
+        return base +| rand.uintLessThan(u64, base / 2 + 1);
+    }
+
+    fn pauseOld(sleep: Sleep, ms: u64) bool {
+        var left = ms;
+        while (left > 0) {
+            const step: u64 = @min(left, 100);
+            sleep(step * std.time.ns_per_ms);
+            left -= step;
+            if (driver.aborting()) return false;
+        }
+        return true;
+    }
+
+    fn retryOld(rand: std.Random, sleep: Sleep, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
+        var slept: u64 = 0;
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            var wait = backoffOld(rand, attempt);
+            const err = if (attemptFn(ctx)) |v| switch (v) {
+                .done => return,
+                .again => continue,
+                .failed => |f| blk: {
+                    if (!(f.retriable orelse retriableOld(f.code))) return f.err;
+                    wait = @max(wait, f.retry_after_ms orelse 0);
+                    break :blk f.err;
+                },
+            } else |e| blk: {
+                if (!transientOld(e)) return e;
+                break :blk e;
+            };
+            if (attempt + 1 >= 5 or slept >= 30_000 or driver.aborting()) return err;
+            wait = @min(wait, 30_000 - slept);
+            if (!pauseOld(sleep, wait)) return err;
+            slept += wait;
+        }
+    }
+
+    const Script = struct {
+        codes: []const u16,
+        calls: usize = 0,
+        retry_after_ms: ?u64 = null,
+        override: ?bool = null,
+
+        var slept_ms: u64 = 0;
+        var naps: usize = 0;
+        var abort_at: usize = std.math.maxInt(usize);
+
+        fn attempt(self: *Script) !Verdict {
+            const code = self.codes[@min(self.calls, self.codes.len - 1)];
+            self.calls += 1;
+            return switch (code) {
+                0 => .again,
+                1 => error.ConnectionResetByPeer,
+                2 => error.OutOfMemory,
+                3 => error.HttpConnectionClosing,
+                200 => .done,
+                else => .{ .failed = .{ .code = code, .err = error.Scripted, .retry_after_ms = self.retry_after_ms, .retriable = self.override } },
+            };
+        }
+
+        fn nap(ns: u64) void {
+            slept_ms += ns / std.time.ns_per_ms;
+            naps += 1;
+            if (naps >= abort_at) driver.requestAbort();
+        }
+
+        fn reset(abort_at_nap: usize) void {
+            slept_ms = 0;
+            naps = 0;
+            abort_at = abort_at_nap;
+            driver.resetAbort();
+        }
+    };
 };
 
-test "retry gives up after max_attempts and only ever retries transient failures" {
-    var prng = std.Random.DefaultPrng.init(0);
-    const policy = Policy{ .rand = prng.random(), .sleep = Scripted.noSleep };
-
-    var throttled = Scripted{ .codes = &.{503} };
-    try std.testing.expectError(error.Scripted, retry(policy, &throttled, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, max_attempts), throttled.calls);
-
-    var flaky = Scripted{ .codes = &.{ 500, 429, 1, 502, 504, 200 } };
-    try std.testing.expectError(error.Scripted, retry(policy, &flaky, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, max_attempts), flaky.calls);
-
-    var recovers = Scripted{ .codes = &.{ 1, 408, 200 } };
-    try retry(policy, &recovers, Scripted.attempt);
-    try std.testing.expectEqual(@as(usize, 3), recovers.calls);
-
-    var denied = Scripted{ .codes = &.{ 403, 200 } };
-    try std.testing.expectError(error.Scripted, retry(policy, &denied, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, 1), denied.calls);
-
-    var broken = Scripted{ .codes = &.{ 2, 200 } };
-    try std.testing.expectError(error.OutOfMemory, retry(policy, &broken, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, 1), broken.calls);
-
-    var created = Scripted{ .codes = &.{ 0, 200 } };
-    try retry(policy, &created, Scripted.attempt);
-    try std.testing.expectEqual(@as(usize, 2), created.calls);
-}
-
-test "retry stretches the wait to Retry-After but never sleeps past the budget" {
-    var prng = std.Random.DefaultPrng.init(0);
-    const policy = Policy{ .rand = prng.random(), .sleep = Scripted.noSleep };
-
-    Scripted.slept_ms = 0;
-    var told = Scripted{ .codes = &.{ 503, 200 }, .retry_after_ms = 4000 };
-    try retry(policy, &told, Scripted.attempt);
-    try std.testing.expectEqual(@as(u64, 4000), Scripted.slept_ms);
-
-    Scripted.slept_ms = 0;
-    var greedy = Scripted{ .codes = &.{503}, .retry_after_ms = 3600 * 1000 };
-    try std.testing.expectError(error.Scripted, retry(policy, &greedy, Scripted.attempt));
-    try std.testing.expectEqual(budget_ms, Scripted.slept_ms);
-    try std.testing.expectEqual(@as(usize, 2), greedy.calls);
-
-    Scripted.slept_ms = 0;
-    var plain = Scripted{ .codes = &.{503} };
-    try std.testing.expectError(error.Scripted, retry(policy, &plain, Scripted.attempt));
-    try std.testing.expect(Scripted.slept_ms >= 500 + 1000 + 2000 + 4000 and Scripted.slept_ms <= budget_ms);
-}
-
-test "retry stops as soon as the run is aborting" {
+test "the re-exported retry classifies, backs off and loops exactly as objstore's own did" {
     defer driver.resetAbort();
-    var prng = std.Random.DefaultPrng.init(0);
-    const policy = Policy{ .rand = prng.random(), .sleep = Scripted.abortingSleep };
+    for (0..1000) |c| try std.testing.expectEqual(Oracle.retriableOld(@intCast(c)), retriable(@intCast(c)));
+    const errs = [_]anyerror{
+        error.ConnectionRefused,      error.ConnectionResetByPeer, error.EndOfStream,  error.HttpConnectionClosing,
+        error.ServerClosedConnection, error.OutOfMemory,           error.S3AuthFailed, error.S3Throttled,
+        error.UnknownHostName,        error.TlsFailure,            error.Aborted,      error.ReadFailed,
+    };
+    for (errs) |e| try std.testing.expectEqual(Oracle.transientOld(e), transient(e));
+    const afters = [_][]const u8{ "7", " 0 ", "\t120", "x", "", "-1", "1.5", "18446744073709551615", "99999999999999999999", "Wed, 21 Oct 2015 07:28:00 GMT" };
+    for (afters) |v| try std.testing.expectEqual(Oracle.retryAfterOld(v), retryAfterMs(v));
+    for (0..64) |seed| for (0..12) |attempt| {
+        var a = std.Random.DefaultPrng.init(seed);
+        var b = std.Random.DefaultPrng.init(seed);
+        try std.testing.expectEqual(Oracle.backoffOld(a.random(), attempt), (Policy{ .rand = b.random() }).backoffMs(attempt));
+    };
 
-    Scripted.slept_ms = 0;
-    var throttled = Scripted{ .codes = &.{503} };
-    try std.testing.expectError(error.Scripted, retry(policy, &throttled, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, 1), throttled.calls);
-    try std.testing.expect(Scripted.slept_ms <= 100);
+    const scripts = [_][]const u16{
+        &.{200},                &.{503},                             &.{ 500, 429, 1, 502, 504, 200 },
+        &.{ 1, 408, 3, 200 },   &.{ 403, 200 },                      &.{ 2, 200 },
+        &.{ 0, 200 },           &.{ 0, 0, 503, 200 },                &.{ 501, 200 },
+        &.{ 3, 3, 3, 3, 3, 3 }, &.{ 0, 0, 0, 0, 0, 0, 0, 503, 200 },
+    };
+    const aborts = [_]usize{ std.math.maxInt(usize), 1, 3 };
+    for (aborts) |abort_at| for ([_]?bool{ null, true, false }) |override| for ([_]?u64{ null, 0, 900, 3_600_000 }) |after| for (scripts) |codes| for (0..3) |seed| {
+        var pa = std.Random.DefaultPrng.init(seed);
+        Oracle.Script.reset(abort_at);
+        var mine = Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
+        const r1 = retry(.{ .rand = pa.random(), .sleep = Oracle.Script.nap }, &mine, Oracle.Script.attempt);
+        const slept1 = Oracle.Script.slept_ms;
+        const naps1 = Oracle.Script.naps;
 
-    var again = Scripted{ .codes = &.{503} };
-    try std.testing.expectError(error.Scripted, retry(policy, &again, Scripted.attempt));
-    try std.testing.expectEqual(@as(usize, 1), again.calls);
+        var pb = std.Random.DefaultPrng.init(seed);
+        Oracle.Script.reset(abort_at);
+        var theirs = Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
+        const r2 = Oracle.retryOld(pb.random(), Oracle.Script.nap, &theirs, Oracle.Script.attempt);
+
+        try std.testing.expectEqual(theirs.calls, mine.calls);
+        try std.testing.expectEqual(Oracle.Script.slept_ms, slept1);
+        try std.testing.expectEqual(Oracle.Script.naps, naps1);
+        if (r2) |_| try r1 else |e| try std.testing.expectError(e, r1);
+    };
 }
 
 test "exchange surfaces ETag, Retry-After and the body, and a reset is a transient failure" {
