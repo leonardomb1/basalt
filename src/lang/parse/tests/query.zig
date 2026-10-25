@@ -144,6 +144,54 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
     }
 }
 
+test "sql: a FLOAT LIMIT through textconv.floatToInt takes the count and refusal the old rounding did" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const old = struct {
+        fn count(f0: f64, neg: bool) union(enum) { n: u64, negative, range } {
+            var r = if (@abs(f0 - @trunc(f0)) == 0.5) 2 * @round(f0 / 2) else @round(f0);
+            if (neg) r = -r;
+            if (r < 0) return .negative;
+            if (!(r < 0x1p63)) return .range;
+            return .{ .n = @intFromFloat(@abs(r)) };
+        }
+    };
+    const corpus = [_]f64{ 0, 0.4, 0.5, 0.6, 1.5, 2.5, 3.5, 1e3, 4503599627370495.5, 9007199254740992, 0x1p63 - 1024, 0x1p63, 1e19, 1e300, 1.7976931348623157e308, 5e-324 };
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for (corpus) |f| for ([_]bool{ false, true }) |neg| {
+        const q = try std.fmt.allocPrint(a, "SELECT id FROM 't.csv' LIMIT {s}{e};", .{ if (neg) "-" else "", f });
+        const shown = if (neg) -f else f;
+        switch (old.count(f, neg)) {
+            .n => |n| {
+                const prog = try parseTest(a, q);
+                const out = prog.stmts[prog.stmts.len - 1].output;
+                try testing.expectEqual(n, out.stages[out.stages.len - 2].node.limit.count);
+            },
+            .negative => {
+                try testing.expectError(error.ParseFailed, parseSource(a, q, &diag));
+                try testing.expectEqualStrings(try std.fmt.allocPrint(a, "LIMIT must not be negative, got {d}", .{shown}), diag.msg);
+            },
+            .range => {
+                try testing.expectError(error.ParseFailed, parseSource(a, q, &diag));
+                try testing.expectEqualStrings(try std.fmt.allocPrint(a, "LIMIT {d} is out of range", .{shown}), diag.msg);
+            },
+        }
+    };
+}
+
+test "sql: a DECIMAL LIMIT past 2^53 still goes through f64 (pinned; decimal branch)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT id FROM 't.csv' LIMIT 9007199254740993.0;");
+    const out = prog.stmts[prog.stmts.len - 1].output;
+    try testing.expectEqual(@as(u64, 9007199254740992), out.stages[out.stages.len - 2].node.limit.count);
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT id FROM 't.csv' LIMIT 9223372036854775807.0;", &diag));
+    try testing.expectEqualStrings("LIMIT 9223372036854776000 is out of range", diag.msg);
+}
+
 test "sql: a table function call is checked where it is written" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
