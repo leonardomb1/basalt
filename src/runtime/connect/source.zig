@@ -16,7 +16,7 @@ const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
-const evalCfgStr = @import("register.zig").evalCfgStr;
+const RunCfg = @import("register.zig").RunCfg;
 const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
 const gen = @import("../../connect/gen.zig");
@@ -430,14 +430,15 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         if (env.scan) |t| driver.ScanTally.add(&t.sql_filters, 1);
     if (std.mem.eql(u8, conn.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a path: conn.GET('/path') or a CREATE RESOURCE");
+        const cfg = RunCfg{ .env = env, .connector = conn.connector };
         var auth: []const u8 = "";
         for (conn.config) |attr| {
-            if (std.mem.eql(u8, attr.key, "auth")) auth = try evalCfgStr(env, attr.value);
+            if (std.mem.eql(u8, attr.key, "auth")) auth = try cfg.text(attr.value);
         }
         var kvs = std.array_list.Managed(http_client.KV).init(env.arena);
         for (conn.config) |attr| {
             if (!httpAttrUsed(conn, auth, attr.key)) continue;
-            try kvs.append(.{ .key = attr.key, .value = try evalCfgStr(env, attr.value) });
+            try kvs.append(.{ .key = attr.key, .value = try cfg.text(attr.value) });
         }
         var errmsg: []const u8 = "";
         const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch

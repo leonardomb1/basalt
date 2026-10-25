@@ -6,29 +6,27 @@ const DbConfig = @import("../env.zig").DbConfig;
 const Env = @import("../env.zig").Env;
 const aad = @import("../../db/sqlserver/aad.zig");
 const ast = @import("../../lang/ast.zig");
+const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
-const eqlAny = @import("../env.zig").eqlAny;
-const evalCfgIntIn = @import("register.zig").evalCfgIntIn;
-const evalCfgStr = @import("register.zig").evalCfgStr;
+const RunCfg = @import("register.zig").RunCfg;
 const krb5 = @import("../../net/auth/krb5.zig");
 const ntlm = @import("../../net/auth/ntlm.zig");
 const options = @import("../analyze/options.zig");
 const planErr = @import("../env.zig").planErr;
+const schema = @import("options_schema.zig");
 const sql = @import("../../db/sql.zig");
 const ssrp = @import("../../db/sqlserver/ssrp.zig");
 const std = @import("std");
 const tds = @import("../../db/sqlserver/tds.zig");
-const LitCfg = @import("testing_util.zig").LitCfg;
 pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 
 /// A connect failure's error name, with the server's or identity provider's own words
 /// when they refused the login.
 pub fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) ![]const u8 {
-    if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver") and tds.lastError().len > 0)
-        return std.fmt.allocPrint(arena, "{s}: {s}", .{ @errorName(e), tds.lastError() });
-    if (e == error.AadTokenFailed and aad.lastError().len > 0)
-        return std.fmt.allocPrint(arena, "{s}: {s}", .{ @errorName(e), aad.lastError() });
+    if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver"))
+        return driver.connectorNoteAlloc(arena, "", e, tds.lastError());
+    if (e == error.AadTokenFailed) return driver.connectorNoteAlloc(arena, "", e, aad.lastError());
     return @errorName(e);
 }
 
@@ -76,73 +74,24 @@ fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
     return .{ .domain = domain, .user = user, .password = cfg.password };
 }
 
-/// `f` fetches each value. Generic because a lenient offline fetcher once existed;
-/// the seam is kept so one can return. `fe_host`/`fe_port` are StarRocks spellings.
-pub fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!DbConfig {
-    var cfg = DbConfig{ .port = default_port };
-    for (conn.config) |attr| {
-        const k = attr.key;
-        if (eqlAny(k, &.{ "port", "fe_port" })) {
-            if (try f.port(attr.value)) |p| {
-                cfg.port = p;
-                cfg.port_explicit = true;
-            }
-            continue;
-        }
-        if (!eqlAny(k, &.{ "host", "fe_host", "user", "password", "database", "tls", "auth", "domain", "realm", "kdc", "spn", "client_id", "resource", "token" })) continue;
-        const v = (try f.str(attr.value)) orelse continue;
-        if (eqlAny(k, &.{ "host", "fe_host" })) {
-            cfg.host = v;
-        } else if (std.mem.eql(u8, k, "user")) {
-            cfg.user = v;
-        } else if (std.mem.eql(u8, k, "password")) {
-            cfg.password = v;
-        } else if (std.mem.eql(u8, k, "database")) {
-            cfg.database = v;
-        } else if (std.mem.eql(u8, k, "tls")) {
-            cfg.tls = try f.tls(v);
-        } else if (std.mem.eql(u8, k, "auth")) {
-            cfg.auth = try f.auth(v);
-        } else if (std.mem.eql(u8, k, "domain")) {
-            cfg.domain = v;
-        } else if (std.mem.eql(u8, k, "realm")) {
-            cfg.realm = v;
-        } else if (std.mem.eql(u8, k, "kdc")) {
-            cfg.kdc = v;
-        } else if (std.mem.eql(u8, k, "spn")) {
-            cfg.spn = v;
-        } else if (std.mem.eql(u8, k, "client_id")) {
-            cfg.client_id = v;
-        } else if (std.mem.eql(u8, k, "resource")) {
-            cfg.resource = v;
-        } else if (std.mem.eql(u8, k, "token")) {
-            cfg.token = v;
-        }
-    }
-    return cfg;
-}
+/// A SQL connection's options; `fe_host`/`fe_port` are StarRocks spellings of
+/// `host`/`port`, and any port is refused as `port`.
+const DbCfg = struct {
+    run: RunCfg,
 
-const EnvCfg = struct {
-    env: *Env,
-    connector: []const u8,
-    pub fn str(self: EnvCfg, e: *const ast.Expr) !?[]const u8 {
-        return try evalCfgStr(self.env, e);
-    }
-    pub fn port(self: EnvCfg, e: *const ast.Expr) !?u16 {
-        return try evalCfgIntIn(u16, self.env, e, self.connector, "port");
-    }
-    pub fn tls(self: EnvCfg, v: []const u8) !sql.TlsMode {
-        return std.meta.stringToEnum(sql.TlsMode, v) orelse
-            planErr(self.env.diag, env_mod.tls_values_msg);
-    }
-    pub fn auth(self: EnvCfg, v: []const u8) !DbAuth {
-        return std.meta.stringToEnum(DbAuth, v) orelse
-            planErr(self.env.diag, env_mod.auth_values_msg);
+    pub fn value(self: DbCfg, comptime F: type, _: schema.Opt, e: *const ast.Expr) !?F {
+        if (F == u16) return try self.run.int(u16, e, "port");
+        const v = try self.run.text(e);
+        if (F == []const u8) return v;
+        if (F == sql.TlsMode) return std.meta.stringToEnum(sql.TlsMode, v) orelse planErr(self.run.env.diag, env_mod.tls_values_msg);
+        if (F == DbAuth) return std.meta.stringToEnum(DbAuth, v) orelse planErr(self.run.env.diag, env_mod.auth_values_msg);
+        @compileError("no reader for " ++ @typeName(F));
     }
 };
 
 pub fn resolveDbConfig(env: *Env, conn: ast.Connection, default_port: u16) !DbConfig {
-    const cfg = try parseDbConfig(conn, default_port, EnvCfg{ .env = env, .connector = conn.connector });
+    var cfg = DbConfig{ .port = default_port };
+    try schema.bind(DbConfig, &schema.db_read, .ignore, &schema.db_aliases, &cfg, conn.config, DbCfg{ .run = .{ .env = env, .connector = conn.connector } });
     if (cfg.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
     if (cfg.auth == .kerberos and cfg.realm.len == 0 and std.mem.indexOfScalar(u8, cfg.user, '@') == null)
         return planErr(env.diag, try options.sqlRealmMsg(env.arena, conn.name));
@@ -163,7 +112,10 @@ test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
     try std.testing.expectEqual(SqlKind.mysql, info.kind);
     try std.testing.expectEqual(sql.Dialect.starrocks, info.dialect);
 
-    const cfg = try parseDbConfig(conn, info.port, LitCfg{});
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const env = try @import("testing_util.zig").testEnv(ar.allocator());
+    const cfg = try resolveDbConfig(env, conn, info.port);
     try std.testing.expectEqualStrings("fe.internal", cfg.host);
     try std.testing.expectEqualStrings("etl", cfg.user);
     try std.testing.expectEqual(@as(u16, 9030), cfg.port);
@@ -172,5 +124,5 @@ test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
         .{ .key = "host", .value = &host, .pos = pos },
         .{ .key = "fe_port", .value = &port, .pos = pos },
     } };
-    try std.testing.expectEqual(@as(u16, 9031), (try parseDbConfig(explicit, info.port, LitCfg{})).port);
+    try std.testing.expectEqual(@as(u16, 9031), (try resolveDbConfig(env, explicit, info.port)).port);
 }

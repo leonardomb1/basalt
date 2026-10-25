@@ -1,156 +1,126 @@
-//! SFTP, SMB and FTP connections registered from their options, and how option values
-//! (literals, env(), secrets) are evaluated.
+//! SFTP, SMB and FTP connections registered from their options, and `RunCfg`, how
+//! the run reads an option's value (literals, env(), secrets) through
+//! `options_schema`, each refusal becoming the plan error `check` gives.
 
 const Env = @import("../env.zig").Env;
 const ast = @import("../../lang/ast.zig");
 const ftp = @import("../../store/ftp.zig");
 const options = @import("../analyze/options.zig");
 const planErr = @import("../env.zig").planErr;
+const schema = @import("options_schema.zig");
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const std = @import("std");
 
-/// A password is optional (a key logs in without one); an unknown option is an
-/// error naming the known ones.
+pub const RunCfg = struct {
+    env: *Env,
+    connector: []const u8,
+
+    fn refuse(self: RunCfg, p: schema.Problem, key: []const u8) error{ PlanFailed, OutOfMemory } {
+        const msg = schema.message(self.env.arena, p, self.connector, key) catch return error.OutOfMemory;
+        return planErr(self.env.diag, msg);
+    }
+
+    /// A text value; an env()/secret() whose variable is unset is refused.
+    pub fn text(self: RunCfg, e: *const ast.Expr) ![]const u8 {
+        return switch (try schema.cfgText(self.env.arena, e)) {
+            .ok => |t| t,
+            .unset => |name| planErr(self.env.diag, try schema.unsetEnvMsg(self.env.arena, name)),
+            .problem => |p| self.refuse(p, ""),
+        };
+    }
+
+    /// A text value, null when its env()/secret() variable is unset.
+    pub fn optText(self: RunCfg, e: *const ast.Expr) !?[]const u8 {
+        return switch (try schema.cfgText(self.env.arena, e)) {
+            .ok => |t| t,
+            .unset => null,
+            .problem => |p| self.refuse(p, ""),
+        };
+    }
+
+    /// An integer option that must fit `T`, refused as out of range for `key` otherwise.
+    pub fn int(self: RunCfg, comptime T: type, e: *const ast.Expr, key: []const u8) !T {
+        return switch (schema.cfgIntIn(T, e)) {
+            .ok => |v| v,
+            .problem => |p| self.refuse(p, key),
+        };
+    }
+
+    pub fn flag(self: RunCfg, e: *const ast.Expr) !bool {
+        return switch (schema.cfgBool(e)) {
+            .ok => |b| b,
+            .problem => |p| self.refuse(p, ""),
+        };
+    }
+};
+
+/// A file connection's options: an unset env() leaves a login part null, an
+/// unknown key is refused after its value is read, naming the known ones.
+const FileCfg = struct {
+    run: RunCfg,
+    conn: ast.Connection,
+
+    pub fn unknown(self: FileCfg, key: []const u8, e: *const ast.Expr) !void {
+        _ = try self.run.optText(e);
+        return planErr(self.run.env.diag, try options.unknownOptionMsg(self.run.env.arena, self.conn, key));
+    }
+
+    pub fn value(self: FileCfg, comptime F: type, opt: schema.Opt, e: *const ast.Expr) !?F {
+        if (F == u16) return try self.run.int(u16, e, opt.key);
+        const v = try self.run.optText(e);
+        if (F == []const u8) return v orelse "";
+        if (F == ?smb.Auth) {
+            const a = v orelse "";
+            if (!options.smbAuthValid(a)) return planErr(self.run.env.diag, try options.smbAuthMsg(self.run.env.arena, self.conn.name, a));
+            return if (std.ascii.eqlIgnoreCase(a, "kerberos")) .kerberos else .ntlm;
+        }
+        if (F != ?[]const u8) @compileError("no reader for " ++ @typeName(F));
+        const t = v orelse return @as(F, null);
+        if (std.mem.eql(u8, opt.key, "share")) return std.mem.trim(u8, t, "/\\");
+        if (std.mem.eql(u8, opt.key, "realm")) return try std.ascii.allocUpperString(self.run.env.arena, t);
+        return t;
+    }
+};
+
+fn fileConn(comptime C: type, comptime opts: []const schema.Opt, env: *Env, conn: ast.Connection) !C {
+    var c = C{ .host = "" };
+    try schema.bind(C, opts, .refuse, &.{}, &c, conn.config, FileCfg{ .run = .{ .env = env, .connector = conn.connector }, .conn = conn });
+    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
+    return c;
+}
+
+pub fn sftpConn(env: *Env, conn: ast.Connection) !sftp.Conn {
+    return fileConn(sftp.Conn, &schema.sftp, env, conn);
+}
+
+/// With `auth = 'kerberos'` the realm comes from `realm` or a `me@REALM` user.
+pub fn smbConn(env: *Env, conn: ast.Connection) !smb.Conn {
+    const c = try fileConn(smb.Conn, &schema.smb, env, conn);
+    if (c.auth == .kerberos and c.realm == null and std.mem.indexOfScalar(u8, c.user orelse "", '@') == null)
+        return planErr(env.diag, try options.smbRealmMsg(env.arena, conn.name));
+    return c;
+}
+
+pub fn ftpConn(env: *Env, conn: ast.Connection) !ftp.Conn {
+    return fileConn(ftp.Conn, &schema.ftp, env, conn);
+}
+
+/// A password is optional (a key logs in without one).
 pub fn registerSftp(env: *Env, conn: ast.Connection) !void {
     if (!std.mem.eql(u8, conn.connector, "sftp")) return;
-    var c = sftp.Conn{ .host = "" };
-    for (conn.config) |attr| {
-        const k = attr.key;
-        if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "sftp"));
-            continue;
-        }
-        const v = optCfgStr(env, attr.value) catch |e| return e;
-        if (std.mem.eql(u8, k, "host")) {
-            c.host = v orelse "";
-        } else if (std.mem.eql(u8, k, "user")) {
-            c.user = v;
-        } else if (std.mem.eql(u8, k, "password")) {
-            c.password = v;
-        } else if (std.mem.eql(u8, k, "key_file")) {
-            c.key_file = v;
-        } else if (std.mem.eql(u8, k, "key_passphrase")) {
-            c.key_passphrase = v;
-        } else if (std.mem.eql(u8, k, "known_hosts")) {
-            c.known_hosts = v;
-        } else if (std.mem.eql(u8, k, "host_key")) {
-            c.host_key = v;
-        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
-    }
-    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
-    try sftp.register(conn.name, c);
+    try sftp.register(conn.name, try sftpConn(env, conn));
 }
 
 /// With a `share`, paths under the name are inside it; without one the first path
-/// part names the share. An unknown option is an error naming the known ones.
+/// part names the share.
 pub fn registerSmb(env: *Env, conn: ast.Connection) !void {
     if (!std.mem.eql(u8, conn.connector, "smb")) return;
-    var c = smb.Conn{ .host = "" };
-    for (conn.config) |attr| {
-        const k = attr.key;
-        if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "smb"));
-            continue;
-        }
-        const v = optCfgStr(env, attr.value) catch |e| return e;
-        if (std.mem.eql(u8, k, "host")) {
-            c.host = v orelse "";
-        } else if (std.mem.eql(u8, k, "user")) {
-            c.user = v;
-        } else if (std.mem.eql(u8, k, "password")) {
-            c.password = v;
-        } else if (std.mem.eql(u8, k, "domain")) {
-            c.domain = v;
-        } else if (std.mem.eql(u8, k, "share")) {
-            c.share = if (v) |sh| std.mem.trim(u8, sh, "/\\") else null;
-        } else if (std.mem.eql(u8, k, "realm")) {
-            c.realm = if (v) |r| try std.ascii.allocUpperString(env.arena, r) else null;
-        } else if (std.mem.eql(u8, k, "kdc")) {
-            c.kdc = v;
-        } else if (std.mem.eql(u8, k, "spn")) {
-            c.spn = v;
-        } else if (std.mem.eql(u8, k, "auth")) {
-            const a = v orelse "";
-            if (!options.smbAuthValid(a)) return planErr(env.diag, try options.smbAuthMsg(env.arena, conn.name, a));
-            c.auth = if (std.ascii.eqlIgnoreCase(a, "kerberos")) .kerberos else .ntlm;
-        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
-    }
-    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
-    if (c.auth == .kerberos and c.realm == null and std.mem.indexOfScalar(u8, c.user orelse "", '@') == null)
-        return planErr(env.diag, try options.smbRealmMsg(env.arena, conn.name));
-    try smb.register(conn.name, c);
+    try smb.register(conn.name, try smbConn(env, conn));
 }
 
-/// Without a `user` (or `NAME_USER`) the login is anonymous; an unknown option is
-/// an error naming the known ones.
+/// Without a `user` (or `NAME_USER`) the login is anonymous.
 pub fn registerFtp(env: *Env, conn: ast.Connection) !void {
     if (!std.mem.eql(u8, conn.connector, "ftp")) return;
-    var c = ftp.Conn{ .host = "" };
-    for (conn.config) |attr| {
-        const k = attr.key;
-        if (std.mem.eql(u8, k, "port")) {
-            c.port = std.math.cast(u16, try evalCfgInt(env, attr.value)) orelse return planErr(env.diag, try options.portRangeMsg(env.arena, "ftp"));
-            continue;
-        }
-        const v = optCfgStr(env, attr.value) catch |e| return e;
-        if (std.mem.eql(u8, k, "host")) {
-            c.host = v orelse "";
-        } else if (std.mem.eql(u8, k, "user")) {
-            c.user = v;
-        } else if (std.mem.eql(u8, k, "password")) {
-            c.password = v;
-        } else return planErr(env.diag, try options.unknownOptionMsg(env.arena, conn, k));
-    }
-    if (c.host.len == 0) return planErr(env.diag, try options.needsHostMsg(env.arena, conn));
-    try ftp.register(conn.name, c);
-}
-
-fn optCfgStr(env: *Env, expr: *const ast.Expr) !?[]const u8 {
-    if (expr.* == .call) {
-        const c = expr.call;
-        if ((std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit)
-            return std.process.getEnvVarOwned(env.arena, c.args[0].str_lit) catch null;
-    }
-    return try evalCfgStr(env, expr);
-}
-
-pub fn evalCfgStr(env: *Env, expr: *const ast.Expr) ![]const u8 {
-    switch (expr.*) {
-        .str_lit => |s| return s,
-        .int_lit => |i| return std.fmt.allocPrint(env.arena, "{d}", .{i}),
-        .bool_lit => |b| return if (b) "true" else "false",
-        .call => |c| {
-            if ((std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and
-                c.args.len == 1 and c.args[0].* == .str_lit)
-            {
-                const name = c.args[0].str_lit;
-                return std.process.getEnvVarOwned(env.arena, name) catch
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "env var `{s}` is not set", .{name}));
-            }
-            return planErr(env.diag, options.literal_cfg_msg);
-        },
-        else => return planErr(env.diag, options.literal_cfg_msg),
-    }
-}
-
-pub fn evalCfgInt(env: *Env, expr: *const ast.Expr) !i64 {
-    return switch (expr.*) {
-        .int_lit => |i| i,
-        .str_lit => |s| std.fmt.parseInt(i64, s, 10) catch return planErr(env.diag, options.int_cfg_msg),
-        else => planErr(env.diag, options.int_cfg_kind_msg),
-    };
-}
-
-/// An integer option that must fit `T`, refused as out of range for `key` otherwise.
-pub fn evalCfgIntIn(comptime T: type, env: *Env, expr: *const ast.Expr, connector: []const u8, key: []const u8) !T {
-    return std.math.cast(T, try evalCfgInt(env, expr)) orelse planErr(env.diag, try options.rangeMsg(env.arena, connector, key));
-}
-
-pub fn evalCfgBool(env: *Env, expr: *const ast.Expr) !bool {
-    return switch (expr.*) {
-        .bool_lit => |b| b,
-        .str_lit => |s| options.cfgBoolText(s) orelse planErr(env.diag, options.bool_cfg_msg),
-        else => planErr(env.diag, options.bool_cfg_msg),
-    };
+    try ftp.register(conn.name, try ftpConn(env, conn));
 }
