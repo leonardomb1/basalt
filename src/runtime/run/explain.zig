@@ -72,8 +72,10 @@ pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.Resu
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try b.finish();
     const w = try arrow.ArrowWriter.open(gpa, schema, info);
-    errdefer w.abort();
+    var open = true;
+    errdefer if (open) w.abort();
     try w.writeBatch(a, .{ .schema = &schema, .columns = cols, .len = n });
+    open = false;
     try w.close();
     return n;
 }
@@ -473,4 +475,14 @@ test "explain: lanes show their spread, and a lane far above the mean is called 
     try testing.expect(std.mem.indexOf(u8, out.written(), "time: 9.00ms (100.0%) [min=1.00ms, max=7.00ms]  skew 2.3x") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "rows per lane [min=1.0K (1000), max=7.0K (7000)]") != null);
     try testing.expect(std.mem.indexOf(u8, out.written(), "(summed over 3 lanes)") != null);
+}
+
+test "explain: an Arrow plan whose stdout write fails returns the error and frees once" {
+    const full = try std.posix.open("/dev/full", .{ .ACCMODE = .WRONLY }, 0);
+    defer std.posix.close(full);
+    const saved = try std.posix.dup(std.posix.STDOUT_FILENO);
+    defer std.posix.close(saved);
+    try std.posix.dup2(full, std.posix.STDOUT_FILENO);
+    defer std.posix.dup2(saved, std.posix.STDOUT_FILENO) catch {};
+    try testing.expectError(error.WriteFailed, printPlanArrow(testing.allocator, "scan\n  filter\n", .{}));
 }
