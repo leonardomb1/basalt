@@ -30,7 +30,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const zipsrc = @import("../compress/zip.zig");
 const xml = @import("../xml/token.zig");
-const civilFromDays = @import("../../exec/eval/time.zig").civilFromDays;
+const serial = @import("serial.zig");
 
 pub const Error = error{
     NotXlsx,
@@ -53,9 +53,6 @@ const max_rows = 1048576;
 /// Cells one row may list: one per column, with room for the duplicates some
 /// writers leave, so a small zip cannot inflate one row into gigabytes of cells.
 const max_row_cells = 4 * max_cols;
-/// Past Excel's last date (9999-12-31) a date-formatted number is read as a
-/// number; NaN and the infinities fail the range test too.
-const max_serial = 2958466.0;
 
 pub fn isPath(path: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(path, ".xlsx") or std.ascii.endsWithIgnoreCase(path, ".xlsm");
@@ -543,16 +540,16 @@ pub const Reader = struct {
             .bool => if (c.kind == .boolean) Value{ .bool = c.num != 0 } else error.XlsxChanged,
             .int => if (c.kind == .number and @abs(c.num) < 9007199254740992.0) Value{ .int = @intFromFloat(c.num) } else error.XlsxChanged,
             .float => if (c.kind == .number) Value{ .float = c.num } else error.XlsxChanged,
-            .date => Value{ .date = @intCast(serialDays(try serialOf(c), self.date1904)) },
-            .timestamp => Value{ .timestamp = serialMicros(try serialOf(c), self.date1904) },
-            .time => Value{ .time = dayMicros(try serialOf(c)) },
+            .date => Value{ .date = @intCast(serial.days(try serialOf(c), self.date1904)) },
+            .timestamp => Value{ .timestamp = serial.micros(try serialOf(c), self.date1904) },
+            .time => Value{ .time = serial.timeMicros(try serialOf(c)) },
             else => error.XlsxChanged,
         };
     }
 
     /// A date, time or timestamp cell's serial, in the range the first pass typed it by.
     fn serialOf(c: Cell) !f64 {
-        if (c.kind != .number or !(c.num >= 0 and c.num < max_serial)) return error.XlsxChanged;
+        if (c.kind != .number or !(c.num >= 0 and c.num < serial.max_serial)) return error.XlsxChanged;
         return c.num;
     }
 
@@ -579,37 +576,6 @@ pub fn sheetNames(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []cons
     return names.items;
 }
 
-/// Days from the workbook's epoch (1899-12-30 or 1904-01-01) to 1970-01-01, less the
-/// day Excel's 1900 calendar adds before March 1900: it counts a 29 February 1900 that
-/// never was, so serial 1 is 1900-01-01 and 59 is 28 February, as Excel shows them;
-/// 60, the missing day, reads as 28 February too, as openpyxl reads it.
-fn epochOffset(serial: f64, date1904: bool) i64 {
-    if (date1904) return 24107;
-    return if (serial >= 1 and serial < 60) 25568 else 25569;
-}
-
-fn serialDays(serial: f64, date1904: bool) i64 {
-    return @as(i64, @intFromFloat(@floor(serial))) - epochOffset(serial, date1904);
-}
-
-/// To the millisecond: a day's fraction in a double cannot say 23:59:59.5 exactly, and
-/// Excel itself keeps times to the millisecond.
-fn serialMicros(serial: f64, date1904: bool) i64 {
-    const ms: i64 = @intFromFloat(@round(serial * 86_400_000.0));
-    return (ms - epochOffset(serial, date1904) * 86_400_000) * 1000;
-}
-
-test "1900 serials before March read as the dates Excel shows" {
-    const day = 86_400_000_000;
-    try std.testing.expectEqual(@as(i64, -25567), serialDays(1, false));
-    try std.testing.expectEqual(@as(i64, -25509), serialDays(59, false));
-    try std.testing.expectEqual(@as(i64, -25509), serialDays(60, false));
-    try std.testing.expectEqual(@as(i64, -25508), serialDays(61, false));
-    try std.testing.expectEqual(@as(i64, -25509 * day + day / 2), serialMicros(59.5, false));
-    try std.testing.expectEqual(@as(i64, -24107), serialDays(0, true));
-    try std.testing.expectEqual(@as(i64, -24106), serialDays(1, true));
-}
-
 test "a cell the first pass would not have typed so is refused, and a time just short of midnight stays in its day" {
     var rd: Reader = undefined;
     rd.date1904 = false;
@@ -622,17 +588,7 @@ test "a cell the first pass would not have typed so is refused, and a time just 
         try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .time));
         if (v != -1) try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .int));
     }
-    try std.testing.expectEqual(@as(i64, 86_399_999_000), dayMicros(0.9999999999));
-    try std.testing.expectEqual(@as(i64, 86_399_999_000), dayMicros(45000.9999999999));
-    try std.testing.expectEqual(@as(i64, 43_200_000_000), dayMicros(0.5));
-}
-
-/// The time of day to the millisecond, a fraction that rounds up to midnight held at
-/// 23:59:59.999 so it stays inside its day.
-fn dayMicros(serial: f64) i64 {
-    const frac = serial - @floor(serial);
-    const ms: i64 = @intFromFloat(@round(frac * 86_400_000.0));
-    return @min(ms, 86_399_999) * 1000;
+    try std.testing.expectEqual(@as(i64, 86_399_999_000), (try rd.convert(a, .{ .col = 0, .kind = .number, .num = 0.9999999999 }, .time)).time);
 }
 
 fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
@@ -642,31 +598,14 @@ fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
         .boolean => if (c.num != 0) "true" else "false",
         .number => switch (c.fmt) {
             .number => c.text,
-            .date => fmtDate(arena, serialDays(c.num, date1904)),
-            .datetime => fmtTimestamp(arena, serialMicros(c.num, date1904)),
-            .time => if (c.num < 1) fmtTime(arena, dayMicros(c.num)) else fmtTimestamp(arena, serialMicros(c.num, date1904)),
+            .date => serial.text(arena, serial.days(c.num, date1904), serial.date_layout),
+            .datetime => serial.text(arena, serial.micros(c.num, date1904), serial.timestamp_layout),
+            .time => if (c.num < 1)
+                serial.text(arena, serial.timeMicros(c.num), serial.time_layout)
+            else
+                serial.text(arena, serial.micros(c.num, date1904), serial.timestamp_layout),
         },
     };
-}
-
-/// ISO `YYYY-MM-DD` for days since 1970, before it too (the
-/// civil-from-days algorithm), since a 1904 workbook's serials start in 1904.
-fn fmtDate(arena: std.mem.Allocator, days: i64) ![]const u8 {
-    const c = civilFromDays(days);
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
-}
-
-fn fmtTime(arena: std.mem.Allocator, us: i64) ![]const u8 {
-    const t: u64 = @intCast(@max(us, 0));
-    const s = t / 1_000_000;
-    const ms = (t % 1_000_000) / 1000;
-    if (ms == 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ s / 3600, s / 60 % 60, s % 60 });
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ s / 3600, s / 60 % 60, s % 60, ms });
-}
-
-fn fmtTimestamp(arena: std.mem.Allocator, us: i64) ![]const u8 {
-    const days = @divFloor(us, 86_400_000_000);
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ try fmtDate(arena, days), try fmtTime(arena, us - days * 86_400_000_000) });
 }
 
 /// The next `<row>` into `out` (cells in column order), or null after the last. Rows
@@ -702,7 +641,7 @@ fn nextRow(tk: *xml.Tokenizer, out: *std.array_list.Managed(Cell), scratch: std.
                     if (si < rd.styles.len) cell.fmt = rd.styles[si];
                 }
                 if (!c.self_closing) try readCell(tk, &cell, ty, scratch, rd);
-                if (cell.kind == .number and cell.fmt != .number and !(cell.num >= 0 and cell.num < max_serial)) cell.fmt = .number;
+                if (cell.kind == .number and cell.fmt != .number and !(cell.num >= 0 and cell.num < serial.max_serial)) cell.fmt = .number;
                 try out.append(cell);
             },
             .close => |name| if (std.mem.eql(u8, name, "row")) break,
@@ -989,9 +928,9 @@ fn dumpFixture(arena: std.mem.Allocator, bytes: []const u8, opts: Options) ![]co
                     .float => |v| try w.print("{d}", .{v}),
                     .bool => |v| try w.writeAll(if (v) "true" else "false"),
                     .string => |v| try w.writeAll(v),
-                    .date => |v| try w.writeAll(try fmtDate(arena, v)),
-                    .timestamp => |v| try w.writeAll(try fmtTimestamp(arena, v)),
-                    .time => |v| try w.writeAll(try fmtTime(arena, v)),
+                    .date => |v| try w.writeAll(try serial.text(arena, v, serial.date_layout)),
+                    .timestamp => |v| try w.writeAll(try serial.text(arena, v, serial.timestamp_layout)),
+                    .time => |v| try w.writeAll(try serial.text(arena, v, serial.time_layout)),
                     else => try w.writeAll("?"),
                 }
             }

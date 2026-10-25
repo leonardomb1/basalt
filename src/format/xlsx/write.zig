@@ -37,17 +37,14 @@ const driver = @import("../../connect/driver.zig");
 const Output = @import("../output.zig").Output;
 const zipwrite = @import("../compress/zipwrite.zig");
 const read = @import("read.zig");
+const serial = @import("serial.zig");
+const utf16 = @import("../utf16.zig");
 const escape = @import("../xml/escape.zig");
 
 pub const max_cols = 16384;
 pub const max_rows = 1048576;
 pub const max_cell_chars = 32767;
 pub const content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-
-const epoch_days = 25569;
-const first_day = 61 - epoch_days;
-const last_day = 2958465 - epoch_days;
-const day_ms = 86_400_000;
 
 const style_date = "1";
 const style_timestamp = "2";
@@ -57,21 +54,12 @@ const style_time = "3";
 pub fn sheetNameProblem(name: []const u8) ?[]const u8 {
     if (name.len == 0) return "a sheet name cannot be empty";
     if (!std.unicode.utf8ValidateSlice(name)) return "a sheet name must be valid UTF-8";
-    if (utf16Len(name) > 31) return "a sheet name is at most 31 characters";
+    if (utf16.unitLen(name) > 31) return "a sheet name is at most 31 characters";
     if (std.mem.indexOfAny(u8, name, "[]:*?/\\") != null) return "a sheet name cannot hold any of `[ ] : * ? / \\`";
     for (name) |c| if (c < 0x20) return "a sheet name cannot hold a control character";
     if (name[0] == '\'' or name[name.len - 1] == '\'') return "a sheet name cannot start or end with `'`";
     if (std.ascii.eqlIgnoreCase(name, "History")) return "`History` is a name Excel reserves";
     return null;
-}
-
-fn utf16Len(s: []const u8) usize {
-    var n: usize = 0;
-    for (s) |c| {
-        if (c & 0xC0 != 0x80) n += 1;
-        if (c >= 0xF0) n += 1;
-    }
-    return n;
 }
 
 pub const Writer = struct {
@@ -182,28 +170,22 @@ pub const Writer = struct {
             },
             .date => {
                 const days: i64 = c.data.i32[r];
-                if (days >= first_day and days <= last_day)
-                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_date ++ "\"><v>{d}</v></c>", .{ ref, self.row, days + epoch_days });
+                if (serial.ofDays(days)) |v|
+                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_date ++ "\"><v>{d}</v></c>", .{ ref, self.row, v });
                 try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, self.row });
                 try format.writeDate(w, days);
                 return w.writeAll("</t></is></c>");
             },
             .timestamp => {
                 const us = c.data.i64[r];
-                const ms = @divFloor(us, 1000);
-                const days = @divFloor(ms, day_ms);
-                if (days >= first_day and days <= last_day) {
-                    const serial = @as(f64, @floatFromInt(ms + epoch_days * day_ms)) / day_ms;
-                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_timestamp ++ "\"><v>{d}</v></c>", .{ ref, self.row, serial });
-                }
+                if (serial.ofMicros(us)) |v|
+                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_timestamp ++ "\"><v>{d}</v></c>", .{ ref, self.row, v });
                 try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, self.row });
                 try format.writeTimestamp(w, us);
                 return w.writeAll("</t></is></c>");
             },
             .time => {
-                const ms = @mod(@divFloor(c.data.i64[r], 1000), day_ms);
-                const serial = @as(f64, @floatFromInt(ms)) / day_ms;
-                return w.print("<c r=\"{s}{d}\" s=\"" ++ style_time ++ "\"><v>{d}</v></c>", .{ ref, self.row, serial });
+                return w.print("<c r=\"{s}{d}\" s=\"" ++ style_time ++ "\"><v>{d}</v></c>", .{ ref, self.row, serial.ofTime(c.data.i64[r]) });
             },
             .array, .@"struct" => unreachable,
         }
@@ -258,10 +240,10 @@ fn tooLong(row: u32, ref: []const u8) anyerror {
 }
 
 fn charsOf(s: []const u8, valid: bool) usize {
-    if (valid) return utf16Len(s);
+    if (valid) return utf16.unitLen(s);
     var n: usize = 0;
     var runs = celltext.Utf8Runs{ .s = s };
-    while (runs.next()) |t| n += utf16Len(t);
+    while (runs.next()) |t| n += utf16.unitLen(t);
     return n;
 }
 
