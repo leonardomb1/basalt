@@ -1002,7 +1002,8 @@ pub const CsvWriter = struct {
 
     /// The header record of the file an append extends, read from its start; a `.gz`
     /// is read through its decoder. A quote opens a field only at its start, as the
-    /// reader decides, and a header past `LINE_BUF` is refused rather than read on.
+    /// reader decides; a line past the read buffer is gathered and a header past
+    /// `MAX_RECORD` is refused, as the reader's limits are.
     fn appendHeader(arena: std.mem.Allocator, path: []const u8, file: std.fs.File, codec: Codec, delim: u8) ![]const u8 {
         const buf = try arena.alloc(u8, LINE_BUF);
         var fr = file.reader(buf);
@@ -1015,20 +1016,47 @@ pub const CsvWriter = struct {
         var head = std.array_list.Managed(u8).init(arena);
         var in_q = false;
         while (true) {
-            const line = r.takeDelimiter('\n') catch |e| switch (e) {
-                error.StreamTooLong => return headerTooLong(path),
-                else => |x| return x,
-            } orelse return head.items;
-            if (head.items.len > 0) try head.append('\n');
-            if (head.items.len + line.len > LINE_BUF) return headerTooLong(path);
-            try head.appendSlice(line);
+            const line = (try appendLine(r, &head, path, in_q)) orelse {
+                if (in_q) return explainf(error.CsvUnterminatedQuote, "`{s}`: the header's quote is never closed", .{path});
+                return head.items;
+            };
             in_q = quotesOpen(line, delim, in_q);
             if (!in_q) return head.items;
         }
     }
 
-    fn headerTooLong(path: []const u8) anyerror {
-        return explainf(error.CsvRecordTooLong, "`{s}`: the header runs past {d} KiB — is a quote left open?", .{ path, LINE_BUF >> 10 });
+    /// One more physical line of the header appended to `head` after a `\n` when it
+    /// continues a record, gathered past the read buffer as the reader's `takeLong`
+    /// does; null at the end of the stream.
+    fn appendLine(r: *std.Io.Reader, head: *std.array_list.Managed(u8), path: []const u8, in_q: bool) !?[]const u8 {
+        const mark = head.items.len;
+        if (mark > 0) try head.append('\n');
+        const start = head.items.len;
+        while (true) {
+            const part = r.takeDelimiter('\n') catch |e| switch (e) {
+                error.StreamTooLong => {
+                    const held = r.buffered();
+                    if (head.items.len + held.len >= MAX_RECORD) return headerTooLong(path, in_q);
+                    try head.appendSlice(held);
+                    r.toss(held.len);
+                    continue;
+                },
+                else => |x| return x,
+            };
+            if (part) |p| {
+                if (head.items.len + p.len >= MAX_RECORD) return headerTooLong(path, in_q);
+                try head.appendSlice(p);
+            } else if (head.items.len == start) {
+                head.shrinkRetainingCapacity(mark);
+                return null;
+            }
+            return head.items[start..];
+        }
+    }
+
+    fn headerTooLong(path: []const u8, in_q: bool) anyerror {
+        if (in_q) return explainf(error.CsvRecordTooLong, "`{s}`: the header runs past {d} MiB without closing its quote — is a quote left open?", .{ path, MAX_RECORD >> 20 });
+        return explainf(error.CsvRecordTooLong, "`{s}`: the header line is longer than {d} MiB — is it a CSV?", .{ path, MAX_RECORD >> 20 });
     }
 
     fn checkAppendHeader(arena: std.mem.Allocator, path: []const u8, line: []const u8, schema: types.Schema, d: Dialect) !void {
@@ -2031,9 +2059,39 @@ test "csv writer: an append reads back a header with an edge space or a mid-fiel
     const long = try a.alloc(u8, LINE_BUF + 16);
     @memset(long, 'h');
     long[0] = '"';
-    try tmp.dir.writeFile(.{ .sub_path = "long.csv", .data = long });
-    try std.testing.expectError(error.CsvRecordTooLong, append(a, try tmp.dir.realpathAlloc(a, "long.csv"), q, try parseSlice(a, &q, "3,4\n")));
-    _ = eval.takeFailure(error.CsvRecordTooLong);
+    try tmp.dir.writeFile(.{ .sub_path = "open.csv", .data = long });
+    try std.testing.expectError(error.CsvUnterminatedQuote, append(a, try tmp.dir.realpathAlloc(a, "open.csv"), q, try parseSlice(a, &q, "3,4\n")));
+    _ = eval.takeFailure(error.CsvUnterminatedQuote);
+}
+
+test "csv writer: an append reads a header longer than the read buffer, bare or with a quoted newline" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const append = struct {
+        fn run(al: std.mem.Allocator, path: []const u8, s: types.Schema, b: Batch) !void {
+            const w = try CsvWriter.open(al, path, s, .append, .{});
+            try w.writeBatch(al, b);
+            try w.close();
+        }
+    }.run;
+
+    const name = try a.alloc(u8, 2 * LINE_BUF + 7);
+    @memset(name, 'h');
+    const bare = try typedSchema(a, &.{ name, "c" }, &.{ .int, .int });
+    const bare_file = try std.mem.concat(a, u8, &.{ name, ",c\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "bare.csv", .data = bare_file });
+    try append(a, try tmp.dir.realpathAlloc(a, "bare.csv"), bare, try parseSlice(a, &bare, "3,4\n"));
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ bare_file, "3,4\n" }), try tmp.dir.readFileAlloc(a, "bare.csv", 4 * LINE_BUF));
+
+    const nl_name = try std.mem.concat(a, u8, &.{ "x\n", name });
+    const nl = try typedSchema(a, &.{ nl_name, "c" }, &.{ .int, .int });
+    const nl_file = try std.mem.concat(a, u8, &.{ "\"x\n", name, "\",c\n1,2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "nl.csv", .data = nl_file });
+    try append(a, try tmp.dir.realpathAlloc(a, "nl.csv"), nl, try parseSlice(a, &nl, "3,4\n"));
+    try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ nl_file, "3,4\n" }), try tmp.dir.readFileAlloc(a, "nl.csv", 4 * LINE_BUF));
 }
 
 test "csv writer: renderBatch produces exactly what writeBatch writes" {
