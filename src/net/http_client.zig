@@ -938,7 +938,7 @@ pub const HttpSource = struct {
         });
         slot.code = res.code;
         slot.body = res.body;
-        const again = res.code == 429 or res.code >= 500 or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
+        const again = busyStatus(res.code) or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
         if (!again) return .done;
         const after: ?u64 = if (res.retry_after_ms) |ms| @min(ms, max_retry_after_ms) else null;
         return .{ .failed = .{ .code = res.code, .err = error.HttpServerBusy, .retry_after_ms = after, .retriable = true } };
@@ -1164,10 +1164,16 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return buf.toOwnedSlice();
 }
 
+/// The statuses `HTTP()` replays and reports as `HttpServerBusy`: 429 and every 5xx.
+/// Not objstore's list, which adds 408 and leaves out 501 and 505+ (D12).
+fn busyStatus(code: u16) bool {
+    return code == 429 or code >= 500;
+}
+
 /// Maps a non-200 status to a named error, distinct per fix: 429/5xx are worth a
 /// control-plane retry (exit 75), 401 is an expired token, 400 a rejected request.
 pub fn statusError(code: u16) anyerror {
-    if (code == 429 or code >= 500) return error.HttpServerBusy;
+    if (busyStatus(code)) return error.HttpServerBusy;
     return switch (code) {
         400 => error.HttpBadRequest,
         401 => error.HttpUnauthorized,
@@ -2032,4 +2038,13 @@ test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
     try std.testing.expect(!repairOnce(&client, &fresh, "file:///x"));
     try std.testing.expect(fresh);
     try std.testing.expectEqual(@as(usize, 0), client.ca_bundle.bytes.items.len);
+}
+
+test "pinned for D12: HTTP() and objstore retry the same statuses except 408, 501 and 505+" {
+    for (100..600) |c| {
+        const code: u16 = @intCast(c);
+        const differs = code == 408 or code == 501 or code >= 505;
+        try std.testing.expectEqual(differs, busyStatus(code) != objstore.retriable(code));
+        try std.testing.expectEqual(busyStatus(code), statusError(code) == error.HttpServerBusy);
+    }
 }

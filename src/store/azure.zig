@@ -244,7 +244,9 @@ fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8,
     return out.toOwnedSlice();
 }
 
-/// Maps a status plus Azure's error code onto a distinct Zig error.
+/// Maps a status plus Azure's error code onto a distinct Zig error. Every status
+/// the retry loop replays as an outage (429 and the 5xx gateways) is `AzureThrottled`,
+/// so a run that exhausts its retries on one exits as transient; 408 and 501 are not (D12).
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "AuthenticationFailed")) return Error.AzureAuthFailed;
@@ -255,7 +257,7 @@ pub fn statusToError(code: u16, body: []const u8) Error {
     return switch (code) {
         401, 403 => Error.AzureAuthFailed,
         404 => Error.AzureContainerMissing,
-        429, 503 => Error.AzureThrottled,
+        429, 500, 502, 503, 504 => Error.AzureThrottled,
         else => Error.AzureRequestFailed,
     };
 }
@@ -899,4 +901,17 @@ fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.h
         why.* = arena.dupe(u8, w.last_error) catch "";
         return e;
     };
+}
+
+test "a retried-out 5xx gateway is AzureThrottled, which a run exits on as transient; 408 and 501 stay RequestFailed (D12)" {
+    for ([_]u16{ 429, 500, 502, 503, 504 }) |c| {
+        try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, ""));
+        try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, "<Error><Code>InternalError</Code></Error>"));
+    }
+    for ([_]u16{ 400, 405, 408, 409, 412, 418, 501, 505, 599 }) |c| try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(c, ""));
+    for (0..600) |c| {
+        const e = statusToError(@intCast(c), "");
+        if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.AzureThrottled, e);
+        if (e == Error.AzureThrottled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    }
 }
