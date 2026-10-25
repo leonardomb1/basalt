@@ -701,7 +701,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
     var guard = SinkGuard.init(snk);
-    errdefer guard.abort();
+    defer guard.abort();
     const t_emit0 = std.time.Instant.now() catch unreachable;
     const emit_span = trace.begin("aggregate emit and write", 0);
     try writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats);
@@ -915,7 +915,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
 
     const snk = try openTailSink(env, w, tail, la.out_schema.*);
     var guard = SinkGuard.init(snk);
-    errdefer guard.abort();
+    defer guard.abort();
     try writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats);
     if (env.profile) |p| {
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));

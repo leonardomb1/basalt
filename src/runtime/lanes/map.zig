@@ -263,13 +263,10 @@ fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
 /// aborts that lane sink.
 fn pourLane(mode: parallel.SinkMode, mtx: *std.Thread.Mutex, gpa: std.mem.Allocator, lane_idx: usize, chain: op.Op, batch_arena: *std.heap.ArenaAllocator, failed: ?*std.atomic.Value(bool)) !u64 {
     var own = SinkGuard.empty;
-    errdefer own.abort();
+    defer own.abort();
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
-        if (failed) |f| if (f.load(.seq_cst)) {
-            own.abort();
-            return out;
-        };
+        if (failed) |f| if (f.load(.seq_cst)) return out;
         if (b.len > 0) {
             if (!own.armed()) switch (mode) {
                 .shared => {},
@@ -338,7 +335,7 @@ pub fn runParallelMap(
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
     var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
-    errdefer shared.abort();
+    defer shared.abort();
     errdefer parallel.abortLanes(sink_mode);
 
     const nthreads = split.lanes(opts);
@@ -577,7 +574,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
         .{ .shared = try openSink(env, w, lp.out_schema) };
     var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
-    errdefer shared.abort();
+    defer shared.abort();
     errdefer parallel.abortLanes(sink_mode);
 
     var ctx = SqlMapJoinCtx{

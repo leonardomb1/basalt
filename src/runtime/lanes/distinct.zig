@@ -331,7 +331,7 @@ pub fn runParallelDistinct(
 
     const snk = try openTailSink(env, w, tail, row_schema.*);
     var guard = SinkGuard.init(snk);
-    errdefer guard.abort();
+    defer guard.abort();
     try writeTail(env, snk, merged, row_schema.*, tail, stats, .distinct);
     try guard.close();
     return true;

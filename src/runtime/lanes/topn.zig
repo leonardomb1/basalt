@@ -225,7 +225,7 @@ pub fn runParallelTopN(
 
     const snk = try openTailSink(env, w, &.{}, row_schema.*);
     var guard = SinkGuard.init(snk);
-    errdefer guard.abort();
+    defer guard.abort();
     if (top) |b| {
         try snk.writeBatch(arena, b);
         stats.rows_out += b.len;

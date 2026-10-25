@@ -75,7 +75,7 @@ pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.Resu
     cols[0] = try b.finish();
     const w = try arrow.ArrowWriter.open(gpa, schema, info);
     var guard = Guard(*arrow.ArrowWriter).init(w);
-    errdefer guard.abort();
+    defer guard.abort();
     try w.writeBatch(a, .{ .schema = &schema, .columns = cols, .len = n });
     try guard.close();
     return n;

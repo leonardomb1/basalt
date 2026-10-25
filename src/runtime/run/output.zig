@@ -510,7 +510,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 } else {
                     const snk = try openSink(env, wr, schema);
                     var guard = SinkGuard.init(snk);
-                    errdefer guard.abort();
+                    defer guard.abort();
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read, profiled);
                     try guard.close();
                 }
@@ -533,7 +533,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
         const snk = try openSink(env, wr, res.schema);
         var guard = SinkGuard.init(snk);
-        errdefer guard.abort();
+        defer guard.abort();
         for (batches.items) |b| {
             if (aborting()) return error.Aborted;
             try snk.writeBatch(batch_arena.allocator(), b);
@@ -547,7 +547,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     const snk = try openSink(env, wr, res.schema);
     var guard = SinkGuard.init(snk);
-    errdefer guard.abort();
+    defer guard.abort();
 
     var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
     defer for (&ping_pong) |*a| a.deinit();
