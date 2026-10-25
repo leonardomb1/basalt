@@ -467,3 +467,15 @@ test "Delta write: a failed run deletes its data files and the folders it made; 
     while (try it.next()) |e| files += @intFromBool(std.mem.endsWith(u8, e.name, ".parquet"));
     try testing.expectEqual(@as(usize, 1), files);
 }
+
+test "Delta write: a column name that is not UTF-8 is refused, at create and at append" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    try runRefuses(a, &tmp, "LOAD INTO '$B/n/' WITH (format = 'delta') AS SELECT id, grp AS \"s\xff\" FROM '$B/a.csv';", "column \"s\\xff\" has a name that is not UTF-8");
+    try testing.expect(!exists(&tmp, "n/_delta_log"));
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' AS SELECT id, grp AS \"s\xff\", amt FROM '$B/a.csv';", "has a name that is not UTF-8");
+}

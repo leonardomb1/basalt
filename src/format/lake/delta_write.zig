@@ -159,10 +159,14 @@ pub fn storeProblem(root: []const u8) ?[]const u8 {
 
 /// The write of `schema` into the table at `root`: the table as it stands, or,
 /// when `create` and there is none, the one this write makes. With no schema
-/// (`check` cannot always know it) only the table itself is judged.
+/// (`check` cannot always know it) only the table itself is judged. A column name
+/// that is not UTF-8 is refused: the log's JSON would hold it repaired while the
+/// Parquet files keep it raw, and the column would read back as all NULL.
 pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool, partition_by: ?[]const []const u8, codec: codecs.Codec, schema_in: ?types.Schema) !*Plan {
     const name = try std.fmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (storeProblem(root)) |why| return refuse("cannot write {s}: {s}", .{ name, why });
+    if (schema_in) |s| for (s.fields) |f| if (!std.unicode.utf8ValidateSlice(f.name))
+        return refuse("column \"{f}\" has a name that is not UTF-8, which {s} cannot hold; rename it with `AS`", .{ std.zig.fmtString(f.name), name });
     const log_path = try std.mem.concat(arena, u8, &.{ root, delta.log_dir });
     const listed: []const []const u8 = folder.listRaw(arena, log_path) catch |e|
         if (table.absent(e) or e == azure.Error.AzureContainerMissing or e == s3.Error.S3BucketMissing) &.{} else return e;
