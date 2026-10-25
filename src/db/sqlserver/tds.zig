@@ -50,6 +50,11 @@ const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const cell = @import("../../exec/cell.zig");
 const decimal = @import("../../exec/decimal.zig");
+const civil = @import("../../exec/civil.zig");
+const charset = @import("../../format/charset.zig");
+const hex = @import("../../format/hex.zig");
+const uuid = @import("../../format/uuid.zig");
+const utf16 = @import("../../format/utf16.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -431,9 +436,9 @@ pub const Conn = struct {
             0,    0,
         });
         @memcpy(payload.items[10..18], &self.txn_desc);
-        const u16s = try std.unicode.utf8ToUtf16LeAlloc(self.wire.gpa, stmt);
-        defer self.wire.gpa.free(u16s);
-        try payload.appendSlice(std.mem.sliceAsBytes(u16s));
+        const text = try utf16.encodeLeAlloc(self.wire.gpa, stmt);
+        defer self.wire.gpa.free(text);
+        try payload.appendSlice(text);
         try self.writePacket(PKT_SQLBATCH, payload.items);
     }
 
@@ -825,7 +830,7 @@ const TdsCursor = struct {
             d.decode = decodeOf(d);
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
-            d.name = try utf16ToUtf8(ma, nbytes);
+            d.name = try utf16.decodeLeAlloc(.question, ma, nbytes);
             self.cols[k] = d;
             fields[k] = .{ .name = d.name, .ty = d.engine_type };
         }
@@ -1106,17 +1111,17 @@ const BulkProto = struct {
             try w.writeByte(0xE7);
             try writeU16(w, NVARCHAR_MAX_BYTES);
             try w.writeAll(&BULK_COLLATION);
-            const name16 = try std.unicode.utf8ToUtf16LeAlloc(gpa, f.name);
+            const name16 = try utf16.encodeLeAlloc(gpa, f.name);
             defer gpa.free(name16);
-            try w.writeByte(@intCast(name16.len));
-            try w.writeAll(std.mem.sliceAsBytes(name16));
+            try w.writeByte(@intCast(name16.len / 2));
+            try w.writeAll(name16);
         }
     }
 
     /// Each cell's text is transcoded through one UTF-16 buffer, grown to the
     /// longest cell of the batch.
     pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
-        var units = std.array_list.Managed(u16).init(arena);
+        var units = std.array_list.Managed(u8).init(arena);
         var buf: [celltext.scalar_bound]u8 = undefined;
         for (0..batch.len) |r| {
             try w.writeByte(0xD1);
@@ -1126,15 +1131,11 @@ const BulkProto = struct {
                     continue;
                 }
                 const s = celltext.text(col, r, &buf, sql.BulkText(.{ .bool_true = "1", .bool_false = "0" }){});
-                try units.resize(s.len);
-                const u16s = units.items[0..try std.unicode.utf8ToUtf16Le(units.items, s)];
-                var blen = @min(u16s.len * 2, NVARCHAR_MAX_BYTES);
-                if (blen < u16s.len * 2 and blen >= 2) {
-                    const last = u16s[blen / 2 - 1];
-                    if (last >= 0xD800 and last <= 0xDBFF) blen -= 2;
-                }
+                try units.resize(2 * s.len);
+                const le = units.items[0..try utf16.encodeLe(units.items, s)];
+                const blen = utf16.cutLe(le, NVARCHAR_MAX_BYTES);
                 try writeU16(w, @intCast(blen));
-                try w.writeAll(std.mem.sliceAsBytes(u16s[0 .. blen / 2]));
+                try w.writeAll(le[0..blen]);
             }
         }
     }
@@ -1282,15 +1283,15 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .float => try b.appendFloat(if (raw.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(raw)))))) else @bitCast(readULE(raw))),
         .decimal => try b.appendDecimal(try decodeDecimal(d, raw)),
         .money => try b.appendDecimal(try decodeMoney(raw)),
-        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(raw))) - 719162)) |days| try b.appendAs(.i32, days) else try b.appendNull(),
+        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(raw))) + civil.epoch.ce1)) |days| try b.appendAs(.i32, days) else try b.appendNull(),
         .time => try b.appendInt(try decodeTime(d, raw)),
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
         .plain_text, .win1252 => {
             if (isAscii(raw)) return b.appendStr(raw);
             return b.commitBytes(win1252Encode(try b.reserveBytes(win1252Len(raw)), raw));
         },
-        .unicode_text => try appendUtf16(b, raw),
-        .guid => try b.appendStr(try formatGuid(arena, raw)),
+        .unicode_text => try b.commitBytes(utf16.decodeLe(.question, try b.reserveBytes(utf16.decodedBound(raw.len)), raw)),
+        .guid => try b.appendStr(if (raw.len < 16) "" else &uuid.text(raw[0..16], .mixed)),
         .hex => try b.appendStr(try bytesToHex(arena, raw)),
         .bytes, .raw_text => try b.appendStr(raw),
     }
@@ -1338,18 +1339,18 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
             const tlen = bytes.len - 3 - off_bytes;
             const time_micros = try decodeTime(d, bytes[0..tlen]);
             const days: i64 = @intCast(readULE(bytes[tlen .. tlen + 3]));
-            return (days - 719162) *| 86_400_000_000 +| time_micros;
+            return civil.dayMicros(days + civil.epoch.ce1) +| time_micros;
         },
         else => switch (bytes.len) {
             8 => {
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
-                return (date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300);
+                return civil.dayMicros(date4 + civil.epoch.sql1900) +| @divTrunc(ticks * 1_000_000, 300);
             },
             4 => {
                 const days: i64 = std.mem.readInt(u16, bytes[0..2], .little);
                 const mins: i64 = std.mem.readInt(u16, bytes[2..4], .little);
-                return (days - 25567) * 86_400_000_000 + mins * 60_000_000;
+                return civil.dayMicros(days + civil.epoch.sql1900) + mins * 60_000_000;
             },
             else => return error.MalformedTdsValue,
         },
@@ -1393,47 +1394,17 @@ fn readIntLE(bytes: []const u8) i64 {
     };
 }
 
-fn cp1252High(b: u8) u21 {
-    return switch (b) {
-        0x80 => 0x20AC,
-        0x82 => 0x201A,
-        0x83 => 0x0192,
-        0x84 => 0x201E,
-        0x85 => 0x2026,
-        0x86 => 0x2020,
-        0x87 => 0x2021,
-        0x88 => 0x02C6,
-        0x89 => 0x2030,
-        0x8A => 0x0160,
-        0x8B => 0x2039,
-        0x8C => 0x0152,
-        0x8E => 0x017D,
-        0x91 => 0x2018,
-        0x92 => 0x2019,
-        0x93 => 0x201C,
-        0x94 => 0x201D,
-        0x95 => 0x2022,
-        0x96 => 0x2013,
-        0x97 => 0x2014,
-        0x98 => 0x02DC,
-        0x99 => 0x2122,
-        0x9A => 0x0161,
-        0x9B => 0x203A,
-        0x9C => 0x0153,
-        0x9E => 0x017E,
-        0x9F => 0x0178,
-        else => b,
-    };
-}
-
 const Utf8Seq = struct { len: u8, bytes: [3]u8 };
 
+/// UTF-8 of each byte 0x80-0xFF; the five bytes Windows-1252 leaves undefined
+/// read as their C1 control, as SQL Server converts them.
 const win1252_high: [128]Utf8Seq = blk: {
     @setEvalBranchQuota(10_000);
     var t: [128]Utf8Seq = undefined;
     for (&t, 0..) |*e, k| {
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cp1252High(0x80 + k), &buf) catch unreachable;
+        const cp: u21 = if (k < 32 and charset.cp1252_high[k] != 0) charset.cp1252_high[k] else 0x80 + k;
+        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
         e.* = .{ .len = n, .bytes = buf[0..3].* };
     }
     break :blk t;
@@ -1481,79 +1452,10 @@ fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
 }
 
 fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
-    const digits = "0123456789abcdef";
     const out = try arena.alloc(u8, 2 + b.len * 2);
-    out[0] = '0';
-    out[1] = 'x';
-    for (b, 0..) |byte, i| {
-        out[2 + i * 2] = digits[byte >> 4];
-        out[2 + i * 2 + 1] = digits[byte & 0x0F];
-    }
+    out[0..2].* = "0x".*;
+    _ = hex.encode(out[2..], b, .lower);
     return out;
-}
-
-fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
-    if (b.len < 16) return arena.dupe(u8, "");
-    return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    });
-}
-
-/// UCS-2 is not UTF-16: halves of a surrogate pair are joined (encoding them singly
-/// once made every emoji `??`); only an unpaired half becomes `?`. The wire buffer is
-/// byte-aligned, so std's `[]const u16` helpers do not apply.
-fn utf16ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const out = try arena.alloc(u8, bytes.len / 2 * 3);
-    return arena.realloc(out, utf16Encode(out, bytes));
-}
-
-/// A UTF-16LE cell transcoded straight into a string column, with no copy between.
-fn appendUtf16(b: *column.Builder, bytes: []const u8) !void {
-    return b.commitBytes(utf16Encode(try b.reserveBytes(bytes.len / 2 * 3), bytes));
-}
-
-/// `bytes` as UTF-8 into `out`, which has room for three bytes per code unit (a
-/// pair's four bytes are two units' worth); returns the length written. Eight
-/// units that are all ASCII, the common run, are narrowed at once.
-fn utf16Encode(out: []u8, bytes: []const u8) usize {
-    const V = @Vector(16, u8);
-    const ascii_mask: V = @bitCast([_]u8{ 0x80, 0xFF } ** 8);
-    const lows = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
-    var o: usize = 0;
-    var k: usize = 0;
-    while (k + 1 < bytes.len) {
-        if (k + 16 <= bytes.len) {
-            const v: V = bytes[k..][0..16].*;
-            if (@reduce(.Or, v & ascii_mask) == 0) {
-                out[o..][0..8].* = @shuffle(u8, v, undefined, lows);
-                o += 8;
-                k += 16;
-                continue;
-            }
-        }
-        var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
-        k += 2;
-        if (cp < 0x80) {
-            out[o] = @intCast(cp);
-            o += 1;
-            continue;
-        }
-        if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
-            const lo: u16 = if (k + 1 < bytes.len) @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8) else 0;
-            if (!std.unicode.utf16IsLowSurrogate(lo)) {
-                out[o] = '?';
-                o += 1;
-                continue;
-            }
-            cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
-            k += 2;
-        }
-        o += std.unicode.utf8Encode(cp, out[o..]) catch blk: {
-            out[o] = '?';
-            break :blk 1;
-        };
-    }
-    return o;
 }
 
 test "bytes to hex string" {
@@ -1563,12 +1465,107 @@ test "bytes to hex string" {
     try std.testing.expectEqualStrings("0x0001abff", out);
 }
 
-test "format sql server guid (mixed-endian)" {
-    const alloc = std.testing.allocator;
+test "tds: a uniqueidentifier cell reads as the mixed-endian GUID the old formatGuid wrote" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const old = struct {
+        fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
+            if (b.len < 16) return arena.dupe(u8, "");
+            return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            });
+        }
+    };
+    var d = ColumnDesc{ .tds_type = 0x24, .engine_type = types.Type.init(.string).asNullable(), .kind = .bytelen, .is_guid = true };
+    d.decode = decodeOf(d);
+    try std.testing.expectEqual(Decode.guid, d.decode);
     const b = [_]u8{ 0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
-    const out = try formatGuid(alloc, &b);
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("76543210-ba98-fedc-0123-456789abcdef", out);
+    try std.testing.expectEqualStrings("76543210-ba98-fedc-0123-456789abcdef", (try cellValue(a, d, &b)).string);
+    var prng = std.Random.DefaultPrng.init(0x6d1d);
+    const r = prng.random();
+    var buf: [20]u8 = undefined;
+    for (0..2000) |_| {
+        const n = r.uintAtMost(usize, buf.len);
+        r.bytes(buf[0..n]);
+        try std.testing.expectEqualStrings(try old.formatGuid(a, buf[0..n]), (try cellValue(a, d, buf[0..n])).string);
+    }
+}
+
+test "tds: binary text is 0x and lower-case hex, as the old bytesToHex wrote it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const old = struct {
+        fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
+            const digits = "0123456789abcdef";
+            const out = try arena.alloc(u8, 2 + b.len * 2);
+            out[0] = '0';
+            out[1] = 'x';
+            for (b, 0..) |byte, i| {
+                out[2 + i * 2] = digits[byte >> 4];
+                out[2 + i * 2 + 1] = digits[byte & 0x0F];
+            }
+            return out;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x0bad);
+    const r = prng.random();
+    var buf: [40]u8 = undefined;
+    for (0..2000) |_| {
+        const n = r.uintAtMost(usize, buf.len);
+        r.bytes(buf[0..n]);
+        try std.testing.expectEqualStrings(try old.bytesToHex(a, buf[0..n]), try bytesToHex(a, buf[0..n]));
+    }
+}
+
+test "tds: the varchar table maps every high byte as the old cp1252High switch did, undefined bytes to C1 (D5)" {
+    const old = struct {
+        fn cp1252High(b: u8) u21 {
+            return switch (b) {
+                0x80 => 0x20AC,
+                0x82 => 0x201A,
+                0x83 => 0x0192,
+                0x84 => 0x201E,
+                0x85 => 0x2026,
+                0x86 => 0x2020,
+                0x87 => 0x2021,
+                0x88 => 0x02C6,
+                0x89 => 0x2030,
+                0x8A => 0x0160,
+                0x8B => 0x2039,
+                0x8C => 0x0152,
+                0x8E => 0x017D,
+                0x91 => 0x2018,
+                0x92 => 0x2019,
+                0x93 => 0x201C,
+                0x94 => 0x201D,
+                0x95 => 0x2022,
+                0x96 => 0x2013,
+                0x97 => 0x2014,
+                0x98 => 0x02DC,
+                0x99 => 0x2122,
+                0x9A => 0x0161,
+                0x9B => 0x203A,
+                0x9C => 0x0153,
+                0x9E => 0x017E,
+                0x9F => 0x0178,
+                else => b,
+            };
+        }
+    };
+    for (0..128) |k| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(old.cp1252High(@intCast(0x80 + k)), &buf);
+        const e = win1252_high[k];
+        try std.testing.expectEqualSlices(u8, buf[0..n], e.bytes[0..e.len]);
+    }
+    for ([_]u8{ 0x81, 0x8D, 0x8F, 0x90, 0x9D }) |b| {
+        const e = win1252_high[b - 0x80];
+        var want: [2]u8 = undefined;
+        _ = try std.unicode.utf8Encode(b, &want);
+        try std.testing.expectEqualSlices(u8, &want, e.bytes[0..e.len]);
+    }
 }
 
 test "win1252 transcode to utf8" {
@@ -1861,31 +1858,37 @@ test "decodeDateTime: DATETIME ticks, SMALLDATETIME minutes, DATETIME2 scale" {
     try std.testing.expectEqual(@as(i64, 86_400_000_000 + 1_500_000), try decodeDateTime(dt2, &b7));
 }
 
-test "utf16ToUtf8 decodes BMP text, pairs surrogates; only an unpaired half degrades to `?`" {
-    const alloc = std.testing.allocator;
-    const bmp = try utf16ToUtf8(alloc, "h\x00i\x00\xe9\x00");
-    defer alloc.free(bmp);
-    try std.testing.expectEqualStrings("hi\u{e9}", bmp);
-
-    const emoji = try utf16ToUtf8(alloc, "a\x00\x3d\xd8\x00\xde" ++ "b\x00");
-    defer alloc.free(emoji);
-    try std.testing.expectEqualStrings("a😀b", emoji);
-
-    const round = try std.unicode.utf8ToUtf16LeAlloc(alloc, "𝄞x𝕏");
-    defer alloc.free(round);
-    const back = try utf16ToUtf8(alloc, std.mem.sliceAsBytes(round));
-    defer alloc.free(back);
-    try std.testing.expectEqualStrings("𝄞x𝕏", back);
-
-    const orphan = try utf16ToUtf8(alloc, "\x3d\xd8" ++ "a\x00");
-    defer alloc.free(orphan);
-    try std.testing.expectEqualStrings("?a", orphan);
-    const cut = try utf16ToUtf8(alloc, "a\x00\x3d\xd8");
-    defer alloc.free(cut);
-    try std.testing.expectEqualStrings("a?", cut);
-    const low = try utf16ToUtf8(alloc, "\x00\xde");
-    defer alloc.free(low);
-    try std.testing.expectEqualStrings("?", low);
+test "tds: epochs from civil are the day counts the decoders used before" {
+    try std.testing.expectEqual(@as(i64, -719162), civil.epoch.ce1);
+    try std.testing.expectEqual(@as(i64, -25567), civil.epoch.sql1900);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var d = ColumnDesc{ .tds_type = 0x28, .engine_type = types.Type.init(.date).asNullable(), .kind = .bytelen };
+    d.decode = decodeOf(d);
+    for ([_]u24{ 0, 1, 719162, 719163, 0xFFFFFF }) |days| {
+        var raw: [3]u8 = undefined;
+        std.mem.writeInt(u24, &raw, days, .little);
+        try std.testing.expectEqual(@as(i32, @intCast(@as(i64, days) - 719162)), (try cellValue(a, d, &raw)).date);
+    }
+    const dt2 = ColumnDesc{ .tds_type = 0x2A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .bytelen, .scale = 7 };
+    const dt = ColumnDesc{ .tds_type = 0x3D, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 8 };
+    const sdt = ColumnDesc{ .tds_type = 0x3A, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 4 };
+    var prng = std.Random.DefaultPrng.init(0xe0c);
+    const r = prng.random();
+    for (0..2000) |_| {
+        var b8: [8]u8 = undefined;
+        r.bytes(&b8);
+        const tu: i64 = @intCast(std.mem.readInt(u40, b8[0..5], .little));
+        const days: i64 = std.mem.readInt(u24, b8[5..8], .little);
+        try std.testing.expectEqual((days - 719162) *| 86_400_000_000 +| @divTrunc(tu * 1_000_000, 10_000_000), try decodeDateTime(dt2, &b8));
+        const date4: i64 = std.mem.readInt(i32, b8[0..4], .little);
+        const ticks: i64 = std.mem.readInt(u32, b8[4..8], .little);
+        try std.testing.expectEqual((date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300), try decodeDateTime(dt, &b8));
+        const sdays: i64 = std.mem.readInt(u16, b8[0..2], .little);
+        const mins: i64 = std.mem.readInt(u16, b8[2..4], .little);
+        try std.testing.expectEqual((sdays - 25567) * 86_400_000_000 + mins * 60_000_000, try decodeDateTime(sdt, b8[0..4]));
+    }
 }
 
 /// The row count of a final DONE (0xFD) with DONE_COUNT (0x10) set.
@@ -2112,9 +2115,9 @@ fn featureExtAck(r: *Body) Body.Error![]const u8 {
 fn errorText(gpa: std.mem.Allocator, body: []const u8) ![]const u8 {
     if (body.len < 8) return gpa.dupe(u8, "the server sent a malformed error");
     const msglen: usize = std.mem.readInt(u16, body[6..8], .little);
-    const utf16 = body[8..@min(body.len, 8 + msglen * 2)];
-    const out = try gpa.alloc(u8, utf16.len / 2);
-    for (out, 0..) |*c, k| c.* = utf16[k * 2];
+    const msg = body[8..@min(body.len, 8 + msglen * 2)];
+    const out = try gpa.alloc(u8, msg.len / 2);
+    for (out, 0..) |*c, k| c.* = msg[k * 2];
     return out;
 }
 
@@ -2297,27 +2300,84 @@ test "fuzz: row cell decode survives arbitrary bytes" {
     try @import("../../testing/fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
 }
 
-test "utf16Encode matches std on valid UTF-16 at every alignment, ASCII runs narrowed eight at a time" {
+test "tds: an nvarchar cell decodes as the old utf16Encode did, lone halves as `?` (D7)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const old = struct {
+        fn utf16Encode(out: []u8, bytes: []const u8) usize {
+            const V = @Vector(16, u8);
+            const ascii_mask: V = @bitCast([_]u8{ 0x80, 0xFF } ** 8);
+            const lows = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
+            var o: usize = 0;
+            var k: usize = 0;
+            while (k + 1 < bytes.len) {
+                if (k + 16 <= bytes.len) {
+                    const v: V = bytes[k..][0..16].*;
+                    if (@reduce(.Or, v & ascii_mask) == 0) {
+                        out[o..][0..8].* = @shuffle(u8, v, undefined, lows);
+                        o += 8;
+                        k += 16;
+                        continue;
+                    }
+                }
+                var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
+                k += 2;
+                if (cp < 0x80) {
+                    out[o] = @intCast(cp);
+                    o += 1;
+                    continue;
+                }
+                if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
+                    const lo: u16 = if (k + 1 < bytes.len) @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8) else 0;
+                    if (!std.unicode.utf16IsLowSurrogate(lo)) {
+                        out[o] = '?';
+                        o += 1;
+                        continue;
+                    }
+                    cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
+                    k += 2;
+                }
+                o += std.unicode.utf8Encode(cp, out[o..]) catch blk: {
+                    out[o] = '?';
+                    break :blk 1;
+                };
+            }
+            return o;
+        }
+    };
+    var d = ColumnDesc{ .tds_type = 0xE7, .engine_type = types.Type.init(.string).asNullable(), .kind = .ushortlen, .is_unicode = true };
+    d.decode = decodeOf(d);
+    try std.testing.expectEqual(Decode.unicode_text, d.decode);
+    try std.testing.expectEqualStrings("?a\u{e9}?", (try cellValue(a, d, "\x3d\xd8a\x00\xe9\x00\x00\xde")).string);
     var prng = std.Random.DefaultPrng.init(0x16_16);
     const r = prng.random();
-    const pool = [_]u21{ 'a', 'Z', '0', ' ', '~', 0x7F, 0xE7, 0xE3, 0x20AC, 0x4E2D, 0xFFFD, 0x1F600, 0x10FFFF };
+    const pool = [_]u16{ 'a', 'Z', ' ', 0x7F, 0x80, 0xE7, 0x20AC, 0x4E2D, 0xFFFD, 0xFFFF, 0xD83D, 0xDE00, 0xDBFF, 0xDC00 };
     for (0..20_000) |_| {
-        var units = std.array_list.Managed(u16).init(a);
+        _ = ar.reset(.retain_capacity);
         const n = r.uintLessThan(usize, 48);
-        for (0..n) |_| {
-            const cp: u21 = if (r.uintLessThan(u8, 4) != 0) r.intRangeAtMost(u21, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)];
-            if (cp >= 0x10000) {
-                const v = cp - 0x10000;
-                try units.append(@intCast(0xD800 + (v >> 10)));
-                try units.append(@intCast(0xDC00 + (v & 0x3FF)));
-            } else try units.append(@intCast(cp));
-        }
-        const bytes = std.mem.sliceAsBytes(units.items);
-        const want = try std.unicode.utf16LeToUtf8Alloc(a, units.items);
-        const out = try a.alloc(u8, bytes.len / 2 * 3);
-        try std.testing.expectEqualStrings(want, out[0..utf16Encode(out, bytes)]);
+        const bytes = try a.alloc(u8, n * 2 + r.uintAtMost(usize, 1));
+        for (0..n) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], if (r.boolean()) r.intRangeAtMost(u16, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)], .little);
+        if (bytes.len % 2 == 1) bytes[bytes.len - 1] = r.int(u8);
+        const want = try a.alloc(u8, bytes.len / 2 * 3);
+        const got = (try cellValue(a, d, bytes)).string;
+        try std.testing.expectEqualStrings(want[0..old.utf16Encode(want, bytes)], got);
+        try std.testing.expectEqualStrings(got, try utf16.decodeLeAlloc(.question, a, bytes));
     }
+}
+
+test "tds: INSERT BULK names a column by its UTF-16 unit count, a pair counting two" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "a\u{e7}\u{e3}o\u{1F600}", .ty = types.Type.init(.string).asNullable() },
+    };
+    var w = std.Io.Writer.Allocating.init(a);
+    try BulkProto.segmentHeader(&w.writer, a, .{ .fields = &fields });
+    const got = w.written();
+    const name = wide("a\u{e7}\u{e3}o\u{1F600}");
+    try std.testing.expectEqual(@as(usize, 6), name.len / 2);
+    try std.testing.expectEqual(@as(u8, 6), got[got.len - name.len - 1]);
+    try std.testing.expectEqualSlices(u8, name, got[got.len - name.len ..]);
 }
