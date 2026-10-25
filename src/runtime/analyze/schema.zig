@@ -193,8 +193,8 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
 
 /// Ranking, NTILE and the counts are a non-null int, PERCENT_RANK and CUME_DIST a
 /// non-null float; LAG, LEAD, the value functions, MIN and MAX keep the column's type;
-/// SUM is an INT over ints, a DECIMAL(38) of the column's scale over decimals, as the SUM
-/// aggregate is, and a float otherwise; any other aggregate is typed as under GROUP
+/// SUM is a float over floats, a DECIMAL(38) of the column's scale over decimals and an
+/// INT otherwise, as the SUM aggregate is; any other aggregate is typed as under GROUP
 /// BY. With an argument it is nullable (an empty frame, the first LAG).
 pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
     return switch (f) {
@@ -208,7 +208,8 @@ pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
                 .int => types.Type.init(.int).asNullable(),
                 .decimal => types.Type.decimal(38, src.scale).asNullable(),
                 .string => if (src.scale > 0) types.Type.decimal(38, src.scale).asNullable() else types.Type.init(.int).asNullable(),
-                else => types.Type.init(.float).asNullable(),
+                .float => types.Type.init(.float).asNullable(),
+                else => types.Type.init(.int).asNullable(),
             },
             else => switch (aggregates.spec(a).result) {
                 .count => types.Type.init(.int),
@@ -324,26 +325,43 @@ fn fracDigits(text: []const u8) u8 {
     return @intCast(@min(text.len - dot - 1, 18));
 }
 
-/// `text` as an integer at `scale` decimal places, exactly when it is plain digits.
+/// The largest RANGE offset kept: past any span of int, date or timestamp keys, yet any
+/// key, a DECIMAL(38) one too, plus or minus it still fits an i128.
+const off_max: i128 = 1 << 125;
+
+/// `text` as an integer at `scale` decimal places, exactly when it is plain digits,
+/// saturating at `off_max`.
 fn scaledText(text: []const u8, scale: u8) i128 {
-    const p = std.math.powi(i128, 10, scale) catch return std.math.maxInt(i64);
+    const p = std.math.powi(i128, 10, scale) catch return off_max;
     if (std.mem.indexOfAny(u8, text, "eE") != null) {
         const f = std.fmt.parseFloat(f64, text) catch return 0;
-        return @intFromFloat(@round(f * @as(f64, @floatFromInt(p))));
+        const x = @round(f * @as(f64, @floatFromInt(p)));
+        if (!(@abs(x) < @as(f64, @floatFromInt(off_max)))) return off_max;
+        return @intFromFloat(x);
     }
     const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
-    var v: i128 = std.fmt.parseInt(i128, text[0..dot], 10) catch std.math.maxInt(i64);
-    v = std.math.mul(i128, v, p) catch std.math.maxInt(i64);
+    var v: i128 = if (dot == 0) 0 else std.fmt.parseInt(i128, text[0..dot], 10) catch return off_max;
+    v = std.math.mul(i128, v, p) catch return off_max;
     if (dot < text.len) {
         const frac = text[dot + 1 ..];
         var place = p;
         for (frac) |c| {
             place = @divTrunc(place, 10);
             if (place == 0) break;
-            v += @as(i128, c - '0') * place;
+            v = std.math.add(i128, v, @as(i128, c - '0') * place) catch return off_max;
         }
     }
-    return v;
+    return @min(v, off_max);
+}
+
+/// A non-negative offset of `unit_us` microseconds each, exact for plain digits and
+/// rounded to the microsecond, saturating at `off_max`.
+fn scaledMicros(text: []const u8, unit_us: i128) i128 {
+    const s = fracDigits(text);
+    const p = std.math.powi(i128, 10, s) catch return off_max;
+    const m = std.math.mul(i128, scaledText(text, s), unit_us) catch return off_max;
+    const r = std.math.add(i128, m, @divTrunc(p, 2)) catch return off_max;
+    return @min(@divTrunc(r, p), off_max);
 }
 
 /// A window's ORDER BY key for a message: as written, or for one only the parser's
@@ -390,10 +408,7 @@ fn opOff(o: ast.FrameOffset, unit: ast.FrameUnit, conv: op.Window.RangeConv, key
     if (unit == .rows) return .{ .rows = std.fmt.parseInt(i64, o.text, 10) catch std.math.maxInt(i64) };
     if (conv.float) return .{ .float = std.fmt.parseFloat(f64, o.text) catch 0 };
     return switch (key_kind) {
-        .date, .timestamp, .time => .{ .int = if (o.unit) |u|
-            @intFromFloat(@round((std.fmt.parseFloat(f64, o.text) catch 0) * @as(f64, @floatFromInt(unitMicros(u)))))
-        else
-            @intFromFloat(@round((std.fmt.parseFloat(f64, o.text) catch 0) * @as(f64, @floatFromInt(us_per_day)))) },
+        .date, .timestamp, .time => .{ .int = scaledMicros(o.text, if (o.unit) |u| unitMicros(u) else us_per_day) },
         else => .{ .int = scaledText(o.text, conv.scale) },
     };
 }
@@ -1015,4 +1030,28 @@ test "orientKeys: each value goes to the side its columns are on; one side's pai
     try std.testing.expectEqual(@as(usize, 1), lp.join.left_keys.len);
     try std.testing.expect(lp.join.residual.?.* == .binary);
     try std.testing.expectEqual(@as(usize, 1), lp.left.len);
+}
+
+test "opOff: an INTERVAL or day offset is exact in microseconds and saturates past any key span" {
+    const ts: op.Window.RangeConv = .{};
+    const date: op.Window.RangeConv = .{ .mul = us_per_day };
+    try std.testing.expectEqual(@as(i128, 5_400_000_000), opOff(.{ .text = "1.5", .unit = .hour }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 43_200_000_000), opOff(.{ .text = ".5", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 1), opOff(.{ .text = "0.000001", .unit = .second }, .range, ts, .time).int);
+    try std.testing.expectEqual(@as(i128, 1), opOff(.{ .text = "0.0000005", .unit = .second }, .range, ts, .time).int);
+    try std.testing.expectEqual(@as(i128, 2 * us_per_day), opOff(.{ .text = "2" }, .range, date, .date).int);
+    try std.testing.expectEqual(@as(i128, 123_456_789_012_345_678 * us_per_day), opOff(.{ .text = "123456789012345678", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "1e40", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "1e40" }, .range, date, .date).int);
+    try std.testing.expectEqual(@as(i128, 5), opOff(.{ .text = ".5" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "1e40" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "99999999999999999999999999999999999999999" }, .range, .{}, .int).int);
+}
+
+test "windowFuncType: SUM over an untyped NULL is an INT, as the SUM aggregate is" {
+    var t = types.Type.init(.bool).asNullable();
+    t.unknown = true;
+    try std.testing.expectEqual(types.TypeKind.int, windowFuncType(.{ .agg = .sum }, t).kind);
+    try std.testing.expectEqual(types.TypeKind.float, windowFuncType(.{ .agg = .sum }, types.Type.init(.float)).kind);
+    try std.testing.expectEqual(types.TypeKind.int, windowFuncType(.{ .agg = .sum }, types.Type.init(.int)).kind);
 }
