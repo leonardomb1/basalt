@@ -28,8 +28,7 @@ const profile = @import("../exec/profile.zig");
 const Profile = profile.Profile;
 const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
+const connectorNote = @import("env.zig").connectorNote;
 const SinkGuard = @import("../connect/guard.zig").SinkGuard;
 
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
@@ -273,14 +272,11 @@ pub const WorkQueue = struct {
         q.err_mtx.lock();
         if (q.first_err == null) {
             q.first_err = e;
-            const name = @errorName(e);
             if (eval.takeFailure(e)) |why| {
                 q.note_len = @min(why.len, q.note_buf.len);
                 @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
-            } else if ((std.mem.startsWith(u8, name, "Sftp") or std.mem.startsWith(u8, name, "Ssh")) and sftp.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "sftp: {s}: {s}", .{ name, sftp.lastError() }) catch q.note_buf[0..0]).len;
-            } else if (std.mem.startsWith(u8, name, "Smb") and smb.lastError().len > 0) {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "smb: {s}: {s}", .{ name, smb.lastError() }) catch q.note_buf[0..0]).len;
+            } else if (connectorNote(e, null)) |n| {
+                q.note_len = (std.fmt.bufPrint(&q.note_buf, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why }) catch q.note_buf[0..0]).len;
             }
         }
         q.err_mtx.unlock();

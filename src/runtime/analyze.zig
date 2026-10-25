@@ -179,11 +179,7 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .null => null,
         .int => |n| if (n < 0) fail(diag, "{s} must not be negative, got {d}", .{ what, n }) else @intCast(n),
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
-        .float => |f| blk: {
-            if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) break :blk fail(diag, "{s} {d} is out of range", .{ what, f });
-            const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
-            break :blk roundedRows(diag, what, @intFromFloat(r));
-        },
+        .float => |f| roundedRows(diag, what, textconv.floatToInt(f, .half_even) orelse return fail(diag, "{s} {d} is out of range", .{ what, f })),
         .decimal => |d| blk: {
             const q = decimal.roundWhole(d) orelse break :blk fail(diag, "{s} is out of range", .{what});
             break :blk roundedRows(diag, what, q);
@@ -2022,6 +2018,31 @@ const parser = @import("../lang/sql_parser.zig");
 pub fn parse(a: std.mem.Allocator, src: []const u8) !ast.Program {
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     return parser.parseSource(a, src, &pd);
+}
+
+test "a float LIMIT rounds half to even through textconv.floatToInt as the old formula did" {
+    const old = struct {
+        fn rows(f: f64) ?i64 {
+            if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) return null;
+            const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
+            return @intFromFloat(r);
+        }
+    };
+    const specials = [_]f64{ 0, -0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.49999999999999994, 4503599627370495.5, 4503599627370497, 9007199254740994, 0x1p62, 0x1p63, -0x1p63 + 1024, 1e300, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 9.223372036854775e18 };
+    for (specials) |f| try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+    try std.testing.expectEqual(@as(?i64, null), old.rows(-0x1p63));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), textconv.floatToInt(-0x1p63, .half_even));
+    var prng = std.Random.DefaultPrng.init(0x6c696d6974);
+    const rand = prng.random();
+    for (0..20000) |_| {
+        const f = switch (rand.uintLessThan(u8, 3)) {
+            0 => (rand.float(f64) - 0.5) * 1000,
+            1 => @as(f64, @floatFromInt(rand.intRangeAtMost(i32, -100000, 100000))) / 2,
+            else => @as(f64, @bitCast(rand.int(u64))),
+        };
+        if (f == -0x1p63) continue;
+        try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+    }
 }
 
 test {

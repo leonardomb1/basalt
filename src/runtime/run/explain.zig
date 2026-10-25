@@ -19,6 +19,7 @@ const analyze = @import("../analyze.zig");
 const arrow = @import("../../format/arrow/write.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../../exec/column.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const print = @import("../../lang/print.zig");
 const profile = @import("../../exec/profile.zig");
 const runDescribe = @import("../run.zig").runDescribe;
@@ -201,7 +202,7 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
         try w.print("  Row groups: {d} read, {d} skipped\n", .{ facts.row_groups, facts.row_groups_skipped });
     if (facts.columns_total > 0) try w.print("  Columns read: {d} of {d}\n", .{ facts.columns_read, facts.columns_total });
     if (facts.spill_peak > 0) try w.print("  Spilled to disk, at most: {f}\n", .{Bytes{ .n = facts.spill_peak }});
-    for (prof.sent.items) |s| try w.print("  Sent to {s}\n", .{clip(s, 400)});
+    for (prof.sent.items) |s| try w.print("  Sent to {s}\n", .{jsontext.clipUtf8(s, 400)});
     for (prof.phases.items) |ph| try w.print("  {s}: {f}\n", .{ ph.name, Dur{ .ns = ph.ns } });
 
     const top = try hottest(arena, prof, o, 5);
@@ -251,7 +252,7 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
     }
     try w.print("{s} (#{d})", .{ kindName(id.kind), numberOf(o, id) });
     const text = prof.detail(id);
-    if (text.len > 0) try w.print("  {s}", .{clip(text, 160)});
+    if (text.len > 0) try w.print("  {s}", .{jsontext.clipUtf8(text, 160)});
     try paint(w, color, 0, false);
     try w.writeAll("\n");
 
@@ -355,13 +356,6 @@ fn paint(w: *std.Io.Writer, on: bool, sh: f64, start: bool) !void {
     if (!on) return;
     if (!start) return w.writeAll("\x1b[0m");
     if (sh >= 0.30) try w.writeAll("\x1b[1;31m") else if (sh >= 0.15) try w.writeAll("\x1b[1;33m");
-}
-
-fn clip(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var end = max;
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return s[0..end];
 }
 
 fn kindName(k: profile.Kind) []const u8 {
@@ -485,4 +479,28 @@ test "explain: an Arrow plan whose stdout write fails returns the error and free
     try std.posix.dup2(full, std.posix.STDOUT_FILENO);
     defer std.posix.dup2(saved, std.posix.STDOUT_FILENO) catch {};
     try testing.expectError(error.WriteFailed, printPlanArrow(testing.allocator, "scan\n  filter\n", .{}));
+}
+
+test "the profile's text clips through jsontext.clipUtf8 as its own clip did on UTF-8 text" {
+    const old = struct {
+        fn clip(s: []const u8, max: usize) []const u8 {
+            if (s.len <= max) return s;
+            var end = max;
+            while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+            return s[0..end];
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0x636c6970);
+    const rand = prng.random();
+    const pieces = [_][]const u8{ "a", " ", "\xc3\xb3", "\xe2\x82\xac", "\xf0\x9f\x98\x80" };
+    var in: std.ArrayList(u8) = .empty;
+    defer in.deinit(testing.allocator);
+    for (0..3000) |_| {
+        in.clearRetainingCapacity();
+        for (0..rand.uintLessThan(usize, 120)) |_| try in.appendSlice(testing.allocator, pieces[rand.uintLessThan(usize, pieces.len)]);
+        for ([_]usize{ 0, 1, 2, 3, 160, 400, rand.uintLessThan(usize, 500) }) |max|
+            try testing.expectEqualStrings(old.clip(in.items, max), jsontext.clipUtf8(in.items, max));
+    }
+    try testing.expectEqualStrings("", old.clip("\x80\x80\x80\x80\x80", 4));
+    try testing.expectEqualStrings("\x80\x80\x80\x80", jsontext.clipUtf8("\x80\x80\x80\x80\x80", 4));
 }
