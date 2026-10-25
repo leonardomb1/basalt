@@ -392,11 +392,24 @@ pub const JoinIndex = struct {
         cap: usize,
         threads: usize,
     ) anyerror!*JoinIndex {
+        return createMeeting(state, build, right_schema, right_keys, null, cap, threads);
+    }
+
+    /// `create` keyed for a probe whose key columns are of `left_kinds`, as `fromBatchesMeeting`.
+    pub fn createMeeting(
+        state: std.mem.Allocator,
+        build: Op,
+        right_schema: *const types.Schema,
+        right_keys: []const usize,
+        left_kinds: ?[]const types.TypeKind,
+        cap: usize,
+        threads: usize,
+    ) anyerror!*JoinIndex {
         var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer pull.deinit();
         var bytes: usize = 0;
         const chunks = try drainBuild(pull.allocator(), build, &bytes, cap);
-        return fromBatches(state, chunks, right_schema, right_keys, bytes, cap, threads);
+        return fromBatchesMeeting(state, chunks, right_schema, right_keys, left_kinds, bytes, cap, threads);
     }
 
     /// Index `chunks` (holding `bytes`), copied into `state`; checked against `cap`
@@ -407,6 +420,21 @@ pub const JoinIndex = struct {
         chunks: []const Batch,
         right_schema: *const types.Schema,
         right_keys: []const usize,
+        bytes: usize,
+        cap: usize,
+        threads: usize,
+    ) anyerror!*JoinIndex {
+        return fromBatchesMeeting(state, chunks, right_schema, right_keys, null, bytes, cap, threads);
+    }
+
+    /// `fromBatches` keyed for a probe whose key columns are of `left_kinds` (one kind a
+    /// key), each build key column's words from `keytable.meetKind`.
+    pub fn fromBatchesMeeting(
+        state: std.mem.Allocator,
+        chunks: []const Batch,
+        right_schema: *const types.Schema,
+        right_keys: []const usize,
+        left_kinds: ?[]const types.TypeKind,
         bytes: usize,
         cap: usize,
         threads: usize,
@@ -423,9 +451,10 @@ pub const JoinIndex = struct {
 
         const want = try state.alloc(types.TypeKind, right_keys.len);
         const kinds = try state.alloc(keyhash.KeyKind, right_keys.len);
-        for (right_keys, want, kinds) |k, *w, *kk| {
-            w.* = right_schema.fields[k].ty.kind;
-            kk.* = keyhash.keyKindOf(w.*) orelse blk: {
+        for (right_keys, want, kinds, 0..) |k, *w, *kk, j| {
+            const m = keytable.meetKind(right_schema.fields[k].ty.kind, if (left_kinds) |p| p[j] else null);
+            w.* = m.want;
+            kk.* = m.kind orelse blk: {
                 self.fixed = false;
                 break :blk .i64k;
             };
@@ -439,7 +468,8 @@ pub const JoinIndex = struct {
 
         var b = Build{ .ix = self, .n = n, .hashes = try state.alloc(u64, n), .nulls = try state.alloc(bool, n) };
         if (self.fixed) {
-            const enc = try keytable.Encoder.init(state, right_keys, kinds);
+            var enc = try keytable.Encoder.init(state, right_keys, kinds);
+            enc.want = want;
             b.enc = try enc.encode(state, batch.columns, n, self.interner(state), false);
         }
         const nparts: usize = if (n >= parallel_min and threads > 1) keytable.parts else 1;
@@ -669,6 +699,7 @@ pub const Join = struct {
     right_keys: []const usize,
     probe_enc: ?keytable.Encoder = null,
     probe_keyed: bool = false,
+    probe_kinds: ?[]const types.TypeKind = null,
     threads: usize = 1,
     left_schema: *const types.Schema,
     right_schema: *const types.Schema,
@@ -868,10 +899,18 @@ pub const Join = struct {
     /// The in-memory index, or null after switching to grace mode. A join that may
     /// spill pulls its build side into a scratch arena, so what it held is freed
     /// once indexed or written out.
+    fn probeKinds(self: *Join) ![]const types.TypeKind {
+        if (self.probe_kinds) |p| return p;
+        const p = try self.state.alloc(types.TypeKind, self.left_keys.len);
+        for (p, self.left_keys) |*x, k| x.* = self.left_schema.fields[k].ty.kind;
+        self.probe_kinds = p;
+        return p;
+    }
+
     fn buildIndex(self: *Join) anyerror!?*JoinIndex {
         const build = self.build orelse return error.JoinHasNoBuildSide;
         const cap = self.build_cap orelse op_mod.join_build_byte_cap;
-        if (!self.mayGrace()) return try JoinIndex.create(self.state, build, self.right_schema, self.right_keys, cap, self.threads);
+        if (!self.mayGrace()) return try JoinIndex.createMeeting(self.state, build, self.right_schema, self.right_keys, try self.probeKinds(), cap, self.threads);
         var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer pull.deinit();
         var held = std.array_list.Managed(Batch).init(pull.allocator());
@@ -884,7 +923,7 @@ pub const Join = struct {
             rows += b.len;
             if (bytes > self.spill_at) break;
         } else if (bytes + indexOverhead(rows, self.right_keys.len) <= self.spill_at and rows < std.math.maxInt(u32)) {
-            return try JoinIndex.fromBatches(self.state, held.items, self.right_schema, self.right_keys, bytes, std.math.maxInt(usize), self.threads);
+            return try JoinIndex.fromBatchesMeeting(self.state, held.items, self.right_schema, self.right_keys, try self.probeKinds(), bytes, std.math.maxInt(usize), self.threads);
         }
         try self.startGrace(&pull, held.items, build);
         return null;
@@ -1093,7 +1132,7 @@ pub const Join = struct {
     /// `run`'s rows indexed in `pa`, under `partCap`; past it the error says why no
     /// split could help.
     fn indexPart(self: *Join, pa: std.mem.Allocator, run_opt: ?spill.Run, fit: Fit) anyerror!*JoinIndex {
-        const run = run_opt orelse return JoinIndex.fromBatches(pa, &.{}, self.right_schema, self.right_keys, 0, std.math.maxInt(usize), self.threads);
+        const run = run_opt orelse return JoinIndex.fromBatchesMeeting(pa, &.{}, self.right_schema, self.right_keys, try self.probeKinds(), 0, std.math.maxInt(usize), self.threads);
         var r = try spill.Reader.open(run);
         defer r.close();
         var held = std.array_list.Managed(Batch).init(pa);
@@ -1103,7 +1142,7 @@ pub const Join = struct {
             bytes += b.heapBytes();
         }
         const cap = self.partCap();
-        return JoinIndex.fromBatches(pa, held.items, self.right_schema, self.right_keys, bytes, cap, self.threads) catch |e| {
+        return JoinIndex.fromBatchesMeeting(pa, held.items, self.right_schema, self.right_keys, try self.probeKinds(), bytes, cap, self.threads) catch |e| {
             if (e != error.JoinBuildTooLarge) return e;
             const ec = self.err orelse return if (fit == .too_deep) error.SpillTooDeep else e;
             switch (fit) {
@@ -2574,4 +2613,37 @@ test "join spill: the disk cap stops a spilling join" {
     const right = try genBatches(a, &join_right_schema, 2000, 100, 1, 500, 1000, "r");
     try testing.expectError(error.SpillCapExceeded, runJoin(a, .{ .kind = .inner, .left = left, .right = right, .space = sd.ds.space(), .spill_at = 1 }));
     try testing.expectEqual(@as(usize, 0), try sd.count());
+}
+
+const float_key_schema = types.Schema{ .fields = &.{
+    .{ .name = "fk", .ty = types.Type.init(.float).asNullable() },
+    .{ .name = "fv", .ty = types.Type.init(.string).asNullable() },
+} };
+
+fn floatBatch(a: std.mem.Allocator, keys: []const ?f64, vals: []const ?[]const u8) !Batch {
+    const cols = try a.alloc(column.Column, 2);
+    var kb = column.Builder.init(a, float_key_schema.fields[0].ty);
+    for (keys) |k| try kb.append(if (k) |x| .{ .float = x } else .null);
+    cols[0] = try kb.finish();
+    var vb = column.Builder.init(a, types.Type.init(.string).asNullable());
+    for (vals) |v| try vb.append(if (v) |s| .{ .string = s } else .null);
+    cols[1] = try vb.finish();
+    return .{ .schema = &float_key_schema, .columns = cols, .len = keys.len };
+}
+
+test "join: an int key meets a float key as a float, whichever side is built" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const big: i64 = (1 << 53) + 1;
+    const ints = [_]Batch{try kvBatch(a, &join_left_schema, &.{ big, 7, null }, &.{ "i0", "i1", "in" })};
+    const exact = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1 << 53, 7 }, &.{ "e0", "e1" })};
+    const floats = [_]Batch{try floatBatch(a, &.{ 9007199254740992.0, 7.0, 7.5, null }, &.{ "f0", "f1", "f2", "fn" })};
+
+    const int_built = try runJoin(a, .{ .kind = .semi, .left = &floats, .right = &ints, .left_schema = &float_key_schema, .out_schema = &float_key_schema });
+    try expectSameRows(&.{ "?|f0", "?|f1" }, int_built.rows);
+    const float_built = try runJoin(a, .{ .kind = .semi, .left = &ints, .right = &floats, .right_schema = &float_key_schema });
+    try expectSameRows(&.{ "7|i1", "9007199254740993|i0" }, float_built.rows);
+    const int_int = try runJoin(a, .{ .kind = .semi, .left = &exact, .right = &ints });
+    try expectSameRows(&.{"7|e1"}, int_int.rows);
 }
