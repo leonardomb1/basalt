@@ -117,7 +117,9 @@ The hashes are over the value's text. For a row's change key, write
 
 ## Dates and times
 
-The units are `year`, `month`, `week`, `day`, `hour`, `minute` and `second`.
+The units are `year`, `month`, `week`, `day`, `hour`, `minute` and `second`,
+in any case and singular or plural (`'hours'` is `'hour'`), as PostgreSQL and
+DuckDB read them.
 `week` is the ISO week: it starts on Monday, `extract` numbers it 1–53 with
 week 1 holding the year's first Thursday, and `date_diff` counts the Mondays
 crossed. `check` rejects an unknown unit even over a SQL table whose columns it

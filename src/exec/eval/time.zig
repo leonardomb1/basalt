@@ -20,9 +20,9 @@ fn isoWeekStart(day: i64) i64 {
     return day - @mod(day + 3, 7);
 }
 
-/// The singular unit `name` spells, ignoring case.
+/// The unit `name` spells, singular or plural, ignoring case.
 pub fn timeUnit(name: []const u8) ?TimeUnit {
-    return TimeUnit.parse(name, .singular);
+    return TimeUnit.parse(name);
 }
 
 /// A DATE as its midnight's microseconds, saturating for one past about ±290,000
@@ -316,15 +316,30 @@ test "an impossible day of the month is rejected, not rolled into the next month
     try std.testing.expect(parseIsoDate("1900-02-29") == null);
 }
 
-test "kept until decided: text readers refuse 5-digit and signed years (D3), TIME refuses a 7th fraction digit (D4), units are singular (D11)" {
+test "kept until decided: text readers refuse 5-digit and signed years (D3), TIME refuses a 7th fraction digit (D4)" {
     try std.testing.expectEqual(@as(?i64, null), parseDateText("11000-01-01"));
     try std.testing.expectEqual(@as(?i64, null), parseDateText("-0001-01-01"));
     try std.testing.expectEqual(@as(?i64, null), parseTimestampText("11000-01-01 00:00:00"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoDate("-0001-01-01"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoTime("12:00:00.1234567"));
     try std.testing.expectEqual(@as(?i64, 43_200_123_456), parseTimestampText("1970-01-01 12:00:00.1234567"));
+}
+
+test "a unit reads singular or plural in date_trunc, extract, date_add and date_diff (D11)" {
     try std.testing.expectEqual(@as(?TimeUnit, .hour), timeUnit("HOUR"));
-    try std.testing.expectEqual(@as(?TimeUnit, null), timeUnit("hours"));
+    try std.testing.expectEqual(@as(?TimeUnit, .hour), timeUnit("hours"));
+    try std.testing.expectEqual(@as(?TimeUnit, .day), timeUnit("Days"));
+    try std.testing.expectEqual(@as(?TimeUnit, null), timeUnit("hourss"));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const evalLit = @import("testing_util.zig").evalLit;
+    const ts = "CAST('2024-03-15 10:20:30' AS TIMESTAMP)";
+    try std.testing.expectEqual(try evalLit(a, "date_trunc('hour', " ++ ts ++ ")"), try evalLit(a, "date_trunc('HOURS', " ++ ts ++ ")"));
+    try std.testing.expectEqual(@as(i64, 20), (try evalLit(a, "extract(minutes FROM " ++ ts ++ ")")).int);
+    try std.testing.expectEqual(try evalLit(a, "date_add('day', 3, " ++ ts ++ ")"), try evalLit(a, "date_add('days', 3, " ++ ts ++ ")"));
+    try std.testing.expectEqual(@as(i64, 2), (try evalLit(a, "date_diff('weeks', CAST('2024-03-04' AS DATE), CAST('2024-03-18' AS DATE))")).int);
+    try std.testing.expectEqual(@as(i32, 19828), (try evalLit(a, "date_add('months', 1, CAST('2024-03-15' AS DATE))")).date);
 }
 
 test "kept until decided (D14): strftime prints a year before 0 as 0000" {

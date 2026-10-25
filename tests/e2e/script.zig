@@ -1444,8 +1444,9 @@ test "check validates a literal date unit or strftime format where the columns' 
         .{ .sql = "SELECT date_trunc('fortnight', ts) AS w FROM p.dbo.t;", .bad = "unknown time unit `fortnight`" },
         .{ .sql = "SELECT * FROM p.dbo.t WHERE date_diff('quarter', a, b) > 1;", .bad = "unknown time unit `quarter`" },
         .{ .sql = "WITH c AS (SELECT strftime(ts, '%Q') AS s FROM p.dbo.t) SELECT * FROM c;", .bad = "does not support `%Q`" },
-        .{ .sql = "SELECT max(date_add('weeks', 1, ts)) AS m FROM p.dbo.t;", .bad = "unknown time unit `weeks`" },
+        .{ .sql = "SELECT max(date_add('weekss', 1, ts)) AS m FROM p.dbo.t;", .bad = "unknown time unit `weekss`" },
         .{ .sql = "SELECT date_trunc('week', ts) AS w FROM p.dbo.t;", .bad = null },
+        .{ .sql = "SELECT max(date_add('weeks', 1, ts)) AS m FROM p.dbo.t;", .bad = null },
     };
     for (cases) |tc| {
         const src = try std.fmt.allocPrint(a, "CREATE CONNECTION p TYPE sqlserver OPTIONS (host = 'h');\n{s}", .{tc.sql});

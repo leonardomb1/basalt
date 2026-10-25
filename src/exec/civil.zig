@@ -178,16 +178,14 @@ pub const Part = enum {
     minute,
     second,
 
-    pub const Forms = enum { singular, singular_or_plural };
-
-    /// The unit `name` spells, ignoring case; `singular_or_plural` also takes a
-    /// trailing `s`.
-    pub fn parse(name: []const u8, comptime forms: Forms) ?Part {
+    /// The unit `name` spells, singular or plural, ignoring case, as PostgreSQL's
+    /// and DuckDB's unit tables read it.
+    pub fn parse(name: []const u8) ?Part {
         var buf: [16]u8 = undefined;
         if (name.len == 0 or name.len >= buf.len) return null;
         const low = std.ascii.lowerString(buf[0..name.len], name);
         if (std.meta.stringToEnum(Part, low)) |p| return p;
-        if (forms == .singular_or_plural and low[low.len - 1] == 's') return std.meta.stringToEnum(Part, low[0 .. low.len - 1]);
+        if (low[low.len - 1] == 's') return std.meta.stringToEnum(Part, low[0 .. low.len - 1]);
         return null;
     }
 
@@ -739,18 +737,15 @@ test "civil: ticks to micros match Parquet and Arrow (saturate) and Avro (fail)"
     try testing.expectEqual(@as(u2, 3), @intFromEnum(Tick.ns));
 }
 
-test "civil: Part.parse pins date_trunc's singular names and the window's plurals" {
+test "civil: Part.parse reads every unit singular or plural, in any case" {
     for ([_]struct { []const u8, Part }{ .{ "year", .year }, .{ "MONTH", .month }, .{ "Week", .week }, .{ "day", .day }, .{ "hour", .hour }, .{ "minute", .minute }, .{ "SeCoNd", .second } }) |c| {
-        try testing.expectEqual(@as(?Part, c[1]), Part.parse(c[0], .singular));
-        try testing.expectEqual(@as(?Part, c[1]), Part.parse(c[0], .singular_or_plural));
+        try testing.expectEqual(@as(?Part, c[1]), Part.parse(c[0]));
     }
     for ([_]struct { []const u8, Part }{ .{ "years", .year }, .{ "Days", .day }, .{ "HOURS", .hour }, .{ "minutes", .minute }, .{ "seconds", .second }, .{ "weeks", .week }, .{ "months", .month } }) |c| {
-        try testing.expectEqual(@as(?Part, null), Part.parse(c[0], .singular));
-        try testing.expectEqual(@as(?Part, c[1]), Part.parse(c[0], .singular_or_plural));
+        try testing.expectEqual(@as(?Part, c[1]), Part.parse(c[0]));
     }
     for ([_][]const u8{ "", "s", "dayss", "secondss", "millisecond", "d", " day", "day ", "aaaaaaaaaaaaaaaa", "dayssssssssssssss" }) |bad| {
-        try testing.expectEqual(@as(?Part, null), Part.parse(bad, .singular));
-        try testing.expectEqual(@as(?Part, null), Part.parse(bad, .singular_or_plural));
+        try testing.expectEqual(@as(?Part, null), Part.parse(bad));
     }
     try testing.expectEqual(@as(?i64, null), Part.year.fixedMicros());
     try testing.expectEqual(@as(?i64, null), Part.month.fixedMicros());

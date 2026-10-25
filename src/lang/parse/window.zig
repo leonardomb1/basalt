@@ -320,7 +320,7 @@ pub fn parseFrame(self: *Parser) Error!ast.WinFrame {
 
 /// A frame's INTERVAL unit: a fixed-length `civil.Part`, singular or plural.
 fn intervalUnit(word: []const u8) ?ast.IntervalUnit {
-    return switch (civil.Part.parse(word, .singular_or_plural) orelse return null) {
+    return switch (civil.Part.parse(word) orelse return null) {
         .day => .day,
         .hour => .hour,
         .minute => .minute,
