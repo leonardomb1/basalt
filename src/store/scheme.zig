@@ -89,6 +89,15 @@ pub fn of(path: []const u8) Scheme {
     return Scheme.of(path);
 }
 
+/// `url` as a URI whose scheme is spelled in lowercase when it is one the table
+/// knows, since std.http matches a scheme case-sensitively.
+pub fn parseUri(url: []const u8) std.Uri.ParseError!std.Uri {
+    var u = try std.Uri.parse(url);
+    const p = of(url).prefix();
+    if (p.len > 0) u.scheme = p[0 .. p.len - "://".len];
+    return u;
+}
+
 pub const Userinfo = struct {
     user: []const u8,
     password: ?[]const u8 = null,
@@ -259,32 +268,61 @@ fn pin(today: bool, path: []const u8, now: bool, case_folds_today: bool) !void {
     }
 }
 
-test "today's predicates equal the scheme table; only a cased s3/az/sftp/http prefix differs" {
+test "every store predicate is the scheme table, in any case; lake_table.isHttp still pins today's" {
     for (corpus) |p| {
         const s = of(p);
-        try pin(s3.isUrl(p), p, s == .s3, false);
-        try pin(azure.isUrl(p), p, s == .az, false);
-        try pin(sftp.isUrl(p), p, s == .sftp, false);
-        try pin(smb.isUrl(p), p, s == .smb, true);
-        try pin(ftp.isUrl(p), p, s == .ftp, true);
-        try pin(objstore.isUrl(p), p, s.has(.object_store), false);
-        try pin(objstore.isRemote(p), p, s.has(.replaced_on_write), s == .smb);
-        try pin(bytes.isRemote(p), p, s.has(.http_ranged), false);
-        try pin(stream.isUrl(p), p, s.has(.streamed), s == .smb);
+        try testing.expectEqual(s == .s3, s3.isUrl(p));
+        try testing.expectEqual(s == .az, azure.isUrl(p));
+        try testing.expectEqual(s == .sftp, sftp.isUrl(p));
+        try testing.expectEqual(s == .smb, smb.isUrl(p));
+        try testing.expectEqual(s == .ftp, ftp.isUrl(p));
+        try testing.expectEqual(s.has(.object_store), objstore.isUrl(p));
+        try testing.expectEqual(s.has(.replaced_on_write), objstore.isRemote(p));
+        try testing.expectEqual(s.has(.http_ranged), bytes.isRemote(p));
+        try testing.expectEqual(s.has(.streamed), stream.isUrl(p));
         try pin(lake_table.isHttp(p), p, s.has(.http), false);
         const commit_ok = delta_write.storeProblem(p) == null;
-        try pin(commit_ok, p, s.has(.atomic_create), false);
+        try testing.expectEqual(s.has(.atomic_create), commit_ok);
     }
 }
 
-test "today: a cased prefix falls to local where scheme reads it remote" {
-    try testing.expect(!sftp.isUrl("SFTP://h/x") and of("SFTP://h/x") == .sftp);
-    try testing.expect(!s3.isUrl("S3://b/k") and of("S3://b/k") == .s3);
-    try testing.expect(!objstore.isUrl("Az://a/c/k") and of("Az://a/c/k").has(.object_store));
-    try testing.expect(!bytes.isRemote("HTTPS://h/a") and of("HTTPS://h/a").has(.http_ranged));
+test "a cased prefix is remote: SFTP://, S3://, Az:// and HTTPS:// no longer fall to local files" {
+    try testing.expect(sftp.isUrl("SFTP://h/x"));
+    try testing.expect(s3.isUrl("S3://b/k"));
+    try testing.expect(objstore.isUrl("Az://a/c/k") and objstore.isRemote("Az://a/c/k"));
+    try testing.expect(objstore.isRemote("SFTP://h/x") and objstore.isRemote("SMB://h/s/x"));
+    try testing.expect(bytes.isRemote("HTTPS://h/a") and stream.isUrl("HTTPS://h/a"));
+    try testing.expect(objstore.find("S3://b/k") == &s3.provider);
+    try testing.expect(objstore.find("AZ://a/c/k") == &azure.provider);
     try testing.expect(smb.isUrl("SMB://h/s/x") and ftp.isUrl("FTP://h/x"));
     try testing.expect(delta_write.storeProblem("FTP://h/x") != null and !of("FTP://h/x").has(.atomic_create));
-    try testing.expect(delta_write.storeProblem("S3://b/k") != null and of("S3://b/k").has(.atomic_create));
+    try testing.expect(delta_write.storeProblem("S3://b/k") == null and of("S3://b/k").has(.atomic_create));
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lower = try s3.parsePrefix("s3://bkt/p/");
+    const upper = try s3.parsePrefix("S3://bkt/p/");
+    try testing.expectEqualStrings(lower.bucket, upper.bucket);
+    try testing.expectEqualStrings(lower.prefix, upper.prefix);
+    const az = try azure.parsePrefix("AZ://acct/cont/p/");
+    try testing.expectEqualStrings("acct", az.account);
+    try testing.expectEqualStrings("p/", az.prefix);
+    const f = try ftp.parseUrl(a, "FTP://u@unregistered-host.invalid/x");
+    try testing.expectEqualStrings("unregistered-host.invalid", f.host);
+}
+
+test "parseUri spells a known scheme in lowercase and leaves an unknown one alone" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "HTTPS://h/a", "https" }, .{ "Http://h:8080/a?b", "http" },
+        .{ "https://h/a", "https" }, .{ "S3://b/k", "s3" },
+        .{ "gs://b/k", "gs" },       .{ "Gs://b/k", "Gs" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c[1], (try parseUri(c[0])).scheme);
+    const u = try parseUri("HTTPS://user@Host.io:8443/p/q?x=1#f");
+    try testing.expectEqual(@as(?u16, 8443), u.port);
+    try testing.expectEqualStrings("Host.io", u.host.?.percent_encoded);
+    try testing.expectError(error.UnexpectedCharacter, parseUri("not a url"));
 }
 
 test "Userinfo splits user and password at the first colon and decodes each part" {

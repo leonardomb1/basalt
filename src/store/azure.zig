@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
 
@@ -69,7 +70,7 @@ pub const Blob = struct {
 };
 
 pub fn isUrl(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "az://");
+    return scheme.of(s) == .az;
 }
 
 /// Splits `az://account/container/path...`; the container is the first segment.
@@ -77,7 +78,7 @@ pub fn isUrl(s: []const u8) bool {
 /// resource, not just the URL (see `canonicalResource`).
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Blob {
     if (!isUrl(url)) return Error.AzureBadUrl;
-    const rest = url["az://".len..];
+    const rest = scheme.Scheme.rest(url);
 
     const a_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.AzureBadUrl;
     const account = rest[0..a_end];
@@ -823,7 +824,7 @@ test "statusToError distinguishes causes instead of one catch-all" {
 /// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { account: []const u8, container: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.AzureBadUrl;
-    const rest = url["az://".len..];
+    const rest = scheme.Scheme.rest(url);
     const a_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.AzureBadUrl;
     const account = rest[0..a_end];
     const after = rest[a_end + 1 ..];
@@ -844,7 +845,7 @@ test "prefix URLs may have an empty prefix" {
 }
 
 pub const provider = objstore.Provider{
-    .scheme = "az://",
+    .scheme = .az,
     .empty_prefix = Error.AzureEmptyPrefix,
     .vtable = &.{
         .parse = vtParse,

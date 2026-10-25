@@ -34,6 +34,7 @@
 const std = @import("std");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
+const scheme = @import("scheme.zig");
 const ntlm = @import("../net/auth/ntlm.zig");
 const krb5 = @import("../net/auth/krb5.zig");
 const spnego = @import("../net/auth/spnego.zig");
@@ -954,7 +955,7 @@ pub const Session = struct {
 };
 
 pub fn isUrl(path: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(path, "smb://");
+    return scheme.of(path) == .smb;
 }
 
 pub const Conn = struct {
@@ -993,20 +994,19 @@ const Proto = struct {
     pub const stream_chunk = 4 << 20;
     pub const upload_buffer = 4 << 20;
 
-    /// `smb://[[domain;]user@]host[:port]/share/path`. Without a registered name the
-    /// user is the URL's, `SMB_USER` or `$USER`; password `SMB_PASSWORD`, domain `SMB_DOMAIN`.
+    /// `smb://[[domain;]user[:password]@]host[:port]/share/path`, each userinfo part
+    /// percent-decoded. Without a registered name the user is the URL's, `SMB_USER`
+    /// or `$USER`; password the URL's or `SMB_PASSWORD`, domain the URL's or `SMB_DOMAIN`.
     pub fn resolve(arena: std.mem.Allocator, url: []const u8) !Target {
         if (!isUrl(url)) return error.NotSmbUrl;
-        const rest = url["smb://".len..];
+        const rest = scheme.Scheme.rest(url);
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.NotSmbUrl;
         const a = remotefs.authority(rest[0..slash]) orelse return error.NotSmbUrl;
         var path = std.mem.trimLeft(u8, rest[slash..], "/");
-        var user = a.userinfo;
-        var domain: ?[]const u8 = null;
-        if (user) |u| if (std.mem.indexOfScalar(u8, u, ';')) |semi| {
-            domain = u[0..semi];
-            user = u[semi + 1 ..];
-        };
+        const info: ?scheme.Userinfo = if (a.userinfo) |s| try scheme.Userinfo.parse(arena, s, .{ .domain = true }) else null;
+        const user = if (info) |i| i.user else null;
+        const pass = if (info) |i| i.password else null;
+        const domain = if (info) |i| i.domain else null;
 
         var cfg: Config = undefined;
         var share: []const u8 = undefined;
@@ -1015,7 +1015,7 @@ const Proto = struct {
                 .host = c.host,
                 .port = a.port orelse c.port,
                 .user = user orelse c.user orelse std.posix.getenv("USER") orelse "",
-                .password = c.password orelse "",
+                .password = pass orelse c.password orelse "",
                 .domain = domain orelse c.domain orelse "",
                 .realm = c.realm orelse "",
                 .kdc = c.kdc orelse "",
@@ -1028,7 +1028,7 @@ const Proto = struct {
                 .host = a.host,
                 .port = a.port orelse 445,
                 .user = user orelse std.posix.getenv("SMB_USER") orelse std.posix.getenv("USER") orelse "",
-                .password = std.posix.getenv("SMB_PASSWORD") orelse "",
+                .password = pass orelse std.posix.getenv("SMB_PASSWORD") orelse "",
                 .domain = domain orelse std.posix.getenv("SMB_DOMAIN") orelse "",
                 .realm = std.posix.getenv("SMB_REALM") orelse "",
                 .kdc = std.posix.getenv("SMB_KDC") orelse "",
@@ -1364,6 +1364,23 @@ test "smb URLs: share, domain, port, registered names" {
     try std.testing.expectEqualStrings("svc", n.cfg.user);
     try std.testing.expectEqualStrings("data", n.share);
     try std.testing.expectEqualStrings("2026\\out.parquet", n.path);
+}
+
+test "smb URLs: domain;user:password split and decoded, in any scheme case" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = try Proto.resolve(a, "SMB://d;u:pw@unregistered-host.invalid/share/x");
+    try std.testing.expectEqualStrings("d", t.cfg.domain);
+    try std.testing.expectEqualStrings("u", t.cfg.user);
+    try std.testing.expectEqualStrings("pw", t.cfg.password);
+    const enc = try Proto.resolve(a, "smb://c%3Bx;a%40corp:p%3Aw@unregistered-host.invalid/share/x");
+    try std.testing.expectEqualStrings("c;x", enc.cfg.domain);
+    try std.testing.expectEqualStrings("a@corp", enc.cfg.user);
+    try std.testing.expectEqualStrings("p:w", enc.cfg.password);
+    try register("FS_PW", .{ .host = "fs.corp.example", .user = "svc", .password = "conf", .share = "data" });
+    try std.testing.expectEqualStrings("url", (try Proto.resolve(a, "smb://u:url@fs_pw/x")).cfg.password);
+    try std.testing.expectEqualStrings("conf", (try Proto.resolve(a, "smb://u@fs_pw/x")).cfg.password);
 }
 
 test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {

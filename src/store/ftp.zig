@@ -21,13 +21,14 @@
 const std = @import("std");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
+const scheme = @import("scheme.zig");
 const percentDecode = @import("../net/percent.zig").decode;
 
 pub const default_port = 21;
 const timeout_s = 60;
 
 pub fn isUrl(path: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(path, "ftp://");
+    return scheme.of(path) == .ftp;
 }
 
 pub const Url = struct {
@@ -53,19 +54,14 @@ pub const register = Names.put;
 
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
     if (!isUrl(url)) return error.InvalidFtpUrl;
-    const rest = url["ftp://".len..];
+    const rest = scheme.Scheme.rest(url);
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const a = remotefs.authority(rest[0..slash]) orelse return error.InvalidFtpUrl;
     const path = try percentDecode(arena, if (slash < rest.len) rest[slash..] else "/");
 
-    var user: ?[]const u8 = null;
-    var pass: ?[]const u8 = null;
-    if (a.userinfo) |info| {
-        if (std.mem.indexOfScalar(u8, info, ':')) |c| {
-            user = try percentDecode(arena, info[0..c]);
-            pass = try percentDecode(arena, info[c + 1 ..]);
-        } else user = try percentDecode(arena, info);
-    }
+    const info: ?scheme.Userinfo = if (a.userinfo) |s| try scheme.Userinfo.parse(arena, s, .{}) else null;
+    const user = if (info) |i| i.user else null;
+    const pass = if (info) |i| i.password else null;
     const host = a.host;
     const port = a.port;
     if (Names.get(host)) |c| return .{

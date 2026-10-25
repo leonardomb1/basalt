@@ -44,6 +44,7 @@ const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
 const driver = @import("../connect/driver.zig");
 const retry_mod = @import("../connect/retry.zig");
+const scheme = @import("scheme.zig");
 const http_client = @import("../net/http_client.zig");
 const percent = @import("../net/percent.zig");
 const FakeServer = @import("../testing/http_fake.zig").FakeServer;
@@ -161,7 +162,7 @@ fn resolveLocation(arena: std.mem.Allocator, base: []const u8, loc: []const u8) 
 }
 
 fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, location: *?[]const u8) !Response {
-    const uri = try std.Uri.parse(call.url);
+    const uri = try scheme.parseUri(call.url);
     var req = try client.request(call.method, uri, .{
         .redirect_behavior = .unhandled,
         .extra_headers = call.headers,
@@ -393,7 +394,7 @@ pub fn listPages(arena: std.mem.Allocator, spec: ListSpec, ctx: anytype, comptim
 }
 
 pub const Provider = struct {
-    scheme: []const u8,
+    scheme: scheme.Scheme,
     empty_prefix: anyerror,
     vtable: *const VTable,
 
@@ -472,7 +473,7 @@ pub const Writer = struct {
 /// Whether `path` is written whole on another host: SFTP, SMB or an object store,
 /// none of which can be appended to.
 pub fn isRemote(path: []const u8) bool {
-    return sftp.isUrl(path) or smb.isUrl(path) or isUrl(path);
+    return scheme.of(path).has(.replaced_on_write);
 }
 
 /// The writer for a remote `path` (see `isRemote`), or null for a local one.
@@ -514,7 +515,8 @@ pub fn cast(comptime T: type, ptr: *const anyopaque) *const T {
 pub const providers = [_]*const Provider{ &azure.provider, &s3.provider };
 
 pub fn find(url: []const u8) ?*const Provider {
-    for (providers) |p| if (std.mem.startsWith(u8, url, p.scheme)) return p;
+    const s = scheme.of(url);
+    for (providers) |p| if (p.scheme == s) return p;
     return null;
 }
 

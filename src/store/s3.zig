@@ -42,6 +42,7 @@
 
 const std = @import("std");
 const objstore = @import("objstore.zig");
+const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const xml = @import("../format/xml/token.zig");
 const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
@@ -79,7 +80,7 @@ pub const Obj = struct {
 };
 
 pub fn isUrl(s: []const u8) bool {
-    return std.mem.startsWith(u8, s, "s3://");
+    return scheme.of(s) == .s3;
 }
 
 /// Why the bucket in this `s3://` URL cannot name a bucket, or null. Checked at plan
@@ -87,7 +88,7 @@ pub fn isUrl(s: []const u8) bool {
 /// the DNS rules AWS and MinIO share, the rest left to the service's own message.
 pub fn bucketNameError(url: []const u8) ?[]const u8 {
     if (!isUrl(url)) return null;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const bucket = std.mem.sliceTo(rest, '/');
     if (bucket.len < 3 or bucket.len > 63)
         return "a bucket name is 3 to 63 characters";
@@ -145,13 +146,8 @@ pub fn credsFromEnv(arena: std.mem.Allocator) !Creds {
 /// The authority (host[:port]) of an endpoint URL, which is the Host that
 /// std.http.Client sends and so the one that must be signed.
 fn authorityOf(endpoint: []const u8) ![]const u8 {
-    const after = if (std.mem.startsWith(u8, endpoint, "https://"))
-        endpoint["https://".len..]
-    else if (std.mem.startsWith(u8, endpoint, "http://"))
-        endpoint["http://".len..]
-    else
-        return Error.S3BadUrl;
-    const host = std.mem.sliceTo(after, '/');
+    if (!scheme.of(endpoint).has(.http)) return Error.S3BadUrl;
+    const host = std.mem.sliceTo(scheme.Scheme.rest(endpoint), '/');
     if (host.len == 0) return Error.S3BadUrl;
     return host;
 }
@@ -160,7 +156,7 @@ fn authorityOf(endpoint: []const u8) ![]const u8 {
 /// selects virtual-host style, non-null path-style against that endpoint.
 pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8) !Obj {
     if (!isUrl(url)) return Error.S3BadUrl;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
     const bucket = rest[0..b_end];
     const key = rest[b_end + 1 ..];
@@ -185,7 +181,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
 /// Splits a prefix URL for listing. Unlike `parseUrl`, the prefix may be empty.
 pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []const u8 } {
     if (!isUrl(url)) return Error.S3BadUrl;
-    const rest = url["s3://".len..];
+    const rest = scheme.Scheme.rest(url);
     const b_end = std.mem.indexOfScalar(u8, rest, '/') orelse return Error.S3BadUrl;
     const bucket = rest[0..b_end];
     if (bucket.len == 0) return Error.S3BadUrl;
@@ -1205,7 +1201,7 @@ test "multipartEtag is the MD5 of the binary part MD5s plus the part count" {
 }
 
 pub const provider = objstore.Provider{
-    .scheme = "s3://",
+    .scheme = .s3,
     .empty_prefix = Error.S3EmptyPrefix,
     .vtable = &.{
         .parse = vtParse,
