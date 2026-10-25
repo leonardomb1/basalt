@@ -26,6 +26,7 @@ const table = @import("../../connect/table.zig");
 const types = @import("../../lang/types.zig");
 const line = @import("line.zig");
 const search = @import("../../exec/search.zig");
+const orderF64 = @import("../../exec/eval/support.zig").orderF64;
 
 const Grid = table.Grid;
 const palette = table.palette;
@@ -82,12 +83,16 @@ fn numeric(kind: ?types.TypeKind) bool {
 }
 
 /// Two values of a column, in its type's order: numbers by value (non-numbers
-/// after them), false before true, the rest as text, case aside first.
+/// after them, a nan after every other number), false before true, the rest as
+/// text, case aside first. Two integers compare as i64, exact past 2^53.
 pub fn order(kind: ?types.TypeKind, a: []const u8, b: []const u8) std.math.Order {
     if (numeric(kind)) {
+        const i = std.fmt.parseInt(i64, a, 10) catch null;
+        const j = std.fmt.parseInt(i64, b, 10) catch null;
+        if (i != null and j != null) return std.math.order(i.?, j.?);
         const x = std.fmt.parseFloat(f64, a) catch null;
         const y = std.fmt.parseFloat(f64, b) catch null;
-        if (x != null and y != null) return std.math.order(x.?, y.?);
+        if (x != null and y != null) return orderF64(x.?, y.?);
         if (x != null) return .lt;
         if (y != null) return .gt;
     }
@@ -818,6 +823,29 @@ test "view: a filter and a found text fold accented letters like upper()/lower()
     defer out.deinit();
     try markedCell(&out.writer, "TIPO CRÉDITO", 12, false, &.{"crédito"}, .case, "", "[");
     try std.testing.expectEqualStrings("TIPO [CRÉDITO\x1b[0m", out.written());
+}
+
+test "view: a nan sorts after every number and filters as one, and big ints compare exactly" {
+    try std.testing.expectEqual(std.math.Order.gt, order(.float, "nan", "1.5"));
+    try std.testing.expectEqual(std.math.Order.lt, order(.float, "inf", "nan"));
+    try std.testing.expectEqual(std.math.Order.eq, order(.float, "nan", "NaN"));
+    try std.testing.expectEqual(std.math.Order.lt, order(.int, "9007199254740992", "9007199254740993"));
+    try std.testing.expectEqual(std.math.Order.gt, order(.int, "-1", "-9223372036854775808"));
+    try std.testing.expectEqual(std.math.Order.lt, order(.float, "2", "2.5"));
+    try std.testing.expect(!Filter.parse("> 1").?.keeps(.float, "-inf"));
+    try std.testing.expect(Filter.parse("= nan").?.keeps(.float, "nan"));
+    const gpa = std.testing.allocator;
+    const S = struct {
+        const names = [_][]const u8{"x"};
+        const tys = [_][]const u8{"float?"};
+        const right = [_]bool{true};
+        const cells = [_]?[]const u8{ "nan", "3", null, "-1", "nan", "inf" };
+    };
+    const g = Grid{ .names = &S.names, .types = &S.tys, .right = &S.right, .cells = &S.cells, .total_rows = 6 };
+    const kinds = [_]?types.TypeKind{.float};
+    const up = try arrange(gpa, g, &kinds, .{ .col = 0, .dir = .asc }, &.{}, .{});
+    defer gpa.free(up);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 1, 5, 0, 4, 2 }, up);
 }
 
 test "view: with accents ignored, the filters, the find and the marks match unaccented text" {
