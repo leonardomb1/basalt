@@ -298,7 +298,9 @@ fn typedArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecErro
         } },
         .col => |c| switch (a) {
             .dec => switch (c.ty.kind) {
-                .decimal => return .{ .col = .{ .d = c.data.dec, .v = c.validity } },
+                .decimal => switch (column.decimals(c)) {
+                    inline else => |ds| return .{ .col = .{ .d = ds, .v = c.validity } },
+                },
                 .int => {
                     const out = try arena.alloc(E, n);
                     for (c.data.i64[0..n], out) |x, *o| o.* = .{ .unscaled = x, .scale = 0 };

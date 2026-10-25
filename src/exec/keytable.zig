@@ -910,12 +910,12 @@ pub const Encoder = struct {
             const w: ?i64 = switch (kk) {
                 .i64k => switch (col.ty.kind) {
                     .float => intOf(col.data.f64[r]),
-                    .decimal => decimal.exactInt(col.data.dec[r]),
+                    .decimal => decimal.exactInt(column.decimals(col).at(r)),
                     else => null,
                 },
                 .f64k => switch (col.ty.kind) {
                     .int => keyhash.floatWord(@floatFromInt(col.data.i64[r])),
-                    .decimal => keyhash.floatWord(col.data.dec[r].keyF64()),
+                    .decimal => keyhash.floatWord(column.decimals(col).at(r).keyF64()),
                     else => null,
                 },
                 else => null,

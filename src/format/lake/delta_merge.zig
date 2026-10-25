@@ -300,9 +300,11 @@ pub const Merge = struct {
             return out;
         }
         if (c.ty.kind != .decimal) return out;
-        const same = for (in.data.dec[0..b.len], 0..) |d, r| {
-            if (in.validity.get(r) and d.scale != c.ty.scale) break false;
-        } else true;
+        const same = switch (column.decimals(in)) {
+            inline else => |v| for (v[0..b.len], 0..) |d, r| {
+                if (in.validity.get(r) and d.scale != c.ty.scale) break false;
+            } else true,
+        };
         if (same) return out;
         var bd = try column.Builder.initCapacity(t, c.ty.asNullable(), b.len);
         for (0..b.len) |r| {

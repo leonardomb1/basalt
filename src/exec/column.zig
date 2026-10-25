@@ -753,6 +753,24 @@ pub const Column = struct {
     }
 };
 
+/// A decimal column's values, one case per storage layout. A loop switches on it
+/// with `inline else`, so each layout gets its own specialized loop.
+pub const DecView = union(enum) {
+    wide: []value.Decimal,
+
+    pub inline fn at(v: DecView, i: usize) value.Decimal {
+        return switch (v) {
+            inline else => |s| s[i],
+        };
+    }
+};
+
+/// The one way to read a decimal column's storage outside this file and
+/// `decimal.zig`; the source check in this file's tests holds every other file to it.
+pub inline fn decimals(c: Column) DecView {
+    return .{ .wide = c.data.dec };
+}
+
 pub const Builder = struct {
     arena: std.mem.Allocator,
     ty: types.Type,

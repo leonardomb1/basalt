@@ -64,7 +64,7 @@ pub inline fn get(comptime S: type, c: column.Column, i: usize) S {
         i64 => c.data.i64[i],
         i32 => c.data.i32[i],
         f64 => c.data.f64[i],
-        Decimal => c.data.dec[i],
+        Decimal => column.decimals(c).at(i),
         bool => c.data.b[i],
         []const u8 => c.data.bytes.at(i),
         else => unreachable,
@@ -75,7 +75,9 @@ pub fn slice(comptime S: type, c: column.Column, n: usize) []const S {
     return switch (S) {
         i64 => c.data.i64[0..n],
         f64 => c.data.f64[0..n],
-        Decimal => c.data.dec[0..n],
+        Decimal => switch (column.decimals(c)) {
+            inline else => |v| v[0..n],
+        },
         else => unreachable,
     };
 }

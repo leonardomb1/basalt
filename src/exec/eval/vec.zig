@@ -836,7 +836,11 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
             .float => Num{ .fcol = .{ .d = c.data.f64, .v = c.validity } },
             .decimal => blk: {
                 const out = try arena.alloc(f64, n);
-                for (c.data.dec, 0..) |d, i| out[i] = d.keyF64();
+                switch (column.decimals(c)) {
+                    inline else => |ds| for (ds, 0..) |d, i| {
+                        out[i] = d.keyF64();
+                    },
+                }
                 break :blk Num{ .fcol = .{ .d = out, .v = c.validity } };
             },
             else => null,
@@ -958,7 +962,9 @@ const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{},
 fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
     return switch (v) {
         .scalar => .{ .scale = scale, .f = f, .c = c },
-        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = col.data.dec, .scale = scale, .f = f, .c = c },
+        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = switch (column.decimals(col)) {
+            inline else => |ds| ds,
+        }, .scale = scale, .f = f, .c = c },
     };
 }
 
@@ -1128,11 +1134,13 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     const pick = cmpBound(op, flip, d, c.ty.scale, std.math.minInt(i128)) orelse return null;
     var f = try Filled(bool).masked(arena, n, try copyBits(arena, c.validity, n));
     switch (pick.op) {
-        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| for (c.data.dec[0..n], f.d) |x, *o| {
-            o.* = if (x.scale == c.ty.scale)
-                cmpResult(cop, std.math.order(x.unscaled, pick.bound))
-            else
-                cmpResult(op, if (flip) d.order(x) else x.order(d));
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| switch (column.decimals(c)) {
+            inline else => |v| for (v[0..n], f.d) |x, *o| {
+                o.* = if (x.scale == c.ty.scale)
+                    cmpResult(cop, std.math.order(x.unscaled, pick.bound))
+                else
+                    cmpResult(op, if (flip) d.order(x) else x.order(d));
+            },
         },
         else => unreachable,
     }
@@ -1173,7 +1181,7 @@ inline fn vecValid(v: Vec, i: usize) bool {
 inline fn decAt(v: Vec, i: usize) Decimal {
     return switch (v) {
         .scalar => |s| asDecimal(s).?,
-        .col => |c| if (c.ty.kind == .decimal) c.data.dec[i] else Decimal{ .unscaled = c.data.i64[i], .scale = 0 },
+        .col => |c| if (c.ty.kind == .decimal) column.decimals(c).at(i) else Decimal{ .unscaled = c.data.i64[i], .scale = 0 },
     };
 }
 

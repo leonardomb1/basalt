@@ -649,14 +649,18 @@ pub const KeyArr = struct {
             },
             .float => .{ .floats = col.data.f64 },
             .decimal => blk: {
-                for (col.data.dec[0..n], 0..) |d, i| {
-                    if (col.validity.get(i)) scale = @max(scale, d.scale);
+                switch (column.decimals(col)) {
+                    inline else => |v| {
+                        for (v[0..n], 0..) |d, i| {
+                            if (col.validity.get(i)) scale = @max(scale, d.scale);
+                        }
+                        const out = try arena.alloc(i128, n);
+                        for (out, v[0..n], 0..) |*o, d, i| {
+                            o.* = if (!col.validity.get(i)) 0 else (decimal.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
+                        }
+                        break :blk .{ .decs = out };
+                    },
                 }
-                const out = try arena.alloc(i128, n);
-                for (out, col.data.dec[0..n], 0..) |*o, d, i| {
-                    o.* = if (!col.validity.get(i)) 0 else (decimal.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
-                }
-                break :blk .{ .decs = out };
             },
             .string, .bytes => blk: {
                 const out = try arena.alloc([]const u8, n);

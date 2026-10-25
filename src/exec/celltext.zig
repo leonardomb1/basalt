@@ -173,7 +173,8 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
         .decimal => {
             const q = if (@hasDecl(P, "quote_decimal")) P.quote_decimal else "";
             try w.writeAll(q);
-            try decimal.writeDecimal(w, c.data.dec[r].unscaled, c.data.dec[r].scale);
+            const d = column.decimals(c.*).at(r);
+            try decimal.writeDecimal(w, d.unscaled, d.scale);
             try w.writeAll(q);
         },
         .date, .time, .timestamp => {

@@ -23,6 +23,7 @@ const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const Column = @import("../../exec/column.zig").Column;
+const decimals = @import("../../exec/column.zig").decimals;
 const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
 const driver = @import("../../connect/driver.zig");
@@ -186,7 +187,7 @@ fn encoderFor(data: Column.Data) Encoder {
                     .i64 => try long(out, col.data.i64[row]),
                     .f64 => try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(col.data.f64[row])))),
                     .bytes => try bytesOf(out, col.data.bytes.at(row)),
-                    .dec => try decimalBytes(out, col.data.dec[row], fld),
+                    .dec => try decimalBytes(out, decimals(col.*).at(row), fld),
                 }
             }
         }.f,
