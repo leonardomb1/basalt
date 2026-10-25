@@ -214,13 +214,13 @@ pub const Spelling = struct {
     stamp_seconds: bool,
     time_seconds: bool,
     frac_min: u8,
-    frac_max: ?u8 = null,
     check_clock: bool = true,
     zone: enum { none, pg, wire } = .none,
     strict_end: bool = true,
 
-    /// `YYYY-MM-DD[?HH:MM:SS[.f{1,6}]]` with any byte between date and time, and a
-    /// time `HH:MM[:SS[.f{1,6}]]`; strict, so `'01/07/2013'` is no date.
+    /// `YYYY-MM-DD[?HH:MM:SS[.f+]]` with any byte between date and time, and a
+    /// time `HH:MM[:SS[.f+]]`, each fraction cut to the microsecond; strict, so
+    /// `'01/07/2013'` is no date.
     pub const iso: Spelling = .{
         .trim = true,
         .year_digits = .{ 4, 4 },
@@ -230,7 +230,6 @@ pub const Spelling = struct {
         .stamp_seconds = true,
         .time_seconds = false,
         .frac_min = 1,
-        .frac_max = 6,
     };
 
     /// As PostgreSQL reads a literal: one- or two-digit month, day and hour, `T` or
@@ -318,7 +317,6 @@ pub fn Text(comptime sp: Spelling) type {
                 var frac: i64 = 0;
                 var scale: i64 = 100_000;
                 while (c.i < c.s.len and std.ascii.isDigit(c.s[c.i])) : (c.i += 1) {
-                    if (sp.frac_max) |max| if (c.i - start == max) break;
                     frac += @as(i64, c.s[c.i] - '0') * scale;
                     scale = @divTrunc(scale, 10);
                 }
@@ -795,7 +793,7 @@ test "civil: Text(.iso) pins parseIsoDate, parseIsoTimestamp and parseIsoTime" {
         .{ "2024-01-05 12:34:56.123456", testStamp(2024, 1, 5, 12, 34, 56, 123456) },
         .{ "2024-01-05 12:34:56.1", testStamp(2024, 1, 5, 12, 34, 56, 100000) },
         .{ " 2024-01-05 23:59:59.999999 ", testStamp(2024, 1, 5, 23, 59, 59, 999999) },
-        .{ "2024-01-05 12:34:56.1234567", null },
+        .{ "2024-01-05 12:34:56.1234567", testStamp(2024, 1, 5, 12, 34, 56, 123456) },
         .{ "2024-01-05 12:34:56.", null },
         .{ "2024-01-05 12:34:56.12x", null },
         .{ "2024-01-05 12:34", null },
@@ -807,13 +805,14 @@ test "civil: Text(.iso) pins parseIsoDate, parseIsoTimestamp and parseIsoTime" {
         .{ "2024-02-30 10:00:00", null },
     });
     try expectGolden(T.time, &.{
-        .{ "01:02:03", 3_723_000_000 }, .{ "12:30", 45_000_000_000 },
-        .{ " 12:30 ", 45_000_000_000 }, .{ "23:59:59.999999", 86_399_999_999 },
-        .{ "00:00:00.5", 500_000 },     .{ "12:30:00.1234567", null },
-        .{ "1:02:03", null },           .{ "24:00:00", null },
-        .{ "01:02:03.", null },         .{ "01:02:03 extra", null },
-        .{ "12:30.5", null },           .{ "12:3", null },
-        .{ "01:02:03+05", null },       .{ "", null },
+        .{ "01:02:03", 3_723_000_000 },          .{ "12:30", 45_000_000_000 },
+        .{ " 12:30 ", 45_000_000_000 },          .{ "23:59:59.999999", 86_399_999_999 },
+        .{ "00:00:00.5", 500_000 },              .{ "12:30:00.1234567", 45_000_123_456 },
+        .{ "23:59:59.9999999", 86_399_999_999 }, .{ "1:02:03", null },
+        .{ "24:00:00", null },                   .{ "01:02:03.", null },
+        .{ "01:02:03 extra", null },             .{ "12:30.5", null },
+        .{ "12:3", null },                       .{ "01:02:03+05", null },
+        .{ "", null },
     });
 }
 

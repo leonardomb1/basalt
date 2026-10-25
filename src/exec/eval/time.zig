@@ -316,13 +316,27 @@ test "an impossible day of the month is rejected, not rolled into the next month
     try std.testing.expect(parseIsoDate("1900-02-29") == null);
 }
 
-test "kept until decided: text readers refuse 5-digit and signed years (D3), TIME refuses a 7th fraction digit (D4)" {
+test "kept until decided: text readers refuse 5-digit and signed years (D3)" {
     try std.testing.expectEqual(@as(?i64, null), parseDateText("11000-01-01"));
     try std.testing.expectEqual(@as(?i64, null), parseDateText("-0001-01-01"));
     try std.testing.expectEqual(@as(?i64, null), parseTimestampText("11000-01-01 00:00:00"));
     try std.testing.expectEqual(@as(?i64, null), parseIsoDate("-0001-01-01"));
-    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("12:00:00.1234567"));
+}
+
+test "a TIME's digits past the microsecond are dropped, as a TIMESTAMP's are (D4)" {
+    try std.testing.expectEqual(@as(?i64, 43_200_123_456), parseIsoTime("12:00:00.1234567"));
     try std.testing.expectEqual(@as(?i64, 43_200_123_456), parseTimestampText("1970-01-01 12:00:00.1234567"));
+    try std.testing.expectEqual(@as(?i64, 43_200_123_456), parseIsoTimestamp("1970-01-01 12:00:00.123456789"));
+    try std.testing.expectEqual(@as(?i64, 86_399_999_999), parseIsoTimestamp("1970-01-01 23:59:59.9999999"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTimestamp("1970-01-01 12:00:00.1234567x"));
+    try std.testing.expectEqual(@as(?i64, 86_399_999_999), parseIsoTime("23:59:59.999999999"));
+    try std.testing.expectEqual(@as(?i64, null), parseIsoTime("12:00:00.1234567x"));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const evalLit = @import("testing_util.zig").evalLit;
+    try std.testing.expectEqual(@as(i64, 43_200_123_456), (try evalLit(a, "CAST('12:00:00.123456789' AS TIME)")).time);
+    try std.testing.expectEqual(@as(i64, 43_200_123_456), (try evalLit(a, "CAST(CAST('1970-01-01 12:00:00.123456789' AS TIMESTAMP) AS TIME)")).time);
 }
 
 test "a unit reads singular or plural in date_trunc, extract, date_add and date_diff (D11)" {
@@ -349,7 +363,7 @@ test "kept until decided (D14): strftime prints a year before 0 as 0000" {
     try std.testing.expectEqualStrings("0000-06-01|00", out.items);
 }
 
-test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses" {
+test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses, and a TIME or ISO timestamp cuts past the microsecond (D4)" {
     const Old = struct {
         fn trim(s: []const u8) []const u8 {
             return std.mem.trim(u8, s, " \t\r\n");
@@ -382,8 +396,8 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
                 if (hh > 23 or mm > 59) return null;
                 return (hh * 3600 + mm * 60) * 1_000_000;
             }
-            if (s.len < 8 or s.len > 8 + 7) return null;
-            var buf: [32]u8 = undefined;
+            if (s.len < 8) return null;
+            var buf: [64]u8 = undefined;
             const ts = std.fmt.bufPrint(&buf, "1970-01-01 {s}", .{s}) catch return null;
             return isoTimestamp(ts);
         }
@@ -401,7 +415,7 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
             if (s.len > 20 and s[19] == '.') {
                 var i: usize = 20;
                 var scale: i64 = 100_000;
-                while (i < s.len and scale > 0 and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+                while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
                     frac += @as(i64, s[i] - '0') * scale;
                     scale = @divTrunc(scale, 10);
                 }

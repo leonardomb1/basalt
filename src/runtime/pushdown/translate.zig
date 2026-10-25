@@ -114,12 +114,22 @@ fn provablyText(e: *const ast.Expr, schema: types.Schema) bool {
     };
 }
 
-/// Date or timestamp text the engine reads its own way (`'2024-1-5'`, a `T`, a zone)
-/// but not plain ISO: against a column of unknown type it stays in the engine, as
-/// a source may read it differently, e.g. dropping the zone.
+/// Date or timestamp text the engine reads its own way (`'2024-1-5'`, a `T`, a zone,
+/// a fraction past the microsecond) but not plain ISO: against a column of unknown
+/// type it stays in the engine, as a source may read it differently, e.g. dropping
+/// the zone or rounding the fraction.
 fn looseTemporal(s: []const u8) bool {
-    if (eval.parseIsoDate(s) != null or eval.parseIsoTimestamp(s) != null) return false;
-    return eval.parseDateText(s) != null or eval.parseTimestampText(s) != null;
+    if (plainIso(s)) return false;
+    return eval.parseIsoDate(s) != null or eval.parseIsoTimestamp(s) != null or
+        eval.parseDateText(s) != null or eval.parseTimestampText(s) != null;
+}
+
+/// ISO text every source reads alike: a four-digit year and at most six fraction digits.
+fn plainIso(s: []const u8) bool {
+    if (eval.parseIsoDate(s) == null and eval.parseIsoTimestamp(s) == null) return false;
+    if (s.len < 5 or s[4] != '-') return false;
+    const dot = std.mem.indexOfScalar(u8, s, '.') orelse return true;
+    return s.len - dot - 1 <= 6;
 }
 
 fn plainNumber(s: []const u8) bool {
@@ -689,7 +699,7 @@ test "translateExpr: loose date text against a column of unknown type stays in t
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    for ([_][]const u8{ "2024-01-05T05:00:00+05:00", "2024-1-5", "2024-01-05 05:00Z" }) |s| {
+    for ([_][]const u8{ "2024-01-05T05:00:00+05:00", "2024-1-5", "2024-01-05 05:00Z", "2024-01-05 05:00:00.1234567" }) |s| {
         const lit = try a.create(ast.Expr);
         lit.* = .{ .str_lit = s };
         const e = try bin(a, .eq, try fld(a, "ts"), lit);

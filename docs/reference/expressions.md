@@ -139,6 +139,9 @@ columns it has not seen.
 - `TRY_CAST(x AS T)` — CAST that yields null instead of failing on a bad value;
   the workhorse for dirty inputs. Never pushed down.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a
-  timestamp (its time of day).
+  timestamp (its time of day). Fraction digits past the microsecond are
+  dropped, for a `TIME` as for a `TIMESTAMP`, in a CAST and in a file alike,
+  as DuckDB and StarRocks do: `'12:00:00.1234567'` is `12:00:00.123456`, never
+  rounded up into the next second or day.
 - Scalar functions are listed on [Scalar functions](functions.md), and the JSON
   ones on [JSON functions](json.md).
