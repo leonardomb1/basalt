@@ -66,6 +66,7 @@ pub const sftp = @import("store/sftp.zig");
 pub const smb = @import("store/smb.zig");
 pub const ftp = @import("store/ftp.zig");
 pub const remotefs = @import("store/remotefs.zig");
+pub const scheme = @import("store/scheme.zig");
 pub const part = @import("store/part.zig");
 pub const krb5 = @import("net/auth/krb5.zig");
 pub const spnego = @import("net/auth/spnego.zig");
