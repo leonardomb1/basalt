@@ -41,7 +41,7 @@ const std = @import("std");
 const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
-const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
+const civil = @import("../exec/civil.zig");
 
 pub const api_version = "2021-08-06";
 
@@ -132,21 +132,9 @@ pub fn keyFromEnv(arena: std.mem.Allocator) ![]const u8 {
 
 /// `Sun, 06 Nov 1994 08:49:37 GMT`, the only date format Shared Key accepts.
 pub fn rfc1123(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
-    const days = @divFloor(epoch_secs, 86400);
-    const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
-    const c = civilFromDays(days);
-    const dow: usize = @intCast(@mod(days + 4, 7));
-    const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    return std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        day_names[dow],
-        c.d,
-        mon_names[c.m - 1],
-        @as(u32, @intCast(c.y)),
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-    });
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    civil.writeRfc1123(&aw.writer, epoch_secs) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 pub const MsHeader = struct { name: []const u8, value: []const u8 };
@@ -913,5 +901,36 @@ test "a retried-out 5xx gateway is AzureThrottled, which a run exits on as trans
         const e = statusToError(@intCast(c), "");
         if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.AzureThrottled, e);
         if (e == Error.AzureThrottled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    }
+}
+
+test "rfc1123 on civil writes exactly what the hand-rolled one did, years 0000 to 99999" {
+    const Old = struct {
+        fn rfc(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+            const days = @divFloor(epoch_secs, 86400);
+            const secs_of_day = @as(u32, @intCast(epoch_secs - days * 86400));
+            const c = civil.civilFromDays(days);
+            const dow: usize = @intCast(@mod(days + 4, 7));
+            const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+            const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+            return std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+                day_names[dow],          c.d,                mon_names[c.m - 1],
+                @as(u32, @intCast(c.y)), secs_of_day / 3600, (secs_of_day % 3600) / 60,
+                secs_of_day % 60,
+            });
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lo: i64 = civil.daysFromCivil(0, 1, 1) * 86400;
+    const hi: i64 = civil.daysFromCivil(100000, 1, 1) * 86400 - 1;
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    const edges = [_]i64{ lo, -1, 0, 1, 86399, 784111777, 951782400, 253402300799, 253402300800, hi };
+    for (0..100_000 + edges.len) |i| {
+        const t = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, lo, hi);
+        _ = ar.reset(.retain_capacity);
+        try std.testing.expectEqualStrings(try Old.rfc(a, t), try rfc1123(a, t));
     }
 }

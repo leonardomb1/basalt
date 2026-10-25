@@ -45,7 +45,7 @@ const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const xml = @import("../format/xml/token.zig");
-const civilFromDays = @import("../exec/eval/time.zig").civilFromDays;
+const civil = @import("../exec/civil.zig");
 
 pub const env_key_id = "AWS_ACCESS_KEY_ID";
 pub const env_secret = "AWS_SECRET_ACCESS_KEY";
@@ -191,12 +191,9 @@ pub fn parsePrefix(url: []const u8) !struct { bucket: []const u8, prefix: []cons
 /// `20130524T000000Z`, the x-amz-date instant; its first 8 characters are the
 /// credential-scope date.
 pub fn amzDate(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
-    const days = @divFloor(epoch_secs, 86400);
-    const secs: u32 = @intCast(epoch_secs - days * 86400);
-    const c = civilFromDays(days);
-    return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
-    });
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    civil.writeLayout(&aw.writer, epoch_secs * civil.us_per_sec, .amz) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 pub fn payloadHash(arena: std.mem.Allocator, payload: []const u8) ![]const u8 {
@@ -1292,5 +1289,31 @@ test "a retried-out 5xx gateway is S3Throttled, which a run exits on as transien
         const e = statusToError(@intCast(c), "");
         if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.S3Throttled, e);
         if (e == Error.S3Throttled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    }
+}
+
+test "amzDate on civil's Layout writes exactly what the hand-rolled one did, years 0000 to 99999" {
+    const Old = struct {
+        fn amz(arena: std.mem.Allocator, epoch_secs: i64) ![]const u8 {
+            const days = @divFloor(epoch_secs, 86400);
+            const secs: u32 = @intCast(epoch_secs - days * 86400);
+            const c = civil.civilFromDays(days);
+            return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+                @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+            });
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lo: i64 = civil.daysFromCivil(0, 1, 1) * 86400;
+    const hi: i64 = civil.daysFromCivil(100000, 1, 1) * 86400 - 1;
+    var prng = std.Random.DefaultPrng.init(7);
+    const r = prng.random();
+    const edges = [_]i64{ lo, -1, 0, 1, 86399, 951782400, 1369353600, 253402300799, 253402300800, hi };
+    for (0..100_000 + edges.len) |i| {
+        const t = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, lo, hi);
+        _ = ar.reset(.retain_capacity);
+        try std.testing.expectEqualStrings(try Old.amz(a, t), try amzDate(a, t));
     }
 }
