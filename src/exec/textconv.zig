@@ -1,0 +1,418 @@
+//! Text to BOOL and float/decimal to INT, written once. Each reader of a boolean
+//! spelling picks a `Words` preset (the set of spellings it accepts) and one
+//! kernel, `boolText`, does the matching; each number-to-int site picks a `Round`
+//! and `floatToInt`/`floatToIntScaled`/`decimalToInt` guard the i64 range, NaN and
+//! infinities, which `@intFromFloat` treats as illegal behaviour.
+//!
+//! The presets reproduce today's readers exactly so callers can switch with no
+//! behaviour change; unifying the word sets is a later decision (D6).
+
+const std = @import("std");
+const column = @import("column.zig");
+const value = @import("value.zig");
+
+const Decimal = value.Decimal;
+const pow10_i128 = value.pow10_i128;
+
+/// A spelling that reads as one truth value. Input matches when it is a prefix of
+/// `text` at least `min` bytes long, so `min == text.len` is a whole-word match.
+pub const Word = struct {
+    text: []const u8,
+    min: usize,
+
+    pub fn whole(comptime text: []const u8) Word {
+        return .{ .text = text, .min = text.len };
+    }
+
+    pub fn prefix(comptime text: []const u8, comptime min: usize) Word {
+        return .{ .text = text, .min = min };
+    }
+};
+
+/// What one boolean reader accepts. `fold` ignores ASCII case, `trim` strips
+/// `" \t\r\n"` first, `lead` lets only the first byte decide (it is compared with
+/// each word's first byte), and `otherwise` is the answer for anything unmatched.
+pub const Words = struct {
+    yes: []const Word,
+    no: []const Word = &.{},
+    fold: bool = false,
+    trim: bool = false,
+    lead: bool = false,
+    otherwise: ?bool = null,
+
+    /// `CAST(s AS BOOL)` (eval/cast.zig:245): trimmed, any case, `true`/`false`.
+    pub const cast: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true, .trim = true };
+
+    /// A string literal compared with a BOOL (eval.zig:325, PostgreSQL's bool
+    /// input): any case, untrimmed, a unique prefix of `true`/`yes`/`false`/`no`,
+    /// `on`/`off` (at least `of`), `1`/`0`.
+    pub const pg_input: Words = .{
+        .yes = &.{ .prefix("true", 1), .prefix("yes", 1), .whole("on"), .whole("1") },
+        .no = &.{ .prefix("false", 1), .prefix("no", 1), .prefix("off", 2), .whole("0") },
+        .fold = true,
+    };
+
+    /// A WITH hint (analyze/targets.zig:197): any case, untrimmed, `true`/`false`.
+    pub const hint: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true };
+
+    /// A PARAM's text (run/params.zig:102, analyze.zig:702): exactly `true`/`false`.
+    pub const exact: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")} };
+
+    /// A connection option string or a PARAM override (connect/register.zig:148,
+    /// analyze.zig:722): exactly `true`, anything else is false.
+    pub const true_or_false: Words = .{ .yes = &.{.whole("true")}, .otherwise = false };
+
+    /// An `xsi:nil` attribute (xml/read.zig:518): exactly `true` or `1`, else false.
+    pub const xsd_nil: Words = .{ .yes = &.{ .whole("true"), .whole("1") }, .otherwise = false };
+
+    /// An OOXML `date1904` attribute (xlsx/read.zig:369): `1` or `true` in any case,
+    /// else false.
+    pub const ooxml_flag: Words = .{ .yes = &.{ .whole("true"), .whole("1") }, .fold = true, .otherwise = false };
+
+    /// A Delta table property (lake/delta_write.zig:439): `true` in any case, else false.
+    pub const delta_property: Words = .{ .yes = &.{.whole("true")}, .fold = true, .otherwise = false };
+
+    /// A driver's wire cell (cell.zig:110): a first byte of `1`, `t` or `y` in any
+    /// case is true, anything else (the empty cell too) is false.
+    pub const wire: Words = .{ .yes = &.{ .whole("1"), .whole("t"), .whole("y") }, .fold = true, .lead = true, .otherwise = false };
+};
+
+/// `s` as a truth value under `w`, or null when `w` has no `otherwise` and `s`
+/// spells neither.
+pub fn boolText(comptime w: Words, s: []const u8) ?bool {
+    const t = if (w.trim) std.mem.trim(u8, s, " \t\r\n") else s;
+    if (spells(w, w.yes, t)) return true;
+    if (spells(w, w.no, t)) return false;
+    return w.otherwise;
+}
+
+fn spells(comptime w: Words, comptime list: []const Word, t: []const u8) bool {
+    inline for (list) |word| {
+        if (w.lead) {
+            if (t.len > 0 and sameByte(w.fold, t[0], word.text[0])) return true;
+        } else if (t.len >= word.min and t.len <= word.text.len) {
+            const head = word.text[0..t.len];
+            if (if (w.fold) std.ascii.eqlIgnoreCase(t, head) else std.mem.eql(u8, t, head)) return true;
+        }
+    }
+    return false;
+}
+
+inline fn sameByte(comptime fold: bool, a: u8, b: u8) bool {
+    return if (fold) std.ascii.toLower(a) == std.ascii.toLower(b) else a == b;
+}
+
+/// How a number with a fraction becomes an int. `half_even` is PostgreSQL's float8
+/// cast (column.floatToInt), `half_away` is `@round` and the decimal cast
+/// (eval/cast.zig rescaleTo), and `exact` refuses any fraction (keytable intOf).
+pub const Round = enum { half_even, half_away, exact };
+
+/// `x` rounded by `r`, or null when it is NaN, infinite or outside i64.
+pub fn floatToInt(x: f64, comptime r: Round) ?i64 {
+    const v = switch (r) {
+        .half_even => halfEven(x),
+        .half_away => @round(x),
+        .exact => if (@trunc(x) == x) x else return null,
+    };
+    if (!(v >= -0x1p63 and v < 0x1p63)) return null;
+    return @intFromFloat(v);
+}
+
+/// `x * factor` rounded by `r`, as a count of a smaller unit (micros of a day
+/// offset, milliseconds of an Excel serial, a decimal's unscaled digits); the
+/// product is taken in f64, so an integer factor past 2^53 is not exact.
+pub fn floatToIntScaled(x: f64, factor: f64, comptime r: Round) ?i64 {
+    return floatToInt(x * factor, r);
+}
+
+fn halfEven(x: f64) f64 {
+    const f = @floor(x);
+    const d = x - f;
+    return if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
+}
+
+/// A decimal value, at its own scale, rounded by `r` to an int in exact i128
+/// arithmetic; null when the result is outside i64 or, for `exact`, has a fraction.
+pub fn decimalToInt(d: Decimal, comptime r: Round) ?i64 {
+    if (d.scale == 0) return std.math.cast(i64, d.unscaled);
+    if (d.scale >= pow10_i128.len) return switch (r) {
+        .exact => if (d.unscaled == 0) 0 else null,
+        else => 0,
+    };
+    const p = pow10_i128[d.scale];
+    const q = @divTrunc(d.unscaled, p);
+    const rem2 = @abs(@rem(d.unscaled, p)) * 2;
+    const away = switch (r) {
+        .exact => if (rem2 != 0) return null else false,
+        .half_away => rem2 >= @abs(p),
+        .half_even => rem2 > @abs(p) or (rem2 == @abs(p) and @rem(q, 2) != 0),
+    };
+    const n = if (!away) q else if (d.unscaled < 0) q - 1 else q + 1;
+    return std.math.cast(i64, n);
+}
+
+const testing = std.testing;
+
+const bool_corpus = [_][]const u8{
+    "",         "t",     "T",  "tr",  "tru", "true",  "TRUE",  "tRuE",   " true",     "true ",
+    "\ttrue\n", "truee", "y",  "Y",   "ye",  "yes",   "YES",   "yes!",   "on",        "ON",
+    "o",        "O",     "of", "OF",  "off", "OFF",   "offf",  "1",      "0",         "10",
+    "01",       "2",     "f",  "F",   "fa",  "false", "FALSE", " false", "false\r\n", "n",
+    "N",        "no",    "NO", "nil", "x",   "-1",    "\xff",  "t\x00",  "1 ",        " 1",
+};
+
+fn oracleCast(s: []const u8) ?bool {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(t, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(t, "false")) return false;
+    return null;
+}
+
+fn oraclePgInput(s: []const u8) ?bool {
+    if (s.len == 0 or s.len > 5) return null;
+    var buf: [5]u8 = undefined;
+    const w = std.ascii.lowerString(&buf, s);
+    if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
+    if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
+    for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
+    for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
+    return null;
+}
+
+fn oracleHint(s: []const u8) ?bool {
+    return if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else null;
+}
+
+fn oracleExact(s: []const u8) ?bool {
+    return if (std.mem.eql(u8, s, "true")) true else if (std.mem.eql(u8, s, "false")) false else null;
+}
+
+fn oracleTrueOrFalse(s: []const u8) ?bool {
+    return std.mem.eql(u8, s, "true");
+}
+
+fn oracleXsdNil(s: []const u8) ?bool {
+    return std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1");
+}
+
+fn oracleOoxmlFlag(s: []const u8) ?bool {
+    return std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "true");
+}
+
+fn oracleDeltaProperty(s: []const u8) ?bool {
+    return std.ascii.eqlIgnoreCase(s, "true");
+}
+
+fn oracleWire(raw: []const u8) ?bool {
+    return raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T' or raw[0] == 'y' or raw[0] == 'Y');
+}
+
+fn expectPreset(comptime w: Words, comptime oracle: fn ([]const u8) ?bool) !void {
+    for (bool_corpus) |s| {
+        testing.expectEqual(oracle(s), boolText(w, s)) catch |e| {
+            std.debug.print("preset disagrees with its source on '{f}'\n", .{std.zig.fmtString(s)});
+            return e;
+        };
+    }
+    var b: [3]u8 = undefined;
+    for (0..256) |i| for (0..256) |j| {
+        b = .{ @intCast(i), @intCast(j), 'e' };
+        for ([_][]const u8{ b[0..1], b[0..2], b[0..3] }) |s| try testing.expectEqual(oracle(s), boolText(w, s));
+    };
+}
+
+test "each bool preset reads exactly what the reader it replaces reads" {
+    try expectPreset(Words.cast, oracleCast);
+    try expectPreset(Words.pg_input, oraclePgInput);
+    try expectPreset(Words.hint, oracleHint);
+    try expectPreset(Words.exact, oracleExact);
+    try expectPreset(Words.true_or_false, oracleTrueOrFalse);
+    try expectPreset(Words.xsd_nil, oracleXsdNil);
+    try expectPreset(Words.ooxml_flag, oracleOoxmlFlag);
+    try expectPreset(Words.delta_property, oracleDeltaProperty);
+    try expectPreset(Words.wire, oracleWire);
+}
+
+test "the bool readers disagree today on the spellings the plan names" {
+    try testing.expectEqual(@as(?bool, true), boolText(Words.pg_input, "t"));
+    try testing.expectEqual(@as(?bool, null), boolText(Words.cast, "t"));
+    try testing.expectEqual(@as(?bool, true), boolText(Words.cast, "TRUE"));
+    try testing.expectEqual(@as(?bool, null), boolText(Words.exact, "TRUE"));
+    try testing.expectEqual(@as(?bool, false), boolText(Words.true_or_false, "TRUE"));
+    try testing.expectEqual(@as(?bool, true), boolText(Words.cast, " true "));
+    try testing.expectEqual(@as(?bool, null), boolText(Words.hint, " true "));
+    try testing.expectEqual(@as(?bool, null), boolText(Words.pg_input, " true"));
+}
+
+test "pg_input takes unique prefixes and refuses the ambiguous o" {
+    for ([_][]const u8{ "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1", "TrU", "On" }) |s|
+        try testing.expectEqual(@as(?bool, true), boolText(Words.pg_input, s));
+    for ([_][]const u8{ "f", "fal", "false", "n", "no", "of", "off", "0", "OFF" }) |s|
+        try testing.expectEqual(@as(?bool, false), boolText(Words.pg_input, s));
+    for ([_][]const u8{ "", "o", "O", "truex", "yess", "onn", "offf", "00", "11", "falsey" }) |s|
+        try testing.expectEqual(@as(?bool, null), boolText(Words.pg_input, s));
+}
+
+test "a custom Words set: lead without fold is case-sensitive" {
+    const w: Words = comptime .{ .yes = &.{.whole("t")}, .no = &.{.whole("f")}, .lead = true };
+    try testing.expectEqual(@as(?bool, true), boolText(w, "tango"));
+    try testing.expectEqual(@as(?bool, false), boolText(w, "foxtrot"));
+    try testing.expectEqual(@as(?bool, null), boolText(w, "Tango"));
+    try testing.expectEqual(@as(?bool, null), boolText(w, ""));
+}
+
+const float_corpus = [_]f64{
+    0,                 -0.0,               0.5,        -0.5,                1.5,
+    -1.5,              2.5,                -2.5,       0.49999999999999994, -0.49999999999999994,
+    1e15 + 0.5,        -(1e15 + 0.5),      0x1p52 + 1, 0x1p53,              0x1p53 + 2,
+    0x1p62,            0x1p63 - 1024,      0x1p63,     -0x1p63,             -0x1p63 - 2048,
+    0x1p64,            1e300,              -1e300,     std.math.inf(f64),   -std.math.inf(f64),
+    std.math.nan(f64), -std.math.nan(f64), 5e-324,     -5e-324,             std.math.floatMax(f64),
+    123.456,           -123.456,           9.5,        10.5,                -9.5,
+};
+
+test "half_even is column.floatToInt" {
+    for (float_corpus) |x| {
+        const want: ?i64 = column.floatToInt(x) catch null;
+        try testing.expectEqual(want, floatToInt(x, .half_even));
+    }
+    var prng = std.Random.DefaultPrng.init(0x7e47c0);
+    const rnd = prng.random();
+    for (0..20_000) |_| {
+        const x: f64 = @bitCast(rnd.int(u64));
+        const want: ?i64 = column.floatToInt(x) catch null;
+        try testing.expectEqual(want, floatToInt(x, .half_even));
+        const y = @as(f64, @floatFromInt(rnd.intRangeAtMost(i32, -1000, 1000))) / 2;
+        try testing.expectEqual(column.floatToInt(y) catch null, floatToInt(y, .half_even));
+    }
+}
+
+test "half_even matches the LIMIT float rounding" {
+    for (float_corpus) |f| {
+        if (!std.math.isFinite(f) or @abs(f) >= 0x1p63) {
+            if (f != -0x1p63) try testing.expectEqual(@as(?i64, null), floatToInt(f, .half_even));
+            continue;
+        }
+        const r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
+        try testing.expectEqual(@as(?i64, @intFromFloat(r)), floatToInt(f, .half_even));
+    }
+}
+
+test "half_away is @round where @intFromFloat is defined, null elsewhere" {
+    for (float_corpus) |x| {
+        const r = @round(x);
+        const want: ?i64 = if (r >= -0x1p63 and r < 0x1p63) @intFromFloat(r) else null;
+        try testing.expectEqual(want, floatToInt(x, .half_away));
+    }
+    try testing.expectEqual(@as(?i64, 3), floatToInt(2.5, .half_away));
+    try testing.expectEqual(@as(?i64, -3), floatToInt(-2.5, .half_away));
+    try testing.expectEqual(@as(?i64, 2), floatToInt(2.5, .half_even));
+    try testing.expectEqual(@as(?i64, -2), floatToInt(-2.5, .half_even));
+    try testing.expectEqual(@as(?i64, std.math.minInt(i64)), floatToInt(-0x1p63, .half_away));
+    try testing.expectEqual(@as(?i64, null), floatToInt(0x1p63, .half_away));
+}
+
+test "exact refuses a fraction and is keytable's intOf" {
+    for (float_corpus) |x| {
+        const want: ?i64 = if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0) or @trunc(x) != x) null else @intFromFloat(x);
+        try testing.expectEqual(want, floatToInt(x, .exact));
+    }
+    try testing.expectEqual(@as(?i64, null), floatToInt(0.5, .exact));
+    try testing.expectEqual(@as(?i64, 0), floatToInt(-0.0, .exact));
+}
+
+test "floatToIntScaled is the guarded @round(x * factor) of opOff and the xlsx reader" {
+    const factors = [_]f64{ 1, 1000, 86_400_000, 86_400_000_000, 3_600_000_000, 1e6, 100 };
+    for (float_corpus) |x| for (factors) |k| {
+        const p = @round(x * k);
+        const want: ?i64 = if (p >= -0x1p63 and p < 0x1p63) @intFromFloat(p) else null;
+        try testing.expectEqual(want, floatToIntScaled(x, k, .half_away));
+    };
+    try testing.expectEqual(@as(?i64, null), floatToIntScaled(1e40, 86_400_000_000, .half_away));
+    try testing.expectEqual(@as(?i64, 129_600_000_000), floatToIntScaled(1.5, 86_400_000_000, .half_away));
+    try testing.expectEqual(@as(?i64, 43_200_000), floatToIntScaled(0.5, 86_400_000, .half_away));
+    try testing.expectEqual(@as(?i64, 86_400_000), floatToIntScaled(0.99999999999, 86_400_000, .half_away));
+    try testing.expectEqual(@as(?i64, 1235), floatToIntScaled(12.345, 100, .half_away));
+}
+
+fn dec(u: i128, s: u8) Decimal {
+    return .{ .unscaled = u, .scale = s };
+}
+
+const dec_corpus = [_]Decimal{
+    dec(0, 0),                                        dec(0, 5),                                        dec(12345, 0),
+    dec(-12345, 0),                                   dec(25, 1),                                       dec(-25, 1),
+    dec(35, 1),                                       dec(-35, 1),                                      dec(15, 1),
+    dec(-15, 1),                                      dec(24999, 4),                                    dec(-24999, 4),
+    dec(250001, 5),                                   dec(1, 38),                                       dec(5, 1),
+    dec(-5, 1),                                       dec(std.math.maxInt(i64), 0),                     dec(std.math.minInt(i64), 0),
+    dec(@as(i128, std.math.maxInt(i64)) + 1, 0),      dec(@as(i128, std.math.minInt(i64)) - 1, 0),      dec(@as(i128, std.math.maxInt(i64)) * 10 + 4, 1),
+    dec(@as(i128, std.math.maxInt(i64)) * 10 + 5, 1), dec(@as(i128, std.math.minInt(i64)) * 10 - 5, 1), dec(@as(i128, std.math.minInt(i64)) * 10 - 4, 1),
+    dec(std.math.maxInt(i128), 38),                   dec(std.math.minInt(i128) + 1, 38),               dec(std.math.maxInt(i128), 20),
+    dec(std.math.maxInt(i128), 0),                    dec(7, 39),                                       dec(-7, 200),
+    dec(0, 255),                                      dec(5 * std.math.pow(i128, 10, 37), 38),          dec(-5 * std.math.pow(i128, 10, 37), 38),
+};
+
+test "decimalToInt half_away is the CAST(decimal AS INT) path" {
+    const rescaleTo = @import("eval/cast.zig").rescaleTo;
+    for (dec_corpus) |d| {
+        const want: ?i64 = if (rescaleTo(d, 0)) |z| std.math.cast(i64, z.unscaled) else null;
+        try testing.expectEqual(want, decimalToInt(d, .half_away));
+    }
+    try testing.expectEqual(@as(?i64, 3), decimalToInt(dec(25, 1), .half_away));
+    try testing.expectEqual(@as(?i64, -3), decimalToInt(dec(-25, 1), .half_away));
+    try testing.expectEqual(@as(?i64, 2), decimalToInt(dec(24999, 4), .half_away));
+    try testing.expectEqual(@as(?i64, 1), decimalToInt(dec(5 * std.math.pow(i128, 10, 37), 38), .half_away));
+    try testing.expectEqual(@as(?i64, null), decimalToInt(dec(@as(i128, std.math.maxInt(i64)) * 10 + 5, 1), .half_away));
+}
+
+test "decimalToInt half_away matches the LIMIT decimal rounding" {
+    for (dec_corpus) |d| {
+        const p = std.math.powi(i128, 10, d.scale) catch {
+            try testing.expectEqual(@as(?i64, 0), decimalToInt(d, .half_away));
+            continue;
+        };
+        var q = @divTrunc(d.unscaled, p);
+        if (@abs(@rem(d.unscaled, p)) * 2 >= p) q += if (d.unscaled < 0) -1 else 1;
+        try testing.expectEqual(std.math.cast(i64, q), decimalToInt(d, .half_away));
+    }
+}
+
+test "decimalToInt exact is keytable's intOfDec" {
+    for (dec_corpus) |d| {
+        const want: ?i64 = blk: {
+            if (d.scale >= pow10_i128.len) break :blk if (d.unscaled == 0) 0 else null;
+            const p = pow10_i128[d.scale];
+            if (@rem(d.unscaled, p) != 0) break :blk null;
+            break :blk std.math.cast(i64, @divExact(d.unscaled, p));
+        };
+        try testing.expectEqual(want, decimalToInt(d, .exact));
+    }
+    try testing.expectEqual(@as(?i64, 12), decimalToInt(dec(1200, 2), .exact));
+    try testing.expectEqual(@as(?i64, null), decimalToInt(dec(1201, 2), .exact));
+}
+
+test "decimalToInt half_even rounds ties to even and agrees with the float path" {
+    try testing.expectEqual(@as(?i64, 2), decimalToInt(dec(25, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 4), decimalToInt(dec(35, 1), .half_even));
+    try testing.expectEqual(@as(?i64, -2), decimalToInt(dec(-25, 1), .half_even));
+    try testing.expectEqual(@as(?i64, -4), decimalToInt(dec(-35, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 0), decimalToInt(dec(5, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 3), decimalToInt(dec(250001, 5), .half_even));
+    for (0..2001) |i| {
+        const u = @as(i128, @intCast(i)) - 1000;
+        const d = dec(u, 1);
+        const x = @as(f64, @floatFromInt(u)) / 10;
+        if (@abs(@rem(u, 10)) == 5) {
+            try testing.expectEqual(floatToInt(x, .half_even), decimalToInt(d, .half_even));
+            try testing.expectEqual(floatToInt(x, .half_away), decimalToInt(d, .half_away));
+        }
+        try testing.expectEqual(floatToInt(x, .exact), decimalToInt(d, .exact));
+    }
+}
+
+test "a decimal value's own scale decides, not a column's" {
+    try testing.expectEqual(decimalToInt(dec(25, 1), .half_away), decimalToInt(dec(2500, 3), .half_away));
+    try testing.expectEqual(decimalToInt(dec(25, 1), .half_even), decimalToInt(dec(25000000, 7), .half_even));
+    try testing.expectEqual(@as(?i64, 7), decimalToInt(dec(7000, 3), .exact));
+}
