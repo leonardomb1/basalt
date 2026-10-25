@@ -14,12 +14,11 @@
 
 const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
-const cast = @import("../../exec/eval/cast.zig");
+const civil = @import("../../exec/civil.zig");
 const decimal = @import("../../exec/decimal.zig");
-const fmtnum = @import("../../exec/eval/format.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const pqwrite = @import("../parquet/write.zig");
 const table = @import("table.zig");
-const time = @import("../../exec/eval/time.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -31,17 +30,18 @@ pub const Error = error{DeltaValueOutOfRange};
 pub const stat_prefix = 32;
 
 /// A primitive of `schemaString`: the basalt type its values are and their
-/// Parquet layout; `writable` false for one basalt reads but does not write.
+/// Parquet layout; `void`, a column only ever NULL, is read as an untyped column
+/// and not written.
 pub const Prim = struct {
     name: []const u8,
     kind: types.TypeKind,
     phys: pqwrite.Physical = .{},
-    writable: bool = true,
+    void: bool = false,
 };
 
 pub const prims = [_]Prim{
     .{ .name = "string", .kind = .string },
-    .{ .name = "void", .kind = .string, .writable = false },
+    .{ .name = "void", .kind = .string, .void = true },
     .{ .name = "long", .kind = .int },
     .{ .name = "integer", .kind = .int, .phys = .{ .int_bits = 32 } },
     .{ .name = "short", .kind = .int, .phys = .{ .int_bits = 16 } },
@@ -65,7 +65,10 @@ pub const Use = enum { read, write };
 
 /// The basalt type of primitive `t`, null for one basalt does not read (or write).
 pub fn scalarType(t: []const u8, comptime use: Use) ?types.Type {
-    if (prim(t)) |p| return if (use == .write and !p.writable) null else types.Type.init(p.kind);
+    if (prim(t)) |p| {
+        if (!p.void) return types.Type.init(p.kind);
+        return if (use == .write) null else types.Type.nullColumn(false);
+    }
     return decimalType(t);
 }
 
@@ -102,10 +105,15 @@ pub fn deltaName(k: types.TypeKind) ?[]const u8 {
     };
 }
 
-/// A decimal column of a new table: precision 0 (unbounded) as 38, at most 38;
-/// null when its scale then exceeds its precision.
+/// The precision a new table gives a decimal column: 0 (unbounded) as 38, at most 38.
+pub fn createdPrecision(t: types.Type) u8 {
+    return if (t.precision == 0) 38 else @min(38, t.precision);
+}
+
+/// A decimal column of a new table at `createdPrecision`; null when its scale
+/// then exceeds its precision.
 pub fn createdDecimal(t: types.Type) ?types.Type {
-    const p: u8 = if (t.precision == 0) 38 else @min(38, t.precision);
+    const p = createdPrecision(t);
     if (t.scale > p) return null;
     return types.Type.decimal(p, t.scale);
 }
@@ -170,33 +178,19 @@ pub fn fields(arena: std.mem.Allocator, v: std.json.Value, comptime lenience: Le
     return .{ .fields = out.items };
 }
 
-pub fn jsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try std.json.Stringify.encodeJsonString(s, .{}, w);
-}
-
 /// `us` as `YYYY-MM-DD HH:MM:SS.ffffff`, with `T` for the space and a trailing `Z`
 /// when `utc`; `ms` cuts the fraction to milliseconds. A year outside 1..9999 has
 /// no such spelling and is `DeltaValueOutOfRange`.
 pub fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
-    const day = @divFloor(us, 86_400_000_000);
-    const rest: u64 = @intCast(@mod(us, 86_400_000_000));
-    const y = try fourDigitYear(day);
-    const c = time.civilFromDays(day);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
-    if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
-    if (utc) try w.writeByte('Z');
+    const r = if (utc)
+        (if (ms) civil.writeLayout(w, us, .delta_timestamp_utc_ms) else civil.writeLayout(w, us, .delta_timestamp_utc))
+    else
+        (if (ms) civil.writeLayout(w, us, .delta_timestamp_ms) else civil.writeLayout(w, us, .delta_timestamp));
+    return r catch |e| if (e == error.YearOutOfRange) Error.DeltaValueOutOfRange else e;
 }
 
 pub fn writeDate(w: *std.Io.Writer, days: i64) !void {
-    const y = try fourDigitYear(days);
-    const c = time.civilFromDays(days);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
-}
-
-fn fourDigitYear(days: i64) Error!u64 {
-    const y = time.civilFromDays(days).y;
-    if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
-    return @intCast(y);
+    return civil.writeLayout(w, days, .delta_date) catch |e| if (e == error.YearOutOfRange) Error.DeltaValueOutOfRange else e;
 }
 
 /// A float as Delta's text: plain digits for a magnitude from 1e-4 to below 1e16,
@@ -249,9 +243,10 @@ pub const Bound = enum {
 };
 
 /// A statistics value as JSON, null where it is left out: a non-finite float, a
-/// date or timestamp outside years 1..9999, a long string's maximum, and any
-/// kind other than int, float, decimal, date, timestamp and string. A decimal is
-/// written at its own scale, a timestamp to milliseconds.
+/// date or timestamp outside years 1..9999, a long string's maximum, a string
+/// that is not UTF-8 (JSON text repaired to U+FFFD would no longer bound it), and
+/// any kind other than int, float, decimal, date, timestamp and string. A decimal
+/// is written at its own scale, a timestamp to milliseconds.
 pub fn statText(arena: std.mem.Allocator, phys: pqwrite.Physical, v: Value, which: Bound) !?[]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
@@ -273,12 +268,14 @@ pub fn statText(arena: std.mem.Allocator, phys: pqwrite.Physical, v: Value, whic
             try w.writeByte('"');
         },
         .string => |s| {
+            var n: usize = s.len;
             if (s.len > stat_prefix) {
                 if (which == .max) return null;
-                var n: usize = stat_prefix;
+                n = stat_prefix;
                 while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
-                try jsonString(w, s[0..n]);
-            } else try jsonString(w, s);
+            }
+            if (!std.unicode.utf8ValidateSlice(s[0..n])) return null;
+            try jsontext.string(w, s[0..n]);
         },
         else => return null,
     }
@@ -611,4 +608,86 @@ test "delta_types: statistics the writer spells read back as the merge reads the
     }
     const t_max = (try statValue(a, parseStats(a, try std.fmt.allocPrint(a, "{{\"maxValues\":{{\"c\":{s}}}}}", .{(try statText(a, physical("timestamp"), .{ .timestamp = us }, .max)).?})).?, .max, "c", T.init(.timestamp))).?;
     try testing.expectEqual(@as(i64, 20454 * 86_400_000_000 + 1_234_999), t_max.timestamp);
+}
+
+const oracle = struct {
+    const time = @import("../../exec/eval/time.zig");
+
+    fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
+        const day = @divFloor(us, 86_400_000_000);
+        const rest: u64 = @intCast(@mod(us, 86_400_000_000));
+        const y = try fourDigitYear(day);
+        const c = time.civilFromDays(day);
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
+        if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
+        if (utc) try w.writeByte('Z');
+    }
+
+    fn writeDate(w: *std.Io.Writer, days: i64) !void {
+        const y = try fourDigitYear(days);
+        const c = time.civilFromDays(days);
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
+    }
+
+    fn fourDigitYear(days: i64) Error!u64 {
+        const y = time.civilFromDays(days).y;
+        if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
+        return @intCast(y);
+    }
+};
+
+fn expectSameText(old: anyerror![]const u8, new: anyerror![]const u8) !void {
+    const o = old catch |e| return testing.expectError(e, new);
+    try testing.expectEqualStrings(o, try new);
+}
+
+test "delta_types: writeTimestamp and writeDate on civil.writeLayout equal the old bodies" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const W = struct {
+        fn ts(arena: std.mem.Allocator, comptime f: anytype, us: i64, utc: bool, ms: bool) ![]const u8 {
+            var aw = std.Io.Writer.Allocating.init(arena);
+            try f(&aw.writer, us, utc, ms);
+            return aw.written();
+        }
+        fn date(arena: std.mem.Allocator, comptime f: anytype, d: i64) ![]const u8 {
+            var aw = std.Io.Writer.Allocating.init(arena);
+            try f(&aw.writer, d);
+            return aw.written();
+        }
+    };
+    const day: i64 = civil.us_per_day;
+    var edges = std.array_list.Managed(i64).init(a);
+    for ([_]i64{ -719162, -719163, 0, -1, 1, 20454, 2932896, 2932897, -106_751_991, 106_751_991 }) |d| {
+        for ([_]i64{ 0, 1, 999, 1000, 999_999, 1_000_000, day - 1, -1, -1000, -1_000_001 }) |off| try edges.append(d *| day +| off);
+    }
+    try edges.appendSlice(&.{ std.math.minInt(i64), std.math.maxInt(i64), std.math.minInt(i64) + 1, std.math.maxInt(i64) - 1 });
+    var prng = std.Random.DefaultPrng.init(0xDE17A);
+    const r = prng.random();
+    for (0..20_000) |_| try edges.append(r.intRangeAtMost(i64, -800_000 * day, 3_000_000 * day));
+    for (0..2_000) |_| try edges.append(r.int(i64));
+    for (edges.items) |us| {
+        for ([_]bool{ false, true }) |utc| for ([_]bool{ false, true }) |ms|
+            try expectSameText(W.ts(a, oracle.writeTimestamp, us, utc, ms), W.ts(a, writeTimestamp, us, utc, ms));
+        const d = @divFloor(us, day);
+        try expectSameText(W.date(a, oracle.writeDate, d), W.date(a, writeDate, d));
+    }
+}
+
+test "delta_types: void reads as a nullable string column, not an unknown one" {
+    const t = scalarType("void", .read).?;
+    try testing.expectEqual(types.TypeKind.string, t.kind);
+    try testing.expect(t.nullable);
+    try testing.expect(!t.unknown);
+}
+
+test "delta_types: a string that is not UTF-8 has no statistic, so it never bounds wrongly" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "a\xff", "\x80", "ok\xc3", "\xfe" ++ "a" ** 40 }) |s| for ([_]Bound{ .min, .max }) |which|
+        try testing.expect(try statText(a, .{}, .{ .string = s }, which) == null);
+    try testing.expectEqualStrings("\"" ++ "a" ** 32 ++ "\"", (try statText(a, .{}, .{ .string = "a" ** 40 ++ "\xfe" }, .min)).?);
+    try testing.expectEqualStrings("\"caf\u{e9}\\n\"", (try statText(a, .{}, .{ .string = "caf\u{e9}\n" }, .max)).?);
 }

@@ -39,17 +39,16 @@
 
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
-const Value = @import("../../exec/value.zig").Value;
-const cast = @import("../../exec/eval/cast.zig");
-const decimal = @import("../../exec/decimal.zig");
 const codecs = @import("../compress/codecs.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
+const dtypes = @import("delta_types.zig");
 const merge = @import("delta_merge.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
 const percent = @import("../../net/percent.zig");
@@ -57,7 +56,6 @@ const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const s3 = @import("../../store/s3.zig");
 const table = @import("table.zig");
-const time = @import("../../exec/eval/time.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -105,10 +103,6 @@ pub const max_open = 16;
 
 /// A data file is closed once this much Parquet is written to it.
 pub const roll_bytes: i64 = 128 << 20;
-
-/// A string longer than this has no maximum in its file's statistics, and its
-/// prefix of this many bytes as its minimum.
-pub const stat_prefix = 32;
 
 /// One column as the table types it.
 pub const Col = struct {
@@ -290,7 +284,7 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
         c.* = try createCol(arena, name, f, i);
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":");
-        try jsonString(w, f.name);
+        try jsontext.string(w, f.name);
         try w.print(",\"type\":\"{s}\",\"nullable\":true,\"metadata\":{{}}}}", .{c.delta_type});
     }
     try w.writeAll("]}");
@@ -304,66 +298,40 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
 fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, src: usize) !Col {
     const t = f.ty;
     if (t.unknown) return refuse("column `{s}` has no type (a bare NULL); CAST it to the type {s} should hold", .{ f.name, name });
-    const dt: []const u8 = switch (t.kind) {
-        .bool => "boolean",
-        .int => "long",
-        .float => "double",
-        .string => "string",
-        .bytes => "binary",
-        .date => "date",
-        .timestamp => "timestamp",
+    switch (t.kind) {
         .decimal => {
-            const p: u8 = if (t.precision == 0) 38 else @min(38, t.precision);
-            if (t.scale > p) return refuse("column `{s}` is decimal({d},{d}), whose scale exceeds its precision", .{ f.name, p, t.scale });
-            return .{ .name = f.name, .delta_type = try std.fmt.allocPrint(arena, "decimal({d},{d})", .{ p, t.scale }), .ty = types.Type.decimal(p, t.scale), .src = src };
+            const d = dtypes.createdDecimal(t) orelse
+                return refuse("column `{s}` is decimal({d},{d}), whose scale exceeds its precision", .{ f.name, dtypes.createdPrecision(t), t.scale });
+            return .{ .name = f.name, .delta_type = try std.fmt.allocPrint(arena, "decimal({d},{d})", .{ d.precision, d.scale }), .ty = d, .src = src };
         },
         .time => return refuse("column `{s}` is a time of day, which Delta has no type for; cast it to a string or store microseconds as a number", .{f.name}),
         .array, .@"struct" => return refuse("column `{s}` is {s}; basalt writes Delta tables of scalar columns", .{ f.name, if (t.kind == .array) "an array" else "a struct" }),
-    };
-    return .{ .name = f.name, .delta_type = dt, .ty = types.Type.init(t.kind), .phys = .{ .utc = t.kind == .timestamp }, .src = src };
+        else => {},
+    }
+    const dt = dtypes.deltaName(t.kind).?;
+    return .{ .name = f.name, .delta_type = dt, .ty = types.Type.init(t.kind), .phys = dtypes.physical(dt), .src = src };
 }
 
-/// A field of a table's `schemaString`.
-const Field = struct {
-    name: []const u8,
-    ty: std.json.Value,
-    nullable: bool,
-    metadata: ?std.json.ObjectMap,
-};
+const Field = dtypes.Field;
 
 fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8) ![]const Field {
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
         return refuse("{s} has a schemaString that is not JSON", .{name});
-    const fields = if (v == .object) v.object.get("fields") else null;
-    if (fields == null or fields.? != .array) return refuse("{s} has a schemaString that is not a struct of fields", .{name});
-    const out = try arena.alloc(Field, fields.?.array.items.len);
-    for (fields.?.array.items, out) |f, *o| {
-        if (f != .object) return refuse("{s} has a schemaString field that is not an object", .{name});
-        const n = f.object.get("name") orelse return refuse("{s} has a schemaString field with no name", .{name});
-        if (n != .string) return refuse("{s} has a schemaString field with no name", .{name});
-        const nl = f.object.get("nullable");
-        const md = f.object.get("metadata");
-        o.* = .{
-            .name = n.string,
-            .ty = f.object.get("type") orelse .null,
-            .nullable = if (nl) |x| (x != .bool or x.bool) else true,
-            .metadata = if (md) |m| (if (m == .object) m.object else null) else null,
-        };
-    }
-    return out;
+    return switch (try dtypes.fields(arena, v, .strict)) {
+        .fields => |fs| fs,
+        .problem => |p| switch (p) {
+            .not_struct => refuse("{s} has a schemaString that is not a struct of fields", .{name}),
+            .not_object => refuse("{s} has a schemaString field that is not an object", .{name}),
+            .nameless => refuse("{s} has a schemaString field with no name", .{name}),
+        },
+    };
 }
 
 /// A table column `f` as the rows' column of type `in` is written to it.
 fn tableCol(name: []const u8, f: Field, in: types.Type, src: usize) !Col {
     const t = if (f.ty == .string) f.ty.string else return refuse("{s} has column `{s}` of a nested type; basalt writes Delta tables of scalar columns", .{ name, f.name });
-    var c = Col{ .name = f.name, .delta_type = t, .ty = scalarType(t) orelse
-        return refuse("{s} has column `{s}` of type `{s}`, which basalt does not write", .{ name, f.name, t }), .nullable = f.nullable, .src = src };
-    const Ints = struct { []const u8, u8 };
-    for ([_]Ints{ .{ "integer", 32 }, .{ "short", 16 }, .{ "byte", 8 } }) |x| if (std.mem.eql(u8, t, x[0])) {
-        c.phys.int_bits = x[1];
-    };
-    c.phys.float32 = std.mem.eql(u8, t, "float");
-    c.phys.utc = std.mem.eql(u8, t, "timestamp");
+    const c = Col{ .name = f.name, .delta_type = t, .ty = dtypes.scalarType(t, .write) orelse
+        return refuse("{s} has column `{s}` of type `{s}`, which basalt does not write", .{ name, f.name, t }), .phys = dtypes.physical(t), .nullable = f.nullable, .src = src };
     if (in.unknown) return c;
     if (in.kind != c.ty.kind)
         return refuse("column `{s}` is {s} in the rows but `{s}` in {s}; cast it", .{ f.name, @tagName(in.kind), t, name });
@@ -373,27 +341,6 @@ fn tableCol(name: []const u8, f: Field, in: types.Type, src: usize) !Col {
             return refuse("column `{s}` is decimal({d},{d}) in the rows but `{s}` in {s}, which cannot hold every value; cast it", .{ f.name, ip, in.scale, t, name });
     }
     return c;
-}
-
-/// The basalt type a Delta primitive's values are, null for one basalt does not write.
-fn scalarType(t: []const u8) ?types.Type {
-    const Simple = struct { []const u8, types.TypeKind };
-    for ([_]Simple{
-        .{ "long", .int },     .{ "integer", .int }, .{ "short", .int },           .{ "byte", .int },
-        .{ "double", .float }, .{ "float", .float }, .{ "boolean", .bool },        .{ "string", .string },
-        .{ "binary", .bytes }, .{ "date", .date },   .{ "timestamp", .timestamp }, .{ "timestamp_ntz", .timestamp },
-    }) |x| if (std.mem.eql(u8, t, x[0])) return types.Type.init(x[1]);
-    return parseDecimal(t);
-}
-
-fn parseDecimal(t: []const u8) ?types.Type {
-    if (std.mem.eql(u8, t, "decimal")) return types.Type.decimal(10, 0);
-    if (!std.mem.startsWith(u8, t, "decimal(") or !std.mem.endsWith(u8, t, ")")) return null;
-    var it = std.mem.splitScalar(u8, t["decimal(".len .. t.len - 1], ',');
-    const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
-    const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
-    if (p < 1 or p > 38 or s > p) return null;
-    return types.Type.decimal(p, s);
 }
 
 /// The writer features basalt honours: the ones that ask nothing of a writer
@@ -447,72 +394,7 @@ fn oneOf(s: []const u8, set: []const []const u8) bool {
     return false;
 }
 
-fn jsonString(w: *std.Io.Writer, s: []const u8) !void {
-    try std.json.Stringify.encodeJsonString(s, .{}, w);
-}
-
-/// `us` as `YYYY-MM-DD HH:MM:SS.ffffff`, with `T` for the space and a trailing `Z`
-/// when `utc`; `ms` cuts the fraction to milliseconds. A year outside 1..9999 has
-/// no such spelling and is `DeltaValueOutOfRange`.
-fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
-    const day = @divFloor(us, 86_400_000_000);
-    const rest: u64 = @intCast(@mod(us, 86_400_000_000));
-    const y = try fourDigitYear(day);
-    const c = time.civilFromDays(day);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
-    if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
-    if (utc) try w.writeByte('Z');
-}
-
-fn writeDate(w: *std.Io.Writer, days: i64) !void {
-    const y = try fourDigitYear(days);
-    const c = time.civilFromDays(days);
-    try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
-}
-
-fn fourDigitYear(days: i64) Error!u64 {
-    const y = time.civilFromDays(days).y;
-    if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
-    return @intCast(y);
-}
-
-/// A partition value as the log's text, null for NULL (and for an empty string,
-/// which Delta reads as NULL).
-fn partitionText(arena: std.mem.Allocator, c: Col, v: Value) !?[]const u8 {
-    var aw = std.Io.Writer.Allocating.init(arena);
-    const w = &aw.writer;
-    switch (v) {
-        .null => return null,
-        .string => |s| return if (s.len == 0) null else s,
-        .int => |i| try w.print("{d}", .{i}),
-        .float => |f| try writeDouble(w, f, c.phys.float32),
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .date => |d| try writeDate(w, d),
-        .timestamp => |us| try writeTimestamp(w, us, c.phys.utc, false),
-        .decimal => |d| {
-            const r = decimal.rescaleTo(d, c.ty.scale) orelse return Error.DeltaValueOutOfRange;
-            try decimal.writeDecimal(w, r.unscaled, r.scale);
-        },
-        else => return Error.DeltaValueOutOfRange,
-    }
-    return aw.written();
-}
-
 pub const Error = error{ DeltaValueOutOfRange, DeltaNullInNotNull };
-
-/// A float as Delta's text: plain digits for a magnitude from 1e-4 to below 1e16,
-/// exponent form past them, NaN and the infinities as Java spells them; a 4-byte
-/// `float` column's value as its shortest 4-byte text.
-fn writeDouble(w: *std.Io.Writer, x: f64, float32: bool) !void {
-    const v: f64 = if (float32) @as(f32, @floatCast(x)) else x;
-    if (std.math.isNan(v)) return w.writeAll("NaN");
-    if (std.math.isInf(v)) return w.writeAll(if (v > 0) "Infinity" else "-Infinity");
-    const plain = v == 0 or (@abs(v) >= 1e-4 and @abs(v) < 1e16);
-    if (float32) {
-        const f: f32 = @floatCast(v);
-        if (plain) try w.print("{d}", .{f}) else try w.print("{e}", .{f});
-    } else if (plain) try w.print("{d}", .{v}) else try w.print("{e}", .{v});
-}
 
 /// Spark's escaping of a partition folder's name and value.
 fn escapePath(w: *std.Io.Writer, s: []const u8) !void {
@@ -534,53 +416,19 @@ fn uriPath(arena: std.mem.Allocator, rel: []const u8) ![]const u8 {
     return aw.written();
 }
 
-/// A statistics value as JSON, null where it is left out.
-fn statJson(arena: std.mem.Allocator, c: Col, v: Value, is_max: bool) !?[]const u8 {
-    var aw = std.Io.Writer.Allocating.init(arena);
-    const w = &aw.writer;
-    switch (v) {
-        .int => |i| try w.print("{d}", .{i}),
-        .float => |f| {
-            if (!std.math.isFinite(f)) return null;
-            try writeDouble(w, f, c.phys.float32);
-        },
-        .decimal => |d| try decimal.writeDecimal(w, d.unscaled, d.scale),
-        .date => |d| {
-            try w.writeByte('"');
-            writeDate(w, d) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;
-            try w.writeByte('"');
-        },
-        .timestamp => |us| {
-            try w.writeByte('"');
-            writeTimestamp(w, us, c.phys.utc, true) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;
-            try w.writeByte('"');
-        },
-        .string => |s| {
-            if (s.len > stat_prefix) {
-                if (is_max) return null;
-                var n: usize = stat_prefix;
-                while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
-                try jsonString(w, s[0..n]);
-            } else try jsonString(w, s);
-        },
-        else => return null,
-    }
-    return aw.written();
-}
-
 fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summary) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.print("{{\"numRecords\":{d}", .{sum.rows});
-    inline for (.{ "minValues", "maxValues" }, .{ false, true }) |key, is_max| {
-        try w.print(",\"{s}\":{{", .{key});
+    for ([_]dtypes.Bound{ .min, .max }) |which| {
+        try w.print(",\"{s}\":{{", .{which.key()});
         var first = true;
         for (p.data, sum.columns) |k, cs| {
-            const v = (if (is_max) cs.max else cs.min) orelse continue;
-            const text = (try statJson(arena, p.cols[k], v, is_max)) orelse continue;
+            const v = (if (which == .max) cs.max else cs.min) orelse continue;
+            const text = (try dtypes.statText(arena, p.cols[k].phys, v, which)) orelse continue;
             if (!first) try w.writeByte(',');
             first = false;
-            try jsonString(w, p.cols[k].name);
+            try jsontext.string(w, p.cols[k].name);
             try w.writeByte(':');
             try w.writeAll(text);
         }
@@ -589,7 +437,7 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
     try w.writeAll(",\"nullCount\":{");
     for (p.data, sum.columns, 0..) |k, cs, i| {
         if (i > 0) try w.writeByte(',');
-        try jsonString(w, p.cols[k].name);
+        try jsontext.string(w, p.cols[k].name);
         try w.print(":{d}", .{cs.nulls});
     }
     try w.writeAll("}}");
@@ -685,7 +533,7 @@ pub const Sink = struct {
         try pb.writer.writeByte('[');
         for (p.parts, 0..) |k, i| {
             if (i > 0) try pb.writer.writeByte(',');
-            try jsonString(&pb.writer, p.cols[k].name);
+            try jsontext.string(&pb.writer, p.cols[k].name);
         }
         try pb.writer.writeByte(']');
         switch (p.mode) {
@@ -693,18 +541,18 @@ pub const Sink = struct {
                 try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"MERGE\",\"operationParameters\":{{\"predicate\":", .{now});
                 var pred = std.Io.Writer.Allocating.init(a);
                 for (u.keys, 0..) |k, i| try pred.writer.print("{s}target.`{s}` = source.`{s}`", .{ if (i > 0) " AND " else "", k, k });
-                try jsonString(w, pred.written());
+                try jsontext.string(w, pred.written());
             },
             else => {
                 try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
-                try jsonString(w, pb.written());
+                try jsontext.string(w, pb.written());
             },
         }
         try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null) "true" else "false", @import("build_options").version, &self.txn });
         if (p.snap == null) {
             try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
             try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
-            try jsonString(w, p.schema_string);
+            try jsontext.string(w, p.schema_string);
             try w.writeAll(",\"partitionColumns\":");
             try w.writeAll(pb.written());
             try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
@@ -739,7 +587,7 @@ pub const Sink = struct {
         for (0..b.len) |r| {
             key.clearRetainingCapacity();
             for (p.parts, vals) |k, *v| {
-                v.* = try partitionText(arena, p.cols[k], b.columns[p.cols[k].src].getValue(r));
+                v.* = try dtypes.partitionText(arena, p.cols[k].phys, p.cols[k].ty.scale, b.columns[p.cols[k].src].getValue(r));
                 if (v.*) |t| {
                     try key.append(1);
                     try key.appendSlice(t);
@@ -888,16 +736,16 @@ pub const Sink = struct {
         const p = self.plan;
         const w = &self.adds.writer;
         try w.writeAll("{\"add\":{\"path\":");
-        try jsonString(w, try uriPath(a, o.rel));
+        try jsontext.string(w, try uriPath(a, o.rel));
         try w.writeAll(",\"partitionValues\":{");
         for (p.parts, o.values, 0..) |k, v, i| {
             if (i > 0) try w.writeByte(',');
-            try jsonString(w, p.cols[k].name);
+            try jsontext.string(w, p.cols[k].name);
             try w.writeByte(':');
-            if (v) |t| try jsonString(w, t) else try w.writeAll("null");
+            if (v) |t| try jsontext.string(w, t) else try w.writeAll("null");
         }
         try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":true,\"stats\":", .{ sum.bytes, std.time.milliTimestamp() });
-        try jsonString(w, try statsJson(a, p, sum));
+        try jsontext.string(w, try statsJson(a, p, sum));
         try w.writeAll("}}\n");
         self.n_added += 1;
     }
@@ -928,7 +776,7 @@ pub const Sink = struct {
         const w = &self.adds.writer;
         for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
-            try jsonString(w, f.raw);
+            try jsontext.string(w, f.raw);
             try w.print(",\"deletionTimestamp\":{d},\"dataChange\":true,\"extendedFileMetadata\":true,\"partitionValues\":", .{now});
             if (f.parts) |pv| try std.json.Stringify.value(pv, .{}, w) else try w.writeAll("{}");
             if (f.size) |s| try w.print(",\"size\":{d}", .{s});
@@ -1010,53 +858,110 @@ test "partition folders: Spark's escaping, NULL as the Hive default, the log pat
     try testing.expectEqualStrings("r=%C3%A9/x%2By.parquet", try uriPath(a, "r=é/x+y.parquet"));
 }
 
-test "partition values and statistics as the log writes them" {
+test "a file's statistics stay JSON when a string column holds bytes that are not UTF-8" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const ts = Col{ .name = "t", .delta_type = "timestamp", .ty = types.Type.init(.timestamp), .phys = .{ .utc = true }, .src = 0 };
-    const ntz = Col{ .name = "t", .delta_type = "timestamp_ntz", .ty = types.Type.init(.timestamp), .src = 0 };
-    const us: i64 = 20454 * 86_400_000_000 + 3_600_000_000 + 1_234_567;
-    try testing.expectEqualStrings("2026-01-01T01:00:01.234567Z", (try partitionText(a, ts, .{ .timestamp = us })).?);
-    try testing.expectEqualStrings("2026-01-01 01:00:01.234567", (try partitionText(a, ntz, .{ .timestamp = us })).?);
-    try testing.expectEqualStrings("\"2026-01-01T01:00:01.234Z\"", (try statJson(a, ts, .{ .timestamp = us }, true)).?);
-    try testing.expectEqualStrings("\"2026-01-01 01:00:01.234\"", (try statJson(a, ntz, .{ .timestamp = us }, false)).?);
-    const dec = Col{ .name = "d", .delta_type = "decimal(10,2)", .ty = types.Type.decimal(10, 2), .src = 0 };
-    try testing.expectEqualStrings("10.50", (try partitionText(a, dec, .{ .decimal = .{ .unscaled = 105, .scale = 1 } })).?);
-    try testing.expectEqualStrings("-1.05", (try statJson(a, dec, .{ .decimal = .{ .unscaled = -105, .scale = 2 } }, false)).?);
-    const s = Col{ .name = "s", .delta_type = "string", .ty = types.Type.init(.string), .src = 0 };
-    try testing.expect(try partitionText(a, s, .{ .string = "" }) == null);
-    const long = "é" ** 20;
-    try testing.expect(try statJson(a, s, .{ .string = long }, true) == null);
-    try testing.expectEqualStrings("\"" ++ "é" ** 16 ++ "\"", (try statJson(a, s, .{ .string = long }, false)).?);
-    const f = Col{ .name = "f", .delta_type = "double", .ty = types.Type.init(.float), .src = 0 };
-    try testing.expect(try statJson(a, f, .{ .float = std.math.inf(f64) }, true) == null);
-    try testing.expectEqualStrings("2026-01-01", (try partitionText(a, .{ .name = "d", .delta_type = "date", .ty = types.Type.init(.date), .src = 0 }, .{ .date = 20454 })).?);
-    const dc = Col{ .name = "d", .delta_type = "date", .ty = types.Type.init(.date), .src = 0 };
-    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, dc, .{ .date = -719163 }));
-    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, dc, .{ .date = 2932897 }));
-    try testing.expectEqualStrings("0001-01-01", (try partitionText(a, dc, .{ .date = -719162 })).?);
-    try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, ts, .{ .timestamp = std.math.minInt(i64) }));
-    try testing.expect(try statJson(a, ts, .{ .timestamp = std.math.maxInt(i64) }, true) == null);
+    const cols = [_]Col{
+        .{ .name = "s\xff", .delta_type = "string", .ty = types.Type.init(.string), .src = 0 },
+        .{ .name = "n", .delta_type = "long", .ty = types.Type.init(.int), .src = 1 },
+    };
+    const p = Plan{ .name = "T", .root = "/t/", .mode = .append, .codec = .uncompressed, .snap = null, .cols = &cols, .parts = &.{}, .data = &.{ 0, 1 }, .schema_string = "" };
+    var cs = [_]pqwrite.Writer.ColumnStats{
+        .{ .nulls = 0, .min = .{ .string = "a\xff" }, .max = .{ .string = "z\xfe" } },
+        .{ .nulls = 1, .min = .{ .int = -3 }, .max = .{ .int = 9 } },
+    };
+    const text = try statsJson(a, &p, .{ .rows = 2, .bytes = 10, .columns = &cs });
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+    try testing.expect(v.object.get("minValues").?.object.get("s\u{fffd}") == null);
+    try testing.expectEqual(@as(i64, -3), v.object.get("minValues").?.object.get("n").?.integer);
+    try testing.expectEqual(@as(i64, 9), v.object.get("maxValues").?.object.get("n").?.integer);
+    try testing.expectEqual(@as(i64, 0), v.object.get("nullCount").?.object.get("s\u{fffd}").?.integer);
+    var line = std.Io.Writer.Allocating.init(a);
+    try jsontext.string(&line.writer, text);
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, a, line.written(), .{});
 }
 
-test "floats as partition values and statistics: compact past a moderate range, Java's NaN and infinities, read back exactly" {
+const oracle = struct {
+    fn scalarType(t: []const u8) ?types.Type {
+        const Simple = struct { []const u8, types.TypeKind };
+        for ([_]Simple{
+            .{ "long", .int },     .{ "integer", .int }, .{ "short", .int },           .{ "byte", .int },
+            .{ "double", .float }, .{ "float", .float }, .{ "boolean", .bool },        .{ "string", .string },
+            .{ "binary", .bytes }, .{ "date", .date },   .{ "timestamp", .timestamp }, .{ "timestamp_ntz", .timestamp },
+        }) |x| if (std.mem.eql(u8, t, x[0])) return types.Type.init(x[1]);
+        return parseDecimal(t);
+    }
+
+    fn parseDecimal(t: []const u8) ?types.Type {
+        if (std.mem.eql(u8, t, "decimal")) return types.Type.decimal(10, 0);
+        if (!std.mem.startsWith(u8, t, "decimal(") or !std.mem.endsWith(u8, t, ")")) return null;
+        var it = std.mem.splitScalar(u8, t["decimal(".len .. t.len - 1], ',');
+        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
+        const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
+        if (p < 1 or p > 38 or s > p) return null;
+        return types.Type.decimal(p, s);
+    }
+
+    fn phys(t: []const u8) pqwrite.Physical {
+        var ph = pqwrite.Physical{};
+        const Ints = struct { []const u8, u8 };
+        for ([_]Ints{ .{ "integer", 32 }, .{ "short", 16 }, .{ "byte", 8 } }) |x| if (std.mem.eql(u8, t, x[0])) {
+            ph.int_bits = x[1];
+        };
+        ph.float32 = std.mem.eql(u8, t, "float");
+        ph.utc = std.mem.eql(u8, t, "timestamp");
+        return ph;
+    }
+
+    fn createdName(t: types.Type) ?[]const u8 {
+        return switch (t.kind) {
+            .bool => "boolean",
+            .int => "long",
+            .float => "double",
+            .string => "string",
+            .bytes => "binary",
+            .date => "date",
+            .timestamp => "timestamp",
+            else => null,
+        };
+    }
+};
+
+test "a table's column types from delta_types equal the writer's old tables" {
+    const names = [_][]const u8{
+        "long",           "integer",      "short",          "byte",          "double",        "float",          "boolean",
+        "string",         "binary",       "date",           "timestamp",     "timestamp_ntz", "void",           "variant",
+        "Long",           "",             "interval",       "timestamp_tz",  "decimal",       "decimal(10,2)",  "decimal( 10 , 2 )",
+        "decimal(38,38)", "decimal(1,0)", "decimal(5,2,9)", "decimal(10)",   "decimal(,2)",   "decimal(39,0)",  "decimal(5,6)",
+        "decimal(0,0)",   "decimal()",    "decimal(10,2",   "decimal(-1,0)", "decimal(a,b)",  "decimal(256,0)", "Decimal(10,2)",
+    };
+    for (names) |t| {
+        const old = oracle.scalarType(t);
+        const new = dtypes.scalarType(t, .write);
+        try testing.expectEqual(old == null, new == null);
+        if (old) |o| {
+            try testing.expectEqual(o, new.?);
+            try testing.expectEqual(oracle.phys(t), dtypes.physical(t));
+        }
+    }
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const a = ar.allocator();
-    const d = Col{ .name = "f", .delta_type = "double", .ty = types.Type.init(.float), .src = 0 };
-    const f = Col{ .name = "f", .delta_type = "float", .ty = types.Type.init(.float), .phys = .{ .float32 = true }, .src = 0 };
-    const Case = struct { f64, []const u8 };
-    for ([_]Case{ .{ 1e301, "1e301" }, .{ -2.5e-300, "-2.5e-300" }, .{ 1e-7, "1e-7" }, .{ 0.0001, "0.0001" }, .{ 123.5, "123.5" }, .{ 1e16, "1e16" }, .{ 0, "0" }, .{ std.math.nan(f64), "NaN" }, .{ -std.math.inf(f64), "-Infinity" } }) |c| {
-        const text = (try partitionText(a, d, .{ .float = c[0] })).?;
-        try testing.expectEqualStrings(c[1], text);
-        const back = (try table.partitionValue(a, text, types.Type.init(.float))).?.float;
-        if (std.math.isNan(c[0])) try testing.expect(std.math.isNan(back)) else try testing.expectEqual(c[0], back);
+    inline for (std.meta.fields(types.TypeKind)) |f| {
+        const k: types.TypeKind = @enumFromInt(f.value);
+        if (oracle.createdName(types.Type.init(k))) |n| {
+            const c = try createCol(ar.allocator(), "T", .{ .name = "c", .ty = types.Type.init(k) }, 0);
+            try testing.expectEqualStrings(n, c.delta_type);
+            try testing.expectEqual(pqwrite.Physical{ .utc = k == .timestamp }, c.phys);
+        }
     }
-    try testing.expectEqualStrings("Infinity", (try partitionText(a, f, .{ .float = 1e300 })).?);
-    try testing.expectEqualStrings("0.1", (try partitionText(a, f, .{ .float = 0.1 })).?);
-    try testing.expectEqualStrings("1e-10", (try statJson(a, f, .{ .float = 1e-10 }, false)).?);
-    try testing.expectEqualStrings("1e300", (try statJson(a, d, .{ .float = 1e300 }, true)).?);
+    const T = types.Type;
+    for ([_]struct { T, []const u8 }{ .{ T.decimal(0, 4), "decimal(38,4)" }, .{ T.decimal(60, 2), "decimal(38,2)" }, .{ T.decimal(12, 3), "decimal(12,3)" } }) |x| {
+        const c = try createCol(ar.allocator(), "T", .{ .name = "c", .ty = x[0] }, 0);
+        try testing.expectEqualStrings(x[1], c.delta_type);
+    }
+    try testing.expectError(table.Error.LakeTableRefused, createCol(ar.allocator(), "T", .{ .name = "c", .ty = T.decimal(60, 39) }, 0));
+    try testing.expectEqualStrings("column `c` is decimal(38,39), whose scale exceeds its precision", eval.takeFailure(table.Error.LakeTableRefused).?);
 }
 
 test "a table's column types: narrower integers and floats, decimals that hold every value" {
