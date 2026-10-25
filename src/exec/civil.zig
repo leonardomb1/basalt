@@ -290,10 +290,17 @@ pub fn Text(comptime sp: Spelling) type {
                 return false;
             }
 
-            fn num(c: *Scan, min: usize, max: usize) ?i64 {
+            /// `min` to `max` digits; both comptime, so the loop unrolls.
+            fn num(c: *Scan, comptime min: usize, comptime max: usize) ?i64 {
                 const start = c.i;
                 var v: i64 = 0;
-                while (c.i < c.s.len and c.i - start < max and std.ascii.isDigit(c.s[c.i])) : (c.i += 1) v = v * 10 + (c.s[c.i] - '0');
+                var more = true;
+                inline for (0..max) |_| {
+                    if (more and c.i < c.s.len and std.ascii.isDigit(c.s[c.i])) {
+                        v = v * 10 + (c.s[c.i] - '0');
+                        c.i += 1;
+                    } else more = false;
+                }
                 if (c.i - start < min) return null;
                 return v;
             }
@@ -465,6 +472,10 @@ inline fn putDigits(out: []u8, v: u64) void {
 
 /// At least four digits, more as the year needs.
 fn putYear(out: []u8, y: u64) usize {
+    if (y < 10_000) {
+        putDigits(out[0..4], y);
+        return 4;
+    }
     var n: usize = 4;
     var x = y / 10_000;
     while (x > 0) : (x /= 10) n += 1;
