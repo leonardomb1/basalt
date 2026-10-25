@@ -8,6 +8,7 @@ const analyze = @import("../../runtime/analyze.zig");
 const complete = @import("complete.zig");
 const parser = @import("../../lang/sql_parser.zig");
 const runtime = @import("../../runtime/run.zig");
+const sql = @import("../../db/sql.zig");
 const std = @import("std");
 const declareFrom = @import("../cmd_complete.zig").declareFrom;
 const writeOffer = @import("../cmd_complete.zig").writeOffer;
@@ -157,7 +158,7 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
         const conn = parts.next().?;
         const schema = parts.next() orelse return rows;
         const tbl = parts.next() orelse return rows;
-        const q = std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = '{s}' AND TABLE_NAME = '{s}' ORDER BY ORDINAL_POSITION$$)", .{ conn, schema, tbl }) catch return rows;
+        const q = (columnsProbe(a, connDialect(cx, conn), conn, schema, tbl) catch return rows) orelse return rows;
         const got = fetchRows(cx, q);
         const cols = a.alloc(complete.Column, got.len) catch return rows;
         for (got, cols) |r, *c| c.* = .{ .name = r[0], .type = if (r.len > 1) r[1] else "" };
@@ -165,6 +166,26 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
     }
     cx.catalog.columns.put(a.dupe(u8, key) catch return rows, rows) catch {};
     return rows;
+}
+
+/// The columns query for `schema.tbl`, the names as the connection's string
+/// literals; null when a name would end the `$$` around it.
+fn columnsProbe(a: std.mem.Allocator, d: sql.Dialect, conn: []const u8, schema: []const u8, tbl: []const u8) !?[]const u8 {
+    const s = try d.strLit(a, schema);
+    const t = try d.strLit(a, tbl);
+    if (std.mem.indexOf(u8, s, "$$") != null or std.mem.indexOf(u8, t, "$$") != null) return null;
+    return try std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s} ORDER BY ORDINAL_POSITION$$)", .{ conn, s, t });
+}
+
+fn connDialect(cx: *const Completer, conn: []const u8) sql.Dialect {
+    for (cx.decls.items.items) |e| {
+        if (e.kind != .connection or !std.ascii.eqlIgnoreCase(e.name, conn)) continue;
+        var buf: [16]u8 = undefined;
+        const ty = connTypeOf(e.text) orelse break;
+        if (ty.len > buf.len) break;
+        return std.meta.stringToEnum(sql.Dialect, std.ascii.lowerString(&buf, ty)) orelse break;
+    }
+    return .postgres;
 }
 
 pub fn connTypeOf(text: []const u8) ?[]const u8 {
@@ -456,6 +477,28 @@ test "a file's columns are offered with their type, in the offer and in its JSON
         try std.testing.expectEqualStrings("date", c.detail);
     };
     try std.testing.expect(found);
+}
+
+test "columnsProbe: a quote or backslash in a name stays inside its literal, a $$ skips the probe" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const pg = (try columnsProbe(a, .postgres, "pg", "o'neil", "a\\b")).?;
+    try std.testing.expect(std.mem.indexOf(u8, pg, "TABLE_SCHEMA = 'o''neil' AND TABLE_NAME = 'a\\b' ORDER") != null);
+    const my = (try columnsProbe(a, .mysql, "my", "s", "it's\\")).?;
+    try std.testing.expect(std.mem.indexOf(u8, my, "TABLE_SCHEMA = 's' AND TABLE_NAME = 'it''s\\\\' ORDER") != null);
+    try std.testing.expect(try columnsProbe(a, .postgres, "pg", "a$$b", "t") == null);
+    try std.testing.expect(try columnsProbe(a, .postgres, "pg", "s", "t$") != null);
+
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var catalog = Catalog.init(std.testing.allocator);
+    defer catalog.deinit();
+    try declareFrom(&decls, a, "CREATE CONNECTION my TYPE MySQL OPTIONS (host = 'h');\nCREATE CONNECTION sr TYPE starrocks;\nCREATE CONNECTION f TYPE sftp;");
+    const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
+    try std.testing.expectEqual(sql.Dialect.mysql, connDialect(&cx, "MY"));
+    try std.testing.expectEqual(sql.Dialect.starrocks, connDialect(&cx, "sr"));
+    try std.testing.expectEqual(sql.Dialect.postgres, connDialect(&cx, "f"));
 }
 
 test "csvCells: quoted cells keep their commas and doubled quotes" {
