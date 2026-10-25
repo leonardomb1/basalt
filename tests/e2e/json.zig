@@ -90,6 +90,27 @@ test "NDJSON and a JSON array are written and read back; an array is not appende
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (array = true) AS SELECT 1 AS a;", "`array` is an option of a JSON file");
 }
 
+test "a JSON key null in the whole file unifies with any type, as a CSV column of NULLs does" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.ndjson", .data = "{\"id\":1,\"x\":null}\n{\"id\":2,\"x\":null}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "a.json", .data = "[{\"id\":1,\"x\":null},{\"id\":2}]" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,x\n3,30\n" });
+    for ([_][]const u8{ "a.ndjson", "a.json" }) |f| for ([_]usize{ 1, 4 }) |threads| {
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '$B/out.csv' AS SELECT id, x FROM '$B/{s}' UNION ALL SELECT id, x FROM '$B/c.csv' ORDER BY id;", .{f});
+        defer alloc.free(script);
+        try checkAndRun(alloc, &tmp, script, threads, &.{});
+        const got = try out(alloc, &tmp);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings("id,x\n1,\n2,\n3,30\n", got);
+    };
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT b.id, a.id AS aid FROM '$B/c.csv' b LEFT JOIN '$B/a.ndjson' a ON b.x = a.x;", 1, &.{});
+    const got = try out(alloc, &tmp);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("id,aid\n3,\n", got);
+}
+
 test "STDIN is refused when stdin carries something else" {
     const alloc = std.testing.allocator;
 
