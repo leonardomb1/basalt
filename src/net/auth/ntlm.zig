@@ -25,6 +25,7 @@
 //! a broken primitive; it is not exported and must not be used elsewhere.
 
 const std = @import("std");
+const utf16 = @import("../../format/utf16.zig");
 
 pub const Error = error{ NtlmBadMessage, NtlmUnsupported } || std.mem.Allocator.Error;
 
@@ -234,14 +235,10 @@ fn ntowfv2(gpa: std.mem.Allocator, cred: Credential) Error![16]u8 {
 }
 
 fn utf16le(gpa: std.mem.Allocator, s: []const u8) Error![]u8 {
-    const wide = std.unicode.utf8ToUtf16LeAlloc(gpa, s) catch |e| switch (e) {
+    return utf16.encodeLeAlloc(gpa, s) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUtf8 => return error.NtlmUnsupported,
     };
-    defer gpa.free(wide);
-    const out = try gpa.alloc(u8, wide.len * 2);
-    for (wide, 0..) |c, i| std.mem.writeInt(u16, out[i * 2 ..][0..2], c, .little);
-    return out;
 }
 
 /// Writes one Len/MaxLen/BufferOffset triple describing a variable-length field.
@@ -495,4 +492,18 @@ fn field(msg: []const u8, at: usize) []const u8 {
     const len = std.mem.readInt(u16, msg[at..][0..2], .little);
     const off = std.mem.readInt(u32, msg[at + 4 ..][0..4], .little);
     return msg[off..][0..len];
+}
+
+test "utf16le on format/utf16 equals std's encoding, and invalid UTF-8 is still NtlmUnsupported" {
+    const gpa = std.testing.allocator;
+    const texts = [_][]const u8{ "", "Password", "Pässwörd", "usér\u{1F600}", "0123456789abcdefΩ0123456789abcdef", "DOMAIN\\user" };
+    for (texts) |s| {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(gpa, s);
+        defer gpa.free(wide);
+        const got = try utf16le(gpa, s);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(wide), got);
+    }
+    for ([_][]const u8{ "\xff", "a\xed\xa0\x80", "\xc0\xaf", "pass\xf0\x9f" }) |s|
+        try std.testing.expectError(error.NtlmUnsupported, utf16le(gpa, s));
 }
