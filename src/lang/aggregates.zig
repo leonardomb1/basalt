@@ -108,6 +108,18 @@ pub fn lookup(name: []const u8) ?AggFunc {
     return null;
 }
 
+/// The nullable type of `SUM(arg)`: FLOAT over floats, DECIMAL(38) at the argument's
+/// scale over decimals and over text whose sample showed decimal places, else INT
+/// (an untyped NULL included).
+pub fn sumType(arg: types.Type) types.Type {
+    return switch (arg.kind) {
+        .float => types.Type.init(.float).withNull(true),
+        .string => if (arg.scale > 0) types.Type.decimal(38, arg.scale).withNull(true) else types.Type.init(.int).withNull(true),
+        .decimal => types.Type.decimal(38, arg.scale).withNull(true),
+        else => types.Type.init(.int).withNull(true),
+    };
+}
+
 test "aggregates: every name is unique and resolves to its own aggregate" {
     for (specs, 0..) |s, i| for (s.names) |n| {
         try std.testing.expectEqual(s.func, lookup(n).?);
@@ -121,6 +133,61 @@ test "aggregates: a numeric argument takes numbers, text and the unseen, nothing
     for ([_]types.TypeKind{ .bool, .bytes, .date, .time, .timestamp }) |k| try std.testing.expect(!num.accepts(types.Type.init(k)));
     try std.testing.expect(num.accepts(types.Type.unknownNull()));
     try std.testing.expect(Arg.any.accepts(types.Type.init(.date)));
+}
+
+fn expectSameType(want: types.Type, got: types.Type) !void {
+    try std.testing.expectEqual(want.kind, got.kind);
+    try std.testing.expectEqual(want.nullable, got.nullable);
+    try std.testing.expectEqual(want.unknown, got.unknown);
+    try std.testing.expectEqual(want.precision, got.precision);
+    try std.testing.expectEqual(want.scale, got.scale);
+}
+
+const sum_args = [_]types.Type{
+    types.Type.init(.int),
+    types.Type.init(.int).asNullable(),
+    types.Type.init(.float),
+    types.Type.decimal(10, 2),
+    types.Type.decimal(38, 0).asNullable(),
+    types.Type.decimal(5, 5),
+    types.Type.init(.string).asNullable(),
+    .{ .kind = .string, .nullable = true, .scale = 3 },
+};
+
+test "sumType: FLOAT over floats, DECIMAL(38, s) over decimals and scaled text, else INT; always nullable" {
+    try expectSameType(types.Type.init(.int).asNullable(), sumType(types.Type.init(.int)));
+    try expectSameType(types.Type.init(.float).asNullable(), sumType(types.Type.init(.float)));
+    try expectSameType(types.Type.decimal(38, 2).asNullable(), sumType(types.Type.decimal(10, 2)));
+    try expectSameType(types.Type.decimal(38, 0).asNullable(), sumType(types.Type.decimal(20, 0)));
+    try expectSameType(types.Type.init(.int).asNullable(), sumType(types.Type.init(.string)));
+    try expectSameType(types.Type.decimal(38, 3).asNullable(), sumType(.{ .kind = .string, .scale = 3 }));
+    try expectSameType(types.Type.init(.int).asNullable(), sumType(types.Type.unknownNull()));
+    try expectSameType(types.Type.init(.int).asNullable(), sumType(types.Type.nullColumn(true)));
+    try expectSameType(types.Type.init(.int).asNullable(), sumType(types.Type.init(.bool)));
+}
+
+test "sumType equals the GROUP BY SUM's type (analyze/schema.zig aggResultType)" {
+    const schema = @import("../runtime/analyze/schema.zig");
+    const Diag = @import("../runtime/analyze.zig").Diag;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for (sum_args) |t| {
+        const fields = [_]types.Schema.Field{.{ .name = "x", .ty = t }};
+        const e = try a.create(ast.Expr);
+        e.* = .{ .field = .{ .parts = &.{"x"} } };
+        var diag = Diag{};
+        try expectSameType(try schema.aggResultType(a, .sum, e, .{ .fields = &fields }, &diag), sumType(t));
+    }
+    var diag = Diag{};
+    const n = try a.create(ast.Expr);
+    n.* = .null_lit;
+    try expectSameType(try schema.aggResultType(a, .sum, n, .{ .fields = &.{} }, &diag), sumType(types.Type.unknownNull()));
+}
+
+test "sumType equals the window SUM's type wherever the window arm agrees with GROUP BY today" {
+    const schema = @import("../runtime/analyze/schema.zig");
+    for (sum_args) |t| try expectSameType(schema.windowFuncType(.{ .agg = .sum }, t), sumType(t));
 }
 
 test "aggregates: lookup ignores case and rejects unknown names" {
