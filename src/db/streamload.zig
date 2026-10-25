@@ -56,6 +56,7 @@ const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
 const RETRY_BUDGET_NS = 60 * std.time.ns_per_s;
 const UNBEGUN_BUDGET_NS = 30 * std.time.ns_per_s;
 const REPLAY_CHUNK = 1 << 20;
+const PAUSE_SLICE_NS = 100 * std.time.ns_per_ms;
 
 pub const Flavor = enum {
     starrocks,
@@ -667,6 +668,7 @@ pub const StreamLoadSink = struct {
         const t0 = try std.time.Instant.now();
         defer self.wait_ns += (std.time.Instant.now() catch t0).since(t0);
         var delay: u64 = std.time.ns_per_s;
+        var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
         while (true) {
             const out = self.attempt() catch |e| blk: {
                 if (!transient(e)) return e;
@@ -677,18 +679,19 @@ pub const StreamLoadSink = struct {
                 .ok => break,
                 .fail => return error.StreamLoadFailed,
                 .resend, .wait, .unbegun => {
-                    if (out == .unbegun and (try std.time.Instant.now()).since(t0) + delay > UNBEGUN_BUDGET_NS) {
+                    const wait = jittered(prng.random(), delay);
+                    if (out == .unbegun and (try std.time.Instant.now()).since(t0) + wait > UNBEGUN_BUDGET_NS) {
                         if (self.errctx) |ec| ec.set("stream load failed: {s}", .{self.why[0..self.why_len]});
                         return error.StreamLoadFailed;
                     }
                     self.broken = true;
                     if (self.spool == null) return error.StreamLoadUnreplayable;
                     if (driver.aborting()) return error.Aborted;
-                    if ((try std.time.Instant.now()).since(t0) + delay > RETRY_BUDGET_NS) {
+                    if ((try std.time.Instant.now()).since(t0) + wait > RETRY_BUDGET_NS) {
                         if (self.errctx) |ec| ec.set("stream load {s}: label {s} still unsettled after {d} s of retries", .{ self.table, self.label, RETRY_BUDGET_NS / std.time.ns_per_s });
                         return error.StreamLoadRetriesExhausted;
                     }
-                    std.Thread.sleep(delay);
+                    if (!pause(std.Thread.sleep, wait)) return error.Aborted;
                     delay = @min(delay * 2, 10 * std.time.ns_per_s);
                 },
             }
@@ -779,6 +782,67 @@ pub const StreamLoadSink = struct {
 
 fn transient(e: anyerror) bool {
     return driver.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
+}
+
+const Sleep = *const fn (ns: u64) void;
+
+/// `ns` plus up to 50% jitter, so parallel lanes that failed together retry apart.
+fn jittered(rand: std.Random, ns: u64) u64 {
+    return ns +| rand.uintLessThan(u64, ns / 2 + 1);
+}
+
+/// Sleeps `ns` in short slices; false as soon as the run starts aborting.
+fn pause(sleep: Sleep, ns: u64) bool {
+    var left = ns;
+    while (left > 0) {
+        const step = @min(left, PAUSE_SLICE_NS);
+        sleep(step);
+        left -= step;
+        if (driver.aborting()) return false;
+    }
+    return true;
+}
+
+var test_slept: u64 = 0;
+var test_naps: usize = 0;
+
+fn testSleep(ns: u64) void {
+    test_slept += ns;
+    test_naps += 1;
+}
+
+test "a stream-load retry pause wakes within one slice of an abort" {
+    test_slept = 0;
+    test_naps = 0;
+    driver.requestAbort();
+    defer driver.resetAbort();
+    try std.testing.expect(!pause(testSleep, 10 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 1), test_naps);
+    try std.testing.expect(test_slept <= 100 * std.time.ns_per_ms);
+}
+
+test "a stream-load retry pause sleeps the whole wait when not aborted" {
+    test_slept = 0;
+    test_naps = 0;
+    try std.testing.expect(pause(testSleep, 1500 * std.time.ns_per_ms));
+    try std.testing.expectEqual(@as(u64, 1500 * std.time.ns_per_ms), test_slept);
+}
+
+test "stream-load retry waits draw up to 50% jitter, so lanes do not retry in lockstep" {
+    const base = 4 * std.time.ns_per_s;
+    var above_base = false;
+    var first: ?u64 = null;
+    var differ = false;
+    for (0..64) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const ns = jittered(prng.random(), base);
+        try std.testing.expect(ns >= base and ns <= base + base / 2);
+        if (ns > base) above_base = true;
+        if (first) |f| {
+            if (f != ns) differ = true;
+        } else first = ns;
+    }
+    try std.testing.expect(above_base and differ);
 }
 
 /// Where the value of key `name` starts in a flat JSON object.
