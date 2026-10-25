@@ -540,6 +540,32 @@ LOAD INTO '$out/mysql_after.csv' AS SELECT * FROM db.basalt_it ORDER BY id;"; th
   fi
 fi
 
+# MySQL converts a TIMESTAMP from and to the session's time zone. With the server
+# defaulting to +05:00, a session left in it read 12:00 UTC as 17:00 and stored a
+# loaded 12:00 as 07:00 UTC; basalt's sessions run in UTC, as PostgreSQL's do.
+if runs mysql; then
+  docker exec it-mysql-1 mysql -uroot -pit it -e "
+    SET GLOBAL time_zone = '+05:00';
+    SET time_zone = '+00:00';
+    DROP TABLE IF EXISTS basalt_tz;
+    CREATE TABLE basalt_tz (id INT, ts TIMESTAMP NULL);
+    INSERT INTO basalt_tz VALUES (1, '2024-01-01 12:00:00');" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);
+LOAD INTO '$out/mysql_tz.csv' AS SELECT * FROM db.basalt_tz ORDER BY id;
+LOAD INTO db.basalt_tz APPEND AS SELECT 2 AS id, CAST('2024-01-01 12:00:00' AS TIMESTAMP) AS ts;"; then
+    { echo "id,ts"; echo "1,2024-01-01 12:00:00"; } >"$out/mysql_tz_expected.csv"
+    check mysql-timestamp-utc-read "$out/mysql_tz.csv" "$out/mysql_tz_expected.csv"
+    if docker exec it-mysql-1 mysql -uroot -pit it -N -e "SET time_zone = '+00:00'; SELECT ts FROM basalt_tz WHERE id = 2;" 2>/dev/null | grep -qx '2024-01-01 12:00:00'; then
+      report mysql-timestamp-utc-write ok
+    else
+      report mysql-timestamp-utc-write bad
+    fi
+  else
+    report "mysql-timestamp-utc (run error)" bad
+  fi
+  docker exec it-mysql-1 mysql -uroot -pit -e "SET GLOBAL time_zone = 'SYSTEM';" >/dev/null 2>&1
+fi
+
 # StarRocks: write via stream load, read back through its MySQL-protocol FE.
 if runs starrocks; then
   if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');

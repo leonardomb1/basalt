@@ -18,6 +18,10 @@
 //!
 //! mysql_clear_password sends the password in the clear for the server (e.g.
 //! LDAP or external auth) to validate, so it is sent only over `tls`.
+//!
+//! Every session runs in `time_zone = '+00:00'` (`session_time_zone`), so MySQL
+//! converts a TIMESTAMP column to and from UTC on both read and write; DATETIME,
+//! and StarRocks' and Doris' columns, which no session zone changes, are unaffected.
 
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -38,6 +42,12 @@ const CLIENT_SECURE_CONNECTION = 0x00008000;
 const CLIENT_PLUGIN_AUTH = 0x00080000;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
+
+/// Sent once a session is authenticated: a TIMESTAMP column reads, and a loaded or
+/// pushed timestamp is stored and compared, in UTC, as basalt's timestamps are and
+/// as a PostgreSQL session's (`TimeZone=UTC`) are, whatever the server's zone is.
+/// The offset form needs no time-zone tables, where `'UTC'` can be refused.
+pub const session_time_zone = "SET time_zone = '+00:00'";
 
 pub const Conn = struct {
     wire: wire.Conn,
@@ -112,6 +122,7 @@ pub const Conn = struct {
                 else => return error.MysqlProtocol,
             }
         }
+        try self.exec(session_time_zone);
         return self;
     }
 
@@ -813,4 +824,59 @@ test "a server asking for the password in clear text on a plain connection is re
     try std.testing.expectError(error.MysqlAuthFailed, Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "s3cret", "", .off));
     t.join();
     try std.testing.expect(std.mem.indexOf(u8, got[0..n], "s3cret") == null);
+}
+
+test "a session is set to UTC before connect returns, so a TIMESTAMP reads as PostgreSQL's does" {
+    const http_fake = @import("../testing/http_fake.zig");
+    var listener = try http_fake.listen(1);
+    defer listener.deinit();
+    const Srv = struct {
+        fn readFull(s: std.net.Stream, out: []u8) !void {
+            var got: usize = 0;
+            while (got < out.len) {
+                const k = try s.read(out[got..]);
+                if (k == 0) return error.EndOfStream;
+                got += k;
+            }
+        }
+        fn packet(s: std.net.Stream, buf: []u8) ![]u8 {
+            var hdr: [4]u8 = undefined;
+            try readFull(s, &hdr);
+            const len: usize = @as(usize, hdr[0]) | (@as(usize, hdr[1]) << 8) | (@as(usize, hdr[2]) << 16);
+            if (len > buf.len) return error.TooLong;
+            try readFull(s, buf[0..len]);
+            return buf[0..len];
+        }
+        fn send(s: std.net.Stream, seq: u8, body: []const u8) !void {
+            const hdr = [4]u8{ @intCast(body.len & 0xff), @intCast(body.len >> 8), 0, seq };
+            try s.writeAll(&hdr);
+            try s.writeAll(body);
+        }
+        fn serve(l: *std.net.Server, first: *[256]u8, n: *usize) void {
+            const conn = l.accept() catch return;
+            defer conn.stream.close();
+            var body: [128]u8 = undefined;
+            var w = std.Io.Writer.fixed(&body);
+            w.writeAll("\x0a8.0\x00\x01\x00\x00\x00abcdefgh\x00\x00\xff\x21\x00\x00\x08\x80\x15") catch return;
+            w.writeAll(&([_]u8{0} ** 10)) catch return;
+            w.writeAll("ijklmnopqrst\x00mysql_native_password\x00") catch return;
+            send(conn.stream, 0, w.buffered()) catch return;
+            var buf: [1024]u8 = undefined;
+            _ = packet(conn.stream, &buf) catch return;
+            send(conn.stream, 2, "\x00\x00\x00\x02\x00\x00\x00") catch return;
+            const q = packet(conn.stream, &buf) catch return;
+            n.* = @min(q.len, first.len);
+            @memcpy(first[0..n.*], q[0..n.*]);
+            send(conn.stream, 1, "\x00\x00\x00\x02\x00\x00\x00") catch return;
+        }
+    };
+    var first: [256]u8 = undefined;
+    var n: usize = 0;
+    const t = try std.Thread.spawn(.{}, Srv.serve, .{ &listener, &first, &n });
+    const port = listener.listen_address.getPort();
+    const c = Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "", "", .off);
+    if (c) |x| x.close() else |_| {}
+    t.join();
+    _ = try c;
+    try std.testing.expectEqualStrings("\x03SET time_zone = '+00:00'", first[0..n]);
 }

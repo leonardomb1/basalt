@@ -4,6 +4,17 @@ Postgres, MySQL, SQL Server, StarRocks and Doris are read with a SQL query and
 written by bulk load or insert; their options are listed under
 [Connections](../language/connections.md). What is particular to each follows.
 
+## PostgreSQL and MySQL
+
+Every session runs in UTC, the zone basalt's timestamps are in: PostgreSQL's
+with `TimeZone=UTC`, MySQL's with `SET time_zone = '+00:00'` (the offset form,
+which needs no time-zone tables on the server). A PostgreSQL `timestamptz` and a
+MySQL `TIMESTAMP` therefore read as the same UTC instant whatever the server's
+or database's default zone, a timestamp loaded into a MySQL `TIMESTAMP` column
+is stored as that UTC instant, and a pushed-down timestamp literal compares in
+UTC. A `DATETIME`, a PostgreSQL `timestamp` and StarRocks' and Doris' columns
+carry no zone and read as written.
+
 ## StarRocks
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load
