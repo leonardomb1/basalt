@@ -166,11 +166,16 @@ fn decimalOf(e: parquet.SchemaElement) types.Type {
     return types.Type.decimal(p, s);
 }
 
-/// A byte-array decimal's big-endian two's-complement unscaled value.
-pub fn unscaledOf(b: []const u8) i128 {
-    var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
-    for (b) |byte| acc = (acc << 8) | byte;
-    return acc;
+/// A byte-array decimal's big-endian two's-complement unscaled value, unchecked
+/// (`decimal.bigEndianWrapping`).
+pub const unscaledOf = @import("../../exec/decimal.zig").bigEndianWrapping;
+
+test "unscaledOf reads big-endian two's complement unchecked: past 16 bytes only the last 16 count" {
+    try testing.expectEqual(@as(i128, 0), unscaledOf(&.{}));
+    try testing.expectEqual(@as(i128, -255), unscaledOf(&.{ 0xFF, 0x01 }));
+    try testing.expectEqual(@as(i128, 0x0102), unscaledOf(&.{ 0x01, 0x02 }));
+    try testing.expectEqual(@as(i128, std.math.minInt(i128)), unscaledOf(&(.{ 0x7F, 0x80 } ++ .{0x00} ** 15)));
+    try testing.expectEqual(@as(i128, 5), unscaledOf(&(.{ 0x01, 0x00 } ++ .{0x00} ** 14 ++ .{0x05})));
 }
 
 test "physical plus converted type maps onto a basalt type" {

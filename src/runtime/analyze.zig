@@ -47,6 +47,7 @@ const formats = @import("../format/formats.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
+const decimal = @import("../exec/decimal.zig");
 const eval = @import("../exec/eval.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
@@ -183,9 +184,7 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
             break :blk roundedRows(diag, what, @intFromFloat(r));
         },
         .decimal => |d| blk: {
-            const p = std.math.powi(i128, 10, d.scale) catch break :blk fail(diag, "{s} is out of range", .{what});
-            var q = @divTrunc(d.unscaled, p);
-            if (@abs(@rem(d.unscaled, p)) * 2 >= p) q += if (d.unscaled < 0) -1 else 1;
+            const q = decimal.roundWhole(d) orelse break :blk fail(diag, "{s} is out of range", .{what});
             break :blk roundedRows(diag, what, q);
         },
         else => fail(diag, "{s} must be an integer, got {s}", .{ what, @tagName(v) }),
@@ -600,7 +599,7 @@ pub fn paramDefaultValue(e: *const ast.Expr) ?Value {
         .unary => |u| if (u.op != .neg) null else switch (paramDefaultValue(u.e) orelse return null) {
             .int => |i| if (i == std.math.minInt(i64)) null else .{ .int = -i },
             .float => |f| .{ .float = -f },
-            .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
+            .decimal => |d| .{ .decimal = decimal.negate(d) },
             else => null,
         },
         else => null,
@@ -734,7 +733,7 @@ fn typedParam(arena: std.mem.Allocator, ty: types.Type, e: *const ast.Expr) Erro
         .date, .time, .timestamp, .decimal => mk(arena, .{ .cast = .{ .e = @constCast(e), .ty = ty } }),
         .float => switch (e.*) {
             .int_lit => |i| mk(arena, .{ .float_lit = @floatFromInt(i) }),
-            .dec_lit => |d| mk(arena, .{ .float_lit = @as(f64, @floatFromInt(d.unscaled)) / std.math.pow(f64, 10, @floatFromInt(d.scale)) }),
+            .dec_lit => |d| mk(arena, .{ .float_lit = decimal.toF64ByPow(d.unscaled, d.scale) }),
             else => e,
         },
         else => e,

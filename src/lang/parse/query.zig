@@ -31,6 +31,7 @@ const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const sidesOf = @import("rewrite.zig").sidesOf;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
+const decimal = @import("../../exec/decimal.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
 
@@ -672,11 +673,9 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
             shown = f;
         } else {
             const d = base.dec_lit;
-            const p = std.math.powi(i128, 10, d.scale) catch return self.fail(vpos, "{s} is out of range", .{what});
-            var q = @divTrunc(d.unscaled, p);
-            if (@abs(@rem(d.unscaled, p)) * 2 >= p) q += 1;
+            const q = decimal.roundWhole(.{ .unscaled = d.unscaled, .scale = d.scale }) orelse return self.fail(vpos, "{s} is out of range", .{what});
             r = @floatFromInt(q);
-            shown = @as(f64, @floatFromInt(d.unscaled)) / @as(f64, @floatFromInt(p));
+            shown = @as(f64, @floatFromInt(d.unscaled)) / @as(f64, @floatFromInt(decimal.pow10_i128[d.scale]));
         }
         if (neg) {
             r = -r;

@@ -182,15 +182,7 @@ pub const AvgDecimal = struct {
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0, f: f64 = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
         s.n += 1;
-        if (x.scale > cx.ty.scale) {
-            s.f += x.toF64();
-            return;
-        }
-        const r = decimal.rescaleTo(x, cx.ty.scale) orelse {
-            s.f += x.toF64();
-            return;
-        };
-        s.s += r.unscaled;
+        decimal.addAvg(&s.s, &s.f, x, cx.ty.scale);
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.s += s.s;
@@ -199,8 +191,7 @@ pub const AvgDecimal = struct {
     }
     pub fn finish(s: *const State, cx: Ctx) !Value {
         if (s.n == 0) return .null;
-        const whole = @as(f64, @floatFromInt(s.s)) / std.math.pow(f64, 10, @floatFromInt(cx.ty.scale));
-        return .{ .float = (whole + s.f) / @as(f64, @floatFromInt(s.n)) };
+        return .{ .float = decimal.avgOf(s.s, s.f, s.n, cx.ty.scale) };
     }
 };
 

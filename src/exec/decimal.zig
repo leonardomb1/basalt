@@ -1,6 +1,8 @@
 //! The one home of DECIMAL logic: the `Decimal` type, its powers of ten, checked
 //! arithmetic and result typing, rescaling and rounding, text, the binary layouts
-//! wires and files store an unscaled integer in, and the exact-integer key reading.
+//! wires and files store an unscaled integer in, fixed-width record fields (zoned,
+//! packed, implied places), the exact-integer key reading, and the comptime lane
+//! kernels the vectorized evaluator runs decimal arithmetic and comparison through.
 //!
 //! A `Decimal` is exact, `unscaled * 10^-scale`, and each value carries its own
 //! scale, which need not equal its column's declared one (PostgreSQL sends a
@@ -86,6 +88,11 @@ pub const pow10_i256 = blk: {
     }
     break :blk t;
 };
+
+/// The largest power of ten a double holds exactly; `pow10f_table` is exact up to it.
+pub const exact_pow10f = 22;
+
+pub const pow10f_table = pow10_table;
 
 const pow10_table = blk: {
     var t: [39]f64 = undefined;
@@ -612,6 +619,369 @@ pub fn minimalBigEndian(x: i128) Minimal {
     return .{ .bytes = be, .start = start };
 }
 
+/// `-d` at its own scale. Plain `-`, so the minimum i128 traps in a safe build and
+/// wraps in a fast one, as every caller's own negation did.
+pub inline fn negate(d: Decimal) Decimal {
+    return .{ .unscaled = -d.unscaled, .scale = d.scale };
+}
+
+/// How a lane operand is held: an INT column, a decimal column, or one constant.
+pub const Side = enum { int, dec, one };
+
+/// One operand of a lane kernel: its column's elements (`ints` or `decs`), the
+/// scale it is read at, the factor `f` that brings it to the result scale, and,
+/// for a constant, `c`, its unscaled value already brought there.
+pub const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{}, scale: u8, f: i128, c: i128 };
+
+/// The result scale `s` of `op` over operands read at scales `ls` and `rs`, and
+/// the factors that raise each to it; null when the lane cannot hold it (past 38
+/// digits, or a raise of more than 18 places).
+pub inline fn lanePlan(comptime op: ast.BinOp, ls: u8, rs: u8) ?struct { s: u8, fl: i128, fr: i128 } {
+    const s = resultScale(op, ls, rs);
+    if (s > max_digits or (op != .mul and (s - ls > 18 or s - rs > 18))) return null;
+    const fl: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - ls)];
+    const fr: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - rs)];
+    return .{ .s = @intCast(s), .fl = fl, .fr = fr };
+}
+
+/// The scale `op` answers in over operands at scales `ls` and `rs`: their sum for
+/// a product, else the wider; it may pass 38.
+pub inline fn resultScale(op: ast.BinOp, ls: u8, rs: u8) u16 {
+    return if (op == .mul) @as(u16, ls) + rs else @max(ls, rs);
+}
+
+/// Whether a product's two sides both fit i64 throughout, so each row is one
+/// widening multiply that cannot pass 38 digits.
+pub inline fn narrowLane(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, lc: i128, rc: i128) bool {
+    return op == .mul and lk != .dec and rk != .dec and std.math.cast(i64, lc) != null and std.math.cast(i64, rc) != null;
+}
+
+/// Each valid row of `op` over lane operands `ln.a` and `ln.b` handed to
+/// `sink.put(row, value)` at scale `ln.s`, in error set `E`. A row an operand
+/// cannot give at its lane's scale, or whose i128 result is not settled, takes
+/// `ln.at(op, row)`, the full `decimalOp`. `narrow`: both sides fit i64
+/// (`narrowLane`). Otherwise a product whose two elements each fit i64, as every
+/// DECIMAL of 18 digits or fewer does, takes that multiply too, row by row; only a
+/// wider pair pays the overflow-checked 128-bit one.
+pub fn laneLoop(comptime E: type, comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: anytype, sink: anytype, valid: anytype, any: bool) E!void {
+    const limit: u128 = @intCast(pow10_i128[max_digits]);
+    const la: LaneSrc = ln.a;
+    const lb: LaneSrc = ln.b;
+    const s: u8 = ln.s;
+    for (0..valid.len) |i| {
+        if (any and !valid.get(i)) continue;
+        if (laneAt(op, lk, la, i)) |a| if (laneAt(op, rk, lb, i)) |b| {
+            var small = narrow;
+            const u: ?i128 = switch (op) {
+                .add => addOrNull(a, b),
+                .sub => subOrNull(a, b),
+                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else blk: {
+                    if (std.math.cast(i64, a)) |x| if (std.math.cast(i64, b)) |y| {
+                        small = true;
+                        break :blk @as(i128, x) * y;
+                    };
+                    break :blk mulOrNull(a, b);
+                },
+                .mod => if (b == 0 or b == -1) null else @rem(a, b),
+                else => unreachable,
+            };
+            if (u) |x| if (small or @abs(x) < limit) {
+                try sink.put(i, .{ .unscaled = x, .scale = s });
+                continue;
+            };
+        };
+        try sink.put(i, try ln.at(op, i));
+    }
+}
+
+inline fn laneAt(comptime op: ast.BinOp, comptime k: Side, src: LaneSrc, i: usize) ?i128 {
+    return switch (k) {
+        .one => src.c,
+        .int => if (op == .mul) src.ints[i] else @as(i128, src.ints[i]) * src.f,
+        .dec => blk: {
+            const d = src.decs[i];
+            if (d.scale != src.scale) break :blk null;
+            break :blk if (op == .mul or src.f == 1) d.unscaled else mulOrNull(d.unscaled, src.f);
+        },
+    };
+}
+
+inline fn addOrNull(a: i128, b: i128) ?i128 {
+    const r = @addWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+inline fn subOrNull(a: i128, b: i128) ?i128 {
+    const r = @subWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+inline fn mulOrNull(a: i128, b: i128) ?i128 {
+    const r = @mulWithOverflow(a, b);
+    return if (r[1] == 0) r[0] else null;
+}
+
+/// `x` against constant `lit` (`flip`: the constant on the left) on a lane typed
+/// at `scale`: there its unscaled value meets `bound` under `fast_op`, the
+/// `cmpBound` pick; at any other scale it compares in full under `op`. `result`
+/// turns an operator and an order into the answer.
+pub inline fn cmpAtScale(x: Decimal, fast_op: ast.BinOp, bound: i128, scale: u8, op: ast.BinOp, flip: bool, lit: Decimal, comptime result: fn (ast.BinOp, std.math.Order) bool) bool {
+    return if (x.scale == scale)
+        result(fast_op, std.math.order(x.unscaled, bound))
+    else
+        result(op, if (flip) lit.order(x) else x.order(lit));
+}
+
+pub const FieldError = error{ NotDecimal, TooManyDigits, TooManyPlaces };
+
+/// A fixed-width field's decimal at `scale` (0 to 38): an optional sign, then digits,
+/// as implied decimals (`scale` of them are places) without `point`, else `point`
+/// the decimal point and the other of `.` and `,` a grouping mark before it.
+/// `t` is trimmed and not empty. A place past `scale` must be zero.
+pub fn fieldDecimal(t: []const u8, point: ?u8, scale: i64) FieldError!Decimal {
+    var i: usize = 0;
+    const neg = t[0] == '-';
+    if (t[0] == '-' or t[0] == '+') i = 1;
+    var v: i128 = 0;
+    var places: i64 = 0;
+    var after = false;
+    var digits: usize = 0;
+    for (t[i..]) |c| {
+        if (point) |pt| {
+            if (c == pt) {
+                if (after) return error.NotDecimal;
+                after = true;
+                continue;
+            }
+            if (c == (if (pt == ',') @as(u8, '.') else ',') and !after) continue;
+        }
+        if (c < '0' or c > '9') return error.NotDecimal;
+        digits += 1;
+        if (digits > max_digits) return error.TooManyDigits;
+        v = v * 10 + (c - '0');
+        if (after) places += 1;
+    }
+    if (digits == 0) return error.NotDecimal;
+    if (point == null) places = scale;
+    while (places > scale) : (places -= 1) {
+        if (@rem(v, 10) != 0) return error.TooManyPlaces;
+        v = @divTrunc(v, 10);
+    }
+    while (places < scale) : (places += 1) v *= 10;
+    return .{ .unscaled = if (neg) -v else v, .scale = @intCast(scale) };
+}
+
+/// A zoned decimal's last byte: its digit and whether it is negative, in ASCII
+/// overpunch (`{A`…`I` positive, `}J`…`R` negative) or EBCDIC zones (C/F positive,
+/// D negative); null when it is neither.
+fn overpunch(c: u8) ?struct { digit: u8, neg: bool } {
+    return switch (c) {
+        '0'...'9' => .{ .digit = c - '0', .neg = false },
+        '{' => .{ .digit = 0, .neg = false },
+        'A'...'I' => .{ .digit = c - 'A' + 1, .neg = false },
+        '}' => .{ .digit = 0, .neg = true },
+        'J'...'R' => .{ .digit = c - 'J' + 1, .neg = true },
+        else => if (c & 0x0F <= 9) switch (c >> 4) {
+            0xC, 0xF => .{ .digit = c & 0x0F, .neg = false },
+            0xD => .{ .digit = c & 0x0F, .neg = true },
+            else => null,
+        } else null,
+    };
+}
+
+/// A zoned decimal's unscaled value: ASCII or EBCDIC digits, the last carrying the
+/// sign (`overpunch`). `raw` is not empty.
+pub fn zonedDecimal(raw: []const u8) error{ TooManyDigits, NotZoned }!i128 {
+    if (raw.len > max_digits) return error.TooManyDigits;
+    var v: i128 = 0;
+    for (raw[0 .. raw.len - 1]) |c| {
+        const d: u8 = if (c >= '0' and c <= '9') c - '0' else if (c >= 0xF0 and c <= 0xF9) c - 0xF0 else return error.NotZoned;
+        v = v * 10 + d;
+    }
+    const last = overpunch(raw[raw.len - 1]) orelse return error.NotZoned;
+    v = v * 10 + last.digit;
+    return if (last.neg) -v else v;
+}
+
+/// A packed (COMP-3) decimal's unscaled value: two digits a byte, the last low
+/// nibble its sign, C or F positive and D negative.
+pub fn packedDecimal(raw: []const u8) error{ TooManyDigits, NotPacked, BadSign }!i128 {
+    if (raw.len == 0 or raw.len * 2 - 1 > max_digits) return error.TooManyDigits;
+    var v: i128 = 0;
+    for (raw, 0..) |c, i| {
+        const hi = c >> 4;
+        const lo = c & 0x0F;
+        if (hi > 9) return error.NotPacked;
+        v = v * 10 + hi;
+        if (i + 1 < raw.len) {
+            if (lo > 9) return error.NotPacked;
+            v = v * 10 + lo;
+        } else {
+            const neg = switch (lo) {
+                0xC, 0xF => false,
+                0xD => true,
+                else => return error.BadSign,
+            };
+            if (neg) v = -v;
+        }
+    }
+    return v;
+}
+
+/// `d`'s unscaled value at `scale` places (0 to 38) exactly: a nonzero digit past
+/// them is `MorePlaces`, a raise past i128 `TooLarge`.
+pub fn exactAtScale(d: Decimal, scale: i64) error{ MorePlaces, TooLarge }!i128 {
+    var v = d.unscaled;
+    var s: i64 = d.scale;
+    while (s > scale) : (s -= 1) {
+        if (@rem(v, 10) != 0) return error.MorePlaces;
+        v = @divTrunc(v, 10);
+    }
+    while (s < scale) : (s += 1) v = std.math.mul(i128, v, 10) catch return error.TooLarge;
+    return v;
+}
+
+/// `digits`, a magnitude's decimal digits, with `point` before its last `places`,
+/// zero-padded to a whole digit before it; with no places, the digits as they are.
+/// `buf` holds 52 bytes, enough for 38 digits and 38 places.
+pub fn withPoint(buf: *[52]u8, digits: []const u8, places: usize, point: u8) []const u8 {
+    var pad: [50]u8 = undefined;
+    const padded = if (digits.len <= places) blk: {
+        @memset(pad[0 .. places + 1 - digits.len], '0');
+        @memcpy(pad[places + 1 - digits.len .. places + 1], digits);
+        break :blk pad[0 .. places + 1];
+    } else digits;
+    const ip = padded.len - places;
+    @memcpy(buf[0..ip], padded[0..ip]);
+    buf[ip] = point;
+    @memcpy(buf[ip + 1 .. ip + 1 + places], padded[ip..]);
+    const out = buf[0 .. padded.len + 1];
+    return if (places == 0) out[0 .. out.len - 1] else out;
+}
+
+/// A magnitude's `digits` as a zoned field filling `out`, zero-padded on the left,
+/// its last byte overpunched with the sign. `digits` fits `out`.
+pub fn zonedInto(out: []u8, digits: []const u8, neg: bool) void {
+    const w = out.len;
+    @memset(out, '0');
+    @memcpy(out[w - digits.len ..], digits);
+    const last = out[w - 1] - '0';
+    out[w - 1] = if (neg) (if (last == 0) '}' else 'J' + last - 1) else (if (last == 0) '{' else 'A' + last - 1);
+}
+
+/// A magnitude's `digits` as a packed field filling `out`, the sign nibble last.
+/// `digits` fits `out.len * 2 - 1` nibbles.
+pub fn packedInto(out: []u8, digits: []const u8, neg: bool) void {
+    const w = out.len;
+    var nib: [80]u8 = undefined;
+    const nd = w * 2 - 1;
+    @memset(nib[0..nd], 0);
+    for (digits, 0..) |ch, i| nib[nd - digits.len + i] = ch - '0';
+    nib[nd] = if (neg) 0xD else 0xC;
+    for (out, 0..) |*o, i| o.* = (nib[i * 2] << 4) | nib[i * 2 + 1];
+}
+
+/// `d` rounded half away from zero to a whole number; null past scale 38, where
+/// no i128 power of ten divides it.
+pub inline fn roundWhole(d: Decimal) ?i128 {
+    if (d.scale >= pow10_i128.len) return null;
+    return roundScaleDown(d.unscaled, d.scale);
+}
+
+/// `unscaled * 10^-scale` with the power from `std.math.pow` rather than
+/// `pow10f`, as a literal typed FLOAT has always read; the two can differ in the
+/// last bit past 10^22.
+pub inline fn toF64ByPow(unscaled: i128, scale: u8) f64 {
+    return @as(f64, @floatFromInt(unscaled)) / std.math.pow(f64, 10, @floatFromInt(scale));
+}
+
+/// Adds `d` to an AVG's exact total `sum` at `scale`, or to its float part `frac`
+/// when it has more places than `scale` or does not fit it. The add is unchecked,
+/// as `addAtScale` argues it may be.
+pub inline fn addAvg(sum: *align(8) i256, frac: *f64, d: Decimal, scale: u8) void {
+    if (d.scale > scale) {
+        frac.* += d.toF64();
+        return;
+    }
+    const r = rescaleTo(d, scale) orelse {
+        frac.* += d.toF64();
+        return;
+    };
+    sum.* += r.unscaled;
+}
+
+/// The mean of `n` decimals summed by `addAvg` into `sum` at `scale` and `frac`.
+pub inline fn avgOf(sum: i256, frac: f64, n: i64, scale: u8) f64 {
+    const whole_part = @as(f64, @floatFromInt(sum)) / std.math.pow(f64, 10, @floatFromInt(scale));
+    return (whole_part + frac) / @as(f64, @floatFromInt(n));
+}
+
+/// Whether `d` has a nonzero digit past `scale` places.
+pub inline fn dropsDigits(d: Decimal, scale: u8) bool {
+    return d.scale > scale and @rem(d.unscaled, pow10_i128[d.scale - scale]) != 0;
+}
+
+/// A numeric literal's digits, with at most one `.`, read exactly: the scale is the
+/// digits written after the point, so `10.00` is 1000 at scale 2. Leading zeros
+/// count toward neither the digits nor the 38 limit, except as places. Null past
+/// 38 digits or 38 places.
+pub fn literal(text: []const u8) ?ast.Expr.DecLit {
+    var unscaled: i128 = 0;
+    var scale: u8 = 0;
+    var digits: u8 = 0;
+    var frac = false;
+    for (text) |ch| {
+        if (ch == '.') {
+            frac = true;
+            continue;
+        }
+        if (frac) scale += 1;
+        if (unscaled == 0 and ch == '0') {
+            if (scale > 38) return null;
+            continue;
+        }
+        digits += 1;
+        if (digits > 38 or scale > 38) return null;
+        unscaled = unscaled * 10 + (ch - '0');
+    }
+    return .{ .unscaled = unscaled, .scale = scale };
+}
+
+/// Whether a double holds the decimal exactly enough to print back: at most 15
+/// significant digits.
+pub fn exactInDouble(unscaled: i128) bool {
+    var m: u128 = @abs(unscaled);
+    while (m != 0 and m % 10 == 0) m /= 10;
+    return m < 1_000_000_000_000_000;
+}
+
+/// The widest scale among the rows `valid` marks of `vals`.
+pub inline fn widestScale(vals: []const Decimal, valid: anytype) u8 {
+    var scale: u8 = 0;
+    for (vals, 0..) |d, i| {
+        if (valid.get(i)) scale = @max(scale, d.scale);
+    }
+    return scale;
+}
+
+/// Each row of `vals` restated at `scale` into `out`, 0 where `valid` marks none;
+/// false when one overflows.
+pub inline fn unscaledAt(out: []i128, vals: []const Decimal, valid: anytype, scale: u8) bool {
+    for (out, vals, 0..) |*o, d, i| {
+        o.* = if (!valid.get(i)) 0 else (rescaleTo(d, scale) orelse return false).unscaled;
+    }
+    return true;
+}
+
+/// A big-endian two's complement integer as an unscaled decimal, with no width
+/// check: past 16 bytes only the last 16 count, as a Parquet byte-array decimal
+/// has always been read. `bigEndianDecimal` is the checked reading.
+pub fn bigEndianWrapping(b: []const u8) i128 {
+    var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
+    for (b) |byte| acc = (acc << 8) | byte;
+    return acc;
+}
+
 const testing = std.testing;
 
 fn writeDecimalReference(w: anytype, unscaled: i128, scale: u8) !void {
@@ -695,4 +1065,39 @@ test "decimal rejects what it cannot read instead of inventing a number" {
     for ([_][]const u8{ "1000,00", "1.234,56", "1,2,3", "abc", "1.2.3", "12 34", "", "-", "R$ 10" }) |s| {
         try testing.expect(parse(s) == null);
     }
+}
+
+test "pow10f_table matches the exact double literals up to exact_pow10f" {
+    const exact = [_]f64{ 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22 };
+    try testing.expectEqual(exact.len, exact_pow10f + 1);
+    for (exact, 0..) |x, i| try testing.expectEqual(x, pow10f_table[i]);
+}
+
+test "found, not fixed (skipped): negate traps on the minimum i128 decimal, which a 16-byte binary decimal reads unchecked" {
+    const min = bigEndianDecimal(&(.{0x80} ++ .{0x00} ** 15)).?;
+    try testing.expectEqual(@as(i128, std.math.minInt(i128)), min);
+    try testing.expect(!fitsPrecision(min, max_digits));
+    try testing.expectEqual(min, 0 -% min);
+    return error.SkipZigTest;
+}
+
+test "found, not fixed: AVG adds a decimal it cannot rescale to its float part, where SUM fails with IntOverflow" {
+    const d = Decimal{ .unscaled = pow10_i128[37], .scale = 0 };
+    var sum: i256 align(8) = 0;
+    try testing.expectError(error.IntOverflow, addAtScale(&sum, d, 2));
+    var avg: i256 align(8) = 0;
+    var frac: f64 = 0;
+    addAvg(&avg, &frac, d, 2);
+    try testing.expectEqual(@as(i256, 0), avg);
+    try testing.expectEqual(d.toF64(), frac);
+}
+
+test "AVG's unchecked i256 total cannot overflow: an i64 count of i128 addends stays far inside it" {
+    var sum: i256 align(8) = 0;
+    var frac: f64 = 0;
+    const big = Decimal{ .unscaled = pow10_i128[38] - 1, .scale = 0 };
+    for (0..1000) |_| addAvg(&sum, &frac, big, 0);
+    try testing.expectEqual(@as(i256, big.unscaled) * 1000, sum);
+    try testing.expectEqual(@as(f64, 0), frac);
+    _ = try std.math.mul(i256, std.math.maxInt(i64), std.math.maxInt(i128));
 }

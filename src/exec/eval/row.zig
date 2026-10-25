@@ -3,7 +3,8 @@
 //! the JSON array functions use.
 
 const Batch = @import("../batch.zig").Batch;
-const asDecimal = @import("../decimal.zig").asDecimal;
+const decimal = @import("../decimal.zig");
+const asDecimal = decimal.asDecimal;
 const decimalOp = @import("../decimal.zig").decimalOp;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
@@ -46,7 +47,7 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                 .neg => switch (v) {
                     .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                     .float => |x| .{ .float = -x },
-                    .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
+                    .decimal => |d| .{ .decimal = decimal.negate(d) },
                     else => error.TypeMismatch,
                 },
                 .not => .{ .bool = !v.bool },

@@ -7,7 +7,8 @@ const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Value = @import("../value.zig").Value;
-const asDecimal = @import("../decimal.zig").asDecimal;
+const decimal = @import("../decimal.zig");
+const asDecimal = decimal.asDecimal;
 const ast = @import("../../lang/ast.zig");
 const castValue = @import("cast.zig").castValue;
 const parseFloatStrict = @import("cast.zig").parseFloatStrict;
@@ -21,7 +22,6 @@ const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("../decimal.zig").rescaleTo;
 const addAtScale = @import("../decimal.zig").addAtScale;
-const pow10_i128 = @import("../decimal.zig").pow10_i128;
 const cmpBound = @import("../decimal.zig").cmpBound;
 const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
@@ -248,7 +248,7 @@ fn unaryVec(arena: std.mem.Allocator, u: ast.Expr.Unary, batch: Batch) VecError!
                 .null => .null,
                 .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                 .float => |x| .{ .float = -x },
-                .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
+                .decimal => |d| .{ .decimal = decimal.negate(d) },
                 else => return error.Unsupported,
             } },
             .col => |c| {
@@ -896,7 +896,7 @@ fn bothValid(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!Bitmap
 const StoreSink = struct {
     out: []Decimal,
 
-    inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
+    pub inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
         self.out[i] = d;
     }
 };
@@ -913,7 +913,7 @@ fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bo
     };
 }
 
-const Side = enum { int, dec, one };
+const Side = decimal.Side;
 
 fn sideOf(v: Vec) Side {
     return switch (v) {
@@ -940,94 +940,39 @@ fn decLanes(comptime op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap
                 if (lk == .one and rk == .one) return false;
                 const ls = sideScale(l);
                 const rs = sideScale(r);
-                const s: u16 = if (op == .mul) @as(u16, ls) + rs else @max(ls, rs);
-                if (s > max_digits or (op != .mul and (s - ls > 18 or s - rs > 18))) return false;
-                const fl: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - ls)];
-                const fr: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - rs)];
-                const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, fl) catch return false else 0;
-                const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, fr) catch return false else 0;
-                const lane = DecLane{ .l = l, .r = r, .a = laneSrc(l, ls, fl, lc), .b = laneSrc(r, rs, fr, rc), .s = @intCast(s) };
-                const narrow = op == .mul and lk != .dec and rk != .dec and std.math.cast(i64, lc) != null and std.math.cast(i64, rc) != null;
-                if (narrow) try decLoop(op, lk, rk, true, lane, sink, valid, any) else try decLoop(op, lk, rk, false, lane, sink, valid, any);
+                const plan = decimal.lanePlan(op, ls, rs) orelse return false;
+                const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, plan.fl) catch return false else 0;
+                const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, plan.fr) catch return false else 0;
+                const lane = DecLane{ .l = l, .r = r, .a = laneSrc(l, ls, plan.fl, lc), .b = laneSrc(r, rs, plan.fr, rc), .s = plan.s };
+                if (decimal.narrowLane(op, lk, rk, lc, rc))
+                    try decimal.laneLoop(VecError, op, lk, rk, true, lane, sink, valid, any)
+                else
+                    try decimal.laneLoop(VecError, op, lk, rk, false, lane, sink, valid, any);
                 return true;
             },
         },
     }
 }
 
-const DecLane = struct { l: Vec, r: Vec, a: LaneSrc, b: LaneSrc, s: u8 };
+const DecLane = struct {
+    l: Vec,
+    r: Vec,
+    a: decimal.LaneSrc,
+    b: decimal.LaneSrc,
+    s: u8,
 
-const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{}, scale: u8, f: i128, c: i128 };
+    pub inline fn at(ln: DecLane, comptime op: ast.BinOp, i: usize) VecError!Decimal {
+        return try (decimalOp(op, decAt(ln.l, i), decAt(ln.r, i)) orelse unreachable);
+    }
+};
 
-fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) LaneSrc {
+fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) decimal.LaneSrc {
     return switch (v) {
         .scalar => .{ .scale = scale, .f = f, .c = c },
         .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = switch (column.decimals(col)) {
             inline else => |ds| ds,
         }, .scale = scale, .f = f, .c = c },
     };
-}
-
-/// `narrow`: both sides fit i64, so a product is one widening multiply that
-/// cannot pass 38 digits. Otherwise a product whose two elements each fit i64,
-/// as every DECIMAL of 18 digits or fewer does, takes that multiply too, row by
-/// row; only a wider pair pays the overflow-checked 128-bit one.
-fn decLoop(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: DecLane, sink: anytype, valid: Bitmap, any: bool) VecError!void {
-    const limit: u128 = @intCast(pow10_i128[max_digits]);
-    const la = ln.a;
-    const lb = ln.b;
-    const s = ln.s;
-    for (0..valid.len) |i| {
-        if (any and !valid.get(i)) continue;
-        if (laneAt(op, lk, la, i)) |a| if (laneAt(op, rk, lb, i)) |b| {
-            var small = narrow;
-            const u: ?i128 = switch (op) {
-                .add => addOrNull(a, b),
-                .sub => subOrNull(a, b),
-                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else blk: {
-                    if (std.math.cast(i64, a)) |x| if (std.math.cast(i64, b)) |y| {
-                        small = true;
-                        break :blk @as(i128, x) * y;
-                    };
-                    break :blk mulOrNull(a, b);
-                },
-                .mod => if (b == 0 or b == -1) null else @rem(a, b),
-                else => unreachable,
-            };
-            if (u) |x| if (small or @abs(x) < limit) {
-                try sink.put(i, .{ .unscaled = x, .scale = s });
-                continue;
-            };
-        };
-        try sink.put(i, try (decimalOp(op, decAt(ln.l, i), decAt(ln.r, i)) orelse unreachable));
-    }
-}
-
-inline fn laneAt(comptime op: ast.BinOp, comptime k: Side, src: LaneSrc, i: usize) ?i128 {
-    return switch (k) {
-        .one => src.c,
-        .int => if (op == .mul) src.ints[i] else @as(i128, src.ints[i]) * src.f,
-        .dec => blk: {
-            const d = src.decs[i];
-            if (d.scale != src.scale) break :blk null;
-            break :blk if (op == .mul or src.f == 1) d.unscaled else mulOrNull(d.unscaled, src.f);
-        },
-    };
-}
-
-inline fn addOrNull(a: i128, b: i128) ?i128 {
-    const r = @addWithOverflow(a, b);
-    return if (r[1] == 0) r[0] else null;
-}
-
-inline fn subOrNull(a: i128, b: i128) ?i128 {
-    const r = @subWithOverflow(a, b);
-    return if (r[1] == 0) r[0] else null;
-}
-
-inline fn mulOrNull(a: i128, b: i128) ?i128 {
-    const r = @mulWithOverflow(a, b);
-    return if (r[1] == 0) r[0] else null;
 }
 
 /// An INT column against a decimal constant (`x > 2.5`), exactly but on the int
@@ -1062,7 +1007,7 @@ fn decOpCmpVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecEr
     _ = decimalArithType(a.op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
     const n = batch.len;
     const d = asDecimal(lit) orelse return null;
-    const sc: u16 = if (a.op == .mul) @as(u16, sideScale(l)) + sideScale(r) else @max(sideScale(l), sideScale(r));
+    const sc = decimal.resultScale(a.op, sideScale(l), sideScale(r));
     const pick = if (sc <= max_digits) cmpBound(b.op, flip, d, @intCast(sc), std.math.minInt(i128)) else null;
     var f = try Filled(bool).masked(arena, n, try bothValid(arena, l, r, n));
     var sink = CmpSink{
@@ -1114,11 +1059,8 @@ const CmpSink = struct {
     fast_op: ast.BinOp,
     bound: i128,
 
-    inline fn put(self: *CmpSink, i: usize, d: Decimal) VecError!void {
-        self.out[i] = if (d.scale == self.scale)
-            cmpResult(self.fast_op, std.math.order(d.unscaled, self.bound))
-        else
-            cmpResult(self.op, if (self.flip) self.lit.order(d) else d.order(self.lit));
+    pub inline fn put(self: *CmpSink, i: usize, d: Decimal) VecError!void {
+        self.out[i] = decimal.cmpAtScale(d, self.fast_op, self.bound, self.scale, self.op, self.flip, self.lit, cmpResult);
     }
 };
 
@@ -1136,10 +1078,7 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     switch (pick.op) {
         inline .eq, .ne, .lt, .le, .gt, .ge => |cop| switch (column.decimals(c)) {
             inline else => |v| for (v[0..n], f.d) |x, *o| {
-                o.* = if (x.scale == c.ty.scale)
-                    cmpResult(cop, std.math.order(x.unscaled, pick.bound))
-                else
-                    cmpResult(op, if (flip) d.order(x) else x.order(d));
+                o.* = decimal.cmpAtScale(x, cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
             },
         },
         else => unreachable,
@@ -1961,7 +1900,7 @@ const TestSum = struct {
     nvalid: usize = 0,
     scale: u8,
 
-    fn put(self: *TestSum, _: usize, d: Decimal) VecError!void {
+    pub fn put(self: *TestSum, _: usize, d: Decimal) VecError!void {
         try addAtScale(&self.sum, d, self.scale);
         self.nvalid += 1;
     }

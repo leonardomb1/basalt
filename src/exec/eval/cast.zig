@@ -9,7 +9,6 @@ const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const decimal = @import("../decimal.zig");
-const pow10_i128 = decimal.pow10_i128;
 const rescaleTo = decimal.rescaleTo;
 const fitsPrecision = decimal.fitsPrecision;
 const max_digits = decimal.max_digits;
@@ -43,7 +42,7 @@ pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
             return failWith(error.CastFailed, "SUM: '{s}' is not an exact number; sum CAST(x AS FLOAT) to add it as a float", .{clip(s)});
         return failWith(error.CastFailed, "SUM: '{s}' is not a number", .{clip(s)});
     };
-    if (d.scale > want and @rem(d.unscaled, pow10_i128[d.scale - want]) != 0) {
+    if (decimal.dropsDigits(d, want)) {
         if (want == 0)
             return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the sum is an INT, as no value sampled at plan time had any; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
         return failWith(error.CastFailed, "SUM: '{s}' has {d} decimal places, more than the {d} of the column's sampled values the sum is typed by; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale, want, d.scale });
