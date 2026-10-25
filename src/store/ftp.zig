@@ -19,7 +19,8 @@
 //! permanent (550 is a missing file); both carry the server's text in `lastError`.
 
 const std = @import("std");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const driver = @import("../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const percentDecode = @import("../net/percent.zig").decode;
@@ -99,7 +100,9 @@ fn refusal(code: u16, text: []const u8) anyerror {
     return error.FtpRefused;
 }
 
-fn setTimeout(handle: std.posix.socket_t) void {
+/// `driver.tuneSocket`, plus read and write timeouts so a silent server fails the call.
+fn tune(handle: std.posix.socket_t) void {
+    driver.tuneSocket(handle);
     const tv = std.posix.timeval{ .sec = timeout_s, .usec = 0 };
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
@@ -120,7 +123,7 @@ pub const Session = struct {
     pub fn open(gpa: std.mem.Allocator, u: Url) !*Session {
         const stream = try std.net.tcpConnectToHost(gpa, u.host, u.port);
         errdefer stream.close();
-        setTimeout(stream.handle);
+        tune(stream.handle);
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .host = u.host, .stream = stream };
@@ -183,7 +186,7 @@ pub const Session = struct {
             break :blk pasvPort(p.text) orelse return error.FtpProtocol;
         };
         const s = try std.net.tcpConnectToHost(self.gpa, self.host, port);
-        setTimeout(s.handle);
+        tune(s.handle);
         return s;
     }
 

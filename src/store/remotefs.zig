@@ -346,3 +346,50 @@ test "an authority splits login, host and port; an empty host or a bad port is n
     try std.testing.expect(authority("u@") == null);
     try std.testing.expect(authority("h:99999") == null);
 }
+
+/// Whether the socket of this process connected to 127.0.0.1:`port` has SO_KEEPALIVE.
+fn keepaliveTo(port: u16) !bool {
+    const linux = std.os.linux;
+    var fd: i32 = 0;
+    while (fd < 4096) : (fd += 1) {
+        var sa: linux.sockaddr.in = undefined;
+        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+        if (linux.E.init(linux.getpeername(fd, @ptrCast(&sa), &len)) != .SUCCESS) continue;
+        if (sa.family != linux.AF.INET or std.mem.bigToNative(u16, sa.port) != port) continue;
+        var v: c_int = 0;
+        var vlen: linux.socklen_t = @sizeOf(c_int);
+        if (linux.E.init(linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.KEEPALIVE, std.mem.asBytes(&v), &vlen)) != .SUCCESS) return error.NoSocket;
+        return v != 0;
+    }
+    return error.NoSocket;
+}
+
+fn dialKeepalive(comptime connect: fn (u16) void) !bool {
+    var server = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{});
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    const t = try std.Thread.spawn(.{}, connect, .{port});
+    const conn = try server.accept();
+    var first: [1]u8 = undefined;
+    _ = conn.stream.read(&first) catch 0;
+    const on = keepaliveTo(port);
+    conn.stream.close();
+    t.join();
+    return on;
+}
+
+test "an SFTP or SMB session's socket keeps alive, so a peer lost behind a NAT surfaces instead of hanging" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const Dial = struct {
+        fn ssh(port: u16) void {
+            const s = @import("../net/ssh.zig").Session.connect(std.heap.page_allocator, .{ .host = "127.0.0.1", .port = port, .user = "u" }) catch return;
+            s.close();
+        }
+        fn smb(port: u16) void {
+            const s = @import("smb.zig").Session.connect(std.heap.page_allocator, .{ .host = "127.0.0.1", .port = port, .user = "u", .password = "p" }) catch return;
+            s.close();
+        }
+    };
+    try std.testing.expect(try dialKeepalive(Dial.ssh));
+    try std.testing.expect(try dialKeepalive(Dial.smb));
+}

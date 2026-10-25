@@ -32,7 +32,8 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
+const driver = @import("../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const utf16 = @import("../format/utf16.zig");
@@ -213,6 +214,7 @@ pub const Session = struct {
         errdefer gpa.free(own.user);
         const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e|
             return fail(error.SmbDisconnected, "cannot reach {s}:{d}: {s}", .{ cfg.host, cfg.port, @errorName(e) });
+        driver.tuneSocket(stream.handle);
         self.* = .{
             .gpa = gpa,
             .stream = stream,
