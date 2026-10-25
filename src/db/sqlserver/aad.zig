@@ -17,6 +17,8 @@ const std = @import("std");
 const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
 const http_client = @import("../../net/http_client.zig");
 const xmlescape = @import("../../format/xml/escape.zig");
+const civil = @import("../../exec/civil.zig");
+const uuid = @import("../../format/uuid.zig");
 
 threadlocal var why: ThreadNote(700) = .{};
 
@@ -232,24 +234,55 @@ const appendForm = http_client.appendForm;
 const formEncode = http_client.formEncode;
 
 fn iso8601(gpa: std.mem.Allocator, secs: i64) ![]const u8 {
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
-    const ed = es.getEpochDay();
-    const yd = ed.calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
-    return std.fmt.allocPrint(gpa, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
-        yd.year,              md.month.numeric(),      md.day_index + 1,
-        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
-    });
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try civil.writeLayout(&w, secs * civil.us_per_sec, .aad);
+    return gpa.dupe(u8, w.buffered());
 }
 
 fn uuidHex(gpa: std.mem.Allocator) ![]const u8 {
     var b: [16]u8 = undefined;
     std.crypto.random.bytes(&b);
-    return std.fmt.allocPrint(gpa, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-        b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
-        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
-    });
+    return gpa.dupe(u8, &uuid.text(&b, .canonical));
+}
+
+test "aad: iso8601 spells a time as the old std.time.epoch body did" {
+    const gpa = std.testing.allocator;
+    const old = struct {
+        fn iso8601(a: std.mem.Allocator, secs: i64) ![]const u8 {
+            const es = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+            const ed = es.getEpochDay();
+            const yd = ed.calculateYearDay();
+            const md = yd.calculateMonthDay();
+            const ds = es.getDaySeconds();
+            return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
+                yd.year,              md.month.numeric(),      md.day_index + 1,
+                ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+            });
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(0xaad);
+    const r = prng.random();
+    const fixed = [_]i64{ 0, 59, 86_399, 86_400, 951_782_400, 951_868_799, 1_761_393_601, 253_402_300_799 };
+    for (0..fixed.len + 5000) |i| {
+        const secs = if (i < fixed.len) fixed[i] else r.intRangeAtMost(i64, 0, 253_402_300_799);
+        const want = try old.iso8601(gpa, secs);
+        defer gpa.free(want);
+        const got = try iso8601(gpa, secs);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
+    const got = try iso8601(gpa, 1_761_393_601);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("2025-10-25T12:00:01.000Z", got);
+}
+
+test "aad: uuidHex is 36 characters of canonical lower-case text" {
+    const gpa = std.testing.allocator;
+    const a = try uuidHex(gpa);
+    defer gpa.free(a);
+    try std.testing.expect(uuid.isText(a));
+    for (a) |c| try std.testing.expect(!std.ascii.isUpper(c));
 }
 
 test "extractElement pulls a namespaced assertion" {
