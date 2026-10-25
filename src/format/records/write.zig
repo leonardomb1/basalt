@@ -61,6 +61,7 @@ pub const Writer = struct {
     out: *Output,
     opts: Options,
     rows: u64 = 0,
+    live: bool = true,
 
     /// An `.append` to a file not ending in the newline adds one first, so the first
     /// new record does not join the last old one; with no newline it just continues.
@@ -136,11 +137,15 @@ pub const Writer = struct {
         self.rows += n;
     }
 
+    /// Releases the output whether or not it succeeds, so an `abort` after it is a no-op.
     pub fn close(self: *Writer) !void {
+        self.live = false;
         return self.out.finish();
     }
 
     pub fn abort(self: *Writer) void {
+        if (!self.live) return;
+        self.live = false;
         self.out.abort();
     }
 
@@ -246,4 +251,11 @@ test "latin-1 encodes text but leaves bytes alone; an append adds the newline th
     try testing.expectEqualStrings("old\r\nnew\r\nmore\r\n", try tmp.dir.readFileAlloc(a, "o.ret", 1 << 16));
     try writeFile(a, path, .append, .{ .newline = .none }, &.{try textBatch(a, .string, &.{"x"})});
     try testing.expectEqualStrings("old\r\nnew\r\nmore\r\nx", try tmp.dir.readFileAlloc(a, "o.ret", 1 << 16));
+}
+
+test "a records file whose close fails can still be aborted" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(error.WriteFailed, writeFile(a, "/dev/full", .append, .{}, &.{try textBatch(a, .string, &.{"x"})}));
 }
