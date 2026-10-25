@@ -129,9 +129,9 @@ pub fn peekFailure(e: anyerror) ?[]const u8 {
     return n.buf[0..n.len];
 }
 
+/// `s` cut to 80 bytes for an error message, never inside a UTF-8 sequence.
 pub fn clip(s: []const u8) []const u8 {
-    const max = 80;
-    return if (s.len <= max) s else s[0..max];
+    return @import("../jsontext.zig").clipUtf8(s, 80);
 }
 
 /// A regex failure as the evaluator raises it: a bad pattern is a CastFailed.
@@ -161,15 +161,23 @@ pub fn cachedRegexOpts(pattern: []const u8, opts: regex.Options) regex.Error!reg
     return c.re;
 }
 
-pub fn orderF64(x: f64, y: f64) std.math.Order {
-    const xn = std.math.isNan(x);
-    const yn = std.math.isNan(y);
-    if (xn or yn) {
-        if (xn and yn) return .eq;
-        return if (xn) .gt else .lt;
-    }
-    return std.math.order(x, y);
+const clock_unset: i64 = std.math.minInt(i64);
+var statement_clock = std.atomic.Value(i64).init(clock_unset);
+
+/// Fixes the instant `now()` and `today()` read for the statement about to run, so
+/// every row, batch and lane sees the same one; null returns them to the system clock.
+pub fn setStatementClock(us: ?i64) void {
+    statement_clock.store(us orelse clock_unset, .release);
 }
+
+/// The statement's instant in microseconds since the epoch, or the system clock's
+/// when no statement has fixed one.
+pub fn statementNow() i64 {
+    const us = statement_clock.load(.acquire);
+    return if (us == clock_unset) std.time.microTimestamp() else us;
+}
+
+pub const orderF64 = @import("../floatord.zig").orderF64;
 
 /// Bytes compare by content: a null answer here once made MIN/MAX over a bytes
 /// column keep the first value forever. Decimals compare exactly with each other
@@ -426,4 +434,15 @@ test "compareValues: decimals order exactly against decimals and ints, at any sc
 test "toI64 trims text as a CAST to INT does" {
     try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = "\t7\n" }));
     try std.testing.expectEqual(@as(i64, 7), toI64(.{ .string = " 7 " }));
+}
+
+test "clip never cuts a UTF-8 sequence, so the message stays valid text" {
+    const s = "a" ** 79 ++ "\u{e9}tail";
+    const c = clip(s);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(c));
+    try std.testing.expectEqualStrings("a" ** 79, c);
+    try std.testing.expectEqualStrings("a" ** 80, clip("a" ** 81));
+    try std.testing.expectEqualStrings("short", clip("short"));
+    const four = "a" ** 78 ++ "\u{1F600}";
+    try std.testing.expectEqualStrings("a" ** 78, clip(four));
 }

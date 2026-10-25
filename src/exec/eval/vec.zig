@@ -10,9 +10,8 @@ const Value = @import("../value.zig").Value;
 const decimal = @import("../decimal.zig");
 const asDecimal = decimal.asDecimal;
 const ast = @import("../../lang/ast.zig");
-const castValue = @import("cast.zig").castValue;
-const parseFloatStrict = @import("cast.zig").parseFloatStrict;
-const parseIntStrict = @import("cast.zig").parseIntStrict;
+const cast = @import("cast.zig");
+const castValue = cast.castValue;
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const decimalArithType = @import("../decimal.zig").decimalArithType;
@@ -27,11 +26,10 @@ const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const max_digits = @import("../decimal.zig").max_digits;
-const orderF64 = @import("support.zig").orderF64;
+const floatord = @import("../floatord.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const std = @import("std");
-const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
 const TypeCtx = @import("../eval.zig").TypeCtx;
 const compareValues = @import("support.zig").compareValues;
@@ -535,7 +533,7 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
     };
 }
 
-/// A comparison without branches. f64 follows `orderF64`'s total order, where NaN
+/// A comparison without branches. f64 follows `floatord`'s total order, where NaN
 /// equals NaN and sorts above every number, so the lanes vectorize.
 inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
     if (T != f64) return switch (op) {
@@ -547,11 +545,9 @@ inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
         .ge => a >= d,
         else => unreachable,
     };
-    const an = std.math.isNan(a);
-    const dn = std.math.isNan(d);
-    const eq = (a == d) | (an & dn);
-    const lt = (a < d) | (!an & dn);
-    const gt = (a > d) | (an & !dn);
+    const eq = floatord.eqF64(a, d);
+    const lt = floatord.ltF64(a, d);
+    const gt = floatord.ltF64(d, a);
     return switch (op) {
         .eq => eq,
         .ne => !eq,
@@ -678,66 +674,43 @@ fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Ve
     }
 }
 
-pub const floatToInt = column.floatToInt;
+/// The casts a column takes here; any other pair goes to the row path.
+const vec_casts = [_][2]types.TypeKind{
+    .{ .float, .int }, .{ .bool, .int },     .{ .string, .int },
+    .{ .int, .float }, .{ .string, .float }, .{ .int, .bool },
+};
 
 fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: usize) VecError!Vec {
-    const src = col.ty.kind;
-    if (src == target) return .{ .col = col };
-    const out_ty = c: {
-        var t = Type.init(target);
-        t.nullable = col.ty.nullable;
-        break :c t;
-    };
-    switch (target) {
-        .int => {
-            const out = try arena.alloc(i64, n);
-            switch (src) {
-                .float => for (col.data.f64[0..n], 0..) |x, i| {
-                    out[i] = if (col.validity.get(i)) try floatToInt(x) else 0;
-                },
-                .bool => for (col.data.b, 0..) |x, i| {
-                    out[i] = if (x) 1 else 0;
-                },
-                .string => for (0..n) |i| {
-                    if (!col.validity.get(i)) {
-                        out[i] = 0;
-                        continue;
-                    }
-                    out[i] = parseIntStrict(trim(col.data.bytes.at(i))) orelse return error.CastFailed;
-                },
-                else => return error.Unsupported,
-            }
-            return mkCol(out_ty, n, col.validity, .{ .i64 = out });
-        },
-        .float => {
-            const out = try arena.alloc(f64, n);
-            switch (src) {
-                .int => for (col.data.i64, 0..) |x, i| {
-                    out[i] = @floatFromInt(x);
-                },
-                .string => for (0..n) |i| {
-                    if (!col.validity.get(i)) {
-                        out[i] = 0;
-                        continue;
-                    }
-                    out[i] = parseFloatStrict(trim(col.data.bytes.at(i))) orelse return error.CastFailed;
-                },
-                else => return error.Unsupported,
-            }
-            return mkCol(out_ty, n, col.validity, .{ .f64 = out });
-        },
-        .bool => {
-            const out = try arena.alloc(bool, n);
-            switch (src) {
-                .int => for (col.data.i64, 0..) |x, i| {
-                    out[i] = x != 0;
-                },
-                else => return error.Unsupported,
-            }
-            return mkCol(out_ty, n, col.validity, .{ .b = out });
-        },
-        else => return error.Unsupported,
+    if (col.ty.kind == target) return .{ .col = col };
+    inline for (vec_casts) |p| {
+        if (col.ty.kind == p[0] and target == p[1]) return castColWith(p[0], p[1], arena, col, n);
     }
+    return error.Unsupported;
+}
+
+/// The one loop of a column cast: `castElem` per row. A pair that can fail skips
+/// null rows, whose slots hold no value to read; one that cannot runs straight.
+fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena: std.mem.Allocator, col: Column, n: usize) VecError!Vec {
+    const out = try arena.alloc(cast.Elem(to), n);
+    const gated = comptime (from == .float or from == .string);
+    if (comptime from == .string) {
+        for (out, 0..) |*o, i| o.* = if (col.validity.get(i)) try cast.castElem(from, to, col.data.bytes.at(i)) else 0;
+    } else {
+        const xs = switch (from) {
+            .float => col.data.f64,
+            .int => col.data.i64,
+            .bool => col.data.b,
+            else => comptime unreachable,
+        };
+        if (gated) {
+            for (out, xs[0..n], 0..) |*o, x, i| o.* = if (col.validity.get(i)) try cast.castElem(from, to, x) else 0;
+        } else for (out, xs[0..n]) |*o, x| {
+            o.* = try cast.castElem(from, to, x);
+        }
+    }
+    var t = Type.init(to);
+    t.nullable = col.ty.nullable;
+    return mkCol(t, n, col.validity, outData(cast.Elem(to), out));
 }
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {

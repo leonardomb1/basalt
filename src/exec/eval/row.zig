@@ -18,6 +18,7 @@ const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
 const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
+const jsontext = @import("../jsontext.zig");
 const failWith = @import("support.zig").failWith;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const std = @import("std");
@@ -303,27 +304,16 @@ pub fn jsonElementValue(arena: std.mem.Allocator, raw: []const u8) EvalError!Val
     };
 }
 
-/// Text that is a JSON object or array goes in as that value, not a string.
-/// NaN and infinity are written as `null`, as JSON.stringify does.
+/// Text that is a JSON object or array goes in as that value, not a string; any
+/// other value is `jsontext.scalar` in the nested shape.
 pub fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) EvalError!void {
-    switch (v) {
-        .null => w.writeAll("null") catch return error.OutOfMemory,
-        .bool => |b| w.writeAll(if (b) "true" else "false") catch return error.OutOfMemory,
-        .int => |i| w.print("{d}", .{i}) catch return error.OutOfMemory,
-        .float => |f| if (std.math.isFinite(f))
-            w.print("{}", .{f}) catch return error.OutOfMemory
-        else
-            w.writeAll("null") catch return error.OutOfMemory,
-        .decimal => w.writeAll(try valueToString(arena, v)) catch return error.OutOfMemory,
-        .string => |s| {
-            const t = std.mem.trim(u8, s, " \t\r\n");
-            if (t.len > 0 and (t[0] == '{' or t[0] == '[')) {
-                if (json.validate(arena, t)) |_| return json.compactInto(arena, t, w) else |_| {}
-            }
-            std.json.Stringify.encodeJsonString(s, .{}, w) catch return error.OutOfMemory;
-        },
-        else => std.json.Stringify.encodeJsonString(try valueToString(arena, v), .{}, w) catch return error.OutOfMemory,
+    if (v == .string) {
+        const t = std.mem.trim(u8, v.string, " \t\r\n");
+        if (t.len > 0 and (t[0] == '{' or t[0] == '[')) {
+            if (json.validate(arena, t)) |_| return json.compactInto(arena, t, w) else |_| {}
+        }
     }
+    jsontext.scalar(w, v, jsontext.nested) catch return error.OutOfMemory;
 }
 
 pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, v: Value) error{OutOfMemory}!*ast.Expr {
@@ -429,4 +419,89 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     defer ar.deinit();
     try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "-(-9223372036854775807 - 1)"));
     try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
+}
+
+fn oldJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
+    switch (v) {
+        .null => try w.writeAll("null"),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .int => |i| try w.print("{d}", .{i}),
+        .float => |f| if (std.math.isFinite(f)) try w.print("{}", .{f}) else try w.writeAll("null"),
+        .decimal => try w.writeAll(try valueToString(arena, v)),
+        .string => |s| try std.json.Stringify.value(s, .{}, w),
+        else => try std.json.Stringify.value(try valueToString(arena, v), .{}, w),
+    }
+}
+
+fn jsonPair(arena: std.mem.Allocator, v: Value) ![2][]const u8 {
+    var old: std.Io.Writer.Allocating = .init(arena);
+    try oldJsonValue(arena, v, &old.writer);
+    var new: std.Io.Writer.Allocating = .init(arena);
+    try writeJsonValue(arena, v, &new.writer);
+    return .{ old.written(), new.written() };
+}
+
+test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and invalid UTF-8" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var rng = std.Random.DefaultPrng.init(0xc0ffee);
+    const r = rng.random();
+    for (0..100_000) |_| {
+        const x: f64 = @bitCast(r.int(u64));
+        const p = try jsonPair(a, .{ .float = x });
+        try std.testing.expectEqualStrings(p[0], p[1]);
+        const d = Value{ .decimal = .{ .unscaled = r.int(i128) >> r.int(u7), .scale = r.uintAtMost(u8, 38) } };
+        const q = try jsonPair(a, d);
+        try std.testing.expectEqualStrings(q[0], q[1]);
+        const i = Value{ .int = r.int(i64) >> r.int(u6) };
+        const n = try jsonPair(a, i);
+        try std.testing.expectEqualStrings(n[0], n[1]);
+    }
+    const fixed = [_]Value{
+        .null,                                  .{ .bool = true },                               .{ .bool = false },
+        .{ .int = std.math.minInt(i64) },       .{ .int = std.math.maxInt(i64) },                .{ .float = -0.0 },
+        .{ .float = std.math.nan(f64) },        .{ .float = -std.math.inf(f64) },                .{ .float = 1e300 },
+        .{ .float = 5e-324 },                   .{ .decimal = .{ .unscaled = -5, .scale = 3 } }, .{ .decimal = .{ .unscaled = 0, .scale = 2 } },
+        .{ .date = 0 },                         .{ .date = std.math.minInt(i32) },               .{ .date = std.math.maxInt(i32) },
+        .{ .time = 0 },                         .{ .time = 86_399_999_999 },                     .{ .timestamp = std.math.minInt(i64) },
+        .{ .timestamp = std.math.maxInt(i64) }, .{ .string = "h\u{e9} \u{1F600} \"q\" \\ /" },   .{ .bytes = "plain" },
+    };
+    for (fixed) |v| {
+        const p = try jsonPair(a, v);
+        try std.testing.expectEqualStrings(p[0], p[1]);
+    }
+    for (0..256) |b| {
+        const s: []const u8 = &.{@intCast(b)};
+        inline for (.{ Value{ .string = s }, Value{ .bytes = s } }) |v| {
+            const p = try jsonPair(a, v);
+            const parsed = try std.json.parseFromSliceLeaky([]const u8, a, p[1], .{});
+            if (b < 0x80 and b != 0x08 and b != 0x0c) {
+                try std.testing.expectEqualStrings(p[0], p[1]);
+            } else if (b < 0x80) {
+                try std.testing.expectEqualStrings(s, parsed);
+            } else {
+                try std.testing.expectEqualStrings("\u{FFFD}", parsed);
+            }
+        }
+    }
+}
+
+test "json_array, json_object and chars write valid JSON for text that is not UTF-8" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{
+        "json_array(from_base64('/w=='))",
+        "json_object('k', from_base64('/w=='))",
+        "json_object(CAST(from_base64('gA==') AS STRING), 1)",
+        "chars(CAST(from_base64('Yf9i') AS STRING))",
+    }) |src| {
+        const out = (try evalLit(a, src)).string;
+        std.testing.expect(std.unicode.utf8ValidateSlice(out)) catch |e| {
+            std.debug.print("{s} gave {any}\n", .{ src, out });
+            return e;
+        };
+        _ = try std.json.parseFromSliceLeaky(std.json.Value, a, out, .{});
+    }
 }

@@ -13,6 +13,7 @@ const eq = @import("support.zig").eq;
 const evalRow = @import("row.zig").evalRow;
 const failWith = @import("support.zig").failWith;
 const json = @import("../json.zig");
+const jsontext = @import("../jsontext.zig");
 const jsonArrayArg = @import("row.zig").jsonArrayArg;
 const jsonElementValue = @import("row.zig").jsonElementValue;
 const lambdaSlots = @import("row.zig").lambdaSlots;
@@ -21,6 +22,8 @@ const max_str_bytes = @import("functions.zig").max_str_bytes;
 const reduceTypeAt = @import("row.zig").reduceTypeAt;
 const regexpReplaceText = @import("fn_scalar.zig").regexpReplaceText;
 const std = @import("std");
+const civil = @import("../civil.zig");
+const statementNow = @import("support.zig").statementNow;
 const valueToString = @import("format.zig").valueToString;
 const writeJsonValue = @import("row.zig").writeJsonValue;
 
@@ -30,7 +33,7 @@ pub const per_row = struct {
         _ = c;
         _ = batch;
         _ = row;
-        return .{ .timestamp = std.time.microTimestamp() };
+        return .{ .timestamp = statementNow() };
     }
 
     pub fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -38,8 +41,7 @@ pub const per_row = struct {
         _ = c;
         _ = batch;
         _ = row;
-        const days = @divFloor(std.time.microTimestamp(), 86_400_000_000);
-        return .{ .date = @intCast(days) };
+        return .{ .date = @intCast(civil.dayOf(statementNow())) };
     }
 
     /// Both the pattern and the replacement are evaluated before either is checked
@@ -71,8 +73,7 @@ pub const per_row = struct {
             const k = try evalRow(arena, c.args[i], batch, row);
             if (k.isNull()) return failWith(error.CastFailed, "json_object: key {d} is null", .{i / 2 + 1});
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.encodeJsonString(try valueToString(arena, k), .{}, w) catch return error.OutOfMemory;
-            w.writeByte(':') catch return error.OutOfMemory;
+            jsontext.key(w, try valueToString(arena, k)) catch return error.OutOfMemory;
             try writeJsonValue(arena, try evalRow(arena, c.args[i + 1], batch, row), w);
         }
         w.writeByte('}') catch return error.OutOfMemory;

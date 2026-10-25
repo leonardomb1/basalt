@@ -317,20 +317,30 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
             inner.* = .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) };
             return .{ .cast = .{ .e = inner, .ty = Type.decimal(38, d.scale) } };
         },
-        .bool => return .{ .bool_lit = boolText(s) orelse return null },
+        .bool => return .{ .bool_lit = textconv.boolText(.pg_input, s) orelse return null },
         else => return null,
     }
 }
 
-fn boolText(s: []const u8) ?bool {
-    if (s.len == 0 or s.len > 5) return null;
-    var buf: [5]u8 = undefined;
-    const w = std.ascii.lowerString(&buf, s);
-    if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
-    if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
-    for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
-    for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
-    return null;
+/// A PARAM's text (`-p name=text`, a PARAM default) as a value of its declared
+/// type, read as CAST reads text: an INT or FLOAT strictly after trimming (no `_`
+/// or hex), a DATE, TIME, TIMESTAMP or DECIMAL through the cast, a STRING or
+/// BYTES as the text itself; a BOOL is exactly `true` or `false`. Null when the
+/// text does not read as `ty` or `ty` is not bound from text.
+pub fn paramFromText(arena: std.mem.Allocator, ty: Type, text: []const u8) error{OutOfMemory}!?Value {
+    const s = std.mem.trim(u8, text, " \t\r\n");
+    return switch (ty.kind) {
+        .int => .{ .int = parseIntStrict(s) orelse return null },
+        .float => .{ .float = parseFloatStrict(s) orelse return null },
+        .bool => .{ .bool = textconv.boolText(.exact, text) orelse return null },
+        .string => .{ .string = text },
+        .bytes => .{ .bytes = text },
+        .date, .time, .timestamp, .decimal => castValueTyped(arena, .{ .string = text }, ty) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        },
+        else => null,
+    };
 }
 
 pub fn numericish(t: Type) bool {
@@ -356,6 +366,7 @@ pub const decFold = @import("eval/vec.zig").decFold;
 pub const constEval = @import("eval/vec.zig").constEval;
 pub const evalRow = @import("eval/row.zig").evalRow;
 const decimal = @import("decimal.zig");
+const textconv = @import("textconv.zig");
 const decimalArithType = decimal.decimalArithType;
 pub const jsonPath = @import("eval/row.zig").jsonPath;
 pub const jsonToValue = @import("eval/row.zig").jsonToValue;
@@ -394,6 +405,7 @@ pub const explain = @import("eval/support.zig").explain;
 pub const takeFailure = @import("eval/support.zig").takeFailure;
 pub const peekFailure = @import("eval/support.zig").peekFailure;
 pub const clip = @import("eval/support.zig").clip;
+pub const setStatementClock = @import("eval/support.zig").setStatementClock;
 pub const orderF64 = @import("eval/support.zig").orderF64;
 pub const compareValues = @import("eval/support.zig").compareValues;
 
@@ -751,6 +763,94 @@ test "division: INT / INT truncates, a DECIMAL quotient takes PostgreSQL's scale
     try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0.0"));
     try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0e0"));
     try std.testing.expectError(error.DivByZero, evalLit(a, "1.5 % 0"));
+}
+
+test "a quoted literal met by a BOOL reads the words it read before, over every short spelling" {
+    const old = struct {
+        fn f(s: []const u8) ?bool {
+            if (s.len == 0 or s.len > 5) return null;
+            var buf: [5]u8 = undefined;
+            const w = std.ascii.lowerString(&buf, s);
+            if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
+            if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
+            for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
+            for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
+            return null;
+        }
+    }.f;
+    const alphabet = "truefalsyonTRFNO01x";
+    var buf: [6]u8 = undefined;
+    for (0..6) |len| {
+        var idx = [_]usize{0} ** 6;
+        while (true) {
+            for (0..len) |i| buf[i] = alphabet[idx[i]];
+            const s = buf[0..len];
+            std.testing.expectEqual(old(s), textconv.boolText(.pg_input, s)) catch |e| {
+                std.debug.print("'{s}'\n", .{s});
+                return e;
+            };
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                idx[i] += 1;
+                if (idx[i] < alphabet.len) break;
+                idx[i] = 0;
+            }
+            if (i == len) break;
+        }
+    }
+}
+
+test "now() and today() read the statement's clock on every row and in every batch" {
+    const column = @import("column.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const at: i64 = 1_000_000_000_123_456;
+    setStatementClock(at);
+    defer setStatementClock(null);
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
+    var cols = [_]column.Column{try column.intColumn(a, &.{ 1, 2, 3, 4, 5 })};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const now_e = try parser.parseExprStr(a, "now()", &diag);
+    const today_e = try parser.parseExprStr(a, "today()", &diag);
+    for (0..batch.len) |r| {
+        try std.testing.expectEqual(at, (try evalRow(a, now_e, batch, r)).timestamp);
+        try std.testing.expectEqual(@as(i32, 11_574), (try evalRow(a, today_e, batch, r)).date);
+    }
+    const col = try evalColumn(a, now_e, batch, Type.init(.timestamp));
+    for (0..batch.len) |r| try std.testing.expectEqual(at, col.getValue(r).timestamp);
+    try std.testing.expectEqual(@as(i32, 11_574), (try evalColumn(a, today_e, batch, Type.init(.date))).getValue(4).date);
+    try std.testing.expectEqual(at, (try evalLit(a, "now()")).timestamp);
+}
+
+test "a PARAM's text reads as CAST reads it: no `_`, hex or untrimmed failures" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const int = Type.init(.int);
+    const float = Type.init(.float);
+    try std.testing.expect(try paramFromText(a, int, "1_000") == null);
+    try std.testing.expect(try paramFromText(a, int, "0x10") == null);
+    try std.testing.expect(try paramFromText(a, float, "0x1p3") == null);
+    try std.testing.expect(try paramFromText(a, float, "1_0.5") == null);
+    try std.testing.expectEqual(@as(i64, 5), (try paramFromText(a, int, " 5")).?.int);
+    try std.testing.expectEqual(@as(i64, -42), (try paramFromText(a, int, "-42")).?.int);
+    try std.testing.expectEqual(@as(f64, 1000), (try paramFromText(a, float, "1e3")).?.float);
+    try std.testing.expect(try paramFromText(a, int, "") == null);
+    for ([_][]const u8{ "1_000", "0x10", " 5", "-42", "x", "", "9223372036854775808" }) |s| {
+        const via_cast: ?i64 = if (castValue(a, .{ .string = s }, .int)) |v| v.int else |_| null;
+        const p = try paramFromText(a, int, s);
+        try std.testing.expectEqual(via_cast, if (p) |v| v.int else null);
+    }
+    try std.testing.expect((try paramFromText(a, Type.init(.bool), "true")).?.bool);
+    try std.testing.expect(!(try paramFromText(a, Type.init(.bool), "false")).?.bool);
+    try std.testing.expect(try paramFromText(a, Type.init(.bool), "TRUE") == null);
+    try std.testing.expect(try paramFromText(a, Type.init(.bool), "t") == null);
+    try std.testing.expectEqual(@as(i32, 20729), (try paramFromText(a, Type.init(.date), "2026-10-03")).?.date);
+    try std.testing.expect(try paramFromText(a, Type.init(.date), "2026-13-03") == null);
+    try std.testing.expectEqual(@as(i128, 1250), (try paramFromText(a, Type.decimal(10, 2), "12.5")).?.decimal.unscaled);
+    try std.testing.expectEqualStrings(" x ", (try paramFromText(a, Type.init(.string), " x ")).?.string);
 }
 
 test {

@@ -14,10 +14,12 @@ const roundDecimal = @import("../decimal.zig").roundDecimal;
 const roundHalfAway = @import("strings.zig").roundHalfAway;
 const roundOutScale = @import("../decimal.zig").roundOutScale;
 const time = @import("time.zig");
+const civil = @import("../civil.zig");
 const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
 const regex = @import("../regex.zig");
 const json = @import("../json.zig");
+const jsontext = @import("../jsontext.zig");
 const cachedRegex = @import("support.zig").cachedRegex;
 const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const regexErr = @import("support.zig").regexErr;
@@ -472,9 +474,7 @@ pub const MakeDate = struct {
     pub const eval_all = true;
     pub fn apply(_: Cx, y: i64, m: i64, d: i64) EvalError!i32 {
         const bad = "make_date: year {d}, month {d}, day {d} is not a date";
-        if (y < -1_000_000_000 or y > 1_000_000_000 or m < 1 or m > 12 or d < 1 or d > time.daysInMonth(y, @intCast(m)))
-            return failWith(error.CastFailed, bad, .{ y, m, d });
-        const days = time.daysFromCivil(y, @intCast(m), @intCast(d));
+        const days = civil.civilDays(y, m, d) orelse return failWith(error.CastFailed, bad, .{ y, m, d });
         return std.math.cast(i32, days) orelse failWith(error.CastFailed, bad, .{ y, m, d });
     }
 };
@@ -483,7 +483,7 @@ pub const MakeDate = struct {
 pub const Epoch = struct {
     pub const args = .{.temporal};
     pub fn apply(_: Cx, us: i64) EvalError!i64 {
-        return @divFloor(us, 1_000_000);
+        return @divFloor(us, civil.us_per_sec);
     }
 };
 
@@ -523,7 +523,7 @@ const ToTimestampInt = struct {
     pub const args = .{.int};
     pub const result = .timestamp;
     pub fn apply(_: Cx, x: i64) EvalError!i64 {
-        return time.mulI64(x, 1_000_000);
+        return time.mulI64(x, civil.us_per_sec);
     }
 };
 
@@ -643,7 +643,7 @@ pub const Chars = struct {
         while (i < str.len) {
             const cw = charWidth(str, i);
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.encodeJsonString(str[i..][0..cw], .{}, w) catch return error.OutOfMemory;
+            jsontext.string(w, str[i..][0..cw]) catch return error.OutOfMemory;
             i += cw;
             if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "chars: the array passes {d} bytes", .{max_str_bytes});
         }
