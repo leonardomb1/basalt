@@ -541,13 +541,19 @@ pub const Reader = struct {
         return switch (k) {
             .string => .{ .string = try renderText(scratch, c, self.date1904) },
             .bool => if (c.kind == .boolean) Value{ .bool = c.num != 0 } else error.XlsxChanged,
-            .int => if (c.kind == .number) Value{ .int = @intFromFloat(c.num) } else error.XlsxChanged,
+            .int => if (c.kind == .number and @abs(c.num) < 9007199254740992.0) Value{ .int = @intFromFloat(c.num) } else error.XlsxChanged,
             .float => if (c.kind == .number) Value{ .float = c.num } else error.XlsxChanged,
-            .date => if (c.kind == .number) Value{ .date = @intCast(serialDays(c.num, self.date1904)) } else error.XlsxChanged,
-            .timestamp => if (c.kind == .number) Value{ .timestamp = serialMicros(c.num, self.date1904) } else error.XlsxChanged,
-            .time => if (c.kind == .number) Value{ .time = dayMicros(c.num) } else error.XlsxChanged,
+            .date => Value{ .date = @intCast(serialDays(try serialOf(c), self.date1904)) },
+            .timestamp => Value{ .timestamp = serialMicros(try serialOf(c), self.date1904) },
+            .time => Value{ .time = dayMicros(try serialOf(c)) },
             else => error.XlsxChanged,
         };
+    }
+
+    /// A date, time or timestamp cell's serial, in the range the first pass typed it by.
+    fn serialOf(c: Cell) !f64 {
+        if (c.kind != .number or !(c.num >= 0 and c.num < max_serial)) return error.XlsxChanged;
+        return c.num;
     }
 
     const vtable = driver.sourceVTable(Reader);
@@ -604,10 +610,29 @@ test "1900 serials before March read as the dates Excel shows" {
     try std.testing.expectEqual(@as(i64, -24106), serialDays(1, true));
 }
 
+test "a cell the first pass would not have typed so is refused, and a time just short of midnight stays in its day" {
+    var rd: Reader = undefined;
+    rd.date1904 = false;
+    const a = std.testing.allocator;
+    const bad = [_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 1e300, -1 };
+    for (bad) |v| {
+        const c = Cell{ .col = 0, .kind = .number, .num = v };
+        try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .date));
+        try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .timestamp));
+        try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .time));
+        if (v != -1) try std.testing.expectError(error.XlsxChanged, rd.convert(a, c, .int));
+    }
+    try std.testing.expectEqual(@as(i64, 86_399_999_000), dayMicros(0.9999999999));
+    try std.testing.expectEqual(@as(i64, 86_399_999_000), dayMicros(45000.9999999999));
+    try std.testing.expectEqual(@as(i64, 43_200_000_000), dayMicros(0.5));
+}
+
+/// The time of day to the millisecond, a fraction that rounds up to midnight held at
+/// 23:59:59.999 so it stays inside its day.
 fn dayMicros(serial: f64) i64 {
     const frac = serial - @floor(serial);
     const ms: i64 = @intFromFloat(@round(frac * 86_400_000.0));
-    return ms * 1000;
+    return @min(ms, 86_399_999) * 1000;
 }
 
 fn renderText(arena: std.mem.Allocator, c: Cell, date1904: bool) ![]const u8 {
