@@ -355,7 +355,7 @@ const Planner = struct {
         const lo = self.cols.items.len;
         const branches = try self.arena.alloc(Step, n.branches.len);
         if (count == 0) {
-            const col = try self.add(name, types.Type.init(.string).asNullable());
+            const col = try self.add(name, types.Type.nullColumn(true));
             for (branches) |*s| s.* = .{ .leaf = .{ .col = col, .node = n.branches[0] } };
         } else if (count == 1) {
             const inner = try self.valueStep(real.?, name, nullable or has_null);
@@ -387,7 +387,7 @@ pub fn zeroWidth(n: *const Node) bool {
 /// The column a plain value reads into, null for one read as JSON text.
 pub fn leafType(n: *const Node) ?types.Type {
     return switch (n.kind) {
-        .null => types.Type.init(.string),
+        .null => types.Type.nullColumn(true),
         .boolean => types.Type.init(.bool),
         .int => types.Type.init(switch (n.logical) {
             .date => .date,
@@ -409,20 +409,27 @@ pub fn leafType(n: *const Node) ?types.Type {
 /// The one column a union of several types reads into: INT for whole numbers, FLOAT
 /// once a float joins them, STRING for strings and enums; null for any other mix.
 fn commonType(branches: []const *const Node) ?types.Type {
-    var ints = true;
-    var nums = true;
-    var strs = true;
-    for (branches) |b| {
-        if (b.kind == .null) continue;
-        const plain = b.logical == .none;
-        ints = ints and plain and (b.kind == .int or b.kind == .long);
-        nums = nums and plain and (b.kind == .int or b.kind == .long or b.kind == .float or b.kind == .double);
-        strs = strs and (b.kind == .@"enum" or (b.kind == .string and (plain or b.logical == .uuid)));
-    }
-    if (ints) return types.Type.init(.int);
-    if (nums) return types.Type.init(.float);
-    if (strs) return types.Type.init(.string);
-    return null;
+    var s: types.Sample = .none;
+    for (branches) |b| if (b.kind != .null) {
+        s = types.widenSample(s, sampleKind(b) orelse return null);
+    };
+    return switch (s) {
+        .one => |k| types.Type.init(k),
+        .none, .mixed => null,
+    };
+}
+
+/// The kind a union branch adds to its union's sample: a plain number or string, an
+/// enum or a uuid; null for any other branch, which no common column holds.
+fn sampleKind(b: *const Node) ?types.TypeKind {
+    const plain = b.logical == .none;
+    return switch (b.kind) {
+        .int, .long => if (plain) .int else null,
+        .float, .double => if (plain) .float else null,
+        .@"enum" => .string,
+        .string => if (plain or b.logical == .uuid) .string else null,
+        else => null,
+    };
 }
 
 /// Whether `name` is one Avro accepts for a field: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -514,6 +521,73 @@ test "a malformed or unsupported schema is refused naming why" {
     const deep = try std.fmt.allocPrint(a, "{s}\"int\"{s}", .{ "{\"type\":\"array\",\"items\":" ** 70, "}" ** 70 });
     try testing.expectError(error.BadAvroSchema, parse(a, deep));
     try testing.expectError(error.UnsupportedAvro, parse(a, "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":40}"));
+}
+
+test "a `null` field reads as a column of unknown type, so a UNION with any other column unifies" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const p = try planOf(a,
+        \\{"type":"record","name":"r","fields":[{"name":"n","type":"null"},{"name":"u","type":["null"]},{"name":"s","type":["null","string"]}]}
+    );
+    for (p.schema.fields[0..2]) |f| {
+        try testing.expectEqual(types.TypeKind.string, f.ty.kind);
+        try testing.expect(f.ty.nullable);
+        for ([_]types.Type{ types.Type.init(.int), types.Type.decimal(10, 2), types.Type.init(.date) }) |other| {
+            const u = types.Type.unify(f.ty, other) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(other.kind, u.kind);
+        }
+    }
+    try testing.expect(!p.schema.fields[2].ty.unknown);
+    try testing.expect(types.Type.unify(p.schema.fields[2].ty, types.Type.init(.int)) == null);
+}
+
+fn commonTypeBefore(branches: []const *const Node) ?types.Type {
+    var ints = true;
+    var nums = true;
+    var strs = true;
+    for (branches) |b| {
+        if (b.kind == .null) continue;
+        const plain = b.logical == .none;
+        ints = ints and plain and (b.kind == .int or b.kind == .long);
+        nums = nums and plain and (b.kind == .int or b.kind == .long or b.kind == .float or b.kind == .double);
+        strs = strs and (b.kind == .@"enum" or (b.kind == .string and (plain or b.logical == .uuid)));
+    }
+    if (ints) return types.Type.init(.int);
+    if (nums) return types.Type.init(.float);
+    if (strs) return types.Type.init(.string);
+    return null;
+}
+
+test "commonType on widenSample equals the flag lattice it replaced on every union of up to three branches" {
+    const kinds = comptime std.enums.values(Node.Kind);
+    const logicals = comptime std.enums.values(Logical);
+    var nodes: [kinds.len * logicals.len]Node = undefined;
+    for (kinds, 0..) |k, i| for (logicals, 0..) |l, j| {
+        nodes[i * logicals.len + j] = .{ .kind = k, .logical = l };
+    };
+    var ptrs: [nodes.len]*const Node = undefined;
+    for (&ptrs, &nodes) |*p, *n| p.* = n;
+    var buf: [3]*const Node = undefined;
+    var seen: usize = 0;
+    for (0..ptrs.len) |x| for (0..ptrs.len) |y| for (0..ptrs.len + 1) |z| {
+        buf[0] = ptrs[x];
+        buf[1] = ptrs[y];
+        var len: usize = 2;
+        if (z < ptrs.len) {
+            buf[2] = ptrs[z];
+            len = 3;
+        }
+        var nonnull: usize = 0;
+        for (buf[0..len]) |b| nonnull += @intFromBool(b.kind != .null);
+        if (nonnull < 2) continue;
+        const before = commonTypeBefore(buf[0..len]);
+        const after = commonType(buf[0..len]);
+        try testing.expectEqual(before == null, after == null);
+        if (before) |t| try testing.expectEqual(t.kind, after.?.kind);
+        seen += 1;
+    };
+    try testing.expect(seen > 100_000);
 }
 
 test "validName follows Avro's name rule" {
