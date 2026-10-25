@@ -27,6 +27,7 @@ const cell = @import("../exec/cell.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
 const wire = @import("wire.zig");
+const typemap = @import("typemap.zig");
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
@@ -591,6 +592,32 @@ test "engineTypeFor maps MySQL wire types to engine types" {
     try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfc, 0, 0, 63).kind);
 }
 
+/// `engineTypeFor` at 10e697a, before the kind came from `typemap`.
+fn pinnedEngineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
+    const unsigned = flags & 0x0020 != 0;
+    const binary = charset == 63;
+    return (switch (mtype) {
+        0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
+        0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
+        0x04, 0x05 => types.Type.init(.float),
+        0x00, 0xf6 => types.Type.decimal(38, decimals),
+        0x0a => types.Type.init(.date),
+        0x07, 0x0c => types.Type.init(.timestamp),
+        0x10 => types.Type.init(.int),
+        0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
+        else => types.Type.init(.string),
+    }).asNullable();
+}
+
+test "engineTypeFor equals its pre-typemap body for every type byte, flag, charset and scale" {
+    for (0..256) |m| {
+        const mtype: u8 = @intCast(m);
+        for ([_]u16{ 0, 0x0020, 0x0021, 0xFFFF, 0xFFDF }) |f| for ([_]u16{ 0, 33, 63, 0xFFFF }) |c| for ([_]u8{ 0, 2, 30, 38, 255 }) |d| {
+            try std.testing.expectEqual(pinnedEngineTypeFor(mtype, d, f, c), engineTypeFor(mtype, d, f, c));
+        };
+    }
+}
+
 test "parseAuthSwitch extracts the plugin and its trailing salt" {
     const payload = "\xfe" ++ "mysql_native_password" ++ "\x00" ++ "ABCDEFGHIJKLMNOPQRST";
     const sw = parseAuthSwitch(payload);
@@ -623,21 +650,17 @@ fn parseColDef(arena: std.mem.Allocator, p: []const u8) !MyCol {
     return .{ .name = try arena.dupe(u8, name), .mtype = mtype, .decimals = decimals, .engine_type = ty, .conv = cell.converter(ty.kind, cell.wire) };
 }
 
-/// `flags & 0x20` is UNSIGNED_FLAG; charset 63 is `binary`.
+/// The kind from `typemap`; a BIGINT UNSIGNED is `unsignedType`'s decimal, a
+/// DECIMAL takes the column's `decimals` as its scale.
 fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
-    const unsigned = flags & 0x0020 != 0;
-    const binary = charset == 63;
-    return (switch (mtype) {
-        0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
-        0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
-        0x04, 0x05 => types.Type.init(.float),
-        0x00, 0xf6 => types.Type.decimal(38, decimals),
-        0x0a => types.Type.init(.date),
-        0x07, 0x0c => types.Type.init(.timestamp),
-        0x10 => types.Type.init(.int),
-        0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
-        else => types.Type.init(.string),
-    }).asNullable();
+    const w = typemap.Wire.mysql(mtype, flags, charset);
+    const kind = typemap.readKind(.mysql, w).?;
+    return (if (kind != .decimal)
+        types.Type.init(kind)
+    else if (w.unsigned)
+        types.unsignedType(64, .decimal)
+    else
+        types.Type.decimal(38, decimals)).asNullable();
 }
 
 /// Far above MySQL's 4096 columns per table, short of what a lying count could make us allocate.
