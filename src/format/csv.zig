@@ -995,7 +995,7 @@ pub const CsvWriter = struct {
     fn writeHeader(w: *std.Io.Writer, schema: types.Schema, dialect: Dialect) !void {
         for (schema.fields, 0..) |f, i| {
             if (i > 0) try w.writeByte(dialect.delim);
-            try writeField(w, f.name, dialect.delim);
+            try writeHeaderField(w, f.name, dialect.delim);
         }
         try w.writeByte('\n');
     }
@@ -1162,7 +1162,17 @@ fn scalarCanNeedQuote(delim: u8) bool {
 }
 
 pub fn writeField(w: anytype, s: []const u8, delim: u8) !void {
-    if (needsQuote(s, delim)) {
+    return writeQuotedIf(w, s, needsQuote(s, delim, false));
+}
+
+/// A header name with a leading or trailing space or tab is quoted too, so an append
+/// reads the name back exactly.
+fn writeHeaderField(w: anytype, s: []const u8, delim: u8) !void {
+    return writeQuotedIf(w, s, needsQuote(s, delim, true));
+}
+
+fn writeQuotedIf(w: anytype, s: []const u8, quote: bool) !void {
+    if (quote) {
         try w.writeByte('"');
         for (s) |c| {
             if (c == '"') try w.writeByte('"');
@@ -1177,9 +1187,9 @@ pub fn writeField(w: anytype, s: []const u8, delim: u8) !void {
 /// An empty string is quoted, since unquoted empty is how the reader spells null;
 /// emitting it bare once turned `""` into NULL on the next read. A leading or
 /// trailing space or tab is quoted too, as the header reader trims a bare name.
-fn needsQuote(s: []const u8, delim: u8) bool {
+fn needsQuote(s: []const u8, delim: u8, edges: bool) bool {
     if (s.len == 0) return true;
-    if (s[0] == ' ' or s[0] == '\t' or s[s.len - 1] == ' ' or s[s.len - 1] == '\t') return true;
+    if (edges and (s[0] == ' ' or s[0] == '\t' or s[s.len - 1] == ' ' or s[s.len - 1] == '\t')) return true;
     for (s) |c| {
         if (c == delim or c == '"' or c == '\n' or c == '\r') return true;
     }
@@ -1334,7 +1344,7 @@ test "writeField quotes exactly the fields that need it, doubling quotes" {
     try writeField(buf.writer(), "trail\t", ',');
     try buf.append('|');
     try writeField(buf.writer(), "in side", ',');
-    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"|\" lead\"|\"trail\t\"|in side", buf.items);
+    try std.testing.expectEqualStrings("plain|\"a,b\"|\"say \"\"hi\"\"\"|\"line\nbreak\"|\"\"| lead|trail\t|in side", buf.items);
 }
 
 test "quoted values and an empty string survive a write/read round-trip, the empty string distinct from null" {
@@ -2145,7 +2155,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2158,7 +2168,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2171,7 +2181,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "\"0.1\"\n0\n-0\n\"" ++ tiny ++ "\"\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n-inf\n\n",
             "\"123.45\"\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
@@ -2184,7 +2194,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n\"-1\"\n\"-9223372036854775808\"\n9223372036854775807\n\n",
             "0.1\n0\n\"-0\"\n" ++ tiny ++ "\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n\"-inf\"\n\n",
             "123.45\n\"-0.0007\"\n5\n0.12345\n\"-18446744073709.551615\"\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2197,7 +2207,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
@@ -2210,7 +2220,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0\n-1\n-9223372036854775808\n9223372036854775807\n\n",
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
-            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
+            "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
@@ -2223,7 +2233,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "\"0\"\n-1\n\"-9223372036854775808\"\n\"9223372036854775807\"\n\n",
             "\"0.1\"\n\"0\"\n\"-0\"\n\"" ++ tiny ++ "\"\n\"1000000000000000000000\"\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
-            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
+            "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
             "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n23:59:59.999999\n\n",
