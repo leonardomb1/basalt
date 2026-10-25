@@ -17,7 +17,7 @@ const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
 const decimal = @import("decimal.zig");
 const cast = @import("eval/cast.zig");
-const time = @import("eval/time.zig");
+const civil = @import("civil.zig");
 
 pub const Error = error{ TextTypeMismatch, UnparseableNumber, OutOfMemory };
 
@@ -106,10 +106,10 @@ pub fn parse(comptime k: types.TypeKind, comptime rules: Rules, raw: []const u8)
         .decimal => decimal.parse(raw) orelse bad,
         .bool => raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T' or raw[0] == 'y' or raw[0] == 'Y'),
         .date => switch (rules.dates) {
-            .iso => @as(?i32, @intCast(time.parseIsoDate(raw) orelse return bad)),
-            .wire => if (zeroDate(raw)) null else std.math.cast(i32, wireDate(raw) orelse return bad) orelse bad,
+            .iso => @as(?i32, @intCast(IsoDate.date(raw) orelse return bad)),
+            .wire => if (zeroDate(raw)) null else std.math.cast(i32, Wire.date(raw) orelse return bad) orelse bad,
         },
-        .timestamp => if (zeroDate(raw)) null else wireDatetime(raw) orelse bad,
+        .timestamp => if (zeroDate(raw)) null else Wire.timestamp(raw) orelse bad,
         else => raw,
     };
 }
@@ -192,80 +192,20 @@ pub fn floatFast(s: []const u8) ?f64 {
     return if (neg) -v else v;
 }
 
-const DateText = struct { days: i64, rest: []const u8 };
-
-/// `YYYY-MM-DD` at the start of `t`, the year four digits or more and a ` BC` at the
-/// end of `t` taken as its era; the month and day must exist. Null for anything
-/// else, `infinity` included, so a value no date can hold fails rather than reads
-/// as 1970-01-01.
-fn dateText(t: []const u8) ?DateText {
-    const bc = std.mem.endsWith(u8, t, " BC");
-    const body = if (bc) t[0 .. t.len - 3] else t;
-    var i: usize = 0;
-    while (i < body.len and i < 7 and std.ascii.isDigit(body[i])) i += 1;
-    if (i < 4 or body.len < i + 6 or body[i] != '-' or body[i + 3] != '-') return null;
-    for ([_]usize{ i + 1, i + 2, i + 4, i + 5 }) |k| if (!std.ascii.isDigit(body[k])) return null;
-    var y = atoiN(body[0..i]);
-    const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
-    const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
-    if (m < 1 or m > 12 or d < 1 or d > time.daysInMonth(y, m)) return null;
-    if (bc) y = 1 - y;
-    return .{ .days = time.daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
-}
-
 /// MySQL's zero date (`0000-00-00`, with or without a time), which stands for no
 /// date: it reads as NULL, as Connector/J's `zeroDateTimeBehavior=convertToNull` does.
 fn zeroDate(t: []const u8) bool {
     return std.mem.startsWith(u8, t, "0000-00-00");
 }
 
-fn wireDate(t: []const u8) ?i64 {
-    const dt = dateText(t) orelse return null;
-    if (dt.rest.len > 0) return null;
-    return dt.days;
-}
-
-/// Keeps the `.ffffff` fraction: dropping it once made `datetime(3)` values within a
-/// second identical, collapsing distinct rows and unsettling ORDER BY. A trailing
-/// offset (`-03`, `+05:45`, ` +00:00`), as a `timestamptz` prints in the session's
-/// zone, is folded into UTC, so a value reads the same whatever that zone is. A
-/// date alone is its midnight; a malformed time is null, never zero.
-fn wireDatetime(t: []const u8) ?i64 {
-    const dt = dateText(t) orelse return null;
-    const r = dt.rest;
-    if (r.len == 0) return dt.days * 86_400_000_000;
-    if (r.len < 9 or (r[0] != ' ' and r[0] != 'T') or r[3] != ':' or r[6] != ':') return null;
-    for ([_]usize{ 1, 2, 4, 5, 7, 8 }) |k| if (!std.ascii.isDigit(r[k])) return null;
-    var secs: i64 = atoiN(r[1..3]) * 3600 + atoiN(r[4..6]) * 60 + atoiN(r[7..9]);
-    var frac: i64 = 0;
-    var i: usize = 9;
-    if (r.len > 10 and r[9] == '.') {
-        i = 10;
-        var scale: i64 = 100_000;
-        while (i < r.len and r[i] >= '0' and r[i] <= '9') : (i += 1) {
-            if (scale > 0) frac += @as(i64, r[i] - '0') * scale;
-            scale = @divTrunc(scale, 10);
-        }
-    }
-    if (i < r.len and r[i] == ' ') i += 1;
-    if (i + 3 <= r.len and (r[i] == '+' or r[i] == '-')) {
-        const sign: i64 = if (r[i] == '-') -1 else 1;
-        var off = atoiN(r[i + 1 .. i + 3]) * 3600;
-        var j = i + 3;
-        if (j < r.len and r[j] == ':') j += 1;
-        if (j + 2 <= r.len) off += atoiN(r[j .. j + 2]) * 60;
-        secs -= sign * off;
-    }
-    return dt.days * 86_400_000_000 + secs * 1_000_000 + frac;
-}
-
-fn atoiN(s: []const u8) i64 {
-    var v: i64 = 0;
-    for (s) |c| {
-        if (c >= '0' and c <= '9') v = v * 10 + (c - '0');
-    }
-    return v;
-}
+/// A database's date and timestamp text (`civil.Spelling.wire`): `YYYY-MM-DD`, the
+/// year four to seven digits and a trailing ` BC` its era, `infinity` refused rather
+/// than read as 1970-01-01. A timestamp keeps its `.ffffff` fraction, since dropping
+/// it once collapsed distinct `datetime(3)` rows, and folds a trailing offset into
+/// UTC, so a `timestamptz` reads the same whatever the session's zone; one past what
+/// an i64 of microseconds holds is null.
+const Wire = civil.Text(.wire);
+const IsoDate = civil.Text(.iso);
 
 const testing = std.testing;
 
@@ -290,8 +230,8 @@ test "floatFast agrees with std on plain decimals and declines the rest" {
 test "wire dates: the real ones read, BC and five-digit years included; no date reads as a made-up one" {
     try testing.expectEqual(@as(?i32, 0), try parse(.date, wire, "1970-01-01"));
     try testing.expectEqual(@as(?i32, 19727), try parse(.date, wire, "2024-01-05"));
-    try testing.expectEqual(@as(?i32, @intCast(time.daysFromCivil(-43, 3, 15))), try parse(.date, wire, "0044-03-15 BC"));
-    try testing.expectEqual(@as(?i32, @intCast(time.daysFromCivil(10000, 1, 1))), try parse(.date, wire, "10000-01-01"));
+    try testing.expectEqual(@as(?i32, @intCast(civil.daysFromCivil(-43, 3, 15))), try parse(.date, wire, "0044-03-15 BC"));
+    try testing.expectEqual(@as(?i32, @intCast(civil.daysFromCivil(10000, 1, 1))), try parse(.date, wire, "10000-01-01"));
     try testing.expectEqual(@as(?i32, null), try parse(.date, wire, "0000-00-00"));
     try testing.expectEqual(@as(?i64, null), try parse(.timestamp, wire, "0000-00-00 00:00:00"));
     for ([_][]const u8{ "infinity", "-infinity", "2024-13-01", "2024-02-30", "24-01-05", "2024/01/05", "" }) |bad| {
@@ -299,7 +239,7 @@ test "wire dates: the real ones read, BC and five-digit years included; no date 
     }
     try testing.expectError(error.UnparseableNumber, parse(.timestamp, wire, "infinity"));
     try testing.expectError(error.UnparseableNumber, parse(.timestamp, wire, "2024-01-05 5:00"));
-    try testing.expectEqual(wireDatetime("2024-01-05 00:00:00").?, wireDatetime("2024-01-05").?);
+    try testing.expectEqual(Wire.timestamp("2024-01-05 00:00:00").?, Wire.timestamp("2024-01-05").?);
 }
 
 test "wire text: bad numbers fail instead of silently zeroing; bools, dates, timestamps and decimals read" {
@@ -319,13 +259,21 @@ test "wire text: bad numbers fail instead of silently zeroing; bools, dates, tim
     try testing.expectEqual(@as(u8, 3), d.scale);
 }
 
+test "a wire timestamp past what an i64 of microseconds holds is unparseable, not an overflow" {
+    for ([_][]const u8{ "300000-01-01", "294247-01-10 04:00:54.775808", "9999999-12-31 23:59:59", "0300000-01-01 00:00:00 BC" }) |s| {
+        errdefer std.debug.print("input `{s}`\n", .{s});
+        try testing.expectError(error.UnparseableNumber, parse(.timestamp, wire, s));
+    }
+    try testing.expectEqual(@as(?i64, std.math.maxInt(i64)), try parse(.timestamp, wire, "294247-01-10 04:00:54.775807"));
+}
+
 test "wire timestamps fold a timestamptz offset into UTC" {
-    const base = wireDatetime("2024-01-05 05:00:00").?;
-    try testing.expectEqual(base, wireDatetime("2024-01-05 02:00:00-03").?);
-    try testing.expectEqual(base, wireDatetime("2024-01-05 10:45:00+05:45").?);
-    try testing.expectEqual(base, wireDatetime("2024-01-05 05:00:00 +00:00").?);
-    try testing.expectEqual(base + 250_000, wireDatetime("2024-01-05 02:00:00.25-03").?);
-    try testing.expectEqual(base + 123_456, wireDatetime("2024-01-05 05:00:00.1234567").?);
+    const base = Wire.timestamp("2024-01-05 05:00:00").?;
+    try testing.expectEqual(base, Wire.timestamp("2024-01-05 02:00:00-03").?);
+    try testing.expectEqual(base, Wire.timestamp("2024-01-05 10:45:00+05:45").?);
+    try testing.expectEqual(base, Wire.timestamp("2024-01-05 05:00:00 +00:00").?);
+    try testing.expectEqual(base + 250_000, Wire.timestamp("2024-01-05 02:00:00.25-03").?);
+    try testing.expectEqual(base + 123_456, Wire.timestamp("2024-01-05 05:00:00.1234567").?);
 }
 
 test "the rules differ where the sources do: a code stays text when sniffed, a padded int reads on the wire" {
