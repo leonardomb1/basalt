@@ -275,14 +275,14 @@ fn bound(comptime opts: []const Opt, comptime aliases: []const Alias, comptime n
 }
 
 /// Walks `config` in order into `out`, the last of a repeated key winning. A key is
-/// looked up in `opts` (under `.refuse` an absent one returns `r.unknown(key)`), mapped
+/// looked up in `opts` (under `.refuse` an absent one returns `r.unknown(key, expr)`), mapped
 /// through `aliases` to a field of `T`, and skipped when `T` has no such field. The
 /// reader's `value(F, opt, expr) !?F` reads it, null leaving the field as it was; a
 /// set field `x` also sets a bool field `x_explicit` when `T` has one.
 pub fn bind(comptime T: type, comptime opts: []const Opt, comptime unknown: Unknown, comptime aliases: []const Alias, out: *T, config: []const ast.Attr, r: anytype) !void {
     for (config) |attr| {
         const opt = find(opts, attr.key) orelse switch (unknown) {
-            .refuse => return r.unknown(attr.key),
+            .refuse => return r.unknown(attr.key, attr.value),
             .ignore => continue,
         };
         const name = fieldOf(aliases, opt.key);
@@ -308,6 +308,7 @@ const Fx = struct {
     const obs = @import("../obs.zig");
     const op = @import("../../exec/op.zig");
     const parser = @import("../../lang/sql_parser.zig");
+    const old = @import("testing_util.zig").old;
     const register = @import("register.zig");
     const sinkmod = @import("sink.zig");
     const sqlmod = @import("../../db/sql.zig");
@@ -333,31 +334,7 @@ const Fx = struct {
     }
 
     fn env(a: std.mem.Allocator) !*env_mod.Env {
-        const e = try a.create(env_mod.Env);
-        const params = try a.create(std.StringHashMap(Value));
-        params.* = .init(a);
-        const bindings = try a.create(std.StringHashMap(ast.Pipeline));
-        bindings.* = .init(a);
-        const connections = try a.create(std.StringHashMap(ast.Connection));
-        connections.* = .init(a);
-        const sources = try a.create(std.array_list.Managed(@import("../../connect/driver.zig").Source));
-        sources.* = .init(a);
-        const diag = try a.create(env_mod.Diag);
-        diag.* = .{};
-        const log = try a.create(obs.Logger);
-        log.* = obs.Logger.init(0, .text, .err);
-        const params_expr = try a.create(std.StringHashMap(*const ast.Expr));
-        params_expr.* = .init(a);
-        const errctx = try a.create(op.ErrCtx);
-        errctx.* = .{};
-        const rows = try a.create(obs.RowCounter);
-        rows.* = obs.RowCounter.init(0);
-        const json = try a.create(std.StringHashMap(std.json.Value));
-        json.* = .init(a);
-        const fns = try a.create(std.StringHashMap(ast.FnDecl));
-        fns.* = .init(a);
-        e.* = .{ .arena = a, .gpa = a, .params = params, .bindings = bindings, .connections = connections, .sources = sources, .diag = diag, .log = log, .params_expr = params_expr, .errctx = errctx, .rows_read = rows, .json_params = json, .fns = fns };
-        return e;
+        return @import("testing_util.zig").testEnv(a);
     }
 
     const int_corpus = [_][]const u8{ "0", "22", "65535", "65536", "70000", "4294967295", "4294967296", "-1", "'-1'", "'42'", "'+5'", "'1_000'", "' 5'", "'0x10'", "'x'", "''", "true", "1 + 2", "env('" ++ unset_var ++ "')" };
@@ -415,7 +392,7 @@ test "integer kinds: port is u16, buckets and replication_num u32, the rest of t
         try testing.expectEqual(if (std.mem.eql(u8, o.key, "port")) Kind.port else Kind.text, o.kind);
 }
 
-test "cfgInt reads every value as register.evalCfgInt does today" {
+test "cfgInt reads every value as the run's evalCfgInt did" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -423,7 +400,7 @@ test "cfgInt reads every value as register.evalCfgInt does today" {
     for (Fx.int_corpus) |src| {
         const e = try Fx.expr(a, src);
         env.diag.* = .{};
-        const today = Fx.register.evalCfgInt(env, e);
+        const today = Fx.old.evalCfgInt(env, e);
         switch (cfgInt(e)) {
             .ok => |v| try testing.expectEqual(v, try today),
             .problem => |p| {
@@ -473,7 +450,7 @@ test "cfgIntIn on a port matches what sftp, smb and ftp registration refuse toda
         const c = try Fx.opts(a, connector, try std.fmt.allocPrint(a, "port = {s}", .{src}));
         const e = c.config[0].value;
         const env = try Fx.env(a);
-        const today = std.math.cast(u16, Fx.register.evalCfgInt(env, e) catch {
+        const today = std.math.cast(u16, Fx.old.evalCfgInt(env, e) catch {
             try testing.expectEqualStrings(env.diag.msg, try message(a, cfgIntIn(u16, e).problem, connector, "port"));
             continue;
         });
@@ -504,9 +481,9 @@ test "cfgBool is strict and case-blind; evalCfgBool agrees on every row but the 
         try testing.expectEqualStrings(w[0], src);
         const e = try Fx.expr(a, src);
         if (!w[3]) {} else if (w[1]) |b| {
-            try testing.expectEqual(b, try Fx.register.evalCfgBool(env, e));
+            try testing.expectEqual(b, try Fx.old.evalCfgBool(env, e));
         } else {
-            try testing.expectError(error.PlanFailed, Fx.register.evalCfgBool(env, e));
+            try testing.expectError(error.PlanFailed, Fx.old.evalCfgBool(env, e));
             try testing.expectEqualStrings(options.bool_cfg_msg, env.diag.msg);
         }
         switch (cfgBool(e)) {
@@ -519,7 +496,7 @@ test "cfgBool is strict and case-blind; evalCfgBool agrees on every row but the 
     }
 }
 
-test "cfgText reads literals and env() as register.evalCfgStr does, and an unset var as optCfgStr's null or evalCfgStr's refusal" {
+test "cfgText reads literals and env() as the run's evalCfgStr did, and an unset var as optCfgStr's null or evalCfgStr's refusal" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -527,7 +504,7 @@ test "cfgText reads literals and env() as register.evalCfgStr does, and an unset
     for (Fx.text_corpus) |src| {
         const e = try Fx.expr(a, src);
         env.diag.* = .{};
-        const today = Fx.register.evalCfgStr(env, e);
+        const today = Fx.old.evalCfgStr(env, e);
         switch (try cfgText(a, e)) {
             .ok => |t| try testing.expectEqualStrings(try today, t),
             .unset => |name| {
@@ -644,7 +621,7 @@ test "checkValue leaves an env() text to the run and checks a literal's kind and
 }
 
 const LitReader = struct {
-    pub fn unknown(_: LitReader, _: []const u8) !void {
+    pub fn unknown(_: LitReader, _: []const u8, _: *const ast.Expr) !void {
         return error.UnknownOption;
     }
     pub fn value(_: LitReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
@@ -673,7 +650,7 @@ test "bind over sqlserver's table plus fe_host/fe_port, aliased, reproduces pars
     };
     for ([_][]const u8{ "postgres", "mysql", "sqlserver", "starrocks" }) |connector| for (bodies) |body| {
         const c = try Fx.opts(a, connector, body);
-        const today = try Fx.dbconfig.parseDbConfig(c, 9030, Fx.LitCfg{});
+        const today = try Fx.old.parseDbConfig(c, 9030, Fx.LitCfg{});
         var ours = Fx.env_mod.DbConfig{ .port = 9030 };
         try bind(Fx.env_mod.DbConfig, &db_read, .ignore, &db_aliases, &ours, c.config, LitReader{});
         try testing.expectEqualDeep(today, ours);
@@ -682,7 +659,7 @@ test "bind over sqlserver's table plus fe_host/fe_port, aliased, reproduces pars
 
 const FileReader = struct {
     arena: std.mem.Allocator,
-    pub fn unknown(_: FileReader, _: []const u8) !void {
+    pub fn unknown(_: FileReader, _: []const u8, _: *const ast.Expr) !void {
         return error.UnknownOption;
     }
     pub fn value(self: FileReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
@@ -726,7 +703,7 @@ test "bind refuses an unknown file option, reads an unset env() as null and keep
 
 const StreamReader = struct {
     arena: std.mem.Allocator,
-    pub fn unknown(_: StreamReader, _: []const u8) !void {}
+    pub fn unknown(_: StreamReader, _: []const u8, _: *const ast.Expr) !void {}
     pub fn value(self: StreamReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
         if (F == bool) return switch (cfgBool(e)) {
             .ok => |b| b,
@@ -763,7 +740,7 @@ test "bind over the stream table with host/port/be_url aliases reproduces resolv
     for (bodies) |body| {
         const c = try Fx.opts(a, "starrocks", body);
         const env = try Fx.env(a);
-        const today = try Fx.sinkmod.resolveStreamLoadConfig(env, c, .starrocks);
+        const today = try Fx.old.resolveStreamLoadConfig(env, c, .starrocks);
         var ours = Fx.streamload.Config{ .flavor = .starrocks, .database = "", .errctx = env.errctx, .space = env.space };
         try bind(Fx.streamload.Config, &stream, .ignore, &stream_aliases, &ours, c.config, StreamReader{ .arena = a });
         try testing.expectEqualDeep(today, ours);
@@ -787,7 +764,7 @@ test "bind sets a field's _explicit companion only when the option is read" {
 const SmbReader = struct {
     arena: std.mem.Allocator,
     const Auth = @import("../../store/smb.zig").Auth;
-    pub fn unknown(_: SmbReader, _: []const u8) !void {
+    pub fn unknown(_: SmbReader, _: []const u8, _: *const ast.Expr) !void {
         return error.UnknownOption;
     }
     pub fn value(self: SmbReader, comptime F: type, opt: Opt, e: *const ast.Expr) !?F {
@@ -828,4 +805,95 @@ test "bind into an smb connection: the reader trims share, uppercases realm and 
     try testing.expectEqual(smbmod.Auth.ntlm, d.auth.?);
     const bad = try Fx.opts(a, "smb", "host = 'fs', auth = 'basic'");
     try testing.expectError(error.BadOption, bind(smbmod.Conn, &smb, .refuse, &.{}, &d, bad.config, SmbReader{ .arena = a }));
+}
+
+fn expectSameRun(a: std.mem.Allocator, today: anytype, ours: anytype, today_msg: []const u8, ours_msg: []const u8) !void {
+    const t = today catch |e| {
+        try testing.expectError(e, ours);
+        try testing.expectEqualStrings(today_msg, ours_msg);
+        return;
+    };
+    const o = ours catch |e| {
+        std.debug.print("old read it, new refused: {s}\n", .{ours_msg});
+        return e;
+    };
+    try testing.expectEqualDeep(t, o);
+    _ = a;
+}
+
+fn runPair(a: std.mem.Allocator, comptime f_old: anytype, comptime f_new: anytype, c: ast.Connection, extra: anytype) !void {
+    const env_old = try Fx.env(a);
+    const env_new = try Fx.env(a);
+    const today = @call(.auto, f_old, .{ env_old, c } ++ extra);
+    const ours = @call(.auto, f_new, .{ env_new, c } ++ extra);
+    try expectSameRun(a, today, ours, env_old.diag.msg, env_new.diag.msg);
+}
+
+const set_var = "PATH";
+
+test "file connections: bind gives the old loop's connection or its message, unknown keys after their value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const bodies = [_][]const u8{
+        "host = 'h'",                                                                                                      "host = 'h', port = 2222",                                        "host = 'h', port = '2222'",
+        "host = 'h', port = 70000",                                                                                        "host = 'h', port = 'x'",                                         "host = 'h', port = -1",
+        "host = 'h', port = env('P')",                                                                                     "host = 'h', zz = 1",                                             "host = 'h', zz = 1 + 2",
+        "host = 'h', zz = env('" ++ Fx.unset_var ++ "')",                                                                  "host = 'h', user = 1 + 2",                                       "host = 'h', user = env('" ++ Fx.unset_var ++ "')",
+        "host = 'h', user = 'a', user = env('" ++ Fx.unset_var ++ "')",                                                    "host = env('" ++ Fx.unset_var ++ "')",                           "host = ''",
+        "host = 'h', host = ''",                                                                                           "user = 'u'",                                                     "host = 'h', password = secret('" ++ set_var ++ "')",
+        "host = 'h', share = '/data\\\\', realm = 'corp.local'",                                                           "host = 'h', share = 's', share = env('" ++ Fx.unset_var ++ "')", "host = 'h', auth = 'Kerberos', realm = 'R'",
+        "host = 'h', auth = 'kerberos'",                                                                                   "host = 'h', auth = 'kerberos', user = 'me@R'",                   "host = 'h', auth = 'NTLM'",
+        "host = 'h', auth = 'basic'",                                                                                      "host = 'h', auth = env('" ++ Fx.unset_var ++ "')",               "host = 'h', auth = 3",
+        "host = 'h', key_file = '/k', known_hosts = env('" ++ Fx.unset_var ++ "'), host_key = 'hk', key_passphrase = 'p'", "host = 'h', domain = 'D', kdc = 'K', spn = 'S'",                 "host = 'h', port = 0, zz = 1 + 2",
+        "host = true, user = 7",
+    };
+    for (bodies) |body| {
+        try runPair(a, Fx.old.sftpConn, Fx.register.sftpConn, try Fx.opts(a, "sftp", body), .{});
+        try runPair(a, Fx.old.smbConn, Fx.register.smbConn, try Fx.opts(a, "smb", body), .{});
+        try runPair(a, Fx.old.ftpConn, Fx.register.ftpConn, try Fx.opts(a, "ftp", body), .{});
+    }
+}
+
+test "SQL connections: resolveDbConfig on bind gives the old config or its message" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const bodies = [_][]const u8{
+        "host = 'h'",                                          "fe_host = 'fe', user = 'etl'",                           "host = 'h', fe_port = 9031",
+        "host = 'h', port = 1433, port = 1434, host = 'g'",    "host = 'h', port = '7', tls = 'require', auth = 'ntlm'", "host = 'h', domain = 'D', realm = 'R', kdc = 'K', spn = 'S', client_id = 'C', resource = 'Rs', token = 'T'",
+        "host = 'h', port = 70000",                            "host = 'h', fe_port = 70000",                            "host = 'h', port = 'x'",
+        "host = 'h', port = -1",                               "host = 'h', port = env('P')",                            "host = 'h', tls = 'maybe'",
+        "host = 'h', tls = 1 + 2",                             "host = 'h', auth = 'basic'",                             "host = 'h', auth = 'ntlm'",
+        "host = 'h', auth = 'kerberos'",                       "host = 'h', auth = 'kerberos', user = 'me@R'",           "host = 'h', auth = 'kerberos', realm = 'R'",
+        "host = env('" ++ Fx.unset_var ++ "')",                "host = secret('" ++ set_var ++ "'), database = 'd'",     "user = 'u'",
+        "host = 'h', buckets = 'x', zz = 1 + 2, load_url = 3", "host = 'h', database = 1 + 2",                           "host = ''",
+        "host = 'h', user = 7, password = true",
+    };
+    for ([_][]const u8{ "postgres", "mysql", "sqlserver", "starrocks", "doris" }) |connector| for (bodies) |body| {
+        try runPair(a, Fx.old.resolveDbConfig, Fx.dbconfig.resolveDbConfig, try Fx.opts(a, connector, body), .{@as(u16, 9030)});
+    };
+}
+
+test "stream load: resolveStreamLoadConfig on bind gives the old config or its message" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const bodies = [_][]const u8{
+        "database = 'd'",                                                        "",                                                                           "database = ''",
+        "database = 'd', host = 'h', fe_port = 9031, be_url = 'http://be:8040'", "database = 'd', fe_host = 'f', port = '9032', load_url = 'l', be_url = 'b'", "database = 'd', port = 70000",
+        "database = 'd', fe_port = 70000",                                       "database = 'd', buckets = 4294967296",                                       "database = 'd', replication_num = -1",
+        "database = 'd', buckets = 'x'",                                         "database = 'd', buckets = 4294967295, replication_num = '3'",                "database = 'd', auto_create = 'yes'",
+        "database = 'd', auto_create = 'TRUE'",                                  "database = 'd', auto_create = false",                                        "database = 'd', auto_create = 1",
+        "database = 'd', tls = 'require'",                                       "database = 'd', tls = 'maybe'",                                              "database = 'd', load_size = '64MB'",
+        "database = 'd', load_size = '0'",                                       "database = 'd', load_size = 'lots'",                                         "database = 'd', compression = 'gzip'",
+        "database = 'd', compression = 'zip'",                                   "database = 'd', label_prefix = 'lp'",                                        "database = 'd', user = env('" ++ Fx.unset_var ++ "')",
+        "database = secret('" ++ set_var ++ "')",                                "database = 'd', zz = 1 + 2, domain = 'x'",                                   "database = 'd', user = 1 + 2",
+        "database = 'd', password = 7",
+    };
+    for (bodies) |body| {
+        const c = try Fx.opts(a, "starrocks", if (body.len == 0) "zz = 1" else body);
+        try runPair(a, Fx.old.resolveStreamLoadConfig, Fx.sinkmod.resolveStreamLoadConfig, c, .{Fx.streamload.Flavor.starrocks});
+        try runPair(a, Fx.old.resolveStreamLoadConfig, Fx.sinkmod.resolveStreamLoadConfig, c, .{Fx.streamload.Flavor.doris});
+    }
 }

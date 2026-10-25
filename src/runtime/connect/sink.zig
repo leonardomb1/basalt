@@ -21,10 +21,8 @@ const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
-const eqlAny = @import("../env.zig").eqlAny;
-const evalCfgBool = @import("register.zig").evalCfgBool;
-const evalCfgIntIn = @import("register.zig").evalCfgIntIn;
-const evalCfgStr = @import("register.zig").evalCfgStr;
+const RunCfg = @import("register.zig").RunCfg;
+const opts_schema = @import("options_schema.zig");
 const mem_connector = @import("../connect.zig").mem_connector;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
@@ -341,42 +339,31 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     return planErr(env.diag, try options.unsupportedSinkMsg(env.arena, conn.connector));
 }
 
+/// A StarRocks or Doris load's options; `host`/`port`/`be_url` are spellings of
+/// `fe_host`/`fe_port`/`load_url`, and an integer is refused under the key written.
+const StreamCfg = struct {
+    run: RunCfg,
+
+    pub fn value(self: StreamCfg, comptime F: type, opt: opts_schema.Opt, e: *const ast.Expr) !?F {
+        if (F == u16 or F == u32) return try self.run.int(F, e, opt.key);
+        if (F == bool) return try self.run.flag(e);
+        const v = try self.run.text(e);
+        const env = self.run.env;
+        if (F == []const u8) return v;
+        if (F == sql.TlsMode) return std.meta.stringToEnum(sql.TlsMode, v) orelse planErr(env.diag, env_mod.tls_values_msg);
+        if (F == u64) {
+            const n = env_mod.parseByteSize(v) orelse 0;
+            return if (n == 0) planErr(env.diag, try options.loadSizeMsg(env.arena, v)) else n;
+        }
+        if (F == streamload.Compression) return std.meta.stringToEnum(streamload.Compression, v) orelse
+            planErr(env.diag, try options.loadCompressionMsg(env.arena, v));
+        @compileError("no reader for " ++ @typeName(F));
+    }
+};
+
 pub fn resolveStreamLoadConfig(env: *Env, conn: ast.Connection, flavor: streamload.Flavor) !streamload.Config {
     var cfg = streamload.Config{ .flavor = flavor, .database = "", .errctx = env.errctx, .space = env.space };
-    for (conn.config) |attr| {
-        const k = attr.key;
-        if (eqlAny(k, &.{ "host", "fe_host" })) {
-            cfg.fe_host = try evalCfgStr(env, attr.value);
-        } else if (eqlAny(k, &.{ "port", "fe_port" })) {
-            cfg.fe_port = try evalCfgIntIn(u16, env, attr.value, conn.connector, k);
-        } else if (eqlAny(k, &.{ "be_url", "load_url" })) {
-            cfg.load_url = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "database")) {
-            cfg.database = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "user")) {
-            cfg.user = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "password")) {
-            cfg.password = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "tls")) {
-            cfg.tls = std.meta.stringToEnum(sql.TlsMode, try evalCfgStr(env, attr.value)) orelse return planErr(env.diag, env_mod.tls_values_msg);
-        } else if (std.mem.eql(u8, k, "buckets")) {
-            cfg.buckets = try evalCfgIntIn(u32, env, attr.value, conn.connector, k);
-        } else if (std.mem.eql(u8, k, "replication_num")) {
-            cfg.replication_num = try evalCfgIntIn(u32, env, attr.value, conn.connector, k);
-        } else if (std.mem.eql(u8, k, "auto_create")) {
-            cfg.auto_create = try evalCfgBool(env, attr.value);
-        } else if (std.mem.eql(u8, k, "label_prefix")) {
-            cfg.label_prefix = try evalCfgStr(env, attr.value);
-        } else if (std.mem.eql(u8, k, "load_size")) {
-            const txt = try evalCfgStr(env, attr.value);
-            cfg.load_size = env_mod.parseByteSize(txt) orelse 0;
-            if (cfg.load_size == 0) return planErr(env.diag, try options.loadSizeMsg(env.arena, txt));
-        } else if (std.mem.eql(u8, k, "compression")) {
-            const txt = try evalCfgStr(env, attr.value);
-            cfg.compression = std.meta.stringToEnum(streamload.Compression, txt) orelse
-                return planErr(env.diag, try options.loadCompressionMsg(env.arena, txt));
-        }
-    }
+    try opts_schema.bind(streamload.Config, &opts_schema.stream, .ignore, &opts_schema.stream_aliases, &cfg, conn.config, StreamCfg{ .run = .{ .env = env, .connector = conn.connector } });
     if (cfg.database.len == 0) return planErr(env.diag, try options.needsDatabaseMsg(env.arena, flavor.name()));
     if (env.sink_label_prefix) |lp| cfg.label_prefix = lp;
     return cfg;

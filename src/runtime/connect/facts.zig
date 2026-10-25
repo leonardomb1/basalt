@@ -7,6 +7,7 @@ const Value = @import("../../exec/value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const catalogQuery = @import("../plan/estimate.zig").catalogQuery;
 const pushdown = @import("../pushdown.zig");
+const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
@@ -85,7 +86,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ 1,
                 \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
-            , .{try sql.objectLit(arena, dialect, parts)});
+            , .{try split.catalogObjectLit(arena, dialect, parts)});
         },
         .postgres => {
             return std.fmt.allocPrint(arena,
@@ -108,7 +109,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\        ELSE coalesce(to_jsonb(co) ->> 'collprovider', 'c') END AS prov,
                 \\   CASE WHEN co.collname = 'default' THEN d.datcollate ELSE to_jsonb(co) ->> 'collcollate' END AS locale) x
                 \\WHERE a.attrelid = {s}::regclass AND a.attnum > 0 AND NOT a.attisdropped AND d.datname = current_database()
-            , .{try sql.objectLit(arena, dialect, parts)});
+            , .{try split.catalogObjectLit(arena, dialect, parts)});
         },
         .mysql => {
             const schema = try sql.schemaLit(arena, dialect, parts);
@@ -120,7 +121,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END
                 \\FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = c.COLLATION_NAME
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
-            , .{ schema, try dialect.strLit(arena, table) });
+            , .{ schema, try split.catalogNameLit(arena, dialect, table) });
         },
         .starrocks, .doris => {
             const schema = try sql.schemaLit(arena, dialect, parts);
@@ -131,7 +132,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN LOWER(DATA_TYPE) = 'char' THEN 1 ELSE 0 END,
                 \\ 0
                 \\FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}
-            , .{ schema, try dialect.strLit(arena, table) });
+            , .{ schema, try split.catalogNameLit(arena, dialect, table) });
         },
     }
 }
@@ -139,4 +140,16 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
 pub fn qualStr(arena: std.mem.Allocator, q: ast.QualName) ![]const u8 {
     if (q.parts.len == 1) return q.parts[0];
     return std.mem.join(arena, ".", q.parts);
+}
+
+test "facts: the SQL Server catalog query names the table with an N literal, so a non-code-page name resolves" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const q = try factsQuery(a, .sqlserver, &.{ "dbo", "Ação" });
+    try std.testing.expect(std.mem.endsWith(u8, q, "WHERE c.object_id = OBJECT_ID(N'[dbo].[Ação]')"));
+    const pg = try factsQuery(a, .postgres, &.{ "s", "Ação" });
+    try std.testing.expect(std.mem.indexOf(u8, pg, "a.attrelid = '\"s\".\"Ação\"'::regclass") != null);
+    const my = try factsQuery(a, .mysql, &.{ "db", "Ação" });
+    try std.testing.expect(std.mem.endsWith(u8, my, "WHERE c.TABLE_SCHEMA = 'db' AND c.TABLE_NAME = 'Ação'"));
 }

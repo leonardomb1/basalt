@@ -29,6 +29,7 @@ const footerOf = @import("../../format/parquet/folder.zig").parseFooterOf;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const pqread = @import("../../format/parquet/read.zig");
 const resolveDbConfig = @import("../connect/dbconfig.zig").resolveDbConfig;
+const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
@@ -199,9 +200,9 @@ pub fn valueRows(v: Value) ?u64 {
 pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
     const table = parts[parts.len - 1];
     switch (dialect) {
-        .postgres => return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try sql.objectLit(arena, dialect, parts)}),
-        .sqlserver => return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try sql.objectLit(arena, dialect, parts)}),
-        .mysql, .starrocks, .doris => return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try dialect.strLit(arena, table) }),
+        .postgres => return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try split.catalogObjectLit(arena, dialect, parts)}),
+        .sqlserver => return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try split.catalogObjectLit(arena, dialect, parts)}),
+        .mysql, .starrocks, .doris => return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try split.catalogNameLit(arena, dialect, table) }),
     }
 }
 
@@ -281,8 +282,12 @@ test "estimate: the catalog query per dialect, quoting each name" {
         try statsQuery(a, .postgres, &.{ "public", "o'k\"s" }),
     );
     try testing.expectEqualStrings(
-        "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID('[dbo].[a]]b]') AND p.index_id IN (0, 1)",
+        "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(N'[dbo].[a]]b]') AND p.index_id IN (0, 1)",
         try statsQuery(a, .sqlserver, &.{ "dbo", "a]b" }),
+    );
+    try testing.expectEqualStrings(
+        "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID(N'[dbo].[Ação 😀]') AND p.index_id IN (0, 1)",
+        try statsQuery(a, .sqlserver, &.{ "dbo", "Ação 😀" }),
     );
     try testing.expectEqualStrings(
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'erp' AND TABLE_NAME = 't'",
