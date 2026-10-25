@@ -142,10 +142,15 @@ pub fn evalCfgInt(env: *Env, expr: *const ast.Expr) !i64 {
     };
 }
 
+/// An integer option that must fit `T`, refused as out of range for `key` otherwise.
+pub fn evalCfgIntIn(comptime T: type, env: *Env, expr: *const ast.Expr, connector: []const u8, key: []const u8) !T {
+    return std.math.cast(T, try evalCfgInt(env, expr)) orelse planErr(env.diag, try options.rangeMsg(env.arena, connector, key));
+}
+
 pub fn evalCfgBool(env: *Env, expr: *const ast.Expr) !bool {
     return switch (expr.*) {
         .bool_lit => |b| b,
-        .str_lit => |s| std.mem.eql(u8, s, "true"),
+        .str_lit => |s| options.cfgBoolText(s) orelse planErr(env.diag, options.bool_cfg_msg),
         else => planErr(env.diag, options.bool_cfg_msg),
     };
 }

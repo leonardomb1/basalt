@@ -129,6 +129,13 @@ fn intProblem(e: *const ast.Expr) ?[]const u8 {
     };
 }
 
+/// A bool option written as text: `true` or `false` in any case, else null.
+pub fn cfgBoolText(s: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(s, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(s, "false")) return false;
+    return null;
+}
+
 fn intValue(e: *const ast.Expr) ?i64 {
     return switch (e.*) {
         .int_lit => |i| i,
@@ -145,8 +152,12 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
         return try std.fmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types });
     const conn = registry.Connector.parse(c.connector).?;
     if (conn.sqlRead() != null) {
-        for (c.config) |attr| if (!containsKey(connectionKeys(c.connector).?, attr.key))
-            return try unknownOptionMsg(arena, c, attr.key);
+        for (c.config) |attr| {
+            if (!containsKey(connectionKeys(c.connector).?, attr.key)) return try unknownOptionMsg(arena, c, attr.key);
+            if (!std.mem.eql(u8, attr.key, "port") and !std.mem.eql(u8, attr.key, "fe_port")) continue;
+            if (intProblem(attr.value)) |why| return why;
+            if (std.math.cast(u16, intValue(attr.value).?) == null) return try rangeMsg(arena, c.connector, attr.key);
+        }
         if (sqlOptionProblem(c)) |why| return why;
         return try sqlLiteralProblem(arena, c);
     }
@@ -271,7 +282,12 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
             continue;
         }
         if (std.mem.eql(u8, k, "auto_create")) {
-            if (attr.value.* != .bool_lit and attr.value.* != .str_lit) return fail(diag, "{s}", .{bool_cfg_msg});
+            const ok = switch (attr.value.*) {
+                .bool_lit => true,
+                .str_lit => |s| cfgBoolText(s) != null,
+                else => false,
+            };
+            if (!ok) return fail(diag, "{s}", .{bool_cfg_msg});
             continue;
         }
         if (!containsKey(&stream_str_keys, k)) continue;
@@ -327,4 +343,42 @@ pub fn checkBareUpsert(stages: []const ast.Stage, connections: *const std.String
 fn containsKey(keys: []const []const u8, k: []const u8) bool {
     for (keys) |x| if (std.mem.eql(u8, x, k)) return true;
     return false;
+}
+
+test "check refuses a SQL connection's out-of-range port and a stream load's non-bool auto_create" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    var host = ast.Expr{ .str_lit = "h" };
+    var db = ast.Expr{ .str_lit = "d" };
+    for ([_]ast.Expr{ .{ .int_lit = 70000 }, .{ .int_lit = -1 }, .{ .str_lit = "65536" } }) |p| {
+        var v = p;
+        const c = ast.Connection{ .name = "pg", .connector = "postgres", .pos = pos, .config = &.{
+            .{ .key = "host", .value = &host, .pos = pos },
+            .{ .key = "port", .value = &v, .pos = pos },
+        } };
+        try std.testing.expectEqualStrings("postgres connection `port` is out of range", (try connectionProblem(a, c)).?);
+    }
+    var bad = ast.Expr{ .str_lit = "x" };
+    const c = ast.Connection{ .name = "pg", .connector = "mysql", .pos = pos, .config = &.{
+        .{ .key = "host", .value = &host, .pos = pos },
+        .{ .key = "port", .value = &bad, .pos = pos },
+    } };
+    try std.testing.expectEqualStrings(int_cfg_msg, (try connectionProblem(a, c)).?);
+
+    var yes = ast.Expr{ .str_lit = "yes" };
+    var upper = ast.Expr{ .str_lit = "TRUE" };
+    var diag = Diag{};
+    const refused = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+        .{ .key = "database", .value = &db, .pos = pos },
+        .{ .key = "auto_create", .value = &yes, .pos = pos },
+    } };
+    try std.testing.expectError(error.AnalyzeFailed, checkSinkConnection(a, refused, &diag));
+    try std.testing.expectEqualStrings(bool_cfg_msg, diag.msg);
+    const taken = ast.Connection{ .name = "sr", .connector = "starrocks", .pos = pos, .config = &.{
+        .{ .key = "database", .value = &db, .pos = pos },
+        .{ .key = "auto_create", .value = &upper, .pos = pos },
+    } };
+    try checkSinkConnection(a, taken, &diag);
 }
