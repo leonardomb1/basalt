@@ -1564,3 +1564,46 @@ fn eqlValue(x: Value, y: Value) bool {
         else => false,
     };
 }
+
+/// Whether `text` names decimal storage directly: the field access not followed by
+/// more of an identifier, so a field such as `decs` does not count.
+fn readsDecimalStorage(text: []const u8) bool {
+    const needle = ".data." ++ "dec";
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, needle)) |at| {
+        const end = at + needle.len;
+        if (end == text.len or !(std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) return true;
+        from = end;
+    }
+    return false;
+}
+
+test "only column.zig and decimal.zig read decimal storage directly; the rest go through decimals()" {
+    const allowed = [_][]const u8{ "exec/column.zig", "exec/decimal.zig" };
+    const gpa = std.testing.allocator;
+    var src = try std.fs.cwd().openDir("src", .{ .iterate = true });
+    defer src.close();
+    var walker = try src.walk(gpa);
+    defer walker.deinit();
+    var offenders = std.array_list.Managed(u8).init(gpa);
+    defer offenders.deinit();
+    var seen: usize = 0;
+    while (try walker.next()) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.path, ".zig")) continue;
+        seen += 1;
+        const ok = for (allowed) |a| {
+            if (std.mem.eql(u8, e.path, a)) break true;
+        } else false;
+        if (ok) continue;
+        const text = try src.readFileAlloc(gpa, e.path, 64 << 20);
+        defer gpa.free(text);
+        if (readsDecimalStorage(text)) try offenders.writer().print(" src/{s}", .{e.path});
+    }
+    try std.testing.expect(seen > 100);
+    if (offenders.items.len > 0) {
+        std.debug.print("decimal storage read outside column.decimals():{s}\n", .{offenders.items});
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(readsDecimalStorage("c" ++ ".data." ++ "dec[i]"));
+    try std.testing.expect(!readsDecimalStorage("other" ++ ".data." ++ "decs[i]"));
+}
