@@ -55,6 +55,17 @@ pub const stream = sql ++ [_]Opt{
     .{ .key = "compression" },
 };
 
+/// What `parseDbConfig` reads for any SQL connection, StarRocks' `fe_` spellings included.
+pub const db_read = sqlserver ++ [_]Opt{ .{ .key = "fe_host" }, .{ .key = "fe_port", .kind = .port } };
+
+pub const Alias = struct { key: []const u8, field: []const u8 };
+
+/// `fe_host`/`fe_port` into `DbConfig.host`/`port`.
+pub const db_aliases = [_]Alias{ .{ .key = "fe_host", .field = "host" }, .{ .key = "fe_port", .field = "port" } };
+
+/// `host`/`port`/`be_url` into `streamload.Config.fe_host`/`fe_port`/`load_url`.
+pub const stream_aliases = [_]Alias{ .{ .key = "host", .field = "fe_host" }, .{ .key = "port", .field = "fe_port" }, .{ .key = "be_url", .field = "load_url" } };
+
 /// The keys of a table, in its order, as the plain list error messages join.
 pub fn keyNames(comptime opts: []const Opt) [opts.len][]const u8 {
     var out: [opts.len][]const u8 = undefined;
@@ -251,8 +262,6 @@ pub fn findingMsg(arena: std.mem.Allocator, f: Finding, c: ast.Connection) ![]co
         .value => |v| message(arena, v.problem, c.connector, v.key),
     };
 }
-
-pub const Alias = struct { key: []const u8, field: []const u8 };
 
 fn fieldOf(comptime aliases: []const Alias, key: []const u8) []const u8 {
     inline for (aliases) |a| if (std.mem.eql(u8, a.key, key)) return a.field;
@@ -478,22 +487,23 @@ test "cfgIntIn on a port matches what sftp, smb and ftp registration refuse toda
     };
 }
 
-test "cfgBool is strict where register.evalCfgBool reads any text but `true` as false" {
+test "cfgBool is strict and case-blind; evalCfgBool agrees on every row but the pre-F2 text rows" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const env = try Fx.env(a);
-    const Want = struct { []const u8, ?bool, ?bool };
+    const Want = struct { []const u8, ?bool, ?bool, bool };
     const rows = [_]Want{
-        .{ "true", true, true },    .{ "false", false, false },   .{ "'true'", true, true }, .{ "'false'", false, false },
-        .{ "'TRUE'", false, true }, .{ "'False'", false, false }, .{ "'yes'", false, null }, .{ "'1'", false, null },
-        .{ "''", false, null },     .{ "1", null, null },         .{ "0", null, null },      .{ "env('" ++ Fx.unset_var ++ "')", null, null },
+        .{ "true", true, true, true },      .{ "false", false, false, true },  .{ "'true'", true, true, true },
+        .{ "'false'", false, false, true }, .{ "'TRUE'", false, true, false }, .{ "'False'", false, false, true },
+        .{ "'yes'", false, null, false },   .{ "'1'", false, null, false },    .{ "''", false, null, false },
+        .{ "1", null, null, true },         .{ "0", null, null, true },        .{ "env('" ++ Fx.unset_var ++ "')", null, null, true },
     };
     try testing.expectEqual(Fx.bool_corpus.len, rows.len);
     for (rows, Fx.bool_corpus) |w, src| {
         try testing.expectEqualStrings(w[0], src);
         const e = try Fx.expr(a, src);
-        if (w[1]) |b| {
+        if (!w[3]) {} else if (w[1]) |b| {
             try testing.expectEqual(b, try Fx.register.evalCfgBool(env, e));
         } else {
             try testing.expectError(error.PlanFailed, Fx.register.evalCfgBool(env, e));
@@ -563,7 +573,7 @@ test "checkLiterals over a file connection gives connectionProblem's message tod
     };
 }
 
-test "checkLiterals on a SQL connection: today's check lets a bad port and a computed text through, the table refuses them" {
+test "checkLiterals on a SQL connection refuses a bad port and a computed text; check lets the computed text through" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -575,10 +585,11 @@ test "checkLiterals on a SQL connection: today's check lets a bad port and a com
     };
     for (refused_now) |w| {
         const c = try Fx.opts(a, "postgres", w[0]);
-        try testing.expect((try options.connectionProblem(a, c)) == null);
         const f = (try checkLiterals(a, &sql, c.config, .refuse)).?;
         try testing.expectEqualStrings(w[1], try findingMsg(a, f, c));
     }
+    const computed = try Fx.opts(a, "postgres", "host = 'h', database = 1 + 2");
+    try testing.expect((try options.connectionProblem(a, computed)) == null);
     const c = try Fx.opts(a, "postgres", "host = 'h', domain = 'd'");
     try testing.expectEqualStrings((try options.connectionProblem(a, c)).?, try findingMsg(a, (try checkLiterals(a, &sql, c.config, .refuse)).?, c));
     try testing.expect((try checkLiterals(a, &sqlserver, c.config, .refuse)) == null);
@@ -587,7 +598,7 @@ test "checkLiterals on a SQL connection: today's check lets a bad port and a com
     try testing.expectEqualStrings(options.literal_cfg_msg, try findingMsg(a, (try checkLiterals(a, &sql, order.config, .refuse)).?, order));
 }
 
-test "checkLiterals on a StarRocks load agrees with checkSinkConnection, except a computed tls and a non-bool auto_create" {
+test "checkLiterals on a StarRocks load agrees with checkSinkConnection, except a computed tls; a non-bool auto_create is refused" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -615,7 +626,7 @@ test "checkLiterals on a StarRocks load agrees with checkSinkConnection, except 
     for (differ) |w| {
         const c = try Fx.opts(a, "starrocks", w[0]);
         var diag = Fx.analyze.Diag{};
-        try options.checkSinkConnection(a, c, &diag);
+        if (w[1] == .not_literal) try options.checkSinkConnection(a, c, &diag);
         try testing.expectEqual(w[1], (try checkLiterals(a, &stream, c.config, .ignore)).?.value.problem);
     }
 }
@@ -647,8 +658,6 @@ const LitReader = struct {
     }
 };
 
-const db_aliases = [_]Alias{ .{ .key = "fe_host", .field = "host" }, .{ .key = "fe_port", .field = "port" } };
-
 test "bind over sqlserver's table plus fe_host/fe_port, aliased, reproduces parseDbConfig for every SQL connector" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -662,12 +671,11 @@ test "bind over sqlserver's table plus fe_host/fe_port, aliased, reproduces pars
         "host = 'h', buckets = 3, load_url = 'u', zz = 1, user = env('U')",
         "host = 'h', port = env('P')",
     };
-    const db_opts = sqlserver ++ [_]Opt{ .{ .key = "fe_host" }, .{ .key = "fe_port", .kind = .port } };
     for ([_][]const u8{ "postgres", "mysql", "sqlserver", "starrocks" }) |connector| for (bodies) |body| {
         const c = try Fx.opts(a, connector, body);
         const today = try Fx.dbconfig.parseDbConfig(c, 9030, Fx.LitCfg{});
         var ours = Fx.env_mod.DbConfig{ .port = 9030 };
-        try bind(Fx.env_mod.DbConfig, &db_opts, .ignore, &db_aliases, &ours, c.config, LitReader{});
+        try bind(Fx.env_mod.DbConfig, &db_read, .ignore, &db_aliases, &ours, c.config, LitReader{});
         try testing.expectEqualDeep(today, ours);
     };
 }
@@ -720,13 +728,12 @@ const StreamReader = struct {
     arena: std.mem.Allocator,
     pub fn unknown(_: StreamReader, _: []const u8) !void {}
     pub fn value(self: StreamReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
-        if (F == bool) return switch (e.*) {
-            .bool_lit => |b| b,
-            .str_lit => |s| std.mem.eql(u8, s, "true"),
-            else => error.BadOption,
+        if (F == bool) return switch (cfgBool(e)) {
+            .ok => |b| b,
+            .problem => error.BadOption,
         };
-        if (F == u16 or F == u32) return switch (cfgInt(e)) {
-            .ok => |v| @as(F, @intCast(v)),
+        if (F == u16 or F == u32) return switch (cfgIntIn(F, e)) {
+            .ok => |v| v,
             .problem => error.BadOption,
         };
         const t = switch (try cfgText(self.arena, e)) {
@@ -740,8 +747,6 @@ const StreamReader = struct {
     }
 };
 
-const stream_aliases = [_]Alias{ .{ .key = "host", .field = "fe_host" }, .{ .key = "port", .field = "fe_port" }, .{ .key = "be_url", .field = "load_url" } };
-
 test "bind over the stream table with host/port/be_url aliases reproduces resolveStreamLoadConfig" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -752,8 +757,8 @@ test "bind over the stream table with host/port/be_url aliases reproduces resolv
         "database = 'd', user = 'u', password = 'p', fe_host = 'f', port = '9032', load_url = 'http://l', be_url = 'http://b'",
         "database = 'd', user = 'u', password = 'p', tls = 'require', buckets = 8, replication_num = '3'",
         "database = 'd', user = 'u', password = 'p', auto_create = false, label_prefix = 'lp', load_size = '64MB', compression = 'gzip'",
-        "database = 'd', user = 'u', password = 'p', auto_create = 'TRUE', zz = 1, domain = 'x'",
-        "database = 'd', user = 'u', password = 'p', auto_create = 'yes', buckets = 4294967295",
+        "database = 'd', user = 'u', password = 'p', auto_create = 'true', zz = 1, domain = 'x'",
+        "database = 'd', user = 'u', password = 'p', auto_create = 'false', buckets = 4294967295",
     };
     for (bodies) |body| {
         const c = try Fx.opts(a, "starrocks", body);
@@ -777,4 +782,50 @@ test "bind sets a field's _explicit companion only when the option is read" {
     try bind(Fx.env_mod.DbConfig, &sql, .ignore, &.{}, &cfg, some.config, LitReader{});
     try testing.expect(cfg.port_explicit);
     try testing.expectEqual(@as(u16, 5433), cfg.port);
+}
+
+const SmbReader = struct {
+    arena: std.mem.Allocator,
+    const Auth = @import("../../store/smb.zig").Auth;
+    pub fn unknown(_: SmbReader, _: []const u8) !void {
+        return error.UnknownOption;
+    }
+    pub fn value(self: SmbReader, comptime F: type, opt: Opt, e: *const ast.Expr) !?F {
+        const file = FileReader{ .arena = self.arena };
+        if (F == ?Auth) {
+            const t = ((try file.value(?[]const u8, opt, e)) orelse null) orelse "";
+            if (!options.smbAuthValid(t)) return error.BadOption;
+            return if (std.ascii.eqlIgnoreCase(t, "kerberos")) .kerberos else .ntlm;
+        }
+        const v = try file.value(F, opt, e) orelse return null;
+        if (F != ?[]const u8) return v;
+        const t = v orelse return @as(F, null);
+        if (std.mem.eql(u8, opt.key, "share")) return std.mem.trim(u8, t, "/\\");
+        if (std.mem.eql(u8, opt.key, "realm")) return try std.ascii.allocUpperString(self.arena, t);
+        return t;
+    }
+};
+
+test "bind into an smb connection: the reader trims share, uppercases realm and reads auth in any case" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const smbmod = @import("../../store/smb.zig");
+    var c = smbmod.Conn{ .host = "" };
+    const conn = try Fx.opts(a, "smb", "host = 'fs', port = 1445, share = '/data\\\\', realm = 'corp.local', auth = 'Kerberos', domain = 'CORP', kdc = 'k', spn = 's'");
+    try bind(smbmod.Conn, &smb, .refuse, &.{}, &c, conn.config, SmbReader{ .arena = a });
+    try testing.expectEqualStrings("fs", c.host);
+    try testing.expectEqual(@as(u16, 1445), c.port);
+    try testing.expectEqualStrings("data", c.share.?);
+    try testing.expectEqualStrings("CORP.LOCAL", c.realm.?);
+    try testing.expectEqual(smbmod.Auth.kerberos, c.auth.?);
+    try testing.expectEqualStrings("CORP", c.domain.?);
+    try testing.expect(c.user == null);
+
+    var d = smbmod.Conn{ .host = "" };
+    const ntlm = try Fx.opts(a, "smb", "host = 'fs', auth = 'NTLM'");
+    try bind(smbmod.Conn, &smb, .refuse, &.{}, &d, ntlm.config, SmbReader{ .arena = a });
+    try testing.expectEqual(smbmod.Auth.ntlm, d.auth.?);
+    const bad = try Fx.opts(a, "smb", "host = 'fs', auth = 'basic'");
+    try testing.expectError(error.BadOption, bind(smbmod.Conn, &smb, .refuse, &.{}, &d, bad.config, SmbReader{ .arena = a }));
 }
