@@ -207,21 +207,21 @@ test "temporal tick converts millisecond columns and leaves micros alone" {
     try testing.expectEqual(@as(i64, 1_583_298_367_123), micros(.us, 1_583_298_367_123));
 }
 
-/// The page kernel's unit rule before `civil.Tick`: multiply saturating, then floor-divide.
-fn oldScaleApply(mul: i64, div: i64, x: i64) i64 {
-    const m = std.math.mul(i64, x, mul) catch
-        return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
-    return if (div == 1) m else @divFloor(m, div);
-}
-
 test "civil.Tick saturating micros equal the old TemporalScale on every unit and edge" {
+    const old = struct {
+        fn oldScaleApply(mul: i64, div: i64, x: i64) i64 {
+            const m = std.math.mul(i64, x, mul) catch
+                return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+            return if (div == 1) m else @divFloor(m, div);
+        }
+    };
     const max = std.math.maxInt(i64);
     const min = std.math.minInt(i64);
     const xs = [_]i64{ 0, 1, -1, 999, -999, 1000, -1000, 1001, -1001, 1999, -1_001, max, min, max - 1, min + 1, max / 1000, max / 1000 + 1, max / 1000 - 1, min / 1000, min / 1000 - 1, min / 1000 + 1, max / 10, 1_583_298_367_123, -1_583_298_367_123 };
     const units = [_]struct { parquet.TimeUnit, i64, i64 }{ .{ .millis, 1000, 1 }, .{ .micros, 1, 1 }, .{ .nanos, 1, 1000 } };
     for (units) |u| for (xs) |x| {
         const e = logical(.int64, .{ .timestamp = .{ .unit = u[0] } });
-        try testing.expectEqual(oldScaleApply(u[1], u[2], x), micros(temporalTick(e), x));
+        try testing.expectEqual(old.oldScaleApply(u[1], u[2], x), micros(temporalTick(e), x));
     };
 }
 

@@ -442,22 +442,6 @@ test "assembleLists: a row count past the levels read is a corrupt page, not an 
     try testing.expectError(Error.CorruptParquetPage, assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1 << 47));
 }
 
-/// The leaf encoder before `jsontext.scalar`, kept as the oracle.
-fn oldJsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
-    switch (v) {
-        .null => try buf.appendSlice("null"),
-        .int => |x| try buf.writer().print("{d}", .{x}),
-        .bool => |x| try buf.appendSlice(if (x) "true" else "false"),
-        .float => |x| if (std.math.isFinite(x)) try buf.writer().print("{d}", .{x}) else try buf.appendSlice("null"),
-        .decimal => try buf.appendSlice(eval.valueToString(arena, v) catch return error.OutOfMemory),
-        else => {
-            var aw = std.Io.Writer.Allocating.init(arena);
-            std.json.Stringify.encodeJsonString(eval.valueToString(arena, v) catch return error.OutOfMemory, .{}, &aw.writer) catch return error.OutOfMemory;
-            try buf.appendSlice(aw.written());
-        },
-    }
-}
-
 fn newJson(a: std.mem.Allocator, v: Value) ![]const u8 {
     var buf = std.array_list.Managed(u8).init(a);
     try jsonValue(&buf, v);
@@ -465,6 +449,22 @@ fn newJson(a: std.mem.Allocator, v: Value) ![]const u8 {
 }
 
 test "jsonValue on jsontext.scalar writes what the old encoder did for valid text and every other kind" {
+    const old = struct {
+        fn oldJsonValue(arena: std.mem.Allocator, buf: *std.array_list.Managed(u8), v: Value) Error!void {
+            switch (v) {
+                .null => try buf.appendSlice("null"),
+                .int => |x| try buf.writer().print("{d}", .{x}),
+                .bool => |x| try buf.appendSlice(if (x) "true" else "false"),
+                .float => |x| if (std.math.isFinite(x)) try buf.writer().print("{d}", .{x}) else try buf.appendSlice("null"),
+                .decimal => try buf.appendSlice(eval.valueToString(arena, v) catch return error.OutOfMemory),
+                else => {
+                    var aw = std.Io.Writer.Allocating.init(arena);
+                    std.json.Stringify.encodeJsonString(eval.valueToString(arena, v) catch return error.OutOfMemory, .{}, &aw.writer) catch return error.OutOfMemory;
+                    try buf.appendSlice(aw.written());
+                },
+            }
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -515,15 +515,15 @@ test "jsonValue on jsontext.scalar writes what the old encoder did for valid tex
         .{ .timestamp = 1_583_298_367_123_456 },
     };
     for (vals) |v| {
-        var old = std.array_list.Managed(u8).init(a);
-        try oldJsonValue(a, &old, v);
-        try testing.expectEqualStrings(old.items, try newJson(a, v));
+        var want = std.array_list.Managed(u8).init(a);
+        try old.oldJsonValue(a, &want, v);
+        try testing.expectEqualStrings(want.items, try newJson(a, v));
     }
     var x: f64 = 1e-8;
     while (x < 1e17) : (x *= 1.37) for ([_]f64{ x, -x, x + 0.1, @round(x) }) |f| {
-        var old = std.array_list.Managed(u8).init(a);
-        try oldJsonValue(a, &old, .{ .float = f });
-        try testing.expectEqualStrings(old.items, try newJson(a, .{ .float = f }));
+        var want = std.array_list.Managed(u8).init(a);
+        try old.oldJsonValue(a, &want, .{ .float = f });
+        try testing.expectEqualStrings(want.items, try newJson(a, .{ .float = f }));
     };
 }
 
