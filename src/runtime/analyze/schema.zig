@@ -329,13 +329,15 @@ fn fracDigits(text: []const u8) u8 {
 /// key, a DECIMAL(38) one too, plus or minus it still fits an i128.
 const off_max: i128 = 1 << 125;
 
-/// Whether `text` is decimal digits with at most one point, the form read exactly.
+/// Whether `text` is decimal digits with at most one point, `_` only between digits
+/// before it, the form read exactly.
 fn plainDecimal(text: []const u8) bool {
     var dots: usize = 0;
     var digits: usize = 0;
-    for (text) |c| switch (c) {
+    for (text, 0..) |c, i| switch (c) {
         '0'...'9' => digits += 1,
         '.' => dots += 1,
+        '_' => if (dots > 0 or i == 0 or i + 1 == text.len or !std.ascii.isDigit(text[i - 1]) or !std.ascii.isDigit(text[i + 1])) return false,
         else => return false,
     };
     return dots <= 1 and digits > 0;
@@ -1087,6 +1089,9 @@ test "opOff: an offset with an exponent, in hex or with separators rounds as bef
     try std.testing.expectEqual(off_max, opOff(.{ .text = "1e300", .unit = .second }, .range, ts, .time).int);
     try std.testing.expectEqual(@as(i128, 16), opOff(.{ .text = "0x10" }, .range, .{}, .int).int);
     try std.testing.expectEqual(@as(i128, 1000), opOff(.{ .text = "1_000" }, .range, .{}, .int).int);
+    try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993), opOff(.{ .text = "9_007_199_254_740_993" }, .range, .{}, .int).int);
+    try std.testing.expectEqual(@as(i128, 90_071_992_547_409_935), opOff(.{ .text = "9_007_199_254_740_993.5" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
+    try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993 * us_per_day), opOff(.{ .text = "9_007_199_254_740_993", .unit = .day }, .range, ts, .timestamp).int);
     try std.testing.expectEqual(@as(i128, 150), opOff(.{ .text = "1.5e1" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
     try std.testing.expectEqual(off_max, opOff(.{ .text = "0x1p200" }, .range, .{}, .int).int);
 }
