@@ -14,7 +14,6 @@ const eval = @import("../../exec/eval.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
 const unsignedBits = @import("logical.zig").unsignedBits;
-const asUnsigned = @import("logical.zig").asUnsigned;
 const types = @import("../../lang/types.zig");
 const collectLeaves = @import("schema.zig").collectLeaves;
 const fx_logical = @import("testing_util.zig").fx_logical;
@@ -40,8 +39,8 @@ pub fn groupMayMatch(
         const meta = g.columns[lf.chunk_idx].meta orelse continue;
         const elem = schema[lf.schema_idx];
 
-        const lo = statValue(elem, meta, meta.stats.min) orelse continue;
-        const hi = statValue(elem, meta, meta.stats.max) orelse continue;
+        const lo = bound(elem, meta, .min) orelse continue;
+        const hi = bound(elem, meta, .max) orelse continue;
 
         const excluded = switch (b.op) {
             .lt => (cmp(lo, b.value) orelse .lt) != .lt,
@@ -83,8 +82,8 @@ pub fn groupMayHoldKeys(
         if (lf.chunk_idx >= g.columns.len) continue;
         const meta = g.columns[lf.chunk_idx].meta orelse continue;
         const elem = schema[lf.schema_idx];
-        const lo = statValue(elem, meta, meta.stats.min) orelse continue;
-        const hi = statValue(elem, meta, meta.stats.max) orelse continue;
+        const lo = bound(elem, meta, .min) orelse continue;
+        const hi = bound(elem, meta, .max) orelse continue;
         if (k.values.len > 0) {
             for (k.values) |v| {
                 if (!sameKind(lo, v) or !sameKind(hi, v)) break;
@@ -103,11 +102,10 @@ pub fn groupMayHoldKeys(
     return true;
 }
 
-/// Whether a key value and a statistic order alike: both numbers, or both of one
-/// kind; a NaN orders with nothing.
+/// Whether a key value and a bound order alike: both numbers, or both of one
+/// kind; a NaN key orders with nothing.
 fn sameKind(stat: Value, v: Value) bool {
     if (v == .float and std.math.isNan(v.float)) return false;
-    if (stat == .float and std.math.isNan(stat.float)) return false;
     if (isNumV(stat) and isNumV(v)) return true;
     return switch (v) {
         .string, .bytes, .date, .timestamp, .time => std.meta.activeTag(stat) == std.meta.activeTag(v),
@@ -131,32 +129,38 @@ pub fn groupBeatsThreshold(
     if (t.nulls_first and elem.repetition != .required and (meta.stats.null_count orelse 1) > 0) return true;
 
     if (t.desc) {
-        const hi = statValue(elem, meta, meta.stats.max) orelse return true;
+        const hi = bound(elem, meta, .max) orelse return true;
         return cmp(hi, t.value) == .gt;
     }
-    const lo = statValue(elem, meta, meta.stats.min) orelse return true;
+    const lo = bound(elem, meta, .min) orelse return true;
     return cmp(lo, t.value) == .lt;
 }
 
 pub const MinMax = struct { min: Value, max: Value };
 
 /// Folded from row-group statistics; null as soon as one group lacks them or the
-/// type cannot be ordered (it once returned row group 0's value instead).
+/// type cannot be ordered (it once returned row group 0's value instead), and for
+/// a float column, whose maximum may hide a NaN (`statBound`).
 pub fn fileMinMax(rdr: *const Reader, name: []const u8) ?MinMax {
-    if (rdr.md.row_groups.len == 0) return null;
-    const lf = findLeaf(rdr.leaves, name) orelse return null;
-    const elem = rdr.md.schema[lf.schema_idx];
+    return minMaxOf(rdr.md.schema, rdr.leaves, rdr.md.row_groups, name);
+}
+
+fn minMaxOf(schema: []const parquet.SchemaElement, leaves: []const Leaf, groups: []const parquet.RowGroup, name: []const u8) ?MinMax {
+    if (groups.len == 0) return null;
+    const lf = findLeaf(leaves, name) orelse return null;
+    const elem = schema[lf.schema_idx];
     var lo: ?Value = null;
     var hi: ?Value = null;
-    for (rdr.md.row_groups) |g| {
+    for (groups) |g| {
         if (lf.chunk_idx >= g.columns.len) return null;
         const meta = g.columns[lf.chunk_idx].meta orelse return null;
         switch (meta.ty) {
             .byte_array, .fixed_len_byte_array => return null,
             else => {},
         }
-        const mn = statValue(elem, meta, meta.stats.min) orelse return null;
-        const mx = statValue(elem, meta, meta.stats.max) orelse return null;
+        const mn = bound(elem, meta, .min) orelse return null;
+        const mx = bound(elem, meta, .max) orelse return null;
+        if (mx == .float) return null;
         if (lo == null) lo = mn else lo = if ((cmp(mn, lo.?) orelse return null) == .lt) mn else lo;
         if (hi == null) hi = mx else hi = if ((cmp(mx, hi.?) orelse return null) == .gt) mx else hi;
     }
@@ -198,9 +202,29 @@ fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]
     if (v == .string or v == .bytes) return null;
     if (v == .int) if (unsignedBits(elem)) |bits| {
         if (meta.stats.legacy) return null;
-        return .{ .int = asUnsigned(bits, v.int) orelse return null };
+        return .{ .int = types.unsignedOf(bits, v.int) orelse return null };
     };
     return v;
+}
+
+pub const Side = enum { min, max };
+
+/// A min or max statistic as a bound under the engine's float order, where NaN
+/// sorts above +inf: a NaN statistic bounds nothing (null), and since Parquet
+/// leaves NaN out of min and max, a float maximum is no upper bound, so its bound
+/// is NaN, the top of the order. Any other statistic is its own bound.
+pub fn statBound(v: Value, side: Side) ?Value {
+    if (v != .float) return v;
+    if (std.math.isNan(v.float)) return null;
+    return if (side == .max) .{ .float = std.math.nan(f64) } else v;
+}
+
+fn bound(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, side: Side) ?Value {
+    const raw = switch (side) {
+        .min => meta.stats.min,
+        .max => meta.stats.max,
+    };
+    return statBound(statValue(elem, meta, raw) orelse return null, side);
 }
 
 /// Null means unknown and the caller must keep the group. It once returned `.eq`
@@ -486,4 +510,62 @@ test "a nested column is typed string and no bound prunes on it" {
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &rb));
     const b = [_]Bound{.{ .column = "xs", .op = .gt, .value = .{ .int = 100 } }};
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &b));
+}
+
+test "a float group's max hides NaN, which sorts above it: >, >=, DESC top-N and the file max keep it" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "x", .ty = .double, .repetition = .optional },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "x", .max_def = 1, .max_rep = 0 }};
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &lo, @bitCast(@as(f64, 1)), .little);
+    std.mem.writeInt(u64, &hi, @bitCast(@as(f64, 3)), .little);
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .double, .stats = .{ .min = &lo, .max = &hi, .null_count = 0 } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 3 };
+    const b = struct {
+        fn f(op: Bound.Op, x: f64) [1]Bound {
+            return .{.{ .column = "x", .op = op, .value = .{ .float = x } }};
+        }
+    }.f;
+
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &b(.gt, 5)));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &b(.ge, 5)));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &b(.eq, std.math.nan(f64))));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &b(.lt, 1)));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &b(.eq, 0.5)));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "x", .desc = true, .full = true, .value = .{ .float = 5 } }));
+    try testing.expect(!groupBeatsThreshold(&schema, &leaves, g, .{ .column = "x", .desc = false, .full = true, .value = .{ .float = 1 } }));
+    try testing.expect(minMaxOf(&schema, &leaves, &.{g}, "x") == null);
+
+    try testing.expect(!groupMayHoldKeys(&schema, &leaves, g, &.{.{ .column = "x", .values = &.{.{ .float = 0.5 }} }}));
+    try testing.expect(groupMayHoldKeys(&schema, &leaves, g, &.{.{ .column = "x", .values = &.{.{ .float = 9 }} }}));
+    try testing.expect(!groupMayHoldKeys(&schema, &leaves, g, &.{.{ .column = "x", .min = .{ .float = -5 }, .max = .{ .float = 0 } }}));
+    try testing.expect(groupMayHoldKeys(&schema, &leaves, g, &.{.{ .column = "x", .min = .{ .float = 7 }, .max = .{ .float = 9 } }}));
+}
+
+test "a NaN statistic bounds nothing" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "x", .ty = .double, .repetition = .optional },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "x", .max_def = 1, .max_rep = 0 }};
+    var nan: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &nan, @bitCast(std.math.nan(f64)), .little);
+    std.mem.writeInt(u64, &hi, @bitCast(@as(f64, 3)), .little);
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .double, .stats = .{ .min = &nan, .max = &hi } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 3 };
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &.{.{ .column = "x", .op = .lt, .value = .{ .float = 0 } }}));
+    try testing.expect(groupBeatsThreshold(&schema, &leaves, g, .{ .column = "x", .desc = false, .full = true, .value = .{ .float = 0 } }));
+}
+
+test "statBound: a NaN is no bound, a float max is NaN, anything else is itself" {
+    try testing.expect(statBound(.{ .float = std.math.nan(f64) }, .min) == null);
+    try testing.expect(statBound(.{ .float = std.math.nan(f64) }, .max) == null);
+    try testing.expectEqual(@as(f64, 2), statBound(.{ .float = 2 }, .min).?.float);
+    try testing.expect(std.math.isNan(statBound(.{ .float = 2 }, .max).?.float));
+    try testing.expectEqual(@as(i64, 7), statBound(.{ .int = 7 }, .max).?.int);
+    try testing.expectEqual(@as(i64, 7), statBound(.{ .timestamp = 7 }, .max).?.timestamp);
 }
