@@ -82,6 +82,8 @@ const analyze = @import("../runtime/analyze.zig");
 const types = @import("../lang/types.zig");
 const parser = @import("../lang/sql_parser.zig");
 const obs = @import("../runtime/obs.zig");
+const jsontext = @import("../exec/jsontext.zig");
+const utf16 = @import("../format/utf16.zig");
 
 const Request = struct {
     op: []const u8,
@@ -160,7 +162,7 @@ const Out = struct {
         var hbuf: [512]u8 = undefined;
         var w = std.Io.Writer.fixed(&hbuf);
         w.writeAll("{\"type\":\"data\",\"id\":") catch return;
-        std.json.Stringify.encodeJsonString(clip(id), .{}, &w) catch return;
+        jsontext.string(&w, clip(id)) catch return;
         w.print(",\"len\":{d}}}\n", .{bytes.len}) catch return;
         self.mu.lock();
         defer self.mu.unlock();
@@ -176,7 +178,7 @@ const Out = struct {
 };
 
 fn clip(id: []const u8) []const u8 {
-    return id[0..@min(id.len, 256)];
+    return jsontext.clipUtf8(id, 256);
 }
 
 fn onInterrupt(_: i32) callconv(.c) void {
@@ -284,9 +286,9 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
         locate(&e, st.text, st.entry_at, is.file orelse "", is.pos, is.end);
         if (k > 0) try w.writeByte(',');
         try w.writeAll("{\"level\":\"error\",\"msg\":");
-        try std.json.Stringify.encodeJsonString(e.msg, .{}, w);
+        try jsontext.string(w, e.msg);
         try w.writeAll(",\"file\":");
-        try std.json.Stringify.encodeJsonString(e.file orelse "script", .{}, w);
+        try jsontext.string(w, e.file orelse "script");
         if (e.line) |ln| try w.print(",\"line\":{d},\"col\":{d}", .{ ln, e.col.? });
         if (e.end_line) |ln| try w.print(",\"end_line\":{d},\"end_col\":{d}", .{ ln, e.end_col.? });
         try w.writeAll(",\"class\":\"permanent\"}");
@@ -341,7 +343,7 @@ fn knownTables(a: std.mem.Allocator, v: ?std.json.Value) error{ OutOfMemory, Bad
 
 fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, catalog: *cli.Catalog, req: Request) !void {
     const script = req.script orelse "";
-    const at = if (req.pos) |p| (if (req.utf16) cli.utf16ToByte(script, p) else p) else script.len;
+    const at = if (req.pos) |p| (if (req.utf16) utf16.unitToByte(script, p) else p) else script.len;
     if (at > script.len)
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`pos` is past the end of `script`" } });
     var scope = cli.DeclStore.init(gpa);
@@ -427,16 +429,16 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     var aw = std.Io.Writer.Allocating.init(a);
     const w = &aw.writer;
     try w.writeAll("{\"type\":\"status\",\"id\":");
-    if (id) |s| try std.json.Stringify.encodeJsonString(clip(s), .{}, w) else try w.writeAll("null");
+    if (id) |s| try jsontext.string(w, clip(s)) else try w.writeAll("null");
     try w.print(",\"ok\":{},\"cancelled\":{},\"truncated\":{}", .{ st.ok, st.cancelled, anyTruncated(st.results) });
     if (st.elapsed_ms) |ms| try w.print(",\"elapsed_ms\":{d}", .{ms});
     if (st.declared) |d| {
         try w.writeAll(",\"declared\":");
-        try std.json.Stringify.value(d, .{}, w);
+        try writeObjects(w, d);
     }
     if (st.results) |r| {
         try w.writeAll(",\"results\":");
-        try std.json.Stringify.value(r, .{}, w);
+        try writeObjects(w, r);
     }
     if (st.loads) |l| {
         try w.writeAll(",\"loads\":[");
@@ -458,7 +460,7 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");
-        try std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, w);
+        try writeObject(w, e);
     }
     try w.writeAll("}\n");
     out.line(aw.written());
@@ -526,17 +528,49 @@ fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
 
 const Loads = struct { list: []const runtime.LoadDone, summary: obs.Summary };
 
+/// A flat struct as the object std.json.Stringify writes for it, null fields left
+/// out, with its strings through `jsontext` so text that is not UTF-8 stays JSON.
+fn writeObject(w: *std.Io.Writer, v: anytype) !void {
+    var first = true;
+    try w.writeByte('{');
+    inline for (std.meta.fields(@TypeOf(v))) |f| {
+        const opt = @typeInfo(f.type) == .optional;
+        const x = @field(v, f.name);
+        if (!opt or x != null) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try jsontext.key(w, f.name);
+            const y = if (opt) x.? else x;
+            switch (@TypeOf(y)) {
+                []const u8 => try jsontext.string(w, y),
+                bool => try w.writeAll(if (y) "true" else "false"),
+                else => try w.print("{d}", .{y}),
+            }
+        }
+    }
+    try w.writeByte('}');
+}
+
+fn writeObjects(w: *std.Io.Writer, items: anytype) !void {
+    try w.writeByte('[');
+    for (items, 0..) |it, k| {
+        if (k > 0) try w.writeByte(',');
+        try writeObject(w, it);
+    }
+    try w.writeByte(']');
+}
+
 /// One load's fields without braces, shared by the `load` frame and the status.
 /// Fields without a value are left out: `reason`/`transient` on success, the
 /// loop's outside one.
 fn writeLoadFields(w: *std.Io.Writer, l: runtime.LoadDone) !void {
     try w.print("\"load\":{d},\"target\":", .{l.ordinal});
-    try std.json.Stringify.encodeJsonString(l.target, .{}, w);
+    try jsontext.string(w, l.target);
     try w.print(",\"line\":{d},\"col\":{d}", .{ l.line, l.col });
     try w.print(",\"rows_read\":{d},\"rows_written\":{d},\"elapsed_ms\":{d},\"lanes\":{d},\"ok\":{}", .{ l.rows_read, l.rows_written, l.elapsed_ms, l.lanes, l.ok });
     if (!l.ok) {
         try w.writeAll(",\"reason\":");
-        try std.json.Stringify.encodeJsonString(l.reason, .{}, w);
+        try jsontext.string(w, l.reason);
         try w.print(",\"transient\":{}", .{l.transient});
     }
     if (l.loop_rows > 0) try w.print(",\"loop_row\":{d},\"loop_rows\":{d}", .{ l.loop_row, l.loop_rows });
@@ -613,7 +647,7 @@ const Capture = struct {
         var hbuf: [640]u8 = undefined;
         var w = std.Io.Writer.fixed(&hbuf);
         w.writeAll("{\"type\":\"result\",\"id\":") catch return;
-        std.json.Stringify.encodeJsonString(clip(self.id), .{}, &w) catch return;
+        jsontext.string(&w, clip(self.id)) catch return;
         w.print(",\"statement\":{d},\"kind\":\"{s}\",\"line\":{d},\"col\":{d},\"rows\":{d},\"elapsed_ms\":{d},\"truncated\":{}}}\n", .{ r.statement, r.kind, r.line, r.col, r.rows, r.elapsed_ms, r.truncated }) catch return;
         self.out.line(w.buffered());
     }
@@ -634,7 +668,7 @@ const Capture = struct {
         var aw = std.Io.Writer.Allocating.init(a);
         const w = &aw.writer;
         w.writeAll("{\"type\":\"load\",\"id\":") catch return;
-        std.json.Stringify.encodeJsonString(clip(self.id), .{}, w) catch return;
+        jsontext.string(w, clip(self.id)) catch return;
         w.writeByte(',') catch return;
         writeLoadFields(w, l) catch return;
         w.writeAll("}\n") catch return;
@@ -646,9 +680,9 @@ const Capture = struct {
         var hbuf: [768]u8 = undefined;
         var w = std.Io.Writer.fixed(&hbuf);
         w.writeAll("{\"type\":\"progress\",\"id\":") catch return;
-        std.json.Stringify.encodeJsonString(clip(self.id), .{}, &w) catch return;
+        jsontext.string(&w, clip(self.id)) catch return;
         w.writeAll(",\"target\":") catch return;
-        std.json.Stringify.encodeJsonString(ev.target, .{}, &w) catch return;
+        jsontext.string(&w, ev.target) catch return;
         w.print(",\"rows\":{d},\"rows_per_sec\":{d},\"elapsed_ms\":{d}", .{ ev.rows, ev.rows_per_sec, ev.elapsed_ms }) catch return;
         if (ev.loop_total > 0) w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ ev.loop_done, ev.loop_total }) catch return;
         w.writeAll("}\n") catch return;
@@ -841,4 +875,56 @@ test "isCancel: only a cancel op is one, with or without an id" {
     const named = isCancel(a, "{\"op\":\"cancel\",\"id\":\"c7\"}").?.?;
     defer a.free(named);
     try std.testing.expectEqualStrings("c7", named);
+}
+
+test "clip: an echoed id cut at 256 bytes never splits a codepoint, so the frame stays JSON" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const id = "a" ** 255 ++ "ç" ++ "tail";
+    var aw = std.Io.Writer.Allocating.init(a);
+    try jsontext.string(&aw.writer, clip(id));
+    const back = try std.json.parseFromSliceLeaky([]const u8, a, aw.written(), .{});
+    try std.testing.expectEqualStrings("a" ** 255, back);
+    try std.testing.expectEqualStrings("a" ** 200, clip("a" ** 200));
+    try std.testing.expectEqualStrings("a" ** 256, clip("a" ** 300));
+}
+
+test "writeObject: the status frame's objects match std.json's spelling on UTF-8" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const errs = [_]ErrorInfo{
+        .{ .msg = "" },
+        .{ .msg = "bad \"x\"\n\x01 é😀", .file = "a/b.sql", .line = 3, .col = 7, .end_line = 3, .end_col = 9, .transient = true },
+        .{ .msg = "m", .line = 1, .col = 2 },
+        .{ .msg = "m", .file = "", .end_col = 0 },
+    };
+    for (errs) |e| {
+        var old = std.Io.Writer.Allocating.init(a);
+        try std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, &old.writer);
+        var new = std.Io.Writer.Allocating.init(a);
+        try writeObject(&new.writer, e);
+        try std.testing.expectEqualStrings(old.written(), new.written());
+    }
+    const decl = [_]Declared{ .{ .kind = "connection", .name = "pg" }, .{ .kind = "let", .name = "a\"b" } };
+    const res = [_]ResultFrame{.{ .statement = 1, .kind = "select", .line = 2, .col = 1, .rows = 1 << 40, .elapsed_ms = 0, .truncated = true }};
+    inline for (.{ @as([]const Declared, &decl), @as([]const Declared, &.{}), @as([]const ResultFrame, &res) }) |items| {
+        var old = std.Io.Writer.Allocating.init(a);
+        try std.json.Stringify.value(items, .{}, &old.writer);
+        var new = std.Io.Writer.Allocating.init(a);
+        try writeObjects(&new.writer, items);
+        try std.testing.expectEqualStrings(old.written(), new.written());
+    }
+}
+
+test "writeObject: a run error whose message is not UTF-8 still makes a JSON status" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw = std.Io.Writer.Allocating.init(a);
+    try writeObject(&aw.writer, ErrorInfo{ .msg = "cannot cast 'caf\xe9'", .file = "x\xff.sql", .line = 1, .col = 1 });
+    const got = try std.json.parseFromSliceLeaky(ErrorInfo, a, aw.written(), .{});
+    try std.testing.expectEqualStrings("cannot cast 'caf\u{FFFD}'", got.msg);
+    try std.testing.expectEqualStrings("x\u{FFFD}.sql", got.file.?);
 }

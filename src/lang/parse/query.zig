@@ -32,6 +32,7 @@ const sidesOf = @import("rewrite.zig").sidesOf;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const decimal = @import("../../exec/decimal.zig");
+const textconv = @import("../../exec/textconv.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
 
@@ -664,19 +665,18 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
     const e = try self.parseExpr();
     const neg = e.* == .unary and e.unary.op == .neg;
     const base = if (neg) e.unary.e else e;
-    if (base.* == .float_lit or base.* == .dec_lit) {
-        var r: f64 = undefined;
-        var shown: f64 = undefined;
-        if (base.* == .float_lit) {
-            const f = base.float_lit;
-            r = if (@abs(f - @trunc(f)) == 0.5) 2 * @round(f / 2) else @round(f);
-            shown = f;
-        } else {
-            const d = base.dec_lit;
-            const q = decimal.roundWhole(.{ .unscaled = d.unscaled, .scale = d.scale }) orelse return self.fail(vpos, "{s} is out of range", .{what});
-            r = @floatFromInt(q);
-            shown = @as(f64, @floatFromInt(d.unscaled)) / @as(f64, @floatFromInt(decimal.pow10_i128[d.scale]));
-        }
+    if (base.* == .float_lit) {
+        const f = if (neg) -base.float_lit else base.float_lit;
+        const r = textconv.floatToInt(f, .half_even);
+        if (if (r) |x| x < 0 else f < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, f });
+        n.* = @intCast(r orelse return self.fail(vpos, "{s} {d} is out of range", .{ what, f }));
+        return;
+    }
+    if (base.* == .dec_lit) {
+        const d = base.dec_lit;
+        const q = decimal.roundWhole(.{ .unscaled = d.unscaled, .scale = d.scale }) orelse return self.fail(vpos, "{s} is out of range", .{what});
+        var r: f64 = @floatFromInt(q);
+        var shown = @as(f64, @floatFromInt(d.unscaled)) / @as(f64, @floatFromInt(decimal.pow10_i128[d.scale]));
         if (neg) {
             r = -r;
             shown = -shown;

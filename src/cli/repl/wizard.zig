@@ -4,6 +4,7 @@ const Session = @import("repl.zig").Session;
 const connTables = @import("catalog.zig").connTables;
 const form = @import("form.zig");
 const hilite = @import("hilite.zig");
+const quote = @import("../../lang/quote.zig");
 const runBlock = @import("repl.zig").runBlock;
 const saveDecls = @import("repl.zig").saveDecls;
 const std = @import("std");
@@ -238,10 +239,9 @@ pub fn connectWizard(alloc: std.mem.Allocator, type_arg: []const u8, sess: *Sess
         } else if (cf.int) {
             for (out) |o| try o.writer().print("{s}{s} = {s}", .{ sep, cf.key, v });
         } else {
-            for (out) |o| try o.writer().print("{s}{s} = '", .{ sep, cf.key });
-            for (v) |ch| try stmt.appendSlice(if (ch == '\'') "''" else &.{ch});
-            if (cf.secret) try shown.appendSlice("********") else for (v) |ch| try shown.appendSlice(if (ch == '\'') "''" else &.{ch});
-            for (out) |o| try o.append('\'');
+            for (out) |o| try o.writer().print("{s}{s} = ", .{ sep, cf.key });
+            try quote.strLit(&stmt, v);
+            if (cf.secret) try shown.appendSlice("'********'") else try quote.strLit(&shown, v);
         }
     }
     for (out) |o| try o.appendSlice(");");

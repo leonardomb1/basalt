@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const quote = @import("quote.zig");
 
 const W = *std.Io.Writer;
 const Error = std.Io.Writer.Error;
@@ -17,7 +18,7 @@ pub fn expr(w: W, e: *const ast.Expr) Error!void {
         .int_lit => |v| try w.print("{d}", .{v}),
         .float_lit => |v| try w.print("{d}", .{v}),
         .dec_lit => |v| try w.print("{f}", .{v}),
-        .str_lit => |s| try quoted(w, s, '\''),
+        .str_lit => |s| try quote.strLit(w, s),
         .field => |q| try name(w, q),
         .lambda_var => |n| try w.writeAll(n),
         .unary => |u| {
@@ -107,7 +108,7 @@ pub fn expr(w: W, e: *const ast.Expr) Error!void {
 pub fn name(w: W, q: ast.QualName) Error!void {
     for (q.parts, 0..) |p, i| {
         if (i > 0) try w.writeByte('.');
-        if (bareIdent(p)) try w.writeAll(p) else try quoted(w, p, '"');
+        if (bareIdent(p)) try w.writeAll(p) else try quote.ident(w, p);
     }
 }
 
@@ -126,15 +127,6 @@ fn list(w: W, es: []const *ast.Expr) Error!void {
         if (i > 0) try w.writeAll(", ");
         try expr(w, a);
     }
-}
-
-fn quoted(w: W, s: []const u8, q: u8) Error!void {
-    try w.writeByte(q);
-    for (s) |c| {
-        if (c == q) try w.writeByte(q);
-        try w.writeByte(c);
-    }
-    try w.writeByte(q);
 }
 
 fn upper(w: W, s: []const u8) Error!void {

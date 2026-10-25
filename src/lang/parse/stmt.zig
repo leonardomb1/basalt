@@ -10,7 +10,7 @@ const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
-const quoteInto = @import("rewrite.zig").quoteInto;
+const quote = @import("../quote.zig");
 const std = @import("std");
 
 /// A script that opens with EXPLAIN explains the whole script offline, without
@@ -355,7 +355,7 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
         .int_lit => |v| try buf.writer().print("{d}", .{v}),
         .float_lit => |v| try buf.writer().print("{e}", .{v}),
         .dec_lit => |v| try buf.writer().print("{f}", .{v}),
-        .str_lit => |s| try quoteInto(buf, s, '\''),
+        .str_lit => |s| try quote.strLit(buf, s),
         .field => |q| for (q.parts, 0..) |p, i| {
             if (i > 0) try buf.append('.');
             try buf.appendSlice(p);

@@ -8,6 +8,7 @@ const ExprAlias = Parser.ExprAlias;
 const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
+const quote = @import("../quote.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const outName = @import("../sql_parser.zig").outName;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
@@ -65,13 +66,13 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
             for (q.parts, 0..) |part, i| {
                 if (i != 0) try buf.append('.');
                 if (i < q.safe.len and q.safe[i]) try buf.append('?');
-                if (plainName(part)) try buf.appendSlice(part) else try quoteInto(buf, part, '"');
+                if (plainName(part)) try buf.appendSlice(part) else try quote.ident(buf, part);
             }
         },
         .int_lit => |v| try buf.print("{d}", .{v}),
         .float_lit => |v| try buf.print("{e}", .{v}),
         .dec_lit => |v| try buf.print("{f}", .{v}),
-        .str_lit => |v| try quoteInto(buf, v, '\''),
+        .str_lit => |v| try quote.strLit(buf, v),
         .bool_lit => |v| try buf.appendSlice(if (v) "true" else "false"),
         .null_lit => try buf.appendSlice("null"),
         .call => |c| {
@@ -166,16 +167,6 @@ fn plainName(s: []const u8) bool {
     if (s.len == 0 or std.ascii.isDigit(s[0])) return false;
     for (s) |c| if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '_')) return false;
     return true;
-}
-
-/// `s` between `q` quotes, an inner `q` doubled.
-pub fn quoteInto(buf: *std.array_list.Managed(u8), s: []const u8, q: u8) Error!void {
-    try buf.append(q);
-    for (s) |c| {
-        if (c == q) try buf.append(q);
-        try buf.append(c);
-    }
-    try buf.append(q);
 }
 
 pub const Bound = struct { name: []const u8, item: bool };

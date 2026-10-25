@@ -39,6 +39,7 @@ const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
+const civil = @import("../../exec/civil.zig");
 const std = @import("std");
 
 pub const OrderExpr = struct { e: *ast.Expr, desc: bool, nulls_first: bool };
@@ -317,15 +318,15 @@ pub fn parseFrame(self: *Parser) Error!ast.WinFrame {
     return .{ .unit = unit, .start = start, .end = end };
 }
 
+/// A frame's INTERVAL unit: a fixed-length `civil.Part`, singular or plural.
 fn intervalUnit(word: []const u8) ?ast.IntervalUnit {
-    const units = [_]struct { []const u8, ast.IntervalUnit }{
-        .{ "day", .day },       .{ "days", .day },
-        .{ "hour", .hour },     .{ "hours", .hour },
-        .{ "minute", .minute }, .{ "minutes", .minute },
-        .{ "second", .second }, .{ "seconds", .second },
+    return switch (civil.Part.parse(word, .singular_or_plural) orelse return null) {
+        .day => .day,
+        .hour => .hour,
+        .minute => .minute,
+        .second => .second,
+        .year, .month, .week => null,
     };
-    for (units) |u| if (std.ascii.eqlIgnoreCase(u[0], word)) return u[1];
-    return null;
 }
 
 fn validNumber(text: []const u8) bool {
@@ -654,3 +655,25 @@ pub const Lower = struct {
         return out;
     }
 };
+
+test "window: intervalUnit on civil.Part reads the same words as the table it replaced" {
+    const old = struct {
+        fn unit(word: []const u8) ?ast.IntervalUnit {
+            const units = [_]struct { []const u8, ast.IntervalUnit }{
+                .{ "day", .day },       .{ "days", .day },
+                .{ "hour", .hour },     .{ "hours", .hour },
+                .{ "minute", .minute }, .{ "minutes", .minute },
+                .{ "second", .second }, .{ "seconds", .second },
+            };
+            for (units) |u| if (std.ascii.eqlIgnoreCase(u[0], word)) return u[1];
+            return null;
+        }
+    };
+    const corpus = [_][]const u8{
+        "day",         "DAY",          "Days",  "dayss", "hour",    "HOURS", "minute",   "Minutes", "second", "SECONDS",
+        "week",        "weeks",        "WEEK",  "month", "months",  "year",  "years",    "",        "s",      "d",
+        "day ",        " day",         "secs",  "sec",   "min",     "hr",    "daysdays", "hourss",  "MiNuTe", "seconds_",
+        "millisecond", "microseconds", "ÿday", "dAyS",  "x" ** 20,
+    };
+    for (corpus) |w| try std.testing.expectEqual(old.unit(w), intervalUnit(w));
+}

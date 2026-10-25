@@ -13,6 +13,7 @@ const runtime = @import("../runtime/run.zig");
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
 const parser = @import("../lang/sql_parser.zig");
+const quote = @import("../lang/quote.zig");
 
 pub const Pending = struct { id: DeclId, text: []const u8 };
 
@@ -133,12 +134,7 @@ pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
         .decimal => |d| try std.fmt.allocPrint(arena, "CAST('{s}' AS DECIMAL(38, {d}))", .{ try eval.valueToString(arena, v), d.scale }),
         .string => |s| blk: {
             var out = std.array_list.Managed(u8).init(arena);
-            try out.append('\'');
-            for (s) |c| {
-                if (c == '\'') try out.append('\'');
-                try out.append(c);
-            }
-            try out.append('\'');
+            try quote.strLit(&out, s);
             break :blk out.items;
         },
         .date => try std.fmt.allocPrint(arena, "CAST('{s}' AS DATE)", .{try eval.valueToString(arena, v)}),
