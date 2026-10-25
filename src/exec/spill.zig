@@ -151,7 +151,7 @@ pub const Writer = struct {
             try self.putPadded(c.validity.bits[0 .. (rows + 7) / 8]);
             switch (c.data) {
                 .bytes => |by| try self.putBytes(by, rows),
-                inline else => |s| try self.putPadded(std.mem.sliceAsBytes(s[0..rows])),
+                inline else => |_, t| try self.putPadded(std.mem.sliceAsBytes(column.fixedOf(t, c.data)[0..rows])),
             }
         }
         self.rows += rows;

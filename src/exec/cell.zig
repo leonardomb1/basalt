@@ -66,7 +66,7 @@ pub fn converter(kind: types.TypeKind, comptime rules: Rules) Converter {
                 switch (comptime as) {
                     .int => try b.appendInt(v),
                     .float => try b.appendFloat(v),
-                    .decimal => try b.appendAs(.dec, v),
+                    .decimal => try b.appendDecimal(v),
                     .bool => try b.appendAs(.b, v),
                     .date => if (v) |x| try b.appendAs(.i32, x) else try b.appendNull(),
                     .timestamp => if (v) |x| try b.appendInt(x) else try b.appendNull(),

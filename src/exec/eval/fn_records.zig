@@ -866,7 +866,7 @@ fn testBatch(a: std.mem.Allocator) !Batch {
     const days = try a.dupe(i32, &.{ 20162, 0, 19000, 10957 });
     const cols = try a.dupe(column.Column, &.{
         .{ .ty = types.Type.init(.bytes).asNullable(), .len = 4, .validity = valid, .data = .{ .bytes = try app.finish() } },
-        .{ .ty = types.Type.decimal(10, 2).asNullable(), .len = 4, .validity = dvalid, .data = .{ .dec = decs } },
+        .{ .ty = types.Type.decimal(10, 2).asNullable(), .len = 4, .validity = dvalid, .data = column.decimalData(decs) },
         .{ .ty = types.Type.init(.date), .len = 4, .validity = try Bitmap.initFull(a, 4), .data = .{ .i32 = days } },
     });
     const schema = try a.create(types.Schema);

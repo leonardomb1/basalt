@@ -1104,7 +1104,7 @@ fn widened(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) E
         },
         .float => if (f.bit_width == 32) .{ .f64 = try widen(f32, f64, arena, cur, off, n, ToFloat{}) } else null,
         .bool_ => .{ .b = try unpackBools(arena, cur, off, n) },
-        .decimal => .{ .dec = try widen(i128, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = f.scale }) },
+        .decimal => column.decimalData(try widen(i128, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = f.scale })),
         .date_ms => .{ .i32 = try widen(i64, i32, arena, cur, off, n, DayOfMs{}) },
         .timestamp, .duration, .time => switch (f.unit) {
             inline else => |u| .{ .i64 = if (f.kind == .time and f.bit_width == 32)

@@ -590,6 +590,14 @@ pub fn fixedBigEndian(b: []u8, x: i128) bool {
     return true;
 }
 
+/// `d` restated at `scale` as 16 bytes of little-endian two's complement, as Arrow
+/// stores a decimal128; false when it overflows doing so.
+pub fn littleEndian128(out: *[16]u8, d: Decimal, scale: u8) bool {
+    const r = rescaleTo(d, scale) orelse return false;
+    std.mem.writeInt(i128, out, r.unscaled, .little);
+    return true;
+}
+
 pub const Minimal = struct { bytes: [16]u8, start: usize };
 
 /// `x` in the fewest big-endian two's complement bytes that hold it: `bytes[start..]`.

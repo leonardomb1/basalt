@@ -382,7 +382,7 @@ pub const Machine = struct {
         const b = &m.out[op.col];
         const t = comptime Code.storageOf(c);
         if (t == null) return b.appendNull();
-        if (t.? == .bytes) try b.appendStr(v) else b.appendAsAssumeCapacity(t.?, v);
+        if (t.? == .bytes) try b.appendStr(v) else if (t.? == .dec) b.appendDecimalAssumeCapacity(v) else b.appendAsAssumeCapacity(t.?, v);
     }
 
     fn Read(comptime c: Code) type {

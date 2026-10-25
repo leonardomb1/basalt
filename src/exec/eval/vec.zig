@@ -761,7 +761,7 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column)
         bm: *Bitmap,
         pub fn fixed(o: @This(), comptime tag: column.Tag) ![]column.Elem(tag) {
             const out = try o.arena.alloc(column.Elem(tag), o.take.len);
-            mergePick(column.Elem(tag), out, o.bm, o.take, @field(o.t.data, @tagName(tag)), @field(o.e.data, @tagName(tag)), o.t.validity, o.e.validity);
+            mergePick(column.Elem(tag), out, o.bm, o.take, column.fixedOf(tag, o.t.data), column.fixedOf(tag, o.e.data), o.t.validity, o.e.validity);
             return out;
         }
         pub fn bytes(o: @This()) !column.Bytes {
@@ -1372,7 +1372,7 @@ pub fn Filled(comptime T: type) type {
                 i32 => .{ .i32 = self.d },
                 i64 => .{ .i64 = self.d },
                 f64 => .{ .f64 = self.d },
-                Decimal => .{ .dec = self.d },
+                Decimal => column.decimalData(self.d),
                 else => @compileError("no column of this type"),
             };
             return mkCol(ty.withNull(self.any), self.d.len, self.bm, data);
@@ -1414,7 +1414,7 @@ fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) E
         n: usize,
         pub fn fixed(o: @This(), comptime tag: column.Tag) ![]column.Elem(tag) {
             const out = try o.arena.alloc(column.Elem(tag), o.n);
-            @memset(out, @field(o.one.data, @tagName(tag))[0]);
+            @memset(out, column.fixedOf(tag, o.one.data)[0]);
             return out;
         }
         pub fn bytes(o: @This()) !column.Bytes {

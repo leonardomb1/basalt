@@ -322,7 +322,7 @@ pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
         c: Column,
         sel: Selection,
         fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
-            return selectSlice(Elem(t), o.arena, @field(o.c.data, @tagName(t)), o.sel);
+            return selectSlice(Elem(t), o.arena, fixedOf(t, o.c.data), o.sel);
         }
         fn bytes(o: @This()) !Bytes {
             return selectBytes(o.arena, o.c.data.bytes, o.sel);
@@ -385,7 +385,7 @@ pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !C
             const out = try o.arena.alloc(Elem(t), o.total);
             var off: usize = 0;
             for (o.chunks) |c| {
-                @memcpy(out[off..][0..c.len], @field(c.data, @tagName(t))[0..c.len]);
+                @memcpy(out[off..][0..c.len], fixedOf(t, c.data)[0..c.len]);
                 off += c.len;
             }
             return out;
@@ -430,7 +430,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
                     @memcpy(o.values[base..][0 .. hi - lo], b.values[lo..hi]);
                     for (b.offsets[1 .. c.len + 1], o.offsets[at + 1 ..][0..c.len]) |src, *dst| dst.* = @intCast(base + @as(usize, @intCast(src)) - lo);
                 },
-                inline else => |s, tag| @memcpy(@field(x.out, @tagName(tag))[at..][0..c.len], s[0..c.len]),
+                inline else => |_, tag| @memcpy(fixedOf(tag, x.out)[at..][0..c.len], fixedOf(tag, c.data)[0..c.len]),
             }
         }
     };
@@ -469,7 +469,7 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
         c: Column,
         idx: []const usize,
         fn fixed(o: @This(), comptime t: Tag) ![]Elem(t) {
-            const src = @field(o.c.data, @tagName(t));
+            const src = fixedOf(t, o.c.data);
             const out = try o.arena.alloc(Elem(t), o.idx.len);
             for (o.idx, 0..) |r, i| out[i] = src[r];
             return out;
@@ -513,9 +513,9 @@ pub fn takeAcross(a: std.mem.Allocator, srcs: []const Column, refs: anytype) !Co
             for (o.refs, out, 0..) |e, *x, i| {
                 if (i + ahead < o.refs.len) {
                     const f = o.refs[i + ahead];
-                    @prefetch(&@field(o.srcs[f.chunk].data, @tagName(t))[f.row], .{});
+                    @prefetch(&fixedOf(t, o.srcs[f.chunk].data)[f.row], .{});
                 }
-                x.* = @field(o.srcs[e.chunk].data, @tagName(t))[e.row];
+                x.* = fixedOf(t, o.srcs[e.chunk].data)[e.row];
             }
             return out;
         }
@@ -558,7 +558,7 @@ pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) !Colum
     out.validity = .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n };
     out.data = switch (c.data) {
         .bytes => |b| .{ .bytes = .{ .offsets = b.offsets[start..][0 .. n + 1], .values = b.values } },
-        inline else => |sl, tag| @unionInit(Column.Data, @tagName(tag), sl[start..][0..n]),
+        inline else => |_, tag| dataOf(tag, fixedOf(tag, c.data)[start..][0..n]),
     };
     if (c.dict) |d| {
         const v = try arena.create(Column.Dict);
@@ -597,7 +597,7 @@ pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
             for (offs, b.offsets[0 .. c.len + 1]) |*o, x| o.* = x - b.offsets[0];
             break :blk .{ .bytes = .{ .offsets = offs, .values = try arena.dupe(u8, b.values[lo..hi]) } };
         },
-        inline else => |sl, tag| @unionInit(Column.Data, @tagName(tag), try arena.dupe(@typeInfo(@TypeOf(sl)).pointer.child, sl[0..c.len])),
+        inline else => |_, tag| dataOf(tag, try arena.dupe(Elem(tag), fixedOf(tag, c.data)[0..c.len])),
     };
     return out;
 }
@@ -654,8 +654,9 @@ pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, t
                         o.offsets[w + 1] = @intCast(off);
                     }
                 },
-                inline else => |s, tag| {
-                    const o = @field(x.out, @tagName(tag));
+                inline else => |_, tag| {
+                    const o = fixedOf(tag, x.out);
+                    const s = fixedOf(tag, x.c.data);
                     for (rows, r[0]..) |row, at| o[at] = s[row];
                 },
             }
@@ -683,8 +684,32 @@ pub fn storageOf(kind: types.TypeKind) Tag {
 
 /// The element type of a fixed-width storage.
 pub fn Elem(comptime t: Tag) type {
-    return std.meta.Elem(@FieldType(Column.Data, @tagName(t)));
+    return if (t == .dec) value.Decimal else std.meta.Elem(@FieldType(Column.Data, @tagName(t)));
 }
+
+/// A fixed-width storage's elements as a plain slice, for layout-generic code that
+/// moves elements without reading them as numbers: copies, gathers, spills, sizes.
+/// Decimal values are read through `decimals`.
+pub inline fn fixedOf(comptime t: Tag, d: Column.Data) []Elem(t) {
+    return if (t == .dec) d.dec.wide_cells else @field(d, @tagName(t));
+}
+
+/// Fixed-width storage over `s`, the one way generic code builds a `Data`.
+pub inline fn dataOf(comptime t: Tag, s: []Elem(t)) Column.Data {
+    return if (t == .dec) decimalData(s) else @unionInit(Column.Data, @tagName(t), s);
+}
+
+/// The one constructor of decimal storage.
+pub inline fn decimalData(s: []value.Decimal) Column.Data {
+    return .{ .dec = .{ .wide_cells = s } };
+}
+
+/// Decimal storage. Its slice is reachable only through `decimals` (to read values)
+/// and `fixedOf` (to move elements), so a tagged capture, `@field` or an `inline
+/// else` over `Data` cannot index it without naming one of them.
+pub const DecStore = struct {
+    wide_cells: []value.Decimal,
+};
 
 /// A `Data` of storage `tag`, from `op.fixed(t)` for a fixed-width one and
 /// `op.bytes()` for bytes: the per-storage dispatch every column copy, merge and
@@ -692,7 +717,7 @@ pub fn Elem(comptime t: Tag) type {
 pub fn mapTag(tag: Tag, op: anytype) !Column.Data {
     return switch (tag) {
         .bytes => .{ .bytes = try op.bytes() },
-        inline else => |t| @unionInit(Column.Data, @tagName(t), try op.fixed(t)),
+        inline else => |t| dataOf(t, try op.fixed(t)),
     };
 }
 
@@ -731,7 +756,7 @@ pub const Column = struct {
         i32: []i32,
         i64: []i64,
         f64: []f64,
-        dec: []value.Decimal,
+        dec: DecStore,
         bytes: Bytes,
     };
 
@@ -741,7 +766,7 @@ pub const Column = struct {
             .array, .@"struct" => .null,
             inline else => |k| blk: {
                 const t = comptime storageOf(k);
-                break :blk @unionInit(Value, @tagName(k), if (t == .bytes) self.data.bytes.at(i) else @field(self.data, @tagName(t))[i]);
+                break :blk @unionInit(Value, @tagName(k), if (t == .bytes) self.data.bytes.at(i) else fixedOf(t, self.data)[i]);
             },
         };
     }
@@ -765,10 +790,9 @@ pub const DecView = union(enum) {
     }
 };
 
-/// The one way to read a decimal column's storage outside this file and
-/// `decimal.zig`; the source check in this file's tests holds every other file to it.
+/// The one way to read a decimal column's values; `DecStore` admits no other.
 pub inline fn decimals(c: Column) DecView {
-    return .{ .wide = c.data.dec };
+    return .{ .wide = c.data.dec.wide_cells };
 }
 
 pub const Builder = struct {
@@ -1015,16 +1039,28 @@ pub const Builder = struct {
         try l.values.appendSlice(s);
         try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
     }
+    /// A decimal goes through `appendDecimal` or `appendDecimalAssumeCapacity`.
     pub fn appendAs(self: *Builder, comptime t: Tag, x: Elem(t)) !void {
+        if (t == .dec) @compileError("a decimal is appended with appendDecimal");
         try self.pushValid(true);
         try @field(self.store, @tagName(t)).append(x);
+    }
+    pub fn appendDecimal(self: *Builder, d: value.Decimal) !void {
+        try self.pushValid(true);
+        try self.store.dec.append(d);
     }
     /// `appendAs` for a builder `initCapacity` sized for this row, checked only by
     /// the list's own assertion in safe builds.
     pub fn appendAsAssumeCapacity(self: *Builder, comptime t: Tag, x: Elem(t)) void {
+        if (t == .dec) @compileError("a decimal is appended with appendDecimal");
         if (self.rows & 7 == 0) self.bits.appendAssumeCapacity(0xFF);
         self.rows += 1;
         @field(self.store, @tagName(t)).appendAssumeCapacity(x);
+    }
+    pub fn appendDecimalAssumeCapacity(self: *Builder, d: value.Decimal) void {
+        if (self.rows & 7 == 0) self.bits.appendAssumeCapacity(0xFF);
+        self.rows += 1;
+        self.store.dec.appendAssumeCapacity(d);
     }
     pub fn appendNull(self: *Builder) !void {
         try self.append(.null);
@@ -1144,7 +1180,7 @@ pub const Builder = struct {
                 @memcpy(offsets[1..], l.ends.items);
                 break :blk .{ .bytes = .{ .offsets = offsets, .values = try l.values.toOwnedSlice() } };
             },
-            inline else => |*l, t| @unionInit(Column.Data, @tagName(t), try l.toOwnedSlice()),
+            inline else => |*l, t| dataOf(t, try l.toOwnedSlice()),
         };
         var dict: ?*const Column.Dict = null;
         if (self.dict_vals) |vals| if (vals.len > 0 and self.dict_codes.items.len == n) {
@@ -1565,10 +1601,10 @@ fn eqlValue(x: Value, y: Value) bool {
     };
 }
 
-/// Whether `text` names decimal storage directly: the field access not followed by
-/// more of an identifier, so a field such as `decs` does not count.
-fn readsDecimalStorage(text: []const u8) bool {
-    const needle = ".data." ++ "dec";
+/// Whether `text` names `DecStore`'s slice: the field not followed by more of an
+/// identifier, so a longer name sharing its start does not count.
+fn namesDecimalSlice(text: []const u8) bool {
+    const needle = "wide_" ++ "cells";
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, text, from, needle)) |at| {
         const end = at + needle.len;
@@ -1578,8 +1614,7 @@ fn readsDecimalStorage(text: []const u8) bool {
     return false;
 }
 
-test "only column.zig and decimal.zig read decimal storage directly; the rest go through decimals()" {
-    const allowed = [_][]const u8{ "exec/column.zig", "exec/decimal.zig" };
+test "only column.zig names DecStore's slice; the rest go through decimals() and fixedOf()" {
     const gpa = std.testing.allocator;
     var src = try std.fs.cwd().openDir("src", .{ .iterate = true });
     defer src.close();
@@ -1591,19 +1626,16 @@ test "only column.zig and decimal.zig read decimal storage directly; the rest go
     while (try walker.next()) |e| {
         if (e.kind != .file or !std.mem.endsWith(u8, e.path, ".zig")) continue;
         seen += 1;
-        const ok = for (allowed) |a| {
-            if (std.mem.eql(u8, e.path, a)) break true;
-        } else false;
-        if (ok) continue;
+        if (std.mem.eql(u8, e.path, "exec/column.zig")) continue;
         const text = try src.readFileAlloc(gpa, e.path, 64 << 20);
         defer gpa.free(text);
-        if (readsDecimalStorage(text)) try offenders.writer().print(" src/{s}", .{e.path});
+        if (namesDecimalSlice(text)) try offenders.writer().print(" src/{s}", .{e.path});
     }
     try std.testing.expect(seen > 100);
     if (offenders.items.len > 0) {
-        std.debug.print("decimal storage read outside column.decimals():{s}\n", .{offenders.items});
+        std.debug.print("DecStore's slice named outside column.zig:{s}\n", .{offenders.items});
         return error.TestUnexpectedResult;
     }
-    try std.testing.expect(readsDecimalStorage("c" ++ ".data." ++ "dec[i]"));
-    try std.testing.expect(!readsDecimalStorage("other" ++ ".data." ++ "decs[i]"));
+    try std.testing.expect(namesDecimalSlice("c.data.dec." ++ "wide_" ++ "cells[i]"));
+    try std.testing.expect(!namesDecimalSlice("wide_" ++ "cellsx"));
 }

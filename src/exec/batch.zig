@@ -48,7 +48,7 @@ pub const Batch = struct {
         for (self.columns) |c| {
             n += c.validity.bits.len + switch (c.data) {
                 .bytes => |b| b.span(c.len) + b.offsets.len * @sizeOf(i32),
-                inline else => |s| std.mem.sliceAsBytes(s).len,
+                inline else => |_, t| std.mem.sliceAsBytes(column_mod.fixedOf(t, c.data)).len,
             };
         }
         return n;

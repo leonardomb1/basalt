@@ -367,10 +367,10 @@ const One = struct {
     }
 
     fn storeOf(comptime T: type, x: []T) column.Column.Data {
-        inline for (std.meta.fields(column.Column.Data)) |f| {
-            if (f.type == []T) return @unionInit(column.Column.Data, f.name, x);
+        inline for (comptime std.enums.values(column.Tag)) |t| {
+            if (t != .bytes and column.Elem(t) == T) return column.dataOf(t, x);
         }
-        unreachable;
+        @compileError("no fixed-width storage holds " ++ @typeName(T));
     }
 };
 
@@ -565,8 +565,9 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
             rows.b.appendDictBytes(d.flat, d.offs, idx, rows.defs, rows.max_def) catch |e| return landed(e);
             try rows.b.noteDict(d.id, d.entries, idx, rows.defs, rows.max_def);
         },
-        inline else => |vals| {
-            const T = std.meta.Elem(@TypeOf(vals));
+        inline else => |_, tag| {
+            const vals = column.fixedOf(tag, d.col.data);
+            const T = column.Elem(tag);
             try rows.put(T, cast, Cast.same, Gather(T){ .vals = vals, .idx = idx }, idx.len);
         },
     }
