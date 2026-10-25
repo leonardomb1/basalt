@@ -322,6 +322,7 @@ test {
     _ = @import("connect/dbconfig.zig");
     _ = @import("connect/facts.zig");
     _ = @import("connect/lane_sink.zig");
+    _ = @import("connect/options_schema.zig");
     _ = @import("connect/register.zig");
     _ = @import("connect/sink.zig");
     _ = @import("connect/source.zig");
