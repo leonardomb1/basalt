@@ -270,6 +270,15 @@ fn atoiN(s: []const u8) i64 {
 
 const testing = std.testing;
 
+test "intFast agrees with std and declines what it cannot prove" {
+    for ([_][]const u8{ "0", "7", "-7", "123456789012345678", "-123456789012345678", "007" }) |s| {
+        try testing.expectEqual(try std.fmt.parseInt(i64, s, 10), intFast(s).?);
+    }
+    for ([_][]const u8{ "", "-", "+1", "1_000", "0x10", "1234567890123456789", "1.0", " 1" }) |s| {
+        try testing.expect(intFast(s) == null);
+    }
+}
+
 test "floatFast agrees with std on plain decimals and declines the rest" {
     for ([_][]const u8{ "0", "1", "-1", "3.25", "-0.001", "123456.789", "99.90", "0.1", "1234567890.12345" }) |s| {
         try testing.expectEqual(try std.fmt.parseFloat(f64, s), floatFast(s).?);
