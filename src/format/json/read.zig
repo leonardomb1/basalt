@@ -9,9 +9,11 @@
 //! float FLOAT, booleans BOOL, strings, nested objects and arrays, or a mix of kinds,
 //! STRING, nested values as compact JSON text. A key never seen with a value is a
 //! STRING, of unknown type when the sample read the whole input, so it unifies with
-//! any type as a CSV column of NULLs does (`Type.nullColumn`). Every row, sampled or later, is read into those columns as `CAST` reads a
-//! value (`Rows`): a key missing from a row is NULL, a key not among the columns is
-//! dropped, and a value its column cannot read is NULL rather than a guess.
+//! any type as a CSV column of NULLs does (`Type.nullColumn`); the first of several
+//! files is not the whole input. Every row, sampled or later, is read into those
+//! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, a key
+//! not among the columns is dropped, and a value its column cannot read is NULL
+//! rather than a guess.
 //!
 //! The input streams: values are cut out of a buffer that holds about one batch of
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
@@ -39,6 +41,9 @@ pub const Options = struct {
     batch_rows: usize = 2048,
     chunk: usize = 64 << 10,
     schema: ?types.Schema = null,
+    /// Whether this input is all that is read, so a sample that reaches its end has
+    /// seen every row; false for the first of several files.
+    alone: bool = true,
 };
 
 pub const Infer = struct {
@@ -440,7 +445,7 @@ pub const Reader = struct {
         try held.appendSlice(self.held);
         while (held.items.len < opts.sample) {
             const row = (try self.nextRow(arena)) orelse {
-                infer.whole = true;
+                infer.whole = opts.alone;
                 break;
             };
             try held.append(try arena.dupe(u8, row));
@@ -505,8 +510,22 @@ pub const Reader = struct {
     }
 };
 
-/// JSON files read as one table (`files.Files`).
-pub const Files = @import("../files.zig").Files(Reader, Options);
+/// JSON files read as one table (`files.Files`); the first of several is not `alone`.
+pub const Files = struct {
+    const Table = @import("../files.zig").Files(Reader, Options);
+
+    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !*Table {
+        var o = opts;
+        o.alone = opts.alone and files.len <= 1;
+        return Table.open(arena, gpa, files, o);
+    }
+
+    pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *stream.Stream, rest: []const []const u8, opts: Options) !*Table {
+        var o = opts;
+        o.alone = opts.alone and rest.len == 0;
+        return Table.on(arena, gpa, s, rest, o);
+    }
+};
 
 const testing = std.testing;
 
@@ -582,6 +601,7 @@ test "a key with no value is of unknown type only when the sample read the whole
         .{ .doc = text, .o = .{}, .unknown = true },
         .{ .doc = text, .o = .{ .sample = 3 }, .unknown = true },
         .{ .doc = text, .o = .{ .sample = 2 }, .unknown = false },
+        .{ .doc = text, .o = .{ .alone = false }, .unknown = false },
         .{ .doc = text, .o = .{ .sample = 1 }, .unknown = false },
         .{ .doc = "[{\"k\":1,\"n\":null},{\"k\":2}]", .o = .{}, .unknown = true },
         .{ .doc = "{\"rows\":[{\"k\":1,\"n\":null},{\"k\":2}]}", .o = .{ .items = "rows" }, .unknown = true },

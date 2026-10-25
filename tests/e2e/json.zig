@@ -109,6 +109,10 @@ test "a JSON key null in the whole file unifies with any type, as a CSV column o
     const got = try out(alloc, &tmp);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("id,aid\n3,\n", got);
+    try tmp.dir.makePath("d");
+    try tmp.dir.writeFile(.{ .sub_path = "d/1.jsonl", .data = "{\"id\":1,\"x\":null}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "d/2.jsonl", .data = "{\"id\":2,\"x\":\"abc\"}\n" });
+    try std.testing.expectError(error.PlanFailed, checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id, x FROM '$B/d/' UNION ALL SELECT id, x FROM '$B/c.csv';", 1, &.{}));
 }
 
 test "STDIN is refused when stdin carries something else" {

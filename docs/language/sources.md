@@ -74,10 +74,11 @@ typed from the values it took there. Integers are `INT`, any float makes it
 kinds `STRING`, nested values as compact JSON text that `json_get` and
 `JSON_EACH` take apart. JSON has no date type, so a date stays text until
 `CAST(d AS DATE)`. A key that is `null` in every row read is a `STRING`; when
-those rows were the whole file it is of unknown type, as a CSV column with no
-value is, so it unifies with any type in a `UNION` or a join. A later row is read into those columns as `CAST` reads a
-value: a missing key is `NULL`, a key not among the columns is dropped, and a
-value its column cannot read is `NULL` rather than a guess.
+those rows were the whole input (one file, not a folder) it is of unknown type,
+as a CSV column with no value is, so it unifies with any type in a `UNION` or a
+join. A later row is read into those columns as `CAST` reads a value: a missing
+key is `NULL`, a key not among the columns is dropped, and a value its column
+cannot read is `NULL` rather than a guess.
 
 Rows stream: an NDJSON file or an array is never held whole, only `items` reads
 its document whole to find the path. A local NDJSON file splits across lanes at
