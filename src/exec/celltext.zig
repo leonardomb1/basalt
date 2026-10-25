@@ -163,18 +163,22 @@ fn escapes(comptime P: type) bool {
     return @hasDecl(P, "escape_scalars") and P.escape_scalars;
 }
 
+/// Out of `scalar`'s line, so the loops it is inlined into stay as tight as before
+/// decimals had two storages to read.
+noinline fn decimalCell(w: anytype, c: *const Column, r: usize, q: []const u8) !void {
+    try w.writeAll(q);
+    const d = c.decAt(r);
+    try format.writeDecimal(w, d.unscaled, d.scale);
+    try w.writeAll(q);
+}
+
 inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     const P = @TypeOf(p);
     switch (c.ty.kind) {
         .bool => try w.writeAll(if (c.data.b[r]) P.bool_true else P.bool_false),
         .int => try format.writeInt(w, c.data.i64[r]),
         .float => if (@hasDecl(P, "float")) try p.float(w, c.data.f64[r]) else try writeFloat(w, c.data.f64[r]),
-        .decimal => {
-            const q = if (@hasDecl(P, "quote_decimal")) P.quote_decimal else "";
-            try w.writeAll(q);
-            try format.writeDecimal(w, c.data.dec[r].unscaled, c.data.dec[r].scale);
-            try w.writeAll(q);
-        },
+        .decimal => try decimalCell(w, c, r, if (@hasDecl(P, "quote_decimal")) P.quote_decimal else ""),
         .date, .time, .timestamp => {
             const q = if (@hasDecl(P, "quote_temporal")) P.quote_temporal else "";
             try w.writeAll(q);
@@ -190,10 +194,11 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
 }
 
 /// Tests' fixture: a one-column batch of `kind` over the values sinks spell
-/// differently, its last row null; decimals carry scales other than the column's.
+/// differently, its last row null; decimals carry scales other than the column's,
+/// as a DECIMAL of no stated precision (PostgreSQL's NUMERIC) holds them.
 pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
     const nested = kind == .array or kind == .@"struct";
-    const ty = if (kind == .decimal) types.Type.decimal(14, 2).asNullable() else types.Type.init(kind).asNullable();
+    const ty = if (kind == .decimal) types.Type.decimal(0, 2).asNullable() else types.Type.init(kind).asNullable();
     var b = column.Builder.init(arena, if (nested) types.Type.init(.string).asNullable() else ty);
     switch (kind) {
         .bool => for ([_]bool{ true, false }) |x| try b.append(.{ .bool = x }),

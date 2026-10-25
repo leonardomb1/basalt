@@ -4,6 +4,7 @@
 //! the column's store type, and `Rows` lays them out around the null rows; a
 //! statistic's value goes through the same kernel into `One`.
 
+const Dec64 = @import("../../exec/value.zig").Dec64;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
@@ -323,6 +324,15 @@ const Cast = struct {
     fn bytesDecimal(c: Cast, s: []const u8) Decimal {
         return .{ .unscaled = unscaledOf(s), .scale = c.ty.scale };
     }
+
+    fn decimal64(_: Cast, x: i64) Dec64 {
+        return .of(x);
+    }
+
+    /// For a value `pushBytes` has checked fits an i64.
+    fn bytesDecimal64(_: Cast, s: []const u8) Dec64 {
+        return .of(@intCast(unscaledOf(s)));
+    }
 };
 
 /// The kernel's destination for a page: the `n` present values of `src`, each
@@ -406,7 +416,7 @@ fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
         else
             sink.put(i64, cast, Cast.scaled, src, n),
         .date => sink.put(i32, cast, Cast.date, src, n),
-        .decimal => sink.put(Decimal, cast, Cast.decimal, src, n),
+        .decimal => if (column.isDec64(cast.ty)) sink.put(Dec64, cast, Cast.decimal64, src, n) else sink.put(Decimal, cast, Cast.decimal, src, n),
         .bool => sink.put(bool, cast, Cast.truthy, src, n),
         else => Error.UnsupportedParquetEncoding,
     };
@@ -418,11 +428,15 @@ fn pushFloats(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
 }
 
 /// Text and binary columns take the slices as they are; a decimal reads each as
-/// a big-endian unscaled value.
+/// a big-endian unscaled value, one of 18 digits or fewer into an i64, where a
+/// value wider than eight bytes that does not fit fails as a corrupt page.
 fn pushBytes(sink: anytype, cast: Cast, vals: []const []const u8) Error!void {
     switch (cast.ty.kind) {
         .string, .bytes => try sink.bytes(cast, vals),
-        .decimal => try sink.put(Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len),
+        .decimal => if (column.isDec64(cast.ty)) {
+            for (vals) |v| if (v.len > 8 and (v.len > 16 or std.math.cast(i64, unscaledOf(v)) == null)) return Error.CorruptParquetPage;
+            try sink.put(Dec64, cast, Cast.bytesDecimal64, Items([]const u8){ .items = vals }, vals.len);
+        } else try sink.put(Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len),
         else => return Error.UnsupportedParquetEncoding,
     }
 }

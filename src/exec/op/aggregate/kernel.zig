@@ -1,6 +1,6 @@
 //! The aggregate factory: `make(Op)` turns an aggregate's math (`funcs.zig`) into a
 //! `Kernel` holding every loop the operator runs, chosen once per aggregate by
-//! `kernelFor`. A loop is generated once per lane of column kinds the op reads
+//! `kernelFor`. A loop is generated once per lane of column storages the op reads
 //! alike (`read.Lane`), with a tight path for a batch with no nulls (the op's
 //! `addAll` where it has one) and a validity-checked one otherwise; every kind the
 //! op cannot take directly shares one lane, read value by value and cast. The
@@ -17,6 +17,7 @@
 const Agg = @import("../aggregate.zig").Aggregate.Agg;
 const Batch = @import("../../batch.zig").Batch;
 const Decimal = @import("../../value.zig").Decimal;
+const Decimal64 = @import("../../value.zig").Dec64;
 const Value = @import("../../value.zig").Value;
 const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
@@ -68,24 +69,24 @@ fn foldsExpr(comptime Op: type) bool {
     return true;
 }
 
-const kinds = std.enums.values(types.TypeKind);
+const keys = std.enums.values(read.Key);
 
-/// Each column kind's lane when read as `In`, indexed by the kind.
-fn lanes(comptime In: type) *const [kinds.len]read.Lane {
+/// Each key's lane when read as `In`, indexed by the key.
+fn lanes(comptime In: type) *const [keys.len]read.Lane {
     const L = struct {
         const of = blk: {
-            var t: [kinds.len]read.Lane = undefined;
-            for (kinds, &t) |k, *l| l.* = read.lane(In, k);
+            var t: [keys.len]read.Lane = undefined;
+            for (keys, &t) |k, *l| l.* = read.lane(In, k);
             break :blk t;
         };
     };
     return &L.of;
 }
 
-/// The kind a lane's loop is generated for, its first; null for a lane no kind
-/// takes when read as `In`, whose loop is never generated.
-fn laneKind(comptime In: type, comptime l: read.Lane) ?types.TypeKind {
-    for (kinds) |k| if (read.lane(In, k) == l) return k;
+/// The key a lane's loop is generated for, its first; null for a lane no key takes
+/// when read as `In`, whose loop is never generated.
+fn laneKey(comptime In: type, comptime l: read.Lane) ?read.Key {
+    for (keys) |k| if (read.lane(In, k) == l) return k;
     return null;
 }
 
@@ -112,12 +113,12 @@ pub fn make(comptime Op: type) Kernel {
             if (Op.In == void) return Op.addN(s, if (col) |c| simd.popcountValid(c.validity.bits, n) else n);
             const c = col.?;
             const all = c.validity.allSet(n);
-            switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
-                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
-                    if (comptime read.Phys(kind)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, read.slice(S, c, n), cx);
+            switch (lanes(Op.In)[@intFromEnum(read.keyOf(c))]) {
+                inline else => |l| if (comptime laneKey(Op.In, l)) |key| {
+                    if (comptime read.Phys(key)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all and (S != Decimal64 or c.ty.scale == cx.ty.scale)) return Op.addAll(s, read.slice(S, c, n), cx);
                     if (all) {
-                        for (0..n) |i| if (try read.atValid(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
-                    } else for (0..n) |i| if (try read.at(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
+                        for (0..n) |i| if (try read.atValid(Op.In, key, c, i, cx)) |x| try Op.add(s, x, cx);
+                    } else for (0..n) |i| if (try read.at(Op.In, key, c, i, cx)) |x| try Op.add(s, x, cx);
                 } else unreachable,
             }
         }
@@ -130,12 +131,12 @@ pub fn make(comptime Op: type) Kernel {
                 return;
             };
             const all = c.validity.allSet(tails.len);
-            switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
-                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
+            switch (lanes(Op.In)[@intFromEnum(read.keyOf(c))]) {
+                inline else => |l| if (comptime laneKey(Op.In, l)) |key| {
                     for (tails, 0..) |t, r| {
                         const tp = t orelse continue;
                         const cx = if (needs_alloc) rows.at(r) else rows.cx;
-                        const x = (if (all) try read.atValid(Op.In, kind, c, r, cx) else try read.at(Op.In, kind, c, r, cx)) orelse continue;
+                        const x = (if (all) try read.atValid(Op.In, key, c, r, cx) else try read.at(Op.In, key, c, r, cx)) orelse continue;
                         try Op.add(st(tp + off), x, cx);
                     }
                 } else unreachable,
@@ -203,8 +204,8 @@ fn kernelOf(comptime Op: type) *const Kernel {
     return &S.k;
 }
 
-fn extreme(comptime want: std.math.Order, kind: types.TypeKind) *const Kernel {
-    return switch (kind) {
+fn extreme(comptime want: std.math.Order, ty: types.Type) *const Kernel {
+    return switch (read.keyOfType(ty)) {
         inline else => |k| if (comptime read.Phys(k)) |T| kernelOf(funcs.Extreme(T, want)) else kernelOf(funcs.ExtremeValue(want)),
     };
 }
@@ -217,17 +218,17 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
     return switch (agg.func) {
         .count => .{ .k = kernelOf(funcs.Count), .ty = agg.ty },
         .sum => switch (agg.ty.kind) {
-            .decimal => .{ .k = kernelOf(funcs.SumDecimal), .ty = agg.ty },
+            .decimal => if (narrowArg(arg, agg.ty)) .{ .k = kernelOf(funcs.SumDec64), .ty = arg } else .{ .k = kernelOf(funcs.SumDecimal), .ty = agg.ty },
             .float => .{ .k = kernelOf(funcs.SumFloat), .ty = agg.ty },
             else => .{ .k = kernelOf(funcs.SumInt), .ty = agg.ty },
         },
         .avg => switch (arg.kind) {
             .int => .{ .k = kernelOf(funcs.AvgInt), .ty = arg },
-            .decimal => .{ .k = kernelOf(funcs.AvgDecimal), .ty = arg },
+            .decimal => if (column.isDec64(arg)) .{ .k = kernelOf(funcs.AvgDec64), .ty = arg } else .{ .k = kernelOf(funcs.AvgDecimal), .ty = arg },
             else => .{ .k = kernelOf(funcs.AvgFloat), .ty = float },
         },
-        .min => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.lt)) else extreme(.lt, agg.ty.kind), .ty = agg.ty },
-        .max => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.gt)) else extreme(.gt, agg.ty.kind), .ty = agg.ty },
+        .min => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.lt)) else extreme(.lt, agg.ty), .ty = agg.ty },
+        .max => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.gt)) else extreme(.gt, agg.ty), .ty = agg.ty },
         .median => .{ .k = kernelOf(funcs.Median), .ty = float },
         .count_if => .{ .k = kernelOf(funcs.CountIf), .ty = types.Type.init(.bool) },
         .bool_and => .{ .k = kernelOf(funcs.BoolFold(true)), .ty = types.Type.init(.bool) },
@@ -240,6 +241,12 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         .stddev_samp => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_samp, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_samp, false)), .ty = float },
         .stddev_pop => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_pop, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_pop, false)), .ty = float },
     };
+}
+
+/// Whether a DECIMAL SUM can add its argument as `dec64` values: the argument is
+/// declared one, at the result's scale, so no addend needs rescaling.
+fn narrowArg(arg: types.Type, out: types.Type) bool {
+    return column.isDec64(arg) and arg.scale == out.scale;
 }
 
 pub const Layout = struct {

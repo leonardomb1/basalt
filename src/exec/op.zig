@@ -109,6 +109,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
+const builtin = @import("builtin");
 const column = @import("column.zig");
 pub const Batch = @import("batch.zig").Batch;
 const eval = @import("eval.zig");
@@ -313,7 +314,10 @@ pub const Op = union(enum) {
         const t1 = std.time.Instant.now() catch return r;
         st.ns += t1.since(t0);
         st.calls += 1;
-        if (r) |b| st.rows += b.len;
+        if (r) |b| {
+            st.rows += b.len;
+            if (builtin.mode == .Debug) for (b.columns) |c| column.assertLayout(c);
+        }
         return r;
     }
 

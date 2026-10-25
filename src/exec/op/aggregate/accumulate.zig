@@ -90,7 +90,7 @@ pub fn emitSets(self: *Aggregate, arena: std.mem.Allocator, sets: []const GroupS
 
     var fixed = sets.len > 0 and sets[0].store == .fixed;
     if (fixed) for (self.out_schema.fields[0..nk], sets[0].key_kinds) |f, kk| {
-        if (column.storageOf(f.ty.kind) != column.storageOf(kk)) fixed = false;
+        if (column.storageOf(f.ty) != column.storageOf(types.Type.init(kk))) fixed = false;
     };
     var outs = try Outs.init(self, arena, n, fixed);
     if (fixed) outs.strs = sets[0].strs;
@@ -157,7 +157,7 @@ const Outs = struct {
         };
         for (o.data, o.bms, o.strs_out, tys[0..o.data.len]) |*d, *bm, *sa, ty| {
             bm.* = try column.Bitmap.initFull(arena, n);
-            switch (column.storageOf(ty.kind)) {
+            switch (column.storageOf(ty)) {
                 .bytes => {
                     sa.* = try column.BytesAppender.init(arena, n);
                     d.* = .{ .bytes = undefined };

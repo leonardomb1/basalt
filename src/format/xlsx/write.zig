@@ -168,7 +168,7 @@ pub const Writer = struct {
                 return w.print("<c r=\"{s}{d}\"><v>{e}</v></c>", .{ ref, self.row, x });
             },
             .decimal => {
-                const d = c.data.dec[r];
+                const d = c.decAt(r);
                 try w.print("<c r=\"{s}{d}\"", .{ ref, self.row });
                 if (exactInDouble(d.unscaled)) {
                     try w.writeAll("><v>");

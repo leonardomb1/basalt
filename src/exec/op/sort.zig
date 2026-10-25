@@ -648,6 +648,12 @@ pub const KeyArr = struct {
             },
             .float => .{ .floats = col.data.f64 },
             .decimal => blk: {
+                if (col.data == .dec64) {
+                    scale = col.ty.scale;
+                    const out = try arena.alloc(i128, n);
+                    for (out, col.data.dec64[0..n], 0..) |*o, d, i| o.* = if (col.validity.get(i)) d.int() else 0;
+                    break :blk .{ .decs = out };
+                }
                 for (col.data.dec[0..n], 0..) |d, i| {
                     if (col.validity.get(i)) scale = @max(scale, d.scale);
                 }

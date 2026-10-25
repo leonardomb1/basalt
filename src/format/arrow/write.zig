@@ -334,6 +334,14 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
         .float => try body.push(std.mem.sliceAsBytes((try store(col.data, .f64))[0..n])),
         .date => try body.push(std.mem.sliceAsBytes((try store(col.data, .i32))[0..n])),
         .decimal => {
+            if (col.data == .dec64) {
+                const out = try arena.alloc(u8, n * 16);
+                @memset(out, 0);
+                for (col.data.dec64[0..n], 0..) |d, i| {
+                    if (col.validity.get(i)) std.mem.writeInt(i128, out[i * 16 ..][0..16], d.int(), .little);
+                }
+                return body.push(out);
+            }
             const src = try store(col.data, .dec);
             const out = try arena.alloc(u8, n * 16);
             @memset(out, 0);

@@ -382,10 +382,10 @@ pub fn assembleLists(
 
 fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usize, row_null: bool) Error!void {
     if (row_null) {
-        try out.append(.null);
+        try out.appendNull();
     } else {
         while (open.* > 0) : (open.* -= 1) try buf.append(']');
-        try out.append(.{ .string = buf.items });
+        try out.appendStr(buf.items);
     }
     buf.clearRetainingCapacity();
 }

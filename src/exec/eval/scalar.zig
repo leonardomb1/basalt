@@ -57,6 +57,7 @@ const toF64 = @import("support.zig").toF64;
 const toI64 = @import("support.zig").toI64;
 const valueToString = @import("format.zig").valueToString;
 const Decimal = @import("../value.zig").Decimal;
+const Dec64 = @import("../value.zig").Dec64;
 const rescaleTo = @import("cast.zig").rescaleTo;
 const decimalOverflow = @import("support.zig").decimalOverflow;
 const types = @import("../../lang/types.zig");
@@ -298,7 +299,14 @@ fn typedArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecErro
         } },
         .col => |c| switch (a) {
             .dec => switch (c.ty.kind) {
-                .decimal => return .{ .col = .{ .d = c.data.dec, .v = c.validity } },
+                .decimal => switch (c.data) {
+                    .dec64 => |ds| {
+                        const out = try arena.alloc(E, n);
+                        for (ds[0..n], out) |x, *o| o.* = x.at(c.ty.scale);
+                        return .{ .col = .{ .d = out, .v = c.validity } };
+                    },
+                    else => return .{ .col = .{ .d = c.data.dec, .v = c.validity } },
+                },
                 .int => {
                     const out = try arena.alloc(E, n);
                     for (c.data.i64[0..n], out) |x, *o| o.* = .{ .unscaled = x, .scale = 0 };
@@ -720,10 +728,27 @@ fn Out(comptime P: type, comptime keep_scale: bool) type {
                 o.f.setNull(i);
             }
             fn finish(o: *@This()) !Vec {
+                if (P == Decimal and column.isDec64(o.ty)) return narrowed(o.f.finish(o.ty), o.ty);
                 return o.f.finish(o.ty);
             }
         },
     };
+}
+
+/// A decimal result column of a `dec64` type moved to that storage, packed down in
+/// its own buffer (slot `i` of eight bytes ends before element `i + 1` of 24
+/// begins); a value off the type's scale or past an i64 fails, and the row path
+/// rechecks the batch.
+fn narrowed(v: Vec, ty: Type) VecError!Vec {
+    var c = v.col;
+    const ds = c.data.dec;
+    const out = @as([*]Dec64, @ptrCast(ds.ptr))[0..ds.len];
+    for (ds, 0..) |d, i| {
+        const x = if (c.validity.get(i)) Dec64.fit(d, ty.scale) orelse return error.IntOverflow else Dec64.of(0);
+        out[i] = x;
+    }
+    c.data = .{ .dec64 = out };
+    return .{ .col = c };
 }
 
 const TestFns = struct {

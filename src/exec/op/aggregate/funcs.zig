@@ -26,6 +26,7 @@
 
 const Value = @import("../../value.zig").Value;
 const Decimal = @import("../../value.zig").Decimal;
+const Dec64 = @import("../../value.zig").Dec64;
 const ast = @import("../../../lang/ast.zig");
 const eval = @import("../../eval.zig");
 const simd = @import("../../simd.zig");
@@ -129,6 +130,36 @@ pub const SumDecimal = struct {
     }
 };
 
+/// SUM of a `dec64` argument at the result's scale (`kernelFor` checks it): each
+/// addend is under 2^63, so an i128 total holds 2^64 of them without a check, and a
+/// batch with no nulls adds in a plain loop the compiler vectorizes.
+pub const SumDec64 = struct {
+    pub const In = Dec64;
+    pub const State = struct { n: i64 = 0, s: i128 align(8) = 0 };
+    pub fn add(s: *State, x: Dec64, _: Ctx) !void {
+        s.s += x.int();
+        s.n += 1;
+    }
+    pub fn remove(s: *State, x: Dec64, _: Ctx) !void {
+        s.s -= x.int();
+        s.n -= 1;
+    }
+    pub fn addAll(s: *State, xs: []const Dec64, _: Ctx) !void {
+        var t: i128 = 0;
+        for (xs) |x| t += x.int();
+        s.s += t;
+        s.n += @intCast(xs.len);
+    }
+    pub fn merge(d: *State, s: *const State, _: Ctx) !void {
+        d.s += s.s;
+        d.n += s.n;
+    }
+    pub fn finish(s: *const State, cx: Ctx) !Value {
+        if (s.n == 0) return .null;
+        return .{ .decimal = .{ .unscaled = s.s, .scale = cx.out.scale } };
+    }
+};
+
 pub const SumFloat = struct {
     pub const In = f64;
     pub const State = struct { n: i64 = 0, s: f64 = 0 };
@@ -203,6 +234,21 @@ pub const AvgDecimal = struct {
     }
 };
 
+/// AVG of a `dec64` argument: summed exactly at its scale, divided once.
+pub const AvgDec64 = struct {
+    pub const In = Dec64;
+    pub const State = SumDec64.State;
+    pub const add = SumDec64.add;
+    pub const addAll = SumDec64.addAll;
+    pub const remove = SumDec64.remove;
+    pub const merge = SumDec64.merge;
+    pub fn finish(s: *const State, cx: Ctx) !Value {
+        if (s.n == 0) return .null;
+        const whole = @as(f64, @floatFromInt(s.s)) / std.math.pow(f64, 10, @floatFromInt(cx.ty.scale));
+        return .{ .float = whole / @as(f64, @floatFromInt(s.n)) };
+    }
+};
+
 /// The order MIN and MAX keep, GROUP BY and window alike: NaN above every number,
 /// decimals exactly across scales, text by bytes, and across kinds `compareValues`'s.
 pub fn order(comptime T: type, a: T, b: T) std.math.Order {
@@ -210,6 +256,7 @@ pub fn order(comptime T: type, a: T, b: T) std.math.Order {
         Value => eval.compareValues(a, b) orelse .eq,
         f64 => eval.orderF64(a, b),
         Decimal => a.order(b),
+        Dec64 => std.math.order(a.int(), b.int()),
         bool => std.math.order(@intFromBool(a), @intFromBool(b)),
         []const u8 => std.mem.order(u8, a, b),
         else => std.math.order(a, b),
@@ -229,6 +276,7 @@ pub fn toValue(comptime T: type, x: T, out: types.Type) Value {
         i32 => .{ .date = x },
         f64 => .{ .float = x },
         Decimal => .{ .decimal = x },
+        Dec64 => .{ .decimal = x.at(out.scale) },
         bool => .{ .bool = x },
         []const u8 => if (out.kind == .bytes) .{ .bytes = x } else .{ .string = x },
         else => unreachable,

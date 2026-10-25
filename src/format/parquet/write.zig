@@ -1207,8 +1207,8 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
             return encodeFixedSlice(i32, cb, sa, m.optional, col, d, lo, hi),
         .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
             return encodeBytesSlice(cb, sa, m.optional, col, lo, hi),
-        .dec => |d| if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
-            return encodeDecimalSlice(cb, sa, m, col, d, lo, hi),
+        inline .dec, .dec64 => |d| if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
+            return encodeDecimalSlice(std.meta.Elem(@TypeOf(d)), cb, sa, m, col, d, lo, hi),
         else => {},
     }
     for (lo..hi) |r| try encodeValue(cb, sa, m, col.getValue(r));
@@ -1287,7 +1287,7 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
 
 /// Each value rescaled to the column's scale as `plainFixed` does, so min and max
 /// compare the integers that are written.
-fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, data: []const Decimal, lo: usize, hi: usize) !void {
+fn encodeDecimalSlice(comptime E: type, cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, data: []const E, lo: usize, hi: usize) !void {
     const scale = m.scale orelse 0;
     const width: usize = switch (m.phys) {
         .int32 => 4,
@@ -1309,19 +1309,20 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
         cb.defs.appendAssumeCapacity(1);
         var buf: [16]u8 = undefined;
         const out = buf[0..width];
+        const d: Decimal = if (E == Decimal) data[r] else data[r].at(col.ty.scale);
         const x: i128 = switch (m.phys) {
             .int32 => blk: {
-                const v = try rescaleTo(i32, data[r], scale);
+                const v = try rescaleTo(i32, d, scale);
                 std.mem.writeInt(i32, out[0..4], v, .little);
                 break :blk v;
             },
             .int64 => blk: {
-                const v = try rescaleTo(i64, data[r], scale);
+                const v = try rescaleTo(i64, d, scale);
                 std.mem.writeInt(i64, out[0..8], v, .little);
                 break :blk v;
             },
             else => blk: {
-                const v = try rescaleTo(i128, data[r], scale);
+                const v = try rescaleTo(i128, d, scale);
                 try decimalBytes(out, v);
                 break :blk v;
             },

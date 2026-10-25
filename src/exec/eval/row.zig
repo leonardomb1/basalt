@@ -4,6 +4,7 @@
 
 const Batch = @import("../batch.zig").Batch;
 const Decimal = @import("../value.zig").Decimal;
+const Dec64 = @import("../value.zig").Dec64;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const TypeCtx = @import("../eval.zig").TypeCtx;
@@ -188,7 +189,8 @@ pub fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
 /// The exact DECIMAL type of `op`, or null when it stays float. `+ - %` take the
 /// wider scale, `*` the summed scale; an INT operand is a DECIMAL(19,0). A
 /// quotient's scale is the operands' wider one but at least 16 while its whole
-/// digits leave room; each value carries the finer scale `decimalDiv` picks.
+/// digits leave room; each value carries the finer scale `decimalDiv` picks, so
+/// its precision is at least 19, where a column keeps each value's scale.
 pub fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
     switch (op) {
         .add, .sub, .mul, .div, .mod => {},
@@ -208,7 +210,7 @@ pub fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
     };
     const prec: u16 = switch (op) {
         .mul => lp + rp,
-        .div => whole + scale,
+        .div => @max(whole + scale, Dec64.max_precision + 1),
         .mod => @max(1, @min(lp -| ls, rp -| rs) + scale),
         else => @max(lp -| ls, rp -| rs) + scale + 1,
     };

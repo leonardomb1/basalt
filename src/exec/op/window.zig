@@ -735,9 +735,9 @@ pub const Window = struct {
 
     /// The one loop every window aggregate runs, generated per aggregate `A` (a
     /// `State` with `add`, `remove` and `finish`, each optionally taking the row's
-    /// position) and the kind its argument reads as: per partition, rows enter at the
+    /// position) and the key its argument reads through: per partition, rows enter at the
     /// frame's end edge and leave at its start edge, as the file header describes.
-    fn Slider(comptime A: type, comptime kind: types.TypeKind) type {
+    fn Slider(comptime A: type, comptime key: read.Key) type {
         return struct {
             fn run(col: ?column.Column, fr: Frames, l: Layout, given: Ctx, bd: *column.Builder) anyerror!void {
                 var cx = given;
@@ -766,9 +766,9 @@ pub const Window = struct {
             inline fn at(col: ?column.Column, p: usize, cx: Ctx) !?A.In {
                 if (A.In == void) {
                     const c = col orelse return {};
-                    return read.at(void, kind, c, p, cx);
+                    return read.at(void, key, c, p, cx);
                 }
-                return read.at(A.In, kind, col.?, p, cx);
+                return read.at(A.In, key, col.?, p, cx);
             }
 
             inline fn step(comptime f: anytype, s: *A.State, x: A.In, p: usize, cx: Ctx) !void {
@@ -778,30 +778,31 @@ pub const Window = struct {
         };
     }
 
-    fn runOf(comptime A: type, kind: types.TypeKind) Run {
-        return switch (kind) {
+    fn runOf(comptime A: type, key: read.Key) Run {
+        return switch (key) {
             inline else => |k| Slider(A, k).run,
         };
     }
 
-    /// The sliding aggregate for `f` over an argument column of `kind`, chosen once.
-    fn slider(f: Func, agg: ast.AggFunc, kind: types.TypeKind, out: types.Type) Run {
-        if (f.arg == null) return runOf(aggFuncs.Count, .int);
+    /// The sliding aggregate for `f` over an argument column of `kind`, read through
+    /// `key`, chosen once.
+    fn slider(f: Func, agg: ast.AggFunc, kind: types.TypeKind, key: read.Key, out: types.Type) Run {
+        if (f.arg == null) return runOf(aggFuncs.Count, .i64);
         return switch (agg) {
-            .count => if (f.distinct) runOf(CountDistinct, kind) else runOf(aggFuncs.Count, kind),
-            .count_if => runOf(aggFuncs.CountIf, kind),
-            .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runOf(SumInt, kind) else runOf(FloatSum(false), kind),
-            .avg => if (kind == .int) runOf(aggFuncs.AvgInt, kind) else runOf(FloatSum(true), kind),
-            inline .min, .max => |m| switch (kind) {
+            .count => if (f.distinct) runOf(CountDistinct, key) else runOf(aggFuncs.Count, key),
+            .count_if => runOf(aggFuncs.CountIf, key),
+            .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, key) else if (kind == .int) runOf(SumInt, key) else runOf(FloatSum(false), key),
+            .avg => if (kind == .int) runOf(aggFuncs.AvgInt, key) else runOf(FloatSum(true), key),
+            inline .min, .max => |m| switch (key) {
                 inline else => |k| runOf(Deque(read.Phys(k) orelse Value, if (m == .min) .lt else .gt), k),
             },
-            .median => runOf(Median, kind),
-            .bool_and => runOf(aggFuncs.BoolFold(true), kind),
-            .bool_or => runOf(aggFuncs.BoolFold(false), kind),
-            .bit_and => runOf(BitStack(.@"and"), kind),
-            .bit_or => runOf(BitStack(.@"or"), kind),
-            .bit_xor => runOf(aggFuncs.Bits(.xor), kind),
-            inline .var_samp, .var_pop, .stddev_samp, .stddev_pop => |g| if (kind == .int) runOf(Spread(g, true), kind) else runOf(Spread(g, false), kind),
+            .median => runOf(Median, key),
+            .bool_and => runOf(aggFuncs.BoolFold(true), key),
+            .bool_or => runOf(aggFuncs.BoolFold(false), key),
+            .bit_and => runOf(BitStack(.@"and"), key),
+            .bit_or => runOf(BitStack(.@"or"), key),
+            .bit_xor => runOf(aggFuncs.Bits(.xor), key),
+            inline .var_samp, .var_pop, .stddev_samp, .stddev_pop => |g| if (kind == .int) runOf(Spread(g, true), key) else runOf(Spread(g, false), key),
         };
     }
 
@@ -990,7 +991,7 @@ pub const Window = struct {
                     const fr = try frames(work, l, f.frame, rk);
                     const col: ?column.Column = if (arg) |x| try read.castText(work, agg, out_ty, x) else null;
                     const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = work, .scratch = work };
-                    slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, &bd) catch |e| {
+                    slider(f, agg, if (col) |x| x.ty.kind else .int, if (col) |x| read.keyOf(x) else .i64, out_ty)(col, fr, l, cx, &bd) catch |e| {
                         if (e == error.IntOverflow and agg == .sum and out_ty.kind == .int) if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(e)});
                         return e;
                     };
