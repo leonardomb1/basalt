@@ -523,7 +523,7 @@ const ToTimestampInt = struct {
     pub const args = .{.int};
     pub const result = .timestamp;
     pub fn apply(_: Cx, x: i64) EvalError!i64 {
-        return time.mulI64(x, 1_000_000);
+        return time.mulI64(x, civil.us_per_sec);
     }
 };
 

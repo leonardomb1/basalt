@@ -322,19 +322,19 @@ fn oldCastValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalEr
         },
         .date => switch (v) {
             .date => v,
-            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 86_400_000_000)) },
+            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 24 * 3600 * 1_000_000)) },
             .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
             else => error.CastFailed,
         },
         .timestamp => switch (v) {
             .timestamp => v,
-            .date => |x| .{ .timestamp = std.math.mul(i64, x, 86_400_000_000) catch return error.CastFailed },
+            .date => |x| .{ .timestamp = std.math.mul(i64, x, 24 * 3600 * 1_000_000) catch return error.CastFailed },
             .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },
         .time => switch (v) {
             .time => v,
-            .timestamp => |x| .{ .time = @mod(x, 86_400_000_000) },
+            .timestamp => |x| .{ .time = @mod(x, 24 * 3600 * 1_000_000) },
             .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },

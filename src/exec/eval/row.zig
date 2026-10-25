@@ -428,8 +428,8 @@ fn oldJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
         .int => |i| try w.print("{d}", .{i}),
         .float => |f| if (std.math.isFinite(f)) try w.print("{}", .{f}) else try w.writeAll("null"),
         .decimal => try w.writeAll(try valueToString(arena, v)),
-        .string => |s| try std.json.Stringify.encodeJsonString(s, .{}, w),
-        else => try std.json.Stringify.encodeJsonString(try valueToString(arena, v), .{}, w),
+        .string => |s| try std.json.Stringify.value(s, .{}, w),
+        else => try std.json.Stringify.value(try valueToString(arena, v), .{}, w),
     }
 }
 
