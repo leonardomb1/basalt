@@ -25,6 +25,7 @@ const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
+const scheme = @import("../../store/scheme.zig");
 const fits = @import("../bytes.zig").fits;
 
 pub const Error = error{
@@ -246,7 +247,7 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
 fn streamRange(arena: std.mem.Allocator, m: *Member, rm: *pqdecode.Remote, off: u64, len: u64) !*std.Io.Reader {
     const range = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
     const extra = try rm.headers(arena, .GET, range);
-    const uri = std.Uri.parse(rm.url) catch return error.InvalidUrl;
+    const uri = scheme.parseUri(rm.url) catch return error.InvalidUrl;
     m.body = .{ .http = .{ .req = undefined, .response = undefined, .redirect_buf = undefined } };
     const h = &m.body.http;
     h.req = try rm.client.request(.GET, uri, .{ .extra_headers = extra, .headers = .{ .accept_encoding = .omit } });
@@ -319,4 +320,20 @@ test "openMember: one member needs no name, several refuse to guess" {
     try std.testing.expectEqual(@as(usize, 2), ns.len);
     try std.testing.expectEqualStrings("a.csv", ns[0]);
     try std.testing.expectEqualStrings("b.csv", ns[1]);
+}
+
+test "openMember: an HTTP:// archive in capitals streams its member by range" {
+    const http_fake = @import("../../testing/http_fake.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var srv: http_fake.RangeServer = undefined;
+    try srv.start(fx_two, false);
+    defer srv.stop();
+    const lower = try srv.url(a, "/t.zip");
+    const url = try std.mem.concat(a, u8, &.{ "HTTP", lower["http".len..] });
+
+    const m = try openMember(a, url, "a.csv");
+    defer m.close();
+    try std.testing.expectEqualStrings("id,v\n1,x\n2,y\n", try m.reader.allocRemaining(a, .limited(1 << 20)));
 }
