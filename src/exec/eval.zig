@@ -325,13 +325,14 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
 /// A PARAM's text (`-p name=text`, a PARAM default) as a value of its declared
 /// type, read as CAST reads text: an INT or FLOAT strictly after trimming (no `_`
 /// or hex), a DATE, TIME, TIMESTAMP or DECIMAL through the cast, a STRING or
-/// BYTES as the text itself; a BOOL is exactly `true` or `false`. Null when the
-/// text does not read as `ty` or `ty` is not bound from text.
+/// BYTES as the text itself; a BOOL is exactly `true` or `false`. A FLOAT past
+/// the f64 range is an infinity, as PARAMs always bound it. Null when the text
+/// does not read as `ty` or `ty` is not bound from text.
 pub fn paramFromText(arena: std.mem.Allocator, ty: Type, text: []const u8) error{OutOfMemory}!?Value {
     const s = std.mem.trim(u8, text, " \t\r\n");
     return switch (ty.kind) {
         .int => .{ .int = parseIntStrict(s) orelse return null },
-        .float => .{ .float = parseFloatStrict(s) orelse return null },
+        .float => .{ .float = paramFloat(s) orelse return null },
         .bool => .{ .bool = textconv.boolText(.exact, text) orelse return null },
         .string => .{ .string = text },
         .bytes => .{ .bytes = text },
@@ -341,6 +342,15 @@ pub fn paramFromText(arena: std.mem.Allocator, ty: Type, text: []const u8) error
         },
         else => null,
     };
+}
+
+/// `parseFloatStrict`, but a number past the f64 range (`1e400`) is the infinity
+/// `std.fmt.parseFloat` rounds it to rather than a failure.
+fn paramFloat(s: []const u8) ?f64 {
+    if (parseFloatStrict(s)) |x| return x;
+    if (std.mem.indexOfAny(u8, s, "_xX") != null) return null;
+    const x = std.fmt.parseFloat(f64, s) catch return null;
+    return if (std.math.isInf(x)) x else null;
 }
 
 pub fn numericish(t: Type) bool {
@@ -837,6 +847,8 @@ test "a PARAM's text reads as CAST reads it: no `_`, hex or untrimmed failures" 
     try std.testing.expectEqual(@as(i64, 5), (try paramFromText(a, int, " 5")).?.int);
     try std.testing.expectEqual(@as(i64, -42), (try paramFromText(a, int, "-42")).?.int);
     try std.testing.expectEqual(@as(f64, 1000), (try paramFromText(a, float, "1e3")).?.float);
+    try std.testing.expect(std.math.isPositiveInf((try paramFromText(a, float, "1e400")).?.float));
+    try std.testing.expect(std.math.isNan((try paramFromText(a, float, "nan")).?.float));
     try std.testing.expect(try paramFromText(a, int, "") == null);
     for ([_][]const u8{ "1_000", "0x10", " 5", "-42", "x", "", "9223372036854775808" }) |s| {
         const via_cast: ?i64 = if (castValue(a, .{ .string = s }, .int)) |v| v.int else |_| null;

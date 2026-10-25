@@ -698,3 +698,22 @@ test "analyze: a query LET is checked where it stands and `$name` takes its colu
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &bdiag));
     try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "unknown field `nope`") != null);
 }
+
+test "a FLOAT PARAM takes what parseFloat took, less `_` and hex; an INT one is strict" {
+    const paramFromText = @import("../analyze.zig").paramFromText;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const float = types.Type.init(.float);
+    const int = types.Type.init(.int);
+    try std.testing.expect(std.math.isPositiveInf(paramFromText(a, float, "inf").?.float));
+    try std.testing.expect(std.math.isNegativeInf(paramFromText(a, float, "-Infinity").?.float));
+    try std.testing.expect(std.math.isNan(paramFromText(a, float, "nan").?.float));
+    try std.testing.expect(std.math.isPositiveInf(paramFromText(a, float, "1e400").?.float));
+    try std.testing.expect(std.math.isNegativeInf(paramFromText(a, float, "-1e400").?.float));
+    try std.testing.expectEqual(@as(f64, 0), paramFromText(a, float, "1e-400").?.float);
+    try std.testing.expectEqual(@as(f64, 2.5), paramFromText(a, float, " 2.5").?.float);
+    for ([_][]const u8{ "0x1p3", "-0X10", "1_000", "1_0.5", "", "x" }) |s| try std.testing.expect(paramFromText(a, float, s) == null);
+    for ([_][]const u8{ "1_000", "0x10", "0x1p3", "1e3", "" }) |s| try std.testing.expect(paramFromText(a, int, s) == null);
+    try std.testing.expectEqual(@as(i64, 5), paramFromText(a, int, " 5").?.int);
+}

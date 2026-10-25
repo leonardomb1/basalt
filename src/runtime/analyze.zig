@@ -708,13 +708,11 @@ pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const 
     };
 }
 
-/// A PARAM's text as its declared type, null when it does not read as one: a number,
-/// date, time, timestamp or decimal as `CAST(text AS ty)` reads it, a BOOL only as
-/// `true` or `false`. Null for the kinds bound as text or not from text at all.
+/// A PARAM's text as its declared type through `eval.paramFromText`, null when it
+/// does not read as one. Null for the kinds bound as text or not from text at all.
 pub fn paramFromText(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?Value {
     return switch (ty.kind) {
-        .bool => .{ .bool = textconv.boolText(textconv.Words.exact, text) orelse return null },
-        .int, .float, .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = text }, ty) catch null,
+        .bool, .int, .float, .date, .time, .timestamp, .decimal => eval.paramFromText(arena, ty, text) catch null,
         else => null,
     };
 }
