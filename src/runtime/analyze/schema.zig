@@ -329,16 +329,32 @@ fn fracDigits(text: []const u8) u8 {
 /// key, a DECIMAL(38) one too, plus or minus it still fits an i128.
 const off_max: i128 = 1 << 125;
 
-/// `text` as an integer at `scale` decimal places, exactly when it is plain digits,
-/// saturating at `off_max`.
+/// Whether `text` is decimal digits with at most one point, the form read exactly.
+fn plainDecimal(text: []const u8) bool {
+    var dots: usize = 0;
+    var digits: usize = 0;
+    for (text) |c| switch (c) {
+        '0'...'9' => digits += 1,
+        '.' => dots += 1,
+        else => return false,
+    };
+    return dots <= 1 and digits > 0;
+}
+
+/// `text` in any form the parser accepts (an exponent, hex, `_` separators) times
+/// `mul`, rounded through f64, saturating at `off_max`.
+fn roundedFloat(text: []const u8, mul: i128) i128 {
+    const f = std.fmt.parseFloat(f64, text) catch return 0;
+    const x = @round(f * @as(f64, @floatFromInt(mul)));
+    if (!(@abs(x) < @as(f64, @floatFromInt(off_max)))) return off_max;
+    return @intFromFloat(x);
+}
+
+/// `text` as an integer at `scale` decimal places, exactly when it is plain digits
+/// and through f64 otherwise, saturating at `off_max`.
 fn scaledText(text: []const u8, scale: u8) i128 {
     const p = std.math.powi(i128, 10, scale) catch return off_max;
-    if (std.mem.indexOfAny(u8, text, "eE") != null) {
-        const f = std.fmt.parseFloat(f64, text) catch return 0;
-        const x = @round(f * @as(f64, @floatFromInt(p)));
-        if (!(@abs(x) < @as(f64, @floatFromInt(off_max)))) return off_max;
-        return @intFromFloat(x);
-    }
+    if (!plainDecimal(text)) return roundedFloat(text, p);
     const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
     var v: i128 = if (dot == 0) 0 else std.fmt.parseInt(i128, text[0..dot], 10) catch return off_max;
     v = std.math.mul(i128, v, p) catch return off_max;
@@ -354,9 +370,10 @@ fn scaledText(text: []const u8, scale: u8) i128 {
     return @min(v, off_max);
 }
 
-/// A non-negative offset of `unit_us` microseconds each, exact for plain digits and
-/// rounded to the microsecond, saturating at `off_max`.
+/// A non-negative offset of `unit_us` microseconds each, rounded to the microsecond:
+/// exact for plain digits, through f64 for any other form, saturating at `off_max`.
 fn scaledMicros(text: []const u8, unit_us: i128) i128 {
+    if (!plainDecimal(text)) return roundedFloat(text, unit_us);
     const s = fracDigits(text);
     const p = std.math.powi(i128, 10, s) catch return off_max;
     const m = std.math.mul(i128, scaledText(text, s), unit_us) catch return off_max;
@@ -1054,4 +1071,22 @@ test "windowFuncType: SUM over an untyped NULL is an INT, as the SUM aggregate i
     try std.testing.expectEqual(types.TypeKind.int, windowFuncType(.{ .agg = .sum }, t).kind);
     try std.testing.expectEqual(types.TypeKind.float, windowFuncType(.{ .agg = .sum }, types.Type.init(.float)).kind);
     try std.testing.expectEqual(types.TypeKind.int, windowFuncType(.{ .agg = .sum }, types.Type.init(.int)).kind);
+}
+
+test "opOff: an offset with an exponent, in hex or with separators rounds as before, and saturates past any key span" {
+    const ts: op.Window.RangeConv = .{};
+    try std.testing.expectEqual(@as(i128, 216_000), opOff(.{ .text = "2.5e-6", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 10_627), opOff(.{ .text = "1.23e-7", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 90_000_000_000), opOff(.{ .text = "1.5E3", .unit = .minute }, .range, ts, .time).int);
+    try std.testing.expectEqual(@as(i128, 16 * us_per_day), opOff(.{ .text = "0x10", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 14 * us_per_day), opOff(.{ .text = "0xe", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 8 * 3_600_000_000), opOff(.{ .text = "0x1p3", .unit = .hour }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(@as(i128, 2 * us_per_day), opOff(.{ .text = "0x2" }, .range, .{ .mul = us_per_day }, .date).int);
+    try std.testing.expectEqual(@as(i128, 1_000_000_000), opOff(.{ .text = "1_000", .unit = .second }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "0x1p200", .unit = .day }, .range, ts, .timestamp).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "1e300", .unit = .second }, .range, ts, .time).int);
+    try std.testing.expectEqual(@as(i128, 16), opOff(.{ .text = "0x10" }, .range, .{}, .int).int);
+    try std.testing.expectEqual(@as(i128, 1000), opOff(.{ .text = "1_000" }, .range, .{}, .int).int);
+    try std.testing.expectEqual(@as(i128, 150), opOff(.{ .text = "1.5e1" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
+    try std.testing.expectEqual(off_max, opOff(.{ .text = "0x1p200" }, .range, .{}, .int).int);
 }
