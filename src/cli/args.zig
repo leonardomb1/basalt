@@ -6,6 +6,7 @@ const include = @import("../lang/include.zig");
 const obs = @import("../runtime/obs.zig");
 const env = @import("../runtime/env.zig");
 const parseByteSize = @import("../runtime/env.zig").parseByteSize;
+const jsontext = @import("../exec/jsontext.zig");
 const std = @import("std");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
@@ -153,9 +154,9 @@ pub const ErrOut = struct {
             try self.w.writeAll("{\"level\":\"error\",\"msg\":")
         else
             try self.w.print("{{\"ts\":{d},\"level\":\"error\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.event });
-        try std.json.Stringify.encodeJsonString(e.msg, .{}, self.w);
+        try jsontext.string(self.w, e.msg);
         try self.w.writeAll(",\"file\":");
-        try std.json.Stringify.encodeJsonString(file, .{}, self.w);
+        try jsontext.string(self.w, file);
         if (e.pos) |p| {
             try self.w.print(",\"line\":{d},\"col\":{d}", .{ p.line, p.col });
             if (e.end) |x| try self.w.print(",\"end_line\":{d},\"end_col\":{d}", .{ x.line, x.col });
@@ -190,6 +191,19 @@ test "sharedFlag: every command spells -j alike, and takes only its own groups" 
     try std.testing.expect(!(try sharedFlag(&argv, &i, &f, .{ .log = false, .output = true }, &w.writer)).?);
     try std.testing.expect((try sharedFlag(&argv, &i, &f, .{}, &w.writer)).?);
     try std.testing.expectEqual(obs.Level.info, f.log.level);
+}
+
+test "ErrOut: a JSON error whose message or file is not UTF-8 still parses" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw = std.Io.Writer.Allocating.init(a);
+    const out = ErrOut{ .w = &aw.writer, .json = true, .label = "s.sql", .bare = true };
+    try out.report(.{ .msg = "cannot read 'caf\xe9'", .file = "d\xedr/x.csv" });
+    const Got = struct { level: []const u8, msg: []const u8, file: []const u8, class: []const u8 };
+    const got = try std.json.parseFromSliceLeaky(Got, a, aw.written(), .{});
+    try std.testing.expectEqualStrings("cannot read 'caf\u{FFFD}'", got.msg);
+    try std.testing.expectEqualStrings("d\u{FFFD}r/x.csv", got.file);
 }
 
 test "wantsJsonLog: the last --log-format wins" {
