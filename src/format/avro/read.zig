@@ -26,6 +26,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
 const codecs = @import("../compress/codecs.zig");
+const conform = @import("../../lang/conform.zig");
 const driver = @import("../../connect/driver.zig");
 const decode = @import("decode.zig");
 const schema_mod = @import("schema.zig");
@@ -172,21 +173,22 @@ pub const Reader = struct {
     /// Each of this file's columns to the one of the table it fills, by name; the
     /// table's columns no file column fills.
     fn route(arena: std.mem.Allocator, own: types.Schema, out: types.Schema, routes: []decode.Route, source_name: []const u8) Error![]usize {
-        var covered = try arena.alloc(bool, out.fields.len);
-        @memset(covered, false);
-        for (own.fields, routes) |f, *r| {
-            const to = out.indexOf(f.name) orelse {
-                r.* = .{};
+        const cols = switch (try conform.conform(arena, out, own, conform.Policy.avro_route, null)) {
+            .cols => |c| c,
+            .problem => |p| {
+                const t = p.type;
+                return unsupported("`{s}`: column `{s}` is {s} here but {s} in the first file", .{ source_name, t.name, try t.got.name(arena), try t.want.name(arena) });
+            },
+        };
+        @memset(routes, .{});
+        var absent = std.ArrayListUnmanaged(usize).empty;
+        for (cols, 0..) |c, to| {
+            const from = c.from orelse {
+                try absent.append(arena, to);
                 continue;
             };
-            const want = out.fields[to].ty;
-            if (!types.Type.eql(f.ty, want) and !types.Type.canWiden(f.ty.kind, want.kind))
-                return unsupported("`{s}`: column `{s}` is {s} here but {s} in the first file", .{ source_name, f.name, try f.ty.name(arena), try want.name(arena) });
-            r.* = .{ .to = to, .cast = !types.Type.eql(f.ty, want) };
-            covered[to] = true;
+            routes[from] = .{ .to = to, .cast = c.how == .cast };
         }
-        var absent = std.ArrayListUnmanaged(usize).empty;
-        for (covered, 0..) |c, i| if (!c) try absent.append(arena, i);
         return absent.items;
     }
 
@@ -602,6 +604,56 @@ test "fuzz: arbitrary bytes behind a valid header never crash the reader" {
             readAny(try std.mem.concat(a, u8, &.{ head, input }));
         }
     }.f, .{});
+}
+
+fn routeBefore(arena: std.mem.Allocator, own: types.Schema, out: types.Schema, routes: []decode.Route) !?[]usize {
+    var covered = try arena.alloc(bool, out.fields.len);
+    @memset(covered, false);
+    for (own.fields, routes) |f, *r| {
+        const to = out.indexOf(f.name) orelse {
+            r.* = .{};
+            continue;
+        };
+        const want = out.fields[to].ty;
+        if (!types.Type.eql(f.ty, want) and !types.Type.canWiden(f.ty.kind, want.kind)) return null;
+        r.* = .{ .to = to, .cast = !types.Type.eql(f.ty, want) };
+        covered[to] = true;
+    }
+    var absent = std.ArrayListUnmanaged(usize).empty;
+    for (covered, 0..) |c, i| if (!c) try absent.append(arena, i);
+    return absent.items;
+}
+
+test "route on conform's avro_route equals the by-name walk it replaced, routes, absent columns and refusals" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const tys = [_]types.Type{ types.Type.init(.int), types.Type.init(.float), types.Type.init(.string), types.Type.init(.bool), types.Type.decimal(10, 2), types.Type.decimal(12, 4), types.Type.init(.date), types.Type.init(.timestamp), types.Type.nullColumn(true), types.Type.init(.int).asNullable() };
+    const names = [_][]const u8{ "a", "b", "c", "d" };
+    var prng = std.Random.DefaultPrng.init(0xa5_70);
+    const r = prng.random();
+    for (0..20_000) |_| {
+        var two: [2]types.Schema = undefined;
+        for (&two) |*s| {
+            const n = r.uintLessThan(usize, names.len + 1);
+            const fields = try a.alloc(types.Schema.Field, n);
+            var pick = names;
+            r.shuffle([]const u8, &pick);
+            for (fields, 0..) |*f, i| f.* = .{ .name = pick[i], .ty = tys[r.uintLessThan(usize, tys.len)] };
+            s.* = .{ .fields = fields };
+        }
+        const want_routes = try a.alloc(decode.Route, two[0].fields.len);
+        const got_routes = try a.alloc(decode.Route, two[0].fields.len);
+        const want = try routeBefore(a, two[0], two[1], want_routes);
+        const got = Reader.route(a, two[0], two[1], got_routes, "f.avro");
+        if (want) |absent| {
+            try testing.expectEqualSlices(usize, absent, try got);
+            for (want_routes, got_routes) |x, y| try testing.expectEqual(x, y);
+        } else {
+            try testing.expectError(error.UnsupportedAvro, got);
+            _ = eval.takeFailure(error.UnsupportedAvro);
+        }
+    }
 }
 
 test "a union of INT and FLOAT branches reads every branch into its FLOAT column, a dropped column still checked" {

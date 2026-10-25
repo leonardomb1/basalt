@@ -18,12 +18,11 @@ const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const column = @import("../../exec/column.zig");
-const cell = @import("../../exec/cell.zig");
+const civil = @import("../../exec/civil.zig");
 const decimal = @import("../../exec/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const format = @import("../../exec/eval/format.zig");
-const celltext = @import("../../exec/celltext.zig");
-const jsonwrite = @import("../json/write.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const schema = @import("schema.zig");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
@@ -169,7 +168,133 @@ pub const Code = enum(u8) {
             .null, .text, .slow, .choice => null,
         };
     }
+
+    /// The leaf code a typed node decodes with, from its kind and logical type: the
+    /// one mapping a compiled op and a decoded `Value` share.
+    pub fn of(n: *const Node) Code {
+        return switch (n.kind) {
+            .null => .null,
+            .boolean => .boolean,
+            .int => switch (n.logical) {
+                .date => .date,
+                .time_millis => .time_millis,
+                else => .int,
+            },
+            .long => switch (n.logical) {
+                .timestamp_millis => .ts_millis,
+                .timestamp_nanos => .ts_nanos,
+                else => .long,
+            },
+            .float => .float,
+            .double => .double,
+            .string => .bytes,
+            .bytes => if (n.logical == .decimal) .dec_bytes else .bytes,
+            .fixed => if (n.logical == .decimal) .dec_fixed else .fixed,
+            .@"enum" => .@"enum",
+            .record, .array, .map, .@"union" => unreachable,
+        };
+    }
 };
+
+/// What a leaf decode reads besides its bytes, from a compiled op.
+const OpArgs = struct {
+    op: Op,
+    nodes: []const *const Node,
+
+    inline fn size(a: OpArgs) usize {
+        return a.op.b;
+    }
+
+    inline fn symbols(a: OpArgs) []const []const u8 {
+        return a.nodes[a.op.a].symbols;
+    }
+
+    inline fn dec(a: OpArgs) Dec {
+        return a.op.decimal();
+    }
+};
+
+/// What a leaf decode reads besides its bytes, from the schema node itself.
+const NodeArgs = struct {
+    n: *const Node,
+
+    inline fn size(a: NodeArgs) usize {
+        return a.n.size;
+    }
+
+    inline fn symbols(a: NodeArgs) []const []const u8 {
+        return a.n.symbols;
+    }
+
+    inline fn dec(a: NodeArgs) Dec {
+        return .{ .precision = a.n.precision, .scale = a.n.scale, .size = a.n.size };
+    }
+};
+
+const Dec = struct { precision: u8, scale: u8, size: usize };
+
+fn Read(comptime c: Code) type {
+    return switch (Code.storageOf(c) orelse return void) {
+        .b => bool,
+        .i32 => i32,
+        .i64 => i64,
+        .f64 => f64,
+        .bytes => []const u8,
+        .dec => Decimal,
+    };
+}
+
+/// One leaf value at the cursor in its builder storage's form, its logical type
+/// applied; the typed program and `Machine.value` both decode through it.
+inline fn decodeLeaf(cur: *Cursor, comptime c: Code, args: anytype) Error!Read(c) {
+    return switch (c) {
+        .null => {},
+        .boolean => cur.boolean(),
+        .int => try cur.int(),
+        .date => cur.int(),
+        .time_millis => @call(.always_inline, civil.Tick.toMicros, .{ .ms, try cur.int(), .saturate }),
+        .long => cur.long(),
+        .ts_millis => blk: {
+            const x = try cur.long();
+            break :blk @call(.always_inline, civil.Tick.toMicros, .{ .ms, x, .fail }) catch corrupt("a timestamp-millis {d} past the range basalt holds", .{x});
+        },
+        .ts_nanos => @call(.always_inline, civil.Tick.toMicros, .{ .ns, try cur.long(), .saturate }),
+        .float => cur.float(),
+        .double => cur.double(),
+        .bytes => cur.bytes(),
+        .fixed => cur.take(args.size()),
+        .@"enum" => blk: {
+            const syms = args.symbols();
+            const i = try cur.long();
+            if (i < 0 or i >= syms.len) return corrupt("an enum symbol {d} of {d}", .{ i, syms.len });
+            break :blk syms[@intCast(i)];
+        },
+        .dec_bytes, .dec_fixed => blk: {
+            const d = args.dec();
+            const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
+            break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
+        },
+        .text, .slow, .choice => comptime unreachable,
+    };
+}
+
+/// A leaf decoded in storage form as the `Value` of its column's kind `kind`.
+fn valueOf(comptime c: Code, kind: types.TypeKind, x: Read(c)) Value {
+    const t = comptime Code.storageOf(c);
+    if (t == null) return .null;
+    return switch (t.?) {
+        .b => .{ .bool = x },
+        .i32 => .{ .date = x },
+        .i64 => switch (kind) {
+            .time => .{ .time = x },
+            .timestamp => .{ .timestamp = x },
+            else => .{ .int = x },
+        },
+        .f64 => .{ .float = x },
+        .bytes => if (kind == .string) .{ .string = x } else .{ .bytes = x },
+        .dec => .{ .decimal = x },
+    };
+}
 
 /// One step of a program. `col` is the builder a leaf, `text` or `slow` op fills
 /// (`none` to decode and drop), and for `choice` the op just past its branches.
@@ -188,8 +313,8 @@ pub const Op = extern struct {
 
     pub const Nulls = enum(u8) { none, first, second };
 
-    fn decimal(op: Op) struct { precision: u8, scale: u8, size: u16 } {
-        return .{ .precision = @truncate(op.a >> 8), .scale = @truncate(op.a), .size = @truncate(op.a >> 16) };
+    fn decimal(op: Op) Dec {
+        return .{ .precision = @truncate(op.a >> 8), .scale = @truncate(op.a), .size = @as(u16, @truncate(op.a >> 16)) };
     }
 };
 
@@ -254,27 +379,14 @@ const Compiler = struct {
         const col = self.colOf(own);
         if (self.routes[own].cast or schema.leafType(n).?.kind != self.own.fields[own].ty.kind)
             return .{ .code = .slow, .col = col, .a = try self.node(n) };
+        const code = Code.of(n);
         const dec = (@as(u32, n.precision) << 8) | n.scale;
-        return switch (n.kind) {
-            .null => .{ .code = .null, .col = col },
-            .boolean => .{ .code = .boolean, .col = col },
-            .int => .{ .code = switch (n.logical) {
-                .date => .date,
-                .time_millis => .time_millis,
-                else => .int,
-            }, .col = col },
-            .long => .{ .code = switch (n.logical) {
-                .timestamp_millis => .ts_millis,
-                .timestamp_nanos => .ts_nanos,
-                else => .long,
-            }, .col = col },
-            .float => .{ .code = .float, .col = col },
-            .double => .{ .code = .double, .col = col },
-            .string => .{ .code = .bytes, .col = col },
-            .bytes => if (n.logical == .decimal) .{ .code = .dec_bytes, .col = col, .a = dec } else .{ .code = .bytes, .col = col },
-            .fixed => if (n.logical == .decimal) .{ .code = .dec_fixed, .col = col, .a = dec | (@as(u32, @intCast(n.size)) << 16) } else .{ .code = .fixed, .col = col, .b = @intCast(n.size) },
-            .@"enum" => .{ .code = .@"enum", .col = col, .a = try self.node(n) },
-            .record, .array, .map, .@"union" => unreachable,
+        return switch (code) {
+            .dec_bytes => .{ .code = code, .col = col, .a = dec },
+            .dec_fixed => .{ .code = code, .col = col, .a = dec | (@as(u32, @intCast(n.size)) << 16) },
+            .fixed => .{ .code = code, .col = col, .b = @intCast(n.size) },
+            .@"enum" => .{ .code = code, .col = col, .a = try self.node(n) },
+            else => .{ .code = code, .col = col },
         };
     }
 
@@ -366,7 +478,7 @@ pub const Machine = struct {
         switch (op.code) {
             .text => {
                 m.text.clearRetainingCapacity();
-                try m.json(arena, m.prog.nodes[op.a], &m.text.writer, 0);
+                try m.json(m.prog.nodes[op.a], &m.text.writer, 0);
                 if (op.col != Op.none) try m.out[op.col].appendStr(m.text.written());
             },
             .slow => try m.slow(arena, op),
@@ -377,56 +489,12 @@ pub const Machine = struct {
 
     /// The decode and append of one leaf code, specialized per `c` at compile time.
     fn leaf(m: *Machine, comptime c: Code, op: Op) Error!void {
-        const v = try m.read(c, op);
+        const v = try decodeLeaf(&m.cur, c, OpArgs{ .op = op, .nodes = m.prog.nodes });
         if (op.col == Op.none) return;
         const b = &m.out[op.col];
         const t = comptime Code.storageOf(c);
         if (t == null) return b.appendNull();
         if (t.? == .bytes) try b.appendStr(v) else if (t.? == .dec) b.appendDecimalAssumeCapacity(v) else b.appendAsAssumeCapacity(t.?, v);
-    }
-
-    fn Read(comptime c: Code) type {
-        return switch (Code.storageOf(c) orelse return void) {
-            .b => bool,
-            .i32 => i32,
-            .i64 => i64,
-            .f64 => f64,
-            .bytes => []const u8,
-            .dec => Decimal,
-        };
-    }
-
-    inline fn read(m: *Machine, comptime c: Code, op: Op) Error!Read(c) {
-        const cur = &m.cur;
-        return switch (c) {
-            .null => {},
-            .boolean => cur.boolean(),
-            .int => try cur.int(),
-            .date => cur.int(),
-            .time_millis => @as(i64, try cur.int()) * 1000,
-            .long => cur.long(),
-            .ts_millis => blk: {
-                const x = try cur.long();
-                break :blk std.math.mul(i64, x, 1000) catch corrupt("a timestamp-millis {d} past the range basalt holds", .{x});
-            },
-            .ts_nanos => @divFloor(try cur.long(), 1000),
-            .float => cur.float(),
-            .double => cur.double(),
-            .bytes => cur.bytes(),
-            .fixed => cur.take(op.b),
-            .@"enum" => blk: {
-                const syms = m.prog.nodes[op.a].symbols;
-                const i = try cur.long();
-                if (i < 0 or i >= syms.len) return corrupt("an enum symbol {d} of {d}", .{ i, syms.len });
-                break :blk syms[@intCast(i)];
-            },
-            .dec_bytes, .dec_fixed => blk: {
-                const d = op.decimal();
-                const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
-                break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
-            },
-            .text, .slow, .choice => comptime unreachable,
-        };
     }
 
     /// A value whose column the table types otherwise, decoded and cast to it.
@@ -443,46 +511,14 @@ pub const Machine = struct {
 
     /// The value at the cursor as a `Value`, for JSON text and a cast.
     pub fn value(m: *Machine, n: *const Node) Error!Value {
-        const c = &m.cur;
-        return switch (n.kind) {
-            .null => .null,
-            .boolean => .{ .bool = try c.boolean() },
-            .int => blk: {
-                const x = try c.int();
-                break :blk switch (n.logical) {
-                    .date => .{ .date = x },
-                    .time_millis => .{ .time = @as(i64, x) * 1000 },
-                    else => .{ .int = x },
-                };
-            },
-            .long => blk: {
-                const x = try c.long();
-                break :blk switch (n.logical) {
-                    .time_micros => .{ .time = x },
-                    .timestamp_millis => .{ .timestamp = std.math.mul(i64, x, 1000) catch return corrupt("a timestamp-millis {d} past the range basalt holds", .{x}) },
-                    .timestamp_micros => .{ .timestamp = x },
-                    .timestamp_nanos => .{ .timestamp = @divFloor(x, 1000) },
-                    else => .{ .int = x },
-                };
-            },
-            .float => .{ .float = try c.float() },
-            .double => .{ .float = try c.double() },
-            .string => .{ .string = try c.bytes() },
-            .@"enum" => blk: {
-                const i = try c.long();
-                if (i < 0 or i >= n.symbols.len) return corrupt("an enum symbol {d} of {d}", .{ i, n.symbols.len });
-                break :blk .{ .string = n.symbols[@intCast(i)] };
-            },
-            .bytes, .fixed => blk: {
-                const b = if (n.kind == .bytes) try c.bytes() else try c.take(n.size);
-                break :blk if (n.logical == .decimal) try decimalOf(b, n.precision, n.scale) else .{ .bytes = b };
-            },
-            .record, .array, .map, .@"union" => unreachable,
+        return switch (Code.of(n)) {
+            .text, .slow, .choice => unreachable,
+            inline else => |c| valueOf(c, schema.leafType(n).?.kind, try decodeLeaf(&m.cur, c, NodeArgs{ .n = n })),
         };
     }
 
     /// The value at the cursor as compact JSON, as basalt's JSON writer writes one.
-    pub fn json(m: *Machine, arena: std.mem.Allocator, n: *const Node, w: *std.Io.Writer, depth: usize) Error!void {
+    pub fn json(m: *Machine, n: *const Node, w: *std.Io.Writer, depth: usize) Error!void {
         if (depth > schema.max_depth) return corrupt("a value nests deeper than {d}", .{schema.max_depth});
         const c = &m.cur;
         switch (n.kind) {
@@ -490,9 +526,8 @@ pub const Machine = struct {
                 try put(w, "{");
                 for (n.fields, 0..) |f, i| {
                     if (i > 0) try put(w, ",");
-                    try quoted(w, f.name);
-                    try put(w, ":");
-                    try m.json(arena, f.node, w, depth + 1);
+                    jsontext.key(w, f.name) catch return error.OutOfMemory;
+                    try m.json(f.node, w, depth + 1);
                 }
                 try put(w, "}");
             },
@@ -505,11 +540,8 @@ pub const Machine = struct {
                     for (0..k) |_| {
                         if (!first) try put(w, ",");
                         first = false;
-                        if (n.kind == .map) {
-                            try quoted(w, try c.bytes());
-                            try put(w, ":");
-                        }
-                        try m.json(arena, n.items.?, w, depth + 1);
+                        if (n.kind == .map) jsontext.key(w, try c.bytes()) catch return error.OutOfMemory;
+                        try m.json(n.items.?, w, depth + 1);
                     }
                 }
                 try put(w, if (n.kind == .array) "]" else "}");
@@ -517,47 +549,25 @@ pub const Machine = struct {
             .@"union" => {
                 const i = try c.long();
                 if (i < 0 or i >= n.branches.len) return corrupt("a union branch {d} of {d}", .{ i, n.branches.len });
-                try m.json(arena, n.branches[@intCast(i)], w, depth + 1);
+                try m.json(n.branches[@intCast(i)], w, depth + 1);
             },
             .int, .long => if (n.logical == .none) {
                 const x = if (n.kind == .int) try c.int() else try c.long();
                 format.writeInt(w, x) catch return error.OutOfMemory;
-            } else try m.jsonValue(arena, n, w),
-            .string => if (n.logical == .none or n.logical == .uuid) try quoted(w, try c.bytes()) else try m.jsonValue(arena, n, w),
-            else => try m.jsonValue(arena, n, w),
+            } else try m.jsonValue(n, w),
+            .string => if (n.logical == .none or n.logical == .uuid) (jsontext.string(w, try c.bytes()) catch return error.OutOfMemory) else try m.jsonValue(n, w),
+            else => try m.jsonValue(n, w),
         }
     }
 
     /// A scalar as JSON by way of its `Value`: what `json` does not write directly.
-    fn jsonValue(m: *Machine, arena: std.mem.Allocator, n: *const Node, w: *std.Io.Writer) Error!void {
-        switch (try m.value(n)) {
-            .null => try put(w, "null"),
-            .bool => |b| try put(w, if (b) "true" else "false"),
-            .int => |x| format.writeInt(w, x) catch return error.OutOfMemory,
-            .float => |x| if (std.math.isFinite(x)) (celltext.writeFloat(w, x) catch return error.OutOfMemory) else try put(w, "null"),
-            .string => |s| try quoted(w, s),
-            .bytes => |s| {
-                try put(w, "\"");
-                std.base64.standard.Encoder.encodeWriter(w, s) catch return error.OutOfMemory;
-                try put(w, "\"");
-            },
-            else => |v| {
-                try put(w, "\"");
-                try put(w, eval.valueToString(arena, v) catch return error.OutOfMemory);
-                try put(w, "\"");
-            },
-        }
+    fn jsonValue(m: *Machine, n: *const Node, w: *std.Io.Writer) Error!void {
+        jsontext.scalar(w, try m.value(n), jsontext.typed) catch return error.OutOfMemory;
     }
 };
 
 fn put(w: *std.Io.Writer, s: []const u8) Error!void {
     w.writeAll(s) catch return error.OutOfMemory;
-}
-
-fn quoted(w: *std.Io.Writer, s: []const u8) Error!void {
-    try put(w, "\"");
-    jsonwrite.writeEscaped(w, s) catch return error.OutOfMemory;
-    try put(w, "\"");
 }
 
 const testing = std.testing;
@@ -612,4 +622,323 @@ test "a nullable leaf compiles to one op marked nullable, a union of records to 
     try testing.expectEqual(@as(u32, Op.none), prog.ops[3].col);
     try testing.expectEqual(@as(usize, 1), prog.cols.len);
     try testing.expectEqual(@as(u32, 1), prog.cols[0]);
+}
+
+fn valueBefore(c: *Cursor, n: *const Node) Error!Value {
+    return switch (n.kind) {
+        .null => .null,
+        .boolean => .{ .bool = try c.boolean() },
+        .int => blk: {
+            const x = try c.int();
+            break :blk switch (n.logical) {
+                .date => .{ .date = x },
+                .time_millis => .{ .time = @as(i64, x) * 1000 },
+                else => .{ .int = x },
+            };
+        },
+        .long => blk: {
+            const x = try c.long();
+            break :blk switch (n.logical) {
+                .time_micros => .{ .time = x },
+                .timestamp_millis => .{ .timestamp = std.math.mul(i64, x, 1000) catch return corrupt("a timestamp-millis {d} past the range basalt holds", .{x}) },
+                .timestamp_micros => .{ .timestamp = x },
+                .timestamp_nanos => .{ .timestamp = @divFloor(x, 1000) },
+                else => .{ .int = x },
+            };
+        },
+        .float => .{ .float = try c.float() },
+        .double => .{ .float = try c.double() },
+        .string => .{ .string = try c.bytes() },
+        .@"enum" => blk: {
+            const i = try c.long();
+            if (i < 0 or i >= n.symbols.len) return corrupt("an enum symbol {d} of {d}", .{ i, n.symbols.len });
+            break :blk .{ .string = n.symbols[@intCast(i)] };
+        },
+        .bytes, .fixed => blk: {
+            const b = if (n.kind == .bytes) try c.bytes() else try c.take(n.size);
+            break :blk if (n.logical == .decimal) try decimalOf(b, n.precision, n.scale) else .{ .bytes = b };
+        },
+        .record, .array, .map, .@"union" => unreachable,
+    };
+}
+
+fn leafOpBefore(n: *const Node, col: u32, node_at: u32) Op {
+    const dec = (@as(u32, n.precision) << 8) | n.scale;
+    return switch (n.kind) {
+        .null => .{ .code = .null, .col = col },
+        .boolean => .{ .code = .boolean, .col = col },
+        .int => .{ .code = switch (n.logical) {
+            .date => .date,
+            .time_millis => .time_millis,
+            else => .int,
+        }, .col = col },
+        .long => .{ .code = switch (n.logical) {
+            .timestamp_millis => .ts_millis,
+            .timestamp_nanos => .ts_nanos,
+            else => .long,
+        }, .col = col },
+        .float => .{ .code = .float, .col = col },
+        .double => .{ .code = .double, .col = col },
+        .string => .{ .code = .bytes, .col = col },
+        .bytes => if (n.logical == .decimal) .{ .code = .dec_bytes, .col = col, .a = dec } else .{ .code = .bytes, .col = col },
+        .fixed => if (n.logical == .decimal) .{ .code = .dec_fixed, .col = col, .a = dec | (@as(u32, @intCast(n.size)) << 16) } else .{ .code = .fixed, .col = col, .b = @intCast(n.size) },
+        .@"enum" => .{ .code = .@"enum", .col = col, .a = node_at },
+        .record, .array, .map, .@"union" => unreachable,
+    };
+}
+
+fn readBefore(cur: *Cursor, comptime c: Code, op: Op, nodes: []const *const Node) Error!Read(c) {
+    return switch (c) {
+        .null => {},
+        .boolean => cur.boolean(),
+        .int => try cur.int(),
+        .date => cur.int(),
+        .time_millis => @as(i64, try cur.int()) * 1000,
+        .long => cur.long(),
+        .ts_millis => blk: {
+            const x = try cur.long();
+            break :blk std.math.mul(i64, x, 1000) catch corrupt("a timestamp-millis {d} past the range basalt holds", .{x});
+        },
+        .ts_nanos => @divFloor(try cur.long(), 1000),
+        .float => cur.float(),
+        .double => cur.double(),
+        .bytes => cur.bytes(),
+        .fixed => cur.take(op.b),
+        .@"enum" => blk: {
+            const syms = nodes[op.a].symbols;
+            const i = try cur.long();
+            if (i < 0 or i >= syms.len) return corrupt("an enum symbol {d} of {d}", .{ i, syms.len });
+            break :blk syms[@intCast(i)];
+        },
+        .dec_bytes, .dec_fixed => blk: {
+            const d = op.decimal();
+            const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
+            break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
+        },
+        .text, .slow, .choice => comptime unreachable,
+    };
+}
+
+/// Every scalar node the parser can give: each primitive under each logical type,
+/// fixed sizes 0 to 17, decimals of several precisions and scales, and an enum.
+fn scalarNodes(a: std.mem.Allocator) ![]const Node {
+    var out = std.array_list.Managed(Node).init(a);
+    const syms: []const []const u8 = &.{ "A", "B", "C" };
+    for ([_]Node.Kind{ .null, .boolean, .int, .long, .float, .double, .bytes, .string }) |k|
+        for (std.enums.values(schema.Logical)) |l| if (l != .decimal) try out.append(.{ .kind = k, .logical = l });
+    try out.append(.{ .kind = .@"enum", .symbols = syms });
+    try out.append(.{ .kind = .@"enum", .symbols = &.{} });
+    for (0..18) |size| try out.append(.{ .kind = .fixed, .size = size });
+    for ([_][2]u8{ .{ 1, 0 }, .{ 2, 1 }, .{ 9, 2 }, .{ 18, 4 }, .{ 19, 0 }, .{ 38, 10 }, .{ 38, 38 } }) |ps| {
+        try out.append(.{ .kind = .bytes, .logical = .decimal, .precision = ps[0], .scale = ps[1] });
+        for ([_]usize{ 1, 4, 8, 16, 17 }) |size| try out.append(.{ .kind = .fixed, .logical = .decimal, .precision = ps[0], .scale = ps[1], .size = size });
+    }
+    return out.items;
+}
+
+/// Random block bytes that a cursor reads as small and extreme varints, lengths and
+/// raw bytes alike.
+fn randomBlock(r: std.Random, a: std.mem.Allocator) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(a);
+    const extremes = [_]i64{ 0, 1, -1, 2, 3, std.math.maxInt(i64) / 1000, std.math.maxInt(i64) / 1000 + 1, std.math.minInt(i64) / 1000 - 1, std.math.maxInt(i64), std.math.minInt(i64), std.math.maxInt(i32) + 1, -1001, 1999 };
+    for (0..r.uintLessThan(usize, 4)) |_| switch (r.uintLessThan(u8, 3)) {
+        0 => try varint.write(&out, varint.zigzag(extremes[r.uintLessThan(usize, extremes.len)])),
+        1 => try out.append(r.uintLessThan(u8, 40)),
+        else => for (0..r.uintLessThan(usize, 20)) |_| try out.append(r.int(u8)),
+    };
+    return out.items;
+}
+
+/// Equal as decoded, a float by its bits so a NaN equals itself.
+fn sameDecoded(x: anytype, y: @TypeOf(x)) bool {
+    const T = @TypeOf(x);
+    if (T == f64) return @as(u64, @bitCast(x)) == @as(u64, @bitCast(y));
+    if (T == Value) if (x == .float and y == .float) return sameDecoded(x.float, y.float);
+    return std.meta.eql(x, y);
+}
+
+fn emptyMachine() Machine {
+    return Machine.init(testing.allocator, .{ .ops = &.{}, .nodes = &.{}, .branches = &.{}, .cols = &.{} }, .{ .fields = &.{} }, "");
+}
+
+test "Machine.value through Code.of and decodeLeaf equals the per-kind decode it replaced on random blocks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nodes = try scalarNodes(a);
+    var prng = std.Random.DefaultPrng.init(0xa5_de);
+    const r = prng.random();
+    var m = emptyMachine();
+    defer m.deinit();
+    for (0..20_000) |_| {
+        const buf = try randomBlock(r, a);
+        for (nodes) |*n| {
+            var old = Cursor{ .buf = buf };
+            m.cur = .{ .buf = buf };
+            const want = valueBefore(&old, n);
+            const got = m.value(n);
+            if (want) |v| {
+                try testing.expect(sameDecoded(v, try got));
+                try testing.expectEqual(old.pos, m.cur.pos);
+            } else |e| try testing.expectError(e, got);
+        }
+    }
+}
+
+test "a compiled leaf op and its decode equal the per-kind op and read they replaced on random blocks" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nodes = try scalarNodes(a);
+    var prng = std.Random.DefaultPrng.init(0xa5_0b);
+    const r = prng.random();
+    var ops = std.array_list.Managed(Op).init(a);
+    var progs = std.array_list.Managed([]const *const Node).init(a);
+    for (nodes) |*n| {
+        const fields = try a.alloc(types.Schema.Field, 1);
+        fields[0] = .{ .name = "c", .ty = schema.leafType(n).? };
+        var comp = Compiler{ .arena = a, .own = .{ .fields = fields }, .routes = &.{.{ .to = 0 }} };
+        const op = try comp.leaf(n, 0);
+        try testing.expectEqual(leafOpBefore(n, 0, 0), op);
+        try ops.append(op);
+        try progs.append(comp.nodes.items);
+    }
+    for (0..20_000) |_| {
+        const buf = try randomBlock(r, a);
+        for (ops.items, progs.items) |op, pn| switch (op.code) {
+            .text, .slow, .choice => unreachable,
+            inline else => |c| {
+                var old = Cursor{ .buf = buf };
+                var new = Cursor{ .buf = buf };
+                const want = readBefore(&old, c, op, pn);
+                const got = decodeLeaf(&new, c, OpArgs{ .op = op, .nodes = pn });
+                if (want) |v| {
+                    try testing.expect(sameDecoded(v, try got));
+                    try testing.expectEqual(old.pos, new.pos);
+                } else |e| try testing.expectError(e, got);
+            },
+        };
+    }
+}
+
+fn jsonValueBefore(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
+    const celltext = @import("../../exec/celltext.zig");
+    const jsonwrite = @import("../json/write.zig");
+    switch (v) {
+        .null => try w.writeAll("null"),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .int => |x| try format.writeInt(w, x),
+        .float => |x| if (std.math.isFinite(x)) try celltext.writeFloat(w, x) else try w.writeAll("null"),
+        .string => |s| {
+            try w.writeAll("\"");
+            try jsonwrite.writeEscaped(w, s);
+            try w.writeAll("\"");
+        },
+        .bytes => |s| {
+            try w.writeAll("\"");
+            try std.base64.standard.Encoder.encodeWriter(w, s);
+            try w.writeAll("\"");
+        },
+        else => {
+            try w.writeAll("\"");
+            try w.writeAll(try eval.valueToString(arena, v));
+            try w.writeAll("\"");
+        },
+    }
+}
+
+test "jsontext.scalar in the typed style writes every nested scalar as Avro's own JSON writer did" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const imin = std.math.minInt(i64);
+    const imax = std.math.maxInt(i64);
+    const fixed = [_]Value{
+        .null,
+        .{ .bool = true },
+        .{ .bool = false },
+        .{ .int = 0 },
+        .{ .int = imin },
+        .{ .int = imax },
+        .{ .float = 0 },
+        .{ .float = -0.0 },
+        .{ .float = 1.5 },
+        .{ .float = 1e300 },
+        .{ .float = 5e-324 },
+        .{ .float = std.math.nan(f64) },
+        .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) },
+        .{ .string = "" },
+        .{ .string = "a\"b\\c\n\r\t\x01\x1f\x7f" },
+        .{ .string = "caf\xc3\xa9 \xff\xfe" },
+        .{ .string = "\xc3" },
+        .{ .bytes = "" },
+        .{ .bytes = "\x00\x01\xff" },
+        .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
+        .{ .decimal = .{ .unscaled = -1, .scale = 2 } },
+        .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 38 } },
+        .{ .decimal = .{ .unscaled = std.math.minInt(i128) + 1, .scale = 0 } },
+        .{ .date = 0 },
+        .{ .date = std.math.minInt(i32) },
+        .{ .date = std.math.maxInt(i32) },
+        .{ .date = -719_163 },
+        .{ .time = 0 },
+        .{ .time = 86_399_999_999 },
+        .{ .timestamp = 0 },
+        .{ .timestamp = imin },
+        .{ .timestamp = imax },
+        .{ .timestamp = -1 },
+    };
+    var prng = std.Random.DefaultPrng.init(0x15_0a);
+    const r = prng.random();
+    var values = std.array_list.Managed(Value).init(a);
+    try values.appendSlice(&fixed);
+    for (0..5_000) |_| {
+        const s = try a.alloc(u8, r.uintLessThan(usize, 12));
+        r.bytes(s);
+        try values.append(switch (r.uintLessThan(u8, 8)) {
+            0 => .{ .int = r.int(i64) },
+            1 => .{ .float = @bitCast(r.int(u64)) },
+            2 => .{ .string = s },
+            3 => .{ .bytes = s },
+            4 => .{ .decimal = .{ .unscaled = r.int(i64), .scale = r.uintAtMost(u8, 38) } },
+            5 => .{ .date = r.int(i32) },
+            6 => .{ .time = r.intRangeLessThan(i64, 0, 86_400_000_000) },
+            else => .{ .timestamp = r.int(i64) },
+        });
+    }
+    for (values.items) |v| {
+        var want = std.Io.Writer.Allocating.init(a);
+        var got = std.Io.Writer.Allocating.init(a);
+        try jsonValueBefore(a, v, &want.writer);
+        try jsontext.scalar(&got.writer, v, jsontext.typed);
+        try testing.expectEqualStrings(want.written(), got.written());
+    }
+}
+
+test "a timestamp-millis past i64 microseconds is a corrupt file on the typed and the cast path alike (kept until D2)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var buf = std.array_list.Managed(u8).init(a);
+    const n = Node{ .kind = .long, .logical = .timestamp_millis };
+    const ok = std.math.maxInt(i64) / 1000;
+    for ([_]i64{ ok, ok + 1, std.math.minInt(i64) / 1000 - 1, std.math.minInt(i64) }) |x| {
+        buf.clearRetainingCapacity();
+        try varint.write(&buf, varint.zigzag(x));
+        var cur = Cursor{ .buf = buf.items };
+        const typed = decodeLeaf(&cur, .ts_millis, NodeArgs{ .n = &n });
+        var m = emptyMachine();
+        defer m.deinit();
+        m.cur = .{ .buf = buf.items };
+        const cast = m.value(&n);
+        if (x == ok) {
+            try testing.expectEqual(x * 1000, try typed);
+            try testing.expectEqual(x * 1000, (try cast).timestamp);
+        } else {
+            try testing.expectError(error.CorruptAvro, typed);
+            try testing.expectError(error.CorruptAvro, cast);
+            try testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CorruptAvro).?, "timestamp-millis") != null);
+        }
+    }
 }

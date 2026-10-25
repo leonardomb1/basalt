@@ -27,7 +27,7 @@ const decimals = @import("../../exec/column.zig").decimals;
 const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
 const driver = @import("../../connect/driver.zig");
-const jsonwrite = @import("../json/write.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const read = @import("read.zig");
 const schema_mod = @import("schema.zig");
 const stream = @import("../stream.zig");
@@ -61,7 +61,7 @@ pub fn schemaJson(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
     for (schema.fields, 0..) |f, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":\"");
-        try jsonwrite.writeEscaped(w, f.name);
+        try jsontext.chars(w, f.name);
         try w.writeAll("\",\"type\":[\"null\",");
         switch (f.ty.kind) {
             .bool => try w.writeAll("\"boolean\""),
