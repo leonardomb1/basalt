@@ -23,6 +23,8 @@
 
 const std = @import("std");
 const sql = @import("../db/sql.zig");
+const civil = @import("../exec/civil.zig");
+const uuid = @import("../format/uuid.zig");
 const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
 
@@ -216,7 +218,7 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
 /// The key's MIN and MAX over `base`, as the driver types them; null when the
 /// probe fails or the table is empty.
 fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?[2]Value {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -248,7 +250,7 @@ fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
 const Bounds = struct { min: i64, max: i64 };
 
 fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -265,7 +267,7 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
 }
 
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
-    const qcol = sql.quoteName(arena, dialect, col) catch col;
+    const qcol = try sql.quoteName(arena, dialect, col);
     const span: i128 = @as(i128, max) - @as(i128, min) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -294,7 +296,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
 /// MIN/MAX of a date/timestamp key as days since 1970, or null when the cursor
 /// did not yield `.date` or `.timestamp` (e.g. a driver left it as text).
 fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ sql.quoteName(arena, dialect, col) catch col, base });
+    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -312,13 +314,13 @@ fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: 
 fn dayOf(v: Value) ?i64 {
     return switch (v) {
         .date => |d| d,
-        .timestamp => |us| @divFloor(us, 86_400_000_000),
+        .timestamp => |us| civil.dayOf(us),
         else => null,
     };
 }
 
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
-    const qcol = sql.quoteName(arena, dialect, col) catch col;
+    const qcol = try sql.quoteName(arena, dialect, col);
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -346,7 +348,7 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
 }
 
 fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m: usize) ![]const []const u8 {
-    const qcol = sql.quoteName(arena, dialect, col) catch col;
+    const qcol = try sql.quoteName(arena, dialect, col);
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
@@ -369,20 +371,29 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     const val: u128 = @intCast((@as(u256, k) << 128) / @as(u256, m));
     var bytes: [16]u8 = undefined;
     std.mem.writeInt(u128, &bytes, val, .big);
-    return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-        bytes[0],  bytes[1],  bytes[2],  bytes[3],
-        bytes[4],  bytes[5],  bytes[6],  bytes[7],
-        bytes[8],  bytes[9],  bytes[10], bytes[11],
-        bytes[12], bytes[13], bytes[14], bytes[15],
-    });
+    return arena.dupe(u8, &uuid.text(&bytes, .canonical));
+}
+
+/// A name as a catalog lookup's string literal: `N'…'` on SQL Server, so a name
+/// outside the database's code page still resolves. Stands in for
+/// `sql.writeStrLit(.catalog_name)` until sql.zig has it.
+pub fn catalogNameLit(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
+    const lit = try dialect.strLit(arena, name);
+    return if (dialect == .sqlserver) std.mem.concat(arena, u8, &.{ "N", lit }) else lit;
+}
+
+/// A table as a catalog lookup names it: its quoted parts as one literal, the way a
+/// read names it (`'"s"."T"'::regclass` keeps the case PostgreSQL would fold).
+pub fn catalogObjectLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
+    return catalogNameLit(arena, dialect, try sql.quoteParts(arena, dialect, parts));
 }
 
 /// What a catalog probe matches the table by: its quoted name as a literal on
 /// postgres and SQL Server, its schema and name columns on the MySQL family.
 fn catalogLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
     return switch (dialect) {
-        .postgres, .sqlserver => sql.objectLit(arena, dialect, parts),
-        .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "k.TABLE_SCHEMA = {s} AND k.TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try dialect.strLit(arena, parts[parts.len - 1]) }),
+        .postgres, .sqlserver => catalogObjectLit(arena, dialect, parts),
+        .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "k.TABLE_SCHEMA = {s} AND k.TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try catalogNameLit(arena, dialect, parts[parts.len - 1]) }),
     };
 }
 
@@ -391,7 +402,8 @@ test "catalog probes name the table by its quoted parts, as the read does" {
     defer ar.deinit();
     const a = ar.allocator();
     try std.testing.expectEqualStrings("'\"s\".\"Orders\"'", try catalogLit(a, .postgres, &.{ "s", "Orders" }));
-    try std.testing.expectEqualStrings("'[dbo].[o''x]'", try catalogLit(a, .sqlserver, &.{ "dbo", "o'x" }));
+    try std.testing.expectEqualStrings("N'[dbo].[o''x]'", try catalogLit(a, .sqlserver, &.{ "dbo", "o'x" }));
+    try std.testing.expectEqualStrings("N'[dbo].[Ação]'", try catalogLit(a, .sqlserver, &.{ "dbo", "Ação" }));
     try std.testing.expectEqualStrings("k.TABLE_SCHEMA = 'db' AND k.TABLE_NAME = 't\\\\'", try catalogLit(a, .mysql, &.{ "db", "t\\" }));
     try std.testing.expectEqualStrings("k.TABLE_SCHEMA = DATABASE() AND k.TABLE_NAME = 't'", try catalogLit(a, .doris, &.{"t"}));
 }
@@ -546,6 +558,30 @@ test "uuid boundary values are exact space fractions" {
     try std.testing.expectEqualStrings("80000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 2));
     try std.testing.expectEqualStrings("40000000-0000-0000-0000-000000000000", try uuidAt(a, 1, 4));
     try std.testing.expectEqualStrings("00000000-0000-0000-0000-000000000000", try uuidAt(a, 0, 3));
+}
+
+test "uuid boundaries: the shared uuid text gives the old allocPrint text for every k of several m" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_]usize{ 1, 2, 3, 4, 7, 16, 255, 1000, 65537 }) |m| {
+        var k: usize = 0;
+        while (k < m) : (k += @max(1, m / 97)) {
+            const val: u128 = @intCast((@as(u256, k) << 128) / @as(u256, m));
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, val, .big);
+            const want = try std.fmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
+                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+            });
+            try std.testing.expectEqualStrings(want, try uuidAt(a, k, m));
+        }
+    }
+}
+
+test "dayOf floors a timestamp to its day, before the epoch too" {
+    for ([_]i64{ 0, 1, -1, 86_399_999_999, -86_400_000_000, -86_400_000_001, std.math.minInt(i64), std.math.maxInt(i64) }) |us|
+        try std.testing.expectEqual(@as(?i64, @divFloor(us, 86_400_000_000)), dayOf(.{ .timestamp = us }));
 }
 
 test "plan-level guards: m<=1 and non-postgres uuid never split" {
@@ -845,7 +881,7 @@ test "introspectKey reads a single-column primary key's name, kind and row estim
 
     f = FakeConn{ .arena = a, .rows = &.{ &.{ .{ .string = "a" }, .{ .string = "int" }, .{ .int = 9 } }, &.{ .{ .string = "b" }, .{ .string = "int" }, .{ .int = 9 } } } };
     try std.testing.expectEqual(@as(?KeyInfo, null), try introspectKey(a, f.prober(), .sqlserver, &.{ "dbo", "t" }));
-    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID('[dbo].[t]') AND i.is_primary_key = 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID(N'[dbo].[t]') AND i.is_primary_key = 1") != null);
 
     f = FakeConn{ .arena = a, .rows = &.{&.{ .null, .{ .string = "int" }, .{ .int = 9 } }} };
     try std.testing.expectEqual(@as(?KeyInfo, null), try introspectKey(a, f.prober(), .postgres, &.{"t"}));
@@ -871,7 +907,7 @@ test "introspectPkCols lists every key column in order, empty when the probe can
     try std.testing.expectEqual(@as(usize, 2), cols.len);
     try std.testing.expectEqualStrings("tenant", cols[0]);
     try std.testing.expectEqualStrings("id", cols[1]);
-    try std.testing.expect(std.mem.endsWith(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID('[dbo].[t]') AND i.is_primary_key = 1\nORDER BY ic.key_ordinal"));
+    try std.testing.expect(std.mem.endsWith(u8, f.queries.items[0], "WHERE i.object_id = OBJECT_ID(N'[dbo].[t]') AND i.is_primary_key = 1\nORDER BY ic.key_ordinal"));
 
     f = FakeConn{ .arena = a, .rows = &.{&.{.{ .string = "id" }}} };
     _ = try introspectPkCols(a, f.prober(), .postgres, &.{ "s", "t" });
