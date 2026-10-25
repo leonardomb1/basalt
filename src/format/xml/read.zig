@@ -29,7 +29,7 @@ const celltext = @import("../../exec/celltext.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const csv = @import("../csv.zig");
-const jsonwrite = @import("../json/write.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 const texttype = @import("../texttype.zig");
 const token = @import("token.zig");
 const escape = @import("escape.zig");
@@ -145,13 +145,13 @@ pub const Reader = struct {
     /// or repeated in the sample) and `#text`.
     fn writeJson(self: *const Reader, arena: std.mem.Allocator, w: *std.Io.Writer, n: *const Node, path: []const u8) !void {
         if (n.nil) return w.writeAll("null");
-        if (n.attrs.len == 0 and n.children.len == 0) return writeString(w, n.text);
+        if (n.attrs.len == 0 and n.children.len == 0) return jsontext.string(w, n.text);
         try w.writeByte('{');
         var first = true;
         for (n.attrs) |a| {
             try sep(w, &first);
             try writeKey(w, "@", a.name);
-            try writeString(w, a.value);
+            try jsontext.string(w, a.value);
         }
         for (try groupByName(arena, n.children)) |group| {
             const c = group[0];
@@ -172,7 +172,7 @@ pub const Reader = struct {
         if (n.text.len > 0 and (n.children.len == 0 or !blank(n.text))) {
             try sep(w, &first);
             try writeKey(w, "", "#text");
-            try writeString(w, n.text);
+            try jsontext.string(w, n.text);
         }
         try w.writeByte('}');
     }
@@ -531,14 +531,8 @@ fn sep(w: *std.Io.Writer, first: *bool) !void {
 fn writeKey(w: *std.Io.Writer, prefix: []const u8, name: []const u8) !void {
     try w.writeByte('"');
     try w.writeAll(prefix);
-    try jsonwrite.writeEscaped(w, name);
+    try jsontext.chars(w, name);
     try w.writeAll("\":");
-}
-
-fn writeString(w: *std.Io.Writer, s: []const u8) !void {
-    try w.writeByte('"');
-    try jsonwrite.writeEscaped(w, s);
-    try w.writeByte('"');
 }
 
 /// The encoding the document declares, after a UTF-8 byte-order mark is passed;
