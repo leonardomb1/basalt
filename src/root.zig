@@ -93,3 +93,4 @@ pub const form = @import("cli/repl/form.zig");
 pub const view = @import("cli/repl/view.zig");
 pub const fixtures = @import("format/testdata/fixtures.zig");
 pub const http_fake = @import("testing/http_fake.zig");
+pub const textconv = @import("exec/textconv.zig");
