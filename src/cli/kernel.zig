@@ -434,11 +434,11 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.elapsed_ms) |ms| try w.print(",\"elapsed_ms\":{d}", .{ms});
     if (st.declared) |d| {
         try w.writeAll(",\"declared\":");
-        try std.json.Stringify.value(d, .{}, w);
+        try writeObjects(w, d);
     }
     if (st.results) |r| {
         try w.writeAll(",\"results\":");
-        try std.json.Stringify.value(r, .{}, w);
+        try writeObjects(w, r);
     }
     if (st.loads) |l| {
         try w.writeAll(",\"loads\":[");
@@ -460,7 +460,7 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");
-        try std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, w);
+        try writeObject(w, e);
     }
     try w.writeAll("}\n");
     out.line(aw.written());
@@ -527,6 +527,38 @@ fn pump(out: *Out, fd: std.posix.fd_t, id: []const u8) void {
 }
 
 const Loads = struct { list: []const runtime.LoadDone, summary: obs.Summary };
+
+/// A flat struct as the object std.json.Stringify writes for it, null fields left
+/// out, with its strings through `jsontext` so text that is not UTF-8 stays JSON.
+fn writeObject(w: *std.Io.Writer, v: anytype) !void {
+    var first = true;
+    try w.writeByte('{');
+    inline for (std.meta.fields(@TypeOf(v))) |f| {
+        const opt = @typeInfo(f.type) == .optional;
+        const x = @field(v, f.name);
+        if (!opt or x != null) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try jsontext.key(w, f.name);
+            const y = if (opt) x.? else x;
+            switch (@TypeOf(y)) {
+                []const u8 => try jsontext.string(w, y),
+                bool => try w.writeAll(if (y) "true" else "false"),
+                else => try w.print("{d}", .{y}),
+            }
+        }
+    }
+    try w.writeByte('}');
+}
+
+fn writeObjects(w: *std.Io.Writer, items: anytype) !void {
+    try w.writeByte('[');
+    for (items, 0..) |it, k| {
+        if (k > 0) try w.writeByte(',');
+        try writeObject(w, it);
+    }
+    try w.writeByte(']');
+}
 
 /// One load's fields without braces, shared by the `load` frame and the status.
 /// Fields without a value are left out: `reason`/`transient` on success, the
@@ -856,4 +888,43 @@ test "clip: an echoed id cut at 256 bytes never splits a codepoint, so the frame
     try std.testing.expectEqualStrings("a" ** 255, back);
     try std.testing.expectEqualStrings("a" ** 200, clip("a" ** 200));
     try std.testing.expectEqualStrings("a" ** 256, clip("a" ** 300));
+}
+
+test "writeObject: the status frame's objects match std.json's spelling on UTF-8" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const errs = [_]ErrorInfo{
+        .{ .msg = "" },
+        .{ .msg = "bad \"x\"\n\x01 é😀", .file = "a/b.sql", .line = 3, .col = 7, .end_line = 3, .end_col = 9, .transient = true },
+        .{ .msg = "m", .line = 1, .col = 2 },
+        .{ .msg = "m", .file = "", .end_col = 0 },
+    };
+    for (errs) |e| {
+        var old = std.Io.Writer.Allocating.init(a);
+        try std.json.Stringify.value(e, .{ .emit_null_optional_fields = false }, &old.writer);
+        var new = std.Io.Writer.Allocating.init(a);
+        try writeObject(&new.writer, e);
+        try std.testing.expectEqualStrings(old.written(), new.written());
+    }
+    const decl = [_]Declared{ .{ .kind = "connection", .name = "pg" }, .{ .kind = "let", .name = "a\"b" } };
+    const res = [_]ResultFrame{.{ .statement = 1, .kind = "select", .line = 2, .col = 1, .rows = 1 << 40, .elapsed_ms = 0, .truncated = true }};
+    inline for (.{ @as([]const Declared, &decl), @as([]const Declared, &.{}), @as([]const ResultFrame, &res) }) |items| {
+        var old = std.Io.Writer.Allocating.init(a);
+        try std.json.Stringify.value(items, .{}, &old.writer);
+        var new = std.Io.Writer.Allocating.init(a);
+        try writeObjects(&new.writer, items);
+        try std.testing.expectEqualStrings(old.written(), new.written());
+    }
+}
+
+test "writeObject: a run error whose message is not UTF-8 still makes a JSON status" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw = std.Io.Writer.Allocating.init(a);
+    try writeObject(&aw.writer, ErrorInfo{ .msg = "cannot cast 'caf\xe9'", .file = "x\xff.sql", .line = 1, .col = 1 });
+    const got = try std.json.parseFromSliceLeaky(ErrorInfo, a, aw.written(), .{});
+    try std.testing.expectEqualStrings("cannot cast 'caf\u{FFFD}'", got.msg);
+    try std.testing.expectEqualStrings("x\u{FFFD}.sql", got.file.?);
 }
