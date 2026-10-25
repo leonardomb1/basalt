@@ -60,6 +60,7 @@ const runCsvLane = @import("../lanes.zig").runCsvLane;
 const runParallelSqlAgg = @import("../lanes.zig").runParallelSqlAgg;
 const runParallelSqlMapJoin = @import("../lanes.zig").runParallelSqlMapJoin;
 const runParquetLane = @import("../lanes.zig").runParquetLane;
+const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
@@ -508,11 +509,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     try parallel.finishLanes(mode);
                 } else {
                     const snk = try openSink(env, wr, schema);
-                    var snk_open = true;
-                    errdefer if (snk_open) snk.abort();
+                    var guard = SinkGuard.init(snk);
+                    errdefer guard.abort();
                     stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read, profiled);
-                    snk_open = false;
-                    try snk.close();
+                    try guard.close();
                 }
                 return;
             }
@@ -532,23 +532,22 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         env.sources.shrinkRetainingCapacity(src_base);
 
         const snk = try openSink(env, wr, res.schema);
-        var snk_open = true;
-        errdefer if (snk_open) snk.abort();
+        var guard = SinkGuard.init(snk);
+        errdefer guard.abort();
         for (batches.items) |b| {
             if (aborting()) return error.Aborted;
             try snk.writeBatch(batch_arena.allocator(), b);
             stats.rows_out += b.len;
             _ = batch_arena.reset(.retain_capacity);
         }
-        snk_open = false;
-        try snk.close();
+        try guard.close();
         if (env.profile) |p| _ = try p.absorb(res.op);
         return;
     }
 
     const snk = try openSink(env, wr, res.schema);
-    var snk_open = true;
-    errdefer if (snk_open) snk.abort();
+    var guard = SinkGuard.init(snk);
+    errdefer guard.abort();
 
     var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
     defer for (&ping_pong) |*a| a.deinit();
@@ -565,8 +564,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         _ = ping_pong[cur].reset(.retain_capacity);
     }
     try pw.finish();
-    snk_open = false;
-    try snk.close();
+    try guard.close();
     if (env.profile) |p| _ = try p.absorb(res.op);
 }
 

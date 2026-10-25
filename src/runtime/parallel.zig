@@ -30,6 +30,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
+const SinkGuard = @import("../connect/guard.zig").SinkGuard;
 
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
 
@@ -290,6 +291,13 @@ pub const WorkQueue = struct {
         const e = q.first_err orelse return null;
         return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
     }
+
+    /// The next item for a lane, or null once every item is taken or a lane failed.
+    pub fn take(q: *WorkQueue) ?usize {
+        if (q.failed.load(.seq_cst)) return null;
+        const i = q.next.fetchAdd(1, .seq_cst);
+        return if (i >= q.nitems) null else i;
+    }
 };
 
 /// A lane's private allocators: a thread-unsafe gpa, a work arena for the chain it
@@ -316,10 +324,7 @@ pub const LaneMem = struct {
 pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, usize) void {
     return struct {
         fn go(ctx: *Ctx, _: usize) void {
-            while (true) {
-                if (ctx.queue.failed.load(.seq_cst)) return;
-                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-                if (i >= ctx.queue.nitems) break;
+            while (ctx.queue.take()) |i| {
                 const span = trace.begin(comptime trace.short(Ctx), i);
                 defer span.end();
                 workOne(ctx, i) catch |e| {
@@ -339,14 +344,8 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var own_sink: ?driver.Sink = null;
-    defer if (own_sink) |s| {
-        if (sh.queue.failed.load(.seq_cst)) {
-            s.abort();
-        } else {
-            s.close() catch |e| sh.queue.fail(e);
-        }
-    };
+    var own_sink = SinkGuard.empty;
+    defer own_sink.settle(sh.queue.failed.load(.seq_cst)) catch |e| sh.queue.fail(e);
 
     const tally: ?LaneTally = if (sh.profiled) |p| (if (p.ids.len == sh.stages.len + 1) LaneTally.init(lane_alloc, sh.stages.len) catch null else null) else null;
     defer if (tally) |t| {
@@ -354,17 +353,13 @@ fn lane(sh: *Shared, lane_idx: usize) void {
         lane_alloc.free(t.t);
     };
 
-    while (true) {
-        if (sh.queue.failed.load(.seq_cst)) return;
-        const i = sh.queue.next.fetchAdd(1, .seq_cst);
-        if (i >= sh.queue.nitems) break;
-
-        if (sh.sink_mode == .per_lane and own_sink == null) {
+    while (sh.queue.take()) |i| {
+        if (sh.sink_mode == .per_lane and !own_sink.armed()) {
             const pl = sh.sink_mode.per_lane;
-            own_sink = pl.open(pl.ctx, lane_alloc, lane_idx) catch |e| {
+            own_sink.arm(pl.open(pl.ctx, lane_alloc, lane_idx) catch |e| {
                 sh.queue.fail(e);
                 return;
-            };
+            });
         }
 
         const src = sh.open(sh.ctx, lane_alloc, sh.predicates[i]) catch |e| {
@@ -396,7 +391,7 @@ fn lane(sh: *Shared, lane_idx: usize) void {
             if (!ok) return;
             if (b.len == 0) continue;
 
-            writeLaneBatch(sh.sink_mode, &sh.sink_mtx, own_sink, a, b) catch |e| {
+            writeLaneBatch(sh.sink_mode, &sh.sink_mtx, own_sink.get(), a, b) catch |e| {
                 sh.queue.fail(e);
                 return;
             };
@@ -602,6 +597,22 @@ test "PipelinedSink: a write failure surfaces on a later submit or on finish" {
     };
     try std.testing.expectEqual(@as(?anyerror, error.SinkWriteFailed), got);
     try std.testing.expectEqual(@as(usize, 1), ss.lens.items.len);
+}
+
+test "WorkQueue.take: each item once in order, then null; nothing after a failure" {
+    var q = WorkQueue{ .nitems = 3 };
+    try std.testing.expectEqual(@as(?usize, 0), q.take());
+    try std.testing.expectEqual(@as(?usize, 1), q.take());
+    try std.testing.expectEqual(@as(?usize, 2), q.take());
+    try std.testing.expectEqual(@as(?usize, null), q.take());
+    try std.testing.expectEqual(@as(?usize, null), q.take());
+    var f = WorkQueue{ .nitems = 3 };
+    try std.testing.expectEqual(@as(?usize, 0), f.take());
+    f.fail(error.Boom);
+    try std.testing.expectEqual(@as(?usize, null), f.take());
+    try std.testing.expectEqual(@as(?anyerror, error.Boom), f.failure());
+    var empty = WorkQueue{ .nitems = 0 };
+    try std.testing.expectEqual(@as(?usize, null), empty.take());
 }
 
 test "spawnJoin: worker runs exactly once per effective lane (n, 1, 0 threads)" {

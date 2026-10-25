@@ -35,6 +35,7 @@ const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
 const keyExprs = @import("../plan.zig").keyExprs;
 const keypush = @import("../plan/keypush.zig");
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
+const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const sqlDescForStage = @import("../connect.zig").sqlDescForStage;
@@ -219,10 +220,7 @@ pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usi
             var mem: LaneMem = .{};
             mem.init();
             defer mem.deinit();
-            while (true) {
-                if (ctx.queue.failed.load(.seq_cst)) return;
-                const i = ctx.queue.next.fetchAdd(1, .seq_cst);
-                if (i >= ctx.queue.nitems) break;
+            while (ctx.queue.take()) |i| {
                 const span = trace.begin(comptime trace.short(Ctx), i);
                 defer span.end();
                 unitFn(ctx, i, &mem) catch |e| {
@@ -264,28 +262,25 @@ fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
 /// opened at the first row and closed at the end. A set `failed` stops the pour and
 /// aborts that lane sink.
 fn pourLane(mode: parallel.SinkMode, mtx: *std.Thread.Mutex, gpa: std.mem.Allocator, lane_idx: usize, chain: op.Op, batch_arena: *std.heap.ArenaAllocator, failed: ?*std.atomic.Value(bool)) !u64 {
-    var own: ?driver.Sink = null;
-    errdefer if (own) |sk| sk.abort();
+    var own = SinkGuard.empty;
+    errdefer own.abort();
     var out: u64 = 0;
     while (try chain.next(batch_arena.allocator())) |b| {
         if (failed) |f| if (f.load(.seq_cst)) {
-            if (own) |sk| sk.abort();
+            own.abort();
             return out;
         };
         if (b.len > 0) {
-            if (own == null) switch (mode) {
+            if (!own.armed()) switch (mode) {
                 .shared => {},
-                .per_lane => |pl| own = try pl.open(pl.ctx, gpa, lane_idx),
+                .per_lane => |pl| own.arm(try pl.open(pl.ctx, gpa, lane_idx)),
             };
-            try parallel.writeLaneBatch(mode, mtx, own, batch_arena.allocator(), b);
+            try parallel.writeLaneBatch(mode, mtx, own.get(), batch_arena.allocator(), b);
             out += b.len;
         }
         _ = batch_arena.reset(.retain_capacity);
     }
-    if (own) |sk| {
-        own = null;
-        try sk.close();
-    }
+    try own.close();
     return out;
 }
 
@@ -342,8 +337,8 @@ pub fn runParallelMap(
     const wr = try resolveUpsertKeys(env, w);
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
-    var shared_open = sink_mode == .shared;
-    errdefer if (shared_open) sink_mode.shared.abort();
+    var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
+    errdefer shared.abort();
     errdefer parallel.abortLanes(sink_mode);
 
     const nthreads = split.lanes(opts);
@@ -387,10 +382,7 @@ pub fn runParallelMap(
 
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
-    if (sink_mode == .shared) {
-        shared_open = false;
-        try sink_mode.shared.close();
-    }
+    try shared.close();
     try parallel.finishLanes(sink_mode);
     return true;
 }
@@ -520,9 +512,7 @@ const SplitSource = struct {
                 src.close();
                 self.cur = null;
             }
-            if (self.ctx.queue.failed.load(.seq_cst)) return null;
-            const i = self.ctx.queue.next.fetchAdd(1, .seq_cst);
-            if (i >= self.ctx.queue.nitems) return null;
+            const i = self.ctx.queue.take() orelse return null;
             const q = try wrapProjected(self.gpa, self.ctx.split.base_sql, self.ctx.split.proj_select, self.ctx.predicates[i], self.ctx.split.where_extra);
             defer self.gpa.free(q);
             self.cur = try openSqlQuery(&self.ctx.split, self.gpa, q);
@@ -586,8 +576,8 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     env.sink_name = sinkLabel(env, w);
     const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
         .{ .shared = try openSink(env, w, lp.out_schema) };
-    var shared_open = sink_mode == .shared;
-    errdefer if (shared_open) sink_mode.shared.abort();
+    var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
+    errdefer shared.abort();
     errdefer parallel.abortLanes(sink_mode);
 
     var ctx = SqlMapJoinCtx{
@@ -617,10 +607,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
     stats.rows_out += try writeLaneJoinDrain(env, lp.lane, sink_mode, &ctx.sink_mtx, nlanes);
-    if (sink_mode == .shared) {
-        shared_open = false;
-        try sink_mode.shared.close();
-    }
+    try shared.close();
     try parallel.finishLanes(sink_mode);
     return true;
 }

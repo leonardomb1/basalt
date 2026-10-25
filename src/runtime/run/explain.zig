@@ -12,6 +12,7 @@
 const Env = @import("../env.zig").Env;
 const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
+const Guard = @import("../../connect/guard.zig").Guard;
 const Stats = @import("../env.zig").Stats;
 const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
@@ -72,11 +73,10 @@ pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.Resu
     const cols = try a.alloc(column.Column, 1);
     cols[0] = try b.finish();
     const w = try arrow.ArrowWriter.open(gpa, schema, info);
-    var open = true;
-    errdefer if (open) w.abort();
+    var guard = Guard(*arrow.ArrowWriter).init(w);
+    errdefer guard.abort();
     try w.writeBatch(a, .{ .schema = &schema, .columns = cols, .len = n });
-    open = false;
-    try w.close();
+    try guard.close();
     return n;
 }
 
