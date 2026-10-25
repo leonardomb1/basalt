@@ -52,6 +52,8 @@ const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
 const codec = @import("../compress/codecs.zig");
 const flatbuf = @import("flatbuf.zig");
+const civil = @import("../../exec/civil.zig");
+const jsontext = @import("../../exec/jsontext.zig");
 
 pub const Error = error{
     NotArrow,
@@ -123,37 +125,25 @@ const Field = struct {
             .timestamp => types.Type.init(.timestamp),
             .utf8, .large_utf8, .utf8_view => types.Type.init(.string),
             .binary, .large_binary, .binary_view, .fixed_binary => types.Type.init(.bytes),
-            .null_, .list, .large_list, .fixed_list, .struct_, .map, .union_ => types.Type.init(.string),
+            .null_ => types.Type.nullColumn(false),
+            .list, .large_list, .fixed_list, .struct_, .map, .union_ => types.Type.init(.string),
         };
         return t.asNullable();
     }
 };
 
-const Unit = enum {
-    s,
-    ms,
-    us,
-    ns,
+const Unit = civil.Tick;
 
-    fn toMicros(self: Unit, x: i64) i64 {
-        return switch (self) {
-            .s => std.math.mul(i64, x, 1_000_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-            .ms => std.math.mul(i64, x, 1_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-            .us => x,
-            .ns => @divFloor(x, 1000),
-        };
-    }
-
-    fn of(v: i16) Error!Unit {
-        return switch (v) {
-            0 => .s,
-            1 => .ms,
-            2 => .us,
-            3 => .ns,
-            else => Error.CorruptArrow,
-        };
-    }
-};
+/// Arrow's TimeUnit code (0..3, seconds to nanoseconds) as a tick.
+fn unitOf(v: i16) Error!Unit {
+    return switch (v) {
+        0 => .s,
+        1 => .ms,
+        2 => .us,
+        3 => .ns,
+        else => Error.CorruptArrow,
+    };
+}
 
 const TypeTag = enum(u8) {
     null_ = 1,
@@ -246,18 +236,18 @@ fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize)
         .time => {
             const tt = t orelse return Error.CorruptArrow;
             out.kind = .time;
-            out.unit = try Unit.of(try tt.int(i16, 0, 1));
+            out.unit = try unitOf(try tt.int(i16, 0, 1));
             out.bit_width = @intCast(try tt.int(i32, 1, 32));
             if (out.bit_width != 32 and out.bit_width != 64) return Error.CorruptArrow;
         },
         .timestamp => {
             const tt = t orelse return Error.CorruptArrow;
             out.kind = .timestamp;
-            out.unit = try Unit.of(try tt.int(i16, 0, 0));
+            out.unit = try unitOf(try tt.int(i16, 0, 0));
         },
         .duration => {
             out.kind = .duration;
-            out.unit = if (t) |tt| try Unit.of(try tt.int(i16, 0, 1)) else .ms;
+            out.unit = if (t) |tt| try unitOf(try tt.int(i16, 0, 1)) else .ms;
         },
         .utf8 => out.kind = .utf8,
         .large_utf8 => out.kind = .large_utf8,
@@ -981,7 +971,7 @@ const Cursor = struct {
             .null_ => .null,
             .union_ => Error.UnsupportedArrow,
             .int => .{ .int = try intAt(self.data, i, f.bit_width, f.signed) },
-            .duration => .{ .int = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
+            .duration => .{ .int = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
             .float => .{ .float = if (f.bit_width == 32)
                 @as(f32, @bitCast(std.mem.readInt(u32, self.data[i * 4 ..][0..4], .little)))
             else
@@ -989,12 +979,12 @@ const Cursor = struct {
             .bool_ => .{ .bool = (self.data[i >> 3] >> @intCast(i & 7)) & 1 != 0 },
             .decimal => .{ .decimal = .{ .unscaled = std.mem.readInt(i128, self.data[i * 16 ..][0..16], .little), .scale = f.scale } },
             .date_day => .{ .date = std.mem.readInt(i32, self.data[i * 4 ..][0..4], .little) },
-            .date_ms => .{ .date = std.math.cast(i32, @divFloor(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), 86_400_000)) orelse return Error.CorruptArrow },
+            .date_ms => .{ .date = try (DayOfMs{}).of(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
             .time => .{ .time = f.unit.toMicros(if (f.bit_width == 32)
                 std.mem.readInt(i32, self.data[i * 4 ..][0..4], .little)
             else
-                std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
-            .timestamp => .{ .timestamp = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
+                std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
+            .timestamp => .{ .timestamp = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
             .utf8, .large_utf8 => blk: {
                 const s = try self.span(i);
                 break :blk .{ .string = self.data[s.lo..s.hi] };
@@ -1041,8 +1031,7 @@ const Cursor = struct {
                 try w.writeByte('{');
                 for (self.kids, self.f.children, 0..) |k, cf, n| {
                     if (n > 0) try w.writeByte(',');
-                    try std.json.Stringify.encodeJsonString(cf.name, .{}, w);
-                    try w.writeByte(':');
+                    try jsontext.key(w, cf.name);
                     try k.json(arena, i, w);
                 }
                 try w.writeByte('}');
@@ -1055,23 +1044,12 @@ const Cursor = struct {
                 for (s.lo..s.hi, 0..) |k, n| {
                     if (n > 0) try w.writeByte(',');
                     const key = try entries.kids[0].value(arena, k);
-                    try std.json.Stringify.encodeJsonString(try eval.valueToString(arena, key), .{}, w);
-                    try w.writeByte(':');
+                    try jsontext.key(w, try eval.valueToString(arena, key));
                     try entries.kids[1].json(arena, k, w);
                 }
                 try w.writeByte('}');
             },
-            else => {
-                const v = try self.value(arena, i);
-                switch (v) {
-                    .null => try w.writeAll("null"),
-                    .int => |x| try w.print("{d}", .{x}),
-                    .bool => |b| try w.writeAll(if (b) "true" else "false"),
-                    .float => |x| if (std.math.isFinite(x)) try w.print("{d}", .{x}) else try w.writeAll("null"),
-                    .decimal => try w.writeAll(try eval.valueToString(arena, v)),
-                    else => try std.json.Stringify.encodeJsonString(try eval.valueToString(arena, v), .{}, w),
-                }
-            },
+            else => try jsontext.scalar(w, try self.value(arena, i), jsontext.nested),
         }
     }
 };
@@ -1167,8 +1145,9 @@ const ToDec = struct {
 };
 
 const DayOfMs = struct {
+    const ms_per_day = civil.us_per_day / 1000;
     fn of(_: DayOfMs, x: i64) Error!i32 {
-        return std.math.cast(i32, @divFloor(x, 86_400_000)) orelse Error.CorruptArrow;
+        return std.math.cast(i32, @divFloor(x, ms_per_day)) orelse Error.CorruptArrow;
     }
     fn zero(_: DayOfMs) i32 {
         return 0;
@@ -1178,7 +1157,7 @@ const DayOfMs = struct {
 fn Micros(comptime u: Unit) type {
     return struct {
         fn of(_: @This(), x: anytype) Error!i64 {
-            return u.toMicros(x);
+            return u.toMicros(x, .saturate);
         }
         fn zero(_: @This()) i64 {
             return 0;
@@ -1398,4 +1377,137 @@ test "fuzz: arbitrary bytes behind a valid magic never crash the reader" {
             _ = dump(ar.allocator(), buf[0 .. 8 + n], null) catch return;
         }
     }.f, .{});
+}
+
+fn oldToMicros(u: Unit, x: i64) i64 {
+    return switch (u) {
+        .s => std.math.mul(i64, x, 1_000_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .ms => std.math.mul(i64, x, 1_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .us => x,
+        .ns => @divFloor(x, 1000),
+    };
+}
+
+test "civil.Tick saturates exactly as the reader's own Unit.toMicros did, on every unit and edge" {
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    const xs = [_]i64{ 0, 1, -1, 999, -999, 1000, -1000, 1001, -1001, max, min, max - 1, min + 1, @divTrunc(max, 1000), @divTrunc(max, 1000) + 1, @divTrunc(min, 1000), @divTrunc(min, 1000) - 1, @divTrunc(max, 1_000_000), @divTrunc(max, 1_000_000) + 1, @divTrunc(min, 1_000_000), @divTrunc(min, 1_000_000) - 1, std.math.maxInt(i32), std.math.minInt(i32) };
+    for ([_]Unit{ .s, .ms, .us, .ns }) |u| for (xs) |x| {
+        try std.testing.expectEqual(oldToMicros(u, x), u.toMicros(x, .saturate));
+    };
+    for ([_]i16{ 0, 1, 2, 3 }, [_]Unit{ .s, .ms, .us, .ns }) |code, u| try std.testing.expectEqual(u, try unitOf(code));
+    try std.testing.expectError(Error.CorruptArrow, unitOf(4));
+    try std.testing.expectError(Error.CorruptArrow, unitOf(-1));
+}
+
+test "a date in milliseconds is the same day on the row path and the window path, out of range refused on both" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ms = [_]i64{ 0, -1, 86_399_999, 86_400_000, -86_400_000, -86_400_001, 1_767_225_600_000, @as(i64, std.math.maxInt(i32)) * 86_400_000, @as(i64, std.math.minInt(i32)) * 86_400_000 };
+    var cur = Cursor{ .f = .{ .name = "d", .kind = .date_ms }, .a = .{ .len = ms.len, .null_count = 0, .bufs = &.{} }, .reader = undefined, .data = std.mem.sliceAsBytes(&ms) };
+    const days = (try widened(a, &cur, 0, ms.len)).?.i32;
+    for (days, 0..) |d, i| {
+        try std.testing.expectEqual(@as(i32, @intCast(@divFloor(ms[i], 86_400_000))), d);
+        try std.testing.expectEqual(Value{ .date = d }, try cur.value(a, i));
+    }
+    for ([_]i64{ (@as(i64, std.math.maxInt(i32)) + 1) * 86_400_000, @as(i64, std.math.minInt(i32)) * 86_400_000 - 1, std.math.maxInt(i64) }) |x| {
+        const bad = [_]i64{x};
+        cur.data = std.mem.sliceAsBytes(&bad);
+        cur.a.len = 1;
+        try std.testing.expectError(Error.CorruptArrow, widened(a, &cur, 0, 1));
+        try std.testing.expectError(Error.CorruptArrow, cur.value(a, 0));
+    }
+}
+
+fn oldJsonLeaf(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
+    switch (v) {
+        .null => try w.writeAll("null"),
+        .int => |x| try w.print("{d}", .{x}),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .float => |x| if (std.math.isFinite(x)) try w.print("{d}", .{x}) else try w.writeAll("null"),
+        .decimal => try w.writeAll(try eval.valueToString(arena, v)),
+        else => try std.json.Stringify.encodeJsonString(try eval.valueToString(arena, v), .{}, w),
+    }
+}
+
+test "a nested leaf through jsontext.scalar(nested) is byte-equal to the reader's own encoder on valid text" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const vals = [_]Value{
+        .null,
+        .{ .bool = true },
+        .{ .bool = false },
+        .{ .int = 0 },
+        .{ .int = -1 },
+        .{ .int = std.math.maxInt(i64) },
+        .{ .int = std.math.minInt(i64) },
+        .{ .float = 0 },
+        .{ .float = -0.0 },
+        .{ .float = 1.5 },
+        .{ .float = -0.25 },
+        .{ .float = 1e-7 },
+        .{ .float = 0.1 },
+        .{ .float = 1e15 },
+        .{ .float = 1e300 },
+        .{ .float = 123456.789 },
+        .{ .float = std.math.nan(f64) },
+        .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) },
+        .{ .float = std.math.floatMin(f64) },
+        .{ .float = std.math.floatMax(f64) },
+        .{ .float = 3.0e-5 },
+        .{ .float = 9007199254740993.0 },
+        .{ .float = @as(f32, 1.1) },
+        .{ .decimal = .{ .unscaled = 12345, .scale = 3 } },
+        .{ .decimal = .{ .unscaled = -1, .scale = 3 } },
+        .{ .decimal = .{ .unscaled = 0, .scale = 0 } },
+        .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 38 } },
+        .{ .decimal = .{ .unscaled = 7, .scale = 0 } },
+        .{ .string = "" },
+        .{ .string = "plain" },
+        .{ .string = "q\"b\\s/n\nr\rt\t" },
+        .{ .string = "\x00\x01\x1f\x7f" },
+        .{ .string = "ação 😀 \u{2028}" },
+        .{ .bytes = "abcd" },
+        .{ .bytes = "" },
+        .{ .date = 0 },
+        .{ .date = -719_528 },
+        .{ .date = 3_000_000 },
+        .{ .time = 0 },
+        .{ .time = 86_399_999_999 },
+        .{ .time = 3_723_000_001 },
+        .{ .timestamp = 0 },
+        .{ .timestamp = -1 },
+        .{ .timestamp = 1_767_225_600_123_456 },
+    };
+    for (vals) |v| {
+        var old = std.Io.Writer.Allocating.init(a);
+        try oldJsonLeaf(a, v, &old.writer);
+        var new = std.Io.Writer.Allocating.init(a);
+        try jsontext.scalar(&new.writer, v, jsontext.nested);
+        try std.testing.expectEqualStrings(old.written(), new.written());
+    }
+    var old = std.Io.Writer.Allocating.init(a);
+    try oldJsonLeaf(a, .{ .string = "\x08\x0c" }, &old.writer);
+    try std.testing.expectEqualStrings("\"\\b\\f\"", old.written());
+    var new = std.Io.Writer.Allocating.init(a);
+    try jsontext.scalar(&new.writer, .{ .string = "\x08\x0c" }, jsontext.nested);
+    try std.testing.expectEqualStrings("\"\\u0008\\u000c\"", new.written());
+}
+
+test "a struct whose names and text are not UTF-8 reads as JSON that parses; a binary leaf stays text" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const offs = [_]i32{ 0, 3 };
+    var s = Cursor{ .f = .{ .name = "s\xff", .kind = .utf8 }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&offs), .data = "a\xffb" };
+    var b = Cursor{ .f = .{ .name = "b", .kind = .binary }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&offs), .data = "xyz" };
+    var kids_f = [_]Field{ s.f, b.f };
+    var kids = [_]*Cursor{ &s, &b };
+    const st = Cursor{ .f = .{ .name = "st", .kind = .struct_, .children = &kids_f }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .kids = &kids };
+    const got = (try st.value(a, 0)).string;
+    try std.testing.expectEqualStrings("{\"s\u{FFFD}\":\"a\u{FFFD}b\",\"b\":\"xyz\"}", got);
+    try std.testing.expect(try std.json.validate(a, got));
 }

@@ -10,7 +10,8 @@
 //! repacked per batch: bools (one byte per row here, one bit in Arrow) and
 //! decimals (an i128 with a per-value scale here, sixteen bytes at the column's
 //! declared scale in Arrow). Dates go out as Date32, times and timestamps in
-//! microseconds, which is what the engine keeps.
+//! microseconds, which is what the engine keeps. A column of no type (a bare
+//! `NULL`) goes out as its `sinkType`, an all-null `utf8`.
 //!
 //! One record batch per engine batch, framed as the streaming format: a
 //! continuation marker, the FlatBuffer message length padded to eight, the
@@ -95,7 +96,7 @@ pub const StreamWriter = struct {
         defer bufs.deinit();
         for (self.schema.fields) |f| {
             try nodes.appendSlice(&.{ 0, 0 });
-            const nbuf: usize = switch (f.ty.kind) {
+            const nbuf: usize = switch (f.ty.sinkType().kind) {
                 .string, .bytes => 3,
                 else => 2,
             };
@@ -132,7 +133,7 @@ pub const StreamWriter = struct {
         defer gpa.free(offs);
         for (schema.fields, offs) |f, *o| {
             const name = try fb.createString(f.name);
-            const ty = try typeTable(fb, f.ty);
+            const ty = try typeTable(fb, f.ty.sinkType());
             const children = try fb.createOffsetVector(&.{});
             try fb.startTable(7);
             try fb.addOffset(0, name);
@@ -152,15 +153,16 @@ pub const StreamWriter = struct {
     pub fn writeBatch(self: *StreamWriter, arena: std.mem.Allocator, batch: Batch) !void {
         const n = batch.len;
         if (n == 0) return;
+        if (batch.columns.len != self.schema.fields.len) return error.ArrowColumnCountMismatch;
         var body = Body{ .bufs = std.array_list.Managed([]const u8).init(arena), .meta = std.array_list.Managed(i64).init(arena) };
         var nodes = std.array_list.Managed(i64).init(arena);
-        for (batch.columns) |*col| {
+        for (batch.columns, self.schema.fields) |*col, f| {
             const nb = (n + 7) / 8;
             if (col.validity.bits.len < nb) return error.ArrowValidityTooShort;
             const validity = col.validity.bits[0..nb];
             try nodes.appendSlice(&.{ @intCast(n), @intCast(n - validCount(validity, n)) });
             try body.push(validity);
-            try pushData(arena, &body, col, n);
+            if (f.ty.unknown) try pushNullText(arena, &body, n) else try pushData(arena, &body, col, n);
         }
         const fb = &self.fb;
         fb.reset();
@@ -317,6 +319,15 @@ fn typeTable(fb: *flatbuf.Builder, ty: types.Type) !struct { tag: TypeTag, off: 
 fn store(data: Column.Data, comptime tag: std.meta.Tag(Column.Data)) !@FieldType(Column.Data, @tagName(tag)) {
     if (data != tag) return error.ArrowColumnStoreMismatch;
     return @field(data, @tagName(tag));
+}
+
+/// The buffers of `n` rows of an untyped column, which holds only nulls: zero
+/// offsets over no bytes, the utf8 layout `sinkType` declares it as.
+fn pushNullText(arena: std.mem.Allocator, body: *Body, n: usize) !void {
+    const offs = try arena.alloc(i32, n + 1);
+    @memset(offs, 0);
+    try body.push(std.mem.sliceAsBytes(offs));
+    try body.push(&.{});
 }
 
 fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize) !void {
@@ -781,4 +792,42 @@ test "a batch and field length past 2^31-1 is refused by the reader, never multi
     const read = @import("read.zig");
     const r = try read.Reader.openBytes(a, bytes, null);
     try std.testing.expectError(read.Error.CorruptArrow, r.next(a));
+}
+
+test "an untyped NULL column is written as an all-null utf8 column, whatever store carries it" {
+    const read = @import("read.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fields = [_]types.Schema.Field{
+        .{ .name = "n", .ty = types.Type.unknownNull() },
+        .{ .name = "i", .ty = .{ .kind = .int, .nullable = true } },
+    };
+    const schema = types.Schema{ .fields = &fields };
+    var xs = [_]?i64{ 1, 2 };
+    for ([_]types.Type{ types.Type.unknownNull(), types.Type.init(.string).asNullable() }) |held| {
+        var nb = column.Builder.init(a, held);
+        try nb.append(.null);
+        try nb.append(.null);
+        var cols = [_]Column{ try nb.finish(), try column.intColumn(a, &xs) };
+        var aw = std.Io.Writer.Allocating.init(a);
+        var sw = try StreamWriter.init(std.testing.allocator, &aw.writer, schema, &.{});
+        defer sw.deinit();
+        try sw.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 });
+        try sw.writeTrailer(&.{.{ .key = "basalt.rows", .value = "2" }});
+        try sw.finish();
+
+        const r = try read.Reader.openBytes(a, aw.written(), null);
+        defer r.close();
+        try std.testing.expectEqual(types.TypeKind.string, r.schema.fields[0].ty.kind);
+        var rows: usize = 0;
+        while (try r.next(a)) |b| {
+            for (0..b.len) |k| {
+                try std.testing.expectEqual(@import("../../exec/value.zig").Value.null, b.columns[0].getValue(k));
+                try std.testing.expectEqual(@as(i64, @intCast(rows + k + 1)), b.columns[1].getValue(k).int);
+            }
+            rows += b.len;
+        }
+        try std.testing.expectEqual(@as(usize, 2), rows);
+    }
 }
