@@ -186,25 +186,26 @@ test "unquotableName refuses a backtick on StarRocks only" {
     try std.testing.expect(unquotableName(.doris, "w`h", "t`x", schema) == null);
 }
 
-/// The FE catalog literal at 10e697a, before `Dialect.writeStrLit`.
-fn pinnedStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
-    try out.append('\'');
-    for (s) |c| switch (c) {
-        '\'' => try out.appendSlice("''"),
-        '\\' => try out.appendSlice("\\\\"),
-        else => try out.append(c),
-    };
-    try out.append('\'');
-}
-
 test "the FE catalog literal equals its pre-writeStrLit body" {
+    const Orig = struct {
+        /// The FE catalog literal at 10e697a, before `Dialect.writeStrLit`.
+        fn pinnedStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
+            try out.append('\'');
+            for (s) |c| switch (c) {
+                '\'' => try out.appendSlice("''"),
+                '\\' => try out.appendSlice("\\\\"),
+                else => try out.append(c),
+            };
+            try out.append('\'');
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const cases = [_][]const u8{ "", "db", "o'k", "a\\b", "\\'", "''\\\\", "w`h", "\xc3\xb3 \xf0\x9f\x98\x80", "\x00\n\t;--", "x'); DROP DATABASE d;--" };
     for (cases) |s| for ([_]Flavor{ .starrocks, .doris }) |f| {
         var want = std.array_list.Managed(u8).init(a);
-        try pinnedStrLit(&want, s);
+        try Orig.pinnedStrLit(&want, s);
         var got = std.array_list.Managed(u8).init(a);
         try f.dialect().writeStrLit(got.writer(), s, .catalog_name);
         try std.testing.expectEqualStrings(want.items, got.items);
@@ -215,7 +216,7 @@ test "the FE catalog literal equals its pre-writeStrLit body" {
         const n = prng.random().uintAtMost(usize, buf.len);
         for (buf[0..n]) |*b| b.* = "'\\`ab\x00\xff"[prng.random().uintLessThan(usize, 7)];
         var want = std.array_list.Managed(u8).init(a);
-        try pinnedStrLit(&want, buf[0..n]);
+        try Orig.pinnedStrLit(&want, buf[0..n]);
         var got = std.array_list.Managed(u8).init(a);
         try Flavor.starrocks.dialect().writeStrLit(got.writer(), buf[0..n], .catalog_name);
         try std.testing.expectEqualStrings(want.items, got.items);

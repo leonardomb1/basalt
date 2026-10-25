@@ -302,73 +302,73 @@ test "a date past the TIMESTAMP range fails the cast instead of overflowing" {
     try std.testing.expectEqual(civil.us_per_day - 1, (try castValue(a, .{ .timestamp = -1 }, .time)).time);
 }
 
-fn oldCastValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
-    const column = @import("../column.zig");
-    return switch (kind) {
-        .int => switch (v) {
-            .int => v,
-            .float => |x| .{ .int = try column.floatToInt(x) },
-            .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
-            .bool => |x| .{ .int = if (x) 1 else 0 },
-            .string => |s| .{ .int = parseIntStrict(trim(s)) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .float => switch (v) {
-            .float => v,
-            .int => |x| .{ .float = @floatFromInt(x) },
-            .decimal => |d| .{ .float = d.toF64() },
-            .string => |s| .{ .float = parseFloatStrict(trim(s)) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .date => switch (v) {
-            .date => v,
-            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 24 * 3600 * 1_000_000)) },
-            .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
-            else => error.CastFailed,
-        },
-        .timestamp => switch (v) {
-            .timestamp => v,
-            .date => |x| .{ .timestamp = std.math.mul(i64, x, 24 * 3600 * 1_000_000) catch return error.CastFailed },
-            .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .time => switch (v) {
-            .time => v,
-            .timestamp => |x| .{ .time = @mod(x, 24 * 3600 * 1_000_000) },
-            .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .string => .{ .string = try valueToString(arena, v) },
-        .bool => switch (v) {
-            .bool => v,
-            .int => |x| .{ .bool = x != 0 },
-            .string => |s| if (std.ascii.eqlIgnoreCase(trim(s), "true"))
-                Value{ .bool = true }
-            else if (std.ascii.eqlIgnoreCase(trim(s), "false"))
-                Value{ .bool = false }
-            else
-                error.CastFailed,
-            else => error.CastFailed,
-        },
-        else => error.CastFailed,
-    };
-}
-
-fn expectSameCast(a: std.mem.Allocator, v: Value, kind: types.TypeKind) !void {
-    const want = oldCastValue(a, v, kind);
-    const got = castValue(a, v, kind);
-    if (want) |w| {
-        const g = try got;
-        try std.testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
-        switch (w) {
-            .string, .bytes => |s| try std.testing.expectEqualStrings(s, if (g == .string) g.string else g.bytes),
-            .float => |x| if (std.math.isNan(x)) try std.testing.expect(std.math.isNan(g.float)) else try std.testing.expectEqual(x, g.float),
-            else => try std.testing.expectEqual(w, g),
+test "castValue on castElem gives what the per-kind switch gave, for every kind pair and every short BOOL text" {
+    const Orig = struct {
+        fn oldCastValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
+            const column = @import("../column.zig");
+            return switch (kind) {
+                .int => switch (v) {
+                    .int => v,
+                    .float => |x| .{ .int = try column.floatToInt(x) },
+                    .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
+                    .bool => |x| .{ .int = if (x) 1 else 0 },
+                    .string => |s| .{ .int = parseIntStrict(trim(s)) orelse return error.CastFailed },
+                    else => error.CastFailed,
+                },
+                .float => switch (v) {
+                    .float => v,
+                    .int => |x| .{ .float = @floatFromInt(x) },
+                    .decimal => |d| .{ .float = d.toF64() },
+                    .string => |s| .{ .float = parseFloatStrict(trim(s)) orelse return error.CastFailed },
+                    else => error.CastFailed,
+                },
+                .date => switch (v) {
+                    .date => v,
+                    .timestamp => |x| .{ .date = @intCast(@divFloor(x, 24 * 3600 * 1_000_000)) },
+                    .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
+                    else => error.CastFailed,
+                },
+                .timestamp => switch (v) {
+                    .timestamp => v,
+                    .date => |x| .{ .timestamp = std.math.mul(i64, x, 24 * 3600 * 1_000_000) catch return error.CastFailed },
+                    .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
+                    else => error.CastFailed,
+                },
+                .time => switch (v) {
+                    .time => v,
+                    .timestamp => |x| .{ .time = @mod(x, 24 * 3600 * 1_000_000) },
+                    .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
+                    else => error.CastFailed,
+                },
+                .string => .{ .string = try valueToString(arena, v) },
+                .bool => switch (v) {
+                    .bool => v,
+                    .int => |x| .{ .bool = x != 0 },
+                    .string => |s| if (std.ascii.eqlIgnoreCase(trim(s), "true"))
+                        Value{ .bool = true }
+                    else if (std.ascii.eqlIgnoreCase(trim(s), "false"))
+                        Value{ .bool = false }
+                    else
+                        error.CastFailed,
+                    else => error.CastFailed,
+                },
+                else => error.CastFailed,
+            };
         }
-    } else |e| try std.testing.expectError(e, got);
-}
-
-test "castValue on castElem gives what the per-kind switch gave, for every kind pair" {
+        fn expectSameCast(a: std.mem.Allocator, v: Value, kind: types.TypeKind) !void {
+            const want = oldCastValue(a, v, kind);
+            const got = castValue(a, v, kind);
+            if (want) |w| {
+                const g = try got;
+                try std.testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
+                switch (w) {
+                    .string, .bytes => |s| try std.testing.expectEqualStrings(s, if (g == .string) g.string else g.bytes),
+                    .float => |x| if (std.math.isNan(x)) try std.testing.expect(std.math.isNan(g.float)) else try std.testing.expectEqual(x, g.float),
+                    else => try std.testing.expectEqual(w, g),
+                }
+            } else |e| try std.testing.expectError(e, got);
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -390,23 +390,17 @@ test "castValue on castElem gives what the per-kind switch gave, for every kind 
         .{ .timestamp = std.math.maxInt(i64) }, .{ .timestamp = std.math.minInt(i64) },
     };
     const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp, .array, .@"struct" };
-    for (values) |v| for (kinds) |k| expectSameCast(a, v, k) catch |e| {
+    for (values) |v| for (kinds) |k| Orig.expectSameCast(a, v, k) catch |e| {
         std.debug.print("CAST({any} AS {s})\n", .{ v, @tagName(k) });
         return e;
     };
-}
-
-test "CAST(text AS BOOL) reads the words it read before, over every short spelling" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
     const alphabet = "tRuEfalsTx01 \t";
     var buf: [6]u8 = undefined;
     for (0..6) |len| {
         var idx = [_]usize{0} ** 6;
         while (true) {
             for (0..len) |i| buf[i] = alphabet[idx[i]];
-            try expectSameCast(a, .{ .string = buf[0..len] }, .bool);
+            try Orig.expectSameCast(a, .{ .string = buf[0..len] }, .bool);
             var i: usize = 0;
             while (i < len) : (i += 1) {
                 idx[i] += 1;

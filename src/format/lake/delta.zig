@@ -916,27 +916,28 @@ test "replay keeps only what it needs: a checkpoint's batches and each commit's 
     try testing.expect(counting.allocated_bytes - counting.freed_bytes < 160 * 1024);
 }
 
-fn oldPrimitive(t: []const u8) ?types.Type {
-    const T = types.Type;
-    if (oneOf(t, &.{ "string", "void" })) return T.init(.string);
-    if (oneOf(t, &.{ "long", "integer", "short", "byte" })) return T.init(.int);
-    if (oneOf(t, &.{ "float", "double" })) return T.init(.float);
-    if (std.mem.eql(u8, t, "boolean")) return T.init(.bool);
-    if (std.mem.eql(u8, t, "binary")) return T.init(.bytes);
-    if (std.mem.eql(u8, t, "date")) return T.init(.date);
-    if (oneOf(t, &.{ "timestamp", "timestamp_ntz" })) return T.init(.timestamp);
-    if (std.mem.eql(u8, t, "decimal")) return T.decimal(10, 0);
-    if (std.mem.startsWith(u8, t, "decimal(") and std.mem.endsWith(u8, t, ")")) {
-        const inner = t["decimal(".len .. t.len - 1];
-        var it = std.mem.splitScalar(u8, inner, ',');
-        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 0;
-        const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 255;
-        if (p >= 1 and p <= 38 and s <= p) return T.decimal(p, s);
-    }
-    return null;
-}
-
 test "schemaString primitives from delta_types read as the reader's old table did" {
+    const Orig = struct {
+        fn oldPrimitive(t: []const u8) ?types.Type {
+            const T = types.Type;
+            if (oneOf(t, &.{ "string", "void" })) return T.init(.string);
+            if (oneOf(t, &.{ "long", "integer", "short", "byte" })) return T.init(.int);
+            if (oneOf(t, &.{ "float", "double" })) return T.init(.float);
+            if (std.mem.eql(u8, t, "boolean")) return T.init(.bool);
+            if (std.mem.eql(u8, t, "binary")) return T.init(.bytes);
+            if (std.mem.eql(u8, t, "date")) return T.init(.date);
+            if (oneOf(t, &.{ "timestamp", "timestamp_ntz" })) return T.init(.timestamp);
+            if (std.mem.eql(u8, t, "decimal")) return T.decimal(10, 0);
+            if (std.mem.startsWith(u8, t, "decimal(") and std.mem.endsWith(u8, t, ")")) {
+                const inner = t["decimal(".len .. t.len - 1];
+                var it = std.mem.splitScalar(u8, inner, ',');
+                const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 0;
+                const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch 255;
+                if (p >= 1 and p <= 38 and s <= p) return T.decimal(p, s);
+            }
+            return null;
+        }
+    };
     const names = [_][]const u8{
         "long",           "integer",        "short",          "byte",           "double",        "float",          "boolean",
         "string",         "binary",         "date",           "timestamp",      "timestamp_ntz", "void",           "variant",
@@ -946,7 +947,7 @@ test "schemaString primitives from delta_types read as the reader's old table di
         "decimal(10,)",   "decimal(3,255)", "decimal(+5,2)",  "decimal(05,02)",
     };
     for (names) |t| {
-        const old = oldPrimitive(t);
+        const old = Orig.oldPrimitive(t);
         const new = primitive("T", "c", t) catch |e| {
             try testing.expect(old == null);
             _ = eval.takeFailure(e);

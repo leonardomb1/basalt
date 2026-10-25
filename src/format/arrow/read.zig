@@ -1379,21 +1379,22 @@ test "fuzz: arbitrary bytes behind a valid magic never crash the reader" {
     }.f, .{});
 }
 
-fn oldToMicros(u: Unit, x: i64) i64 {
-    return switch (u) {
-        .s => std.math.mul(i64, x, 1_000_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-        .ms => std.math.mul(i64, x, 1_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-        .us => x,
-        .ns => @divFloor(x, 1000),
-    };
-}
-
 test "civil.Tick saturates exactly as the reader's own Unit.toMicros did, on every unit and edge" {
+    const Orig = struct {
+        fn oldToMicros(u: Unit, x: i64) i64 {
+            return switch (u) {
+                .s => std.math.mul(i64, x, 1_000_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+                .ms => std.math.mul(i64, x, 1_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+                .us => x,
+                .ns => @divFloor(x, 1000),
+            };
+        }
+    };
     const max = std.math.maxInt(i64);
     const min = std.math.minInt(i64);
     const xs = [_]i64{ 0, 1, -1, 999, -999, 1000, -1000, 1001, -1001, max, min, max - 1, min + 1, @divTrunc(max, 1000), @divTrunc(max, 1000) + 1, @divTrunc(min, 1000), @divTrunc(min, 1000) - 1, @divTrunc(max, 1_000_000), @divTrunc(max, 1_000_000) + 1, @divTrunc(min, 1_000_000), @divTrunc(min, 1_000_000) - 1, std.math.maxInt(i32), std.math.minInt(i32) };
     for ([_]Unit{ .s, .ms, .us, .ns }) |u| for (xs) |x| {
-        try std.testing.expectEqual(oldToMicros(u, x), u.toMicros(x, .saturate));
+        try std.testing.expectEqual(Orig.oldToMicros(u, x), u.toMicros(x, .saturate));
     };
     for ([_]i16{ 0, 1, 2, 3 }, [_]Unit{ .s, .ms, .us, .ns }) |code, u| try std.testing.expectEqual(u, try unitOf(code));
     try std.testing.expectError(Error.CorruptArrow, unitOf(4));
@@ -1420,18 +1421,19 @@ test "a date in milliseconds is the same day on the row path and the window path
     }
 }
 
-fn oldJsonLeaf(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
-    switch (v) {
-        .null => try w.writeAll("null"),
-        .int => |x| try w.print("{d}", .{x}),
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .float => |x| if (std.math.isFinite(x)) try w.print("{d}", .{x}) else try w.writeAll("null"),
-        .decimal => try w.writeAll(try eval.valueToString(arena, v)),
-        else => try std.json.Stringify.encodeJsonString(try eval.valueToString(arena, v), .{}, w),
-    }
-}
-
 test "a nested leaf through jsontext.scalar(nested) is byte-equal to the reader's own encoder on valid text" {
+    const Orig = struct {
+        fn oldJsonLeaf(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
+            switch (v) {
+                .null => try w.writeAll("null"),
+                .int => |x| try w.print("{d}", .{x}),
+                .bool => |b| try w.writeAll(if (b) "true" else "false"),
+                .float => |x| if (std.math.isFinite(x)) try w.print("{d}", .{x}) else try w.writeAll("null"),
+                .decimal => try w.writeAll(try eval.valueToString(arena, v)),
+                else => try std.json.Stringify.encodeJsonString(try eval.valueToString(arena, v), .{}, w),
+            }
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1484,13 +1486,13 @@ test "a nested leaf through jsontext.scalar(nested) is byte-equal to the reader'
     };
     for (vals) |v| {
         var old = std.Io.Writer.Allocating.init(a);
-        try oldJsonLeaf(a, v, &old.writer);
+        try Orig.oldJsonLeaf(a, v, &old.writer);
         var new = std.Io.Writer.Allocating.init(a);
         try jsontext.scalar(&new.writer, v, jsontext.nested);
         try std.testing.expectEqualStrings(old.written(), new.written());
     }
     var old = std.Io.Writer.Allocating.init(a);
-    try oldJsonLeaf(a, .{ .string = "\x08\x0c" }, &old.writer);
+    try Orig.oldJsonLeaf(a, .{ .string = "\x08\x0c" }, &old.writer);
     try std.testing.expectEqualStrings("\"\\b\\f\"", old.written());
     var new = std.Io.Writer.Allocating.init(a);
     try jsontext.scalar(&new.writer, .{ .string = "\x08\x0c" }, jsontext.nested);

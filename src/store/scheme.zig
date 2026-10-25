@@ -424,34 +424,35 @@ test "shown drops userinfo and every query value" {
     try testing.expectEqualStrings("(url)", shown(&empty, "x"));
 }
 
-/// http_client's `redactUrl` before it became `shown`, the oracle `shown` must match.
-fn oldRedactUrl(buf: []u8, url: []const u8) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    var rest = url;
-    if (std.mem.indexOf(u8, rest, "://")) |at| {
-        w.writeAll(rest[0 .. at + 3]) catch return "(url)";
-        rest = rest[at + 3 ..];
-        const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-        if (std.mem.lastIndexOfScalar(u8, rest[0..host_end], '@')) |amp| rest = rest[amp + 1 ..];
-    }
-    const q = std.mem.indexOfScalar(u8, rest, '?') orelse {
-        w.writeAll(rest) catch return "(url)";
-        return w.buffered();
-    };
-    w.writeAll(rest[0 .. q + 1]) catch return "(url)";
-    var it = std.mem.splitScalar(u8, rest[q + 1 ..], '&');
-    var first = true;
-    while (it.next()) |kv| {
-        if (!first) w.writeByte('&') catch return "(url)";
-        first = false;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
-        w.writeAll(kv[0..eq]) catch return "(url)";
-        if (eq < kv.len) w.writeAll("=...") catch return "(url)";
-    }
-    return w.buffered();
-}
-
 test "shown equals http_client's old redactUrl byte for byte, and fmtShown equals shown" {
+    const Orig = struct {
+        /// http_client's `redactUrl` before it became `shown`, the oracle `shown` must match.
+        fn oldRedactUrl(buf: []u8, url: []const u8) []const u8 {
+            var w = std.Io.Writer.fixed(buf);
+            var rest = url;
+            if (std.mem.indexOf(u8, rest, "://")) |at| {
+                w.writeAll(rest[0 .. at + 3]) catch return "(url)";
+                rest = rest[at + 3 ..];
+                const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+                if (std.mem.lastIndexOfScalar(u8, rest[0..host_end], '@')) |amp| rest = rest[amp + 1 ..];
+            }
+            const q = std.mem.indexOfScalar(u8, rest, '?') orelse {
+                w.writeAll(rest) catch return "(url)";
+                return w.buffered();
+            };
+            w.writeAll(rest[0 .. q + 1]) catch return "(url)";
+            var it = std.mem.splitScalar(u8, rest[q + 1 ..], '&');
+            var first = true;
+            while (it.next()) |kv| {
+                if (!first) w.writeByte('&') catch return "(url)";
+                first = false;
+                const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
+                w.writeAll(kv[0..eq]) catch return "(url)";
+                if (eq < kv.len) w.writeAll("=...") catch return "(url)";
+            }
+            return w.buffered();
+        }
+    };
     const urls = [_][]const u8{
         "https://user:secret@api.example.com/v1/x?api_key=abc&page=2",
         "http://h/p",
@@ -469,8 +470,8 @@ test "shown equals http_client's old redactUrl byte for byte, and fmtShown equal
     for (urls) |u| for ([_]usize{ 0, 8, 16, 32, 256 }) |cap| {
         const b1 = try ar.allocator().alloc(u8, cap);
         const b2 = try ar.allocator().alloc(u8, cap);
-        try testing.expectEqualStrings(oldRedactUrl(b1, u), shown(b2, u));
-        try testing.expectEqualStrings(oldRedactUrl(b1, u), http_client.redactUrl(b2, u));
+        try testing.expectEqualStrings(Orig.oldRedactUrl(b1, u), shown(b2, u));
+        try testing.expectEqualStrings(Orig.oldRedactUrl(b1, u), http_client.redactUrl(b2, u));
     };
     for (urls) |u| {
         var buf: [256]u8 = undefined;

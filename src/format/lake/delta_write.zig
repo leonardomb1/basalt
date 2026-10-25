@@ -888,53 +888,54 @@ test "a file's statistics stay JSON when a string column holds bytes that are no
     _ = try std.json.parseFromSliceLeaky(std.json.Value, a, line.written(), .{});
 }
 
-const oracle = struct {
-    fn scalarType(t: []const u8) ?types.Type {
-        const Simple = struct { []const u8, types.TypeKind };
-        for ([_]Simple{
-            .{ "long", .int },     .{ "integer", .int }, .{ "short", .int },           .{ "byte", .int },
-            .{ "double", .float }, .{ "float", .float }, .{ "boolean", .bool },        .{ "string", .string },
-            .{ "binary", .bytes }, .{ "date", .date },   .{ "timestamp", .timestamp }, .{ "timestamp_ntz", .timestamp },
-        }) |x| if (std.mem.eql(u8, t, x[0])) return types.Type.init(x[1]);
-        return parseDecimal(t);
-    }
-
-    fn parseDecimal(t: []const u8) ?types.Type {
-        if (std.mem.eql(u8, t, "decimal")) return types.Type.decimal(10, 0);
-        if (!std.mem.startsWith(u8, t, "decimal(") or !std.mem.endsWith(u8, t, ")")) return null;
-        var it = std.mem.splitScalar(u8, t["decimal(".len .. t.len - 1], ',');
-        const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
-        const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
-        if (p < 1 or p > 38 or s > p) return null;
-        return types.Type.decimal(p, s);
-    }
-
-    fn phys(t: []const u8) pqwrite.Physical {
-        var ph = pqwrite.Physical{};
-        const Ints = struct { []const u8, u8 };
-        for ([_]Ints{ .{ "integer", 32 }, .{ "short", 16 }, .{ "byte", 8 } }) |x| if (std.mem.eql(u8, t, x[0])) {
-            ph.int_bits = x[1];
-        };
-        ph.float32 = std.mem.eql(u8, t, "float");
-        ph.utc = std.mem.eql(u8, t, "timestamp");
-        return ph;
-    }
-
-    fn createdName(t: types.Type) ?[]const u8 {
-        return switch (t.kind) {
-            .bool => "boolean",
-            .int => "long",
-            .float => "double",
-            .string => "string",
-            .bytes => "binary",
-            .date => "date",
-            .timestamp => "timestamp",
-            else => null,
-        };
-    }
-};
-
 test "a table's column types from delta_types equal the writer's old tables" {
+    const Orig = struct {
+        const oracle = struct {
+            fn scalarType(t: []const u8) ?types.Type {
+                const Simple = struct { []const u8, types.TypeKind };
+                for ([_]Simple{
+                    .{ "long", .int },     .{ "integer", .int }, .{ "short", .int },           .{ "byte", .int },
+                    .{ "double", .float }, .{ "float", .float }, .{ "boolean", .bool },        .{ "string", .string },
+                    .{ "binary", .bytes }, .{ "date", .date },   .{ "timestamp", .timestamp }, .{ "timestamp_ntz", .timestamp },
+                }) |x| if (std.mem.eql(u8, t, x[0])) return types.Type.init(x[1]);
+                return parseDecimal(t);
+            }
+
+            fn parseDecimal(t: []const u8) ?types.Type {
+                if (std.mem.eql(u8, t, "decimal")) return types.Type.decimal(10, 0);
+                if (!std.mem.startsWith(u8, t, "decimal(") or !std.mem.endsWith(u8, t, ")")) return null;
+                var it = std.mem.splitScalar(u8, t["decimal(".len .. t.len - 1], ',');
+                const p = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
+                const s = std.fmt.parseInt(u8, std.mem.trim(u8, it.next() orelse "", " "), 10) catch return null;
+                if (p < 1 or p > 38 or s > p) return null;
+                return types.Type.decimal(p, s);
+            }
+
+            fn phys(t: []const u8) pqwrite.Physical {
+                var ph = pqwrite.Physical{};
+                const Ints = struct { []const u8, u8 };
+                for ([_]Ints{ .{ "integer", 32 }, .{ "short", 16 }, .{ "byte", 8 } }) |x| if (std.mem.eql(u8, t, x[0])) {
+                    ph.int_bits = x[1];
+                };
+                ph.float32 = std.mem.eql(u8, t, "float");
+                ph.utc = std.mem.eql(u8, t, "timestamp");
+                return ph;
+            }
+
+            fn createdName(t: types.Type) ?[]const u8 {
+                return switch (t.kind) {
+                    .bool => "boolean",
+                    .int => "long",
+                    .float => "double",
+                    .string => "string",
+                    .bytes => "binary",
+                    .date => "date",
+                    .timestamp => "timestamp",
+                    else => null,
+                };
+            }
+        };
+    };
     const names = [_][]const u8{
         "long",           "integer",      "short",          "byte",          "double",        "float",          "boolean",
         "string",         "binary",       "date",           "timestamp",     "timestamp_ntz", "void",           "variant",
@@ -943,19 +944,19 @@ test "a table's column types from delta_types equal the writer's old tables" {
         "decimal(0,0)",   "decimal()",    "decimal(10,2",   "decimal(-1,0)", "decimal(a,b)",  "decimal(256,0)", "Decimal(10,2)",
     };
     for (names) |t| {
-        const old = oracle.scalarType(t);
+        const old = Orig.oracle.scalarType(t);
         const new = dtypes.scalarType(t, .write);
         try testing.expectEqual(old == null, new == null);
         if (old) |o| {
             try testing.expectEqual(o, new.?);
-            try testing.expectEqual(oracle.phys(t), dtypes.physical(t));
+            try testing.expectEqual(Orig.oracle.phys(t), dtypes.physical(t));
         }
     }
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     inline for (std.meta.fields(types.TypeKind)) |f| {
         const k: types.TypeKind = @enumFromInt(f.value);
-        if (oracle.createdName(types.Type.init(k))) |n| {
+        if (Orig.oracle.createdName(types.Type.init(k))) |n| {
             const c = try createCol(ar.allocator(), "T", .{ .name = "c", .ty = types.Type.init(k) }, 0);
             try testing.expectEqualStrings(n, c.delta_type);
             try testing.expectEqual(pqwrite.Physical{ .utc = k == .timestamp }, c.phys);

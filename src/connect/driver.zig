@@ -384,55 +384,55 @@ const error_corpus = [_]anyerror{
     error.LoginFailed,        error.Aborted,                  error.AccessDenied,               error.FileNotFound,
 };
 
-fn oldTransientNet(e: anyerror) bool {
-    return switch (e) {
-        error.ConnectionRefused,
-        error.ConnectionTimedOut,
-        error.ConnectionResetByPeer,
-        error.NetworkUnreachable,
-        error.HostUnreachable,
-        error.BrokenPipe,
-        error.EndOfStream,
-        error.ReadFailed,
-        error.WriteFailed,
-        error.UnexpectedConnectFailure,
-        error.TemporaryNameServerFailure,
-        error.ServerClosedConnection,
-        error.ConnectionIoFailed,
-        => true,
-        else => false,
-    };
-}
-
-fn oldIsTransient(e: anyerror) bool {
-    return switch (e) {
-        error.ConnectionRefused,
-        error.ConnectionTimedOut,
-        error.ConnectionResetByPeer,
-        error.NetworkUnreachable,
-        error.HostUnreachable,
-        error.BrokenPipe,
-        error.TemporaryNameServerFailure,
-        error.NameServerFailure,
-        error.HostLacksNetworkAddresses,
-        error.UnknownHostName,
-        error.HttpServerBusy,
-        error.FtpServerBusy,
-        error.HttpTransportFailed,
-        error.ServerClosedConnection,
-        error.ConnectionIoFailed,
-        error.S3Throttled,
-        error.AzureThrottled,
-        => true,
-        else => false,
-    };
-}
-
 test "classify: transientNet keeps its socket set and transientRun matches the run's isTransient" {
+    const Orig = struct {
+        fn oldTransientNet(e: anyerror) bool {
+            return switch (e) {
+                error.ConnectionRefused,
+                error.ConnectionTimedOut,
+                error.ConnectionResetByPeer,
+                error.NetworkUnreachable,
+                error.HostUnreachable,
+                error.BrokenPipe,
+                error.EndOfStream,
+                error.ReadFailed,
+                error.WriteFailed,
+                error.UnexpectedConnectFailure,
+                error.TemporaryNameServerFailure,
+                error.ServerClosedConnection,
+                error.ConnectionIoFailed,
+                => true,
+                else => false,
+            };
+        }
+        fn oldIsTransient(e: anyerror) bool {
+            return switch (e) {
+                error.ConnectionRefused,
+                error.ConnectionTimedOut,
+                error.ConnectionResetByPeer,
+                error.NetworkUnreachable,
+                error.HostUnreachable,
+                error.BrokenPipe,
+                error.TemporaryNameServerFailure,
+                error.NameServerFailure,
+                error.HostLacksNetworkAddresses,
+                error.UnknownHostName,
+                error.HttpServerBusy,
+                error.FtpServerBusy,
+                error.HttpTransportFailed,
+                error.ServerClosedConnection,
+                error.ConnectionIoFailed,
+                error.S3Throttled,
+                error.AzureThrottled,
+                => true,
+                else => false,
+            };
+        }
+    };
     const env = @import("../runtime/env.zig");
     for (error_corpus) |e| {
-        try testing.expectEqual(oldTransientNet(e), transientNet(e));
-        try testing.expectEqual(oldIsTransient(e), transientRun(e));
+        try testing.expectEqual(Orig.oldTransientNet(e), transientNet(e));
+        try testing.expectEqual(Orig.oldIsTransient(e), transientRun(e));
         try testing.expectEqual(env.isTransient(e), transientRun(e));
     }
     try testing.expectEqual(Class.wire, classify(error.EndOfStream));

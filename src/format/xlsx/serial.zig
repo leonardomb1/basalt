@@ -87,53 +87,11 @@ pub fn text(arena: std.mem.Allocator, x: i64, comptime layout: civil.Layout) ![]
 
 const testing = std.testing;
 
-fn oracleOffset(serial: f64, date1904: bool) i64 {
-    if (date1904) return 24107;
-    return if (serial >= 1 and serial < 60) 25568 else 25569;
-}
-
-fn oracleDays(serial: f64, date1904: bool) i64 {
-    return @as(i64, @intFromFloat(@floor(serial))) - oracleOffset(serial, date1904);
-}
-
-fn oracleMicros(serial: f64, date1904: bool) i64 {
-    const ms: i64 = @intFromFloat(@round(serial * 86_400_000.0));
-    return (ms - oracleOffset(serial, date1904) * 86_400_000) * 1000;
-}
-
-fn oracleTimeMicros(serial: f64) i64 {
-    const frac = serial - @floor(serial);
-    const ms: i64 = @intFromFloat(@round(frac * 86_400_000.0));
-    return @min(ms, 86_399_999) * 1000;
-}
-
-const oracle_epoch_days = 25569;
-const oracle_first_day = 61 - oracle_epoch_days;
-const oracle_last_day = 2958465 - oracle_epoch_days;
-
-fn oracleDate(arena: std.mem.Allocator, d: i64) ![]const u8 {
-    const c = civil.civilFromDays(d);
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
-}
-
-fn oracleTime(arena: std.mem.Allocator, us: i64) ![]const u8 {
-    const t: u64 = @intCast(@max(us, 0));
-    const s = t / 1_000_000;
-    const ms = (t % 1_000_000) / 1000;
-    if (ms == 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ s / 3600, s / 60 % 60, s % 60 });
-    return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ s / 3600, s / 60 % 60, s % 60, ms });
-}
-
-fn oracleTimestamp(arena: std.mem.Allocator, us: i64) ![]const u8 {
-    const d = @divFloor(us, 86_400_000_000);
-    return std.fmt.allocPrint(arena, "{s} {s}", .{ try oracleDate(arena, d), try oracleTime(arena, us - d * 86_400_000_000) });
-}
-
 test "serial: the epochs and bounds equal the literals the reader and writer held" {
     try testing.expectEqual(@as(i64, 25569), epoch1900);
     try testing.expectEqual(@as(i64, 24107), epoch1904);
-    try testing.expectEqual(@as(i64, oracle_first_day), first_day);
-    try testing.expectEqual(@as(i64, oracle_last_day), last_day);
+    try testing.expectEqual(@as(i64, 61 - 25569), first_day);
+    try testing.expectEqual(@as(i64, 2958465 - 25569), last_day);
     try testing.expectEqual(@as(f64, 2958466.0), max_serial);
 }
 
@@ -152,33 +110,56 @@ test "serial: 1900 serials before March read as the dates Excel shows" {
 }
 
 test "serial: reading equals the reader's old arithmetic over the whole serial range" {
+    const Orig = struct {
+        fn oracleOffset(serial: f64, date1904: bool) i64 {
+            if (date1904) return 24107;
+            return if (serial >= 1 and serial < 60) 25568 else 25569;
+        }
+        fn oracleDays(serial: f64, date1904: bool) i64 {
+            return @as(i64, @intFromFloat(@floor(serial))) - oracleOffset(serial, date1904);
+        }
+        fn oracleMicros(serial: f64, date1904: bool) i64 {
+            const ms: i64 = @intFromFloat(@round(serial * 86_400_000.0));
+            return (ms - oracleOffset(serial, date1904) * 86_400_000) * 1000;
+        }
+        fn oracleTimeMicros(serial: f64) i64 {
+            const frac = serial - @floor(serial);
+            const ms: i64 = @intFromFloat(@round(frac * 86_400_000.0));
+            return @min(ms, 86_399_999) * 1000;
+        }
+    };
     var prng = std.Random.DefaultPrng.init(0x5e_71a1);
     const r = prng.random();
     const edges = [_]f64{ 0, 0.5, 1, 1.5, 59, 59.999999, 60, 60.5, 61, 25569, 25569.25, max_serial - 1e-6, max_serial - 1 };
     for (0..200_000 + edges.len) |i| {
         const s = if (i < edges.len) edges[i] else if (i % 3 == 0) @as(f64, @floatFromInt(r.uintLessThan(u32, 2958466))) else r.float(f64) * max_serial;
         for ([_]bool{ false, true }) |d1904| {
-            try testing.expectEqual(oracleDays(s, d1904), days(s, d1904));
-            try testing.expectEqual(oracleMicros(s, d1904), micros(s, d1904));
+            try testing.expectEqual(Orig.oracleDays(s, d1904), days(s, d1904));
+            try testing.expectEqual(Orig.oracleMicros(s, d1904), micros(s, d1904));
         }
-        try testing.expectEqual(oracleTimeMicros(s), timeMicros(s));
+        try testing.expectEqual(Orig.oracleTimeMicros(s), timeMicros(s));
     }
 }
 
 test "serial: writing equals the writer's old arithmetic, and what it writes reads back" {
+    const Orig = struct {
+        const oracle_epoch_days = 25569;
+        const oracle_first_day = 61 - oracle_epoch_days;
+        const oracle_last_day = 2958465 - oracle_epoch_days;
+    };
     var prng = std.Random.DefaultPrng.init(0x5e_71a2);
     const r = prng.random();
     const edges = [_]i64{ first_day - 1, first_day, 0, -1, last_day, last_day + 1, std.math.minInt(i32), std.math.maxInt(i32) };
     for (0..200_000 + edges.len) |i| {
         const d: i64 = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, first_day - 400, last_day + 400);
-        const want: ?i64 = if (d >= oracle_first_day and d <= oracle_last_day) d + oracle_epoch_days else null;
+        const want: ?i64 = if (d >= Orig.oracle_first_day and d <= Orig.oracle_last_day) d + Orig.oracle_epoch_days else null;
         try testing.expectEqual(want, ofDays(d));
         if (ofDays(d)) |s| try testing.expectEqual(d, days(@floatFromInt(s), false));
 
         const us = if (i < edges.len) d *| 86_400_000_000 else r.intRangeAtMost(i64, (first_day - 2) * 86_400_000_000, (last_day + 2) * 86_400_000_000);
         const ms = @divFloor(us, 1000);
         const day_of = @divFloor(ms, 86_400_000);
-        const want_ts: ?f64 = if (day_of >= oracle_first_day and day_of <= oracle_last_day) @as(f64, @floatFromInt(ms + oracle_epoch_days * 86_400_000)) / 86_400_000 else null;
+        const want_ts: ?f64 = if (day_of >= Orig.oracle_first_day and day_of <= Orig.oracle_last_day) @as(f64, @floatFromInt(ms + Orig.oracle_epoch_days * 86_400_000)) / 86_400_000 else null;
         try testing.expectEqual(want_ts, ofMicros(us));
         if (ofMicros(us)) |s| try testing.expectEqual(ms * 1000, micros(s, false));
 
@@ -189,21 +170,38 @@ test "serial: writing equals the writer's old arithmetic, and what it writes rea
 }
 
 test "serial: cell text equals the reader's old formatters" {
+    const Orig = struct {
+        fn oracleDate(arena: std.mem.Allocator, d: i64) ![]const u8 {
+            const c = civil.civilFromDays(d);
+            return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
+        }
+        fn oracleTime(arena: std.mem.Allocator, us: i64) ![]const u8 {
+            const t: u64 = @intCast(@max(us, 0));
+            const s = t / 1_000_000;
+            const ms = (t % 1_000_000) / 1000;
+            if (ms == 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ s / 3600, s / 60 % 60, s % 60 });
+            return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ s / 3600, s / 60 % 60, s % 60, ms });
+        }
+        fn oracleTimestamp(arena: std.mem.Allocator, us: i64) ![]const u8 {
+            const d = @divFloor(us, 86_400_000_000);
+            return std.fmt.allocPrint(arena, "{s} {s}", .{ try oracleDate(arena, d), try oracleTime(arena, us - d * 86_400_000_000) });
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var prng = std.Random.DefaultPrng.init(0x5e_71a3);
     const r = prng.random();
     const day_edges = [_]i64{ 0, -1, -719528, -719529, -800000, last_day, last_day + 1, 3_000_000 };
-    for (day_edges) |d| try testing.expectEqualStrings(try oracleDate(a, d), try text(a, d, date_layout));
+    for (day_edges) |d| try testing.expectEqualStrings(try Orig.oracleDate(a, d), try text(a, d, date_layout));
     for (0..50_000) |_| {
         _ = ar.reset(.retain_capacity);
         const d = r.intRangeAtMost(i64, -1_000_000, 3_500_000);
-        try testing.expectEqualStrings(try oracleDate(a, d), try text(a, d, date_layout));
+        try testing.expectEqualStrings(try Orig.oracleDate(a, d), try text(a, d, date_layout));
         const t = r.intRangeLessThan(i64, 0, 86_400_000_000);
         const tm = if (r.boolean()) @divFloor(t, 1000) * 1000 else t;
-        try testing.expectEqualStrings(try oracleTime(a, tm), try text(a, tm, time_layout));
+        try testing.expectEqualStrings(try Orig.oracleTime(a, tm), try text(a, tm, time_layout));
         const us = r.intRangeAtMost(i64, -800_000 * 86_400_000_000, 3_500_000 * 86_400_000_000);
-        try testing.expectEqualStrings(try oracleTimestamp(a, us), try text(a, us, timestamp_layout));
+        try testing.expectEqualStrings(try Orig.oracleTimestamp(a, us), try text(a, us, timestamp_layout));
     }
 }

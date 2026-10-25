@@ -592,28 +592,29 @@ test "engineTypeFor maps MySQL wire types to engine types" {
     try std.testing.expectEqual(types.TypeKind.bytes, engineTypeFor(0xfc, 0, 0, 63).kind);
 }
 
-/// `engineTypeFor` at 10e697a, before the kind came from `typemap`.
-fn pinnedEngineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
-    const unsigned = flags & 0x0020 != 0;
-    const binary = charset == 63;
-    return (switch (mtype) {
-        0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
-        0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
-        0x04, 0x05 => types.Type.init(.float),
-        0x00, 0xf6 => types.Type.decimal(38, decimals),
-        0x0a => types.Type.init(.date),
-        0x07, 0x0c => types.Type.init(.timestamp),
-        0x10 => types.Type.init(.int),
-        0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
-        else => types.Type.init(.string),
-    }).asNullable();
-}
-
 test "engineTypeFor equals its pre-typemap body for every type byte, flag, charset and scale" {
+    const Orig = struct {
+        /// `engineTypeFor` at 10e697a, before the kind came from `typemap`.
+        fn pinnedEngineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
+            const unsigned = flags & 0x0020 != 0;
+            const binary = charset == 63;
+            return (switch (mtype) {
+                0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),
+                0x01, 0x02, 0x03, 0x09, 0x0d => types.Type.init(.int),
+                0x04, 0x05 => types.Type.init(.float),
+                0x00, 0xf6 => types.Type.decimal(38, decimals),
+                0x0a => types.Type.init(.date),
+                0x07, 0x0c => types.Type.init(.timestamp),
+                0x10 => types.Type.init(.int),
+                0xfb, 0xfc, 0xfd, 0xfe => if (binary) types.Type.init(.bytes) else types.Type.init(.string),
+                else => types.Type.init(.string),
+            }).asNullable();
+        }
+    };
     for (0..256) |m| {
         const mtype: u8 = @intCast(m);
         for ([_]u16{ 0, 0x0020, 0x0021, 0xFFFF, 0xFFDF }) |f| for ([_]u16{ 0, 33, 63, 0xFFFF }) |c| for ([_]u8{ 0, 2, 30, 38, 255 }) |d| {
-            try std.testing.expectEqual(pinnedEngineTypeFor(mtype, d, f, c), engineTypeFor(mtype, d, f, c));
+            try std.testing.expectEqual(Orig.pinnedEngineTypeFor(mtype, d, f, c), engineTypeFor(mtype, d, f, c));
         };
     }
 }

@@ -533,26 +533,27 @@ test "pgType maps OIDs; numeric typmod carries precision and scale" {
     try std.testing.expectEqual(@as(u8, 38), wide_scale.scale);
 }
 
-/// `pgType` at 10e697a, before the kind came from `typemap`.
-fn pinnedPgType(oid: i32, typmod: i32) types.Type {
-    return (switch (oid) {
-        16 => types.Type.init(.bool),
-        20, 21, 23 => types.Type.init(.int),
-        700, 701 => types.Type.init(.float),
-        1700 => decimalFromTypmod(typmod),
-        1082 => types.Type.init(.date),
-        1114, 1184 => types.Type.init(.timestamp),
-        else => types.Type.init(.string),
-    }).asNullable();
-}
-
 test "pgType equals its pre-typemap body for every OID and typmod shape" {
+    const Orig = struct {
+        /// `pgType` at 10e697a, before the kind came from `typemap`.
+        fn pinnedPgType(oid: i32, typmod: i32) types.Type {
+            return (switch (oid) {
+                16 => types.Type.init(.bool),
+                20, 21, 23 => types.Type.init(.int),
+                700, 701 => types.Type.init(.float),
+                1700 => decimalFromTypmod(typmod),
+                1082 => types.Type.init(.date),
+                1114, 1184 => types.Type.init(.timestamp),
+                else => types.Type.init(.string),
+            }).asNullable();
+        }
+    };
     const typmods = [_]i32{ -1, 0, 3, 4, (10 << 16 | 2) + 4, (500 << 16 | 2) + 4, (1000 << 16 | 900) + 4, std.math.maxInt(i32), std.math.minInt(i32) };
     var oid: i32 = -2;
     while (oid < 4000) : (oid += 1) {
-        for (typmods) |t| try std.testing.expectEqual(pinnedPgType(oid, t), pgType(oid, t));
+        for (typmods) |t| try std.testing.expectEqual(Orig.pinnedPgType(oid, t), pgType(oid, t));
     }
-    for ([_]i32{ std.math.minInt(i32), std.math.maxInt(i32), 70_000 }) |o| try std.testing.expectEqual(pinnedPgType(o, -1), pgType(o, -1));
+    for ([_]i32{ std.math.minInt(i32), std.math.maxInt(i32), 70_000 }) |o| try std.testing.expectEqual(Orig.pinnedPgType(o, -1), pgType(o, -1));
 }
 
 test "ErrorResponse extraction picks the M field" {

@@ -616,39 +616,40 @@ test "a key with no value is of unknown type only when the sample read the whole
     try testing.expect(!(try schemaOf(a, &.{"{\"n\":null}"}, 8)).fields[0].ty.unknown);
 }
 
-fn oracleInferKinds(arena: std.mem.Allocator, rows: []const []const u8) ![]const types.TypeKind {
-    const Kind = enum { none, boolean, int, float, text };
-    var names = std.StringArrayHashMap(Kind).init(arena);
-    for (rows) |row| {
-        if (row[0] != '{') continue;
-        var m = jt.Members.root(row);
-        while (m.next()) |mem| {
-            const gop = try names.getOrPut(try jt.decodeString(arena, mem.key));
-            if (!gop.found_existing) gop.value_ptr.* = .none;
-            const b: Kind = switch (mem.value[0]) {
-                'n' => .none,
-                't', 'f' => .boolean,
-                '"', '{', '[' => .text,
-                else => switch (jt.number(mem.value)) {
-                    .int => .int,
-                    .float, .text => .float,
-                },
-            };
-            const x = gop.value_ptr.*;
-            gop.value_ptr.* = if (x == .none) b else if (b == .none or x == b) x else if ((x == .int and b == .float) or (x == .float and b == .int)) .float else .text;
-        }
-    }
-    const out = try arena.alloc(types.TypeKind, names.count());
-    for (names.values(), out) |k, *o| o.* = switch (k) {
-        .boolean => .bool,
-        .int => .int,
-        .float => .float,
-        .none, .text => .string,
-    };
-    return out;
-}
-
 test "Infer on widenSample types every key as the lattice it replaced did" {
+    const Orig = struct {
+        fn oracleInferKinds(arena: std.mem.Allocator, rows: []const []const u8) ![]const types.TypeKind {
+            const Kind = enum { none, boolean, int, float, text };
+            var names = std.StringArrayHashMap(Kind).init(arena);
+            for (rows) |row| {
+                if (row[0] != '{') continue;
+                var m = jt.Members.root(row);
+                while (m.next()) |mem| {
+                    const gop = try names.getOrPut(try jt.decodeString(arena, mem.key));
+                    if (!gop.found_existing) gop.value_ptr.* = .none;
+                    const b: Kind = switch (mem.value[0]) {
+                        'n' => .none,
+                        't', 'f' => .boolean,
+                        '"', '{', '[' => .text,
+                        else => switch (jt.number(mem.value)) {
+                            .int => .int,
+                            .float, .text => .float,
+                        },
+                    };
+                    const x = gop.value_ptr.*;
+                    gop.value_ptr.* = if (x == .none) b else if (b == .none or x == b) x else if ((x == .int and b == .float) or (x == .float and b == .int)) .float else .text;
+                }
+            }
+            const out = try arena.alloc(types.TypeKind, names.count());
+            for (names.values(), out) |k, *o| o.* = switch (k) {
+                .boolean => .bool,
+                .int => .int,
+                .float => .float,
+                .none, .text => .string,
+            };
+            return out;
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -669,7 +670,7 @@ test "Infer on widenSample types every key as the lattice it replaced did" {
             try t.writer.writeByte('}');
             row.* = t.written();
         }
-        const want = try oracleInferKinds(a, rows[0..nrows]);
+        const want = try Orig.oracleInferKinds(a, rows[0..nrows]);
         const got = try schemaOf(a, rows[0..nrows], nrows);
         try testing.expectEqual(want.len, got.fields.len);
         for (want, got.fields) |k, f| {

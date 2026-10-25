@@ -35,18 +35,19 @@ fn quoted(out: anytype, s: []const u8, comptime q: u8) !void {
 
 const testing = std.testing;
 
-fn oracle(a: std.mem.Allocator, s: []const u8, q: u8) ![]const u8 {
-    var out = std.array_list.Managed(u8).init(a);
-    try out.append(q);
-    for (s) |c| {
-        if (c == q) try out.append(q);
-        try out.append(c);
-    }
-    try out.append(q);
-    return out.items;
-}
-
 test "quote: strLit and ident match the byte-wise doubling they replace, on both sinks" {
+    const Orig = struct {
+        fn oracle(a: std.mem.Allocator, s: []const u8, q: u8) ![]const u8 {
+            var out = std.array_list.Managed(u8).init(a);
+            try out.append(q);
+            for (s) |c| {
+                if (c == q) try out.append(q);
+                try out.append(c);
+            }
+            try out.append(q);
+            return out.items;
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -54,17 +55,17 @@ test "quote: strLit and ident match the byte-wise doubling they replace, on both
     for (corpus) |s| {
         var list = std.array_list.Managed(u8).init(a);
         try strLit(&list, s);
-        try testing.expectEqualStrings(try oracle(a, s, '\''), list.items);
+        try testing.expectEqualStrings(try Orig.oracle(a, s, '\''), list.items);
         list.clearRetainingCapacity();
         try ident(&list, s);
-        try testing.expectEqualStrings(try oracle(a, s, '"'), list.items);
+        try testing.expectEqualStrings(try Orig.oracle(a, s, '"'), list.items);
 
         var aw = std.Io.Writer.Allocating.init(a);
         try strLit(&aw.writer, s);
-        try testing.expectEqualStrings(try oracle(a, s, '\''), aw.written());
+        try testing.expectEqualStrings(try Orig.oracle(a, s, '\''), aw.written());
         aw.clearRetainingCapacity();
         try ident(&aw.writer, s);
-        try testing.expectEqualStrings(try oracle(a, s, '"'), aw.written());
+        try testing.expectEqualStrings(try Orig.oracle(a, s, '"'), aw.written());
     }
     var prng = std.Random.DefaultPrng.init(0x9707e);
     const r = prng.random();
@@ -78,9 +79,9 @@ test "quote: strLit and ident match the byte-wise doubling they replace, on both
         };
         var list = std.array_list.Managed(u8).init(a);
         try strLit(&list, buf[0..n]);
-        try testing.expectEqualStrings(try oracle(a, buf[0..n], '\''), list.items);
+        try testing.expectEqualStrings(try Orig.oracle(a, buf[0..n], '\''), list.items);
         list.clearRetainingCapacity();
         try ident(&list, buf[0..n]);
-        try testing.expectEqualStrings(try oracle(a, buf[0..n], '"'), list.items);
+        try testing.expectEqualStrings(try Orig.oracle(a, buf[0..n], '"'), list.items);
     }
 }

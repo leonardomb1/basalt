@@ -385,7 +385,6 @@ pub const plan = [_]Rule{
         "exec/eval/row.zig",
         "exec/json.zig",
         "exec/trace.zig",
-        "format/arrow/read.zig",
         "format/lake/delta_write.zig",
         "format/parquet/nested.zig",
         "runtime/obs.zig",
@@ -395,7 +394,6 @@ pub const plan = [_]Rule{
         "format/uuid.zig",
         "store/scheme.zig",
         "exec/eval/fn_records.zig",
-        "format/xml/escape.zig",
         "format/xml/token.zig",
     } },
     .{ .home = "utf16", .pattern = utf16_pattern, .allow = &.{

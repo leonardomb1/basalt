@@ -421,27 +421,27 @@ test "integer arithmetic overflow is an error, not a silent wrap" {
     try std.testing.expectError(error.IntOverflow, evalLit(ar.allocator(), "abs(-9223372036854775807 - 1)"));
 }
 
-fn oldJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
-    switch (v) {
-        .null => try w.writeAll("null"),
-        .bool => |b| try w.writeAll(if (b) "true" else "false"),
-        .int => |i| try w.print("{d}", .{i}),
-        .float => |f| if (std.math.isFinite(f)) try w.print("{}", .{f}) else try w.writeAll("null"),
-        .decimal => try w.writeAll(try valueToString(arena, v)),
-        .string => |s| try std.json.Stringify.value(s, .{}, w),
-        else => try std.json.Stringify.value(try valueToString(arena, v), .{}, w),
-    }
-}
-
-fn jsonPair(arena: std.mem.Allocator, v: Value) ![2][]const u8 {
-    var old: std.Io.Writer.Allocating = .init(arena);
-    try oldJsonValue(arena, v, &old.writer);
-    var new: std.Io.Writer.Allocating = .init(arena);
-    try writeJsonValue(arena, v, &new.writer);
-    return .{ old.written(), new.written() };
-}
-
 test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and invalid UTF-8" {
+    const Orig = struct {
+        fn oldJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) !void {
+            switch (v) {
+                .null => try w.writeAll("null"),
+                .bool => |b| try w.writeAll(if (b) "true" else "false"),
+                .int => |i| try w.print("{d}", .{i}),
+                .float => |f| if (std.math.isFinite(f)) try w.print("{}", .{f}) else try w.writeAll("null"),
+                .decimal => try w.writeAll(try valueToString(arena, v)),
+                .string => |s| try std.json.Stringify.value(s, .{}, w),
+                else => try std.json.Stringify.value(try valueToString(arena, v), .{}, w),
+            }
+        }
+        fn jsonPair(arena: std.mem.Allocator, v: Value) ![2][]const u8 {
+            var old: std.Io.Writer.Allocating = .init(arena);
+            try oldJsonValue(arena, v, &old.writer);
+            var new: std.Io.Writer.Allocating = .init(arena);
+            try writeJsonValue(arena, v, &new.writer);
+            return .{ old.written(), new.written() };
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -449,13 +449,13 @@ test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and
     const r = rng.random();
     for (0..100_000) |_| {
         const x: f64 = @bitCast(r.int(u64));
-        const p = try jsonPair(a, .{ .float = x });
+        const p = try Orig.jsonPair(a, .{ .float = x });
         try std.testing.expectEqualStrings(p[0], p[1]);
         const d = Value{ .decimal = .{ .unscaled = r.int(i128) >> r.int(u7), .scale = r.uintAtMost(u8, 38) } };
-        const q = try jsonPair(a, d);
+        const q = try Orig.jsonPair(a, d);
         try std.testing.expectEqualStrings(q[0], q[1]);
         const i = Value{ .int = r.int(i64) >> r.int(u6) };
-        const n = try jsonPair(a, i);
+        const n = try Orig.jsonPair(a, i);
         try std.testing.expectEqualStrings(n[0], n[1]);
     }
     const fixed = [_]Value{
@@ -468,13 +468,13 @@ test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and
         .{ .timestamp = std.math.maxInt(i64) }, .{ .string = "h\u{e9} \u{1F600} \"q\" \\ /" },   .{ .bytes = "plain" },
     };
     for (fixed) |v| {
-        const p = try jsonPair(a, v);
+        const p = try Orig.jsonPair(a, v);
         try std.testing.expectEqualStrings(p[0], p[1]);
     }
     for (0..256) |b| {
         const s: []const u8 = &.{@intCast(b)};
         inline for (.{ Value{ .string = s }, Value{ .bytes = s } }) |v| {
-            const p = try jsonPair(a, v);
+            const p = try Orig.jsonPair(a, v);
             const parsed = try std.json.parseFromSliceLeaky([]const u8, a, p[1], .{});
             if (b < 0x80 and b != 0x08 and b != 0x0c) {
                 try std.testing.expectEqualStrings(p[0], p[1]);

@@ -610,38 +610,39 @@ test "delta_types: statistics the writer spells read back as the merge reads the
     try testing.expectEqual(@as(i64, 20454 * 86_400_000_000 + 1_234_999), t_max.timestamp);
 }
 
-const oracle = struct {
-    const time = @import("../../exec/eval/time.zig");
-
-    fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
-        const day = @divFloor(us, 86_400_000_000);
-        const rest: u64 = @intCast(@mod(us, 86_400_000_000));
-        const y = try fourDigitYear(day);
-        const c = time.civilFromDays(day);
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
-        if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
-        if (utc) try w.writeByte('Z');
-    }
-
-    fn writeDate(w: *std.Io.Writer, days: i64) !void {
-        const y = try fourDigitYear(days);
-        const c = time.civilFromDays(days);
-        try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
-    }
-
-    fn fourDigitYear(days: i64) Error!u64 {
-        const y = time.civilFromDays(days).y;
-        if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
-        return @intCast(y);
-    }
-};
-
 fn expectSameText(old: anyerror![]const u8, new: anyerror![]const u8) !void {
     const o = old catch |e| return testing.expectError(e, new);
     try testing.expectEqualStrings(o, try new);
 }
 
 test "delta_types: writeTimestamp and writeDate on civil.writeLayout equal the old bodies" {
+    const Orig = struct {
+        const oracle = struct {
+            const time = @import("../../exec/eval/time.zig");
+
+            fn writeTimestamp(w: *std.Io.Writer, us: i64, utc: bool, ms: bool) !void {
+                const day = @divFloor(us, 86_400_000_000);
+                const rest: u64 = @intCast(@mod(us, 86_400_000_000));
+                const y = try fourDigitYear(day);
+                const c = time.civilFromDays(day);
+                try w.print("{d:0>4}-{d:0>2}-{d:0>2}{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ y, c.m, c.d, @as(u8, if (utc) 'T' else ' '), rest / 3_600_000_000, rest / 60_000_000 % 60, rest / 1_000_000 % 60 });
+                if (ms) try w.print(".{d:0>3}", .{rest / 1000 % 1000}) else try w.print(".{d:0>6}", .{rest % 1_000_000});
+                if (utc) try w.writeByte('Z');
+            }
+
+            fn writeDate(w: *std.Io.Writer, days: i64) !void {
+                const y = try fourDigitYear(days);
+                const c = time.civilFromDays(days);
+                try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, c.m, c.d });
+            }
+
+            fn fourDigitYear(days: i64) Error!u64 {
+                const y = time.civilFromDays(days).y;
+                if (y < 1 or y > 9999) return Error.DeltaValueOutOfRange;
+                return @intCast(y);
+            }
+        };
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -669,9 +670,9 @@ test "delta_types: writeTimestamp and writeDate on civil.writeLayout equal the o
     for (0..2_000) |_| try edges.append(r.int(i64));
     for (edges.items) |us| {
         for ([_]bool{ false, true }) |utc| for ([_]bool{ false, true }) |ms|
-            try expectSameText(W.ts(a, oracle.writeTimestamp, us, utc, ms), W.ts(a, writeTimestamp, us, utc, ms));
+            try expectSameText(W.ts(a, Orig.oracle.writeTimestamp, us, utc, ms), W.ts(a, writeTimestamp, us, utc, ms));
         const d = @divFloor(us, day);
-        try expectSameText(W.date(a, oracle.writeDate, d), W.date(a, writeDate, d));
+        try expectSameText(W.date(a, Orig.oracle.writeDate, d), W.date(a, writeDate, d));
     }
 }
 

@@ -228,70 +228,37 @@ test "charsets decode and encode back, refusing what they cannot hold" {
     try std.testing.expectEqual(Charset.latin1, Charset.parse("ISO-8859-1").?);
 }
 
-fn oracleCodePoint(cs: Charset, c: u8) u21 {
-    return switch (cs) {
-        .utf8, .latin1 => c,
-        .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] == 0) 0xFFFD else cp1252_high[c - 0x80],
-        .cp037 => cp037_to_unicode[c],
-    };
-}
-
-fn oracleDecode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const u8 {
-    if (cs == .utf8) {
-        if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
-        var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len + 8);
-        var runs = celltext.Utf8Runs{ .s = bytes };
-        while (runs.next()) |t| try out.appendSlice(t);
-        return out.items;
-    }
-    if (cs != .cp037) {
-        for (bytes) |c| {
-            if (c >= 0x80) break;
-        } else return bytes;
-    }
-    var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len * 3);
-    var buf: [4]u8 = undefined;
-    for (bytes) |c| {
-        const n = std.unicode.utf8Encode(oracleCodePoint(cs, c), &buf) catch unreachable;
-        out.appendSliceAssumeCapacity(buf[0..n]);
-    }
-    return out.items;
-}
-
-fn tdsCp1252High(b: u8) u21 {
-    return switch (b) {
-        0x80 => 0x20AC,
-        0x82 => 0x201A,
-        0x83 => 0x0192,
-        0x84 => 0x201E,
-        0x85 => 0x2026,
-        0x86 => 0x2020,
-        0x87 => 0x2021,
-        0x88 => 0x02C6,
-        0x89 => 0x2030,
-        0x8A => 0x0160,
-        0x8B => 0x2039,
-        0x8C => 0x0152,
-        0x8E => 0x017D,
-        0x91 => 0x2018,
-        0x92 => 0x2019,
-        0x93 => 0x201C,
-        0x94 => 0x201D,
-        0x95 => 0x2022,
-        0x96 => 0x2013,
-        0x97 => 0x2014,
-        0x98 => 0x02DC,
-        0x99 => 0x2122,
-        0x9A => 0x0161,
-        0x9B => 0x203A,
-        0x9C => 0x0153,
-        0x9E => 0x017E,
-        0x9F => 0x0178,
-        else => b,
-    };
-}
-
 test "decode by table equals the per-byte encoder it replaced, every byte and a random corpus" {
+    const Orig = struct {
+        fn oracleCodePoint(cs: Charset, c: u8) u21 {
+            return switch (cs) {
+                .utf8, .latin1 => c,
+                .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] == 0) 0xFFFD else cp1252_high[c - 0x80],
+                .cp037 => cp037_to_unicode[c],
+            };
+        }
+        fn oracleDecode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const u8 {
+            if (cs == .utf8) {
+                if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
+                var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len + 8);
+                var runs = celltext.Utf8Runs{ .s = bytes };
+                while (runs.next()) |t| try out.appendSlice(t);
+                return out.items;
+            }
+            if (cs != .cp037) {
+                for (bytes) |c| {
+                    if (c >= 0x80) break;
+                } else return bytes;
+            }
+            var out = try std.array_list.Managed(u8).initCapacity(arena, bytes.len * 3);
+            var buf: [4]u8 = undefined;
+            for (bytes) |c| {
+                const n = std.unicode.utf8Encode(oracleCodePoint(cs, c), &buf) catch unreachable;
+                out.appendSliceAssumeCapacity(buf[0..n]);
+            }
+            return out.items;
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -301,23 +268,57 @@ test "decode by table equals the per-byte encoder it replaced, every byte and a 
     const r = prng.random();
     var buf: [96]u8 = undefined;
     for ([_]Charset{ .utf8, .latin1, .cp1252, .cp037 }) |cs| {
-        for (0..256) |i| try std.testing.expectEqualStrings(try oracleDecode(a, cs, all[i .. i + 1]), try decode(a, cs, all[i .. i + 1]));
-        try std.testing.expectEqualStrings(try oracleDecode(a, cs, &all), try decode(a, cs, &all));
+        for (0..256) |i| try std.testing.expectEqualStrings(try Orig.oracleDecode(a, cs, all[i .. i + 1]), try decode(a, cs, all[i .. i + 1]));
+        try std.testing.expectEqualStrings(try Orig.oracleDecode(a, cs, &all), try decode(a, cs, &all));
         try std.testing.expectEqualStrings("", try decode(a, cs, ""));
         for (0..3000) |it| {
             const n = r.uintLessThan(usize, buf.len + 1);
             for (buf[0..n]) |*b| b.* = if (it % 2 == 0) r.int(u8) else r.uintLessThan(u8, 0x80);
-            try std.testing.expectEqualStrings(try oracleDecode(a, cs, buf[0..n]), try decode(a, cs, buf[0..n]));
+            try std.testing.expectEqualStrings(try Orig.oracleDecode(a, cs, buf[0..n]), try decode(a, cs, buf[0..n]));
         }
     }
 }
 
 test "cp1252 with C1 undefined bytes equals SQL Server's table; the default policy gives U+FFFD" {
+    const Orig = struct {
+        fn tdsCp1252High(b: u8) u21 {
+            return switch (b) {
+                0x80 => 0x20AC,
+                0x82 => 0x201A,
+                0x83 => 0x0192,
+                0x84 => 0x201E,
+                0x85 => 0x2026,
+                0x86 => 0x2020,
+                0x87 => 0x2021,
+                0x88 => 0x02C6,
+                0x89 => 0x2030,
+                0x8A => 0x0160,
+                0x8B => 0x2039,
+                0x8C => 0x0152,
+                0x8E => 0x017D,
+                0x91 => 0x2018,
+                0x92 => 0x2019,
+                0x93 => 0x201C,
+                0x94 => 0x201D,
+                0x95 => 0x2022,
+                0x96 => 0x2013,
+                0x97 => 0x2014,
+                0x98 => 0x02DC,
+                0x99 => 0x2122,
+                0x9A => 0x0161,
+                0x9B => 0x203A,
+                0x9C => 0x0153,
+                0x9E => 0x017E,
+                0x9F => 0x0178,
+                else => b,
+            };
+        }
+    };
     const t = utf8Table(.cp1252, .c1);
     for (0..256) |i| {
         const b: u8 = @intCast(i);
         var want: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(if (b < 0x80) b else tdsCp1252High(b), &want);
+        const n = try std.unicode.utf8Encode(if (b < 0x80) b else Orig.tdsCp1252High(b), &want);
         try std.testing.expectEqualSlices(u8, want[0..n], t[b].bytes[0..t[b].len]);
     }
     var out: [16]u8 = undefined;

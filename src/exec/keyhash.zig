@@ -360,22 +360,23 @@ test "meetKind: INT against FLOAT keys as FLOAT from either side; otherwise the 
     try testing.expectEqual(Meet{ .want = .string, .kind = .strk }, meetKind(.string, .bytes));
 }
 
-fn pinnedJoinHash(c: *const Column, row: usize) u64 {
-    var h = std.hash.Wyhash.init(0);
-    switch (std.meta.activeTag(c.data)) {
-        .i64 => switch (c.ty.kind) {
-            .int => hashInt(&h, c.data.i64[row]),
-            .time => hashTagged(&h, .time, std.mem.asBytes(&c.data.i64[row])),
-            .timestamp => hashTagged(&h, .timestamp, std.mem.asBytes(&c.data.i64[row])),
-            else => hashValue(&h, c.getValue(row)),
-        },
-        .bytes => hashTagged(&h, if (c.ty.kind == .string) .string else .bytes, c.data.bytes.at(row)),
-        else => hashValue(&h, c.getValue(row)),
-    }
-    return h.final();
-}
-
 test "hashCell: every scalar kind hashes as its boxed value and as the old join row hash" {
+    const Orig = struct {
+        fn pinnedJoinHash(c: *const Column, row: usize) u64 {
+            var h = std.hash.Wyhash.init(0);
+            switch (std.meta.activeTag(c.data)) {
+                .i64 => switch (c.ty.kind) {
+                    .int => hashInt(&h, c.data.i64[row]),
+                    .time => hashTagged(&h, .time, std.mem.asBytes(&c.data.i64[row])),
+                    .timestamp => hashTagged(&h, .timestamp, std.mem.asBytes(&c.data.i64[row])),
+                    else => hashValue(&h, c.getValue(row)),
+                },
+                .bytes => hashTagged(&h, if (c.ty.kind == .string) .string else .bytes, c.data.bytes.at(row)),
+                else => hashValue(&h, c.getValue(row)),
+            }
+            return h.final();
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -401,20 +402,9 @@ test "hashCell: every scalar kind hashes as its boxed value and as the old join 
             hashCell(&h, &col, r);
             const got = h.final();
             try testing.expectEqual(hashOne(col.getValue(r)), got);
-            try testing.expectEqual(pinnedJoinHash(&col, r), got);
+            try testing.expectEqual(Orig.pinnedJoinHash(&col, r), got);
         }
     }
-}
-
-fn pinnedKeysetBounds(vals: []const Value) [2]?Value {
-    var lo: ?Value = null;
-    var hi: ?Value = null;
-    for (vals) |v| {
-        if (v == .null) continue;
-        if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = v;
-        if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = v;
-    }
-    return .{ lo, hi };
 }
 
 fn sameBound(want: ?Value, got: ?Value) !void {
@@ -427,6 +417,18 @@ fn sameBound(want: ?Value, got: ?Value) !void {
 }
 
 test "MinMax: lo and hi are the old keyset fold's bounds, NaN payload included" {
+    const Orig = struct {
+        fn pinnedKeysetBounds(vals: []const Value) [2]?Value {
+            var lo: ?Value = null;
+            var hi: ?Value = null;
+            for (vals) |v| {
+                if (v == .null) continue;
+                if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = v;
+                if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = v;
+            }
+            return .{ lo, hi };
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -441,7 +443,7 @@ test "MinMax: lo and hi are the old keyset fold's bounds, NaN payload included" 
         for (vals) |*v| v.* = pool[rand.uintLessThan(usize, pool.len)];
         var mm = MinMax{};
         for (vals) |v| try mm.fold(a, v);
-        const want = pinnedKeysetBounds(vals);
+        const want = Orig.pinnedKeysetBounds(vals);
         try sameBound(want[0], mm.lo());
         try sameBound(want[1], mm.hi());
     }

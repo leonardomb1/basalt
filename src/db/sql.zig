@@ -1586,56 +1586,57 @@ test "a string literal keeps a name from data inside it in every dialect" {
     try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
 }
 
-/// The literal writers at 10e697a, before `writeStrLit`: `quoteString`, `strLit`,
-/// the OBJECT_ID literal of `createTableSqlWith`, and `hexLiteral`.
-const Pinned = struct {
-    fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
-        try w.writeByte('\'');
-        for (s) |ch| {
-            if (ch == '\'') {
-                try w.writeAll("''");
-            } else if (ch == '\\' and dialect.mysqlWire()) {
-                try w.writeAll("\\\\");
-            } else {
-                try w.writeByte(ch);
-            }
-        }
-        try w.writeByte('\'');
-    }
-
-    fn strLit(self: Dialect, arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-        var out = std.array_list.Managed(u8).init(arena);
-        try out.append('\'');
-        for (s) |c| {
-            if (c == '\'' or (c == '\\' and self.mysqlWire())) try out.append(c);
-            try out.append(c);
-        }
-        try out.append('\'');
-        return out.toOwnedSlice();
-    }
-
-    fn objectId(arena: std.mem.Allocator, qtable: []const u8) ![]const u8 {
-        const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
-        return std.fmt.allocPrint(arena, "IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
-    }
-
-    fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
-        if (dialect == .postgres) {
-            try w.writeAll("'\\x");
-            for (s) |b| try w.print("{x:0>2}", .{b});
-            try w.writeByte('\'');
-        } else {
-            try w.writeAll("0x");
-            for (s) |b| try w.print("{x:0>2}", .{b});
-        }
-    }
-
-    fn unquotable(dialect: Dialect, name: []const u8) bool {
-        return dialect == .starrocks and std.mem.indexOfScalar(u8, name, '`') != null;
-    }
-};
-
 test "the literal writers equal their pre-writeStrLit bodies, but for SQL Server's N on a value" {
+    const Orig = struct {
+        /// The literal writers at 10e697a, before `writeStrLit`: `quoteString`, `strLit`,
+        /// the OBJECT_ID literal of `createTableSqlWith`, and `hexLiteral`.
+        const Pinned = struct {
+            fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
+                try w.writeByte('\'');
+                for (s) |ch| {
+                    if (ch == '\'') {
+                        try w.writeAll("''");
+                    } else if (ch == '\\' and dialect.mysqlWire()) {
+                        try w.writeAll("\\\\");
+                    } else {
+                        try w.writeByte(ch);
+                    }
+                }
+                try w.writeByte('\'');
+            }
+
+            fn strLit(self: Dialect, arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+                var out = std.array_list.Managed(u8).init(arena);
+                try out.append('\'');
+                for (s) |c| {
+                    if (c == '\'' or (c == '\\' and self.mysqlWire())) try out.append(c);
+                    try out.append(c);
+                }
+                try out.append('\'');
+                return out.toOwnedSlice();
+            }
+
+            fn objectId(arena: std.mem.Allocator, qtable: []const u8) ![]const u8 {
+                const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
+                return std.fmt.allocPrint(arena, "IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
+            }
+
+            fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
+                if (dialect == .postgres) {
+                    try w.writeAll("'\\x");
+                    for (s) |b| try w.print("{x:0>2}", .{b});
+                    try w.writeByte('\'');
+                } else {
+                    try w.writeAll("0x");
+                    for (s) |b| try w.print("{x:0>2}", .{b});
+                }
+            }
+
+            fn unquotable(dialect: Dialect, name: []const u8) bool {
+                return dialect == .starrocks and std.mem.indexOfScalar(u8, name, '`') != null;
+            }
+        };
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1649,22 +1650,22 @@ test "the literal writers equal their pre-writeStrLit bodies, but for SQL Server
         for (std.enums.values(Dialect)) |d| {
             var want: std.Io.Writer.Allocating = .init(a);
             var got: std.Io.Writer.Allocating = .init(a);
-            try Pinned.quoteString(&want.writer, d, s);
+            try Orig.Pinned.quoteString(&want.writer, d, s);
             try d.writeStrLit(&got.writer, s, .data);
             const n_prefix: []const u8 = if (d == .sqlserver) "N" else "";
             try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ n_prefix, want.written() }), got.written());
-            try std.testing.expectEqualStrings(try Pinned.strLit(d, a, s), try d.strLit(a, s));
-            try std.testing.expectEqual(Pinned.unquotable(d, s), !d.quotable(s));
+            try std.testing.expectEqualStrings(try Orig.Pinned.strLit(d, a, s), try d.strLit(a, s));
+            try std.testing.expectEqual(Orig.Pinned.unquotable(d, s), !d.quotable(s));
 
             var hw: std.Io.Writer.Allocating = .init(a);
             var hg: std.Io.Writer.Allocating = .init(a);
-            try Pinned.hexLiteral(&hw.writer, d, s);
+            try Orig.Pinned.hexLiteral(&hw.writer, d, s);
             try hexLiteral(&hg.writer, d, s);
             try std.testing.expectEqualStrings(hw.written(), hg.written());
         }
         const qt = try quoteIdent(a, .sqlserver, s);
         const ddl = try createTableSql(a, .sqlserver, qt, .{ .fields = &.{.{ .name = "c", .ty = types.Type.init(.int) }} }, .append);
-        try std.testing.expect(std.mem.startsWith(u8, ddl, try Pinned.objectId(a, qt)));
+        try std.testing.expect(std.mem.startsWith(u8, ddl, try Orig.Pinned.objectId(a, qt)));
     }
 }
 

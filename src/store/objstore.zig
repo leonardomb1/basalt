@@ -607,118 +607,119 @@ test "a listing page gives every item, entities decoded, and nothing else" {
     try std.testing.expectEqualStrings("p/c&d.csv", amp[1]);
 }
 
-/// objstore's own retry loop before it moved to connect/retry.zig, kept as the
-/// oracle the re-exported one must match call for call and sleep for sleep.
-const Oracle = struct {
-    fn retriableOld(code: u16) bool {
-        return switch (code) {
-            408, 429, 500, 502, 503, 504 => true,
-            else => false,
-        };
-    }
-
-    fn transientOld(e: anyerror) bool {
-        return driver.transientNet(e) or e == error.HttpConnectionClosing;
-    }
-
-    fn retryAfterOld(value: []const u8) ?u64 {
-        const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
-        return std.math.mul(u64, secs, std.time.ms_per_s) catch 30_000;
-    }
-
-    fn backoffOld(rand: std.Random, attempt: usize) u64 {
-        const base = @as(u64, 500) *| (@as(u64, 1) << @intCast(@min(attempt, 4)));
-        return base +| rand.uintLessThan(u64, base / 2 + 1);
-    }
-
-    fn pauseOld(sleep: Sleep, ms: u64) bool {
-        var left = ms;
-        while (left > 0) {
-            const step: u64 = @min(left, 100);
-            sleep(step * std.time.ns_per_ms);
-            left -= step;
-            if (driver.aborting()) return false;
-        }
-        return true;
-    }
-
-    fn retryOld(rand: std.Random, sleep: Sleep, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
-        var slept: u64 = 0;
-        var attempt: usize = 0;
-        while (true) : (attempt += 1) {
-            var wait = backoffOld(rand, attempt);
-            const err = if (attemptFn(ctx)) |v| switch (v) {
-                .done => return,
-                .again => continue,
-                .failed => |f| blk: {
-                    if (!(f.retriable orelse retriableOld(f.code))) return f.err;
-                    wait = @max(wait, f.retry_after_ms orelse 0);
-                    break :blk f.err;
-                },
-            } else |e| blk: {
-                if (!transientOld(e)) return e;
-                break :blk e;
-            };
-            if (attempt + 1 >= 5 or slept >= 30_000 or driver.aborting()) return err;
-            wait = @min(wait, 30_000 - slept);
-            if (!pauseOld(sleep, wait)) return err;
-            slept += wait;
-        }
-    }
-
-    const Script = struct {
-        codes: []const u16,
-        calls: usize = 0,
-        retry_after_ms: ?u64 = null,
-        override: ?bool = null,
-
-        var slept_ms: u64 = 0;
-        var naps: usize = 0;
-        var abort_at: usize = std.math.maxInt(usize);
-
-        fn attempt(self: *Script) !Verdict {
-            const code = self.codes[@min(self.calls, self.codes.len - 1)];
-            self.calls += 1;
-            return switch (code) {
-                0 => .again,
-                1 => error.ConnectionResetByPeer,
-                2 => error.OutOfMemory,
-                3 => error.HttpConnectionClosing,
-                200 => .done,
-                else => .{ .failed = .{ .code = code, .err = error.Scripted, .retry_after_ms = self.retry_after_ms, .retriable = self.override } },
-            };
-        }
-
-        fn nap(ns: u64) void {
-            slept_ms += ns / std.time.ns_per_ms;
-            naps += 1;
-            if (naps >= abort_at) driver.requestAbort();
-        }
-
-        fn reset(abort_at_nap: usize) void {
-            slept_ms = 0;
-            naps = 0;
-            abort_at = abort_at_nap;
-            driver.resetAbort();
-        }
-    };
-};
-
 test "the re-exported retry classifies, backs off and loops exactly as objstore's own did" {
+    const Orig = struct {
+        /// objstore's own retry loop before it moved to connect/retry.zig, kept as the
+        /// oracle the re-exported one must match call for call and sleep for sleep.
+        const Oracle = struct {
+            fn retriableOld(code: u16) bool {
+                return switch (code) {
+                    408, 429, 500, 502, 503, 504 => true,
+                    else => false,
+                };
+            }
+
+            fn transientOld(e: anyerror) bool {
+                return driver.transientNet(e) or e == error.HttpConnectionClosing;
+            }
+
+            fn retryAfterOld(value: []const u8) ?u64 {
+                const secs = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch return null;
+                return std.math.mul(u64, secs, std.time.ms_per_s) catch 30_000;
+            }
+
+            fn backoffOld(rand: std.Random, attempt: usize) u64 {
+                const base = @as(u64, 500) *| (@as(u64, 1) << @intCast(@min(attempt, 4)));
+                return base +| rand.uintLessThan(u64, base / 2 + 1);
+            }
+
+            fn pauseOld(sleep: Sleep, ms: u64) bool {
+                var left = ms;
+                while (left > 0) {
+                    const step: u64 = @min(left, 100);
+                    sleep(step * std.time.ns_per_ms);
+                    left -= step;
+                    if (driver.aborting()) return false;
+                }
+                return true;
+            }
+
+            fn retryOld(rand: std.Random, sleep: Sleep, ctx: anytype, comptime attemptFn: anytype) anyerror!void {
+                var slept: u64 = 0;
+                var attempt: usize = 0;
+                while (true) : (attempt += 1) {
+                    var wait = backoffOld(rand, attempt);
+                    const err = if (attemptFn(ctx)) |v| switch (v) {
+                        .done => return,
+                        .again => continue,
+                        .failed => |f| blk: {
+                            if (!(f.retriable orelse retriableOld(f.code))) return f.err;
+                            wait = @max(wait, f.retry_after_ms orelse 0);
+                            break :blk f.err;
+                        },
+                    } else |e| blk: {
+                        if (!transientOld(e)) return e;
+                        break :blk e;
+                    };
+                    if (attempt + 1 >= 5 or slept >= 30_000 or driver.aborting()) return err;
+                    wait = @min(wait, 30_000 - slept);
+                    if (!pauseOld(sleep, wait)) return err;
+                    slept += wait;
+                }
+            }
+
+            const Script = struct {
+                codes: []const u16,
+                calls: usize = 0,
+                retry_after_ms: ?u64 = null,
+                override: ?bool = null,
+
+                var slept_ms: u64 = 0;
+                var naps: usize = 0;
+                var abort_at: usize = std.math.maxInt(usize);
+
+                fn attempt(self: *Script) !Verdict {
+                    const code = self.codes[@min(self.calls, self.codes.len - 1)];
+                    self.calls += 1;
+                    return switch (code) {
+                        0 => .again,
+                        1 => error.ConnectionResetByPeer,
+                        2 => error.OutOfMemory,
+                        3 => error.HttpConnectionClosing,
+                        200 => .done,
+                        else => .{ .failed = .{ .code = code, .err = error.Scripted, .retry_after_ms = self.retry_after_ms, .retriable = self.override } },
+                    };
+                }
+
+                fn nap(ns: u64) void {
+                    slept_ms += ns / std.time.ns_per_ms;
+                    naps += 1;
+                    if (naps >= abort_at) driver.requestAbort();
+                }
+
+                fn reset(abort_at_nap: usize) void {
+                    slept_ms = 0;
+                    naps = 0;
+                    abort_at = abort_at_nap;
+                    driver.resetAbort();
+                }
+            };
+        };
+    };
     defer driver.resetAbort();
-    for (0..1000) |c| try std.testing.expectEqual(Oracle.retriableOld(@intCast(c)), retriable(@intCast(c)));
+    for (0..1000) |c| try std.testing.expectEqual(Orig.Oracle.retriableOld(@intCast(c)), retriable(@intCast(c)));
     const errs = [_]anyerror{
         error.ConnectionRefused,      error.ConnectionResetByPeer, error.EndOfStream,  error.HttpConnectionClosing,
         error.ServerClosedConnection, error.OutOfMemory,           error.S3AuthFailed, error.S3Throttled,
         error.UnknownHostName,        error.TlsFailure,            error.Aborted,      error.ReadFailed,
     };
-    for (errs) |e| try std.testing.expectEqual(Oracle.transientOld(e), transient(e));
+    for (errs) |e| try std.testing.expectEqual(Orig.Oracle.transientOld(e), transient(e));
     const afters = [_][]const u8{ "7", " 0 ", "\t120", "x", "", "-1", "1.5", "18446744073709551615", "99999999999999999999", "Wed, 21 Oct 2015 07:28:00 GMT" };
-    for (afters) |v| try std.testing.expectEqual(Oracle.retryAfterOld(v), retryAfterMs(v));
+    for (afters) |v| try std.testing.expectEqual(Orig.Oracle.retryAfterOld(v), retryAfterMs(v));
     for (0..64) |seed| for (0..12) |attempt| {
         var a = std.Random.DefaultPrng.init(seed);
         var b = std.Random.DefaultPrng.init(seed);
-        try std.testing.expectEqual(Oracle.backoffOld(a.random(), attempt), (Policy{ .rand = b.random() }).backoffMs(attempt));
+        try std.testing.expectEqual(Orig.Oracle.backoffOld(a.random(), attempt), (Policy{ .rand = b.random() }).backoffMs(attempt));
     };
 
     const scripts = [_][]const u16{
@@ -730,20 +731,20 @@ test "the re-exported retry classifies, backs off and loops exactly as objstore'
     const aborts = [_]usize{ std.math.maxInt(usize), 1, 3 };
     for (aborts) |abort_at| for ([_]?bool{ null, true, false }) |override| for ([_]?u64{ null, 0, 900, 3_600_000 }) |after| for (scripts) |codes| for (0..3) |seed| {
         var pa = std.Random.DefaultPrng.init(seed);
-        Oracle.Script.reset(abort_at);
-        var mine = Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
-        const r1 = retry(.{ .rand = pa.random(), .sleep = Oracle.Script.nap }, &mine, Oracle.Script.attempt);
-        const slept1 = Oracle.Script.slept_ms;
-        const naps1 = Oracle.Script.naps;
+        Orig.Oracle.Script.reset(abort_at);
+        var mine = Orig.Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
+        const r1 = retry(.{ .rand = pa.random(), .sleep = Orig.Oracle.Script.nap }, &mine, Orig.Oracle.Script.attempt);
+        const slept1 = Orig.Oracle.Script.slept_ms;
+        const naps1 = Orig.Oracle.Script.naps;
 
         var pb = std.Random.DefaultPrng.init(seed);
-        Oracle.Script.reset(abort_at);
-        var theirs = Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
-        const r2 = Oracle.retryOld(pb.random(), Oracle.Script.nap, &theirs, Oracle.Script.attempt);
+        Orig.Oracle.Script.reset(abort_at);
+        var theirs = Orig.Oracle.Script{ .codes = codes, .retry_after_ms = after, .override = override };
+        const r2 = Orig.Oracle.retryOld(pb.random(), Orig.Oracle.Script.nap, &theirs, Orig.Oracle.Script.attempt);
 
         try std.testing.expectEqual(theirs.calls, mine.calls);
-        try std.testing.expectEqual(Oracle.Script.slept_ms, slept1);
-        try std.testing.expectEqual(Oracle.Script.naps, naps1);
+        try std.testing.expectEqual(Orig.Oracle.Script.slept_ms, slept1);
+        try std.testing.expectEqual(Orig.Oracle.Script.naps, naps1);
         if (r2) |_| try r1 else |e| try std.testing.expectError(e, r1);
     };
 }

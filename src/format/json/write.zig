@@ -125,57 +125,56 @@ test "json escape covers quotes, backslash, control bytes and invalid UTF-8" {
     try std.testing.expectEqualStrings("caf\u{FFFD}\\t\\\"", w.buffered());
 }
 
-fn oracleEscaped(out: *std.Io.Writer, s: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(s)) return oracleEscapeValid(out, s);
-    var runs = celltext.Utf8Runs{ .s = s };
-    while (runs.next()) |t| try oracleEscapeValid(out, t);
-}
-
-fn oracleEscapeValid(out: *std.Io.Writer, s: []const u8) !void {
-    var start: usize = 0;
-    for (s, 0..) |c, i| {
-        const esc: []const u8 = switch (c) {
-            '"' => "\\\"",
-            '\\' => "\\\\",
-            '\n' => "\\n",
-            '\r' => "\\r",
-            '\t' => "\\t",
-            0...8, 11, 12, 14...0x1f => "",
-            else => continue,
-        };
-        try out.writeAll(s[start..i]);
-        if (esc.len > 0) try out.writeAll(esc) else try out.print("\\u{x:0>4}", .{c});
-        start = i + 1;
-    }
-    try out.writeAll(s[start..]);
-}
-
-const OracleText = struct {
-    pub const null_text = "null";
-    pub const bool_true = "true";
-    pub const bool_false = "false";
-    pub const quote_decimal = "\"";
-    pub const quote_temporal = "\"";
-
-    pub fn string(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
-        try out.writeByte('"');
-        try oracleEscaped(out, s);
-        try out.writeByte('"');
-    }
-
-    pub fn bytes(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
-        try out.writeByte('"');
-        try std.base64.standard.Encoder.encodeWriter(out, s);
-        try out.writeByte('"');
-    }
-
-    pub fn float(_: OracleText, out: *std.Io.Writer, x: f64) !void {
-        if (std.math.isFinite(x)) return out.print("{d}", .{x});
-        return out.writeAll("null");
-    }
-};
-
 test "the jsontext escaper, key and Text policy equal the copies this file held" {
+    const Orig = struct {
+        fn oracleEscaped(out: *std.Io.Writer, s: []const u8) !void {
+            if (std.unicode.utf8ValidateSlice(s)) return oracleEscapeValid(out, s);
+            var runs = celltext.Utf8Runs{ .s = s };
+            while (runs.next()) |t| try oracleEscapeValid(out, t);
+        }
+        fn oracleEscapeValid(out: *std.Io.Writer, s: []const u8) !void {
+            var start: usize = 0;
+            for (s, 0..) |c, i| {
+                const esc: []const u8 = switch (c) {
+                    '"' => "\\\"",
+                    '\\' => "\\\\",
+                    '\n' => "\\n",
+                    '\r' => "\\r",
+                    '\t' => "\\t",
+                    0...8, 11, 12, 14...0x1f => "",
+                    else => continue,
+                };
+                try out.writeAll(s[start..i]);
+                if (esc.len > 0) try out.writeAll(esc) else try out.print("\\u{x:0>4}", .{c});
+                start = i + 1;
+            }
+            try out.writeAll(s[start..]);
+        }
+        const OracleText = struct {
+            pub const null_text = "null";
+            pub const bool_true = "true";
+            pub const bool_false = "false";
+            pub const quote_decimal = "\"";
+            pub const quote_temporal = "\"";
+
+            pub fn string(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
+                try out.writeByte('"');
+                try oracleEscaped(out, s);
+                try out.writeByte('"');
+            }
+
+            pub fn bytes(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
+                try out.writeByte('"');
+                try std.base64.standard.Encoder.encodeWriter(out, s);
+                try out.writeByte('"');
+            }
+
+            pub fn float(_: OracleText, out: *std.Io.Writer, x: f64) !void {
+                if (std.math.isFinite(x)) return out.print("{d}", .{x});
+                return out.writeAll("null");
+            }
+        };
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -187,7 +186,7 @@ test "the jsontext escaper, key and Text policy equal the copies this file held"
         for (in[0..n]) |*c| c.* = if (it % 2 == 0) r.int(u8) else r.uintLessThan(u8, 0x80);
         var want = std.Io.Writer.Allocating.init(a);
         try want.writer.writeByte('"');
-        try oracleEscaped(&want.writer, in[0..n]);
+        try Orig.oracleEscaped(&want.writer, in[0..n]);
         try want.writer.writeAll("\":");
         var got = std.Io.Writer.Allocating.init(a);
         try jsontext.key(&got.writer, in[0..n]);
@@ -195,7 +194,7 @@ test "the jsontext escaper, key and Text policy equal the copies this file held"
     }
     for (try celltext.goldenBatches(a)) |batch| for (batch.columns) |*col| for (0..batch.len) |row| {
         var want = std.Io.Writer.Allocating.init(a);
-        try celltext.write(&want.writer, col, row, OracleText{});
+        try celltext.write(&want.writer, col, row, Orig.OracleText{});
         var got = std.Io.Writer.Allocating.init(a);
         try celltext.write(&got.writer, col, row, Text{});
         try std.testing.expectEqualStrings(want.written(), got.written());

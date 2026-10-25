@@ -176,27 +176,27 @@ test "names are encoded as FOR XML does and decode back" {
     }
 }
 
-fn oracleDecodedAt(s: []const u8) ?Decoded {
-    if (s.len < 7 or s[0] != '_' or s[1] != 'x') return null;
-    inline for (.{ 4, 8 }) |n| {
-        if (s.len >= n + 3 and s[n + 2] == '_') {
-            const digits = s[2 .. n + 2];
-            const all_hex = for (digits) |h| {
-                if (!std.ascii.isHex(h)) break false;
-            } else true;
-            if (all_hex) if (std.fmt.parseInt(u21, digits, 16)) |cp| return .{ .cp = cp, .len = n + 3 } else |_| {};
-        }
-    }
-    return null;
-}
-
-fn oracleOoxmlEscape(s: []const u8) ?u21 {
-    if (s.len < 7 or s[0] != '_' or s[1] != 'x' or s[6] != '_') return null;
-    for (s[2..6]) |c| if (!std.ascii.isHex(c)) return null;
-    return std.fmt.parseInt(u21, s[2..6], 16) catch null;
-}
-
 test "the _xHHHH_ recognizers on format/hex equal their parseInt bodies" {
+    const Orig = struct {
+        fn oracleDecodedAt(s: []const u8) ?Decoded {
+            if (s.len < 7 or s[0] != '_' or s[1] != 'x') return null;
+            inline for (.{ 4, 8 }) |n| {
+                if (s.len >= n + 3 and s[n + 2] == '_') {
+                    const digits = s[2 .. n + 2];
+                    const all_hex = for (digits) |h| {
+                        if (!std.ascii.isHex(h)) break false;
+                    } else true;
+                    if (all_hex) if (std.fmt.parseInt(u21, digits, 16)) |cp| return .{ .cp = cp, .len = n + 3 } else |_| {};
+                }
+            }
+            return null;
+        }
+        fn oracleOoxmlEscape(s: []const u8) ?u21 {
+            if (s.len < 7 or s[0] != '_' or s[1] != 'x' or s[6] != '_') return null;
+            for (s[2..6]) |c| if (!std.ascii.isHex(c)) return null;
+            return std.fmt.parseInt(u21, s[2..6], 16) catch null;
+        }
+    };
     var prng = std.Random.DefaultPrng.init(0x5f78);
     const r = prng.random();
     const alphabet = "_x0123456789abcdefABCDEFg+- ";
@@ -211,7 +211,7 @@ test "the _xHHHH_ recognizers on format/hex equal their parseInt bodies" {
         for ([_]usize{ 6, 10 }) |at| if (n > at and r.boolean()) {
             buf[at] = '_';
         };
-        try std.testing.expectEqual(oracleDecodedAt(buf[0..n]), decodedAt(buf[0..n]));
-        try std.testing.expectEqual(oracleOoxmlEscape(buf[0..n]), token.ooxmlEscape(buf[0..n]));
+        try std.testing.expectEqual(Orig.oracleDecodedAt(buf[0..n]), decodedAt(buf[0..n]));
+        try std.testing.expectEqual(Orig.oracleOoxmlEscape(buf[0..n]), token.ooxmlEscape(buf[0..n]));
     }
 }
