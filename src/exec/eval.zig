@@ -415,7 +415,6 @@ pub const explain = @import("eval/support.zig").explain;
 pub const takeFailure = @import("eval/support.zig").takeFailure;
 pub const peekFailure = @import("eval/support.zig").peekFailure;
 pub const clip = @import("eval/support.zig").clip;
-pub const setStatementClock = @import("eval/support.zig").setStatementClock;
 pub const orderF64 = @import("eval/support.zig").orderF64;
 pub const compareValues = @import("eval/support.zig").compareValues;
 
@@ -810,28 +809,66 @@ test "a quoted literal met by a BOOL reads the words it read before, over every 
     }
 }
 
-test "now() and today() read the statement's clock on every row and in every batch" {
+test "now() and today() read their own statement's clock on every row and batch, alternately and on two threads" {
     const column = @import("column.zig");
+    const Stmt = struct {
+        now_e: *const ast.Expr,
+        today_e: *const ast.Expr,
+        at: i64,
+        day: i32,
+        ok: bool = false,
+
+        fn stamped(a: std.mem.Allocator, at: i64, day: i32) !@This() {
+            var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+            const items = [_]ast.SelectItem{
+                .{ .computed = .{ .name = "t", .expr = try parser.parseExprStr(a, "CASE WHEN x > 0 THEN coalesce(now(), now()) ELSE now() END", &diag) } },
+                .{ .computed = .{ .name = "d", .expr = try parser.parseExprStr(a, "today()", &diag) } },
+            };
+            const stages = [_]ast.Stage{.{ .node = .{ .select = &items }, .hints = &.{}, .pos = .{ .line = 1, .col = 1 } }};
+            const out = try ast.stampClock(a, &stages, at);
+            try std.testing.expect(items[1].computed.expr.call.now_us == null);
+            const sel = out[0].node.select;
+            return .{ .now_e = sel[0].computed.expr, .today_e = sel[1].computed.expr, .at = at, .day = day };
+        }
+
+        fn check(s: *const @This(), a: std.mem.Allocator, batch: Batch) !void {
+            for (0..batch.len) |r| {
+                try std.testing.expectEqual(s.at, (try evalRow(a, s.now_e, batch, r)).timestamp);
+                try std.testing.expectEqual(s.day, (try evalRow(a, s.today_e, batch, r)).date);
+            }
+            const col = try evalColumn(a, s.now_e, batch, Type.init(.timestamp));
+            for (0..batch.len) |r| try std.testing.expectEqual(s.at, col.getValue(r).timestamp);
+            try std.testing.expectEqual(s.day, (try evalColumn(a, s.today_e, batch, Type.init(.date))).getValue(batch.len - 1).date);
+        }
+
+        fn loop(s: *@This(), batch: Batch) void {
+            var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer ar.deinit();
+            for (0..500) |_| {
+                s.check(ar.allocator(), batch) catch return;
+                _ = ar.reset(.retain_capacity);
+            }
+            s.ok = true;
+        }
+    };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const at: i64 = 1_000_000_000_123_456;
-    setStatementClock(at);
-    defer setStatementClock(null);
     const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
-    var cols = [_]column.Column{try column.intColumn(a, &.{ 1, 2, 3, 4, 5 })};
+    var cols = [_]column.Column{try column.intColumn(a, &.{ 1, -2, 3, -4, 5 })};
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
-    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    const now_e = try parser.parseExprStr(a, "now()", &diag);
-    const today_e = try parser.parseExprStr(a, "today()", &diag);
-    for (0..batch.len) |r| {
-        try std.testing.expectEqual(at, (try evalRow(a, now_e, batch, r)).timestamp);
-        try std.testing.expectEqual(@as(i32, 11_574), (try evalRow(a, today_e, batch, r)).date);
+    var s1 = try Stmt.stamped(a, 1_000_000_000_123_456, 11_574);
+    var s2 = try Stmt.stamped(a, 86_400_000_000 * 20_000 + 7, 20_000);
+    for (0..3) |_| {
+        try s1.check(a, batch);
+        try s2.check(a, batch);
     }
-    const col = try evalColumn(a, now_e, batch, Type.init(.timestamp));
-    for (0..batch.len) |r| try std.testing.expectEqual(at, col.getValue(r).timestamp);
-    try std.testing.expectEqual(@as(i32, 11_574), (try evalColumn(a, today_e, batch, Type.init(.date))).getValue(4).date);
-    try std.testing.expectEqual(at, (try evalLit(a, "now()")).timestamp);
+    const t1 = try std.Thread.spawn(.{}, Stmt.loop, .{ &s1, batch });
+    const t2 = try std.Thread.spawn(.{}, Stmt.loop, .{ &s2, batch });
+    t1.join();
+    t2.join();
+    try std.testing.expect(s1.ok and s2.ok);
+    try std.testing.expect(@abs((try evalLit(a, "now()")).timestamp - std.time.microTimestamp()) < 60_000_000);
 }
 
 test "a PARAM's text reads as CAST reads it: no `_`, hex or untrimmed failures" {

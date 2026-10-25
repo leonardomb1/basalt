@@ -23,25 +23,23 @@ const reduceTypeAt = @import("row.zig").reduceTypeAt;
 const regexpReplaceText = @import("fn_scalar.zig").regexpReplaceText;
 const std = @import("std");
 const civil = @import("../civil.zig");
-const statementNow = @import("support.zig").statementNow;
+const clockOf = @import("support.zig").clockOf;
 const valueToString = @import("format.zig").valueToString;
 const writeJsonValue = @import("row.zig").writeJsonValue;
 
 pub const per_row = struct {
     pub fn now(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         _ = arena;
-        _ = c;
         _ = batch;
         _ = row;
-        return .{ .timestamp = statementNow() };
+        return .{ .timestamp = clockOf(c) };
     }
 
     pub fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         _ = arena;
-        _ = c;
         _ = batch;
         _ = row;
-        return .{ .date = @intCast(civil.dayOf(statementNow())) };
+        return .{ .date = @intCast(civil.dayOf(clockOf(c))) };
     }
 
     /// Both the pattern and the replacement are evaluated before either is checked

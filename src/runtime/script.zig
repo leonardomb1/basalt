@@ -504,8 +504,9 @@ pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
     });
 }
 
-/// `renderPipeline`, then its LIMIT and OFFSET expressions evaluated against the
-/// script's PARAMs and LETs, before anything plans on their numbers.
+/// `renderPipeline`, its `now()` and `today()` stamped with this statement's one
+/// instant, then its LIMIT and OFFSET expressions evaluated against the script's
+/// PARAMs and LETs, before anything plans on their numbers.
 pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
     const rendered = try env.arena.alloc(ast.Stage, p.stages.len);
     for (p.stages, rendered) |src, *dst| dst.* = renderStage(env.arena, src, lr) catch |e| {
@@ -514,7 +515,7 @@ pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
         env.diag.pos = src.pos;
         return err;
     };
-    const r = ast.Pipeline{ .stages = rendered, .pos = p.pos, .show = p.show };
+    const r = ast.Pipeline{ .stages = try ast.stampClock(env.arena, rendered, std.time.microTimestamp()), .pos = p.pos, .show = p.show };
     var ad = analyze.Diag{};
     const stages = analyze.bindLimits(env.arena, r.stages, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
     return .{ .stages = stages, .pos = r.pos, .show = r.show };

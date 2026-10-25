@@ -11,7 +11,7 @@ const column = @import("../column.zig");
 const mkCol = @import("vec.zig").mkCol;
 const std = @import("std");
 const civil = @import("../civil.zig");
-const statementNow = @import("support.zig").statementNow;
+const clockOf = @import("support.zig").clockOf;
 const strArg = @import("vec.zig").strArg;
 const strAt = @import("vec.zig").strAt;
 const compareVecs = @import("vec.zig").compareVecs;
@@ -23,16 +23,14 @@ const TypeKind = @import("../../lang/types.zig").TypeKind;
 pub const vectorized = struct {
     pub fn now(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         _ = arena;
-        _ = c;
         _ = batch;
-        return .{ .scalar = .{ .timestamp = statementNow() } };
+        return .{ .scalar = .{ .timestamp = clockOf(c) } };
     }
 
     pub fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         _ = arena;
-        _ = c;
         _ = batch;
-        return .{ .scalar = .{ .date = @intCast(civil.dayOf(statementNow())) } };
+        return .{ .scalar = .{ .date = @intCast(civil.dayOf(clockOf(c))) } };
     }
 
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {

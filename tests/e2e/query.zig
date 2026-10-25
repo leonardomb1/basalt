@@ -8,6 +8,7 @@ const Diag = basalt.env.Diag;
 const ParamArg = basalt.env.ParamArg;
 const run = basalt.runtime.run;
 const runToString = @import("harness.zig").runToString;
+const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const exec = @import("harness.zig").exec;
 const runScript = @import("harness.zig").runScript;
 const runScriptOpts = @import("harness.zig").runScriptOpts;
@@ -413,6 +414,22 @@ test "CSV -> filter/select -> CSV round-trips" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("id,amount\n1,100\n3,200\n", out);
+}
+
+test "now() and today() are one instant for the whole statement, across batches, lanes and the row path" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.Io.Writer.Allocating.init(alloc);
+    defer csv.deinit();
+    try csv.writer.writeAll("id\n");
+    for (0..40_000) |i| try csv.writer.print("{d}\n", .{i});
+    const query = "SELECT COUNT(*) AS n FROM (SELECT DISTINCT now() AS t, CASE WHEN id >= 0 THEN json_object('n', now()) END AS j, today() AS d FROM '$IN')";
+    for ([_]usize{ 1, 4 }) |threads| {
+        const out = try runCsvThreaded(alloc, &tmp, csv.written(), query, threads);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("n\n1\n", out);
+    }
 }
 
 test "sort: nulls sort as the largest value unless NULLS FIRST or NULLS LAST says" {

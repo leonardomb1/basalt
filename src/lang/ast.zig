@@ -145,7 +145,7 @@ pub const Expr = union(enum) {
     };
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
-    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null };
+    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null, now_us: ?i64 = null };
     pub const Cond = struct { cond: *Expr, then: *Expr, els: *Expr };
     pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
     pub const Lambda = struct { params: []const []const u8, body: *Expr };
@@ -188,7 +188,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .call => |c| blk: {
             const args = try arena.alloc(*Expr, c.args.len);
             for (c.args, args) |a, *out| out.* = try recur(ctx, a);
-            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
+            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span, .now_us = c.now_us } });
         },
         .match => |m| blk: {
             const subject = if (m.subject) |s| try recur(ctx, s) else null;
@@ -207,6 +207,56 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         },
     };
 }
+
+/// `stages` with every `now()` and `today()` call in them, wherever an expression
+/// sits, carrying `now_us`, so a statement reads one instant on every
+/// row, batch and lane while another statement keeps its own. What holds an
+/// expression is copied into `arena`; `stages` is left as it was.
+pub fn stampClock(arena: std.mem.Allocator, stages: []const Stage, now_us: i64) error{OutOfMemory}![]const Stage {
+    return Clock.walk([]const Stage, .{ .arena = arena, .now_us = now_us }, stages);
+}
+
+const Clock = struct {
+    arena: std.mem.Allocator,
+    now_us: i64,
+
+    fn expr(cx: Clock, e: *const Expr) error{OutOfMemory}!*Expr {
+        const out = try rebuildExpr(cx.arena, e, cx, expr);
+        if (out.* == .call and out.call.args.len == 0 and (std.mem.eql(u8, out.call.name, "now") or std.mem.eql(u8, out.call.name, "today")))
+            out.call.now_us = cx.now_us;
+        return out;
+    }
+
+    /// `v` rebuilt through every field, optional, slice and union arm its type has,
+    /// down to each `*Expr`; text and other pointers are shared.
+    fn walk(comptime T: type, cx: Clock, v: T) error{OutOfMemory}!T {
+        if (T == Expr) return (try cx.expr(&v)).*;
+        switch (@typeInfo(T)) {
+            .pointer => |p| {
+                if (p.child == Expr and p.size == .one) return cx.expr(v);
+                if (p.size != .slice or p.child == u8 or p.child == []const u8) return v;
+                const out = try cx.arena.alloc(p.child, v.len);
+                for (v, out) |x, *o| o.* = try walk(p.child, cx, x);
+                return out;
+            },
+            .optional => |o| return if (v) |x| try walk(o.child, cx, x) else null,
+            .@"struct" => |s| {
+                var out = v;
+                inline for (s.fields) |f| {
+                    if (!f.is_comptime) @field(out, f.name) = try walk(f.type, cx, @field(v, f.name));
+                }
+                return out;
+            },
+            .@"union" => |u| {
+                if (u.tag_type == null) return v;
+                switch (v) {
+                    inline else => |x, tag| return @unionInit(T, @tagName(tag), try walk(@TypeOf(x), cx, x)),
+                }
+            },
+            else => return v,
+        }
+    }
+};
 
 pub const Hint = struct { key: []const u8, value: HintVal, pos: Pos };
 
