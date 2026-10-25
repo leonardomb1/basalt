@@ -1029,11 +1029,11 @@ const TdsCursor = struct {
         if ((col.kind == .bytelen and len == 0) or (col.kind == .ushortlen and len == 0xFFFF)) return b.append(.null);
         const dst = try b.reserveBytes(len);
         try self.reader.readBytes(dst);
-        if (isAscii(dst)) return b.commitBytes(len);
+        if (charset.isAscii(dst)) return b.commitBytes(len);
         const raw = self.cell[0..len];
         @memcpy(raw, dst);
-        const out = try b.reserveBytes(win1252Len(raw));
-        return b.commitBytes(win1252Encode(out, raw));
+        const out = try b.reserveBytes(charset.decodedLen(.cp1252, raw));
+        return b.commitBytes(charset.decodeInto(.cp1252, out, raw));
     }
 
     /// Fixed and length-prefixed cells, never longer than the cell buffer, are read
@@ -1287,8 +1287,8 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .time => try b.appendInt(try decodeTime(d, raw)),
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
         .plain_text, .win1252 => {
-            if (isAscii(raw)) return b.appendStr(raw);
-            return b.commitBytes(win1252Encode(try b.reserveBytes(win1252Len(raw)), raw));
+            if (charset.isAscii(raw)) return b.appendStr(raw);
+            return b.commitBytes(charset.decodeInto(.cp1252, try b.reserveBytes(charset.decodedLen(.cp1252, raw)), raw));
         },
         .unicode_text => try b.commitBytes(utf16.decodeLe(.question, try b.reserveBytes(utf16.decodedBound(raw.len)), raw)),
         .guid => try b.appendStr(if (raw.len < 16) "" else &uuid.text(raw[0..16], .mixed)),
@@ -1394,63 +1394,6 @@ fn readIntLE(bytes: []const u8) i64 {
     };
 }
 
-const Utf8Seq = struct { len: u8, bytes: [3]u8 };
-
-/// UTF-8 of each byte 0x80-0xFF; the five bytes Windows-1252 leaves undefined
-/// read as their C1 control, as SQL Server converts them.
-const win1252_high: [128]Utf8Seq = blk: {
-    @setEvalBranchQuota(10_000);
-    var t: [128]Utf8Seq = undefined;
-    for (&t, 0..) |*e, k| {
-        var buf: [4]u8 = undefined;
-        const cp: u21 = if (k < 32 and charset.cp1252_high[k] != 0) charset.cp1252_high[k] else 0x80 + k;
-        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
-        e.* = .{ .len = n, .bytes = buf[0..3].* };
-    }
-    break :blk t;
-};
-
-/// Whether every byte is below 0x80, sixteen bytes at a time.
-fn isAscii(bytes: []const u8) bool {
-    const V = @Vector(16, u8);
-    var acc: V = @splat(0);
-    var i: usize = 0;
-    while (i + 16 <= bytes.len) : (i += 16) acc |= @as(V, bytes[i..][0..16].*);
-    var tail: u8 = @reduce(.Or, acc);
-    for (bytes[i..]) |b| tail |= b;
-    return tail < 0x80;
-}
-
-/// Writes the UTF-8 form of Windows-1252 `src` into `dst`, which holds at least
-/// `win1252Len(src)` bytes, and returns that length.
-fn win1252Encode(dst: []u8, src: []const u8) usize {
-    var o: usize = 0;
-    for (src) |b| {
-        if (b < 0x80) {
-            dst[o] = b;
-            o += 1;
-        } else {
-            const e = win1252_high[b - 0x80];
-            @memcpy(dst[o..][0..e.len], e.bytes[0..e.len]);
-            o += e.len;
-        }
-    }
-    return o;
-}
-
-fn win1252Len(src: []const u8) usize {
-    var n: usize = 0;
-    for (src) |b| n += if (b < 0x80) 1 else win1252_high[b - 0x80].len;
-    return n;
-}
-
-fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    if (isAscii(bytes)) return arena.dupe(u8, bytes);
-    const out = try arena.alloc(u8, win1252Len(bytes));
-    _ = win1252Encode(out, bytes);
-    return out;
-}
-
 fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
     const out = try arena.alloc(u8, 2 + b.len * 2);
     out[0..2].* = "0x".*;
@@ -1519,96 +1462,62 @@ test "tds: binary text is 0x and lower-case hex, as the old bytesToHex wrote it"
     }
 }
 
-test "tds: the varchar table maps every high byte as the old cp1252High switch did, undefined bytes to C1 (D5)" {
-    const old = struct {
-        fn cp1252High(b: u8) u21 {
-            return switch (b) {
-                0x80 => 0x20AC,
-                0x82 => 0x201A,
-                0x83 => 0x0192,
-                0x84 => 0x201E,
-                0x85 => 0x2026,
-                0x86 => 0x2020,
-                0x87 => 0x2021,
-                0x88 => 0x02C6,
-                0x89 => 0x2030,
-                0x8A => 0x0160,
-                0x8B => 0x2039,
-                0x8C => 0x0152,
-                0x8E => 0x017D,
-                0x91 => 0x2018,
-                0x92 => 0x2019,
-                0x93 => 0x201C,
-                0x94 => 0x201D,
-                0x95 => 0x2022,
-                0x96 => 0x2013,
-                0x97 => 0x2014,
-                0x98 => 0x02DC,
-                0x99 => 0x2122,
-                0x9A => 0x0161,
-                0x9B => 0x203A,
-                0x9C => 0x0153,
-                0x9E => 0x017E,
-                0x9F => 0x0178,
-                else => b,
-            };
-        }
-    };
-    for (0..128) |k| {
-        var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(old.cp1252High(@intCast(0x80 + k)), &buf);
-        const e = win1252_high[k];
-        try std.testing.expectEqualSlices(u8, buf[0..n], e.bytes[0..e.len]);
+/// One varchar cell's wire bytes through the read path's decode, as text.
+fn varcharCell(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var d = ColumnDesc{ .tds_type = 0xA7, .engine_type = types.Type.init(.string).asNullable(), .kind = .ushortlen };
+    d.decode = decodeOf(d);
+    return (try cellValue(a, d, raw)).string;
+}
+
+test "tds: a varchar cell decodes as charset's cp1252 does, the unassigned bytes to C1 as SQL Server converts them (D5)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for (0..256) |i| {
+        const b = [1]u8{@intCast(i)};
+        try std.testing.expectEqualStrings(try charset.decode(a, .cp1252, &b), try varcharCell(a, &b));
     }
-    for ([_]u8{ 0x81, 0x8D, 0x8F, 0x90, 0x9D }) |b| {
-        const e = win1252_high[b - 0x80];
-        var want: [2]u8 = undefined;
-        _ = try std.unicode.utf8Encode(b, &want);
-        try std.testing.expectEqualSlices(u8, &want, e.bytes[0..e.len]);
-    }
+    try std.testing.expectEqualStrings("\xc2\x81\xc2\x8d\xc2\x8f\xc2\x90\xc2\x9d", try varcharCell(a, "\x81\x8d\x8f\x90\x9d"));
+    try std.testing.expectEqualStrings("\xc2\x81\xc2\x8d\xc2\x8f\xc2\x90\xc2\x9d", try charset.decode(a, .cp1252, "\x81\x8d\x8f\x90\x9d"));
 }
 
 test "win1252 transcode to utf8" {
-    const alloc = std.testing.allocator;
-    const out = try win1252ToUtf8(alloc, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' });
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("RELÓGIO", out);
-    const a = try win1252ToUtf8(alloc, "plain");
-    defer alloc.free(a);
-    try std.testing.expectEqualStrings("plain", a);
-    const e = try win1252ToUtf8(alloc, &[_]u8{0x80});
-    defer alloc.free(e);
-    try std.testing.expectEqualStrings("€", e);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("RELÓGIO", try varcharCell(a, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' }));
+    try std.testing.expectEqualStrings("plain", try varcharCell(a, "plain"));
+    try std.testing.expectEqualStrings("€", try varcharCell(a, &[_]u8{0x80}));
 }
 
 test "win1252 decodes every byte" {
-    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
     var all: [256]u8 = undefined;
     for (&all, 0..) |*b, k| b.* = @intCast(k);
-    const got = try win1252ToUtf8(alloc, &all);
-    defer alloc.free(got);
+    const got = try varcharCell(ar.allocator(), &all);
     try std.testing.expectEqualStrings("\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f\xe2\x82\xac\xc2\x81\xe2\x80\x9a\xc6\x92\xe2\x80\x9e\xe2\x80\xa6\xe2\x80\xa0\xe2\x80\xa1\xcb\x86\xe2\x80\xb0\xc5\xa0\xe2\x80\xb9\xc5\x92\xc2\x8d\xc5\xbd\xc2\x8f\xc2\x90\xe2\x80\x98\xe2\x80\x99\xe2\x80\x9c\xe2\x80\x9d\xe2\x80\xa2\xe2\x80\x93\xe2\x80\x94\xcb\x9c\xe2\x84\xa2\xc5\xa1\xe2\x80\xba\xc5\x93\xc2\x9d\xc5\xbe\xc5\xb8\xc2\xa0\xc2\xa1\xc2\xa2\xc2\xa3\xc2\xa4\xc2\xa5\xc2\xa6\xc2\xa7\xc2\xa8\xc2\xa9\xc2\xaa\xc2\xab\xc2\xac\xc2\xad\xc2\xae\xc2\xaf\xc2\xb0\xc2\xb1\xc2\xb2\xc2\xb3\xc2\xb4\xc2\xb5\xc2\xb6\xc2\xb7\xc2\xb8\xc2\xb9\xc2\xba\xc2\xbb\xc2\xbc\xc2\xbd\xc2\xbe\xc2\xbf\xc3\x80\xc3\x81\xc3\x82\xc3\x83\xc3\x84\xc3\x85\xc3\x86\xc3\x87\xc3\x88\xc3\x89\xc3\x8a\xc3\x8b\xc3\x8c\xc3\x8d\xc3\x8e\xc3\x8f\xc3\x90\xc3\x91\xc3\x92\xc3\x93\xc3\x94\xc3\x95\xc3\x96\xc3\x97\xc3\x98\xc3\x99\xc3\x9a\xc3\x9b\xc3\x9c\xc3\x9d\xc3\x9e\xc3\x9f\xc3\xa0\xc3\xa1\xc3\xa2\xc3\xa3\xc3\xa4\xc3\xa5\xc3\xa6\xc3\xa7\xc3\xa8\xc3\xa9\xc3\xaa\xc3\xab\xc3\xac\xc3\xad\xc3\xae\xc3\xaf\xc3\xb0\xc3\xb1\xc3\xb2\xc3\xb3\xc3\xb4\xc3\xb5\xc3\xb6\xc3\xb7\xc3\xb8\xc3\xb9\xc3\xba\xc3\xbb\xc3\xbc\xc3\xbd\xc3\xbe\xc3\xbf", got);
 }
 
 test "win1252 text decodes as its pieces decode, split anywhere" {
-    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
     var prng = std.Random.DefaultPrng.init(0x1252);
     const rnd = prng.random();
     var buf: [80]u8 = undefined;
     for (0..4000) |it| {
+        _ = ar.reset(.retain_capacity);
         const len = rnd.uintLessThan(usize, buf.len + 1);
         for (buf[0..len]) |*b| b.* = if (it % 3 == 0) rnd.int(u8) else rnd.uintLessThan(u8, 0x80);
         if (it % 5 == 0 and len > 0) buf[rnd.uintLessThan(usize, len)] = 0x80 + rnd.uintLessThan(u8, 0x80);
         const cut = rnd.uintAtMost(usize, len);
-        const whole = try win1252ToUtf8(alloc, buf[0..len]);
-        defer alloc.free(whole);
-        const head = try win1252ToUtf8(alloc, buf[0..cut]);
-        defer alloc.free(head);
-        const tail = try win1252ToUtf8(alloc, buf[cut..len]);
-        defer alloc.free(tail);
+        const whole = try varcharCell(a, buf[0..len]);
+        const head = try varcharCell(a, buf[0..cut]);
+        const tail = try varcharCell(a, buf[cut..len]);
         try std.testing.expectEqualSlices(u8, head, whole[0..head.len]);
         try std.testing.expectEqualSlices(u8, tail, whole[head.len..]);
-        try std.testing.expectEqual(whole.len == len, isAscii(buf[0..len]));
+        try std.testing.expectEqual(whole.len == len, charset.isAscii(buf[0..len]));
     }
 }
 
