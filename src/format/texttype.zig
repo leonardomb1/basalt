@@ -8,7 +8,6 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
-const eval = @import("../exec/eval.zig");
 const cell = @import("../exec/cell.zig");
 const Value = @import("../exec/value.zig").Value;
 
@@ -30,14 +29,9 @@ pub const Column = struct {
         } else if (raw.len > 0) {
             c.seen = true;
             noteScale(c, raw);
-            if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
-            if (cell.codeLooking(raw)) {
-                c.all_int = false;
-                c.all_float = false;
-            } else {
-                if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
-                if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
-            }
+            if (c.all_date and !cell.parses(.date, cell.sniffed, raw)) c.all_date = false;
+            if (c.all_int and !cell.parses(.int, cell.sniffed, raw)) c.all_int = false;
+            if (c.all_float and !cell.parses(.float, cell.sniffed, raw)) c.all_float = false;
         }
     }
 
@@ -95,4 +89,59 @@ pub fn appendCell(b: *column.Builder, raw: []const u8, quoted: bool) !void {
 /// Whether `raw` reads as `kind`, as `appendCell` would read it.
 pub fn cellParses(kind: types.TypeKind, raw: []const u8) bool {
     return raw.len == 0 or cell.parses(kind, cell.sniffed, raw);
+}
+
+/// `Column.note` as it was before it read cells through `cell.parses`, kept as the
+/// oracle the differential test checks against.
+fn oldNote(c: *Column, raw: []const u8) void {
+    const eval = @import("../exec/eval.zig");
+    c.seen = true;
+    if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
+    if (cell.codeLooking(raw)) {
+        c.all_int = false;
+        c.all_float = false;
+    } else {
+        if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
+        if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
+    }
+}
+
+test "a sniffed cell types as it did before the sniffer read it through cell.parses" {
+    const corpus = [_][]const u8{
+        "0",                    "7",                   "-7",                  "-0",                  "007",                  "-01",                 "+1",
+        "+",                    "-",                   ".",                   ".5",                  "5.",                   "-.5",                 "-5.",
+        "1e5",                  "1E-5",                "1.5e-05",             "1e",                  "1e+",                  "nan",                 "NaN",
+        "inf",                  "-inf",                "Infinity",            "+inf",                "1_000",                "0x10",                " 1",
+        "1 ",                   " 2024-01-05",         "2024-01-05",          "2024-01-05 ",         "2024-1-5",             "2024-02-30",          "0044-03-15 BC",
+        "123456789012345678",   "1234567890123456789", "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-123456789012345678", "1234567890.12345",
+        "1234567890123456.5",   "0.1",                 "00.5",                "0.",                  "1.2.3",                "abc",                 "1,5",
+        "12345678901234567890", "1e400",               "-1e400",              "1e-400",              "\t3",                  "3\r",                 "2024-01-05T00:00",
+    };
+    for (corpus) |raw| {
+        var old = Column{};
+        var new = Column{};
+        oldNote(&old, raw);
+        new.note(raw, false);
+        errdefer std.debug.print("cell `{s}`\n", .{raw});
+        try std.testing.expectEqual(old.all_int, new.all_int);
+        try std.testing.expectEqual(old.all_float, new.all_float);
+        try std.testing.expectEqual(old.all_date, new.all_date);
+    }
+    var rnd = std.Random.DefaultPrng.init(0x5aff);
+    const r = rnd.random();
+    const alphabet = "0123456789-+.eE_x n";
+    var buf: [24]u8 = undefined;
+    for (0..200_000) |_| {
+        const n = r.intRangeAtMost(usize, 1, buf.len);
+        for (buf[0..n]) |*ch| ch.* = alphabet[if (r.boolean()) r.uintLessThan(usize, 10) else r.uintLessThan(usize, alphabet.len)];
+        const raw = buf[0..n];
+        var old = Column{};
+        var new = Column{};
+        oldNote(&old, raw);
+        new.note(raw, false);
+        errdefer std.debug.print("cell `{s}`\n", .{raw});
+        try std.testing.expectEqual(old.all_int, new.all_int);
+        try std.testing.expectEqual(old.all_float, new.all_float);
+        try std.testing.expectEqual(old.all_date, new.all_date);
+    }
 }

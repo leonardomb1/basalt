@@ -21,7 +21,7 @@ const TypeCtx = @import("../eval.zig").TypeCtx;
 const TypeError = @import("../eval.zig").TypeError;
 const Cx = @import("scalar.zig").Cx;
 const failWith = @import("support.zig").failWith;
-const time = @import("time.zig");
+const civil = @import("../civil.zig");
 const charset = @import("../../format/charset.zig");
 const hex = @import("../../format/hex.zig");
 const bytes = @import("../../format/bytes.zig");
@@ -262,8 +262,6 @@ pub const DecimalAt = struct {
     }
 };
 
-const Civil = struct { y: i64 = 1970, mo: u32 = 1, d: u32 = 1, h: u32 = 0, mi: u32 = 0, s: u32 = 0 };
-
 const Part = enum { yyyy, yy, mo, dd, hh, mi, ss };
 
 /// The next part of a date pattern at `p[i..]`, null for a literal character.
@@ -297,9 +295,13 @@ fn checkPattern(self: *TypeCtx, c: ast.Expr.Call, at: usize, comptime allowed: [
     if (litInt(c, 2)) |len| if (len != p.len) return self.err("`{s}` reads {d} bytes, but pattern `{s}` is {d} long", .{ c.name, len, p, p.len });
 }
 
+const Civil = struct { days: i64, clock: i64 };
+
+/// The date and time of day `raw` spells in pattern `p`, a part it leaves out
+/// taken from 1970-01-01 00:00:00.
 fn readCivil(comptime name: []const u8, raw: []const u8, p: []const u8) EvalError!Civil {
     if (raw.len != p.len) return bad(name, raw, "as long as its pattern");
-    var cv = Civil{};
+    var cv = civil.Fields{ .y = 1970, .m = 1, .d = 1 };
     var i: usize = 0;
     while (i < p.len) {
         const pa = partAt(p, i) orelse {
@@ -314,8 +316,8 @@ fn readCivil(comptime name: []const u8, raw: []const u8, p: []const u8) EvalErro
         }
         switch (pa.part) {
             .yyyy => cv.y = v,
-            .yy => cv.y = if (v >= 69) 1900 + @as(i64, v) else 2000 + @as(i64, v),
-            .mo => cv.mo = v,
+            .yy => cv.y = civil.pivotYY(v),
+            .mo => cv.m = v,
             .dd => cv.d = v,
             .hh => cv.h = v,
             .mi => cv.mi = v,
@@ -323,12 +325,12 @@ fn readCivil(comptime name: []const u8, raw: []const u8, p: []const u8) EvalErro
         }
         i += pa.width;
     }
-    if (cv.mo < 1 or cv.mo > 12 or cv.d < 1 or cv.d > time.daysInMonth(cv.y, cv.mo) or cv.h > 23 or cv.mi > 59 or cv.s > 59)
-        return bad(name, raw, "a valid date or time");
-    return cv;
+    const days = civil.civilDays(cv.y, cv.m, cv.d) orelse return bad(name, raw, "a valid date or time");
+    const clock = civil.clockMicros(cv.h, cv.mi, cv.s, 0) orelse return bad(name, raw, "a valid date or time");
+    return .{ .days = days, .clock = clock };
 }
 
-fn writeCivil(comptime name: []const u8, cx: Cx, cv: Civil, p: []const u8) EvalError![]const u8 {
+fn writeCivil(comptime name: []const u8, cx: Cx, cv: civil.Fields, p: []const u8) EvalError![]const u8 {
     var i: usize = 0;
     while (i < p.len) {
         const pa = partAt(p, i) orelse {
@@ -339,7 +341,7 @@ fn writeCivil(comptime name: []const u8, cx: Cx, cv: Civil, p: []const u8) EvalE
         const v: i64 = switch (pa.part) {
             .yyyy => if (cv.y < 0 or cv.y > 9999) return failWith(error.CastFailed, "`" ++ name ++ "`: year {d} does not fit YYYY", .{cv.y}) else cv.y,
             .yy => if (cv.y < 1969 or cv.y > 2068) return failWith(error.CastFailed, "`" ++ name ++ "`: year {d} would read back as another as YY, which holds 1969 to 2068", .{cv.y}) else @mod(cv.y, 100),
-            .mo => cv.mo,
+            .mo => cv.m,
             .dd => cv.d,
             .hh => cv.h,
             .mi => cv.mi,
@@ -372,8 +374,7 @@ pub const DateAt = struct {
     pub fn apply(_: Cx, rec: []const u8, pos: i64, len: i64, p: []const u8, marker: ?[]const u8) EvalError!?i32 {
         const raw = try fieldOf("date_at", rec, pos, len);
         if (nullMarked(raw, marker)) return null;
-        const cv = try readCivil("date_at", raw, p);
-        return @intCast(time.daysFromCivil(cv.y, cv.mo, cv.d));
+        return @intCast((try readCivil("date_at", raw, p)).days);
     }
 };
 
@@ -388,8 +389,7 @@ pub const TimeAt = struct {
     pub fn apply(_: Cx, rec: []const u8, pos: i64, len: i64, p: []const u8, marker: ?[]const u8) EvalError!?i64 {
         const raw = try fieldOf("time_at", rec, pos, len);
         if (nullMarked(raw, marker)) return null;
-        const cv = try readCivil("time_at", raw, p);
-        return (@as(i64, cv.h) * 3600 + @as(i64, cv.mi) * 60 + cv.s) * 1_000_000;
+        return (try readCivil("time_at", raw, p)).clock;
     }
 };
 
@@ -405,7 +405,7 @@ pub const TimestampAt = struct {
         const raw = try fieldOf("timestamp_at", rec, pos, len);
         if (nullMarked(raw, marker)) return null;
         const cv = try readCivil("timestamp_at", raw, p);
-        return (time.daysFromCivil(cv.y, cv.mo, cv.d) * 86_400 + @as(i64, cv.h) * 3600 + @as(i64, cv.mi) * 60 + cv.s) * 1_000_000;
+        return cv.days * civil.us_per_day + cv.clock;
     }
 };
 
@@ -566,21 +566,6 @@ pub const FmtDecimal = struct {
     }
 };
 
-fn civilOfDays(days: i64) Civil {
-    const c = time.civilFromDays(days);
-    return .{ .y = c.y, .mo = c.m, .d = c.d };
-}
-
-fn civilOfMicros(us: i64) Civil {
-    const secs = @divFloor(us, 1_000_000);
-    var cv = civilOfDays(@divFloor(secs, 86_400));
-    const day: u32 = @intCast(@mod(secs, 86_400));
-    cv.h = day / 3600;
-    cv.mi = day % 3600 / 60;
-    cv.s = day % 60;
-    return cv;
-}
-
 pub const FmtDate = struct {
     pub const args = .{ .day, .str };
     pub const result = .bytes;
@@ -591,7 +576,7 @@ pub const FmtDate = struct {
     }
     pub fn apply(cx: Cx, v: ?i32, p: []const u8) EvalError![]const u8 {
         const d = v orelse return spaces(cx, @intCast(p.len), ' ');
-        return writeCivil("fmt_date", cx, civilOfDays(d), p);
+        return writeCivil("fmt_date", cx, civil.fieldsOfDays(d), p);
     }
 };
 
@@ -605,7 +590,7 @@ pub const FmtTime = struct {
     }
     pub fn apply(cx: Cx, v: ?i64, p: []const u8) EvalError![]const u8 {
         const t = v orelse return spaces(cx, @intCast(p.len), ' ');
-        return writeCivil("fmt_time", cx, civilOfMicros(t), p);
+        return writeCivil("fmt_time", cx, civil.fieldsOfMicros(t), p);
     }
 };
 
@@ -619,7 +604,7 @@ pub const FmtTimestamp = struct {
     }
     pub fn apply(cx: Cx, v: ?i64, p: []const u8) EvalError![]const u8 {
         const t = v orelse return spaces(cx, @intCast(p.len), ' ');
-        return writeCivil("fmt_timestamp", cx, civilOfMicros(t), p);
+        return writeCivil("fmt_timestamp", cx, civil.fieldsOfMicros(t), p);
     }
 };
 
@@ -1086,4 +1071,93 @@ test "unhex takes hex digits only, with no sign or `_`, and hex prints every byt
         .string, .bytes => |s| s,
         else => return error.TestUnexpectedResult,
     });
+}
+
+/// The pattern reader and the fields the encoders print, as they were before
+/// `civil.Fields`, kept as the oracle the differential test checks against.
+const OldCivil = struct {
+    y: i64 = 1970,
+    mo: u32 = 1,
+    d: u32 = 1,
+    h: u32 = 0,
+    mi: u32 = 0,
+    s: u32 = 0,
+
+    fn read(raw: []const u8, p: []const u8) ?OldCivil {
+        if (raw.len != p.len) return null;
+        var cv = OldCivil{};
+        var i: usize = 0;
+        while (i < p.len) {
+            const pa = partAt(p, i) orelse {
+                if (raw[i] != p[i]) return null;
+                i += 1;
+                continue;
+            };
+            var v: u32 = 0;
+            for (raw[i .. i + pa.width]) |ch| {
+                if (ch < '0' or ch > '9') return null;
+                v = v * 10 + (ch - '0');
+            }
+            switch (pa.part) {
+                .yyyy => cv.y = v,
+                .yy => cv.y = if (v >= 69) 1900 + @as(i64, v) else 2000 + @as(i64, v),
+                .mo => cv.mo = v,
+                .dd => cv.d = v,
+                .hh => cv.h = v,
+                .mi => cv.mi = v,
+                .ss => cv.s = v,
+            }
+            i += pa.width;
+        }
+        if (cv.mo < 1 or cv.mo > 12 or cv.d < 1 or cv.d > civil.daysInMonth(cv.y, cv.mo) or cv.h > 23 or cv.mi > 59 or cv.s > 59) return null;
+        return cv;
+    }
+
+    fn ofMicros(us: i64) OldCivil {
+        const secs = @divFloor(us, 1_000_000);
+        const c = civil.civilFromDays(@divFloor(secs, 86_400));
+        const day: u32 = @intCast(@mod(secs, 86_400));
+        return .{ .y = c.y, .mo = c.m, .d = c.d, .h = day / 3600, .mi = day % 3600 / 60, .s = day % 60 };
+    }
+};
+
+test "date_at, time_at and timestamp_at read, and the fmt_ encoders see, what the code they replaced did" {
+    var rnd = std.Random.DefaultPrng.init(0xda7e);
+    const r = rnd.random();
+    const patterns = [_][]const u8{ "YYYYMMDD", "DD/MM/YY", "YYYY-MM-DD hh:mm:ss", "hhmmss", "hh:mm", "YYMMDDhhmm" };
+    var buf: [32]u8 = undefined;
+    var accepted: usize = 0;
+    for (0..100_000) |i| {
+        const p = patterns[i % patterns.len];
+        for (p, 0..) |ch, k| buf[k] = if (std.ascii.isAlphabetic(ch)) '0' + r.uintLessThan(u8, if (r.uintLessThan(u8, 3) == 0) 10 else 3) else ch;
+        if (r.uintLessThan(u8, 50) == 0) buf[r.uintLessThan(usize, p.len)] = 'x';
+        const raw = buf[0..p.len];
+        errdefer std.debug.print("`{s}` in `{s}`\n", .{ raw, p });
+        const old = OldCivil.read(raw, p);
+        const got_date = DateAt.apply(undefined, raw, 0, @intCast(raw.len), p, null);
+        const got_time = TimeAt.apply(undefined, raw, 0, @intCast(raw.len), p, null);
+        const got_stamp = TimestampAt.apply(undefined, raw, 0, @intCast(raw.len), p, null);
+        if (old) |cv| {
+            accepted += 1;
+            const days = civil.daysFromCivil(cv.y, cv.mo, cv.d);
+            try testing.expectEqual(@as(?i32, @intCast(days)), try got_date);
+            try testing.expectEqual(@as(?i64, (@as(i64, cv.h) * 3600 + @as(i64, cv.mi) * 60 + cv.s) * 1_000_000), try got_time);
+            try testing.expectEqual(@as(?i64, (days * 86_400 + @as(i64, cv.h) * 3600 + @as(i64, cv.mi) * 60 + cv.s) * 1_000_000), try got_stamp);
+        } else {
+            try testing.expectError(error.CastFailed, got_date);
+            try testing.expectError(error.CastFailed, got_time);
+            try testing.expectError(error.CastFailed, got_stamp);
+        }
+    }
+    try testing.expect(accepted > 10_000);
+    for (0..100_000) |i| {
+        const us: i64 = if (i == 0) std.math.minInt(i64) else if (i == 1) std.math.maxInt(i64) else r.int(i64) >> @intCast(i % 20);
+        const o = OldCivil.ofMicros(us);
+        const f = civil.fieldsOfMicros(us);
+        try testing.expectEqual(o, OldCivil{ .y = f.y, .mo = f.m, .d = f.d, .h = f.h, .mi = f.mi, .s = f.s });
+        const days = us >> 37;
+        const od = civil.civilFromDays(days);
+        const fd = civil.fieldsOfDays(days);
+        try testing.expectEqual(OldCivil{ .y = od.y, .mo = od.m, .d = od.d }, OldCivil{ .y = fd.y, .mo = fd.m, .d = fd.d });
+    }
 }
