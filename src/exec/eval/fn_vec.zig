@@ -10,6 +10,8 @@ const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const mkCol = @import("vec.zig").mkCol;
 const std = @import("std");
+const civil = @import("../civil.zig");
+const statementNow = @import("support.zig").statementNow;
 const strArg = @import("vec.zig").strArg;
 const strAt = @import("vec.zig").strAt;
 const compareVecs = @import("vec.zig").compareVecs;
@@ -23,14 +25,14 @@ pub const vectorized = struct {
         _ = arena;
         _ = c;
         _ = batch;
-        return .{ .scalar = .{ .timestamp = std.time.microTimestamp() } };
+        return .{ .scalar = .{ .timestamp = statementNow() } };
     }
 
     pub fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         _ = arena;
         _ = c;
         _ = batch;
-        return .{ .scalar = .{ .date = @intCast(@divFloor(std.time.microTimestamp(), 86_400_000_000)) } };
+        return .{ .scalar = .{ .date = @intCast(civil.dayOf(statementNow())) } };
     }
 
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {

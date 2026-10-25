@@ -405,6 +405,7 @@ pub const explain = @import("eval/support.zig").explain;
 pub const takeFailure = @import("eval/support.zig").takeFailure;
 pub const peekFailure = @import("eval/support.zig").peekFailure;
 pub const clip = @import("eval/support.zig").clip;
+pub const setStatementClock = @import("eval/support.zig").setStatementClock;
 pub const orderF64 = @import("eval/support.zig").orderF64;
 pub const compareValues = @import("eval/support.zig").compareValues;
 
@@ -797,6 +798,30 @@ test "a quoted literal met by a BOOL reads the words it read before, over every 
             if (i == len) break;
         }
     }
+}
+
+test "now() and today() read the statement's clock on every row and in every batch" {
+    const column = @import("column.zig");
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const at: i64 = 1_000_000_000_123_456;
+    setStatementClock(at);
+    defer setStatementClock(null);
+    const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = Type.init(.int) }} };
+    var cols = [_]column.Column{try column.intColumn(a, &.{ 1, 2, 3, 4, 5 })};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const now_e = try parser.parseExprStr(a, "now()", &diag);
+    const today_e = try parser.parseExprStr(a, "today()", &diag);
+    for (0..batch.len) |r| {
+        try std.testing.expectEqual(at, (try evalRow(a, now_e, batch, r)).timestamp);
+        try std.testing.expectEqual(@as(i32, 11_574), (try evalRow(a, today_e, batch, r)).date);
+    }
+    const col = try evalColumn(a, now_e, batch, Type.init(.timestamp));
+    for (0..batch.len) |r| try std.testing.expectEqual(at, col.getValue(r).timestamp);
+    try std.testing.expectEqual(@as(i32, 11_574), (try evalColumn(a, today_e, batch, Type.init(.date))).getValue(4).date);
+    try std.testing.expectEqual(at, (try evalLit(a, "now()")).timestamp);
 }
 
 test "a PARAM's text reads as CAST reads it: no `_`, hex or untrimmed failures" {

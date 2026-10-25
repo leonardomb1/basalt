@@ -161,6 +161,22 @@ pub fn cachedRegexOpts(pattern: []const u8, opts: regex.Options) regex.Error!reg
     return c.re;
 }
 
+const clock_unset: i64 = std.math.minInt(i64);
+var statement_clock = std.atomic.Value(i64).init(clock_unset);
+
+/// Fixes the instant `now()` and `today()` read for the statement about to run, so
+/// every row, batch and lane sees the same one; null returns them to the system clock.
+pub fn setStatementClock(us: ?i64) void {
+    statement_clock.store(us orelse clock_unset, .release);
+}
+
+/// The statement's instant in microseconds since the epoch, or the system clock's
+/// when no statement has fixed one.
+pub fn statementNow() i64 {
+    const us = statement_clock.load(.acquire);
+    return if (us == clock_unset) std.time.microTimestamp() else us;
+}
+
 pub const orderF64 = @import("../floatord.zig").orderF64;
 
 /// Bytes compare by content: a null answer here once made MIN/MAX over a bytes

@@ -22,6 +22,8 @@ const max_str_bytes = @import("functions.zig").max_str_bytes;
 const reduceTypeAt = @import("row.zig").reduceTypeAt;
 const regexpReplaceText = @import("fn_scalar.zig").regexpReplaceText;
 const std = @import("std");
+const civil = @import("../civil.zig");
+const statementNow = @import("support.zig").statementNow;
 const valueToString = @import("format.zig").valueToString;
 const writeJsonValue = @import("row.zig").writeJsonValue;
 
@@ -31,7 +33,7 @@ pub const per_row = struct {
         _ = c;
         _ = batch;
         _ = row;
-        return .{ .timestamp = std.time.microTimestamp() };
+        return .{ .timestamp = statementNow() };
     }
 
     pub fn today(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -39,8 +41,7 @@ pub const per_row = struct {
         _ = c;
         _ = batch;
         _ = row;
-        const days = @divFloor(std.time.microTimestamp(), 86_400_000_000);
-        return .{ .date = @intCast(days) };
+        return .{ .date = @intCast(civil.dayOf(statementNow())) };
     }
 
     /// Both the pattern and the replacement are evaluated before either is checked
