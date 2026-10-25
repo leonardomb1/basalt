@@ -32,8 +32,9 @@ const schema_mod = @import("schema.zig");
 const stream = @import("../stream.zig");
 const varint = @import("../varint.zig");
 const eval = @import("../../exec/eval.zig");
+const decimal = @import("../../exec/decimal.zig");
 const Decimal = @import("../../exec/value.zig").Decimal;
-const pow10_i128 = @import("../../exec/value.zig").pow10_i128;
+const pow10_i128 = decimal.pow10_i128;
 const Output = @import("../output.zig").Output;
 
 pub const Codec = read.Codec;
@@ -197,16 +198,10 @@ fn encoderFor(data: Column.Data) Encoder {
 /// the schema's precision fails naming the column, as a reader would refuse it.
 fn decimalBytes(out: *std.array_list.Managed(u8), d: Decimal, f: types.Schema.Field) !void {
     const p = precisionOf(f.ty);
-    const r = eval.rescaleTo(d, f.ty.scale) orelse return decimalTooWide(f, p);
-    if (r.unscaled >= pow10_i128[p] or r.unscaled <= -pow10_i128[p]) return decimalTooWide(f, p);
-    const be = std.mem.toBytes(std.mem.nativeToBig(i128, r.unscaled));
-    var start: usize = 0;
-    while (start < 15) : (start += 1) {
-        const lead = be[start];
-        const next_high = be[start + 1] & 0x80 != 0;
-        if (!((lead == 0 and !next_high) or (lead == 0xFF and next_high))) break;
-    }
-    try bytesOf(out, be[start..]);
+    const r = decimal.rescaleTo(d, f.ty.scale) orelse return decimalTooWide(f, p);
+    if (!decimal.withinPrecision(r.unscaled, p)) return decimalTooWide(f, p);
+    const be = decimal.minimalBigEndian(r.unscaled);
+    try bytesOf(out, be.bytes[be.start..]);
 }
 
 fn decimalTooWide(f: types.Schema.Field, p: u8) anyerror {
@@ -242,7 +237,7 @@ fn same(want: Value, got: Value, ty: types.Type) bool {
     if (want == .null or got == .null) return want == .null and got == .null;
     return switch (want) {
         .float => |x| std.math.isNan(x) and std.math.isNan(got.float) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(got.float)),
-        .decimal => |d| eval.rescaleTo(d, ty.scale).?.order(got.decimal) == .eq,
+        .decimal => |d| decimal.rescaleTo(d, ty.scale).?.order(got.decimal) == .eq,
         .string => |s| std.mem.eql(u8, s, got.string),
         .bytes => |s| std.mem.eql(u8, s, got.bytes),
         else => std.meta.eql(want, got),
@@ -346,7 +341,7 @@ test "a decimal is written in the fewest bytes, restated at its column's scale" 
         try decimalBytes(&out, c[0], .{ .name = "d", .ty = types.Type.decimal(38, c[1]) });
         try testing.expectEqual(@as(u8, @intCast(2 * c[2].len)), out.items[0]);
         try testing.expectEqualSlices(u8, c[2], out.items[1..]);
-        try testing.expect((try read.decimalOf(out.items[1..], 38, c[1])).decimal.order(eval.rescaleTo(c[0], c[1]).?) == .eq);
+        try testing.expect((try read.decimalOf(out.items[1..], 38, c[1])).decimal.order(decimal.rescaleTo(c[0], c[1]).?) == .eq);
     }
     var out = std.array_list.Managed(u8).init(a);
     try testing.expectError(error.AvroDecimalOverflow, decimalBytes(&out, .{ .unscaled = 1000, .scale = 0 }, .{ .name = "d", .ty = types.Type.decimal(3, 0) }));

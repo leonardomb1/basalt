@@ -33,6 +33,7 @@ const Folder = @import("../parquet/folder.zig").Folder;
 const Space = @import("../../exec/space.zig").Space;
 const Value = @import("../../exec/value.zig").Value;
 const cast = @import("../../exec/eval/cast.zig");
+const decimal = @import("../../exec/decimal.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
@@ -310,7 +311,7 @@ pub const Merge = struct {
                 try bd.append(v);
                 continue;
             }
-            const d = cast.rescaleTo(v.decimal, c.ty.scale) orelse
+            const d = decimal.rescaleTo(v.decimal, c.ty.scale) orelse
                 return self.fail(write.Error.DeltaValueOutOfRange, "column `{s}` is `{s}` in {s}, which cannot hold a value of the rows' scale {d}", .{ c.name, c.delta_type, self.plan.name, v.decimal.scale });
             try bd.append(.{ .decimal = d });
         }

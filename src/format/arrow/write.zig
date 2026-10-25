@@ -38,7 +38,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const Part = @import("../../store/part.zig").Part;
 const flatbuf = @import("flatbuf.zig");
-const rescaleTo = @import("../../exec/eval.zig").rescaleTo;
+const rescaleTo = @import("../../exec/decimal.zig").rescaleTo;
 
 comptime {
     if (builtin.cpu.arch.endian() != .little)

@@ -18,6 +18,7 @@ const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
+const decimal = @import("../decimal.zig");
 const keytable = @import("../keytable.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -433,7 +434,7 @@ test "aggregate: a grouped decimal SUM of arithmetic folded from its operands ma
                     const g = try want.getOrPut(key);
                     if (!g.found_existing) g.value_ptr.* = .{};
                     if (v.isNull()) continue;
-                    g.value_ptr.s += eval.rescaleTo(v.decimal, sty.scale).?.unscaled;
+                    g.value_ptr.s += decimal.rescaleTo(v.decimal, sty.scale).?.unscaled;
                     g.value_ptr.n += 1;
                 };
                 const aggs = [_]Aggregate.Agg{

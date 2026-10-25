@@ -10,6 +10,7 @@ const aggregates = @import("../../../lang/aggregates.zig");
 const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
+const decimal = @import("../../decimal.zig");
 const funcs = @import("funcs.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -114,7 +115,7 @@ fn extract(comptime In: type, v: Value) ?In {
             .float, .int, .decimal => eval.toF64(v),
             else => null,
         },
-        Decimal => eval.asDecimal(v),
+        Decimal => decimal.asDecimal(v),
         bool => if (v == .bool) v.bool else null,
         []const u8 => switch (v) {
             .string, .bytes => |s| s,

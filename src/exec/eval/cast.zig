@@ -1,4 +1,4 @@
-//! Casts between value kinds, and decimal rescaling and rounding.
+//! Casts between value kinds.
 
 const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
@@ -8,12 +8,15 @@ const floatToInt = @import("vec.zig").floatToInt;
 const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseTimestampText = @import("time.zig").parseTimestampText;
-const pow10_i128 = @import("../value.zig").pow10_i128;
-const pow10_i256 = @import("../value.zig").pow10_i256;
-const cell = @import("../cell.zig");
+const decimal = @import("../decimal.zig");
+const pow10_i128 = decimal.pow10_i128;
+const rescaleTo = decimal.rescaleTo;
+const fitsPrecision = decimal.fitsPrecision;
+const max_digits = decimal.max_digits;
+const asDecimalValue = decimal.asDecimalValue;
 const std = @import("std");
 const clip = @import("support.zig").clip;
-const decimalOverflow = @import("support.zig").decimalOverflow;
+const decimalOverflow = decimal.decimalOverflow;
 const failWith = @import("support.zig").failWith;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
@@ -35,7 +38,7 @@ pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalEr
 pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
     const s = trim(text);
     const want: u8 = if (ty.kind == .decimal) ty.scale else 0;
-    const d: Decimal = cell.decimal(s) orelse {
+    const d: Decimal = decimal.parse(s) orelse {
         if (parseFloatStrict(s) != null)
             return failWith(error.CastFailed, "SUM: '{s}' is not an exact number; sum CAST(x AS FLOAT) to add it as a float", .{clip(s)});
         return failWith(error.CastFailed, "SUM: '{s}' is not a number", .{clip(s)});
@@ -52,34 +55,6 @@ pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
     }
     return .{ .int = std.math.cast(i64, r.unscaled) orelse
         return failWith(error.IntOverflow, "SUM: '{s}' is past the INT range; sum CAST(x AS DECIMAL(38, 0)) instead", .{clip(s)}) };
-}
-
-/// The decimal a value reads as before it meets a target's scale and precision.
-pub fn asDecimalValue(v: Value) ?Decimal {
-    return switch (v) {
-        .decimal => |x| x,
-        .int => |x| .{ .unscaled = x, .scale = 0 },
-        .bool => |x| .{ .unscaled = if (x) 1 else 0, .scale = 0 },
-        .float => |x| floatToDecimal(x),
-        .string, .bytes => |str| cell.decimal(trim(str)),
-        else => null,
-    };
-}
-
-/// Whether `u` has at most `p` digits; precision 0, a driver's "unknown", is 38.
-pub fn fitsPrecision(u: i128, p: u8) bool {
-    const digits: u8 = if (p == 0 or p > max_digits) max_digits else p;
-    return @abs(u) < @as(u128, @intCast(pow10_i128[digits]));
-}
-
-pub const max_digits = 38;
-
-/// A DECIMAL SUM's wide total as a 38-digit decimal at `scale`, null past 38 digits.
-/// Sums add in i256 and only the total is range-checked, as PostgreSQL's NUMERIC
-/// sum is exact, so no batch split or row order can fail a sum that fits.
-pub fn wideSumDecimal(total: i256, scale: u8) ?Decimal {
-    const u = std.math.cast(i128, total) orelse return null;
-    return if (fitsPrecision(u, max_digits)) .{ .unscaled = u, .scale = scale } else null;
 }
 
 /// Text as an INT: an optional sign and digits, nothing else (callers trim).
@@ -121,86 +96,6 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
     if (i != s.len) return null;
     const x = std.fmt.parseFloat(f64, s) catch return null;
     return if (std.math.isFinite(x)) x else null;
-}
-
-/// A float as the decimal its 15 significant digits spell, as PostgreSQL casts
-/// float8 to numeric. Null for a non-finite value or one past 38 digits.
-pub fn floatToDecimal(x: f64) ?Decimal {
-    if (!std.math.isFinite(x)) return null;
-    if (x == 0) return .{ .unscaled = 0, .scale = 0 };
-    var buf: [48]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{e:.14}", .{@abs(x)}) catch return null;
-    const e_at = std.mem.indexOfScalar(u8, s, 'e') orelse return null;
-    var m: i128 = 0;
-    for (s[0..e_at]) |c| {
-        if (c == '.') continue;
-        m = m * 10 + (c - '0');
-    }
-    const exp = std.fmt.parseInt(i32, s[e_at + 1 ..], 10) catch return null;
-    if (x < 0) m = -m;
-    const shift = exp - 14;
-    if (shift >= 0) {
-        if (shift > 23) return null;
-        return .{ .unscaled = std.math.mul(i128, m, pow10_i128[@intCast(shift)]) catch return null, .scale = 0 };
-    }
-    const sc = -shift;
-    if (sc <= 38) return .{ .unscaled = m, .scale = @intCast(sc) };
-    return .{ .unscaled = roundScaleDown(m, @intCast(sc - 38)), .scale = 38 };
-}
-
-/// The scale `round(decimal, digits)` answers in: the digits when they are a
-/// literal (as DuckDB types it; a negative one is scale 0), else the input's own.
-pub fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
-    if (c.args.len < 2) return 0;
-    const d = c.args[1];
-    if (d.* == .unary and d.unary.op == .neg and d.unary.e.* == .int_lit) return 0;
-    if (d.* != .int_lit) return in_scale;
-    return @intCast(std.math.clamp(d.int_lit, 0, in_scale));
-}
-
-pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
-    var r = d;
-    if (digits < d.scale) {
-        const drop = @as(i64, d.scale) - digits;
-        if (drop > 38) return .{ .unscaled = 0, .scale = out_scale };
-        var q = roundScaleDown(d.unscaled, @intCast(drop));
-        if (digits < 0) {
-            q = std.math.mul(i128, q, pow10_i128[@intCast(@min(-digits, 38))]) catch return null;
-            r = .{ .unscaled = q, .scale = 0 };
-        } else r = .{ .unscaled = q, .scale = @intCast(digits) };
-    }
-    return rescaleTo(r, out_scale);
-}
-
-/// `u / 10^drop` for an i128 or i256 `u`, rounded half away from zero.
-pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
-    const table = if (@TypeOf(u) == i128) &pow10_i128 else &pow10_i256;
-    if (drop >= table.len) return 0;
-    const p = table[drop];
-    const q = @divTrunc(u, p);
-    if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
-    return q;
-}
-
-/// Adds `d` to a DECIMAL SUM's wide total, at the sum's `scale`. The add needs no
-/// check: each addend is an i128, so fewer than 2^63 of them (a state's i64 count)
-/// stay under 2^191, far inside i256.
-pub inline fn addAtScale(sum: *align(8) i256, d: Decimal, scale: u8) error{IntOverflow}!void {
-    const u = if (d.scale == scale) d.unscaled else (rescaleTo(d, scale) orelse return decimalOverflow()).unscaled;
-    sum.* += u;
-}
-
-/// Shifts a decimal to `want`, rounding half away from zero; null on overflow.
-/// Public because a value's scale need not match its column's (Postgres sends a
-/// per-value `dscale`), so anything combining decimals across rows normalizes first.
-pub fn rescaleTo(d: Decimal, want: u8) ?Decimal {
-    var unscaled = d.unscaled;
-    var have: i32 = d.scale;
-    while (have < want) : (have += 1) {
-        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
-    }
-    if (have > want) unscaled = roundScaleDown(unscaled, @intCast(have - want));
-    return .{ .unscaled = unscaled, .scale = want };
 }
 
 pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {

@@ -29,7 +29,7 @@ const column = @import("../column.zig");
 const Batch = @import("../batch.zig").Batch;
 const Bitmap = @import("vec.zig").Bitmap;
 
-const max_digits = 38;
+const max_digits = @import("../decimal.zig").max_digits;
 
 fn fieldOf(comptime name: []const u8, rec: []const u8, pos: i64, len: i64) EvalError![]const u8 {
     if (pos < 0 or len < 0 or pos > rec.len or len > @as(i64, @intCast(rec.len)) - pos)

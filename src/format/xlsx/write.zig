@@ -30,6 +30,7 @@ const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const celltext = @import("../../exec/celltext.zig");
 const format = @import("../../exec/eval/format.zig");
+const decimal = @import("../../exec/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
@@ -172,11 +173,11 @@ pub const Writer = struct {
                 try w.print("<c r=\"{s}{d}\"", .{ ref, self.row });
                 if (exactInDouble(d.unscaled)) {
                     try w.writeAll("><v>");
-                    try format.writeDecimal(w, d.unscaled, d.scale);
+                    try decimal.writeDecimal(w, d.unscaled, d.scale);
                     return w.writeAll("</v></c>");
                 }
                 try w.writeAll(" t=\"inlineStr\"><is><t>");
-                try format.writeDecimal(w, d.unscaled, d.scale);
+                try decimal.writeDecimal(w, d.unscaled, d.scale);
                 return w.writeAll("</t></is></c>");
             },
             .date => {

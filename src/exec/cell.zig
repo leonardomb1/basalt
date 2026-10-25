@@ -8,17 +8,14 @@
 //! `converter` picks, once per column, the function that parses a cell of that
 //! column's type and appends it straight into the builder's storage, one
 //! instantiated per type and rules at compile time, so the per-cell work is the
-//! parse and a typed append with no `Value` between them.
-//!
-//! Binary cells share less, since each wire lays its numbers out its own way, but
-//! a decimal's unscaled integer comes in two layouts that several readers decode:
-//! big-endian two's complement (Avro, Parquet) and a sign beside a little-endian
-//! magnitude (SQL Server's TDS).
+//! parse and a typed append with no `Value` between them. A decimal's text, and
+//! the binary layouts its unscaled integer comes in, are read in `decimal.zig`.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
+const decimal = @import("decimal.zig");
 const cast = @import("eval/cast.zig");
 const time = @import("eval/time.zig");
 
@@ -106,7 +103,7 @@ pub fn parse(comptime k: types.TypeKind, comptime rules: Rules, raw: []const u8)
     return switch (k) {
         .int => int(rules, raw) orelse bad,
         .float => float(rules, raw) orelse bad,
-        .decimal => decimal(raw) orelse bad,
+        .decimal => decimal.parse(raw) orelse bad,
         .bool => raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T' or raw[0] == 'y' or raw[0] == 'Y'),
         .date => switch (rules.dates) {
             .iso => @as(?i32, @intCast(time.parseIsoDate(raw) orelse return bad)),
@@ -196,74 +193,6 @@ pub fn floatFast(s: []const u8) ?f64 {
     return if (neg) -v else v;
 }
 
-/// A decimal literal: optional sign, digits, at most one `.`, at least one digit, else
-/// null. It once skipped unknown characters, so `'1000,00'` read as 100000.00 and
-/// `'abc'` as 0; comma-decimal data must be rewritten with `replace(x, ',', '.')`.
-pub fn decimal(t: []const u8) ?Decimal {
-    var s = t;
-    var neg = false;
-    if (s.len > 0 and (s[0] == '-' or s[0] == '+')) {
-        neg = s[0] == '-';
-        s = s[1..];
-    }
-    if (s.len == 0) return null;
-    var unscaled: i128 = 0;
-    var scale: u8 = 0;
-    var digits: usize = 0;
-    var after_dot = false;
-    for (s) |c| {
-        if (c == '.') {
-            if (after_dot) return null;
-            after_dot = true;
-            continue;
-        }
-        if (c < '0' or c > '9') return null;
-        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
-        unscaled = std.math.add(i128, unscaled, c - '0') catch return null;
-        digits += 1;
-        if (after_dot) scale += 1;
-    }
-    if (digits == 0) return null;
-    return .{ .unscaled = if (neg) -unscaled else unscaled, .scale = scale };
-}
-
-/// A big-endian two's complement integer as an unscaled decimal; null when it is
-/// wider than an i128 holds. Eight bytes or fewer take a 64-bit path.
-pub fn bigEndianDecimal(b: []const u8) ?i128 {
-    if (b.len == 0) return 0;
-    const neg = b[0] & 0x80 != 0;
-    if (b.len <= 8) {
-        var acc: u64 = if (neg) std.math.maxInt(u64) else 0;
-        for (b) |x| acc = (acc << 8) | x;
-        return @as(i64, @bitCast(acc));
-    }
-    var start: usize = 0;
-    if (b.len > 16) {
-        start = b.len - 16;
-        for (b[0..start]) |x| if (x != (if (neg) @as(u8, 0xFF) else 0)) return null;
-        if ((b[start] & 0x80 != 0) != neg) return null;
-    }
-    var acc: u128 = if (neg) std.math.maxInt(u128) else 0;
-    for (b[start..]) |x| acc = (acc << 8) | x;
-    return @bitCast(acc);
-}
-
-/// A sign beside a little-endian magnitude as an unscaled decimal; null when the
-/// magnitude is wider than an i128 holds.
-pub fn signMagnitudeDecimal(positive: bool, mag: []const u8) ?i128 {
-    if (mag.len > 16) return null;
-    var u: u128 = 0;
-    for (mag, 0..) |b, k| u |= @as(u128, b) << @intCast(k * 8);
-    const m = std.math.cast(i128, u) orelse return null;
-    return if (positive) m else -m;
-}
-
-/// Whether an unscaled decimal has at most `precision` digits.
-pub fn withinPrecision(v: i128, precision: u8) bool {
-    const bound = @import("value.zig").pow10_i128[precision];
-    return v < bound and v > -bound;
-}
-
 const DateText = struct { days: i64, rest: []const u8 };
 
 /// `YYYY-MM-DD` at the start of `t`, the year four digits or more and a ` BC` at the
@@ -341,49 +270,12 @@ fn atoiN(s: []const u8) i64 {
 
 const testing = std.testing;
 
-test "binary decimals: both layouts at every width, too wide refused" {
-    const Case = struct { []const u8, ?i128 };
-    const be = [_]Case{
-        .{ &.{}, 0 },                                            .{ &.{0x7F}, 127 },
-        .{ &.{0x80}, -128 },                                     .{ &.{ 0x00, 0x80 }, 128 },
-        .{ &.{ 0xFF, 0x7F }, -129 },                             .{ &(.{0xFF} ** 8), -1 },
-        .{ &(.{0x00} ++ .{0xFF} ** 8), 0xFFFF_FFFF_FFFF_FFFF },  .{ &(.{0xFF} ** 20), -1 },
-        .{ &(.{0x7F} ++ .{0xFF} ** 15), std.math.maxInt(i128) }, .{ &(.{ 0x01, 0x00 } ++ .{0x00} ** 15), null },
-    };
-    for (be) |c| try testing.expectEqual(c[1], bigEndianDecimal(c[0]));
-    try testing.expectEqual(@as(?i128, 12345), signMagnitudeDecimal(true, &.{ 0x39, 0x30, 0, 0 }));
-    try testing.expectEqual(@as(?i128, -12345), signMagnitudeDecimal(false, &.{ 0x39, 0x30, 0, 0 }));
-    try testing.expectEqual(@as(?i128, null), signMagnitudeDecimal(true, &(.{0xFF} ** 16)));
-    try testing.expectEqual(@as(?i128, null), signMagnitudeDecimal(true, &(.{0x00} ** 17)));
-    try testing.expect(withinPrecision(999, 3) and !withinPrecision(1000, 3) and !withinPrecision(-1000, 3));
-}
-
-test "intFast agrees with std and declines what it cannot prove" {
-    for ([_][]const u8{ "0", "7", "-7", "123456789012345678", "-123456789012345678", "007" }) |s| {
-        try testing.expectEqual(try std.fmt.parseInt(i64, s, 10), intFast(s).?);
-    }
-    for ([_][]const u8{ "", "-", "+1", "1_000", "0x10", "1234567890123456789", "1.0", " 1" }) |s| {
-        try testing.expect(intFast(s) == null);
-    }
-}
-
 test "floatFast agrees with std on plain decimals and declines the rest" {
     for ([_][]const u8{ "0", "1", "-1", "3.25", "-0.001", "123456.789", "99.90", "0.1", "1234567890.12345" }) |s| {
         try testing.expectEqual(try std.fmt.parseFloat(f64, s), floatFast(s).?);
     }
     for ([_][]const u8{ "", "-", ".", "1e5", "+1", "1.2.3", "abc", "1234567890123456", "nan" }) |s| {
         try testing.expect(floatFast(s) == null);
-    }
-}
-
-test "decimal rejects what it cannot read instead of inventing a number" {
-    try testing.expectEqual(@as(i128, 100000), decimal("1000.00").?.unscaled);
-    try testing.expectEqual(@as(u8, 2), decimal("1000.00").?.scale);
-    try testing.expectEqual(@as(i128, -5), decimal("-5").?.unscaled);
-    try testing.expectEqual(@as(i128, 7), decimal("+7").?.unscaled);
-    try testing.expectEqual(@as(i128, 25), decimal(".25").?.unscaled);
-    for ([_][]const u8{ "1000,00", "1.234,56", "1,2,3", "abc", "1.2.3", "12 34", "", "-", "R$ 10" }) |s| {
-        try testing.expect(decimal(s) == null);
     }
 }
 

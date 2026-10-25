@@ -7,25 +7,26 @@ const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Value = @import("../value.zig").Value;
-const asDecimal = @import("row.zig").asDecimal;
+const asDecimal = @import("../decimal.zig").asDecimal;
 const ast = @import("../../lang/ast.zig");
 const castValue = @import("cast.zig").castValue;
 const parseFloatStrict = @import("cast.zig").parseFloatStrict;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
-const decimalArithType = @import("row.zig").decimalArithType;
-const decimalOp = @import("row.zig").decimalOp;
+const decimalArithType = @import("../decimal.zig").decimalArithType;
+const decimalOp = @import("../decimal.zig").decimalOp;
 const evalRow = @import("row.zig").evalRow;
 const fieldIndex = @import("support.zig").fieldIndex;
 const forgetFailure = @import("support.zig").forgetFailure;
-const rescaleTo = @import("cast.zig").rescaleTo;
-const addAtScale = @import("cast.zig").addAtScale;
-const pow10_i128 = @import("../value.zig").pow10_i128;
+const rescaleTo = @import("../decimal.zig").rescaleTo;
+const addAtScale = @import("../decimal.zig").addAtScale;
+const pow10_i128 = @import("../decimal.zig").pow10_i128;
+const cmpBound = @import("../decimal.zig").cmpBound;
 const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
-const max_digits = @import("cast.zig").max_digits;
+const max_digits = @import("../decimal.zig").max_digits;
 const orderF64 = @import("support.zig").orderF64;
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
@@ -1021,40 +1022,6 @@ inline fn subOrNull(a: i128, b: i128) ?i128 {
 inline fn mulOrNull(a: i128, b: i128) ?i128 {
     const r = @mulWithOverflow(a, b);
     return if (r[1] == 0) r[0] else null;
-}
-
-/// A comparison against constant `d` at a column's scale `sc` (`x > 2.5` over INT
-/// is `x > 2`): the operator and whole bound that decide the same rows, with the
-/// constant on the right. `never` is a bound no element falls below. Null when
-/// the bound passes i128.
-fn cmpBound(op: ast.BinOp, flip: bool, d: Decimal, sc: u8, never: i128) ?struct { op: ast.BinOp, bound: i128 } {
-    var fl: i128 = undefined;
-    var exact = true;
-    if (d.scale <= sc) {
-        fl = std.math.mul(i128, d.unscaled, pow10_i128[sc - d.scale]) catch return null;
-    } else {
-        if (d.scale - sc >= pow10_i128.len) return null;
-        const p = pow10_i128[d.scale - sc];
-        fl = @divFloor(d.unscaled, p);
-        exact = @mod(d.unscaled, p) == 0;
-    }
-    const ce = if (exact) fl else fl + 1;
-    const o: ast.BinOp = if (!flip) op else switch (op) {
-        .lt => .gt,
-        .le => .ge,
-        .gt => .lt,
-        .ge => .le,
-        else => op,
-    };
-    return switch (o) {
-        .gt => .{ .op = .gt, .bound = fl },
-        .ge => .{ .op = .ge, .bound = ce },
-        .lt => .{ .op = .lt, .bound = ce },
-        .le => .{ .op = .le, .bound = fl },
-        .eq => if (exact) .{ .op = .eq, .bound = fl } else .{ .op = .lt, .bound = never },
-        .ne => if (exact) .{ .op = .ne, .bound = fl } else .{ .op = .ge, .bound = never },
-        else => null,
-    };
 }
 
 /// An INT column against a decimal constant (`x > 2.5`), exactly but on the int

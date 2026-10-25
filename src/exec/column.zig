@@ -21,6 +21,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
+const decimal = @import("decimal.zig");
 const par = @import("par.zig");
 
 const Value = value.Value;
@@ -1090,11 +1091,7 @@ pub const Builder = struct {
 
     /// An INT read as a scale-0 decimal, as an INT arm beside a DECIMAL one types.
     fn asDec(self: *Builder, v: Value) value.Decimal {
-        return switch (v) {
-            .decimal => |d| d,
-            .int => |x| .{ .unscaled = x, .scale = 0 },
-            else => .{ .unscaled = 0, .scale = self.ty.scale },
-        };
+        return decimal.asDecimal(v) orelse .{ .unscaled = 0, .scale = self.ty.scale };
     }
 
     /// The missing `.decimal` arm once made `ROUND(AVG(CAST(x AS DECIMAL(p,s))), n)`

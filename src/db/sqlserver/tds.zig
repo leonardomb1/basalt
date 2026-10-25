@@ -49,6 +49,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const cell = @import("../../exec/cell.zig");
+const decimal = @import("../../exec/decimal.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -1312,21 +1313,12 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) MalformedValue!Decimal {
         5, 9, 13, 17 => {},
         else => return error.MalformedTdsValue,
     }
-    const v = cell.signMagnitudeDecimal(bytes[0] == 1, bytes[1..]) orelse return error.MalformedTdsValue;
+    const v = decimal.signMagnitudeDecimal(bytes[0] == 1, bytes[1..]) orelse return error.MalformedTdsValue;
     return .{ .unscaled = v, .scale = d.scale };
 }
 
 fn decodeMoney(bytes: []const u8) MalformedValue!Decimal {
-    const unscaled: i64 = switch (bytes.len) {
-        4 => std.mem.readInt(i32, bytes[0..4], .little),
-        8 => blk: {
-            const hi: u64 = @bitCast(@as(i64, std.mem.readInt(i32, bytes[0..4], .little)));
-            const lo: u64 = std.mem.readInt(u32, bytes[4..8], .little);
-            break :blk @bitCast((hi << 32) | lo);
-        },
-        else => return error.MalformedTdsValue,
-    };
-    return .{ .unscaled = unscaled, .scale = 4 };
+    return decimal.money(bytes) orelse error.MalformedTdsValue;
 }
 
 /// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.

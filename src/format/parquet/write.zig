@@ -55,6 +55,7 @@ const thrift = @import("thrift.zig");
 const varint = @import("../varint.zig");
 const codec = @import("../compress/codecs.zig");
 const eval = @import("../../exec/eval.zig");
+const decimal = @import("../../exec/decimal.zig");
 const driver = @import("../../connect/driver.zig");
 const objstore = @import("../../store/objstore.zig");
 const Part = @import("../../store/part.zig").Part;
@@ -1433,22 +1434,13 @@ fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
 /// The unscaled integer restated to the schema's scale. Overflow is an error:
 /// clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
 fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
-    const r = eval.rescaleTo(d, @intCast(want)) orelse return Error.UnsupportedParquetDecimal;
-    return std.math.cast(T, r.unscaled) orelse Error.UnsupportedParquetDecimal;
+    return decimal.rescaleAs(T, d, @intCast(want)) orelse Error.UnsupportedParquetDecimal;
 }
 
 /// Big-endian two's complement in exactly `len` bytes (a FIXED_LEN_BYTE_ARRAY
 /// decimal); errors rather than truncating a value the precision cannot hold.
 fn decimalBytes(b: []u8, x: i128) Error!void {
-    if (b.len == 0 or b.len > 16) return Error.UnsupportedParquetDecimal;
-    var v = x;
-    var i = b.len;
-    while (i > 0) : (i -= 1) {
-        b[i - 1] = @truncate(@as(u128, @bitCast(v)));
-        v >>= 8;
-    }
-    if (v != (if (x < 0) @as(i128, -1) else 0)) return Error.UnsupportedParquetDecimal;
-    if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
+    if (!decimal.fixedBigEndian(b, x)) return Error.UnsupportedParquetDecimal;
 }
 
 const sink_vtable = driver.sinkVTable(Writer);

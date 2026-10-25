@@ -41,6 +41,7 @@ const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const cast = @import("../../exec/eval/cast.zig");
+const decimal = @import("../../exec/decimal.zig");
 const codecs = @import("../compress/codecs.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
@@ -49,7 +50,6 @@ const merge = @import("delta_merge.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
-const fmtnum = @import("../../exec/eval/format.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
 const percent = @import("../../net/percent.zig");
@@ -490,8 +490,8 @@ fn partitionText(arena: std.mem.Allocator, c: Col, v: Value) !?[]const u8 {
         .date => |d| try writeDate(w, d),
         .timestamp => |us| try writeTimestamp(w, us, c.phys.utc, false),
         .decimal => |d| {
-            const r = cast.rescaleTo(d, c.ty.scale) orelse return Error.DeltaValueOutOfRange;
-            try fmtnum.writeDecimal(w, r.unscaled, r.scale);
+            const r = decimal.rescaleTo(d, c.ty.scale) orelse return Error.DeltaValueOutOfRange;
+            try decimal.writeDecimal(w, r.unscaled, r.scale);
         },
         else => return Error.DeltaValueOutOfRange,
     }
@@ -544,7 +544,7 @@ fn statJson(arena: std.mem.Allocator, c: Col, v: Value, is_max: bool) !?[]const 
             if (!std.math.isFinite(f)) return null;
             try writeDouble(w, f, c.phys.float32);
         },
-        .decimal => |d| try fmtnum.writeDecimal(w, d.unscaled, d.scale),
+        .decimal => |d| try decimal.writeDecimal(w, d.unscaled, d.scale),
         .date => |d| {
             try w.writeByte('"');
             writeDate(w, d) catch |e| return if (e == Error.DeltaValueOutOfRange) null else e;

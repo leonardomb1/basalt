@@ -28,6 +28,7 @@ const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
+const decimal = @import("../decimal.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Filter = @import("../op.zig").Filter;
@@ -653,7 +654,7 @@ pub const KeyArr = struct {
                 }
                 const out = try arena.alloc(i128, n);
                 for (out, col.data.dec[0..n], 0..) |*o, d, i| {
-                    o.* = if (!col.validity.get(i)) 0 else (eval.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
+                    o.* = if (!col.validity.get(i)) 0 else (decimal.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
                 }
                 break :blk .{ .decs = out };
             },

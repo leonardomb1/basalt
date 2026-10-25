@@ -17,6 +17,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const format = @import("eval/format.zig");
+const decimal = @import("decimal.zig");
 const Batch = @import("batch.zig").Batch;
 const Value = @import("value.zig").Value;
 
@@ -172,7 +173,7 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
         .decimal => {
             const q = if (@hasDecl(P, "quote_decimal")) P.quote_decimal else "";
             try w.writeAll(q);
-            try format.writeDecimal(w, c.data.dec[r].unscaled, c.data.dec[r].scale);
+            try decimal.writeDecimal(w, c.data.dec[r].unscaled, c.data.dec[r].scale);
             try w.writeAll(q);
         },
         .date, .time, .timestamp => {
