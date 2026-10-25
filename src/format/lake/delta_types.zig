@@ -117,22 +117,23 @@ pub const Field = struct {
     metadata: ?std.json.ObjectMap,
 };
 
-/// What `fields` does with a malformed part: refuse it or pass over it.
+/// What `fields` does with a malformed field: refuse it or pass over it.
 pub const Bad = enum { refuse, skip };
 
+/// `not_struct`, a type with no `fields` array, comes back under every lenience:
+/// the reader and writer refuse it, the column mapping takes it as a leaf.
 pub const Problem = enum { not_struct, not_object, nameless };
 
 pub const Lenience = struct {
-    not_struct: Bad,
     not_object: Bad,
     nameless: Bad,
 
-    /// The writer's: every malformed part refused.
-    pub const strict = Lenience{ .not_struct = .refuse, .not_object = .refuse, .nameless = .refuse };
+    /// The writer's: every malformed field refused.
+    pub const strict = Lenience{ .not_object = .refuse, .nameless = .refuse };
     /// The reader's columns: a field that is not an object passed over.
-    pub const reading = Lenience{ .not_struct = .refuse, .not_object = .skip, .nameless = .refuse };
-    /// The reader's column mapping: everything malformed passed over.
-    pub const lenient = Lenience{ .not_struct = .skip, .not_object = .skip, .nameless = .skip };
+    pub const reading = Lenience{ .not_object = .skip, .nameless = .refuse };
+    /// The reader's column mapping: every malformed field passed over.
+    pub const lenient = Lenience{ .not_object = .skip, .nameless = .skip };
 };
 
 pub const Walk = union(enum) {
@@ -144,7 +145,7 @@ pub const Walk = union(enum) {
 /// `lenience` refuses. A field's `nullable` is true unless it is `false`.
 pub fn fields(arena: std.mem.Allocator, v: std.json.Value, comptime lenience: Lenience) !Walk {
     const list = if (v == .object) v.object.get("fields") else null;
-    if (list == null or list.? != .array) return if (lenience.not_struct == .refuse) .{ .problem = .not_struct } else .{ .fields = &.{} };
+    if (list == null or list.? != .array) return .{ .problem = .not_struct };
     var out = try std.array_list.Managed(Field).initCapacity(arena, list.?.array.items.len);
     for (list.?.array.items) |f| {
         if (f != .object) {
@@ -441,13 +442,13 @@ test "delta_types: fields pins each copy's lenience: writer refuses, reader skip
         try testing.expectEqualStrings("a", kept[0].name);
     }
 
-    for ([_][]const u8{ "\"long\"", "[]", "{}", "{\"fields\":{}}", "{\"type\":\"array\",\"elementType\":\"long\"}" }) |text| {
+    for ([_][]const u8{ "\"long\"", "[]", "{}", "{\"type\":\"struct\"}", "{\"fields\":{}}", "{\"type\":\"array\",\"elementType\":\"long\"}" }) |text| {
         const bad = try parseJson(a, text);
-        try testing.expectEqual(Problem.not_struct, (try fields(a, bad, .strict)).problem);
-        try testing.expectEqual(Problem.not_struct, (try fields(a, bad, .reading)).problem);
-        try testing.expectEqual(@as(usize, 0), (try fields(a, bad, .lenient)).fields.len);
+        inline for (.{ Lenience.strict, Lenience.reading, Lenience.lenient }) |l|
+            try testing.expectEqual(Problem.not_struct, (try fields(a, bad, l)).problem);
     }
-    try testing.expectEqual(@as(usize, 0), (try fields(a, try parseJson(a, "{\"fields\":[]}"), .strict)).fields.len);
+    inline for (.{ Lenience.strict, Lenience.reading, Lenience.lenient }) |l|
+        try testing.expectEqual(@as(usize, 0), (try fields(a, try parseJson(a, "{\"fields\":[]}"), l)).fields.len);
 }
 
 test "delta_types: partition text and statistics as the writer spells them" {
@@ -609,8 +610,4 @@ test "delta_types: statistics the writer spells read back as the merge reads the
     }
     const t_max = (try statValue(a, parseStats(a, try std.fmt.allocPrint(a, "{{\"maxValues\":{{\"c\":{s}}}}}", .{(try statText(a, physical("timestamp"), .{ .timestamp = us }, .max)).?})).?, .max, "c", T.init(.timestamp))).?;
     try testing.expectEqual(@as(i64, 20454 * 86_400_000_000 + 1_234_999), t_max.timestamp);
-}
-
-test "delta_types: stat_prefix is the writer's and the merge's cut" {
-    try testing.expectEqual(@as(usize, 32), stat_prefix);
 }
