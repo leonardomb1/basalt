@@ -28,6 +28,7 @@ const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
+const floatord = @import("../floatord.zig");
 const decimal = @import("../decimal.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -678,7 +679,7 @@ pub const KeyArr = struct {
         if (an or bn) return nullOrder(an, bn, self.nulls_first);
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| if (other.data == .ints) std.math.order(v[a], other.data.ints[c]) else return self.boxedAcross(a, other, c),
-            .floats => |v| if (other.data == .floats) eval.orderF64(v[a], other.data.floats[c]) else return self.boxedAcross(a, other, c),
+            .floats => |v| if (other.data == .floats) floatord.orderF64(v[a], other.data.floats[c]) else return self.boxedAcross(a, other, c),
             .decs => |v| if (other.data == .decs) Decimal.order(.{ .unscaled = v[a], .scale = self.scale }, .{ .unscaled = other.data.decs[c], .scale = other.scale }) else return self.boxedAcross(a, other, c),
             .strs => |v| if (other.data == .strs) std.mem.order(u8, v[a], other.data.strs[c]) else return self.boxedAcross(a, other, c),
             .boxed => return self.boxedAcross(a, other, c),
@@ -696,7 +697,7 @@ pub const KeyArr = struct {
         if (an or bn) return nullOrder(an, bn, self.nulls_first);
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| std.math.order(v[a], v[c]),
-            .floats => |v| eval.orderF64(v[a], v[c]),
+            .floats => |v| floatord.orderF64(v[a], v[c]),
             .decs => |v| std.math.order(v[a], v[c]),
             .strs => |v| std.mem.order(u8, v[a], v[c]),
             .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc, self.nulls_first),
@@ -1082,16 +1083,12 @@ fn sameWords(arrs: []const KeyArr, plans: []const KeyPlan, a: usize, b: usize) b
     return true;
 }
 
-/// The u64 whose unsigned order is the key's: ints flip the sign bit, floats use the
-/// IEEE trick with NaN canonicalized last and -0.0 folded into 0.0; `desc` complements.
+/// The u64 whose unsigned order is the key's: ints flip the sign bit, floats take
+/// `floatord.orderedBits`; `desc` complements.
 fn orderedWord(k: KeyArr, i: usize) u64 {
     const w: u64 = switch (k.data) {
         .ints => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),
-        .floats => |v| blk: {
-            const x = if (v[i] == 0) 0.0 else v[i];
-            const b: u64 = if (std.math.isNan(x)) 0x7ff8000000000000 else @bitCast(x);
-            break :blk if (b >> 63 != 0) ~b else b | (1 << 63);
-        },
+        .floats => |v| floatord.orderedBits(v[i]),
         else => unreachable,
     };
     return if (k.desc) ~w else w;

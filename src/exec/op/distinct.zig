@@ -218,11 +218,7 @@ pub const Distinct = struct {
                     const nk = seen.key_idx.len;
                     const hashes = try pull.alloc(u64, b.len);
                     const probes = try pull.alloc(Value, b.len * nk);
-                    for (0..b.len) |r| {
-                        const probe = probes[r * nk ..][0..nk];
-                        for (seen.key_idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
-                        hashes[r] = keyhash.MultiKeyCtx.hash(.{}, probe);
-                    }
+                    keytable.hashBatch(b.columns, seen.key_idx, b.len, probes, hashes);
                     var v = Dedup(BoxedStore){ .seen = seen, .tb = &seen.table, .st = st, .keep = keep, .dest = dest, .frozen = frozen, .depth = self.spill_depth };
                     try keytable.probe(BoxedStore, .dupe, &keytable.Runs(Value).over(nk, &.{}, hashes, probes, &.{}), 0, b.len, &v);
                     nspill = v.nspill;

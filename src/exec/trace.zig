@@ -5,6 +5,7 @@
 //! and a branch; on, its end takes a lock, so spans mark units of work, not rows.
 
 const std = @import("std");
+const jsontext = @import("jsontext.zig");
 
 const Event = struct { name: []const u8, tid: u64, ts: u64, dur: u64, arg: u64 };
 
@@ -67,14 +68,40 @@ pub fn write(path: []const u8) !void {
     const w = &fw.interface;
     try w.writeAll("{\"traceEvents\":[\n");
     for (events.items, 0..) |e, i| {
-        try w.print("{s}{{\"name\":", .{if (i == 0) "" else ",\n"});
-        try std.json.Stringify.encodeJsonString(e.name, .{}, w);
+        try w.writeAll(if (i == 0) "{" else ",\n{");
+        try jsontext.key(w, "name");
+        try jsontext.string(w, e.name);
         try w.print(",\"ph\":\"X\",\"pid\":1,\"tid\":{d},\"ts\":{d}.{d:0>3},\"dur\":{d}.{d:0>3},\"args\":{{\"n\":{d}}}}}", .{
             e.tid, e.ts / 1000, e.ts % 1000, e.dur / 1000, e.dur % 1000, e.arg,
         });
     }
     try w.writeAll("\n]}\n");
     try w.flush();
+}
+
+test "a span name is written as std.json wrote it, for every name a span is given" {
+    const names = [_][]const u8{ "", "lane", "Fold", "row group", "a\"b\\c", "tab\there\nnl\rcr", "~!@#$%^&*()_+{}|:<>?`-=[];',./" };
+    var all: [128]u8 = undefined;
+    for (&all, 0..) |*c, i| c.* = @intCast(i);
+    for (names ++ [_][]const u8{&all}) |n| {
+        var want: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer want.deinit();
+        var got: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer got.deinit();
+        try std.json.Stringify.encodeJsonString(n, .{}, &want.writer);
+        try jsontext.string(&got.writer, n);
+        const ws = want.written();
+        const gs = got.written();
+        if (std.mem.indexOfAny(u8, n, "\x08\x0c") == null) {
+            try std.testing.expectEqualStrings(ws, gs);
+        } else {
+            const a = try std.json.parseFromSlice([]const u8, std.testing.allocator, ws, .{});
+            defer a.deinit();
+            const b = try std.json.parseFromSlice([]const u8, std.testing.allocator, gs, .{});
+            defer b.deinit();
+            try std.testing.expectEqualStrings(a.value, b.value);
+        }
+    }
 }
 
 test "spans are recorded only once enabled and written as trace events" {

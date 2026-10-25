@@ -86,7 +86,6 @@ pub const Aggregate = struct {
     pub const drainSet = @import("aggregate/drain.zig").drainSet;
     pub const drainParts = @import("aggregate/drain.zig").drainParts;
     pub const fold_parts = @import("aggregate/drain.zig").fold_parts;
-    pub const part_shift = @import("aggregate/drain.zig").part_shift;
     pub const partOf = @import("aggregate/drain.zig").partOf;
     pub const FoldPart = @import("aggregate/drain.zig").FoldPart;
     pub const foldParts = @import("aggregate/drain.zig").foldParts;

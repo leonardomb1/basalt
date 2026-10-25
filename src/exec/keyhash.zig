@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const Column = @import("column.zig").Column;
 const eval = @import("eval.zig");
 const types = @import("../lang/types.zig");
 
@@ -56,6 +57,18 @@ pub fn keyKindOf(kind: types.TypeKind) ?KeyKind {
         .string => .strk,
         else => null,
     };
+}
+
+pub const Meet = struct { want: types.TypeKind, kind: ?KeyKind };
+
+/// The words a build key column of `build` stands for against a probe column of
+/// `other` (null: unknown, the build's own). An INT meeting a FLOAT keys as the float
+/// it compares as under `valueEq`, so the result does not depend on which side is
+/// built.
+pub fn meetKind(build: types.TypeKind, other: ?types.TypeKind) Meet {
+    const p = other orelse build;
+    if ((build == .int and p == .float) or (build == .float and p == .int)) return .{ .want = .float, .kind = .f64k };
+    return .{ .want = build, .kind = keyKindOf(build) };
 }
 
 /// A float key's word: its canonical bits, so equal floats share one word.
@@ -111,6 +124,20 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
     }
 }
 
+/// `hashValue` of valid row `row` of `col`, read from its storage without boxing. A
+/// nested value, which boxes to null, hashes by its encoded bytes under the bytes tag.
+pub inline fn hashCell(h: *std.hash.Wyhash, col: *const Column, row: usize) void {
+    switch (col.ty.kind) {
+        .int => hashInt(h, col.data.i64[row]),
+        .float => hashNum(h, col.data.f64[row]),
+        .time => hashTagged(h, .time, std.mem.asBytes(&col.data.i64[row])),
+        .timestamp => hashTagged(h, .timestamp, std.mem.asBytes(&col.data.i64[row])),
+        .string => hashTagged(h, .string, col.data.bytes.at(row)),
+        .bytes, .array, .@"struct" => hashTagged(h, .bytes, col.data.bytes.at(row)),
+        .bool, .date, .decimal => hashValue(h, col.getValue(row)),
+    }
+}
+
 pub fn hashOne(v: Value) u64 {
     var h = std.hash.Wyhash.init(0);
     hashValue(&h, v);
@@ -135,6 +162,43 @@ pub fn valueEq(a: Value, b: Value) bool {
         },
     };
 }
+
+/// A text or bytes value copied into `a`, out of a batch that may be freed.
+pub fn ownValue(a: std.mem.Allocator, v: Value) !Value {
+    return switch (v) {
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
+        else => v,
+    };
+}
+
+/// The running MIN and MAX of the non-null values folded, in `compareValues` order,
+/// owned in the fold's allocator. A NaN is kept apart (`nan`, the first one seen), so
+/// `min`/`max` bound the other values; `lo`/`hi` are the total order's own answer,
+/// where a NaN sits above everything. A value that does not compare moves neither.
+pub const MinMax = struct {
+    min: ?Value = null,
+    max: ?Value = null,
+    nan: ?f64 = null,
+
+    pub fn fold(self: *MinMax, a: std.mem.Allocator, v: Value) !void {
+        if (v == .null) return;
+        if (v == .float and std.math.isNan(v.float)) {
+            if (self.nan == null) self.nan = v.float;
+            return;
+        }
+        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try ownValue(a, v);
+        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try ownValue(a, v);
+    }
+
+    pub fn lo(self: MinMax) ?Value {
+        return self.min orelse if (self.nan) |x| Value{ .float = x } else null;
+    }
+
+    pub fn hi(self: MinMax) ?Value {
+        return if (self.nan) |x| .{ .float = x } else self.max;
+    }
+};
 
 pub const MultiKeyCtx = struct {
     pub fn hash(_: MultiKeyCtx, key: []const Value) u64 {
@@ -285,4 +349,105 @@ test "valueEq is symmetric: text never equals a date, whichever side it is on" {
     try std.testing.expect(!valueEq(d, t));
     try std.testing.expect(!valueEq(t, d));
     try std.testing.expect(valueEq(.{ .int = 1 }, .{ .float = 1.0 }) == valueEq(.{ .float = 1.0 }, .{ .int = 1 }));
+}
+
+test "meetKind: INT against FLOAT keys as FLOAT from either side; otherwise the build's own" {
+    try testing.expectEqual(Meet{ .want = .float, .kind = .f64k }, meetKind(.int, .float));
+    try testing.expectEqual(Meet{ .want = .float, .kind = .f64k }, meetKind(.float, .int));
+    try testing.expectEqual(Meet{ .want = .int, .kind = .i64k }, meetKind(.int, null));
+    try testing.expectEqual(Meet{ .want = .int, .kind = .i64k }, meetKind(.int, .decimal));
+    try testing.expectEqual(Meet{ .want = .decimal, .kind = null }, meetKind(.decimal, .int));
+    try testing.expectEqual(Meet{ .want = .string, .kind = .strk }, meetKind(.string, .bytes));
+}
+
+fn pinnedJoinHash(c: *const Column, row: usize) u64 {
+    var h = std.hash.Wyhash.init(0);
+    switch (std.meta.activeTag(c.data)) {
+        .i64 => switch (c.ty.kind) {
+            .int => hashInt(&h, c.data.i64[row]),
+            .time => hashTagged(&h, .time, std.mem.asBytes(&c.data.i64[row])),
+            .timestamp => hashTagged(&h, .timestamp, std.mem.asBytes(&c.data.i64[row])),
+            else => hashValue(&h, c.getValue(row)),
+        },
+        .bytes => hashTagged(&h, if (c.ty.kind == .string) .string else .bytes, c.data.bytes.at(row)),
+        else => hashValue(&h, c.getValue(row)),
+    }
+    return h.final();
+}
+
+test "hashCell: every scalar kind hashes as its boxed value and as the old join row hash" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const D = @import("value.zig").Decimal;
+    const nan = std.math.nan(f64);
+    const cases = [_]struct { ty: types.Type, vals: []const Value }{
+        .{ .ty = types.Type.init(.int), .vals = &.{ .{ .int = 0 }, .{ .int = -1 }, .{ .int = std.math.maxInt(i64) }, .{ .int = 9007199254740993 } } },
+        .{ .ty = types.Type.init(.float), .vals = &.{ .{ .float = 0.0 }, .{ .float = -0.0 }, .{ .float = nan }, .{ .float = -nan }, .{ .float = 1.5 }, .{ .float = std.math.inf(f64) } } },
+        .{ .ty = types.Type.init(.time), .vals = &.{ .{ .time = 0 }, .{ .time = 86_399_999_999 } } },
+        .{ .ty = types.Type.init(.timestamp), .vals = &.{ .{ .timestamp = -1 }, .{ .timestamp = 1 } } },
+        .{ .ty = types.Type.init(.date), .vals = &.{ .{ .date = 0 }, .{ .date = -719162 } } },
+        .{ .ty = types.Type.init(.bool), .vals = &.{ .{ .bool = true }, .{ .bool = false } } },
+        .{ .ty = types.Type.init(.string), .vals = &.{ .{ .string = "" }, .{ .string = "a\x00b" }, .{ .string = "\xff" } } },
+        .{ .ty = types.Type.init(.bytes), .vals = &.{ .{ .bytes = "" }, .{ .bytes = "\x01\x02" } } },
+        .{ .ty = types.Type.decimal(10, 2), .vals = &.{ .{ .decimal = D{ .unscaled = 150, .scale = 2 } }, .{ .decimal = D{ .unscaled = -1, .scale = 2 } } } },
+    };
+    for (cases) |cs| {
+        var b = @import("column.zig").Builder.init(a, cs.ty);
+        for (cs.vals) |v| try b.append(v);
+        const col = try b.finish();
+        for (0..cs.vals.len) |r| {
+            var h = std.hash.Wyhash.init(0);
+            hashCell(&h, &col, r);
+            const got = h.final();
+            try testing.expectEqual(hashOne(col.getValue(r)), got);
+            try testing.expectEqual(pinnedJoinHash(&col, r), got);
+        }
+    }
+}
+
+fn pinnedKeysetBounds(vals: []const Value) [2]?Value {
+    var lo: ?Value = null;
+    var hi: ?Value = null;
+    for (vals) |v| {
+        if (v == .null) continue;
+        if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = v;
+        if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = v;
+    }
+    return .{ lo, hi };
+}
+
+fn sameBound(want: ?Value, got: ?Value) !void {
+    try testing.expectEqual(want == null, got == null);
+    const w = want orelse return;
+    const g = got.?;
+    try testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
+    if (w == .float) return testing.expectEqual(@as(u64, @bitCast(w.float)), @as(u64, @bitCast(g.float)));
+    try testing.expect(valueEq(w, g));
+}
+
+test "MinMax: lo and hi are the old keyset fold's bounds, NaN payload included" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const nan = std.math.nan(f64);
+    const odd: f64 = @bitCast(@as(u64, 0xfff8000000000123));
+    const pool = [_]Value{ .null, .{ .float = nan }, .{ .float = odd }, .{ .float = -0.0 }, .{ .float = 0.0 }, .{ .float = 1.5 }, .{ .float = -std.math.inf(f64) }, .{ .float = std.math.inf(f64) } };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+    for (0..4000) |_| {
+        var buf: [6]Value = undefined;
+        const vals = buf[0..rand.uintAtMost(usize, buf.len)];
+        for (vals) |*v| v.* = pool[rand.uintLessThan(usize, pool.len)];
+        var mm = MinMax{};
+        for (vals) |v| try mm.fold(a, v);
+        const want = pinnedKeysetBounds(vals);
+        try sameBound(want[0], mm.lo());
+        try sameBound(want[1], mm.hi());
+    }
+    var t = MinMax{};
+    for ([_][]const u8{ "m", "b", "z", "b" }) |s| try t.fold(a, .{ .string = s });
+    try testing.expectEqualStrings("b", t.lo().?.string);
+    try testing.expectEqualStrings("z", t.hi().?.string);
+    try testing.expect(t.nan == null);
 }

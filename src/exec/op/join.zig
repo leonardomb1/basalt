@@ -123,23 +123,14 @@ fn classOf(a: column.Column, b: column.Column) KeyClass {
     };
 }
 
-/// Composite key hash for one row, folded from the typed store exactly as
-/// `keyhash.MultiKeyCtx` folds boxed values, so build and probe sides agree.
+/// Composite key hash for one row, folded from the typed store (`keyhash.hashCell`)
+/// exactly as `keyhash.MultiKeyCtx` folds boxed values, so build and probe sides agree.
 fn hashRowKeys(cols: []const column.Column, keys: []const usize, classes: []const KeyClass, row: usize) u64 {
     var h = std.hash.Wyhash.init(0);
-    for (keys, classes) |k, cls| {
-        const c = &cols[k];
-        switch (cls) {
-            .i64s => switch (c.ty.kind) {
-                .int => keyhash.hashInt(&h, c.data.i64[row]),
-                .time => keyhash.hashTagged(&h, .time, std.mem.asBytes(&c.data.i64[row])),
-                .timestamp => keyhash.hashTagged(&h, .timestamp, std.mem.asBytes(&c.data.i64[row])),
-                else => keyhash.hashValue(&h, c.getValue(row)),
-            },
-            .bytes => keyhash.hashTagged(&h, if (c.ty.kind == .string) .string else .bytes, c.data.bytes.at(row)),
-            .boxed => keyhash.hashValue(&h, c.getValue(row)),
-        }
-    }
+    for (keys, classes) |k, cls| switch (cls) {
+        .i64s, .bytes => keyhash.hashCell(&h, &cols[k], row),
+        .boxed => keyhash.hashValue(&h, cols[k].getValue(row)),
+    };
     return h.final();
 }
 
@@ -428,7 +419,7 @@ pub const JoinIndex = struct {
     }
 
     /// `fromBatches` keyed for a probe whose key columns are of `left_kinds` (one kind a
-    /// key), each build key column's words from `keytable.meetKind`.
+    /// key), each build key column's words from `keyhash.meetKind`.
     pub fn fromBatchesMeeting(
         state: std.mem.Allocator,
         chunks: []const Batch,
@@ -452,7 +443,7 @@ pub const JoinIndex = struct {
         const want = try state.alloc(types.TypeKind, right_keys.len);
         const kinds = try state.alloc(keyhash.KeyKind, right_keys.len);
         for (right_keys, want, kinds, 0..) |k, *w, *kk, j| {
-            const m = keytable.meetKind(right_schema.fields[k].ty.kind, if (left_kinds) |p| p[j] else null);
+            const m = keyhash.meetKind(right_schema.fields[k].ty.kind, if (left_kinds) |p| p[j] else null);
             w.* = m.want;
             kk.* = m.kind orelse blk: {
                 self.fixed = false;
