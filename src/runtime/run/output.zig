@@ -27,6 +27,7 @@ const hasAggregate = @import("../run.zig").hasAggregate;
 const hasFlagHint = @import("../env.zig").hasFlagHint;
 const hasSort = @import("../run.zig").hasSort;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
+const stampedBinding = @import("../plan.zig").stampedBinding;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
 const isRecordRead = @import("../connect.zig").isRecordRead;
@@ -158,7 +159,7 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
-    const b = env.bindings.get(name) orelse return null;
+    const b = (try stampedBinding(env, name)) orelse return null;
     if (b.stages.len < 2 or b.stages[0].node != .read) return null;
     for (b.stages) |st| {
         if (st.node == .aggregate) break;
@@ -217,7 +218,7 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     var stages = stages_in;
     if (stages.len > 0 and stages[0].node == .ref) {
         if (env.materialized.contains(stages[0].node.ref)) return null;
-        const b = env.bindings.get(stages[0].node.ref) orelse return null;
+        const b = (try stampedBinding(env, stages[0].node.ref)) orelse return null;
         if (b.stages.len == 0 or b.stages[0].node != .read) return null;
         const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
         @memcpy(joined[0..b.stages.len], b.stages);
@@ -383,7 +384,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     var inlined: usize = 0;
     while (head_stages[0].node == .ref and inlined < 16) : (inlined += 1) {
         if (env.materialized.contains(head_stages[0].node.ref)) break;
-        const b = env.bindings.get(head_stages[0].node.ref) orelse break;
+        const b = (try stampedBinding(env, head_stages[0].node.ref)) orelse break;
         if (b.stages.len == 0) break;
         const joined = try arena.alloc(ast.Stage, b.stages.len + head_stages.len - 1);
         @memcpy(joined[0..b.stages.len], b.stages);

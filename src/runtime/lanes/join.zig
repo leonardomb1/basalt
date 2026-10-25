@@ -10,6 +10,7 @@ const buildChainFrom = @import("../plan.zig").buildChainFrom;
 const buildPipeline = @import("../plan.zig").buildPipeline;
 const joinMaySpill = @import("../plan.zig").joinMaySpill;
 const joinSpillAt = @import("../plan.zig").joinSpillAt;
+const stampedBinding = @import("../plan.zig").stampedBinding;
 const laneJoinCap = @import("../plan.zig").laneJoinCap;
 const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const op = @import("../../exec/op.zig");
@@ -203,7 +204,7 @@ fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const a
 /// serial plan, which reads that side again.
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
     const arena = env.arena;
-    const binding = env.bindings.get(j.binding) orelse
+    const binding = (try stampedBinding(env, j.binding)) orelse
         return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const src_base = env.sources.items.len;
     const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));

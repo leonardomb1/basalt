@@ -429,6 +429,9 @@ test "now() and today() are one instant for the whole statement, across batches,
         const out = try runCsvThreaded(alloc, &tmp, csv.written(), query, threads);
         defer alloc.free(out);
         try std.testing.expectEqualStrings("n\n1\n", out);
+        const same = try runCsvThreaded(alloc, &tmp, csv.written(), "SELECT COUNT(*) AS n FROM (SELECT now() AS t FROM '$IN') WHERE t = now()", threads);
+        defer alloc.free(same);
+        try std.testing.expectEqualStrings("n\n40000\n", same);
     }
 }
 

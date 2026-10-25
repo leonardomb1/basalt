@@ -93,6 +93,7 @@ const openSink = @import("connect.zig").openSink;
 const env_mod = @import("env.zig");
 
 const buildPipeline = @import("plan.zig").buildPipeline;
+const ownClock = @import("plan.zig").ownClock;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
 const renderBound = @import("script.zig").renderBound;
@@ -390,7 +391,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
 fn runScalarLet(env: *Env, l: ast.LetConst) !void {
     const what = try analyze.queryLetLabel(env.arena, l.name);
-    const pipe = try buildPipeline(env, l.query.?.stages);
+    const pipe = try buildPipeline(env, try ownClock(env, l.query.?.stages));
     defer pipe.op.release();
     if (try analyze.queryLetColumnsProblem(env.arena, l.name, pipe.schema.fields.len)) |why| {
         const e = planErr(env.diag, why);

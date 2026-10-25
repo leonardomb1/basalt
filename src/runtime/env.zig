@@ -331,6 +331,7 @@ pub const Env = struct {
     on_load: ?LoadHook = null,
     loop_row: usize = 0,
     loop_rows: usize = 0,
+    now_us: ?i64 = null,
 
     params_expr: *std.StringHashMap(*const ast.Expr),
     errctx: *op.ErrCtx,

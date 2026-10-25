@@ -692,7 +692,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 current = .{ .scan = scan };
                 schema = m.schema;
             } else {
-                const b = env.bindings.get(name) orelse
+                const b = (try stampedBinding(env, name)) orelse
                     return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                     try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
@@ -933,7 +933,7 @@ pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.
     while (stages[0].node == .ref and n < 16) : (n += 1) {
         const name = stages[0].node.ref;
         if (env.materialized.contains(name)) break;
-        const b = env.bindings.get(name) orelse break;
+        const b = (try stampedBinding(env, name)) orelse break;
         if (b.stages.len == 0 or (b.stages[0].node != .read and b.stages[0].node != .ref)) break;
         for (b.stages) |st| {
             if (st.node == .window) return stages;
@@ -944,6 +944,22 @@ pub fn inlineHeadBindings(env: *Env, stages_in: []const ast.Stage) ![]const ast.
         stages = joined;
     }
     return stages;
+}
+
+/// `stages` as a statement of their own, run without `renderBound` (a query LET, a
+/// FOR EACH discovery): `env.now_us` set to a fresh instant and stamped on them.
+pub fn ownClock(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
+    const at = std.time.microTimestamp();
+    env.now_us = at;
+    return ast.stampClock(env.arena, stages, at);
+}
+
+/// The binding `name` as the statement planning it runs it: its `now()` and
+/// `today()` on the statement's instant, not the one the binding was rendered at.
+pub fn stampedBinding(env: *Env, name: []const u8) !?ast.Pipeline {
+    var b = env.bindings.get(name) orelse return null;
+    if (env.now_us) |at| b.stages = try ast.stampClock(env.arena, b.stages, at);
+    return b;
 }
 
 /// The implicit pushdown: the contiguous WHERE right after a SQL read, translated
@@ -1028,7 +1044,7 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const
         return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
     const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
     const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
-    var rstages = try prepareSide(env, try j.rightStages(env.arena, env.bindings.get(j.binding).?.stages), tail);
+    var rstages = try prepareSide(env, try j.rightStages(env.arena, (try stampedBinding(env, j.binding)).?.stages), tail);
     if (needs) |n| rstages = try projectJoinedSqlRead(env, rstages, n);
     var right_late: ?keypush.Taker = null;
     const a_want: ?keypush.Want = if (keypush.disabled(hints) or !keypush.rightMayNarrow(j))

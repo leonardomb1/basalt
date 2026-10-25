@@ -8,6 +8,7 @@ const aborting = @import("../env.zig").aborting;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildPipeline = @import("../plan.zig").buildPipeline;
+const ownClock = @import("../plan.zig").ownClock;
 const jsonToStr = @import("../plan.zig").jsonToStr;
 const openSource = @import("../connect.zig").openSource;
 const planErr = @import("../env.zig").planErr;
@@ -72,7 +73,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
         env.pq_folder = saved_pq_folder;
     }
 
-    const res = buildPipeline(env, pipe.stages) catch |e| {
+    const res = buildPipeline(env, try ownClock(env, pipe.stages)) catch |e| {
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
         return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
