@@ -91,22 +91,21 @@ pub fn cellParses(kind: types.TypeKind, raw: []const u8) bool {
     return raw.len == 0 or cell.parses(kind, cell.sniffed, raw);
 }
 
-/// `Column.note` as it was before it read cells through `cell.parses`, kept as the
-/// oracle the differential test checks against.
-fn oldNote(c: *Column, raw: []const u8) void {
-    const eval = @import("../exec/eval.zig");
-    c.seen = true;
-    if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
-    if (cell.codeLooking(raw)) {
-        c.all_int = false;
-        c.all_float = false;
-    } else {
-        if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
-        if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
-    }
-}
-
 test "a sniffed cell types as it did before the sniffer read it through cell.parses" {
+    const oldNote = struct {
+        fn f(c: *Column, raw: []const u8) void {
+            const eval = @import("../exec/eval.zig");
+            c.seen = true;
+            if (c.all_date and eval.parseIsoDate(raw) == null) c.all_date = false;
+            if (cell.codeLooking(raw)) {
+                c.all_int = false;
+                c.all_float = false;
+            } else {
+                if (c.all_int and eval.parseIntStrict(raw) == null) c.all_int = false;
+                if (c.all_float and eval.parseFloatStrict(raw) == null) c.all_float = false;
+            }
+        }
+    }.f;
     const corpus = [_][]const u8{
         "0",                    "7",                   "-7",                  "-0",                  "007",                  "-01",                 "+1",
         "+",                    "-",                   ".",                   ".5",                  "5.",                   "-.5",                 "-5.",

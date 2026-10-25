@@ -1073,55 +1073,52 @@ test "unhex takes hex digits only, with no sign or `_`, and hex prints every byt
     });
 }
 
-/// The pattern reader and the fields the encoders print, as they were before
-/// `civil.Fields`, kept as the oracle the differential test checks against.
-const OldCivil = struct {
-    y: i64 = 1970,
-    mo: u32 = 1,
-    d: u32 = 1,
-    h: u32 = 0,
-    mi: u32 = 0,
-    s: u32 = 0,
-
-    fn read(raw: []const u8, p: []const u8) ?OldCivil {
-        if (raw.len != p.len) return null;
-        var cv = OldCivil{};
-        var i: usize = 0;
-        while (i < p.len) {
-            const pa = partAt(p, i) orelse {
-                if (raw[i] != p[i]) return null;
-                i += 1;
-                continue;
-            };
-            var v: u32 = 0;
-            for (raw[i .. i + pa.width]) |ch| {
-                if (ch < '0' or ch > '9') return null;
-                v = v * 10 + (ch - '0');
-            }
-            switch (pa.part) {
-                .yyyy => cv.y = v,
-                .yy => cv.y = if (v >= 69) 1900 + @as(i64, v) else 2000 + @as(i64, v),
-                .mo => cv.mo = v,
-                .dd => cv.d = v,
-                .hh => cv.h = v,
-                .mi => cv.mi = v,
-                .ss => cv.s = v,
-            }
-            i += pa.width;
-        }
-        if (cv.mo < 1 or cv.mo > 12 or cv.d < 1 or cv.d > civil.daysInMonth(cv.y, cv.mo) or cv.h > 23 or cv.mi > 59 or cv.s > 59) return null;
-        return cv;
-    }
-
-    fn ofMicros(us: i64) OldCivil {
-        const secs = @divFloor(us, 1_000_000);
-        const c = civil.civilFromDays(@divFloor(secs, 86_400));
-        const day: u32 = @intCast(@mod(secs, 86_400));
-        return .{ .y = c.y, .mo = c.m, .d = c.d, .h = day / 3600, .mi = day % 3600 / 60, .s = day % 60 };
-    }
-};
-
 test "date_at, time_at and timestamp_at read, and the fmt_ encoders see, what the code they replaced did" {
+    const OldCivil = struct {
+        y: i64 = 1970,
+        mo: u32 = 1,
+        d: u32 = 1,
+        h: u32 = 0,
+        mi: u32 = 0,
+        s: u32 = 0,
+
+        fn read(raw: []const u8, p: []const u8) ?@This() {
+            if (raw.len != p.len) return null;
+            var cv = @This(){};
+            var i: usize = 0;
+            while (i < p.len) {
+                const pa = partAt(p, i) orelse {
+                    if (raw[i] != p[i]) return null;
+                    i += 1;
+                    continue;
+                };
+                var v: u32 = 0;
+                for (raw[i .. i + pa.width]) |ch| {
+                    if (ch < '0' or ch > '9') return null;
+                    v = v * 10 + (ch - '0');
+                }
+                switch (pa.part) {
+                    .yyyy => cv.y = v,
+                    .yy => cv.y = if (v >= 69) 1900 + @as(i64, v) else 2000 + @as(i64, v),
+                    .mo => cv.mo = v,
+                    .dd => cv.d = v,
+                    .hh => cv.h = v,
+                    .mi => cv.mi = v,
+                    .ss => cv.s = v,
+                }
+                i += pa.width;
+            }
+            if (cv.mo < 1 or cv.mo > 12 or cv.d < 1 or cv.d > civil.daysInMonth(cv.y, cv.mo) or cv.h > 23 or cv.mi > 59 or cv.s > 59) return null;
+            return cv;
+        }
+
+        fn ofMicros(us: i64) @This() {
+            const secs = @divFloor(us, 1_000_000);
+            const c = civil.civilFromDays(@divFloor(secs, 86_400));
+            const day: u32 = @intCast(@mod(secs, 86_400));
+            return .{ .y = c.y, .mo = c.m, .d = c.d, .h = day / 3600, .mi = day % 3600 / 60, .s = day % 60 };
+        }
+    };
     var rnd = std.Random.DefaultPrng.init(0xda7e);
     const r = rnd.random();
     const patterns = [_][]const u8{ "YYYYMMDD", "DD/MM/YY", "YYYY-MM-DD hh:mm:ss", "hhmmss", "hh:mm", "YYMMDDhhmm" };

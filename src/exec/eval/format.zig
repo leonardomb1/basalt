@@ -77,88 +77,85 @@ pub fn formatTimestamp(arena: std.mem.Allocator, micros: i64) ![]const u8 {
     return arena.dupe(u8, w.buffered());
 }
 
-/// The date, time and timestamp writers as they were before `civil.writeLayout`,
-/// kept as the oracle the differential test checks it against.
-const Old = struct {
-    fn writeDate(w: anytype, days: i64) !void {
-        const c = civil.civilFromDays(days);
-        if (c.y < 0 or c.y > 9999) {
-            try writeYear(w, c.y);
-            return w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
-        }
-        var buf: [10]u8 = undefined;
-        putDigits(buf[0..4], @intCast(c.y));
-        buf[4] = '-';
-        putDigits(buf[5..7], @intCast(c.m));
-        buf[7] = '-';
-        putDigits(buf[8..10], @intCast(c.d));
-        return w.writeAll(&buf);
-    }
-
-    inline fn putDigits(out: []u8, v: u64) void {
-        var x = v;
-        var i = out.len;
-        while (i > 0) {
-            i -= 1;
-            out[i] = '0' + @as(u8, @intCast(x % 10));
-            x /= 10;
-        }
-    }
-
-    fn writeYear(w: anytype, y: i64) !void {
-        if (y < 0) try w.writeByte('-');
-        try w.print("{d:0>4}", .{@abs(y)});
-    }
-
-    fn writeTime(w: anytype, t: i64) !void {
-        const us: u64 = @intCast(@mod(t, 86_400_000_000));
-        const secs = us / 1_000_000;
-        const frac = us % 1_000_000;
-        if (frac != 0) {
-            try w.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
-        } else {
-            try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, (secs % 3600) / 60, secs % 60 });
-        }
-    }
-
-    fn writeTimestamp(w: anytype, micros: i64) !void {
-        const days = @divFloor(micros, 86_400_000_000);
-        const us: u64 = @intCast(@mod(micros, 86_400_000_000));
-        const secs = us / 1_000_000;
-        const frac = us % 1_000_000;
-        const c = civil.civilFromDays(days);
-        if (c.y >= 0 and c.y <= 9999) {
-            var buf: [26]u8 = undefined;
+test "writeDate, writeTime and writeTimestamp print what the bodies they replaced did" {
+    const Old = struct {
+        fn writeDate(w: anytype, days: i64) !void {
+            const c = civil.civilFromDays(days);
+            if (c.y < 0 or c.y > 9999) {
+                try writeYear(w, c.y);
+                return w.print("-{d:0>2}-{d:0>2}", .{ c.m, c.d });
+            }
+            var buf: [10]u8 = undefined;
             putDigits(buf[0..4], @intCast(c.y));
             buf[4] = '-';
             putDigits(buf[5..7], @intCast(c.m));
             buf[7] = '-';
             putDigits(buf[8..10], @intCast(c.d));
-            buf[10] = ' ';
-            putDigits(buf[11..13], secs / 3600);
-            buf[13] = ':';
-            putDigits(buf[14..16], (secs % 3600) / 60);
-            buf[16] = ':';
-            putDigits(buf[17..19], secs % 60);
-            if (frac == 0) return w.writeAll(buf[0..19]);
-            buf[19] = '.';
-            putDigits(buf[20..26], frac);
             return w.writeAll(&buf);
         }
-        try writeYear(w, c.y);
-        if (frac != 0) {
-            try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
-                c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
-            });
-        } else {
-            try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-                c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
-            });
-        }
-    }
-};
 
-test "writeDate, writeTime and writeTimestamp print what the bodies they replaced did" {
+        inline fn putDigits(out: []u8, v: u64) void {
+            var x = v;
+            var i = out.len;
+            while (i > 0) {
+                i -= 1;
+                out[i] = '0' + @as(u8, @intCast(x % 10));
+                x /= 10;
+            }
+        }
+
+        fn writeYear(w: anytype, y: i64) !void {
+            if (y < 0) try w.writeByte('-');
+            try w.print("{d:0>4}", .{@abs(y)});
+        }
+
+        fn writeTime(w: anytype, t: i64) !void {
+            const us: u64 = @intCast(@mod(t, 86_400_000_000));
+            const secs = us / 1_000_000;
+            const frac = us % 1_000_000;
+            if (frac != 0) {
+                try w.print("{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ secs / 3600, (secs % 3600) / 60, secs % 60, frac });
+            } else {
+                try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ secs / 3600, (secs % 3600) / 60, secs % 60 });
+            }
+        }
+
+        fn writeTimestamp(w: anytype, micros: i64) !void {
+            const days = @divFloor(micros, 86_400_000_000);
+            const us: u64 = @intCast(@mod(micros, 86_400_000_000));
+            const secs = us / 1_000_000;
+            const frac = us % 1_000_000;
+            const c = civil.civilFromDays(days);
+            if (c.y >= 0 and c.y <= 9999) {
+                var buf: [26]u8 = undefined;
+                putDigits(buf[0..4], @intCast(c.y));
+                buf[4] = '-';
+                putDigits(buf[5..7], @intCast(c.m));
+                buf[7] = '-';
+                putDigits(buf[8..10], @intCast(c.d));
+                buf[10] = ' ';
+                putDigits(buf[11..13], secs / 3600);
+                buf[13] = ':';
+                putDigits(buf[14..16], (secs % 3600) / 60);
+                buf[16] = ':';
+                putDigits(buf[17..19], secs % 60);
+                if (frac == 0) return w.writeAll(buf[0..19]);
+                buf[19] = '.';
+                putDigits(buf[20..26], frac);
+                return w.writeAll(&buf);
+            }
+            try writeYear(w, c.y);
+            if (frac != 0) {
+                try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{
+                    c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60, frac,
+                });
+            } else {
+                try w.print("-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+                    c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
+                });
+            }
+        }
+    };
     var rnd = std.Random.DefaultPrng.init(0xf0a7);
     const r = rnd.random();
     var a: [fmt_bound]u8 = undefined;

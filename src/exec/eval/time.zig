@@ -39,7 +39,7 @@ pub fn truncMicros(us: i64, u: TimeUnit) i64 {
     const day = civil.dayOf(us);
     const rem = civil.timeOfDay(us);
     return switch (u) {
-        .second, .minute, .hour => us - @mod(rem, u.fixedMicros().?),
+        inline .second, .minute, .hour => |p| us - @mod(rem, comptime p.fixedMicros().?),
         .day => civil.dayMicros(day),
         .week => civil.dayMicros(isoWeekStart(day)),
         .month => blk: {
@@ -112,7 +112,7 @@ pub fn addMicros(us: i64, u: TimeUnit, n: i64) EvalError!i64 {
             const shifted = try mulI64(try addMonthsToDays(civil.dayOf(us), months), us_per_day);
             break :blk try addI64(shifted, civil.timeOfDay(us));
         },
-        .week, .day, .hour, .minute, .second => try addI64(us, try mulI64(n, u.fixedMicros().?)),
+        inline .week, .day, .hour, .minute, .second => |p| try addI64(us, try mulI64(n, comptime p.fixedMicros().?)),
     };
 }
 
@@ -131,7 +131,7 @@ pub fn dateDiff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
             const wb = isoWeekStart(civil.dayOf(b_us));
             return @divExact(wb - wa, 7);
         },
-        .day, .hour, .minute, .second => return @intCast(@divTrunc(@as(i128, b_us) - a_us, u.fixedMicros().?)),
+        inline .day, .hour, .minute, .second => |p| return @intCast(@divTrunc(@as(i128, b_us) - a_us, comptime p.fixedMicros().?)),
     }
 }
 
@@ -334,268 +334,264 @@ test "kept until decided (D14): strftime prints a year before 0 as 0000" {
     try std.testing.expectEqualStrings("0000-06-01|00", out.items);
 }
 
-/// Today's temporal text parsers as they were before `civil.Text`, kept as the
-/// oracle the differential test checks the new ones against.
-const Old = struct {
-    fn trim(s: []const u8) []const u8 {
-        return std.mem.trim(u8, s, " \t\r\n");
-    }
-
-    fn isoNum(s: []const u8) ?i64 {
-        var v: i64 = 0;
-        for (s) |c| {
-            if (c < '0' or c > '9') return null;
-            v = v * 10 + @as(i64, c - '0');
+test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses" {
+    const Old = struct {
+        fn trim(s: []const u8) []const u8 {
+            return std.mem.trim(u8, s, " \t\r\n");
         }
-        return v;
-    }
 
-    fn isoDate(s0: []const u8) ?i64 {
-        const s = trim(s0);
-        if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
-        const y = isoNum(s[0..4]) orelse return null;
-        const m = isoNum(s[5..7]) orelse return null;
-        const d = isoNum(s[8..10]) orelse return null;
-        if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
-        return daysFromCivil(y, @intCast(m), @intCast(d));
-    }
-
-    fn isoTime(s0: []const u8) ?i64 {
-        const s = trim(s0);
-        if (s.len == 5 and s[2] == ':') {
-            const hh = isoNum(s[0..2]) orelse return null;
-            const mm = isoNum(s[3..5]) orelse return null;
-            if (hh > 23 or mm > 59) return null;
-            return (hh * 3600 + mm * 60) * 1_000_000;
-        }
-        if (s.len < 8 or s.len > 8 + 7) return null;
-        var buf: [32]u8 = undefined;
-        const ts = std.fmt.bufPrint(&buf, "1970-01-01 {s}", .{s}) catch return null;
-        return isoTimestamp(ts);
-    }
-
-    fn isoTimestamp(s0: []const u8) ?i64 {
-        const s = trim(s0);
-        if (s.len == 10) return (isoDate(s) orelse return null) * 86_400_000_000;
-        if (s.len < 19 or s[13] != ':' or s[16] != ':') return null;
-        const days = isoDate(s[0..10]) orelse return null;
-        const hh = isoNum(s[11..13]) orelse return null;
-        const mm = isoNum(s[14..16]) orelse return null;
-        const ss = isoNum(s[17..19]) orelse return null;
-        if (hh > 23 or mm > 59 or ss > 59) return null;
-        var frac: i64 = 0;
-        if (s.len > 20 and s[19] == '.') {
-            var i: usize = 20;
-            var scale: i64 = 100_000;
-            while (i < s.len and scale > 0 and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-                frac += @as(i64, s[i] - '0') * scale;
-                scale = @divTrunc(scale, 10);
+        fn isoNum(s: []const u8) ?i64 {
+            var v: i64 = 0;
+            for (s) |c| {
+                if (c < '0' or c > '9') return null;
+                v = v * 10 + @as(i64, c - '0');
             }
-            if (i != s.len) return null;
-        } else if (s.len != 19) return null;
-        return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
-    }
-
-    fn pgDate(s0: []const u8) ?i64 {
-        const s = trim(s0);
-        var p = TextParser{ .s = s };
-        const days = p.date() orelse return null;
-        if (p.i == s.len) return days;
-        if (s[p.i] != ' ' and s[p.i] != 'T') return null;
-        _ = pgTimestamp(s) orelse return null;
-        return days;
-    }
-
-    fn pgTimestamp(s0: []const u8) ?i64 {
-        const s = trim(s0);
-        var p = TextParser{ .s = s };
-        const days = p.date() orelse return null;
-        if (p.i == s.len) return days * 86_400_000_000;
-        if (s[p.i] != ' ' and s[p.i] != 'T') return null;
-        p.i += 1;
-        const hh = p.num(1, 2) orelse return null;
-        if (!p.eat(':')) return null;
-        const mm = p.num(2, 2) orelse return null;
-        var ss: i64 = 0;
-        var frac: i64 = 0;
-        if (p.eat(':')) {
-            ss = p.num(2, 2) orelse return null;
-            if (p.eat('.')) {
-                var scale: i64 = 100_000;
-                const start = p.i;
-                while (p.i < s.len and std.ascii.isDigit(s[p.i])) : (p.i += 1) {
-                    frac += @as(i64, s[p.i] - '0') * scale;
-                    scale = @divTrunc(scale, 10);
-                }
-                if (p.i == start) return null;
-            }
+            return v;
         }
-        if (hh > 23 or mm > 59 or ss > 59) return null;
-        var off_s: i64 = 0;
-        if (p.i < s.len) {
-            const c = s[p.i];
-            if (c == 'Z' or c == 'z') {
-                p.i += 1;
-            } else if (c == '+' or c == '-') {
-                p.i += 1;
-                const oh = p.num(2, 2) orelse return null;
-                _ = p.eat(':');
-                const om = if (p.i < s.len) p.num(2, 2) orelse return null else 0;
-                if (oh > 15 or om > 59) return null;
-                off_s = (oh * 3600 + om * 60) * @as(i64, if (c == '-') -1 else 1);
-            }
-        }
-        if (p.i != s.len) return null;
-        return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss - off_s) * 1_000_000 + frac;
-    }
 
-    const TextParser = struct {
-        s: []const u8,
-        i: usize = 0,
-
-        fn date(p: *TextParser) ?i64 {
-            const y = p.num(4, 4) orelse return null;
-            if (!p.eat('-')) return null;
-            const m = p.num(1, 2) orelse return null;
-            if (!p.eat('-')) return null;
-            const d = p.num(1, 2) orelse return null;
+        fn isoDate(s0: []const u8) ?i64 {
+            const s = trim(s0);
+            if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
+            const y = isoNum(s[0..4]) orelse return null;
+            const m = isoNum(s[5..7]) orelse return null;
+            const d = isoNum(s[8..10]) orelse return null;
             if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
             return daysFromCivil(y, @intCast(m), @intCast(d));
         }
 
-        fn num(p: *TextParser, min: usize, max: usize) ?i64 {
-            const start = p.i;
-            while (p.i < p.s.len and p.i - start < max and std.ascii.isDigit(p.s[p.i])) p.i += 1;
-            if (p.i - start < min) return null;
-            return isoNum(p.s[start..p.i]);
+        fn isoTime(s0: []const u8) ?i64 {
+            const s = trim(s0);
+            if (s.len == 5 and s[2] == ':') {
+                const hh = isoNum(s[0..2]) orelse return null;
+                const mm = isoNum(s[3..5]) orelse return null;
+                if (hh > 23 or mm > 59) return null;
+                return (hh * 3600 + mm * 60) * 1_000_000;
+            }
+            if (s.len < 8 or s.len > 8 + 7) return null;
+            var buf: [32]u8 = undefined;
+            const ts = std.fmt.bufPrint(&buf, "1970-01-01 {s}", .{s}) catch return null;
+            return isoTimestamp(ts);
         }
 
-        fn eat(p: *TextParser, c: u8) bool {
-            if (p.i < p.s.len and p.s[p.i] == c) {
-                p.i += 1;
-                return true;
+        fn isoTimestamp(s0: []const u8) ?i64 {
+            const s = trim(s0);
+            if (s.len == 10) return (isoDate(s) orelse return null) * 86_400_000_000;
+            if (s.len < 19 or s[13] != ':' or s[16] != ':') return null;
+            const days = isoDate(s[0..10]) orelse return null;
+            const hh = isoNum(s[11..13]) orelse return null;
+            const mm = isoNum(s[14..16]) orelse return null;
+            const ss = isoNum(s[17..19]) orelse return null;
+            if (hh > 23 or mm > 59 or ss > 59) return null;
+            var frac: i64 = 0;
+            if (s.len > 20 and s[19] == '.') {
+                var i: usize = 20;
+                var scale: i64 = 100_000;
+                while (i < s.len and scale > 0 and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+                    frac += @as(i64, s[i] - '0') * scale;
+                    scale = @divTrunc(scale, 10);
+                }
+                if (i != s.len) return null;
+            } else if (s.len != 19) return null;
+            return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
+        }
+
+        fn pgDate(s0: []const u8) ?i64 {
+            const s = trim(s0);
+            var p = TextParser{ .s = s };
+            const days = p.date() orelse return null;
+            if (p.i == s.len) return days;
+            if (s[p.i] != ' ' and s[p.i] != 'T') return null;
+            _ = pgTimestamp(s) orelse return null;
+            return days;
+        }
+
+        fn pgTimestamp(s0: []const u8) ?i64 {
+            const s = trim(s0);
+            var p = TextParser{ .s = s };
+            const days = p.date() orelse return null;
+            if (p.i == s.len) return days * 86_400_000_000;
+            if (s[p.i] != ' ' and s[p.i] != 'T') return null;
+            p.i += 1;
+            const hh = p.num(1, 2) orelse return null;
+            if (!p.eat(':')) return null;
+            const mm = p.num(2, 2) orelse return null;
+            var ss: i64 = 0;
+            var frac: i64 = 0;
+            if (p.eat(':')) {
+                ss = p.num(2, 2) orelse return null;
+                if (p.eat('.')) {
+                    var scale: i64 = 100_000;
+                    const start = p.i;
+                    while (p.i < s.len and std.ascii.isDigit(s[p.i])) : (p.i += 1) {
+                        frac += @as(i64, s[p.i] - '0') * scale;
+                        scale = @divTrunc(scale, 10);
+                    }
+                    if (p.i == start) return null;
+                }
             }
-            return false;
+            if (hh > 23 or mm > 59 or ss > 59) return null;
+            var off_s: i64 = 0;
+            if (p.i < s.len) {
+                const c = s[p.i];
+                if (c == 'Z' or c == 'z') {
+                    p.i += 1;
+                } else if (c == '+' or c == '-') {
+                    p.i += 1;
+                    const oh = p.num(2, 2) orelse return null;
+                    _ = p.eat(':');
+                    const om = if (p.i < s.len) p.num(2, 2) orelse return null else 0;
+                    if (oh > 15 or om > 59) return null;
+                    off_s = (oh * 3600 + om * 60) * @as(i64, if (c == '-') -1 else 1);
+                }
+            }
+            if (p.i != s.len) return null;
+            return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss - off_s) * 1_000_000 + frac;
+        }
+
+        const TextParser = struct {
+            s: []const u8,
+            i: usize = 0,
+
+            fn date(p: *TextParser) ?i64 {
+                const y = p.num(4, 4) orelse return null;
+                if (!p.eat('-')) return null;
+                const m = p.num(1, 2) orelse return null;
+                if (!p.eat('-')) return null;
+                const d = p.num(1, 2) orelse return null;
+                if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
+                return daysFromCivil(y, @intCast(m), @intCast(d));
+            }
+
+            fn num(p: *TextParser, min: usize, max: usize) ?i64 {
+                const start = p.i;
+                while (p.i < p.s.len and p.i - start < max and std.ascii.isDigit(p.s[p.i])) p.i += 1;
+                if (p.i - start < min) return null;
+                return isoNum(p.s[start..p.i]);
+            }
+
+            fn eat(p: *TextParser, c: u8) bool {
+                if (p.i < p.s.len and p.s[p.i] == c) {
+                    p.i += 1;
+                    return true;
+                }
+                return false;
+            }
+        };
+
+        const DateText = struct { days: i64, rest: []const u8 };
+
+        fn dateText(t: []const u8) ?DateText {
+            const bc = std.mem.endsWith(u8, t, " BC");
+            const body = if (bc) t[0 .. t.len - 3] else t;
+            var i: usize = 0;
+            while (i < body.len and i < 7 and std.ascii.isDigit(body[i])) i += 1;
+            if (i < 4 or body.len < i + 6 or body[i] != '-' or body[i + 3] != '-') return null;
+            for ([_]usize{ i + 1, i + 2, i + 4, i + 5 }) |k| if (!std.ascii.isDigit(body[k])) return null;
+            var y = atoiN(body[0..i]);
+            const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
+            const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
+            if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
+            if (bc) y = 1 - y;
+            return .{ .days = daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
+        }
+
+        fn wireDate(t: []const u8) ?i64 {
+            const dt = dateText(t) orelse return null;
+            if (dt.rest.len > 0) return null;
+            return dt.days;
+        }
+
+        /// cell.zig's `wireDatetime`, its arithmetic widened to i128 so that a value past
+        /// i64, where the old body overflowed, shows as such.
+        fn wireDatetime(t: []const u8) ?i128 {
+            const dt = dateText(t) orelse return null;
+            const r = dt.rest;
+            if (r.len == 0) return @as(i128, dt.days) * 86_400_000_000;
+            if (r.len < 9 or (r[0] != ' ' and r[0] != 'T') or r[3] != ':' or r[6] != ':') return null;
+            for ([_]usize{ 1, 2, 4, 5, 7, 8 }) |k| if (!std.ascii.isDigit(r[k])) return null;
+            var secs: i64 = atoiN(r[1..3]) * 3600 + atoiN(r[4..6]) * 60 + atoiN(r[7..9]);
+            var frac: i64 = 0;
+            var i: usize = 9;
+            if (r.len > 10 and r[9] == '.') {
+                i = 10;
+                var scale: i64 = 100_000;
+                while (i < r.len and r[i] >= '0' and r[i] <= '9') : (i += 1) {
+                    if (scale > 0) frac += @as(i64, r[i] - '0') * scale;
+                    scale = @divTrunc(scale, 10);
+                }
+            }
+            if (i < r.len and r[i] == ' ') i += 1;
+            if (i + 3 <= r.len and (r[i] == '+' or r[i] == '-')) {
+                const sign: i64 = if (r[i] == '-') -1 else 1;
+                var off = atoiN(r[i + 1 .. i + 3]) * 3600;
+                var j = i + 3;
+                if (j < r.len and r[j] == ':') j += 1;
+                if (j + 2 <= r.len) off += atoiN(r[j .. j + 2]) * 60;
+                secs -= sign * off;
+            }
+            return @as(i128, dt.days) * 86_400_000_000 + secs * 1_000_000 + frac;
+        }
+
+        fn atoiN(s: []const u8) i64 {
+            var v: i64 = 0;
+            for (s) |c| {
+                if (c >= '0' and c <= '9') v = v * 10 + (c - '0');
+            }
+            return v;
         }
     };
-
-    const DateText = struct { days: i64, rest: []const u8 };
-
-    fn dateText(t: []const u8) ?DateText {
-        const bc = std.mem.endsWith(u8, t, " BC");
-        const body = if (bc) t[0 .. t.len - 3] else t;
-        var i: usize = 0;
-        while (i < body.len and i < 7 and std.ascii.isDigit(body[i])) i += 1;
-        if (i < 4 or body.len < i + 6 or body[i] != '-' or body[i + 3] != '-') return null;
-        for ([_]usize{ i + 1, i + 2, i + 4, i + 5 }) |k| if (!std.ascii.isDigit(body[k])) return null;
-        var y = atoiN(body[0..i]);
-        const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
-        const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
-        if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
-        if (bc) y = 1 - y;
-        return .{ .days = daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
-    }
-
-    fn wireDate(t: []const u8) ?i64 {
-        const dt = dateText(t) orelse return null;
-        if (dt.rest.len > 0) return null;
-        return dt.days;
-    }
-
-    /// cell.zig's `wireDatetime`, its arithmetic widened to i128 so that a value past
-    /// i64, where the old body overflowed, shows as such.
-    fn wireDatetime(t: []const u8) ?i128 {
-        const dt = dateText(t) orelse return null;
-        const r = dt.rest;
-        if (r.len == 0) return @as(i128, dt.days) * 86_400_000_000;
-        if (r.len < 9 or (r[0] != ' ' and r[0] != 'T') or r[3] != ':' or r[6] != ':') return null;
-        for ([_]usize{ 1, 2, 4, 5, 7, 8 }) |k| if (!std.ascii.isDigit(r[k])) return null;
-        var secs: i64 = atoiN(r[1..3]) * 3600 + atoiN(r[4..6]) * 60 + atoiN(r[7..9]);
-        var frac: i64 = 0;
-        var i: usize = 9;
-        if (r.len > 10 and r[9] == '.') {
-            i = 10;
-            var scale: i64 = 100_000;
-            while (i < r.len and r[i] >= '0' and r[i] <= '9') : (i += 1) {
-                if (scale > 0) frac += @as(i64, r[i] - '0') * scale;
-                scale = @divTrunc(scale, 10);
+    const fuzzTemporal = struct {
+        fn f(r: std.Random, buf: []u8) []const u8 {
+            var w = std.Io.Writer.fixed(buf);
+            const pick = struct {
+                fn f(rr: std.Random, comptime opts: []const []const u8) []const u8 {
+                    return opts[rr.uintLessThan(usize, opts.len)];
+                }
+            }.f;
+            const num = struct {
+                fn f(rr: std.Random, ww: *std.Io.Writer, usual: usize, max: i64) void {
+                    const digits = if (rr.uintLessThan(u8, 8) == 0) rr.intRangeAtMost(usize, 1, usual + 1) else usual;
+                    const v = rr.intRangeAtMost(i64, 0, max);
+                    var tmp: [24]u8 = undefined;
+                    const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+                    if (s.len < digits) ww.splatByteAll('0', digits - s.len) catch {};
+                    ww.writeAll(s[s.len -| @max(digits, 1)..]) catch {};
+                }
+            }.f;
+            if (r.uintLessThan(u8, 6) == 0) w.writeAll(pick(r, &.{ " ", "\t", "\r\n", "\x0B", "\x0C", "  " })) catch {};
+            const time_only = r.uintLessThan(u8, 4) == 0;
+            if (!time_only) {
+                switch (r.uintLessThan(u8, 10)) {
+                    0 => w.writeAll(pick(r, &.{ "294247", "294248", "300000", "10000", "11000", "0000", "0001", "-0001", "+2024", "9999999", "12345678", "0044" })) catch {},
+                    1 => num(r, &w, r.intRangeAtMost(usize, 1, 8), 99_999_999),
+                    else => num(r, &w, 4, 9999),
+                }
+                w.writeAll(if (r.uintLessThan(u8, 20) == 0) pick(r, &.{ "/", " ", "", ":" }) else "-") catch {};
+                num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 13);
+                w.writeAll(if (r.uintLessThan(u8, 20) == 0) pick(r, &.{ "/", " ", "" }) else "-") catch {};
+                num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 31);
             }
-        }
-        if (i < r.len and r[i] == ' ') i += 1;
-        if (i + 3 <= r.len and (r[i] == '+' or r[i] == '-')) {
-            const sign: i64 = if (r[i] == '-') -1 else 1;
-            var off = atoiN(r[i + 1 .. i + 3]) * 3600;
-            var j = i + 3;
-            if (j < r.len and r[j] == ':') j += 1;
-            if (j + 2 <= r.len) off += atoiN(r[j .. j + 2]) * 60;
-            secs -= sign * off;
-        }
-        return @as(i128, dt.days) * 86_400_000_000 + secs * 1_000_000 + frac;
-    }
-
-    fn atoiN(s: []const u8) i64 {
-        var v: i64 = 0;
-        for (s) |c| {
-            if (c >= '0' and c <= '9') v = v * 10 + (c - '0');
-        }
-        return v;
-    }
-};
-
-/// A random date, time or timestamp spelled the many ways a source might, valid
-/// often enough that each parser accepts a fair share.
-fn fuzzTemporal(r: std.Random, buf: []u8) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    const pick = struct {
-        fn f(rr: std.Random, comptime opts: []const []const u8) []const u8 {
-            return opts[rr.uintLessThan(usize, opts.len)];
+            if (time_only or r.uintLessThan(u8, 10) < 6) {
+                if (!time_only) w.writeAll(pick(r, &.{ " ", " ", "T", "T", "x", "-", "  " })) catch {};
+                num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 24);
+                w.writeAll(if (r.uintLessThan(u8, 30) == 0) "." else ":") catch {};
+                num(r, &w, 2, 60);
+                if (r.uintLessThan(u8, 4) != 0) {
+                    w.writeByte(':') catch {};
+                    num(r, &w, 2, 60);
+                    if (r.boolean()) {
+                        w.writeByte('.') catch {};
+                        const n = r.uintAtMost(usize, 9);
+                        for (0..n) |_| w.writeByte('0' + r.uintLessThan(u8, 10)) catch {};
+                    }
+                }
+                if (r.uintLessThan(u8, 3) == 0) w.writeAll(pick(r, &.{ "Z", "z", "+5", "-03", "+05:45", "-0230", "+05:", " +00:00", " UTC", "+16", "+05:60", "+a5", "Zx", "+0", "-1:3" })) catch {};
+            }
+            if (r.uintLessThan(u8, 12) == 0) w.writeAll(pick(r, &.{ " BC", " AD", "BC", "x" })) catch {};
+            if (r.uintLessThan(u8, 6) == 0) w.writeAll(pick(r, &.{ " ", "\t", "\n", "\x0B", " \r" })) catch {};
+            return w.buffered();
         }
     }.f;
-    const num = struct {
-        fn f(rr: std.Random, ww: *std.Io.Writer, usual: usize, max: i64) void {
-            const digits = if (rr.uintLessThan(u8, 8) == 0) rr.intRangeAtMost(usize, 1, usual + 1) else usual;
-            const v = rr.intRangeAtMost(i64, 0, max);
-            var tmp: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
-            if (s.len < digits) ww.splatByteAll('0', digits - s.len) catch {};
-            ww.writeAll(s[s.len -| @max(digits, 1)..]) catch {};
-        }
-    }.f;
-    if (r.uintLessThan(u8, 6) == 0) w.writeAll(pick(r, &.{ " ", "\t", "\r\n", "\x0B", "\x0C", "  " })) catch {};
-    const time_only = r.uintLessThan(u8, 4) == 0;
-    if (!time_only) {
-        switch (r.uintLessThan(u8, 10)) {
-            0 => w.writeAll(pick(r, &.{ "294247", "294248", "300000", "10000", "11000", "0000", "0001", "-0001", "+2024", "9999999", "12345678", "0044" })) catch {},
-            1 => num(r, &w, r.intRangeAtMost(usize, 1, 8), 99_999_999),
-            else => num(r, &w, 4, 9999),
-        }
-        w.writeAll(if (r.uintLessThan(u8, 20) == 0) pick(r, &.{ "/", " ", "", ":" }) else "-") catch {};
-        num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 13);
-        w.writeAll(if (r.uintLessThan(u8, 20) == 0) pick(r, &.{ "/", " ", "" }) else "-") catch {};
-        num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 31);
-    }
-    if (time_only or r.uintLessThan(u8, 10) < 6) {
-        if (!time_only) w.writeAll(pick(r, &.{ " ", " ", "T", "T", "x", "-", "  " })) catch {};
-        num(r, &w, 2, if (r.uintLessThan(u8, 10) == 0) 99 else 24);
-        w.writeAll(if (r.uintLessThan(u8, 30) == 0) "." else ":") catch {};
-        num(r, &w, 2, 60);
-        if (r.uintLessThan(u8, 4) != 0) {
-            w.writeByte(':') catch {};
-            num(r, &w, 2, 60);
-            if (r.boolean()) {
-                w.writeByte('.') catch {};
-                const n = r.uintAtMost(usize, 9);
-                for (0..n) |_| w.writeByte('0' + r.uintLessThan(u8, 10)) catch {};
-            }
-        }
-        if (r.uintLessThan(u8, 3) == 0) w.writeAll(pick(r, &.{ "Z", "z", "+5", "-03", "+05:45", "-0230", "+05:", " +00:00", " UTC", "+16", "+05:60", "+a5", "Zx", "+0", "-1:3" })) catch {};
-    }
-    if (r.uintLessThan(u8, 12) == 0) w.writeAll(pick(r, &.{ " BC", " AD", "BC", "x" })) catch {};
-    if (r.uintLessThan(u8, 6) == 0) w.writeAll(pick(r, &.{ " ", "\t", "\n", "\x0B", " \r" })) catch {};
-    return w.buffered();
-}
-
-test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses" {
     const Wire = civil.Text(.wire);
     var rnd = std.Random.DefaultPrng.init(0x7e47);
     const r = rnd.random();
@@ -646,4 +642,173 @@ test "civil dates round-trip through year 0 and negative multiples of 400" {
         const prev = civilFromDays(days - 1);
         try std.testing.expectEqual(daysInMonth(prev.y, prev.m), prev.d);
     };
+}
+
+test "date_trunc, extract, date_add, date_diff and strptime agree with the bodies they replaced" {
+    const Old = struct {
+        fn trunc(us: i64, u: TimeUnit) i64 {
+            const day = @divFloor(us, 86_400_000_000);
+            const rem = @mod(us, 86_400_000_000);
+            return switch (u) {
+                .second => us - @mod(rem, 1_000_000),
+                .minute => us - @mod(rem, 60_000_000),
+                .hour => us - @mod(rem, 3_600_000_000),
+                .day => day *| 86_400_000_000,
+                .week => isoWeekStart(day) *| 86_400_000_000,
+                .month => blk: {
+                    const c = civilFromDays(day);
+                    break :blk daysFromCivil(c.y, c.m, 1) *| 86_400_000_000;
+                },
+                .year => blk: {
+                    const c = civilFromDays(day);
+                    break :blk daysFromCivil(c.y, 1, 1) *| 86_400_000_000;
+                },
+            };
+        }
+
+        fn extract(us: i64, u: TimeUnit) i64 {
+            const day = @divFloor(us, 86_400_000_000);
+            const rem = @mod(us, 86_400_000_000);
+            const c = civilFromDays(day);
+            return switch (u) {
+                .year => c.y,
+                .month => @intCast(c.m),
+                .week => blk: {
+                    const thu = isoWeekStart(day) + 3;
+                    const ty = civilFromDays(thu).y;
+                    break :blk @divFloor(thu - daysFromCivil(ty, 1, 1), 7) + 1;
+                },
+                .day => @intCast(c.d),
+                .hour => @divFloor(rem, 3_600_000_000),
+                .minute => @mod(@divFloor(rem, 60_000_000), 60),
+                .second => @mod(@divFloor(rem, 1_000_000), 60),
+            };
+        }
+
+        fn add(us: i64, u: TimeUnit, n: i64) EvalError!i64 {
+            return switch (u) {
+                .year, .month => blk: {
+                    const day = @divFloor(us, 86_400_000_000);
+                    const rem = @mod(us, 86_400_000_000);
+                    const months = if (u == .year) try mulI64(n, 12) else n;
+                    const shifted = try mulI64(try addMonthsToDays(day, months), 86_400_000_000);
+                    break :blk try addI64(shifted, rem);
+                },
+                .week => try addI64(us, try mulI64(n, 7 * 86_400_000_000)),
+                .day => try addI64(us, try mulI64(n, 86_400_000_000)),
+                .hour => try addI64(us, try mulI64(n, 3_600_000_000)),
+                .minute => try addI64(us, try mulI64(n, 60_000_000)),
+                .second => try addI64(us, try mulI64(n, 1_000_000)),
+            };
+        }
+
+        fn diff(a_us: i64, b_us: i64, u: TimeUnit) i64 {
+            switch (u) {
+                .year, .month => {
+                    const ca = civilFromDays(@divFloor(a_us, 86_400_000_000));
+                    const cb = civilFromDays(@divFloor(b_us, 86_400_000_000));
+                    if (u == .year) return cb.y - ca.y;
+                    return (cb.y * 12 + @as(i64, cb.m)) - (ca.y * 12 + @as(i64, ca.m));
+                },
+                .week => {
+                    const wa = isoWeekStart(@divFloor(a_us, 86_400_000_000));
+                    const wb = isoWeekStart(@divFloor(b_us, 86_400_000_000));
+                    return @divExact(wb - wa, 7);
+                },
+                .day => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 86_400_000_000)),
+                .hour => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 3_600_000_000)),
+                .minute => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 60_000_000)),
+                .second => return @intCast(@divTrunc(@as(i128, b_us) - a_us, 1_000_000)),
+            }
+        }
+
+        fn strptime(text: []const u8, fmt: []const u8) ?i64 {
+            var y: i64 = 1970;
+            var mo: u32 = 1;
+            var d: u32 = 1;
+            var h: i64 = 0;
+            var mi: i64 = 0;
+            var sec: i64 = 0;
+            var t: usize = 0;
+            var i: usize = 0;
+            while (i < fmt.len) : (i += 1) {
+                if (fmt[i] != '%' or (i + 1 < fmt.len and fmt[i + 1] == '%')) {
+                    if (fmt[i] == '%') i += 1;
+                    if (t >= text.len or text[t] != fmt[i]) return null;
+                    t += 1;
+                    continue;
+                }
+                i += 1;
+                if (i >= fmt.len) return null;
+                const width: usize = if (fmt[i] == 'Y') 4 else 2;
+                const start = t;
+                var n: i64 = 0;
+                while (t < text.len and t - start < width and std.ascii.isDigit(text[t])) : (t += 1) n = n * 10 + (text[t] - '0');
+                if (t == start) return null;
+                switch (fmt[i]) {
+                    'Y' => y = n,
+                    'y' => y = if (n >= 69) 1900 + n else 2000 + n,
+                    'm' => mo = std.math.cast(u32, n) orelse return null,
+                    'd' => d = std.math.cast(u32, n) orelse return null,
+                    'H' => h = n,
+                    'M' => mi = n,
+                    'S' => sec = n,
+                    else => return null,
+                }
+            }
+            if (t != text.len) return null;
+            if (mo < 1 or mo > 12 or d < 1 or d > daysInMonth(y, mo) or h > 23 or mi > 59 or sec > 59) return null;
+            return (daysFromCivil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1_000_000;
+        }
+    };
+    var rnd = std.Random.DefaultPrng.init(0xa7d1);
+    const r = rnd.random();
+    const units = std.enums.values(TimeUnit);
+    const span: i64 = 180_000 * 365 * us_per_day;
+    for (0..200_000) |i| {
+        const a = if (i % 3 == 0) r.int(i64) else r.intRangeAtMost(i64, -span, span);
+        const b = r.intRangeAtMost(i64, -span, span);
+        const u = units[i % units.len];
+        errdefer std.debug.print("{d} {d} {t}\n", .{ a, b, u });
+        try std.testing.expectEqual(Old.trunc(a, u), truncMicros(a, u));
+        try std.testing.expectEqual(Old.extract(a, u), extractField(a, u));
+        if (i % 3 != 0) try std.testing.expectEqual(Old.diff(a, b, u), dateDiff(a, b, u));
+        const n: i64 = switch (i % 4) {
+            0 => r.intRangeAtMost(i64, -1000, 1000),
+            1 => r.int(i64),
+            2 => r.int(i32),
+            else => @divTrunc(std.math.maxInt(i64), u.fixedMicros() orelse us_per_day) + r.intRangeAtMost(i64, -2, 2),
+        };
+        const old = Old.add(a, u, n);
+        const new = addMicros(a, u, n);
+        if (old) |v| try std.testing.expectEqual(v, try new) else |e| try std.testing.expectError(e, new);
+    }
+    const fmts = [_][]const u8{ "%Y-%m-%d", "%d/%m/%y %H:%M:%S", "%Y%m%d%H%M", "%H:%M", "%%%Y" };
+    var buf: [32]u8 = undefined;
+    for (0..100_000) |i| {
+        const f = fmts[i % fmts.len];
+        var n: usize = 0;
+        var k: usize = 0;
+        while (k < f.len) : (k += 1) {
+            if (f[k] == '%' and k + 1 < f.len and f[k + 1] != '%') {
+                const w: usize = if (f[k + 1] == 'Y') 4 else 2;
+                const digits = if (r.uintLessThan(u8, 10) == 0) r.uintAtMost(usize, w) else w;
+                for (0..digits) |_| {
+                    buf[n] = '0' + r.uintLessThan(u8, if (r.boolean()) 3 else 10);
+                    n += 1;
+                }
+                k += 1;
+            } else {
+                buf[n] = if (f[k] == '%') blk: {
+                    k += 1;
+                    break :blk '%';
+                } else f[k];
+                n += 1;
+            }
+        }
+        if (r.uintLessThan(u8, 30) == 0) buf[r.uintLessThan(usize, n + 1) -| 1] = 'x';
+        const text = buf[0..n];
+        errdefer std.debug.print("`{s}` in `{s}`\n", .{ text, f });
+        try std.testing.expectEqual(Old.strptime(text, f), strptimeFmt(text, f));
+    }
 }
