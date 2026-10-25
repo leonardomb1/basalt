@@ -4,6 +4,7 @@ const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
+const civil = @import("../civil.zig");
 const floatToInt = @import("vec.zig").floatToInt;
 const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
@@ -116,19 +117,19 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         },
         .date => switch (v) {
             .date => v,
-            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 86_400_000_000)) },
+            .timestamp => |x| .{ .date = @intCast(civil.dayOf(x)) },
             .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
             else => error.CastFailed,
         },
         .timestamp => switch (v) {
             .timestamp => v,
-            .date => |x| .{ .timestamp = @as(i64, x) * 86_400_000_000 },
+            .date => |x| .{ .timestamp = civil.dayMicrosChecked(x) orelse return error.CastFailed },
             .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },
         .time => switch (v) {
             .time => v,
-            .timestamp => |x| .{ .time = @mod(x, 86_400_000_000) },
+            .timestamp => |x| .{ .time = civil.timeOfDay(x) },
             .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
             else => error.CastFailed,
         },
@@ -249,4 +250,16 @@ test "a DECIMAL cast fails when the value does not fit its precision" {
     try std.testing.expectEqual(@as(i128, 12345), (try castValueTyped(a, .{ .string = "123.45" }, types.Type.decimal(0, 2))).decimal.unscaled);
     try std.testing.expect(fitsPrecision(std.math.pow(i128, 10, 38) - 1, 38));
     try std.testing.expect(!fitsPrecision(std.math.pow(i128, 10, 38), 0));
+}
+
+test "a date past the TIMESTAMP range fails the cast instead of overflowing" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .date = std.math.maxInt(i32) }, .timestamp));
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .date = std.math.minInt(i32) }, .timestamp));
+    try std.testing.expectError(error.CastFailed, @import("testing_util.zig").evalLit(a, "CAST(make_date(300000, 1, 1) AS TIMESTAMP)"));
+    try std.testing.expectEqual(@as(i64, 106_751 * civil.us_per_day), (try castValue(a, .{ .date = 106_751 }, .timestamp)).timestamp);
+    try std.testing.expectEqual(@as(i64, -1), (try castValue(a, .{ .timestamp = -civil.us_per_day - 1 }, .date)).date + 1);
+    try std.testing.expectEqual(civil.us_per_day - 1, (try castValue(a, .{ .timestamp = -1 }, .time)).time);
 }
