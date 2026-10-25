@@ -23,6 +23,7 @@ const Cx = @import("scalar.zig").Cx;
 const failWith = @import("support.zig").failWith;
 const time = @import("time.zig");
 const charset = @import("../../format/charset.zig");
+const hex = @import("../../format/hex.zig");
 const bytes = @import("../../format/bytes.zig");
 const vecmod = @import("vec.zig");
 const column = @import("../column.zig");
@@ -131,8 +132,7 @@ pub const Hex = struct {
     pub const args = .{.str};
     pub const signature = "(bytes)";
     pub fn apply(cx: Cx, b: []const u8) EvalError![]const u8 {
-        const out = try cx.extend(b.len * 2);
-        for (b, 0..) |c, i| _ = std.fmt.bufPrint(out[i * 2 ..][0..2], "{X:0>2}", .{c}) catch unreachable;
+        _ = hex.encode(try cx.extend(b.len * 2), b, .upper);
         return cx.written();
     }
 };
@@ -143,8 +143,7 @@ pub const Unhex = struct {
     pub const signature = "(hex text)";
     pub fn apply(cx: Cx, t: []const u8) EvalError![]const u8 {
         if (t.len % 2 != 0) return bad("unhex", t, "an even number of hex digits");
-        const out = try cx.extend(t.len / 2);
-        for (out, 0..) |*o, i| o.* = std.fmt.parseInt(u8, t[i * 2 ..][0..2], 16) catch return bad("unhex", t, "hex digits");
+        _ = hex.decode(try cx.extend(t.len / 2), t) catch return bad("unhex", t, "hex digits");
         return cx.written();
     }
 };
@@ -1058,4 +1057,33 @@ test "read_bytes and file_size: ranges of a file, NULL offsets per row, and the 
             try testing.expect(row.isNull());
         }
     }
+}
+
+test "unhex takes hex digits only, with no sign or `_`, and hex prints every byte as two upper-case digits" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    const takeFailure = @import("support.zig").takeFailure;
+    try testing.expectEqualStrings("\x0F\xAB", (try lit(a, "unhex('0fAb')")).bytes);
+    try testing.expectEqualStrings("", (try lit(a, "unhex('')")).bytes);
+    const refused = [_]struct { src: []const u8, msg: []const u8 }{
+        .{ .src = "unhex('+f')", .msg = "`unhex`: `+f` is not hex digits" },
+        .{ .src = "unhex('-0')", .msg = "`unhex`: `-0` is not hex digits" },
+        .{ .src = "unhex('_1')", .msg = "`unhex`: `_1` is not hex digits" },
+        .{ .src = "unhex('0g')", .msg = "`unhex`: `0g` is not hex digits" },
+        .{ .src = "unhex('abc')", .msg = "`unhex`: `abc` is not an even number of hex digits" },
+    };
+    for (refused) |r| {
+        errdefer std.debug.print("in `{s}`\n", .{r.src});
+        try testing.expectError(error.CastFailed, lit(a, r.src));
+        try testing.expectEqualStrings(r.msg, takeFailure(error.CastFailed).?);
+    }
+    var want: [512]u8 = undefined;
+    for (0..256) |i| _ = try std.fmt.bufPrint(want[i * 2 ..][0..2], "{X:0>2}", .{@as(u8, @intCast(i))});
+    const got = try lit(a, try std.fmt.allocPrint(a, "hex(unhex('{s}'))", .{&want}));
+    try testing.expectEqualStrings(&want, switch (got) {
+        .string, .bytes => |s| s,
+        else => return error.TestUnexpectedResult,
+    });
 }

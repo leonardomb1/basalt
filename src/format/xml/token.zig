@@ -9,6 +9,7 @@
 //! Tag attributes and text are returned raw; entities are decoded with `decode`.
 
 const std = @import("std");
+const hex = @import("../hex.zig");
 
 pub const Error = error{ BadXml, XmlTokenTooLong, OutOfMemory, ReadFailed };
 
@@ -283,10 +284,10 @@ pub fn decodeInto(out: *std.array_list.Managed(u8), raw: []const u8, ooxml: bool
         const ent = raw[i + 1 .. semi];
         i = semi + 1;
         if (ent.len > 1 and ent[0] == '#') {
-            const cp = (if (ent[1] == 'x' or ent[1] == 'X')
-                std.fmt.parseInt(u21, ent[2..], 16)
+            const cp = if (ent[1] == 'x' or ent[1] == 'X')
+                hex.int(u21, ent[2..]) orelse return error.BadXml
             else
-                std.fmt.parseInt(u21, ent[1..], 10)) catch return error.BadXml;
+                std.fmt.parseInt(u21, ent[1..], 10) catch return error.BadXml;
             try appendCodepoint(out, cp);
         } else if (std.mem.eql(u8, ent, "amp")) {
             try out.append('&');
@@ -376,4 +377,15 @@ test "decode: entities, then OOXML _xHHHH_ escapes" {
     try decodeInto(&out, "keep_x000D_", false);
     try std.testing.expectEqualStrings("keep_x000D_", out.items);
     try std.testing.expectError(error.BadXml, decodeInto(&out, "bad &nope;", false));
+}
+
+test "decode: a hex character reference takes hex digits only, with no sign or `_`" {
+    var out = std.array_list.Managed(u8).init(std.testing.allocator);
+    defer out.deinit();
+    try decodeInto(&out, "&#x41;&#X0042;&#x10FFFF;", false);
+    try std.testing.expectEqualStrings("AB\u{10FFFF}", out.items);
+    for ([_][]const u8{ "&#x4_1;", "&#x+41;", "&#x-0;", "&#x;", "&#x110000;", "&#xD800;", "&#x0x41;" }) |bad| {
+        errdefer std.debug.print("in `{s}`\n", .{bad});
+        try std.testing.expectError(error.BadXml, decodeInto(&out, bad, false));
+    }
 }
