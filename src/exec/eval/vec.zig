@@ -27,7 +27,7 @@ const intDiv = @import("row.zig").intDiv;
 const intRem = @import("row.zig").intRem;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const max_digits = @import("../decimal.zig").max_digits;
-const orderF64 = @import("support.zig").orderF64;
+const floatord = @import("../floatord.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const std = @import("std");
@@ -535,7 +535,7 @@ inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError
     };
 }
 
-/// A comparison without branches. f64 follows `orderF64`'s total order, where NaN
+/// A comparison without branches. f64 follows `floatord`'s total order, where NaN
 /// equals NaN and sorts above every number, so the lanes vectorize.
 inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
     if (T != f64) return switch (op) {
@@ -547,11 +547,9 @@ inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
         .ge => a >= d,
         else => unreachable,
     };
-    const an = std.math.isNan(a);
-    const dn = std.math.isNan(d);
-    const eq = (a == d) | (an & dn);
-    const lt = (a < d) | (!an & dn);
-    const gt = (a > d) | (an & !dn);
+    const eq = floatord.eqF64(a, d);
+    const lt = floatord.ltF64(a, d);
+    const gt = floatord.ltF64(d, a);
     return switch (op) {
         .eq => eq,
         .ne => !eq,
