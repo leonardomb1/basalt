@@ -38,7 +38,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const Part = @import("../../store/part.zig").Part;
 const flatbuf = @import("flatbuf.zig");
-const rescaleTo = @import("../../exec/eval.zig").rescaleTo;
+const littleEndian128 = @import("../../exec/decimal.zig").littleEndian128;
 
 comptime {
     if (builtin.cpu.arch.endian() != .little)
@@ -334,13 +334,13 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
         .float => try body.push(std.mem.sliceAsBytes((try store(col.data, .f64))[0..n])),
         .date => try body.push(std.mem.sliceAsBytes((try store(col.data, .i32))[0..n])),
         .decimal => {
-            const src = try store(col.data, .dec);
+            if (col.data != .dec) return error.ArrowColumnStoreMismatch;
+            const src = column.decimals(col.*);
             const out = try arena.alloc(u8, n * 16);
             @memset(out, 0);
-            for (src[0..n], 0..) |d, i| {
+            for (0..n) |i| {
                 if (!col.validity.get(i)) continue;
-                const r = rescaleTo(d, col.ty.scale) orelse return error.DecimalOverflow;
-                std.mem.writeInt(i128, out[i * 16 ..][0..16], r.unscaled, .little);
+                if (!littleEndian128(out[i * 16 ..][0..16], src.at(i), col.ty.scale)) return error.DecimalOverflow;
             }
             try body.push(out);
         },

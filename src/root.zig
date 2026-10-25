@@ -12,6 +12,7 @@ pub const expand = @import("lang/expand.zig");
 pub const print = @import("lang/print.zig");
 pub const value = @import("exec/value.zig");
 pub const civil = @import("exec/civil.zig");
+pub const decimal = @import("exec/decimal.zig");
 pub const cell = @import("exec/cell.zig");
 pub const column = @import("exec/column.zig");
 pub const celltext = @import("exec/celltext.zig");

@@ -55,6 +55,7 @@ const thrift = @import("thrift.zig");
 const varint = @import("../varint.zig");
 const codec = @import("../compress/codecs.zig");
 const eval = @import("../../exec/eval.zig");
+const decimal = @import("../../exec/decimal.zig");
 const driver = @import("../../connect/driver.zig");
 const objstore = @import("../../store/objstore.zig");
 const Part = @import("../../store/part.zig").Part;
@@ -1207,8 +1208,8 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
             return encodeFixedSlice(i32, cb, sa, m.optional, col, d, lo, hi),
         .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
             return encodeBytesSlice(cb, sa, m.optional, col, lo, hi),
-        .dec => |d| if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
-            return encodeDecimalSlice(cb, sa, m, col, d, lo, hi),
+        .dec => if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
+            return encodeDecimalSlice(cb, sa, m, col, column.decimals(col), lo, hi),
         else => {},
     }
     for (lo..hi) |r| try encodeValue(cb, sa, m, col.getValue(r));
@@ -1287,7 +1288,7 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
 
 /// Each value rescaled to the column's scale as `plainFixed` does, so min and max
 /// compare the integers that are written.
-fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, data: []const Decimal, lo: usize, hi: usize) !void {
+fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Column, data: column.DecView, lo: usize, hi: usize) !void {
     const scale = m.scale orelse 0;
     const width: usize = switch (m.phys) {
         .int32 => 4,
@@ -1311,17 +1312,17 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
         const out = buf[0..width];
         const x: i128 = switch (m.phys) {
             .int32 => blk: {
-                const v = try rescaleTo(i32, data[r], scale);
+                const v = try rescaleTo(i32, data.at(r), scale);
                 std.mem.writeInt(i32, out[0..4], v, .little);
                 break :blk v;
             },
             .int64 => blk: {
-                const v = try rescaleTo(i64, data[r], scale);
+                const v = try rescaleTo(i64, data.at(r), scale);
                 std.mem.writeInt(i64, out[0..8], v, .little);
                 break :blk v;
             },
             else => blk: {
-                const v = try rescaleTo(i128, data[r], scale);
+                const v = try rescaleTo(i128, data.at(r), scale);
                 try decimalBytes(out, v);
                 break :blk v;
             },
@@ -1433,22 +1434,13 @@ fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
 /// The unscaled integer restated to the schema's scale. Overflow is an error:
 /// clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
 fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
-    const r = eval.rescaleTo(d, @intCast(want)) orelse return Error.UnsupportedParquetDecimal;
-    return std.math.cast(T, r.unscaled) orelse Error.UnsupportedParquetDecimal;
+    return decimal.rescaleAs(T, d, @intCast(want)) orelse Error.UnsupportedParquetDecimal;
 }
 
 /// Big-endian two's complement in exactly `len` bytes (a FIXED_LEN_BYTE_ARRAY
 /// decimal); errors rather than truncating a value the precision cannot hold.
 fn decimalBytes(b: []u8, x: i128) Error!void {
-    if (b.len == 0 or b.len > 16) return Error.UnsupportedParquetDecimal;
-    var v = x;
-    var i = b.len;
-    while (i > 0) : (i -= 1) {
-        b[i - 1] = @truncate(@as(u128, @bitCast(v)));
-        v >>= 8;
-    }
-    if (v != (if (x < 0) @as(i128, -1) else 0)) return Error.UnsupportedParquetDecimal;
-    if ((b[0] & 0x80 != 0) != (x < 0)) return Error.UnsupportedParquetDecimal;
+    if (!decimal.fixedBigEndian(b, x)) return Error.UnsupportedParquetDecimal;
 }
 
 const sink_vtable = driver.sinkVTable(Writer);

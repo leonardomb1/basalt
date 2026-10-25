@@ -28,6 +28,7 @@ const Value = @import("../../value.zig").Value;
 const Decimal = @import("../../value.zig").Decimal;
 const ast = @import("../../../lang/ast.zig");
 const eval = @import("../../eval.zig");
+const decimal = @import("../../decimal.zig");
 const simd = @import("../../simd.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -111,21 +112,21 @@ pub const SumDecimal = struct {
     pub const fold_expr = true;
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
-        try eval.addAtScale(&s.s, x, cx.out.scale);
+        try decimal.addAtScale(&s.s, x, cx.out.scale);
         s.n += 1;
     }
     pub fn remove(s: *State, x: Decimal, cx: Ctx) !void {
-        const u = (eval.rescaleTo(x, cx.out.scale) orelse return eval.decimalOverflow()).unscaled;
-        s.s = std.math.sub(i256, s.s, u) catch return eval.decimalOverflow();
+        const u = (decimal.rescaleTo(x, cx.out.scale) orelse return decimal.decimalOverflow()).unscaled;
+        s.s = std.math.sub(i256, s.s, u) catch return decimal.decimalOverflow();
         s.n -= 1;
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
-        d.s = std.math.add(i256, d.s, s.s) catch return eval.decimalOverflow();
+        d.s = std.math.add(i256, d.s, s.s) catch return decimal.decimalOverflow();
         d.n += s.n;
     }
     pub fn finish(s: *const State, cx: Ctx) !Value {
         if (s.n == 0) return .null;
-        return .{ .decimal = eval.wideSumDecimal(s.s, cx.out.scale) orelse return eval.decimalOverflow() };
+        return .{ .decimal = decimal.wideSumDecimal(s.s, cx.out.scale) orelse return decimal.decimalOverflow() };
     }
 };
 
@@ -181,15 +182,7 @@ pub const AvgDecimal = struct {
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0, f: f64 = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
         s.n += 1;
-        if (x.scale > cx.ty.scale) {
-            s.f += x.toF64();
-            return;
-        }
-        const r = eval.rescaleTo(x, cx.ty.scale) orelse {
-            s.f += x.toF64();
-            return;
-        };
-        s.s += r.unscaled;
+        decimal.addAvg(&s.s, &s.f, x, cx.ty.scale);
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.s += s.s;
@@ -198,8 +191,7 @@ pub const AvgDecimal = struct {
     }
     pub fn finish(s: *const State, cx: Ctx) !Value {
         if (s.n == 0) return .null;
-        const whole = @as(f64, @floatFromInt(s.s)) / std.math.pow(f64, 10, @floatFromInt(cx.ty.scale));
-        return .{ .float = (whole + s.f) / @as(f64, @floatFromInt(s.n)) };
+        return .{ .float = decimal.avgOf(s.s, s.f, s.n, cx.ty.scale) };
     }
 };
 

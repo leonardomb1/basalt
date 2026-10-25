@@ -3,8 +3,8 @@
 
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
-const asDecimal = @import("row.zig").asDecimal;
-const asDecimalValue = @import("cast.zig").asDecimalValue;
+const asDecimal = @import("../decimal.zig").asDecimal;
+const asDecimalValue = @import("../decimal.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
@@ -15,16 +15,8 @@ const regex = @import("../regex.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const valueToString = @import("format.zig").valueToString;
-const writeDecimal = @import("format.zig").writeDecimal;
 const evalLit = @import("testing_util.zig").evalLit;
 const formatTimestamp = @import("format.zig").formatTimestamp;
-
-pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]const u8 {
-    var buf: [fmt_bound]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    writeDecimal(&w, unscaled, scale) catch unreachable;
-    return arena.dupe(u8, w.buffered());
-}
 
 threadlocal var field_memo: [8]usize = @splat(0);
 
@@ -94,10 +86,6 @@ pub fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError
     n.len = msg.len;
     n.err = e;
     return e;
-}
-
-pub fn decimalOverflow() error{IntOverflow} {
-    return @errorCast(failWith(error.IntOverflow, "decimal overflow: more than 38 digits", .{}));
 }
 
 /// A CAST failure naming the value and target, with the format a date or time is
@@ -244,16 +232,6 @@ test "toI64 truncates a decimal as it does a float" {
     try std.testing.expectEqual(@as(i64, 2024), toI64(.{ .decimal = .{ .unscaled = 20249, .scale = 1 } }));
     try std.testing.expectEqual(@as(i64, -86400), toI64(.{ .decimal = .{ .unscaled = -864005, .scale = 1 } }));
     try std.testing.expectEqual(@as(i64, 7), toI64(.{ .decimal = .{ .unscaled = 7, .scale = 0 } }));
-}
-
-test "formatDecimal pads sub-unit magnitudes, zero, and negatives" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    try std.testing.expectEqualStrings("-0.005", try formatDecimal(a, -5, 3));
-    try std.testing.expectEqualStrings("0", try formatDecimal(a, 0, 0));
-    try std.testing.expectEqualStrings("0.00", try formatDecimal(a, 0, 2));
-    try std.testing.expectEqualStrings("7", try formatDecimal(a, 7, 0));
 }
 
 test "compareValues orders across numeric kinds and rejects mixed kinds" {

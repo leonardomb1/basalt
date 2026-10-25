@@ -4,15 +4,15 @@
 
 const Cx = @import("scalar.zig").Cx;
 const Decimal = @import("../value.zig").Decimal;
-const pow10_i128 = @import("../value.zig").pow10_i128;
+const decimal = @import("../decimal.zig");
 const Numeric = @import("scalar.zig").Numeric;
 const Overload = @import("scalar.zig").Overload;
 const Type = @import("../../lang/types.zig").Type;
 const TypeKind = @import("../../lang/types.zig").TypeKind;
 const ast = @import("../../lang/ast.zig");
-const roundDecimal = @import("cast.zig").roundDecimal;
+const roundDecimal = @import("../decimal.zig").roundDecimal;
 const roundHalfAway = @import("strings.zig").roundHalfAway;
-const roundOutScale = @import("cast.zig").roundOutScale;
+const roundOutScale = @import("../decimal.zig").roundOutScale;
 const time = @import("time.zig");
 const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
@@ -329,7 +329,7 @@ pub const Abs = Numeric(struct {
         return @abs(x);
     }
     pub fn dec(d: Decimal) Decimal {
-        return .{ .unscaled = if (d.unscaled < 0) -d.unscaled else d.unscaled, .scale = d.scale };
+        return decimal.abs(d);
     }
 });
 
@@ -343,17 +343,10 @@ pub fn Whole(comptime down: bool) type {
             return if (down) @floor(x) else @ceil(x);
         }
         pub fn dec(d: Decimal) Decimal {
-            if (d.scale >= pow10_i128.len) return .{ .unscaled = 0, .scale = 0 };
-            const p = pow10_i128[d.scale];
-            var q = @divTrunc(d.unscaled, p);
-            if (@rem(d.unscaled, p) != 0) {
-                if (down and d.unscaled < 0) q -= 1;
-                if (!down and d.unscaled > 0) q += 1;
-            }
-            return .{ .unscaled = q, .scale = 0 };
+            return decimal.whole(down, d);
         }
         pub fn decType(t: Type) Type {
-            return Type.decimal(@min(38, (t.precision -| t.scale) + 1), 0);
+            return decimal.wholeType(t);
         }
     });
 }
@@ -369,7 +362,7 @@ pub const Sign = Numeric(struct {
         return if (x > 0) 1 else if (x < 0) -1 else 0;
     }
     pub fn dec(d: Decimal) Decimal {
-        return .{ .unscaled = std.math.sign(d.unscaled), .scale = 0 };
+        return decimal.sign(d);
     }
     pub fn decType(_: Type) Type {
         return Type.decimal(1, 0);
@@ -522,11 +515,7 @@ const ToTimestampDec = struct {
     pub const args = .{.dec};
     pub const result = .timestamp;
     pub fn apply(_: Cx, d: Decimal) EvalError!i64 {
-        var q: i128 = d.unscaled;
-        var s: u8 = d.scale;
-        while (s < 6) : (s += 1) q = std.math.mul(i128, q, 10) catch return error.IntOverflow;
-        while (s > 6) : (s -= 1) q = @divTrunc(q + (if (s == 7) @as(i128, if (q < 0) -5 else 5) else 0), 10);
-        return std.math.cast(i64, q) orelse error.IntOverflow;
+        return decimal.toMicros(d) orelse error.IntOverflow;
     }
 };
 

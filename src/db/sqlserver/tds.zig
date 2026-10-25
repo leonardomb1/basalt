@@ -49,6 +49,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const cell = @import("../../exec/cell.zig");
+const decimal = @import("../../exec/decimal.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -1279,8 +1280,8 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .int => try b.appendInt(readIntLE(raw)),
         .bool => try b.appendAs(.b, raw.len > 0 and raw[0] != 0),
         .float => try b.appendFloat(if (raw.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(raw)))))) else @bitCast(readULE(raw))),
-        .decimal => try b.appendAs(.dec, try decodeDecimal(d, raw)),
-        .money => try b.appendAs(.dec, try decodeMoney(raw)),
+        .decimal => try b.appendDecimal(try decodeDecimal(d, raw)),
+        .money => try b.appendDecimal(try decodeMoney(raw)),
         .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(raw))) - 719162)) |days| try b.appendAs(.i32, days) else try b.appendNull(),
         .time => try b.appendInt(try decodeTime(d, raw)),
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
@@ -1312,21 +1313,12 @@ fn decodeDecimal(d: ColumnDesc, bytes: []const u8) MalformedValue!Decimal {
         5, 9, 13, 17 => {},
         else => return error.MalformedTdsValue,
     }
-    const v = cell.signMagnitudeDecimal(bytes[0] == 1, bytes[1..]) orelse return error.MalformedTdsValue;
+    const v = decimal.signMagnitudeDecimal(bytes[0] == 1, bytes[1..]) orelse return error.MalformedTdsValue;
     return .{ .unscaled = v, .scale = d.scale };
 }
 
 fn decodeMoney(bytes: []const u8) MalformedValue!Decimal {
-    const unscaled: i64 = switch (bytes.len) {
-        4 => std.mem.readInt(i32, bytes[0..4], .little),
-        8 => blk: {
-            const hi: u64 = @bitCast(@as(i64, std.mem.readInt(i32, bytes[0..4], .little)));
-            const lo: u64 = std.mem.readInt(u32, bytes[4..8], .little);
-            break :blk @bitCast((hi << 32) | lo);
-        },
-        else => return error.MalformedTdsValue,
-    };
-    return .{ .unscaled = unscaled, .scale = 4 };
+    return decimal.money(bytes) orelse error.MalformedTdsValue;
 }
 
 /// TIMENTYPE: 3-5 little-endian bytes counting 10^-scale seconds since midnight.

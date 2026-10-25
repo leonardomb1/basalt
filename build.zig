@@ -1,5 +1,6 @@
 //! The build graph. The e2e and docs tests see the engine only as the `basalt` module,
-//! its public API; the docs check reads docs/, so it always re-runs. Coverage builds the
+//! its public API; the docs check reads docs/, so it always re-runs. The unit tests run
+//! from the repo root, since one of them reads src/. Coverage builds the
 //! tests with LLVM, since kcov cannot read the self-hosted backend's debug info, and makes
 //! zig-out/ first, since kcov creates only its own folder. `bench-e2e` times the installed
 //! CLI, so it needs -Doptimize=ReleaseFast for meaningful numbers.
@@ -54,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .filters = filters,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.setCwd(b.path("."));
 
     const basalt_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -114,6 +116,7 @@ pub fn build(b: *std.Build) void {
             const dir = b.fmt("{s}-{s}", .{ out_dir, name });
             const run = b.addSystemCommand(&.{ kcov, include, dir });
             run.addArtifactArg(t);
+            run.setCwd(b.path("."));
             run.has_side_effects = true;
             run.step.dependOn(&mkdir.step);
             merge.addArg(dir);

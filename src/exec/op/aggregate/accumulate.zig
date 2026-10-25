@@ -162,7 +162,7 @@ const Outs = struct {
                     sa.* = try column.BytesAppender.init(arena, n);
                     d.* = .{ .bytes = undefined };
                 },
-                inline else => |t| d.* = @unionInit(column.Column.Data, @tagName(t), try arena.alloc(column.Elem(t), n)),
+                inline else => |t| d.* = column.dataOf(t, try arena.alloc(column.Elem(t), n)),
             }
         }
         for (o.boxed, tys[0..o.boxed.len]) |*b, ty| b.* = try column.Builder.initCapacity(arena, ty, @max(n, 1));
@@ -180,8 +180,9 @@ const Outs = struct {
                         try sa.pushNull();
                     } else try sa.push(o.strs.?.at(@intCast(k[j])));
                 },
-                inline else => |arr| {
-                    const T = @TypeOf(arr[0]);
+                inline else => |_, tag| {
+                    const arr = column.fixedOf(tag, d.*);
+                    const T = column.Elem(tag);
                     for (keys, masks, arr[o.at..][0..keys.len], o.at..) |k, m, *x, r| {
                         if (m & bit != 0) {
                             bm.setValid(r, false);

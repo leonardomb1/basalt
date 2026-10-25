@@ -29,7 +29,8 @@ const column = @import("../column.zig");
 const Batch = @import("../batch.zig").Batch;
 const Bitmap = @import("vec.zig").Bitmap;
 
-const max_digits = 38;
+const decimal = @import("../decimal.zig");
+const max_digits = decimal.max_digits;
 
 fn fieldOf(comptime name: []const u8, rec: []const u8, pos: i64, len: i64) EvalError![]const u8 {
     if (pos < 0 or len < 0 or pos > rec.len or len > @as(i64, @intCast(rec.len)) - pos)
@@ -240,36 +241,11 @@ fn digitsDecimal(comptime name: []const u8, raw: []const u8, scale: i64, sep: ?[
     if (t.len == 0) return null;
     if (scale < 0 or scale > max_digits) return failWith(error.CastFailed, "`" ++ name ++ "`: scale {d} is out of range", .{scale});
     const point: ?u8 = if (sep) |s| (if (s.len == 1 and (s[0] == '.' or s[0] == ',')) s[0] else return failWith(error.CastFailed, "`" ++ name ++ "`: the separator is `.` or `,`, not `{s}`", .{s})) else null;
-    var i: usize = 0;
-    const neg = t[0] == '-';
-    if (t[0] == '-' or t[0] == '+') i = 1;
-    var v: i128 = 0;
-    var places: i64 = 0;
-    var after = false;
-    var digits: usize = 0;
-    for (t[i..]) |c| {
-        if (point) |pt| {
-            if (c == pt) {
-                if (after) return bad(name, raw, "a decimal");
-                after = true;
-                continue;
-            }
-            if (c == (if (pt == ',') @as(u8, '.') else ',') and !after) continue;
-        }
-        if (c < '0' or c > '9') return bad(name, raw, "a decimal");
-        digits += 1;
-        if (digits > max_digits) return bad(name, raw, "a decimal of at most 38 digits");
-        v = v * 10 + (c - '0');
-        if (after) places += 1;
-    }
-    if (digits == 0) return bad(name, raw, "a decimal");
-    if (point == null) places = scale;
-    while (places > scale) : (places -= 1) {
-        if (@rem(v, 10) != 0) return bad(name, raw, "a decimal with at most its scale's places");
-        v = @divTrunc(v, 10);
-    }
-    while (places < scale) : (places += 1) v *= 10;
-    return .{ .unscaled = if (neg) -v else v, .scale = @intCast(scale) };
+    return decimal.fieldDecimal(t, point, scale) catch |e| switch (e) {
+        error.NotDecimal => bad(name, raw, "a decimal"),
+        error.TooManyDigits => bad(name, raw, "a decimal of at most 38 digits"),
+        error.TooManyPlaces => bad(name, raw, "a decimal with at most its scale's places"),
+    };
 }
 
 pub const DecimalAt = struct {
@@ -434,24 +410,6 @@ pub const TimestampAt = struct {
     }
 };
 
-/// A zoned decimal's last byte: its digit and whether it is negative, in ASCII
-/// overpunch (`{A`…`I` positive, `}J`…`R` negative) or EBCDIC zones (C/F positive,
-/// D negative); null when it is neither.
-fn overpunch(c: u8) ?struct { digit: u8, neg: bool } {
-    return switch (c) {
-        '0'...'9' => .{ .digit = c - '0', .neg = false },
-        '{' => .{ .digit = 0, .neg = false },
-        'A'...'I' => .{ .digit = c - 'A' + 1, .neg = false },
-        '}' => .{ .digit = 0, .neg = true },
-        'J'...'R' => .{ .digit = c - 'J' + 1, .neg = true },
-        else => if (c & 0x0F <= 9) switch (c >> 4) {
-            0xC, 0xF => .{ .digit = c & 0x0F, .neg = false },
-            0xD => .{ .digit = c & 0x0F, .neg = true },
-            else => null,
-        } else null,
-    };
-}
-
 pub const ZonedAt = struct {
     pub const args = .{ .str, .int, .int, .int };
     pub const signature = "(rec, pos, len, scale)";
@@ -465,15 +423,11 @@ pub const ZonedAt = struct {
     pub fn apply(_: Cx, rec: []const u8, pos: i64, len: i64, scale: i64) EvalError!?Decimal {
         const raw = try fieldOf("zoned_at", rec, pos, len);
         if (blank(raw)) return null;
-        if (raw.len > max_digits) return bad("zoned_at", raw, "a zoned decimal of at most 38 digits");
-        var v: i128 = 0;
-        for (raw[0 .. raw.len - 1]) |c| {
-            const d: u8 = if (c >= '0' and c <= '9') c - '0' else if (c >= 0xF0 and c <= 0xF9) c - 0xF0 else return bad("zoned_at", raw, "a zoned decimal");
-            v = v * 10 + d;
-        }
-        const last = overpunch(raw[raw.len - 1]) orelse return bad("zoned_at", raw, "a zoned decimal");
-        v = v * 10 + last.digit;
-        return .{ .unscaled = if (last.neg) -v else v, .scale = @intCast(scale) };
+        const v = decimal.zonedDecimal(raw) catch |e| return switch (e) {
+            error.TooManyDigits => bad("zoned_at", raw, "a zoned decimal of at most 38 digits"),
+            error.NotZoned => bad("zoned_at", raw, "a zoned decimal"),
+        };
+        return .{ .unscaled = v, .scale = @intCast(scale) };
     }
 };
 
@@ -493,25 +447,11 @@ pub const PackedAt = struct {
     }
     pub fn apply(_: Cx, rec: []const u8, pos: i64, len: i64, scale: i64) EvalError!Decimal {
         const raw = try fieldOf("packed_at", rec, pos, len);
-        if (raw.len == 0 or raw.len * 2 - 1 > max_digits) return bad("packed_at", raw, "a packed decimal of at most 38 digits");
-        var v: i128 = 0;
-        for (raw, 0..) |c, i| {
-            const hi = c >> 4;
-            const lo = c & 0x0F;
-            if (hi > 9) return bad("packed_at", raw, "a packed decimal");
-            v = v * 10 + hi;
-            if (i + 1 < raw.len) {
-                if (lo > 9) return bad("packed_at", raw, "a packed decimal");
-                v = v * 10 + lo;
-            } else {
-                const neg = switch (lo) {
-                    0xC, 0xF => false,
-                    0xD => true,
-                    else => return bad("packed_at", raw, "a packed decimal (its sign nibble is not C, D or F)"),
-                };
-                if (neg) v = -v;
-            }
-        }
+        const v = decimal.packedDecimal(raw) catch |e| return switch (e) {
+            error.TooManyDigits => bad("packed_at", raw, "a packed decimal of at most 38 digits"),
+            error.NotPacked => bad("packed_at", raw, "a packed decimal"),
+            error.BadSign => bad("packed_at", raw, "a packed decimal (its sign nibble is not C, D or F)"),
+        };
         return .{ .unscaled = v, .scale = @intCast(scale) };
     }
 };
@@ -602,14 +542,10 @@ pub const FmtInt = struct {
 /// `d` at `scale` places exactly: more places with nonzero digits there is an error.
 fn exactAt(comptime name: []const u8, d: Decimal, scale: i64) EvalError!i128 {
     if (scale < 0 or scale > max_digits) return failWith(error.CastFailed, "`" ++ name ++ "`: scale {d} is out of range", .{scale});
-    var v = d.unscaled;
-    var s: i64 = d.scale;
-    while (s > scale) : (s -= 1) {
-        if (@rem(v, 10) != 0) return failWith(error.CastFailed, "`" ++ name ++ "`: the value has more than {d} decimal places; round it first", .{scale});
-        v = @divTrunc(v, 10);
-    }
-    while (s < scale) : (s += 1) v = std.math.mul(i128, v, 10) catch return failWith(error.CastFailed, "`" ++ name ++ "`: the value is too large", .{});
-    return v;
+    return decimal.exactAtScale(d, scale) catch |e| switch (e) {
+        error.MorePlaces => failWith(error.CastFailed, "`" ++ name ++ "`: the value has more than {d} decimal places; round it first", .{scale}),
+        error.TooLarge => failWith(error.CastFailed, "`" ++ name ++ "`: the value is too large", .{}),
+    };
 }
 
 pub const FmtDecimal = struct {
@@ -621,23 +557,11 @@ pub const FmtDecimal = struct {
         const d = v orelse return spaces(cx, width, ' ');
         const u = try exactAt("fmt_decimal", d, scale);
         var buf: [48]u8 = undefined;
-        var digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(u)}) catch unreachable;
+        const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(u)}) catch unreachable;
         if (sep) |s| {
             if (s.len != 1 or (s[0] != '.' and s[0] != ',')) return failWith(error.CastFailed, "`fmt_decimal`: the separator is `.` or `,`, not `{s}`", .{s});
-            const places: usize = @intCast(scale);
-            var whole: [50]u8 = undefined;
-            const padded = if (digits.len <= places) blk: {
-                @memset(whole[0 .. places + 1 - digits.len], '0');
-                @memcpy(whole[places + 1 - digits.len .. places + 1], digits);
-                break :blk whole[0 .. places + 1];
-            } else digits;
             var withsep: [52]u8 = undefined;
-            const ip = padded.len - places;
-            @memcpy(withsep[0..ip], padded[0..ip]);
-            withsep[ip] = s[0];
-            @memcpy(withsep[ip + 1 .. ip + 1 + places], padded[ip..]);
-            digits = withsep[0 .. padded.len + 1];
-            return padDigits("fmt_decimal", cx, if (places == 0) digits[0 .. digits.len - 1] else digits, u < 0, width);
+            return padDigits("fmt_decimal", cx, decimal.withPoint(&withsep, digits, @intCast(scale), s[0]), u < 0, width);
         }
         return padDigits("fmt_decimal", cx, digits, u < 0, width);
     }
@@ -712,11 +636,7 @@ pub const FmtZoned = struct {
         const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(u)}) catch unreachable;
         if (width < 1 or digits.len > width) return tooWide("fmt_zoned", digits.len, width);
         const w: usize = @intCast(width);
-        const out = try cx.extend(w);
-        @memset(out, '0');
-        @memcpy(out[w - digits.len ..], digits);
-        const last = out[w - 1] - '0';
-        out[w - 1] = if (u < 0) (if (last == 0) '}' else 'J' + last - 1) else (if (last == 0) '{' else 'A' + last - 1);
+        decimal.zonedInto(try cx.extend(w), digits, u < 0);
         return cx.written();
     }
 };
@@ -732,13 +652,7 @@ pub const FmtPacked = struct {
         var buf: [48]u8 = undefined;
         const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(u)}) catch unreachable;
         if (digits.len > w * 2 - 1) return tooWide("fmt_packed", (digits.len + 2) / 2, width);
-        var nib: [80]u8 = undefined;
-        const nd = w * 2 - 1;
-        @memset(nib[0..nd], 0);
-        for (digits, 0..) |ch, i| nib[nd - digits.len + i] = ch - '0';
-        nib[nd] = if (u < 0) 0xD else 0xC;
-        const out = try cx.extend(w);
-        for (out, 0..) |*o, i| o.* = (nib[i * 2] << 4) | nib[i * 2 + 1];
+        decimal.packedInto(try cx.extend(w), digits, u < 0);
         return cx.written();
     }
 };
@@ -866,7 +780,7 @@ fn testBatch(a: std.mem.Allocator) !Batch {
     const days = try a.dupe(i32, &.{ 20162, 0, 19000, 10957 });
     const cols = try a.dupe(column.Column, &.{
         .{ .ty = types.Type.init(.bytes).asNullable(), .len = 4, .validity = valid, .data = .{ .bytes = try app.finish() } },
-        .{ .ty = types.Type.decimal(10, 2).asNullable(), .len = 4, .validity = dvalid, .data = .{ .dec = decs } },
+        .{ .ty = types.Type.decimal(10, 2).asNullable(), .len = 4, .validity = dvalid, .data = column.decimalData(decs) },
         .{ .ty = types.Type.init(.date), .len = 4, .validity = try Bitmap.initFull(a, 4), .data = .{ .i32 = days } },
     });
     const schema = try a.create(types.Schema);

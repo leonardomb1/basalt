@@ -28,6 +28,7 @@ const Stats = @import("../op.zig").Stats;
 const Value = @import("../value.zig").Value;
 const column = @import("../column.zig");
 const eval = @import("../eval.zig");
+const decimal = @import("../decimal.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Filter = @import("../op.zig").Filter;
@@ -648,14 +649,14 @@ pub const KeyArr = struct {
             },
             .float => .{ .floats = col.data.f64 },
             .decimal => blk: {
-                for (col.data.dec[0..n], 0..) |d, i| {
-                    if (col.validity.get(i)) scale = @max(scale, d.scale);
+                switch (column.decimals(col)) {
+                    inline else => |v| {
+                        scale = decimal.widestScale(v[0..n], col.validity);
+                        const out = try arena.alloc(i128, n);
+                        if (!decimal.unscaledAt(out, v[0..n], col.validity, scale)) break :blk Data{ .boxed = col };
+                        break :blk .{ .decs = out };
+                    },
                 }
-                const out = try arena.alloc(i128, n);
-                for (out, col.data.dec[0..n], 0..) |*o, d, i| {
-                    o.* = if (!col.validity.get(i)) 0 else (eval.rescaleTo(d, scale) orelse break :blk Data{ .boxed = col }).unscaled;
-                }
-                break :blk .{ .decs = out };
             },
             .string, .bytes => blk: {
                 const out = try arena.alloc([]const u8, n);

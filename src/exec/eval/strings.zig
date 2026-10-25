@@ -4,7 +4,7 @@
 const EvalError = @import("../eval.zig").EvalError;
 const failWith = @import("support.zig").failWith;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
-const pow10f = @import("../value.zig").pow10f;
+const pow10f = @import("../decimal.zig").pow10f;
 const std = @import("std");
 
 pub inline fn charWidth(s: []const u8, i: usize) usize {

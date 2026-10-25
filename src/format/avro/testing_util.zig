@@ -7,7 +7,7 @@ const schema = @import("schema.zig");
 const read = @import("read.zig");
 const write = @import("write.zig");
 const varint = @import("../varint.zig");
-const pow10_i128 = @import("../../exec/value.zig").pow10_i128;
+const pow10_i128 = @import("../../exec/decimal.zig").pow10_i128;
 
 const Node = schema.Node;
 

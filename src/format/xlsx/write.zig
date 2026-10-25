@@ -30,6 +30,7 @@ const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const celltext = @import("../../exec/celltext.zig");
 const format = @import("../../exec/eval/format.zig");
+const decimal = @import("../../exec/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
@@ -168,15 +169,15 @@ pub const Writer = struct {
                 return w.print("<c r=\"{s}{d}\"><v>{e}</v></c>", .{ ref, self.row, x });
             },
             .decimal => {
-                const d = c.data.dec[r];
+                const d = column.decimals(c.*).at(r);
                 try w.print("<c r=\"{s}{d}\"", .{ ref, self.row });
-                if (exactInDouble(d.unscaled)) {
+                if (decimal.exactInDouble(d.unscaled)) {
                     try w.writeAll("><v>");
-                    try format.writeDecimal(w, d.unscaled, d.scale);
+                    try decimal.writeDecimal(w, d.unscaled, d.scale);
                     return w.writeAll("</v></c>");
                 }
                 try w.writeAll(" t=\"inlineStr\"><is><t>");
-                try format.writeDecimal(w, d.unscaled, d.scale);
+                try decimal.writeDecimal(w, d.unscaled, d.scale);
                 return w.writeAll("</t></is></c>");
             },
             .date => {
@@ -266,14 +267,6 @@ fn charsOf(s: []const u8, valid: bool) usize {
 
 fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
-}
-
-/// Whether a double holds the decimal exactly enough to print back: at most 15
-/// significant digits.
-fn exactInDouble(unscaled: i128) bool {
-    var m: u128 = @abs(unscaled);
-    while (m != 0 and m % 10 == 0) m /= 10;
-    return m < 1_000_000_000_000_000;
 }
 
 const xml_decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
@@ -392,9 +385,9 @@ test "Excel's bounds: columns refused at open, a cell's characters counted, not 
 }
 
 test "decimals a double holds exactly" {
-    try std.testing.expect(exactInDouble(123456789012345));
-    try std.testing.expect(exactInDouble(-12345678901234500000));
-    try std.testing.expect(!exactInDouble(1234567890123456));
+    try std.testing.expect(decimal.exactInDouble(123456789012345));
+    try std.testing.expect(decimal.exactInDouble(-12345678901234500000));
+    try std.testing.expect(!decimal.exactInDouble(1234567890123456));
 }
 
 const Dump = struct {

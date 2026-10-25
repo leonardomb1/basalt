@@ -19,6 +19,7 @@ const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const column = @import("../../exec/column.zig");
 const cell = @import("../../exec/cell.zig");
+const decimal = @import("../../exec/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const format = @import("../../exec/eval/format.zig");
 const celltext = @import("../../exec/celltext.zig");
@@ -125,8 +126,8 @@ pub const Cursor = struct {
 /// A two's complement big-endian integer as an unscaled decimal; one wider than
 /// an i128 or with more digits than `precision` is corrupt.
 pub fn unscaledOf(b: []const u8, precision: u8) Error!i128 {
-    const v = cell.bigEndianDecimal(b) orelse return corrupt("a decimal wider than its precision", .{});
-    if (!cell.withinPrecision(v, precision)) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
+    const v = decimal.bigEndianDecimal(b) orelse return corrupt("a decimal wider than its precision", .{});
+    if (!decimal.withinPrecision(v, precision)) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
     return v;
 }
 
@@ -381,7 +382,7 @@ pub const Machine = struct {
         const b = &m.out[op.col];
         const t = comptime Code.storageOf(c);
         if (t == null) return b.appendNull();
-        if (t.? == .bytes) try b.appendStr(v) else b.appendAsAssumeCapacity(t.?, v);
+        if (t.? == .bytes) try b.appendStr(v) else if (t.? == .dec) b.appendDecimalAssumeCapacity(v) else b.appendAsAssumeCapacity(t.?, v);
     }
 
     fn Read(comptime c: Code) type {

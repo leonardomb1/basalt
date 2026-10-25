@@ -57,8 +57,8 @@ const toF64 = @import("support.zig").toF64;
 const toI64 = @import("support.zig").toI64;
 const valueToString = @import("format.zig").valueToString;
 const Decimal = @import("../value.zig").Decimal;
-const rescaleTo = @import("cast.zig").rescaleTo;
-const decimalOverflow = @import("support.zig").decimalOverflow;
+const rescaleTo = @import("../decimal.zig").rescaleTo;
+const decimalOverflow = @import("../decimal.zig").decimalOverflow;
 const types = @import("../../lang/types.zig");
 const TypeCtx = @import("../eval.zig").TypeCtx;
 const TypeError = @import("../eval.zig").TypeError;
@@ -298,7 +298,9 @@ fn typedArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecErro
         } },
         .col => |c| switch (a) {
             .dec => switch (c.ty.kind) {
-                .decimal => return .{ .col = .{ .d = c.data.dec, .v = c.validity } },
+                .decimal => switch (column.decimals(c)) {
+                    inline else => |ds| return .{ .col = .{ .d = ds, .v = c.validity } },
+                },
                 .int => {
                     const out = try arena.alloc(E, n);
                     for (c.data.i64[0..n], out) |x, *o| o.* = .{ .unscaled = x, .scale = 0 };

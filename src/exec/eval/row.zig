@@ -3,7 +3,9 @@
 //! the JSON array functions use.
 
 const Batch = @import("../batch.zig").Batch;
-const Decimal = @import("../value.zig").Decimal;
+const decimal = @import("../decimal.zig");
+const asDecimal = decimal.asDecimal;
+const decimalOp = @import("../decimal.zig").decimalOp;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const TypeCtx = @import("../eval.zig").TypeCtx;
@@ -18,12 +20,6 @@ const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
 const failWith = @import("support.zig").failWith;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
-const rescaleTo = @import("cast.zig").rescaleTo;
-const roundScaleDown = @import("cast.zig").roundScaleDown;
-const decimalOverflow = @import("support.zig").decimalOverflow;
-const fitsPrecision = @import("cast.zig").fitsPrecision;
-const max_digits = @import("cast.zig").max_digits;
-const pow10_i256 = @import("../value.zig").pow10_i256;
 const std = @import("std");
 const toF64 = @import("support.zig").toF64;
 const types = @import("../../lang/types.zig");
@@ -51,7 +47,7 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                 .neg => switch (v) {
                     .int => |x| .{ .int = std.math.negate(x) catch return error.IntOverflow },
                     .float => |x| .{ .float = -x },
-                    .decimal => |d| .{ .decimal = .{ .unscaled = -d.unscaled, .scale = d.scale } },
+                    .decimal => |d| .{ .decimal = decimal.negate(d) },
                     else => error.TypeMismatch,
                 },
                 .not => .{ .bool = !v.bool },
@@ -183,146 +179,6 @@ pub fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         .mod => .{ .float = @rem(a, b) },
         else => unreachable,
     };
-}
-
-/// The exact DECIMAL type of `op`, or null when it stays float. `+ - %` take the
-/// wider scale, `*` the summed scale; an INT operand is a DECIMAL(19,0). A
-/// quotient's scale is the operands' wider one but at least 16 while its whole
-/// digits leave room; each value carries the finer scale `decimalDiv` picks.
-pub fn decimalArithType(op: ast.BinOp, lt: Type, rt: Type) ?Type {
-    switch (op) {
-        .add, .sub, .mul, .div, .mod => {},
-        else => return null,
-    }
-    if (lt.kind == .float or rt.kind == .float) return null;
-    if (lt.kind != .decimal and rt.kind != .decimal) return null;
-    const lp: u16 = if (lt.kind != .decimal) 19 else if (lt.precision == 0) 38 else lt.precision;
-    const rp: u16 = if (rt.kind != .decimal) 19 else if (rt.precision == 0) 38 else rt.precision;
-    const ls: u16 = if (lt.kind == .decimal) lt.scale else 0;
-    const rs: u16 = if (rt.kind == .decimal) rt.scale else 0;
-    const whole = (lp -| ls) + rs;
-    const scale: u16 = switch (op) {
-        .mul => ls + rs,
-        .div => @max(ls, rs, @min(div_min_digits, max_digits -| whole)),
-        else => @max(ls, rs),
-    };
-    const prec: u16 = switch (op) {
-        .mul => lp + rp,
-        .div => whole + scale,
-        .mod => @max(1, @min(lp -| ls, rp -| rs) + scale),
-        else => @max(lp -| ls, rp -| rs) + scale + 1,
-    };
-    return Type.decimal(@intCast(@min(38, prec)), @intCast(@min(38, scale)));
-}
-
-const div_min_digits = 16;
-
-/// `a / b` as PostgreSQL's numeric division answers it (`select_div_scale`): at
-/// least 16 significant digits, judged from the operands' leading base-10000
-/// digits, and no fewer scale digits than either operand, rounded half away from
-/// zero. Past 38 digits in all, the scale gives way first.
-pub fn decimalDiv(a: Decimal, b: Decimal) error{ IntOverflow, DivByZero }!Decimal {
-    if (b.unscaled == 0) return error.DivByZero;
-    const wa = pgWeight(a);
-    const wb = pgWeight(b);
-    var qweight = wa.weight - wb.weight;
-    if (wa.first <= wb.first) qweight -= 1;
-    const rscale: i32 = @max(div_min_digits - qweight * 4, a.scale, b.scale, 0);
-    var scale: u8 = @intCast(@min(rscale, max_digits));
-    while (true) {
-        const q = quotientAt(a, b, scale);
-        const excess = excessDigits(q);
-        if (excess == 0) return .{ .unscaled = @intCast(q), .scale = scale };
-        if (scale < excess) return decimalOverflow();
-        scale -= excess;
-    }
-}
-
-/// A decimal's PostgreSQL weight (the power of 10000 of its leading base-10000
-/// digit) and that digit; a zero is weight 0, digit 0.
-fn pgWeight(d: Decimal) struct { weight: i32, first: u256 } {
-    const u: u256 = @abs(d.unscaled);
-    if (u == 0) return .{ .weight = 0, .first = 0 };
-    var n: i32 = 1;
-    while (n < pow10_i256.len and u >= @as(u256, @intCast(pow10_i256[@intCast(n)]))) n += 1;
-    const weight = @divFloor(n - 1 - @as(i32, d.scale), 4);
-    const shift = weight * 4 + d.scale;
-    const first = if (shift >= 0) u / @as(u256, @intCast(pow10_i256[@intCast(shift)])) else u * @as(u256, @intCast(pow10_i256[@intCast(-shift)]));
-    return .{ .weight = weight, .first = first };
-}
-
-/// `a / b` at `scale`, rounded half away from zero. i256 holds every case whose
-/// dividend is raised by at most 38 places; only a wider shift pays for i512.
-fn quotientAt(a: Decimal, b: Decimal, scale: u8) i512 {
-    const e: i32 = @as(i32, scale) + b.scale - a.scale;
-    if (e <= max_digits) return roundedQuotient(i256, a.unscaled, b.unscaled, e);
-    return roundedQuotient(i512, a.unscaled, b.unscaled, e);
-}
-
-fn roundedQuotient(comptime T: type, x: i128, y: i128, e: i32) T {
-    var n: T = x;
-    var d: T = y;
-    if (e >= 0) n *= pow10Of(T, @intCast(e)) else d *= pow10Of(T, @intCast(-e));
-    const q = @divTrunc(n, d);
-    const r = @rem(n, d);
-    if (@abs(r) * 2 >= @abs(d)) return if ((n < 0) != (d < 0)) q - 1 else q + 1;
-    return q;
-}
-
-fn pow10Of(comptime T: type, n: u16) T {
-    if (n < pow10_i256.len) return pow10_i256[n];
-    var r: T = pow10_i256[pow10_i256.len - 1];
-    for (pow10_i256.len - 1..n) |_| r *= 10;
-    return r;
-}
-
-/// How many digits `q` has past 38; 0 when it fits.
-fn excessDigits(q: i512) u8 {
-    var k: u8 = 0;
-    const u = @abs(q);
-    while (u >= @as(u512, @intCast(pow10Of(i512, max_digits + k)))) k += 1;
-    return k;
-}
-
-pub fn asDecimal(v: Value) ?Decimal {
-    return switch (v) {
-        .decimal => |d| d,
-        .int => |x| .{ .unscaled = x, .scale = 0 },
-        else => null,
-    };
-}
-
-/// `*` multiplies in i256 so a product past scale 38 can round back to it before
-/// the 38-digit check; any result wider than 38 digits is a decimal overflow.
-pub fn decimalOp(op: ast.BinOp, a: Decimal, b: Decimal) ?error{ IntOverflow, DivByZero }!Decimal {
-    const r: Decimal = switch (op) {
-        .mul => blk: {
-            const s = @as(u16, a.scale) + b.scale;
-            if (s <= max_digits) if (std.math.mul(i128, a.unscaled, b.unscaled)) |u| break :blk .{ .unscaled = u, .scale = @intCast(s) } else |_| {};
-            const p = @as(i256, a.unscaled) * b.unscaled;
-            const drop = s -| max_digits;
-            const q = roundScaleDown(p, drop);
-            break :blk .{ .unscaled = std.math.cast(i128, q) orelse return decimalOverflow(), .scale = @intCast(s - drop) };
-        },
-        .add, .sub => blk: {
-            const s = @max(a.scale, b.scale);
-            const x = rescaleTo(a, s) orelse return decimalOverflow();
-            const y = rescaleTo(b, s) orelse return decimalOverflow();
-            const u = if (op == .add) std.math.add(i128, x.unscaled, y.unscaled) else std.math.sub(i128, x.unscaled, y.unscaled);
-            break :blk .{ .unscaled = u catch return decimalOverflow(), .scale = s };
-        },
-        .div => try decimalDiv(a, b),
-        .mod => blk: {
-            const s = @max(a.scale, b.scale);
-            const x = rescaleTo(a, s) orelse return decimalOverflow();
-            const y = rescaleTo(b, s) orelse return decimalOverflow();
-            if (y.unscaled == 0) return error.DivByZero;
-            break :blk .{ .unscaled = @rem(x.unscaled, y.unscaled), .scale = s };
-        },
-        else => return null,
-    };
-    if (!fitsPrecision(r.unscaled, max_digits)) return decimalOverflow();
-    return r;
 }
 
 fn bitwise(op: ast.BinOp, l: Value, r: Value) EvalError!Value {

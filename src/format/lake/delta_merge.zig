@@ -33,6 +33,7 @@ const Folder = @import("../parquet/folder.zig").Folder;
 const Space = @import("../../exec/space.zig").Space;
 const Value = @import("../../exec/value.zig").Value;
 const cast = @import("../../exec/eval/cast.zig");
+const decimal = @import("../../exec/decimal.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
@@ -299,9 +300,11 @@ pub const Merge = struct {
             return out;
         }
         if (c.ty.kind != .decimal) return out;
-        const same = for (in.data.dec[0..b.len], 0..) |d, r| {
-            if (in.validity.get(r) and d.scale != c.ty.scale) break false;
-        } else true;
+        const same = switch (column.decimals(in)) {
+            inline else => |v| for (v[0..b.len], 0..) |d, r| {
+                if (in.validity.get(r) and d.scale != c.ty.scale) break false;
+            } else true,
+        };
         if (same) return out;
         var bd = try column.Builder.initCapacity(t, c.ty.asNullable(), b.len);
         for (0..b.len) |r| {
@@ -310,7 +313,7 @@ pub const Merge = struct {
                 try bd.append(v);
                 continue;
             }
-            const d = cast.rescaleTo(v.decimal, c.ty.scale) orelse
+            const d = decimal.rescaleTo(v.decimal, c.ty.scale) orelse
                 return self.fail(write.Error.DeltaValueOutOfRange, "column `{s}` is `{s}` in {s}, which cannot hold a value of the rows' scale {d}", .{ c.name, c.delta_type, self.plan.name, v.decimal.scale });
             try bd.append(.{ .decimal = d });
         }

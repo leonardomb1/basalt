@@ -10,7 +10,7 @@
 
 const Decimal = @import("value.zig").Decimal;
 const Value = @import("value.zig").Value;
-const pow10_i128 = @import("value.zig").pow10_i128;
+const decimal = @import("decimal.zig");
 const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
 const types = @import("../lang/types.zig");
@@ -910,25 +910,18 @@ pub const Encoder = struct {
             const w: ?i64 = switch (kk) {
                 .i64k => switch (col.ty.kind) {
                     .float => intOf(col.data.f64[r]),
-                    .decimal => intOfDec(col.data.dec[r]),
+                    .decimal => decimal.exactInt(column.decimals(col).at(r)),
                     else => null,
                 },
                 .f64k => switch (col.ty.kind) {
                     .int => keyhash.floatWord(@floatFromInt(col.data.i64[r])),
-                    .decimal => keyhash.floatWord(col.data.dec[r].keyF64()),
+                    .decimal => keyhash.floatWord(column.decimals(col).at(r).keyF64()),
                     else => null,
                 },
                 else => null,
             };
             if (w) |x| e.keys[r * e.nk + j] = x else e.absent[r] = true;
         }
-    }
-
-    fn intOfDec(d: Decimal) ?i64 {
-        if (d.scale >= pow10_i128.len) return if (d.unscaled == 0) 0 else null;
-        const p = pow10_i128[d.scale];
-        if (@rem(d.unscaled, p) != 0) return null;
-        return std.math.cast(i64, @divExact(d.unscaled, p));
     }
 
     fn intOf(x: f64) ?i64 {

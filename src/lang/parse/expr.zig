@@ -350,29 +350,7 @@ noinline fn numberLiteral(self: *Parser) Error!*ast.Expr {
     return self.mk(.{ .dec_lit = d });
 }
 
-/// Digits with at most one `.`, read exactly: the scale is the digits written after
-/// the point, so `10.00` is 1000 at scale 2. Null past 38 digits.
-pub fn decimalLiteral(text: []const u8) ?ast.Expr.DecLit {
-    var unscaled: i128 = 0;
-    var scale: u8 = 0;
-    var digits: u8 = 0;
-    var frac = false;
-    for (text) |ch| {
-        if (ch == '.') {
-            frac = true;
-            continue;
-        }
-        if (frac) scale += 1;
-        if (unscaled == 0 and ch == '0') {
-            if (scale > 38) return null;
-            continue;
-        }
-        digits += 1;
-        if (digits > 38 or scale > 38) return null;
-        unscaled = unscaled * 10 + (ch - '0');
-    }
-    return .{ .unscaled = unscaled, .scale = scale };
-}
+pub const decimalLiteral = @import("../../exec/decimal.zig").literal;
 
 /// An aggregate refuses arguments past its maximum: extras were once dropped, so
 /// `SUM(x, id)` answered `SUM(x)`.
