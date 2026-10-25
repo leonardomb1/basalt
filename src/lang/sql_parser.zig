@@ -67,7 +67,7 @@ const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 pub const ColUses = @import("parse/textcols.zig").ColUses;
-const quoteInto = @import("parse/rewrite.zig").quoteInto;
+const quote = @import("quote.zig");
 const types = @import("types.zig");
 
 pub const Token = token.Token;
@@ -757,7 +757,7 @@ pub const Parser = struct {
         var buf = std.array_list.Managed(u8).init(self.arena);
         for (self.toks[start..end]) |t| {
             if (t.tag == .string) {
-                try quoteInto(&buf, t.text, '\'');
+                try quote.strLit(&buf, t.text);
             } else for (t.text) |c| try buf.append(std.ascii.toLower(c));
         }
         return buf.toOwnedSlice();
