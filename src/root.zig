@@ -17,6 +17,7 @@ pub const celltext = @import("exec/celltext.zig");
 pub const batch = @import("exec/batch.zig");
 pub const eval = @import("exec/eval.zig");
 pub const json = @import("exec/json.zig");
+pub const jsontext = @import("exec/jsontext.zig");
 pub const builtins = @import("exec/builtins.zig");
 pub const op = @import("exec/op.zig");
 pub const profile = @import("exec/profile.zig");
