@@ -780,7 +780,8 @@ pub const StreamLoadSink = struct {
             else => return e,
         };
         const body = body_aw.writer.buffered();
-        const out = classify(body);
+        const code: u16 = @intFromEnum(res.head.status);
+        const out = settle(code, body);
         switch (out) {
             .ok => if (self.logger) |lg| lg.log(.debug, "stream load {s} #{d}: {d} rows, {d} bytes, total {d} ms, begin {d}, plan {d}, read {d}, write {d}, commit+publish {d} ms", .{
                 self.table,                            self.seq,
@@ -790,10 +791,12 @@ pub const StreamLoadSink = struct {
                 jsonInt(body, "WriteDataTimeMs"),      jsonInt(body, "CommitAndPublishTimeMs"),
             }),
             .fail => {
-                obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ @intFromEnum(res.head.status), body });
+                obs.logOr(self.logger, .err, "stream load failed (http {d}): {s}", .{ code, body });
                 if (self.errctx) |ec| {
-                    const why = jsonField(body, "Message") orelse jsonField(body, "Status") orelse "no reason given";
-                    if (jsonField(body, "ErrorURL")) |u|
+                    const why = jsonField(body, "Message") orelse jsonField(body, "Status") orelse "";
+                    if (why.len == 0)
+                        ec.set("stream load failed: http {d}", .{code})
+                    else if (jsonField(body, "ErrorURL")) |u|
                         ec.set("stream load failed: {s} (rejected rows: {s})", .{ why, u })
                     else
                         ec.set("stream load failed: {s}", .{why});
@@ -803,7 +806,7 @@ pub const StreamLoadSink = struct {
                 const why = jsonField(body, "Message") orelse "";
                 self.why_len = @min(why.len, self.why.len);
                 @memcpy(self.why[0..self.why_len], why[0..self.why_len]);
-                obs.logOr(self.logger, .warn, "stream load {s} #{d} not settled (http {d}): {s}", .{ self.table, self.seq, @intFromEnum(res.head.status), body });
+                obs.logOr(self.logger, .warn, "stream load {s} #{d} not settled (http {d}): {s}", .{ self.table, self.seq, code, body });
             },
         }
         return out;
@@ -958,6 +961,14 @@ fn classify(body: []const u8) Outcome {
     return .wait;
 }
 
+/// `classify`, except that an answer with no `Status` under an HTTP error that
+/// `driver.transientStatus` does not retry (a proxy's 401, 404, 413 or 501) is a
+/// failure, not a resend, as on every other HTTP path.
+fn settle(code: u16, body: []const u8) Outcome {
+    if (jsonField(body, "Status") == null and code >= 400 and !driver.transientStatus(code)) return .fail;
+    return classify(body);
+}
+
 fn eqlAnyIgnoreCase(s: []const u8, options: []const []const u8) bool {
     for (options) |o| if (std.ascii.eqlIgnoreCase(s, o)) return true;
     return false;
@@ -972,6 +983,26 @@ test "classify settles on the parsed Status, not on words anywhere in the body" 
     try std.testing.expectEqual(Outcome.fail, classify("{\"TxnId\": 9, \"Status\": \"Fail\", \"Message\": \"too many filtered rows\", \"NumberTotalRows\": 3}"));
     try std.testing.expectEqual(Outcome.resend, classify(""));
     try std.testing.expectEqual(Outcome.resend, classify("<html>503 Service Unavailable</html>"));
+}
+
+test "settle resends a bare answer only under a status every HTTP path retries" {
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 507, 599 }) |c| {
+        try std.testing.expectEqual(Outcome.resend, settle(c, ""));
+        try std.testing.expectEqual(Outcome.resend, settle(c, "<html>gateway</html>"));
+    }
+    for ([_]u16{ 400, 401, 403, 404, 413, 418, 501, 505, 511, 600 }) |c| {
+        try std.testing.expectEqual(Outcome.fail, settle(c, ""));
+        try std.testing.expectEqual(Outcome.fail, settle(c, "<html>Not Implemented</html>"));
+    }
+    for ([_]u16{ 200, 307 }) |c| try std.testing.expectEqual(Outcome.resend, settle(c, ""));
+    try std.testing.expectEqual(Outcome.ok, settle(501, "{\"Status\": \"Success\"}"));
+    try std.testing.expectEqual(Outcome.unbegun, settle(401, "{\"TxnId\": -1, \"Status\": \"Fail\", \"NumberTotalRows\": 0}"));
+    try std.testing.expectEqual(Outcome.fail, settle(503, "{\"Status\": \"Fail\", \"Message\": \"refused\"}"));
+    for (0..1000) |c| {
+        const code: u16 = @intCast(c);
+        const want: Outcome = if (code >= 400 and !driver.transientStatus(code)) .fail else .resend;
+        try std.testing.expectEqual(want, settle(code, "not json"));
+    }
 }
 
 test "classify: a reused label is ok only once its earlier load committed" {

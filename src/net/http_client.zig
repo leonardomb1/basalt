@@ -54,10 +54,11 @@
 //! before `retry_statuses` is consulted. A login request runs like a page, under
 //! its deadline and retries.
 //!
-//! Resilience: transient failures (429/5xx, connection resets) retry in place
+//! Resilience: transient failures (`driver.transientStatus`: 408, 429 and every 5xx
+//! but 501, 505 and 511; connection resets) retry in place
 //! `retries` times through `objstore.retry`, backing off from `retry_base_ms` with
 //! jitter, stretched to a `Retry-After` of up to a minute, so one blip deep in a long
-//! backfill does not restart the run. `retry_statuses` ("404,408") marks extra
+//! backfill does not restart the run. `retry_statuses` ("404,501") marks extra
 //! codes transient for APIs that misreport an outage; if they outlive the budget
 //! the run exits 75 so the control plane re-runs it. A socket failure that
 //! survives the budget surfaces as HttpTransportFailed, never as a std.Io
@@ -897,9 +898,9 @@ pub const HttpSource = struct {
         }
     }
 
-    /// One request of a slot. A 429, a 5xx or a listed status other than 401 is worth
-    /// another attempt; every status is kept for the consumer, a transport error is not.
-    /// An abandoned slot stops retrying, as nobody waits for it.
+    /// One request of a slot. A `driver.transientStatus` code or a listed status other
+    /// than 401 is worth another attempt; every status is kept for the consumer, a
+    /// transport error is not. An abandoned slot stops retrying, as nobody waits for it.
     fn attempt(slot: *Slot) !objstore.Verdict {
         if (slot.state.load(.acquire) == @intFromEnum(SlotState.abandoned)) return error.Aborted;
         slot.code = 0;
@@ -914,7 +915,7 @@ pub const HttpSource = struct {
         });
         slot.code = res.code;
         slot.body = res.body;
-        const again = busyStatus(res.code) or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
+        const again = objstore.retriable(res.code) or (res.code != 401 and statusListed(slot.retry_statuses, res.code));
         if (!again) return .done;
         const after: ?u64 = if (res.retry_after_ms) |ms| @min(ms, max_retry_after_ms) else null;
         return .{ .failed = .{ .code = res.code, .err = error.HttpServerBusy, .retry_after_ms = after, .retriable = true } };
@@ -1140,16 +1141,11 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return buf.toOwnedSlice();
 }
 
-/// The statuses `HTTP()` replays and reports as `HttpServerBusy`: 429 and every 5xx.
-/// Not objstore's list, which adds 408 and leaves out 501 and 505+ (D12).
-fn busyStatus(code: u16) bool {
-    return code == 429 or code >= 500;
-}
-
-/// Maps a non-200 status to a named error, distinct per fix: 429/5xx are worth a
-/// control-plane retry (exit 75), 401 is an expired token, 400 a rejected request.
+/// Maps a non-200 status to a named error, distinct per fix: a `driver.transientStatus`
+/// code is worth a control-plane retry (exit 75), 401 is an expired token, 400 a
+/// rejected request.
 pub fn statusError(code: u16) anyerror {
-    if (busyStatus(code)) return error.HttpServerBusy;
+    if (objstore.retriable(code)) return error.HttpServerBusy;
     return switch (code) {
         400 => error.HttpBadRequest,
         401 => error.HttpUnauthorized,
@@ -2016,11 +2012,53 @@ test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
     try std.testing.expectEqual(@as(usize, 0), client.ca_bundle.bytes.items.len);
 }
 
-test "pinned for D12: HTTP() and objstore retry the same statuses except 408, 501 and 505+" {
-    for (100..600) |c| {
+test "HTTP() names 408 busy like the object stores do, and 501, 505, 511 and 6xx a plain failure" {
+    for (0..1000) |c| {
         const code: u16 = @intCast(c);
-        const differs = code == 408 or code == 501 or code >= 505;
-        try std.testing.expectEqual(differs, busyStatus(code) != objstore.retriable(code));
-        try std.testing.expectEqual(busyStatus(code), statusError(code) == error.HttpServerBusy);
+        try std.testing.expectEqual(objstore.retriable(code), statusError(code) == error.HttpServerBusy);
     }
+    for ([_]u16{ 408, 429, 507, 509, 599 }) |c| try std.testing.expectEqual(error.HttpServerBusy, statusError(c));
+    for ([_]u16{ 501, 505, 511, 600, 999 }) |c| try std.testing.expectEqual(error.HttpRequestFailed, statusError(c));
+}
+
+test "http source: a 408 is retried in place like a 503" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        "",
+        \\[{"id":1},{"id":2}]
+    });
+    srv.statuses = &.{ "408 Request Timeout", "200 OK" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer srv.finish(th);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+    try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.seq_cst));
+}
+
+test "http source: a 501 fails at once, not retried, and not as transient" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const srv = try TestServer.start(&.{
+        "",
+        \\[{"id":1}]
+    });
+    srv.statuses = &.{ "501 Not Implemented", "200 OK" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer srv.finish(th);
+
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const got = HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
+    if (got) |s| s.close() else |_| {}
+    try std.testing.expectError(error.HttpRequestFailed, got);
+    try std.testing.expectEqual(@as(usize, 1), srv.requests.load(.seq_cst));
 }

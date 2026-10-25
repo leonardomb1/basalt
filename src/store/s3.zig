@@ -349,8 +349,8 @@ fn signedHeaders(arena: std.mem.Allocator, creds: Creds, r: Request) ![]const st
 }
 
 /// Maps a status plus S3's error code onto a distinct Zig error. Every status the
-/// retry loop replays as an outage (429 and the 5xx gateways) is `S3Throttled`, so a
-/// run that exhausts its retries on one exits as transient; 408 and 501 are not (D12).
+/// retry loop replays (`objstore.retriable`) is `S3Throttled`, so a run that
+/// exhausts its retries on one exits as transient.
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "NoSuchBucket")) return Error.S3BucketMissing;
@@ -362,10 +362,10 @@ pub fn statusToError(code: u16, body: []const u8) Error {
         if (std.mem.eql(u8, e.code, "SlowDown")) return Error.S3Throttled;
         if (std.mem.eql(u8, e.code, "NoSuchUpload")) return Error.S3UploadMissing;
     }
+    if (objstore.retriable(code)) return Error.S3Throttled;
     return switch (code) {
         401, 403 => Error.S3AuthFailed,
         404 => Error.S3BucketMissing,
-        429, 500, 502, 503, 504 => Error.S3Throttled,
         else => Error.S3RequestFailed,
     };
 }
@@ -1279,16 +1279,22 @@ test "putIfAbsent: 200 creates, 412 and 409 find one there, a 503 is retried, a 
     try std.testing.expectEqualStrings("PUT /lake/out.csv HTTP/1.1", srv.line(0));
 }
 
-test "a retried-out 5xx gateway is S3Throttled, which a run exits on as transient; 408 and 501 stay RequestFailed (D12)" {
-    for ([_]u16{ 429, 500, 502, 503, 504 }) |c| {
+test "every retried status is S3Throttled, which a run exits on as transient; 501, 505 and 511 are RequestFailed" {
+    const env = @import("../runtime/env.zig");
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 507, 509, 599 }) |c| {
         try std.testing.expectEqual(Error.S3Throttled, statusToError(c, ""));
         try std.testing.expectEqual(Error.S3Throttled, statusToError(c, "<Error><Code>InternalError</Code></Error>"));
+        try std.testing.expect(env.isTransient(statusToError(c, "")));
     }
-    for ([_]u16{ 400, 405, 408, 409, 412, 418, 501, 505, 599 }) |c| try std.testing.expectEqual(Error.S3RequestFailed, statusToError(c, ""));
-    for (0..600) |c| {
-        const e = statusToError(@intCast(c), "");
-        if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.S3Throttled, e);
-        if (e == Error.S3Throttled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    for ([_]u16{ 400, 405, 409, 412, 418, 501, 505, 511, 600 }) |c| {
+        try std.testing.expectEqual(Error.S3RequestFailed, statusToError(c, ""));
+        try std.testing.expect(!env.isTransient(statusToError(c, "")));
+    }
+    try std.testing.expectEqual(Error.S3Throttled, statusToError(400, "<Error><Code>SlowDown</Code></Error>"));
+    try std.testing.expectEqual(Error.S3AuthFailed, statusToError(503, "<Error><Code>AccessDenied</Code></Error>"));
+    for (0..1000) |c| {
+        const code: u16 = @intCast(c);
+        try std.testing.expectEqual(objstore.retriable(code), statusToError(code, "") == Error.S3Throttled);
     }
 }
 

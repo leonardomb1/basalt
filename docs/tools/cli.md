@@ -210,7 +210,10 @@ plain left-aligned table — whether stdout is a terminal, a pipe or a file. Wha
 | `130`| aborted (SIGINT) |
 
 Transient means the network or the peer failed, not the script: a refused,
-reset or timed-out connection, a failed name lookup, an HTTP 429/5xx, and a
+reset or timed-out connection, a failed name lookup, an HTTP status that every
+HTTP path (`HTTP()` and REST sources, `s3://` and Azure, stream load) retries
+before giving up — 408, 429 and every 5xx except 501, 505 and 511, which name
+something a retry cannot fix — and a
 database that closed the connection or failed on its socket — during login
 (a server turning connections away under a burst of parallel logins) or
 mid-query (`ServerClosedConnection`, `ConnectionIoFailed`). Past an HTTP

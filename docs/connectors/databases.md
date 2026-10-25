@@ -34,7 +34,10 @@ spill directory (`--spill-dir`, counted against `--spill-cap`; on a RAM-backed
 `/tmp` that is memory, up to one `load_size` per lane), so a connection lost
 along the way — the server restarting, say — resends it under the same label
 instead of failing the load. A load the server refuses is not resent: the run
-fails with the server's message. Loads run in strict mode, so a value too long
+fails with the server's message. An answer that is not a stream load response
+(a proxy's error page) is resent only under a status every HTTP path retries
+(408, 429, a 5xx other than 501, 505 and 511); under any other error status the
+run fails with that status. Loads run in strict mode, so a value too long
 for its column, or one that does not convert to the column's type, fails the
 load instead of landing as NULL.
 

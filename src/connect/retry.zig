@@ -172,8 +172,8 @@ const Scripted = struct {
 };
 
 test "status and error classification match objstore's lists" {
-    for ([_]u16{ 408, 429, 500, 502, 503, 504 }) |c| try testing.expect(retriable(c));
-    for ([_]u16{ 0, 100, 200, 201, 206, 301, 400, 401, 403, 404, 409, 412, 413, 501, 505, 599 }) |c| try testing.expect(!retriable(c));
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 506, 507, 509, 599 }) |c| try testing.expect(retriable(c));
+    for ([_]u16{ 0, 100, 200, 201, 206, 301, 400, 401, 403, 404, 409, 412, 413, 418, 501, 505, 511, 600 }) |c| try testing.expect(!retriable(c));
     for (0..1000) |c| try testing.expectEqual(objstore.retriable(@intCast(c)), retriable(@intCast(c)));
     const errs = [_]anyerror{
         error.ConnectionRefused,  error.ConnectionTimedOut,       error.ConnectionResetByPeer,      error.NetworkUnreachable,
