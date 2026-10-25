@@ -28,6 +28,7 @@ const Value = @import("../../value.zig").Value;
 const Decimal = @import("../../value.zig").Decimal;
 const ast = @import("../../../lang/ast.zig");
 const eval = @import("../../eval.zig");
+const floatord = @import("../../floatord.zig");
 const decimal = @import("../../decimal.zig");
 const simd = @import("../../simd.zig");
 const std = @import("std");
@@ -200,7 +201,7 @@ pub const AvgDecimal = struct {
 pub fn order(comptime T: type, a: T, b: T) std.math.Order {
     return switch (T) {
         Value => eval.compareValues(a, b) orelse .eq,
-        f64 => eval.orderF64(a, b),
+        f64 => floatord.orderF64(a, b),
         Decimal => a.order(b),
         bool => std.math.order(@intFromBool(a), @intFromBool(b)),
         []const u8 => std.mem.order(u8, a, b),
@@ -522,7 +523,7 @@ pub fn dupeValue(alloc: std.mem.Allocator, v: Value) !Value {
 
 /// Quickselect: `xs[k]` becomes the k-th smallest, smaller before, larger after.
 /// Median-of-three pivot, Hoare partition; expected O(n). NaN orders above every
-/// number, as `eval.orderF64` has it, so the NaNs are moved to the end first.
+/// number, as `floatord.orderF64` has it, so the NaNs are moved to the end first.
 pub fn selectNth(xs_all: []f64, k: usize) f64 {
     var m: usize = 0;
     for (xs_all) |x| {

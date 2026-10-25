@@ -13,6 +13,7 @@ const Value = @import("value.zig").Value;
 const decimal = @import("decimal.zig");
 const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
+const textconv = @import("textconv.zig");
 const types = @import("../lang/types.zig");
 const std = @import("std");
 const stats = @import("build_options").stats;
@@ -315,12 +316,15 @@ inline fn tableOf(v: anytype, h: u64) *GroupTable {
     return if (@hasDecl(@typeInfo(@TypeOf(v)).pointer.child, "table")) v.table(h) else v.tb;
 }
 
-fn ownValue(a: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try a.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
-        else => v,
-    };
+/// The boxed keys of rows `0..n` of `cols` at `idx` into `probes`, `idx.len` a row,
+/// and each row's `keyhash.MultiKeyCtx` hash into `hashes`.
+pub fn hashBatch(cols: []const column.Column, idx: []const usize, n: usize, probes: []Value, hashes: []u64) void {
+    const nk = idx.len;
+    for (0..n) |r| {
+        const key = probes[r * nk ..][0..nk];
+        for (idx, key) |ci, *v| v.* = cols[ci].getValue(r);
+        hashes[r] = keyhash.MultiKeyCtx.hash(.{}, key);
+    }
 }
 
 /// Each word through murmur3's 64-bit finalizer. Wyhash's streaming form was a fifth
@@ -682,10 +686,10 @@ pub fn GroupStore(comptime P: type) type {
             switch (copy) {
                 .alias => @memcpy(nr.keys, key),
                 .dupe => for (nr.keys, key) |*o, v| {
-                    o.* = try ownValue(self.recs.alloc, v);
+                    o.* = try keyhash.ownValue(self.recs.alloc, v);
                 },
                 .canon => for (nr.keys, key) |*o, v| {
-                    o.* = try ownValue(self.recs.alloc, keyhash.canonValue(v));
+                    o.* = try keyhash.ownValue(self.recs.alloc, keyhash.canonValue(v));
                 },
             }
             return nr;
@@ -795,18 +799,6 @@ pub const Encoded = struct {
         return fixedHash(self.hkeys[r * self.nk ..][0..self.nk], self.mask(r));
     }
 };
-
-pub const Meet = struct { want: types.TypeKind, kind: ?keyhash.KeyKind };
-
-/// The words a build key column of `build` stands for against a probe column of
-/// `other` (null: unknown, the build's own). An INT meeting a FLOAT keys as the float
-/// it compares as under `keyhash.valueEq`, so the result does not depend on which
-/// side is built.
-pub fn meetKind(build: types.TypeKind, other: ?types.TypeKind) Meet {
-    const p = other orelse build;
-    if ((build == .int and p == .float) or (build == .float and p == .int)) return .{ .want = .float, .kind = .f64k };
-    return .{ .want = build, .kind = keyhash.keyKindOf(build) };
-}
 
 /// Key columns (`cols`, each of `kinds`, from `keyhash.keyKindOf`) encoded a column at
 /// a time: ints, dates and booleans as their value, floats by `keyhash.floatWord`,
@@ -921,7 +913,7 @@ pub const Encoder = struct {
             if (!col.validity.get(r)) continue;
             const w: ?i64 = switch (kk) {
                 .i64k => switch (col.ty.kind) {
-                    .float => intOf(col.data.f64[r]),
+                    .float => textconv.floatToInt(col.data.f64[r], .exact),
                     .decimal => decimal.exactInt(column.decimals(col).at(r)),
                     else => null,
                 },
@@ -934,11 +926,6 @@ pub const Encoder = struct {
             };
             if (w) |x| e.keys[r * e.nk + j] = x else e.absent[r] = true;
         }
-    }
-
-    fn intOf(x: f64) ?i64 {
-        if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0) or @trunc(x) != x) return null;
-        return @intFromFloat(x);
     }
 
     fn putStr(_: Encoder, e: *Encoded, r: usize, j: usize, x: StrId) void {
@@ -1122,5 +1109,51 @@ test "probe: boxed string keys are copied once a key and found again" {
         const k = st.at(i).keys;
         try std.testing.expect(k[0].string.ptr != vals[2 * i].string.ptr);
         if (k[1] == .float) try std.testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(k[1].float)));
+    }
+}
+
+test "cross: a FLOAT read as an INT word is textconv's exact float-to-int, as the old intOf" {
+    const Old = struct {
+        fn intOf(x: f64) ?i64 {
+            if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0) or @trunc(x) != x) return null;
+            return @intFromFloat(x);
+        }
+    };
+    const edge = [_]f64{
+        0,                     -0.0,                   1,                       -1,                         0.5,                -0.5,
+        1.0000000000000002,    0x1p53,                 0x1p53 + 2,              -0x1p53,                    0x1p62,             0x1p63,
+        -0x1p63,               0x1p63 - 1024,          -0x1p63 - 2048,          std.math.inf(f64),          -std.math.inf(f64), std.math.nan(f64),
+        -std.math.nan(f64),    std.math.floatMax(f64), -std.math.floatMax(f64), std.math.floatMin(f64),     1e300,              123456789.0,
+        9223372036854774784.0, -123456789.25,          -9223372036854775808.0,  std.math.floatTrueMin(f64),
+    };
+    for (edge) |x| try std.testing.expectEqual(Old.intOf(x), textconv.floatToInt(x, .exact));
+    var prng = std.Random.DefaultPrng.init(0x1d0f);
+    const rand = prng.random();
+    for (0..100_000) |_| {
+        const x: f64 = @bitCast(rand.int(u64));
+        try std.testing.expectEqual(Old.intOf(x), textconv.floatToInt(x, .exact));
+        const y = @trunc(@as(f64, @floatFromInt(rand.int(i64))) / @as(f64, @floatFromInt(@as(u64, 1) << rand.int(u6))));
+        try std.testing.expectEqual(Old.intOf(y), textconv.floatToInt(y, .exact));
+    }
+}
+
+test "hashBatch: each row's boxed keys and their MultiKeyCtx hash" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var ib = column.Builder.init(a, types.Type.init(.int));
+    var sb = column.Builder.init(a, types.Type.init(.string));
+    for ([_]?i64{ 1, null, 3 }, [_]?[]const u8{ "x", "y", null }) |i, s| {
+        try ib.append(if (i) |x| .{ .int = x } else .null);
+        try sb.append(if (s) |x| .{ .string = x } else .null);
+    }
+    const cols = [_]column.Column{ try ib.finish(), try sb.finish() };
+    var probes: [6]Value = undefined;
+    var hashes: [3]u64 = undefined;
+    hashBatch(&cols, &.{ 1, 0 }, 3, &probes, &hashes);
+    for (0..3) |r| {
+        const want = [_]Value{ cols[1].getValue(r), cols[0].getValue(r) };
+        try std.testing.expect(keyhash.MultiKeyCtx.eql(.{}, &want, probes[2 * r ..][0..2]));
+        try std.testing.expectEqual(keyhash.MultiKeyCtx.hash(.{}, &want), hashes[r]);
     }
 }

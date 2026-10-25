@@ -201,11 +201,7 @@ pub const TopK = struct {
             .boxed => |st| {
                 const nk = self.part.len;
                 const probes = try scratch.alloc(Value, b.len * nk);
-                for (hashes, 0..) |*h, r| {
-                    const probe = probes[r * nk ..][0..nk];
-                    for (self.part, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
-                    h.* = keyhash.MultiKeyCtx.hash(.{}, probe);
-                }
+                keytable.hashBatch(b.columns, self.part, b.len, probes, hashes);
                 var v = GroupIds(BoxedStore){ .self = self, .tb = &l.table, .st = st, .gid = gid };
                 try keytable.probe(BoxedStore, .dupe, &keytable.Runs(Value).over(nk, &.{}, hashes, probes, &.{}), 0, b.len, &v);
             },

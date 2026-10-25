@@ -52,8 +52,6 @@ pub fn drainParts(self: *Aggregate) anyerror![]GroupSet {
 
 pub const fold_parts = keytable.parts;
 
-pub const part_shift = keytable.part_shift;
-
 pub const partOf = keytable.partOf;
 
 /// One partition's table and the store it indexes. A serial fold shares one store,
@@ -198,11 +196,11 @@ fn Fold(comptime Store: type) type {
         nspill: usize = 0,
 
         pub inline fn table(c: *@This(), h: u64) *GroupTable {
-            return &c.parts[h >> part_shift].table;
+            return &c.parts[partOf(h)].table;
         }
 
         pub inline fn store(c: *@This(), h: u64) *Store {
-            return c.parts[h >> part_shift].store;
+            return c.parts[partOf(h)].store;
         }
 
         pub inline fn early(c: *@This(), r: usize, key: anytype) keytable.Early {
@@ -216,7 +214,7 @@ fn Fold(comptime Store: type) type {
         }
 
         pub inline fn hit(c: *@This(), r: usize, h: u64, key: anytype, x: keytable.Hit(Store)) !void {
-            const pi: u8 = @intCast(h >> part_shift);
+            const pi: u8 = @intCast(partOf(h));
             if (!x.found) c.layout.setOrd(x.rec.tail, x.slot);
             c.tails[r] = x.rec.tail;
             c.pidx[r] = pi;
@@ -274,7 +272,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
         };
         const by_part = groups >= few_groups;
         const pof = try pull.alloc(u8, m);
-        for (pof, live[0..m]) |*p, r| p.* = if (by_part) @intCast(hashes[r] >> part_shift) else 0;
+        for (pof, live[0..m]) |*p, r| p.* = if (by_part) @intCast(partOf(hashes[r])) else 0;
         const runs = try keytable.Runs(i64).init(pull, if (by_part) fold_parts else 1, e.nk, pof, live[0..m], hashes, e.keys, e.masks);
 
         var fold = Fold(FixedStore){ .self = self, .parts = parts, .layout = layout, .tails = tails, .pidx = pidx, .dest = dest, .frozen = frozen, .direct = if (direct) |*d| d else null };
@@ -330,7 +328,6 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     errdefer for (parts) |*p| p.table.deinit();
     try initPairs(self, true);
     errdefer for (self.pairs) |*pp| pp.deinit();
-    const hctx = keyhash.MultiKeyCtx{};
     while (try self.child.next(pull)) |b| {
         const frozen = self.overBudget(parts);
         const nk = self.by.len;
@@ -338,20 +335,14 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
         const hashes = try pull.alloc(u64, b.len);
         const dest: []u8 = if (frozen) try pull.alloc(u8, b.len) else &.{};
         @memset(dest, spill_parts.keep);
-
-        var r: usize = 0;
-        while (r < b.len) : (r += 1) {
-            const probe = probes[r * nk ..][0..nk];
-            for (self.by, 0..) |ci, j| probe[j] = b.columns[ci].getValue(r);
-            hashes[r] = hctx.hash(probe);
-        }
+        keytable.hashBatch(b.columns, self.by, b.len, probes, hashes);
 
         const tails = try pull.alloc(?[*]u8, b.len);
         const pidx = try pull.alloc(u8, b.len);
         @memset(tails, null);
 
         const pof = try pull.alloc(u8, b.len);
-        for (pof, hashes) |*p, h| p.* = @intCast(h >> part_shift);
+        for (pof, hashes) |*p, h| p.* = @intCast(partOf(h));
         const all = try pull.alloc(u32, b.len);
         for (all, 0..) |*x, i| x.* = @intCast(i);
         const runs = try keytable.Runs(Value).init(pull, fold_parts, nk, pof, all, hashes, probes, &.{});

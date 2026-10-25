@@ -46,6 +46,7 @@ const column = @import("../column.zig");
 const par = @import("../par.zig");
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
+const floatord = @import("../floatord.zig");
 const rescaleTo = @import("../decimal.zig").rescaleTo;
 const keyhash = @import("../keyhash.zig");
 const aggFuncs = @import("aggregate/funcs.zig");
@@ -464,13 +465,10 @@ pub const Window = struct {
         const Item = struct { x: f64, p: usize };
         const Heap = std.PriorityQueue(Item, bool, cmp);
 
-        /// Value order with NaN last, ties by position, so every row is distinct.
+        /// `floatord` value order, ties by position, so every row is distinct.
         fn lt(a: Item, b: Item) bool {
-            const an = std.math.isNan(a.x);
-            const bn = std.math.isNan(b.x);
-            if (an != bn) return bn;
-            if (!an and a.x != b.x) return a.x < b.x;
-            return a.p < b.p;
+            const o = floatord.orderF64(a.x, b.x);
+            return o == .lt or (o == .eq and a.p < b.p);
         }
 
         fn cmp(max: bool, a: Item, b: Item) std.math.Order {

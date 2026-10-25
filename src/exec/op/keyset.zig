@@ -6,7 +6,6 @@
 
 const Batch = @import("../batch.zig").Batch;
 const Value = @import("../value.zig").Value;
-const eval = @import("../eval.zig");
 const keyhash = @import("../keyhash.zig");
 const std = @import("std");
 
@@ -35,38 +34,27 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
         var seen = std.HashMap(Value, void, keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage).init(arena);
         var vals = std.array_list.Managed(Value).init(arena);
         var overflow = false;
-        var lo: ?Value = null;
-        var hi: ?Value = null;
+        var bounds = keyhash.MinMax{};
         for (batches) |b| {
             const col = b.columns[ci];
             for (0..b.len) |i| {
                 const v = col.getValue(i);
                 if (v == .null) continue;
-                if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = try own(arena, v);
-                if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = try own(arena, v);
+                try bounds.fold(arena, v);
                 if (overflow) continue;
                 if (seen.contains(v)) continue;
                 if (vals.items.len == cap) {
                     overflow = true;
                     continue;
                 }
-                const o = try own(arena, v);
+                const o = try keyhash.ownValue(arena, v);
                 try seen.put(o, {});
                 try vals.append(o);
             }
         }
-        kv.* = .{ .values = try vals.toOwnedSlice(), .overflow = overflow, .min = lo, .max = hi };
+        kv.* = .{ .values = try vals.toOwnedSlice(), .overflow = overflow, .min = bounds.lo(), .max = bounds.hi() };
     }
     return out;
-}
-
-/// A text or bytes value copied out of the batch it came from, which may be freed.
-fn own(arena: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try arena.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try arena.dupe(u8, s) },
-        else => v,
-    };
 }
 
 test "collect: distinct non-null values per key, min and max past the cap" {
