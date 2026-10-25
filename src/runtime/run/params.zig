@@ -96,11 +96,11 @@ fn planErrAt(diag: *Diag, msg: []const u8, pos: ast.Pos) error{PlanFailed} {
 /// `CAST('2026-02-01' AS DATE)` would, and a decimal rounds as a cast does.
 fn parseParamValue(arena: std.mem.Allocator, ty: types.Type, str: []const u8, diag: *Diag) !Value {
     return switch (ty.kind) {
-        .int => .{ .int = std.fmt.parseInt(i64, str, 10) catch return planErr(diag, "invalid integer param value") },
-        .float => .{ .float = std.fmt.parseFloat(f64, str) catch return planErr(diag, "invalid float param value") },
+        .int => analyze.paramFromText(arena, ty, str) orelse planErr(diag, "invalid integer param value"),
+        .float => analyze.paramFromText(arena, ty, str) orelse planErr(diag, "invalid float param value"),
         .string => .{ .string = try arena.dupe(u8, str) },
-        .bool => if (std.mem.eql(u8, str, "true")) Value{ .bool = true } else if (std.mem.eql(u8, str, "false")) Value{ .bool = false } else planErr(diag, "invalid bool param value"),
-        .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = str }, ty) catch
+        .bool => analyze.paramFromText(arena, ty, str) orelse planErr(diag, "invalid bool param value"),
+        .date, .time, .timestamp, .decimal => analyze.paramFromText(arena, ty, str) orelse
             planErr(diag, try std.fmt.allocPrint(arena, "invalid {s} param value `{s}` — expected {s}", .{ try ty.name(arena), str, switch (ty.kind) {
                 .date => "YYYY-MM-DD",
                 .time => "HH:MM[:SS[.ffffff]]",
@@ -109,4 +109,49 @@ fn parseParamValue(arena: std.mem.Allocator, ty: types.Type, str: []const u8, di
             } })),
         else => planErr(diag, try std.fmt.allocPrint(arena, "a {s} param cannot be bound from text", .{try ty.name(arena)})),
     };
+}
+
+fn bindOne(arena: std.mem.Allocator, decl: []const u8, text: []const u8) !?Value {
+    const prog = try analyze.parse(arena, decl);
+    var params = std.StringHashMap(Value).init(arena);
+    var diag = Diag{};
+    resolveParams(arena, prog, &.{.{ .key = "p", .val = text }}, &params, &diag) catch return null;
+    return params.get("p").?;
+}
+
+test "PARAM text binds as CAST reads it: trimmed, no `_` separators, no hex floats; check and run agree" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const int_decl = "PARAM p INT; SELECT $p AS p;";
+    const float_decl = "PARAM p FLOAT; SELECT $p AS p;";
+    try std.testing.expectEqual(@as(i64, 5), (try bindOne(a, int_decl, " 5")).?.int);
+    try std.testing.expectEqual(@as(i64, -7), (try bindOne(a, int_decl, "-7 ")).?.int);
+    try std.testing.expectEqual(@as(i64, 5), (try bindOne(a, int_decl, "+5")).?.int);
+    try std.testing.expect((try bindOne(a, int_decl, "1_000")) == null);
+    try std.testing.expect((try bindOne(a, int_decl, "1.5")) == null);
+    try std.testing.expect((try bindOne(a, int_decl, "0x10")) == null);
+    try std.testing.expectEqual(@as(f64, 1000), (try bindOne(a, float_decl, " 1e3 ")).?.float);
+    try std.testing.expectEqual(@as(f64, 0.5), (try bindOne(a, float_decl, "0.5")).?.float);
+    try std.testing.expect((try bindOne(a, float_decl, "0x1p3")) == null);
+    try std.testing.expect((try bindOne(a, float_decl, "1_0.5")) == null);
+    const int_ty = types.Type.init(.int);
+    const float_ty = types.Type.init(.float);
+    for ([_][]const u8{ " 5", "+5", "-7 ", "1_000", "1.5", "0x10", "", " " }) |t|
+        try std.testing.expectEqual((try bindOne(a, int_decl, t)) == null, analyze.paramTextProblem(a, int_ty, t) != null);
+    for ([_][]const u8{ " 1e3 ", "0.5", "0x1p3", "1_0.5", "nan", "inf", "" }) |t|
+        try std.testing.expectEqual((try bindOne(a, float_decl, t)) == null, analyze.paramTextProblem(a, float_ty, t) != null);
+}
+
+test "PARAM BOOL text is exactly `true` or `false` (the word set awaits decision D6)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const decl = "PARAM p BOOL; SELECT $p AS p;";
+    try std.testing.expectEqual(true, (try bindOne(a, decl, "true")).?.bool);
+    try std.testing.expectEqual(false, (try bindOne(a, decl, "false")).?.bool);
+    for ([_][]const u8{ "TRUE", "True", " true", "t", "1", "yes", "on", "" }) |t| {
+        try std.testing.expect((try bindOne(a, decl, t)) == null);
+        try std.testing.expect(analyze.paramTextProblem(a, types.Type.init(.bool), t) != null);
+    }
 }

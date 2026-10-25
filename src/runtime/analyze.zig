@@ -49,6 +49,7 @@ const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
 const decimal = @import("../exec/decimal.zig");
 const eval = @import("../exec/eval.zig");
+const textconv = @import("../exec/textconv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
 const ftp = @import("../store/ftp.zig");
@@ -696,10 +697,7 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
 /// or null when it does; `check` and the run both word the error from it.
 pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?[]const u8 {
     const ok = switch (ty.kind) {
-        .int => if (std.fmt.parseInt(i64, text, 10)) |_| true else |_| false,
-        .float => if (std.fmt.parseFloat(f64, text)) |_| true else |_| false,
-        .bool => std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "false"),
-        .date, .time, .timestamp, .decimal => if (eval.castValueTyped(arena, .{ .string = text }, ty)) |_| true else |_| false,
+        .int, .float, .bool, .date, .time, .timestamp, .decimal => paramFromText(arena, ty, text) != null,
         else => true,
     };
     if (ok) return null;
@@ -714,11 +712,22 @@ pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const 
     };
 }
 
+/// A PARAM's text as its declared type, null when it does not read as one: a number,
+/// date, time, timestamp or decimal as `CAST(text AS ty)` reads it, a BOOL only as
+/// `true` or `false`. Null for the kinds bound as text or not from text at all.
+pub fn paramFromText(arena: std.mem.Allocator, ty: types.Type, text: []const u8) ?Value {
+    return switch (ty.kind) {
+        .bool => .{ .bool = textconv.boolText(textconv.Words.exact, text) orelse return null },
+        .int, .float, .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = text }, ty) catch null,
+        else => null,
+    };
+}
+
 fn overrideExpr(arena: std.mem.Allocator, ty: types.Type, raw: []const u8) Error!?*const ast.Expr {
     return switch (ty.kind) {
-        .int => mk(arena, .{ .int_lit = std.fmt.parseInt(i64, raw, 10) catch return null }),
-        .float => mk(arena, .{ .float_lit = std.fmt.parseFloat(f64, raw) catch return null }),
-        .bool => mk(arena, .{ .bool_lit = std.mem.eql(u8, raw, "true") }),
+        .int => mk(arena, .{ .int_lit = (paramFromText(arena, ty, raw) orelse return null).int }),
+        .float => mk(arena, .{ .float_lit = (paramFromText(arena, ty, raw) orelse return null).float }),
+        .bool => mk(arena, .{ .bool_lit = (paramFromText(arena, ty, raw) orelse return null).bool }),
         .string, .bytes => mk(arena, .{ .str_lit = raw }),
         .date, .time, .timestamp, .decimal => typedParam(arena, ty, try mk(arena, .{ .str_lit = raw })),
         else => null,
