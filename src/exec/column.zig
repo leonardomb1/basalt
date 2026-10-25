@@ -23,6 +23,7 @@ const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const decimal = @import("decimal.zig");
 const par = @import("par.zig");
+const textconv = @import("textconv.zig");
 
 const Value = value.Value;
 
@@ -84,16 +85,10 @@ pub fn checkSpan(n: usize) error{OutOfMemory}!usize {
     return n;
 }
 
-/// Float to int rounding half to even, as PostgreSQL casts float8 (a decimal
-/// rounds half away from zero instead), guarding the i64 range and NaN/inf,
-/// which `@intFromFloat` treats as illegal behavior; out of range is
-/// CastFailed, as for a string.
+/// Float to int rounding half to even, as PostgreSQL casts float8; NaN, the
+/// infinities and anything outside i64 are CastFailed, as for a string.
 pub fn floatToInt(x: f64) error{CastFailed}!i64 {
-    if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
-    const f = @floor(x);
-    const d = x - f;
-    const r = if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
-    return @intFromFloat(r);
+    return textconv.floatToInt(x, .half_even) orelse error.CastFailed;
 }
 
 pub const Bytes = struct {
@@ -1638,4 +1633,30 @@ test "only column.zig names DecStore's slice; the rest go through decimals() and
     }
     try std.testing.expect(namesDecimalSlice("c.data.dec." ++ "wide_" ++ "cells[i]"));
     try std.testing.expect(!namesDecimalSlice("wide_" ++ "cellsx"));
+}
+
+test "floatToInt through textconv gives what its own half-even body gave" {
+    const old = struct {
+        fn f(x: f64) error{CastFailed}!i64 {
+            if (!(x >= -9223372036854775808.0 and x < 9223372036854775808.0)) return error.CastFailed;
+            const fl = @floor(x);
+            const d = x - fl;
+            const r = if (d < 0.5) fl else if (d > 0.5) fl + 1 else if (@mod(fl, 2) == 0) fl else fl + 1;
+            return @intFromFloat(r);
+        }
+    }.f;
+    const edges = [_]f64{
+        0,                                  -0.0,                                0.5,                                                  1.5,                 2.5,               -0.5,               -1.5,                   -2.5,
+        0.49999999999999994,                -0.49999999999999994,                4503599627370495.5,                                   -4503599627370495.5, 1e19,              -1e19,              -0x1p63,                0x1p63,
+        std.math.nextAfter(f64, 0x1p63, 0), std.math.nextAfter(f64, -0x1p63, 0), std.math.nextAfter(f64, -0x1p63, -std.math.inf(f64)), std.math.nan(f64),   std.math.inf(f64), -std.math.inf(f64), std.math.floatMax(f64), std.math.floatTrueMin(f64),
+    };
+    for (edges) |x| try std.testing.expectEqual(old(x) catch null, floatToInt(x) catch null);
+    var rng = std.Random.DefaultPrng.init(0x5eed);
+    for (0..100_000) |_| {
+        const bits = rng.random().int(u64);
+        const x: f64 = @bitCast(bits);
+        try std.testing.expectEqual(old(x) catch null, floatToInt(x) catch null);
+        const y = @as(f64, @floatFromInt(rng.random().int(i32))) / 4;
+        try std.testing.expectEqual(old(y) catch null, floatToInt(y) catch null);
+    }
 }

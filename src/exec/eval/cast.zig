@@ -5,7 +5,7 @@ const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const civil = @import("../civil.zig");
-const floatToInt = @import("vec.zig").floatToInt;
+const textconv = @import("../textconv.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseTimestampText = @import("time.zig").parseTimestampText;
@@ -98,55 +98,93 @@ pub fn parseFloatStrict(s: []const u8) ?f64 {
     return if (std.math.isFinite(x)) x else null;
 }
 
-pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
-    return switch (kind) {
-        .int => switch (v) {
-            .int => v,
-            .float => |x| .{ .int = try floatToInt(x) },
-            .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
-            .bool => |x| .{ .int = if (x) 1 else 0 },
-            .string => |s| .{ .int = parseIntStrict(trim(s)) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .float => switch (v) {
-            .float => v,
-            .int => |x| .{ .float = @floatFromInt(x) },
-            .decimal => |d| .{ .float = d.toF64() },
-            .string => |s| .{ .float = parseFloatStrict(trim(s)) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .date => switch (v) {
-            .date => v,
-            .timestamp => |x| .{ .date = @intCast(civil.dayOf(x)) },
-            .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
-            else => error.CastFailed,
-        },
-        .timestamp => switch (v) {
-            .timestamp => v,
-            .date => |x| .{ .timestamp = civil.dayMicrosChecked(x) orelse return error.CastFailed },
-            .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .time => switch (v) {
-            .time => v,
-            .timestamp => |x| .{ .time = civil.timeOfDay(x) },
-            .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
-            else => error.CastFailed,
-        },
-        .string => .{ .string = try valueToString(arena, v) },
-        .bool => switch (v) {
-            .bool => v,
-            .int => |x| .{ .bool = x != 0 },
-            .string => |s| if (std.ascii.eqlIgnoreCase(trim(s), "true"))
-                Value{ .bool = true }
-            else if (std.ascii.eqlIgnoreCase(trim(s), "false"))
-                Value{ .bool = false }
-            else
-                error.CastFailed,
-            else => error.CastFailed,
-        },
-        else => error.CastFailed,
+/// How a non-decimal kind's value is held, in a `Value` and in a column.
+pub fn Elem(comptime k: types.TypeKind) type {
+    return switch (k) {
+        .bool => bool,
+        .int, .time, .timestamp => i64,
+        .float => f64,
+        .date => i32,
+        .string => []const u8,
+        else => @compileError("castElem covers the non-decimal scalar kinds"),
     };
+}
+
+/// Whether `castElem` converts `from` to `to`: the pairs between different kinds
+/// other than DECIMAL ones and those to STRING.
+pub fn hasElemCast(comptime from: types.TypeKind, comptime to: types.TypeKind) bool {
+    return switch (to) {
+        .int => from == .float or from == .bool or from == .string,
+        .float => from == .int or from == .string,
+        .date => from == .timestamp or from == .string,
+        .timestamp => from == .date or from == .string,
+        .time => from == .timestamp or from == .string,
+        .bool => from == .int or from == .string,
+        else => false,
+    };
+}
+
+/// One value cast from `from` to `to`, the math the row cast and the vector cast
+/// share. Its error set is empty for a pair that cannot fail, so a column loop over
+/// one has no failure branch.
+pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKind, x: Elem(from)) !Elem(to) {
+    if (comptime !hasElemCast(from, to)) @compileError("no element cast from " ++ @tagName(from) ++ " to " ++ @tagName(to));
+    return switch (to) {
+        .int => switch (from) {
+            .float => textconv.floatToInt(x, .half_even) orelse error.CastFailed,
+            .bool => @intFromBool(x),
+            .string => parseIntStrict(trim(x)) orelse error.CastFailed,
+            else => comptime unreachable,
+        },
+        .float => switch (from) {
+            .int => @floatFromInt(x),
+            .string => parseFloatStrict(trim(x)) orelse error.CastFailed,
+            else => comptime unreachable,
+        },
+        .date => switch (from) {
+            .timestamp => @intCast(civil.dayOf(x)),
+            .string => @intCast(parseDateText(x) orelse return error.CastFailed),
+            else => comptime unreachable,
+        },
+        .timestamp => switch (from) {
+            .date => civil.dayMicrosChecked(x) orelse error.CastFailed,
+            .string => parseTimestampText(x) orelse error.CastFailed,
+            else => comptime unreachable,
+        },
+        .time => switch (from) {
+            .timestamp => civil.timeOfDay(x),
+            .string => parseIsoTime(x) orelse error.CastFailed,
+            else => comptime unreachable,
+        },
+        .bool => switch (from) {
+            .int => x != 0,
+            .string => textconv.boolText(.cast, x) orelse error.CastFailed,
+            else => comptime unreachable,
+        },
+        else => comptime unreachable,
+    };
+}
+
+/// A cast by kind alone; `castValueTyped` brings a DECIMAL to its scale.
+pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
+    switch (kind) {
+        .string => return .{ .string = try valueToString(arena, v) },
+        inline .bool, .int, .float, .date, .timestamp, .time => |to| switch (v) {
+            .null, .bytes => return error.CastFailed,
+            .decimal => |d| return switch (to) {
+                .int => .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
+                .float => .{ .float = d.toF64() },
+                else => error.CastFailed,
+            },
+            inline else => |x, tag| {
+                const from = comptime @field(types.TypeKind, @tagName(tag));
+                if (comptime from == to) return v;
+                if (comptime !hasElemCast(from, to)) return error.CastFailed;
+                return @unionInit(Value, @tagName(to), try castElem(from, to, x));
+            },
+        },
+        else => return error.CastFailed,
+    }
 }
 
 test "decimals lose digits by rounding half away from zero, on every path" {
@@ -262,4 +300,158 @@ test "a date past the TIMESTAMP range fails the cast instead of overflowing" {
     try std.testing.expectEqual(@as(i64, 106_751 * civil.us_per_day), (try castValue(a, .{ .date = 106_751 }, .timestamp)).timestamp);
     try std.testing.expectEqual(@as(i64, -1), (try castValue(a, .{ .timestamp = -civil.us_per_day - 1 }, .date)).date + 1);
     try std.testing.expectEqual(civil.us_per_day - 1, (try castValue(a, .{ .timestamp = -1 }, .time)).time);
+}
+
+fn oldCastValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
+    const column = @import("../column.zig");
+    return switch (kind) {
+        .int => switch (v) {
+            .int => v,
+            .float => |x| .{ .int = try column.floatToInt(x) },
+            .decimal => |d| .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
+            .bool => |x| .{ .int = if (x) 1 else 0 },
+            .string => |s| .{ .int = parseIntStrict(trim(s)) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
+        .float => switch (v) {
+            .float => v,
+            .int => |x| .{ .float = @floatFromInt(x) },
+            .decimal => |d| .{ .float = d.toF64() },
+            .string => |s| .{ .float = parseFloatStrict(trim(s)) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
+        .date => switch (v) {
+            .date => v,
+            .timestamp => |x| .{ .date = @intCast(@divFloor(x, 86_400_000_000)) },
+            .string => |str| .{ .date = @intCast(parseDateText(str) orelse return error.CastFailed) },
+            else => error.CastFailed,
+        },
+        .timestamp => switch (v) {
+            .timestamp => v,
+            .date => |x| .{ .timestamp = std.math.mul(i64, x, 86_400_000_000) catch return error.CastFailed },
+            .string => |str| .{ .timestamp = parseTimestampText(str) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
+        .time => switch (v) {
+            .time => v,
+            .timestamp => |x| .{ .time = @mod(x, 86_400_000_000) },
+            .string => |str| .{ .time = parseIsoTime(str) orelse return error.CastFailed },
+            else => error.CastFailed,
+        },
+        .string => .{ .string = try valueToString(arena, v) },
+        .bool => switch (v) {
+            .bool => v,
+            .int => |x| .{ .bool = x != 0 },
+            .string => |s| if (std.ascii.eqlIgnoreCase(trim(s), "true"))
+                Value{ .bool = true }
+            else if (std.ascii.eqlIgnoreCase(trim(s), "false"))
+                Value{ .bool = false }
+            else
+                error.CastFailed,
+            else => error.CastFailed,
+        },
+        else => error.CastFailed,
+    };
+}
+
+fn expectSameCast(a: std.mem.Allocator, v: Value, kind: types.TypeKind) !void {
+    const want = oldCastValue(a, v, kind);
+    const got = castValue(a, v, kind);
+    if (want) |w| {
+        const g = try got;
+        try std.testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
+        switch (w) {
+            .string, .bytes => |s| try std.testing.expectEqualStrings(s, if (g == .string) g.string else g.bytes),
+            .float => |x| if (std.math.isNan(x)) try std.testing.expect(std.math.isNan(g.float)) else try std.testing.expectEqual(x, g.float),
+            else => try std.testing.expectEqual(w, g),
+        }
+    } else |e| try std.testing.expectError(e, got);
+}
+
+test "castValue on castElem gives what the per-kind switch gave, for every kind pair" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const values = [_]Value{
+        .null,                                  .{ .bool = true },                      .{ .bool = false },
+        .{ .int = 0 },                          .{ .int = 1 },                          .{ .int = -1 },
+        .{ .int = std.math.maxInt(i64) },       .{ .int = std.math.minInt(i64) },       .{ .float = 2.5 },
+        .{ .float = -3.5 },                     .{ .float = 0x1p63 },                   .{ .float = -0x1p63 },
+        .{ .float = 1e19 },                     .{ .float = std.math.nan(f64) },        .{ .float = std.math.inf(f64) },
+        .{ .float = -std.math.inf(f64) },       .{ .float = -0.0 },                     .{ .decimal = .{ .unscaled = 125, .scale = 2 } },
+        .{ .string = " 42 " },                  .{ .string = "1_000" },                 .{ .string = "0x10" },
+        .{ .string = "2.5" },                   .{ .string = "1e3" },                   .{ .string = " TRUE " },
+        .{ .string = "false" },                 .{ .string = "t" },                     .{ .string = "" },
+        .{ .string = "nan" },                   .{ .string = "2026-10-03" },            .{ .string = "2026-10-03 12:34:56.5" },
+        .{ .string = "12:34:56" },              .{ .string = "-0043-03-15" },           .{ .bytes = "\x01\xff" },
+        .{ .date = 0 },                         .{ .date = 106_751 },                   .{ .date = -106_752 },
+        .{ .date = std.math.maxInt(i32) },      .{ .date = std.math.minInt(i32) },      .{ .time = 0 },
+        .{ .time = 86_399_999_999 },            .{ .timestamp = 0 },                    .{ .timestamp = -1 },
+        .{ .timestamp = std.math.maxInt(i64) }, .{ .timestamp = std.math.minInt(i64) },
+    };
+    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp, .array, .@"struct" };
+    for (values) |v| for (kinds) |k| expectSameCast(a, v, k) catch |e| {
+        std.debug.print("CAST({any} AS {s})\n", .{ v, @tagName(k) });
+        return e;
+    };
+}
+
+test "CAST(text AS BOOL) reads the words it read before, over every short spelling" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const alphabet = "tRuEfalsTx01 \t";
+    var buf: [6]u8 = undefined;
+    for (0..6) |len| {
+        var idx = [_]usize{0} ** 6;
+        while (true) {
+            for (0..len) |i| buf[i] = alphabet[idx[i]];
+            try expectSameCast(a, .{ .string = buf[0..len] }, .bool);
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                idx[i] += 1;
+                if (idx[i] < alphabet.len) break;
+                idx[i] = 0;
+            }
+            if (i == len) break;
+        }
+    }
+}
+
+test "a column cast and the row cast agree, nulls and failures included" {
+    const column = @import("../column.zig");
+    const Batch = @import("../batch.zig").Batch;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const T = types.Type;
+    var fb = column.Builder.init(a, T.init(.float).asNullable());
+    var bb = column.Builder.init(a, T.init(.bool).asNullable());
+    var sb = column.Builder.init(a, T.init(.string).asNullable());
+    var nb = column.Builder.init(a, T.init(.string).asNullable());
+    const fs = [_]?f64{ 2.5, -3.5, null, 1e18, -0.0, 7 };
+    const bs = [_]?bool{ true, false, null, true, false, true };
+    const ss = [_]?[]const u8{ " 42 ", "-7", null, "+3", "0", "9223372036854775807" };
+    const ns = [_]?[]const u8{ "1_000", "x", null, "", "1e3", "0x10" };
+    for (fs, bs, ss, ns) |f, b, s, t| {
+        try fb.append(if (f) |x| .{ .float = x } else .null);
+        try bb.append(if (b) |x| .{ .bool = x } else .null);
+        try sb.append(if (s) |x| .{ .string = x } else .null);
+        try nb.append(if (t) |x| .{ .string = x } else .null);
+    }
+    const x = try column.intColumn(a, &.{ 0, 1, null, -1, std.math.maxInt(i64), std.math.minInt(i64) });
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "f", .ty = T.init(.float).asNullable() },
+        .{ .name = "b", .ty = T.init(.bool).asNullable() },
+        .{ .name = "s", .ty = T.init(.string).asNullable() },
+        .{ .name = "n", .ty = T.init(.string).asNullable() },
+        .{ .name = "x", .ty = T.init(.int).asNullable() },
+    } };
+    var cols = [_]column.Column{ try fb.finish(), try bb.finish(), try sb.finish(), try nb.finish(), x };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = fs.len };
+    const util = @import("testing_util.zig");
+    try util.expectVecMatchesRows(a, batch, &.{
+        "CAST(f AS INT)", "CAST(b AS INT)", "CAST(s AS INT)", "CAST(x AS DOUBLE)", "CAST(s AS DOUBLE)", "CAST(x AS BOOL)",
+    }, true);
+    try util.expectVecMatchesRows(a, batch, &.{ "CAST(n AS INT)", "CAST(n AS DOUBLE)", "CAST(s AS BOOL)", "CAST(CAST(x AS DOUBLE) * 1e3 AS INT)" }, false);
 }
