@@ -19,6 +19,7 @@ const cell = @import("../exec/cell.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("sql.zig");
 const wire = @import("wire.zig");
+const typemap = @import("typemap.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
 
@@ -410,16 +411,10 @@ fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
     }
 }
 
+/// The kind from `typemap`; a numeric's precision and scale from its typmod.
 fn pgType(oid: i32, typmod: i32) types.Type {
-    return (switch (oid) {
-        16 => types.Type.init(.bool),
-        20, 21, 23 => types.Type.init(.int),
-        700, 701 => types.Type.init(.float),
-        1700 => decimalFromTypmod(typmod),
-        1082 => types.Type.init(.date),
-        1114, 1184 => types.Type.init(.timestamp),
-        else => types.Type.init(.string),
-    }).asNullable();
+    const kind = typemap.readKind(.postgres, .pg(oid)).?;
+    return (if (kind == .decimal) decimalFromTypmod(typmod) else types.Type.init(kind)).asNullable();
 }
 
 fn decimalFromTypmod(typmod: i32) types.Type {
@@ -538,6 +533,28 @@ test "pgType maps OIDs; numeric typmod carries precision and scale" {
     try std.testing.expectEqual(@as(u8, 38), wide_scale.scale);
 }
 
+/// `pgType` at 10e697a, before the kind came from `typemap`.
+fn pinnedPgType(oid: i32, typmod: i32) types.Type {
+    return (switch (oid) {
+        16 => types.Type.init(.bool),
+        20, 21, 23 => types.Type.init(.int),
+        700, 701 => types.Type.init(.float),
+        1700 => decimalFromTypmod(typmod),
+        1082 => types.Type.init(.date),
+        1114, 1184 => types.Type.init(.timestamp),
+        else => types.Type.init(.string),
+    }).asNullable();
+}
+
+test "pgType equals its pre-typemap body for every OID and typmod shape" {
+    const typmods = [_]i32{ -1, 0, 3, 4, (10 << 16 | 2) + 4, (500 << 16 | 2) + 4, (1000 << 16 | 900) + 4, std.math.maxInt(i32), std.math.minInt(i32) };
+    var oid: i32 = -2;
+    while (oid < 4000) : (oid += 1) {
+        for (typmods) |t| try std.testing.expectEqual(pinnedPgType(oid, t), pgType(oid, t));
+    }
+    for ([_]i32{ std.math.minInt(i32), std.math.maxInt(i32), 70_000 }) |o| try std.testing.expectEqual(pinnedPgType(o, -1), pgType(o, -1));
+}
+
 test "ErrorResponse extraction picks the M field" {
     const payload = "SFATAL\x00C28P01\x00Mpassword authentication failed\x00\x00";
     try std.testing.expectEqualStrings("password authentication failed", errMessage(payload));
@@ -642,7 +659,7 @@ const CopyProto = struct {
     }
 
     pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {
-        try sql.appendBulkText(w, batch, .{});
+        try sql.appendBulkText(w, batch, .{ .bytes = .pg_hex });
     }
 
     pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {
@@ -654,6 +671,22 @@ const CopyProto = struct {
 };
 
 pub const CopySink = sql.BulkSink(CopyProto);
+
+test "COPY writes a BYTES cell as bytea hex, its backslash escaped for the text format" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ty = types.Type.init(.bytes).asNullable();
+    var b = column.Builder.init(a, ty);
+    for ([_][]const u8{ "", "\x01\x02 \\ \t\n\"", "\xc3\xb3" }) |x| try b.append(.{ .bytes = x });
+    try b.append(.null);
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try b.finish();
+    var schema = types.Schema{ .fields = &.{.{ .name = "b", .ty = ty }} };
+    var out = std.array_list.Managed(u8).init(a);
+    try CopyProto.appendBatch(out.writer(), a, .{ .schema = &schema, .columns = cols, .len = 4 });
+    try std.testing.expectEqualStrings("\\\\x\n\\\\x0102205c20090a22\n\\\\xc3b3\n\\N\n", out.items);
+}
 
 fn errMessage(p: []const u8) []const u8 {
     var i: usize = 0;

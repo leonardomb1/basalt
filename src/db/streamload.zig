@@ -43,6 +43,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const Column = @import("../exec/column.zig").Column;
 const celltext = @import("../exec/celltext.zig");
 const driver = @import("../connect/driver.zig");
+const retry = @import("../connect/retry.zig");
 const mysql = @import("mysql.zig");
 const sql = @import("sql.zig");
 const obs = @import("../runtime/obs.zig");
@@ -56,7 +57,6 @@ const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
 const RETRY_BUDGET_NS = 60 * std.time.ns_per_s;
 const UNBEGUN_BUDGET_NS = 30 * std.time.ns_per_s;
 const REPLAY_CHUNK = 1 << 20;
-const PAUSE_SLICE_NS = 100 * std.time.ns_per_ms;
 
 pub const Flavor = enum {
     starrocks,
@@ -132,17 +132,6 @@ pub const Config = struct {
     errctx: ?*op.ErrCtx = null,
 };
 
-/// A single-quoted literal for the FE's MySQL protocol: `'` and `\` doubled.
-fn appendStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
-    try out.append('\'');
-    for (s) |c| switch (c) {
-        '\'' => try out.appendSlice("''"),
-        '\\' => try out.appendSlice("\\\\"),
-        else => try out.append(c),
-    };
-    try out.append('\'');
-}
-
 pub fn genCreateTable(
     arena: std.mem.Allocator,
     flavor: Flavor,
@@ -177,13 +166,12 @@ test "loadUrl percent-encodes the database and table" {
     try std.testing.expectEqualStrings("http://be:8040/api/my%20db/a%2Fb%3Fc%23d/_stream_load", u);
 }
 
-/// The first name StarRocks cannot quote, if any: its parser collapses a doubled
-/// backtick to nothing, so `a``b` names the column `ab`.
+/// The first name the flavor cannot quote (`Dialect.quotable`), if any.
 pub fn unquotableName(flavor: Flavor, db: []const u8, table: []const u8, schema: types.Schema) ?[]const u8 {
-    if (flavor != .starrocks) return null;
-    if (std.mem.indexOfScalar(u8, db, '`') != null) return db;
-    if (std.mem.indexOfScalar(u8, table, '`') != null) return table;
-    for (schema.fields) |f| if (std.mem.indexOfScalar(u8, f.name, '`') != null) return f.name;
+    const d = flavor.dialect();
+    if (!d.quotable(db)) return db;
+    if (!d.quotable(table)) return table;
+    for (schema.fields) |f| if (!d.quotable(f.name)) return f.name;
     return null;
 }
 
@@ -194,10 +182,48 @@ test "unquotableName refuses a backtick on StarRocks only" {
     try std.testing.expectEqualStrings("t`x", unquotableName(.starrocks, "db", "t`x", .{ .fields = &.{} }).?);
     try std.testing.expect(unquotableName(.doris, "db", "t", schema) == null);
     try std.testing.expect(unquotableName(.starrocks, "db", "t", .{ .fields = fields[0..1] }) == null);
+    try std.testing.expectEqualStrings("w`h", unquotableName(.starrocks, "w`h", "t", schema).?);
+    try std.testing.expect(unquotableName(.doris, "w`h", "t`x", schema) == null);
+}
+
+/// The FE catalog literal at 10e697a, before `Dialect.writeStrLit`.
+fn pinnedStrLit(out: *std.array_list.Managed(u8), s: []const u8) !void {
+    try out.append('\'');
+    for (s) |c| switch (c) {
+        '\'' => try out.appendSlice("''"),
+        '\\' => try out.appendSlice("\\\\"),
+        else => try out.append(c),
+    };
+    try out.append('\'');
+}
+
+test "the FE catalog literal equals its pre-writeStrLit body" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cases = [_][]const u8{ "", "db", "o'k", "a\\b", "\\'", "''\\\\", "w`h", "\xc3\xb3 \xf0\x9f\x98\x80", "\x00\n\t;--", "x'); DROP DATABASE d;--" };
+    for (cases) |s| for ([_]Flavor{ .starrocks, .doris }) |f| {
+        var want = std.array_list.Managed(u8).init(a);
+        try pinnedStrLit(&want, s);
+        var got = std.array_list.Managed(u8).init(a);
+        try f.dialect().writeStrLit(got.writer(), s, .catalog_name);
+        try std.testing.expectEqualStrings(want.items, got.items);
+    };
+    var prng = std.Random.DefaultPrng.init(7);
+    var buf: [24]u8 = undefined;
+    for (0..2000) |_| {
+        const n = prng.random().uintAtMost(usize, buf.len);
+        for (buf[0..n]) |*b| b.* = "'\\`ab\x00\xff"[prng.random().uintLessThan(usize, 7)];
+        var want = std.array_list.Managed(u8).init(a);
+        try pinnedStrLit(&want, buf[0..n]);
+        var got = std.array_list.Managed(u8).init(a);
+        try Flavor.starrocks.dialect().writeStrLit(got.writer(), buf[0..n], .catalog_name);
+        try std.testing.expectEqualStrings(want.items, got.items);
+    }
 }
 
 fn qualified(arena: std.mem.Allocator, flavor: Flavor, db: []const u8, table: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}.{s}", .{ try sql.quoteName(arena, flavor.dialect(), db), try sql.quoteName(arena, flavor.dialect(), table) });
+    return sql.quoteParts(arena, flavor.dialect(), &.{ db, table });
 }
 
 /// `<prefix>_<table>_<run_id>_<seq>`, with every byte outside `[-\w]` folded to `_`:
@@ -441,11 +467,12 @@ pub const StreamLoadSink = struct {
     fn exists(self: *StreamLoadSink, view: []const u8, schema_col: []const u8, db: []const u8, table: ?[]const u8) !bool {
         var q = std.array_list.Managed(u8).init(self.gpa);
         defer q.deinit();
+        const d = self.cfg.flavor.dialect();
         try q.writer().print("SELECT COUNT(*) FROM {s} WHERE {s} = ", .{ view, schema_col });
-        try appendStrLit(&q, db);
+        try d.writeStrLit(q.writer(), db, .catalog_name);
         if (table) |t| {
             try q.appendSlice(" AND TABLE_NAME = ");
-            try appendStrLit(&q, t);
+            try d.writeStrLit(q.writer(), t, .catalog_name);
         }
         const conn = mysql.Conn.connect(self.gpa, self.cfg.fe_host, self.cfg.fe_port, self.cfg.user, self.cfg.password, "", self.cfg.tls) catch return false;
         var cur = conn.sqlConn().queryCursor(q.items) catch {
@@ -667,8 +694,9 @@ pub const StreamLoadSink = struct {
         };
         const t0 = try std.time.Instant.now();
         defer self.wait_ns += (std.time.Instant.now() catch t0).since(t0);
-        var delay: u64 = std.time.ns_per_s;
-        var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+        var prng = retry.jitterPrng();
+        const policy = commitBackoff(prng.random());
+        var tries: usize = 0;
         while (true) {
             const out = self.attempt() catch |e| blk: {
                 if (!transient(e)) return e;
@@ -679,7 +707,8 @@ pub const StreamLoadSink = struct {
                 .ok => break,
                 .fail => return error.StreamLoadFailed,
                 .resend, .wait, .unbegun => {
-                    const wait = jittered(prng.random(), delay);
+                    const wait_ms = policy.backoffMs(tries);
+                    const wait = wait_ms * std.time.ns_per_ms;
                     if (out == .unbegun and (try std.time.Instant.now()).since(t0) + wait > UNBEGUN_BUDGET_NS) {
                         if (self.errctx) |ec| ec.set("stream load failed: {s}", .{self.why[0..self.why_len]});
                         return error.StreamLoadFailed;
@@ -691,8 +720,8 @@ pub const StreamLoadSink = struct {
                         if (self.errctx) |ec| ec.set("stream load {s}: label {s} still unsettled after {d} s of retries", .{ self.table, self.label, RETRY_BUDGET_NS / std.time.ns_per_s });
                         return error.StreamLoadRetriesExhausted;
                     }
-                    if (!pause(std.Thread.sleep, wait)) return error.Aborted;
-                    delay = @min(delay * 2, 10 * std.time.ns_per_s);
+                    if (!policy.pause(wait_ms)) return error.Aborted;
+                    tries += 1;
                 },
             }
         }
@@ -781,26 +810,13 @@ pub const StreamLoadSink = struct {
 };
 
 fn transient(e: anyerror) bool {
-    return driver.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
+    return retry.transient(e) or e == error.WouldBlock;
 }
 
-const Sleep = *const fn (ns: u64) void;
-
-/// `ns` plus up to 50% jitter, so parallel lanes that failed together retry apart.
-fn jittered(rand: std.Random, ns: u64) u64 {
-    return ns +| rand.uintLessThan(u64, ns / 2 + 1);
-}
-
-/// Sleeps `ns` in short slices; false as soon as the run starts aborting.
-fn pause(sleep: Sleep, ns: u64) bool {
-    var left = ns;
-    while (left > 0) {
-        const step = @min(left, PAUSE_SLICE_NS);
-        sleep(step);
-        left -= step;
-        if (driver.aborting()) return false;
-    }
-    return true;
+/// The commit's backoff: 1 s doubling to a 10 s cap, plus up to 50% jitter so
+/// parallel lanes that failed together retry apart; paused in abortable slices.
+fn commitBackoff(rand: std.Random) retry.Policy {
+    return .{ .rand = rand, .base_ms = 1000, .max_shift = 4, .max_ms = 10_000, .jitter_pct = 50 };
 }
 
 var test_slept: u64 = 0;
@@ -811,38 +827,56 @@ fn testSleep(ns: u64) void {
     test_naps += 1;
 }
 
-test "a stream-load retry pause wakes within one slice of an abort" {
+test "a stream-load commit waits as its own loop did: 1 s doubling to 10 s, up to 50% jitter" {
+    var above_base = false;
+    var differ = false;
+    for (0..64) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const policy = commitBackoff(prng.random());
+        var delay: u64 = std.time.ns_per_s;
+        for (0..9) |i| {
+            const ns = policy.backoffMs(i) * std.time.ns_per_ms;
+            try std.testing.expect(ns >= delay and ns <= delay + delay / 2);
+            if (ns > delay) above_base = true;
+            delay = @min(delay * 2, 10 * std.time.ns_per_s);
+        }
+        var other = std.Random.DefaultPrng.init(seed +% 1000);
+        if (commitBackoff(other.random()).backoffMs(2) != policy.backoffMs(2)) differ = true;
+    }
+    try std.testing.expect(above_base and differ);
+    var prng = std.Random.DefaultPrng.init(0);
+    var flat = commitBackoff(prng.random());
+    flat.jitter_pct = 0;
+    var delay: u64 = std.time.ns_per_s;
+    for (0..9) |i| {
+        try std.testing.expectEqual(delay, flat.backoffMs(i) * std.time.ns_per_ms);
+        delay = @min(delay * 2, 10 * std.time.ns_per_s);
+    }
+}
+
+test "a stream-load commit pause wakes within one slice of an abort and otherwise sleeps the whole wait" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var policy = commitBackoff(prng.random());
+    policy.sleep = testSleep;
+    test_slept = 0;
+    test_naps = 0;
+    try std.testing.expect(policy.pause(1500));
+    try std.testing.expectEqual(@as(u64, 1500 * std.time.ns_per_ms), test_slept);
     test_slept = 0;
     test_naps = 0;
     driver.requestAbort();
     defer driver.resetAbort();
-    try std.testing.expect(!pause(testSleep, 10 * std.time.ns_per_s));
+    try std.testing.expect(!policy.pause(10_000));
     try std.testing.expectEqual(@as(usize, 1), test_naps);
     try std.testing.expect(test_slept <= 100 * std.time.ns_per_ms);
 }
 
-test "a stream-load retry pause sleeps the whole wait when not aborted" {
-    test_slept = 0;
-    test_naps = 0;
-    try std.testing.expect(pause(testSleep, 1500 * std.time.ns_per_ms));
-    try std.testing.expectEqual(@as(u64, 1500 * std.time.ns_per_ms), test_slept);
-}
-
-test "stream-load retry waits draw up to 50% jitter, so lanes do not retry in lockstep" {
-    const base = 4 * std.time.ns_per_s;
-    var above_base = false;
-    var first: ?u64 = null;
-    var differ = false;
-    for (0..64) |seed| {
-        var prng = std.Random.DefaultPrng.init(seed);
-        const ns = jittered(prng.random(), base);
-        try std.testing.expect(ns >= base and ns <= base + base / 2);
-        if (ns > base) above_base = true;
-        if (first) |f| {
-            if (f != ns) differ = true;
-        } else first = ns;
+test "stream-load transient errors are the old list: the shared wire set, a closing server, and a timeout" {
+    const errs = [_]anyerror{ error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream, error.ServerClosedConnection, error.HttpConnectionClosing, error.WouldBlock, error.OutOfMemory, error.StreamLoadFailed, error.Aborted, error.UnknownHostName };
+    for (errs) |e| {
+        const old = driver.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
+        try std.testing.expectEqual(old, transient(e));
     }
-    try std.testing.expect(above_base and differ);
 }
 
 /// Where the value of key `name` starts in a flat JSON object.

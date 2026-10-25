@@ -42,7 +42,10 @@ const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
+const retry = @import("../connect/retry.zig");
 const ast = @import("../lang/ast.zig");
+const typemap = @import("typemap.zig");
+const hexfmt = @import("../format/hex.zig");
 
 pub const STREAM_ROWS = 4096;
 
@@ -244,6 +247,10 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
     };
 }
 
+/// What a string literal is for: a value compared in a pushed predicate, a value
+/// written into a table, or a name looked up in the catalog.
+pub const LitKind = enum { predicate, data, catalog_name };
+
 pub const Dialect = enum {
     postgres,
     mysql,
@@ -260,17 +267,32 @@ pub const Dialect = enum {
         };
     }
 
-    /// `s` as a string literal: quotes doubled, and on the MySQL wire a `\`
-    /// doubled too, so a table or schema name from data cannot end the literal.
+    /// `writeStrLit` of a `.predicate` literal, allocated.
     pub fn strLit(self: Dialect, arena: std.mem.Allocator, s: []const u8) ![]const u8 {
         var out = std.array_list.Managed(u8).init(arena);
-        try out.append('\'');
-        for (s) |c| {
-            if (c == '\'' or (c == '\\' and self.mysqlWire())) try out.append(c);
-            try out.append(c);
-        }
-        try out.append('\'');
+        try self.writeStrLit(out.writer(), s, .predicate);
         return out.toOwnedSlice();
+    }
+
+    /// `s` as a string literal: quotes doubled, and on the MySQL wire a `\`
+    /// doubled too, so text from data cannot end the literal. On SQL Server a
+    /// `.data` value and a `.catalog_name` are `N'...'`, so text outside the code
+    /// page survives; a `.predicate` stays `'...'` (ASCII only, see `textLitOk`)
+    /// so a VARCHAR column is compared without being converted.
+    pub fn writeStrLit(self: Dialect, w: anytype, s: []const u8, kind: LitKind) !void {
+        if (self == .sqlserver and kind != .predicate) try w.writeByte('N');
+        try w.writeByte('\'');
+        for (s) |c| {
+            if (c == '\'' or (c == '\\' and self.mysqlWire())) try w.writeByte(c);
+            try w.writeByte(c);
+        }
+        try w.writeByte('\'');
+    }
+
+    /// Whether the dialect can quote `name` at all: StarRocks's parser collapses a
+    /// doubled backtick to nothing, so `a``b` would name `ab`.
+    pub fn quotable(self: Dialect, name: []const u8) bool {
+        return self != .starrocks or std.mem.indexOfScalar(u8, name, '`') == null;
     }
 
     /// Whether `s` may be sent as a string literal at all: SQL Server reads a
@@ -423,86 +445,15 @@ pub const Dialect = enum {
         };
     }
 
-    /// The column type a CREATE TABLE gets for an engine type. `is_key` shrinks
-    /// unbounded text to something indexable where the database demands it.
+    /// The column type a CREATE TABLE gets for an engine type, from `typemap`.
     pub fn ddlType(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bool) ![]const u8 {
-        return switch (ty.kind) {
-            .bool => switch (self) {
-                .sqlserver => "BIT",
-                .mysql => "TINYINT(1)",
-                .postgres, .starrocks, .doris => "BOOLEAN",
-            },
-            .int => "BIGINT",
-            .float => switch (self) {
-                .postgres => "DOUBLE PRECISION",
-                .mysql, .starrocks, .doris => "DOUBLE",
-                .sqlserver => "FLOAT",
-            },
-            .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
-            .string => switch (self) {
-                .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
-                .doris => if (is_key) "VARCHAR(65533)" else "STRING",
-                .mysql => "VARCHAR(255)",
-                .sqlserver => if (is_key) "NVARCHAR(255)" else "NVARCHAR(4000)",
-                .starrocks => "VARCHAR(65533)",
-            },
-            .bytes => switch (self) {
-                .postgres => "BYTEA",
-                .mysql => "BLOB",
-                .sqlserver => "VARBINARY(MAX)",
-                .starrocks, .doris => "STRING",
-            },
-            .date => "DATE",
-            .time => switch (self) {
-                .postgres, .mysql, .sqlserver => "TIME",
-                .starrocks, .doris => "VARCHAR(32)",
-            },
-            .timestamp => switch (self) {
-                .postgres => "TIMESTAMP",
-                .mysql, .starrocks => "DATETIME",
-                .doris => "DATETIME(6)",
-                .sqlserver => "DATETIME2",
-            },
-            .array => switch (self) {
-                .postgres, .mysql, .sqlserver => "TEXT",
-                .starrocks, .doris => "STRING",
-            },
-            .@"struct" => switch (self) {
-                .postgres, .mysql, .sqlserver => "TEXT",
-                .starrocks, .doris => "JSON",
-            },
-        };
+        return typemap.ddlType(typemap.dialectOf(self), arena, ty, is_key);
     }
 
     /// The type a pushed-down `CAST` uses, or null when the predicate stays in the
-    /// engine. Not `ddlType`: MySQL casts to SIGNED and CHAR but declares BIGINT and
-    /// VARCHAR. A bool is rendered as a comparison instead.
+    /// engine, from `typemap`.
     pub fn castType(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const u8 {
-        return switch (ty.kind) {
-            .int => switch (self) {
-                .postgres, .sqlserver => "BIGINT",
-                .mysql, .starrocks, .doris => "SIGNED",
-            },
-            .float => switch (self) {
-                .postgres => "DOUBLE PRECISION",
-                .mysql, .starrocks, .doris => "DOUBLE",
-                .sqlserver => "FLOAT",
-            },
-            .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
-            .string => switch (self) {
-                .postgres => "TEXT",
-                .mysql, .starrocks, .doris => "CHAR",
-                .sqlserver => "VARCHAR(MAX)",
-            },
-            .date => "DATE",
-            .time => "TIME",
-            .timestamp => switch (self) {
-                .postgres => "TIMESTAMP",
-                .mysql, .starrocks, .doris => "DATETIME",
-                .sqlserver => "DATETIME2",
-            },
-            .bool, .bytes, .array, .@"struct" => null,
-        };
+        return typemap.castType(typemap.dialectOf(self), arena, ty);
     }
 };
 
@@ -651,7 +602,7 @@ pub const Sink = struct {
             if (!driver.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
             self.conn.close();
             self.conn_alive = false;
-            std.Thread.sleep(500 * std.time.ns_per_ms);
+            if (!retry.pauseWith(std.Thread.sleep, 500)) return e;
             self.conn = try rd.dial(rd.ctx, self.gpa);
             self.conn_alive = true;
             try self.conn.exec(stmt);
@@ -805,8 +756,9 @@ pub fn createTableSqlWith(arena: std.mem.Allocator, dialect: Dialect, qtable: []
     const w = buf.writer();
 
     if (dialect == .sqlserver) {
-        const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
-        try w.print("IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
+        try w.writeAll("IF OBJECT_ID(");
+        try dialect.writeStrLit(w, qtable, .catalog_name);
+        try w.print(", N'U') IS NULL CREATE TABLE {s} (", .{qtable});
     } else {
         try w.print("CREATE TABLE IF NOT EXISTS {s} (", .{qtable});
     }
@@ -1031,7 +983,7 @@ fn Literal(comptime dialect: Dialect) type {
         pub const quote_temporal = "'";
 
         pub fn string(_: @This(), w: anytype, s: []const u8) !void {
-            return quoteString(w, dialect, s);
+            return dialect.writeStrLit(w, s, .data);
         }
 
         pub fn bytes(_: @This(), w: anytype, s: []const u8) !void {
@@ -1069,34 +1021,36 @@ test "floatLiteral keeps -0, NaN and the infinities on PostgreSQL" {
     try std.testing.expectError(error.NonFiniteFloat, floatLiteral(&w, .sqlserver, std.math.inf(f64)));
 }
 
-fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
-    try w.writeByte('\'');
-    for (s) |ch| {
-        if (ch == '\'') {
-            try w.writeAll("''");
-        } else if (ch == '\\' and dialect.mysqlWire()) {
-            try w.writeAll("\\\\");
-        } else {
-            try w.writeByte(ch);
-        }
-    }
-    try w.writeByte('\'');
-}
-
 fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
     if (dialect == .postgres) {
         try w.writeAll("'\\x");
-        for (s) |b| try w.print("{x:0>2}", .{b});
+        try writeHex(w, s);
         try w.writeByte('\'');
     } else {
         try w.writeAll("0x");
-        for (s) |b| try w.print("{x:0>2}", .{b});
+        try writeHex(w, s);
     }
 }
+
+/// `s` as lowercase hex digits, through a stack buffer.
+fn writeHex(w: anytype, s: []const u8) !void {
+    var buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = @min(s.len - i, buf.len / 2);
+        try w.writeAll(hexfmt.encode(&buf, s[i..][0..n], .lower));
+        i += n;
+    }
+}
+
+/// How a bulk text format spells a BYTES cell: escaped raw bytes (LOAD DATA into
+/// a BLOB), or PostgreSQL's bytea hex `\x...` with its backslash escaped (COPY).
+pub const BulkBytes = enum { escaped, pg_hex };
 
 pub const BulkFormat = struct {
     bool_true: []const u8 = "t",
     bool_false: []const u8 = "f",
+    bytes: BulkBytes = .escaped,
 };
 
 /// The `celltext.write` policy for COPY and LOAD DATA text: `\N` for null, and a
@@ -1109,6 +1063,16 @@ pub fn BulkText(comptime fmt: BulkFormat) type {
 
         pub fn string(_: @This(), w: anytype, s: []const u8) !void {
             return bulkEscaped(w, s);
+        }
+
+        pub fn bytes(_: @This(), w: anytype, s: []const u8) !void {
+            switch (fmt.bytes) {
+                .escaped => return bulkEscaped(w, s),
+                .pg_hex => {
+                    try w.writeAll("\\\\x");
+                    return writeHex(w, s);
+                },
+            }
         }
     };
 }
@@ -1402,6 +1366,7 @@ test "INSERT literals of every kind, in every dialect" {
     const stamps = "('1970-01-01 00:00:00') ('2024-01-01 00:00:00.123456') ('1969-12-31 23:59:59.999999') ('0001-01-01 00:00:00') (NULL)";
     const nested = "(NULL) (NULL)";
     const rows = "(1,'a b',2.50) (NULL,NULL,NULL) (-2,'',-0.1)";
+    const n_strings = "(N'') (N'plain') (N'tab\there') (N'line\nbreak') (N'cr\rlf\r\n') (N'say \"hi\"') (N'O''Brien') (N'back\\slash\\') (N'a\\Nb') (N'\\N ') (N'NULL') (N'a\x01b\x02c') (N'a,b;c:d.e-1 0') (N'\xc3\xb3 \xf0\x9f\x98\x80') (N'\x00nul') (N'sixteen bytes and more\x01') (NULL)";
     const wire_strings = "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\\\slash\\\\') ('a\\\\Nb') ('\\\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)";
     const want = [_]struct { Dialect, [11][]const u8 }{
         .{ .postgres, .{
@@ -1430,7 +1395,7 @@ test "INSERT literals of every kind, in every dialect" {
             nested,
             rows,
         } },
-        .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, strings, hex, dates, times, stamps, nested, rows } },
+        .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, n_strings, hex, dates, times, stamps, nested, "(1,N'a b',2.50) (NULL,NULL,NULL) (-2,N'',-0.1)" } },
         .{ .starrocks, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
         .{ .doris, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
     };
@@ -1467,7 +1432,10 @@ test "COPY and LOAD DATA text of every kind" {
         "1\ta b\t2.50\n\\N\t\\N\t\\N\n-2\t\t-0.1\n",
     };
     try celltext.expectGolden(&want, try goldenBulkText(a, .{}));
+    want[5] = "\\\\x\n\\\\x706c61696e\n\\\\x0102205c20090a22\n\\\\xc3b3\n\\N\n";
+    try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bytes = .pg_hex }));
     want[0] = "1\n0\n\\N\n";
+    want[5] = "\nplain\n\x01\x02 \\\\ \\t\\n\"\n\xc3\xb3\n\\N\n";
     try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bool_true = "1", .bool_false = "0" }));
 }
 
@@ -1616,4 +1584,136 @@ test "a string literal keeps a name from data inside it in every dialect" {
     try std.testing.expectEqualStrings("'x''); DROP TABLE t;--'", try Dialect.sqlserver.strLit(a, "x'); DROP TABLE t;--"));
     try std.testing.expectEqualStrings("'a\\b'", try Dialect.postgres.strLit(a, "a\\b"));
     try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
+}
+
+/// The literal writers at 10e697a, before `writeStrLit`: `quoteString`, `strLit`,
+/// the OBJECT_ID literal of `createTableSqlWith`, and `hexLiteral`.
+const Pinned = struct {
+    fn quoteString(w: anytype, dialect: Dialect, s: []const u8) !void {
+        try w.writeByte('\'');
+        for (s) |ch| {
+            if (ch == '\'') {
+                try w.writeAll("''");
+            } else if (ch == '\\' and dialect.mysqlWire()) {
+                try w.writeAll("\\\\");
+            } else {
+                try w.writeByte(ch);
+            }
+        }
+        try w.writeByte('\'');
+    }
+
+    fn strLit(self: Dialect, arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+        var out = std.array_list.Managed(u8).init(arena);
+        try out.append('\'');
+        for (s) |c| {
+            if (c == '\'' or (c == '\\' and self.mysqlWire())) try out.append(c);
+            try out.append(c);
+        }
+        try out.append('\'');
+        return out.toOwnedSlice();
+    }
+
+    fn objectId(arena: std.mem.Allocator, qtable: []const u8) ![]const u8 {
+        const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
+        return std.fmt.allocPrint(arena, "IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
+    }
+
+    fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {
+        if (dialect == .postgres) {
+            try w.writeAll("'\\x");
+            for (s) |b| try w.print("{x:0>2}", .{b});
+            try w.writeByte('\'');
+        } else {
+            try w.writeAll("0x");
+            for (s) |b| try w.print("{x:0>2}", .{b});
+        }
+    }
+
+    fn unquotable(dialect: Dialect, name: []const u8) bool {
+        return dialect == .starrocks and std.mem.indexOfScalar(u8, name, '`') != null;
+    }
+};
+
+test "the literal writers equal their pre-writeStrLit bodies, but for SQL Server's N on a value" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(11);
+    const r = prng.random();
+    var buf: [300]u8 = undefined;
+    for (0..3000) |i| {
+        const n = if (i < 8) i * 37 else r.uintAtMost(usize, 40);
+        for (buf[0..n]) |*b| b.* = if (i % 3 == 0) r.int(u8) else "'\\`[]\".ab\x00\xc3\xb3"[r.uintLessThan(usize, 12)];
+        const s = buf[0..n];
+        for (std.enums.values(Dialect)) |d| {
+            var want: std.Io.Writer.Allocating = .init(a);
+            var got: std.Io.Writer.Allocating = .init(a);
+            try Pinned.quoteString(&want.writer, d, s);
+            try d.writeStrLit(&got.writer, s, .data);
+            const n_prefix: []const u8 = if (d == .sqlserver) "N" else "";
+            try std.testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ n_prefix, want.written() }), got.written());
+            try std.testing.expectEqualStrings(try Pinned.strLit(d, a, s), try d.strLit(a, s));
+            try std.testing.expectEqual(Pinned.unquotable(d, s), !d.quotable(s));
+
+            var hw: std.Io.Writer.Allocating = .init(a);
+            var hg: std.Io.Writer.Allocating = .init(a);
+            try Pinned.hexLiteral(&hw.writer, d, s);
+            try hexLiteral(&hg.writer, d, s);
+            try std.testing.expectEqualStrings(hw.written(), hg.written());
+        }
+        const qt = try quoteIdent(a, .sqlserver, s);
+        const ddl = try createTableSql(a, .sqlserver, qt, .{ .fields = &.{.{ .name = "c", .ty = types.Type.init(.int) }} }, .append);
+        try std.testing.expect(std.mem.startsWith(u8, ddl, try Pinned.objectId(a, qt)));
+    }
+}
+
+test "a SQL Server value literal is N-prefixed, so text outside the code page survives a MERGE" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("N'\xc3\xb3 \xf0\x9f\x98\x80'", try literalOf(a, .sqlserver, .string, .{ .string = "\xc3\xb3 \xf0\x9f\x98\x80" }));
+    try std.testing.expectEqualStrings("N'O''Brien'", try literalOf(a, .sqlserver, .string, .{ .string = "O'Brien" }));
+    try std.testing.expectEqualStrings("'\xc3\xb3'", try literalOf(a, .postgres, .string, .{ .string = "\xc3\xb3" }));
+    var w: std.Io.Writer.Allocating = .init(a);
+    try Dialect.sqlserver.writeStrLit(&w.writer, "[dbo].[A\xc3\xa7\xc3\xa3o]", .catalog_name);
+    try Dialect.sqlserver.writeStrLit(&w.writer, "x", .predicate);
+    try Dialect.mysql.writeStrLit(&w.writer, "x", .catalog_name);
+    try std.testing.expectEqualStrings("N'[dbo].[A\xc3\xa7\xc3\xa3o]''x''x'", w.written());
+}
+
+test "the INSERT sink gives up its redial pause, and the redial, once the run is aborting" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Fake = struct {
+        dials: usize = 0,
+        fn queryCursor(_: *anyopaque, _: []const u8) anyerror!Cursor {
+            return error.Unsupported;
+        }
+        fn exec(_: *anyopaque, s: []const u8) anyerror!void {
+            if (std.mem.startsWith(u8, s, "INSERT")) return error.ConnectionResetByPeer;
+        }
+        fn close(_: *anyopaque) void {}
+        fn dial(ctx: *const anyopaque, _: std.mem.Allocator) anyerror!Conn {
+            const f: *@This() = @ptrCast(@alignCast(@constCast(ctx)));
+            f.dials += 1;
+            return .{ .ptr = f, .vtable = &vt };
+        }
+        const vt = Conn.VTable{ .queryCursor = queryCursor, .exec = exec, .close = close };
+    };
+    var fake = Fake{};
+    const schema = types.Schema{ .fields = &.{.{ .name = "id", .ty = types.Type.init(.int).asNullable() }} };
+    var ids = [_]?i64{1};
+    var cols = [_]column.Column{try column.intColumn(a, &ids)};
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 1 };
+    const s = try Sink.open(gpa, .{ .ptr = &fake, .vtable = &Fake.vt }, .postgres, "t", schema, .append, .{ .ctx = &fake, .dial = Fake.dial });
+    try s.writeBatch(a, batch);
+    driver.requestAbort();
+    defer driver.resetAbort();
+    const t0 = try std.time.Instant.now();
+    try std.testing.expectError(error.ConnectionResetByPeer, s.close());
+    try std.testing.expect((try std.time.Instant.now()).since(t0) < 400 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), fake.dials);
 }

@@ -99,58 +99,8 @@ pub const Conn = struct {
     }
 };
 
-/// A cursor over one received body whose every read is checked against what is
-/// left, failing with the driver's own `short` error rather than reading past it.
-pub fn Reader(comptime endian: std.builtin.Endian, comptime short: anytype) type {
-    return struct {
-        const Self = @This();
-        pub const Error = @TypeOf(short);
-
-        p: []const u8,
-        i: usize = 0,
-
-        pub fn left(self: *const Self) usize {
-            return self.p.len - self.i;
-        }
-
-        pub fn bytes(self: *Self, n: usize) Error![]const u8 {
-            if (n > self.left()) return short;
-            defer self.i += n;
-            return self.p[self.i..][0..n];
-        }
-
-        pub fn skip(self: *Self, n: usize) Error!void {
-            _ = try self.bytes(n);
-        }
-
-        pub fn int(self: *Self, comptime T: type) Error!T {
-            return std.mem.readInt(T, (try self.bytes(@sizeOf(T)))[0..@sizeOf(T)], endian);
-        }
-
-        /// A NUL-terminated string, the NUL consumed.
-        pub fn cstr(self: *Self) Error![]const u8 {
-            const end = std.mem.indexOfScalarPos(u8, self.p, self.i, 0) orelse return short;
-            defer self.i = end + 1;
-            return self.p[self.i..end];
-        }
-
-        pub fn rest(self: *Self) []const u8 {
-            defer self.i = self.p.len;
-            return self.p[self.i..];
-        }
-    };
-}
-
-test "a reader never reads past its body" {
-    var r: Reader(.big, error.Short) = .{ .p = "\x00\x02ab\x00c" };
-    try std.testing.expectEqual(@as(u16, 2), try r.int(u16));
-    try std.testing.expectEqualStrings("ab", try r.cstr());
-    try std.testing.expectError(error.Short, r.int(u16));
-    try std.testing.expectError(error.Short, r.cstr());
-    try std.testing.expectError(error.Short, r.skip(std.math.maxInt(usize)));
-    try std.testing.expectEqualStrings("c", r.rest());
-    try std.testing.expectEqual(@as(usize, 0), r.left());
-}
+/// The bounds-checked body cursor, `format/cursor.zig`'s.
+pub const Reader = @import("../format/cursor.zig").Reader;
 
 test "the last error frees the message it replaces" {
     var c: Conn = .{ .gpa = std.testing.allocator, .stream = undefined, .msg = .init(std.testing.allocator) };
