@@ -9,6 +9,7 @@ const Error = @import("../analyze.zig").Error;
 const ParamMap = std.StringHashMap(*const ast.Expr);
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
+const civil = @import("../../exec/civil.zig");
 const exprType = @import("../analyze.zig").exprType;
 const fail = @import("../analyze.zig").fail;
 const failPos = @import("../analyze.zig").failPos;
@@ -178,12 +179,7 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
         return fail(diag, "`{s}` needs {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
     return switch (sp.result) {
         .count => types.Type.init(.int),
-        .sum => switch (at.kind) {
-            .float => types.Type.init(.float).withNull(true),
-            .string => if (at.scale > 0) types.Type.decimal(38, at.scale).withNull(true) else types.Type.init(.int).withNull(true),
-            .decimal => types.Type.decimal(38, at.scale).withNull(true),
-            else => types.Type.init(.int).withNull(true),
-        },
+        .sum => aggregates.sumType(at),
         .float => types.Type.init(.float).withNull(true),
         .same => at.withNull(true),
         .bool => types.Type.init(.bool).withNull(true),
@@ -203,21 +199,13 @@ pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
             .percent_rank, .cume_dist => types.Type.init(.float),
             .lag, .lead, .first_value, .last_value, .nth_value => src.asNullable(),
         },
-        .agg => |a| switch (a) {
-            .sum => switch (src.kind) {
-                .int => types.Type.init(.int).asNullable(),
-                .decimal => types.Type.decimal(38, src.scale).asNullable(),
-                .string => if (src.scale > 0) types.Type.decimal(38, src.scale).asNullable() else types.Type.init(.int).asNullable(),
-                .float => types.Type.init(.float).asNullable(),
-                else => types.Type.init(.int).asNullable(),
-            },
-            else => switch (aggregates.spec(a).result) {
-                .count => types.Type.init(.int),
-                .float, .sum => types.Type.init(.float).asNullable(),
-                .same => src.asNullable(),
-                .bool => types.Type.init(.bool).asNullable(),
-                .int => types.Type.init(.int).asNullable(),
-            },
+        .agg => |a| switch (aggregates.spec(a).result) {
+            .count => types.Type.init(.int),
+            .sum => aggregates.sumType(src),
+            .float => types.Type.init(.float).asNullable(),
+            .same => src.asNullable(),
+            .bool => types.Type.init(.bool).asNullable(),
+            .int => types.Type.init(.int).asNullable(),
         },
     };
 }
@@ -307,14 +295,11 @@ pub fn windowOffset(arena: std.mem.Allocator, f: ast.WindowFunc, e: *const ast.E
     return n.?;
 }
 
-const us_per_day: i128 = 86_400_000_000;
+const us_per_day: i128 = civil.us_per_day;
 
 fn unitMicros(u: ast.IntervalUnit) i128 {
     return switch (u) {
-        .day => us_per_day,
-        .hour => 3_600_000_000,
-        .minute => 60_000_000,
-        .second => 1_000_000,
+        inline else => |t| comptime @field(civil.Part, @tagName(t)).fixedMicros().?,
     };
 }
 
@@ -1094,4 +1079,56 @@ test "opOff: an offset with an exponent, in hex or with separators rounds as bef
     try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993 * us_per_day), opOff(.{ .text = "9_007_199_254_740_993", .unit = .day }, .range, ts, .timestamp).int);
     try std.testing.expectEqual(@as(i128, 150), opOff(.{ .text = "1.5e1" }, .range, .{ .mul = 10, .scale = 1 }, .int).int);
     try std.testing.expectEqual(off_max, opOff(.{ .text = "0x1p200" }, .range, .{}, .int).int);
+}
+
+test "SUM's type under GROUP BY and as a window equals the old switches, over every kind" {
+    const old = struct {
+        fn groupBy(at: types.Type) types.Type {
+            return switch (at.kind) {
+                .float => types.Type.init(.float).withNull(true),
+                .string => if (at.scale > 0) types.Type.decimal(38, at.scale).withNull(true) else types.Type.init(.int).withNull(true),
+                .decimal => types.Type.decimal(38, at.scale).withNull(true),
+                else => types.Type.init(.int).withNull(true),
+            };
+        }
+        fn window(src: types.Type) types.Type {
+            return switch (src.kind) {
+                .int => types.Type.init(.int).asNullable(),
+                .decimal => types.Type.decimal(38, src.scale).asNullable(),
+                .string => if (src.scale > 0) types.Type.decimal(38, src.scale).asNullable() else types.Type.init(.int).asNullable(),
+                .float => types.Type.init(.float).asNullable(),
+                else => types.Type.init(.int).asNullable(),
+            };
+        }
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for (std.enums.values(types.TypeKind)) |k| for ([_]u8{ 0, 3 }) |scale| for ([_]bool{ false, true }) |nullable| for ([_]bool{ false, true }) |unknown| {
+        var t = types.Type.init(k);
+        t.scale = scale;
+        t.nullable = nullable;
+        t.unknown = unknown;
+        if (k == .decimal) t.precision = 18;
+        for ([_]types.Type{ windowFuncType(.{ .agg = .sum }, t), old.window(t) }, [_]types.Type{ old.window(t), old.groupBy(t) }) |got, want| {
+            try std.testing.expect(types.Type.eql(want, got));
+            try std.testing.expectEqual(want.nullable, got.nullable);
+            try std.testing.expectEqual(want.unknown, got.unknown);
+        }
+        if (!aggregates.Arg.numeric.accepts(t)) continue;
+        const fields = [_]types.Schema.Field{.{ .name = "x", .ty = t }};
+        const e = try a.create(ast.Expr);
+        e.* = .{ .field = .{ .parts = &.{"x"} } };
+        var diag = Diag{};
+        const got = try aggResultType(a, .sum, e, .{ .fields = &fields }, &diag);
+        try std.testing.expect(types.Type.eql(old.groupBy(t), got));
+        try std.testing.expectEqual(old.groupBy(t).nullable, got.nullable);
+    };
+}
+
+test "unitMicros: a day, an hour, a minute and a second in microseconds" {
+    try std.testing.expectEqual(@as(i128, 24 * 3_600_000_000), unitMicros(.day));
+    try std.testing.expectEqual(@as(i128, 3_600_000_000), unitMicros(.hour));
+    try std.testing.expectEqual(@as(i128, 60_000_000), unitMicros(.minute));
+    try std.testing.expectEqual(@as(i128, 1_000_000), unitMicros(.second));
 }
