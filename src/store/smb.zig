@@ -1271,10 +1271,22 @@ fn utf16(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     return out;
 }
 
+/// Decodes a UTF-16LE name; an unpaired surrogate becomes U+FFFD so one odd name cannot fail a listing.
 fn utf8(arena: std.mem.Allocator, le: []const u8) ![]const u8 {
     const w = try arena.alloc(u16, le.len / 2);
-    for (w, 0..) |*c, i| c.* = std.mem.readInt(u16, le[i * 2 ..][0..2], .little);
-    return std.unicode.utf16LeToUtf8Alloc(arena, w);
+    @memcpy(std.mem.sliceAsBytes(w), le[0 .. w.len * 2]);
+    return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf16Le(w)});
+}
+
+test "smb: a name with a lone surrogate decodes with U+FFFD, a paired one round-trips" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const lone = [_]u8{ 'a', 0, 0x00, 0xD8, 'b', 0, 0x00, 0xDC };
+    try std.testing.expectEqualStrings("a\u{FFFD}b\u{FFFD}", try utf8(arena, &lone));
+    const le = try utf16(std.testing.allocator, "x\u{1F600}y");
+    defer std.testing.allocator.free(le);
+    try std.testing.expectEqualStrings("x\u{1F600}y", try utf8(arena, le));
 }
 
 test "smb: AES-128-CCM seals and opens, and refuses a tampered message" {
