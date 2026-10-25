@@ -19,6 +19,7 @@ const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
 const regex = @import("../regex.zig");
 const json = @import("../json.zig");
+const jsontext = @import("../jsontext.zig");
 const cachedRegex = @import("support.zig").cachedRegex;
 const cachedRegexOpts = @import("support.zig").cachedRegexOpts;
 const regexErr = @import("support.zig").regexErr;
@@ -642,7 +643,7 @@ pub const Chars = struct {
         while (i < str.len) {
             const cw = charWidth(str, i);
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.encodeJsonString(str[i..][0..cw], .{}, w) catch return error.OutOfMemory;
+            jsontext.string(w, str[i..][0..cw]) catch return error.OutOfMemory;
             i += cw;
             if (out.written().len > max_str_bytes) return failWith(error.CastFailed, "chars: the array passes {d} bytes", .{max_str_bytes});
         }

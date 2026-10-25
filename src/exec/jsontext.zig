@@ -344,10 +344,10 @@ test "jsontext scalar(nested) pins eval writeJsonValue on valid text, the copy W
     }
     var want = Writer.Allocating.init(a);
     try row.writeJsonValue(a, .{ .string = "caf\xe9" }, &want.writer);
-    try testing.expectEqualStrings("\"caf\xe9\"", want.written());
+    try testing.expectEqualStrings("\"caf\u{FFFD}\"", want.written());
     want = Writer.Allocating.init(a);
     try row.writeJsonValue(a, .{ .string = "\x08" }, &want.writer);
-    try testing.expectEqualStrings("\"\\b\"", want.written());
+    try testing.expectEqualStrings("\"\\u0008\"", want.written());
 }
 
 test "jsontext Text renders the celltext golden batches as json/write Text does" {

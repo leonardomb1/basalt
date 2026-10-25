@@ -13,6 +13,7 @@ const eq = @import("support.zig").eq;
 const evalRow = @import("row.zig").evalRow;
 const failWith = @import("support.zig").failWith;
 const json = @import("../json.zig");
+const jsontext = @import("../jsontext.zig");
 const jsonArrayArg = @import("row.zig").jsonArrayArg;
 const jsonElementValue = @import("row.zig").jsonElementValue;
 const lambdaSlots = @import("row.zig").lambdaSlots;
@@ -71,8 +72,7 @@ pub const per_row = struct {
             const k = try evalRow(arena, c.args[i], batch, row);
             if (k.isNull()) return failWith(error.CastFailed, "json_object: key {d} is null", .{i / 2 + 1});
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.encodeJsonString(try valueToString(arena, k), .{}, w) catch return error.OutOfMemory;
-            w.writeByte(':') catch return error.OutOfMemory;
+            jsontext.key(w, try valueToString(arena, k)) catch return error.OutOfMemory;
             try writeJsonValue(arena, try evalRow(arena, c.args[i + 1], batch, row), w);
         }
         w.writeByte('}') catch return error.OutOfMemory;
