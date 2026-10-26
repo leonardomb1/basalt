@@ -11,7 +11,6 @@ const decimal = @import("../decimal.zig");
 const asDecimal = decimal.asDecimal;
 const ast = @import("../../lang/ast.zig");
 const cast = @import("cast.zig");
-const castValue = cast.castValue;
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const decimalArithType = @import("../decimal.zig").decimalArithType;
@@ -140,11 +139,13 @@ pub fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch
 
 /// Row-wise evaluation of one node as a column, typed by widening every non-null
 /// value's type (the first value's alone made the answer depend on where a batch
-/// began). Kinds with no common type decline.
+/// began). Kinds with no common type decline. `unify` is idempotent, so a value
+/// typed as the one before it skips it.
 fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) VecError!Vec {
     const n = batch.len;
     const vals = try arena.alloc(Value, n);
     var ty: ?Type = null;
+    var last: ?Type = null;
     for (vals, 0..) |*v, i| {
         v.* = evalRow(arena, expr, batch, i) catch return error.Unsupported;
         const vt: Type = switch (v.*) {
@@ -159,6 +160,8 @@ fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Vec
             .timestamp => Type.init(.timestamp),
             .decimal => |d| Type.decimal(0, d.scale),
         };
+        if (last) |l| if (l.kind == vt.kind and l.scale == vt.scale) continue;
+        last = vt;
         ty = if (ty) |t| Type.unify(t, vt) orelse return error.Unsupported else vt;
     }
     const t = ty orelse return .{ .scalar = .null };
@@ -531,10 +534,6 @@ inline fn cmpLane(comptime T: type, comptime op: ast.BinOp, a: T, d: T) bool {
     };
 }
 
-inline fn outData(comptime Out: type, out: []Out) Column.Data {
-    return if (Out == bool) .{ .b = out } else if (Out == i64) .{ .i64 = out } else .{ .f64 = out };
-}
-
 /// A dictionary column against a string literal: each entry compared once and the
 /// answer gathered through the codes. Null when the operands are not that shape.
 fn dictCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
@@ -629,60 +628,54 @@ fn boolOpVec(arena: std.mem.Allocator, op: ast.BinOp, le: *const ast.Expr, re: *
 fn castVec(arena: std.mem.Allocator, c: ast.Expr.Cast, batch: Batch) VecError!Vec {
     if (c.safe) return error.Unsupported;
     const v = try evalVec(arena, c.e, batch);
-    const target = c.ty.kind;
-    if (target == .decimal) return error.Unsupported;
-    switch (v) {
-        .scalar => |s| {
-            if (s.isNull()) return .{ .scalar = .null };
-            return .{ .scalar = castValue(arena, s, target) catch |e| switch (e) {
-                error.CastFailed => return error.Unsupported,
-                else => return e,
-            } };
-        },
-        .col => |col| return castColVec(arena, col, target, batch.len) catch |e| switch (e) {
-            error.CastFailed => return error.Unsupported,
-            else => return e,
-        },
-    }
+    const out: VecError!Vec = switch (v) {
+        .scalar => |s| if (s.isNull()) v else if (cast.castValueTyped(arena, s, c.ty)) |r| .{ .scalar = r } else |e| e,
+        .col => |col| castColVec(arena, col, c.ty, batch.len),
+    };
+    return out catch |e| switch (e) {
+        error.CastFailed, error.IntOverflow => error.Unsupported,
+        else => e,
+    };
 }
 
-/// The casts a column takes here; any other pair goes to the row path.
-const vec_casts = [_][2]types.TypeKind{
-    .{ .float, .int }, .{ .bool, .int },     .{ .string, .int },
-    .{ .int, .float }, .{ .string, .float }, .{ .int, .bool },
+/// The casts a column takes here, every pair `castElem` converts; any other goes
+/// to the row path.
+const vec_casts = blk: {
+    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .date, .time, .timestamp };
+    var pairs: []const [2]types.TypeKind = &.{};
+    for (kinds) |f| for (kinds) |t| if (cast.hasElemCast(f, t)) {
+        pairs = pairs ++ .{.{ f, t }};
+    };
+    break :blk pairs;
 };
 
-fn castColVec(arena: std.mem.Allocator, col: Column, target: types.TypeKind, n: usize) VecError!Vec {
-    if (col.ty.kind == target) return .{ .col = col };
-    inline for (vec_casts) |p| {
-        if (col.ty.kind == p[0] and target == p[1]) return castColWith(p[0], p[1], arena, col, n);
-    }
+fn castColVec(arena: std.mem.Allocator, col: Column, ty: Type, n: usize) VecError!Vec {
+    if (col.ty.kind == ty.kind and ty.kind != .decimal) return .{ .col = col };
+    inline for (vec_casts) |p| if (col.ty.kind == p[0] and ty.kind == p[1]) return switch (p[0]) {
+        .string => castColWith(p[0], p[1], arena, col.data.bytes, col, ty, n),
+        .decimal => switch (column.decimals(col)) {
+            inline else => |xs| castColWith(p[0], p[1], arena, xs, col, ty, n),
+        },
+        else => castColWith(p[0], p[1], arena, column.fixedOf(comptime column.storageOf(p[0]), col.data), col, ty, n),
+    };
     return error.Unsupported;
 }
 
-/// The one loop of a column cast: `castElem` per row. A pair that can fail skips
-/// null rows, whose slots hold no value to read; one that cannot runs straight.
-fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena: std.mem.Allocator, col: Column, n: usize) VecError!Vec {
-    const out = try arena.alloc(cast.Elem(to), n);
-    const gated = comptime (from == .float or from == .string);
-    if (comptime from == .string) {
-        for (out, 0..) |*o, i| o.* = if (col.validity.get(i)) try cast.castElem(from, to, col.data.bytes.at(i)) else 0;
-    } else {
-        const xs = switch (from) {
-            .float => col.data.f64,
-            .int => col.data.i64,
-            .bool => col.data.b,
-            else => comptime unreachable,
-        };
-        if (gated) {
-            for (out, xs[0..n], 0..) |*o, x, i| o.* = if (col.validity.get(i)) try cast.castElem(from, to, x) else 0;
-        } else for (out, xs[0..n]) |*o, x| {
-            o.* = try cast.castElem(from, to, x);
-        }
+/// The one loop of a column cast: `castElem` per row over `xs`, the column's values.
+/// Only a pair from INT or BOOL that cannot fail runs straight; every other skips
+/// null rows, whose slots it does not trust to hold a value it can convert.
+fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena: std.mem.Allocator, xs: anytype, col: Column, ty: Type, n: usize) VecError!Vec {
+    const Out = cast.Elem(to);
+    const zero: Out = if (to == .decimal) .{ .unscaled = 0, .scale = ty.scale } else std.mem.zeroes(Out);
+    const out = try arena.alloc(Out, n);
+    const R = @typeInfo(@TypeOf(cast.castElem(from, to, undefined, ty))).error_union.error_set;
+    const straight = comptime (from == .int or from == .bool) and @typeInfo(R).error_set.?.len == 0;
+    for (out, 0..) |*o, i| {
+        const x = if (from == .string) xs.at(i) else xs[i];
+        o.* = if (straight or col.validity.get(i)) try cast.castElem(from, to, x, ty) else zero;
     }
-    var t = Type.init(to);
-    t.nullable = col.ty.nullable;
-    return mkCol(t, n, col.validity, outData(cast.Elem(to), out));
+    const t = if (to == .decimal) Type.decimal(ty.precision, ty.scale) else Type.init(to);
+    return mkCol(t.withNull(col.ty.nullable), n, col.validity, column.dataOf(comptime column.storageOf(to), out));
 }
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {

@@ -26,9 +26,11 @@ const valueToString = @import("format.zig").valueToString;
 /// for `DECIMAL(p, s)` left the conversion undefined.
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
-    const r = rescaleTo(asDecimalValue(v) orelse return error.CastFailed, ty.scale) orelse return error.CastFailed;
-    if (!fitsPrecision(r.unscaled, ty.precision)) return error.CastFailed;
-    return .{ .decimal = r };
+    return .{ .decimal = try toDecimal(asDecimalValue(v), ty) };
+}
+
+fn toDecimal(d: ?Decimal, ty: types.Type) error{CastFailed}!Decimal {
+    return decimal.fitTo(d orelse return error.CastFailed, ty.precision, ty.scale) orelse error.CastFailed;
 }
 
 /// Text as `SUM` over a text column adds it: an exact number in `ty` (an INT, or a
@@ -104,18 +106,20 @@ pub fn Elem(comptime k: types.TypeKind) type {
         .bool => bool,
         .int, .time, .timestamp => i64,
         .float => f64,
+        .decimal => Decimal,
         .date => i32,
         .string => []const u8,
-        else => @compileError("castElem covers the non-decimal scalar kinds"),
+        else => @compileError("castElem covers the scalar kinds"),
     };
 }
 
 /// Whether `castElem` converts `from` to `to`: the pairs between different kinds
-/// other than DECIMAL ones and those to STRING.
+/// other than those to STRING, and DECIMAL to DECIMAL, a rescale.
 pub fn hasElemCast(comptime from: types.TypeKind, comptime to: types.TypeKind) bool {
     return switch (to) {
-        .int => from == .float or from == .bool or from == .string,
-        .float => from == .int or from == .string,
+        .int => from == .float or from == .bool or from == .string or from == .decimal,
+        .float => from == .int or from == .string or from == .decimal,
+        .decimal => from == .int or from == .float or from == .bool or from == .string or from == .decimal,
         .date => from == .timestamp or from == .string,
         .timestamp => from == .date or from == .string,
         .time => from == .timestamp or from == .string,
@@ -124,23 +128,26 @@ pub fn hasElemCast(comptime from: types.TypeKind, comptime to: types.TypeKind) b
     };
 }
 
-/// One value cast from `from` to `to`, the math the row cast and the vector cast
-/// share. Its error set is empty for a pair that cannot fail, so a column loop over
-/// one has no failure branch.
-pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKind, x: Elem(from)) !Elem(to) {
+/// One value cast from `from` to `to` (`ty` gives a DECIMAL's precision and scale),
+/// the math the row cast and the vector cast share. Its error set is empty for a
+/// pair that cannot fail, so a column loop over one has no failure branch.
+pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKind, x: Elem(from), ty: types.Type) !Elem(to) {
     if (comptime !hasElemCast(from, to)) @compileError("no element cast from " ++ @tagName(from) ++ " to " ++ @tagName(to));
     return switch (to) {
         .int => switch (from) {
             .float => textconv.floatToInt(x, .half_even) orelse error.CastFailed,
             .bool => @intFromBool(x),
             .string => parseIntStrict(trim(x)) orelse error.CastFailed,
+            .decimal => std.math.cast(i64, (rescaleTo(x, 0) orelse return error.IntOverflow).unscaled) orelse error.IntOverflow,
             else => comptime unreachable,
         },
         .float => switch (from) {
             .int => @floatFromInt(x),
             .string => parseFloatStrict(trim(x)) orelse error.CastFailed,
+            .decimal => x.toF64(),
             else => comptime unreachable,
         },
+        .decimal => toDecimal(asDecimalValue(@unionInit(Value, @tagName(from), x)), ty),
         .date => switch (from) {
             .timestamp => @intCast(civil.dayOf(x)),
             .string => @intCast(parseDateText(x) orelse return error.CastFailed),
@@ -171,16 +178,11 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
         .string => return .{ .string = try valueToString(arena, v) },
         inline .bool, .int, .float, .date, .timestamp, .time => |to| switch (v) {
             .null, .bytes => return error.CastFailed,
-            .decimal => |d| return switch (to) {
-                .int => .{ .int = std.math.cast(i64, (rescaleTo(d, 0) orelse return error.IntOverflow).unscaled) orelse return error.IntOverflow },
-                .float => .{ .float = d.toF64() },
-                else => error.CastFailed,
-            },
             inline else => |x, tag| {
                 const from = comptime @field(types.TypeKind, @tagName(tag));
                 if (comptime from == to) return v;
                 if (comptime !hasElemCast(from, to)) return error.CastFailed;
-                return @unionInit(Value, @tagName(to), try castElem(from, to, x));
+                return @unionInit(Value, @tagName(to), try castElem(from, to, x, types.Type.init(to)));
             },
         },
         else => return error.CastFailed,
@@ -450,4 +452,114 @@ test "a column cast and the row cast agree, nulls and failures included" {
         "CAST(f AS INT)", "CAST(b AS INT)", "CAST(s AS INT)", "CAST(x AS DOUBLE)", "CAST(s AS DOUBLE)", "CAST(x AS BOOL)",
     }, true);
     try util.expectVecMatchesRows(a, batch, &.{ "CAST(n AS INT)", "CAST(n AS DOUBLE)", "CAST(s AS BOOL)", "CAST(CAST(x AS DOUBLE) * 1e3 AS INT)" }, false);
+}
+
+test "the vector cast and the row cast agree bit for bit, per row, over random values and edges" {
+    const column = @import("../column.zig");
+    const Batch = @import("../batch.zig").Batch;
+    const vec = @import("vec.zig");
+    const evalRow = @import("row.zig").evalRow;
+    const parser = @import("../../lang/sql_parser.zig");
+    const T = types.Type;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xCA57);
+    const r = prng.random();
+    const n = 1200;
+    const big = [_]i128{ 0, 1, -1, 5, -5, 15, -25, (1 << 53) + 1, -(1 << 53) - 1, (1 << 63) + 1, (1 << 63) - 1, -(1 << 63), -(1 << 63) - 1, std.math.maxInt(i128), std.math.minInt(i128) };
+    const texts = [_][]const u8{ " 12.5 ", "-0", "1e3", "abc", "", "2026-10-03", "12:34:56", "2026-10-03 12:34:56.5", "true", "0.000000000000000000000000000000000000015", "99999999999999999999999999999999999999999", "9223372036854775808", "-9223372036854775808", "1_000", "nan" };
+    const floats = [_]f64{ 0, -0.0, 2.5, -3.5, 1e300, -1e-300, std.math.nan(f64), std.math.inf(f64), 0x1p63, 123456789012345678.0, 0.1 + 0.2 };
+    var db = column.Builder.init(a, T.decimal(38, 2).asNullable());
+    var qb = column.Builder.init(a, T.decimal(18, 2).asNullable());
+    var xb = column.Builder.init(a, T.init(.int).asNullable());
+    var fb = column.Builder.init(a, T.init(.float).asNullable());
+    var sb = column.Builder.init(a, T.init(.string).asNullable());
+    var tb = column.Builder.init(a, T.init(.date).asNullable());
+    for (0..n) |i| {
+        if (i % 13 == 7) {
+            inline for (.{ &db, &qb, &xb, &fb, &sb, &tb }) |b| try b.append(.null);
+            continue;
+        }
+        const edge = i < big.len * 39;
+        const u: i128 = if (edge) big[i / 39] else r.int(i128) >> r.uintLessThan(u7, 127);
+        const sc: u8 = if (edge) @intCast(i % 39) else r.uintLessThan(u8, 39);
+        try db.append(.{ .decimal = .{ .unscaled = u, .scale = sc } });
+        const q: Decimal = .{ .unscaled = @rem(u, 1_000_000_000_000), .scale = r.uintLessThan(u8, 7) };
+        try qb.append(.{ .decimal = q });
+        try xb.append(.{ .int = if (i < big.len) @truncate(big[i]) else r.int(i64) >> r.uintLessThan(u6, 63) });
+        try fb.append(.{ .float = if (i < floats.len) floats[i] else (r.float(f64) - 0.5) * std.math.pow(f64, 10, @floatFromInt(r.uintLessThan(u8, 40))) });
+        try sb.append(.{ .string = if (i % 3 == 0) texts[r.uintLessThan(usize, texts.len)] else try decimal.formatDecimal(a, q.unscaled, q.scale) });
+        try tb.append(.{ .date = r.intRangeAtMost(i32, -800_000, 800_000) });
+    }
+    var cols = [_]column.Column{ try db.finish(), try qb.finish(), try xb.finish(), try fb.finish(), try sb.finish(), try tb.finish() };
+    for (0..n) |i| if (!cols[0].validity.get(i)) {
+        column.fixedOf(.dec, cols[0].data)[i] = .{ .unscaled = std.math.maxInt(i128), .scale = 0 };
+        column.fixedOf(.dec, cols[1].data)[i] = .{ .unscaled = std.math.maxInt(i128), .scale = 0 };
+        cols[2].data.i64[i] = std.math.maxInt(i64);
+        cols[5].data.i32[i] = std.math.maxInt(i32);
+    };
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "d", .ty = cols[0].ty }, .{ .name = "q", .ty = cols[1].ty }, .{ .name = "x", .ty = cols[2].ty },
+        .{ .name = "f", .ty = cols[3].ty }, .{ .name = "s", .ty = cols[4].ty }, .{ .name = "t", .ty = cols[5].ty },
+    } };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = n };
+    const cases = [_]struct { src: []const u8, whole: bool }{
+        .{ .src = "CAST(d AS DOUBLE)", .whole = true },                  .{ .src = "CAST(q AS DOUBLE)", .whole = true },
+        .{ .src = "CAST(q AS INT)", .whole = true },                     .{ .src = "CAST(q AS DECIMAL(18,4))", .whole = true },
+        .{ .src = "CAST(q AS DECIMAL(38,0))", .whole = true },           .{ .src = "CAST(x AS DECIMAL(38,2))", .whole = true },
+        .{ .src = "CAST(x AS DOUBLE)", .whole = true },                  .{ .src = "CAST(t AS TIMESTAMP)", .whole = true },
+        .{ .src = "CAST(CAST(t AS TIMESTAMP) AS DATE)", .whole = true }, .{ .src = "CAST(1.25 AS DECIMAL(5,1))", .whole = true },
+        .{ .src = "CAST(d AS INT)", .whole = false },                    .{ .src = "CAST(d AS DECIMAL(38,2))", .whole = false },
+        .{ .src = "CAST(d AS DECIMAL(18,4))", .whole = false },          .{ .src = "CAST(d AS DECIMAL(38,38))", .whole = false },
+        .{ .src = "CAST(x AS DECIMAL(5,1))", .whole = false },           .{ .src = "CAST(f AS INT)", .whole = false },
+        .{ .src = "CAST(f AS DECIMAL(38,10))", .whole = false },         .{ .src = "CAST(s AS DECIMAL(20,3))", .whole = false },
+        .{ .src = "CAST(s AS INT)", .whole = false },                    .{ .src = "CAST(s AS DOUBLE)", .whole = false },
+        .{ .src = "CAST(s AS DATE)", .whole = false },                   .{ .src = "CAST(s AS TIMESTAMP)", .whole = false },
+        .{ .src = "CAST(s AS TIME)", .whole = false },                   .{ .src = "CAST(s AS BOOL)", .whole = false },
+    };
+    const Check = struct {
+        fn same(want: Value, got: Value) !void {
+            try std.testing.expectEqual(std.meta.activeTag(want), std.meta.activeTag(got));
+            switch (want) {
+                .float => |w| try std.testing.expectEqual(@as(u64, @bitCast(w)), @as(u64, @bitCast(got.float))),
+                .decimal => |w| {
+                    try std.testing.expectEqual(w.unscaled, got.decimal.unscaled);
+                    try std.testing.expectEqual(w.scale, got.decimal.scale);
+                },
+                .string, .bytes => unreachable,
+                else => try std.testing.expectEqual(want, got),
+            }
+        }
+        fn at(v: vec.Vec, i: usize) Value {
+            return switch (v) {
+                .col => |c| c.getValue(i),
+                .scalar => |s| s,
+            };
+        }
+    };
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for (cases) |c| {
+        errdefer std.debug.print("mismatch in `{s}`\n", .{c.src});
+        const e = try parser.parseExprStr(a, c.src, &diag);
+        if (vec.evalVecNode(a, e, batch)) |v| {
+            for (0..n) |i| try Check.same(try evalRow(a, e, batch, i), Check.at(v, i));
+        } else |err| {
+            try std.testing.expect(!c.whole);
+            try std.testing.expectEqual(error.Unsupported, err);
+        }
+        var keep = [_]bool{false} ** n;
+        var one_cols: [cols.len]column.Column = undefined;
+        const one = Batch{ .schema = &schema, .columns = &one_cols, .len = 1 };
+        for (0..n) |i| {
+            keep[i] = true;
+            try column.gatherColumns(a, &cols, &one_cols, &keep, 1);
+            keep[i] = false;
+            _ = evalRow(a, e, one, 0) catch {
+                try std.testing.expectError(error.Unsupported, vec.evalVecNode(a, e, one));
+                continue;
+            };
+            try Check.same(try evalRow(a, e, one, 0), Check.at(try vec.evalVecNode(a, e, one), 0));
+        }
+    }
 }
