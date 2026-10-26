@@ -291,10 +291,16 @@ pub const WorkQueue = struct {
     /// The next item for a lane, or null once every item is taken or a lane failed.
     pub fn take(q: *WorkQueue) ?usize {
         if (q.failed.load(.seq_cst)) return null;
-        const i = q.next.fetchAdd(1, .seq_cst);
-        return if (i >= q.nitems) null else i;
+        return claim(&q.next, q.nitems, .seq_cst);
     }
 };
+
+/// The next of `n` items off the shared counter `next`, or null once all are
+/// taken: the steal under `WorkQueue.take`, for a loop that latches its own stop.
+pub inline fn claim(next: *std.atomic.Value(usize), n: usize, comptime order: std.builtin.AtomicOrder) ?usize {
+    const i = next.fetchAdd(1, order);
+    return if (i >= n) null else i;
+}
 
 /// A lane's private allocators: a thread-unsafe gpa, a work arena for the chain it
 /// builds, and a batch arena reset between batches. Init in place; it must not move.

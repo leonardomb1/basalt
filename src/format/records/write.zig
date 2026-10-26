@@ -159,6 +159,7 @@ pub const Writer = struct {
 const testing = std.testing;
 const column = @import("../../exec/column.zig");
 const types = @import("../../lang/types.zig");
+const Guard = @import("../../connect/guard.zig").Guard;
 
 fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, vals: []const ?[]const u8) !Batch {
     var b = column.Builder.init(a, types.Type.init(kind).asNullable());
@@ -174,9 +175,10 @@ fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, vals: []const ?[]const 
 
 fn writeFile(a: std.mem.Allocator, path: []const u8, mode: driver.FileMode, opts: Options, batches: []const Batch) !void {
     const w = try Writer.open(a, path, mode, opts);
-    errdefer w.abort();
+    var g = Guard(*Writer).init(w);
+    defer g.abort();
     for (batches, 0..) |b, i| if (i % 2 == 0) try w.writeBatch(a, b) else try w.writeRendered(try w.renderBatch(a, b));
-    try w.close();
+    try g.close();
 }
 
 test "parseNewline takes names, escapes, literal bytes and empty; nothing else" {

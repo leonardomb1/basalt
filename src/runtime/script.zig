@@ -418,8 +418,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
     while (true) {
         if (aborting()) break;
         if (ctx.on_error == .stop and ctx.stop.load(.acquire)) break;
-        const i = ctx.next.fetchAdd(1, .monotonic);
-        if (i >= ctx.rows.len) break;
+        const i = parallel.claim(&ctx.next, ctx.rows.len, .monotonic) orelse break;
         const row = ctx.rows[i];
 
         var w_arena = std.heap.ArenaAllocator.init(gpa);
