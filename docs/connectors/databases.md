@@ -111,8 +111,8 @@ collation, which every result carries:
   not valid UTF-8 fails the read, naming the column.
 - Any other code page (Cyrillic, Greek, Turkish, Japanese, ...) is not decoded.
   ASCII reads the same in all of them, so ASCII values pass, but the first value
-  holding a byte above 0x7F fails the read, naming the column and its collation,
-  rather than turning into mojibake. Read such a column
+  holding a byte above 0x7F fails the read, naming the column and its
+  collation's LCID and sort id, rather than turning into mojibake. Read such a column
   `CAST(col AS nvarchar(...))`.
 
 `nvarchar`, `nchar`, `ntext` and `xml` read as UTF-16, surrogate pairs joined. An
