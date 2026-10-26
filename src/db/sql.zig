@@ -29,8 +29,9 @@
 //! double-writes. Flushes already committed stay on abort; downstream dedup owns
 //! exactly-once (see split.zig).
 //!
-//! Text from the wire is typed by `cell.wire`. A cell that does not parse as its
-//! numeric type is an error, never a quiet 0 or a different number.
+//! Text from the wire is typed by `cell.wire`, or by `cell.pg_wire` for PostgreSQL,
+//! whose `time` and `bytea` text it decodes. A cell that does not parse as its
+//! type is an error, never a quiet 0 or a different value.
 
 const std = @import("std");
 const op = @import("../exec/op.zig");
