@@ -17,11 +17,11 @@ carry no zone and read as written.
 
 The session zone also sets the server's own clock in basalt's sessions. On
 MySQL, StarRocks and Doris, `NOW()`, `CURRENT_TIMESTAMP` and `FROM_UNIXTIME` in
-a query basalt sends give UTC, and so does a `DATETIME` column's `DEFAULT` or
-`ON UPDATE CURRENT_TIMESTAMP` filled by a row basalt writes; on PostgreSQL a
-`timestamp` column's `DEFAULT now()` is the UTC wall-clock time. Other sessions
-on the same server keep their own zone, so a row they write may differ by the
-offset.
+a query basalt sends give UTC. On MySQL so does a `DATETIME` column's `DEFAULT`
+or `ON UPDATE CURRENT_TIMESTAMP` filled by a row basalt writes, and on
+PostgreSQL a `timestamp` column's `DEFAULT now()` is the UTC wall-clock time.
+StarRocks and Doris are written by Stream Load, outside the session, so their
+defaults keep the server's zone, as do other sessions on the same server.
 
 A PostgreSQL `bytea` reads as `BYTES`, decoded from whichever `bytea_output`
 format the server uses, and a PostgreSQL `time` as `TIME`. A basalt `TIME` is a
