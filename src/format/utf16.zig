@@ -7,16 +7,17 @@
 //! reject text that is not valid Unicode), so a cell is never silently altered.
 //! A name or message (a file in a listing, a column, a server error) is repaired
 //! with U+FFFD (`replacement`, as Windows' WideCharToMultiByte does), so one bad
-//! name cannot hide every other. A trailing odd byte is not a code unit and is dropped.
+//! name cannot hide every other. A trailing odd byte is not a code unit: data fails
+//! on it (`OddUtf16`), a name drops it.
 
 const std = @import("std");
 
 pub const Lone = enum { replacement, fail };
 
-pub const LoneError = error{LoneSurrogate};
+pub const DecodeError = error{ LoneSurrogate, OddUtf16 };
 
 fn Decoded(comptime lone: Lone) type {
-    return if (lone == .fail) LoneError!usize else usize;
+    return if (lone == .fail) DecodeError!usize else usize;
 }
 
 /// Room `decodeLe` needs for `n` bytes of UTF-16LE: three per code unit (a pair's
@@ -26,7 +27,7 @@ pub fn decodedBound(n: usize) usize {
 }
 
 /// `bytes` as UTF-8 into `out`, which holds `decodedBound(bytes.len)`; returns the
-/// length written. Eight units that are all ASCII, the common run, are narrowed at
+/// length written. Under `fail` an odd length is `OddUtf16`. Eight units that are all ASCII, the common run, are narrowed at
 /// once. Moved from TDS `utf16Encode`.
 pub fn decodeLe(comptime lone: Lone, out: []u8, bytes: []const u8) Decoded(lone) {
     const V = @Vector(16, u8);
@@ -66,6 +67,7 @@ pub fn decodeLe(comptime lone: Lone, out: []u8, bytes: []const u8) Decoded(lone)
             break :blk lonely(lone, out[o..]);
         };
     }
+    if (lone == .fail and k < bytes.len) return error.OddUtf16;
     return o;
 }
 
@@ -80,7 +82,7 @@ fn lonely(comptime lone: Lone, out: []u8) usize {
 }
 
 /// `decodeLe` into a slice of `a` sized to fit.
-pub fn decodeLeAlloc(comptime lone: Lone, a: std.mem.Allocator, bytes: []const u8) (if (lone == .fail) (std.mem.Allocator.Error || LoneError) else std.mem.Allocator.Error)![]u8 {
+pub fn decodeLeAlloc(comptime lone: Lone, a: std.mem.Allocator, bytes: []const u8) (if (lone == .fail) (std.mem.Allocator.Error || DecodeError) else std.mem.Allocator.Error)![]u8 {
     const out = try a.alloc(u8, decodedBound(bytes.len));
     errdefer a.free(out);
     const n = if (lone == .fail) try decodeLe(lone, out, bytes) else decodeLe(lone, out, bytes);
@@ -243,13 +245,23 @@ test "utf16: decodeLe reads BMP text and joined pairs; an unpaired half is U+FFF
         const round = try std.unicode.utf8ToUtf16LeAlloc(a, "𝄞x𝕏");
         try testing.expectEqualStrings("𝄞x𝕏", try decodeLeAlloc(p, a, std.mem.sliceAsBytes(round)));
         try testing.expectEqualStrings("?", try decodeLeAlloc(p, a, "?\x00"));
-        try testing.expectEqualStrings("a", try decodeLeAlloc(p, a, "a\x00b"));
-        try testing.expectEqualStrings("", try decodeLeAlloc(p, a, "a"));
         try testing.expectEqualStrings("", try decodeLeAlloc(p, a, ""));
     }
+    try testing.expectEqualStrings("a", try decodeLeAlloc(.replacement, a, "a\x00b"));
+    try testing.expectEqualStrings("", try decodeLeAlloc(.replacement, a, "a"));
     try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", try decodeLeAlloc(.replacement, a, "\x3d\xd8\x3d\xd8"));
     try testing.expectEqualStrings("\u{FFFD}😀", try decodeLeAlloc(.replacement, a, "\x3d\xd8\x3d\xd8\x00\xde"));
     try testing.expectError(error.LoneSurrogate, decodeLeAlloc(.fail, a, "\x3d\xd8\x3d\xd8"));
+}
+
+test "utf16: under fail a trailing odd byte is an error, never dropped" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "a", "a\x00b", "a\x00\x3d\xd8\x00\xde" ++ "b", "abcdefghijklmnopqrstuvwxyz0123456" }) |b|
+        try testing.expectError(error.OddUtf16, decodeLeAlloc(.fail, a, b));
+    try testing.expectError(error.LoneSurrogate, decodeLeAlloc(.fail, a, "\x3d\xd8b"));
+    try testing.expectEqualStrings("a😀", try decodeLeAlloc(.replacement, a, "a\x00\x3d\xd8\x00\xde" ++ "b"));
 }
 
 test "utf16: replacement puts one U+FFFD per unpaired half; fail refuses it" {
@@ -291,8 +303,11 @@ test "utf16: every policy matches a scalar reference at every alignment, std whe
         const std_units = units.items[0 .. bytes.len / 2];
         if (std.unicode.utf16LeToUtf8Alloc(a, std_units)) |want| {
             try testing.expectEqualStrings(want, strict.?);
-            try testing.expectEqualStrings(want, out[0..try decodeLe(.fail, out, bytes)]);
             try testing.expectEqualStrings(want, out[0..decodeLe(.replacement, out, bytes)]);
+            if (bytes.len % 2 == 1)
+                try testing.expectError(error.OddUtf16, decodeLe(.fail, out, bytes))
+            else
+                try testing.expectEqualStrings(want, out[0..try decodeLe(.fail, out, bytes)]);
         } else |_| {
             try testing.expect(strict == null);
             try testing.expectError(error.LoneSurrogate, decodeLe(.fail, out, bytes));

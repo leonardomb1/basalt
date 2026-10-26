@@ -1292,17 +1292,21 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
             if (charset.isAscii(raw)) return b.appendStr(raw);
             return b.commitBytes(charset.decodeInto(.cp1252, try b.reserveBytes(charset.decodedLen(.cp1252, raw)), raw));
         },
-        .unicode_text => try b.commitBytes(utf16.decodeLe(.fail, try b.reserveBytes(utf16.decodedBound(raw.len)), raw) catch return loneSurrogate(d.name)),
+        .unicode_text => try b.commitBytes(utf16.decodeLe(.fail, try b.reserveBytes(utf16.decodedBound(raw.len)), raw) catch |e| return notUtf16(d.name, e)),
         .guid => try b.appendStr(if (raw.len < 16) "" else &uuid.text(raw[0..16], .mixed)),
         .hex => try b.appendStr(try bytesToHex(arena, raw)),
         .bytes, .raw_text => try b.appendStr(raw),
     }
 }
 
-/// Fails a read on an nvarchar cell holding an unpaired surrogate half, naming its column.
-fn loneSurrogate(name: []const u8) error{LoneSurrogate} {
+/// Fails a read on an nvarchar cell that is not UTF-16 text, naming its column.
+fn notUtf16(name: []const u8, e: utf16.DecodeError) utf16.DecodeError {
     var buf: [480]u8 = undefined;
-    return @errorCast(eval.explain(error.LoneSurrogate, std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds an unpaired UTF-16 surrogate half, which is not Unicode text; REPLACE it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}) catch unreachable));
+    const msg = switch (e) {
+        error.LoneSurrogate => std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds an unpaired UTF-16 surrogate half, which is not Unicode text; REPLACE it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}),
+        error.OddUtf16 => std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds a value of an odd number of bytes, which is not UTF-16 text; read the column CAST(... AS varbinary)", .{eval.clip(name)}),
+    } catch unreachable;
+    return @errorCast(eval.explain(e, msg));
 }
 
 /// Fails a bulk load on text that is not valid UTF-8, naming its column.
@@ -2232,6 +2236,10 @@ test "tds: an nvarchar cell with an unpaired surrogate half fails the read, neve
     for ([_][]const u8{ "\x3d\xd8a\x00", "a\x00\x00\xde", "a\x00\x3d\xd8", "\x3d\xd8\x3d\xd8\x00\xde" }) |raw| {
         try std.testing.expectError(error.LoneSurrogate, cellValue(a, d, raw));
         try std.testing.expect(std.mem.startsWith(u8, eval.takeFailure(error.LoneSurrogate).?, "SQL Server column `nm` holds an unpaired UTF-16 surrogate half"));
+    }
+    for ([_][]const u8{ "a", "a\x00b", "a\x00\x3d\xd8\x00\xde" ++ "b" }) |raw| {
+        try std.testing.expectError(error.OddUtf16, cellValue(a, d, raw));
+        try std.testing.expect(std.mem.startsWith(u8, eval.takeFailure(error.OddUtf16).?, "SQL Server column `nm` holds a value of an odd number of bytes"));
     }
     var prng = std.Random.DefaultPrng.init(0x16_16);
     const r = prng.random();
