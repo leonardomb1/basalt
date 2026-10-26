@@ -636,7 +636,7 @@ pub const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &
 /// The result scale `s` of `op` over operands read at scales `ls` and `rs`, and
 /// the factors that raise each to it; null when the lane cannot hold it (past 38
 /// digits, or a raise of more than 18 places).
-pub inline fn lanePlan(comptime op: ast.BinOp, ls: u8, rs: u8) ?struct { s: u8, fl: i128, fr: i128 } {
+pub fn lanePlan(op: ast.BinOp, ls: u8, rs: u8) ?struct { s: u8, fl: i128, fr: i128 } {
     const s = resultScale(op, ls, rs);
     if (s > max_digits or (op != .mul and (s - ls > 18 or s - rs > 18))) return null;
     const fl: i128 = if (op == .mul) 1 else pow10_i128[@intCast(s - ls)];
@@ -650,10 +650,16 @@ pub inline fn resultScale(op: ast.BinOp, ls: u8, rs: u8) u16 {
     return if (op == .mul) @as(u16, ls) + rs else @max(ls, rs);
 }
 
-/// Whether a product's two sides both fit i64 throughout, so each row is one
-/// widening multiply that cannot pass 38 digits.
-pub inline fn narrowLane(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, lc: i128, rc: i128) bool {
-    return op == .mul and lk != .dec and rk != .dec and std.math.cast(i64, lc) != null and std.math.cast(i64, rc) != null;
+/// Whether a product's two sides can both fit i64 throughout (no decimal column),
+/// so `narrowLane` may pick the widening-multiply loop.
+pub inline fn narrowable(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side) bool {
+    return op == .mul and lk != .dec and rk != .dec;
+}
+
+/// Whether a `narrowable` product's constants fit i64, so each row is one widening
+/// multiply that cannot pass 38 digits.
+pub inline fn narrowLane(lc: i128, rc: i128) bool {
+    return std.math.cast(i64, lc) != null and std.math.cast(i64, rc) != null;
 }
 
 /// Each valid row of `op` over lane operands `ln.a` and `ln.b` handed to
@@ -664,34 +670,42 @@ pub inline fn narrowLane(comptime op: ast.BinOp, comptime lk: Side, comptime rk:
 /// DECIMAL of 18 digits or fewer does, takes that multiply too, row by row; only a
 /// wider pair pays the overflow-checked 128-bit one.
 pub fn laneLoop(comptime E: type, comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, ln: anytype, sink: anytype, valid: anytype, any: bool) E!void {
-    const limit: u128 = @intCast(pow10_i128[max_digits]);
-    const la: LaneSrc = ln.a;
-    const lb: LaneSrc = ln.b;
-    const s: u8 = ln.s;
     for (0..valid.len) |i| {
         if (any and !valid.get(i)) continue;
-        if (laneAt(op, lk, la, i)) |a| if (laneAt(op, rk, lb, i)) |b| {
-            var small = narrow;
-            const u: ?i128 = switch (op) {
-                .add => addOrNull(a, b),
-                .sub => subOrNull(a, b),
-                .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else blk: {
-                    if (std.math.cast(i64, a)) |x| if (std.math.cast(i64, b)) |y| {
-                        small = true;
-                        break :blk @as(i128, x) * y;
-                    };
-                    break :blk mulOrNull(a, b);
-                },
-                .mod => if (b == 0 or b == -1) null else @rem(a, b),
-                else => unreachable,
-            };
-            if (u) |x| if (small or @abs(x) < limit) {
-                try sink.put(i, .{ .unscaled = x, .scale = s });
-                continue;
-            };
-        };
-        try sink.put(i, try ln.at(op, i));
+        if (laneRow(op, lk, rk, narrow, ln.a, ln.b, i)) |u| {
+            try sink.put(i, .{ .unscaled = u, .scale = ln.s });
+        } else {
+            @branchHint(.cold);
+            try rowPut(E, op, &ln, sink, i);
+        }
     }
+}
+
+/// A row the lane cannot settle, out of line and shared by every lane of a sink.
+noinline fn rowPut(comptime E: type, op: ast.BinOp, ln: anytype, sink: anytype, i: usize) E!void {
+    try sink.put(i, try ln.at(op, i));
+}
+
+/// Row `i` of `op` over lane operands `la` and `lb` at the lane's scale; null when
+/// an operand is off its lane's scale or the i128 result is not settled.
+inline fn laneRow(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, comptime narrow: bool, la: LaneSrc, lb: LaneSrc, i: usize) ?i128 {
+    const limit: u128 = @intCast(pow10_i128[max_digits]);
+    const a = laneAt(op, lk, la, i) orelse return null;
+    const b = laneAt(op, rk, lb, i) orelse return null;
+    var small = narrow;
+    const u: i128 = @as(?i128, switch (op) {
+        .add => addOrNull(a, b),
+        .sub => subOrNull(a, b),
+        .mul => if (narrow) @as(i128, @as(i64, @intCast(a))) * @as(i64, @intCast(b)) else blk: {
+            if (std.math.cast(i64, a)) |x| if (std.math.cast(i64, b)) |y| {
+                small = true;
+                break :blk @as(i128, x) * y;
+            };
+            break :blk mulOrNull(a, b);
+        },
+        else => unreachable,
+    }) orelse return null;
+    return if (small or @abs(u) < limit) u else null;
 }
 
 inline fn laneAt(comptime op: ast.BinOp, comptime k: Side, src: LaneSrc, i: usize) ?i128 {
@@ -726,10 +740,13 @@ inline fn mulOrNull(a: i128, b: i128) ?i128 {
 /// `cmpBound` pick; at any other scale it compares in full under `op`. `result`
 /// turns an operator and an order into the answer.
 pub inline fn cmpAtScale(x: Decimal, fast_op: ast.BinOp, bound: i128, scale: u8, op: ast.BinOp, flip: bool, lit: Decimal, comptime result: fn (ast.BinOp, std.math.Order) bool) bool {
-    return if (x.scale == scale)
-        result(fast_op, std.math.order(x.unscaled, bound))
-    else
-        result(op, if (flip) lit.order(x) else x.order(lit));
+    if (x.scale == scale) return result(fast_op, std.math.order(x.unscaled, bound));
+    return cmpFull(x, op, flip, lit, result);
+}
+
+noinline fn cmpFull(x: Decimal, op: ast.BinOp, flip: bool, lit: Decimal, comptime result: fn (ast.BinOp, std.math.Order) bool) bool {
+    @branchHint(.cold);
+    return result(op, if (flip) lit.order(x) else x.order(lit));
 }
 
 pub const FieldError = error{ NotDecimal, TooManyDigits, TooManyPlaces };
