@@ -349,26 +349,11 @@ pub fn compareVecs(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: u
 }
 
 fn numOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
-    const int_lane = isIntNum(l) and isIntNum(r);
-    switch (op) {
-        inline .add, .sub, .mul, .div, .mod => |cop| {
-            return if (int_lane)
-                numOpVecT(i64, cop, arena, l, r, n)
-            else
-                numOpVecT(f64, cop, arena, l, r, n);
-        },
-        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| {
-            return if (int_lane)
-                cmpVecT(i64, cop, arena, l, r, n)
-            else
-                cmpVecT(f64, cop, arena, l, r, n);
-        },
-        else => unreachable,
-    }
+    return if (isIntNum(l) and isIntNum(r)) numOpVecT(i64, arena, op, l, r, n) else numOpVecT(f64, arena, op, l, r, n);
 }
 
-/// One side of a comparison as `T` lanes: a column's values (an INT column widened
-/// once for the float lane) or a constant.
+/// One operand of a lane kernel: a column's values (an INT column widened once for
+/// the float lane) or one value for every row.
 fn Lane(comptime T: type) type {
     return union(enum) { col: []const T, one: T };
 }
@@ -385,6 +370,13 @@ fn laneOf(comptime T: type, arena: std.mem.Allocator, x: Num, n: usize) VecError
     };
 }
 
+inline fn laneVal(comptime T: type, x: Lane(T), i: usize) T {
+    return switch (x) {
+        .col => |c| c[i],
+        .one => |v| v,
+    };
+}
+
 fn numValidity(x: Num) ?Bitmap {
     return switch (x) {
         .icol => |c| c.v,
@@ -393,96 +385,75 @@ fn numValidity(x: Num) ?Bitmap {
     };
 }
 
-/// `op` over every row, null rows included (a comparison cannot fail), with the
-/// operands' validity adopted as the result's.
-fn cmpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator, l: Num, r: Num, n: usize) VecError!Vec {
+/// `op` elementwise over operands widened to comptime `T`, the operands' validity
+/// adopted as the result's. A comparison or a float `+ - *` cannot fail, so it
+/// runs every row and has its null slots zeroed after; any other op skips null
+/// rows, so only a valid row raises.
+fn numOpVecT(comptime T: type, arena: std.mem.Allocator, op: ast.BinOp, l: Num, r: Num, n: usize) VecError!Vec {
     const bm = try Bitmap.initFull(arena, n);
     for ([_]?Bitmap{ numValidity(l), numValidity(r) }) |v| if (v) |src| for (bm.bits, src.bits[0..bm.bits.len]) |*o, x| {
         o.* &= x;
     };
-    var f = try Filled(bool).masked(arena, n, bm);
-    switch (try laneOf(T, arena, l, n)) {
-        .col => |a| switch (try laneOf(T, arena, r, n)) {
-            .col => |b| for (f.d, a[0..n], b[0..n]) |*o, x, y| {
-                o.* = cmpLane(T, op, x, y);
-            },
-            .one => |y| for (f.d, a[0..n]) |*o, x| {
-                o.* = cmpLane(T, op, x, y);
-            },
+    const a = try laneOf(T, arena, l, n);
+    const b = try laneOf(T, arena, r, n);
+    switch (op) {
+        .eq, .ne, .lt, .le, .gt, .ge => {
+            var f = try Filled(bool).masked(arena, n, bm);
+            cmpLanes(T, op, f.d, a, b);
+            return f.finish(Type.init(.bool));
         },
-        .one => |x| switch (try laneOf(T, arena, r, n)) {
-            .col => |b| for (f.d, b[0..n]) |*o, y| {
-                o.* = cmpLane(T, op, x, y);
-            },
-            .one => |y| @memset(f.d, cmpLane(T, op, x, y)),
+        inline .add, .sub, .mul, .div, .mod => |cop| {
+            var f = try Filled(T).masked(arena, n, bm);
+            const total = T == f64 and (cop == .add or cop == .sub or cop == .mul);
+            if (total or !f.any) {
+                try zipLanes(T, cop, f.d, a, b);
+            } else for (f.d, 0..) |*o, i| {
+                if (bm.get(i)) o.* = try applyOp(T, cop, laneVal(T, a, i), laneVal(T, b, i));
+            }
+            return f.finish(Type.init(if (T == i64) .int else .float));
         },
-    }
-    return f.finish(Type.init(.bool));
-}
-
-/// Applies `op` elementwise over operands widened to comptime `T`. All-valid
-/// inputs skip the per-row validity checks; a null slot is zero-filled.
-fn numOpVecT(comptime T: type, comptime op: ast.BinOp, arena: std.mem.Allocator, l: Num, r: Num, n: usize) VecError!Vec {
-    const Out = OpOut(T, op);
-    const ty = Type.init(if (Out == bool) .bool else if (T == i64) .int else .float);
-    const out = try arena.alloc(Out, n);
-    if (allValidNum(l, n) and allValidNum(r, n)) {
-        if (Out == bool and T == i64) {
-            cmpInto(i64, op, out, intSide(l), intSide(r));
-            return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
-        }
-        for (0..n) |i| out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
-        return mkCol(ty, n, try Bitmap.initFull(arena, n), outData(Out, out));
-    }
-    var f = Filled(Out){ .d = out, .bm = try Bitmap.initFull(arena, n) };
-    for (0..n) |i| {
-        if (!numValid(l, i) or !numValid(r, i)) f.setNull(i) else out[i] = try applyOp(T, op, numAt(T, l, i), numAt(T, r, i));
-    }
-    return f.finish(ty);
-}
-
-/// One operand of a comparison kernel: a column's values or one value for every row.
-fn CmpSide(comptime T: type) type {
-    return union(enum) { col: []const T, one: T };
-}
-
-inline fn intSide(x: Num) CmpSide(i64) {
-    return switch (x) {
-        .icol => |c| .{ .col = c.d },
-        .iscalar => |v| .{ .one = v },
         else => unreachable,
-    };
+    }
 }
 
-inline fn cmpOne(comptime T: type, comptime op: ast.BinOp, a: T, b: T) bool {
-    return switch (op) {
-        .eq => a == b,
-        .ne => a != b,
-        .lt => a < b,
-        .le => a <= b,
-        .gt => a > b,
-        .ge => a >= b,
+/// Comparison `op` over two lanes, mirrored so a constant is on the right and two
+/// columns meet under `=`, `<>`, `>` or `>=` only, which halves the loops.
+fn cmpLanes(comptime T: type, op: ast.BinOp, out: []bool, a: Lane(T), b: Lane(T)) void {
+    const flip = (a == .one and b == .col) or (a == .col and b == .col and (op == .lt or op == .le));
+    const x = if (flip) b else a;
+    const y = if (flip) a else b;
+    const mop: ast.BinOp = if (!flip) op else switch (op) {
+        .lt => .gt,
+        .le => .ge,
+        .gt => .lt,
+        .ge => .le,
+        else => op,
+    };
+    switch (mop) {
+        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| zipLanes(T, cop, out, x, y) catch unreachable,
         else => unreachable,
-    };
+    }
 }
 
-/// `op` over two null-free integer operands, one loop per operand shape so each
-/// compiles to a plain vectorizable compare.
-fn cmpInto(comptime T: type, comptime op: ast.BinOp, out: []bool, l: CmpSide(T), r: CmpSide(T)) void {
-    switch (l) {
-        .col => |a| switch (r) {
-            .col => |b| for (out, a[0..out.len], b[0..out.len]) |*o, x, y| {
-                o.* = cmpOne(T, op, x, y);
+/// `op` over every row of two lanes, one loop per operand shape so each compiles
+/// to a plain vectorizable loop. A comparison never sees the shapes `cmpLanes`
+/// mirrors away.
+fn zipLanes(comptime T: type, comptime op: ast.BinOp, out: []OpOut(T, op), a: Lane(T), b: Lane(T)) VecError!void {
+    const cmp = OpOut(T, op) == bool;
+    switch (a) {
+        .col => |x| switch (b) {
+            .col => |y| if (cmp and (op == .lt or op == .le)) unreachable else for (out, x[0..out.len], y[0..out.len]) |*o, p, q| {
+                o.* = try applyOp(T, op, p, q);
             },
-            .one => |y| for (out, a[0..out.len]) |*o, x| {
-                o.* = cmpOne(T, op, x, y);
+            .one => |q| for (out, x[0..out.len]) |*o, p| {
+                o.* = try applyOp(T, op, p, q);
             },
         },
-        .one => |x| switch (r) {
-            .col => |b| for (out, b[0..out.len]) |*o, y| {
-                o.* = cmpOne(T, op, x, y);
+        .one => |p| switch (b) {
+            .col => |y| if (cmp) unreachable else for (out, y[0..out.len]) |*o, q| {
+                o.* = try applyOp(T, op, p, q);
             },
-            .one => |y| @memset(out, cmpOne(T, op, x, y)),
+            .one => |q| if (out.len > 0) @memset(out, try applyOp(T, op, p, q)),
         },
     }
 }
@@ -494,20 +465,21 @@ fn dateCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize)
     if (l != .col and r != .col) return null;
     const ls = dateSide(l, n) orelse return null;
     const rs = dateSide(r, n) orelse return null;
-    const out = try arena.alloc(bool, n);
     switch (op) {
-        inline .eq, .ne, .lt, .le, .gt, .ge => |cop| cmpInto(i32, cop, out, ls, rs),
+        .eq, .ne, .lt, .le, .gt, .ge => {},
         else => return null,
     }
+    const out = try arena.alloc(bool, n);
+    cmpLanes(i32, op, out, ls, rs);
     return mkCol(Type.init(.bool), n, try Bitmap.initFull(arena, n), .{ .b = out });
 }
 
-fn dateSide(v: Vec, n: usize) ?CmpSide(i32) {
+fn dateSide(v: Vec, n: usize) ?Lane(i32) {
     return switch (v) {
         .col => |c| if (c.ty.kind == .date and c.validity.allSet(n)) .{ .col = c.data.i32 } else null,
         .scalar => |x| switch (x) {
             .date => |d| .{ .one = d },
-            .string => |t| if (parseDateText(t)) |d| (if (std.math.cast(i32, d)) |v32| CmpSide(i32){ .one = v32 } else null) else null,
+            .string => |t| if (parseDateText(t)) |d| (if (std.math.cast(i32, d)) |v32| Lane(i32){ .one = v32 } else null) else null,
             else => null,
         },
     };
@@ -874,19 +846,38 @@ const StoreSink = struct {
     }
 };
 
-/// Every valid row's `decimalOp` handed to `sink` in row order.
+/// Every valid row's `decimalOp` handed to `sink` in row order: through a lane
+/// kernel when `decLane` plans one, else row by row.
 fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bool) VecError!void {
-    const lanes = switch (op) {
-        inline .add, .sub, .mul, .mod => |cop| try decLanes(cop, l, r, sink, valid, any),
-        else => false,
+    if (decLane(op, l, r)) |lane| return switch (op) {
+        inline .add, .sub, .mul => |cop| switch (lane.lk) {
+            inline else => |lk| switch (lane.rk) {
+                inline else => |rk| if (comptime !laneShape(cop, lk, rk))
+                    unreachable
+                else if ((comptime decimal.narrowable(cop, lk, rk)) and lane.narrow)
+                    decimal.laneLoop(VecError, cop, lk, rk, true, lane, sink, valid, any)
+                else
+                    decimal.laneLoop(VecError, cop, lk, rk, false, lane, sink, valid, any),
+            },
+        },
+        else => unreachable,
     };
-    if (!lanes) for (0..valid.len) |i| {
+    for (0..valid.len) |i| {
         if (any and !valid.get(i)) continue;
-        try sink.put(i, try (decimalOp(op, decAt(l, i), decAt(r, i)) orelse unreachable));
-    };
+        try sink.put(i, try decRow(op, &l, &r, i));
+    }
 }
 
 const Side = decimal.Side;
+
+/// The operand shapes `decLane` hands out for `op`: never two constants or two INT
+/// columns, and for a commutative `+` or `*` a decimal column first, or an INT
+/// column with a constant.
+fn laneShape(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side) bool {
+    if (lk == .one and rk == .one or lk == .int and rk == .int) return false;
+    if (op == .sub) return true;
+    return lk == .dec or (lk == .int and rk == .one);
+}
 
 fn sideOf(v: Vec) Side {
     return switch (v) {
@@ -905,39 +896,55 @@ fn sideScale(v: Vec) u8 {
 /// `decimalOp` over whole operands, each read at one scale (0 for an INT column, a
 /// decimal column's type scale) and brought to the result scale once. An element
 /// off its side's scale, or one i128 cannot settle, takes `decimalOp` itself, so
-/// values and errors match the row path. False when the shapes do not fit.
-fn decLanes(comptime op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bool) VecError!bool {
-    switch (sideOf(l)) {
-        inline else => |lk| switch (sideOf(r)) {
-            inline else => |rk| {
-                if (lk == .one and rk == .one) return false;
-                const ls = sideScale(l);
-                const rs = sideScale(r);
-                const plan = decimal.lanePlan(op, ls, rs) orelse return false;
-                const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, plan.fl) catch return false else 0;
-                const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, plan.fr) catch return false else 0;
-                const lane = DecLane{ .l = l, .r = r, .a = laneSrc(l, ls, plan.fl, lc), .b = laneSrc(r, rs, plan.fr, rc), .s = plan.s };
-                if (decimal.narrowLane(op, lk, rk, lc, rc))
-                    try decimal.laneLoop(VecError, op, lk, rk, true, lane, sink, valid, any)
-                else
-                    try decimal.laneLoop(VecError, op, lk, rk, false, lane, sink, valid, any);
-                return true;
-            },
-        },
-    }
-}
-
+/// values and errors match the row path.
 const DecLane = struct {
     l: Vec,
     r: Vec,
     a: decimal.LaneSrc,
     b: decimal.LaneSrc,
     s: u8,
+    lk: Side,
+    rk: Side,
+    narrow: bool,
 
-    pub inline fn at(ln: DecLane, comptime op: ast.BinOp, i: usize) VecError!Decimal {
-        return try (decimalOp(op, decAt(ln.l, i), decAt(ln.r, i)) orelse unreachable);
+    pub inline fn at(ln: *const DecLane, op: ast.BinOp, i: usize) VecError!Decimal {
+        return decRow(op, &ln.l, &ln.r, i);
     }
 };
+
+/// The lane plan for `op` over `l` and `r`, a commutative op's operands swapped to
+/// a `laneShape`; null when no lane fits (`%`, `/`, two constants, two INT
+/// columns, or a scale `lanePlan` refuses), and the rows take `decimalOp`.
+noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
+    if (op != .add and op != .sub and op != .mul) return null;
+    const swap = op != .sub and (sideOf(l0) == .one or sideOf(l0) == .int and sideOf(r0) == .dec);
+    const l = if (swap) r0 else l0;
+    const r = if (swap) l0 else r0;
+    const lk = sideOf(l);
+    const rk = sideOf(r);
+    if (lk == .one and rk == .one or lk == .int and rk == .int) return null;
+    const ls = sideScale(l);
+    const rs = sideScale(r);
+    const plan = decimal.lanePlan(op, ls, rs) orelse return null;
+    const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, plan.fl) catch return null else 0;
+    const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, plan.fr) catch return null else 0;
+    return .{
+        .l = l,
+        .r = r,
+        .a = laneSrc(l, ls, plan.fl, lc),
+        .b = laneSrc(r, rs, plan.fr, rc),
+        .s = plan.s,
+        .lk = lk,
+        .rk = rk,
+        .narrow = op == .mul and lk != .dec and rk != .dec and decimal.narrowLane(lc, rc),
+    };
+}
+
+/// Row `i`'s `decimalOp`, out of line: the lanes call it only for a row they cannot
+/// settle, and `/` and `%` for every row.
+noinline fn decRow(op: ast.BinOp, l: *const Vec, r: *const Vec, i: usize) VecError!Decimal {
+    return try (decimalOp(op, decAt(l.*, i), decAt(r.*, i)) orelse unreachable);
+}
 
 fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) decimal.LaneSrc {
     return switch (v) {
@@ -1206,14 +1213,6 @@ pub inline fn numValid(x: Num, i: usize) bool {
     return switch (x) {
         .icol => |c| c.v.get(i),
         .fcol => |c| c.v.get(i),
-        else => true,
-    };
-}
-
-inline fn allValidNum(x: Num, n: usize) bool {
-    return switch (x) {
-        .icol => |c| c.v.allSet(n),
-        .fcol => |c| c.v.allSet(n),
         else => true,
     };
 }
@@ -1927,7 +1926,8 @@ test "decimal arithmetic and comparisons on the vector lanes match the row path,
         "e < 3",                                            "d = 100000000000000000000000000000000000.5",   "100 < x * 0.5",
         "x * 1.25 + 3 >= 50",                               "d * 2 = 5",                                    "d + e < -3.5",
         "d * 0.00000000000000000000000000000000000001 > 0", "x % 7.5 <> 2",                                 "x % 0.00 > 1",
-        "e - x <= 0.001",
+        "e - x <= 0.001",                                   "x * d",                                        "x + e",
+        "1.5 + d",                                          "1 - d",                                        "0.5 * x * d",
     };
     for (0..2) |round| {
         const wide = round == 1;
