@@ -55,6 +55,7 @@ const charset = @import("../../format/charset.zig");
 const hex = @import("../../format/hex.zig");
 const uuid = @import("../../format/uuid.zig");
 const utf16 = @import("../../format/utf16.zig");
+const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -830,7 +831,7 @@ const TdsCursor = struct {
             d.decode = decodeOf(d);
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
-            d.name = try utf16.decodeLeAlloc(.question, ma, nbytes);
+            d.name = try utf16.decodeLeAlloc(.replacement, ma, nbytes);
             self.cols[k] = d;
             fields[k] = .{ .name = d.name, .ty = d.engine_type };
         }
@@ -1125,14 +1126,14 @@ const BulkProto = struct {
         var buf: [celltext.scalar_bound]u8 = undefined;
         for (0..batch.len) |r| {
             try w.writeByte(0xD1);
-            for (batch.columns) |*col| {
+            for (batch.columns, batch.schema.fields) |*col, f| {
                 if (celltext.isNull(col, r)) {
                     try writeU16(w, 0xFFFF);
                     continue;
                 }
                 const s = celltext.text(col, r, &buf, sql.BulkText(.{ .bool_true = "1", .bool_false = "0" }){});
                 try units.resize(2 * s.len);
-                const le = units.items[0..try utf16.encodeLe(units.items, s)];
+                const le = units.items[0 .. utf16.encodeLe(units.items, s) catch return notUtf8(f.name)];
                 const blen = utf16.cutLe(le, NVARCHAR_MAX_BYTES);
                 try writeU16(w, @intCast(blen));
                 try w.writeAll(le[0..blen]);
@@ -1197,7 +1198,7 @@ test "INSERT BULK rows of every kind" {
     }, got);
 }
 
-test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8" {
+test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8, never repairs it (D7)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1227,6 +1228,7 @@ test "INSERT BULK cuts a long cell before a split surrogate pair and refuses inv
     try std.testing.expectEqual(got.items.len, off);
     try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" })));
     try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"})));
+    try std.testing.expectEqualStrings("column `c` holds text that is not valid UTF-8, which SQL Server's nvarchar cannot take unaltered; repair or drop it before the load", eval.takeFailure(error.InvalidUtf8).?);
 }
 
 fn writeU16(w: anytype, v: u16) !void {
@@ -1290,11 +1292,23 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
             if (charset.isAscii(raw)) return b.appendStr(raw);
             return b.commitBytes(charset.decodeInto(.cp1252, try b.reserveBytes(charset.decodedLen(.cp1252, raw)), raw));
         },
-        .unicode_text => try b.commitBytes(utf16.decodeLe(.question, try b.reserveBytes(utf16.decodedBound(raw.len)), raw)),
+        .unicode_text => try b.commitBytes(utf16.decodeLe(.fail, try b.reserveBytes(utf16.decodedBound(raw.len)), raw) catch return loneSurrogate(d.name)),
         .guid => try b.appendStr(if (raw.len < 16) "" else &uuid.text(raw[0..16], .mixed)),
         .hex => try b.appendStr(try bytesToHex(arena, raw)),
         .bytes, .raw_text => try b.appendStr(raw),
     }
+}
+
+/// Fails a read on an nvarchar cell holding an unpaired surrogate half, naming its column.
+fn loneSurrogate(name: []const u8) error{LoneSurrogate} {
+    var buf: [480]u8 = undefined;
+    return @errorCast(eval.explain(error.LoneSurrogate, std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds an unpaired UTF-16 surrogate half, which is not Unicode text; REPLACE it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}) catch unreachable));
+}
+
+/// Fails a bulk load on text that is not valid UTF-8, naming its column.
+fn notUtf8(name: []const u8) error{InvalidUtf8} {
+    var buf: [480]u8 = undefined;
+    return @errorCast(eval.explain(error.InvalidUtf8, std.fmt.bufPrint(&buf, "column `{s}` holds text that is not valid UTF-8, which SQL Server's nvarchar cannot take unaltered; repair or drop it before the load", .{eval.clip(name)}) catch unreachable));
 }
 
 /// `appendRaw` for a column whose decode is known only at run time.
@@ -1617,7 +1631,7 @@ test "rows split across packets of every small size decode as each cell decoded 
                 raw[8] = 0;
             }
             if (col.is_unicode) for (0..len / 2) |k| {
-                if (rnd.uintLessThan(u8, 4) != 0) raw[2 * k + 1] = 0;
+                if (rnd.uintLessThan(u8, 4) != 0 or raw[2 * k + 1] & 0xF8 == 0xD8) raw[2 * k + 1] = 0;
             };
             const is_null = col.kind != .fixed and rnd.uintLessThan(u8, 8) == 0;
             switch (col.kind) {
@@ -2024,10 +2038,7 @@ fn featureExtAck(r: *Body) Body.Error![]const u8 {
 fn errorText(gpa: std.mem.Allocator, body: []const u8) ![]const u8 {
     if (body.len < 8) return gpa.dupe(u8, "the server sent a malformed error");
     const msglen: usize = std.mem.readInt(u16, body[6..8], .little);
-    const msg = body[8..@min(body.len, 8 + msglen * 2)];
-    const out = try gpa.alloc(u8, msg.len / 2);
-    for (out, 0..) |*c, k| c.* = msg[k * 2];
-    return out;
+    return utf16.decodeLeAlloc(.replacement, gpa, body[8..@min(body.len, 8 + msglen * 2)]);
 }
 
 test "PLP and text values past SQL Server's 2 GiB limit are refused before room is made for them" {
@@ -2209,70 +2220,62 @@ test "fuzz: row cell decode survives arbitrary bytes" {
     try @import("../../testing/fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
 }
 
-test "tds: an nvarchar cell decodes as the old utf16Encode did, lone halves as `?` (D7)" {
+test "tds: an nvarchar cell with an unpaired surrogate half fails the read, never `?` or U+FFFD (D7)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const old = struct {
-        fn utf16Encode(out: []u8, bytes: []const u8) usize {
-            const V = @Vector(16, u8);
-            const ascii_mask: V = @bitCast([_]u8{ 0x80, 0xFF } ** 8);
-            const lows = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
-            var o: usize = 0;
-            var k: usize = 0;
-            while (k + 1 < bytes.len) {
-                if (k + 16 <= bytes.len) {
-                    const v: V = bytes[k..][0..16].*;
-                    if (@reduce(.Or, v & ascii_mask) == 0) {
-                        out[o..][0..8].* = @shuffle(u8, v, undefined, lows);
-                        o += 8;
-                        k += 16;
-                        continue;
-                    }
-                }
-                var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
-                k += 2;
-                if (cp < 0x80) {
-                    out[o] = @intCast(cp);
-                    o += 1;
-                    continue;
-                }
-                if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
-                    const lo: u16 = if (k + 1 < bytes.len) @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8) else 0;
-                    if (!std.unicode.utf16IsLowSurrogate(lo)) {
-                        out[o] = '?';
-                        o += 1;
-                        continue;
-                    }
-                    cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
-                    k += 2;
-                }
-                o += std.unicode.utf8Encode(cp, out[o..]) catch blk: {
-                    out[o] = '?';
-                    break :blk 1;
-                };
-            }
-            return o;
-        }
-    };
     var d = ColumnDesc{ .tds_type = 0xE7, .engine_type = types.Type.init(.string).asNullable(), .kind = .ushortlen, .is_unicode = true };
     d.decode = decodeOf(d);
     try std.testing.expectEqual(Decode.unicode_text, d.decode);
-    try std.testing.expectEqualStrings("?a\u{e9}?", (try cellValue(a, d, "\x3d\xd8a\x00\xe9\x00\x00\xde")).string);
+    try std.testing.expectEqualStrings("a\u{e9}😀?", (try cellValue(a, d, "a\x00\xe9\x00\x3d\xd8\x00\xde?\x00")).string);
+    d.name = "nm";
+    for ([_][]const u8{ "\x3d\xd8a\x00", "a\x00\x00\xde", "a\x00\x3d\xd8", "\x3d\xd8\x3d\xd8\x00\xde" }) |raw| {
+        try std.testing.expectError(error.LoneSurrogate, cellValue(a, d, raw));
+        try std.testing.expect(std.mem.startsWith(u8, eval.takeFailure(error.LoneSurrogate).?, "SQL Server column `nm` holds an unpaired UTF-16 surrogate half"));
+    }
     var prng = std.Random.DefaultPrng.init(0x16_16);
     const r = prng.random();
     const pool = [_]u16{ 'a', 'Z', ' ', 0x7F, 0x80, 0xE7, 0x20AC, 0x4E2D, 0xFFFD, 0xFFFF, 0xD83D, 0xDE00, 0xDBFF, 0xDC00 };
     for (0..20_000) |_| {
         _ = ar.reset(.retain_capacity);
         const n = r.uintLessThan(usize, 48);
-        const bytes = try a.alloc(u8, n * 2 + r.uintAtMost(usize, 1));
-        for (0..n) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], if (r.boolean()) r.intRangeAtMost(u16, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)], .little);
-        if (bytes.len % 2 == 1) bytes[bytes.len - 1] = r.int(u8);
-        const want = try a.alloc(u8, bytes.len / 2 * 3);
-        const got = (try cellValue(a, d, bytes)).string;
-        try std.testing.expectEqualStrings(want[0..old.utf16Encode(want, bytes)], got);
-        try std.testing.expectEqualStrings(got, try utf16.decodeLeAlloc(.question, a, bytes));
+        const units = try a.alloc(u16, n);
+        for (units) |*u| u.* = if (r.boolean()) r.intRangeAtMost(u16, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)];
+        const bytes = try a.alloc(u8, n * 2);
+        for (units, 0..) |u, i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], u, .little);
+        if (std.unicode.utf16LeToUtf8Alloc(a, units)) |want| {
+            try std.testing.expectEqualStrings(want, (try cellValue(a, d, bytes)).string);
+        } else |_| try std.testing.expectError(error.LoneSurrogate, cellValue(a, d, bytes));
     }
+    _ = eval.takeFailure(error.LoneSurrogate);
+}
+
+test "tds: a column name with an unpaired surrogate half reads with U+FFFD, not `?` (D7)" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const col = [_]u8{ 0, 0, 0, 0, 0, 0, 0xE7, 0x40, 0x00, 0x09, 0x04, 0xD0, 0x00, 0x34 };
+    const payload = [_]u8{ 2, 0 } ++ col ++ [_]u8{ 3, 'a', 0, 0x3d, 0xd8, 'b', 0 } ++ col ++ [_]u8{ 3, 'c', 0, 0x3d, 0xd8, 0x00, 0xde };
+    var src = std.Io.Reader.fixed(try framePackets(a, &payload, 64));
+    const cur = try gpa.create(TdsCursor);
+    defer gpa.destroy(cur);
+    cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &.{}, .schema = undefined, .done = false };
+    defer cur.reader.deinit();
+    try cur.parseColMeta(a);
+    try std.testing.expectEqualStrings("a\u{FFFD}b", cur.schema.fields[0].name);
+    try std.testing.expectEqualStrings("c😀", cur.schema.fields[1].name);
+}
+
+test "tds: a server error message keeps its non-ASCII text, an unpaired half as U+FFFD (D7)" {
+    const gpa = std.testing.allocator;
+    const body = [_]u8{ 0x10, 0x27, 0, 0, 1, 16, 5, 0 } ++ "N\x00\xe3\x00o\x00\x00\xde\x20\xac".*;
+    const msg = try errorText(gpa, &body);
+    defer gpa.free(msg);
+    try std.testing.expectEqualStrings("N\u{e3}o\u{FFFD}\u{ac20}", msg);
+    const ascii = try errorText(gpa, &([_]u8{ 0x10, 0x27, 0, 0, 1, 16, 2, 0 } ++ "o\x00k\x00".*));
+    defer gpa.free(ascii);
+    try std.testing.expectEqualStrings("ok", ascii);
 }
 
 test "tds: INSERT BULK names a column by its UTF-16 unit count, a pair counting two" {

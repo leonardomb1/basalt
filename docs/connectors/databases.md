@@ -97,3 +97,15 @@ close that gap. Note that NTLMv2 never puts the password on the wire — only a
 challenge-response derived from it — whereas a SQL login sends it under
 LOGIN7's trivially reversible scrambling, so on an unverified channel NTLM is
 the stronger of the two, not the weaker.
+
+**Text:** `varchar` and `char` read as windows-1252, its five unassigned bytes
+(0x81, 0x8D, 0x8F, 0x90, 0x9D) as the C1 controls SQL Server itself converts
+them to, the same table a `cp1252` CSV uses. `nvarchar`, `nchar`, `ntext` and
+`xml` read as UTF-16, surrogate pairs joined. An `nvarchar` value holding an
+unpaired surrogate half (legal in SQL Server, not in Unicode) fails the read,
+naming the column, rather than being altered, as PostgreSQL, DuckDB and
+StarRocks refuse text that is not valid Unicode; fix it at the source (for
+example `REPLACE` it) or read the column `CAST(... AS varbinary)`. A column
+name or a server error message with one shows U+FFFD in its place. A bulk load
+(`LOAD INTO`) refuses text that is not valid UTF-8, naming the column, rather
+than repairing it.

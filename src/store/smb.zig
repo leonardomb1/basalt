@@ -1266,7 +1266,7 @@ fn put64(b: *std.array_list.Managed(u8), v: u64) void {
     b.appendSlice(&x) catch {};
 }
 
-test "smb: a name with a lone surrogate decodes with U+FFFD, a paired one round-trips" {
+test "smb: a name with a lone surrogate decodes with U+FFFD, a paired one round-trips (D7)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

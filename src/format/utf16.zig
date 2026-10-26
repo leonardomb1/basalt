@@ -3,12 +3,15 @@
 //!
 //! UCS-2 is not UTF-16: the halves of a surrogate pair are joined (encoding them
 //! singly once made every emoji `??`). Only an unpaired half meets the `Lone`
-//! policy: `?` (SQL Server's TDS reader today), U+FFFD, or an error (std's rule).
-//! A trailing odd byte is not a code unit and is dropped.
+//! policy. Data fails (`fail`, std's rule; PostgreSQL, DuckDB and StarRocks
+//! reject text that is not valid Unicode), so a cell is never silently altered.
+//! A name or message (a file in a listing, a column, a server error) is repaired
+//! with U+FFFD (`replacement`, as Windows' WideCharToMultiByte does), so one bad
+//! name cannot hide every other. A trailing odd byte is not a code unit and is dropped.
 
 const std = @import("std");
 
-pub const Lone = enum { question, replacement, fail };
+pub const Lone = enum { replacement, fail };
 
 pub const LoneError = error{LoneSurrogate};
 
@@ -68,10 +71,6 @@ pub fn decodeLe(comptime lone: Lone, out: []u8, bytes: []const u8) Decoded(lone)
 
 fn lonely(comptime lone: Lone, out: []u8) usize {
     switch (lone) {
-        .question => {
-            out[0] = '?';
-            return 1;
-        },
         .replacement => {
             out[0..3].* = "\u{FFFD}".*;
             return 3;
@@ -207,7 +206,6 @@ fn reference(a: std.mem.Allocator, comptime lone: Lone, bytes: []const u8) !?[]u
             k += 2;
         } else if (std.unicode.utf16IsHighSurrogate(u) or std.unicode.utf16IsLowSurrogate(u)) {
             switch (lone) {
-                .question => try out.append('?'),
                 .replacement => try out.appendSlice("\u{FFFD}"),
                 .fail => return null,
             }
@@ -235,22 +233,23 @@ fn randomUnits(r: std.Random, units: *std.array_list.Managed(u16), n: usize, sur
     }
 }
 
-test "utf16: decodeLe pins TDS utf16ToUtf8: BMP text, joined pairs, an unpaired half is `?`" {
+test "utf16: decodeLe reads BMP text and joined pairs; an unpaired half is U+FFFD or an error, never `?` (D7)" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try testing.expectEqualStrings("hi\u{e9}", try decodeLeAlloc(.question, a, "h\x00i\x00\xe9\x00"));
-    try testing.expectEqualStrings("a😀b", try decodeLeAlloc(.question, a, "a\x00\x3d\xd8\x00\xde" ++ "b\x00"));
-    const round = try std.unicode.utf8ToUtf16LeAlloc(a, "𝄞x𝕏");
-    try testing.expectEqualStrings("𝄞x𝕏", try decodeLeAlloc(.question, a, std.mem.sliceAsBytes(round)));
-    try testing.expectEqualStrings("?a", try decodeLeAlloc(.question, a, "\x3d\xd8" ++ "a\x00"));
-    try testing.expectEqualStrings("a?", try decodeLeAlloc(.question, a, "a\x00\x3d\xd8"));
-    try testing.expectEqualStrings("?", try decodeLeAlloc(.question, a, "\x00\xde"));
-    try testing.expectEqualStrings("??", try decodeLeAlloc(.question, a, "\x3d\xd8\x3d\xd8"));
-    try testing.expectEqualStrings("?😀", try decodeLeAlloc(.question, a, "\x3d\xd8\x3d\xd8\x00\xde"));
-    try testing.expectEqualStrings("a", try decodeLeAlloc(.question, a, "a\x00b"));
-    try testing.expectEqualStrings("", try decodeLeAlloc(.question, a, "a"));
-    try testing.expectEqualStrings("", try decodeLeAlloc(.question, a, ""));
+    inline for (.{ Lone.replacement, Lone.fail }) |p| {
+        try testing.expectEqualStrings("hi\u{e9}", try decodeLeAlloc(p, a, "h\x00i\x00\xe9\x00"));
+        try testing.expectEqualStrings("a😀b", try decodeLeAlloc(p, a, "a\x00\x3d\xd8\x00\xde" ++ "b\x00"));
+        const round = try std.unicode.utf8ToUtf16LeAlloc(a, "𝄞x𝕏");
+        try testing.expectEqualStrings("𝄞x𝕏", try decodeLeAlloc(p, a, std.mem.sliceAsBytes(round)));
+        try testing.expectEqualStrings("?", try decodeLeAlloc(p, a, "?\x00"));
+        try testing.expectEqualStrings("a", try decodeLeAlloc(p, a, "a\x00b"));
+        try testing.expectEqualStrings("", try decodeLeAlloc(p, a, "a"));
+        try testing.expectEqualStrings("", try decodeLeAlloc(p, a, ""));
+    }
+    try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", try decodeLeAlloc(.replacement, a, "\x3d\xd8\x3d\xd8"));
+    try testing.expectEqualStrings("\u{FFFD}😀", try decodeLeAlloc(.replacement, a, "\x3d\xd8\x3d\xd8\x00\xde"));
+    try testing.expectError(error.LoneSurrogate, decodeLeAlloc(.fail, a, "\x3d\xd8\x3d\xd8"));
 }
 
 test "utf16: replacement puts one U+FFFD per unpaired half; fail refuses it" {
@@ -287,14 +286,13 @@ test "utf16: every policy matches a scalar reference at every alignment, std whe
         const cut = r.uintAtMost(usize, 1);
         const bytes = whole[0 .. whole.len - @min(whole.len, cut)];
         const out = try a.alloc(u8, decodedBound(bytes.len));
-        try testing.expectEqualStrings((try reference(a, .question, bytes)).?, out[0..decodeLe(.question, out, bytes)]);
         try testing.expectEqualStrings((try reference(a, .replacement, bytes)).?, out[0..decodeLe(.replacement, out, bytes)]);
         const strict = try reference(a, .fail, bytes);
         const std_units = units.items[0 .. bytes.len / 2];
         if (std.unicode.utf16LeToUtf8Alloc(a, std_units)) |want| {
             try testing.expectEqualStrings(want, strict.?);
             try testing.expectEqualStrings(want, out[0..try decodeLe(.fail, out, bytes)]);
-            try testing.expectEqualStrings(want, out[0..decodeLe(.question, out, bytes)]);
+            try testing.expectEqualStrings(want, out[0..decodeLe(.replacement, out, bytes)]);
         } else |_| {
             try testing.expect(strict == null);
             try testing.expectError(error.LoneSurrogate, decodeLe(.fail, out, bytes));
@@ -355,9 +353,9 @@ test "utf16: the allocating forms free what they do not return" {
     const back = try decodeLeAlloc(.fail, gpa, le);
     defer gpa.free(back);
     try testing.expectEqualStrings("a😀çabcdefghijklmnopq", back);
-    const q = try decodeLeAlloc(.question, gpa, "\x3d\xd8a\x00");
+    const q = try decodeLeAlloc(.replacement, gpa, "\x3d\xd8a\x00");
     defer gpa.free(q);
-    try testing.expectEqualStrings("?a", q);
+    try testing.expectEqualStrings("\u{FFFD}a", q);
     const empty = try encodeLeAlloc(gpa, "");
     defer gpa.free(empty);
     try testing.expectEqual(@as(usize, 0), empty.len);
