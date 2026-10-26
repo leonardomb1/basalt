@@ -25,32 +25,36 @@ pub fn timeUnit(name: []const u8) ?TimeUnit {
     return TimeUnit.parse(name);
 }
 
-/// A DATE as its midnight's microseconds, saturating for one past about ±290,000
-/// years that no timestamp holds; a TIMESTAMP as itself.
-pub fn temporalMicros(v: Value) ?i64 {
+/// A DATE as its midnight's microseconds, as `CAST(d AS TIMESTAMP)` reads it: a
+/// date past the ±290,000 years a timestamp holds is CastFailed, never clamped;
+/// a TIMESTAMP as itself.
+pub fn temporalMicros(v: Value) error{ CastFailed, TypeMismatch }!i64 {
     return switch (v) {
         .timestamp => |x| x,
-        .date => |x| civil.dayMicros(x),
-        else => null,
+        .date => |x| civil.dayMicrosChecked(x) orelse error.CastFailed,
+        else => error.TypeMismatch,
     };
 }
 
-pub fn truncMicros(us: i64, u: TimeUnit) i64 {
+/// The start of `us`'s unit; a start before the first instant a timestamp holds
+/// is CastFailed, as `date_add` past it is.
+pub fn truncMicros(us: i64, u: TimeUnit) EvalError!i64 {
     const day = civil.dayOf(us);
     const rem = civil.timeOfDay(us);
-    return switch (u) {
-        inline .second, .minute, .hour => |p| us - @mod(rem, comptime p.fixedMicros().?),
-        .day => civil.dayMicros(day),
-        .week => civil.dayMicros(isoWeekStart(day)),
+    const start = switch (u) {
+        inline .second, .minute, .hour => |p| return us - @mod(rem, comptime p.fixedMicros().?),
+        .day => day,
+        .week => isoWeekStart(day),
         .month => blk: {
             const c = civilFromDays(day);
-            break :blk civil.dayMicros(daysFromCivil(c.y, c.m, 1));
+            break :blk daysFromCivil(c.y, c.m, 1);
         },
         .year => blk: {
             const c = civilFromDays(day);
-            break :blk civil.dayMicros(daysFromCivil(c.y, 1, 1));
+            break :blk daysFromCivil(c.y, 1, 1);
         },
     };
+    return mulI64(start, us_per_day);
 }
 
 pub fn extractField(us: i64, u: TimeUnit) i64 {
@@ -396,6 +400,50 @@ test "strftime prints the true year outside 0..9999, as a date prints it (D14)" 
     try std.testing.expectEqualStrings("-0001-06-01", (try evalLit(a, "strftime(make_date(-1, 6, 1), '%Y-%m-%d')")).string);
     try std.testing.expectEqualStrings("12345", (try evalLit(a, "strftime(make_date(12345, 1, 1), '%Y')")).string);
     try std.testing.expectEqualStrings((try evalLit(a, "CAST(make_date(-1, 6, 1) AS STRING)")).string, (try evalLit(a, "strftime(make_date(-1, 6, 1), '%Y-%m-%d')")).string);
+}
+
+test "a DATE no timestamp holds fails wherever it becomes one, as CAST does, on the row and the batch path (D1)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const evalLit = @import("testing_util.zig").evalLit;
+    const far = "make_date(1000000, 1, 1)";
+    for ([_][]const u8{
+        "CAST(" ++ far ++ " AS TIMESTAMP)",
+        "date_trunc('day', " ++ far ++ ")",
+        "extract(year FROM " ++ far ++ ")",
+        "epoch(" ++ far ++ ")",
+        "strftime(" ++ far ++ ", '%Y')",
+        "date_diff('day', make_date(2024, 1, 1), " ++ far ++ ")",
+        "date_trunc('year', make_date(-290308, 12, 31))",
+    }) |src| {
+        errdefer std.debug.print("`{s}`\n", .{src});
+        try std.testing.expectError(error.CastFailed, evalLit(a, src));
+    }
+    try std.testing.expectEqual(@as(i64, 294246), (try evalLit(a, "extract(year FROM make_date(294246, 1, 1))")).int);
+    try std.testing.expectEqual(@as(i32, @intCast(daysFromCivil(1000000, 1, 2))), (try evalLit(a, "date_add('day', 1, " ++ far ++ ")")).date);
+    try std.testing.expectError(error.CastFailed, truncMicros(std.math.minInt(i64), .day));
+
+    const column = @import("../column.zig");
+    const types = @import("../../lang/types.zig");
+    const lim = @divFloor(std.math.maxInt(i64), us_per_day);
+    const util = @import("testing_util.zig");
+    const srcs = [_][]const u8{ "extract(year FROM d)", "epoch(d)", "date_trunc('day', d)" };
+    var cols: [2]column.Column = undefined;
+    for ([_][]const ?i64{ &.{ 0, lim, -lim, null }, &.{ 0, lim, -lim, null, lim + 1 } }, &cols) |days, *col| {
+        var db = column.Builder.init(a, types.Type.init(.date).asNullable());
+        for (days) |d| try db.append(if (d) |x| .{ .date = @intCast(x) } else .null);
+        col.* = try db.finish();
+    }
+    const schema = types.Schema{ .fields = &.{.{ .name = "d", .ty = cols[0].ty }} };
+    try util.expectVecMatchesRows(a, .{ .schema = &schema, .columns = cols[0..1], .len = 4 }, &srcs, true);
+    const over = cols[1..2];
+    try util.expectVecMatchesRows(a, .{ .schema = &schema, .columns = over, .len = 5 }, &srcs, false);
+    try util.expectVecMatchesRows(a, .{ .schema = &schema, .columns = over, .len = 5 }, &.{"CASE WHEN d < make_date(300000, 1, 1) THEN extract(year FROM d) ELSE 0 END"}, false);
+    const vec = @import("vec.zig");
+    var diag: @import("../../lang/sql_parser.zig").Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try @import("../../lang/sql_parser.zig").parseExprStr(a, "extract(year FROM d)", &diag);
+    try std.testing.expectError(error.CastFailed, vec.evalColumn(a, e, .{ .schema = &schema, .columns = over, .len = 5 }, types.Type.init(.int).asNullable()));
 }
 
 test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses, and a TIME or ISO timestamp cuts past the microsecond (D4)" {

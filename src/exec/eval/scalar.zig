@@ -224,7 +224,7 @@ fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base(
             .timestamp => |t| t,
             else => error.TypeMismatch,
         },
-        .temporal => temporalMicros(v) orelse error.TypeMismatch,
+        .temporal => try temporalMicros(v),
         .unit => if (v == .string) timeUnit(v.string) orelse error.TypeMismatch else error.TypeMismatch,
     };
 }
@@ -243,6 +243,16 @@ const Temporal = union(enum) {
     micros: Typed(i64),
 };
 
+/// Whether every day in `days` has a midnight a timestamp holds, in one pass with
+/// no branch per row; a batch with one that has not goes row by row, where that
+/// row is CastFailed.
+fn allStamps(days: []const i32) bool {
+    const lim = comptime @divFloor(std.math.maxInt(i64), civil.us_per_day);
+    var bad: u1 = 0;
+    for (days) |d| bad |= @intFromBool(d > lim) | @intFromBool(d < -lim);
+    return bad == 0;
+}
+
 /// An argument across a batch as the kernel reads it, or null when absent.
 fn Operand(comptime a: Arg) type {
     if (a == .unit) return ?TimeUnit;
@@ -256,12 +266,12 @@ fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!
     if (comptime a == .unit) return if (v == .scalar and v.scalar == .string) timeUnit(v.scalar.string) orelse error.Unsupported else error.Unsupported;
     if (comptime a == .temporal) return switch (v) {
         .col => |c| switch (c.ty.kind) {
-            .date => .{ .days = .{ .col = .{ .d = c.data.i32, .v = c.validity } } },
+            .date => if (allStamps(c.data.i32)) .{ .days = .{ .col = .{ .d = c.data.i32, .v = c.validity } } } else error.Unsupported,
             .timestamp => .{ .micros = .{ .col = .{ .d = c.data.i64, .v = c.validity } } },
             else => error.Unsupported,
         },
         .scalar => |s| switch (s) {
-            .date => |d| .{ .days = .{ .scalar = d } },
+            .date => |d| if (allStamps(&.{d})) .{ .days = .{ .scalar = d } } else error.Unsupported,
             .timestamp => |t| .{ .micros = .{ .scalar = t } },
             else => error.Unsupported,
         },

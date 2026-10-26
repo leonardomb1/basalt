@@ -240,10 +240,10 @@ test "date builtins: month clamp, boundary diffs, epoch round trip, strftime pad
     try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(9223372036854775807, 1, 1)"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(-9223372036854775807 - 1, 1, 1)"));
     try std.testing.expectError(error.CastFailed, evalLit(a, "make_date(6000000, 1, 1)"));
-    _ = try evalLit(a, "epoch(make_date(5000000, 1, 1))");
-    _ = try evalLit(a, "date_trunc('day', make_date(-5000000, 1, 1))");
-    _ = try evalLit(a, "date_diff('second', make_date(-5000000, 1, 1), make_date(5000000, 1, 1))");
-    _ = try evalLit(a, "extract('year', make_date(-5000000, 1, 1))");
+    try std.testing.expectError(error.CastFailed, evalLit(a, "epoch(make_date(5000000, 1, 1))"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "date_trunc('day', make_date(-5000000, 1, 1))"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "date_diff('second', make_date(-5000000, 1, 1), make_date(5000000, 1, 1))"));
+    try std.testing.expectError(error.CastFailed, evalLit(a, "extract('year', make_date(-5000000, 1, 1))"));
 
     try std.testing.expectEqual(@as(i64, 1700000000), (try evalLit(a, "epoch(to_timestamp(1700000000))")).int);
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "epoch(cast('1970-01-01' as date))")).int);

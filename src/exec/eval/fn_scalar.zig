@@ -419,7 +419,7 @@ pub const DateTrunc = struct {
     pub const args = .{ .unit, .temporal };
     pub const result = .timestamp;
     pub fn apply(_: Cx, u: TimeUnit, us: i64) EvalError!i64 {
-        return time.truncMicros(us, u);
+        return try time.truncMicros(us, u);
     }
 };
 

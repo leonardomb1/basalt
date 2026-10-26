@@ -125,6 +125,14 @@ week 1 holding the year's first Thursday, and `date_diff` counts the Mondays
 crossed. `check` rejects an unknown unit even over a SQL table whose columns it
 has not seen.
 
+A `DATE` holds about ±5.8 million years, a `TIMESTAMP` about ±292,000. A date
+past what a timestamp holds is an error wherever it would become one — `CAST(d
+AS TIMESTAMP)`, a database's text, and the functions below that read a date as
+its midnight (`date_trunc`, `extract`, `date_diff`, `epoch`, `strftime`) — as
+a cast to a timestamp fails in PostgreSQL and DuckDB — never clamped to the
+last instant; `date_add`
+on a `DATE` stays a date and reaches the whole range.
+
 | function | returns |
 |---|---|
 | `now()` | the current timestamp |
