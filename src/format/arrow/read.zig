@@ -971,7 +971,7 @@ const Cursor = struct {
             .null_ => .null,
             .union_ => Error.UnsupportedArrow,
             .int => .{ .int = try intAt(self.data, i, f.bit_width, f.signed) },
-            .duration => .{ .int = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
+            .duration => .{ .int = try ticksOf(f.unit, std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
             .float => .{ .float = if (f.bit_width == 32)
                 @as(f32, @bitCast(std.mem.readInt(u32, self.data[i * 4 ..][0..4], .little)))
             else
@@ -980,11 +980,11 @@ const Cursor = struct {
             .decimal => .{ .decimal = .{ .unscaled = std.mem.readInt(i128, self.data[i * 16 ..][0..16], .little), .scale = f.scale } },
             .date_day => .{ .date = std.mem.readInt(i32, self.data[i * 4 ..][0..4], .little) },
             .date_ms => .{ .date = try (DayOfMs{}).of(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
-            .time => .{ .time = f.unit.toMicros(if (f.bit_width == 32)
+            .time => .{ .time = try ticksOf(f.unit, if (f.bit_width == 32)
                 std.mem.readInt(i32, self.data[i * 4 ..][0..4], .little)
             else
-                std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
-            .timestamp => .{ .timestamp = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
+                std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
+            .timestamp => .{ .timestamp = try ticksOf(f.unit, std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little)) },
             .utf8, .large_utf8 => blk: {
                 const s = try self.span(i);
                 break :blk .{ .string = self.data[s.lo..s.hi] };
@@ -1154,10 +1154,15 @@ const DayOfMs = struct {
     }
 };
 
+/// Ticks of `u` as micros; a count past i64 micros is a corrupt file, never clamped.
+fn ticksOf(u: Unit, x: i64) Error!i64 {
+    return u.toMicros(x) catch Error.CorruptArrow;
+}
+
 fn Micros(comptime u: Unit) type {
     return struct {
         fn of(_: @This(), x: anytype) Error!i64 {
-            return u.toMicros(x, .saturate);
+            return ticksOf(u, x);
         }
         fn zero(_: @This()) i64 {
             return 0;
@@ -1379,23 +1384,38 @@ test "fuzz: arbitrary bytes behind a valid magic never crash the reader" {
     }.f, .{});
 }
 
-test "civil.Tick saturates exactly as the reader's own Unit.toMicros did, on every unit and edge" {
-    const Orig = struct {
-        fn oldToMicros(u: Unit, x: i64) i64 {
-            return switch (u) {
-                .s => std.math.mul(i64, x, 1_000_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-                .ms => std.math.mul(i64, x, 1_000) catch if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64),
-                .us => x,
-                .ns => @divFloor(x, 1000),
-            };
-        }
-    };
+test "a tick count past i64 micros is a corrupt file on the row and window paths, never a clamp; a null slot's bytes never fail (D2)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
     const max = std.math.maxInt(i64);
     const min = std.math.minInt(i64);
-    const xs = [_]i64{ 0, 1, -1, 999, -999, 1000, -1000, 1001, -1001, max, min, max - 1, min + 1, @divTrunc(max, 1000), @divTrunc(max, 1000) + 1, @divTrunc(min, 1000), @divTrunc(min, 1000) - 1, @divTrunc(max, 1_000_000), @divTrunc(max, 1_000_000) + 1, @divTrunc(min, 1_000_000), @divTrunc(min, 1_000_000) - 1, std.math.maxInt(i32), std.math.minInt(i32) };
-    for ([_]Unit{ .s, .ms, .us, .ns }) |u| for (xs) |x| {
-        try std.testing.expectEqual(Orig.oldToMicros(u, x), u.toMicros(x, .saturate));
-    };
+    inline for (.{ .{ Unit.s, 1_000_000 }, .{ Unit.ms, 1000 } }) |c| {
+        inline for (.{ .timestamp, .duration, .time }) |kind| {
+            const good = [_]i64{ 0, -1, @divTrunc(max, c[1]), @divTrunc(min, c[1]) };
+            var cur = Cursor{ .f = .{ .name = "t", .kind = kind, .unit = c[0], .bit_width = 64 }, .a = .{ .len = good.len, .null_count = 0, .bufs = &.{} }, .reader = undefined, .data = std.mem.sliceAsBytes(&good) };
+            const got = (try widened(a, &cur, 0, good.len)).?.i64;
+            for (good, got, 0..) |x, us, i| {
+                try std.testing.expectEqual(x * c[1], us);
+                try std.testing.expectEqual(x * c[1], switch (try cur.value(a, i)) {
+                    .timestamp, .time, .int => |v| v,
+                    else => return error.TestUnexpectedResult,
+                });
+            }
+            for ([_]i64{ @divTrunc(max, c[1]) + 1, @divTrunc(min, c[1]) - 1, max, min }) |x| {
+                const bad = [_]i64{x};
+                cur.data = std.mem.sliceAsBytes(&bad);
+                cur.a.len = 1;
+                try std.testing.expectError(Error.CorruptArrow, widened(a, &cur, 0, 1));
+                try std.testing.expectError(Error.CorruptArrow, cur.value(a, 0));
+            }
+            const under_null = [_]i64{ max, 7 };
+            const bits = [_]u8{0b10};
+            cur = Cursor{ .f = .{ .name = "t", .kind = kind, .unit = c[0], .bit_width = 64 }, .a = .{ .len = 2, .null_count = 1, .bufs = &.{} }, .reader = undefined, .bits = &bits, .data = std.mem.sliceAsBytes(&under_null) };
+            try std.testing.expectEqual(7 * c[1], (try widened(a, &cur, 0, 2)).?.i64[1]);
+            try std.testing.expectEqual(Value.null, try cur.value(a, 0));
+        }
+    }
     for ([_]i16{ 0, 1, 2, 3 }, [_]Unit{ .s, .ms, .us, .ns }) |code, u| try std.testing.expectEqual(u, try unitOf(code));
     try std.testing.expectError(Error.CorruptArrow, unitOf(4));
     try std.testing.expectError(Error.CorruptArrow, unitOf(-1));

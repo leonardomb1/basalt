@@ -143,27 +143,24 @@ pub const Tick = enum {
     us,
     ns,
 
-    pub const Policy = enum { saturate, fail };
-
-    pub fn Micros(comptime policy: Policy) type {
-        return switch (policy) {
-            .saturate => i64,
-            .fail => error{Overflow}!i64,
+    /// `x` ticks as microseconds; nanoseconds round toward minus infinity. A count
+    /// past i64 microseconds is an Overflow, never clamped to a wrong instant.
+    pub fn toMicros(t: Tick, x: i64) error{Overflow}!i64 {
+        return switch (t) {
+            .s => std.math.mul(i64, x, us_per_sec),
+            .ms => std.math.mul(i64, x, 1000),
+            .us => x,
+            .ns => @divFloor(x, 1000),
         };
     }
 
-    /// `x` ticks as microseconds; nanoseconds round toward minus infinity. Past
-    /// i64, `saturate` clamps by the sign of `x` and `fail` is an Overflow.
-    pub fn toMicros(t: Tick, x: i64, comptime policy: Policy) Micros(policy) {
-        const per: i64 = switch (t) {
-            .s => 1_000_000,
-            .ms => 1_000,
-            .us => return x,
-            .ns => return @divFloor(x, 1000),
-        };
-        return std.math.mul(i64, x, per) catch {
-            if (policy == .fail) return error.Overflow;
-            return if (x < 0) std.math.minInt(i64) else std.math.maxInt(i64);
+    /// The largest magnitude of ticks `toMicros` takes, for a kernel that checks a
+    /// whole run of values at once.
+    pub fn limit(comptime t: Tick) i64 {
+        return switch (t) {
+            .s => @divTrunc(std.math.maxInt(i64), us_per_sec),
+            .ms => @divTrunc(std.math.maxInt(i64), 1000),
+            .us, .ns => std.math.maxInt(i64),
         };
     }
 };
@@ -716,47 +713,44 @@ test "civil: civilDays, clockMicros and pivotYY refuse what does not exist" {
     try testing.expectEqual(@as(i64, 1999), pivotYY(99));
 }
 
-test "civil: ticks to micros match Parquet and Arrow (saturate) and Avro (fail)" {
+test "civil: ticks past i64 microseconds overflow in every unit, never clamp (D2)" {
     const max: i64 = std.math.maxInt(i64);
     const min: i64 = std.math.minInt(i64);
-    const Case = struct { Tick, i64, i64, ?i64 };
+    const Case = struct { Tick, i64, ?i64 };
     const cases = [_]Case{
-        .{ .s, 1, 1_000_000, 1_000_000 },
-        .{ .s, -1, -1_000_000, -1_000_000 },
-        .{ .s, max / 1_000_000, max / 1_000_000 * 1_000_000, max / 1_000_000 * 1_000_000 },
-        .{ .s, max / 1_000_000 + 1, max, null },
-        .{ .s, min / 1_000_000 - 1, min, null },
-        .{ .ms, 1_583_298_367_123, 1_583_298_367_123_000, 1_583_298_367_123_000 },
-        .{ .ms, max / 1000, max / 1000 * 1000, max / 1000 * 1000 },
-        .{ .ms, max / 1000 + 1, max, null },
-        .{ .ms, min / 1000 - 1, min, null },
-        .{ .ms, min, min, null },
-        .{ .us, max, max, max },
-        .{ .us, min, min, min },
-        .{ .ns, 1_999, 1, 1 },
-        .{ .ns, -1, -1, -1 },
-        .{ .ns, -1000, -1, -1 },
-        .{ .ns, -1001, -2, -2 },
-        .{ .ns, max, @divFloor(max, 1000), @divFloor(max, 1000) },
-        .{ .ns, min, @divFloor(min, 1000), @divFloor(min, 1000) },
+        .{ .s, 1, 1_000_000 },
+        .{ .s, -1, -1_000_000 },
+        .{ .s, max / 1_000_000, max / 1_000_000 * 1_000_000 },
+        .{ .s, max / 1_000_000 + 1, null },
+        .{ .s, min / 1_000_000, min / 1_000_000 * 1_000_000 },
+        .{ .s, min / 1_000_000 - 1, null },
+        .{ .ms, 1_583_298_367_123, 1_583_298_367_123_000 },
+        .{ .ms, max / 1000, max / 1000 * 1000 },
+        .{ .ms, max / 1000 + 1, null },
+        .{ .ms, min / 1000 - 1, null },
+        .{ .ms, min, null },
+        .{ .us, max, max },
+        .{ .us, min, min },
+        .{ .ns, 1_999, 1 },
+        .{ .ns, -1, -1 },
+        .{ .ns, -1000, -1 },
+        .{ .ns, -1001, -2 },
+        .{ .ns, max, @divFloor(max, 1000) },
+        .{ .ns, min, @divFloor(min, 1000) },
     };
     for (cases) |c| {
-        try testing.expectEqual(c[2], c[0].toMicros(c[1], .saturate));
-        if (c[3]) |want| {
-            try testing.expectEqual(want, try c[0].toMicros(c[1], .fail));
-        } else try testing.expectError(error.Overflow, c[0].toMicros(c[1], .fail));
+        if (c[2]) |want| {
+            try testing.expectEqual(want, try c[0].toMicros(c[1]));
+        } else try testing.expectError(error.Overflow, c[0].toMicros(c[1]));
     }
     var rnd = std.Random.DefaultPrng.init(3);
     for (0..50_000) |i| {
         const x = rnd.random().int(i64) >> @intCast(i % 64);
-        const pq_ms = std.math.mul(i64, x, 1000) catch if (x < 0) min else max;
-        try testing.expectEqual(pq_ms, Tick.ms.toMicros(x, .saturate));
-        try testing.expectEqual(@divFloor(x, 1000), Tick.ns.toMicros(x, .saturate));
-        const arrow_s = std.math.mul(i64, x, 1_000_000) catch if (x < 0) min else max;
-        try testing.expectEqual(arrow_s, Tick.s.toMicros(x, .saturate));
-        if (std.math.mul(i64, x, 1000)) |avro| {
-            try testing.expectEqual(avro, try Tick.ms.toMicros(x, .fail));
-        } else |_| try testing.expectError(error.Overflow, Tick.ms.toMicros(x, .fail));
+        inline for (.{ .s, .ms, .us, .ns }) |t| {
+            const fits = x >= -Tick.limit(t) and x <= Tick.limit(t);
+            if (Tick.toMicros(t, x)) |_| try testing.expect(fits) else |_| try testing.expect(!fits);
+        }
+        try testing.expectEqual(@divFloor(x, 1000), try Tick.ns.toMicros(x));
     }
     try testing.expectEqual(@as(u2, 0), @intFromEnum(Tick.s));
     try testing.expectEqual(@as(u2, 3), @intFromEnum(Tick.ns));

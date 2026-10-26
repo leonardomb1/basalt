@@ -19,7 +19,7 @@ const decodeDeltaBinaryPacked = @import("encoding.zig").decodeDeltaBinaryPacked;
 const decodeDeltaByteArray = @import("encoding.zig").decodeDeltaByteArray;
 const decodeDeltaLengthByteArray = @import("encoding.zig").decodeDeltaLengthByteArray;
 const decodeRleHybrid = @import("encoding.zig").decodeRleHybrid;
-const int96ToMicros = @import("encoding.zig").int96ToMicros;
+const int96Wrapping = @import("encoding.zig").int96Wrapping;
 const civil = @import("../../exec/civil.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
@@ -304,11 +304,12 @@ const Cast = struct {
     }
 
     /// A count of `t` as micros, one function per unit so the page loop has no
-    /// branch on it.
+    /// branch on it; `pushInts` has checked the run with `ticksFit` first, or it
+    /// is i32, which no unit takes past i64 micros.
     fn micros(comptime t: civil.Tick) fn (Cast, i64) i64 {
         return struct {
             fn f(_: Cast, x: i64) i64 {
-                return t.toMicros(x, .saturate);
+                return t.toMicros(x) catch unreachable;
             }
         }.f;
     }
@@ -408,13 +409,29 @@ fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
         .int => sink.put(i64, cast, Cast.same, src, n),
         .time, .timestamp => switch (cast.tick) {
             .us => sink.put(i64, cast, Cast.same, src, n),
-            inline else => |t| sink.put(i64, cast, Cast.micros(t), src, n),
+            inline else => |t| {
+                if (comptime @TypeOf(src.get(0)) != i32) if (!ticksFit(t, src, n)) return Error.CorruptParquetPage;
+                return sink.put(i64, cast, Cast.micros(t), src, n);
+            },
         },
         .date => sink.put(i32, cast, Cast.date, src, n),
         .decimal => sink.put(Decimal, cast, Cast.decimal, src, n),
         .bool => sink.put(bool, cast, Cast.truthy, src, n),
         else => Error.UnsupportedParquetEncoding,
     };
+}
+
+/// Whether all `n` ticks of `src` hold as i64 micros, in one pass that ORs the
+/// out-of-range tests rather than branching on each: a value past them is a
+/// corrupt file, never a clamped instant.
+fn ticksFit(comptime t: civil.Tick, src: anytype, n: usize) bool {
+    const lim = comptime t.limit();
+    var bad: u1 = 0;
+    for (0..n) |i| {
+        const x: i64 = src.get(i);
+        bad |= @intFromBool(x > lim) | @intFromBool(x < -lim);
+    }
+    return bad == 0;
 }
 
 fn pushFloats(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
@@ -455,7 +472,9 @@ fn pushPlain(
         .double => try pushFloats(sink, cast, try plain(f64, body, n), n),
         .int96 => {
             if (body.len < n * 12) return Error.CorruptParquetPage;
-            try sink.put(i64, cast, Cast.same, Int96{ .body = body }, n);
+            const src = Int96{ .body = body };
+            if (!src.fits(n)) return Error.CorruptParquetPage;
+            try sink.put(i64, cast, Cast.same, src, n);
         },
         .byte_array => try pushBytes(sink, cast, try plainByteArrays(arena, body, n)),
         .fixed_len_byte_array => try pushBytes(sink, cast, try fixedByteArrays(arena, body, type_length, n)),
@@ -507,9 +526,21 @@ const Bits = struct {
 const Int96 = struct {
     body: []const u8,
 
-    inline fn get(s: Int96, i: usize) i64 {
+    inline fn wrapped(s: Int96, i: usize) @TypeOf(int96Wrapping(0, 0)) {
         const w = s.body[i * 12 ..][0..12];
-        return int96ToMicros(std.mem.readInt(u32, w[8..12], .little), std.mem.readInt(u64, w[0..8], .little));
+        return int96Wrapping(std.mem.readInt(u32, w[8..12], .little), std.mem.readInt(u64, w[0..8], .little));
+    }
+
+    /// Whether all `n` values hold as i64 micros, the overflow bits ORed, not branched on.
+    fn fits(s: Int96, n: usize) bool {
+        var bad: u1 = 0;
+        for (0..n) |i| bad |= s.wrapped(i).overflow;
+        return bad == 0;
+    }
+
+    /// A value `fits` has already passed.
+    inline fn get(s: Int96, i: usize) i64 {
+        return s.wrapped(i).us;
     }
 };
 
@@ -646,6 +677,35 @@ test "a PLAIN count the page body cannot hold is refused before it is allocated"
     try testing.expect(!plainFits(.byte_array, 0, body.len, 3));
     try testing.expect(plainFits(.boolean, 0, 1, 8) and !plainFits(.boolean, 0, 1, 9));
     try testing.expect(!plainFits(.int96, 0, 23, 2));
+}
+
+test "a millisecond or INT96 value past i64 micros is a corrupt page, in a page and a statistic alike (D2)" {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var v: Value = .null;
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    const ms: Cast = .{ .ty = types.Type.init(.timestamp), .tick = .ms };
+    const ok: i64 = @divTrunc(max, 1000);
+    try pushPlain(fba.allocator(), One{ .out = &v }, ms, .int64, 0, std.mem.asBytes(&ok), 1);
+    try testing.expectEqual(Value{ .timestamp = ok * 1000 }, v);
+    const millis: parquet.SchemaElement = .{ .ty = .int64, .converted_type = 9 };
+    try testing.expectEqual(Value{ .timestamp = ok * 1000 }, try plainValue(millis, .int64, std.mem.asBytes(&ok)));
+    for ([_]i64{ ok + 1, @divTrunc(min, 1000) - 1, max, min }) |x| {
+        const run = [_]i64{ 0, x, 0 };
+        try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, ms, .int64, 0, std.mem.sliceAsBytes(&run), 3));
+        try testing.expectError(Error.CorruptParquetPage, plainValue(millis, .int64, std.mem.asBytes(&x)));
+    }
+    const day_ok: u32 = @intCast(@divFloor(max, civil.us_per_day) + civil.epoch.julian_unix);
+    var w: [24]u8 = undefined;
+    std.mem.writeInt(u64, w[0..8], 0, .little);
+    std.mem.writeInt(u32, w[8..12], day_ok, .little);
+    std.mem.writeInt(u64, w[12..20], 0, .little);
+    std.mem.writeInt(u32, w[20..24], day_ok + 1, .little);
+    const cast: Cast = .{ .ty = types.Type.init(.timestamp), .tick = .us };
+    try pushPlain(fba.allocator(), One{ .out = &v }, cast, .int96, 12, w[0..12], 1);
+    try testing.expectEqual(Value{ .timestamp = (@as(i64, day_ok) - civil.epoch.julian_unix) * civil.us_per_day }, v);
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .int96, 12, &w, 2));
 }
 
 test "a dictionary page's count is bounded by its body before the dictionary is sized" {

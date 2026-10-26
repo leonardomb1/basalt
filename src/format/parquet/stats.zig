@@ -325,7 +325,7 @@ test "INT96 statistics never prune: a byte-order max can sit below the group's l
     std.mem.writeInt(u32, late[8..12], day + 1, .little);
     var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int96, .stats = .{ .min = &late, .max = &early } } }};
     const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 2 };
-    const noon: i64 = @import("encoding.zig").int96ToMicros(day, 12 * 3_600_000_000_000);
+    const noon: i64 = @import("encoding.zig").int96ToMicros(day, 12 * 3_600_000_000_000).?;
     const ge = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .string = "2024-01-05T12:00:00" } }};
     const ge_noon = [_]Bound{.{ .column = "ts", .op = .ge, .value = .{ .timestamp = noon } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &ge));

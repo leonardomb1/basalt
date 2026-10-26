@@ -137,10 +137,19 @@ fn readVarint(src: []const u8, pos: *usize) Error!u64 {
 }
 
 /// INT96: Julian day (`civil.epoch.julian_unix` is 1970-01-01) plus nanoseconds of
-/// day. Saturates, since a u32 Julian day of micros overflows i64 on a corrupt file.
-pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) i64 {
+/// day; null past i64 micros, which only a corrupt file's u32 Julian day reaches.
+pub fn int96ToMicros(julian_day: u32, nanos_of_day: u64) ?i64 {
+    const r = int96Wrapping(julian_day, nanos_of_day);
+    return if (r.overflow == 0) r.us else null;
+}
+
+/// `int96ToMicros` with no branch: the wrapped micros and whether they wrapped,
+/// for a page kernel that checks a whole run before it converts it.
+pub fn int96Wrapping(julian_day: u32, nanos_of_day: u64) struct { us: i64, overflow: u1 } {
     const days: i64 = @as(i64, julian_day) - civil.epoch.julian_unix;
-    return civil.dayMicros(days) +| @as(i64, @intCast(nanos_of_day / 1000));
+    const m = @mulWithOverflow(days, civil.us_per_day);
+    const s = @addWithOverflow(m[0], @as(i64, @intCast(nanos_of_day / 1000)));
+    return .{ .us = s[0], .overflow = m[1] | s[1] };
 }
 
 const DeltaHeader = struct { miniblocks: usize, per_mini: usize, total: usize, first: i64 };
@@ -382,14 +391,18 @@ test "a truncated hybrid stream errors rather than reading past the page" {
     try testing.expectError(Error.CorruptParquetPage, decodeRleHybrid(ar.allocator(), &[_]u8{ 0x00, 0x01 }, 1, 4));
 }
 
-test "int96 converts Julian day plus nanoseconds to epoch micros" {
+test "int96 converts Julian day plus nanoseconds to epoch micros, and refuses a day past i64 micros (D2)" {
     try testing.expectEqual(@as(i64, 2_440_588), civil.epoch.julian_unix);
-    try testing.expectEqual(@as(i64, 0), int96ToMicros(2_440_588, 0));
-    try testing.expectEqual(@as(i64, 1_000_000), int96ToMicros(2_440_588, 1_000_000_000));
-    try testing.expectEqual(@as(i64, 86_400_000_000), int96ToMicros(2_440_589, 0));
-    try testing.expectEqual(@as(i64, -86_400_000_000), int96ToMicros(2_440_587, 0));
-    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), int96ToMicros(std.math.maxInt(u32), 0));
-    try testing.expectEqual(@as(i64, -210_866_803_200_000_000), int96ToMicros(0, 0));
+    try testing.expectEqual(@as(?i64, 0), int96ToMicros(2_440_588, 0));
+    try testing.expectEqual(@as(?i64, 1_000_000), int96ToMicros(2_440_588, 1_000_000_000));
+    try testing.expectEqual(@as(?i64, 86_400_000_000), int96ToMicros(2_440_589, 0));
+    try testing.expectEqual(@as(?i64, -86_400_000_000), int96ToMicros(2_440_587, 0));
+    try testing.expectEqual(@as(?i64, -210_866_803_200_000_000), int96ToMicros(0, 0));
+    try testing.expectEqual(@as(?i64, null), int96ToMicros(std.math.maxInt(u32), 0));
+    const last_day: u32 = @intCast(@divFloor(std.math.maxInt(i64), civil.us_per_day) + civil.epoch.julian_unix);
+    try testing.expect(int96ToMicros(last_day, 0) != null);
+    try testing.expectEqual(@as(?i64, null), int96ToMicros(last_day + 1, 0));
+    try testing.expectEqual(@as(?i64, null), int96ToMicros(last_day, std.math.maxInt(u64)));
 }
 
 test "a bit-packed run length from the wire cannot overflow the byte count" {

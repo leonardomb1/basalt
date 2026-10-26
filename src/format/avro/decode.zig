@@ -252,13 +252,13 @@ inline fn decodeLeaf(cur: *Cursor, comptime c: Code, args: anytype) Error!Read(c
         .boolean => cur.boolean(),
         .int => try cur.int(),
         .date => cur.int(),
-        .time_millis => @call(.always_inline, civil.Tick.toMicros, .{ .ms, try cur.int(), .saturate }),
+        .time_millis => @call(.always_inline, civil.Tick.toMicros, .{ .ms, try cur.int() }) catch unreachable,
         .long => cur.long(),
         .ts_millis => blk: {
             const x = try cur.long();
-            break :blk @call(.always_inline, civil.Tick.toMicros, .{ .ms, x, .fail }) catch corrupt("a timestamp-millis {d} past the range basalt holds", .{x});
+            break :blk @call(.always_inline, civil.Tick.toMicros, .{ .ms, x }) catch corrupt("a timestamp-millis {d} past the range basalt holds", .{x});
         },
-        .ts_nanos => @call(.always_inline, civil.Tick.toMicros, .{ .ns, try cur.long(), .saturate }),
+        .ts_nanos => @call(.always_inline, civil.Tick.toMicros, .{ .ns, try cur.long() }) catch unreachable,
         .float => cur.float(),
         .double => cur.double(),
         .bytes => cur.bytes(),
@@ -916,7 +916,7 @@ test "jsontext.scalar in the typed style writes every nested scalar as Avro's ow
     }
 }
 
-test "a timestamp-millis past i64 microseconds is a corrupt file on the typed and the cast path alike (kept until D2)" {
+test "a timestamp-millis past i64 microseconds is a corrupt file on the typed and the cast path alike, as in Parquet and Arrow (D2)" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
