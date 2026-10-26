@@ -32,6 +32,7 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const driver = @import("../connect/driver.zig");
 const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
@@ -675,7 +676,7 @@ pub const Session = struct {
         const low = std.ascii.lowerString(&low_buf, share);
         if (self.trees.get(low)) |t| return t;
 
-        const unc = std.fmt.allocPrint(self.gpa, "\\\\{s}\\{s}", .{ self.cfg.host, share }) catch return error.SmbFailure;
+        const unc = msgfmt.allocPrint(self.gpa, "\\\\{s}\\{s}", .{ self.cfg.host, share }) catch return error.SmbFailure;
         defer self.gpa.free(unc);
         const path = utf16.encodeLeAlloc(self.gpa, unc) catch return error.SmbFailure;
         defer self.gpa.free(path);
@@ -1115,7 +1116,7 @@ const Proto = struct {
     pub fn listDir(s: *Session, arena: std.mem.Allocator, t: Target, rel: []const u8) ![]const remotefs.Entry {
         const top = std.mem.trimRight(u8, t.path, "\\");
         const sub = try winPath(arena, rel);
-        const dir = if (rel.len == 0) top else if (top.len == 0) sub else try std.fmt.allocPrint(arena, "{s}\\{s}", .{ top, sub });
+        const dir = if (rel.len == 0) top else if (top.len == 0) sub else try msgfmt.allocPrint(arena, "{s}\\{s}", .{ top, sub });
         const h = try s.open(t.share, dir, read_access, disposition_open, option_directory);
         defer s.closeHandle(h);
         return s.list(arena, h);
@@ -1291,7 +1292,7 @@ test "smb: names encode and decode through format/utf16 exactly as through std.u
         fn decode(a: std.mem.Allocator, le: []const u8) ![]const u8 {
             const w = try a.alloc(u16, le.len / 2);
             @memcpy(std.mem.sliceAsBytes(w), le[0 .. w.len * 2]);
-            return std.fmt.allocPrint(a, "{f}", .{std.unicode.fmtUtf16Le(w)});
+            return msgfmt.allocPrint(a, "{f}", .{std.unicode.fmtUtf16Le(w)});
         }
     };
     const texts = [_][]const u8{

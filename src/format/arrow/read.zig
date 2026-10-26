@@ -44,6 +44,7 @@
 //! several, and which one a query meant is not something to guess.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -211,7 +212,7 @@ fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize)
                 1 => 32,
                 2 => 64,
                 else => {
-                    why.* = try std.fmt.allocPrint(arena, "column `{s}`: half-precision floats are not supported", .{out.name});
+                    why.* = try msgfmt.allocPrint(arena, "column `{s}`: half-precision floats are not supported", .{out.name});
                     return Error.UnsupportedArrow;
                 },
             };
@@ -223,7 +224,7 @@ fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize)
             const scale = try tt.int(i32, 1, 0);
             const bw = try tt.int(i32, 2, 128);
             if (bw != 128 or prec < 1 or prec > 38 or scale < 0 or scale > prec) {
-                why.* = try std.fmt.allocPrint(arena, "column `{s}`: decimal({d},{d}) at {d} bits does not fit the engine's 38-digit decimal", .{ out.name, prec, scale, bw });
+                why.* = try msgfmt.allocPrint(arena, "column `{s}`: decimal({d},{d}) at {d} bits does not fit the engine's 38-digit decimal", .{ out.name, prec, scale, bw });
                 return Error.UnsupportedArrow;
             }
             out.kind = .decimal;
@@ -279,7 +280,7 @@ fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize)
             out.dense = if (t) |tt| (try tt.int(i16, 0, 0)) == 1 else false;
         },
         else => {
-            why.* = try std.fmt.allocPrint(arena, "column `{s}`: the Arrow {s} type is not supported", .{ out.name, tagName(tag) });
+            why.* = try msgfmt.allocPrint(arena, "column `{s}`: the Arrow {s} type is not supported", .{ out.name, tagName(tag) });
             return Error.UnsupportedArrow;
         },
     }
@@ -567,9 +568,9 @@ pub const Reader = struct {
         for (self.keep) |i| if (unionIn(self.fields[i])) |u| {
             const f = self.fields[i];
             return self.refuse(if (f.kind == .union_)
-                try std.fmt.allocPrint(self.arena, "column `{s}`: the Arrow Union type is not supported", .{f.name})
+                try msgfmt.allocPrint(self.arena, "column `{s}`: the Arrow Union type is not supported", .{f.name})
             else
-                try std.fmt.allocPrint(self.arena, "column `{s}`: its field `{s}` is an Arrow Union, which is not supported", .{ f.name, u }));
+                try msgfmt.allocPrint(self.arena, "column `{s}`: its field `{s}` is an Arrow Union, which is not supported", .{ f.name, u }));
         };
         const out = try self.arena.alloc(types.Schema.Field, self.keep.len);
         for (out, self.keep) |*o, i| o.* = .{ .name = self.fields[i].name, .ty = self.fields[i].basaltType() };
@@ -748,7 +749,7 @@ pub const Reader = struct {
             break;
         };
         if ((try m.table.int(u8, 2, 0)) != 0)
-            return self.refuse(try std.fmt.allocPrint(self.arena, "column `{s}`: delta dictionary batches (a dictionary extended mid-stream) are not supported", .{col}));
+            return self.refuse(try msgfmt.allocPrint(self.arena, "column `{s}`: delta dictionary batches (a dictionary extended mid-stream) are not supported", .{col}));
         var f = vf orelse return;
         f.dict = null;
         var w = try walker(self.arena, rb, m.body, m.meta);

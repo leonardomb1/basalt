@@ -12,6 +12,7 @@
 //!   - `;` statement terminator, `<>` as not-equal, `||` concat over bitwise `|`
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const token = @import("token.zig");
 
 const Token = token.Token;
@@ -219,7 +220,7 @@ pub const Lexer = struct {
                 const name = self.src[nstart..self.i];
                 if (self.i < self.src.len and self.src[self.i] == '$') {
                     _ = self.bump();
-                    const closer = std.fmt.allocPrint(self.alloc, "${s}$", .{name}) catch return error.OutOfMemory;
+                    const closer = msgfmt.allocPrint(self.alloc, "${s}$", .{name}) catch return error.OutOfMemory;
                     const start = self.i;
                     const end = std.mem.indexOfPos(u8, self.src, self.i, closer) orelse {
                         const rest = self.src[nstart - 1 ..];

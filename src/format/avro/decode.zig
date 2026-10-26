@@ -34,11 +34,11 @@ pub const Error = error{ CorruptAvro, UnsupportedAvro, OutOfMemory };
 
 pub const max_empty = 1 << 16;
 
-pub fn corrupt(comptime fmt: []const u8, args: anytype) Error {
+pub inline fn corrupt(comptime fmt: []const u8, args: anytype) Error {
     return @errorCast(stream.explainf(error.CorruptAvro, fmt, args));
 }
 
-pub fn unsupported(comptime fmt: []const u8, args: anytype) Error {
+pub inline fn unsupported(comptime fmt: []const u8, args: anytype) Error {
     return @errorCast(stream.explainf(error.UnsupportedAvro, fmt, args));
 }
 

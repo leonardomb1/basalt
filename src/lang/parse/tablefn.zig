@@ -18,6 +18,7 @@ const expand = @import("../expand.zig");
 const max_tvf_depth = @import("../sql_parser.zig").max_tvf_depth;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 
 fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
@@ -33,7 +34,7 @@ fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
 /// to this call.
 pub fn cteName(self: *Parser, name: []const u8) Error![]const u8 {
     const f = self.tvf orelse return name;
-    const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ f.id, name });
+    const bname = try msgfmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ f.id, name });
     try f.ctes.append(.{ name, bname });
     return bname;
 }
@@ -123,7 +124,7 @@ pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from
     _ = self.expect(.semi) catch |e| return self.inTableFn(e, fd.name, pos);
     const keys = if (correlated.items.len == 0) &.{} else try self.decorrelate(fd.name, pos, &stages, inner.items, correlated.items);
 
-    const bname = try std.fmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ frame.id, fd.name });
+    const bname = try msgfmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ frame.id, fd.name });
     try self.let_names.append(bname);
     try self.pending_bindings.appendSlice(inner.items);
     try self.pending_bindings.append(.{ .binding = .{
@@ -228,7 +229,7 @@ pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array
 /// the call the script wrote.
 pub fn inTableFn(self: *Parser, e: Error, name: []const u8, pos: Pos) Error {
     if (e == error.ParseFailed and self.tvf_depth == 1)
-        self.diag.msg = std.fmt.allocPrint(self.arena, "in `{s}` called at {d}:{d}: {s}", .{ name, pos.line, pos.col, self.diag.msg }) catch self.diag.msg;
+        self.diag.msg = msgfmt.allocPrint(self.arena, "in `{s}` called at {d}:{d}: {s}", .{ name, pos.line, pos.col, self.diag.msg }) catch self.diag.msg;
     return e;
 }
 
@@ -257,8 +258,8 @@ pub fn parseDerivedTable(self: *Parser) Error!Derived {
 
 fn derivedName(self: *Parser, alias: ?[]const u8) Error![]const u8 {
     self.derived_n += 1;
-    const al = alias orelse return std.fmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
-    return std.fmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al });
+    const al = alias orelse return msgfmt.allocPrint(self.arena, "__derived{d}", .{self.derived_n});
+    return msgfmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al });
 }
 
 const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };

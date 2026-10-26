@@ -40,9 +40,9 @@ fn fieldOf(comptime name: []const u8, rec: []const u8, pos: i64, len: i64) EvalE
     return rec[p .. p + @as(usize, @intCast(len))];
 }
 
-fn bad(comptime name: []const u8, raw: []const u8, comptime what: []const u8) EvalError {
+fn bad(name: []const u8, raw: []const u8, what: []const u8) EvalError {
     var buf: [64]u8 = undefined;
-    return failWith(error.CastFailed, "`" ++ name ++ "`: `{s}` is not " ++ what, .{shown(&buf, raw)});
+    return failWith(error.CastFailed, "`{s}`: `{s}` is not {s}", .{ name, shown(&buf, raw), what });
 }
 
 /// `raw` as a message shows it: printable ASCII as is, anything else as `\xNN`.

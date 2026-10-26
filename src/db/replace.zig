@@ -16,6 +16,7 @@
 //! always deletes.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 
@@ -32,17 +33,17 @@ pub fn intrinsics(d: sql.Dialect) Intrinsics {
     return switch (d) {
         .postgres => .{ .begin = "BEGIN", .commit = "COMMIT", .truncate_in_txn = true, .createLike = struct {
             fn f(a: std.mem.Allocator, stg: []const u8, target: []const u8) error{OutOfMemory}![]const u8 {
-                return std.fmt.allocPrint(a, "CREATE TABLE {s} (LIKE {s})", .{ stg, target });
+                return msgfmt.allocPrint(a, "CREATE TABLE {s} (LIKE {s})", .{ stg, target });
             }
         }.f },
         .sqlserver => .{ .begin = "BEGIN TRANSACTION", .commit = "COMMIT TRANSACTION", .truncate_in_txn = true, .createLike = struct {
             fn f(a: std.mem.Allocator, stg: []const u8, target: []const u8) error{OutOfMemory}![]const u8 {
-                return std.fmt.allocPrint(a, "SELECT * INTO {s} FROM {s} WHERE 1 = 0", .{ stg, target });
+                return msgfmt.allocPrint(a, "SELECT * INTO {s} FROM {s} WHERE 1 = 0", .{ stg, target });
             }
         }.f },
         .mysql, .starrocks, .doris => .{ .begin = "START TRANSACTION", .commit = "COMMIT", .truncate_in_txn = false, .createLike = struct {
             fn f(a: std.mem.Allocator, stg: []const u8, target: []const u8) error{OutOfMemory}![]const u8 {
-                return std.fmt.allocPrint(a, "CREATE TABLE {s} LIKE {s}", .{ stg, target });
+                return msgfmt.allocPrint(a, "CREATE TABLE {s} LIKE {s}", .{ stg, target });
             }
         }.f },
     };
@@ -54,8 +55,8 @@ pub fn stagingName(a: std.mem.Allocator, target: []const u8) ![]const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, target, '.');
     const schema = if (dot) |i| target[0 .. i + 1] else "";
     const table = if (dot) |i| target[i + 1 ..] else target;
-    const name = try std.fmt.allocPrint(a, "_basalt_stage_{s}", .{table});
-    return std.fmt.allocPrint(a, "{s}{s}", .{ schema, name[0..@min(name.len, 63)] });
+    const name = try msgfmt.allocPrint(a, "_basalt_stage_{s}", .{table});
+    return msgfmt.allocPrint(a, "{s}{s}", .{ schema, name[0..@min(name.len, 63)] });
 }
 
 /// Statements that make a fresh staging table shaped like the target, which must
@@ -79,16 +80,16 @@ pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, sche
     const out = try a.alloc([]const u8, 4);
     out[0] = in.begin;
     out[1] = if (how == .truncate and in.truncate_in_txn)
-        try std.fmt.allocPrint(a, "TRUNCATE TABLE {s}", .{qt})
+        try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{qt})
     else
-        try std.fmt.allocPrint(a, "DELETE FROM {s}", .{qt});
-    out[2] = try std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
+        try msgfmt.allocPrint(a, "DELETE FROM {s}", .{qt});
+    out[2] = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
     out[3] = in.commit;
     return out;
 }
 
 pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, try stagingName(a, target))});
+    return msgfmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, try stagingName(a, target))});
 }
 
 /// Runs `stmts` in order on `conn`; on a failure a transaction left open by it is

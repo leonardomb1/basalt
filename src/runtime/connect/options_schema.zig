@@ -10,6 +10,7 @@ const options = @import("../analyze/options.zig");
 const textconv = @import("../../exec/textconv.zig");
 const registry = @import("../../connect/registry.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 pub const Kind = enum {
     text,
@@ -143,7 +144,7 @@ pub fn message(arena: std.mem.Allocator, p: Problem, connector: []const u8, key:
 }
 
 pub fn unsetEnvMsg(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "env var `{s}` is not set", .{name});
+    return msgfmt.allocPrint(arena, "env var `{s}` is not set", .{name});
 }
 
 pub fn Read(comptime T: type) type {
@@ -181,7 +182,7 @@ pub fn cfgBool(e: *const ast.Expr) Read(bool) {
 pub fn literalText(arena: std.mem.Allocator, e: *const ast.Expr) !?[]const u8 {
     return switch (e.*) {
         .str_lit => |s| s,
-        .int_lit => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .int_lit => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
         .bool_lit => |b| if (b) "true" else "false",
         else => null,
     };
@@ -322,11 +323,11 @@ const Fx = struct {
     }
 
     fn opts(a: std.mem.Allocator, connector: []const u8, body: []const u8) !ast.Connection {
-        return conn(a, try std.fmt.allocPrint(a, "CREATE CONNECTION optsx TYPE {s} OPTIONS ({s});", .{ connector, body }));
+        return conn(a, try msgfmt.allocPrint(a, "CREATE CONNECTION optsx TYPE {s} OPTIONS ({s});", .{ connector, body }));
     }
 
     fn expr(a: std.mem.Allocator, src: []const u8) !*const ast.Expr {
-        return (try opts(a, "sftp", try std.fmt.allocPrint(a, "v = {s}", .{src}))).config[0].value;
+        return (try opts(a, "sftp", try msgfmt.allocPrint(a, "v = {s}", .{src}))).config[0].value;
     }
 
     fn env(a: std.mem.Allocator) !*env_mod.Env {
@@ -355,9 +356,9 @@ test "every table lists its keys in the order unknownOptionMsg names them today"
     for (want) |w| {
         const c = try Fx.opts(a, w[0], "host = 'h'");
         const today = try options.unknownOptionMsg(a, c, "zz");
-        const ours = try std.fmt.allocPrint(a, "{s} connection `optsx`: unknown option `zz` ({s})", .{ w[0], try std.mem.join(a, ", ", namesFor(w[0]).?) });
+        const ours = try msgfmt.allocPrint(a, "{s} connection `optsx`: unknown option `zz` ({s})", .{ w[0], try std.mem.join(a, ", ", namesFor(w[0]).?) });
         try testing.expectEqualStrings(today, ours);
-        try testing.expect(std.mem.endsWith(u8, today, try std.fmt.allocPrint(a, "({s})", .{w[1]})));
+        try testing.expect(std.mem.endsWith(u8, today, try msgfmt.allocPrint(a, "({s})", .{w[1]})));
         try testing.expectEqual(namesFor(w[0]).?.len, forConnector(w[0]).?.len);
     }
     for ([_][]const u8{ "http", "csv", "stdout", "stdin", "unit", "nope" }) |none| {
@@ -443,7 +444,7 @@ test "cfgIntIn on a port matches what sftp, smb and ftp registration refuse toda
     defer ar.deinit();
     const a = ar.allocator();
     for ([_][]const u8{ "sftp", "smb", "ftp" }) |connector| for (Fx.int_corpus) |src| {
-        const c = try Fx.opts(a, connector, try std.fmt.allocPrint(a, "port = {s}", .{src}));
+        const c = try Fx.opts(a, connector, try msgfmt.allocPrint(a, "port = {s}", .{src}));
         const e = c.config[0].value;
         const env = try Fx.env(a);
         const today = std.math.cast(u16, Fx.old.evalCfgInt(env, e) catch {

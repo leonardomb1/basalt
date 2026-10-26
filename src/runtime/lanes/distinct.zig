@@ -29,6 +29,7 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
@@ -326,7 +327,7 @@ pub fn runParallelDistinct(
     const merged = try gatherKept(arena, row_schema, items);
     if (env.profile) |p| {
         try p.phase("merge the lanes' rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ split.label(), nitems, split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ split.label(), nitems, split.unitName() });
     }
 
     const snk = try openTailSink(env, w, tail, row_schema.*);

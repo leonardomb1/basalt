@@ -48,6 +48,7 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const tailSchema = @import("../plan.zig").tailSchema;
 const topNTail = @import("topn.zig").topNTail;
@@ -715,7 +716,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     if (env.profile) |p| {
         try p.phase("emit and write the groups", t_emit1.since(t_emit0));
         for (lane_joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
-        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
     }
     try guard.close();
     return true;
@@ -920,7 +921,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     if (env.profile) |p| {
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
         try p.phase("emit and write the groups", (std.time.Instant.now() catch unreachable).since(t_emit0));
-        p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
         try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
     try guard.close();

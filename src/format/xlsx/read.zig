@@ -23,6 +23,7 @@
 //! cell, as strict OOXML writes it, stays text.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
 const Value = @import("../../exec/value.zig").Value;
@@ -274,7 +275,7 @@ fn relsOf(arena: std.mem.Allocator, part: []const u8) ![]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, part, '/');
     const dir = if (slash) |i| part[0 .. i + 1] else "";
     const base = if (slash) |i| part[i + 1 ..] else part;
-    return std.fmt.allocPrint(arena, "{s}_rels/{s}.rels", .{ dir, base });
+    return msgfmt.allocPrint(arena, "{s}_rels/{s}.rels", .{ dir, base });
 }
 
 const Rel = struct { id: []const u8, kind: []const u8, target: []const u8 };
@@ -468,7 +469,7 @@ pub const Reader = struct {
             const want = if (st.header) |h| (if (h.len > 0) h else try colName(a, @intCast(cmin + i))) else try colName(a, @intCast(cmin + i));
             var name = want;
             var dup: usize = 2;
-            while (seen.contains(name)) : (dup += 1) name = try std.fmt.allocPrint(a, "{s}_{d}", .{ want, dup });
+            while (seen.contains(name)) : (dup += 1) name = try msgfmt.allocPrint(a, "{s}_{d}", .{ want, dup });
             try seen.put(name, {});
             f.* = .{ .name = name, .ty = types.Type.init(k.*).asNullable() };
         }

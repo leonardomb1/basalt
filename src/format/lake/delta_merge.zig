@@ -43,6 +43,7 @@ const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
+const msgfmt = @import("../msgfmt.zig");
 const op = @import("../../exec/op.zig");
 const pqstats = @import("../parquet/stats.zig");
 const spill = @import("../../exec/spill.zig");
@@ -203,7 +204,8 @@ pub const Merge = struct {
     }
 
     fn fail(self: *Merge, e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
-        return eval.explain(e, try std.fmt.allocPrint(self.mem.allocator(), fmt, args));
+        @branchHint(.cold);
+        return eval.explain(e, try msgfmt.allocPrint(self.mem.allocator(), fmt, args));
     }
 
     /// Spools one batch of incoming rows: a NULL key is refused, a value put as
@@ -783,7 +785,7 @@ test "UPSERT racing a concurrent writer: an append of a key it writes, or a REPL
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     const up: write.Mode = .{ .upsert = .{ .keys = &.{"id"} } };
     try TestRows.load(a, root, .append, &.{ 1, 2 }, &.{ "a", "b" });
 
@@ -815,7 +817,7 @@ test "UPSERT past its memory: the spool and both joins go to disk, the rows are 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     var ids: [600]i64 = undefined;
     var vs: [600][]const u8 = undefined;
     for (&ids, &vs, 0..) |*i, *v, k| {

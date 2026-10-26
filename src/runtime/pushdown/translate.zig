@@ -7,6 +7,7 @@ const inSchema = @import("../pushdown.zig").inSchema;
 const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const msgfmt = @import("../../format/msgfmt.zig");
 pub const bin = @import("testing_util.zig").bin;
 const builtins = @import("../../exec/builtins.zig");
 const litAs = @import("../../exec/eval.zig").litAs;
@@ -198,7 +199,7 @@ const Tx = struct {
     };
 
     fn fmt(self: Tx, comptime f: []const u8, args: anytype) Err![]const u8 {
-        return std.fmt.allocPrint(self.arena, f, args);
+        return msgfmt.allocPrint(self.arena, f, args);
     }
 
     fn want(self: Tx) void {
@@ -662,7 +663,7 @@ const render = struct {
         _ = c;
         _ = dialect;
         const joined = try std.mem.join(arena, ", ", args);
-        return try std.fmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
+        return try msgfmt.allocPrint(arena, "{s}({s})", .{ p.sql, joined });
     }
 
     /// NULL when any argument is, as the engine's `concat`: a CASE where the
@@ -675,7 +676,7 @@ const render = struct {
             if (i > 0) try nulls.appendSlice(" OR ");
             try nulls.writer().print("{s} IS NULL", .{a});
         }
-        return try std.fmt.allocPrint(arena, "CASE WHEN {s} THEN NULL ELSE {s} END", .{ nulls.items, call });
+        return try msgfmt.allocPrint(arena, "CASE WHEN {s} THEN NULL ELSE {s} END", .{ nulls.items, call });
     }
 
     fn trim(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
@@ -687,7 +688,7 @@ const render = struct {
     fn ceil(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         _ = p;
         _ = c;
-        return try std.fmt.allocPrint(arena, "{s}({s})", .{ dialect.ceilFn(), args[0] });
+        return try msgfmt.allocPrint(arena, "{s}({s})", .{ dialect.ceilFn(), args[0] });
     }
 
     /// Takes the dividend's sign everywhere, matching the engine.
@@ -706,7 +707,7 @@ const render = struct {
             "RIGHT"
         else
             dialect.repeatFn();
-        return try std.fmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
+        return try msgfmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
 };
 
@@ -843,7 +844,7 @@ test "translateExpr: a decimal literal is sent with every digit it was written w
         const lit = try a.create(ast.Expr);
         lit.* = .{ .dec_lit = c.lit };
         const got = (try translateExpr(a, try bin(a, .gt, try fld(a, "a"), lit), d, testSchema(), true)).?;
-        try testing.expect(std.mem.endsWith(u8, got, try std.fmt.allocPrint(a, " > {s})", .{c.want})));
+        try testing.expect(std.mem.endsWith(u8, got, try msgfmt.allocPrint(a, " > {s})", .{c.want})));
     };
 }
 

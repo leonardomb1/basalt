@@ -65,6 +65,7 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
 const topNStages = @import("../lanes.zig").topNStages;
@@ -138,7 +139,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .columns_read = scan1[2] - scan0[2],
             .columns_total = scan1[3] - scan0[3],
             .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
-            .sink = std.mem.trimRight(u8, try std.fmt.allocPrint(arena, "{s} {s}", .{ env.sink_name, try targetLabel(arena, last.write) }), " "),
+            .sink = std.mem.trimRight(u8, try msgfmt.allocPrint(arena, "{s} {s}", .{ env.sink_name, try targetLabel(arena, last.write) }), " "),
         });
     }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
@@ -205,8 +206,8 @@ fn leaveScope(env: *Env, outer: u64) void {
 /// until the pipeline over it names its own, and the scan at `pos` over it is named.
 fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
     const p = env.profile orelse return;
-    p.path = try std.fmt.allocPrint(env.arena, "{s} read into memory first ({s}), then serial", .{ what, p.path });
-    try p.describe(profile.keyOf(pos), .scan, try std.fmt.allocPrint(env.arena, "{s}, in memory", .{what}));
+    p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first ({s}), then serial", .{ what, p.path });
+    try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
 }
 
 const window_input = "__window_input";
@@ -500,7 +501,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
                     const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
                     const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
-                    p.path = try std.fmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
+                    p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
                     try p.noteSent("{s}, once per key range: {s}", .{ @tagName(env.sql_desc.?.kind), sp.base_sql });
                     break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
                 } else null;

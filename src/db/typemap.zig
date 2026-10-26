@@ -10,6 +10,7 @@
 //! the TDS type byte. StarRocks and Doris speak the MySQL protocol.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("../lang/types.zig");
 
 const TypeKind = types.TypeKind;
@@ -59,7 +60,7 @@ pub const Spell = union(enum) {
     fn render(self: Spell, arena: std.mem.Allocator, ty: types.Type) ![]const u8 {
         return switch (self) {
             .name => |s| s,
-            .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
+            .decimal => try msgfmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
         };
     }
 };
@@ -258,7 +259,7 @@ fn pinnedDdl(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bo
             .mysql, .starrocks, .doris => "DOUBLE",
             .sqlserver => "FLOAT",
         },
-        .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
+        .decimal => try msgfmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
         .string => switch (self) {
             .postgres => if (is_key) "VARCHAR(255)" else "TEXT",
             .doris => if (is_key) "VARCHAR(65533)" else "STRING",
@@ -306,7 +307,7 @@ fn pinnedCast(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const
             .mysql, .starrocks, .doris => "DOUBLE",
             .sqlserver => "FLOAT",
         },
-        .decimal => try std.fmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
+        .decimal => try msgfmt.allocPrint(arena, "DECIMAL({d},{d})", .{ ty.precision, ty.scale }),
         .string => switch (self) {
             .postgres => "TEXT",
             .mysql, .starrocks, .doris => "CHAR",

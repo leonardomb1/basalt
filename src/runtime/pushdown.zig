@@ -43,6 +43,7 @@
 //! moves filters through joins and selects toward the sources.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const sql = @import("../db/sql.zig");
@@ -135,7 +136,7 @@ pub fn planWholeAggWhy(
     for (prefix) |st| {
         if (st.node != .filter) return refuse(why, "a stage other than WHERE sits between the read and the aggregate");
         const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts, .need = .exact })) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "the WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)}));
+            return refuse(why, try msgfmt.allocPrint(arena, "the WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)}));
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -146,33 +147,33 @@ pub fn planWholeAggWhy(
         if (q.parts.len != 1) return refuse(why, "a group key is not a bare source column");
         const col = q.parts[0];
         const idx = src_schema.indexOf(col) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is not a source column", .{col}));
+            return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` is not a source column", .{col}));
         const out = plan_schema.fields[i];
-        if (!std.mem.eql(u8, out.name, col)) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
-        if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try std.fmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
+        if (!std.mem.eql(u8, out.name, col)) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
+        if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
         const qc = try sql.quoteName(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try std.fmt.allocPrint(arena, "{s} AS {s}", .{ qc, qc }));
+        try sel.appendSlice(try msgfmt.allocPrint(arena, "{s} AS {s}", .{ qc, qc }));
     }
 
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
         const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language/pushdown.md)", .{out.name}));
+            return refuse(why, try msgfmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language/pushdown.md)", .{out.name}));
         const cast_to = (try dialect.castType(arena, out.ty)) orelse
-            return refuse(why, try std.fmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
+            return refuse(why, try msgfmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try std.fmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
+        try sel.appendSlice(try msgfmt.allocPrint(arena, "CAST({s} AS {s}) AS {s}", .{
             inner, cast_to, try sql.quoteName(arena, dialect, out.name),
         }));
     }
 
     var q = std.array_list.Managed(u8).init(arena);
-    try q.appendSlice(try std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _g", .{ sel.items, base_sql }));
-    if (where.items.len > 0) try q.appendSlice(try std.fmt.allocPrint(arena, " WHERE {s}", .{where.items}));
-    if (keys.items.len > 0) try q.appendSlice(try std.fmt.allocPrint(arena, " GROUP BY {s}", .{keys.items}));
+    try q.appendSlice(try msgfmt.allocPrint(arena, "SELECT {s} FROM ({s}) _g", .{ sel.items, base_sql }));
+    if (where.items.len > 0) try q.appendSlice(try msgfmt.allocPrint(arena, " WHERE {s}", .{where.items}));
+    if (keys.items.len > 0) try q.appendSlice(try msgfmt.allocPrint(arena, " GROUP BY {s}", .{keys.items}));
 
     const where_sql: ?[]const u8 = if (where.items.len > 0) where.items else null;
     return WholeAgg{ .sql = try q.toOwnedSlice(), .where_sql = where_sql };
@@ -190,7 +191,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
 
     if (item.func == .count and item.arg == null) {
         if (item.distinct) return null;
-        return try std.fmt.allocPrint(arena, "{s}(*)", .{count_fn});
+        return try msgfmt.allocPrint(arena, "{s}(*)", .{count_fn});
     }
 
     const arg = item.arg orelse return null;
@@ -202,8 +203,8 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
 
     switch (item.func) {
         .count => {
-            if (item.distinct) return try std.fmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, col });
-            return try std.fmt.allocPrint(arena, "{s}({s})", .{ count_fn, col });
+            if (item.distinct) return try msgfmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, col });
+            return try msgfmt.allocPrint(arena, "{s}({s})", .{ count_fn, col });
         },
         .sum => {
             if (item.distinct) return null;
@@ -218,7 +219,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
                 .decimal => if (out_ty.precision == 0 or out_ty.scale > out_ty.precision) return null,
                 else => return null,
             }
-            return try std.fmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
+            return try msgfmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
         },
         .avg, .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => return null,
     }

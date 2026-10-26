@@ -14,6 +14,7 @@
 //! is why no registration is needed.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
 const http_client = @import("../../net/http_client.zig");
 const xmlescape = @import("../../format/xml/escape.zig");
@@ -66,7 +67,7 @@ fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
     var login_enc = std.array_list.Managed(u8).init(gpa);
     defer login_enc.deinit();
     try formEncode(&login_enc, upn);
-    const url = try std.fmt.allocPrint(gpa, "https://login.microsoftonline.com/getuserrealm.srf?login={s}&api-version=1.0", .{login_enc.items});
+    const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/getuserrealm.srf?login={s}&api-version=1.0", .{login_enc.items});
     defer gpa.free(url);
     var aw = std.Io.Writer.Allocating.init(gpa);
     defer aw.deinit();
@@ -80,7 +81,7 @@ fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
     if (!std.ascii.eqlIgnoreCase(ns, "Federated")) return Realm{ .federated = false, .sts_url = "" };
     const auth = if (obj.get("AuthURL")) |v| (if (v == .string) v.string else "") else "";
     const host = hostOf(auth) orelse return Realm{ .federated = true, .sts_url = "" };
-    const sts = try std.fmt.allocPrint(gpa, "https://{s}/adfs/services/trust/13/usernamemixed", .{host});
+    const sts = try msgfmt.allocPrint(gpa, "https://{s}/adfs/services/trust/13/usernamemixed", .{host});
     return Realm{ .federated = true, .sts_url = sts };
 }
 
@@ -107,7 +108,7 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     const p_esc = try xmlescape.attrAlloc(gpa, password);
     defer gpa.free(p_esc);
 
-    const envelope = try std.fmt.allocPrint(gpa,
+    const envelope = try msgfmt.allocPrint(gpa,
         \\<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><s:Header><a:Action s:mustUnderstand="1">http://docs.oasis-open.org/ws-sx/ws-trust/200512/RST/Issue</a:Action><a:MessageID>urn:uuid:{s}</a:MessageID><a:ReplyTo><a:Address>http://www.w3.org/2005/08/addressing/anonymous</a:Address></a:ReplyTo><a:To s:mustUnderstand="1">{s}</a:To><o:Security s:mustUnderstand="1" xmlns:o="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"><u:Timestamp u:Id="_0"><u:Created>{s}</u:Created><u:Expires>{s}</u:Expires></u:Timestamp><o:UsernameToken u:Id="uuid-{s}"><o:Username>{s}</o:Username><o:Password>{s}</o:Password></o:UsernameToken></o:Security></s:Header><s:Body><trust:RequestSecurityToken xmlns:trust="http://docs.oasis-open.org/ws-sx/ws-trust/200512"><wsp:AppliesTo xmlns:wsp="http://schemas.xmlsoap.org/ws/2004/09/policy"><a:EndpointReference><a:Address>urn:federation:MicrosoftOnline</a:Address></a:EndpointReference></wsp:AppliesTo><trust:KeyType>http://docs.oasis-open.org/ws-sx/ws-trust/200512/Bearer</trust:KeyType><trust:RequestType>http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue</trust:RequestType></trust:RequestSecurityToken></s:Body></s:Envelope>
     , .{ mid, sts_url, created, expires, uid, u_esc, p_esc });
     defer gpa.free(envelope);
@@ -170,7 +171,7 @@ fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []cons
     try appendForm(&body, "client_id", client_id);
     try appendForm(&body, "resource", resource);
 
-    const url = try std.fmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/token", .{tenant});
+    const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/token", .{tenant});
     defer gpa.free(url);
     return postForToken(gpa, url, body.items);
 }
@@ -190,11 +191,11 @@ pub fn ropcToken(
     try appendForm(&body, "client_id", client_id);
     try appendForm(&body, "username", username);
     try appendForm(&body, "password", password);
-    const scope = try std.fmt.allocPrint(gpa, "{s}/.default", .{resource});
+    const scope = try msgfmt.allocPrint(gpa, "{s}/.default", .{resource});
     defer gpa.free(scope);
     try appendForm(&body, "scope", scope);
 
-    const url = try std.fmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{tenant});
+    const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{tenant});
     defer gpa.free(url);
     return postForToken(gpa, url, body.items);
 }
@@ -255,7 +256,7 @@ test "aad: iso8601 spells a time as the old std.time.epoch body did" {
             const yd = ed.calculateYearDay();
             const md = yd.calculateMonthDay();
             const ds = es.getDaySeconds();
-            return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
+            return msgfmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z", .{
                 yd.year,              md.month.numeric(),      md.day_index + 1,
                 ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
             });

@@ -23,6 +23,7 @@
 //! ways, so a builtin added there cannot go missing from Tab.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const hilite = @import("hilite.zig");
 const eval = @import("../../exec/eval.zig");
 
@@ -250,7 +251,7 @@ pub fn complete(arena: std.mem.Allocator, names: Names, text: []const u8, cursor
     }
     if (word.len > 0 and word[0] == '$') {
         for (names.params) |p| {
-            if (startsWithFold(p, word[1..])) try out.append(.{ .text = try std.fmt.allocPrint(arena, "${s}", .{p}), .kind = .param });
+            if (startsWithFold(p, word[1..])) try out.append(.{ .text = try msgfmt.allocPrint(arena, "${s}", .{p}), .kind = .param });
         }
         return finish(&out, start);
     }
@@ -260,12 +261,12 @@ pub fn complete(arena: std.mem.Allocator, names: Names, text: []const u8, cursor
         for (names.tables) |ct| {
             if (!std.ascii.eqlIgnoreCase(ct.conn, head)) continue;
             for (ct.tables) |t| {
-                if (startsWithFold(t, rest)) try out.append(.{ .text = try std.fmt.allocPrint(arena, "{s}.{s}", .{ head, t }), .kind = .table });
+                if (startsWithFold(t, rest)) try out.append(.{ .text = try msgfmt.allocPrint(arena, "{s}.{s}", .{ head, t }), .kind = .table });
             }
             return finish(&out, start);
         }
         for (names.columns) |c| {
-            if (startsWithFold(c.name, rest)) try add(&out, .{ .text = try std.fmt.allocPrint(arena, "{s}.{s}", .{ head, c.name }), .kind = .column, .detail = c.type });
+            if (startsWithFold(c.name, rest)) try add(&out, .{ .text = try msgfmt.allocPrint(arena, "{s}.{s}", .{ head, c.name }), .kind = .column, .detail = c.type });
         }
         return finish(&out, start);
     }

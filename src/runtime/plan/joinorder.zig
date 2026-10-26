@@ -47,6 +47,7 @@ const planErr = @import("../env.zig").planErr;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 pub const flip_ratio = 4;
@@ -136,10 +137,10 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     const spill_at = try plan.joinSpillAt(env, st.hints);
     const p = decide(left, right, spill_at) orelse {
         if (estimate.pair(left, right)) |q|
-            a.o.note = try std.fmt.allocPrint(env.arena, "build: right (est. {s} vs {s})", .{ try estimate.describe(env.arena, q.right, q.unit), try estimate.describe(env.arena, q.left, q.unit) });
+            a.o.note = try msgfmt.allocPrint(env.arena, "build: right (est. {s} vs {s})", .{ try estimate.describe(env.arena, q.right, q.unit), try estimate.describe(env.arena, q.left, q.unit) });
         return plain;
     };
-    const note = try std.fmt.allocPrint(env.arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(env.arena, p.left, p.unit), try estimate.describe(env.arena, p.right, p.unit) });
+    const note = try msgfmt.allocPrint(env.arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(env.arena, p.left, p.unit), try estimate.describe(env.arena, p.right, p.unit) });
     env.log.log(.info, "join with `{s}`: the left side is held in memory, {s}", .{ j.alias, note["build: left ".len..] });
     return .{ .res = try flipped(env.arena, a.o, a.schema, note, env.errctx), .next = si + 1 };
 }
@@ -200,7 +201,7 @@ fn buildChain(env: *Env, chain: []const ast.Stage, after: []const ast.Stage, pro
         const st = chain[k];
         at[k] = sch.fields.len;
         const a = try plan.assembleJoin(env, st.node.join, st.hints, sides[k], sch, cur, null);
-        a.o.note = try std.fmt.allocPrint(arena, "joined {d} of {d}, written {d} (est. {s})", .{ n + 1, chain.len, k + 1, try estimate.describe(arena, order.rows[k], .rows) });
+        a.o.note = try msgfmt.allocPrint(arena, "joined {d} of {d}, written {d} (est. {s})", .{ n + 1, chain.len, k + 1, try estimate.describe(arena, order.rows[k], .rows) });
         cur = .{ .join = a.o };
         cur.stampNew(profile.keyOf(st.pos));
         sch = a.schema;

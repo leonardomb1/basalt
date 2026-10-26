@@ -23,6 +23,7 @@
 //! repaired (a name is repaired). The input streams, a row at a time.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
@@ -116,7 +117,7 @@ pub const Reader = struct {
     /// it is an array in every row, one item or many, as the sample showed it.
     fn noteArrays(self: *Reader, arena: std.mem.Allocator, n: *const Node, path: []const u8) !void {
         for (try groupByName(arena, n.children)) |group| {
-            const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, group[0].name });
+            const sub = try msgfmt.allocPrint(arena, "{s}/{s}", .{ path, group[0].name });
             if (group.len > 1) try self.arrays.put(arena, sub, {});
             for (group) |c| try self.noteArrays(arena, c, sub);
         }
@@ -157,7 +158,7 @@ pub const Reader = struct {
         }
         for (try groupByName(arena, n.children)) |group| {
             const c = group[0];
-            const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ path, c.name });
+            const sub = try msgfmt.allocPrint(arena, "{s}/{s}", .{ path, c.name });
             try sep(w, &first);
             try writeKey(w, "", c.name);
             if (group.len == 1 and !self.arrays.contains(sub)) {
@@ -202,7 +203,7 @@ pub const Reader = struct {
         for (fields, keys.items) |*f, k| f.* = .{
             .name = switch (k.kind) {
                 .elem, .child_attr => k.name,
-                .attr => if (elems.contains(k.name)) try std.fmt.allocPrint(arena, "@{s}", .{k.name}) else k.name,
+                .attr => if (elems.contains(k.name)) try msgfmt.allocPrint(arena, "@{s}", .{k.name}) else k.name,
             },
             .ty = undefined,
         };
@@ -271,7 +272,7 @@ pub const Reader = struct {
     }
 
     fn mismatch(self: *Reader, name: []const u8, v: []const u8, kind: types.TypeKind, what: []const u8) anyerror {
-        return eval.explain(error.TextTypeMismatch, std.fmt.allocPrint(self.arena, "{s}{s}XML row {d}: `{s}` holds {s} (`{s}`) that is not {s}, as its first rows typed it; read it with `CAST({s} AS VARCHAR)` to keep it as text", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, name, what, eval.clip(v), @tagName(kind), name }) catch "XML row holds a value its column cannot read");
+        return eval.explain(error.TextTypeMismatch, msgfmt.allocPrint(self.arena, "{s}{s}XML row {d}: `{s}` holds {s} (`{s}`) that is not {s}, as its first rows typed it; read it with `CAST({s} AS VARCHAR)` to keep it as text", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, name, what, eval.clip(v), @tagName(kind), name }) catch "XML row holds a value its column cannot read");
     }
 
     /// The next row's cells, the document read up to it. A document that ends before
@@ -305,7 +306,7 @@ pub const Reader = struct {
     }
 
     fn malformed(self: *Reader, why: []const u8) anyerror {
-        return eval.explain(error.BadXml, std.fmt.allocPrint(self.arena, "{s}{s}{s}", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", why }) catch why);
+        return eval.explain(error.BadXml, msgfmt.allocPrint(self.arena, "{s}{s}{s}", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", why }) catch why);
     }
 
     fn readRow(self: *Reader, arena: std.mem.Allocator, o: token.Tag, name: []const u8) ![]const Cell {
@@ -318,7 +319,7 @@ pub const Reader = struct {
             const child = group[0];
             try cells.append(.{ .kind = .elem, .name = child.name, .group = group });
             if (group.len == 1 and child.children.len == 0)
-                for (child.attrs) |a| try cells.append(.{ .kind = .child_attr, .name = try std.fmt.allocPrint(arena, "{s}@{s}", .{ child.name, a.name }), .value = a.value });
+                for (child.attrs) |a| try cells.append(.{ .kind = .child_attr, .name = try msgfmt.allocPrint(arena, "{s}@{s}", .{ child.name, a.name }), .value = a.value });
         }
         if (node.text.len > 0 and (node.children.len == 0 or !blank(node.text)))
             try cells.append(.{ .kind = .elem, .name = name, .value = node.text });
@@ -329,7 +330,7 @@ pub const Reader = struct {
     /// row nested past `max_depth` is refused, which bounds every walk of its tree.
     fn readBody(self: *Reader, arena: std.mem.Allocator, name: []const u8, attrs: []const Attr, nil: bool, depth: usize) anyerror!*Node {
         if (depth > max_depth)
-            return self.malformed(std.fmt.allocPrint(self.arena, "row {d}, a `{s}` element, nests elements more than {d} deep", .{ self.rows_seen, self.row_name, max_depth }) catch "a row nests too deep");
+            return self.malformed(msgfmt.allocPrint(self.arena, "row {d}, a `{s}` element, nests elements more than {d} deep", .{ self.rows_seen, self.row_name, max_depth }) catch "a row nests too deep");
         var children = std.array_list.Managed(*const Node).init(arena);
         var text = Text{};
         while (try self.tz.next()) |t| {
@@ -340,7 +341,7 @@ pub const Reader = struct {
             };
             if (t == .open) self.row_elems += 1;
             if (self.row_bytes > max_row_bytes or self.row_elems > max_row_elems)
-                return self.malformed(std.fmt.allocPrint(self.arena, "row {d}, a `{s}` element, passes {d} MB or {d} elements, so it is not one row of many; name the repeating element with `WITH (row = '...')`", .{ self.rows_seen, self.row_name, max_row_bytes >> 20, max_row_elems }) catch "a row passes the size of one row");
+                return self.malformed(msgfmt.allocPrint(self.arena, "row {d}, a `{s}` element, passes {d} MB or {d} elements, so it is not one row of many; name the repeating element with `WITH (row = '...')`", .{ self.rows_seen, self.row_name, max_row_bytes >> 20, max_row_elems }) catch "a row passes the size of one row");
             switch (t) {
                 .open => |c| {
                     const cname = try self.nameOf(arena, c.name);
@@ -406,7 +407,7 @@ pub const Reader = struct {
 
     fn notUtf8(self: *Reader, owner: []const u8, raw: []const u8) anyerror {
         const bad = charset.badUtf8(raw) orelse charset.BadByte{ .offset = 0, .byte = 0 };
-        return eval.explain(error.InvalidUtf8, std.fmt.allocPrint(self.arena, "{s}{s}XML row {d}, `{s}`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, eval.clip(owner), bad.byte, bad.offset }) catch "XML text is not valid UTF-8");
+        return eval.explain(error.InvalidUtf8, msgfmt.allocPrint(self.arena, "{s}{s}XML row {d}, `{s}`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, eval.clip(owner), bad.byte, bad.offset }) catch "XML text is not valid UTF-8");
     }
 
     /// A name decoded once and kept, as the same few names recur on every row; past
@@ -511,7 +512,7 @@ fn groupByName(arena: std.mem.Allocator, children: []const *const Node) ![]const
 }
 
 fn keyOf(arena: std.mem.Allocator, kind: Kind, name: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{c}{s}", .{ @as(u8, switch (kind) {
+    return msgfmt.allocPrint(arena, "{c}{s}", .{ @as(u8, switch (kind) {
         .elem => 'e',
         .attr => 'a',
         .child_attr => 'c',

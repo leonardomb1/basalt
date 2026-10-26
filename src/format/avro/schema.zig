@@ -19,6 +19,7 @@
 //! the spec asks.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const stream = @import("../stream.zig");
 
@@ -57,7 +58,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!*const Node {
     return p.node(v, "");
 }
 
-fn bad(comptime fmt: []const u8, args: anytype) Error {
+inline fn bad(comptime fmt: []const u8, args: anytype) Error {
     return @errorCast(stream.explainf(error.BadAvroSchema, "a malformed Avro schema: " ++ fmt, args));
 }
 
@@ -94,7 +95,7 @@ const Parser = struct {
         if (primitive(s)) |k| return self.make(.{ .kind = k });
         if (self.named.get(s)) |n| return n;
         if (std.mem.indexOfScalar(u8, s, '.') == null and space.len > 0) {
-            const full = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ space, s });
+            const full = try msgfmt.allocPrint(self.arena, "{s}.{s}", .{ space, s });
             if (self.named.get(full)) |n| return n;
         }
         return bad("type `{s}` is not defined before it is used", .{s});
@@ -208,7 +209,7 @@ const Parser = struct {
     fn define(self: *Parser, o: std.json.ObjectMap, space: []const u8, n: *Node) Error![]const u8 {
         const name = strField(o, "name") orelse return bad("a named type has no `name`", .{});
         const ns = strField(o, "namespace") orelse space;
-        const full = if (std.mem.indexOfScalar(u8, name, '.') != null or ns.len == 0) name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ ns, name });
+        const full = if (std.mem.indexOfScalar(u8, name, '.') != null or ns.len == 0) name else try msgfmt.allocPrint(self.arena, "{s}.{s}", .{ ns, name });
         const gop = try self.named.getOrPut(self.arena, full);
         if (gop.found_existing) return bad("type `{s}` is defined twice", .{full});
         gop.value_ptr.* = n;
@@ -324,7 +325,7 @@ const Planner = struct {
         defer _ = self.open.pop();
         const steps = try self.arena.alloc(Step, n.fields.len);
         for (n.fields, steps) |f, *s| {
-            const name = if (prefix.len == 0) f.name else try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ prefix, f.name });
+            const name = if (prefix.len == 0) f.name else try msgfmt.allocPrint(self.arena, "{s}.{s}", .{ prefix, f.name });
             s.* = try self.valueStep(f.node, name, nullable);
         }
         return .{ .record = steps };
@@ -518,7 +519,7 @@ test "a malformed or unsupported schema is refused naming why" {
         "{\"type\":\"fixed\",\"name\":\"f\",\"size\":2,\"logicalType\":\"decimal\",\"precision\":9}",
     };
     for (bads) |b| try testing.expectError(error.BadAvroSchema, parse(a, b));
-    const deep = try std.fmt.allocPrint(a, "{s}\"int\"{s}", .{ "{\"type\":\"array\",\"items\":" ** 70, "}" ** 70 });
+    const deep = try msgfmt.allocPrint(a, "{s}\"int\"{s}", .{ "{\"type\":\"array\",\"items\":" ** 70, "}" ** 70 });
     try testing.expectError(error.BadAvroSchema, parse(a, deep));
     try testing.expectError(error.UnsupportedAvro, parse(a, "{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":40}"));
 }

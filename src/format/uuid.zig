@@ -3,6 +3,7 @@
 //! UNIQUEIDENTIFIER, whose first three groups are stored little-endian.
 
 const std = @import("std");
+const msgfmt = @import("msgfmt.zig");
 const hex = @import("hex.zig");
 
 pub const Order = enum { canonical, mixed };
@@ -55,14 +56,14 @@ const testing = std.testing;
 const sample = [16]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
 
 fn printed(a: std.mem.Allocator, b: [16]u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+    return msgfmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
         b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
     });
 }
 
 fn printedMixed(a: std.mem.Allocator, b: [16]u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+    return msgfmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
     });
 }

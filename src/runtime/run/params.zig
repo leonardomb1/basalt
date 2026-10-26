@@ -11,6 +11,7 @@ const eval = @import("../../exec/eval.zig");
 const mkLit = @import("../env.zig").mkLit;
 const planErr = @import("../env.zig").planErr;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// A default takes the declared type: `PARAM d DATE DEFAULT '2026-01-01'` is a DATE.
@@ -24,7 +25,7 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
         for (cli) |kv| {
             if (std.mem.eql(u8, kv.key, p.name)) {
                 if (analyze.paramTextProblem(arena, p.ty, kv.val)) |want|
-                    return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, kv.val, want }));
+                    return planErr(diag, try msgfmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, kv.val, want }));
                 v = try parseParamValue(arena, p.ty, kv.val, diag);
                 break;
             }
@@ -34,20 +35,20 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
                 const raw = analyze.paramDefaultValue(d) orelse return planErr(diag, analyze.param_default_msg);
                 if (raw == .string and p.ty.kind != .string and p.ty.kind != .bytes) {
                     if (analyze.paramTextProblem(arena, p.ty, raw.string)) |want|
-                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, raw.string, want }));
+                        return planErr(diag, try msgfmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, raw.string, want }));
                     try params.put(p.name, try parseParamValue(arena, p.ty, raw.string, diag));
                     continue;
                 }
                 if (p.ty.kind == .int and (raw == .float or raw == .decimal))
-                    return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: its DEFAULT is not an integer", .{p.name}));
+                    return planErr(diag, try msgfmt.allocPrint(arena, "PARAM `{s}`: its DEFAULT is not an integer", .{p.name}));
                 v = switch (p.ty.kind) {
                     .float => if (raw == .int or raw == .decimal) Value{ .float = eval.toF64(raw) } else raw,
                     .date, .time, .timestamp, .decimal => if (raw == .null) raw else eval.castValueTyped(arena, raw, p.ty) catch
-                        return planErr(diag, try std.fmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", analyze.paramTextProblem(arena, p.ty, if (raw == .string) raw.string else "") orelse try p.ty.name(arena) })),
+                        return planErr(diag, try msgfmt.allocPrint(arena, "PARAM `{s}`: `{s}` is not {s}", .{ p.name, if (raw == .string) raw.string else "its DEFAULT", analyze.paramTextProblem(arena, p.ty, if (raw == .string) raw.string else "") orelse try p.ty.name(arena) })),
                     else => raw,
                 };
             } else {
-                return planErr(diag, try std.fmt.allocPrint(arena, "missing required param `{s}`", .{p.name}));
+                return planErr(diag, try msgfmt.allocPrint(arena, "missing required param `{s}`", .{p.name}));
             }
         }
         try params.put(p.name, v.?);
@@ -78,7 +79,7 @@ pub fn resolveLets(
         const l = s.let_const;
         const le = l.expr orelse continue;
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
-            return planErrAt(diag, try std.fmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, eval.takeFailure(e) orelse errLabel(e) }), l.pos);
+            return planErrAt(diag, try msgfmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, eval.takeFailure(e) orelse errLabel(e) }), l.pos);
         try names.append(l.name);
         try values.append(v);
         try params.put(l.name, v);
@@ -101,13 +102,13 @@ fn parseParamValue(arena: std.mem.Allocator, ty: types.Type, str: []const u8, di
         .string => .{ .string = try arena.dupe(u8, str) },
         .bool => analyze.paramFromText(arena, ty, str) orelse planErr(diag, "invalid bool param value"),
         .date, .time, .timestamp, .decimal => analyze.paramFromText(arena, ty, str) orelse
-            planErr(diag, try std.fmt.allocPrint(arena, "invalid {s} param value `{s}` — expected {s}", .{ try ty.name(arena), str, switch (ty.kind) {
+            planErr(diag, try msgfmt.allocPrint(arena, "invalid {s} param value `{s}` — expected {s}", .{ try ty.name(arena), str, switch (ty.kind) {
                 .date => "YYYY-MM-DD",
                 .time => "HH:MM[:SS[.ffffff]]",
                 .timestamp => "YYYY-MM-DD[ HH:MM:SS[.ffffff]]",
                 else => "a number",
             } })),
-        else => planErr(diag, try std.fmt.allocPrint(arena, "a {s} param cannot be bound from text", .{try ty.name(arena)})),
+        else => planErr(diag, try msgfmt.allocPrint(arena, "a {s} param cannot be bound from text", .{try ty.name(arena)})),
     };
 }
 

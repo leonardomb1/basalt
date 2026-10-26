@@ -28,6 +28,7 @@
 //! link, a failure there being `DeltaCommitUnsynced`, as the version is visible.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const delta = @import("delta.zig");
 const eval = @import("../../exec/eval.zig");
 const objstore = @import("../../store/objstore.zig");
@@ -102,7 +103,7 @@ pub const TableStore = struct {
     const vtable = Store.VTable{ .read = vtRead, .create = vtCreate };
 
     fn path(self: *TableStore, arena: std.mem.Allocator, version: u64) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}_delta_log/{d:0>20}.json", .{ self.root, version });
+        return msgfmt.allocPrint(arena, "{s}_delta_log/{d:0>20}.json", .{ self.root, version });
     }
 
     fn vtRead(p: *anyopaque, arena: std.mem.Allocator, version: u64) anyerror!?[]const u8 {
@@ -127,7 +128,7 @@ fn createLocal(arena: std.mem.Allocator, root: []const u8, at: []const u8, versi
     try std.fs.cwd().makePath(dir_path);
     var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
     defer dir.close();
-    const tmp = try std.fmt.allocPrint(arena, ".{d:0>20}.json.{s}.tmp", .{ version, &uuid() });
+    const tmp = try msgfmt.allocPrint(arena, ".{d:0>20}.json.{s}.tmp", .{ version, &uuid() });
     {
         const f = try dir.createFile(tmp, .{ .exclusive = true });
         defer f.close();
@@ -146,7 +147,7 @@ fn createLocal(arena: std.mem.Allocator, root: []const u8, at: []const u8, versi
 }
 
 fn unsynced(arena: std.mem.Allocator, at: []const u8, e: anyerror) anyerror {
-    return eval.explain(Error.DeltaCommitUnsynced, try std.fmt.allocPrint(arena, "`{s}` was committed, but syncing its folder to disk failed ({s}), so a crash could lose it; its data files are kept", .{ at, @errorName(e) }));
+    return eval.explain(Error.DeltaCommitUnsynced, try msgfmt.allocPrint(arena, "`{s}` was committed, but syncing its folder to disk failed ({s}), so a crash could lose it; its data files are kept", .{ at, @errorName(e) }));
 }
 
 /// `path` without a trailing `/`, `.` for none left.
@@ -172,7 +173,7 @@ fn createObject(arena: std.mem.Allocator, at: []const u8, bytes: []const u8) !bo
     const made = obj.putIfAbsent(arena, &client, bytes, "application/json", &why) catch |e| return explainStore(e, at, why);
     if (!made) return false;
     if (obj.putIfAbsent(arena, &client, bytes, "application/json", &why) catch |e| return explainStore(e, at, why))
-        return eval.explain(Error.DeltaStoreUnsafe, try std.fmt.allocPrint(arena, "`{s}` was committed, but its store ignored `If-None-Match: *` (a second create of it succeeded), so two writers could overwrite each other's commit there; do not write this table from basalt on this store", .{at}));
+        return eval.explain(Error.DeltaStoreUnsafe, try msgfmt.allocPrint(arena, "`{s}` was committed, but its store ignored `If-None-Match: *` (a second create of it succeeded), so two writers could overwrite each other's commit there; do not write this table from basalt on this store", .{at}));
     return true;
 }
 
@@ -225,20 +226,20 @@ fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
 /// Why the winner at `version` fails `c`, or null when `c` may move past it.
 fn conflict(arena: std.mem.Allocator, c: Commit, w: Winner, version: u64) !?[]const u8 {
     if (c.kind == .create or version == 0)
-        return try std.fmt.allocPrint(arena, "another writer created the table first (version {d})", .{version});
+        return try msgfmt.allocPrint(arena, "another writer created the table first (version {d})", .{version});
     if (w.meta or w.protocol)
-        return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's {s}", .{ version, if (w.meta) "metadata (schema, partitioning or properties)" else "protocol" });
+        return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's {s}", .{ version, if (w.meta) "metadata (schema, partitioning or properties)" else "protocol" });
     if (w.removed.items.len > 0 and c.read_set.len > 0) {
         var mine: std.StringHashMapUnmanaged(void) = .empty;
         for (c.read_set) |f| try mine.put(arena, try keyOf(arena, c.key_root, try table.percentDecode(arena, f)), {});
         for (w.removed.items) |r| if (mine.contains(try keyOf(arena, c.key_root, r)))
-            return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, removed `{s}`, which this write read", .{ version, r });
+            return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, removed `{s}`, which this write read", .{ version, r });
     }
     if (c.kind == .replace and (w.adds.items.len > 0 or w.removed.items.len > 0))
-        return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's files after this REPLACE read them", .{version});
+        return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's files after this REPLACE read them", .{version});
     if (c.hold) |h| for (w.adds.items) |add| if (try h.may(h.ctx, arena, add)) {
         const p = if (add.get("path")) |x| (if (x == .string) try table.percentDecode(arena, x.string) else "?") else "?";
-        return try std.fmt.allocPrint(arena, "version {d}, committed concurrently, added `{s}`, which may hold a key this UPSERT writes, so the row could end up in the table twice", .{ version, p });
+        return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, added `{s}`, which may hold a key this UPSERT writes, so the row could end up in the table twice", .{ version, p });
     };
     return null;
 }
@@ -254,7 +255,7 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commi
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
         if (attempts >= max_attempts)
-            return fail(arena, name, c, try std.fmt.allocPrint(arena, "it lost the race for {d} versions in a row (the last tried was {d})", .{ max_attempts, version }));
+            return fail(arena, name, c, try msgfmt.allocPrint(arena, "it lost the race for {d} versions in a row (the last tried was {d})", .{ max_attempts, version }));
         const made = store.create(arena, version, c.body) catch |e| {
             if (e == Error.DeltaStoreUnsafe or e == Error.DeltaCommitUnsynced) return e;
             const outcome = landed(arena, store, version, c.txn_id);
@@ -463,7 +464,7 @@ test "local commit: a hidden synced file linked to the name, refused once the na
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     var ts = TableStore{ .root = root };
     const s = ts.store();
     try testing.expect(try s.read(a, 0) == null);
@@ -484,7 +485,7 @@ test "local commit: an append read at version 0 moves past a winner already on d
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     var ts = TableStore{ .root = root };
     try testing.expect(try ts.store().create(a, 1, "{\"commitInfo\":{\"txnId\":\"W\"}}\n{\"add\":{\"path\":\"w.parquet\"}}\n"));
     try testing.expectEqual(@as(u64, 2), try commit(a, ts.store(), "T", testCommit(.append, 0, "T")));

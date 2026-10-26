@@ -9,6 +9,7 @@
 //! file of each.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const formats = @import("../format/formats.zig");
 const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
@@ -49,7 +50,7 @@ pub fn listRaw(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
         defer w.deinit();
         while (try w.next()) |en| {
             if (en.kind != .file) continue;
-            try out.append(try std.fmt.allocPrint(arena, "{s}{s}", .{ path, en.path }));
+            try out.append(try msgfmt.allocPrint(arena, "{s}{s}", .{ path, en.path }));
         }
     }
     return out.items;
@@ -133,7 +134,7 @@ test "folder: hidden parts, kinds, a local walk sorted" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const root = try tmp.dir.realpathAlloc(ar.allocator(), ".");
-    const base = try std.fmt.allocPrint(ar.allocator(), "{s}/", .{root});
+    const base = try msgfmt.allocPrint(ar.allocator(), "{s}/", .{root});
     const got = try list(ar.allocator(), base);
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expect(std.mem.endsWith(u8, got[0], "year=2026/a.parquet"));

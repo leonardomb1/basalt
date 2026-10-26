@@ -42,6 +42,7 @@
 //! `env.space` with `env.op_memory`, and removed when the run ends.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const ftp = @import("../store/ftp.zig");
@@ -170,7 +171,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         };
         if (std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{})) |jv| {
             try json_params.put(name, jv);
-        } else |_| return planErr(diag, try std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}));
+        } else |_| return planErr(diag, try msgfmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}));
     }
 
     var bindings = std.StringHashMap(ast.Pipeline).init(arena);
@@ -411,7 +412,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
         }
         rows += b.len;
         if (rows > 1)
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s}: returned more than one row", .{what}));
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s}: returned more than one row", .{what}));
         _ = scratch.reset(.retain_capacity);
     }
 
@@ -540,16 +541,16 @@ pub fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {
 
 pub fn targetLabel(arena: std.mem.Allocator, w: ast.Write) ![]const u8 {
     if (std.mem.eql(u8, w.connector, "csv") or w.target.len == 0) return w.target;
-    return std.fmt.allocPrint(arena, "{s}.{s}", .{ w.connector, w.target });
+    return msgfmt.allocPrint(arena, "{s}.{s}", .{ w.connector, w.target });
 }
 
 /// `source → sink` for the progress line, each as the script spelled it.
 pub fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]const u8 {
     const src: []const u8 = switch (first.node) {
         .read => |rd| switch (rd.form) {
-            .table => |q| try std.fmt.allocPrint(arena, "{s}.{s}", .{ rd.connector, try std.mem.join(arena, ".", q.parts) }),
+            .table => |q| try msgfmt.allocPrint(arena, "{s}.{s}", .{ rd.connector, try std.mem.join(arena, ".", q.parts) }),
             .path => |p| p,
-            .query => try std.fmt.allocPrint(arena, "{s} query", .{rd.connector}),
+            .query => try msgfmt.allocPrint(arena, "{s} query", .{rd.connector}),
             else => rd.connector,
         },
         .ref => |name| name,
@@ -557,7 +558,7 @@ pub fn moveLabel(arena: std.mem.Allocator, first: ast.Stage, w: ast.Write) ![]co
         else => "?",
     };
     const dst = if (std.mem.eql(u8, w.connector, "stdout")) "stdout" else try targetLabel(arena, w);
-    return std.fmt.allocPrint(arena, "{s} → {s}", .{ src, dst });
+    return msgfmt.allocPrint(arena, "{s} → {s}", .{ src, dst });
 }
 
 pub fn hasAggregate(stages: []const ast.Stage) bool {
@@ -574,7 +575,7 @@ pub fn hasSort(stages: []const ast.Stage) bool {
 /// values; a nested loop's source is rendered with the outer row and chains to it.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     if (lr.badCell(env.arena)) |b|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "loop variable `{s}`: `{s}` is not {s}", .{ b.name, b.cell, try b.ty.name(env.arena) }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "loop variable `{s}`: `{s}` is not {s}", .{ b.name, b.cell, try b.ty.name(env.arena) }));
     var saved = std.array_list.Managed(struct { name: []const u8, prev: ?ast.Pipeline }).init(env.arena);
     for (body) |st| if (st == .binding) try saved.append(.{ .name = st.binding.name, .prev = env.bindings.get(st.binding.name) });
     defer {
@@ -662,7 +663,7 @@ test "checkFirst frees its analysis, a local Delta log's replay included, before
         \\{"add":{"path":"a.parquet","partitionValues":{},"modificationTime":0,"dataChange":true}}
     });
     const base = try tmp.dir.realpathAlloc(a, ".");
-    const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/t/';", .{ base, base });
+    const script = try msgfmt.allocPrint(a, "LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/t/';", .{ base, base });
     var pd: sql_parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try sql_parser.parseSource(a, script, &pd);
     var diag: Diag = .{};

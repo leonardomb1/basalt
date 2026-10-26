@@ -41,6 +41,7 @@
 //! the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
@@ -169,9 +170,9 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     return .{
         .bucket = bucket,
         .key = key,
-        .url = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ base.url, sep, enc_key }),
+        .url = try msgfmt.allocPrint(arena, "{s}{s}{s}", .{ base.url, sep, enc_key }),
         .host = base.host,
-        .uri_path = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ base.uri_path, sep, enc_key }),
+        .uri_path = try msgfmt.allocPrint(arena, "{s}{s}{s}", .{ base.uri_path, sep, enc_key }),
         .region = region,
         .bucket_url = base.url,
         .bucket_uri_path = base.uri_path,
@@ -258,7 +259,7 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 /// The derived SigV4 signing key: an HMAC chain over date, region, service and
 /// `aws4_request`, rooted at `AWS4` + secret.
 pub fn signingKey(arena: std.mem.Allocator, secret: []const u8, date: []const u8, region: []const u8, service: []const u8) ![32]u8 {
-    const seed = try std.fmt.allocPrint(arena, "AWS4{s}", .{secret});
+    const seed = try msgfmt.allocPrint(arena, "AWS4{s}", .{secret});
     var k: [32]u8 = undefined;
     HmacSha256.create(&k, date, seed);
     HmacSha256.create(&k, region, &k);
@@ -275,7 +276,7 @@ pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const 
     std.crypto.hash.sha2.Sha256.hash(cr.text, &cr_hash, .{});
 
     const date = p.timestamp[0..8];
-    const sts = try std.fmt.allocPrint(arena, "AWS4-HMAC-SHA256\n{s}\n{s}/{s}/{s}/aws4_request\n{s}", .{
+    const sts = try msgfmt.allocPrint(arena, "AWS4-HMAC-SHA256\n{s}\n{s}/{s}/{s}/aws4_request\n{s}", .{
         p.timestamp, date, p.region, p.service, &std.fmt.bytesToHex(cr_hash, .lower),
     });
 
@@ -283,7 +284,7 @@ pub fn authHeader(arena: std.mem.Allocator, access: []const u8, secret: []const 
     var mac: [32]u8 = undefined;
     HmacSha256.create(&mac, sts, &key);
 
-    return std.fmt.allocPrint(
+    return msgfmt.allocPrint(
         arena,
         "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/{s}/aws4_request,SignedHeaders={s},Signature={s}",
         .{ access, date, p.region, p.service, cr.signed, &std.fmt.bytesToHex(mac, .lower) },
@@ -379,16 +380,16 @@ fn bucketBase(arena: std.mem.Allocator, bucket: []const u8, region: []const u8, 
 } {
     if (endpoint) |ep| {
         const base = std.mem.trimRight(u8, ep, "/");
-        const uri_path = try std.fmt.allocPrint(arena, "/{s}", .{bucket});
+        const uri_path = try msgfmt.allocPrint(arena, "/{s}", .{bucket});
         return .{
-            .url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, uri_path }),
+            .url = try msgfmt.allocPrint(arena, "{s}{s}", .{ base, uri_path }),
             .host = try authorityOf(base),
             .uri_path = uri_path,
         };
     }
-    const host = try std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
+    const host = try msgfmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, region });
     return .{
-        .url = try std.fmt.allocPrint(arena, "https://{s}/", .{host}),
+        .url = try msgfmt.allocPrint(arena, "https://{s}/", .{host}),
         .host = host,
         .uri_path = "/",
     };
@@ -408,9 +409,9 @@ const ListPage = struct {
     fn page(c: ListPage, token: []const u8) ![]const u8 {
         var q = std.array_list.Managed([]const u8).init(c.arena);
         if (token.len > 0)
-            try q.append(try std.fmt.allocPrint(c.arena, "continuation-token={s}", .{try objstore.uriEncode(c.arena, token, .encode_slash)}));
+            try q.append(try msgfmt.allocPrint(c.arena, "continuation-token={s}", .{try objstore.uriEncode(c.arena, token, .encode_slash)}));
         try q.append("list-type=2");
-        try q.append(try std.fmt.allocPrint(c.arena, "prefix={s}", .{try objstore.uriEncode(c.arena, c.prefix, .encode_slash)}));
+        try q.append(try msgfmt.allocPrint(c.arena, "prefix={s}", .{try objstore.uriEncode(c.arena, c.prefix, .encode_slash)}));
 
         var url = std.array_list.Managed(u8).init(c.arena);
         try url.appendSlice(c.base_url);
@@ -541,12 +542,12 @@ pub const MultipartWriter = struct {
     fn sendAbort(self: *MultipartWriter) !void {
         const a = self.up.fresh();
         const q = [_][]const u8{
-            try std.fmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
+            try msgfmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
         };
         const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8 };
         const ctx = Ctx{
             .w = self,
-            .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ self.obj.url, q[0] }),
+            .url = try msgfmt.allocPrint(a, "{s}?{s}", .{ self.obj.url, q[0] }),
             .q = try a.dupe([]const u8, &q),
         };
         try objstore.retry(self.policy(), ctx, struct {
@@ -565,7 +566,7 @@ pub const MultipartWriter = struct {
     /// `uploads=`; both sides canonicalize a valueless key that way.
     fn ensureUpload(self: *MultipartWriter) !void {
         if (self.upload_id != null) return;
-        const url = try std.fmt.allocPrint(self.up.fresh(), "{s}?uploads", .{self.obj.url});
+        const url = try msgfmt.allocPrint(self.up.fresh(), "{s}?uploads", .{self.obj.url});
         const Ctx = struct { w: *MultipartWriter, url: []const u8 };
         try objstore.retry(self.policy(), Ctx{ .w = self, .url = url }, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
@@ -597,13 +598,13 @@ pub const MultipartWriter = struct {
         try self.ensureUpload();
         const a = self.up.fresh();
         const q = [_][]const u8{
-            try std.fmt.allocPrint(a, "partNumber={d}", .{self.etags.items.len + 1}),
-            try std.fmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
+            try msgfmt.allocPrint(a, "partNumber={d}", .{self.etags.items.len + 1}),
+            try msgfmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
         };
         const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8, ph: []const u8, bytes: []const u8 };
         const ctx = Ctx{
             .w = self,
-            .url = try std.fmt.allocPrint(a, "{s}?{s}&{s}", .{ self.obj.url, q[0], q[1] }),
+            .url = try msgfmt.allocPrint(a, "{s}?{s}&{s}", .{ self.obj.url, q[0], q[1] }),
             .q = try a.dupe([]const u8, &q),
             .ph = try payloadHash(a, bytes),
             .bytes = bytes,
@@ -710,13 +711,13 @@ pub const MultipartWriter = struct {
 
         const a = self.up.fresh();
         const q = [_][]const u8{
-            try std.fmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
+            try msgfmt.allocPrint(a, "uploadId={s}", .{self.upload_id_enc}),
         };
         const Ctx = struct { w: *MultipartWriter, url: []const u8, q: []const []const u8, ph: []const u8, body: []const u8 };
         const body = try completeBody(a, self.etags.items);
         const ctx = Ctx{
             .w = self,
-            .url = try std.fmt.allocPrint(a, "{s}?{s}", .{ self.obj.url, q[0] }),
+            .url = try msgfmt.allocPrint(a, "{s}?{s}", .{ self.obj.url, q[0] }),
             .q = try a.dupe([]const u8, &q),
             .ph = try payloadHash(a, body),
             .body = body,
@@ -765,7 +766,7 @@ pub const MultipartWriter = struct {
         const body = if (std.mem.eql(u8, self.obj.region, default_region))
             ""
         else
-            try std.fmt.allocPrint(
+            try msgfmt.allocPrint(
                 self.up.alloc(),
                 "<CreateBucketConfiguration><LocationConstraint>{s}</LocationConstraint></CreateBucketConfiguration>",
                 .{self.obj.region},
@@ -816,7 +817,7 @@ pub fn multipartEtag(arena: std.mem.Allocator, etags: []const []const u8) !?[]co
     }
     var d: [16]u8 = undefined;
     md5.final(&d);
-    return try std.fmt.allocPrint(arena, "\"{s}-{d}\"", .{ &std.fmt.bytesToHex(d, .lower), etags.len });
+    return try msgfmt.allocPrint(arena, "\"{s}-{d}\"", .{ &std.fmt.bytesToHex(d, .lower), etags.len });
 }
 
 test "amzDate matches the reference instant from the S3 signing docs" {
@@ -946,7 +947,7 @@ test "parseUrl: virtual-host style for the real service" {
     try std.testing.expectEqualStrings("/dir/f.parquet", o.uri_path);
     try std.testing.expectEqualStrings("/", o.bucket_uri_path);
     if (std.process.hasEnvVarConstant(env_region)) {
-        const host = try std.fmt.allocPrint(a, "mybucket.s3.{s}.amazonaws.com", .{regionFromEnv(a)});
+        const host = try msgfmt.allocPrint(a, "mybucket.s3.{s}.amazonaws.com", .{regionFromEnv(a)});
         try std.testing.expectEqualStrings(host, o.host);
     } else {
         try std.testing.expectEqualStrings("mybucket.s3.us-east-1.amazonaws.com", o.host);
@@ -1111,7 +1112,7 @@ test "a complete whose answer was lost counts as done only when the object it ma
     defer client.deinit();
     const part = "\"9dd4e461268c8034f5c8564e155c67a6\"";
     const etag = (try multipartEtag(a, &.{part})).?;
-    const head_ok = try std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\nETag: {s}\r\ncontent-length: 1\r\nconnection: close\r\n\r\n", .{etag});
+    const head_ok = try msgfmt.allocPrint(a, "HTTP/1.1 200 OK\r\nETag: {s}\r\ncontent-length: 1\r\nconnection: close\r\n\r\n", .{etag});
     const head_other = "HTTP/1.1 200 OK\r\nETag: \"0123456789abcdef0123456789abcdef-1\"\r\ncontent-length: 1\r\nconnection: close\r\n\r\n";
     const head_missing = reply("404 Not Found", "", "");
 
@@ -1193,7 +1194,7 @@ test "multipartEtag is the MD5 of the binary part MD5s plus the part count" {
     _ = try std.fmt.hexToBytes(raw[16..], "d41d8cd98f00b204e9800998ecf8427e");
     var d: [16]u8 = undefined;
     std.crypto.hash.Md5.hash(&raw, &d, .{});
-    const want = try std.fmt.allocPrint(a, "\"{s}-2\"", .{&std.fmt.bytesToHex(d, .lower)});
+    const want = try msgfmt.allocPrint(a, "\"{s}-2\"", .{&std.fmt.bytesToHex(d, .lower)});
     const got = (try multipartEtag(a, &.{ "\"9dd4e461268c8034f5c8564e155c67a6\"", "\"D41D8CD98F00B204E9800998ECF8427E\"" })).?;
     try std.testing.expectEqualStrings(want, got);
     try std.testing.expect((try multipartEtag(a, &.{"\"kms-opaque-etag\""})) == null);
@@ -1222,7 +1223,7 @@ fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const
     const p = try parsePrefix(url);
     const keys = try listPrefix(arena, client, p.bucket, p.prefix, endpointFromEnv(arena));
     const urls = try arena.alloc([]const u8, keys.len);
-    for (keys, urls) |k, *u| u.* = try std.fmt.allocPrint(arena, "s3://{s}/{s}", .{ p.bucket, k });
+    for (keys, urls) |k, *u| u.* = try msgfmt.allocPrint(arena, "s3://{s}/{s}", .{ p.bucket, k });
     return urls;
 }
 
@@ -1304,7 +1305,7 @@ test "amzDate on civil's Layout writes exactly what the hand-rolled one did, yea
             const days = @divFloor(epoch_secs, 86400);
             const secs: u32 = @intCast(epoch_secs - days * 86400);
             const c = civil.civilFromDays(days);
-            return std.fmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
+            return msgfmt.allocPrint(arena, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
                 @as(u32, @intCast(c.y)), c.m, c.d, secs / 3600, (secs % 3600) / 60, secs % 60,
             });
         }

@@ -5,6 +5,7 @@
 const ast = @import("../../lang/ast.zig");
 const parser = @import("../../lang/sql_parser.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 /// The `}` closing a `${` opened before `start`: brace-balanced and quote-aware
 /// (`'...'` and `"..."`, both escaped by doubling).
@@ -89,7 +90,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!Pars
 }
 
 pub fn failMsg(arena: std.mem.Allocator, text: []const u8, why: []const u8) error{OutOfMemory}![]const u8 {
-    return std.fmt.allocPrint(arena, "`${{{s}}}`: {s}", .{ text, why });
+    return msgfmt.allocPrint(arena, "`${{{s}}}`: {s}", .{ text, why });
 }
 
 /// The first hole in `s` whose text cannot be an expression, worded as the run words it.

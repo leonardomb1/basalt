@@ -13,6 +13,7 @@
 //! its file-wide index whichever row groups a read prunes (`read.zig`).
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const Bytes = @import("../bytes.zig").Bytes;
 const Deletes = @import("../parquet/fit.zig").Deletes;
 const roaring = @import("roaring.zig");
@@ -97,8 +98,8 @@ pub fn descriptor(name: []const u8, file: []const u8, v: std.json.Value) !Descri
     return d;
 }
 
-fn malformed(name: []const u8, file: []const u8, comptime why: []const u8) anyerror {
-    return refuse("{s} has file `{s}` whose deletion vector descriptor is malformed (" ++ why ++ "); basalt does not read the file, as reading it without its deletion vector would return deleted rows", .{ name, file });
+fn malformed(name: []const u8, file: []const u8, why: []const u8) anyerror {
+    return refuse("{s} has file `{s}` whose deletion vector descriptor is malformed ({s}); basalt does not read the file, as reading it without its deletion vector would return deleted rows", .{ name, file, why });
 }
 
 const z85_chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
@@ -151,7 +152,7 @@ pub fn location(arena: std.mem.Allocator, root: []const u8, d: Descriptor) ![]co
     const prefix = d.where[0 .. d.where.len - uuid_len];
     const u = (try z85(arena, d.where[d.where.len - uuid_len ..])) orelse
         return refuse("deletion vector path `{s}` does not end in a Z85 UUID", .{d.where});
-    return std.fmt.allocPrint(arena, "{s}{s}{s}deletion_vector_{s}.bin", .{
+    return msgfmt.allocPrint(arena, "{s}{s}{s}deletion_vector_{s}.bin", .{
         root, prefix, if (prefix.len > 0) "/" else "", &uuids.text(u[0..16], .canonical),
     });
 }

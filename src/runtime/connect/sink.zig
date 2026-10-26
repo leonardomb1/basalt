@@ -43,6 +43,7 @@ const split = @import("../../connect/split.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
@@ -59,8 +60,8 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, desc.read.form.table.parts) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
-    if (keys.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `UPSERT ON (col)`", .{table}));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
+    if (keys.len == 0) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "no primary key found on `{s}`; name the key with `UPSERT ON (col)`", .{table}));
     env.log.log(.debug, "upsert: inferred key on {s}: {s}", .{ table, try std.mem.join(env.arena, ", ", keys) });
     var out = w;
     out.mode = .{ .upsert = .{ .keys = keys, .partial = w.mode.upsert.partial } };
@@ -69,21 +70,21 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
-    if (env.write_opts == .json and env.write_opts.json == .array) return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
+    if (env.write_opts == .json and env.write_opts.json == .array) return planErr(env.diag, try msgfmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
-    return planErr(env.diag, try std.fmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
+    return planErr(env.diag, try msgfmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
 }
 
 /// `run` does not analyze first; without this a `.zip` was parsed as CSV and
 /// `COUNT(*)` answered with its deflate stream's newline count.
 pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
     if (comptime std.mem.eql(u8, verb, "read")) if (explicit) |f| if (formats.readRefused(f)) |why|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
     const unwritable = if (comptime std.mem.eql(u8, verb, "write")) analyze.unwritableTarget(path, explicit) else null;
     if (unwritable orelse analyze.unreadableTarget(path, explicit)) |why|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
     if (comptime std.mem.eql(u8, verb, "read")) if (analyze.archiveProblem(env.arena, path, explicit, true)) |why|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
 }
 
 /// Held from a stdout result's open to its close or abort, hook call included:
@@ -231,37 +232,37 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         switch (env.write_opts) {
             .json => |shape| {
                 const jw = jsonwrite.Writer.open(env.arena, w.target, schema, fmode, shape) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output JSON `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return jw.sink();
             },
             .xml => |names| {
                 const xw = xmlwrite.Writer.open(env.arena, w.target, schema, names) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output XML `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output XML `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return xw.sink();
             },
             .xlsx => |sheet| {
                 const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, sheet) catch |e| switch (e) {
-                    error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
-                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                    error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+                    else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
                 };
                 return xw.sink();
             },
             .arrow => {
                 const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
-                    error.ArrowRemoteSink => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
+                    error.ArrowRemoteSink => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
                     error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry an array or struct column"),
-                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                    else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
                 };
                 return aw.sink();
             },
             .parquet => |codec| {
                 const pw = pqwrite.Writer.open(env.arena, w.target, schema, codec, fmode) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output parquet `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return pw.sink();
             },
             .delta => |o| {
                 if (w.mode == .upsert and w.mode.upsert.keys.len == 0)
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
+                    return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
                 const p = delta_write.plan(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.sort_threads, .err = env.errctx }) catch |e|
@@ -270,19 +271,19 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             },
             .avro => |codec| {
                 const aw = avrowrite.Writer.open(env.arena, w.target, schema, codec) catch |e| switch (e) {
-                    error.AvroUnsupportedType, error.AvroBadName, error.AvroCodecUnsupported => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
-                    else => return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output Avro `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
+                    error.AvroUnsupportedType, error.AvroBadName, error.AvroCodecUnsupported => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+                    else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Avro `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
                 };
                 return aw.sink();
             },
             .records => |opts| {
                 const rw = recordswrite.Writer.open(env.arena, w.target, fmode, opts) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output records file `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return rw.sink();
             },
             .csv => {
                 const writer = csv.CsvWriter.open(env.arena, w.target, schema, fmode, env.csv_out) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output CSV `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) }));
                 return writer.sink();
             },
         }
@@ -292,9 +293,9 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (streamload.Flavor.of(conn.connector)) |flavor| {
         const cfg = try resolveStreamLoadConfig(env, conn, flavor);
         if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} cannot name a database, table or column `{s}`: it drops a backtick from a quoted name, so the rows would land under another name", .{ flavor.name(), name }));
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} cannot name a database, table or column `{s}`: it drops a backtick from a quoted name, so the rows would land under another name", .{ flavor.name(), name }));
         const s = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-            return srOpenErr(env, e, try std.fmt.allocPrint(env.arena, "{s} sink open failed", .{flavor.name()}));
+            return srOpenErr(env, e, try msgfmt.allocPrint(env.arena, "{s} sink open failed", .{flavor.name()}));
         s.logger = env.log;
         s.errctx = env.errctx;
         return s.sink();
@@ -304,7 +305,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
                 var target = w.target;
                 var mode = w.mode;
                 var plan: ?*ReplacePlan = null;
@@ -312,13 +313,13 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     const qt = try sql.quoteIdent(env.arena, info.dialect, w.target);
                     c.sqlConn().exec(try sql.createTableSql(env.arena, info.dialect, qt, schema, .append)) catch |e| {
                         defer c.close();
-                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
+                        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                     };
                     const p = try env.arena.create(ReplacePlan);
                     p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
                     p.prepare() catch |e| {
                         c.close();
-                        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+                        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
                     };
                     target = try p.stagingTarget(env.arena);
                     mode = .append;
@@ -327,7 +328,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                 const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx) catch |e| {
                     defer c.close();
                     if (plan) |p| p.abort();
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
+                    return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                 };
                 const p = plan orelse return inner;
                 const rs = try env.arena.create(ReplaceSink);

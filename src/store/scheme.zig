@@ -5,6 +5,7 @@
 //! percent-decodes each part; `shown` is a URL as logs and messages may print it.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const percent = @import("../net/percent.zig");
 
 pub const Cap = enum {
@@ -395,7 +396,7 @@ test "today: ftp's userinfo is Userinfo.parse; sftp takes it whole, smb splits o
     const a = ar.allocator();
     const infos = [_][]const u8{ "u", "u:pw", "u%40corp:p%3Aw", ":pw", "u:p:w", "d;u:pw", "u%3Ax:y" };
     for (infos) |info| {
-        const url = try std.fmt.allocPrint(a, "ftp://{s}@unregistered-host.invalid/f", .{info});
+        const url = try msgfmt.allocPrint(a, "ftp://{s}@unregistered-host.invalid/f", .{info});
         const got = try ftp.parseUrl(a, url);
         const u = try Userinfo.parse(a, info, .{});
         try testing.expectEqualStrings(u.user, got.user);
@@ -492,7 +493,7 @@ test "shown equals http_client's old redactUrl byte for byte, and fmtShown equal
     };
     for (urls) |u| {
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.allocPrint(ar.allocator(), "{f}", .{fmtShown(u)});
+        const s = try msgfmt.allocPrint(ar.allocator(), "{f}", .{fmtShown(u)});
         try testing.expectEqualStrings(shown(&buf, u), s);
     }
 }

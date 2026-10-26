@@ -11,6 +11,7 @@ const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// Per-column text and collation facts that decide which text comparisons may
@@ -20,7 +21,7 @@ pub fn columnFacts(env: *Env, rd: ast.Read) !?*const pushdown.Facts {
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
     const cache = env.facts_cache orelse return null;
-    const key = try std.fmt.allocPrint(env.arena, "{s}\x00{s}", .{ rd.connector, try qualStr(env.arena, rd.form.table) });
+    const key = try msgfmt.allocPrint(env.arena, "{s}\x00{s}", .{ rd.connector, try qualStr(env.arena, rd.form.table) });
     const Ask = struct { env: *Env, conn: ast.Connection, info: SqlConnInfo, parts: []const []const u8, name: []const u8 };
     const ask = Ask{ .env = env, .conn = conn, .info = info, .parts = rd.form.table.parts, .name = key[rd.connector.len + 1 ..] };
     return try cache.facts.get(cache, key, ask, struct {
@@ -78,7 +79,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
     const table = parts[parts.len - 1];
     switch (dialect) {
         .sqlserver => {
-            return std.fmt.allocPrint(arena,
+            return msgfmt.allocPrint(arena,
                 \\SELECT c.name,
                 \\ CASE WHEN c.collation_name IS NULL THEN 0 ELSE 1 END,
                 \\ CASE WHEN c.collation_name LIKE '%[_]BIN2%' THEN 1
@@ -89,7 +90,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
             , .{try split.catalogObjectLit(arena, dialect, parts)});
         },
         .postgres => {
-            return std.fmt.allocPrint(arena,
+            return msgfmt.allocPrint(arena,
                 \\SELECT a.attname,
                 \\ CASE WHEN t.typcategory = 'S' THEN 1 ELSE 0 END,
                 \\ CASE WHEN t.typcategory <> 'S' OR t.typname = 'citext' THEN 0
@@ -113,7 +114,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
         },
         .mysql => {
             const schema = try sql.schemaLit(arena, dialect, parts);
-            return std.fmt.allocPrint(arena,
+            return msgfmt.allocPrint(arena,
                 \\SELECT c.COLUMN_NAME,
                 \\ CASE WHEN c.COLLATION_NAME IS NULL THEN 0 ELSE 1 END,
                 \\ CASE WHEN c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin' THEN 1 ELSE 0 END,
@@ -125,7 +126,7 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
         },
         .starrocks, .doris => {
             const schema = try sql.schemaLit(arena, dialect, parts);
-            return std.fmt.allocPrint(arena,
+            return msgfmt.allocPrint(arena,
                 \\SELECT COLUMN_NAME,
                 \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'char', 'string') THEN 1 ELSE 0 END,
                 \\ 1,

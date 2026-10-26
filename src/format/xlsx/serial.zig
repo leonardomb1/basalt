@@ -7,6 +7,7 @@
 //! cell shows when its column is text.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const civil = @import("../../exec/civil.zig");
 
 pub const day_ms: i64 = 86_400_000;
@@ -173,18 +174,18 @@ test "serial: cell text equals the reader's old formatters" {
     const Orig = struct {
         fn oracleDate(arena: std.mem.Allocator, d: i64) ![]const u8 {
             const c = civil.civilFromDays(d);
-            return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
+            return msgfmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d });
         }
         fn oracleTime(arena: std.mem.Allocator, us: i64) ![]const u8 {
             const t: u64 = @intCast(@max(us, 0));
             const s = t / 1_000_000;
             const ms = (t % 1_000_000) / 1000;
-            if (ms == 0) return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ s / 3600, s / 60 % 60, s % 60 });
-            return std.fmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ s / 3600, s / 60 % 60, s % 60, ms });
+            if (ms == 0) return msgfmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}", .{ s / 3600, s / 60 % 60, s % 60 });
+            return msgfmt.allocPrint(arena, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ s / 3600, s / 60 % 60, s % 60, ms });
         }
         fn oracleTimestamp(arena: std.mem.Allocator, us: i64) ![]const u8 {
             const d = @divFloor(us, 86_400_000_000);
-            return std.fmt.allocPrint(arena, "{s} {s}", .{ try oracleDate(arena, d), try oracleTime(arena, us - d * 86_400_000_000) });
+            return msgfmt.allocPrint(arena, "{s} {s}", .{ try oracleDate(arena, d), try oracleTime(arena, us - d * 86_400_000_000) });
         }
     };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);

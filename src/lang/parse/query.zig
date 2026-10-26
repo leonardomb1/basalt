@@ -31,6 +31,7 @@ const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const sidesOf = @import("rewrite.zig").sidesOf;
 const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const decimal = @import("../../exec/decimal.zig");
 const textconv = @import("../../exec/textconv.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
@@ -1829,7 +1830,7 @@ pub fn parseUsing(
         const k = try self.expectIdent();
         if (self.col_uses) |u| try u.bareUse(self.arena, try self.singleName(k));
         const rk = try self.freshName("__uk{d}");
-        const lk = try std.fmt.allocPrint(self.arena, "__ul{d}", .{self.derived_n});
+        const lk = try msgfmt.allocPrint(self.arena, "__ul{d}", .{self.derived_n});
         try renames.append(.{ .from = k, .to = rk });
         try left_renames.append(.{ .from = k, .to = lk });
         try left_keys.append(try self.singleName(k));

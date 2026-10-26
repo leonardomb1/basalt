@@ -11,6 +11,7 @@
 //! once a collision renamed it `x_r`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 
 pub const TypeKind = enum {
     bool,
@@ -81,7 +82,7 @@ pub const Type = struct {
     /// The type as `DESCRIBE` and Tab name it: the kind, and a decimal's
     /// precision and scale. Nullability is not part of the name.
     pub fn name(self: Type, arena: std.mem.Allocator) ![]const u8 {
-        if (self.kind == .decimal) return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ self.precision, self.scale });
+        if (self.kind == .decimal) return msgfmt.allocPrint(arena, "decimal({d},{d})", .{ self.precision, self.scale });
         return @tagName(self.kind);
     }
 
@@ -536,7 +537,7 @@ test "widenSample reproduces JSON Infer's kinds; an all-NULL key is a known STRI
     };
     for (cases) |c| {
         var inf: json_read.Infer = .{};
-        for (c[0]) |v| try inf.note(a, try std.fmt.allocPrint(a, "{{\"k\":{s}}}", .{v}));
+        for (c[0]) |v| try inf.note(a, try msgfmt.allocPrint(a, "{{\"k\":{s}}}", .{v}));
         const today = (try inf.schema(a)).fields[0].ty;
         const s = foldSample(c[1]);
         const home = if (s.kind()) |k| Type.init(k).asNullable() else Type.init(.string).asNullable();

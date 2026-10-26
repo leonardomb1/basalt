@@ -15,6 +15,7 @@
 //! does not track; a `bytea` therefore reads in either `bytea_output` format.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const cell = @import("../exec/cell.zig");
@@ -160,8 +161,8 @@ pub const Conn = struct {
         std.crypto.random.bytes(&raw_nonce);
         var nb: [40]u8 = undefined;
         const client_nonce = enc.encode(&nb, &raw_nonce);
-        const cfb = try std.fmt.allocPrint(a, "n=,r={s}", .{client_nonce});
-        const client_first = try std.fmt.allocPrint(a, "n,,{s}", .{cfb});
+        const cfb = try msgfmt.allocPrint(a, "n=,r={s}", .{client_nonce});
+        const client_first = try msgfmt.allocPrint(a, "n,,{s}", .{cfb});
 
         var init_msg = std.array_list.Managed(u8).init(a);
         try appendCStr(&init_msg, "SCRAM-SHA-256");
@@ -184,14 +185,14 @@ pub const Conn = struct {
 
         const keys = try scramKeys(password, salt, iters);
 
-        const cfwp = try std.fmt.allocPrint(a, "c=biws,r={s}", .{sr});
-        const auth_message = try std.fmt.allocPrint(a, "{s},{s},{s}", .{ cfb, server_first, cfwp });
+        const cfwp = try msgfmt.allocPrint(a, "c=biws,r={s}", .{sr});
+        const auth_message = try msgfmt.allocPrint(a, "{s},{s},{s}", .{ cfb, server_first, cfwp });
 
         const proof = scramProof(keys, auth_message);
         var proof_b64: [64]u8 = undefined;
         const proof_enc = enc.encode(&proof_b64, &proof);
 
-        const client_final = try std.fmt.allocPrint(a, "{s},p={s}", .{ cfwp, proof_enc });
+        const client_final = try msgfmt.allocPrint(a, "{s},p={s}", .{ cfwp, proof_enc });
         try self.writeMsg('p', client_final);
 
         const t = try self.readMsg();
@@ -665,7 +666,7 @@ const CopyProto = struct {
     pub const stmt = "COPY";
 
     pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
-        return std.fmt.allocPrint(arena, "COPY {s} ({s}) FROM STDIN", .{ qtable, try sql.colList(arena, .postgres, schema) });
+        return msgfmt.allocPrint(arena, "COPY {s} ({s}) FROM STDIN", .{ qtable, try sql.colList(arena, .postgres, schema) });
     }
 
     pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {

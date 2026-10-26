@@ -13,6 +13,7 @@
 //! kept as they are and pinned by the tests below.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const Value = @import("../../exec/value.zig").Value;
 const civil = @import("../../exec/civil.zig");
 const decimal = @import("../../exec/decimal.zig");
@@ -593,7 +594,7 @@ test "delta_types: statistics the writer spells read back as the merge reads the
     }) |c| {
         for ([_]Bound{ .min, .max }) |which| {
             const text = (try statText(a, c[0], c[2], which)).?;
-            const json = try std.fmt.allocPrint(a, "{{\"{s}\":{{\"c\":{s}}}}}", .{ which.key(), text });
+            const json = try msgfmt.allocPrint(a, "{{\"{s}\":{{\"c\":{s}}}}}", .{ which.key(), text });
             const back = (try statValue(a, parseStats(a, json).?, which, "c", c[1])).?;
             switch (c[2]) {
                 .timestamp => |t| if (which == .max) try testing.expect(back.timestamp >= t) else try testing.expect(back.timestamp <= t),
@@ -606,7 +607,7 @@ test "delta_types: statistics the writer spells read back as the merge reads the
             }
         }
     }
-    const t_max = (try statValue(a, parseStats(a, try std.fmt.allocPrint(a, "{{\"maxValues\":{{\"c\":{s}}}}}", .{(try statText(a, physical("timestamp"), .{ .timestamp = us }, .max)).?})).?, .max, "c", T.init(.timestamp))).?;
+    const t_max = (try statValue(a, parseStats(a, try msgfmt.allocPrint(a, "{{\"maxValues\":{{\"c\":{s}}}}}", .{(try statText(a, physical("timestamp"), .{ .timestamp = us }, .max)).?})).?, .max, "c", T.init(.timestamp))).?;
     try testing.expectEqual(@as(i64, 20454 * 86_400_000_000 + 1_234_999), t_max.timestamp);
 }
 

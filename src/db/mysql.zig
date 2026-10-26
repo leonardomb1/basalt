@@ -24,6 +24,7 @@
 //! and StarRocks' and Doris' columns, which no session zone changes, are unaffected.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
@@ -453,7 +454,7 @@ const LoadDataProto = struct {
     pub const stmt = "LOAD DATA";
 
     pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
-        return std.fmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
+        return msgfmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
     }
 
     pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {

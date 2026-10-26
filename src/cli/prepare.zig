@@ -12,6 +12,7 @@ const include = @import("../lang/include.zig");
 const runtime = @import("../runtime/run.zig");
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const parser = @import("../lang/sql_parser.zig");
 const quote = @import("../lang/quote.zig");
 
@@ -105,7 +106,7 @@ pub const LetFreezer = struct {
     fn onLet(ctx: *anyopaque, name: []const u8, v: Value) void {
         const self: *LetFreezer = @ptrCast(@alignCast(ctx));
         const lit = letLiteral(self.arena, v) catch return orelse return;
-        const text = std.fmt.allocPrint(self.arena, "LET {s} = {s}", .{ name, lit }) catch return;
+        const text = msgfmt.allocPrint(self.arena, "LET {s} = {s}", .{ name, lit }) catch return;
         const n = self.arena.dupe(u8, name) catch return;
         self.frozen.append(.{ .name = n, .text = text }) catch {};
     }
@@ -129,17 +130,17 @@ pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
         .int => |x| if (x == std.math.minInt(i64))
             "CAST('-9223372036854775808' AS BIGINT)"
         else
-            try std.fmt.allocPrint(arena, "{d}", .{x}),
-        .float => |x| try std.fmt.allocPrint(arena, "CAST('{e}' AS DOUBLE)", .{x}),
-        .decimal => |d| try std.fmt.allocPrint(arena, "CAST('{s}' AS DECIMAL(38, {d}))", .{ try eval.valueToString(arena, v), d.scale }),
+            try msgfmt.allocPrint(arena, "{d}", .{x}),
+        .float => |x| try msgfmt.allocPrint(arena, "CAST('{e}' AS DOUBLE)", .{x}),
+        .decimal => |d| try msgfmt.allocPrint(arena, "CAST('{s}' AS DECIMAL(38, {d}))", .{ try eval.valueToString(arena, v), d.scale }),
         .string => |s| blk: {
             var out = std.array_list.Managed(u8).init(arena);
             try quote.strLit(&out, s);
             break :blk out.items;
         },
-        .date => try std.fmt.allocPrint(arena, "CAST('{s}' AS DATE)", .{try eval.valueToString(arena, v)}),
-        .time => try std.fmt.allocPrint(arena, "CAST('{s}' AS TIME)", .{try eval.valueToString(arena, v)}),
-        .timestamp => try std.fmt.allocPrint(arena, "CAST('{s}' AS TIMESTAMP)", .{try eval.valueToString(arena, v)}),
+        .date => try msgfmt.allocPrint(arena, "CAST('{s}' AS DATE)", .{try eval.valueToString(arena, v)}),
+        .time => try msgfmt.allocPrint(arena, "CAST('{s}' AS TIME)", .{try eval.valueToString(arena, v)}),
+        .timestamp => try msgfmt.allocPrint(arena, "CAST('{s}' AS TIMESTAMP)", .{try eval.valueToString(arena, v)}),
         else => null,
     };
 }
@@ -160,7 +161,7 @@ test "letLiteral: every value folds back to itself" {
     };
     for (values) |v| {
         const lit = (try letLiteral(a, v)).?;
-        const src = try std.fmt.allocPrint(a, "LET x = {s};", .{lit});
+        const src = try msgfmt.allocPrint(a, "LET x = {s};", .{lit});
         var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const prog = try parser.parseSource(a, src, &diag);
         const back = try eval.constEval(a, prog.stmts[1].let_const.expr.?, &.{}, &.{});

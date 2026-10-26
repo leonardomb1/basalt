@@ -10,6 +10,7 @@ const parser = @import("../../lang/sql_parser.zig");
 const runtime = @import("../../runtime/run.zig");
 const sql = @import("../../db/sql.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const declareFrom = @import("../cmd_complete.zig").declareFrom;
 const writeOffer = @import("../cmd_complete.zig").writeOffer;
 const writeOfferIn = @import("../cmd_complete.zig").writeOfferIn;
@@ -122,7 +123,7 @@ pub fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
     if (cx.catalog.tables.get(conn)) |t| return t;
     if (!cx.connect) return &.{};
     const a = cx.catalog.arena.allocator();
-    const q = std.fmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND TABLE_SCHEMA NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
+    const q = msgfmt.allocPrint(a, "SELECT table_schema || '.' || table_name AS t FROM {s}.QUERY($$SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE IN ('BASE TABLE', 'VIEW') AND TABLE_SCHEMA NOT IN ('information_schema', 'pg_catalog', 'mysql', 'performance_schema', 'sys', '_statistics_') ORDER BY 1, 2$$)", .{conn}) catch return &.{};
     const rows = fetchColumn(cx, q);
     cx.catalog.tables.put(a.dupe(u8, conn) catch return rows, rows) catch {};
     return rows;
@@ -139,7 +140,7 @@ fn sourceColumns(cx: *const Completer, key: []const u8) []const complete.Column 
         defer scratch.deinit();
         const sa = scratch.allocator();
         blk: {
-            const text = std.fmt.allocPrint(sa, "SELECT * FROM {s};", .{key}) catch break :blk;
+            const text = msgfmt.allocPrint(sa, "SELECT * FROM {s};", .{key}) catch break :blk;
             var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
             const prog = parser.parseSource(sa, text, &pdiag) catch break :blk;
             var adiag = analyze.Diag{};
@@ -174,7 +175,7 @@ fn columnsProbe(a: std.mem.Allocator, d: sql.Dialect, conn: []const u8, schema: 
     const s = try d.strLit(a, schema);
     const t = try d.strLit(a, tbl);
     if (std.mem.indexOf(u8, s, "$$") != null or std.mem.indexOf(u8, t, "$$") != null) return null;
-    return try std.fmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s} ORDER BY ORDINAL_POSITION$$)", .{ conn, s, t });
+    return try msgfmt.allocPrint(a, "SELECT col_name, col_type FROM {s}.QUERY($$SELECT COLUMN_NAME AS col_name, DATA_TYPE AS col_type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s} ORDER BY ORDINAL_POSITION$$)", .{ conn, s, t });
 }
 
 fn connDialect(cx: *const Completer, conn: []const u8) sql.Dialect {
@@ -351,7 +352,7 @@ fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 
     while (try it.next()) |e| {
         if (name_part.len == 0 and e.name[0] == '.') continue;
         if (!std.mem.startsWith(u8, e.name, name_part)) continue;
-        try out.append(try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ dir_part, e.name, if (e.kind == .directory) "/" else "" }));
+        try out.append(try msgfmt.allocPrint(arena, "{s}{s}{s}", .{ dir_part, e.name, if (e.kind == .directory) "/" else "" }));
     }
     std.sort.pdq([]const u8, out.items, {}, struct {
         fn lt(_: void, x: []const u8, y: []const u8) bool {
@@ -374,7 +375,7 @@ test "suggestFor: a half-typed script's own declarations and a local file's colu
     defer decls.deinit();
     var catalog = Catalog.init(std.testing.allocator);
     defer catalog.deinit();
-    const text = try std.fmt.allocPrint(a, "CREATE FUNCTION tax(x) AS x * 2;\nPARAM since DATE;\nSELECT ta FROM '{s}/t.csv' WHERE order_", .{dir});
+    const text = try msgfmt.allocPrint(a, "CREATE FUNCTION tax(x) AS x * 2;\nPARAM since DATE;\nSELECT ta FROM '{s}/t.csv' WHERE order_", .{dir});
     try declareFrom(&decls, a, text);
     const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
 
@@ -456,7 +457,7 @@ test "a file's columns are offered with their type, in the offer and in its JSON
     defer catalog.deinit();
     const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
 
-    const text = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE na", .{dir});
+    const text = try msgfmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE na", .{dir});
     const n = try suggestFor(a, &cx, text, text.len);
     try std.testing.expectEqual(@as(usize, 1), n.items.len);
     try std.testing.expectEqual(complete.Kind.column, n.items[0].kind);
@@ -468,7 +469,7 @@ test "a file's columns are offered with their type, in the offer and in its JSON
     const item = parsed.value.object.get("items").?.array.items[0].object;
     try std.testing.expectEqualStrings("string", item.get("detail").?.string);
 
-    const wtext = try std.fmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE wh", .{dir});
+    const wtext = try msgfmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE wh", .{dir});
     const w = try suggestFor(a, &cx, wtext, wtext.len);
     var found = false;
     for (w.items) |c| if (std.mem.eql(u8, c.text, "when_at")) {

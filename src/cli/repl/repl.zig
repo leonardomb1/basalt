@@ -23,6 +23,7 @@ const nextWord = @import("../entry.zig").nextWord;
 const prepareEntry = @import("../prepare.zig").prepareEntry;
 const runtime = @import("../../runtime/run.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const suggest = @import("catalog.zig").suggest;
 const table = @import("../../connect/table.zig");
 const view = @import("view.zig");
@@ -107,7 +108,7 @@ fn listConnections(sess: *Session, msg: *std.Io.Writer, probe: bool) !void {
         var status: []const u8 = "not asked yet";
         if (probe and !std.mem.eql(u8, ty, "http")) _ = connTables(&sess.completer(), e.name);
         if (sess.catalog.tables.get(e.name)) |t| {
-            status = if (t.len == 0) "unreachable, or no tables" else try std.fmt.allocPrint(sess.catalog.arena.allocator(), "reached, {d} tables", .{t.len});
+            status = if (t.len == 0) "unreachable, or no tables" else try msgfmt.allocPrint(sess.catalog.arena.allocator(), "reached, {d} tables", .{t.len});
         }
         try msg.print("{s: <14} {s: <10} {s: <28} {s: <16} {s}\n", .{ e.name, ty, host, db, status });
     }

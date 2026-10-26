@@ -14,6 +14,7 @@ const openSource = @import("../connect.zig").openSource;
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 /// Append a discovery batch's first `ncols` columns as text (null → ""), shared by
 /// every discovery form so all agree on coercion and the column-count error.
@@ -26,7 +27,7 @@ fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, 
             row[j] = switch (b.columns[j].getValue(r)) {
                 .null => "",
                 .string, .bytes => |s| try env.arena.dupe(u8, s),
-                .int => |x| try std.fmt.allocPrint(env.arena, "{d}", .{x}),
+                .int => |x| try msgfmt.allocPrint(env.arena, "{d}", .{x}),
                 else => return planErr(env.diag, "for-each values must be string or int"),
             };
         }
@@ -39,7 +40,7 @@ fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, 
 pub fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
     const src = openSource(env, src_read, &.{}) catch |e| {
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
     defer src.close();
     var rows = std.array_list.Managed(Row).init(env.arena);
@@ -75,7 +76,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
 
     const res = buildPipeline(env, try ownClock(env, pipe.stages)) catch |e| {
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
     defer res.op.release();
     var rows = std.array_list.Managed(Row).init(env.arena);
@@ -104,7 +105,7 @@ pub fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []cons
     };
     if (cur == .null) {
         if (path.safe.len > 0 and path.safe[0]) return &.{};
-        const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "missing required param `{s}`", .{head}));
+        const e = planErr(env.diag, try msgfmt.allocPrint(env.arena, "missing required param `{s}`", .{head}));
         if (path.span) |sp| env.diag.pos = sp.start;
         return e;
     }
@@ -113,7 +114,7 @@ pub fn discoverRowsJson(env: *Env, path: ast.QualName, var_names: []const []cons
         cur = switch (cur) {
             .object => |o| o.get(key) orelse {
                 if (seg_safe) return &.{};
-                return planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: json key `{s}` not found", .{key}));
+                return planErr(env.diag, try msgfmt.allocPrint(env.arena, "for-each: json key `{s}` not found", .{key}));
             },
             else => {
                 if (seg_safe) return &.{};

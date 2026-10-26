@@ -58,12 +58,14 @@
 //! `write.zig` is the writer, `footer.zig` the file metadata, `thrift.zig` its codec.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const parquet = @import("footer.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 pub const Threshold = @import("../../exec/value.zig").Threshold;
 const Value = @import("../../exec/value.zig").Value;
 const eval = @import("../../exec/eval.zig");
+const stream = @import("../stream.zig");
 const fuzzKernels = @import("testing_util.zig").fuzzKernels;
 const fuzzKernels_corpus = @import("testing_util.zig").fuzzKernels_corpus;
 const fx_v2 = @import("testing_util.zig").fx_v2;
@@ -415,12 +417,7 @@ pub const Reader = struct {
     /// A decode failure's account, prefixed with this file, which a folder read needs.
     fn named(self: *const Reader, e: anyerror) anyerror {
         const why = eval.takeFailure(e) orelse return e;
-        var buf: [480]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "`{s}`: {s}", .{ self.path, why }) catch blk: {
-            @memcpy(buf[buf.len - 3 ..], "...");
-            break :blk buf[0..];
-        };
-        return eval.explain(e, msg);
+        return stream.explainf(e, "`{s}`: {s}", .{ self.path, why });
     }
 
     fn chunkOf(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, lf: Leaf) !Chunk {
@@ -492,7 +489,7 @@ pub fn mismatchMessage(arena: std.mem.Allocator, root: []const u8, path: []const
             return if (std.mem.startsWith(u8, x, r)) x[r.len..] else x;
         }
     }.f;
-    return std.fmt.allocPrint(arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ rel(root, path), root, rel(root, first), why }) catch why;
+    return msgfmt.allocPrint(arena, "`{s}` in folder `{s}` does not match `{s}`, its first file: {s}", .{ rel(root, path), root, rel(root, first), why }) catch why;
 }
 
 const testing = std.testing;
@@ -700,30 +697,30 @@ test "schemaMismatch on conform gives the old check's verdict and words on every
     const old = struct {
         fn oldSchemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema, requested: ?[]const []const u8) ?[]const u8 {
             for (want.fields, 0..) |w, k| {
-                if (k >= got.fields.len) return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+                if (k >= got.fields.len) return msgfmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
                 const g = got.fields[k];
                 if (!std.mem.eql(u8, w.name, g.name)) {
                     for (got.fields) |o| if (std.mem.eql(u8, o.name, w.name))
-                        return std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
+                        return msgfmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ g.name, w.name }) catch "columns in another order";
                     const asked = if (requested) |r| for (r) |n| {
                         if (std.mem.eql(u8, n, g.name)) break true;
                     } else false else true;
                     if (asked) for (want.fields) |o| {
                         if (std.mem.eql(u8, o.name, g.name)) break;
-                    } else return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
-                    return std.fmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
+                    } else return msgfmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{g.name}) catch "an extra column";
+                    return msgfmt.allocPrint(arena, "it has no column `{s}`", .{w.name}) catch "a column is missing";
                 }
                 if (w.ty.kind != g.ty.kind or w.ty.precision != g.ty.precision or w.ty.scale != g.ty.scale)
-                    return std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, oldTypeName(arena, g.ty), oldTypeName(arena, w.ty) }) catch "a column has another type";
+                    return msgfmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ w.name, oldTypeName(arena, g.ty), oldTypeName(arena, w.ty) }) catch "a column has another type";
             }
             if (got.fields.len > want.fields.len)
-                return std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
+                return msgfmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{got.fields[want.fields.len].name}) catch "an extra column";
             return null;
         }
 
         fn oldTypeName(arena: std.mem.Allocator, t: types.Type) []const u8 {
             if (t.kind != .decimal) return @tagName(t.kind);
-            return std.fmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
+            return msgfmt.allocPrint(arena, "decimal({d},{d})", .{ t.precision, t.scale }) catch "decimal";
         }
     };
     var ar = std.heap.ArenaAllocator.init(testing.allocator);

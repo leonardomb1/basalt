@@ -9,6 +9,7 @@ const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const parseSource = @import("../../sql_parser.zig").parseSource;
 const parseTest = @import("../testing_util.zig").parseTest;
 const std = @import("std");
+const msgfmt = @import("../../../format/msgfmt.zig");
 const testing = std.testing;
 
 test "sql: terminal select from csv becomes read+write stdout" {
@@ -160,7 +161,7 @@ test "sql: a FLOAT LIMIT through textconv.floatToInt takes the count and refusal
     const corpus = [_]f64{ 0, 0.4, 0.5, 0.6, 1.5, 2.5, 3.5, 1e3, 4503599627370495.5, 9007199254740992, 0x1p63 - 1024, 0x1p63, 1e19, 1e300, 1.7976931348623157e308, 5e-324 };
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     for (corpus) |f| for ([_]bool{ false, true }) |neg| {
-        const q = try std.fmt.allocPrint(a, "SELECT id FROM 't.csv' LIMIT {s}{e};", .{ if (neg) "-" else "", f });
+        const q = try msgfmt.allocPrint(a, "SELECT id FROM 't.csv' LIMIT {s}{e};", .{ if (neg) "-" else "", f });
         const shown = if (neg) -f else f;
         switch (old.count(f, neg)) {
             .n => |n| {
@@ -170,11 +171,11 @@ test "sql: a FLOAT LIMIT through textconv.floatToInt takes the count and refusal
             },
             .negative => {
                 try testing.expectError(error.ParseFailed, parseSource(a, q, &diag));
-                try testing.expectEqualStrings(try std.fmt.allocPrint(a, "LIMIT must not be negative, got {d}", .{shown}), diag.msg);
+                try testing.expectEqualStrings(try msgfmt.allocPrint(a, "LIMIT must not be negative, got {d}", .{shown}), diag.msg);
             },
             .range => {
                 try testing.expectError(error.ParseFailed, parseSource(a, q, &diag));
-                try testing.expectEqualStrings(try std.fmt.allocPrint(a, "LIMIT {d} is out of range", .{shown}), diag.msg);
+                try testing.expectEqualStrings(try msgfmt.allocPrint(a, "LIMIT {d} is out of range", .{shown}), diag.msg);
             },
         }
     };
@@ -271,7 +272,7 @@ test "sql: JOIN LATERAL refuses a body the join could not apply per row" {
     };
     for (cases) |c| {
         var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const src = try std.fmt.allocPrint(a, "CREATE FUNCTION f(p) RETURNS TABLE AS {s}; SELECT o.id FROM 'o.csv' o CROSS JOIN LATERAL f(o.id) i;", .{c.body});
+        const src = try msgfmt.allocPrint(a, "CREATE FUNCTION f(p) RETURNS TABLE AS {s}; SELECT o.id FROM 'o.csv' o CROSS JOIN LATERAL f(o.id) i;", .{c.body});
         try testing.expectError(error.ParseFailed, parseSource(a, src, &diag));
         if (std.mem.indexOf(u8, diag.msg, c.says) == null) {
             std.debug.print("for `{s}` got: {s}\n", .{ c.body, diag.msg });

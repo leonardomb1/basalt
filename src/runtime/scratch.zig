@@ -10,6 +10,7 @@
 const DirSpace = @import("../exec/space.zig").DirSpace;
 const Space = @import("../exec/space.zig").Space;
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 
 pub const Scratch = struct {
     gpa: std.mem.Allocator,
@@ -51,7 +52,7 @@ pub const Scratch = struct {
         defer if (env_tmp) |t| self.gpa.free(t);
         const base = self.base orelse if (env_tmp != null and env_tmp.?.len > 0) env_tmp.? else "/tmp";
         try std.fs.cwd().makePath(base);
-        const path = try std.fmt.allocPrint(self.gpa, "{s}/basalt-spill-{x}", .{ base, std.crypto.random.int(u64) });
+        const path = try msgfmt.allocPrint(self.gpa, "{s}/basalt-spill-{x}", .{ base, std.crypto.random.int(u64) });
         errdefer self.gpa.free(path);
         try std.fs.cwd().makeDir(path);
         self.inner.dir = path;
@@ -181,7 +182,7 @@ test "Scratch makes a missing spill directory and creates from parallel threads"
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try testBase(&tmp, &buf);
-    const base = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/spill", .{root});
+    const base = try msgfmt.allocPrint(std.testing.allocator, "{s}/nested/spill", .{root});
     defer std.testing.allocator.free(base);
 
     var s = Scratch.init(std.testing.allocator, base, 8 << 30);

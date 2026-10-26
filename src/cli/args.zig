@@ -8,6 +8,7 @@ const env = @import("../runtime/env.zig");
 const parseByteSize = @import("../runtime/env.zig").parseByteSize;
 const jsontext = @import("../exec/jsontext.zig");
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
 
@@ -95,10 +96,10 @@ pub fn paramProblem(arena: std.mem.Allocator, prog: ast.Program, name: []const u
     for (prog.stmts) |s| switch (s) {
         .param => |p| if (std.mem.eql(u8, p.name, name)) return null,
         .let_const => |l| if (std.mem.eql(u8, l.name, name))
-            return try std.fmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{name}),
+            return try msgfmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{name}),
         else => {},
     };
-    return try std.fmt.allocPrint(arena, "`-p {s}`: the script declares no PARAM `{s}`", .{ name, name });
+    return try msgfmt.allocPrint(arena, "`-p {s}`: the script declares no PARAM `{s}`", .{ name, name });
 }
 
 /// The first `-p` key given twice, which would otherwise bind one of the values silently.

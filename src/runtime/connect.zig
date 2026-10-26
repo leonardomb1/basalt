@@ -29,6 +29,7 @@
 //! `register.zig` registers SFTP and SMB connections.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
@@ -251,7 +252,7 @@ pub fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const h
         const key = h.key["query:".len..];
         const val = switch (h.value) {
             .str, .ident => |s| s,
-            .int => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .int => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
             .flag => "",
         };
         for (out.items) |*kv| {

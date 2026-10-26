@@ -68,6 +68,7 @@ const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 pub const ColUses = @import("parse/textcols.zig").ColUses;
 const quote = @import("quote.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("types.zig");
 
 pub const Token = token.Token;
@@ -158,7 +159,7 @@ fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8,
 }
 
 fn qualified(arena: std.mem.Allocator, ns: []const u8, name: []const u8) Error![]const u8 {
-    const s = std.fmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
+    const s = msgfmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
     for (s) |*c| c.* = std.ascii.toLower(c.*);
     return s;
 }
@@ -400,9 +401,9 @@ fn nameTaken(items: []const ast.SelectItem, name: []const u8) bool {
 pub fn nameApart(arena: std.mem.Allocator, items: []ast.SelectItem) !void {
     for (items, 0..) |*it, i| {
         if (it.* != .field or !nameTaken(items[0..i], it.field.last())) continue;
-        var nm = try std.fmt.allocPrint(arena, "{s}_r", .{it.field.last()});
+        var nm = try msgfmt.allocPrint(arena, "{s}_r", .{it.field.last()});
         var n: usize = 2;
-        while (nameTaken(items, nm)) : (n += 1) nm = try std.fmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
+        while (nameTaken(items, nm)) : (n += 1) nm = try msgfmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
         const e = try arena.create(ast.Expr);
         e.* = .{ .field = it.field };
         it.* = .{ .computed = .{ .name = nm, .expr = e } };
@@ -773,8 +774,15 @@ pub const Parser = struct {
     }
 
     pub fn fail(self: *Parser, pos: Pos, comptime fmt: []const u8, args: anytype) Error {
+        @branchHint(.cold);
+        return self.failMsg(pos, msgfmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic");
+    }
+
+    /// `fail` with its message formatted: the diagnostic, underlining the token at `pos`.
+    noinline fn failMsg(self: *Parser, pos: Pos, msg: []const u8) Error {
+        @branchHint(.cold);
         self.diag.* = .{
-            .msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic",
+            .msg = msg,
             .line = pos.line,
             .col = pos.col,
             .file = pos.file,
@@ -794,7 +802,7 @@ pub const Parser = struct {
     /// A hidden name no query writes: `fmt` with the parser's next number.
     pub fn freshName(self: *Parser, comptime fmt: []const u8) Error![]const u8 {
         self.derived_n += 1;
-        return std.fmt.allocPrint(self.arena, fmt, .{self.derived_n});
+        return msgfmt.allocPrint(self.arena, fmt, .{self.derived_n});
     }
 
     /// Binds `stages` under the hidden `name`, which the query then reads as a CTE.

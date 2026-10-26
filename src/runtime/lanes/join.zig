@@ -19,6 +19,7 @@ const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -205,7 +206,7 @@ fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const a
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
     const arena = env.arena;
     const binding = (try stampedBinding(env, j.binding)) orelse
-        return planErr(env.diag, try std.fmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
+        return planErr(env.diag, try msgfmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const src_base = env.sources.items.len;
     const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
     var split = try buildSplit(env, rstages);

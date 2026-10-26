@@ -89,6 +89,7 @@
 //! flat across pages.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("../store/objstore.zig");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
@@ -218,7 +219,7 @@ pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u
             cc.base_url = kv.value;
         } else if (std.mem.eql(u8, kv.key, "auth")) {
             cc.auth = std.meta.stringToEnum(AuthKind, kv.value) orelse {
-                errmsg.* = try std.fmt.allocPrint(arena, "unknown auth kind `{s}`", .{kv.value});
+                errmsg.* = try msgfmt.allocPrint(arena, "unknown auth kind `{s}`", .{kv.value});
                 return error.BadHttpConn;
             };
         } else if (std.mem.eql(u8, kv.key, "token")) {
@@ -242,7 +243,7 @@ pub fn connFromKvs(arena: std.mem.Allocator, kvs: []const KV, errmsg: *[]const u
         } else if (std.mem.eql(u8, kv.key, "token_prefix")) {
             cc.token_prefix = kv.value;
         } else {
-            errmsg.* = try std.fmt.allocPrint(arena, "unknown attribute `{s}`", .{kv.key});
+            errmsg.* = try msgfmt.allocPrint(arena, "unknown attribute `{s}`", .{kv.key});
             return error.BadHttpConn;
         }
     }
@@ -272,14 +273,14 @@ pub const AuthState = struct {
             .none => return null,
             .bearer => self.header = .{
                 .name = "Authorization",
-                .value = try std.fmt.allocPrint(self.arena, "Bearer {s}", .{self.cc.token}),
+                .value = try msgfmt.allocPrint(self.arena, "Bearer {s}", .{self.cc.token}),
             },
             .basic => {
-                const raw = try std.fmt.allocPrint(self.arena, "{s}:{s}", .{ self.cc.user, self.cc.password });
+                const raw = try msgfmt.allocPrint(self.arena, "{s}:{s}", .{ self.cc.user, self.cc.password });
                 const enc = std.base64.standard.Encoder;
                 const b64 = try self.arena.alloc(u8, enc.calcSize(raw.len));
                 _ = enc.encode(b64, raw);
-                self.header = .{ .name = "Authorization", .value = try std.fmt.allocPrint(self.arena, "Basic {s}", .{b64}) };
+                self.header = .{ .name = "Authorization", .value = try msgfmt.allocPrint(self.arena, "Basic {s}", .{b64}) };
             },
             .header => self.header = .{ .name = self.cc.header_name, .value = self.cc.header_value },
             .login_json, .oauth2 => try src.login(self),
@@ -334,7 +335,7 @@ pub const AuthState = struct {
         const prefix = self.cc.token_prefix orelse (if (is_oauth) "Bearer " else "");
         self.header = .{
             .name = self.cc.token_header,
-            .value = try std.fmt.allocPrint(arena, "{s}{s}", .{ prefix, tok }),
+            .value = try msgfmt.allocPrint(arena, "{s}{s}", .{ prefix, tok }),
         };
     }
 };
@@ -363,7 +364,7 @@ pub fn joinUrl(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]
     if (scheme.of(path).has(.http)) return path;
     const b = std.mem.trimRight(u8, base, "/");
     const sep: []const u8 = if (path.len > 0 and path[0] == '/') "" else "/";
-    return std.fmt.allocPrint(arena, "{s}{s}{s}", .{ b, sep, path });
+    return msgfmt.allocPrint(arena, "{s}{s}{s}", .{ b, sep, path });
 }
 
 /// `path` with each param appended as `key=value`, both percent-encoded, after a
@@ -1083,17 +1084,17 @@ pub fn userAgentOf(opts: Options) []const u8 {
 fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Header {
     var hdrs = std.array_list.Managed(std.http.Header).init(arena);
     if (opts.bearer orelse try envOpt(arena, opts.bearer_env)) |tok| {
-        try hdrs.append(.{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{tok}) });
+        try hdrs.append(.{ .name = "Authorization", .value = try msgfmt.allocPrint(arena, "Bearer {s}", .{tok}) });
     } else if (opts.auth orelse try envOpt(arena, opts.auth_env)) |val| {
         try hdrs.append(.{ .name = "Authorization", .value = try arena.dupe(u8, val) });
     } else if (opts.user_env != null and opts.pass_env != null) {
         const user = (try envOpt(arena, opts.user_env)) orelse return error.MissingAuthEnv;
         const pass = (try envOpt(arena, opts.pass_env)) orelse return error.MissingAuthEnv;
-        const raw = try std.fmt.allocPrint(arena, "{s}:{s}", .{ user, pass });
+        const raw = try msgfmt.allocPrint(arena, "{s}:{s}", .{ user, pass });
         const enc = std.base64.standard.Encoder;
         const b64 = try arena.alloc(u8, enc.calcSize(raw.len));
         _ = enc.encode(b64, raw);
-        try hdrs.append(.{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Basic {s}", .{b64}) });
+        try hdrs.append(.{ .name = "Authorization", .value = try msgfmt.allocPrint(arena, "Basic {s}", .{b64}) });
     }
     if (opts.header) |h| {
         const colon = std.mem.indexOfScalar(u8, h, ':') orelse return error.BadHeaderHint;
@@ -1126,7 +1127,7 @@ fn itemsOf(arena: std.mem.Allocator, doc: []const u8, items_path: ?[]const u8) !
 
 fn appendParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: []const u8) ![]const u8 {
     const sep: []const u8 = if (base.len == 0) "" else "&";
-    return std.fmt.allocPrint(arena, "{s}{s}{s}={s}", .{ base, sep, key, val });
+    return msgfmt.allocPrint(arena, "{s}{s}{s}={s}", .{ base, sep, key, val });
 }
 
 /// `base` with `key=val` appended, `val` percent-encoded: a cursor token may hold
@@ -1302,7 +1303,7 @@ test "http source: bare array, single fetch, bearer header sent" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .bearer = "sek" });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), s.schema.fields.len);
@@ -1327,7 +1328,7 @@ test "http source: page pagination stops on empty page" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
@@ -1352,7 +1353,7 @@ test "http source: offset pagination advances $skip by page_size, raw auth sent"
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/api/odata/businessobject/incidents", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/api/odata/businessobject/incidents", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .auth = "session-tok-xyz",
         .items = "value",
@@ -1385,7 +1386,7 @@ test "http source: 204 past the end of the dataset ends the stream cleanly" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .items = "value",
         .paginate = .offset,
@@ -1435,7 +1436,7 @@ test "http connection: login_json posts body, token rides later requests" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
         .base_url = base,
         .auth = .login_json,
@@ -1469,7 +1470,7 @@ test "http connection: 401 mid-run triggers re-login and the page retries" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
         .base_url = base,
         .auth = .login_json,
@@ -1494,7 +1495,7 @@ test "http connection: oauth2 client credentials form post -> Bearer" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
+    const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{srv.port()});
     const s = try HttpSource.openConn(a, std.testing.allocator, .{
         .base_url = base,
         .auth = .oauth2,
@@ -1531,7 +1532,7 @@ test "http source: prefetch fetches the pages ahead and stops on empty" {
     var joined = false;
     defer if (!joined) srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .paginate = .offset,
         .page_param = "$skip",
@@ -1569,7 +1570,7 @@ test "http source: stop_short ends after a short page (no trailing empty fetch)"
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .paginate = .offset,
         .page_param = "$skip",
@@ -1595,7 +1596,7 @@ test "abort flag stops pagination between page requests" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page });
     defer s.close();
     _ = (try s.next(a)).?;
@@ -1621,7 +1622,7 @@ test "http source: POST form body carries pagination, content-type set" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .method = .post,
         .body = "user=u&token=t&pag=ponto&cmd=get",
@@ -1656,7 +1657,7 @@ test "http source: total_field bounds the page count exactly" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .method = .post,
         .body = "cmd=get",
@@ -1684,7 +1685,7 @@ test "http source: transient 503 retries in place and succeeds" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
@@ -1704,7 +1705,7 @@ test "retry_statuses treats a lying 404 as transient and retries through it" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{
         .retries = 2,
         .retry_base_ms = 10,
@@ -1756,7 +1757,7 @@ test "a black-holed page request times out instead of hanging the run" {
     defer th.join();
     defer hang_released.store(true, .seq_cst);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{listener.listen_address.getPort()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{listener.listen_address.getPort()});
     const s = try HttpSource.open(a, std.heap.page_allocator, url, .{
         .paginate = .page,
         .prefetch = 2,
@@ -1804,7 +1805,7 @@ test "a page replayed after a re-login times out like any page" {
     defer th.join();
     defer hang_released.store(true, .seq_cst);
 
-    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+    const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
     const started = std.time.milliTimestamp();
     try std.testing.expectError(error.ConnectionTimedOut, HttpSource.openConn(a, std.heap.page_allocator, .{
         .base_url = base,
@@ -1830,7 +1831,7 @@ test "a black-holed login, first or after a 401, times out instead of hanging th
         defer th.join();
         defer hang_released.store(true, .seq_cst);
 
-        const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
+        const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
         const started = std.time.milliTimestamp();
         try std.testing.expectError(error.ConnectionTimedOut, HttpSource.openConn(a, std.heap.page_allocator, .{
             .base_url = base,
@@ -1881,7 +1882,7 @@ test "http source: cursor pagination follows token then stops" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
@@ -1903,7 +1904,7 @@ test "http source: a cursor token is URL-encoded; a later page's failure names i
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
     defer s.close();
     try std.testing.expectError(error.HttpBadRequest, drain(s, a));
@@ -2035,7 +2036,7 @@ test "http source: a 408 is retried in place like a 503" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const s = try HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
     defer s.close();
     try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
@@ -2056,7 +2057,7 @@ test "http source: a 501 fails at once, not retried, and not as transient" {
     const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
     defer srv.finish(th);
 
-    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
     const got = HttpSource.open(a, std.testing.allocator, url, .{ .retries = 2, .retry_base_ms = 10 });
     if (got) |s| s.close() else |_| {}
     try std.testing.expectError(error.HttpRequestFailed, got);

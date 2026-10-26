@@ -15,6 +15,7 @@
 const std = @import("std");
 const eval = @import("../exec/eval.zig");
 const http_client = @import("../net/http_client.zig");
+const msgfmt = @import("msgfmt.zig");
 const objstore = @import("../store/objstore.zig");
 const scheme = @import("../store/scheme.zig");
 const sftp = @import("../store/sftp.zig");
@@ -313,11 +314,9 @@ pub const Stream = struct {
 /// `eval.explain` with a formatted message, cut to fit with `...`, for a reader
 /// failing mid-stream.
 pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+    @branchHint(.cold);
     var buf: [480]u8 = undefined;
-    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch blk: {
-        @memcpy(buf[buf.len - 3 ..], "...");
-        break :blk buf[0..];
-    });
+    return eval.explain(e, msgfmt.clipPrint(&buf, fmt, args));
 }
 
 /// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the

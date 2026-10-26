@@ -25,6 +25,7 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 const TopNTail = struct { keys: []const ast.SortKey, n: usize };
@@ -220,7 +221,7 @@ pub fn runParallelTopN(
     const top = try op.TopN.combine(env.gpa, arena, row_schema, ks, lim.count, lim.offset, ctx.kept.items);
     if (env.profile) |p| {
         try p.phase("combine the lanes' best rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ split.label(), split.count(nthreads), split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ split.label(), split.count(nthreads), split.unitName() });
     }
 
     const snk = try openTailSink(env, w, &.{}, row_schema.*);

@@ -20,6 +20,7 @@ const folder = @import("../../connect/folder.zig");
 const ftp = @import("../../store/ftp.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 const textconv = @import("../../exec/textconv.zig");
 const replace = @import("../../db/replace.zig");
@@ -389,9 +390,9 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
 
     const chosen = if (ar.member) |want| blk: {
         for (members) |m| if (std.mem.eql(u8, m, want)) break :blk m;
-        return std.fmt.allocPrint(arena, "no file `{s}` in the archive ({s})", .{ want, joinNames(arena, members) }) catch null;
+        return msgfmt.allocPrint(arena, "no file `{s}` in the archive ({s})", .{ want, joinNames(arena, members) }) catch null;
     } else if (members.len > 1)
-        return std.fmt.allocPrint(arena, "the archive holds {d} files; name one with `:: <name>` ({s})", .{ members.len, joinNames(arena, members) }) catch null
+        return msgfmt.allocPrint(arena, "the archive holds {d} files; name one with `:: <name>` ({s})", .{ members.len, joinNames(arena, members) }) catch null
     else
         members[0];
 
@@ -400,15 +401,15 @@ pub fn archiveProblem(arena: std.mem.Allocator, path: []const u8, explicit: ?Fil
 
 fn memberProblem(arena: std.mem.Allocator, chosen: []const u8, explicit: ?FileFormat) ?[]const u8 {
     const tag = explicit orelse formatOfPath(chosen) orelse
-        return std.fmt.allocPrint(arena, "`{s}` inside it has no extension basalt reads; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
+        return msgfmt.allocPrint(arena, "`{s}` inside it has no extension basalt reads; name the format with `WITH (format = 'csv')`", .{chosen}) catch null;
     return formats.of(tag).archive_refused;
 }
 
 fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
     var out: []const u8 = "";
     for (items, 0..) |m, i| {
-        if (i == 3) return std.fmt.allocPrint(arena, "{s}, …", .{out}) catch out;
-        out = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ out, if (i == 0) "" else ", ", m }) catch return out;
+        if (i == 3) return msgfmt.allocPrint(arena, "{s}, …", .{out}) catch out;
+        out = msgfmt.allocPrint(arena, "{s}{s}{s}", .{ out, if (i == 0) "" else ", ", m }) catch return out;
     }
     return out;
 }

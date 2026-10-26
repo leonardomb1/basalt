@@ -33,6 +33,7 @@ const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 pub const Estimate = struct {
     rows: ?u64 = null,
@@ -200,9 +201,9 @@ pub fn valueRows(v: Value) ?u64 {
 pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
     const table = parts[parts.len - 1];
     switch (dialect) {
-        .postgres => return std.fmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try split.catalogObjectLit(arena, dialect, parts)}),
-        .sqlserver => return std.fmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try split.catalogObjectLit(arena, dialect, parts)}),
-        .mysql, .starrocks, .doris => return std.fmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try split.catalogNameLit(arena, dialect, table) }),
+        .postgres => return msgfmt.allocPrint(arena, "SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass({s})", .{try split.catalogObjectLit(arena, dialect, parts)}),
+        .sqlserver => return msgfmt.allocPrint(arena, "SELECT SUM(p.rows) FROM sys.partitions p WHERE p.object_id = OBJECT_ID({s}) AND p.index_id IN (0, 1)", .{try split.catalogObjectLit(arena, dialect, parts)}),
+        .mysql, .starrocks, .doris => return msgfmt.allocPrint(arena, "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try split.catalogNameLit(arena, dialect, table) }),
     }
 }
 
@@ -210,10 +211,10 @@ pub fn statsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const
 pub fn describe(arena: std.mem.Allocator, n: u64, unit: Unit) ![]const u8 {
     const f: f64 = @floatFromInt(n);
     const u = @tagName(unit);
-    if (n < 1000) return std.fmt.allocPrint(arena, "{d} {s}", .{ n, u });
-    if (n < 1_000_000) return std.fmt.allocPrint(arena, "{d:.1}k {s}", .{ f / 1e3, u });
-    if (n < 1_000_000_000) return std.fmt.allocPrint(arena, "{d:.1}M {s}", .{ f / 1e6, u });
-    return std.fmt.allocPrint(arena, "{d:.1}G {s}", .{ f / 1e9, u });
+    if (n < 1000) return msgfmt.allocPrint(arena, "{d} {s}", .{ n, u });
+    if (n < 1_000_000) return msgfmt.allocPrint(arena, "{d:.1}k {s}", .{ f / 1e3, u });
+    if (n < 1_000_000_000) return msgfmt.allocPrint(arena, "{d:.1}M {s}", .{ f / 1e6, u });
+    return msgfmt.allocPrint(arena, "{d:.1}G {s}", .{ f / 1e9, u });
 }
 
 const testing = std.testing;

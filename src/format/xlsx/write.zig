@@ -40,6 +40,7 @@ const read = @import("read.zig");
 const serial = @import("serial.zig");
 const utf16 = @import("../utf16.zig");
 const escape = @import("../xml/escape.zig");
+const msgfmt = @import("../msgfmt.zig");
 
 pub const max_cols = 16384;
 pub const max_rows = 1048576;
@@ -231,8 +232,9 @@ pub const Writer = struct {
 const sink_vtable = driver.sinkVTable(Writer);
 
 fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+    @branchHint(.cold);
     var buf: [480]u8 = undefined;
-    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch fmt);
+    return eval.explain(e, msgfmt.bufPrint(&buf, fmt, args) catch fmt);
 }
 
 fn tooLong(row: u32, ref: []const u8) anyerror {
@@ -331,7 +333,7 @@ test "Excel's bounds: columns refused at open, a cell's characters counted, not 
 
     const ty = types.Type.init(.string).asNullable();
     const fields = try a.alloc(types.Schema.Field, max_cols + 1);
-    for (fields, 0..) |*f, i| f.* = .{ .name = try std.fmt.allocPrint(a, "c{d}", .{i}), .ty = ty };
+    for (fields, 0..) |*f, i| f.* = .{ .name = try msgfmt.allocPrint(a, "c{d}", .{i}), .ty = ty };
     try std.testing.expectError(error.XlsxTooManyColumns, Writer.open(a, path, .{ .fields = fields }, "Sheet1"));
     const wide = try Writer.open(a, path, .{ .fields = fields[0..max_cols] }, "Sheet1");
     wide.abort();

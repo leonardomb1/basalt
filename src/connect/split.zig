@@ -23,6 +23,7 @@
 //! @[splits] overrides. Each probe consumes the connection `Prober` opens for it.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const sql = @import("../db/sql.zig");
 const civil = @import("../exec/civil.zig");
 const uuid = @import("../format/uuid.zig");
@@ -64,8 +65,8 @@ pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]con
 pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const u8, pred: []const u8, extra: ?[]const u8) ![]const u8 {
     const sel = proj orelse "*";
     if (extra) |x|
-        return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s} AND ({s})", .{ sel, base, pred, x });
-    return std.fmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
+        return msgfmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s} AND ({s})", .{ sel, base, pred, x });
+    return msgfmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, base, pred });
 }
 
 /// Every primary-key column name for the table `parts` names, in key order, or
@@ -73,14 +74,14 @@ pub fn wrapProjected(arena: std.mem.Allocator, base: []const u8, proj: ?[]const 
 pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, parts: []const []const u8) ![]const []const u8 {
     const lit = try catalogLit(arena, dialect, parts);
     const query = switch (dialect) {
-        .postgres => try std.fmt.allocPrint(arena,
+        .postgres => try msgfmt.allocPrint(arena,
             \\SELECT a.attname
             \\FROM pg_index i
             \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
             \\WHERE i.indrelid = {s}::regclass AND i.indisprimary
             \\ORDER BY (SELECT k FROM generate_subscripts(i.indkey, 1) k WHERE i.indkey[k] = a.attnum)
         , .{lit}),
-        .sqlserver => try std.fmt.allocPrint(arena,
+        .sqlserver => try msgfmt.allocPrint(arena,
             \\SELECT c.name
             \\FROM sys.indexes i
             \\JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
@@ -88,7 +89,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
             \\WHERE i.object_id = OBJECT_ID({s}) AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{lit}),
-        .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks, .doris => try msgfmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\WHERE k.CONSTRAINT_NAME = 'PRIMARY' AND {s}
@@ -115,7 +116,7 @@ pub fn introspectPkCols(arena: std.mem.Allocator, prober: Prober, dialect: Diale
 pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, parts: []const []const u8) !?KeyInfo {
     const lit = try catalogLit(arena, dialect, parts);
     const query = switch (dialect) {
-        .postgres => try std.fmt.allocPrint(arena,
+        .postgres => try msgfmt.allocPrint(arena,
             \\SELECT a.attname, t.typname, c.reltuples::bigint
             \\FROM pg_index i
             \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
@@ -123,7 +124,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\JOIN pg_class c ON c.oid = i.indrelid
             \\WHERE i.indrelid = {s}::regclass AND i.indisprimary
         , .{lit}),
-        .sqlserver => try std.fmt.allocPrint(arena,
+        .sqlserver => try msgfmt.allocPrint(arena,
             \\SELECT c.name, ty.name, p.rows
             \\FROM sys.indexes i
             \\JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
@@ -133,7 +134,7 @@ pub fn introspectKey(arena: std.mem.Allocator, prober: Prober, dialect: Dialect,
             \\WHERE i.object_id = OBJECT_ID({s}) AND i.is_primary_key = 1
             \\ORDER BY ic.key_ordinal
         , .{lit}),
-        .mysql, .starrocks, .doris => try std.fmt.allocPrint(arena,
+        .mysql, .starrocks, .doris => try msgfmt.allocPrint(arena,
             \\SELECT k.COLUMN_NAME, c.DATA_TYPE, t.TABLE_ROWS
             \\FROM information_schema.KEY_COLUMN_USAGE k
             \\JOIN information_schema.COLUMNS c ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
@@ -218,7 +219,7 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
 /// The key's MIN and MAX over `base`, as the driver types them; null when the
 /// probe fails or the table is empty.
 fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?[2]Value {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
+    const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -236,7 +237,7 @@ fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []co
 /// A `LIMIT 1` probe so a forced uuid split does not fan out over an empty table.
 /// A failed probe returns true; only a confirmed empty result skips the split.
 fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
-    const q = try std.fmt.allocPrint(arena, "SELECT 1 FROM ({s}) _e LIMIT 1", .{base});
+    const q = try msgfmt.allocPrint(arena, "SELECT 1 FROM ({s}) _e LIMIT 1", .{base});
     const conn = prober.open() catch return true;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -261,7 +262,7 @@ fn intKey(v: Value) ?i128 {
 }
 
 fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?IntBounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
+    const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -283,7 +284,7 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
 /// overflow i128, as bounds near a DECIMAL(38,0)'s limits can.
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i128, max: i128, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
-    const one = try std.fmt.allocPrint(arena, "({s} >= {d} OR {s} IS NULL)", .{ qcol, min, qcol });
+    const one = try msgfmt.allocPrint(arena, "({s} >= {d} OR {s} IS NULL)", .{ qcol, min, qcol });
     const span: i128 = std.math.add(i128, std.math.sub(i128, max, min) catch return dupeOne(arena, one), 1) catch return dupeOne(arena, one);
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
@@ -295,13 +296,13 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         const off: i128 = std.math.mul(i128, @intCast(k), width) catch return dupeOne(arena, one);
         const lo: i128 = std.math.add(i128, min, off) catch return dupeOne(arena, one);
         if (k == m - 1) {
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
+            try list.append(try msgfmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
         } else {
             const hi: i128 = std.math.add(i128, lo, width) catch return dupeOne(arena, one);
             if (k == 0) {
-                try list.append(try std.fmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
+                try list.append(try msgfmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
             } else {
-                try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
+                try list.append(try msgfmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
             }
         }
     }
@@ -311,7 +312,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
 /// MIN/MAX of a date/timestamp key as days since 1970, or null when the cursor
 /// did not yield `.date` or `.timestamp` (e.g. a driver left it as text).
 fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
+    const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
         conn.close();
@@ -339,12 +340,12 @@ fn dayOf(v: Value) ?i64 {
 /// when a bound is a day the dialect cannot name, rather than one it misreads.
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
-    const whole = try std.fmt.allocPrint(arena, "({s} IS NULL OR {s} IS NOT NULL)", .{ qcol, qcol });
+    const whole = try msgfmt.allocPrint(arena, "({s} IS NULL OR {s} IS NOT NULL)", .{ qcol, qcol });
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
-        const one = try std.fmt.allocPrint(arena, "({s} >= {s} OR {s} IS NULL)", .{ qcol, (try sql.dateLit(arena, dialect, min_day)) orelse return dupeOne(arena, whole), qcol });
+        const one = try msgfmt.allocPrint(arena, "({s} >= {s} OR {s} IS NULL)", .{ qcol, (try sql.dateLit(arena, dialect, min_day)) orelse return dupeOne(arena, whole), qcol });
         return try dupeOne(arena, one);
     }
     const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
@@ -354,14 +355,14 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
         const lo: i64 = @intCast(@as(i128, min_day) + @as(i128, @intCast(k)) * width);
         const lo_lit = (try sql.dateLit(arena, dialect, lo)) orelse return dupeOne(arena, whole);
         if (k == m - 1) {
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= {s}", .{ qcol, lo_lit }));
+            try list.append(try msgfmt.allocPrint(arena, "{s} >= {s}", .{ qcol, lo_lit }));
         } else {
             const hi: i64 = @intCast(@as(i128, lo) + width);
             const hi_lit = (try sql.dateLit(arena, dialect, hi)) orelse return dupeOne(arena, whole);
             if (k == 0) {
-                try list.append(try std.fmt.allocPrint(arena, "(({s} >= {s} AND {s} < {s}) OR {s} IS NULL)", .{ qcol, lo_lit, qcol, hi_lit, qcol }));
+                try list.append(try msgfmt.allocPrint(arena, "(({s} >= {s} AND {s} < {s}) OR {s} IS NULL)", .{ qcol, lo_lit, qcol, hi_lit, qcol }));
             } else {
-                try list.append(try std.fmt.allocPrint(arena, "{s} >= {s} AND {s} < {s}", .{ qcol, lo_lit, qcol, hi_lit }));
+                try list.append(try msgfmt.allocPrint(arena, "{s} >= {s} AND {s} < {s}", .{ qcol, lo_lit, qcol, hi_lit }));
             }
         }
     }
@@ -376,11 +377,11 @@ fn uuidSpacePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
         const lo = if (k == 0) null else try uuidAt(arena, k, m);
         const hi = if (k == m - 1) null else try uuidAt(arena, k + 1, m);
         if (lo == null) {
-            try list.append(try std.fmt.allocPrint(arena, "({s} < '{s}' OR {s} IS NULL)", .{ qcol, hi.?, qcol }));
+            try list.append(try msgfmt.allocPrint(arena, "({s} < '{s}' OR {s} IS NULL)", .{ qcol, hi.?, qcol }));
         } else if (hi == null) {
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, lo.? }));
+            try list.append(try msgfmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, lo.? }));
         } else {
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, lo.?, qcol, hi.? }));
+            try list.append(try msgfmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, lo.?, qcol, hi.? }));
         }
     }
     return list.toOwnedSlice();
@@ -414,7 +415,7 @@ pub fn catalogObjectLit(arena: std.mem.Allocator, dialect: Dialect, parts: []con
 fn catalogLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
     return switch (dialect) {
         .postgres, .sqlserver => catalogObjectLit(arena, dialect, parts),
-        .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "k.TABLE_SCHEMA = {s} AND k.TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try catalogNameLit(arena, dialect, parts[parts.len - 1]) }),
+        .mysql, .starrocks, .doris => msgfmt.allocPrint(arena, "k.TABLE_SCHEMA = {s} AND k.TABLE_NAME = {s}", .{ try sql.schemaLit(arena, dialect, parts), try catalogNameLit(arena, dialect, parts[parts.len - 1]) }),
     };
 }
 
@@ -591,7 +592,7 @@ test "uuid boundaries: the shared uuid text gives the old allocPrint text for ev
             const val: u128 = @intCast((@as(u256, k) << 128) / @as(u256, m));
             var b: [16]u8 = undefined;
             std.mem.writeInt(u128, &b, val, .big);
-            const want = try std.fmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+            const want = try msgfmt.allocPrint(a, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
                 b[0], b[1], b[2],  b[3],  b[4],  b[5],  b[6],  b[7],
                 b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
             });

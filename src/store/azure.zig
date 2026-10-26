@@ -38,6 +38,7 @@
 //! loop, the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
@@ -91,12 +92,12 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
 
     const base = try containerBase(arena, account, container, endpoint);
     const enc = try objstore.uriEncode(arena, path, .keep_slash);
-    const url_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base.path, enc });
+    const url_path = try msgfmt.allocPrint(arena, "{s}/{s}", .{ base.path, enc });
     return .{
         .account = account,
         .container = container,
         .path = enc,
-        .url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ base.url, enc }),
+        .url = try msgfmt.allocPrint(arena, "{s}/{s}", .{ base.url, enc }),
         .canonical_resource = try canonicalResource(arena, account, url_path),
     };
 }
@@ -105,13 +106,13 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
 /// `/<account>/<container>` against a path-style `endpoint`.
 fn containerBase(arena: std.mem.Allocator, account: []const u8, container: []const u8, endpoint: ?[]const u8) !struct { url: []const u8, path: []const u8 } {
     const path = if (endpoint == null)
-        try std.fmt.allocPrint(arena, "/{s}", .{container})
+        try msgfmt.allocPrint(arena, "/{s}", .{container})
     else
-        try std.fmt.allocPrint(arena, "/{s}/{s}", .{ account, container });
+        try msgfmt.allocPrint(arena, "/{s}/{s}", .{ account, container });
     const url = if (endpoint) |ep|
-        try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), path })
+        try msgfmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimRight(u8, ep, "/"), path })
     else
-        try std.fmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, path });
+        try msgfmt.allocPrint(arena, "https://{s}.blob.core.windows.net{s}", .{ account, path });
     return .{ .url = url, .path = path };
 }
 
@@ -119,7 +120,7 @@ fn containerBase(arena: std.mem.Allocator, account: []const u8, container: []con
 /// that path already begins with the account, so it legitimately appears twice
 /// (`/devstoreaccount1/devstoreaccount1/lake/f.csv`); signing it once is a bare 403.
 pub fn canonicalResource(arena: std.mem.Allocator, account: []const u8, url_path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "/{s}{s}", .{ account, url_path });
+    return msgfmt.allocPrint(arena, "/{s}{s}", .{ account, url_path });
 }
 
 pub fn endpointFromEnv(arena: std.mem.Allocator) ?[]const u8 {
@@ -193,7 +194,7 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     const enc = std.base64.standard.Encoder;
     const sig = try arena.alloc(u8, enc.calcSize(mac.len));
     _ = enc.encode(sig, &mac);
-    return std.fmt.allocPrint(arena, "SharedKey {s}:{s}", .{ account, sig });
+    return msgfmt.allocPrint(arena, "SharedKey {s}:{s}", .{ account, sig });
 }
 
 /// Signed headers for any verb; `range` is `bytes=a-b` or empty for the whole object.
@@ -313,12 +314,12 @@ pub const BlockBlobWriter = struct {
         const id = try self.blockId(self.block_ids.items.len);
         const a = self.up.fresh();
         const id_enc = try objstore.uriEncode(a, id, .encode_slash);
-        const url = try std.fmt.allocPrint(a, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
+        const url = try msgfmt.allocPrint(a, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
 
         const sign = Sign{
             .content_length = bytes.len,
             .query = &.{
-                try std.fmt.allocPrint(a, "blockid:{s}", .{id}),
+                try msgfmt.allocPrint(a, "blockid:{s}", .{id}),
                 "comp:block",
             },
         };
@@ -359,7 +360,7 @@ pub const BlockBlobWriter = struct {
         }
         try body.appendSlice("</BlockList>");
 
-        const url = try std.fmt.allocPrint(a, "{s}?comp=blocklist", .{self.blob.url});
+        const url = try msgfmt.allocPrint(a, "{s}?comp=blocklist", .{self.blob.url});
         const sign = Sign{
             .ms_headers = &.{.{ .name = "x-ms-blob-content-type", .value = self.content_type }},
             .content_length = body.items.len,
@@ -437,7 +438,7 @@ pub const BlockBlobWriter = struct {
     /// Create the container; 409 (already exists) counts as success.
     fn createContainer(self: *BlockBlobWriter) !void {
         const base = self.blob.url[0 .. self.blob.url.len - self.blob.path.len - 1];
-        const url = try std.fmt.allocPrint(self.up.alloc(), "{s}?restype=container", .{base});
+        const url = try msgfmt.allocPrint(self.up.alloc(), "{s}?restype=container", .{base});
         const canon = self.blob.canonical_resource[0 .. self.blob.canonical_resource.len - self.blob.path.len - 1];
 
         const hdrs = try signedHeaders(self.up.alloc(), self.blob.account, self.key, .{
@@ -746,14 +747,14 @@ const ListPage = struct {
 
     fn page(c: ListPage, marker: []const u8) ![]const u8 {
         const url = if (marker.len == 0)
-            try std.fmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash) })
+            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash) })
         else
-            try std.fmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash), try objstore.uriEncode(c.arena, marker, .encode_slash) });
+            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash), try objstore.uriEncode(c.arena, marker, .encode_slash) });
 
         var q = std.array_list.Managed([]const u8).init(c.arena);
         try q.append("comp:list");
-        if (marker.len > 0) try q.append(try std.fmt.allocPrint(c.arena, "marker:{s}", .{marker}));
-        try q.append(try std.fmt.allocPrint(c.arena, "prefix:{s}", .{c.prefix}));
+        if (marker.len > 0) try q.append(try msgfmt.allocPrint(c.arena, "marker:{s}", .{marker}));
+        try q.append(try msgfmt.allocPrint(c.arena, "prefix:{s}", .{c.prefix}));
         try q.append("restype:container");
 
         var body: []const u8 = "";
@@ -857,7 +858,7 @@ fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const
     const p = try parsePrefix(url);
     const names = try listPrefix(arena, client, p.account, p.container, p.prefix, endpointFromEnv(arena));
     const urls = try arena.alloc([]const u8, names.len);
-    for (names, urls) |n, *u| u.* = try std.fmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
+    for (names, urls) |n, *u| u.* = try msgfmt.allocPrint(arena, "az://{s}/{s}/{s}", .{ p.account, p.container, n });
     return urls;
 }
 
@@ -918,7 +919,7 @@ test "rfc1123 on civil writes exactly what the hand-rolled one did, years 0000 t
             const dow: usize = @intCast(@mod(days + 4, 7));
             const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
             const mon_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-            return std.fmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+            return msgfmt.allocPrint(arena, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
                 day_names[dow],          c.d,                mon_names[c.m - 1],
                 @as(u32, @intCast(c.y)), secs_of_day / 3600, (secs_of_day % 3600) / 60,
                 secs_of_day % 60,

@@ -13,6 +13,7 @@ const binOpText = @import("../sql_parser.zig").binOpText;
 const outName = @import("../sql_parser.zig").outName;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
 
@@ -341,7 +342,7 @@ fn stripSearchCols(p: *Parser, c: ast.Expr.Call, aliases: *const AliasSet) Error
             o.* = try p.mk(.{ .str_lit = "*@" });
         } else if (std.mem.startsWith(u8, item, "=")) {
             if (std.mem.indexOfScalar(u8, item, '.')) |dot| if (aliases.strips(item[1..dot])) {
-                o.* = try p.mk(.{ .str_lit = try std.fmt.allocPrint(p.arena, "={s}", .{item[dot + 1 ..]}) });
+                o.* = try p.mk(.{ .str_lit = try msgfmt.allocPrint(p.arena, "={s}", .{item[dot + 1 ..]}) });
             };
         }
     }
