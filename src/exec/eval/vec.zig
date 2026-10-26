@@ -850,7 +850,7 @@ const StoreSink = struct {
 /// kernel when `decLane` plans one, else row by row.
 fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bool) VecError!void {
     if (decLane(op, l, r)) |lane| return switch (op) {
-        inline .add, .sub, .mul => |cop| switch (lane.lk) {
+        inline .add, .sub, .mul, .mod => |cop| switch (lane.lk) {
             inline else => |lk| switch (lane.rk) {
                 inline else => |rk| if (comptime !laneShape(cop, lk, rk))
                     unreachable
@@ -875,7 +875,7 @@ const Side = decimal.Side;
 /// column with a constant.
 fn laneShape(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side) bool {
     if (lk == .one and rk == .one or lk == .int and rk == .int) return false;
-    if (op == .sub) return true;
+    if (op == .sub or op == .mod) return true;
     return lk == .dec or (lk == .int and rk == .one);
 }
 
@@ -913,11 +913,11 @@ const DecLane = struct {
 };
 
 /// The lane plan for `op` over `l` and `r`, a commutative op's operands swapped to
-/// a `laneShape`; null when no lane fits (`%`, `/`, two constants, two INT
+/// a `laneShape`; null when no lane fits (`/`, two constants, two INT
 /// columns, or a scale `lanePlan` refuses), and the rows take `decimalOp`.
 noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
-    if (op != .add and op != .sub and op != .mul) return null;
-    const swap = op != .sub and (sideOf(l0) == .one or sideOf(l0) == .int and sideOf(r0) == .dec);
+    if (op != .add and op != .sub and op != .mul and op != .mod) return null;
+    const swap = (op == .add or op == .mul) and (sideOf(l0) == .one or sideOf(l0) == .int and sideOf(r0) == .dec);
     const l = if (swap) r0 else l0;
     const r = if (swap) l0 else r0;
     const lk = sideOf(l);
@@ -941,7 +941,7 @@ noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
 }
 
 /// Row `i`'s `decimalOp`, out of line: the lanes call it only for a row they cannot
-/// settle, and `/` and `%` for every row.
+/// settle, and `/` for every row.
 noinline fn decRow(op: ast.BinOp, l: *const Vec, r: *const Vec, i: usize) VecError!Decimal {
     return try (decimalOp(op, decAt(l.*, i), decAt(r.*, i)) orelse unreachable);
 }
