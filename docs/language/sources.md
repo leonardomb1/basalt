@@ -259,7 +259,7 @@ A complete REST read, for orientation:
 
 ```sql
 CREATE CONNECTION crates TYPE http OPTIONS (base_url = 'https://crates.io/api/v1')
-  RETRY 2 ON (429, 503);
+  RETRY 2;
 
 SELECT id AS crate, downloads, json_get(links, 'owners') AS owners
 FROM crates.GET('/crates', sort = 'downloads', per_page = 100)
