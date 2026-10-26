@@ -16,8 +16,8 @@
 //! parallel reader's byte-range chunking. Byte `b` of latin-1 is U+00`b`, so no
 //! byte sequence can hold a delimiter or newline. Files labelled latin-1 are
 //! often really cp1252, whose 0x80–0x9F block holds curly quotes, dashes and the
-//! euro sign (its five unassigned slots decode to their C1 controls, as SQL Server
-//! reads them, and encode back).
+//! euro sign (its five unassigned slots decode to their C1 controls, as Windows'
+//! bestfit1252 table, WHATWG and MySQL read them, and encode back).
 //!
 //! Where the bytes come from (a file, a URL, an object, SFTP, SMB, a zip member)
 //! and their gzip or zstd decoding is `stream.zig`'s; the reader parses its
@@ -1837,7 +1837,7 @@ test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
     try std.testing.expectEqualStrings("CANCELADA", b.columns[0].data.bytes.at(1));
 }
 
-test "csv dialect: a cp1252 file reads its unassigned bytes as C1 controls, as SQL Server does (D5)" {
+test "csv dialect: a cp1252 file reads its unassigned bytes as C1 controls, as WHATWG and MySQL do (D5)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

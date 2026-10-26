@@ -177,7 +177,8 @@ source is asked to do are on [Pushdown](pushdown.md).
   input is decoded to UTF-8 as it is read, so everything downstream — comparisons,
   `length()`, a parquet sink — sees proper text. The five bytes cp1252 leaves
   unassigned (0x81, 0x8D, 0x8F, 0x90, 0x9D) read as the C1 controls U+0081 …
-  U+009D, as SQL Server, MySQL and browsers read them, so no byte is lost and the
+  U+009D, as Windows' code page 1252 best-fit table, the WHATWG Encoding standard
+  and MySQL read them, so no byte is lost and the
   text writes back to the same bytes. A local file read with a dialect
   still fans out over byte-range chunks under `-j`, each lane decoding its chunk
   in that dialect. Multi-byte encodings are not supported: they would break that

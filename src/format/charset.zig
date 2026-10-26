@@ -4,8 +4,8 @@
 //! charset's bytes, refusing a character it cannot hold rather than substituting one.
 //!
 //! The five bytes windows-1252 leaves unassigned (0x81, 0x8D, 0x8F, 0x90, 0x9D) are
-//! their C1 controls, as Microsoft's own table, SQL Server, WHATWG, ICU and MySQL read
-//! them: lossless, so every byte decodes and encodes back to itself.
+//! their C1 controls, as Windows' bestfit1252 table, the WHATWG Encoding standard and
+//! MySQL read them: lossless, so every byte decodes and encodes back to itself.
 
 const std = @import("std");
 const celltext = @import("../exec/celltext.zig");
