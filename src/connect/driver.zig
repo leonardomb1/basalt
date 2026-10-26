@@ -129,6 +129,10 @@ pub fn tuneSocket(handle: std.posix.socket_t) void {
     }
 }
 
+/// How long one request may take, its retries included, unless its read says
+/// otherwise: an HTTP page or login, an identity provider's token call, a KDC exchange.
+pub const request_timeout_ms: i64 = 300_000;
+
 /// How `dial` sets a socket up. `tune = false` keeps the OS defaults, for a one-shot
 /// exchange that neither idles nor streams (a KDC request, a TLS chain probe);
 /// `io_timeout_s` adds read and write timeouts so a silent server fails the call.

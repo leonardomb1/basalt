@@ -43,6 +43,28 @@ pub fn contentLength(head: []const u8) usize {
     return 0;
 }
 
+/// Set by a test once it is done with a `serveThenHang` server, so the hung
+/// connection closes and the thread can be joined.
+pub var hang_released = std.atomic.Value(bool).init(false);
+
+/// Answers one connection per reply in `replies`, then accepts one more, reads its
+/// request and never answers it until `hang_released` (or ~10s): a black-holed endpoint.
+pub fn serveThenHang(listener: *std.net.Server, replies: []const []const u8) void {
+    for (replies) |r| {
+        const conn = listener.accept() catch return;
+        defer conn.stream.close();
+        var rb: [2048]u8 = undefined;
+        _ = conn.stream.read(&rb) catch return;
+        conn.stream.writeAll(r) catch return;
+    }
+    const conn = listener.accept() catch return;
+    var rb: [2048]u8 = undefined;
+    _ = conn.stream.read(&rb) catch return;
+    var waited: usize = 0;
+    while (!hang_released.load(.seq_cst) and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);
+    conn.stream.close();
+}
+
 /// A scripted HTTP/1.1 server for request-path tests: each connection gets the next
 /// reply, `null` resetting it unanswered; past the script every request gets a 418.
 /// Request lines are recorded so a test can check what was replayed.

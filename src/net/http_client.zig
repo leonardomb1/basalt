@@ -417,6 +417,57 @@ pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
 
 pub const Mode = enum { none, page, offset, cursor };
 
+/// The deadline and retries one request runs under, a page's from its read's
+/// `timeout_ms`, `retries` and `retry_base_ms`; a SQL Server AAD token call takes
+/// the defaults.
+pub const Deadline = struct {
+    timeout_ms: i64 = driver.request_timeout_ms,
+    retries: i64 = 2,
+    retry_base_ms: i64 = 500,
+};
+
+/// One request a slot's worker sends.
+pub const Request = struct {
+    url: []const u8,
+    body: ?[]const u8 = null,
+    post: bool = false,
+    content_type: ?[]const u8 = null,
+};
+
+pub const Reply = struct { code: u16, body: []u8 };
+
+/// A request outside any read, such as an identity provider's realm or token call,
+/// sent exactly as a page is: on a slot's worker under `dl`'s deadline and
+/// `driver.transientStatus` retries, so a black-holed endpoint is ConnectionTimedOut.
+/// The slot owns its client, so an abandoned worker frees both; the body is `gpa`'s.
+pub fn request(gpa: std.mem.Allocator, req: Request, dl: Deadline) !Reply {
+    if (driver.aborting()) return error.Aborted;
+    const client = try gpa.create(std.http.Client);
+    client.* = initClient(gpa);
+    const slot = HttpSource.makeSlot(gpa, client, req, dl, user_agent, 0) catch |e| {
+        client.deinit();
+        gpa.destroy(client);
+        return e;
+    };
+    slot.owns_client = true;
+    HttpSource.startSlot(slot) catch |e| {
+        HttpSource.freeSlot(slot);
+        return e;
+    };
+    var red_buf: [512]u8 = undefined;
+    HttpSource.waitSlot(slot, deadlineAfter(dl.timeout_ms)) catch |e| {
+        obs.logOr(null, .warn, "request abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, req.url) });
+        return e;
+    };
+    defer HttpSource.freeSlot(slot);
+    if (slot.err) |e| return mapTransport(e);
+    return .{ .code = slot.code, .body = try gpa.dupe(u8, slot.body) };
+}
+
+fn deadlineAfter(timeout_ms: i64) i64 {
+    return if (timeout_ms > 0) std.time.milliTimestamp() +| timeout_ms else std.math.maxInt(i64);
+}
+
 pub const Options = struct {
     bearer: ?[]const u8 = null,
     bearer_env: ?[]const u8 = null,
@@ -439,9 +490,9 @@ pub const Options = struct {
     cursor_field: []const u8 = "next",
     max_pages: i64 = 10_000,
     prefetch: i64 = 1,
-    retries: i64 = 2,
-    retry_base_ms: i64 = 500,
-    timeout_ms: i64 = 300_000,
+    retries: i64 = (Deadline{}).retries,
+    retry_base_ms: i64 = (Deadline{}).retry_base_ms,
+    timeout_ms: i64 = (Deadline{}).timeout_ms,
     progress_ms: i64 = 30_000,
     retry_statuses: ?[]const u8 = null,
     logger: ?*obs.Logger = null,
@@ -568,12 +619,47 @@ pub const HttpSource = struct {
         code: u16 = 0,
         body: []const u8 = &.{},
         err: ?anyerror = null,
+        owns_client: bool = false,
     };
 
     fn freeSlot(slot: *Slot) void {
         const gpa = slot.gpa;
+        if (slot.owns_client) {
+            slot.client.deinit();
+            gpa.destroy(slot.client);
+        }
         slot.snap.deinit();
         gpa.destroy(slot);
+    }
+
+    /// A slot for `req` with everything it reads copied into its own arena, not yet
+    /// started.
+    fn makeSlot(gpa: std.mem.Allocator, client: *std.http.Client, req: Request, dl: Deadline, ua: []const u8, gen: u32) !*Slot {
+        const slot = try gpa.create(Slot);
+        slot.* = .{
+            .gpa = gpa,
+            .snap = std.heap.ArenaAllocator.init(gpa),
+            .client = client,
+            .method_post = req.post,
+            .content_type = null,
+            .user_agent = undefined,
+            .url = undefined,
+            .gen = gen,
+            .retries = dl.retries,
+            .retry_base_ms = dl.retry_base_ms,
+        };
+        errdefer freeSlot(slot);
+        const sa = slot.snap.allocator();
+        slot.user_agent = try sa.dupe(u8, ua);
+        slot.url = try sa.dupe(u8, req.url);
+        if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
+        if (req.content_type) |ct| slot.content_type = try sa.dupe(u8, ct);
+        return slot;
+    }
+
+    fn startSlot(slot: *Slot) !void {
+        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
+        th.detach();
     }
 
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, url: []const u8, opts: Options) !*HttpSource {
@@ -860,27 +946,11 @@ pub const HttpSource = struct {
 
     /// A page carries the source's headers and auth; a login carries neither.
     fn spawnSlotFor(self: *HttpSource, req: PageReq, post: bool, content_type: ?[]const u8, page: bool) !*Slot {
-        const slot = try self.gpa.create(Slot);
-        slot.* = .{
-            .gpa = self.gpa,
-            .snap = std.heap.ArenaAllocator.init(self.gpa),
-            .client = self.client,
-            .method_post = post,
-            .content_type = content_type,
-            .user_agent = userAgentOf(self.opts),
-            .url = undefined,
-            .gen = self.auth_gen,
-            .retries = self.opts.retries,
-            .retry_base_ms = self.opts.retry_base_ms,
-        };
+        const dl: Deadline = .{ .timeout_ms = self.opts.timeout_ms, .retries = self.opts.retries, .retry_base_ms = self.opts.retry_base_ms };
+        const slot = try makeSlot(self.gpa, self.client, .{ .url = req.url, .body = req.body, .post = post, .content_type = content_type }, dl, userAgentOf(self.opts), self.auth_gen);
         errdefer freeSlot(slot);
-        const sa = slot.snap.allocator();
-        slot.user_agent = try sa.dupe(u8, slot.user_agent);
-        slot.url = try sa.dupe(u8, req.url);
-        if (req.body) |b| slot.req_body = try sa.dupe(u8, b);
         if (page) try self.snapshotInto(slot);
-        var th = try std.Thread.spawn(.{}, workerMain, .{slot});
-        th.detach();
+        try startSlot(slot);
         return slot;
     }
 
@@ -948,14 +1018,19 @@ pub const HttpSource = struct {
     /// Waits under the page deadline, polling so Ctrl+C interrupts within ~25ms. On
     /// timeout or abort the slot is abandoned to its worker and counted as a zombie.
     fn awaitSlot(self: *HttpSource, slot: *Slot) !void {
-        const deadline: i64 = if (self.opts.timeout_ms > 0)
-            std.time.milliTimestamp() +| self.opts.timeout_ms
-        else
-            std.math.maxInt(i64);
-        return self.awaitSlotUntil(slot, deadline);
+        return self.awaitSlotUntil(slot, deadlineAfter(self.opts.timeout_ms));
     }
 
     fn awaitSlotUntil(self: *HttpSource, slot: *Slot, deadline: i64) !void {
+        waitSlot(slot, deadline) catch |e| {
+            self.zombies += 1;
+            return e;
+        };
+    }
+
+    /// Waits until `deadline`, polling so Ctrl+C interrupts within ~25ms. On timeout or
+    /// abort the slot is abandoned to its worker, which frees it.
+    fn waitSlot(slot: *Slot, deadline: i64) !void {
         while (true) {
             if (slot.state.load(.acquire) == @intFromEnum(SlotState.done)) return;
             if (driver.aborting() or std.time.milliTimestamp() >= deadline) {
@@ -965,7 +1040,6 @@ pub const HttpSource = struct {
                     .acq_rel,
                     .acquire,
                 ) == null) {
-                    self.zombies += 1;
                     return if (driver.aborting()) error.Aborted else error.ConnectionTimedOut;
                 }
                 return;
@@ -1724,27 +1798,6 @@ test "statusListed parses comma lists with spaces" {
     try std.testing.expect(!statusListed("garbage,abc", 404));
 }
 
-var hang_released = std.atomic.Value(bool).init(false);
-
-fn serveOneThenHang(listener: *std.net.Server) void {
-    const body = "[{\"id\":1}]";
-    {
-        const conn = listener.accept() catch return;
-        defer conn.stream.close();
-        var rb: [2048]u8 = undefined;
-        _ = conn.stream.read(&rb) catch return;
-        var wb: [256]u8 = undefined;
-        const head = std.fmt.bufPrint(&wb, "HTTP/1.1 200 OK\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
-        conn.stream.writeAll(head) catch return;
-    }
-    const conn = listener.accept() catch return;
-    var rb: [2048]u8 = undefined;
-    _ = conn.stream.read(&rb) catch return;
-    var waited: usize = 0;
-    while (!hang_released.load(.seq_cst) and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);
-    conn.stream.close();
-}
-
 test "a black-holed page request times out instead of hanging the run" {
     var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer ar.deinit();
@@ -1752,10 +1805,11 @@ test "a black-holed page request times out instead of hanging the run" {
 
     var listener = try http_fake.listen(128);
     defer listener.deinit();
-    hang_released.store(false, .seq_cst);
-    const th = try std.Thread.spawn(.{}, serveOneThenHang, .{&listener});
+    http_fake.hang_released.store(false, .seq_cst);
+    const one_page = [_][]const u8{http_fake.FakeServer.reply("200 OK", "", "[{\"id\":1}]")};
+    const th = try std.Thread.spawn(.{}, http_fake.serveThenHang, .{ &listener, @as([]const []const u8, &one_page) });
     defer th.join();
-    defer hang_released.store(true, .seq_cst);
+    defer http_fake.hang_released.store(true, .seq_cst);
 
     const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{listener.listen_address.getPort()});
     const s = try HttpSource.open(a, std.heap.page_allocator, url, .{
@@ -1772,22 +1826,6 @@ test "a black-holed page request times out instead of hanging the run" {
     try std.testing.expect(waited >= 350 and waited < 5_000);
 }
 
-fn serveThenHang(listener: *std.net.Server, replies: []const []const u8) void {
-    for (replies) |r| {
-        const conn = listener.accept() catch return;
-        defer conn.stream.close();
-        var rb: [2048]u8 = undefined;
-        _ = conn.stream.read(&rb) catch return;
-        conn.stream.writeAll(r) catch return;
-    }
-    const conn = listener.accept() catch return;
-    var rb: [2048]u8 = undefined;
-    _ = conn.stream.read(&rb) catch return;
-    var waited: usize = 0;
-    while (!hang_released.load(.seq_cst) and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);
-    conn.stream.close();
-}
-
 test "a page replayed after a re-login times out like any page" {
     var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer ar.deinit();
@@ -1795,15 +1833,15 @@ test "a page replayed after a re-login times out like any page" {
 
     var listener = try http_fake.listen(128);
     defer listener.deinit();
-    hang_released.store(false, .seq_cst);
+    http_fake.hang_released.store(false, .seq_cst);
     const replies = [_][]const u8{
         "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n\"tok-A\"",
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\n\"tok-B\"",
     };
-    const th = try std.Thread.spawn(.{}, serveThenHang, .{ &listener, @as([]const []const u8, &replies) });
+    const th = try std.Thread.spawn(.{}, http_fake.serveThenHang, .{ &listener, @as([]const []const u8, &replies) });
     defer th.join();
-    defer hang_released.store(true, .seq_cst);
+    defer http_fake.hang_released.store(true, .seq_cst);
 
     const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
     const started = std.time.milliTimestamp();
@@ -1826,10 +1864,10 @@ test "a black-holed login, first or after a 401, times out instead of hanging th
     for (cases) |replies| {
         var listener = try http_fake.listen(128);
         defer listener.deinit();
-        hang_released.store(false, .seq_cst);
-        const th = try std.Thread.spawn(.{}, serveThenHang, .{ &listener, replies });
+        http_fake.hang_released.store(false, .seq_cst);
+        const th = try std.Thread.spawn(.{}, http_fake.serveThenHang, .{ &listener, replies });
         defer th.join();
-        defer hang_released.store(true, .seq_cst);
+        defer http_fake.hang_released.store(true, .seq_cst);
 
         const base = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}", .{listener.listen_address.getPort()});
         const started = std.time.milliTimestamp();

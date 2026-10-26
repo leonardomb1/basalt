@@ -9,6 +9,10 @@
 //!     is exchanged at AAD via the SAML-bearer grant (v1.0 endpoint with
 //!     `resource`, like ADAL's federated flow).
 //!
+//! Every request goes through `http_client.request`, under the same deadline and
+//! retries as an HTTP read's page, so a hung identity provider fails the connect with
+//! ConnectionTimedOut instead of hanging the run.
+//!
 //! No MFA: the password flow cannot satisfy an interactive challenge. The ADO.NET
 //! first-party client id (`ado_client_id`) is pre-consented in every tenant, which
 //! is why no registration is needed.
@@ -20,6 +24,7 @@ const http_client = @import("../../net/http_client.zig");
 const xmlescape = @import("../../format/xml/escape.zig");
 const civil = @import("../../exec/civil.zig");
 const uuid = @import("../../format/uuid.zig");
+const http_fake = @import("../../testing/http_fake.zig");
 
 threadlocal var why: ThreadNote(700) = .{};
 
@@ -33,23 +38,38 @@ pub const sql_resource = "https://database.windows.net";
 
 /// Token for an AAD username/password, auto-detecting managed vs federated.
 /// `resource` is the audience with no trailing slash, e.g. https://database.windows.net.
+/// A realm lookup that fails falls back to the managed flow, unless it timed out or
+/// was aborted, which ends the connect.
 pub fn passwordToken(
     gpa: std.mem.Allocator,
     client_id: []const u8,
     username: []const u8,
     password: []const u8,
     resource: []const u8,
+    dl: Deadline,
 ) ![]const u8 {
     why.clear();
-    const realm = getUserRealm(gpa, username) catch Realm{ .federated = false, .sts_url = "" };
+    const realm = getUserRealm(gpa, username, dl) catch |e| switch (e) {
+        error.ConnectionTimedOut, error.Aborted => return e,
+        else => Realm{ .federated = false, .sts_url = "" },
+    };
     defer if (realm.sts_url.len > 0) gpa.free(realm.sts_url);
     const tenant = tenantOf(username);
     if (realm.federated and realm.sts_url.len > 0) {
-        const assertion = try wsTrustAssertion(gpa, username, password, realm.sts_url);
+        const assertion = try wsTrustAssertion(gpa, username, password, realm.sts_url, dl);
         defer gpa.free(assertion);
-        return samlBearerToken(gpa, tenant, client_id, assertion, resource);
+        return samlBearerToken(gpa, tenant, client_id, assertion, resource, dl);
     }
-    return ropcToken(gpa, tenant, client_id, username, password, resource);
+    return ropcToken(gpa, tenant, client_id, username, password, resource, dl);
+}
+
+/// A failed request as the token flow reports it: a deadline or an abort stays
+/// itself, so the run says it timed out; anything else is AadTokenFailed.
+fn requestFailed(e: anyerror) anyerror {
+    return switch (e) {
+        error.ConnectionTimedOut, error.Aborted, error.OutOfMemory => e,
+        else => error.AadTokenFailed,
+    };
 }
 
 fn tenantOf(upn: []const u8) []const u8 {
@@ -61,18 +81,15 @@ const Realm = struct { federated: bool, sts_url: []const u8 };
 
 /// GET getuserrealm.srf for {NameSpaceType, AuthURL}. For a federated domain,
 /// derives the WS-Trust 1.3 usernamemixed endpoint from the AuthURL host.
-fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8) !Realm {
-    var client = http_client.initClient(gpa);
-    defer client.deinit();
+fn getUserRealm(gpa: std.mem.Allocator, upn: []const u8, dl: Deadline) !Realm {
     var login_enc = std.array_list.Managed(u8).init(gpa);
     defer login_enc.deinit();
     try formEncode(&login_enc, upn);
     const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/getuserrealm.srf?login={s}&api-version=1.0", .{login_enc.items});
     defer gpa.free(url);
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    _ = try client.fetch(.{ .method = .GET, .location = .{ .url = url }, .response_writer = &aw.writer });
-    const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, aw.writer.buffered(), .{}) catch return Realm{ .federated = false, .sts_url = "" };
+    const res = try http_client.request(gpa, .{ .url = url }, dl);
+    defer gpa.free(res.body);
+    const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, res.body, .{}) catch return Realm{ .federated = false, .sts_url = "" };
     const obj = switch (root) {
         .object => |o| o,
         else => return Realm{ .federated = false, .sts_url = "" },
@@ -93,7 +110,7 @@ fn hostOf(url: []const u8) ?[]const u8 {
 
 /// POSTs a WS-Trust 1.3 RST to the ADFS usernamemixed endpoint and returns the
 /// SAML assertion XML (caller owns it).
-fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []const u8, sts_url: []const u8) ![]const u8 {
+fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []const u8, sts_url: []const u8, dl: Deadline) ![]const u8 {
     const now = std.time.timestamp();
     const created = try iso8601(gpa, now);
     defer gpa.free(created);
@@ -113,24 +130,20 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
     , .{ mid, sts_url, created, expires, uid, u_esc, p_esc });
     defer gpa.free(envelope);
 
-    var client = http_client.initClient(gpa);
-    defer client.deinit();
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    const res = client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = sts_url },
-        .headers = .{ .content_type = .{ .override = "application/soap+xml; charset=utf-8" } },
-        .payload = envelope,
-        .response_writer = &aw.writer,
-    }) catch |e| {
+    const res = http_client.request(gpa, .{
+        .url = sts_url,
+        .post = true,
+        .content_type = "application/soap+xml; charset=utf-8",
+        .body = envelope,
+    }, dl) catch |e| {
         why.print("ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
-        return error.AadTokenFailed;
+        return requestFailed(e);
     };
-    const body = aw.writer.buffered();
+    defer gpa.free(res.body);
+    const body = res.body;
     const assertion = extractElement(body, "Assertion") orelse {
         const reason = extractElement(body, "Text") orelse extractElement(body, "faultstring") orelse "";
-        why.print("ADFS WS-Trust http {d}; fault: {s}", .{ @intFromEnum(res.status), reason });
+        why.print("ADFS WS-Trust http {d}; fault: {s}", .{ res.code, reason });
         return error.AadTokenFailed;
     };
     return gpa.dupe(u8, assertion);
@@ -157,7 +170,7 @@ fn extractElement(xml: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []const u8, assertion: []const u8, resource: []const u8) ![]const u8 {
+fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []const u8, assertion: []const u8, resource: []const u8, dl: Deadline) ![]const u8 {
     const enc = std.base64.standard.Encoder;
     const b64 = try gpa.alloc(u8, enc.calcSize(assertion.len));
     defer gpa.free(b64);
@@ -173,7 +186,7 @@ fn samlBearerToken(gpa: std.mem.Allocator, tenant: []const u8, client_id: []cons
 
     const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/token", .{tenant});
     defer gpa.free(url);
-    return postForToken(gpa, url, body.items);
+    return postForToken(gpa, url, body.items, dl);
 }
 
 pub fn ropcToken(
@@ -183,6 +196,7 @@ pub fn ropcToken(
     username: []const u8,
     password: []const u8,
     resource: []const u8,
+    dl: Deadline,
 ) ![]const u8 {
     why.clear();
     var body = std.array_list.Managed(u8).init(gpa);
@@ -197,27 +211,23 @@ pub fn ropcToken(
 
     const url = try msgfmt.allocPrint(gpa, "https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{tenant});
     defer gpa.free(url);
-    return postForToken(gpa, url, body.items);
+    return postForToken(gpa, url, body.items, dl);
 }
 
-fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]const u8 {
-    var client = http_client.initClient(gpa);
-    defer client.deinit();
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    defer aw.deinit();
-    const res = client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = url },
-        .headers = .{ .content_type = .{ .override = "application/x-www-form-urlencoded" } },
-        .payload = body,
-        .response_writer = &aw.writer,
-    }) catch |e| {
+fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8, dl: Deadline) ![]const u8 {
+    const res = http_client.request(gpa, .{
+        .url = url,
+        .post = true,
+        .content_type = "application/x-www-form-urlencoded",
+        .body = body,
+    }, dl) catch |e| {
         why.print("token request failed ({s})", .{@errorName(e)});
-        return error.AadTokenFailed;
+        return requestFailed(e);
     };
-    const resp = aw.writer.buffered();
-    if (@intFromEnum(res.status) != 200) {
-        why.print("token http {d}: {s}", .{ @intFromEnum(res.status), resp[0..@min(resp.len, 600)] });
+    defer gpa.free(res.body);
+    const resp = res.body;
+    if (res.code != 200) {
+        why.print("token http {d}: {s}", .{ res.code, resp[0..@min(resp.len, 600)] });
         return error.AadTokenFailed;
     }
     const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, resp, .{}) catch return error.AadTokenFailed;
@@ -232,6 +242,7 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8) ![]co
 }
 
 const appendForm = http_client.appendForm;
+const Deadline = http_client.Deadline;
 const formEncode = http_client.formEncode;
 
 fn iso8601(gpa: std.mem.Allocator, secs: i64) ![]const u8 {
@@ -284,6 +295,23 @@ test "aad: uuidHex is 36 characters of canonical lower-case text" {
     defer gpa.free(a);
     try std.testing.expect(uuid.isText(a));
     for (a) |c| try std.testing.expect(!std.ascii.isUpper(c));
+}
+
+test "a black-holed token endpoint fails the connect with ConnectionTimedOut, not a hang" {
+    var listener = try http_fake.listen(16);
+    defer listener.deinit();
+    http_fake.hang_released.store(false, .seq_cst);
+    const th = try std.Thread.spawn(.{}, http_fake.serveThenHang, .{ &listener, @as([]const []const u8, &.{}) });
+    defer th.join();
+    defer http_fake.hang_released.store(true, .seq_cst);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/t/oauth2/v2.0/token", .{listener.listen_address.getPort()});
+    const started = std.time.milliTimestamp();
+    try std.testing.expectError(error.ConnectionTimedOut, postForToken(std.heap.page_allocator, url, "grant_type=password", .{ .timeout_ms = 400, .retries = 0 }));
+    const waited = std.time.milliTimestamp() - started;
+    try std.testing.expect(waited >= 350 and waited < 5_000);
+    try std.testing.expect(std.mem.indexOf(u8, lastError(), "ConnectionTimedOut") != null);
 }
 
 test "extractElement pulls a namespaced assertion" {

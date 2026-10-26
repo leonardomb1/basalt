@@ -247,7 +247,7 @@ error rather than ignored.
 | `retries` | `2` | retries of a transient failure (`RETRY n`) |
 | `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,501'`, on top of 408, 429 and every 5xx but 501, 505 and 511 (`RETRY n ON (...)`) |
 | `retry_base_ms` | `500` | the first retry's back-off, doubled each time, ±30% jitter |
-| `timeout_ms` | `300000` | the limit on one page's fetch |
+| `timeout_ms` | `300000` | the limit on one page's fetch or one login, retries included |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
 A page or login reply that decodes past 256 MiB stops the read (`HttpBodyTooLarge`),

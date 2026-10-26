@@ -58,7 +58,7 @@ pub fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
         rbuf = try msgfmt.allocPrint(gpa, "https://{s}", .{cfg.host});
         break :blk rbuf.?;
     } else aad.sql_resource;
-    const token = try aad.passwordToken(gpa, client_id, cfg.user, cfg.password, resource);
+    const token = try aad.passwordToken(gpa, client_id, cfg.user, cfg.password, resource, .{});
     defer gpa.free(token);
     return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
 }

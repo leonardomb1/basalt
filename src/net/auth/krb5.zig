@@ -21,7 +21,8 @@
 
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
-const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
+const driver = @import("../../connect/driver.zig");
+const ThreadNote = driver.ThreadNote;
 const civil = @import("../../exec/civil.zig");
 
 pub const Error = error{
@@ -481,6 +482,9 @@ const err_preauth_failed = 24;
 const err_preauth_required = 25;
 const err_skew = 37;
 
+/// One AS or TGS round-trip, trying each KDC in turn; each socket read and write is
+/// bounded by `driver.request_timeout_ms`, so a silent KDC moves on to the next one
+/// and, if none answers, fails naming the timeout instead of hanging the connect.
 fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
     var hosts_buf: [16][]const u8 = undefined;
     var hosts = std.array_list.Managed([]const u8).init(gpa);
@@ -503,7 +507,7 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
             host = hp[0..c];
             port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch 88;
         }
-        const stream = @import("../../connect/driver.zig").dial(gpa, host, port, .{ .tune = false }) catch |e| {
+        const stream = driver.dial(gpa, host, port, .{ .tune = false, .io_timeout_s = kdc_timeout_s }) catch |e| {
             last = e;
             continue;
         };
@@ -519,28 +523,34 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
             continue;
         };
         var got: [4]u8 = undefined;
-        if (!readFull(stream, &got)) continue;
+        readFull(stream, &got) catch |e| {
+            last = e;
+            continue;
+        };
         const n = std.mem.readInt(u32, &got, .big);
         if (n > 1 << 20) return fail(error.KrbProtocol, "the KDC at {s} sent a {d}-byte reply", .{ hp, n });
         const buf = try gpa.alloc(u8, n);
-        if (!readFull(stream, buf)) {
+        readFull(stream, buf) catch |e| {
             gpa.free(buf);
+            last = e;
             continue;
-        }
+        };
         return buf;
     }
     return fail(error.KrbKdcUnreachable, "no KDC for {s} answered ({s}) — set `kdc` on the connection", .{ cred.realm, @errorName(last) });
 }
 
-fn readFull(stream: std.net.Stream, buf: []u8) bool {
+/// Fills `buf`; a read the socket timeout cut short is ConnectionTimedOut.
+fn readFull(stream: std.net.Stream, buf: []u8) !void {
     var at: usize = 0;
     while (at < buf.len) {
-        const n = stream.read(buf[at..]) catch return false;
-        if (n == 0) return false;
+        const n = stream.read(buf[at..]) catch |e| return if (e == error.WouldBlock) error.ConnectionTimedOut else e;
+        if (n == 0) return error.EndOfStream;
         at += n;
     }
-    return true;
 }
+
+const kdc_timeout_s: u31 = @intCast(@divTrunc(driver.request_timeout_ms, std.time.ms_per_s));
 
 fn kdcError(e: El, cred: Credential, what: []const u8) Error {
     const code = if (e.field(6)) |c| c.int() else -1;
