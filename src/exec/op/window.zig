@@ -787,21 +787,18 @@ pub const Window = struct {
     }
 
     /// Row `p` of a column whose kind `In` is not read from directly, as `read.at`
-    /// has it: NULL when null or nested, else its value cast to `In`. Out of line and
-    /// one per `In`, as the cast outweighs the call.
+    /// has it: NULL when null, else its value cast to `In`. Out of line and one per
+    /// `In`, as the cast outweighs the call.
     noinline fn valueAt(comptime In: type, c: column.Column, p: usize, cx: Ctx) anyerror!?In {
         if (!c.validity.get(p)) return null;
-        return switch (c.ty.kind) {
-            .array, .@"struct" => null,
-            else => try read.fromValue(In, c.getValue(p), cx),
-        };
+        return try read.fromValue(In, c.getValue(p), cx);
     }
 
     /// `A`'s loop over a column of kind `k`: one per lane of kinds `A.In` reads alike,
     /// and one for every kind read as a value.
     fn runAt(comptime A: type, comptime k: types.TypeKind) Run {
         return switch (comptime read.lane(A.In, k)) {
-            .nested, .slow, .value => Slider(A, null).run,
+            .slow, .value => Slider(A, null).run,
             else => |l| Slider(A, comptime read.laneKind(A.In, l)).run,
         };
     }
