@@ -134,36 +134,27 @@ pub const Type = struct {
     }
 };
 
-/// How a 64-bit unsigned integer is typed: as an INT whose values past 2^63-1 are
-/// refused (`int_checked`, Parquet and Arrow), or as the exact DECIMAL(20,0)
-/// (`decimal`, MySQL `bigint unsigned`).
-pub const UnsignedPolicy = enum { int_checked, decimal };
-
-/// The type of an unsigned integer `bits` wide; one narrower than 64 bits is always
-/// an INT.
-pub fn unsignedType(bits: u8, comptime policy: UnsignedPolicy) Type {
-    if (bits < 64) return Type.init(.int);
-    return switch (policy) {
-        .int_checked => Type.init(.int),
-        .decimal => Type.decimal(20, 0),
-    };
+/// The type of an unsigned integer `bits` wide: an INT below 64 bits, and the exact
+/// DECIMAL(20,0) at 64, which holds every UINT64 as DuckDB's UBIGINT and
+/// StarRocks' LARGEINT do, where an INT would refuse the values past 2^63-1.
+pub fn unsignedType(bits: u8) Type {
+    return if (bits < 64) Type.init(.int) else Type.decimal(20, 0);
 }
 
-/// A u64 as the engine's int, or null past 2^63-1.
-pub fn u64ToEngine(u: u64) ?i64 {
-    return std.math.cast(i64, u);
-}
-
-/// The unsigned value of a `bits`-wide integer stored sign-extended in `x`, or null
-/// for a 64-bit one past 2^63-1.
-pub fn unsignedOf(bits: u8, x: i64) ?i64 {
+/// The unsigned value of a `bits`-wide integer, below 64 bits, stored sign-extended
+/// in `x`.
+pub fn unsignedOf(bits: u8, x: i64) i64 {
     const u: u64 = @bitCast(x);
     return switch (bits) {
         8 => @as(u8, @truncate(u)),
         16 => @as(u16, @truncate(u)),
-        32 => @as(u32, @truncate(u)),
-        else => u64ToEngine(u),
+        else => @as(u32, @truncate(u)),
     };
+}
+
+/// A UINT64 stored as the bits of an i64, as DECIMAL(20,0)'s unscaled value.
+pub fn u64Unscaled(x: i64) i128 {
+    return @as(u64, @bitCast(x));
 }
 
 /// The running type of a column's sampled values: nothing seen yet, one kind, or a
@@ -375,34 +366,24 @@ test "sinkType writes an unknown column as a nullable string and every other typ
     for (kept) |t| try expectSameType(t, Type.sinkType(t));
 }
 
-test "unsignedType: narrower than 64 bits is INT; 64 bits follows the policy" {
-    for ([_]u8{ 8, 16, 24, 32 }) |bits| {
-        try expectSameType(Type.init(.int), unsignedType(bits, .int_checked));
-        try expectSameType(Type.init(.int), unsignedType(bits, .decimal));
-    }
-    try expectSameType(Type.init(.int), unsignedType(64, .int_checked));
-    try expectSameType(Type.decimal(20, 0), unsignedType(64, .decimal));
+test "unsignedType: narrower than 64 bits is INT; a UINT64 is DECIMAL(20,0), not an INT that refuses past 2^63-1" {
+    for ([_]u8{ 8, 16, 24, 32 }) |bits| try expectSameType(Type.init(.int), unsignedType(bits));
+    try expectSameType(Type.decimal(20, 0), unsignedType(64));
+    try std.testing.expect(unsignedType(64).kind != .int);
 }
 
-test "u64ToEngine refuses past 2^63-1, as Arrow's ToInt does" {
-    try std.testing.expectEqual(@as(?i64, 0), u64ToEngine(0));
-    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), u64ToEngine(std.math.maxInt(i64)));
-    try std.testing.expectEqual(@as(?i64, null), u64ToEngine(@as(u64, std.math.maxInt(i64)) + 1));
-    try std.testing.expectEqual(@as(?i64, null), u64ToEngine(std.math.maxInt(u64)));
+test "unsignedOf reads a narrow unsigned's sign-extended bits; u64Unscaled reads every UINT64 exactly" {
+    try std.testing.expectEqual(@as(i64, 255), unsignedOf(8, -1));
+    try std.testing.expectEqual(@as(i64, 65535), unsignedOf(16, -1));
+    try std.testing.expectEqual(@as(i64, 4294967295), unsignedOf(32, -1));
+    try std.testing.expectEqual(@as(i64, 127), unsignedOf(8, 127));
+    try std.testing.expectEqual(@as(i128, 0), u64Unscaled(0));
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(i64)), u64Unscaled(std.math.maxInt(i64)));
+    try std.testing.expectEqual(@as(i128, 9223372036854775808), u64Unscaled(std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i128, 18446744073709551615), u64Unscaled(-1));
 }
 
-test "unsignedOf equals Parquet's asUnsigned on every width" {
-    const logical = @import("../format/parquet/logical.zig");
-    const xs = [_]i64{ 0, 1, -1, 127, -128, 255, 256, -129, 32767, -32768, 65535, 65536, std.math.maxInt(i32), std.math.minInt(i32), 4294967295, 4294967296, std.math.maxInt(i64), std.math.minInt(i64), -4294967296 };
-    for ([_]u8{ 8, 16, 32, 64 }) |bits| for (xs) |x| {
-        try std.testing.expectEqual(logical.asUnsigned(bits, x), unsignedOf(bits, x));
-    };
-    try std.testing.expectEqual(@as(?i64, 255), unsignedOf(8, -1));
-    try std.testing.expectEqual(@as(?i64, 4294967295), unsignedOf(32, -1));
-    try std.testing.expectEqual(@as(?i64, null), unsignedOf(64, -1));
-}
-
-test "unsignedType reproduces MySQL's engineTypeFor on its integer types (mysql.zig:627-641, transcribed)" {
+test "unsignedType gives MySQL's engineTypeFor its integer types: BIGINT UNSIGNED is DECIMAL(20,0)" {
     const Case = struct { mtype: u8, unsigned: bool, bits: u8 };
     const cases = [_]Case{
         .{ .mtype = 0x01, .unsigned = true, .bits = 8 },
@@ -413,9 +394,9 @@ test "unsignedType reproduces MySQL's engineTypeFor on its integer types (mysql.
         .{ .mtype = 0x08, .unsigned = false, .bits = 64 },
     };
     for (cases) |c| {
-        const today: Type = if (c.mtype == 0x08 and c.unsigned) Type.decimal(20, 0) else Type.init(.int);
-        const home: Type = if (c.unsigned) unsignedType(c.bits, .decimal) else Type.init(.int);
-        try expectSameType(today, home);
+        const want: Type = if (c.mtype == 0x08 and c.unsigned) Type.decimal(20, 0) else Type.init(.int);
+        const home: Type = if (c.unsigned) unsignedType(c.bits) else Type.init(.int);
+        try expectSameType(want, home);
     }
 }
 

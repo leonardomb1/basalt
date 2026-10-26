@@ -438,8 +438,9 @@ Arrow IPC — `.arrow`, `.feather`, `.ipc` (the file format, Feather v2) or
 file is memory-mapped and its columns copied out, so polars' `write_ipc` or
 pyarrow's `write_feather` hands a frame over with no encode or decode step.
 Both formats read, uncompressed or with LZ4-frame or ZSTD buffers, and only
-the columns a query uses are converted. Every integer width reads as `int` (a
-`UInt64` above 2^63−1 is an error, never a wraparound), floats as `float`,
+the columns a query uses are converted. Every integer width reads as `int`
+but `UInt64`, which reads as the exact `DECIMAL(20,0)`, so a value above
+2^63−1 keeps its value; floats read as `float`,
 all three string layouts (`utf8`, `large_utf8`, polars' default `utf8_view`)
 as `string` and the binary ones as `bytes`, `decimal128` as `decimal`, and
 dates, times, timestamps and durations in any unit as basalt's own
@@ -541,8 +542,9 @@ A UTC-adjusted timestamp reads as its UTC
 wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
 carried. `DATE`, `DECIMAL`, `STRING`/`ENUM`/`JSON` and `INTEGER` map as their
 converted twins do; a `UUID` stays `bytes`. An unsigned integer (`UINT8` to
-`UINT64`) reads as its unsigned value, and a `UINT64` above 2^63−1 is an error
-naming the column, never a wraparound.
+`UINT64`) reads as its unsigned value: `UINT8` to `UINT32` as `int`, and a
+`UINT64` as the exact `DECIMAL(20,0)`, so a value above 2^63−1 keeps its value
+rather than fail or wrap, and its statistics still prune row groups.
 
 A struct's fields read as flat dotted columns (`addr.city`). Everything
 repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them —

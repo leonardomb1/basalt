@@ -433,6 +433,34 @@ FROM db.it_dec;"; then
   fi
 fi
 
+# PostgreSQL bytea and time. A bytea read as text kept its `\x01ff` spelling and
+# a time read as text, not TIME. bytea is decoded from either `bytea_output`: the
+# hex default, then escape, set on the database so basalt's next session gets it.
+if runs postgres; then
+  pgq -c "DROP TABLE IF EXISTS it_bytea;
+          CREATE TABLE it_bytea (k int, b bytea, t time);
+          INSERT INTO it_bytea VALUES (1, '\\x01ff5c', '01:02:03'),
+            (2, '\\x01615c62ff', '23:59:59.999999'), (3, '', '00:00:00'), (4, NULL, NULL);" >/dev/null 2>&1
+  { echo "k,b,t";
+    echo "1,01FF5C,01:02:03";
+    echo "2,01615C62FF,23:59:59.999999";
+    echo '3,"",00:00:00';
+    echo "4,,"; } >"$out/pg_bytea_expected.csv"
+  for fmt in hex escape; do
+    pgq -c "ALTER DATABASE it SET bytea_output = '$fmt';" >/dev/null 2>&1
+    want='\x01ff5c'; [ "$fmt" = escape ] && want='\001\377\\'
+    if [ "$(pgq -c "SELECT b FROM it_bytea WHERE k = 1;")" != "$want" ]; then
+      report "postgres-bytea-time-$fmt (server not in $fmt output)" bad
+    elif brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_bytea_$fmt.csv' AS SELECT k, hex(b) AS b, t FROM db.it_bytea ORDER BY k;"; then
+      check "postgres-bytea-time-$fmt" "$out/pg_bytea_$fmt.csv" "$out/pg_bytea_expected.csv"
+    else
+      report "postgres-bytea-time-$fmt (run error)" bad
+    fi
+  done
+  pgq -c "ALTER DATABASE it RESET bytea_output;" >/dev/null 2>&1
+fi
+
 # SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
 # high word first, not a float — decoding it as one turned -0.0001 into NaN — and
 # the fixed-length forms (money NOT NULL) were missing from the type switch
@@ -538,6 +566,32 @@ LOAD INTO '$out/mysql_after.csv' AS SELECT * FROM db.basalt_it ORDER BY id;"; th
   else
     report "mysql-large-packet (run error)" bad
   fi
+fi
+
+# MySQL converts a TIMESTAMP from and to the session's time zone. With the server
+# defaulting to +05:00, a session left in it read 12:00 UTC as 17:00 and stored a
+# loaded 12:00 as 07:00 UTC; basalt's sessions run in UTC, as PostgreSQL's do.
+if runs mysql; then
+  docker exec it-mysql-1 mysql -uroot -pit it -e "
+    SET GLOBAL time_zone = '+05:00';
+    SET time_zone = '+00:00';
+    DROP TABLE IF EXISTS basalt_tz;
+    CREATE TABLE basalt_tz (id INT, ts TIMESTAMP NULL);
+    INSERT INTO basalt_tz VALUES (1, '2024-01-01 12:00:00');" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);
+LOAD INTO '$out/mysql_tz.csv' AS SELECT * FROM db.basalt_tz ORDER BY id;
+LOAD INTO db.basalt_tz APPEND AS SELECT 2 AS id, CAST('2024-01-01 12:00:00' AS TIMESTAMP) AS ts;"; then
+    { echo "id,ts"; echo "1,2024-01-01 12:00:00"; } >"$out/mysql_tz_expected.csv"
+    check mysql-timestamp-utc-read "$out/mysql_tz.csv" "$out/mysql_tz_expected.csv"
+    if docker exec it-mysql-1 mysql -uroot -pit it -N -e "SET time_zone = '+00:00'; SELECT ts FROM basalt_tz WHERE id = 2;" 2>/dev/null | grep -qx '2024-01-01 12:00:00'; then
+      report mysql-timestamp-utc-write ok
+    else
+      report mysql-timestamp-utc-write bad
+    fi
+  else
+    report "mysql-timestamp-utc (run error)" bad
+  fi
+  docker exec it-mysql-1 mysql -uroot -pit -e "SET GLOBAL time_zone = 'SYSTEM';" >/dev/null 2>&1
 fi
 
 # StarRocks: write via stream load, read back through its MySQL-protocol FE.

@@ -90,9 +90,9 @@ const pg_rows = [_]Row{
     .{ .kind = .float, .ddl = n("DOUBLE PRECISION"), .cast = n("DOUBLE PRECISION"), .echo = .{ .code = 701 }, .wire = codes(&.{ 700, 701 }) },
     .{ .kind = .decimal, .ddl = .decimal, .cast = .decimal, .echo = .{ .code = 1700 }, .wire = codes(&.{1700}) },
     .{ .kind = .string, .ddl = n("TEXT"), .key = n("VARCHAR(255)"), .cast = n("TEXT"), .echo = .{ .code = 25 } },
-    .{ .kind = .bytes, .ddl = n("BYTEA"), .cast = null, .echo = .{ .code = 17 } },
+    .{ .kind = .bytes, .ddl = n("BYTEA"), .cast = null, .echo = .{ .code = 17 }, .wire = codes(&.{17}) },
     .{ .kind = .date, .ddl = n("DATE"), .cast = n("DATE"), .echo = .{ .code = 1082 }, .wire = codes(&.{1082}) },
-    .{ .kind = .time, .ddl = n("TIME"), .cast = n("TIME"), .echo = .{ .code = 1083 } },
+    .{ .kind = .time, .ddl = n("TIME"), .cast = n("TIME"), .echo = .{ .code = 1083 }, .wire = codes(&.{1083}) },
     .{ .kind = .timestamp, .ddl = n("TIMESTAMP"), .cast = n("TIMESTAMP"), .echo = .{ .code = 1114 }, .wire = codes(&.{ 1114, 1184 }) },
     .{ .kind = .array, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 25 } },
     .{ .kind = .@"struct", .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 25 } },
@@ -174,7 +174,7 @@ pub const rows = std.EnumArray(Dialect, []const Row).init(.{
 
 /// The kinds each dialect's declared column reads back as something else.
 pub const lossy = std.EnumArray(Dialect, []const TypeKind).init(.{
-    .postgres = &.{ .bytes, .time, .array, .@"struct" },
+    .postgres = &.{ .array, .@"struct" },
     .mysql = &.{ .bool, .time, .array, .@"struct" },
     .sqlserver = &.{ .bytes, .array, .@"struct" },
     .starrocks = &.{ .bool, .bytes, .time, .array, .@"struct" },
@@ -323,10 +323,12 @@ fn pinnedCast(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const
     };
 }
 
-/// postgres.zig:413 `pgType` at 7f890a1, kind only.
+/// postgres.zig:413 `pgType` at 7f890a1, kind only, with D9's `bytea` and `time`.
 fn pinnedPg(oid: i32) TypeKind {
     return switch (oid) {
         16 => .bool,
+        17 => .bytes,
+        1083 => .time,
         20, 21, 23 => .int,
         700, 701 => .float,
         1700 => .decimal,
@@ -475,8 +477,6 @@ test "a declared column reads back as its kind or is listed lossy" {
 test "lossy pairs read back as the kind each driver produces today" {
     const Case = struct { d: Dialect, k: TypeKind, back: TypeKind };
     const cases = [_]Case{
-        .{ .d = .postgres, .k = .bytes, .back = .string },
-        .{ .d = .postgres, .k = .time, .back = .string },
         .{ .d = .mysql, .k = .bool, .back = .int },
         .{ .d = .mysql, .k = .time, .back = .string },
         .{ .d = .sqlserver, .k = .bytes, .back = .string },
@@ -488,6 +488,20 @@ test "lossy pairs read back as the kind each driver produces today" {
     for (std.enums.values(Dialect)) |d| {
         try testing.expectEqual(@as(?TypeKind, .string), readKind(d, row(d, .array).echo));
         try testing.expectEqual(@as(?TypeKind, .string), readKind(d, row(d, .@"struct").echo));
+    }
+}
+
+test "a PostgreSQL bytea and time read back as their kinds; a MySQL-protocol TIME stays text" {
+    try testing.expectEqual(@as(?TypeKind, .bytes), readKind(.postgres, .pg(17)));
+    try testing.expectEqual(@as(?TypeKind, .time), readKind(.postgres, .pg(1083)));
+    try testing.expectEqual(@as(?TypeKind, .string), readKind(.postgres, .pg(1266)));
+    for ([_]TypeKind{ .bytes, .time }) |k| {
+        try testing.expect(!isLossy(.postgres, k));
+        try testing.expectEqual(@as(?TypeKind, k), readKind(.postgres, row(.postgres, k).echo));
+    }
+    for ([_]Dialect{ .mysql, .starrocks, .doris }) |d| {
+        try testing.expectEqual(@as(?TypeKind, .string), readKind(d, .mysql(0x0b, 0, 63)));
+        try testing.expect(isLossy(d, .time));
     }
 }
 

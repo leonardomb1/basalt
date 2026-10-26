@@ -1,7 +1,7 @@
 //! Minimal PostgreSQL v3 wire-protocol client: startup, auth (trust/cleartext/
 //! md5/SCRAM-SHA-256), simple Query, COPY FROM STDIN, and RowDescription/DataRow
 //! parsing into a batch. Values arrive in text format, so the shared
-//! `cell.wire` does the typing. Exposes the `sql.Conn` interface.
+//! `cell.pg_wire` does the typing. Exposes the `sql.Conn` interface.
 //!
 //! Everything read off the wire is bounds-checked before use. Past bugs: a short
 //! md5 reply hashed adjacent heap into a digest sent to the server, and a DataRow
@@ -10,7 +10,9 @@
 //! schema is the first's. NUMERIC precision (up to 1000 in Postgres) is capped at
 //! 38, the ceiling of the engine's i128 decimal. Sessions start in `TimeZone=UTC`,
 //! the zone basalt's timestamps keep: a `timestamptz` reads, and a pushed timestamp
-//! literal compares, the same whatever the server's or database's zone is.
+//! literal compares, the same whatever the server's or database's zone is. No
+//! other startup parameter is sent, since a pooler such as PgBouncer refuses one it
+//! does not track; a `bytea` therefore reads in either `bytea_output` format.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -71,8 +73,10 @@ pub const Conn = struct {
             try appendCStr(&body, "database");
             try appendCStr(&body, database);
         }
-        try appendCStr(&body, "TimeZone");
-        try appendCStr(&body, "UTC");
+        for (session_params) |kv| {
+            try appendCStr(&body, kv[0]);
+            try appendCStr(&body, kv[1]);
+        }
         try body.append(0);
 
         var hdr: [4]u8 = undefined;
@@ -368,6 +372,9 @@ fn readMessage(r: *std.Io.Reader, payload: *std.array_list.Managed(u8)) !u8 {
 const sql_vtable = sql.connVTable(Conn);
 const cursor_vtable = sql.textCursorVTable(Conn);
 
+/// The run-time parameters every session's StartupMessage sets.
+const session_params = [_][2][]const u8{.{ "TimeZone", "UTC" }};
+
 const PgCol = struct { name: []const u8, oid: i32, engine_type: types.Type, conv: cell.Converter };
 const RowDesc = struct { cols: []PgCol, fields: []types.Schema.Field };
 
@@ -386,7 +393,7 @@ fn parseRowDescription(arena: std.mem.Allocator, p: []const u8) !RowDesc {
         const typmod = try r.int(i32);
         try r.skip(2);
         const ty = pgType(oid, typmod);
-        cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty, .conv = cell.converter(ty.kind, cell.wire) };
+        cols[k] = .{ .name = try arena.dupe(u8, name), .oid = oid, .engine_type = ty, .conv = cell.converter(ty.kind, cell.pg_wire) };
         fields[k] = .{ .name = cols[k].name, .ty = ty };
     }
     return .{ .cols = cols, .fields = fields };
@@ -533,12 +540,14 @@ test "pgType maps OIDs; numeric typmod carries precision and scale" {
     try std.testing.expectEqual(@as(u8, 38), wide_scale.scale);
 }
 
-test "pgType equals its pre-typemap body for every OID and typmod shape" {
+test "pgType equals its pre-typemap body, bytea as BYTES and time as TIME, for every OID and typmod shape" {
     const Orig = struct {
-        /// `pgType` at 10e697a, before the kind came from `typemap`.
+        /// `pgType` at 10e697a, before the kind came from `typemap`, with D9's `bytea` and `time`.
         fn pinnedPgType(oid: i32, typmod: i32) types.Type {
             return (switch (oid) {
                 16 => types.Type.init(.bool),
+                17 => types.Type.init(.bytes),
+                1083 => types.Type.init(.time),
                 20, 21, 23 => types.Type.init(.int),
                 700, 701 => types.Type.init(.float),
                 1700 => decimalFromTypmod(typmod),
@@ -701,4 +710,64 @@ fn errMessage(p: []const u8) []const u8 {
         if (ft == 'M') return val;
     }
     return "postgres error";
+}
+
+test "a bytea reads as BYTES in either output format and a time as TIME; timetz stays text, and a time past the day fails naming its column" {
+    const FakePg = @import("../testing/postgres_fake.zig").FakePg;
+    const Table = @import("../testing/postgres_fake.zig").Table;
+    const tables = [_]Table{
+        .{
+            .name = "t",
+            .cols = &.{ .{ .name = "b", .oid = 17 }, .{ .name = "t", .oid = 1083 }, .{ .name = "tz", .oid = 1266 }, .{ .name = "e", .oid = 17 } },
+            .rows = &.{
+                &.{ "\\x01ff5c", "01:02:03.5", "01:02:03+02", "\\001a\\\\b" },
+                &.{ "\\x", "23:59:59.999999", null, "plain" },
+                &.{ null, "00:00:00", "00:00:00+00", null },
+            },
+        },
+        .{ .name = "late", .cols = &.{.{ .name = "at", .oid = 1083 }}, .rows = &.{&.{"24:00:00"}} },
+        .{ .name = "odd", .cols = &.{.{ .name = "raw", .oid = 17 }}, .rows = &.{&.{"\\x1"}} },
+    };
+    const srv = try FakePg.start(std.testing.allocator, &tables);
+    defer srv.finish();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    {
+        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off);
+        const cur = try c.sqlConn().queryCursor("SELECT * FROM t");
+        defer cur.close();
+        const b = (try cur.nextBatch(a)).?;
+        try std.testing.expectEqual(types.TypeKind.bytes, b.columns[0].ty.kind);
+        try std.testing.expectEqual(types.TypeKind.time, b.columns[1].ty.kind);
+        try std.testing.expectEqual(types.TypeKind.string, b.columns[2].ty.kind);
+        try std.testing.expectEqualStrings("\x01\xff\x5c", b.columns[0].getValue(0).bytes);
+        try std.testing.expectEqualStrings("", b.columns[0].getValue(1).bytes);
+        try std.testing.expect(b.columns[0].getValue(2).isNull());
+        try std.testing.expectEqual(@as(i64, 3_723_500_000), b.columns[1].getValue(0).time);
+        try std.testing.expectEqual(@as(i64, 86_399_999_999), b.columns[1].getValue(1).time);
+        try std.testing.expectEqual(@as(i64, 0), b.columns[1].getValue(2).time);
+        try std.testing.expectEqualStrings("01:02:03+02", b.columns[2].getValue(0).string);
+        try std.testing.expectEqualStrings("\x01a\\b", b.columns[3].getValue(0).bytes);
+        try std.testing.expectEqualStrings("plain", b.columns[3].getValue(1).bytes);
+    }
+    const Bad = struct { q: []const u8, msg: []const u8 };
+    for ([_]Bad{
+        .{ .q = "SELECT * FROM late", .msg = "column \"at\": unparseable time value \"24:00:00\"" },
+        .{ .q = "SELECT * FROM odd", .msg = "column \"raw\": unparseable bytes value \"\\x1\"" },
+    }) |bad| {
+        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off);
+        const cur = try c.sqlConn().queryCursor(bad.q);
+        try std.testing.expectError(error.UnparseableNumber, cur.nextBatch(a));
+        try std.testing.expectEqualStrings(bad.msg, cur.lastError());
+        cur.close();
+    }
+
+    const starts = srv.startups.items;
+    try std.testing.expectEqual(@as(usize, 3), starts.len);
+    for (starts) |s| {
+        try std.testing.expect(std.mem.indexOf(u8, s, "TimeZone\x00UTC\x00") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "bytea_output") == null);
+    }
 }

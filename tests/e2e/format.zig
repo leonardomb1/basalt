@@ -257,6 +257,80 @@ test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
 
 const fx_logical = fixtures.logical_types_parquet;
 
+test "a parquet UINT64 is DECIMAL(20,0): it joins and compares against an INT, and keeps a value past 2^63-1" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "u.parquet", .data = fixtures.unsigned_parquet });
+    try tmp.dir.writeFile(.{ .sub_path = "b.parquet", .data = fixtures.unsigned_big_parquet });
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "k,tag\n4,four\n9223372036854775807,max\n5,five\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const Case = struct { q: []const u8, want: []const u8 };
+    const cases = comptime [_]Case{
+        .{
+            .q = "SELECT tag, COUNT(*) AS n FROM '{0s}/u.parquet' JOIN '{0s}/k.csv' ON u64 = k GROUP BY tag ORDER BY tag",
+            .want = "tag,n\nfour,2\nmax,1\n",
+        },
+        .{
+            .q = "SELECT u64 FROM '{0s}/u.parquet' WHERE u64 = 4 AND u64 < 9223372036854775807 ORDER BY u32",
+            .want = "u64\n4\n4\n",
+        },
+        .{
+            .q = "SELECT big, big > 9223372036854775807 AS past, big + 0 AS same FROM '{0s}/b.parquet' WHERE big > 9223372036854775807",
+            .want = "big,past,same\n18446744073709551615,true,18446744073709551615\n",
+        },
+    };
+    inline for (cases) |c| {
+        const q = try std.fmt.allocPrint(alloc, c.q, .{base});
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
+
+test "a parquet folder mixing a UINT64 and an INT64 file is refused naming the retyped column, in either order" {
+    const alloc = std.testing.allocator;
+    const Order = struct { uint: []const u8, int: []const u8, why: []const u8 };
+    const orders = [_]Order{
+        .{ .uint = "a.parquet", .int = "b.parquet", .why = "column `big` is int there, not decimal(20,0)" },
+        .{ .uint = "b.parquet", .int = "a.parquet", .why = "column `big` is decimal(20,0) there, not int" },
+    };
+    for (orders) |o| for ([_][]const u8{ "SELECT big FROM '$B/d/'", "SELECT SUM(big) AS s FROM '$B/d/'" }) |sel| for ([_]usize{ 1, 4 }) |threads| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.makeDir("d");
+        const upath = try std.fmt.allocPrint(alloc, "d/{s}", .{o.uint});
+        defer alloc.free(upath);
+        try tmp.dir.writeFile(.{ .sub_path = upath, .data = fixtures.unsigned_big_parquet });
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const mk = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/d/{s}' AS SELECT CAST(7 AS INT) AS big;", .{ base, o.int });
+        defer alloc.free(mk);
+        var mdiag: Diag = .{};
+        _ = try exec(alloc, mk, .{ .log = .{ .quiet = true } }, &mdiag);
+        const q = try std.mem.replaceOwned(u8, alloc, sel, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var rdiag: Diag = .{};
+        const msg = if (exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag)) |_|
+            return error.TestExpectedError
+        else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.eval.takeFailure(e) orelse "";
+        const want = try std.fmt.allocPrint(alloc, "`b.parquet` in folder `{s}/d/` does not match `a.parquet`, its first file: {s}", .{ base, o.why });
+        defer alloc.free(want);
+        if (std.mem.indexOf(u8, msg, want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ want, msg });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
 test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -4,6 +4,37 @@ Postgres, MySQL, SQL Server, StarRocks and Doris are read with a SQL query and
 written by bulk load or insert; their options are listed under
 [Connections](../language/connections.md). What is particular to each follows.
 
+## PostgreSQL and MySQL
+
+Every session runs in UTC, the zone basalt's timestamps are in: PostgreSQL's
+with `TimeZone=UTC`, MySQL's with `SET time_zone = '+00:00'` (the offset form,
+which needs no time-zone tables on the server). A PostgreSQL `timestamptz` and a
+MySQL `TIMESTAMP` therefore read as the same UTC instant whatever the server's
+or database's default zone, a timestamp loaded into a MySQL `TIMESTAMP` column
+is stored as that UTC instant, and a pushed-down timestamp literal compares in
+UTC. A `DATETIME`, a PostgreSQL `timestamp` and StarRocks' and Doris' columns
+carry no zone and read as written.
+
+The session zone also sets the server's own clock in basalt's sessions. On
+MySQL, StarRocks and Doris, `NOW()`, `CURRENT_TIMESTAMP` and `FROM_UNIXTIME` in
+a query basalt sends give UTC. On MySQL so does a `DATETIME` column's `DEFAULT`
+or `ON UPDATE CURRENT_TIMESTAMP` filled by a row basalt writes, and on
+PostgreSQL a `timestamp` column's `DEFAULT now()` is the UTC wall-clock time.
+StarRocks and Doris are written by Stream Load, outside the session, so their
+defaults keep the server's zone, as do other sessions on the same server.
+
+A PostgreSQL `bytea` reads as `BYTES`, decoded from whichever `bytea_output`
+format the server uses, and a PostgreSQL `time` as `TIME`. A basalt `TIME` is a
+time of day below `24:00:00`, so PostgreSQL's `24:00:00` fails the read, naming
+the column, rather than read as midnight; a `timetz` reads as text. A MySQL
+`TIME` reads as text: it may hold an elapsed time (`-838:59:59` to `838:59:59`)
+that no time of day can, and `CAST(t AS TIME)` reads one that is a time of day.
+
+A MySQL `BIGINT UNSIGNED` reads as `DECIMAL(20,0)`, as a Parquet `UINT64` and an
+Arrow `UInt64` do, so every value up to 18446744073709551615 reads exactly. A
+`BIGINT UNSIGNED` primary key still splits a read under `-j`, over its whole
+unsigned range.
+
 ## StarRocks
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load

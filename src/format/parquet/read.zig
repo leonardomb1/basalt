@@ -75,7 +75,6 @@ pub const Error = error{
     ByteRangeOutOfFile,
     UnsupportedParquetSchema,
     UnsupportedParquetEncoding,
-    ParquetIntOverflow,
 } || std.mem.Allocator.Error;
 
 pub const BitReader = @import("encoding.zig").BitReader;
@@ -456,7 +455,7 @@ pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.S
     };
 }
 
-test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 is an error naming the column" {
+test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 reads as its DECIMAL(20,0) value" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -466,8 +465,10 @@ test "unsigned columns read as their unsigned values; a UINT64 past 2^63-1 is an
         \\u8=1 u16=2 u32=3000000000 u64=4
         \\
     , try readAllText(a, @embedFile("../testdata/unsigned.parquet"), "u.parquet"));
-    try testing.expectError(Error.ParquetIntOverflow, readAllText(a, @embedFile("../testdata/unsigned_big.parquet"), "b.parquet"));
-    try testing.expect(std.mem.endsWith(u8, eval.takeFailure(Error.ParquetIntOverflow).?, "b.parquet`: parquet column `big` holds the UINT64 18446744073709551615, past 2^63-1, the largest basalt int"));
+    try testing.expectEqualStrings(
+        \\big=18446744073709551615
+        \\
+    , try readAllText(a, @embedFile("../testdata/unsigned_big.parquet"), "b.parquet"));
 }
 
 test "a folder mismatch shows decimal precision and names the column the first file lacks" {

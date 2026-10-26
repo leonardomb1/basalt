@@ -191,8 +191,9 @@ pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
 }
 
 /// A text or binary bound is unknown: legacy writers ordered byte arrays as signed
-/// bytes, so it is not trusted to prune. An unsigned bound reads as its unsigned value; one only the deprecated signed-order
-/// `min`/`max` gave, or a UINT64 past 2^63-1, is unknown. An INT96 bound is unknown:
+/// bytes, so it is not trusted to prune. An unsigned bound reads as its unsigned
+/// value, a UINT64's as DECIMAL(20,0); one only the deprecated signed-order
+/// `min`/`max` gave is unknown. An INT96 bound is unknown:
 /// the format leaves its order undefined, and writers that kept one compared the
 /// 12 bytes, nanoseconds first, not the instants.
 fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]const u8) ?Value {
@@ -200,10 +201,10 @@ fn statValue(elem: parquet.SchemaElement, meta: parquet.ColumnMetaData, raw: ?[]
     if (meta.ty == .int96) return null;
     const v = plainValue(elem, meta.ty, b) catch return null;
     if (v == .string or v == .bytes) return null;
-    if (v == .int) if (unsignedBits(elem)) |bits| {
+    if (unsignedBits(elem)) |bits| {
         if (meta.stats.legacy) return null;
-        return .{ .int = types.unsignedOf(bits, v.int) orelse return null };
-    };
+        if (v == .int) return .{ .int = types.unsignedOf(bits, v.int) };
+    }
     return v;
 }
 
@@ -285,6 +286,25 @@ test "unsigned statistics compare in unsigned order" {
     chunks[0].meta.?.stats.legacy = true;
     const beyond = [_]Bound{.{ .column = "u", .op = .gt, .value = .{ .int = 4_000_000_000 } }};
     try testing.expect(groupMayMatch(&schema, &leaves, g, &beyond));
+}
+
+test "UINT64 statistics bound as DECIMAL(20,0) past 2^63-1; signed-order legacy ones bound nothing" {
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "u", .ty = .int64, .repetition = .optional, .converted_type = 14 },
+    };
+    const leaves = [_]Leaf{.{ .schema_idx = 1, .chunk_idx = 0, .name = "u", .max_def = 1, .max_rep = 0 }};
+    var lo: [8]u8 = undefined;
+    var hi: [8]u8 = undefined;
+    std.mem.writeInt(u64, &lo, 10_000_000_000_000_000_000, .little);
+    std.mem.writeInt(u64, &hi, std.math.maxInt(u64), .little);
+    var chunks = [_]parquet.ColumnChunk{.{ .meta = .{ .ty = .int64, .stats = .{ .min = &lo, .max = &hi } } }};
+    const g = parquet.RowGroup{ .columns = &chunks, .num_rows = 2 };
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &.{.{ .column = "u", .op = .lt, .value = .{ .int = 0 } }}));
+    try testing.expect(!groupMayMatch(&schema, &leaves, g, &.{.{ .column = "u", .op = .eq, .value = .{ .int = 7 } }}));
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &.{.{ .column = "u", .op = .gt, .value = .{ .int = std.math.maxInt(i64) } }}));
+    chunks[0].meta.?.stats.legacy = true;
+    try testing.expect(groupMayMatch(&schema, &leaves, g, &.{.{ .column = "u", .op = .eq, .value = .{ .int = 7 } }}));
 }
 
 test "a BYTE_ARRAY statistic is the value's bytes, not a length-prefixed PLAIN value; text bounds never prune" {

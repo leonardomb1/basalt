@@ -6,6 +6,7 @@ const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const civil = @import("../../exec/civil.zig");
+const eval = @import("../../exec/eval.zig");
 
 pub const conv_utf8 = 0;
 pub const conv_decimal = 5;
@@ -54,9 +55,22 @@ fn tickOf(unit: parquet.TimeUnit) civil.Tick {
 /// zoned timestamp, so a UTC instant reads as its UTC wall-clock.
 pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     const phys = e.ty orelse return Error.UnsupportedParquetSchema;
+    if (unsignedBits(e)) |bits| {
+        const want: parquet.PhysicalType = if (bits == 64) .int64 else .int32;
+        if (phys != want) return unsignedOnWrongPhysical(e, bits, phys, want);
+    }
     var t = logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
     if (e.repetition orelse .required != .required) t = t.asNullable();
     return t;
+}
+
+/// An unsigned annotation on a physical type the spec does not allow it on, a
+/// UINT64 on anything but INT64 or a narrower one on anything but INT32, is a
+/// corrupt file, as DuckDB refuses it.
+fn unsignedOnWrongPhysical(e: parquet.SchemaElement, bits: u8, phys: parquet.PhysicalType, want: parquet.PhysicalType) Error {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` is a {d}-bit unsigned integer stored as {s}; the format allows it only as {s}", .{ e.name, bits, @tagName(phys), @tagName(want) }) catch "a parquet unsigned integer on the wrong physical type";
+    return @errorCast(eval.explain(Error.CorruptParquetPage, msg));
 }
 
 /// Null when the logical type is absent, says nothing basalt acts on, or does
@@ -136,15 +150,12 @@ pub fn unsignedBits(e: parquet.SchemaElement) ?u8 {
     };
 }
 
-/// An integer column's type: an unsigned one is an INT whose values past 2^63-1
-/// are refused when read (`readUnsigned`).
+/// An integer column's type: `types.unsignedType` for an unsigned one, so a UINT64
+/// is the exact DECIMAL(20,0).
 fn intType(e: parquet.SchemaElement) types.Type {
     const bits = unsignedBits(e) orelse return types.Type.init(.int);
-    return types.unsignedType(bits, .int_checked);
+    return types.unsignedType(bits);
 }
-
-/// `types.unsignedOf`, kept under its old name for the oracle test in lang/types.zig.
-pub const asUnsigned = types.unsignedOf;
 
 fn decimalOf(e: parquet.SchemaElement) types.Type {
     const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
@@ -180,17 +191,51 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
 }
 
-test "unsigned columns read their stored value, a UINT64 past 2^63-1 none" {
+test "unsigned columns know their width; a UINT64 is DECIMAL(20,0) and a narrower one INT" {
     const u32c = logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = false } });
     try testing.expectEqual(@as(?u8, 32), unsignedBits(u32c));
     try testing.expectEqual(@as(?u8, null), unsignedBits(logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = true } })));
     try testing.expectEqual(@as(?u8, 16), unsignedBits(.{ .ty = .int32, .converted_type = 12 }));
     try testing.expectEqual(@as(?u8, null), unsignedBits(.{ .ty = .int32 }));
-    try testing.expectEqual(@as(?i64, 3_000_000_000), asUnsigned(32, -1_294_967_296));
-    try testing.expectEqual(@as(?i64, 255), asUnsigned(8, -1));
-    try testing.expectEqual(@as(?i64, 65535), asUnsigned(16, -1));
-    try testing.expectEqual(@as(?i64, 7), asUnsigned(64, 7));
-    try testing.expectEqual(@as(?i64, null), asUnsigned(64, -1));
+    const u64c = logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = false } });
+    try testing.expectEqual(@as(?u8, 64), unsignedBits(u64c));
+    const dec = try basaltType(u64c);
+    try testing.expectEqual(types.TypeKind.decimal, dec.kind);
+    try testing.expectEqual(@as(u8, 20), dec.precision);
+    try testing.expectEqual(@as(u8, 0), dec.scale);
+    try testing.expectEqual(types.TypeKind.decimal, (try basaltType(.{ .ty = .int64, .converted_type = 14 })).kind);
+    try testing.expectEqual(types.TypeKind.int, (try basaltType(u32c)).kind);
+}
+
+test "an unsigned annotation is refused on any physical type but its own: UINT64 on INT64, narrower on INT32" {
+    const bad = [_]parquet.SchemaElement{
+        logical(.int32, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 32, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 8, .signed = false } }),
+        logical(.byte_array, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        .{ .ty = .int32, .converted_type = conv_uint64 },
+        .{ .ty = .int96, .converted_type = conv_uint64 },
+        .{ .ty = .int64, .converted_type = conv_uint8 },
+        .{ .ty = .int64, .converted_type = conv_uint16 },
+        .{ .ty = .int64, .converted_type = conv_uint32 },
+        .{ .ty = .double, .converted_type = conv_uint32 },
+    };
+    for (bad) |e| {
+        var named = e;
+        named.name = "qty";
+        try testing.expectError(Error.CorruptParquetPage, basaltType(named));
+        const msg = eval.takeFailure(Error.CorruptParquetPage) orelse return error.TestExpectedFailNote;
+        try testing.expect(std.mem.indexOf(u8, msg, "parquet column `qty` is a ") != null);
+        try testing.expect(std.mem.indexOf(u8, msg, "-bit unsigned integer stored as ") != null);
+    }
+    const good = [_]parquet.SchemaElement{
+        logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        logical(.int32, .{ .integer = .{ .bit_width = 16, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 32, .signed = true } }),
+        .{ .ty = .int64, .converted_type = conv_uint64 },
+        .{ .ty = .int32, .converted_type = conv_uint8 },
+    };
+    for (good) |e| _ = try basaltType(e);
 }
 
 fn micros(t: civil.Tick, x: i64) !i64 {
