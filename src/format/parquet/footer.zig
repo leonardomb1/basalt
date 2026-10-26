@@ -502,7 +502,7 @@ pub fn parsePageHeader(bytes: []const u8) Error!PageHeader {
         }
     }
     try r.structEnd();
-    h.header_len = r.pos;
+    h.header_len = r.c.i;
     return h;
 }
 

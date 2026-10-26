@@ -158,38 +158,7 @@ pub const Buf = struct {
     }
 };
 
-pub const Cursor = struct {
-    s: []const u8,
-    i: usize = 0,
-
-    pub fn byte(self: *Cursor) !u8 {
-        if (self.i >= self.s.len) return error.SshProtocol;
-        defer self.i += 1;
-        return self.s[self.i];
-    }
-    pub fn u32be(self: *Cursor) !u32 {
-        if (self.i + 4 > self.s.len) return error.SshProtocol;
-        defer self.i += 4;
-        return std.mem.readInt(u32, self.s[self.i..][0..4], .big);
-    }
-    pub fn u64be(self: *Cursor) !u64 {
-        if (self.i + 8 > self.s.len) return error.SshProtocol;
-        defer self.i += 8;
-        return std.mem.readInt(u64, self.s[self.i..][0..8], .big);
-    }
-    pub fn str(self: *Cursor) ![]const u8 {
-        const n = try self.u32be();
-        if (n > self.s.len - self.i) return error.SshProtocol;
-        defer self.i += n;
-        return self.s[self.i..][0..n];
-    }
-    pub fn boolean(self: *Cursor) !bool {
-        return (try self.byte()) != 0;
-    }
-    pub fn rest(self: *Cursor) []const u8 {
-        return self.s[self.i..];
-    }
-};
+pub const Cursor = @import("../format/cursor.zig").Reader(.big, error.SshProtocol);
 
 fn listHas(list: []const u8, name: []const u8) bool {
     var it = std.mem.splitScalar(u8, list, ',');
@@ -680,15 +649,15 @@ pub const Session = struct {
         const is = is_owned.items;
         if (is.len < 17) return self.fail(error.SshProtocol, "a short KEXINIT", .{});
 
-        var c = Cursor{ .s = is[17..] };
-        const kex_algs = try c.str();
-        const hostkey_offer = try c.str();
-        const enc_cs = try c.str();
-        const enc_sc = try c.str();
-        const mac_cs = try c.str();
-        const mac_sc = try c.str();
-        const comp_cs = try c.str();
-        const comp_sc = try c.str();
+        var c = Cursor{ .p = is[17..] };
+        const kex_algs = try c.prefixed(u32);
+        const hostkey_offer = try c.prefixed(u32);
+        const enc_cs = try c.prefixed(u32);
+        const enc_sc = try c.prefixed(u32);
+        const mac_cs = try c.prefixed(u32);
+        const mac_sc = try c.prefixed(u32);
+        const comp_cs = try c.prefixed(u32);
+        const comp_sc = try c.prefixed(u32);
         if (first and listHas(kex_algs, "kex-strict-s-v00@openssh.com")) {
             self.strict = true;
             if (self.rx.seq != 1) return self.fail(error.SshProtocol, "packets before the server's KEXINIT in a strict key exchange", .{});
@@ -715,12 +684,12 @@ pub const Session = struct {
 
         const reply = try self.nextKex(first);
         if (reply.len == 0 or reply[0] != msg.kex_ecdh_reply) return self.fail(error.SshProtocol, "expected KEX_ECDH_REPLY", .{});
-        var rc = Cursor{ .s = reply[1..] };
-        const k_s = try self.gpa.dupe(u8, try rc.str());
+        var rc = Cursor{ .p = reply[1..] };
+        const k_s = try self.gpa.dupe(u8, try rc.prefixed(u32));
         defer self.gpa.free(k_s);
-        const q_s = try rc.str();
+        const q_s = try rc.prefixed(u32);
         if (q_s.len != 32) return error.SshProtocol;
-        const sig = try self.gpa.dupe(u8, try rc.str());
+        const sig = try self.gpa.dupe(u8, try rc.prefixed(u32));
         defer self.gpa.free(sig);
         const shared = X25519.scalarmult(kp.secret_key, q_s[0..32].*) catch return error.SshProtocol;
 
@@ -827,9 +796,9 @@ pub const Session = struct {
     }
 
     fn disconnected(self: *Session, p: []const u8) Error {
-        var c = Cursor{ .s = p[1..] };
-        _ = c.u32be() catch {};
-        const why = c.str() catch "";
+        var c = Cursor{ .p = p[1..] };
+        _ = c.int(u32) catch {};
+        const why = c.prefixed(u32) catch "";
         return self.fail(error.SshDisconnected, "the server disconnected: {s}", .{why});
     }
 
@@ -848,9 +817,9 @@ pub const Session = struct {
                     try self.kex(theirs);
                 },
                 msg.global_request => {
-                    var c = Cursor{ .s = p[1..] };
-                    _ = try c.str();
-                    if (try c.boolean()) try self.sendPacket(&.{msg.request_failure});
+                    var c = Cursor{ .p = p[1..] };
+                    _ = try c.prefixed(u32);
+                    if ((try c.int(u8)) != 0) try self.sendPacket(&.{msg.request_failure});
                 },
                 else => return p,
             }
@@ -948,8 +917,8 @@ pub const Session = struct {
     }
 
     fn authRefused(self: *Session, p: []const u8) bool {
-        var c = Cursor{ .s = p[1..] };
-        const methods = c.str() catch "";
+        var c = Cursor{ .p = p[1..] };
+        const methods = c.prefixed(u32) catch "";
         const n = @min(methods.len, self.auth_methods.len);
         @memcpy(self.auth_methods[0..n], methods[0..n]);
         self.auth_methods_len = n;
@@ -992,11 +961,11 @@ pub const Session = struct {
                 msg.userauth_success => return true,
                 msg.userauth_failure => return self.authRefused(p),
                 msg.userauth_info_request => {
-                    var c = Cursor{ .s = p[1..] };
-                    _ = try c.str();
-                    _ = try c.str();
-                    _ = try c.str();
-                    const n = try c.u32be();
+                    var c = Cursor{ .p = p[1..] };
+                    _ = try c.prefixed(u32);
+                    _ = try c.prefixed(u32);
+                    _ = try c.prefixed(u32);
+                    const n = try c.int(u32);
                     if (n > 16) return error.SshProtocol;
                     var r = Buf.init(self.gpa);
                     defer {
@@ -1069,13 +1038,13 @@ pub const Session = struct {
         try self.sendPacket(b.list.items);
         while (true) {
             const p = try self.next();
-            var c = Cursor{ .s = p[1..] };
+            var c = Cursor{ .p = p[1..] };
             switch (p[0]) {
                 msg.channel_open_confirmation => {
-                    _ = try c.u32be();
-                    self.chan_remote = try c.u32be();
-                    self.remote_window = try c.u32be();
-                    self.remote_max_packet = try c.u32be();
+                    _ = try c.int(u32);
+                    self.chan_remote = try c.int(u32);
+                    self.remote_window = try c.int(u32);
+                    self.remote_max_packet = try c.int(u32);
                     if (self.remote_max_packet <= 64) return self.fail(error.SshProtocol, "the server's channel takes packets of at most {d} bytes, too small to carry data", .{self.remote_max_packet});
                     self.local_window = local_window_size;
                     self.chan_open = true;
@@ -1104,9 +1073,9 @@ pub const Session = struct {
     }
 
     fn onWindow(self: *Session, p: []const u8) !void {
-        var c = Cursor{ .s = p[1..] };
-        _ = try c.u32be();
-        self.remote_window += try c.u32be();
+        var c = Cursor{ .p = p[1..] };
+        _ = try c.int(u32);
+        self.remote_window += try c.int(u32);
     }
 
     /// Send `data` on the channel, cut to the peer's packet size and waiting on its window.
@@ -1138,9 +1107,9 @@ pub const Session = struct {
     /// Holds data that arrives while `send` waits. Its window is granted back only
     /// when `recv` hands it on, so what is held never exceeds one window.
     fn stash(self: *Session, p: []const u8) !void {
-        var c = Cursor{ .s = p[1..] };
-        _ = try c.u32be();
-        const d = try c.str();
+        var c = Cursor{ .p = p[1..] };
+        _ = try c.int(u32);
+        const d = try c.prefixed(u32);
         try self.arrived(d.len);
         try self.held.appendSlice(d);
     }
@@ -1153,20 +1122,20 @@ pub const Session = struct {
         }
         while (true) {
             const p = try self.next();
-            var c = Cursor{ .s = p[1..] };
+            var c = Cursor{ .p = p[1..] };
             switch (p[0]) {
                 msg.channel_data => {
-                    _ = try c.u32be();
-                    const d = try c.str();
+                    _ = try c.int(u32);
+                    const d = try c.prefixed(u32);
                     try self.arrived(d.len);
                     try out.appendSlice(d);
                     try self.regrant();
                     if (d.len > 0) return;
                 },
                 msg.channel_extended_data => {
-                    _ = try c.u32be();
-                    _ = try c.u32be();
-                    try self.arrived((try c.str()).len);
+                    _ = try c.int(u32);
+                    _ = try c.int(u32);
+                    try self.arrived((try c.prefixed(u32)).len);
                     try self.regrant();
                 },
                 msg.channel_window_adjust => try self.onWindow(p),
@@ -1175,9 +1144,9 @@ pub const Session = struct {
                     return self.fail(error.SshDisconnected, "the server closed the channel", .{});
                 },
                 msg.channel_request => {
-                    _ = try c.u32be();
-                    _ = try c.str();
-                    if (try c.boolean()) {
+                    _ = try c.int(u32);
+                    _ = try c.prefixed(u32);
+                    if ((try c.int(u8)) != 0) {
                         var b = Buf.init(self.gpa);
                         defer b.deinit();
                         try b.byte(msg.channel_failure);
@@ -1377,15 +1346,15 @@ fn glob(pat: []const u8, s: []const u8) bool {
 }
 
 fn verifySignature(self: *Session, blob: []const u8, alg: []const u8, sig: []const u8, h: *const [32]u8) !void {
-    var kc = Cursor{ .s = blob };
-    const ktype = try kc.str();
-    var sc = Cursor{ .s = sig };
-    const salg = try sc.str();
-    const sbytes = try sc.str();
+    var kc = Cursor{ .p = blob };
+    const ktype = try kc.prefixed(u32);
+    var sc = Cursor{ .p = sig };
+    const salg = try sc.prefixed(u32);
+    const sbytes = try sc.prefixed(u32);
     if (!std.mem.eql(u8, salg, alg)) return self.fail(error.SshBadHostSignature, "the server signed with {s}, not the agreed {s}", .{ salg, alg });
     const bad = error.SshBadHostSignature;
     if (std.mem.eql(u8, ktype, "ssh-ed25519")) {
-        const pk = try kc.str();
+        const pk = try kc.prefixed(u32);
         if (pk.len != 32 or sbytes.len != 64) return bad;
         const pub_key = Ed25519.PublicKey.fromBytes(pk[0..32].*) catch return bad;
         const s = Ed25519.Signature.fromBytes(sbytes[0..64].*);
@@ -1393,12 +1362,12 @@ fn verifySignature(self: *Session, blob: []const u8, alg: []const u8, sig: []con
         return;
     }
     if (std.mem.eql(u8, ktype, "ecdsa-sha2-nistp256")) {
-        _ = try kc.str();
-        const q = try kc.str();
+        _ = try kc.prefixed(u32);
+        const q = try kc.prefixed(u32);
         const pub_key = EcdsaP256.PublicKey.fromSec1(q) catch return bad;
-        var rs = Cursor{ .s = sbytes };
-        const r = try rs.str();
-        const s = try rs.str();
+        var rs = Cursor{ .p = sbytes };
+        const r = try rs.prefixed(u32);
+        const s = try rs.prefixed(u32);
         var raw: [64]u8 = @splat(0);
         if (!fitInt(r, raw[0..32]) or !fitInt(s, raw[32..64])) return bad;
         const sg = EcdsaP256.Signature.fromBytes(raw);
@@ -1406,8 +1375,8 @@ fn verifySignature(self: *Session, blob: []const u8, alg: []const u8, sig: []con
         return;
     }
     if (std.mem.eql(u8, ktype, "ssh-rsa")) {
-        const e = try kc.str();
-        const n = try kc.str();
+        const e = try kc.prefixed(u32);
+        const n = try kc.prefixed(u32);
         var nb = n;
         while (nb.len > 0 and nb[0] == 0) nb = nb[1..];
         const pk = rsa.PublicKey.fromBytes(e, nb) catch return bad;
@@ -1458,13 +1427,13 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     dec.decode(raw, b64.items) catch return error.SshKeyUnsupported;
     const magic = "openssh-key-v1\x00";
     if (!std.mem.startsWith(u8, raw, magic)) return error.SshKeyUnsupported;
-    var c = Cursor{ .s = raw[magic.len..] };
-    const cipher = try c.str();
-    const kdf = try c.str();
-    const kdf_opts = try c.str();
-    if (try c.u32be() != 1) return error.SshKeyUnsupported;
-    _ = try c.str();
-    const sec_in = try c.str();
+    var c = Cursor{ .p = raw[magic.len..] };
+    const cipher = try c.prefixed(u32);
+    const kdf = try c.prefixed(u32);
+    const kdf_opts = try c.prefixed(u32);
+    if (try c.int(u32) != 1) return error.SshKeyUnsupported;
+    _ = try c.prefixed(u32);
+    const sec_in = try c.prefixed(u32);
     const sec = try gpa.dupe(u8, sec_in);
     defer {
         crypto.secureZero(u8, sec);
@@ -1473,23 +1442,23 @@ fn parsePrivateKey(gpa: std.mem.Allocator, text: []const u8, passphrase: ?[]cons
     if (!std.mem.eql(u8, cipher, "none")) {
         if (!std.mem.eql(u8, cipher, "aes256-ctr") or !std.mem.eql(u8, kdf, "bcrypt")) return error.SshKeyUnsupported;
         const pass = passphrase orelse return error.SshKeyPassphrase;
-        var oc = Cursor{ .s = kdf_opts };
-        const salt = try oc.str();
-        const rounds = try oc.u32be();
+        var oc = Cursor{ .p = kdf_opts };
+        const salt = try oc.prefixed(u32);
+        const rounds = try oc.int(u32);
         var km: [48]u8 = undefined;
         defer crypto.secureZero(u8, &km);
         crypto.pwhash.bcrypt.opensshKdf(pass, salt, &km, rounds) catch return error.SshKeyUnsupported;
         var iv: [16]u8 = km[32..48].*;
         ctrRun(crypto.core.aes.Aes256, km[0..32].*, &iv, sec);
     }
-    var pc = Cursor{ .s = sec };
-    const c1 = try pc.u32be();
-    const c2 = try pc.u32be();
+    var pc = Cursor{ .p = sec };
+    const c1 = try pc.int(u32);
+    const c2 = try pc.int(u32);
     if (c1 != c2) return error.SshKeyPassphrase;
-    const ktype = try pc.str();
+    const ktype = try pc.prefixed(u32);
     if (!std.mem.eql(u8, ktype, "ssh-ed25519")) return error.SshKeyUnsupported;
-    const pk = try pc.str();
-    const sk = try pc.str();
+    const pk = try pc.prefixed(u32);
+    const sk = try pc.prefixed(u32);
     if (pk.len != 32 or sk.len != 64) return error.SshKeyUnsupported;
     return .{ .public = pk[0..32].*, .secret = sk[0..64].* };
 }

@@ -125,12 +125,12 @@ pub const Client = struct {
         try session.send(b.list.items);
         const v = try self.reply();
         if (v[0] != fxp.version) return error.SftpProtocol;
-        var c = ssh.Cursor{ .s = v[1..] };
-        _ = try c.u32be();
+        var c = ssh.Cursor{ .p = v[1..] };
+        _ = try c.int(u32);
         var limits = false;
-        while (c.i < c.s.len) {
-            const n = try c.str();
-            _ = try c.str();
+        while (c.left() > 0) {
+            const n = try c.prefixed(u32);
+            _ = try c.prefixed(u32);
             if (std.mem.eql(u8, n, "posix-rename@openssh.com")) self.posix_rename = true;
             if (std.mem.eql(u8, n, "limits@openssh.com")) limits = true;
         }
@@ -145,10 +145,10 @@ pub const Client = struct {
         try self.finish();
         const r = try self.replyFor(id);
         if (r[0] != fxp.extended_reply) return;
-        var c = ssh.Cursor{ .s = r[5..] };
-        _ = try c.u64be();
-        const mr = try c.u64be();
-        const mw = try c.u64be();
+        var c = ssh.Cursor{ .p = r[5..] };
+        _ = try c.int(u64);
+        const mr = try c.int(u64);
+        const mw = try c.int(u64);
         if (mr > 0) self.max_read = @intCast(@min(mr, 255 * 1024));
         if (mw > 0) self.max_write = @intCast(@min(mw, 255 * 1024));
     }
@@ -211,9 +211,9 @@ pub const Client = struct {
 
     fn statusOf(self: *Client, r: []const u8) !void {
         if (r[0] != fxp.status) return error.SftpProtocol;
-        var c = ssh.Cursor{ .s = r[5..] };
-        const code = try c.u32be();
-        const text = c.str() catch "";
+        var c = ssh.Cursor{ .p = r[5..] };
+        const code = try c.int(u32);
+        const text = c.prefixed(u32) catch "";
         self.why.clearRetainingCapacity();
         try self.why.appendSlice(text);
         return switch (code) {
@@ -234,8 +234,8 @@ pub const Client = struct {
         try self.finish();
         const r = try self.replyFor(id);
         if (r[0] == fxp.handle) {
-            var c = ssh.Cursor{ .s = r[5..] };
-            return self.gpa.dupe(u8, try c.str());
+            var c = ssh.Cursor{ .p = r[5..] };
+            return self.gpa.dupe(u8, try c.prefixed(u32));
         }
         try self.statusOf(r);
         return error.SftpProtocol;
@@ -257,7 +257,7 @@ pub const Client = struct {
             try self.statusOf(r);
             return error.SftpProtocol;
         }
-        var c = ssh.Cursor{ .s = r[5..] };
+        var c = ssh.Cursor{ .p = r[5..] };
         const a = try readAttrs(&c);
         return a.size orelse error.SftpUnsupported;
     }
@@ -293,8 +293,8 @@ pub const Client = struct {
             reqs[k] = reqs[n_out - 1];
             n_out -= 1;
             if (r[0] == fxp.data) {
-                var c = ssh.Cursor{ .s = r[5..] };
-                const d = try c.str();
+                var c = ssh.Cursor{ .p = r[5..] };
+                const d = try c.prefixed(u32);
                 if (d.len > q.len) return error.SftpProtocol;
                 const dst: usize = @intCast(q.at - off);
                 @memcpy(out[dst..][0..d.len], d);
@@ -390,8 +390,8 @@ pub const Client = struct {
             try self.statusOf(r);
             return error.SftpProtocol;
         }
-        var hc = ssh.Cursor{ .s = r[5..] };
-        const handle = try arena.dupe(u8, try hc.str());
+        var hc = ssh.Cursor{ .p = r[5..] };
+        const handle = try arena.dupe(u8, try hc.prefixed(u32));
         var out = std.array_list.Managed(remotefs.Entry).init(arena);
         while (true) {
             const rid = try self.begin(fxp.readdir);
@@ -405,11 +405,11 @@ pub const Client = struct {
                 };
                 break;
             }
-            var c = ssh.Cursor{ .s = rr[5..] };
-            const count = try c.u32be();
+            var c = ssh.Cursor{ .p = rr[5..] };
+            const count = try c.int(u32);
             for (0..count) |_| {
-                const name = try c.str();
-                _ = try c.str();
+                const name = try c.prefixed(u32);
+                _ = try c.prefixed(u32);
                 const a = try readAttrs(&c);
                 try out.append(.{
                     .name = try arena.dupe(u8, name),
@@ -427,22 +427,22 @@ const Attrs = struct { size: ?u64 = null, perms: ?u32 = null };
 
 fn readAttrs(c: *ssh.Cursor) !Attrs {
     var a = Attrs{};
-    const f = try c.u32be();
-    if (f & 0x1 != 0) a.size = try c.u64be();
+    const f = try c.int(u32);
+    if (f & 0x1 != 0) a.size = try c.int(u64);
     if (f & 0x2 != 0) {
-        _ = try c.u32be();
-        _ = try c.u32be();
+        _ = try c.int(u32);
+        _ = try c.int(u32);
     }
-    if (f & 0x4 != 0) a.perms = try c.u32be();
+    if (f & 0x4 != 0) a.perms = try c.int(u32);
     if (f & 0x8 != 0) {
-        _ = try c.u32be();
-        _ = try c.u32be();
+        _ = try c.int(u32);
+        _ = try c.int(u32);
     }
     if (f & 0x80000000 != 0) {
-        const n = try c.u32be();
+        const n = try c.int(u32);
         for (0..n) |_| {
-            _ = try c.str();
-            _ = try c.str();
+            _ = try c.prefixed(u32);
+            _ = try c.prefixed(u32);
         }
     }
     return a;

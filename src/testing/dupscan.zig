@@ -388,6 +388,15 @@ pub const plan = [_]Rule{
     .{ .home = "utf16", .pattern = utf16_pattern, .exact = true, .allow = &.{
         "format/utf16.zig",
     } },
+    .{ .home = "charset", .pattern = charset_pattern, .exact = true, .allow = &.{
+        "format/charset.zig",
+    } },
+    .{ .home = "cursor", .pattern = cursor_pattern, .exact = true, .allow = &.{
+        "format/cursor.zig",
+    } },
+    .{ .home = "typemap", .pattern = typemap_pattern, .exact = true, .allow = &.{
+        "db/typemap.zig",
+    } },
     .{ .home = "scheme", .pattern = scheme_pattern, .allow = &.{
         "store/scheme.zig",
         "format/bytes.zig",
@@ -440,6 +449,9 @@ pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?
 pub const jsontext_pattern = "encodeJsonString(Chars)?|\\\\\\\\u(\\{[xX]:0>4|00\\{[xX]:0>2)\\}";
 pub const hex_pattern = "parseInt\\(.*16\\)|- 'a' \\+ 10|\"0123456789(abcdef|ABCDEF)\";|i == 8 or i == 13 or i == 18|i == 4 or i == 6 or i == 8";
 pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc|utf16IsHighSurrogate|0xD800 \\+";
+pub const charset_pattern = "0x201[aA], 0x0192|0x80 => 0x20[aA][cC]|0x009[cC], 0x0009,";
+pub const cursor_pattern = "> self\\.left\\(\\)|if \\(self\\.\\w+ \\+ \\w+ > self\\.\\w+\\.len\\) return|if \\(\\w+ > self\\.\\w+\\.len - self\\.\\w+\\) return";
+pub const typemap_pattern = "1114, 1184|0x00, 0xf6";
 pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|https?)://";
 pub const dial_pattern = "tcpConnectToHost";
 pub const options_pattern = "@intCast\\(try evalCfgInt";
@@ -481,6 +493,9 @@ test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles(civil_pattern, &.{ "719", "146", "719", "25", "107", "440", "86_400_000_000", "std.time.epoch." });
     try expectNeedles(jsontext_pattern, &.{ "encodeJsonString", "\\\\u" });
     try expectNeedles(utf16_pattern, &.{ "utf16LeToUtf8Alloc", "utf8ToUtf16LeAlloc", "utf16IsHighSurrogate", "0xD800 +" });
+    try expectNeedles(charset_pattern, &.{ ", 0x0192", "0x80 => 0x20", ", 0x0009," });
+    try expectNeedles(cursor_pattern, &.{ "> self.left()", ".len) return", ".len - self." });
+    try expectNeedles(typemap_pattern, &.{ "1114, 1184", "0x00, 0xf6" });
     try expectNeedles(scheme_pattern, &.{"startsWith(u8, "});
     try expectNeedles(sql_pattern, &.{"\"''\""});
     try expectNeedles(hex_pattern, &.{ "parseInt(", "- 'a' + 10", "\"0123456789", "i == 8 or i == 13 or i == 18", "i == 4 or i == 6 or i == 8" });
@@ -554,6 +569,21 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ utf16_pattern, "if (std.unicode.utf16IsHighSurrogate(u)) {", true },
         .{ utf16_pattern, "hi = @intCast(0xD800 + (v >> 10));", true },
         .{ utf16_pattern, "cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);", false },
+        .{ charset_pattern, "0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,", true },
+        .{ charset_pattern, "0x20AC, 0xFFFD, 0x201a, 0x0192,", true },
+        .{ charset_pattern, "0x80 => 0x20AC,", true },
+        .{ charset_pattern, "0x0000, 0x0001, 0x0002, 0x0003, 0x009C, 0x0009, 0x0086, 0x007F,", true },
+        .{ charset_pattern, "const pool = [_]u21{ 0x7FF, 0x800, 0x20AC, 0x4E2D, 0xFFFD };", false },
+        .{ cursor_pattern, "if (n > self.left()) return short;", true },
+        .{ cursor_pattern, "if (self.pos + n > self.buf.len) return Error.CorruptThrift;", true },
+        .{ cursor_pattern, "if (self.i + 4 > self.s.len) return error.SshProtocol;", true },
+        .{ cursor_pattern, "if (n > self.b.len - self.at) return error.DeletionVectorCorrupt;", true },
+        .{ cursor_pattern, "if (n > self.c.left()) return Error.CorruptThrift;", false },
+        .{ cursor_pattern, "const avail = self.buf.items.len - self.pos;", false },
+        .{ typemap_pattern, ".wire = codes(&.{ 1114, 1184 }) },", true },
+        .{ typemap_pattern, "1114, 1184 => .timestamp,", true },
+        .{ typemap_pattern, "0x00, 0xf6 => .decimal,", true },
+        .{ typemap_pattern, "1114 => .timestamp,", false },
         .{ scheme_pattern, "if (std.mem.startsWith(u8, url, \"sftp://\")) {", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"https://\")", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"http://\")", true },
