@@ -433,6 +433,31 @@ FROM db.it_dec;"; then
   fi
 fi
 
+# PostgreSQL bytea and time. A bytea read as text kept its `\x01ff` spelling and
+# a time read as text, not TIME. bytea is decoded from either `bytea_output`: the
+# hex default, then escape, set on the database so basalt's next session gets it.
+if runs postgres; then
+  pgq -c "DROP TABLE IF EXISTS it_bytea;
+          CREATE TABLE it_bytea (k int, b bytea, t time);
+          INSERT INTO it_bytea VALUES (1, '\\x01ff5c', '01:02:03'),
+            (2, '\\x01615c62ff', '23:59:59.999999'), (3, '', '00:00:00'), (4, NULL, NULL);" >/dev/null 2>&1
+  { echo "k,b,t";
+    echo "1,01FF5C,01:02:03";
+    echo "2,01615C62FF,23:59:59.999999";
+    echo '3,"",00:00:00';
+    echo "4,,"; } >"$out/pg_bytea_expected.csv"
+  for fmt in hex escape; do
+    pgq -c "ALTER DATABASE it SET bytea_output = '$fmt';" >/dev/null 2>&1
+    if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_bytea_$fmt.csv' AS SELECT k, hex(b) AS b, t FROM db.it_bytea ORDER BY k;"; then
+      check "postgres-bytea-time-$fmt" "$out/pg_bytea_$fmt.csv" "$out/pg_bytea_expected.csv"
+    else
+      report "postgres-bytea-time-$fmt (run error)" bad
+    fi
+  done
+  pgq -c "ALTER DATABASE it RESET bytea_output;" >/dev/null 2>&1
+fi
+
 # SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
 # high word first, not a float — decoding it as one turned -0.0001 into NaN — and
 # the fixed-length forms (money NOT NULL) were missing from the type switch
