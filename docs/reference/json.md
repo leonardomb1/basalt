@@ -15,7 +15,9 @@ null as `null` (the result itself is never null), and a NaN or infinity as
 `null` too, since JSON has neither. Text
 that is a JSON object or array — another `json_object`, or what `json_get`
 returned — goes in as that object or array, so
-`json_object('id', id, 'tags', json_array(a, b))` nests. A null key fails
+`json_object('id', id, 'tags', json_array(a, b))` nests. A key is its text,
+except a `BYTES` key, which is its base64 like a `BYTES` value, so
+`json_object(x'ff', 1, x'fe', 2)` is `{"/w==":1,"/g==":2}`. A null key fails
 the statement.
 
 ## Reading a value
