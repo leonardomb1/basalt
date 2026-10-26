@@ -703,6 +703,7 @@ inline fn laneRow(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side, 
             };
             break :blk mulOrNull(a, b);
         },
+        .mod => if (b == 0 or b == -1) null else @rem(a, b),
         else => unreachable,
     }) orelse return null;
     return if (small or @abs(u) < limit) u else null;
