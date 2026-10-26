@@ -138,10 +138,26 @@ fn argsOf(comptime F: type) [F.args.len]Arg {
     return F.args;
 }
 
-fn Args(comptime F: type) type {
-    var fields: [F.args.len]type = undefined;
-    for (argsOf(F), 0..) |a, i| fields[i] = if (i == 0 and nullFirst(F) and !a.optional()) ?a.T() else a.T();
+/// What the plumbing shared by every function of one argument shape needs to know
+/// besides the arguments' kinds.
+const Flags = struct {
+    null_first: bool,
+    eval_all: bool,
+    typed_last: bool,
+};
+
+fn flagsOf(comptime F: type) Flags {
+    return .{ .null_first = nullFirst(F), .eval_all = flag(F, "eval_all"), .typed_last = flag(F, "typed_last") };
+}
+
+fn ArgTuple(comptime args: anytype, comptime null_first: bool) type {
+    var fields: [args.len]type = undefined;
+    for (args, 0..) |a, i| fields[i] = if (i == 0 and null_first and !a.optional()) ?a.T() else a.T();
     return std.meta.Tuple(&fields);
+}
+
+fn Args(comptime F: type) type {
+    return ArgTuple(argsOf(F), nullFirst(F));
 }
 
 fn nullFirst(comptime F: type) bool {
@@ -207,7 +223,7 @@ fn atScale(d: Decimal, ty: Type) EvalError!Decimal {
     return rescaleTo(d, ty.scale) orelse decimalOverflow();
 }
 
-fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base() {
+noinline fn rowArg(comptime a: Arg, arena: std.mem.Allocator, v: Value) EvalError!a.Base() {
     return switch (a) {
         .str, .opt_str => try valueToString(arena, v),
         .int, .opt_int => toI64(v),
@@ -261,7 +277,7 @@ fn Operand(comptime a: Arg) type {
     return if (a.text()) ?Str else if (a.typed()) ?Typed(a.Base()) else ?Num;
 }
 
-fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!Operand(a) {
+noinline fn vecArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecError!Operand(a) {
     if (comptime a.text()) return asStr(v) orelse error.Unsupported;
     if (comptime a.typed()) return try typedArg(a, arena, v, n);
     if (comptime a == .unit) return if (v == .scalar and v.scalar == .string) timeUnit(v.scalar.string) orelse error.Unsupported else error.Unsupported;
@@ -342,35 +358,41 @@ fn isBytes(v: Vec) bool {
 pub fn typeRule(comptime F: type) fn (*TypeCtx, ast.Expr.Call) TypeError!Type {
     return struct {
         fn rule(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
-            const args = comptime argsOf(F);
-            const required = comptime blk: {
-                var n = 0;
-                for (args) |a| {
-                    if (!a.optional()) n += 1;
-                }
-                break :blk n;
-            };
-            if (c.args.len < required or c.args.len > args.len) return self.err("`{s}` takes " ++ F.signature, .{c.name});
-            var nullable = @hasDecl(F, "may_null") and F.may_null;
-            inline for (args, 0..) |a, i| if (i < c.args.len) {
-                const t = try self.argType(c, i);
-                const ok = switch (a) {
-                    .str, .opt_str => t.kind != .array and t.kind != .@"struct",
-                    .int, .exact_int, .opt_int => intish(t),
-                    .num => numericish(t),
-                    .dec => t.kind == .decimal or intish(t),
-                    .day => t.kind == .date,
-                    .micros => t.kind == .time or t.kind == .timestamp,
-                    .temporal => temporalish(t),
-                    .unit => c.args[i].* == .str_lit and timeUnit(c.args[i].str_lit) != null,
-                };
-                if (!ok and !t.unknown) return self.err("`{s}` argument {d} must be {s}, got {s}", .{ c.name, i + 1, argWord(a), @tagName(t.kind) });
-                if (t.nullable and !(i == 0 and nullFirst(F))) nullable = true;
-            };
+            const nullable = try checkArgs(comptime argsOf(F), comptime nullFirst(F), self, c, F.signature);
             if (@hasDecl(F, "check")) try F.check(self, c);
-            return resultType(F, c, null).withNull(nullable);
+            return resultType(F, c, null).withNull(nullable or (@hasDecl(F, "may_null") and F.may_null));
         }
     }.rule;
+}
+
+/// The typing plumbing for every function of one argument shape: the call's arity
+/// against `signature`, each argument of its kind, and whether one is nullable.
+noinline fn checkArgs(comptime args: anytype, comptime null_first: bool, self: *TypeCtx, c: ast.Expr.Call, signature: []const u8) TypeError!bool {
+    const required = comptime blk: {
+        var n = 0;
+        for (args) |a| {
+            if (!a.optional()) n += 1;
+        }
+        break :blk n;
+    };
+    if (c.args.len < required or c.args.len > args.len) return self.err("`{s}` takes {s}", .{ c.name, signature });
+    var nullable = false;
+    inline for (args, 0..) |a, i| if (i < c.args.len) {
+        const t = try self.argType(c, i);
+        const ok = switch (a) {
+            .str, .opt_str => t.kind != .array and t.kind != .@"struct",
+            .int, .exact_int, .opt_int => intish(t),
+            .num => numericish(t),
+            .dec => t.kind == .decimal or intish(t),
+            .day => t.kind == .date,
+            .micros => t.kind == .time or t.kind == .timestamp,
+            .temporal => temporalish(t),
+            .unit => c.args[i].* == .str_lit and timeUnit(c.args[i].str_lit) != null,
+        };
+        if (!ok and !t.unknown) return self.err("`{s}` argument {d} must be {s}, got {s}", .{ c.name, i + 1, argWord(a), @tagName(t.kind) });
+        if (t.nullable and !(i == 0 and null_first)) nullable = true;
+    };
+    return nullable;
 }
 
 fn argWord(comptime a: Arg) []const u8 {
@@ -397,33 +419,10 @@ pub fn Scalar(comptime F: type) type {
 
         /// The row form, the arguments in `given` already evaluated (by an overload).
         pub fn evalWith(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize, given: []const ?Value) EvalError!Value {
+            const g = (try gather(comptime argsOf(F), comptime flagsOf(F), arena, c, batch, row, given)) orelse return .null;
             var buf = std.array_list.Managed(u8).init(arena);
-            var cx = Cx{ .arena = arena, .buf = &buf, .call = c };
-            const late = comptime flag(F, "eval_all") or flag(F, "typed_last");
-            var vals: [F.args.len]Value = undefined;
-            if (comptime flag(F, "eval_all")) {
-                for (vals[0..@min(vals.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
-                for (vals[0..@min(vals.len, c.args.len)]) |v| if (v.isNull()) return .null;
-            }
-            var t: Args(F) = undefined;
-            inline for (comptime argsOf(F), 0..) |a, i| {
-                if (i >= c.args.len) {
-                    if (comptime !a.optional()) return error.TypeMismatch;
-                    t[i] = null;
-                } else {
-                    const v = if (comptime flag(F, "eval_all")) vals[i] else if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
-                    if (v.isNull()) {
-                        if (comptime i == 0 and nullFirst(F)) t[i] = null else return .null;
-                    } else {
-                        if (i == 0) cx.bytes = v == .bytes;
-                        if (late) vals[i] = v else t[i] = try rowArg(a, arena, v);
-                    }
-                }
-            }
-            if (late) inline for (comptime argsOf(F), 0..) |a, i| if (i < c.args.len) {
-                t[i] = try rowArg(a, arena, vals[i]);
-            };
-            return wrap(try @call(.auto, F.apply, .{cx} ++ t), c);
+            const cx = Cx{ .arena = arena, .buf = &buf, .call = c, .bytes = g.bytes };
+            return wrap(try @call(.auto, F.apply, .{cx} ++ g.t), c);
         }
 
         fn evalMany(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
@@ -457,24 +456,23 @@ pub fn Scalar(comptime F: type) type {
             return vecWith(arena, c, batch, &.{}, 0);
         }
 
+        fn readsArg() bool {
+            return @hasDecl(F, "resultType") and @typeInfo(@TypeOf(F.resultType)).@"fn".params.len == 2;
+        }
+
+        fn typeOf(c: ast.Expr.Call, arg: ?Type) Type {
+            return resultType(F, c, arg);
+        }
+
         /// The kernel, the arguments in `given` already evaluated (by an overload,
         /// which picked its variant by argument `on`).
         pub fn vecWith(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, given: []const ?Vec, on: usize) VecError!Vec {
             const n = batch.len;
-            var vecs: [F.args.len]?Vec = @splat(null);
-            for (vecs[0..@min(vecs.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalVec(arena, c.args[i], batch);
-            var out = try Out(Payload(F), flag(F, "value_scale")).init(arena, n, resultType(F, c, if (on < vecs.len) if (vecs[on]) |v| vecType(v) else null else null));
-            var cx = Cx{ .arena = arena, .buf = out.buf(), .call = c };
-            var ops: OperandTuple(F) = undefined;
-            inline for (comptime argsOf(F), 0..) |a, i| {
-                if (vecs[i]) |v| {
-                    if (i == 0) cx.bytes = isBytes(v);
-                    ops[i] = try vecArg(a, arena, v, n);
-                } else {
-                    if (comptime !a.optional()) return error.Unsupported;
-                    ops[i] = null;
-                }
-            }
+            var kern: Kernel(argsOf(F), Payload(F), flag(F, "value_scale")) = undefined;
+            try begin(comptime argsOf(F), Payload(F), comptime flag(F, "value_scale"), &kern, arena, c, batch, given, if (comptime readsArg()) on else null, &typeOf);
+            const out = &kern.out;
+            const ops = kern.ops;
+            var cx = Cx{ .arena = arena, .buf = out.buf(), .call = c, .bytes = kern.bytes };
             rows: for (0..n) |i| {
                 cx.mark = out.begin();
                 var t: Args(F) = undefined;
@@ -661,10 +659,75 @@ pub fn Numeric(comptime M: type) type {
     });
 }
 
-fn OperandTuple(comptime F: type) type {
-    var fields: [F.args.len]type = undefined;
-    for (argsOf(F), 0..) |a, i| fields[i] = Operand(a);
+fn OperandTuple(comptime args: anytype) type {
+    var fields: [args.len]type = undefined;
+    for (args, 0..) |a, i| fields[i] = Operand(a);
     return std.meta.Tuple(&fields);
+}
+
+/// A row's arguments read as their kinds, and whether the first is BYTES.
+fn Gathered(comptime args: anytype, comptime fl: Flags) type {
+    return struct { t: ArgTuple(args, fl.null_first), bytes: bool };
+}
+
+/// The row form's plumbing for every function of one argument shape: each argument
+/// evaluated (or taken from `given`) and read as its kind, null when one is NULL.
+noinline fn gather(comptime args: anytype, comptime fl: Flags, arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize, given: []const ?Value) EvalError!?Gathered(args, fl) {
+    const late = fl.eval_all or fl.typed_last;
+    var g: Gathered(args, fl) = .{ .t = undefined, .bytes = false };
+    var vals: [args.len]Value = undefined;
+    if (fl.eval_all) {
+        for (vals[0..@min(vals.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
+        for (vals[0..@min(vals.len, c.args.len)]) |v| if (v.isNull()) return null;
+    }
+    inline for (args, 0..) |a, i| {
+        if (i >= c.args.len) {
+            if (comptime !a.optional()) return error.TypeMismatch;
+            g.t[i] = null;
+        } else {
+            const v = if (fl.eval_all) vals[i] else if (i < given.len and given[i] != null) given[i].? else try evalRow(arena, c.args[i], batch, row);
+            if (v.isNull()) {
+                if (comptime i == 0 and fl.null_first) g.t[i] = null else return null;
+            } else {
+                if (i == 0) g.bytes = v == .bytes;
+                if (late) vals[i] = v else g.t[i] = try rowArg(a, arena, v);
+            }
+        }
+    }
+    if (late) inline for (args, 0..) |a, i| if (i < c.args.len) {
+        g.t[i] = try rowArg(a, arena, vals[i]);
+    };
+    return g;
+}
+
+/// A kernel's output column and its arguments read for it, before any row.
+fn Kernel(comptime args: anytype, comptime P: type, comptime keep_scale: bool) type {
+    return struct { out: Out(P, keep_scale), ops: OperandTuple(args), bytes: bool };
+}
+
+/// The kernel's plumbing for every function of one argument and result shape, filling
+/// `k`: each argument evaluated (or taken from `given`), the output typed by `rt`
+/// (handed argument `on`'s type when `on` is set) and the arguments read as their kinds.
+noinline fn begin(comptime args: anytype, comptime P: type, comptime keep_scale: bool, k: *Kernel(args, P, keep_scale), arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, given: []const ?Vec, on: ?usize, rt: *const fn (ast.Expr.Call, ?Type) Type) VecError!void {
+    const n = batch.len;
+    var vecs: [args.len]?Vec = @splat(null);
+    try evalArgs(arena, c, batch, given, &vecs);
+    const arg_ty: ?Type = if (on) |o| if (o < vecs.len) if (vecs[o]) |v| vecType(v) else null else null else null;
+    k.* = .{ .out = try Out(P, keep_scale).init(arena, n, rt(c, arg_ty)), .ops = undefined, .bytes = false };
+    inline for (args, 0..) |a, i| {
+        if (vecs[i]) |v| {
+            if (i == 0) k.bytes = isBytes(v);
+            k.ops[i] = try vecArg(a, arena, v, n);
+        } else {
+            if (comptime !a.optional()) return error.Unsupported;
+            k.ops[i] = null;
+        }
+    }
+}
+
+/// The call's arguments over `batch`, as many as `vecs` holds, those in `given` as given.
+fn evalArgs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, given: []const ?Vec, vecs: []?Vec) VecError!void {
+    for (vecs[0..@min(vecs.len, c.args.len)], 0..) |*v, i| v.* = if (i < given.len and given[i] != null) given[i].? else try evalVec(arena, c.args[i], batch);
 }
 
 fn unsupported(e: anyerror) VecError {
@@ -680,7 +743,7 @@ fn Out(comptime P: type, comptime keep_scale: bool) type {
             bm: Bitmap,
             ty: Type,
             any: bool = false,
-            fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
+            noinline fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
                 return .{ .app = try column.BytesAppender.init(arena, n), .bm = try Bitmap.initFull(arena, n), .ty = ty };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
@@ -709,7 +772,7 @@ fn Out(comptime P: type, comptime keep_scale: bool) type {
                 o.bm.setValid(i, false);
                 o.any = true;
             }
-            fn finish(o: *@This()) !Vec {
+            noinline fn finish(o: *@This()) !Vec {
                 return mkCol(o.ty.withNull(o.any), o.bm.len, o.bm, .{ .bytes = try o.app.finish() });
             }
         },
@@ -717,7 +780,7 @@ fn Out(comptime P: type, comptime keep_scale: bool) type {
             f: Filled(P),
             scratch: std.array_list.Managed(u8),
             ty: Type,
-            fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
+            noinline fn init(arena: std.mem.Allocator, n: usize, ty: Type) !@This() {
                 return .{ .f = try .init(arena, n), .scratch = .init(arena), .ty = ty };
             }
             fn buf(o: *@This()) *std.array_list.Managed(u8) {
@@ -733,7 +796,7 @@ fn Out(comptime P: type, comptime keep_scale: bool) type {
             fn none(o: *@This(), i: usize, _: usize) !void {
                 o.f.setNull(i);
             }
-            fn finish(o: *@This()) !Vec {
+            noinline fn finish(o: *@This()) !Vec {
                 return o.f.finish(o.ty);
             }
         },
