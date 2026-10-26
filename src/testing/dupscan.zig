@@ -28,6 +28,7 @@ pub const Rule = struct {
     allow: []const []const u8 = &.{},
     tests: bool = false,
     span: Span = .line,
+    exact: bool = false,
 };
 
 pub const Span = enum { line, file };
@@ -277,10 +278,12 @@ pub fn expectConfined(rules: []const Rule, mode: Mode) !void {
         gpa.free(reports);
     }
     var failed = false;
-    for (rules, reports) |rule, r| if (!r.ok(mode)) {
-        explain(rule, r, mode);
+    for (rules, reports) |rule, r| {
+        const m: Mode = if (rule.exact) .exact else mode;
+        if (r.ok(m)) continue;
+        explain(rule, r, m);
         failed = true;
-    };
+    }
     if (failed) return error.TestUnexpectedResult;
 }
 
@@ -432,21 +435,23 @@ pub const plan = [_]Rule{
         "db/streamload.zig",
         "net/http_client.zig",
     } },
-    .{ .home = "queue", .pattern = queue_pattern, .allow = &.{
+    .{ .home = "queue", .pattern = queue_pattern, .exact = true, .allow = &.{
         "runtime/parallel.zig",
-        "runtime/lanes/agg.zig",
-        "runtime/lanes/distinct.zig",
-        "runtime/lanes/join.zig",
-        "runtime/lanes/map.zig",
     } },
-    .{ .home = "sql", .pattern = sql_pattern, .under = "db/", .allow = &.{
+    .{ .home = "sql", .pattern = sql_pattern, .under = "db/", .exact = true, .allow = &.{
         "db/sql.zig",
-        "db/streamload.zig",
     } },
-    .{ .home = "guard", .pattern = guard_pattern, .span = .file, .allow = &.{
+    .{ .home = "guard", .pattern = guard_pattern, .span = .file, .exact = true, .allow = &.{
         "connect/guard.zig",
-        "format/records/write.zig",
-        "runtime/run/explain.zig",
+    } },
+    .{ .home = "delta_types", .pattern = delta_types_pattern, .exact = true, .allow = &.{
+        "format/lake/delta_types.zig",
+    } },
+    .{ .home = "unsigned", .pattern = unsigned_pattern, .exact = true, .allow = &.{
+        "lang/types.zig",
+    } },
+    .{ .home = "widen", .pattern = widen_pattern, .exact = true, .allow = &.{
+        "lang/types.zig",
     } },
 };
 
@@ -458,9 +463,12 @@ pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|https?)://";
 pub const dial_pattern = "tcpConnectToHost";
 pub const options_pattern = "@intCast\\(try evalCfgInt";
 pub const retry_pattern = "std\\.Thread\\.sleep\\(";
-pub const queue_pattern = "queue\\.next\\.fetchAdd";
-pub const sql_pattern = "\"''\"";
+pub const queue_pattern = "next\\.fetchAdd\\(";
+pub const sql_pattern = "\"''\"|== '\\\\''|'\\\\'' =>";
 pub const guard_pattern = "errdefer \\w+\\.abort\\(\\);([^{}]|\\{[^{}]*\\})*try \\w+\\.close\\(";
+pub const delta_types_pattern = "\"timestamp_ntz\"|\"decimal\\(\"";
+pub const unsigned_pattern = "decimal\\(20, ?0\\)";
+pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -495,7 +503,7 @@ test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles(civil_pattern, &.{ "719", "146", "719", "25", "107", "440", "86_400_000_000", "std.time.epoch." });
     try expectNeedles(jsontext_pattern, &.{"encodeJsonString"});
     try expectNeedles(scheme_pattern, &.{"startsWith(u8, "});
-    try expectNeedles(sql_pattern, &.{"\"''\""});
+    try expectNeedles(sql_pattern, &.{ "\"''\"", "== '\\''", "'\\'' =>" });
     try expectNeedles(hex_pattern, &.{"parseInt("});
     try expectNeedles(guard_pattern, &.{"errdefer "});
     try expectNeedles("ab+c", &.{"a"});
@@ -578,6 +586,52 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
     try expectStarts(guard_pattern, "errdefer w.abort();\n    try w.finish();\n", .file, &.{});
     try expectStarts(guard_pattern, "x();\n    errdefer w.abort();\n    try w.writeBatch(a, .{ .n = n });\n    try w.close();", .file, &.{9});
     try expectStarts(guard_pattern, "errdefer w.abort();\n    if (a) { b(); }\n    try w.close();", .file, &.{0});
+}
+
+test "dupscan queue, sql, guard, delta_types, unsigned and widen patterns" {
+    try expectNeedles(queue_pattern, &.{"next.fetchAdd("});
+    try expectNeedles(delta_types_pattern, &.{ "\"timestamp_ntz\"", "\"decimal(\"" });
+    try expectNeedles(unsigned_pattern, &.{"decimal(20,"});
+    try expectNeedles(widen_pattern, &.{ " == .decimal or", "== .decimal and " });
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ queue_pattern, "const i = queue.next.fetchAdd(1, .monotonic);", true },
+        .{ queue_pattern, "const i = q.next.fetchAdd(1, .seq_cst);", true },
+        .{ queue_pattern, "const i = ctx.next.fetchAdd(1, .monotonic);", true },
+        .{ queue_pattern, "const i = next.fetchAdd(1, order);", true },
+        .{ queue_pattern, "_ = ctx.rows_out.fetchAdd(1, .monotonic);", false },
+        .{ queue_pattern, "const i = parallel.claim(&ctx.next, n, .monotonic) orelse break;", false },
+        .{ sql_pattern, "try w.writeAll(\"''\");", true },
+        .{ sql_pattern, "const lit = try std.mem.replaceOwned(u8, a, s, \"'\", \"''\");", true },
+        .{ sql_pattern, "if (c == '\\'' or (c == '\\\\' and self.mysqlWire())) try w.writeByte(c);", true },
+        .{ sql_pattern, "'\\'' => try out.appendSlice(\"''\"),", true },
+        .{ sql_pattern, "switch (c) { '\\'' => n += 1, else => {} }", true },
+        .{ sql_pattern, "try w.writeByte('\\'');", false },
+        .{ sql_pattern, "try w.writeAll(\"'\");", false },
+        .{ delta_types_pattern, ".{ .name = \"timestamp_ntz\", .kind = .timestamp },", true },
+        .{ delta_types_pattern, "if (oneOf(t, &.{ \"timestamp\", \"timestamp_ntz\" })) return T.init(.timestamp);", true },
+        .{ delta_types_pattern, "if (std.mem.startsWith(u8, t, \"decimal(\") and std.mem.endsWith(u8, t, \")\")) {", true },
+        .{ delta_types_pattern, "return std.fmt.allocPrint(arena, \"decimal({d},{d})\", .{ p, s });", false },
+        .{ delta_types_pattern, "\"timestamp\"", false },
+        .{ unsigned_pattern, "0x08 => if (unsigned) types.Type.decimal(20, 0) else types.Type.init(.int),", true },
+        .{ unsigned_pattern, "Type.decimal(20,0)", true },
+        .{ unsigned_pattern, "Type.decimal(38, 0)", false },
+        .{ unsigned_pattern, "Type.decimal(20, 2)", false },
+        .{ widen_pattern, "return (from == .int and (to == .decimal or to == .float)) or (from == .decimal and to == .float);", true },
+        .{ widen_pattern, "if (a == .decimal and b == .float) return .float;", true },
+        .{ widen_pattern, "if ((build == .int and p == .float) or (build == .float and p == .int)) return f;", false },
+        .{ widen_pattern, "if (a.kind == .int and b.kind == .decimal) return unify(d, b);", false },
+        .{ widen_pattern, "if (p.ty.kind == .int and (raw == .float or raw == .decimal))", false },
+    };
+    for (cases) |c| {
+        const got = try startsOf(c[0], c[1], .line);
+        defer std.testing.allocator.free(got);
+        std.testing.expectEqual(c[2], got.len != 0) catch |e| {
+            std.debug.print("pattern {s} on {s}\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+    try expectStarts(guard_pattern, "const w = try Writer.open(a, p, m, o);\n    errdefer w.abort();\n    for (bs) |b| try w.writeBatch(a, b);\n    try w.close();", .file, &.{43});
+    try expectStarts(guard_pattern, "var g = Guard(*Writer).init(try Writer.open(a, p, m, o));\n    defer g.abort();\n    const w = g.get().?;\n    try g.close();", .file, &.{});
 }
 
 test "dupscan mask blanks comments and tests but keeps strings and lines" {
