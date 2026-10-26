@@ -31,6 +31,7 @@ const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const table = @import("table.zig");
 const types = @import("../../lang/types.zig");
+const uuid = @import("../uuid.zig");
 const testing = std.testing;
 
 pub const log_dir = "_delta_log/";
@@ -47,15 +48,6 @@ const Name = union(enum) {
     other,
 };
 
-fn isUuid(s: []const u8) bool {
-    if (s.len != 36) return false;
-    for (s, 0..) |c, i| {
-        const dash = i == 8 or i == 13 or i == 18 or i == 23;
-        if (if (dash) c != '-' else !std.ascii.isHex(c)) return false;
-    }
-    return true;
-}
-
 fn parseName(name: []const u8) Name {
     var n: usize = 0;
     while (n < name.len and std.ascii.isDigit(name[n])) n += 1;
@@ -66,10 +58,10 @@ fn parseName(name: []const u8) Name {
     if (std.mem.eql(u8, rest, ".checkpoint.parquet")) return .{ .checkpoint = .{ .version = v, .part = 1, .parts = 1 } };
     const pre = ".checkpoint.";
     if (!std.mem.startsWith(u8, rest, pre)) return .other;
-    if (std.mem.endsWith(u8, rest, ".json") and isUuid(rest[pre.len .. rest.len - ".json".len])) return .{ .v2 = v };
+    if (std.mem.endsWith(u8, rest, ".json") and uuid.isText(rest[pre.len .. rest.len - ".json".len])) return .{ .v2 = v };
     if (!std.mem.endsWith(u8, rest, ".parquet")) return .other;
     const mid = rest[pre.len .. rest.len - ".parquet".len];
-    if (isUuid(mid)) return .{ .v2 = v };
+    if (uuid.isText(mid)) return .{ .v2 = v };
     const dot = std.mem.indexOfScalar(u8, mid, '.') orelse return .other;
     if (dot != 10 or mid.len != 21) return .other;
     const part = std.fmt.parseInt(u32, mid[0..dot], 10) catch return .other;

@@ -28,6 +28,7 @@ pub const Rule = struct {
     allow: []const []const u8 = &.{},
     tests: bool = false,
     span: Span = .line,
+    exact: bool = false,
 };
 
 pub const Span = enum { line, file };
@@ -266,7 +267,8 @@ pub fn explain(rule: Rule, report: Report, mode: Mode) void {
 }
 
 /// Fails the calling test when any rule finds a stray copy, or under `.exact`
-/// a stale allowlist entry; every failure is printed before returning.
+/// (`mode`, or the rule's own `exact`) a stale allowlist entry; every failure is
+/// printed before returning.
 pub fn expectConfined(rules: []const Rule, mode: Mode) !void {
     const gpa = std.testing.allocator;
     var src = try openSrc();
@@ -277,10 +279,12 @@ pub fn expectConfined(rules: []const Rule, mode: Mode) !void {
         gpa.free(reports);
     }
     var failed = false;
-    for (rules, reports) |rule, r| if (!r.ok(mode)) {
-        explain(rule, r, mode);
+    for (rules, reports) |rule, r| {
+        const m: Mode = if (rule.exact) .exact else mode;
+        if (r.ok(m)) continue;
+        explain(rule, r, m);
         failed = true;
-    };
+    }
     if (failed) return error.TestUnexpectedResult;
 }
 
@@ -374,33 +378,15 @@ pub const plan = [_]Rule{
         "net/auth/krb5.zig",
         "runtime/analyze/schema.zig",
     } },
-    .{ .home = "jsontext", .pattern = jsontext_pattern, .allow = &.{
+    .{ .home = "jsontext", .pattern = jsontext_pattern, .exact = true, .allow = &.{
         "exec/jsontext.zig",
-        "format/lake/delta_types.zig",
-        "cli/args.zig",
-        "cli/cmd_complete.zig",
-        "cli/kernel.zig",
-        "exec/eval/fn_row.zig",
-        "exec/eval/fn_scalar.zig",
-        "exec/eval/row.zig",
-        "exec/json.zig",
-        "exec/trace.zig",
-        "format/lake/delta_write.zig",
-        "format/parquet/nested.zig",
-        "runtime/obs.zig",
     } },
-    .{ .home = "hex", .pattern = hex_pattern, .allow = &.{
+    .{ .home = "hex", .pattern = hex_pattern, .exact = true, .allow = &.{
         "format/hex.zig",
         "format/uuid.zig",
-        "store/scheme.zig",
-        "exec/eval/fn_records.zig",
-        "format/xml/token.zig",
     } },
-    .{ .home = "utf16", .pattern = utf16_pattern, .allow = &.{
+    .{ .home = "utf16", .pattern = utf16_pattern, .exact = true, .allow = &.{
         "format/utf16.zig",
-        "db/sqlserver/tds.zig",
-        "net/auth/ntlm.zig",
-        "store/smb.zig",
     } },
     .{ .home = "scheme", .pattern = scheme_pattern, .allow = &.{
         "store/scheme.zig",
@@ -451,9 +437,9 @@ pub const plan = [_]Rule{
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
-pub const jsontext_pattern = "encodeJsonString(Chars)?";
-pub const hex_pattern = "parseInt\\(.*16\\)";
-pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc";
+pub const jsontext_pattern = "encodeJsonString(Chars)?|\\\\\\\\u(\\{[xX]:0>4|00\\{[xX]:0>2)\\}";
+pub const hex_pattern = "parseInt\\(.*16\\)|- 'a' \\+ 10|\"0123456789(abcdef|ABCDEF)\";|i == 8 or i == 13 or i == 18|i == 4 or i == 6 or i == 8";
+pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc|utf16IsHighSurrogate|0xD800 \\+";
 pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|https?)://";
 pub const dial_pattern = "tcpConnectToHost";
 pub const options_pattern = "@intCast\\(try evalCfgInt";
@@ -493,10 +479,11 @@ fn expectNeedles(pattern: []const u8, want: ?[]const []const u8) !void {
 test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles("abc", &.{"abc"});
     try expectNeedles(civil_pattern, &.{ "719", "146", "719", "25", "107", "440", "86_400_000_000", "std.time.epoch." });
-    try expectNeedles(jsontext_pattern, &.{"encodeJsonString"});
+    try expectNeedles(jsontext_pattern, &.{ "encodeJsonString", "\\\\u" });
+    try expectNeedles(utf16_pattern, &.{ "utf16LeToUtf8Alloc", "utf8ToUtf16LeAlloc", "utf16IsHighSurrogate", "0xD800 +" });
     try expectNeedles(scheme_pattern, &.{"startsWith(u8, "});
     try expectNeedles(sql_pattern, &.{"\"''\""});
-    try expectNeedles(hex_pattern, &.{"parseInt("});
+    try expectNeedles(hex_pattern, &.{ "parseInt(", "- 'a' + 10", "\"0123456789", "i == 8 or i == 13 or i == 18", "i == 4 or i == 6 or i == 8" });
     try expectNeedles(guard_pattern, &.{"errdefer "});
     try expectNeedles("ab+c", &.{"a"});
     try expectNeedles("ab+cd", &.{"cd"});
@@ -547,11 +534,26 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ jsontext_pattern, "std.json.encodeJsonString(s, .{}, w)", true },
         .{ jsontext_pattern, "std.json.encodeJsonStringChars(s, .{}, w)", true },
         .{ jsontext_pattern, "jsontext.string(w, s)", false },
+        .{ jsontext_pattern, "else try w.print(\"\\\\u{x:0>4}\", .{c});", true },
+        .{ jsontext_pattern, "try out.print(\"\\\\u00{X:0>2}\", .{c});", true },
+        .{ jsontext_pattern, "try w.print(\"{x:0>4}\", .{c});", false },
+        .{ jsontext_pattern, "try w.writeAll(\"\\\\u\");", false },
         .{ hex_pattern, "std.fmt.parseInt(u8, s[i..][0..2], 16)", true },
         .{ hex_pattern, "std.fmt.parseInt(u8, s, 10)", false },
+        .{ hex_pattern, "'a'...'f' => c - 'a' + 10,", true },
+        .{ hex_pattern, "'a'...'z' => c - 'a',", false },
+        .{ hex_pattern, "const digits = \"0123456789abcdef\";", true },
+        .{ hex_pattern, "else \"0123456789ABCDEF\";", true },
+        .{ hex_pattern, "pub const sync = \"0123456789abcdef\".*;", false },
+        .{ hex_pattern, "const dash = i == 8 or i == 13 or i == 18 or i == 23;", true },
+        .{ hex_pattern, "if (i == 4 or i == 6 or i == 8 or i == 10) {", true },
+        .{ hex_pattern, "if (i == 4 or i == 6) {", false },
         .{ utf16_pattern, "std.unicode.utf16LeToUtf8Alloc(a, w)", true },
         .{ utf16_pattern, "std.unicode.utf8ToUtf16LeAlloc(a, s)", true },
         .{ utf16_pattern, "std.unicode.utf8ToUtf16Le(buf, s)", false },
+        .{ utf16_pattern, "if (std.unicode.utf16IsHighSurrogate(u)) {", true },
+        .{ utf16_pattern, "hi = @intCast(0xD800 + (v >> 10));", true },
+        .{ utf16_pattern, "cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);", false },
         .{ scheme_pattern, "if (std.mem.startsWith(u8, url, \"sftp://\")) {", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"https://\")", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"http://\")", true },

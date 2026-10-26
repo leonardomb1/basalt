@@ -23,9 +23,9 @@ pub const replacement = celltext.Utf8Runs.replacement;
 
 /// `s` as the inside of a JSON string, repaired to UTF-8 first when it is not.
 pub fn chars(w: *Writer, s: []const u8) Writer.Error!void {
-    if (std.unicode.utf8ValidateSlice(s)) return escapeValid(w, s);
+    if (std.unicode.utf8ValidateSlice(s)) return escapeValid(.hex, w, s);
     var runs = celltext.Utf8Runs{ .s = s };
-    while (runs.next()) |t| try escapeValid(w, t);
+    while (runs.next()) |t| try escapeValid(.hex, w, t);
 }
 
 pub fn string(w: *Writer, s: []const u8) Writer.Error!void {
@@ -40,7 +40,19 @@ pub fn key(w: *Writer, s: []const u8) Writer.Error!void {
     try w.writeByte(':');
 }
 
-fn escapeValid(w: *Writer, s: []const u8) Writer.Error!void {
+/// `s` quoted as `std.json.Stringify.encodeJsonString` writes it: `\b` and `\f`
+/// short and no byte repaired, otherwise as `string`. The compact text of the JSON
+/// functions, which equals std.json's.
+pub fn stdString(w: *Writer, s: []const u8) Writer.Error!void {
+    try w.writeByte('"');
+    try escapeValid(.short, w, s);
+    try w.writeByte('"');
+}
+
+/// How the controls with a short JSON escape (`\b`, `\f`) are spelled.
+const Controls = enum { hex, short };
+
+fn escapeValid(comptime controls: Controls, w: *Writer, s: []const u8) Writer.Error!void {
     var start: usize = 0;
     for (s, 0..) |c, i| {
         const esc: []const u8 = switch (c) {
@@ -49,7 +61,9 @@ fn escapeValid(w: *Writer, s: []const u8) Writer.Error!void {
             '\n' => "\\n",
             '\r' => "\\r",
             '\t' => "\\t",
-            0...8, 11, 12, 14...0x1f => "",
+            8 => if (controls == .short) "\\b" else "",
+            12 => if (controls == .short) "\\f" else "",
+            0...7, 11, 14...0x1f => "",
             else => continue,
         };
         try w.writeAll(s[start..i]);
@@ -263,6 +277,21 @@ test "jsontext chars equals std.json on valid UTF-8 without \\b or \\f, and the 
     try std.json.Stringify.encodeJsonStringChars("caf\xe9", .{}, &w);
     try testing.expectEqualStrings("caf\xe9", w.buffered());
     try testing.expectEqualStrings("caf\u{FFFD}", try render(&b1, chars, .{"caf\xe9"}));
+}
+
+test "jsontext stdString equals std.json encodeJsonString on any bytes" {
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(13);
+    const rand = prng.random();
+    var in: [96]u8 = undefined;
+    for (0..4000) |it| {
+        const n = rand.uintLessThan(usize, in.len);
+        for (in[0..n]) |*c| c.* = if (it % 2 == 0) rand.int(u8) else rand.uintLessThan(u8, 0x30);
+        var w = Writer.fixed(&b2);
+        try std.json.Stringify.encodeJsonString(in[0..n], .{}, &w);
+        try testing.expectEqualStrings(w.buffered(), try render(&b1, stdString, .{in[0..n]}));
+    }
 }
 
 test "jsontext chars equals json/write writeEscaped, the copy it was moved from" {

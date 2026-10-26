@@ -1,6 +1,6 @@
 //! Hex text, strict: exactly the digits `[0-9a-fA-F]`. `std.fmt.parseInt(.., 16)`
 //! also takes a sign and `_`; a prefix such as SQL Server's `0x` or postgres's `'\x`
-//! is stripped or written by its caller. The digit rule is `json.zig` `hex4`'s.
+//! is stripped or written by its caller. `json.zig` `hex4` reads its `\u` digits with `digit`.
 
 const std = @import("std");
 

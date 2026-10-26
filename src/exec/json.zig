@@ -17,6 +17,8 @@
 //! other.
 
 const std = @import("std");
+const jsontext = @import("jsontext.zig");
+const hex = @import("../format/hex.zig");
 
 pub const Error = error{ InvalidJson, OutOfMemory };
 
@@ -215,13 +217,7 @@ fn hex4(t: []const u8, at: usize) ?u21 {
     if (at + 4 > t.len) return null;
     var v: u21 = 0;
     for (t[at..][0..4]) |c| {
-        const d: u21 = switch (c) {
-            '0'...'9' => c - '0',
-            'a'...'f' => c - 'a' + 10,
-            'A'...'F' => c - 'A' + 10,
-            else => return null,
-        };
-        v = v * 16 + d;
+        v = v * 16 + (hex.digit(c) orelse return null);
     }
     return v;
 }
@@ -504,7 +500,7 @@ pub fn compactInto(arena: std.mem.Allocator, raw: []const u8, w: *std.Io.Writer)
                 if (std.mem.indexOfScalar(u8, content, '\\') == null) {
                     w.writeAll(raw[i..e]) catch return error.OutOfMemory;
                 } else {
-                    std.json.Stringify.encodeJsonString(try decodeString(arena, content), .{}, w) catch return error.OutOfMemory;
+                    jsontext.stdString(w, try decodeString(arena, content)) catch return error.OutOfMemory;
                 }
                 i = e;
             },
