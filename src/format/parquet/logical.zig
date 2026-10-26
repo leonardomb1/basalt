@@ -6,6 +6,7 @@ const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const civil = @import("../../exec/civil.zig");
+const eval = @import("../../exec/eval.zig");
 
 pub const conv_utf8 = 0;
 pub const conv_decimal = 5;
@@ -54,9 +55,22 @@ fn tickOf(unit: parquet.TimeUnit) civil.Tick {
 /// zoned timestamp, so a UTC instant reads as its UTC wall-clock.
 pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
     const phys = e.ty orelse return Error.UnsupportedParquetSchema;
+    if (unsignedBits(e)) |bits| {
+        const want: parquet.PhysicalType = if (bits == 64) .int64 else .int32;
+        if (phys != want) return unsignedOnWrongPhysical(e, bits, phys, want);
+    }
     var t = logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
     if (e.repetition orelse .required != .required) t = t.asNullable();
     return t;
+}
+
+/// An unsigned annotation on a physical type the spec does not allow it on, a
+/// UINT64 on anything but INT64 or a narrower one on anything but INT32, is a
+/// corrupt file, as DuckDB refuses it.
+fn unsignedOnWrongPhysical(e: parquet.SchemaElement, bits: u8, phys: parquet.PhysicalType, want: parquet.PhysicalType) Error {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` is a {d}-bit unsigned integer stored as {s}; the format allows it only as {s}", .{ e.name, bits, @tagName(phys), @tagName(want) }) catch "a parquet unsigned integer on the wrong physical type";
+    return @errorCast(eval.explain(Error.CorruptParquetPage, msg));
 }
 
 /// Null when the logical type is absent, says nothing basalt acts on, or does
@@ -191,6 +205,30 @@ test "unsigned columns know their width; a UINT64 is DECIMAL(20,0) and a narrowe
     try testing.expectEqual(@as(u8, 0), dec.scale);
     try testing.expectEqual(types.TypeKind.decimal, (try basaltType(.{ .ty = .int64, .converted_type = 14 })).kind);
     try testing.expectEqual(types.TypeKind.int, (try basaltType(u32c)).kind);
+}
+
+test "an unsigned annotation is refused on any physical type but its own: UINT64 on INT64, narrower on INT32" {
+    const bad = [_]parquet.SchemaElement{
+        logical(.int32, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 32, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 8, .signed = false } }),
+        logical(.byte_array, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        .{ .ty = .int32, .converted_type = conv_uint64 },
+        .{ .ty = .int96, .converted_type = conv_uint64 },
+        .{ .ty = .int64, .converted_type = conv_uint8 },
+        .{ .ty = .int64, .converted_type = conv_uint16 },
+        .{ .ty = .int64, .converted_type = conv_uint32 },
+        .{ .ty = .double, .converted_type = conv_uint32 },
+    };
+    for (bad) |e| try testing.expectError(Error.CorruptParquetPage, basaltType(e));
+    const good = [_]parquet.SchemaElement{
+        logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = false } }),
+        logical(.int32, .{ .integer = .{ .bit_width = 16, .signed = false } }),
+        logical(.int64, .{ .integer = .{ .bit_width = 32, .signed = true } }),
+        .{ .ty = .int64, .converted_type = conv_uint64 },
+        .{ .ty = .int32, .converted_type = conv_uint8 },
+    };
+    for (good) |e| _ = try basaltType(e);
 }
 
 fn micros(t: civil.Tick, x: i64) i64 {
