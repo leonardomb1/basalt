@@ -37,6 +37,10 @@ const testing = std.testing;
 
 pub const log_dir = "_delta_log/";
 
+/// How many logs `snapshot` has replayed in this process, so a test can count a
+/// statement's replays.
+pub var replays = std.atomic.Value(u64).init(0);
+
 const refuse = table.refuse;
 
 /// One name in `_delta_log/`: a commit, a checkpoint (or one part of one), a V2
@@ -639,6 +643,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
 /// only what makes the replay itself unreliable; what a reader or a writer
 /// cannot honour each judges from the state.
 pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*State {
+    _ = replays.fetchAdd(1, .monotonic);
     const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
         return refuse("{s} cannot be read over http(s): a Delta table is found by listing _delta_log/, which a URL cannot do; read it from a local path, s3://, az://, sftp:// or smb://", .{name});

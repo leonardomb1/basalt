@@ -362,6 +362,9 @@ pub const Env = struct {
     pq_folder: ?*pqdecode.Folder = null,
     sort_threads: usize = 1,
     folder_memo: std.ArrayListUnmanaged(FolderMemo) = .empty,
+    /// The run's lake tables, each replayed once per statement; null in a PARALLEL
+    /// loop's row, which resolves its own.
+    tables: ?*lake.Memo = null,
     sink_name: []const u8 = "",
     last_target: []const u8 = "",
     wrote_sink: bool = false,
@@ -393,6 +396,12 @@ pub const Env = struct {
                 _ = self.folder_memo.swapRemove(i);
             } else i += 1;
         }
+    }
+
+    /// A statement ended: the lake tables it read are replayed anew by the next,
+    /// and after it `wrote` every table is.
+    pub fn endStatement(self: *Env, wrote: bool) void {
+        if (self.tables) |m| m.endStatement(wrote);
     }
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {
