@@ -140,7 +140,10 @@ has not seen.
 | `strptime(text, format)` | the timestamp read out of text: `strptime(dt, '%d/%m/%Y')` |
 | `try_strptime(text, format)` | the same, but null where the text does not fit |
 
-The format codes are `%Y %m %d %H %M %S %y %%`. `strptime` takes a number
+The format codes are `%Y %m %d %H %M %S %y %%`. `strftime`'s `%Y` is the
+year as a date prints it: at least four digits, more past 9999, and `-` before
+year 0 (`-0001` is 2 BC), so `strftime(d, '%Y-%m-%d')` is `CAST(d AS STRING)`;
+`%y` is its last two digits without the sign. `strptime` takes a number
 shorter than its width (`3/1/2026`) and pivots `%y` at 69. Text that does not
 fit the format, or a day that does not exist, is an error that stops the
 statement, as a failed `CAST` does — one bad date in a file loads nothing;

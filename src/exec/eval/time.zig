@@ -150,10 +150,12 @@ pub fn badStrftime(fmt: []const u8) ?[]const u8 {
 }
 
 /// `strftime` over exactly `%Y %m %d %H %M %S %y %%`, appended to `out`; any other
-/// directive is an error, never a silent passthrough. A year before 0 prints as 0.
+/// directive is an error, never a silent passthrough. `%Y` is the year as a date
+/// prints it, at least four digits and `-` before year 0; `%y` is its last two
+/// digits, sign dropped, as DuckDB has it.
 pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) EvalError!void {
     const f = civil.fieldsOfMicros(us);
-    const year: u32 = if (f.y < 0) 0 else @intCast(f.y);
+    const year = @abs(f.y);
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
         if (fmt[i] != '%') {
@@ -163,7 +165,10 @@ pub fn strftimeInto(out: *std.array_list.Managed(u8), us: i64, fmt: []const u8) 
         i += 1;
         if (i >= fmt.len) return error.CastFailed;
         switch (fmt[i]) {
-            'Y' => try padded(out, year, 4),
+            'Y' => {
+                if (f.y < 0) try out.append('-');
+                try padded(out, year, 4);
+            },
             'y' => try padded(out, year % 100, 2),
             'm' => try padded(out, f.m, 2),
             'd' => try padded(out, f.d, 2),
@@ -356,11 +361,27 @@ test "a unit reads singular or plural in date_trunc, extract, date_add and date_
     try std.testing.expectEqual(@as(i32, 19828), (try evalLit(a, "date_add('months', 1, CAST('2024-03-15' AS DATE))")).date);
 }
 
-test "kept until decided (D14): strftime prints a year before 0 as 0000" {
+test "strftime prints the true year outside 0..9999, as a date prints it (D14)" {
     var out = std.array_list.Managed(u8).init(std.testing.allocator);
     defer out.deinit();
-    try strftimeInto(&out, civil.dayMicros(daysFromCivil(-1, 6, 1)), "%Y-%m-%d|%y");
-    try std.testing.expectEqualStrings("0000-06-01|00", out.items);
+    for ([_]struct { i64, []const u8 }{
+        .{ -1, "-0001-06-01|01" },
+        .{ 0, "0000-06-01|00" },
+        .{ -12345, "-12345-06-01|45" },
+        .{ 12345, "12345-06-01|45" },
+        .{ 9999, "9999-06-01|99" },
+    }) |c| {
+        out.clearRetainingCapacity();
+        try strftimeInto(&out, civil.dayMicros(daysFromCivil(c[0], 6, 1)), "%Y-%m-%d|%y");
+        try std.testing.expectEqualStrings(c[1], out.items);
+    }
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const evalLit = @import("testing_util.zig").evalLit;
+    try std.testing.expectEqualStrings("-0001-06-01", (try evalLit(a, "strftime(make_date(-1, 6, 1), '%Y-%m-%d')")).string);
+    try std.testing.expectEqualStrings("12345", (try evalLit(a, "strftime(make_date(12345, 1, 1), '%Y')")).string);
+    try std.testing.expectEqualStrings((try evalLit(a, "CAST(make_date(-1, 6, 1) AS STRING)")).string, (try evalLit(a, "strftime(make_date(-1, 6, 1), '%Y-%m-%d')")).string);
 }
 
 test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64 the wire now refuses, and a TIME or ISO timestamp cuts past the microsecond (D4)" {
