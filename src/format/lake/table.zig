@@ -23,6 +23,7 @@ const folder = @import("../../connect/folder.zig");
 const formats = @import("../formats.zig");
 const s3 = @import("../../store/s3.zig");
 const scheme = @import("../../store/scheme.zig");
+const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -151,13 +152,8 @@ pub fn isHttp(path: []const u8) bool {
 }
 
 /// A refusal carrying its account, which the read reports as is.
-pub fn refuse(comptime fmt: []const u8, args: anytype) anyerror {
-    var buf: [480]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch blk: {
-        @memcpy(buf[buf.len - 3 ..], "...");
-        break :blk buf[0..];
-    };
-    return eval.explain(Error.LakeTableRefused, msg);
+pub inline fn refuse(comptime fmt: []const u8, args: anytype) anyerror {
+    return stream.explainf(Error.LakeTableRefused, fmt, args);
 }
 
 /// A whole file of a table's log, wherever it lives.

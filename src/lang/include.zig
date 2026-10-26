@@ -28,6 +28,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const parser = @import("sql_parser.zig");
 const remote = @import("remote.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 const include_fetch = @import("../net/include_fetch.zig");
 
 pub const Error = parser.Error;
@@ -128,7 +129,8 @@ const Ctx = struct {
     }
 
     fn fail(self: *Ctx, label: []const u8, line: u32, col: u32, comptime fmt: []const u8, args: anytype) Error {
-        const msg: []const u8 = std.fmt.allocPrint(self.arena, fmt, args) catch "include error";
+        @branchHint(.cold);
+        const msg: []const u8 = msgfmt.allocPrint(self.arena, fmt, args) catch "include error";
         self.diag.* = .{ .parse = .{ .msg = msg, .line = line, .col = col }, .label = label };
         return error.ParseFailed;
     }

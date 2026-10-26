@@ -57,7 +57,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) Error!*const Node {
     return p.node(v, "");
 }
 
-fn bad(comptime fmt: []const u8, args: anytype) Error {
+inline fn bad(comptime fmt: []const u8, args: anytype) Error {
     return @errorCast(stream.explainf(error.BadAvroSchema, "a malformed Avro schema: " ++ fmt, args));
 }
 

@@ -9,6 +9,7 @@ const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const fmt_bound = @import("format.zig").fmt_bound;
+const msgfmt = @import("../../format/msgfmt.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const regex = @import("../regex.zig");
@@ -78,12 +79,9 @@ pub fn explain(e: anyerror, msg: []const u8) anyerror {
 }
 
 pub fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError {
+    @branchHint(.cold);
     const n = &fail_note;
-    const msg = std.fmt.bufPrint(&n.buf, fmt, args) catch blk: {
-        @memcpy(n.buf[n.buf.len - 3 ..], "...");
-        break :blk n.buf[0..];
-    };
-    n.len = msg.len;
+    n.len = msgfmt.clipPrint(&n.buf, fmt, args).len;
     n.err = e;
     return e;
 }

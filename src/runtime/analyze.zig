@@ -64,6 +64,7 @@ const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
 const holes = @import("analyze/holes.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -79,20 +80,23 @@ pub const Diag = struct {
 pub const Error = error{ AnalyzeFailed, OutOfMemory };
 
 pub fn fail(diag: *Diag, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
-    diag.msg = std.fmt.bufPrint(&diag.buf, fmt, args) catch "analysis error";
-    diag.pos = null;
-    diag.end = null;
-    return error.AnalyzeFailed;
+    @branchHint(.cold);
+    return failSpan(diag, null, null, msgfmt.bufPrint(&diag.buf, fmt, args) catch "analysis error");
 }
 
 /// `fail`, underlining `span` when the offending text has one.
 pub fn failAt(diag: *Diag, span: ?ast.Span, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
-    const e = fail(diag, fmt, args);
-    if (span) |s| {
-        diag.pos = s.start;
-        diag.end = s.end;
-    }
-    return e;
+    @branchHint(.cold);
+    const msg = msgfmt.bufPrint(&diag.buf, fmt, args) catch "analysis error";
+    const s = span orelse return failSpan(diag, null, null, msg);
+    return failSpan(diag, s.start, s.end, msg);
+}
+
+fn failSpan(diag: *Diag, pos: ?ast.Pos, end: ?ast.Pos, msg: []const u8) error{AnalyzeFailed} {
+    diag.msg = msg;
+    diag.pos = pos;
+    diag.end = end;
+    return error.AnalyzeFailed;
 }
 
 const ParamMap = std.StringHashMap(*const ast.Expr);
@@ -548,9 +552,8 @@ fn checkScriptStmt(arena: std.mem.Allocator, s: ast.Stmt, program: ast.Program, 
 }
 
 pub fn failPos(diag: *Diag, pos: ?ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
-    const e = fail(diag, fmt, args);
-    diag.pos = pos;
-    return e;
+    @branchHint(.cold);
+    return failSpan(diag, pos, null, msgfmt.bufPrint(&diag.buf, fmt, args) catch "analysis error");
 }
 
 /// A statement `CASE` arm's string-literal pattern that cannot read as its typed
@@ -1293,10 +1296,8 @@ const Ctx = struct {
         }
     }
 
-    fn failNear(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
-        const e = fail(self.diag, fmt, args);
-        self.diag.stamp(pos);
-        return e;
+    inline fn failNear(self: *Ctx, pos: ast.Pos, comptime fmt: []const u8, args: anytype) error{AnalyzeFailed} {
+        return failPos(self.diag, pos, fmt, args);
     }
 
     /// `p` with its LIMITs and OFFSETs evaluated as the run does; a problem with one is

@@ -40,6 +40,7 @@ const read = @import("read.zig");
 const serial = @import("serial.zig");
 const utf16 = @import("../utf16.zig");
 const escape = @import("../xml/escape.zig");
+const msgfmt = @import("../msgfmt.zig");
 
 pub const max_cols = 16384;
 pub const max_rows = 1048576;
@@ -231,8 +232,9 @@ pub const Writer = struct {
 const sink_vtable = driver.sinkVTable(Writer);
 
 fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+    @branchHint(.cold);
     var buf: [480]u8 = undefined;
-    return eval.explain(e, std.fmt.bufPrint(&buf, fmt, args) catch fmt);
+    return eval.explain(e, msgfmt.bufPrint(&buf, fmt, args) catch fmt);
 }
 
 fn tooLong(row: u32, ref: []const u8) anyerror {

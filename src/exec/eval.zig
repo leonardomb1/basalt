@@ -66,6 +66,7 @@
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 pub const Value = @import("value.zig").Value;
 pub const Batch = @import("batch.zig").Batch;
 
@@ -282,7 +283,8 @@ pub const TypeCtx = struct {
     }
 
     pub fn err(self: *TypeCtx, comptime fmt: []const u8, args: anytype) TypeError {
-        self.msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory";
+        @branchHint(.cold);
+        self.msg = msgfmt.allocPrint(self.arena, fmt, args) catch "out of memory";
         return error.TypeError;
     }
 

@@ -68,6 +68,7 @@ const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 pub const ColUses = @import("parse/textcols.zig").ColUses;
 const quote = @import("quote.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("types.zig");
 
 pub const Token = token.Token;
@@ -773,8 +774,15 @@ pub const Parser = struct {
     }
 
     pub fn fail(self: *Parser, pos: Pos, comptime fmt: []const u8, args: anytype) Error {
+        @branchHint(.cold);
+        return self.failMsg(pos, msgfmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic");
+    }
+
+    /// `fail` with its message formatted: the diagnostic, underlining the token at `pos`.
+    noinline fn failMsg(self: *Parser, pos: Pos, msg: []const u8) Error {
+        @branchHint(.cold);
         self.diag.* = .{
-            .msg = std.fmt.allocPrint(self.arena, fmt, args) catch "out of memory formatting diagnostic",
+            .msg = msg,
             .line = pos.line,
             .col = pos.col,
             .file = pos.file,
@@ -794,7 +802,7 @@ pub const Parser = struct {
     /// A hidden name no query writes: `fmt` with the parser's next number.
     pub fn freshName(self: *Parser, comptime fmt: []const u8) Error![]const u8 {
         self.derived_n += 1;
-        return std.fmt.allocPrint(self.arena, fmt, .{self.derived_n});
+        return msgfmt.allocPrint(self.arena, fmt, .{self.derived_n});
     }
 
     /// Binds `stages` under the hidden `name`, which the query then reads as a CTE.

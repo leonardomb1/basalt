@@ -27,6 +27,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const driver = @import("../connect/driver.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 const jsontext = @import("../exec/jsontext.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -157,7 +158,10 @@ pub const Logger = struct {
         if (!self.enabled(level)) return;
         if (builtin.is_test and self.file.handle == std.posix.STDERR_FILENO) return;
         var buf: [16384]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+        self.emit(level, msgfmt.bufPrint(&buf, fmt, args) catch buf[0..]);
+    }
+
+    noinline fn emit(self: *Logger, level: Level, msg: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         var lbuf: [17408]u8 = undefined;

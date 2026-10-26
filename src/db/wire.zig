@@ -14,6 +14,7 @@
 const std = @import("std");
 const sql = @import("sql.zig");
 const driver = @import("../connect/driver.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 
 const SOCK_BUF = 64 * 1024;
 
@@ -94,7 +95,8 @@ pub const Conn = struct {
 
     /// `putError` with a formatted message.
     pub fn printError(self: *Conn, comptime fmt: []const u8, args: anytype) !void {
-        self.putError(try std.fmt.allocPrint(self.gpa, fmt, args));
+        @branchHint(.cold);
+        self.putError(try msgfmt.allocPrint(self.gpa, fmt, args));
     }
 };
 

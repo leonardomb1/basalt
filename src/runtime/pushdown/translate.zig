@@ -7,6 +7,7 @@ const inSchema = @import("../pushdown.zig").inSchema;
 const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
 const types = @import("../../lang/types.zig");
+const msgfmt = @import("../../format/msgfmt.zig");
 pub const bin = @import("testing_util.zig").bin;
 const builtins = @import("../../exec/builtins.zig");
 const litAs = @import("../../exec/eval.zig").litAs;
@@ -198,7 +199,7 @@ const Tx = struct {
     };
 
     fn fmt(self: Tx, comptime f: []const u8, args: anytype) Err![]const u8 {
-        return std.fmt.allocPrint(self.arena, f, args);
+        return msgfmt.allocPrint(self.arena, f, args);
     }
 
     fn want(self: Tx) void {

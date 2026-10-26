@@ -43,6 +43,7 @@ const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
+const msgfmt = @import("../msgfmt.zig");
 const op = @import("../../exec/op.zig");
 const pqstats = @import("../parquet/stats.zig");
 const spill = @import("../../exec/spill.zig");
@@ -203,7 +204,8 @@ pub const Merge = struct {
     }
 
     fn fail(self: *Merge, e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
-        return eval.explain(e, try std.fmt.allocPrint(self.mem.allocator(), fmt, args));
+        @branchHint(.cold);
+        return eval.explain(e, try msgfmt.allocPrint(self.mem.allocator(), fmt, args));
     }
 
     /// Spools one batch of incoming rows: a NULL key is refused, a value put as

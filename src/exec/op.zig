@@ -112,6 +112,7 @@ const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 pub const Batch = @import("batch.zig").Batch;
 const eval = @import("eval.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 pub const Value = @import("value.zig").Value;
 const driver = @import("../connect/driver.zig");
 const TestSource = @import("op/testing_util.zig").TestSource;
@@ -125,13 +126,11 @@ pub const ErrCtx = struct {
     mutex: std.Thread.Mutex = .{},
 
     pub fn set(self: *ErrCtx, comptime fmt: []const u8, args: anytype) void {
+        @branchHint(.cold);
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.msg.len > 0) return;
-        self.msg = std.fmt.bufPrint(&self.buf, fmt, args) catch blk: {
-            @memcpy(self.buf[self.buf.len - 3 ..], "...");
-            break :blk self.buf[0..];
-        };
+        self.msg = msgfmt.clipPrint(&self.buf, fmt, args);
     }
 };
 

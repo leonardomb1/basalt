@@ -64,6 +64,7 @@ const column = @import("../../exec/column.zig");
 pub const Threshold = @import("../../exec/value.zig").Threshold;
 const Value = @import("../../exec/value.zig").Value;
 const eval = @import("../../exec/eval.zig");
+const stream = @import("../stream.zig");
 const fuzzKernels = @import("testing_util.zig").fuzzKernels;
 const fuzzKernels_corpus = @import("testing_util.zig").fuzzKernels_corpus;
 const fx_v2 = @import("testing_util.zig").fx_v2;
@@ -415,12 +416,7 @@ pub const Reader = struct {
     /// A decode failure's account, prefixed with this file, which a folder read needs.
     fn named(self: *const Reader, e: anyerror) anyerror {
         const why = eval.takeFailure(e) orelse return e;
-        var buf: [480]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "`{s}`: {s}", .{ self.path, why }) catch blk: {
-            @memcpy(buf[buf.len - 3 ..], "...");
-            break :blk buf[0..];
-        };
-        return eval.explain(e, msg);
+        return stream.explainf(e, "`{s}`: {s}", .{ self.path, why });
     }
 
     fn chunkOf(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, lf: Leaf) !Chunk {

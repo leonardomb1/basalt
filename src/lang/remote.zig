@@ -15,6 +15,7 @@
 //! and may not climb out of it; it can never include a local path.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 
 pub const Spec = struct {
     host: []const u8,
@@ -214,7 +215,8 @@ pub const Resolver = struct {
     }
 
     fn fail(self: *Resolver, comptime fmt: []const u8, args: anytype) error{ RemoteInclude, OutOfMemory } {
-        self.msg = try std.fmt.allocPrint(self.arena, fmt, args);
+        @branchHint(.cold);
+        self.msg = try msgfmt.allocPrint(self.arena, fmt, args);
         return error.RemoteInclude;
     }
 };

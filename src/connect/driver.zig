@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
+const msgfmt = @import("../format/msgfmt.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 
 var g_abort = std.atomic.Value(bool).init(false);
@@ -107,7 +108,8 @@ pub fn ThreadNote(comptime n: usize) type {
         }
 
         pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) void {
-            self.len = (std.fmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..]).len;
+            @branchHint(.cold);
+            self.len = (msgfmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..]).len;
         }
     };
 }

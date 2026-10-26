@@ -97,8 +97,8 @@ pub fn descriptor(name: []const u8, file: []const u8, v: std.json.Value) !Descri
     return d;
 }
 
-fn malformed(name: []const u8, file: []const u8, comptime why: []const u8) anyerror {
-    return refuse("{s} has file `{s}` whose deletion vector descriptor is malformed (" ++ why ++ "); basalt does not read the file, as reading it without its deletion vector would return deleted rows", .{ name, file });
+fn malformed(name: []const u8, file: []const u8, why: []const u8) anyerror {
+    return refuse("{s} has file `{s}` whose deletion vector descriptor is malformed ({s}); basalt does not read the file, as reading it without its deletion vector would return deleted rows", .{ name, file, why });
 }
 
 const z85_chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
