@@ -685,7 +685,7 @@ test "a value its column cannot read is NULL; strings and escaped keys decode" {
     defer ar.deinit();
     const a = ar.allocator();
     const got = try readAll(a,
-        \\[{"ok":true,"n":1,"s\u0074":"a\nb"},{"ok":"yes","n":1e300,"st":"x"},{"ok":false,"n":"9","st":2},{"ok":null,"n":{"x":1},"st":[1]}]
+        \\[{"ok":true,"n":1,"s\u0074":"a\nb"},{"ok":"maybe","n":1e300,"st":"x"},{"ok":false,"n":"9","st":2},{"ok":null,"n":{"x":1},"st":[1]}]
     , .{ .sample = 1 });
     try testing.expectEqualStrings("st", got.schema.fields[2].name);
     try testing.expectEqualStrings("a\nb", got.rows[0][2].string);
