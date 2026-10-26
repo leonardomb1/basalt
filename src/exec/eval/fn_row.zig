@@ -61,7 +61,7 @@ pub const per_row = struct {
     }
 
     /// Values are written as `json_transform` writes elements, so a nested object or
-    /// array goes in as JSON. A null key is an error.
+    /// array goes in as JSON. A key is spelled by `jsontext.keyText`; a null key is an error.
     pub fn jsonObject(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         var out = std.Io.Writer.Allocating.init(arena);
         const w = &out.writer;
@@ -71,7 +71,7 @@ pub const per_row = struct {
             const k = try evalRow(arena, c.args[i], batch, row);
             if (k.isNull()) return failWith(error.CastFailed, "json_object: key {d} is null", .{i / 2 + 1});
             if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
-            jsontext.key(w, try valueToString(arena, k)) catch return error.OutOfMemory;
+            jsontext.key(w, try jsontext.keyText(arena, k)) catch return error.OutOfMemory;
             try writeJsonValue(arena, try evalRow(arena, c.args[i + 1], batch, row), w);
         }
         w.writeByte('}') catch return error.OutOfMemory;

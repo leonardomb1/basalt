@@ -465,7 +465,7 @@ test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and
         .{ .float = 5e-324 },                   .{ .decimal = .{ .unscaled = -5, .scale = 3 } }, .{ .decimal = .{ .unscaled = 0, .scale = 2 } },
         .{ .date = 0 },                         .{ .date = std.math.minInt(i32) },               .{ .date = std.math.maxInt(i32) },
         .{ .time = 0 },                         .{ .time = 86_399_999_999 },                     .{ .timestamp = std.math.minInt(i64) },
-        .{ .timestamp = std.math.maxInt(i64) }, .{ .string = "h\u{e9} \u{1F600} \"q\" \\ /" },   .{ .bytes = "plain" },
+        .{ .timestamp = std.math.maxInt(i64) }, .{ .string = "h\u{e9} \u{1F600} \"q\" \\ /" },
     };
     for (fixed) |v| {
         const p = try Orig.jsonPair(a, v);
@@ -473,7 +473,7 @@ test "writeJsonValue through jsontext writes what it wrote, but for \\b, \\f and
     }
     for (0..256) |b| {
         const s: []const u8 = &.{@intCast(b)};
-        inline for (.{ Value{ .string = s }, Value{ .bytes = s } }) |v| {
+        inline for (.{Value{ .string = s }}) |v| {
             const p = try Orig.jsonPair(a, v);
             const parsed = try std.json.parseFromSliceLeaky([]const u8, a, p[1], .{});
             if (b < 0x80 and b != 0x08 and b != 0x0c) {
@@ -504,4 +504,24 @@ test "json_array, json_object and chars write valid JSON for text that is not UT
         };
         _ = try std.json.parseFromSliceLeaky(std.json.Value, a, out, .{});
     }
+}
+
+test "D8: json_object and json_array write BYTES as base64, a nested BYTES list as base64 too" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("{\"b\":\"Af9h\"}", (try evalLit(a, "json_object('b', x'01FF61')")).string);
+    try std.testing.expectEqualStrings("[\"/w==\",\"\",null]", (try evalLit(a, "json_array(from_base64('/w=='), x'', CAST(NULL AS BYTES))")).string);
+    try std.testing.expectEqualStrings("{\"s\":\"plain\",\"b\":\"cGxhaW4=\"}", (try evalLit(a, "json_object('s', 'plain', 'b', x'706C61696E')")).string);
+    var w: std.Io.Writer.Allocating = .init(a);
+    try writeJsonValue(a, .{ .bytes = "{\"a\":1}" }, &w.writer);
+    try std.testing.expectEqualStrings("\"eyJhIjoxfQ==\"", w.written());
+}
+
+test "json_object writes a BYTES key as base64, so distinct binary keys stay distinct" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("{\"/w==\":1,\"/g==\":2}", (try evalLit(a, "json_object(x'ff', 1, x'fe', 2)")).string);
+    try std.testing.expectEqualStrings("{\"7\":1,\"2024-01-01\":2}", (try evalLit(a, "json_object(7, 1, CAST('2024-01-01' AS DATE), 2)")).string);
 }

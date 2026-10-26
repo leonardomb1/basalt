@@ -1044,7 +1044,7 @@ const Cursor = struct {
                 for (s.lo..s.hi, 0..) |k, n| {
                     if (n > 0) try w.writeByte(',');
                     const key = try entries.kids[0].value(arena, k);
-                    try jsontext.key(w, try eval.valueToString(arena, key));
+                    try jsontext.key(w, try jsontext.keyText(arena, key));
                     try entries.kids[1].json(arena, k, w);
                 }
                 try w.writeByte('}');
@@ -1492,8 +1492,6 @@ test "a nested leaf through jsontext.scalar(nested) is byte-equal to the reader'
         .{ .string = "q\"b\\s/n\nr\rt\t" },
         .{ .string = "\x00\x01\x1f\x7f" },
         .{ .string = "ação 😀 \u{2028}" },
-        .{ .bytes = "abcd" },
-        .{ .bytes = "" },
         .{ .date = 0 },
         .{ .date = -719_528 },
         .{ .date = 3_000_000 },
@@ -1519,17 +1517,39 @@ test "a nested leaf through jsontext.scalar(nested) is byte-equal to the reader'
     try std.testing.expectEqualStrings("\"\\u0008\\u000c\"", new.written());
 }
 
-test "a struct whose names and text are not UTF-8 reads as JSON that parses; a binary leaf stays text" {
+test "a struct whose names and text are not UTF-8 reads as JSON that parses; a binary leaf is base64 (D8)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const offs = [_]i32{ 0, 3 };
     var s = Cursor{ .f = .{ .name = "s\xff", .kind = .utf8 }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&offs), .data = "a\xffb" };
-    var b = Cursor{ .f = .{ .name = "b", .kind = .binary }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&offs), .data = "xyz" };
+    var b = Cursor{ .f = .{ .name = "b", .kind = .binary }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&offs), .data = "a\xffb" };
     var kids_f = [_]Field{ s.f, b.f };
     var kids = [_]*Cursor{ &s, &b };
     const st = Cursor{ .f = .{ .name = "st", .kind = .struct_, .children = &kids_f }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .kids = &kids };
     const got = (try st.value(a, 0)).string;
-    try std.testing.expectEqualStrings("{\"s\u{FFFD}\":\"a\u{FFFD}b\",\"b\":\"xyz\"}", got);
+    try std.testing.expectEqualStrings("{\"s\u{FFFD}\":\"a\u{FFFD}b\",\"b\":\"Yf9i\"}", got);
     try std.testing.expect(try std.json.validate(a, got));
+}
+
+test "D8: binary list elements, map values and map keys are base64, so distinct keys stay distinct" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const leaf_offs = [_]i32{ 0, 1, 2 };
+    const one = Arr{ .len = 2, .null_count = 0, .bufs = &.{} };
+    var k = Cursor{ .f = .{ .name = "key", .kind = .binary }, .a = one, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&leaf_offs), .data = "\xff\xfe" };
+    var v = Cursor{ .f = .{ .name = "value", .kind = .fixed_binary, .fixed_size = 2 }, .a = one, .reader = undefined, .data = "\x00\x01\xfb\xff" };
+    var ent_f = [_]Field{ k.f, v.f };
+    var ent_k = [_]*Cursor{ &k, &v };
+    var ent = Cursor{ .f = .{ .name = "entries", .kind = .struct_, .children = &ent_f }, .a = one, .reader = undefined, .kids = &ent_k };
+    const row_offs = [_]i32{ 0, 2 };
+    var m_f = [_]Field{ent.f};
+    var m_k = [_]*Cursor{&ent};
+    const m = Cursor{ .f = .{ .name = "m", .kind = .map, .children = &m_f }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&row_offs), .kids = &m_k };
+    try std.testing.expectEqualStrings("{\"/w==\":\"AAE=\",\"/g==\":\"+/8=\"}", (try m.value(a, 0)).string);
+    var l_f = [_]Field{k.f};
+    var l_k = [_]*Cursor{&k};
+    const l = Cursor{ .f = .{ .name = "l", .kind = .list, .children = &l_f }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .offs32 = std.mem.sliceAsBytes(&row_offs), .kids = &l_k };
+    try std.testing.expectEqualStrings("[\"/w==\",\"/g==\"]", (try l.value(a, 0)).string);
 }

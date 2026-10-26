@@ -447,7 +447,9 @@ dates, times, timestamps and durations in any unit as basalt's own
 wall-clock; a count of seconds or milliseconds past the ±292,277 years a
 microsecond timestamp holds is a corrupt file, never clamped). Dictionary-encoded columns — a polars `Categorical` — read as
 their values. Lists, structs and maps read as JSON text, so `json_get` and
-`CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them. A union is refused with the
+`CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them: a binary value or map key
+as base64, dates and times as quoted ISO text, a NaN or infinite float as
+`null`. A union is refused with the
 column named when the query reads it (or a struct holding one); a file with a union
 column still reads every other column. Run-end and list-view encodings are refused
 with the column named. Only the first stream of a
@@ -547,7 +549,11 @@ repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them
 reads as one `string` column named for it, holding each row's value as JSON:
 lists as arrays (`[1,2]`, `[]` when empty), structs as objects, maps as objects
 keyed by each key's text (`{"k1":3}`), `NULL` for a null column value and
-`null` for a null element or field, dates and timestamps as quoted text.
+`null` for a null element or field, dates and timestamps as quoted text, a NaN
+or infinite float as `null`, and a binary leaf or map key (`BYTE_ARRAY` with no
+`STRING` annotation, a `UUID`) as base64, as the JSON writer spells `BYTES`, so
+no byte is lost; `CAST(from_base64(json_get(c, 'k')) AS STRING)` gives the text
+of a binary leaf that holds text.
 `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` gives a row per element and
 `json_get` reaches into one. No column of the file is left out, so
 `LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every one — the

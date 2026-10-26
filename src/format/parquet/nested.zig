@@ -252,7 +252,7 @@ const Assembler = struct {
                 if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
                 const e = self.entries[key.first_leaf];
                 const kv_val = if (e.defs[s.lo] < key.max_def) Value.null else e.vals.getValue(s.lo);
-                try kbuf.appendSlice(if (kv_val == .null) "null" else try eval.valueToString(self.arena, kv_val));
+                try kbuf.appendSlice(try jsontext.keyText(self.arena, kv_val));
             } else try ka.field(key, sub);
             try appendJson(self.out, jsontext.string, .{kbuf.items});
             try self.out.append(':');
@@ -397,7 +397,7 @@ fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usiz
 }
 
 /// A leaf value as JSON in the nested shape (`jsontext.nested`): decimals bare,
-/// bytes as their text.
+/// bytes as base64.
 fn jsonValue(buf: *std.array_list.Managed(u8), v: Value) Error!void {
     return appendJson(buf, jsontext.scalar, .{ v, jsontext.nested });
 }
@@ -504,7 +504,6 @@ test "jsonValue on jsontext.scalar writes what the old encoder did for valid tex
         .{ .string = "plain" },
         .{ .string = "q\"b\\s/\n\r\t\x01\x1f\x7f" },
         .{ .string = "a\u{e7}\u{e3}o \u{1F600}" },
-        .{ .bytes = "raw" },
         .{ .date = 0 },
         .{ .date = -719_162 },
         .{ .date = 2_932_896 },
@@ -536,10 +535,39 @@ test "a nested leaf string holding invalid UTF-8 is valid JSON, each bad byte a 
     try testing.expectEqualStrings("a\u{FFFD}b", try std.json.parseFromSliceLeaky([]const u8, a, got, .{}));
 }
 
-test "nested BYTES stay their text, not base64 (D8 pending); \\b and \\f are spelled \\u00XX" {
+test "D8: nested BYTES are base64 in a list, a map value and a map key; \\b and \\f are spelled \\u00XX" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try testing.expectEqualStrings("\"\\u0001ab\"", try newJson(a, .{ .bytes = "\x01ab" }));
+    try testing.expectEqualStrings("\"AWFi\"", try newJson(a, .{ .bytes = "\x01ab" }));
     try testing.expectEqualStrings("\"\\u0008\\u000c\"", try newJson(a, .{ .string = "\x08\x0c" }));
+
+    var eb = try column.Builder.initCapacity(a, types.Type.init(.bytes).asNullable(), 3);
+    try eb.append(.{ .bytes = "\xff" });
+    try eb.append(.{ .bytes = "\xfe" });
+    try eb.append(.null);
+    const elems = try eb.finish();
+    const shape: ListShape = .{ .rep_def = &.{1} };
+    const list = try assembleLists(a, elems, &.{ 0, 1, 1 }, &.{ 2, 2, 1 }, 2, shape, 1);
+    try testing.expectEqualStrings("[\"/w==\",\"/g==\",null]", list.getValue(0).string);
+
+    const schema = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "m", .repetition = .optional, .num_children = 1, .converted_type = 1 },
+        .{ .name = "key_value", .repetition = .repeated, .num_children = 2 },
+        .{ .name = "key", .ty = .byte_array, .repetition = .required },
+        .{ .name = "value", .ty = .byte_array, .repetition = .optional },
+    };
+    const root = try buildNested(a, &schema, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    var kb = try column.Builder.initCapacity(a, types.Type.init(.bytes).asNullable(), 2);
+    try kb.append(.{ .bytes = "\xff" });
+    try kb.append(.{ .bytes = "\xfe" });
+    var vb = try column.Builder.initCapacity(a, types.Type.init(.bytes).asNullable(), 2);
+    try vb.append(.{ .bytes = "\x01ab" });
+    try vb.append(.null);
+    const keys: Entries = .{ .vals = try kb.finish(), .reps = &.{ 0, 1 }, .defs = &.{ 2, 2 } };
+    const vals: Entries = .{ .vals = try vb.finish(), .reps = &.{ 0, 1 }, .defs = &.{ 3, 2 } };
+    const got = (try assembleNested(a, &root, &.{ keys, vals }, 1)).getValue(0).string;
+    try testing.expectEqualStrings("{\"/w==\":\"AWFi\",\"/g==\":null}", got);
+    try testing.expect(try std.json.validate(a, got));
 }
