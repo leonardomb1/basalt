@@ -430,6 +430,35 @@ test "copying a parquet with nested columns keeps every one of them" {
     );
 }
 
+test "a set operation writes a NULL from any branch into parquet, the column nullable when one branch's is" {
+    const alloc = std.testing.allocator;
+    const script =
+        \\LOAD INTO '$B/last.parquet' AS SELECT 1 AS k, unhex('') AS b UNION ALL SELECT 2, CAST(NULL AS BYTES);
+        \\LOAD INTO '$B/first.parquet' AS SELECT 1 AS k, CAST(NULL AS BYTES) AS b UNION ALL SELECT 2, unhex('ff');
+        \\LOAD INTO '$B/mid.parquet' AS SELECT 1 AS k, unhex('01') AS b UNION ALL SELECT 2, CAST(NULL AS BYTES) UNION ALL SELECT 3, unhex('02');
+        \\LOAD INTO '$B/except.parquet' AS SELECT 1 AS k, CAST(NULL AS INT) AS v EXCEPT SELECT 2, 7;
+        \\LOAD INTO '$B/out.csv' AS
+        \\  SELECT * FROM (SELECT 'last' AS f, k, hex(b) AS h, b IS NULL AS n FROM '$B/last.parquet'
+        \\  UNION ALL SELECT 'first', k, hex(b), b IS NULL FROM '$B/first.parquet'
+        \\  UNION ALL SELECT 'mid', k, hex(b), b IS NULL FROM '$B/mid.parquet'
+        \\  UNION ALL SELECT 'except', k, CAST(v AS STRING), v IS NULL FROM '$B/except.parquet') t ORDER BY f, k;
+    ;
+    for ([_]usize{ 1, 4 }) |threads| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try checkAndRun(alloc, &tmp, script, threads, &.{});
+        try @import("harness.zig").expectFile(&tmp, "out.csv", "f,k,h,n\n" ++
+            "except,1,,true\n" ++
+            "first,1,,true\n" ++
+            "first,2,FF,false\n" ++
+            "last,1,\"\",false\n" ++
+            "last,2,,true\n" ++
+            "mid,1,01,false\n" ++
+            "mid,2,,true\n" ++
+            "mid,3,02,false\n");
+    }
+}
+
 /// A stored zip whose one member, `p.parquet`, holds `x`: the refusal comes from the
 /// member's name, before anything reads it.
 const parquet_member_zip = "\x50\x4b\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00\x21\x5c\x83\x16\xdc\x8c\x01\x00\x00\x00\x01\x00\x00\x00\x09\x00\x00\x00\x70\x2e\x70\x61\x72\x71\x75\x65\x74\x78\x50\x4b\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00\x21\x5c\x83\x16\xdc\x8c\x01\x00\x00\x00\x01\x00\x00\x00\x09\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00\x70\x2e\x70\x61\x72\x71\x75\x65\x74\x50\x4b\x05\x06\x00\x00\x00\x00\x01\x00\x01\x00\x37\x00\x00\x00\x28\x00\x00\x00\x00\x00";

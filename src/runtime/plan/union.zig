@@ -361,7 +361,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names
     else
         try dupeSchema(arena, try unionCanon(env, specs, schemas, canon_opt, except));
 
-    var out_schema: types.Schema = undefined;
+    var out_fields: []types.Schema.Field = &.{};
     for (specs, 0..) |s, i| {
         var items = if (u.positional)
             try positionalReconcile(arena, schemas[i], canon)
@@ -370,8 +370,13 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names
         if (u.set != .union_all) items = try withSideMarks(arena, items, i);
         const proj = try buildProject(env, items, schemas[i], children[i]);
         children[i] = proj.op;
-        out_schema = proj.schema;
+        if (i == 0) {
+            out_fields = try arena.dupe(types.Schema.Field, proj.schema.fields);
+        } else for (out_fields, proj.schema.fields) |*f, b| {
+            f.ty.nullable = f.ty.nullable or b.ty.nullable;
+        }
     }
+    const out_schema: types.Schema = .{ .fields = out_fields };
     const un = try arena.create(op.Union);
     un.* = .{ .children = children };
     if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
@@ -549,5 +554,54 @@ test "union canon through conform equals the old folds: types, messages and the 
                 try expectSameFields(old_p, new_p);
             }
         }
+    }
+}
+
+test "a set operation's column is nullable when any branch's is, wherever the NULL sits, and stays required when none is" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    const env_mod = @import("../env.zig");
+    const Value = @import("../../exec/value.zig").Value;
+    const Case = struct { src: []const u8, kind: types.TypeKind, nullable: [2]bool };
+    const cases = [_]Case{
+        .{ .src = "SELECT 1 AS k, unhex('') AS b UNION ALL SELECT 2, CAST(NULL AS BYTES);", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, CAST(NULL AS BYTES) AS b UNION ALL SELECT 2, unhex('');", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, unhex('00') AS b UNION ALL SELECT 2, CAST(NULL AS BYTES) UNION ALL SELECT 3, unhex('01');", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, CAST(NULL AS BYTES) AS b UNION SELECT 2, unhex('');", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, CAST(NULL AS BYTES) AS b INTERSECT SELECT 1, unhex('');", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, CAST(NULL AS BYTES) AS b EXCEPT SELECT 2, unhex('');", .kind = .bytes, .nullable = .{ false, true } },
+        .{ .src = "SELECT 1 AS k, CAST(NULL AS INT) AS b UNION ALL SELECT 2, 1.5;", .kind = .decimal, .nullable = .{ false, true } },
+        .{ .src = "SELECT CAST(NULL AS INT) AS k, 'x' AS b UNION ALL BY NAME SELECT 'y' AS b, 2 AS k;", .kind = .string, .nullable = .{ true, false } },
+        .{ .src = "SELECT 1 AS k, unhex('') AS b UNION ALL SELECT 2, unhex('01') UNION ALL SELECT 3, unhex('02');", .kind = .bytes, .nullable = .{ false, false } },
+    };
+    for (cases) |c| {
+        var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, c.src, &pd);
+        var params = std.StringHashMap(Value).init(a);
+        var bindings = std.StringHashMap(ast.Pipeline).init(a);
+        var connections = std.StringHashMap(ast.Connection).init(a);
+        var stages: []const ast.Stage = &.{};
+        for (prog.stmts) |st| switch (st) {
+            .binding => |b| try bindings.put(b.name, b.pipeline),
+            .output => |o| stages = o.stages,
+            else => {},
+        };
+        var sources = std.array_list.Managed(@import("../../connect/driver.zig").Source).init(a);
+        var diag = env_mod.Diag{};
+        var log = obs.Logger.init(0, .text, .err);
+        var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+        var errctx = op.ErrCtx{};
+        var rows = obs.RowCounter.init(0);
+        var json = std.StringHashMap(std.json.Value).init(a);
+        const fns = std.StringHashMap(ast.FnDecl).init(a);
+        var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+        const r = try buildPipeline(&env, stages[0 .. stages.len - 1]);
+        const k = r.schema.fields[r.schema.indexOf("k").?].ty;
+        const b = r.schema.fields[r.schema.indexOf("b").?].ty;
+        try std.testing.expectEqual(c.kind, b.kind);
+        try std.testing.expectEqual(c.nullable[0], k.nullable);
+        try std.testing.expectEqual(c.nullable[1], b.nullable);
     }
 }
