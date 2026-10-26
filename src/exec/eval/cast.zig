@@ -138,7 +138,7 @@ pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKin
             .float => textconv.floatToInt(x, .half_even) orelse error.CastFailed,
             .bool => @intFromBool(x),
             .string => parseIntStrict(trim(x)) orelse error.CastFailed,
-            .decimal => std.math.cast(i64, (rescaleTo(x, 0) orelse return error.IntOverflow).unscaled) orelse error.IntOverflow,
+            .decimal => decimal.toInt(x) orelse error.IntOverflow,
             else => comptime unreachable,
         },
         .float => switch (from) {

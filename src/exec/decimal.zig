@@ -136,16 +136,24 @@ pub fn withinPrecision(v: i128, precision: u8) bool {
     return v < bound and v > -bound;
 }
 
-/// `u / 10^drop` for an i128 or i256 `u`, rounded half away from zero. An i128
-/// within i64 divides in i64, as does an i64 `u` (with `drop` at most 18).
+/// `u / 10^drop` for an i128 or i256 `u`, rounded half away from zero.
 pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
-    const T = @TypeOf(u);
-    if (T == i128 and drop <= 18) if (std.math.cast(i64, u)) |s| return roundScaleDown(s, drop);
-    const table = if (T == i256) &pow10_i256 else &pow10_i128;
+    const table = if (@TypeOf(u) == i128) &pow10_i128 else &pow10_i256;
     if (drop >= table.len) return 0;
-    const p: T = @intCast(table[drop]);
+    const p = table[drop];
     const q = @divTrunc(u, p);
     if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
+    return q;
+}
+
+/// A decimal rounded half away from zero to an i64, null past its range: what
+/// `rescaleTo(d, 0)` gives, divided in i64 when the unscaled value fits one.
+pub fn toInt(d: Decimal) ?i64 {
+    const s = (if (d.scale <= 18) std.math.cast(i64, d.unscaled) else null) orelse
+        return std.math.cast(i64, (rescaleTo(d, 0) orelse return null).unscaled);
+    const p: i64 = @intCast(pow10_i128[d.scale]);
+    const q = @divTrunc(s, p);
+    if (@abs(@rem(s, p)) * 2 >= p) return if (s < 0) q - 1 else q + 1;
     return q;
 }
 
@@ -153,21 +161,14 @@ pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
 /// Public because a value's scale need not match its column's (Postgres sends a
 /// per-value `dscale`), so anything combining decimals across rows normalizes first.
 pub fn rescaleTo(d: Decimal, want: u8) ?Decimal {
-    if (want == d.scale) return d;
-    if (want < d.scale) return .{ .unscaled = roundScaleDown(d.unscaled, d.scale - want), .scale = want };
-    const up = want - d.scale;
-    if (up >= pow10_i128.len) return if (d.unscaled == 0) .{ .unscaled = 0, .scale = want } else null;
-    if (@abs(d.unscaled) > raise_limit[up]) return null;
-    return .{ .unscaled = d.unscaled * pow10_i128[up], .scale = want };
+    var unscaled = d.unscaled;
+    var have: i32 = d.scale;
+    while (have < want) : (have += 1) {
+        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
+    }
+    if (have > want) unscaled = roundScaleDown(unscaled, @intCast(have - want));
+    return .{ .unscaled = unscaled, .scale = want };
 }
-
-/// The largest magnitude `10^k` times stays an i128, so a raise is checked by one
-/// compare; the debug backend's i128 overflow multiply missed some overflows.
-const raise_limit = blk: {
-    var t: [pow10_i128.len]u128 = undefined;
-    for (&t, pow10_i128) |*e, p| e.* = std.math.maxInt(i128) / @as(u128, @intCast(p));
-    break :blk t;
-};
 
 /// A decimal as a `DECIMAL(precision, scale)` holds it: at `scale`, rounded half
 /// away from zero, null when it overflows or has more than `precision` digits.
@@ -1170,35 +1171,15 @@ test "AVG's unchecked i256 total cannot overflow: an i64 count of i128 addends s
     _ = try std.math.mul(i256, std.math.maxInt(i64), std.math.maxInt(i128));
 }
 
-test "toF64, rescaleTo and roundScaleDown give what their i128-only forms gave, bit for bit" {
-    const Old = struct {
-        fn toF64(d: Decimal) f64 {
-            return @as(f64, @floatFromInt(d.unscaled)) / pow10f(d.scale);
-        }
-        fn roundDown(u: i128, drop: u32) i128 {
-            if (drop >= pow10_i128.len) return 0;
-            const p = pow10_i128[drop];
-            const q = @divTrunc(u, p);
-            if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
-            return q;
-        }
-        fn rescale(d: Decimal, want: u8) ?Decimal {
-            var unscaled = d.unscaled;
-            var have: i32 = d.scale;
-            while (have < want) : (have += 1) unscaled = std.math.mul(i128, unscaled, 10) catch return null;
-            if (have > want) unscaled = roundDown(unscaled, @intCast(have - want));
-            return .{ .unscaled = unscaled, .scale = want };
-        }
-    };
+test "toF64 and toInt give what the i128 conversion and rescaleTo(d, 0) gave, bit for bit" {
     var prng = std.Random.DefaultPrng.init(0xF64);
     const r = prng.random();
-    const edges = [_]i128{ 0, 1, -1, 5, -5, 49, -50, (1 << 53) + 1, -(1 << 53) - 1, std.math.maxInt(i64), std.math.minInt(i64), @as(i128, std.math.maxInt(i64)) + 1, @as(i128, std.math.minInt(i64)) - 1, std.math.maxInt(i128), std.math.minInt(i128) };
+    const edges = [_]i128{ 0, 1, -1, 5, -5, 49, -50, (1 << 53) + 1, -(1 << 53) - 1, std.math.maxInt(i64), std.math.minInt(i64), @as(i128, std.math.maxInt(i64)) + 1, @as(i128, std.math.minInt(i64)) - 1, 5 * std.math.pow(i128, 10, 18), -5 * std.math.pow(i128, 10, 18), std.math.maxInt(i128), std.math.minInt(i128) };
     for (0..200_000) |i| {
-        const u: i128 = if (i < edges.len * 50) edges[i % edges.len] else r.int(i128) >> r.uintLessThan(u7, 127);
-        const d: Decimal = .{ .unscaled = u, .scale = r.uintLessThan(u8, 45) };
-        const want = r.uintLessThan(u8, 45);
-        try testing.expectEqual(@as(u64, @bitCast(Old.toF64(d))), @as(u64, @bitCast(d.toF64())));
-        try testing.expectEqual(Old.rescale(d, want), rescaleTo(d, want));
-        try testing.expectEqual(Old.roundDown(u, want), roundScaleDown(u, want));
+        const u: i128 = if (i < edges.len * 45) edges[i % edges.len] else r.int(i128) >> r.uintLessThan(u7, 127);
+        const d: Decimal = .{ .unscaled = u, .scale = if (i < edges.len * 45) @intCast(i / edges.len) else r.uintLessThan(u8, 45) };
+        const f: f64 = @as(f64, @floatFromInt(u)) / pow10f(d.scale);
+        try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(d.toF64())));
+        try testing.expectEqual(if (rescaleTo(d, 0)) |w| std.math.cast(i64, w.unscaled) else null, toInt(d));
     }
 }

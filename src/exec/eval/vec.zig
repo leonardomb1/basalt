@@ -668,11 +668,15 @@ fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena
     const Out = cast.Elem(to);
     const zero: Out = if (to == .decimal) .{ .unscaled = 0, .scale = ty.scale } else std.mem.zeroes(Out);
     const out = try arena.alloc(Out, n);
-    const R = @typeInfo(@TypeOf(cast.castElem(from, to, undefined, ty))).error_union.error_set;
+    const At = struct {
+        inline fn at(v: @TypeOf(xs), i: usize) cast.Elem(from) {
+            return if (from == .string) v.at(i) else v[i];
+        }
+    };
+    const R = @typeInfo(@TypeOf(cast.castElem(from, to, At.at(xs, 0), ty))).error_union.error_set;
     const straight = comptime (from == .int or from == .bool) and @typeInfo(R).error_set.?.len == 0;
     for (out, 0..) |*o, i| {
-        const x = if (from == .string) xs.at(i) else xs[i];
-        o.* = if (straight or col.validity.get(i)) try cast.castElem(from, to, x, ty) else zero;
+        o.* = if (straight or col.validity.get(i)) try cast.castElem(from, to, At.at(xs, i), ty) else zero;
     }
     const t = if (to == .decimal) Type.decimal(ty.precision, ty.scale) else Type.init(to);
     return mkCol(t.withNull(col.ty.nullable), n, col.validity, column.dataOf(comptime column.storageOf(to), out));
