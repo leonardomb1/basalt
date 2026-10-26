@@ -98,14 +98,30 @@ challenge-response derived from it — whereas a SQL login sends it under
 LOGIN7's trivially reversible scrambling, so on an unverified channel NTLM is
 the stronger of the two, not the weaker.
 
-**Text:** `varchar` and `char` read as windows-1252, its five unassigned bytes
-(0x81, 0x8D, 0x8F, 0x90, 0x9D) as the C1 controls SQL Server itself converts
-them to, the same table a `cp1252` CSV uses. `nvarchar`, `nchar`, `ntext` and
-`xml` read as UTF-16, surrogate pairs joined. An `nvarchar` value holding an
-unpaired surrogate half (legal in SQL Server, not in Unicode) fails the read,
-naming the column, rather than being altered, as PostgreSQL, DuckDB and
-StarRocks refuse text that is not valid Unicode; fix it at the source (for
-example `REPLACE` it) or read the column `CAST(... AS varbinary)`. A column
-name or a server error message with one shows U+FFFD in its place. A bulk load
+**Text:** `varchar`, `char` and `text` read by the code page of their column's
+collation, which every result carries:
+
+- A windows-1252 collation (`Latin1_General_*`, `SQL_Latin1_General_CP1_*`,
+  `French_*`, `Modern_Spanish_*` and the other Western European ones) is
+  transcoded with the table a `cp1252` CSV uses. Its five unassigned bytes
+  (0x81, 0x8D, 0x8F, 0x90, 0x9D) read as the C1 controls of the same number, as
+  Windows' code page 1252 best-fit table, the WHATWG Encoding standard and MySQL
+  read them.
+- A `_UTF8` collation (SQL Server 2019 and later) reads as UTF-8; a value that is
+  not valid UTF-8 fails the read, naming the column.
+- Any other code page (Cyrillic, Greek, Turkish, Japanese, ...) is not decoded.
+  ASCII reads the same in all of them, so ASCII values pass, but the first value
+  holding a byte above 0x7F fails the read, naming the column and its collation,
+  rather than turning into mojibake. Read such a column
+  `CAST(col AS nvarchar(...))`.
+
+`nvarchar`, `nchar`, `ntext` and `xml` read as UTF-16, surrogate pairs joined. An
+`nvarchar` value holding an unpaired surrogate half fails the read, naming the
+column, rather than being altered, as PostgreSQL, DuckDB and StarRocks refuse
+text that is not valid Unicode. A column in a non-`_SC` collation can come to
+hold one, since such columns store "only the subset of character data supported
+by the UCS-2 character encoding" (Microsoft's `nchar` and `nvarchar`
+reference). Fix it at the source (for example `REPLACE` it) or read the column `CAST(... AS varbinary)`.
+A column name or a server error message with one shows U+FFFD in its place. A bulk load
 (`LOAD INTO`) refuses text that is not valid UTF-8, naming the column, rather
 than repairing it.

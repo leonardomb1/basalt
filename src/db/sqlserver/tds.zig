@@ -32,9 +32,11 @@
 //!
 //! Decoding notes: `tinyint` is the only 1-byte integer and is unsigned (sign
 //! extension once turned 200 into -56). MONEY is a scaled integer of
-//! ten-thousandths, the 8-byte form sent high word first. Non-Unicode text is
-//! transcoded from Windows-1252, the code page behind the common Latin collations,
-//! so accented text does not reach a UTF-8 sink as invalid bytes. `uniqueidentifier`
+//! ten-thousandths, the 8-byte form sent high word first. Non-Unicode text reads by
+//! its column's collation: Windows-1252, the code page behind the common Latin
+//! collations, is transcoded so accented text does not reach a UTF-8 sink as invalid
+//! bytes; a UTF-8 collation's bytes are validated; any other code page fails on its
+//! first non-ASCII value rather than turn into mojibake. `uniqueidentifier`
 //! renders as a canonical GUID and binary as `0x...` hex, since raw bytes would
 //! carry separators and newlines into a delimited bulk load.
 //!
@@ -952,7 +954,7 @@ const TdsCursor = struct {
             },
             0xA7, 0xAF => {
                 const ml = try self.reader.readU16();
-                try self.reader.skip(5);
+                try self.readCollation(&d);
                 d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
             },
@@ -981,7 +983,8 @@ const TdsCursor = struct {
             },
             0x22, 0x23, 0x63 => {
                 _ = try self.reader.readU32();
-                if (t == 0x23 or t == 0x63) try self.reader.skip(5);
+                if (t == 0x23) try self.readCollation(&d);
+                if (t == 0x63) try self.reader.skip(5);
                 var parts = try self.reader.readByte();
                 while (parts > 0) : (parts -= 1) try self.reader.skip(@as(usize, try self.reader.readU16()) * 2);
                 d.kind = .textptr;
@@ -992,6 +995,12 @@ const TdsCursor = struct {
             else => return error.UnsupportedTdsType,
         }
         return d;
+    }
+
+    /// A varchar, char or text column's COLLATION, and the encoding its bytes read in.
+    fn readCollation(self: *TdsCursor, d: *ColumnDesc) !void {
+        try self.reader.readBytes(&d.collation);
+        d.text_enc = textEncoding(d.collation);
     }
 
     fn parseRow(self: *TdsCursor, arena: std.mem.Allocator, builders: []column.Builder, nbc: bool) !void {
@@ -1031,6 +1040,14 @@ const TdsCursor = struct {
         const dst = try b.reserveBytes(len);
         try self.reader.readBytes(dst);
         if (charset.isAscii(dst)) return b.commitBytes(len);
+        switch (col.text_enc) {
+            .cp1252 => {},
+            .utf8 => {
+                if (!std.unicode.utf8ValidateSlice(dst)) return badUtf8(col.name);
+                return b.commitBytes(len);
+            },
+            .other => return otherCodePage(col),
+        }
         const raw = self.cell[0..len];
         @memcpy(raw, dst);
         const out = try b.reserveBytes(charset.decodedLen(.cp1252, raw));
@@ -1253,8 +1270,55 @@ const ColumnDesc = struct {
     is_guid: bool = false,
     is_binary: bool = false,
     is_money: bool = false,
+    collation: [5]u8 = .{ 0, 0, 0, 0, 0 },
+    text_enc: TextEnc = .cp1252,
     decode: Decode = .raw_text,
 };
+
+/// The encoding of a varchar, char or text column's bytes, from its COLLATION
+/// ([MS-TDS] 2.2.5.1.2: a 20-bit LCID, eight flags of which fUTF8 is u32 bit 26,
+/// a 4-bit version, then a SortId byte). ASCII reads the same in every one.
+const TextEnc = enum { cp1252, utf8, other };
+
+/// Windows collations (SortId 0) whose code page is 1252, by the low 16 bits of the
+/// LCID (the high four are a sort variant, as German_PhoneBook's 0x10407).
+const cp1252_lcids = [_]u16{
+    0x0403, 0x0406, 0x0407, 0x0409, 0x040a, 0x040b, 0x040c, 0x040f, 0x0410, 0x0413,
+    0x0414, 0x0416, 0x0417, 0x041d, 0x0421, 0x042d, 0x042e, 0x0436, 0x0437, 0x0438,
+    0x043b, 0x043e, 0x0441, 0x0452, 0x0456, 0x0462, 0x047a, 0x047c, 0x047e, 0x0483,
+    0x0807, 0x0809, 0x080a, 0x080c, 0x0810, 0x0813, 0x0814, 0x0816, 0x081d, 0x083b,
+    0x083e, 0x085f, 0x0c07, 0x0c09, 0x0c0a, 0x0c0c, 0x1007, 0x1009, 0x100a, 0x100c,
+    0x1407, 0x1409, 0x140a, 0x140c, 0x1809, 0x180a, 0x180c, 0x1c09, 0x1c0a, 0x2009,
+    0x200a, 0x2409, 0x240a, 0x2809, 0x280a, 0x2c09, 0x2c0a, 0x3009, 0x300a, 0x3409,
+    0x340a, 0x380a, 0x3c0a, 0x400a, 0x440a, 0x480a, 0x4c0a, 0x500a,
+};
+
+/// The UTF-8 flag wins; a SQL collation (SortId not 0) is cp1252 only for the
+/// SQL_*_CP1_* sort orders 51-54 and 183-186; a Windows one by its LCID. Anything
+/// not known to be 1252 is `other`, never guessed.
+fn textEncoding(c: [5]u8) TextEnc {
+    if (c[3] & 0x04 != 0) return .utf8;
+    if (c[4] != 0) return switch (c[4]) {
+        51...54, 183...186 => .cp1252,
+        else => .other,
+    };
+    const lcid = std.mem.readInt(u16, c[0..2], .little);
+    return if (std.mem.indexOfScalar(u16, &cp1252_lcids, lcid) != null) .cp1252 else .other;
+}
+
+/// Fails a read on a varchar cell in a UTF-8 collation holding bytes that are not UTF-8.
+fn badUtf8(name: []const u8) error{InvalidUtf8} {
+    var buf: [480]u8 = undefined;
+    return @errorCast(eval.explain(error.InvalidUtf8, std.fmt.bufPrint(&buf, "SQL Server column `{s}` has a UTF-8 collation but holds bytes that are not valid UTF-8; repair it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}) catch unreachable));
+}
+
+/// Fails a read on a non-ASCII varchar cell whose collation's code page is not
+/// windows-1252, rather than guess its characters.
+fn otherCodePage(d: ColumnDesc) error{UnsupportedCollation} {
+    var buf: [480]u8 = undefined;
+    const lcid = std.mem.readInt(u32, d.collation[0..4], .little) & 0xFFFFF;
+    return @errorCast(eval.explain(error.UnsupportedCollation, std.fmt.bufPrint(&buf, "SQL Server column `{s}` is non-Unicode text in a collation (LCID 0x{x:0>5}, sort id {d}) whose code page basalt does not read; read the column CAST(... AS nvarchar(...))", .{ eval.clip(d.name), lcid, d.collation[4] }) catch unreachable));
+}
 
 /// How a column's cells reach its builder, chosen once from its metadata
 /// (`decodeOf`); each is an `appendRaw` instantiated at compile time.
@@ -1290,6 +1354,14 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
         .plain_text, .win1252 => {
             if (charset.isAscii(raw)) return b.appendStr(raw);
+            switch (d.text_enc) {
+                .cp1252 => {},
+                .utf8 => {
+                    if (!std.unicode.utf8ValidateSlice(raw)) return badUtf8(d.name);
+                    return b.appendStr(raw);
+                },
+                .other => return otherCodePage(d),
+            }
             return b.commitBytes(charset.decodeInto(.cp1252, try b.reserveBytes(charset.decodedLen(.cp1252, raw)), raw));
         },
         .unicode_text => try b.commitBytes(utf16.decodeLe(.fail, try b.reserveBytes(utf16.decodedBound(raw.len)), raw) catch |e| return notUtf16(d.name, e)),
@@ -1487,7 +1559,7 @@ fn varcharCell(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
     return (try cellValue(a, d, raw)).string;
 }
 
-test "tds: a varchar cell decodes as charset's cp1252 does, the unassigned bytes to C1 as SQL Server converts them (D5)" {
+test "tds: a varchar cell decodes as charset's cp1252 does, the unassigned bytes to their C1 controls (D5)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -2273,6 +2345,95 @@ test "tds: a column name with an unpaired surrogate half reads with U+FFFD, not 
     try cur.parseColMeta(a);
     try std.testing.expectEqualStrings("a\u{FFFD}b", cur.schema.fields[0].name);
     try std.testing.expectEqualStrings("c😀", cur.schema.fields[1].name);
+}
+
+/// COLMETADATA for one varchar(64) named `name` in collation `c`, as [MS-TDS] 2.2.7.4 lays it.
+fn varcharMeta(comptime name: u8, c: [5]u8) [17]u8 {
+    return [_]u8{ 0, 0, 0, 0, 0, 0, 0xA7, 0x40, 0x00 } ++ c ++ [_]u8{ 1, name, 0 };
+}
+
+/// One ROW of single-byte-length-prefixed varchar cells.
+fn varcharRow(comptime cells: []const []const u8) []const u8 {
+    comptime var out: []const u8 = &.{0xD1};
+    inline for (cells) |v| out = out ++ [_]u8{ @intCast(v.len), 0 } ++ v;
+    return out;
+}
+
+const latin1_cp1 = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 };
+const latin1_utf8 = [5]u8{ 0x09, 0x04, 0xD0, 0x24, 0x00 };
+const cyrillic = [5]u8{ 0x19, 0x04, 0xD0, 0x00, 0x00 };
+
+/// The rows after a three-column COLMETADATA in cp1252, UTF-8 and Cyrillic collations,
+/// fetched as a run reads them.
+fn collatedFetch(a: std.mem.Allocator, rows: []const u8) !Batch {
+    const gpa = std.testing.allocator;
+    const meta = [_]u8{ 3, 0 } ++ varcharMeta('p', latin1_cp1) ++ varcharMeta('u', latin1_utf8) ++ varcharMeta('r', cyrillic);
+    const payload = try std.mem.concat(a, u8, &.{ &meta, rows, &done_final });
+    var src = std.Io.Reader.fixed(try framePackets(a, payload, 64));
+    const cur = try gpa.create(TdsCursor);
+    defer gpa.destroy(cur);
+    cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &.{}, .schema = undefined, .done = false };
+    defer cur.reader.deinit();
+    try cur.parseColMeta(a);
+    try std.testing.expectEqual(TextEnc.cp1252, cur.cols[0].text_enc);
+    try std.testing.expectEqual(TextEnc.utf8, cur.cols[1].text_enc);
+    try std.testing.expectEqual(TextEnc.other, cur.cols[2].text_enc);
+    return (try cur.fetchBatch(a)).?;
+}
+
+test "tds: a varchar reads in its collation's encoding: 1252, UTF-8, or a failure naming it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ok = try collatedFetch(a, varcharRow(&.{ "caf\xe9", "caf\xc3\xa9 \xf0\x9f\x98\x80", "plain" }));
+    try std.testing.expectEqualStrings("caf\u{e9}", ok.columns[0].getValue(0).string);
+    try std.testing.expectEqualStrings("caf\u{e9} \u{1F600}", ok.columns[1].getValue(0).string);
+    try std.testing.expectEqualStrings("plain", ok.columns[2].getValue(0).string);
+    try std.testing.expectError(error.InvalidUtf8, collatedFetch(a, varcharRow(&.{ "a", "caf\xe9", "b" })));
+    try std.testing.expectEqualStrings("SQL Server column `u` has a UTF-8 collation but holds bytes that are not valid UTF-8; repair it at the source or read the column CAST(... AS varbinary)", eval.takeFailure(error.InvalidUtf8).?);
+    try std.testing.expectError(error.UnsupportedCollation, collatedFetch(a, varcharRow(&.{ "a", "b", "\xcf\xf0\xe8" })));
+    try std.testing.expectEqualStrings("SQL Server column `r` is non-Unicode text in a collation (LCID 0x00419, sort id 0) whose code page basalt does not read; read the column CAST(... AS nvarchar(...))", eval.takeFailure(error.UnsupportedCollation).?);
+}
+
+test "tds: varchar(max) and text cells follow their collation too" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const strT = types.Type.init(.string).asNullable();
+    for ([_]ColKind{ .plp, .textptr }) |kind| {
+        var d = ColumnDesc{ .tds_type = if (kind == .plp) 0xA7 else 0x23, .engine_type = strT, .kind = kind, .name = "m" };
+        d.decode = decodeOf(d);
+        try std.testing.expectEqual(Decode.win1252, d.decode);
+        d.collation = latin1_cp1;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("\u{e9}", (try cellValue(a, d, "\xe9")).string);
+        d.collation = latin1_utf8;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("\u{e9}", (try cellValue(a, d, "\xc3\xa9")).string);
+        try std.testing.expectError(error.InvalidUtf8, cellValue(a, d, "\xe9"));
+        _ = eval.takeFailure(error.InvalidUtf8);
+        d.collation = cyrillic;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("ok", (try cellValue(a, d, "ok")).string);
+        try std.testing.expectError(error.UnsupportedCollation, cellValue(a, d, "\xe9"));
+        _ = eval.takeFailure(error.UnsupportedCollation);
+    }
+}
+
+test "tds: textEncoding knows 1252 only where it is sure" {
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(latin1_cp1));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x07, 0x04, 0x01, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x0a, 0x0c, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 183 }));
+    try std.testing.expectEqual(TextEnc.utf8, textEncoding(latin1_utf8));
+    try std.testing.expectEqual(TextEnc.utf8, textEncoding(.{ 0x19, 0x04, 0x00, 0x04, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(cyrillic));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 42 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 106 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x08, 0x04, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x11, 0x04, 0x01, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0, 0, 0, 0, 0 }));
 }
 
 test "tds: a server error message keeps its non-ASCII text, an unpaired half as U+FFFD (D7)" {
