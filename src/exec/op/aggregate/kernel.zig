@@ -82,13 +82,6 @@ fn lanes(comptime In: type) *const [kinds.len]read.Lane {
     return &L.of;
 }
 
-/// The kind a lane's loop is generated for, its first; null for a lane no kind
-/// takes when read as `In`, whose loop is never generated.
-fn laneKind(comptime In: type, comptime l: read.Lane) ?types.TypeKind {
-    for (kinds) |k| if (read.lane(In, k) == l) return k;
-    return null;
-}
-
 pub fn make(comptime Op: type) Kernel {
     const K = struct {
         fn st(p: [*]u8) *Op.State {
@@ -113,7 +106,7 @@ pub fn make(comptime Op: type) Kernel {
             const c = col.?;
             const all = c.validity.allSet(n);
             switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
-                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
+                inline else => |l| if (comptime read.laneKind(Op.In, l)) |kind| {
                     if (comptime read.Phys(kind)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, read.slice(S, c, n), cx);
                     if (all) {
                         for (0..n) |i| if (try read.atValid(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
@@ -131,7 +124,7 @@ pub fn make(comptime Op: type) Kernel {
             };
             const all = c.validity.allSet(tails.len);
             switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
-                inline else => |l| if (comptime laneKind(Op.In, l)) |kind| {
+                inline else => |l| if (comptime read.laneKind(Op.In, l)) |kind| {
                     for (tails, 0..) |t, r| {
                         const tp = t orelse continue;
                         const cx = if (needs_alloc) rows.at(r) else rows.cx;

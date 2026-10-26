@@ -155,6 +155,13 @@ pub fn lane(comptime In: type, comptime kind: types.TypeKind) Lane {
     };
 }
 
+/// The kind a lane's loop is generated for, its first; null for a lane no kind
+/// takes when read as `In`, whose loop is never generated.
+pub fn laneKind(comptime In: type, comptime l: Lane) ?types.TypeKind {
+    for (std.enums.values(types.TypeKind)) |k| if (lane(In, k) == l) return k;
+    return null;
+}
+
 /// Row `i` of a column of `kind` as `In`, or null when it is NULL; a nested value
 /// counts as present but reads as NULL otherwise. The one per-row read every
 /// aggregate loop makes.
