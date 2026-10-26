@@ -706,6 +706,8 @@ pub const KeyArr = struct {
     }
 };
 
+/// Row order by the keys, equal keys by row index: a total order, so an unstable
+/// sort of rows held in input order gives the stable result.
 pub const SortCtx = struct {
     arrs: []const KeyArr,
 
@@ -714,7 +716,7 @@ pub const SortCtx = struct {
             const o = k.order(a, c);
             if (o != .eq) return o == .lt;
         }
-        return false;
+        return a < c;
     }
 };
 
@@ -735,13 +737,13 @@ pub fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const 
     var exact = true;
     for (arrs, plans) |k, *p| {
         p.* = KeyPlan.of(k, n) orelse {
-            std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+            std.mem.sortUnstable(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
             return;
         };
         if (!p.exact) exact = false;
     }
     if (n > std.math.maxInt(u32)) {
-        std.mem.sort(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        std.mem.sortUnstable(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
         return;
     }
     if (try sortIdxParallel(arena, idx, arrs, plans, exact, threads)) return;
@@ -1067,7 +1069,7 @@ fn fixTies(idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan) void {
     while (start < idx.len) {
         var end = start + 1;
         while (end < idx.len and sameWords(arrs[0 .. m + 1], plans[0 .. m + 1], idx[start], idx[end])) end += 1;
-        if (end - start > 1) std.mem.sort(usize, idx[start..end], SortCtx{ .arrs = arrs }, SortCtx.lessThan);
+        if (end - start > 1) std.mem.sortUnstable(usize, idx[start..end], SortCtx{ .arrs = arrs }, SortCtx.lessThan);
         start = end;
     }
 }

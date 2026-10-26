@@ -216,12 +216,13 @@ pub fn arrange(gpa: std.mem.Allocator, g: Grid, kinds: []const ?types.TypeKind, 
             fn less(cx: @This(), x: usize, y: usize) bool {
                 const a = cx.g.cell(x, cx.col);
                 const b = cx.g.cell(y, cx.col);
-                if (a == null or b == null) return a != null and b == null;
-                const o = order(cx.kind, a.?, b.?);
+                if ((a == null) != (b == null)) return b == null;
+                const o = if (a == null) .eq else order(cx.kind, a.?, b.?);
+                if (o == .eq) return x < y;
                 return if (cx.desc) o == .gt else o == .lt;
             }
         };
-        std.sort.block(usize, rows.items, Ctx{ .g = g, .col = so.col, .kind = kinds[so.col], .desc = so.dir == .desc }, Ctx.less);
+        std.mem.sortUnstable(usize, rows.items, Ctx{ .g = g, .col = so.col, .kind = kinds[so.col], .desc = so.dir == .desc }, Ctx.less);
     }
     return rows.toOwnedSlice();
 }

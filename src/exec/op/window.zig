@@ -547,7 +547,7 @@ pub const Window = struct {
                 k += 1;
             };
             heap.items.len = k;
-            std.mem.sort(Item, heap.items, max, heapLess);
+            std.mem.sortUnstable(Item, heap.items, max, heapLess);
         }
 
         fn heapLess(max: bool, a: Item, b: Item) bool {
