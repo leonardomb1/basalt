@@ -20,6 +20,7 @@
 //! counts toward the account's lockout.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
 const civil = @import("../../exec/civil.zig");
 
@@ -860,7 +861,7 @@ fn srvLookup(gpa: std.mem.Allocator, realm: []const u8, out: [][]const u8) !usiz
     hdr[2] = 0x01;
     std.mem.writeInt(u16, hdr[4..6], 1, .big);
     try q.appendSlice(&hdr);
-    const name = try std.fmt.allocPrint(gpa, "_kerberos._tcp.{s}", .{realm});
+    const name = try msgfmt.allocPrint(gpa, "_kerberos._tcp.{s}", .{realm});
     defer gpa.free(name);
     var labels = std.mem.splitScalar(u8, name, '.');
     while (labels.next()) |l| {
@@ -898,7 +899,7 @@ fn srvLookup(gpa: std.mem.Allocator, realm: []const u8, out: [][]const u8) !usiz
             defer host.deinit();
             readName(r, at + 6, &host) catch {};
             if (host.items.len > 0) {
-                out[k] = try std.fmt.allocPrint(gpa, "{s}:{d}", .{ host.items, port });
+                out[k] = try msgfmt.allocPrint(gpa, "{s}:{d}", .{ host.items, port });
                 k += 1;
             }
         }

@@ -22,6 +22,7 @@ const planErr = @import("../env.zig").planErr;
 const analyze = @import("../analyze.zig");
 const sourceLabel = @import("../connect.zig").sourceLabel;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// The per-branch reconcile projection: an optional tag literal, then every canon
@@ -60,7 +61,7 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
         const tag_key = forHintName(hints, "tag_field");
         const tag_substr = forHintName(hints, "tag_substr");
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, u.discover_json, .{}) catch
-            return planErr(env.diag, try std.fmt.allocPrint(arena, "union json: invalid JSON: {s}", .{u.discover_json}));
+            return planErr(env.diag, try msgfmt.allocPrint(arena, "union json: invalid JSON: {s}", .{u.discover_json}));
         const items = switch (parsed) {
             .array => |a| a.items,
             else => return planErr(env.diag, "union json: expected a JSON array"),
@@ -153,7 +154,7 @@ fn unifyByName(arena: std.mem.Allocator, canon: []types.Schema.Field, rest: []co
         .cols => |cols| for (canon, cols) |*f, c| {
             f.ty = c.ty;
         },
-        .problem => |p| return try std.fmt.allocPrint(
+        .problem => |p| return try msgfmt.allocPrint(
             arena,
             "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
             .{ p.type.name, @tagName(p.type.want.kind), @tagName(p.type.got.kind) },
@@ -180,12 +181,12 @@ fn unifyByPosition(arena: std.mem.Allocator, canon: []types.Schema.Field, rest: 
             f.ty = c.ty;
         },
         .problem => |p| return switch (p) {
-            .count => |c| try std.fmt.allocPrint(
+            .count => |c| try msgfmt.allocPrint(
                 arena,
                 "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
                 .{ op_name, n, c.got, c.want, op_name, hint },
             ),
-            .type => |t| try std.fmt.allocPrint(
+            .type => |t| try msgfmt.allocPrint(
                 arena,
                 "{s}: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
                 .{ op_name, (try columnOf(arena, canon, sch)) + 1, t.name, @tagName(t.want.kind), @tagName(t.got.kind), n },
@@ -469,7 +470,7 @@ const OldCanon = struct {
             for (canon) |*f| {
                 const other = sch.indexOf(f.name) orelse continue;
                 const ot = sch.fields[other].ty;
-                f.ty = types.Type.unify(f.ty, ot) orelse return try std.fmt.allocPrint(
+                f.ty = types.Type.unify(f.ty, ot) orelse return try msgfmt.allocPrint(
                     arena,
                     "union: column `{s}` is {s} in one branch and {s} in another, with no common type",
                     .{ f.name, @tagName(f.ty.kind), @tagName(ot.kind) },
@@ -483,13 +484,13 @@ const OldCanon = struct {
         const op_name = setOpName(set);
         const hint: []const u8 = if (set == .union_all) " (`UNION ALL BY NAME` matches them by name)" else "";
         for (rest, 2..) |sch, n| {
-            if (sch.fields.len != fields.len) return try std.fmt.allocPrint(
+            if (sch.fields.len != fields.len) return try msgfmt.allocPrint(
                 arena,
                 "{s}: branch {d} has {d} columns and the first has {d}; {s} lines columns up by position{s}",
                 .{ op_name, n, sch.fields.len, fields.len, op_name, hint },
             );
             for (fields, sch.fields, 1..) |*f, of, col| {
-                f.ty = types.Type.unify(f.ty, of.ty) orelse return try std.fmt.allocPrint(
+                f.ty = types.Type.unify(f.ty, of.ty) orelse return try msgfmt.allocPrint(
                     arena,
                     "{s}: column {d} (`{s}`) is {s} in the first branch and {s} in branch {d}, with no common type",
                     .{ op_name, col, f.name, @tagName(f.ty.kind), @tagName(of.ty.kind), n },

@@ -20,6 +20,7 @@
 //! basalt does not know.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Layout = @import("../parquet/fit.zig").Layout;
 const Mapping = @import("../parquet/fit.zig").Mapping;
@@ -187,7 +188,7 @@ pub fn fileKey(arena: std.mem.Allocator, key_root: []const u8, decoded: []const 
 /// A deletion vector's `uniqueId`: its storage type and path or inline bytes, with
 /// `@offset` when it has one.
 fn dvId(arena: std.mem.Allocator, storage: []const u8, where: []const u8, offset: ?i64) ![]const u8 {
-    if (offset) |o| return std.fmt.allocPrint(arena, "{s}{s}@{d}", .{ storage, where, o });
+    if (offset) |o| return msgfmt.allocPrint(arena, "{s}{s}@{d}", .{ storage, where, o });
     return std.mem.concat(arena, u8, &.{ storage, where });
 }
 
@@ -580,7 +581,7 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
     r.* = .{
         .kind = .delta,
         .root = root,
-        .label = try std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ st.version, layout.files.len, if (layout.files.len == 1) "" else "s" }),
+        .label = try msgfmt.allocPrint(arena, "version {d}, {d} file{s}", .{ st.version, layout.files.len, if (layout.files.len == 1) "" else "s" }),
         .layout = &layout.layout,
     };
     return r;
@@ -638,7 +639,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
 /// only what makes the replay itself unreliable; what a reader or a writer
 /// cannot honour each judges from the state.
 pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*State {
-    const name = try std.fmt.allocPrint(arena, "Delta table `{s}`", .{root});
+    const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
         return refuse("{s} cannot be read over http(s): a Delta table is found by listing _delta_log/, which a URL cannot do; read it from a local path, s3://, az://, sftp:// or smb://", .{name});
     const log_path = try std.mem.concat(arena, u8, &.{ root, log_dir });

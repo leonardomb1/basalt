@@ -28,6 +28,7 @@
 //! per outer row, which one join cannot.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const ast = @import("../ast.zig");
 const sp = @import("../sql_parser.zig");
 const Parser = sp.Parser;
@@ -150,7 +151,7 @@ const Work = struct {
     outer_only: ?*ast.Expr = null,
 
     fn name(self: *Work, p: *Parser, comptime suffix: []const u8, i: usize) Error![]const u8 {
-        return std.fmt.allocPrint(p.arena, "__sq{d}_" ++ suffix ++ "{d}", .{ self.id, i });
+        return msgfmt.allocPrint(p.arena, "__sq{d}_" ++ suffix ++ "{d}", .{ self.id, i });
     }
 
     fn hidden(self: *const Work, p: *Parser) Error![]const []const u8 {
@@ -360,7 +361,7 @@ fn corrOf(w: *Work) Error!Corr {
 }
 
 fn sentinelFor(self: *Parser, w: *Work, lhs: ?*ast.Expr, negated: bool, what: []const u8, pos: Pos) Error!*ast.Expr {
-    const bname = try std.fmt.allocPrint(self.arena, "__sq{d}", .{w.id});
+    const bname = try msgfmt.allocPrint(self.arena, "__sq{d}", .{w.id});
     try self.bindHidden(bname, try w.stages.toOwnedSlice(), pos);
     const sentinel = try self.mk(.{ .bool_lit = true });
     try self.pending_semijoins.append(.{
@@ -549,7 +550,7 @@ pub fn correlatedScalar(self: *Parser, cap: Captured, pos: Pos) Error!*ast.Expr 
         value = try self.mk(.{ .call = .{ .name = "__one_row", .args = args } });
     }
     if (w.outer_only) |p| value = try self.mk(.{ .cond = .{ .cond = p, .then = value, .els = empty_out } });
-    const bname = try std.fmt.allocPrint(self.arena, "__sq{d}", .{w.id});
+    const bname = try msgfmt.allocPrint(self.arena, "__sq{d}", .{w.id});
     try self.bindHidden(bname, try w.stages.toOwnedSlice(), pos);
     try self.corr.?.scalars.append(.{
         .binding = bname,

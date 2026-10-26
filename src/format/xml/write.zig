@@ -11,6 +11,7 @@
 //! gzipped or uploaded, but not appended to, as its root closes on its last line.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const celltext = @import("../../exec/celltext.zig");
@@ -52,9 +53,9 @@ pub const Writer = struct {
             .out = out,
             .opens = opens,
             .closes = closes,
-            .row_open = try std.fmt.allocPrint(arena, "  {s}", .{try tag(arena, "<", names.row)}),
-            .row_close = try std.fmt.allocPrint(arena, "{s}\n", .{try tag(arena, "</", names.row)}),
-            .root_close = try std.fmt.allocPrint(arena, "{s}\n", .{try tag(arena, "</", names.root)}),
+            .row_open = try msgfmt.allocPrint(arena, "  {s}", .{try tag(arena, "<", names.row)}),
+            .row_close = try msgfmt.allocPrint(arena, "{s}\n", .{try tag(arena, "</", names.row)}),
+            .root_close = try msgfmt.allocPrint(arena, "{s}\n", .{try tag(arena, "</", names.root)}),
         };
         return self;
     }

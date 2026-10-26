@@ -8,6 +8,7 @@ const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const parseSource = @import("../../sql_parser.zig").parseSource;
 const parseTest = @import("../testing_util.zig").parseTest;
 const std = @import("std");
+const msgfmt = @import("../../../format/msgfmt.zig");
 const testing = std.testing;
 
 fn windows(stages: []const ast.Stage, out: *std.array_list.Managed(ast.Window)) !void {
@@ -83,7 +84,7 @@ test "window frames: a start after its end, impossible bounds and bad offsets ar
         .{ "ROWS 1", "expected PRECEDING or FOLLOWING" },
     };
     for (cases) |c| {
-        const src = try std.fmt.allocPrint(a, "SELECT SUM(v) OVER (ORDER BY t {s}) AS s FROM 'in.csv';", .{c[0]});
+        const src = try msgfmt.allocPrint(a, "SELECT SUM(v) OVER (ORDER BY t {s}) AS s FROM 'in.csv';", .{c[0]});
         try expectRefused(a, src, c[1]);
     }
     try expectRefused(a, "SELECT SUM(v) OVER (ORDER BY k, t RANGE 1 PRECEDING) AS s FROM 'in.csv';", "RANGE with an offset needs exactly one ORDER BY key");

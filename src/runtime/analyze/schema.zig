@@ -19,6 +19,7 @@ const lastPart = @import("../analyze.zig").lastPart;
 const mk = @import("../analyze.zig").mk;
 const op = @import("../../exec/op.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const substExpr = @import("../analyze.zig").substExpr;
 const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
 const coerceLits = @import("../analyze.zig").coerceLits;
@@ -47,9 +48,9 @@ fn freeName(arena: std.mem.Allocator, cols: []const Col, want: []const u8, joine
     var n: usize = 0;
     while (colNamed(cols, nm)) : (n += 1) {
         nm = if (n == 0)
-            try std.fmt.allocPrint(arena, "{s}_r", .{joined})
+            try msgfmt.allocPrint(arena, "{s}_r", .{joined})
         else
-            try std.fmt.allocPrint(arena, "{s}_r{d}", .{ joined, n + 1 });
+            try msgfmt.allocPrint(arena, "{s}_r{d}", .{ joined, n + 1 });
     }
     return nm;
 }
@@ -373,7 +374,7 @@ fn scaledMicros(text: []const u8, unit_us: i128) i128 {
 /// hidden name spells, what it is.
 fn keyText(arena: std.mem.Allocator, key: []const u8) Error![]const u8 {
     if (std.mem.indexOf(u8, key, "__") != null) return "the ORDER BY expression";
-    return std.fmt.allocPrint(arena, "`{s}`", .{key});
+    return msgfmt.allocPrint(arena, "`{s}`", .{key});
 }
 
 /// How a stage's single ORDER BY key reads as a number for its RANGE offsets: a
@@ -448,11 +449,11 @@ pub const LagDefault = union(enum) { value: Value, problem: []const u8 };
 pub fn lagDefault(arena: std.mem.Allocator, d: *const ast.Expr, q: ast.QualName, ty: types.Type) Error!LagDefault {
     const v = eval.constEval(arena, d, &.{}, &.{}) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .problem = try std.fmt.allocPrint(arena, "LAG/LEAD default: {s}", .{@import("../env.zig").errLabel(e)}) };
+        return .{ .problem = try msgfmt.allocPrint(arena, "LAG/LEAD default: {s}", .{@import("../env.zig").errLabel(e)}) };
     };
     if (v.isNull()) return .{ .value = .null };
     const typed = eval.castValueTyped(arena, v, ty.asNullable()) catch
-        return .{ .problem = try std.fmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }) };
+        return .{ .problem = try msgfmt.allocPrint(arena, "LAG/LEAD default does not fit `{s}` ({s})", .{ q.last(), try ty.name(arena) }) };
     return .{ .value = typed };
 }
 
@@ -682,9 +683,9 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         var n: usize = 0;
         while ((types.Schema{ .fields = fields.items }).indexOf(name) != null) : (n += 1) {
             name = if (n == 0)
-                try std.fmt.allocPrint(arena, "{s}_r", .{f.name})
+                try msgfmt.allocPrint(arena, "{s}_r", .{f.name})
             else
-                try std.fmt.allocPrint(arena, "{s}_r{d}", .{ f.name, n + 1 });
+                try msgfmt.allocPrint(arena, "{s}_r{d}", .{ f.name, n + 1 });
         }
         try fields.append(.{
             .name = name,
@@ -707,9 +708,9 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
 /// A join key for a message: its column; a USING side's copy by the key's name
 /// (`using`); a key the parser computed from an ON expression as that.
 fn keyLabel(arena: std.mem.Allocator, name: []const u8, using: []const u8) Error![]const u8 {
-    if (std.mem.startsWith(u8, name, "__u")) return std.fmt.allocPrint(arena, "`{s}`", .{using});
+    if (std.mem.startsWith(u8, name, "__u")) return msgfmt.allocPrint(arena, "`{s}`", .{using});
     if (std.mem.startsWith(u8, name, "__")) return "an ON expression";
-    return std.fmt.allocPrint(arena, "`{s}`", .{name});
+    return msgfmt.allocPrint(arena, "`{s}`", .{name});
 }
 
 fn isNumeric(k: types.TypeKind) bool {

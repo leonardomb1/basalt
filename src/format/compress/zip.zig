@@ -21,6 +21,7 @@
 //! other.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");
 const sftp = @import("../../store/sftp.zig");
@@ -245,7 +246,7 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
 /// One identity-encoded GET for the member's compressed extent, streamed, so a
 /// multi-gigabyte member costs a window of memory. A 200 (Range ignored) is skipped to `off`.
 fn streamRange(arena: std.mem.Allocator, m: *Member, rm: *pqdecode.Remote, off: u64, len: u64) !*std.Io.Reader {
-    const range = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
+    const range = try msgfmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
     const extra = try rm.headers(arena, .GET, range);
     const uri = scheme.parseUri(rm.url) catch return error.InvalidUrl;
     m.body = .{ .http = .{ .req = undefined, .response = undefined, .redirect_buf = undefined } };

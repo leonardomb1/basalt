@@ -72,6 +72,7 @@
 //! or not the rest of that script succeeds.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const Flags = @import("args.zig").Flags;
 const sharedFlag = @import("args.zig").sharedFlag;
 const cli = @import("cli.zig");
@@ -252,7 +253,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try std.fmt.allocPrint(a, "unknown op `{s}` — run, check, complete, cancel, reset or close", .{req.op});
+            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
@@ -500,8 +501,8 @@ fn paramArgs(a: std.mem.Allocator, v: ?std.json.Value) ![]runtime.ParamArg {
     while (it.next()) |kv| {
         const val: []const u8 = switch (kv.value_ptr.*) {
             .string => |s| s,
-            .integer => |n| try std.fmt.allocPrint(a, "{d}", .{n}),
-            .float => |f| try std.fmt.allocPrint(a, "{d}", .{f}),
+            .integer => |n| try msgfmt.allocPrint(a, "{d}", .{n}),
+            .float => |f| try msgfmt.allocPrint(a, "{d}", .{f}),
             .number_string => |s| s,
             .bool => |b| if (b) "true" else "false",
             .null => "",

@@ -25,7 +25,7 @@ pub const Spec = struct {
 
     /// How the spec is written, and its key in `basalt.sum`.
     pub fn key(self: Spec, arena: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s}/{s}{s}/{s}@{s}", .{ self.host, self.project, if (self.dotGit()) ".git" else "", self.path, self.ref });
+        return msgfmt.allocPrint(arena, "{s}/{s}{s}/{s}@{s}", .{ self.host, self.project, if (self.dotGit()) ".git" else "", self.path, self.ref });
     }
 
     fn dotGit(self: Spec) bool {
@@ -35,8 +35,8 @@ pub const Spec = struct {
     /// The raw-file URL: GitHub's raw host, else GitLab's `/-/raw/` route.
     pub fn url(self: Spec, arena: std.mem.Allocator) ![]const u8 {
         if (std.mem.eql(u8, self.host, "github.com"))
-            return std.fmt.allocPrint(arena, "https://raw.githubusercontent.com/{s}/{s}/{s}", .{ self.project, self.ref, self.path });
-        return std.fmt.allocPrint(arena, "https://{s}/{s}/-/raw/{s}/{s}", .{ self.host, self.project, self.ref, self.path });
+            return msgfmt.allocPrint(arena, "https://raw.githubusercontent.com/{s}/{s}/{s}", .{ self.project, self.ref, self.path });
+        return msgfmt.allocPrint(arena, "https://{s}/{s}/-/raw/{s}/{s}", .{ self.host, self.project, self.ref, self.path });
     }
 
     /// The header that reads a private repository, from the environment: the GitLab
@@ -45,7 +45,7 @@ pub const Spec = struct {
     pub fn auth(self: Spec, arena: std.mem.Allocator) !?std.http.Header {
         if (std.mem.eql(u8, self.host, "github.com")) {
             const t = std.process.getEnvVarOwned(arena, "GITHUB_TOKEN") catch return null;
-            return .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) };
+            return .{ .name = "Authorization", .value = try msgfmt.allocPrint(arena, "Bearer {s}", .{t}) };
         }
         if (!gitlabHost(arena, self.host)) return null;
         const t = std.process.getEnvVarOwned(arena, "GITLAB_TOKEN") catch return null;
@@ -224,7 +224,7 @@ pub const Resolver = struct {
 fn hexHash(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     var d: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(text, &d, .{});
-    return std.fmt.allocPrint(arena, "{x}", .{&d});
+    return msgfmt.allocPrint(arena, "{x}", .{&d});
 }
 
 /// `$BASALT_CACHE/include`, else `$XDG_CACHE_HOME/basalt/include`, else

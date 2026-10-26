@@ -333,7 +333,7 @@ test "Excel's bounds: columns refused at open, a cell's characters counted, not 
 
     const ty = types.Type.init(.string).asNullable();
     const fields = try a.alloc(types.Schema.Field, max_cols + 1);
-    for (fields, 0..) |*f, i| f.* = .{ .name = try std.fmt.allocPrint(a, "c{d}", .{i}), .ty = ty };
+    for (fields, 0..) |*f, i| f.* = .{ .name = try msgfmt.allocPrint(a, "c{d}", .{i}), .ty = ty };
     try std.testing.expectError(error.XlsxTooManyColumns, Writer.open(a, path, .{ .fields = fields }, "Sheet1"));
     const wide = try Writer.open(a, path, .{ .fields = fields[0..max_cols] }, "Sheet1");
     wide.abort();

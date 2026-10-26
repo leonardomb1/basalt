@@ -20,6 +20,7 @@
 //! the last write error.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const trace = @import("../exec/trace.zig");
 const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
@@ -654,7 +655,7 @@ const RenderSink = struct {
         self.renders += 1;
         self.rendered_unlocked = self.mtx.tryLock();
         if (self.rendered_unlocked) self.mtx.unlock();
-        return std.fmt.allocPrint(a, "rows={d}", .{b.len});
+        return msgfmt.allocPrint(a, "rows={d}", .{b.len});
     }
     fn vtWriteRendered(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *RenderSink = @ptrCast(@alignCast(ptr));

@@ -13,6 +13,7 @@
 //! a bare name is a column and a same-named param must not displace it.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
@@ -607,9 +608,9 @@ pub fn setMsg(diag: *Diag, msg: []const u8) void {
 
 pub fn srOpenErr(env: *Env, e: anyerror, what: []const u8) error{PlanFailed} {
     const msg = if (env.diag.msg.len == 0)
-        std.fmt.allocPrint(env.arena, "{s} ({s})", .{ what, @errorName(e) }) catch what
+        msgfmt.allocPrint(env.arena, "{s} ({s})", .{ what, @errorName(e) }) catch what
     else
-        std.fmt.allocPrint(env.arena, "{s} ({s}) — {s}", .{ what, @errorName(e), env.diag.msg }) catch what;
+        msgfmt.allocPrint(env.arena, "{s} ({s}) — {s}", .{ what, @errorName(e), env.diag.msg }) catch what;
     return planErr(env.diag, msg);
 }
 
@@ -650,8 +651,8 @@ fn pathLayer(path: []const u8) []const u8 {
 
 pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]const u8 {
     if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
-    if (connectorNote(e, path)) |n| return std.fmt.allocPrint(arena, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why });
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
+    if (connectorNote(e, path)) |n| return msgfmt.allocPrint(arena, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why });
+    return msgfmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
 }
 
 /// A file connector's own words for its last failure on this thread and the layer it

@@ -38,6 +38,7 @@
 //! checkpoint's actions are nested structs and maps.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const textconv = @import("../../exec/textconv.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const codecs = @import("../compress/codecs.zig");
@@ -74,9 +75,9 @@ pub const Mode = union(enum) {
             else => return @tagName(self),
         };
         const keys = try std.mem.join(arena, ", ", u.keys);
-        const on = if (u.keys.len == 0) "upsert (key from the source)" else try std.fmt.allocPrint(arena, "upsert on ({s})", .{keys});
+        const on = if (u.keys.len == 0) "upsert (key from the source)" else try msgfmt.allocPrint(arena, "upsert on ({s})", .{keys});
         const pc = u.partial orelse return on;
-        return std.fmt.allocPrint(arena, "{s} partial cols ({s})", .{ on, try std.mem.join(arena, ", ", pc) });
+        return msgfmt.allocPrint(arena, "{s} partial cols ({s})", .{ on, try std.mem.join(arena, ", ", pc) });
     }
 };
 
@@ -143,7 +144,7 @@ pub const Plan = struct {
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
         const st = self.snap orelse return "created by this write";
-        return std.fmt.allocPrint(arena, "version {d}, {d} file{s}", .{ st.version, st.files.count(), if (st.files.count() == 1) "" else "s" });
+        return msgfmt.allocPrint(arena, "version {d}, {d} file{s}", .{ st.version, st.files.count(), if (st.files.count() == 1) "" else "s" });
     }
 };
 
@@ -164,7 +165,7 @@ pub fn storeProblem(root: []const u8) ?[]const u8 {
 /// that is not UTF-8 is refused: the log's JSON would hold it repaired while the
 /// Parquet files keep it raw, and the column would read back as all NULL.
 pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool, partition_by: ?[]const []const u8, codec: codecs.Codec, schema_in: ?types.Schema) !*Plan {
-    const name = try std.fmt.allocPrint(arena, "Delta table `{s}`", .{root});
+    const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (storeProblem(root)) |why| return refuse("cannot write {s}: {s}", .{ name, why });
     if (schema_in) |s| for (s.fields) |f| if (!std.unicode.utf8ValidateSlice(f.name))
         return refuse("column \"{f}\" has a name that is not UTF-8, which {s} cannot hold; rename it with `AS`", .{ std.zig.fmtString(f.name), name });
@@ -309,7 +310,7 @@ fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, 
         .decimal => {
             const d = dtypes.createdDecimal(t) orelse
                 return refuse("column `{s}` is decimal({d},{d}), whose scale exceeds its precision", .{ f.name, dtypes.createdPrecision(t), t.scale });
-            return .{ .name = f.name, .delta_type = try std.fmt.allocPrint(arena, "decimal({d},{d})", .{ d.precision, d.scale }), .ty = d, .src = src };
+            return .{ .name = f.name, .delta_type = try msgfmt.allocPrint(arena, "decimal({d},{d})", .{ d.precision, d.scale }), .ty = d, .src = src };
         },
         .time => return refuse("column `{s}` is a time of day, which Delta has no type for; cast it to a string or store microseconds as a number", .{f.name}),
         .array, .@"struct" => return refuse("column `{s}` is {s}; basalt writes Delta tables of scalar columns", .{ f.name, if (t.kind == .array) "an array" else "a struct" }),
@@ -637,14 +638,14 @@ pub const Sink = struct {
             if (c.nullable and !narrow) continue;
             for (0..b.len) |r| {
                 if (!col.validity.get(r)) {
-                    if (!c.nullable) return eval.explain(Error.DeltaNullInNotNull, try std.fmt.allocPrint(self.mem.allocator(), "column `{s}` is NOT NULL in {s}, but a row holds NULL in it", .{ c.name, self.plan.name }));
+                    if (!c.nullable) return eval.explain(Error.DeltaNullInNotNull, try msgfmt.allocPrint(self.mem.allocator(), "column `{s}` is NOT NULL in {s}, but a row holds NULL in it", .{ c.name, self.plan.name }));
                     continue;
                 }
                 if (!narrow) continue;
                 const x = col.data.i64[r];
                 const lim = @as(i64, 1) << @intCast(c.phys.int_bits - 1);
                 if (x < -lim or x >= lim)
-                    return eval.explain(Error.DeltaValueOutOfRange, try std.fmt.allocPrint(self.mem.allocator(), "column `{s}` is `{s}` in {s}, which cannot hold {d}", .{ c.name, c.delta_type, self.plan.name, x }));
+                    return eval.explain(Error.DeltaValueOutOfRange, try msgfmt.allocPrint(self.mem.allocator(), "column `{s}` is `{s}` in {s}, which cannot hold {d}", .{ c.name, c.delta_type, self.plan.name, x }));
             }
         }
     }
@@ -667,7 +668,7 @@ pub const Sink = struct {
 
     fn explainWrite(self: *Sink, e: anyerror) anyerror {
         if (e == pqwrite.Error.UnsupportedParquetDecimal or e == pqwrite.Error.ParquetValueOutOfRange)
-            return eval.explain(e, std.fmt.allocPrint(self.mem.allocator(), "a value does not fit its column's type in {s} (a decimal past its precision)", .{self.plan.name}) catch return e);
+            return eval.explain(e, msgfmt.allocPrint(self.mem.allocator(), "a value does not fit its column's type in {s} (a decimal past its precision)", .{self.plan.name}) catch return e);
         return e;
     }
 

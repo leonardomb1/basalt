@@ -785,7 +785,7 @@ test "UPSERT racing a concurrent writer: an append of a key it writes, or a REPL
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     const up: write.Mode = .{ .upsert = .{ .keys = &.{"id"} } };
     try TestRows.load(a, root, .append, &.{ 1, 2 }, &.{ "a", "b" });
 
@@ -817,7 +817,7 @@ test "UPSERT past its memory: the spool and both joins go to disk, the rows are 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    const root = try msgfmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
     var ids: [600]i64 = undefined;
     var vs: [600][]const u8 = undefined;
     for (&ids, &vs, 0..) |*i, *v, k| {

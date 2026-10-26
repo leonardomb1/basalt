@@ -41,6 +41,7 @@
 //! always a typo.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
 const driver = @import("../connect/driver.zig");
@@ -65,9 +66,9 @@ pub fn describe(arena: std.mem.Allocator, code: u16, body: []const u8) ![]const 
     if (parseError(body)) |e| {
         var msg = std.array_list.Managed(u8).init(arena);
         xml.decodeInto(&msg, e.message, false) catch try msg.appendSlice(e.message);
-        return std.fmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, msg.items, code });
+        return msgfmt.allocPrint(arena, "{s}: {s} (HTTP {d})", .{ e.code, msg.items, code });
     }
-    return std.fmt.allocPrint(arena, "HTTP {d}", .{code});
+    return msgfmt.allocPrint(arena, "HTTP {d}", .{code});
 }
 
 pub const retriable = retry_mod.retriable;
@@ -843,7 +844,7 @@ test "a redirect to another host drops the request's headers; one within the ori
     var other: FakeServer = undefined;
     try other.start(&.{FakeServer.reply("200 OK", "", "far")});
     defer other.stop();
-    const away = try std.fmt.allocPrint(a, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{try other.url(a, "/x")});
+    const away = try msgfmt.allocPrint(a, "HTTP/1.1 302 Found\r\nlocation: {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{try other.url(a, "/x")});
     var home: FakeServer = undefined;
     try home.start(&.{ FakeServer.reply("302 Found", "location: /next\r\n", ""), FakeServer.reply("200 OK", "", "near"), away });
     defer home.stop();

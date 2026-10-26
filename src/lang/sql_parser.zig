@@ -159,7 +159,7 @@ fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8,
 }
 
 fn qualified(arena: std.mem.Allocator, ns: []const u8, name: []const u8) Error![]const u8 {
-    const s = std.fmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
+    const s = msgfmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
     for (s) |*c| c.* = std.ascii.toLower(c.*);
     return s;
 }
@@ -401,9 +401,9 @@ fn nameTaken(items: []const ast.SelectItem, name: []const u8) bool {
 pub fn nameApart(arena: std.mem.Allocator, items: []ast.SelectItem) !void {
     for (items, 0..) |*it, i| {
         if (it.* != .field or !nameTaken(items[0..i], it.field.last())) continue;
-        var nm = try std.fmt.allocPrint(arena, "{s}_r", .{it.field.last()});
+        var nm = try msgfmt.allocPrint(arena, "{s}_r", .{it.field.last()});
         var n: usize = 2;
-        while (nameTaken(items, nm)) : (n += 1) nm = try std.fmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
+        while (nameTaken(items, nm)) : (n += 1) nm = try msgfmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
         const e = try arena.create(ast.Expr);
         e.* = .{ .field = it.field };
         it.* = .{ .computed = .{ .name = nm, .expr = e } };

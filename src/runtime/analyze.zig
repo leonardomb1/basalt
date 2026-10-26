@@ -427,15 +427,15 @@ pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folde
 /// condition fires (null is not a failure, as in SQL), an absent one always does.
 pub fn throwVerdict(arena: std.mem.Allocator, t: ast.Throw, sc: Scope) Error!?[]const u8 {
     if (t.when) |w| switch (try fold(arena, w, sc)) {
-        .failed => |why| return try std.fmt.allocPrint(arena, "THROW condition: {s}", .{why}),
+        .failed => |why| return try msgfmt.allocPrint(arena, "THROW condition: {s}", .{why}),
         .value => |c| {
             if (c == .null) return null;
-            if (c != .bool) return try std.fmt.allocPrint(arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
+            if (c != .bool) return try msgfmt.allocPrint(arena, "THROW condition must be a boolean, got {s}", .{@tagName(std.meta.activeTag(c))});
             if (!c.bool) return null;
         },
     };
     return switch (try fold(arena, t.message, sc)) {
-        .failed => |why| try std.fmt.allocPrint(arena, "THROW message: {s}", .{why}),
+        .failed => |why| try msgfmt.allocPrint(arena, "THROW message: {s}", .{why}),
         .value => |m| try eval.valueToString(arena, m),
     };
 }
@@ -445,7 +445,7 @@ pub const Printed = union(enum) { text: []const u8, problem: []const u8 };
 /// A `PRINT`'s text, rendered as any cell is, or why it cannot be.
 pub fn printed(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Printed {
     return switch (try fold(arena, e, sc)) {
-        .failed => |why| .{ .problem = try std.fmt.allocPrint(arena, "PRINT: {s}", .{why}) },
+        .failed => |why| .{ .problem = try msgfmt.allocPrint(arena, "PRINT: {s}", .{why}) },
         .value => |v| .{ .text = try eval.valueToString(arena, v) },
     };
 }
@@ -456,7 +456,7 @@ pub const CallArgs = union(enum) { cells: []const []const u8, problem: []const u
 pub fn callArgs(arena: std.mem.Allocator, c: ast.CallStmt, params: []const ast.FnParam, sc: Scope) Error!CallArgs {
     const cells = try arena.alloc([]const u8, params.len);
     for (params, c.args, cells) |p, a, *cell| switch (try fold(arena, a, sc)) {
-        .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, why }) },
+        .failed => |why| return .{ .problem = try msgfmt.allocPrint(arena, "CALL {s}: argument `{s}`: {s}", .{ c.name, p.name, why }) },
         .value => |v| cell.* = try eval.valueToString(arena, v),
     };
     return .{ .cells = cells };
@@ -469,7 +469,7 @@ pub const ArmPick = union(enum) { arm: ?usize, problem: []const u8 };
 pub fn matchArm(arena: std.mem.Allocator, m: ast.StmtMatch, sc: Scope, ctx: []const u8) Error!ArmPick {
     var subj: ?Value = null;
     if (m.subject) |s| switch (try fold(arena, s, sc)) {
-        .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} subject: {s}", .{ ctx, why }) },
+        .failed => |why| return .{ .problem = try msgfmt.allocPrint(arena, "{s} subject: {s}", .{ ctx, why }) },
         .value => |v| subj = v,
     };
     if (subj) |sv| for (m.arms) |arm| for (arm.pats) |p| if (try patternTypeProblem(arena, sv, p)) |why|
@@ -478,14 +478,14 @@ pub fn matchArm(arena: std.mem.Allocator, m: ast.StmtMatch, sc: Scope, ctx: []co
         if (arm.is_default) return .{ .arm = i };
         if (arm.guard) |g| {
             switch (try fold(arena, g, sc)) {
-                .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} guard: {s}", .{ ctx, why }) },
+                .failed => |why| return .{ .problem = try msgfmt.allocPrint(arena, "{s} guard: {s}", .{ ctx, why }) },
                 .value => |gv| if (gv == .bool and gv.bool) return .{ .arm = i },
             }
             continue;
         }
         const sv = subj orelse continue;
         for (arm.pats) |p| switch (try fold(arena, p, sc)) {
-            .failed => |why| return .{ .problem = try std.fmt.allocPrint(arena, "{s} pattern: {s}", .{ ctx, why }) },
+            .failed => |why| return .{ .problem = try msgfmt.allocPrint(arena, "{s} pattern: {s}", .{ ctx, why }) },
             .value => |pv| if (valuesEqualLoose(arena, sv, pv)) return .{ .arm = i },
         };
     }
@@ -571,7 +571,7 @@ pub fn patternTypeProblem(arena: std.mem.Allocator, subj: Value, pat: *const ast
         else => return null,
     };
     if (eval.castValueTyped(arena, .{ .string = pat.str_lit }, ty)) |_| return null else |_| {}
-    return try std.fmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(ty.kind) });
+    return try msgfmt.allocPrint(arena, "CASE pattern '{s}' is not {s} like its subject, so it can never match", .{ pat.str_lit, @tagName(ty.kind) });
 }
 
 /// `matchArm`'s pattern refusal, for a top-level `CASE` whose subject folds here
@@ -610,19 +610,19 @@ pub fn paramDefaultValue(e: *const ast.Expr) ?Value {
 /// "scalar subquery".
 pub fn queryLetLabel(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
     if (std.mem.startsWith(u8, name, "__scalar")) return "scalar subquery";
-    return std.fmt.allocPrint(arena, "LET `{s}`", .{name});
+    return msgfmt.allocPrint(arena, "LET `{s}`", .{name});
 }
 
 /// A query LET binds one cell, so a result of other than one column is refused.
 pub fn queryLetColumnsProblem(arena: std.mem.Allocator, name: []const u8, ncols: usize) Error!?[]const u8 {
     if (ncols == 1) return null;
-    return try std.fmt.allocPrint(arena, "{s}: must produce exactly one column, got {d}", .{ try queryLetLabel(arena, name), ncols });
+    return try msgfmt.allocPrint(arena, "{s}: must produce exactly one column, got {d}", .{ try queryLetLabel(arena, name), ncols });
 }
 
 /// A FOR EACH binds one discovery column per loop variable, so a narrower result is refused.
 pub fn loopColumnsProblem(arena: std.mem.Allocator, ncols: usize, nvars: usize) Error!?[]const u8 {
     if (ncols >= nvars) return null;
-    return try std.fmt.allocPrint(arena, "for-each: the discovery query returns fewer columns than loop variables ({d} for {d})", .{ ncols, nvars });
+    return try msgfmt.allocPrint(arena, "for-each: the discovery query returns fewer columns than loop variables ({d} for {d})", .{ ncols, nvars });
 }
 
 /// The name `ANCHOR SCHEMA` matches a union branch by: a table's last name part,
@@ -638,11 +638,11 @@ pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
 /// `ANCHOR SCHEMA name` must name one of the union's tables (`first` names the first).
 pub fn unionCanonProblem(arena: std.mem.Allocator, canon: []const u8, names: []const []const u8) Error!?[]const u8 {
     if (std.mem.eql(u8, canon, "first") or ast.nameIn(names, canon)) return null;
-    return try std.fmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
+    return try msgfmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
 }
 
 pub fn notJsonParamMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "for-each: `{s}` is not a JSON param", .{name});
+    return msgfmt.allocPrint(arena, "for-each: `{s}` is not a JSON param", .{name});
 }
 
 /// The literal a `-p` string stands for, typed by the PARAM's declared type. Anything
@@ -682,12 +682,12 @@ pub fn letRefProblem(arena: std.mem.Allocator, program: ast.Program, l: ast.LetC
                 if (std.mem.eql(u8, other.name, l.name)) break;
                 if (!std.mem.eql(u8, other.name, n)) continue;
                 if (other.expr == null)
-                    return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n }) };
+                    return .{ .span = q.span, .msg = try msgfmt.allocPrint(arena, "LET `{s}` reads `${s}`, a query LET: an expression LET is folded before any query runs, so compute it in the query instead", .{ l.name, n }) };
                 declared = true;
             },
             else => {},
         };
-        if (!declared) return .{ .span = q.span, .msg = try std.fmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n }) };
+        if (!declared) return .{ .span = q.span, .msg = try msgfmt.allocPrint(arena, "LET `{s}`: unknown `${s}`: no PARAM or earlier LET of that name", .{ l.name, n }) };
     }
     return null;
 }
@@ -1328,7 +1328,7 @@ const Ctx = struct {
             self.diag.stamp(stages[0].pos);
             return e;
         };
-        if (via) |name| source.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ source.detail, name });
+        if (via) |name| source.detail = try msgfmt.allocPrint(self.arena, "{s} (via binding {s})", .{ source.detail, name });
 
         var top_n: ?pushdown.ExplainedTopN = null;
         if (try self.previewPushdown(stages)) |pv| {
@@ -1336,7 +1336,7 @@ const Ctx = struct {
             if (try pushdown.explainTopN(self.arena, pv.dialect, pv.bound[0 .. pv.bound.len - 1])) |t| {
                 top_n = t;
                 source.pushdown = if (source.pushdown.len > 0)
-                    try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
+                    try msgfmt.allocPrint(self.arena, "{s}; {s}", .{ source.pushdown, t.text })
                 else
                     t.text;
             }
@@ -1377,7 +1377,7 @@ const Ctx = struct {
             } else try self.checkUnbound(st.node);
             if (how == null and st.node == .join and st.node.join.keyless()) how = "no key: range or nested-loop, decided at run time";
             if (how) |h| {
-                si.detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, h });
+                si.detail = try msgfmt.allocPrint(self.arena, "{s} ({s})", .{ si.detail, h });
                 si.how = h;
             }
             try stage_infos.append(si);
@@ -1403,7 +1403,7 @@ const Ctx = struct {
             return e;
         };
         var sink_out = sink;
-        if (try self.offlineDelta(w, stages[stages.len - 1].hints, cur)) |label| sink_out.mode = try std.fmt.allocPrint(self.arena, "{s}; {s}", .{ sink.mode, label });
+        if (try self.offlineDelta(w, stages[stages.len - 1].hints, cur)) |label| sink_out.mode = try msgfmt.allocPrint(self.arena, "{s}; {s}", .{ sink.mode, label });
 
         const src_is_sql = isSqlSource(source.connector);
         const sink_is_parallel = isSqlConnector(sink.connector) or
@@ -1466,7 +1466,7 @@ const Ctx = struct {
                     return fail(self.diag, "{s}", .{try options.unsupportedSourceMsg(self.arena, connector)});
                 try checkSourceForm(lead, connector, self.diag);
                 const detail = switch (rd.form) {
-                    .table => |t| try std.fmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
+                    .table => |t| try msgfmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
                     .path => |p| p,
                     .builtin => |b| table_builtins.of(b).label,
@@ -1500,7 +1500,7 @@ const Ctx = struct {
                         return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
                     if (t) |tb| return .{
                         .connector = connector,
-                        .detail = try std.fmt.allocPrint(self.arena, "{s} ({s})", .{ detail, tb.label }),
+                        .detail = try msgfmt.allocPrint(self.arena, "{s} ({s})", .{ detail, tb.label }),
                         .schema = tb.layout.schema,
                         .format = @tagName(tb.kind),
                     };
@@ -1512,20 +1512,20 @@ const Ctx = struct {
                 try checkSourceForm(lead, "", self.diag);
                 const b = self.bindings.get(name) orelse {
                     if (self.knownTable(name)) |k|
-                        return .{ .connector = "session", .detail = try std.fmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
+                        return .{ .connector = "session", .detail = try msgfmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
                     return fail(self.diag, "unknown binding `{s}`", .{name});
                 };
                 var src = try self.resolveSource(b.stages[0]);
                 src.schema = try self.bindingSchema(b);
-                src.detail = try std.fmt.allocPrint(self.arena, "{s} (via binding {s})", .{ src.detail, name });
+                src.detail = try msgfmt.allocPrint(self.arena, "{s} (via binding {s})", .{ src.detail, name });
                 return src;
             },
             .union_ => |un| {
                 try checkSourceForm(lead, "union", self.diag);
                 const detail = if (un.discover_query.len > 0 or un.discover_pipeline != null)
-                    try std.fmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
+                    try msgfmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
-                    try std.fmt.allocPrint(self.arena, "{s} of {d} sources", .{ switch (un.set) {
+                    try msgfmt.allocPrint(self.arena, "{s} of {d} sources", .{ switch (un.set) {
                         .union_all => "union",
                         .intersect => "intersect",
                         .except => "except",
@@ -1656,11 +1656,11 @@ const Ctx = struct {
             .limit => |l| .{ .kind = "limit", .detail = if (l.count == std.math.maxInt(u64))
                 (if (l.offset > 0) "all (offset)" else "all")
             else
-                try std.fmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
+                try msgfmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
             .explode => |e| .{ .kind = "explode", .detail = e.field, .breaker = false },
             .distinct => .{ .kind = "distinct", .detail = "", .breaker = true },
-            .sort => |s| .{ .kind = "sort", .detail = try std.fmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
-            .aggregate => |ag| .{ .kind = "aggregate", .detail = try std.fmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
+            .sort => |s| .{ .kind = "sort", .detail = try msgfmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
+            .aggregate => |ag| .{ .kind = "aggregate", .detail = try msgfmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
             .join => |j| try self.joinInfo(j),
             .window => |wd| .{ .kind = "window", .detail = try ast.windowDetail(self.arena, wd), .breaker = true },
             .read, .ref, .write, .union_ => fail(self.diag, "unexpected operator in the middle of a pipeline", .{}),
@@ -1670,7 +1670,7 @@ const Ctx = struct {
     fn joinInfo(self: *Ctx, j: ast.Join) !Stage {
         if (self.bindings.get(j.binding) == null and self.knownTable(j.binding) == null)
             return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
-        const d = try std.fmt.allocPrint(self.arena, "{s} {s}", .{ @tagName(j.kind), j.binding });
+        const d = try msgfmt.allocPrint(self.arena, "{s} {s}", .{ @tagName(j.kind), j.binding });
         var st = Stage{ .kind = "join", .detail = d, .breaker = true };
         const b = self.bindings.get(j.binding) orelse return st;
         if (b.stages.len == 0) return st;
@@ -1678,7 +1678,7 @@ const Ctx = struct {
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
         if (stages[0].node != .read) return st;
         var src = self.resolveSource(stages[0]) catch return st;
-        st.right_scan = try std.fmt.allocPrint(self.arena, "{s} {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });
+        st.right_scan = try msgfmt.allocPrint(self.arena, "{s} {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });
         if (try self.previewPushdown(stages)) |pv| src.pushdown = pv.where;
         st.right_pushdown = src.pushdown;
         return st;
@@ -1695,11 +1695,11 @@ const Ctx = struct {
         if (b.stages.len == 0) return "";
         const right = (try self.inlineHead(try j.rightStages(self.arena, b.stages))).stages;
         if (keypush.rightMayNarrow(j) and self.sqlSide(right))
-            return try std.fmt.allocPrint(self.arena, "the right read takes the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
+            return try msgfmt.allocPrint(self.arena, "the right read takes the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
         if (keypush.leftMayNarrow(j) and self.sqlSide(before))
             return "the left read takes the right side's keys";
         if (keypush.rightMayNarrow(j) and parquetFileSide(right))
-            return try std.fmt.allocPrint(self.arena, "the right Parquet read skips row groups by the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
+            return try msgfmt.allocPrint(self.arena, "the right Parquet read skips row groups by the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
         if (keypush.leftMayNarrow(j) and parquetFileSide(before))
             return "the left Parquet read skips row groups by the right side's keys";
         return "";
@@ -1746,7 +1746,7 @@ const Ctx = struct {
             if (for (b.stages) |st| {
                 if (st.node == .window) break true;
             } else false) break;
-            via = if (via) |v| try std.fmt.allocPrint(self.arena, "{s}, {s}", .{ v, head[0].node.ref }) else head[0].node.ref;
+            via = if (via) |v| try msgfmt.allocPrint(self.arena, "{s}, {s}", .{ v, head[0].node.ref }) else head[0].node.ref;
             const joined = try self.arena.alloc(ast.Stage, b.stages.len + head.len - 1);
             @memcpy(joined[0..b.stages.len], b.stages);
             @memcpy(joined[b.stages.len..], head[1..]);
@@ -1772,7 +1772,7 @@ const Ctx = struct {
         const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
         var where = try composePushdown(self.arena, raw, implicit);
         if (wants) where = if (where.len > 0)
-            try std.fmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{where})
+            try msgfmt.allocPrint(self.arena, "{s}; text comparisons decided by the collation at run time", .{where})
         else
             "text comparisons decided by the collation at run time";
         return .{ .where = where, .dialect = d, .bound = bound };
@@ -1786,7 +1786,7 @@ const Ctx = struct {
                 .star => try buf.appendSlice("*"),
                 .star_except => try buf.appendSlice("* except (…)"),
                 .star_rename => try buf.appendSlice("* rename (…)"),
-                .star_of => |so| try buf.appendSlice(if (so.rel.len > 0) try std.fmt.allocPrint(self.arena, "{s}.*", .{so.rel}) else "*"),
+                .star_of => |so| try buf.appendSlice(if (so.rel.len > 0) try msgfmt.allocPrint(self.arena, "{s}.*", .{so.rel}) else "*"),
                 .field => |q| try buf.appendSlice(lastPart(q)),
                 .computed => |c| try buf.appendSlice(c.name),
             }
@@ -1983,7 +1983,7 @@ fn dialectOf(connector: []const u8) ?Dialect {
 
 fn composePushdown(arena: std.mem.Allocator, raw: []const u8, implicit: ?[]const u8) ![]const u8 {
     if (raw.len > 0 and implicit != null)
-        return std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ raw, implicit.? });
+        return msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ raw, implicit.? });
     if (raw.len > 0) return raw;
     return implicit orelse "";
 }

@@ -27,6 +27,7 @@ const sftp = @import("../../store/sftp.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 const builtinArgs = @import("../connect/source.zig").builtinArgs;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 const LaneRows = union(enum) {
@@ -146,7 +147,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
     } else {
         for (files, 0..) |f, k| {
             const r = if (k == 0) probe else pqdecode.Reader.openProjected(arena, f, project) catch |e|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(arena, "could not read parquet `{s}` ({s})", .{ f, @errorName(e) }));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(arena, "could not read parquet `{s}` ({s})", .{ f, @errorName(e) }));
             defer if (k != 0) r.close();
             if (k != 0) if (pqdecode.schemaMismatch(arena, schema, r.schema, project)) |why|
                 return planErr(env.diag, pqdecode.mismatchMessage(arena, root.?, f, files[0], why));

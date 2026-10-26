@@ -20,6 +20,7 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const replace = @import("../../db/replace.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const streamload = @import("../../db/streamload.zig");
@@ -37,7 +38,7 @@ const StreamLoadSpec = struct {
 fn openLaneStreamLoadSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
     const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx_ptr));
     var cfg = spec.cfg;
-    const lp = try std.fmt.allocPrint(gpa, "{s}_l{d}", .{ spec.cfg.label_prefix, lane_idx });
+    const lp = try msgfmt.allocPrint(gpa, "{s}_l{d}", .{ spec.cfg.label_prefix, lane_idx });
     defer gpa.free(lp);
     cfg.label_prefix = lp;
     const s = try streamload.StreamLoadSink.open(gpa, cfg, spec.target, spec.schema, spec.mode);
@@ -206,14 +207,14 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     const cfg = try resolveDbConfig(env, conn, info.port);
 
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
     const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
         defer setup_conn.close();
         const why = try driver.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, why }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, why }));
     };
     setup.sink().close() catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
 
     const spec = try env.arena.create(SqlSinkSpec);
     spec.* = .{
@@ -230,7 +231,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         const plan = try env.arena.create(ReplacePlan);
         plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
         plan.prepare() catch |e|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
         spec.target = try plan.stagingTarget(env.arena);
         spec.replace_plan = plan;
     }
@@ -245,11 +246,11 @@ fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamL
     cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());
 
     const setup = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
-        return srOpenErr(env, e, try std.fmt.allocPrint(env.arena, "{s} setup failed", .{flavor.name()}));
+        return srOpenErr(env, e, try msgfmt.allocPrint(env.arena, "{s} setup failed", .{flavor.name()}));
     setup.logger = env.log;
     setup.errctx = env.errctx;
     setup.sink().close() catch |e|
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "{s} setup close failed: {s}", .{ flavor.name(), @errorName(e) }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} setup close failed: {s}", .{ flavor.name(), @errorName(e) }));
     cfg.auto_create = false;
 
     const spec = try env.arena.create(StreamLoadSpec);

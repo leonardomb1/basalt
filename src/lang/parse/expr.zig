@@ -11,6 +11,7 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const max_expr_depth = Parser.max_expr_depth;
 const max_paren_depth = Parser.max_paren_depth;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 /// One call argument: an expression, or a lambda `x -> body` / `(acc, x) -> body`,
 /// which only the JSON array functions accept.
@@ -596,7 +597,7 @@ pub fn parseSearch(self: *Parser) Error!*ast.Expr {
         _ = self.advance();
         while (true) {
             const q = try self.parseQualNameField();
-            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
+            try items.append(try self.mk(.{ .str_lit = try msgfmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
             if (!self.eat(.comma)) break;
         }
         _ = try self.expect(.rparen);
@@ -610,17 +611,17 @@ pub fn parseSearch(self: *Parser) Error!*ast.Expr {
             const rel = self.advance().text;
             _ = self.advance();
             _ = self.advance();
-            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "*@{s}", .{rel}) }));
+            try items.append(try self.mk(.{ .str_lit = try msgfmt.allocPrint(self.arena, "*@{s}", .{rel}) }));
             star = true;
         } else {
             const q = try self.parseQualNameField();
-            try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
+            try items.append(try self.mk(.{ .str_lit = try msgfmt.allocPrint(self.arena, "={s}", .{try std.mem.join(self.arena, ".", q.parts)}) }));
         }
         if (star and self.eatKw("except")) {
             _ = try self.expect(.lparen);
             while (true) {
                 const name = try self.expectColName();
-                try items.append(try self.mk(.{ .str_lit = try std.fmt.allocPrint(self.arena, "-{s}", .{name}) }));
+                try items.append(try self.mk(.{ .str_lit = try msgfmt.allocPrint(self.arena, "-{s}", .{name}) }));
                 if (!self.eat(.comma)) break;
             }
             _ = try self.expect(.rparen);

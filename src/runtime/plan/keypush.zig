@@ -46,6 +46,7 @@ const ftp = @import("../../store/ftp.zig");
 const op = @import("../../exec/op.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const translate = @import("../pushdown/translate.zig");
 const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
@@ -224,13 +225,13 @@ pub fn render(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema, 
                 try list.appendSlice(lit);
             }
             if (ok) {
-                try parts.append(try std.fmt.allocPrint(arena, "{s} IN ({s})", .{ key_sql, list.items }));
+                try parts.append(try msgfmt.allocPrint(arena, "{s} IN ({s})", .{ key_sql, list.items }));
                 continue;
             }
         }
         const lo = (try literal(arena, dialect, kv.min orelse continue, true)) orelse continue;
         const hi = (try literal(arena, dialect, kv.max orelse continue, true)) orelse continue;
-        try parts.append(try std.fmt.allocPrint(arena, "{s} >= {s} AND {s} <= {s}", .{ key_sql, lo, key_sql, hi }));
+        try parts.append(try msgfmt.allocPrint(arena, "{s} >= {s} AND {s} <= {s}", .{ key_sql, lo, key_sql, hi }));
     }
     if (parts.items.len == 0) return null;
     return try std.mem.join(arena, " AND ", parts.items);
@@ -313,9 +314,9 @@ pub const Taker = union(enum) {
 fn literal(arena: std.mem.Allocator, dialect: Dialect, v: Value, ranged: bool) !?[]const u8 {
     const opts = translate.Opts{ .need = .superset };
     return switch (v) {
-        .int => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .int => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
         .decimal => try eval.valueToString(arena, v),
-        .float => |f| if (ranged and std.math.isFinite(f)) try std.fmt.allocPrint(arena, "{e}", .{f}) else null,
+        .float => |f| if (ranged and std.math.isFinite(f)) try msgfmt.allocPrint(arena, "{e}", .{f}) else null,
         .string => |s| if (ranged) null else blk: {
             const e = try arena.create(ast.Expr);
             e.* = .{ .str_lit = s };
@@ -388,7 +389,7 @@ pub const LateSql = struct {
         if (self.inner == null) {
             var rd = self.rd;
             if (self.extra) |x| rd.where = if (rd.where.len > 0)
-                try std.fmt.allocPrint(self.env.arena, "({s}) AND ({s})", .{ rd.where, x })
+                try msgfmt.allocPrint(self.env.arena, "({s}) AND ({s})", .{ rd.where, x })
             else
                 x;
             self.inner = connect.openSourceProjected(self.env, rd, self.hints, null, &.{}) catch |e| {

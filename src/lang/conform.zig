@@ -12,6 +12,7 @@
 //! against a CSV file's header (`csv_append`).
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("types.zig");
 const Type = types.Type;
 const Schema = types.Schema;
@@ -145,11 +146,11 @@ fn check(rule: Policy.Types, w: Schema.Field, g: Type, k: usize) ?Col {
 /// A problem as a Parquet folder names it, after "does not match its first file: ".
 pub fn describe(arena: std.mem.Allocator, p: Problem) []const u8 {
     return switch (p) {
-        .missing => |n| std.fmt.allocPrint(arena, "it has no column `{s}`", .{n}) catch "a column is missing",
-        .extra => |n| std.fmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{n}) catch "an extra column",
-        .order => |o| std.fmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ o.got, o.want }) catch "columns in another order",
-        .count => |c| std.fmt.allocPrint(arena, "it has {d} columns, not {d}", .{ c.got, c.want }) catch "another number of columns",
-        .type => |t| std.fmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ t.name, t.got.name(arena) catch "decimal", t.want.name(arena) catch "decimal" }) catch "a column has another type",
+        .missing => |n| msgfmt.allocPrint(arena, "it has no column `{s}`", .{n}) catch "a column is missing",
+        .extra => |n| msgfmt.allocPrint(arena, "it has a column `{s}` the first file lacks", .{n}) catch "an extra column",
+        .order => |o| msgfmt.allocPrint(arena, "its columns are in another order (`{s}` where `{s}` is expected)", .{ o.got, o.want }) catch "columns in another order",
+        .count => |c| msgfmt.allocPrint(arena, "it has {d} columns, not {d}", .{ c.got, c.want }) catch "another number of columns",
+        .type => |t| msgfmt.allocPrint(arena, "column `{s}` is {s} there, not {s}", .{ t.name, t.got.name(arena) catch "decimal", t.want.name(arena) catch "decimal" }) catch "a column has another type",
     };
 }
 

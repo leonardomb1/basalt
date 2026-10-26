@@ -17,6 +17,7 @@ const schema = @import("options_schema.zig");
 const sql = @import("../../db/sql.zig");
 const ssrp = @import("../../db/sqlserver/ssrp.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const tds = @import("../../db/sqlserver/tds.zig");
 pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
@@ -54,7 +55,7 @@ pub fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     var rbuf: ?[]u8 = null;
     defer if (rbuf) |b| gpa.free(b);
     const resource = if (cfg.resource.len > 0) cfg.resource else if (std.mem.endsWith(u8, cfg.host, ".dynamics.com")) blk: {
-        rbuf = try std.fmt.allocPrint(gpa, "https://{s}", .{cfg.host});
+        rbuf = try msgfmt.allocPrint(gpa, "https://{s}", .{cfg.host});
         break :blk rbuf.?;
     } else aad.sql_resource;
     const token = try aad.passwordToken(gpa, client_id, cfg.user, cfg.password, resource);

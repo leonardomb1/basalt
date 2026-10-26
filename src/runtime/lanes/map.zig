@@ -40,6 +40,7 @@ const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const sqlDescForStage = @import("../connect.zig").sqlDescForStage;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const wrapProjected = @import("../../connect/split.zig").wrapProjected;
@@ -374,7 +375,7 @@ pub fn runParallelMap(
     });
     if (env.profile) |p| {
         if (lane_join) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
-        p.path = try std.fmt.allocPrint(env.arena, "{s} parallel map{s}, {d} {s}", .{ split.label(), if (lane_join != null) "+join" else "", units, split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel map{s}, {d} {s}", .{ split.label(), if (lane_join != null) "+join" else "", units, split.unitName() });
     }
 
     if (ctx.queue.failure()) |e| return e;
@@ -597,7 +598,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
     if (env.profile) |p| {
         if (lp.lane.build_root) |b| try p.graftBuild(lp.lane.at, b);
-        p.path = try std.fmt.allocPrint(env.arena, "{s} split-parallel map+join, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel map+join, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
         try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
     }
 

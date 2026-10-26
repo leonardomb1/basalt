@@ -25,6 +25,7 @@
 //! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
@@ -497,7 +498,7 @@ const Proto = struct {
         } };
         var key_file: ?[]const u8 = null;
         if (std.posix.getenv("HOME")) |home| {
-            const kf = try std.fmt.allocPrint(arena, "{s}/.ssh/id_ed25519", .{home});
+            const kf = try msgfmt.allocPrint(arena, "{s}/.ssh/id_ed25519", .{home});
             if (std.fs.cwd().access(kf, .{})) |_| key_file = kf else |_| {}
         }
         return .{ .path = path, .cfg = .{
@@ -609,7 +610,7 @@ const Proto = struct {
 
     pub fn listDir(c: *Client, arena: std.mem.Allocator, t: Target, rel: []const u8) ![]const remotefs.Entry {
         const top = if (t.path.len > 1 and t.path[t.path.len - 1] == '/') t.path[0 .. t.path.len - 1] else t.path;
-        const dir = if (rel.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ top, rel }) else if (top.len == 0) "." else top;
+        const dir = if (rel.len > 0) try msgfmt.allocPrint(arena, "{s}/{s}", .{ top, rel }) else if (top.len == 0) "." else top;
         return c.listDir(arena, dir) catch |e| return noted(c, e);
     }
 };
@@ -672,7 +673,7 @@ test "live: upload, list, read back whole, by range and streaming; an aborted up
         .port = try std.fmt.parseInt(u16, port, 10),
         .user = "basalt",
         .password = "pw",
-        .known_hosts = try std.fmt.allocPrint(a, "{s}/known_hosts", .{dir}),
+        .known_hosts = try msgfmt.allocPrint(a, "{s}/known_hosts", .{dir}),
     });
     const body = try a.alloc(u8, 3 * 1024 * 1024 + 123);
     for (body, 0..) |*b, i| b.* = @truncate(i *% 31 +% (i >> 9));

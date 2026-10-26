@@ -19,6 +19,7 @@
 //! compressor.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
@@ -388,7 +389,7 @@ test "fuzz: random tables of every type round-trip through each codec, any batch
         for (fields, 0..) |*f, i| {
             const k = kinds[r.uintLessThan(usize, kinds.len)];
             const p = 1 + r.uintLessThan(u8, 38);
-            f.* = .{ .name = try std.fmt.allocPrint(a, "c_{d}", .{i}), .ty = (if (k == .decimal) types.Type.decimal(p, r.uintAtMost(u8, p)) else types.Type.init(k)).asNullable() };
+            f.* = .{ .name = try msgfmt.allocPrint(a, "c_{d}", .{i}), .ty = (if (k == .decimal) types.Type.decimal(p, r.uintAtMost(u8, p)) else types.Type.init(k)).asNullable() };
         }
         const sch = try a.create(types.Schema);
         sch.* = .{ .fields = fields };

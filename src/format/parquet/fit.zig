@@ -15,6 +15,7 @@
 //! table deletes (`Deletes`), which its reader skips.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const Bytes = @import("../bytes.zig").Bytes;
@@ -112,7 +113,7 @@ pub const Layout = struct {
         const r = self.openFile(arena, file, names.items) catch |e| {
             if (e == error.OutOfMemory) return e;
             const why = eval.peekFailure(e) orelse @errorName(e);
-            return eval.explain(e, std.fmt.allocPrint(arena, "{s} could not read its file `{s}` ({s})", .{ self.name, below(file.path, self.root), why }) catch self.name);
+            return eval.explain(e, msgfmt.allocPrint(arena, "{s} could not read its file `{s}` ({s})", .{ self.name, below(file.path, self.root), why }) catch self.name);
         };
         errdefer r.close();
         r.deletes = file.deletes;
@@ -129,7 +130,7 @@ pub const Layout = struct {
             };
             const got = r.schema.fields[k].ty;
             const fits = got.kind == want.ty.kind and (got.kind != .decimal or got.scale == want.ty.scale);
-            if (!fits) return eval.explain(Error.LakeFileMismatch, std.fmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
+            if (!fits) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
                 self.name, below(file.path, self.root), want.name, try got.name(arena), try want.ty.name(arena),
             }) catch self.name);
             o.* = .{ .column = k };

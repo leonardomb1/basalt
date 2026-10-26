@@ -155,7 +155,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             if (!std.mem.eql(u8, f.canon, canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
-        const sub_ns: ?[]const u8 = if (d.alias) |a| (if (namespace) |ns| try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ns, a }) else a) else namespace;
+        const sub_ns: ?[]const u8 = if (d.alias) |a| (if (namespace) |ns| try msgfmt.allocPrint(ctx.arena, "{s}.{s}", .{ ns, a }) else a) else namespace;
         if (d.alias) |a| {
             for (my_aliases.items) |m| if (std.ascii.eqlIgnoreCase(m, a))
                 return ctx.fail(label, d.line, d.col, "alias `{s}` names two includes here; give each its own", .{a});
@@ -165,7 +165,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
                 return ctx.fail(label, d.line, d.col, "`{s}` already names the library `{s}`, reached through another include; its functions would collide — choose another alias", .{ sub_ns.?, gop.value_ptr.* });
             gop.value_ptr.* = canon;
         }
-        const memo_key = try std.fmt.allocPrint(ctx.arena, "{s}\x00{s}", .{ canon, sub_ns orelse "" });
+        const memo_key = try msgfmt.allocPrint(ctx.arena, "{s}\x00{s}", .{ canon, sub_ns orelse "" });
         if (canonical) if (ctx.memo.get(memo_key)) |cached| {
             try seen.append(cached);
             if (d.alias == null) try same_ns.append(cached);
@@ -580,7 +580,7 @@ test "a fan-out @include tree is spliced once per file, so it neither hangs nor 
     for (0..levels) |i| {
         var body = std.array_list.Managed(u8).init(a);
         for (0..4) |_| try body.writer().print("@include 'b{d}.sql';\n", .{i + 1});
-        try writeFile(&tmp, try std.fmt.allocPrint(a, "b{d}.sql", .{i}), body.items);
+        try writeFile(&tmp, try msgfmt.allocPrint(a, "b{d}.sql", .{i}), body.items);
     }
     try writeFile(&tmp, "b12.sql", "SELECT 1 AS x FROM 'in.csv';\n");
 
@@ -869,7 +869,7 @@ test "remote @include: refused until pinned, pinned by check, verified, its own 
         };
         var r = try remote.Resolver.init(a, base, fetch, true);
         r.cache_dir = null;
-        const s = try std.fmt.allocPrint(a, "@include 'github.com/acme/kit/sql/{s}@v1';\nSELECT 1 AS a;\n", .{f});
+        const s = try msgfmt.allocPrint(a, "@include 'github.com/acme/kit/sql/{s}@v1';\nSELECT 1 AS a;\n", .{f});
         try testing.expectError(error.ParseFailed, loadProgramOpts(a, s, "m.sql", base, &diag, .{ .remote = &r }));
     }
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'github.com/acme/kit/sql/lib.sql';\nSELECT 1 AS a;\n", "m.sql", base, &diag));

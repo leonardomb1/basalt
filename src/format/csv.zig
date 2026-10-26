@@ -45,6 +45,7 @@
 //! `.part` is removed. Committing on close is what makes the object appear.
 
 const std = @import("std");
+const msgfmt = @import("msgfmt.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
@@ -1810,7 +1811,7 @@ test "csv reader: a zip member reads, and MappedCsv refuses both containers" {
     const zpath = try tmp.dir.realpathAlloc(a, "t.zip");
     const gpath = try tmp.dir.realpathAlloc(a, "rows.csv.gz");
 
-    const ref = try std.fmt.allocPrint(a, "{s} :: a.csv", .{zpath});
+    const ref = try msgfmt.allocPrint(a, "{s} :: a.csv", .{zpath});
     const r = try CsvReader.open(a, ref, .{});
     defer r.close();
     const b = (try r.next(a)).?;

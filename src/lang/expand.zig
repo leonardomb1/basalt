@@ -19,6 +19,7 @@
 //! a 64-deep chain is 2^64 nodes, hence the `max_nodes` cap on the total.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const builtins = @import("../exec/builtins.zig");
 const eval = @import("../exec/eval.zig");
 const aggregates = @import("aggregates.zig");
@@ -111,11 +112,11 @@ fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, 
     for (program.stmts) |s| if (s == .func) {
         at.* = s.func.pos;
         if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null) {
-            msg.* = std.fmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
+            msg.* = msgfmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
         }
         if (!s.func.replace and fns.contains(s.func.name)) {
-            msg.* = std.fmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
+            msg.* = msgfmt.allocPrint(arena, "function `{s}` is already defined — use CREATE OR REPLACE FUNCTION", .{s.func.name}) catch "duplicate CREATE FUNCTION";
             return error.ExpandFailed;
         }
         try fns.put(s.func.name, s.func);
@@ -193,17 +194,17 @@ fn expandBlock(cx: *Ctx, stmts: []const ast.Stmt) Error![]const ast.Stmt {
 /// The arguments stay expressions; `run.zig` const-evaluates them at the call site.
 fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     const fd = cx.fns.get(c.name) orelse {
-        cx.msg.* = std.fmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
+        cx.msg.* = msgfmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
         return error.ExpandFailed;
     };
     switch (fd.body) {
         .stmts => {},
         .expr => {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name}) catch "CALL of a scalar function";
+            cx.msg.* = msgfmt.allocPrint(cx.arena, "`{s}` is a scalar function — use it in an expression, not CALL", .{c.name}) catch "CALL of a scalar function";
             return error.ExpandFailed;
         },
         .table => {
-            cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not CALL", .{ c.name, c.name }) catch "CALL of a table function";
+            cx.msg.* = msgfmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not CALL", .{ c.name, c.name }) catch "CALL of a table function";
             return error.ExpandFailed;
         },
     }
@@ -257,11 +258,11 @@ fn renderDiscoverJson(cx: *Ctx, s: []const u8) Error!?[]const u8 {
         if (key.len == 0) return null;
         switch (cur) {
             .object => |o| cur = o.get(key) orelse {
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "union json: key `{s}` not found in `{s}`", .{ key, s }) catch "union json: key not found";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "union json: key `{s}` not found in `{s}`", .{ key, s }) catch "union json: key not found";
                 return error.ExpandFailed;
             },
             else => {
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "union json: `{s}` is not an object in `{s}`", .{ key, s }) catch "union json: not an object";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "union json: `{s}` is not an object in `{s}`", .{ key, s }) catch "union json: not an object";
                 return error.ExpandFailed;
             },
         }
@@ -296,7 +297,7 @@ fn expandStmtMatch(cx: *Ctx, m: ast.StmtMatch) Error!ast.StmtMatch {
 
 fn parseJsonArg(arena: std.mem.Allocator, name: []const u8, text: []const u8, msg: *[]const u8) Error!std.json.Value {
     return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch {
-        msg.* = std.fmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}) catch "param value is not valid JSON";
+        msg.* = msgfmt.allocPrint(arena, "param `{s}`: value is not valid JSON", .{name}) catch "param value is not valid JSON";
         return error.ExpandFailed;
     };
 }
@@ -321,12 +322,12 @@ fn jsonPathLit(cx: *Ctx, maybe_val: ?std.json.Value, path: []const []const u8, s
         switch (cur) {
             .object => |o| cur = o.get(key) orelse {
                 if (seg_safe) return mkNull(cx);
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "json path: key `{s}` not found", .{key}) catch "json path: key not found";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "json path: key `{s}` not found", .{key}) catch "json path: key not found";
                 return error.ExpandFailed;
             },
             else => {
                 if (seg_safe) return mkNull(cx);
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "json path: `{s}` is not an object", .{key}) catch "json path: not an object";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "json path: `{s}` is not an object", .{key}) catch "json path: not an object";
                 return error.ExpandFailed;
             },
         }
@@ -420,11 +421,11 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
         switch (fd.body) {
             .expr => {},
             .stmts => {
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a statement function — invoke it with CALL", .{c.name}) catch "statement fn used as an expression";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "`{s}` is a statement function — invoke it with CALL", .{c.name}) catch "statement fn used as an expression";
                 return error.ExpandFailed;
             },
             .table => {
-                cx.msg.* = std.fmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not in an expression", .{ c.name, c.name }) catch "table fn used as an expression";
+                cx.msg.* = msgfmt.allocPrint(cx.arena, "`{s}` is a table function — read it with FROM {s}(...), not in an expression", .{ c.name, c.name }) catch "table fn used as an expression";
                 return error.ExpandFailed;
             },
         }
@@ -459,8 +460,8 @@ pub fn arityError(arena: std.mem.Allocator, fd: ast.FnDecl, n: usize) error{OutO
     }
     if (n >= required and n <= fd.params.len) return null;
     if (required == fd.params.len)
-        return try std.fmt.allocPrint(arena, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, n });
-    return try std.fmt.allocPrint(arena, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, n });
+        return try msgfmt.allocPrint(arena, "`{s}` expects {d} argument(s), got {d}", .{ fd.name, fd.params.len, n });
+    return try msgfmt.allocPrint(arena, "`{s}` expects {d} to {d} argument(s), got {d}", .{ fd.name, required, fd.params.len, n });
 }
 
 fn checkArgTypes(cx: *Ctx, fd: ast.FnDecl, args: []const *ast.Expr) Error![]const *ast.Expr {
@@ -482,10 +483,10 @@ pub fn bindArg(arena: std.mem.Allocator, fd: ast.FnDecl, i: usize, a: **ast.Expr
     const want = ty.kind;
     const got = literalKind(a.*) orelse return null;
     if (!acceptsLiteral(want, got))
-        return try std.fmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i + 1, p.name, typeWord(want), typeWord(got) });
+        return try msgfmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i + 1, p.name, typeWord(want), typeWord(got) });
     if (!isTemporalText(ty, a.*)) return null;
     if (!temporalTextOk(arena, ty, a.*.str_lit))
-        return try std.fmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i + 1, p.name, typeWord(want), a.*.str_lit });
+        return try msgfmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i + 1, p.name, typeWord(want), a.*.str_lit });
     const cast = try arena.create(ast.Expr);
     cast.* = .{ .cast = .{ .e = a.*, .ty = ty } };
     a.* = cast;

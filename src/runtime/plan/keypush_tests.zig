@@ -3,6 +3,7 @@
 //! every query), and the row groups a Parquet side skips.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const FakePg = @import("../../testing/postgres_fake.zig").FakePg;
 const Table = @import("../../testing/postgres_fake.zig").Table;
 const column = @import("../../exec/column.zig");
@@ -37,9 +38,9 @@ const Ran = struct {
 /// a `CREATE CONNECTION pg` to the fake server on `srv_port`.
 fn runPg(a: std.mem.Allocator, tmp: *std.testing.TmpDir, srv_port: u16, body: []const u8, threads: usize) !Ran {
     const base = try tmp.dir.realpathAlloc(a, ".");
-    const conn = try std.fmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\n", .{srv_port});
+    const conn = try msgfmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\n", .{srv_port});
     const q = try std.mem.replaceOwned(u8, a, body, "$B", base);
-    const script = try std.fmt.allocPrint(a, "{s}LOAD INTO '{s}/out.csv' AS {s};", .{ conn, base, q });
+    const script = try msgfmt.allocPrint(a, "{s}LOAD INTO '{s}/out.csv' AS {s};", .{ conn, base, q });
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, script, &pd);
     var ran = Ran{ .err = null, .diag = .{}, .out = "", .summary = .{ .run_id = 0 } };
@@ -186,7 +187,7 @@ fn writeGroups(a: std.mem.Allocator, path: []const u8, first: i64, groups: usize
     for (0..groups) |g| {
         const id = first + @as(i64, @intCast(g));
         try ids.append(.{ .int = id });
-        try vs.append(.{ .string = try std.fmt.allocPrint(a, "v{d}", .{id}) });
+        try vs.append(.{ .string = try msgfmt.allocPrint(a, "v{d}", .{id}) });
     }
     var cols = [_]column.Column{ try ids.finish(), try vs.finish() };
     try w.writeBatch(a, .{ .schema = &pq_schema, .columns = &cols, .len = groups });
@@ -255,7 +256,7 @@ test "a Parquet left side, a file or a folder, serial or in lanes, skips the row
 
     for ([_][]const u8{ "l.parquet", "d/" }) |src| {
         for ([_]usize{ 1, 4 }) |threads| {
-            const body = try std.fmt.allocPrint(a, "SELECT l.v, s.q FROM '$B/{s}' l JOIN '$B/s.csv' s ON l.id = s.k", .{src});
+            const body = try msgfmt.allocPrint(a, "SELECT l.v, s.q FROM '$B/{s}' l JOIN '$B/s.csv' s ON l.id = s.k", .{src});
             const r = try runPg(a, &tmp, srv.port(), body, threads);
             try testing.expect(r.err == null);
             try testing.expectEqualStrings("v,q\nv2,a\nv7,b\n", r.out);

@@ -37,6 +37,7 @@
 //! unit-tested; the network paths need a live server.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -231,7 +232,7 @@ fn qualified(arena: std.mem.Allocator, flavor: Flavor, db: []const u8, table: []
 /// a qualified target's dot once got the load rejected with "Label format error".
 /// Over 128 bytes the head is cut, keeping the run id and sequence that make it unique.
 pub fn genLabel(arena: std.mem.Allocator, prefix: []const u8, table: []const u8, run_id: u64, seq: u64) ![]const u8 {
-    const raw = try std.fmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
+    const raw = try msgfmt.allocPrint(arena, "{s}_{s}_{d}_{d}", .{ prefix, table, run_id, seq });
     for (raw) |*c| {
         const ok = std.ascii.isAlphanumeric(c.*) or c.* == '_' or c.* == '-';
         if (!ok) c.* = '_';
@@ -396,13 +397,13 @@ pub const StreamLoadSink = struct {
             const a = aa.allocator();
             if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
                 if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
-                    try self.runDDL(try std.fmt.allocPrint(a, "CREATE DATABASE IF NOT EXISTS {s}", .{try sql.quoteName(a, cfg.flavor.dialect(), cfg.database)}));
+                    try self.runDDL(try msgfmt.allocPrint(a, "CREATE DATABASE IF NOT EXISTS {s}", .{try sql.quoteName(a, cfg.flavor.dialect(), cfg.database)}));
                 }
                 try self.runDDL(try genCreateTable(a, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num));
             }
 
             if (mode == .overwrite) {
-                try self.runDDL(try std.fmt.allocPrint(a, "TRUNCATE TABLE {s}", .{try qualified(a, cfg.flavor, cfg.database, table)}));
+                try self.runDDL(try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{try qualified(a, cfg.flavor, cfg.database, table)}));
             }
         }
         self.setup_ns = (try std.time.Instant.now()).since(self.opened);
@@ -416,11 +417,11 @@ pub const StreamLoadSink = struct {
     /// The URL and headers every transaction sends; the label is filled per transaction.
     fn buildRequestParts(self: *StreamLoadSink) !void {
         self.url = try loadUrl(self.gpa, self.cfg.load_url, self.db, self.table);
-        const cred = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{ self.cfg.user, self.cfg.password });
+        const cred = try msgfmt.allocPrint(self.gpa, "{s}:{s}", .{ self.cfg.user, self.cfg.password });
         defer self.gpa.free(cred);
         const b64 = try self.gpa.alloc(u8, std.base64.standard.Encoder.calcSize(cred.len));
         defer self.gpa.free(b64);
-        self.auth = try std.fmt.allocPrint(self.gpa, "Basic {s}", .{std.base64.standard.Encoder.encode(b64, cred)});
+        self.auth = try msgfmt.allocPrint(self.gpa, "Basic {s}", .{std.base64.standard.Encoder.encode(b64, cred)});
         const h = &self.headers;
         try h.append(.{ .name = "Authorization", .value = self.auth });
         try h.append(.{ .name = "label", .value = "" });

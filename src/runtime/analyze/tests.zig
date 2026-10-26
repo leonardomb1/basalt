@@ -14,6 +14,7 @@ const parser = @import("../../lang/sql_parser.zig");
 const pushdown = @import("../pushdown.zig");
 const Stage = @import("../analyze.zig").Stage;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const substFilterParams = @import("../analyze.zig").substFilterParams;
 const types = @import("../../lang/types.zig");
 
@@ -27,7 +28,7 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const src = try std.fmt.allocPrint(
+    const src = try msgfmt.allocPrint(
         a,
         "LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= 50;",
         .{in},
@@ -67,7 +68,7 @@ test "physical plan: which SQL shapes report a key-range split" {
     };
 
     for (cases) |c| {
-        const src = try std.fmt.allocPrint(a, "{s}LOAD INTO '/tmp/o.csv' AS {s};", .{ conn, c.q });
+        const src = try msgfmt.allocPrint(a, "{s}LOAD INTO '/tmp/o.csv' AS {s};", .{ conn, c.q });
         const prog = try parse(a, src);
         var diag = Diag{};
         const plan = try analyze(a, prog, &diag);
@@ -97,7 +98,7 @@ test "physical plan: which file reads divide into morsels" {
     };
 
     for (cases) |c| {
-        const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/o.csv' AS SELECT * FROM {s};", .{c.from});
+        const src = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/o.csv' AS SELECT * FROM {s};", .{c.from});
         const prog = try parse(a, src);
         var diag = Diag{};
         const plan = try analyze(a, prog, &diag);
@@ -219,7 +220,7 @@ test "analyze: EXPLAIN tells which side's SQL read takes the other side's join k
     };
     for (cases) |c| {
         var diag = Diag{};
-        const src = try std.fmt.allocPrint(a,
+        const src = try msgfmt.allocPrint(a,
             \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', user = 'u', password = 'p', database = 'd');
             \\LOAD INTO '/tmp/x.csv' AS SELECT * {s};
         , .{c.join});
@@ -274,7 +275,7 @@ test "type flow fills out_schema for resolved sources" {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,amount\n1,100\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT id, CAST(amount AS INT) * 2 AS d FROM '{s}';", .{in});
+    const src = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT id, CAST(amount AS INT) * 2 AS d FROM '{s}';", .{in});
     var diag = Diag{};
     const plan = try analyze(a, try parse(a, src), &diag);
     const sel = plan.outputs[0].stages[0];
@@ -292,7 +293,7 @@ test "type flow catches a type error in an expression" {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,x\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
-    const src = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
+    const src = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT * FROM '{s}' WHERE NOT name;", .{in});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
     try std.testing.expectEqualStrings("`not` needs a bool operand", diag.msg);
@@ -469,7 +470,7 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const src = try std.fmt.allocPrint(a,
+    const src = try msgfmt.allocPrint(a,
         \\PARAM floor INT DEFAULT 10;
         \\LET cutoff = $floor * 5;
         \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}' WHERE CAST(amount AS INT) >= $cutoff;
@@ -479,7 +480,7 @@ test "check accepts a filter over a statement-level LET (and rejects a LET/PARAM
     const plan = try analyze(a, prog, &diag);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
     try std.testing.expectEqualStrings("filter", plan.outputs[0].stages[0].kind);
-    const clash = try std.fmt.allocPrint(a,
+    const clash = try msgfmt.allocPrint(a,
         \\PARAM cutoff INT DEFAULT 10;
         \\LET cutoff = 5;
         \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
@@ -500,7 +501,7 @@ test "check rejects a script whose THROW guard fires, and passes one whose WHEN 
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const fires = try std.fmt.allocPrint(a,
+    const fires = try msgfmt.allocPrint(a,
         \\PARAM tbl STRING DEFAULT '';
         \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
         \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
@@ -509,7 +510,7 @@ test "check rejects a script whose THROW guard fires, and passes one whose WHEN 
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, fires), &fdiag));
     try std.testing.expectEqualStrings("tbl is required (e.g. -p tbl=SC5)", fdiag.msg);
 
-    const holds = try std.fmt.allocPrint(a,
+    const holds = try msgfmt.allocPrint(a,
         \\PARAM tbl STRING DEFAULT 'SC5';
         \\THROW 'tbl is required (e.g. -p tbl=SC5)' WHEN $tbl IS EMPTY;
         \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
@@ -518,7 +519,7 @@ test "check rejects a script whose THROW guard fires, and passes one whose WHEN 
     const plan = try analyze(a, try parse(a, holds), &hdiag);
     try std.testing.expectEqual(@as(usize, 1), plan.outputs.len);
 
-    const bare = try std.fmt.allocPrint(a,
+    const bare = try msgfmt.allocPrint(a,
         \\LET tag = 'zz';
         \\THROW 'unreachable branch: ' || $tag;
         \\LOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';
@@ -565,12 +566,12 @@ test "analyze: string builtins refuse a non-INT position but coerce scalars to t
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const bad = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT substr(id, 'a', 'b') AS s FROM '{s}';", .{in});
+    const bad = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT substr(id, 'a', 'b') AS s FROM '{s}';", .{in});
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &diag));
     try std.testing.expectEqualStrings("`substr` start must be an INT, got string", diag.msg);
 
-    const ok = try std.fmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT concat(id, '-', name) AS c, lpad(id, 5, '0') AS p, length(id) AS n FROM '{s}';", .{in});
+    const ok = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT concat(id, '-', name) AS c, lpad(id, 5, '0') AS p, length(id) AS n FROM '{s}';", .{in});
     var diag2 = Diag{};
     _ = try analyze(a, try parse(a, ok), &diag2);
 }
@@ -580,7 +581,7 @@ test "analyze: CREATE FUNCTION cannot shadow a builtin or an aggregate" {
     defer ar.deinit();
     const a = ar.allocator();
     inline for (.{ "upper", "sum" }) |name| {
-        const src = try std.fmt.allocPrint(a, "CREATE FUNCTION {s}(x) AS 999; SELECT 1 AS a;", .{name});
+        const src = try msgfmt.allocPrint(a, "CREATE FUNCTION {s}(x) AS 999; SELECT 1 AS a;", .{name});
         var diag = Diag{};
         try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
         try std.testing.expectEqualStrings("`" ++ name ++ "` is a built-in function and cannot be redefined", diag.msg);
@@ -666,13 +667,13 @@ test "analyze: a table function's body is checked where it is declared, called o
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const bad = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT nope FROM '{s}' WHERE id = $m;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in });
+    const bad = try msgfmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT nope FROM '{s}' WHERE id = $m;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in });
     var diag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "unknown field `nope`") != null);
     try std.testing.expectEqual(@as(u32, 1), diag.pos.?.line);
 
-    const ok = try std.fmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT id, upper($m) AS u, (SELECT max(id) FROM '{s}') AS mx FROM '{s}' WHERE id = $m AND $d IS NOT NULL;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in, in });
+    const ok = try msgfmt.allocPrint(a, "CREATE FUNCTION w(m, d DATE) RETURNS TABLE AS SELECT id, upper($m) AS u, (SELECT max(id) FROM '{s}') AS mx FROM '{s}' WHERE id = $m AND $d IS NOT NULL;\nLOAD INTO '/tmp/x.csv' AS SELECT id FROM '{s}';", .{ in, in, in });
     var okdiag = Diag{};
     _ = try analyze(a, try parse(a, ok), &okdiag);
 }
@@ -687,13 +688,13 @@ test "analyze: a query LET is checked where it stands and `$name` takes its colu
     const base = try tmp.dir.realpathAlloc(a, ".");
     const in = try std.fs.path.join(a, &.{ base, "in.csv" });
 
-    const ok = try std.fmt.allocPrint(a, "LET q = (SELECT count(*) AS c FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    const ok = try msgfmt.allocPrint(a, "LET q = (SELECT count(*) AS c FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
     var diag = Diag{};
     const plan = try analyze(a, try parse(a, ok), &diag);
     const out = plan.outputs[0].stages[plan.outputs[0].stages.len - 1].out_schema.?;
     try std.testing.expectEqual(types.TypeKind.int, out.fields[0].ty.kind);
 
-    const bad = try std.fmt.allocPrint(a, "LET q = (SELECT nope FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
+    const bad = try msgfmt.allocPrint(a, "LET q = (SELECT nope FROM '{s}');\nLOAD INTO '/tmp/x.csv' AS SELECT $q AS v FROM '{s}';", .{ in, in });
     var bdiag = Diag{};
     try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, bad), &bdiag));
     try std.testing.expect(std.mem.indexOf(u8, bdiag.msg, "unknown field `nope`") != null);

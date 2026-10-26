@@ -6,6 +6,7 @@ const Facts = @import("translate.zig").Facts;
 const ast = @import("../../lang/ast.zig");
 const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const translatePred = @import("translate.zig").translatePred;
 const types = @import("../../lang/types.zig");
 pub const topNStagesOf = @import("testing_util.zig").topNStagesOf;
@@ -68,7 +69,7 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
     const keys = try arena.alloc(TopN.Key, s.keys.len);
     for (s.keys, keys) |k, *out| {
         const col = sourceName(mid[sel_start..selects_end], k.field.last()) orelse {
-            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a plain source column", .{k.field.last()});
+            why.* = try msgfmt.allocPrint(arena, "ORDER BY `{s}` is not a plain source column", .{k.field.last()});
             return null;
         };
         out.* = .{ .col = col, .desc = k.desc, .nulls_first = k.nulls_first };
@@ -146,7 +147,7 @@ pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
     _ = (try filtersAllTranslate(arena, dialect, stages, .{ .fields = &.{} }, false, null)) orelse return null;
     const d = try t.describe(arena);
     return .{
-        .text = if (t.keys.len == 0) d else try std.fmt.allocPrint(arena, "{s} (if the keys are numeric or temporal)", .{d}),
+        .text = if (t.keys.len == 0) d else try msgfmt.allocPrint(arena, "{s} (if the keys are numeric or temporal)", .{d}),
         .rows = t.rows,
         .sorted = t.keys.len > 0,
     };
@@ -154,21 +155,21 @@ pub fn explainTopN(arena: std.mem.Allocator, dialect: Dialect, stages: []const a
 
 pub fn planTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const u8, src_schema: types.Schema, stages: []const ast.Stage, t: TopN, facts: ?*const Facts, why: *[]const u8) !?[]const u8 {
     const where = (try filtersAllTranslate(arena, dialect, stages, src_schema, true, facts)) orelse {
-        why.* = try std.fmt.allocPrint(arena, "a WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)});
+        why.* = try msgfmt.allocPrint(arena, "a WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)});
         return null;
     };
     for (t.keys) |k| {
         const idx = src_schema.indexOf(k.col) orelse {
-            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is not a source column", .{k.col});
+            why.* = try msgfmt.allocPrint(arena, "ORDER BY `{s}` is not a source column", .{k.col});
             return null;
         };
         const kind = src_schema.fields[idx].ty.kind;
         if (!orderedAlike(kind)) {
-            why.* = try std.fmt.allocPrint(arena, "ORDER BY `{s}` is a {s}, which {s} orders by its collation rather than byte by byte", .{ k.col, @tagName(kind), @tagName(dialect) });
+            why.* = try msgfmt.allocPrint(arena, "ORDER BY `{s}` is a {s}, which {s} orders by its collation rather than byte by byte", .{ k.col, @tagName(kind), @tagName(dialect) });
             return null;
         }
     }
-    const base = if (where.len == 0) base_sql else try std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base_sql, where });
+    const base = if (where.len == 0) base_sql else try msgfmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base_sql, where });
     return try renderTopN(arena, dialect, base, t);
 }
 
@@ -182,7 +183,7 @@ pub fn renderTopN(arena: std.mem.Allocator, dialect: Dialect, base_sql: []const 
         const q = try quoteName(arena, dialect, k.col);
         try dialect.orderKey(ob.writer(), q, k.desc, k.nulls_first);
     }
-    const order: []const u8 = if (ob.items.len > 0) try std.fmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";
+    const order: []const u8 = if (ob.items.len > 0) try msgfmt.allocPrint(arena, " ORDER BY {s}", .{ob.items}) else "";
     return dialect.firstRows(arena, base_sql, order, t.rows);
 }
 
@@ -200,7 +201,7 @@ test "top-N: key types the source orders as the engine does, and filters that mu
     var why: []const u8 = "";
 
     for ([_][]const u8{ "id", "ts", "amt" }) |k| {
-        const sql = try std.fmt.allocPrint(a, "SELECT * FROM db.t ORDER BY {s} LIMIT 5", .{k});
+        const sql = try msgfmt.allocPrint(a, "SELECT * FROM db.t ORDER BY {s} LIMIT 5", .{k});
         const stages = try topNStagesOf(a, sql);
         const t = (try classifyTopN(a, stages, &why)).?;
         try std.testing.expect((try planTopN(a, .postgres, "SELECT * FROM t", schema, stages, t, null, &why)) != null);

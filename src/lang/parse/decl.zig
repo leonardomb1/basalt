@@ -8,6 +8,7 @@ const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 const types = @import("../types.zig");
 
@@ -77,7 +78,7 @@ pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Man
             if (!post) return self.fail(apos, "GET takes no body — use {s}.POST(path, body = ...)", .{conn});
             try hints.append(.{ .key = "body", .value = .{ .str = val }, .pos = apos });
         } else if (expr.* != .null_lit) {
-            try hints.append(.{ .key = try std.fmt.allocPrint(self.arena, "query:{s}", .{key}), .value = .{ .str = val }, .pos = apos });
+            try hints.append(.{ .key = try msgfmt.allocPrint(self.arena, "query:{s}", .{key}), .value = .{ .str = val }, .pos = apos });
         }
     }
     _ = try self.expect(.rparen);
@@ -171,7 +172,7 @@ pub fn hasHint(_: *Parser, hints: []const ast.Hint, key: []const u8) bool {
 
 pub fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*ast.Expr {
     const upper = try std.ascii.allocUpperString(self.arena, conn_name);
-    const var_name = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ upper, suffix });
+    const var_name = try msgfmt.allocPrint(self.arena, "{s}{s}", .{ upper, suffix });
     const arg = try self.mk(.{ .str_lit = var_name });
     const args = try self.arena.alloc(*ast.Expr, 1);
     args[0] = arg;

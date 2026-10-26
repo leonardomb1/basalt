@@ -14,6 +14,7 @@
 //! counters and the first-error buffer are shared, under atomics and a mutex.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
@@ -58,7 +59,7 @@ fn rowLabel(arena: std.mem.Allocator, names: []const []const u8, row: Row) []con
     for (names, 0..) |n, i| {
         if (i >= row.len) break;
         const sep: []const u8 = if (out.len > 0) ", " else "";
-        out = std.fmt.allocPrint(arena, "{s}{s}{s}={s}", .{ out, sep, n, row[i] }) catch return row[0];
+        out = msgfmt.allocPrint(arena, "{s}{s}{s}={s}", .{ out, sep, n, row[i] }) catch return row[0];
     }
     return if (out.len > 0) out else row[0];
 }
@@ -534,7 +535,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     };
     std.debug.assert(c.args.len == fd.params.len);
     if (env.call_depth >= max_call_depth) {
-        const e = planErr(env.diag, try std.fmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
+        const e = planErr(env.diag, try msgfmt.allocPrint(env.arena, "CALL nesting too deep (recursive?) at `{s}`", .{c.name}));
         env.diag.pos = c.pos;
         return e;
     }
@@ -682,12 +683,12 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                     if (on_error == .continue_ and !env.item_reported) env.log.log(.err, "for-each row {s}: {s}", .{ label, emsg });
                     env.item_reported = false;
                     if (first_err == null)
-                        first_err = std.fmt.allocPrint(env.arena, "row {s}: {s}", .{ label, emsg }) catch null;
+                        first_err = msgfmt.allocPrint(env.arena, "row {s}: {s}", .{ label, emsg }) catch null;
                     if (on_error == .stop) {
                         if (isTransient(e)) env.diag.retryable = true;
                         if (first_err) |why| {
                             const at = env.diag.pos;
-                            const err = planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each {s}", .{why}));
+                            const err = planErr(env.diag, try msgfmt.allocPrint(env.arena, "for-each {s}", .{why}));
                             env.diag.pos = at orelse fe.pos;
                             return err;
                         }
@@ -696,7 +697,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 }
             }
             if (failures > 0 and opts.outcomes == null) {
-                const err = planErr(env.diag, try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
+                const err = planErr(env.diag, try msgfmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ failures, rows.len, first_err orelse "?" }));
                 env.diag.pos = fe.pos;
                 return err;
             }
@@ -718,9 +719,9 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 if (ctx.first_retryable.load(.monotonic)) env.diag.retryable = true;
                 const first = ctx.first_err_buf[0..ctx.first_err_len];
                 const why = if (on_error == .stop)
-                    try std.fmt.allocPrint(env.arena, "for-each {s}", .{first})
+                    try msgfmt.allocPrint(env.arena, "for-each {s}", .{first})
                 else
-                    try std.fmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, first });
+                    try msgfmt.allocPrint(env.arena, "for-each: {d}/{d} failed (first: {s})", .{ fails, rows.len, first });
                 const err = planErr(env.diag, why);
                 env.diag.pos = fe.pos;
                 return err;

@@ -13,6 +13,7 @@
 //! dark and light terminals alike.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const celltext = @import("../exec/celltext.zig");
@@ -227,8 +228,8 @@ pub const TableWriter = struct {
 
 fn typeLabel(gpa: std.mem.Allocator, t: types.Type) ![]const u8 {
     const q: []const u8 = if (t.nullable) "?" else "";
-    if (t.kind == .decimal) return std.fmt.allocPrint(gpa, "decimal({d},{d}){s}", .{ t.precision, t.scale, q });
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ @tagName(t.kind), q });
+    if (t.kind == .decimal) return msgfmt.allocPrint(gpa, "decimal({d},{d}){s}", .{ t.precision, t.scale, q });
+    return msgfmt.allocPrint(gpa, "{s}{s}", .{ @tagName(t.kind), q });
 }
 
 pub fn kindOf(label: []const u8) ?types.TypeKind {

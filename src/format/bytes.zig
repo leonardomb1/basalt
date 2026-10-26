@@ -10,6 +10,7 @@ const http_fake = @import("../testing/http_fake.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const std = @import("std");
+const msgfmt = @import("msgfmt.zig");
 const testing = std.testing;
 
 /// Whether `path` is read over HTTP: a URL or an object-store path.
@@ -170,7 +171,7 @@ pub const Remote = struct {
             return w[@intCast(off)..][0..len];
         }
 
-        const hdr = try std.fmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
+        const hdr = try msgfmt.allocPrint(arena, "bytes={d}-{d}", .{ off, off + len - 1 });
         const res = try self.send(arena, .GET, hdr);
         switch (res.code) {
             206 => {

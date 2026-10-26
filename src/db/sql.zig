@@ -34,6 +34,7 @@
 //! type is an error, never a quiet 0 or a different value.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const op = @import("../exec/op.zig");
 const TlsClient = @import("../net/tls_client.zig");
 const types = @import("../lang/types.zig");
@@ -322,11 +323,11 @@ pub const Dialect = enum {
     /// `<=>`; null on SQL Server, which before 2022 has neither.
     pub fn distinctPred(self: Dialect, arena: std.mem.Allocator, l: []const u8, r: []const u8, distinct: bool) !?[]const u8 {
         return switch (self) {
-            .postgres => try std.fmt.allocPrint(arena, "({s} IS {s}DISTINCT FROM {s})", .{ l, if (distinct) "" else "NOT ", r }),
+            .postgres => try msgfmt.allocPrint(arena, "({s} IS {s}DISTINCT FROM {s})", .{ l, if (distinct) "" else "NOT ", r }),
             .mysql, .starrocks, .doris => if (distinct)
-                try std.fmt.allocPrint(arena, "(NOT ({s} <=> {s}))", .{ l, r })
+                try msgfmt.allocPrint(arena, "(NOT ({s} <=> {s}))", .{ l, r })
             else
-                try std.fmt.allocPrint(arena, "({s} <=> {s})", .{ l, r }),
+                try msgfmt.allocPrint(arena, "({s} <=> {s})", .{ l, r }),
             .sqlserver => null,
         };
     }
@@ -369,8 +370,8 @@ pub const Dialect = enum {
 
     pub fn trimExpr(self: Dialect, arena: std.mem.Allocator, arg: []const u8) ![]const u8 {
         return switch (self) {
-            .sqlserver => std.fmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{arg}),
-            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "TRIM({s})", .{arg}),
+            .sqlserver => msgfmt.allocPrint(arena, "LTRIM(RTRIM({s}))", .{arg}),
+            .postgres, .mysql, .starrocks, .doris => msgfmt.allocPrint(arena, "TRIM({s})", .{arg}),
         };
     }
 
@@ -384,8 +385,8 @@ pub const Dialect = enum {
     /// SQL Server has only `%`; both spellings take the dividend's sign.
     pub fn modExpr(self: Dialect, arena: std.mem.Allocator, a: []const u8, b: []const u8) ![]const u8 {
         return switch (self) {
-            .sqlserver => std.fmt.allocPrint(arena, "({s} % {s})", .{ a, b }),
-            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "MOD({s}, {s})", .{ a, b }),
+            .sqlserver => msgfmt.allocPrint(arena, "({s} % {s})", .{ a, b }),
+            .postgres, .mysql, .starrocks, .doris => msgfmt.allocPrint(arena, "MOD({s}, {s})", .{ a, b }),
         };
     }
 
@@ -408,8 +409,8 @@ pub const Dialect = enum {
     /// SQL Server's int SUM does.
     pub fn intSum(self: Dialect, arena: std.mem.Allocator, col: []const u8) ![]const u8 {
         return switch (self) {
-            .sqlserver => std.fmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col}),
-            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "SUM({s})", .{col}),
+            .sqlserver => msgfmt.allocPrint(arena, "SUM(CAST({s} AS BIGINT))", .{col}),
+            .postgres, .mysql, .starrocks, .doris => msgfmt.allocPrint(arena, "SUM({s})", .{col}),
         };
     }
 
@@ -427,8 +428,8 @@ pub const Dialect = enum {
     /// The first `rows` rows of `base` in `order` (an ` ORDER BY ...` clause or "").
     pub fn firstRows(self: Dialect, arena: std.mem.Allocator, base: []const u8, order: []const u8, rows: u64) ![]const u8 {
         return switch (self) {
-            .sqlserver => std.fmt.allocPrint(arena, "SELECT TOP ({d}) * FROM ({s}) _t{s}", .{ rows, base, order }),
-            .postgres, .mysql, .starrocks, .doris => std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _t{s} LIMIT {d}", .{ base, order, rows }),
+            .sqlserver => msgfmt.allocPrint(arena, "SELECT TOP ({d}) * FROM ({s}) _t{s}", .{ rows, base, order }),
+            .postgres, .mysql, .starrocks, .doris => msgfmt.allocPrint(arena, "SELECT * FROM ({s}) _t{s} LIMIT {d}", .{ base, order, rows }),
         };
     }
 
@@ -875,7 +876,7 @@ fn statementParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
         return mergeParts(arena, dialect, qtable, schema, mode.upsert.keys, cols);
     }
 
-    const head = try std.fmt.allocPrint(arena, "INSERT INTO {s} ({s}) VALUES ", .{ qtable, cols });
+    const head = try msgfmt.allocPrint(arena, "INSERT INTO {s} ({s}) VALUES ", .{ qtable, cols });
     var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
 
@@ -898,7 +899,7 @@ fn statementParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
 }
 
 fn mergeParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, keys: []const []const u8, cols: []const u8) !Parts {
-    const head = try std.fmt.allocPrint(arena, "MERGE INTO {s} AS T USING (VALUES ", .{qtable});
+    const head = try msgfmt.allocPrint(arena, "MERGE INTO {s} AS T USING (VALUES ", .{qtable});
     var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
     try w.print(") AS S ({s}) ON ", .{cols});
@@ -1694,7 +1695,7 @@ test "the literal writers equal their pre-writeStrLit bodies, but for SQL Server
 
             fn objectId(arena: std.mem.Allocator, qtable: []const u8) ![]const u8 {
                 const lit = try std.mem.replaceOwned(u8, arena, qtable, "'", "''");
-                return std.fmt.allocPrint(arena, "IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
+                return msgfmt.allocPrint(arena, "IF OBJECT_ID(N'{s}', N'U') IS NULL CREATE TABLE {s} (", .{ lit, qtable });
             }
 
             fn hexLiteral(w: anytype, dialect: Dialect, s: []const u8) !void {

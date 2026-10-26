@@ -26,6 +26,7 @@
 //! the server's disconnect message or a fingerprint, never a secret.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const builtin = @import("builtin");
 const driver = @import("../connect/driver.zig");
 const ThreadNote = driver.ThreadNote;
@@ -828,7 +829,7 @@ pub const Session = struct {
     fn knownHostsText(self: *Session) ![]const u8 {
         const path = self.cfg.known_hosts orelse blk: {
             const home = std.posix.getenv("HOME") orelse return "";
-            break :blk try std.fmt.allocPrint(self.gpa, "{s}/.ssh/known_hosts", .{home});
+            break :blk try msgfmt.allocPrint(self.gpa, "{s}/.ssh/known_hosts", .{home});
         };
         defer if (self.cfg.known_hosts == null) self.gpa.free(path);
         return std.fs.cwd().readFileAlloc(self.gpa, path, 16 << 20) catch "";
@@ -1639,9 +1640,9 @@ test "live: log in and open sftp (BASALT_SSH_TEST_PORT)" {
     const port_s = std.posix.getenv("BASALT_SSH_TEST_PORT") orelse return error.SkipZigTest;
     const dir = std.posix.getenv("BASALT_SSH_TEST_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const kh = try std.fmt.allocPrint(a, "{s}/known_hosts", .{dir});
+    const kh = try msgfmt.allocPrint(a, "{s}/known_hosts", .{dir});
     defer a.free(kh);
-    const key = try std.fmt.allocPrint(a, "{s}/id_ed25519", .{dir});
+    const key = try msgfmt.allocPrint(a, "{s}/id_ed25519", .{dir});
     defer a.free(key);
     const port = try std.fmt.parseInt(u16, port_s, 10);
     for ([_]Config{

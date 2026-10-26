@@ -20,11 +20,12 @@ const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
         .query => |q| queryText(q),
-        .table => |t| try std.fmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try fromName(env, rd.connector, t) }),
+        .table => |t| try msgfmt.allocPrint(env.arena, "SELECT {s} FROM {s}", .{ try selectList(env, rd), try fromName(env, rd.connector, t) }),
         else => return planErr(env.diag, "a DB read needs `table <name>` or `query \"...\"`"),
     };
     return sqlWithWhere(env.arena, base, rd.form == .query, rd.where);
@@ -227,8 +228,8 @@ pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: [
 /// empty predicate (a `${var}` that rendered empty) means a full scan.
 pub fn sqlWithWhere(arena: std.mem.Allocator, base: []const u8, is_query: bool, where: []const u8) ![]const u8 {
     if (where.len == 0) return base;
-    if (is_query) return std.fmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base, where });
-    return std.fmt.allocPrint(arena, "{s} WHERE {s}", .{ base, where });
+    if (is_query) return msgfmt.allocPrint(arena, "SELECT * FROM ({s}) _w WHERE {s}", .{ base, where });
+    return msgfmt.allocPrint(arena, "{s} WHERE {s}", .{ base, where });
 }
 
 pub fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig, base_sql: []const u8, rd: ast.Read) !SqlDesc {
@@ -259,7 +260,7 @@ pub fn hintedWhere(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hi
     const wh = forHintName(hints, "where") orelse return rd.where;
     if (wh.len == 0 or std.mem.eql(u8, wh, rd.where)) return rd.where;
     if (rd.where.len == 0) return wh;
-    return std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ wh, rd.where });
+    return msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ wh, rd.where });
 }
 
 const SplitHints = struct { col: ?[]const u8 = null, count: ?usize = null, kind: ?split.KeyKind = null };

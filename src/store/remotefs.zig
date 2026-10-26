@@ -15,6 +15,7 @@
 //! `closeHandle`, `freeHandle`, `commit`, `discard` and `listDir`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
 
 /// Connection names, process-wide as the pools are. A later registration of a name
@@ -96,7 +97,7 @@ pub fn walk(arena: std.mem.Allocator, lister: anytype, opts: Walk) ![]const []co
             if (en.name.len == 0 or std.mem.indexOfAny(u8, en.name, "/\\\x00") != null) continue;
             if (std.mem.eql(u8, en.name, ".") or std.mem.eql(u8, en.name, "..")) continue;
             const hidden = en.name[0] == '_' or en.name[0] == '.';
-            const sub = if (d.rel.len == 0) en.name else try std.fmt.allocPrint(arena, "{s}/{s}", .{ d.rel, en.name });
+            const sub = if (d.rel.len == 0) en.name else try msgfmt.allocPrint(arena, "{s}/{s}", .{ d.rel, en.name });
             if (en.dir) {
                 if (!hidden) try todo.append(.{ .rel = sub, .depth = d.depth + 1 });
             } else if (en.file and !(hidden and opts.skip_hidden_files)) {
@@ -218,7 +219,7 @@ pub fn RemoteFs(comptime P: type) type {
 
             pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
                 const t = try P.resolve(arena, url);
-                const part = try std.fmt.allocPrint(arena, "{s}.part", .{t.path});
+                const part = try msgfmt.allocPrint(arena, "{s}.part", .{t.path});
                 const self = try arena.create(Upload);
                 const buffer = try arena.alloc(u8, P.upload_buffer);
                 const l = try checkout(arena, t.cfg);

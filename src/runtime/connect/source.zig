@@ -38,6 +38,7 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 const xlsx = @import("../../format/xlsx/read.zig");
@@ -75,7 +76,7 @@ pub fn localRead(env: *Env, rd: ast.Read) !ast.Read {
     if (rd.form != .path or !ftp.isUrl(rd.form.path)) return rd;
     var out = rd;
     out.form = .{ .path = ftp.localize(env.arena, rd.form.path) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not download `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) })) };
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not download `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) })) };
     return out;
 }
 
@@ -119,7 +120,7 @@ fn openSourceOf(
         pqdecode.Reader.isPath(rd.form.path);
     if (is_pq) {
         const pr = openParquetFile(env, rd.form.path, project) catch |e|
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
         noteParquet(env, pr);
         env.pq_readers += 1;
@@ -174,17 +175,17 @@ fn resolveTable(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake
     const kind = found.kind;
     const t = lake.resolve(env.arena, path, kind, at, found.listed) catch |e| {
         if (eval.takeFailure(e)) |why| return planErrT(env.diag, e, try env.arena.dupe(u8, why));
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read {s} table `{s}` ({s})", .{ kind.label(), path, try pathFail(env.arena, path, e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read {s} table `{s}` ({s})", .{ kind.label(), path, try pathFail(env.arena, path, e) }));
     };
     return .{ .kind = .parquet, .files = try t.layout.paths(env.arena), .table = t };
 }
 
 fn listFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
     if (e == azure.Error.AzureEmptyPrefix)
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{path}));
     if (e == s3.Error.S3EmptyPrefix)
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{path}));
-    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{path}));
+    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not list folder `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
 }
 
 fn resolvePlain(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !FolderRead {
@@ -193,15 +194,15 @@ fn resolvePlain(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake
         return planErrT(env.diag, e, try env.arena.dupe(u8, eval.takeFailure(e).?));
     }
     const all = folder.list(env.arena, path) catch |e| return listFailed(env, path, e);
-    if (all.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{path}));
-    const kind: folder.Kind = if (want) |w| (if (formats.of(w).folder_exts.len > 0) w else return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}`: a folder reads " ++ formats.folder_labels ++ " files", .{path}))) else switch (folder.kindOf(all)) {
+    if (all.len == 0) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "no files in folder `{s}`", .{path}));
+    const kind: folder.Kind = if (want) |w| (if (formats.of(w).folder_exts.len > 0) w else return planErr(env.diag, try msgfmt.allocPrint(env.arena, "folder `{s}`: a folder reads " ++ formats.folder_labels ++ " files", .{path}))) else switch (folder.kindOf(all)) {
         .kind => |k| k,
-        .mixed => |m| return planErr(env.diag, try std.fmt.allocPrint(env.arena, "folder `{s}` holds both {s} (`{s}`) and {s} (`{s}`) files; one table reads one format — name it with WITH (format = '{s}') or '{s}'", .{ path, folder.label(m.a.kind), folder.below(m.a.file, path), folder.label(m.b.kind), folder.below(m.b.file, path), @tagName(m.a.kind), @tagName(m.b.kind) })),
+        .mixed => |m| return planErr(env.diag, try msgfmt.allocPrint(env.arena, "folder `{s}` holds both {s} (`{s}`) and {s} (`{s}`) files; one table reads one format — name it with WITH (format = '{s}') or '{s}'", .{ path, folder.label(m.a.kind), folder.below(m.a.file, path), folder.label(m.b.kind), folder.below(m.b.file, path), @tagName(m.a.kind), @tagName(m.b.kind) })),
         .empty => unreachable,
-        .neither => return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no " ++ formats.folder_exts_list ++ " file in folder `{s}`", .{path})),
+        .neither => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "no " ++ formats.folder_exts_list ++ " file in folder `{s}`", .{path})),
     };
     const files = try folder.only(env.arena, all, kind);
-    if (files.len == 0) return planErr(env.diag, try std.fmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ formats.folder_exts_of[@intFromEnum(kind)], path }));
+    if (files.len == 0) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "no {s} file in folder `{s}`", .{ formats.folder_exts_of[@intFromEnum(kind)], path }));
     return .{ .kind = kind, .files = files };
 }
 
@@ -215,7 +216,7 @@ fn openParquetFolder(env: *Env, path: []const u8, fr: FolderRead, project: ?[][]
     }
     const files = fr.files;
     const pf = pqdecode.Folder.open(env.arena, path, files, project) catch |e|
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` in folder `{s}` ({s})", .{ files[0], path, try pathFail(env.arena, files[0], e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` in folder `{s}` ({s})", .{ files[0], path, try pathFail(env.arena, files[0], e) }));
     if (pf.firstReader()) |first| {
         noteParquet(env, first);
         pf.tally = first.tally;
@@ -234,14 +235,14 @@ fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source
     const r = arrowread.Reader.openProjected(env.arena, path, project) catch |e| {
         const why = switch (e) {
             error.UnsupportedArrow => if (eval.takeFailure(e)) |w|
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read {s}", .{w}))
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read {s}", .{w}))
             else
                 "an Arrow type or feature basalt does not read",
             error.NotArrow => "not an Arrow IPC file or stream",
             error.CorruptArrow => "the file is truncated or corrupt",
             else => try pathFail(env.arena, path, e),
         };
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Arrow IPC `{s}` ({s})", .{ path, why }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Arrow IPC `{s}` ({s})", .{ path, why }));
     };
     if (env.scan) |t| {
         driver.ScanTally.add(&t.columns_read, r.keep.len);
@@ -259,7 +260,7 @@ fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source
                 const names = xlsx.sheetNames(env.arena, env.gpa, path) catch &.{};
                 const list = try std.mem.join(env.arena, ", ", names);
                 break :blk if (opts.sheet) |w|
-                    try std.fmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ w, list })
+                    try msgfmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ w, list })
                 else
                     "the workbook has no worksheet";
             },
@@ -268,7 +269,7 @@ fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source
             error.XlsxTooManyStrings => "its shared strings pass 512 MB",
             else => try pathFail(env.arena, path, e),
         };
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ path, why }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ path, why }));
     };
     return r.source();
 }
@@ -277,8 +278,8 @@ fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source
 fn openJson(env: *Env, path: []const u8, files: []const []const u8, hints: []const ast.Hint) !driver.Source {
     const f = jsonread.Files.open(env.arena, env.gpa, files, analyze.jsonOptions(hints)) catch |e| {
         if (e == error.InvalidJson)
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{path}));
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read JSON `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{path}));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read JSON `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
     };
     return f.source();
 }
@@ -295,7 +296,7 @@ fn avroOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
         error.CorruptAvro, error.UnsupportedAvro, error.BadAvroSchema => eval.takeFailure(e) orelse @errorName(e),
         else => try pathFail(env.arena, path, e),
     };
-    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read Avro `{s}` ({s})", .{ path, why }));
+    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Avro `{s}` ({s})", .{ path, why }));
 }
 
 /// XML files as one table, `path` naming them in messages.
@@ -309,13 +310,13 @@ fn openXml(env: *Env, path: []const u8, files: []const []const u8, hints: []cons
 fn xmlOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
     const told = eval.takeFailure(e);
     if (told) |t| if (std.mem.startsWith(u8, t, path) and std.mem.startsWith(u8, t[path.len..], ": "))
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read XML `{s}`: {s}", .{ path, t[path.len + 2 ..] }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read XML `{s}`: {s}", .{ path, t[path.len + 2 ..] }));
     const why = switch (e) {
         error.BadXml, error.XmlTokenTooLong => told orelse "it is not well-formed XML in its first rows",
         error.XmlUnsupportedEncoding, error.TextTypeMismatch => told orelse @errorName(e),
         else => try pathFail(env.arena, path, e),
     };
-    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read XML `{s}` ({s})", .{ path, why }));
+    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read XML `{s}` ({s})", .{ path, why }));
 }
 
 /// The process's stdin, as CSV unless `format` names JSON or NDJSON. Refused when
@@ -389,7 +390,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         switch (analyze.readFormat(rd.form.path, want)) {
             .parquet => {
                 const pr = openParquetFile(env, rd.form.path, null) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
                 noteParquet(env, pr);
                 return pr.source();
             },
@@ -405,19 +406,19 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
         d.text = rd.text_cols;
         if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
-            return planErr(env.diag, try std.fmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
         const opened = if (fr) |f| csv.CsvReader.openList(env.arena, f.files, d) else csv.CsvReader.open(env.arena, rd.form.path, d);
         const reader = opened catch |e| {
             if (e == azure.Error.AzureEmptyPrefix)
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
             if (e == error.NoCsvInFolder)
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no .csv, .tsv or .txt file in folder `{s}`", .{rd.form.path}));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no .csv, .tsv or .txt file in folder `{s}`", .{rd.form.path}));
             if (e == error.EmptyFolder)
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
             if (e == s3.Error.S3EmptyPrefix)
-                return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
             const what: []const u8 = if (csv.splitArchive(rd.form.path) != null) "archive" else "input CSV";
-            return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         };
         if (project) |p| try reader.project(p);
         return reader.source();
@@ -460,10 +461,10 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
                 const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
                     defer c.close();
-                    return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                 };
                 s.report = try readReport(env, conn.connector);
                 env.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
@@ -479,9 +480,9 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
 fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
     if (e == error.Aborted) return e;
     const msg = if (eval.takeFailure(e)) |why|
-        try std.fmt.allocPrint(env.arena, "http read failed: {s} ({s})", .{ why, @errorName(e) })
+        try msgfmt.allocPrint(env.arena, "http read failed: {s} ({s})", .{ why, @errorName(e) })
     else
-        try std.fmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ url, @errorName(e) });
+        try msgfmt.allocPrint(env.arena, "http read failed for `{s}` ({s})", .{ url, @errorName(e) });
     return planErrT(env.diag, e, msg);
 }
 
@@ -504,6 +505,6 @@ fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
     return b.open(env.arena, env.gpa, vals) catch |e| {
         if (e == error.OutOfMemory) return e;
         const path = table_builtins.pathArg(b, vals) orelse return e;
-        return planErrT(env.diag, e, try std.fmt.allocPrint(env.arena, "{s}: could not open `{s}` ({s})", .{ b.label, path, try pathFail(env.arena, path, e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s}: could not open `{s}` ({s})", .{ b.label, path, try pathFail(env.arena, path, e) }));
     };
 }

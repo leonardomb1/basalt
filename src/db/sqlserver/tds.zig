@@ -44,6 +44,7 @@
 //! COLMETADATA then ROW tokens of UTF-16 cells, verified against the DONE count.
 
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const celltext = @import("../../exec/celltext.zig");
@@ -1117,7 +1118,7 @@ const BulkProto = struct {
             try cols.appendSlice(try sql.quoteName(arena, .sqlserver, f.name));
             try cols.appendSlice(" nvarchar(4000)");
         }
-        return std.fmt.allocPrint(arena, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
+        return msgfmt.allocPrint(arena, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
     }
 
     pub fn segmentHeader(w: anytype, gpa: std.mem.Allocator, schema: types.Schema) !void {
@@ -1515,7 +1516,7 @@ test "tds: a uniqueidentifier cell reads as the mixed-endian GUID the old format
     const old = struct {
         fn formatGuid(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
             if (b.len < 16) return arena.dupe(u8, "");
-            return std.fmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+            return msgfmt.allocPrint(arena, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
                 b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
             });
         }

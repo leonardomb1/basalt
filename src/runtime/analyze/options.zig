@@ -17,6 +17,7 @@ const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const sql = @import("../../db/sql.zig");
 const textconv = @import("../../exec/textconv.zig");
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const streamload = @import("../../db/streamload.zig");
 
 const sftp_keys = [_][]const u8{ "host", "port", "user", "password", "key_file", "key_passphrase", "known_hosts", "host_key" };
@@ -55,7 +56,7 @@ fn connectionKeys(connector: []const u8) ?[]const []const u8 {
 
 pub fn unknownOptionMsg(arena: std.mem.Allocator, c: ast.Connection, key: []const u8) Error![]const u8 {
     const keys = connectionKeys(c.connector) orelse &.{};
-    return std.fmt.allocPrint(arena, "{s} connection `{s}`: unknown option `{s}` ({s})", .{ c.connector, c.name, key, try std.mem.join(arena, ", ", keys) });
+    return msgfmt.allocPrint(arena, "{s} connection `{s}`: unknown option `{s}` ({s})", .{ c.connector, c.name, key, try std.mem.join(arena, ", ", keys) });
 }
 
 pub fn portRangeMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
@@ -63,19 +64,19 @@ pub fn portRangeMsg(arena: std.mem.Allocator, connector: []const u8) Error![]con
 }
 
 pub fn rangeMsg(arena: std.mem.Allocator, connector: []const u8, key: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} connection `{s}` is out of range", .{ connector, key });
+    return msgfmt.allocPrint(arena, "{s} connection `{s}` is out of range", .{ connector, key });
 }
 
 pub fn needsHostMsg(arena: std.mem.Allocator, c: ast.Connection) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} connection `{s}` needs a `host`", .{ c.connector, c.name });
+    return msgfmt.allocPrint(arena, "{s} connection `{s}` needs a `host`", .{ c.connector, c.name });
 }
 
 pub fn smbAuthMsg(arena: std.mem.Allocator, name: []const u8, auth: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "smb connection `{s}`: `auth` is kerberos or ntlm, not `{s}`", .{ name, auth });
+    return msgfmt.allocPrint(arena, "smb connection `{s}`: `auth` is kerberos or ntlm, not `{s}`", .{ name, auth });
 }
 
 pub fn smbRealmMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{name});
+    return msgfmt.allocPrint(arena, "smb connection `{s}`: Kerberos needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{name});
 }
 
 pub fn smbAuthValid(auth: []const u8) bool {
@@ -83,34 +84,34 @@ pub fn smbAuthValid(auth: []const u8) bool {
 }
 
 pub fn loadSizeMsg(arena: std.mem.Allocator, text: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "`load_size` must be a positive size like '128MB', not '{s}'", .{text});
+    return msgfmt.allocPrint(arena, "`load_size` must be a positive size like '128MB', not '{s}'", .{text});
 }
 
 pub fn loadCompressionMsg(arena: std.mem.Allocator, text: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "`compression` must be 'none' or 'gzip', not '{s}'", .{text});
+    return msgfmt.allocPrint(arena, "`compression` must be 'none' or 'gzip', not '{s}'", .{text});
 }
 
 pub fn needsDatabaseMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} connection needs a `database`", .{connector});
+    return msgfmt.allocPrint(arena, "{s} connection needs a `database`", .{connector});
 }
 
 pub fn unsupportedSinkMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "unsupported sink connector `{s}`", .{connector});
+    return msgfmt.allocPrint(arena, "unsupported sink connector `{s}`", .{connector});
 }
 
 pub fn unsupportedSourceMsg(arena: std.mem.Allocator, connector: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "unsupported source connector `{s}`", .{connector});
+    return msgfmt.allocPrint(arena, "unsupported source connector `{s}`", .{connector});
 }
 
 pub fn unknownConnectionMsg(arena: std.mem.Allocator, name: []const u8, where: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "unknown connection `{s}` in {s}", .{ name, where });
+    return msgfmt.allocPrint(arena, "unknown connection `{s}` in {s}", .{ name, where });
 }
 
 /// The text a literal option value reads as, or null for one only the run evaluates.
 fn literalText(arena: std.mem.Allocator, e: *const ast.Expr) Error!?[]const u8 {
     return switch (e.*) {
         .str_lit => |s| s,
-        .int_lit => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+        .int_lit => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
         .bool_lit => |b| if (b) "true" else "false",
         else => null,
     };
@@ -127,7 +128,7 @@ fn isEnvCall(e: *const ast.Expr) bool {
 /// SMB or FTP connection's keys, port and literal values. Null when it would not.
 pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const u8 {
     if (!analyze.isConnectionType(c.connector))
-        return try std.fmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types });
+        return try msgfmt.allocPrint(arena, "unknown connection type `{s}` (one of {s})", .{ c.connector, analyze.connection_types });
     const conn = registry.Connector.parse(c.connector).?;
     if (conn.sqlRead() != null) {
         for (c.config) |attr| {
@@ -199,7 +200,7 @@ pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
 }
 
 pub fn httpConnMsg(arena: std.mem.Allocator, name: []const u8, why: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "http connection `{s}`: {s}", .{ name, why });
+    return msgfmt.allocPrint(arena, "http connection `{s}`: {s}", .{ name, why });
 }
 
 /// An http connection whose options are all literals, judged by the run's own
@@ -241,7 +242,7 @@ fn sqlLiteralProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const
 }
 
 pub fn sqlRealmMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
-    return std.fmt.allocPrint(arena, "connection `{s}`: `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{name});
+    return msgfmt.allocPrint(arena, "connection `{s}`: `auth = 'kerberos'` needs the `realm` — the domain's DNS name, as CORP.LOCAL, not its NetBIOS name — or a user written `me@CORP.LOCAL`", .{name});
 }
 
 /// What a `LOAD INTO conn.table` is refused for by the connection it names, before
@@ -295,7 +296,7 @@ pub fn maxBuild(arena: std.mem.Allocator, h: ast.Hint) Error!BuildCap {
         .flag => "",
     };
     if (env_mod.parseByteSize(txt)) |v| if (std.math.cast(usize, v)) |cap| return .{ .bytes = cap };
-    return .{ .problem = try std.fmt.allocPrint(arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}) };
+    return .{ .problem = try msgfmt.allocPrint(arena, "bad max_build `{s}` — use e.g. '512MB' or '8GB'", .{txt}) };
 }
 
 pub const bare_upsert_source_msg = "a bare `UPSERT` infers the primary key from the source, which needs a SQL table read — this query's source can't be introspected; name the key with `UPSERT ON (col)`";

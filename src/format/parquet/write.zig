@@ -48,6 +48,7 @@
 //! a lane), and the next unit reuses those pages already faulted in.
 
 const std = @import("std");
+const msgfmt = @import("../msgfmt.zig");
 const parquet = @import("footer.zig");
 const logical = @import("logical.zig");
 const pqdecode = @import("read.zig");
@@ -2031,9 +2032,9 @@ test "chunk size totals account for page headers" {
 /// Test rows: column `c` of row `i` for the dictionary and byte-cap tests.
 fn capValue(a: std.mem.Allocator, c: usize, i: usize) !Value {
     return switch (c) {
-        0 => if (i % 13 == 0) .null else if (i < 3000) .{ .string = ([_][]const u8{ "red", "green", "blue" })[i % 3] } else .{ .string = try std.fmt.allocPrint(a, "s{d:0>40}", .{i}) },
+        0 => if (i % 13 == 0) .null else if (i < 3000) .{ .string = ([_][]const u8{ "red", "green", "blue" })[i % 3] } else .{ .string = try msgfmt.allocPrint(a, "s{d:0>40}", .{i}) },
         1 => if (i % 7 == 0) .null else .{ .int = if (i < 3000) @as(i64, @intCast(i % 4)) else @as(i64, @intCast(i)) * 1_000_003 },
-        2 => .{ .string = try std.fmt.allocPrint(a, "u{d}", .{i % 1000}) },
+        2 => .{ .string = try msgfmt.allocPrint(a, "u{d}", .{i % 1000}) },
         3 => .{ .decimal = .{ .unscaled = @as(i128, @intCast(i % 1000)) * 99_999_999_999, .scale = 2 } },
         4 => if (i == 5) .{ .string = blk: {
             const big = try a.alloc(u8, (dict_max_bytes * 3) / 2);
@@ -2180,7 +2181,7 @@ test "a moderate write is one row group, whether written directly or through a u
         for (k * step..(k + 1) * step) |i| {
             try bs[0].append(.{ .int = @intCast(i) });
             try bs[1].append(if (i % 9 == 0) .null else .{ .string = ([_][]const u8{ "a", "b", "c" })[i % 3] });
-            try bs[2].append(.{ .string = try std.fmt.allocPrint(a, "note-{d:0>24}", .{i}) });
+            try bs[2].append(.{ .string = try msgfmt.allocPrint(a, "note-{d:0>24}", .{i}) });
         }
         for (cols, &bs) |*c, *b| c.* = try b.finish();
         bt.* = .{ .schema = &schema, .columns = cols, .len = step };
@@ -2212,7 +2213,7 @@ test "a NULL in a REQUIRED column fails the write instead of writing a short pag
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const kinds = [_]types.Type{ types.Type.init(.int), types.Type.init(.float), types.Type.init(.date), types.Type.init(.string), types.Type.decimal(10, 2), types.Type.init(.bool) };
     for (kinds, 0..) |t, k| {
-        const path = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "req{d}.parquet", .{k}) });
+        const path = try std.fs.path.join(a, &.{ dir, try msgfmt.allocPrint(a, "req{d}.parquet", .{k}) });
         const schema = types.Schema{ .fields = &.{.{ .name = "x", .ty = t }} };
         var w = try Writer.open(a, path, schema, .snappy, .truncate);
         defer w.abort();

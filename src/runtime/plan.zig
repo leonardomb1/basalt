@@ -29,6 +29,7 @@
 //! rows in `plan/discover.zig`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
@@ -693,7 +694,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 schema = m.schema;
             } else {
                 const b = (try stampedBinding(env, name)) orelse
-                    return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
+                    return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
                     try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
                 else
@@ -976,7 +977,7 @@ pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.St
     const out = try arena.dupe(ast.Stage, stages);
     var nrd = rd;
     nrd.where = if (rd.where.len > 0)
-        try std.fmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra })
+        try msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra })
     else
         extra;
     out[0].node = .{ .read = nrd };
@@ -1041,7 +1042,7 @@ pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_
 /// known: a SQL table read then asks only for the columns those stages may take.
 pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const ast.Stage) anyerror!JoinSide {
     if (env.bindings.get(j.binding) == null)
-        return planErr(env.diag, try std.fmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
     const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
     const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
     var rstages = try prepareSide(env, try j.rightStages(env.arena, (try stampedBinding(env, j.binding)).?.stages), tail);
@@ -1163,8 +1164,8 @@ pub fn jsonToStr(arena: std.mem.Allocator, v: std.json.Value) ![]const u8 {
     return switch (v) {
         .null => "",
         .bool => |b| if (b) "true" else "false",
-        .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
-        .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+        .integer => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
+        .float => |f| try msgfmt.allocPrint(arena, "{d}", .{f}),
         .number_string, .string => |s| s,
         .array, .object => try std.json.Stringify.valueAlloc(arena, v, .{}),
     };

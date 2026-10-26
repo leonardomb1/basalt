@@ -10,6 +10,7 @@ const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const std = @import("std");
+const msgfmt = @import("../../format/msgfmt.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
 
 /// A FROM source: a path, `IDENTIFIER(<expr>)`, HTTP('url'), a CTE, or a
@@ -162,7 +163,7 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
     if (self.at(.dollar_ident)) {
         const q = try self.parseDollarPath();
         const joined = try std.mem.join(self.arena, ".", q.parts);
-        u.discover_json = try std.fmt.allocPrint(self.arena, "${{{s}}}", .{joined});
+        u.discover_json = try msgfmt.allocPrint(self.arena, "${{{s}}}", .{joined});
     } else if (self.at(.string)) {
         u.discover_json = self.advance().text;
     } else if (self.isKw("select")) {

@@ -55,6 +55,7 @@
 //! there is no cost model.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("types.zig");
 const token = @import("token.zig");
 
@@ -567,7 +568,7 @@ pub const WinFrame = struct {
 
     /// The frame as SQL writes it, for EXPLAIN.
     pub fn render(self: WinFrame, arena: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} BETWEEN {s} AND {s}", .{
+        return msgfmt.allocPrint(arena, "{s} BETWEEN {s} AND {s}", .{
             if (self.unit == .rows) "ROWS" else "RANGE",
             try renderBound(self.start, arena),
             try renderBound(self.end, arena),
@@ -579,7 +580,7 @@ pub const WinFrame = struct {
             .unbounded_preceding => "UNBOUNDED PRECEDING",
             .current_row => "CURRENT ROW",
             .unbounded_following => "UNBOUNDED FOLLOWING",
-            .preceding, .following => |o| std.fmt.allocPrint(arena, "{s}{s}{s}{s} {s}", .{
+            .preceding, .following => |o| msgfmt.allocPrint(arena, "{s}{s}{s}{s} {s}", .{
                 if (o.unit != null) "INTERVAL '" else "",
                 o.text,
                 if (o.unit != null) "' " else "",

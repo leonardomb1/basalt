@@ -19,6 +19,7 @@
 //! permanent (550 is a missing file); both carry the server's text in `lastError`.
 
 const std = @import("std");
+const msgfmt = @import("../format/msgfmt.zig");
 const driver = @import("../connect/driver.zig");
 const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
@@ -337,12 +338,12 @@ fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const u = try parseUrl(arena, url);
     if (local.dir == null) {
         const base = std.process.getEnvVarOwned(arena, "TMPDIR") catch try arena.dupe(u8, "/tmp");
-        const dir = try std.fmt.allocPrint(gpa, "{s}/basalt-ftp-{x}", .{ base, std.crypto.random.int(u64) });
+        const dir = try msgfmt.allocPrint(gpa, "{s}/basalt-ftp-{x}", .{ base, std.crypto.random.int(u64) });
         try std.fs.cwd().makePath(dir);
         local.dir = dir;
     }
     local.seq += 1;
-    const sub = try std.fmt.allocPrint(arena, "{s}/{d}", .{ local.dir.?, local.seq });
+    const sub = try msgfmt.allocPrint(arena, "{s}/{d}", .{ local.dir.?, local.seq });
     try std.fs.cwd().makePath(sub);
 
     const s = try Session.open(gpa, u);
@@ -359,7 +360,7 @@ fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
             if (std.fs.path.dirname(dest)) |d| try std.fs.cwd().makePath(d);
             try download(s, try std.mem.concat(arena, u8, &.{ u.path, rel }), dest);
         }
-        break :blk try std.fmt.allocPrint(arena, "{s}/", .{sub});
+        break :blk try msgfmt.allocPrint(arena, "{s}/", .{sub});
     } else blk: {
         const name = std.fs.path.basenamePosix(u.path);
         const dest = try std.fs.path.join(arena, &.{ sub, if (name.len > 0) name else "download" });
@@ -663,8 +664,8 @@ test "a file downloads over EPSV, a folder and its subfolder over MLSD, and a se
     try expectFolder(a, dir);
 
     var mb: [256]u8 = undefined;
-    const msg = try std.fmt.allocPrint(a, "no file in folder `{s}` nor `{s}sub/c.csv`", .{ dir, dir });
-    const want = try std.fmt.allocPrint(a, "no file in folder `{s}` nor `{s}sub/c.csv`", .{ srv.url(&ub, "/d/"), srv.url(&ub, "/d/") });
+    const msg = try msgfmt.allocPrint(a, "no file in folder `{s}` nor `{s}sub/c.csv`", .{ dir, dir });
+    const want = try msgfmt.allocPrint(a, "no file in folder `{s}` nor `{s}sub/c.csv`", .{ srv.url(&ub, "/d/"), srv.url(&ub, "/d/") });
     try std.testing.expectEqualStrings(want, unlocalize(&mb, msg));
 
     const member = try localize(a, try std.mem.concat(a, u8, &.{ srv.url(&ub, "/d/a.csv"), " :: inner.csv" }));
