@@ -10,6 +10,11 @@
 //! instantiated per type and rules at compile time, so the per-cell work is the
 //! parse and a typed append with no `Value` between them. A decimal's text, and
 //! the binary layouts its unscaled integer comes in, are read in `decimal.zig`.
+//!
+//! A PostgreSQL `time` reads as a TIME, a time of day in `[00:00:00, 24:00:00)`:
+//! PostgreSQL's `24:00:00` has no basalt TIME and fails, naming the column, rather
+//! than wrap to midnight. A MySQL TIME stays text, as it may hold an elapsed time
+//! (`-838:59:59` to `838:59:59`) that no time of day can.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -18,6 +23,7 @@ const Decimal = @import("value.zig").Decimal;
 const decimal = @import("decimal.zig");
 const cast = @import("eval/cast.zig");
 const civil = @import("civil.zig");
+const hex = @import("../format/hex.zig");
 
 pub const Error = error{ TextTypeMismatch, UnparseableNumber, OutOfMemory };
 
@@ -39,18 +45,32 @@ pub const Rules = struct {
     dates: enum { iso, wire } = .iso,
     /// What a cell its column cannot read fails with.
     mismatch: Error = error.TextTypeMismatch,
+    /// A BYTES cell: `raw` as sent (MySQL's binary columns), or `pg_bytea`,
+    /// PostgreSQL's `bytea` text in its hex or escape format.
+    bytes: enum { raw, pg_bytea } = .raw,
 };
 
 /// A sniffed text source's cells: CSV and XML.
 pub const sniffed = Rules{ .typed = &.{ .int, .float, .date }, .codes = true };
 
-/// A database's text protocol: PostgreSQL and MySQL.
+/// MySQL's text protocol, and the MySQL-protocol StarRocks and Doris.
 pub const wire = Rules{
     .typed = &.{ .int, .float, .decimal, .bool, .date, .timestamp },
     .numbers = .std,
     .trim_ints = true,
     .dates = .wire,
     .mismatch = error.UnparseableNumber,
+};
+
+/// PostgreSQL's text protocol: `wire`, its `time` read as a time of day and its
+/// `bytea` decoded.
+pub const pg_wire = Rules{
+    .typed = wire.typed ++ &[_]types.TypeKind{ .time, .bytes },
+    .numbers = wire.numbers,
+    .trim_ints = wire.trim_ints,
+    .dates = wire.dates,
+    .mismatch = wire.mismatch,
+    .bytes = .pg_bytea,
 };
 
 /// Appends one non-NULL cell to a builder of the column's type.
@@ -62,9 +82,10 @@ pub fn converter(kind: types.TypeKind, comptime rules: Rules) Converter {
         inline else => |k| &struct {
             fn f(b: *column.Builder, raw: []const u8) Error!void {
                 const as = comptime readAs(k, rules);
+                if (comptime as == .bytes and rules.bytes == .pg_bytea) return appendPgBytea(b, raw, rules.mismatch);
                 const v = try parse(as, rules, raw);
                 switch (comptime as) {
-                    .int => try b.appendInt(v),
+                    .int, .time => try b.appendInt(v),
                     .float => try b.appendFloat(v),
                     .decimal => try b.appendDecimal(v),
                     .bool => try b.appendAs(.b, v),
@@ -91,6 +112,7 @@ fn Parsed(comptime k: types.TypeKind) type {
         .bool => bool,
         .date => ?i32,
         .timestamp => ?i64,
+        .time => i64,
         else => []const u8,
     };
 }
@@ -106,12 +128,44 @@ pub fn parse(comptime k: types.TypeKind, comptime rules: Rules, raw: []const u8)
         .decimal => decimal.parse(raw) orelse bad,
         .bool => raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T' or raw[0] == 'y' or raw[0] == 'Y'),
         .date => switch (rules.dates) {
-            .iso => @as(?i32, @intCast(IsoDate.date(raw) orelse return bad)),
+            .iso => @as(?i32, @intCast(Iso.date(raw) orelse return bad)),
             .wire => if (zeroDate(raw)) null else std.math.cast(i32, Wire.date(raw) orelse return bad) orelse bad,
         },
         .timestamp => if (zeroDate(raw)) null else Wire.timestamp(raw) orelse bad,
+        .time => Iso.time(raw) orelse bad,
         else => raw,
     };
+}
+
+/// PostgreSQL's `bytea` output decoded straight into the builder, in either format
+/// a server's `bytea_output` gives: hex, `\x` then two digits a byte (the default),
+/// or escape, a byte as itself, `\\` a backslash and `\ooo` any byte in octal.
+/// Text neither format spells fails with `bad`.
+fn appendPgBytea(b: *column.Builder, raw: []const u8, bad: Error) Error!void {
+    if (raw.len >= 2 and raw[0] == '\\' and raw[1] == 'x') {
+        if (raw.len % 2 != 0) return bad;
+        const digits = raw[2..];
+        const out = try b.reserveBytes(digits.len / 2);
+        _ = hex.decode(out, digits) catch return bad;
+        return b.commitBytes(digits.len / 2);
+    }
+    const out = try b.reserveBytes(raw.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (n += 1) {
+        if (raw[i] != '\\') {
+            out[n] = raw[i];
+            i += 1;
+        } else if (i + 1 < raw.len and raw[i + 1] == '\\') {
+            out[n] = '\\';
+            i += 2;
+        } else {
+            if (i + 4 > raw.len) return bad;
+            out[n] = std.fmt.parseInt(u8, raw[i + 1 .. i + 4], 8) catch return bad;
+            i += 4;
+        }
+    }
+    try b.commitBytes(n);
 }
 
 /// Whether a non-empty cell reads as a column of `kind` under `rules`.
@@ -205,7 +259,9 @@ fn zeroDate(t: []const u8) bool {
 /// UTC, so a `timestamptz` reads the same whatever the session's zone; one past what
 /// an i64 of microseconds holds is null.
 const Wire = civil.Text(.wire);
-const IsoDate = civil.Text(.iso);
+/// ISO text (`civil.Spelling.iso`), its clock checked: a time is `HH:MM[:SS[.f{1,6}]]`
+/// below 24:00:00.
+const Iso = civil.Text(.iso);
 
 const testing = std.testing;
 
@@ -301,12 +357,13 @@ test "a converter appends each kind into its storage, a zero date as NULL" {
         .{ .bool, &.{ "t", "f", "1" }, "true|false|true" },
         .{ .date, &.{ "2024-01-05", "0000-00-00" }, "2024-01-05|NULL" },
         .{ .timestamp, &.{ "2024-01-05 01:02:03.5", "0000-00-00 00:00:00" }, "2024-01-05 01:02:03.500000|NULL" },
+        .{ .time, &.{ "01:02:03", "23:59:59.999999", "00:00:00.5" }, "01:02:03|23:59:59.999999|00:00:00.500000" },
         .{ .string, &.{ "a", "" }, "a|" },
     };
     for (cases) |c| {
         const ty = if (c[0] == .decimal) types.Type.decimal(10, 2) else types.Type.init(c[0]);
         var b = column.Builder.init(a, ty.asNullable());
-        const conv = converter(c[0], wire);
+        const conv = if (c[0] == .time) converter(c[0], pg_wire) else converter(c[0], wire);
         for (c[1]) |raw| try conv(&b, raw);
         const col = try b.finish();
         var out = std.Io.Writer.Allocating.init(a);
@@ -317,4 +374,39 @@ test "a converter appends each kind into its storage, a zero date as NULL" {
         }
         try testing.expectEqualStrings(c[2], out.written());
     }
+}
+
+test "a PostgreSQL time is a time of day, its 24:00:00 failing rather than wrapping; a MySQL TIME stays text" {
+    try testing.expectEqual(@as(i64, 3_723_000_000), try parse(.time, pg_wire, "01:02:03"));
+    try testing.expectEqual(@as(i64, 86_399_999_999), try parse(.time, pg_wire, "23:59:59.999999"));
+    for ([_][]const u8{ "24:00:00", "25:00:00", "-01:00:00", "12:60:00", "1:02:03", "" }) |bad| {
+        try testing.expectError(error.UnparseableNumber, parse(.time, pg_wire, bad));
+    }
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var b = column.Builder.init(ar.allocator(), types.Type.init(.time).asNullable());
+    try testing.expectError(error.UnparseableNumber, converter(.time, pg_wire)(&b, "24:00:00"));
+    try testing.expectEqualStrings("838:59:59", try parse(comptime readAs(.time, wire), wire, "838:59:59"));
+    try testing.expectEqualStrings("-01:00:00", try parse(comptime readAs(.time, wire), wire, "-01:00:00"));
+}
+
+test "a BYTES cell is MySQL's raw bytes, and PostgreSQL's bytea decoded from hex or escape; other text fails" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var my = column.Builder.init(a, types.Type.init(.bytes).asNullable());
+    try converter(.bytes, wire)(&my, "\\x01");
+    var pg = column.Builder.init(a, types.Type.init(.bytes).asNullable());
+    for ([_][]const u8{ "\\x01ff5C", "\\x", "\\001a\\\\b\\377", "" }) |raw| try converter(.bytes, pg_wire)(&pg, raw);
+    for ([_][]const u8{ "\\x1", "\\xzz", "\\01", "\\", "a\\9zz", "\\400" }) |raw| {
+        try testing.expectError(error.UnparseableNumber, converter(.bytes, pg_wire)(&pg, raw));
+    }
+    const mc = try my.finish();
+    try testing.expectEqualStrings("\\x01", mc.getValue(0).bytes);
+    const pc = try pg.finish();
+    try testing.expectEqual(@as(usize, 4), pc.len);
+    try testing.expectEqualStrings("\x01\xff\x5c", pc.getValue(0).bytes);
+    try testing.expectEqualStrings("", pc.getValue(1).bytes);
+    try testing.expectEqualStrings("\x01a\\b\xff", pc.getValue(2).bytes);
+    try testing.expectEqualStrings("", pc.getValue(3).bytes);
 }

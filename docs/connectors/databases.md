@@ -15,6 +15,13 @@ is stored as that UTC instant, and a pushed-down timestamp literal compares in
 UTC. A `DATETIME`, a PostgreSQL `timestamp` and StarRocks' and Doris' columns
 carry no zone and read as written.
 
+A PostgreSQL `bytea` reads as `BYTES`, decoded from whichever `bytea_output`
+format the server uses, and a PostgreSQL `time` as `TIME`. A basalt `TIME` is a
+time of day below `24:00:00`, so PostgreSQL's `24:00:00` fails the read, naming
+the column, rather than read as midnight; a `timetz` reads as text. A MySQL
+`TIME` reads as text: it may hold an elapsed time (`-838:59:59` to `838:59:59`)
+that no time of day can, and `CAST(t AS TIME)` reads one that is a time of day.
+
 ## StarRocks
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load

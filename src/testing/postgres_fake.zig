@@ -1,8 +1,9 @@
 //! A PostgreSQL server for tests, each connection on a thread of its own: a trust
 //! login (AuthenticationOk, ReadyForQuery; an SSLRequest is refused with 'N'), and
 //! simple Query messages over tables held in memory, answered with RowDescription,
-//! DataRows in text format, CommandComplete and ReadyForQuery. Every query's text
-//! is recorded, so a test can assert what the engine sent.
+//! DataRows in text format, CommandComplete and ReadyForQuery. Every query's text,
+//! and every StartupMessage's parameters, are recorded, so a test can assert what
+//! the engine sent.
 //!
 //! It reads only the queries basalt itself writes for a table: `SELECT * | "a", "b"
 //! FROM <table> [WHERE …]`. A WHERE holding `1 = 0` returns no rows, and each
@@ -32,6 +33,7 @@ pub const FakePg = struct {
     stop: std.atomic.Value(bool) = .init(false),
     mutex: std.Thread.Mutex = .{},
     queries: std.array_list.Managed([]u8),
+    startups: std.array_list.Managed([]u8),
     sessions: std.array_list.Managed(std.Thread),
     acceptor: ?std.Thread = null,
 
@@ -44,6 +46,7 @@ pub const FakePg = struct {
             .listener = try addr.listen(.{ .reuse_address = true }),
             .tables = tables,
             .queries = std.array_list.Managed([]u8).init(gpa),
+            .startups = std.array_list.Managed([]u8).init(gpa),
             .sessions = std.array_list.Managed(std.Thread).init(gpa),
         };
         self.acceptor = try std.Thread.spawn(.{}, acceptLoop, .{self});
@@ -63,6 +66,8 @@ pub const FakePg = struct {
         self.sessions.deinit();
         for (self.queries.items) |q| self.gpa.free(q);
         self.queries.deinit();
+        for (self.startups.items) |q| self.gpa.free(q);
+        self.startups.deinit();
         self.listener.deinit();
         self.gpa.destroy(self);
     }
@@ -121,6 +126,9 @@ pub const FakePg = struct {
                 try w.flush();
                 continue;
             }
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.startups.append(try self.gpa.dupe(u8, body[4..]));
             break;
         }
         try message(w, 'R', &.{ 0, 0, 0, 0 });
