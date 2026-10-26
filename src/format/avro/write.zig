@@ -28,6 +28,7 @@ const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
 const driver = @import("../../connect/driver.zig");
 const jsontext = @import("../../exec/jsontext.zig");
+const civil = @import("../../exec/civil.zig");
 const read = @import("read.zig");
 const schema_mod = @import("schema.zig");
 const stream = @import("../stream.zig");
@@ -367,7 +368,7 @@ fn randomValue(r: std.Random, a: std.mem.Allocator, ty: types.Type) !Value {
             break :blk if (ty.kind == .string) Value{ .string = s } else Value{ .bytes = s };
         },
         .date => .{ .date = if (edge) std.math.minInt(i32) + 1 else r.int(i32) },
-        .time => .{ .time = r.intRangeLessThan(i64, 0, 86_400_000_000) },
+        .time => .{ .time = r.intRangeLessThan(i64, 0, civil.us_per_day) },
         .timestamp => .{ .timestamp = if (edge) (if (r.boolean()) std.math.minInt(i64) else std.math.maxInt(i64)) else r.int(i64) },
         .array, .@"struct" => unreachable,
     };

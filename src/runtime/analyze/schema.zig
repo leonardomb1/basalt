@@ -10,6 +10,7 @@ const ParamMap = std.StringHashMap(*const ast.Expr);
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const civil = @import("../../exec/civil.zig");
+const decimal = @import("../../exec/decimal.zig");
 const exprType = @import("../analyze.zig").exprType;
 const fail = @import("../analyze.zig").fail;
 const failPos = @import("../analyze.zig").failPos;
@@ -340,7 +341,7 @@ fn roundedFloat(text: []const u8, mul: i128) i128 {
 /// `text` as an integer at `scale` decimal places, exactly when it is plain digits
 /// and through f64 otherwise, saturating at `off_max`.
 fn scaledText(text: []const u8, scale: u8) i128 {
-    const p = std.math.powi(i128, 10, scale) catch return off_max;
+    const p = decimal.pow10Checked(scale) orelse return off_max;
     if (!plainDecimal(text)) return roundedFloat(text, p);
     const dot = std.mem.indexOfScalar(u8, text, '.') orelse text.len;
     var v: i128 = if (dot == 0) 0 else std.fmt.parseInt(i128, text[0..dot], 10) catch return off_max;
@@ -362,7 +363,7 @@ fn scaledText(text: []const u8, scale: u8) i128 {
 fn scaledMicros(text: []const u8, unit_us: i128) i128 {
     if (!plainDecimal(text)) return roundedFloat(text, unit_us);
     const s = fracDigits(text);
-    const p = std.math.powi(i128, 10, s) catch return off_max;
+    const p = decimal.pow10Checked(s) orelse return off_max;
     const m = std.math.mul(i128, scaledText(text, s), unit_us) catch return off_max;
     const r = std.math.add(i128, m, @divTrunc(p, 2)) catch return off_max;
     return @min(@divTrunc(r, p), off_max);
@@ -401,7 +402,7 @@ fn rangeConv(arena: std.mem.Allocator, kt: types.Type, key: []const u8, funcs: [
     }
     return switch (kt.kind) {
         .float => .{ .float = true },
-        .int => .{ .mul = std.math.powi(i128, 10, digits) catch 1, .scale = digits },
+        .int => .{ .mul = decimal.pow10Checked(digits) orelse 1, .scale = digits },
         .decimal => .{ .scale = @max(kt.scale, digits) },
         .date => .{ .mul = us_per_day },
         else => .{},

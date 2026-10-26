@@ -682,8 +682,7 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
             shown = -shown;
         }
         if (r < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, shown });
-        if (!(r < 0x1p63)) return self.fail(vpos, "{s} {d} is out of range", .{ what, shown });
-        n.* = @intFromFloat(@abs(r));
+        n.* = @intCast(textconv.floatToInt(@abs(r), .exact) orelse return self.fail(vpos, "{s} {d} is out of range", .{ what, shown }));
         return;
     }
     if (e.* == .int_lit) {

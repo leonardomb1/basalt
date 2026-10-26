@@ -26,6 +26,7 @@ const table = @import("../../connect/table.zig");
 const types = @import("../../lang/types.zig");
 const line = @import("line.zig");
 const search = @import("../../exec/search.zig");
+const textconv = @import("../../exec/textconv.zig");
 const orderF64 = @import("../../exec/eval/support.zig").orderF64;
 
 const Grid = table.Grid;
@@ -96,7 +97,7 @@ pub fn order(kind: ?types.TypeKind, a: []const u8, b: []const u8) std.math.Order
         if (x != null) return .lt;
         if (y != null) return .gt;
     }
-    if (kind == .bool) return std.math.order(@intFromBool(std.mem.eql(u8, a, "true")), @intFromBool(std.mem.eql(u8, b, "true")));
+    if (kind == .bool) return std.math.order(@intFromBool(textconv.boolText(.printed, a).?), @intFromBool(textconv.boolText(.printed, b).?));
     const ci = std.ascii.orderIgnoreCase(a, b);
     return if (ci != .eq) ci else std.mem.order(u8, a, b);
 }

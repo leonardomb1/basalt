@@ -881,6 +881,34 @@ pub fn packedInto(out: []u8, digits: []const u8, neg: bool) void {
     for (out, 0..) |*o, i| o.* = (nib[i * 2] << 4) | nib[i * 2 + 1];
 }
 
+/// How a number with a fraction becomes a whole one: half to even, half away
+/// from zero, or (`exact`) not at all.
+pub const Round = enum { half_even, half_away, exact };
+
+/// `d`, at its own scale, as a whole number rounded by `r`; null when `exact`
+/// meets a fraction. Past scale 38 every value rounds to 0.
+pub fn roundedWhole(d: Decimal, comptime r: Round) ?i128 {
+    if (d.scale == 0) return d.unscaled;
+    if (d.scale >= pow10_i128.len) return switch (r) {
+        .exact => if (d.unscaled == 0) 0 else null,
+        else => 0,
+    };
+    const p = pow10_i128[d.scale];
+    const q = @divTrunc(d.unscaled, p);
+    const rem2 = @abs(@rem(d.unscaled, p)) * 2;
+    const away = switch (r) {
+        .exact => if (rem2 != 0) return null else false,
+        .half_away => rem2 >= @abs(p),
+        .half_even => rem2 > @abs(p) or (rem2 == @abs(p) and @rem(q, 2) != 0),
+    };
+    return if (!away) q else if (d.unscaled < 0) q - 1 else q + 1;
+}
+
+/// 10^n as an i128, null past 10^38, the largest power of ten an i128 holds.
+pub fn pow10Checked(n: anytype) ?i128 {
+    return if (n < pow10_i128.len) pow10_i128[n] else null;
+}
+
 /// `d` rounded half away from zero to a whole number; null past scale 38, where
 /// no i128 power of ten divides it.
 pub inline fn roundWhole(d: Decimal) ?i128 {

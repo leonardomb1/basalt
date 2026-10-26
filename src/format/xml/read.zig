@@ -30,6 +30,7 @@ const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const csv = @import("../csv.zig");
 const jsontext = @import("../../exec/jsontext.zig");
+const textconv = @import("../../exec/textconv.zig");
 const texttype = @import("../texttype.zig");
 const token = @import("token.zig");
 const escape = @import("escape.zig");
@@ -515,7 +516,7 @@ fn keyOf(arena: std.mem.Allocator, kind: Kind, name: []const u8) ![]const u8 {
 fn isNil(o: token.Tag) bool {
     var it = o.iterator();
     while (it.next()) |a| if (std.mem.eql(u8, token.localName(a.name), "nil") and std.mem.startsWith(u8, a.name, "xsi:"))
-        return std.mem.eql(u8, a.value, "true") or std.mem.eql(u8, a.value, "1");
+        return textconv.boolText(.xsd_nil, a.value).?;
     return false;
 }
 

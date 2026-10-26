@@ -38,6 +38,7 @@
 //! checkpoint's actions are nested structs and maps.
 
 const std = @import("std");
+const textconv = @import("../../exec/textconv.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const codecs = @import("../compress/codecs.zig");
 const column = @import("../../exec/column.zig");
@@ -389,9 +390,9 @@ fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
         while (it.next()) |kv| if (std.mem.startsWith(u8, kv.key_ptr.*, "delta.constraints."))
             return refuse("{s} has CHECK constraint `{s}`, which basalt does not enforce, so it does not write the table", .{ st.name, kv.key_ptr.*["delta.constraints.".len..] });
     }
-    if (mode != .append) if (st.property("delta.appendOnly")) |v| if (std.ascii.eqlIgnoreCase(v, "true"))
+    if (mode != .append) if (st.property("delta.appendOnly")) |v| if (textconv.boolText(.delta_property, v).?)
         return refuse("{s} is append-only (`delta.appendOnly`), so {s} cannot remove its files", .{ st.name, if (mode == .replace) "a REPLACE" else "an UPSERT" });
-    if (mode == .upsert) if (st.property("delta.enableChangeDataFeed")) |v| if (std.ascii.eqlIgnoreCase(v, "true"))
+    if (mode == .upsert) if (st.property("delta.enableChangeDataFeed")) |v| if (textconv.boolText(.delta_property, v).?)
         return refuse("{s} records a change data feed (`delta.enableChangeDataFeed`), which an UPSERT's rewritten files would misreport (every row of a rewritten file as deleted and inserted); basalt does not write the change files that would say which rows changed", .{st.name});
 }
 

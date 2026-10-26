@@ -1416,7 +1416,7 @@ fn decodeMoney(bytes: []const u8) MalformedValue!Decimal {
 fn decodeTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
     if (bytes.len < 3 or bytes.len > 5) return error.MalformedTdsValue;
     const tu: i64 = @intCast(readULE(bytes));
-    return @divTrunc(tu * 1_000_000, pow10(d.scale));
+    return @divTrunc(tu * 1_000_000, scaleDivisor(d.scale));
 }
 
 /// DATETIME2/DATETIMEOFFSET: 3-5 bytes of time, 3 of date (and 2 of offset);
@@ -1449,11 +1449,8 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
 
 /// 10^18 is the largest power of ten an i64 holds; a wire scale is capped there.
 /// TDS never sends more than 7.
-fn pow10(n: u8) i64 {
-    var r: i64 = 1;
-    var k: u8 = 0;
-    while (k < @min(n, 18)) : (k += 1) r *= 10;
-    return r;
+fn scaleDivisor(n: u8) i64 {
+    return @intCast(decimal.pow10_i128[@min(n, 18)]);
 }
 
 fn readULE(bytes: []const u8) u64 {

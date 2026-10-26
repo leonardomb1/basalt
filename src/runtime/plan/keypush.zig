@@ -47,6 +47,7 @@ const op = @import("../../exec/op.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const std = @import("std");
 const translate = @import("../pushdown/translate.zig");
+const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
 
 pub const Dialect = translate.Dialect;
@@ -56,7 +57,7 @@ pub fn disabled(hints: []const ast.Hint) bool {
     for (hints) |h| {
         if (!std.mem.eql(u8, h.key, "key_pushdown")) continue;
         return switch (h.value) {
-            .ident, .str => |s| std.ascii.eqlIgnoreCase(s, "false") or std.ascii.eqlIgnoreCase(s, "off"),
+            .ident, .str => |s| !textconv.boolText(.key_pushdown, s).?,
             .int => |i| i == 0,
             .flag => false,
         };

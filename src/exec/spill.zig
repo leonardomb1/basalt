@@ -23,6 +23,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const column = @import("column.zig");
+const civil = @import("civil.zig");
 const space_mod = @import("space.zig");
 
 const Space = space_mod.Space;
@@ -367,7 +368,7 @@ fn allKindsBatch(a: std.mem.Allocator, rows: usize, seed: usize) !Batch {
             if (nul) .null else .{ .bytes = if (k % 5 == 2) "" else raw },
             if (nul) .null else .{ .date = @as(i32, @intCast(k)) - 20000 },
             if (nul) .null else .{ .time = ki * 1_000_000 },
-            if (nul) .null else .{ .timestamp = ki * 86_400_000_000 - 5 },
+            if (nul) .null else .{ .timestamp = ki * civil.us_per_day - 5 },
             .null,
         };
         for (&builders, row) |*b, v| try b.append(v);

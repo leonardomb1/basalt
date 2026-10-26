@@ -16,6 +16,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const celltext = @import("../exec/celltext.zig");
+const textconv = @import("../exec/textconv.zig");
 const driver = @import("driver.zig");
 
 pub const Grid = struct {
@@ -247,7 +248,7 @@ pub const palette = struct {
         return switch (k) {
             .int, .float, .decimal => if (cell.len > 0 and cell[0] == '-') "\x1b[31m" else "\x1b[36m",
             .date, .time, .timestamp => "\x1b[35m",
-            .bool => if (std.mem.eql(u8, cell, "true")) "\x1b[32m" else "\x1b[31m",
+            .bool => if (textconv.boolText(.printed, cell).?) "\x1b[32m" else "\x1b[31m",
             .array, .@"struct" => "\x1b[33m",
             .bytes => "\x1b[2m",
             .string => "",

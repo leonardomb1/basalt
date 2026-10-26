@@ -352,31 +352,11 @@ pub fn mask(gpa: std.mem.Allocator, source: [:0]const u8, tests: bool) ![]u8 {
 /// modules that may legitimately hold one, some not yet written. Wave 2 shrinks
 /// each list to its homes and switches to `.exact`.
 pub const plan = [_]Rule{
-    .{ .home = "civil", .pattern = civil_pattern, .allow = &.{
-        "exec/civil.zig",
-        "format/xlsx/serial.zig",
-        "format/lake/delta_types.zig",
-        "connect/split.zig",
-        "db/sqlserver/aad.zig",
-        "db/sqlserver/tds.zig",
-        "exec/cell.zig",
-        "exec/eval/cast.zig",
-        "exec/eval/fn_row.zig",
-        "exec/eval/fn_vec.zig",
-        "exec/eval/format.zig",
-        "exec/eval/functions.zig",
-        "exec/eval/scalar.zig",
-        "exec/eval/time.zig",
-        "exec/spill.zig",
-        "format/avro/testing_util.zig",
-        "format/avro/write.zig",
-        "format/lake/delta_write.zig",
-        "format/parquet/encoding.zig",
-        "format/xlsx/read.zig",
-        "format/xlsx/write.zig",
-        "net/auth/krb5.zig",
-        "runtime/analyze/schema.zig",
-    } },
+    .{ .home = "civil", .pattern = civil_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
+    .{ .home = "civil.Part", .pattern = part_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
+    .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &.{"exec/textconv.zig"} },
+    .{ .home = "floatord", .pattern = floatord_pattern, .exact = true, .allow = &.{"exec/floatord.zig"} },
+    .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
     .{ .home = "jsontext", .pattern = jsontext_pattern, .allow = &.{
         "exec/jsontext.zig",
         "format/lake/delta_types.zig",
@@ -456,6 +436,10 @@ pub const plan = [_]Rule{
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
+pub const part_pattern = "\"(year|month|week|day|hour|minute|second)s?\", \\.(year|month|week|day|hour|minute|second)|eqlIgnoreCase\\([^\"]*\"(year|month|week|day|hour|minute|second)s?\"|stringToEnum\\(Part,";
+pub const textconv_pattern = "(eqlIgnoreCase\\(|eql\\(u8, )[^\"]*\"(true|false|yes|no)\"\\)|\\[0\\] == '[tTyY]'|0x1p63";
+pub const floatord_pattern = "0x7[fF][fF]8|>> 63 != 0\\) ~|\\| \\(1 << 63\\)|std\\.math\\.order\\([^)]*\\.float";
+pub const decimal_pattern = "fn pow10|std\\.math\\.powi?\\(i(64|128|256), 10,|@(divTrunc|rem|mod|divFloor|divExact)\\(\\w+\\.unscaled, ";
 pub const jsontext_pattern = "encodeJsonString(Chars)?";
 pub const hex_pattern = "parseInt\\(.*16\\)";
 pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc";
@@ -501,6 +485,10 @@ fn expectNeedles(pattern: []const u8, want: ?[]const []const u8) !void {
 test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles("abc", &.{"abc"});
     try expectNeedles(civil_pattern, &.{ "719", "146", "719", "25", "107", "440", "86_400_000_000", "std.time.epoch." });
+    try expectNeedles(part_pattern, &.{ "\", .", "eqlIgnoreCase(", "stringToEnum(Part," });
+    try expectNeedles(textconv_pattern, &.{ "\")", "[0] == '", "0x1p63" });
+    try expectNeedles(floatord_pattern, &.{ "0x7", ">> 63 != 0) ~", "| (1 << 63)", "std.math.order(" });
+    try expectNeedles(decimal_pattern, &.{ "fn pow10", "std.math.pow", ".unscaled, " });
     try expectNeedles(jsontext_pattern, &.{"encodeJsonString"});
     try expectNeedles(scheme_pattern, &.{"startsWith(u8, "});
     try expectNeedles(sql_pattern, &.{ "\"''\"", "== '\\''", "'\\'' =>" });
@@ -552,6 +540,33 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ civil_pattern, "86400000000", false },
         .{ civil_pattern, "std.time.epoch.EpochSeconds", true },
         .{ civil_pattern, "std.time.timestamp()", false },
+        .{ part_pattern, ".{ \"hours\", .hour },", true },
+        .{ part_pattern, "if (std.ascii.eqlIgnoreCase(u, \"minutes\")) return .minute;", true },
+        .{ part_pattern, "std.meta.stringToEnum(Part, low)", true },
+        .{ part_pattern, "civil.Part.parse(word)", false },
+        .{ part_pattern, ".{ .name = \"day\", .ty = types.Type.init(.date) },", false },
+        .{ textconv_pattern, "return std.mem.eql(u8, a.value, \"true\") or std.mem.eql(u8, a.value, \"1\");", true },
+        .{ textconv_pattern, "if (std.ascii.eqlIgnoreCase(v, \"true\"))", true },
+        .{ textconv_pattern, "raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T')", true },
+        .{ textconv_pattern, "if (!(r < 0x1p63)) return null;", true },
+        .{ textconv_pattern, "std.mem.eql(u8, tls.?, \"off\")", false },
+        .{ textconv_pattern, "textconv.boolText(.xsd_nil, a.value).?", false },
+        .{ textconv_pattern, ".bool => |b| if (b) \"true\" else \"false\",", false },
+        .{ floatord_pattern, "const b: u64 = if (std.math.isNan(y)) 0x7ff8000000000000 else @bitCast(y);", true },
+        .{ floatord_pattern, "return if (b >> 63 != 0) ~b else b | (1 << 63);", true },
+        .{ floatord_pattern, "return std.math.order(a.float, b.float);", true },
+        .{ floatord_pattern, ".ints => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),", false },
+        .{ floatord_pattern, "return std.math.order(a.int, b.int);", false },
+        .{ floatord_pattern, "floatord.orderedBits(x)", false },
+        .{ decimal_pattern, "fn pow10(n: u8) i64 {", true },
+        .{ decimal_pattern, "const p = std.math.powi(i128, 10, scale) catch return off_max;", true },
+        .{ decimal_pattern, "const top: i128 = std.math.pow(i128, 10, 38) - 1;", true },
+        .{ decimal_pattern, "const q = @divTrunc(d.unscaled, p);", true },
+        .{ decimal_pattern, "if (@rem(d.unscaled, p) != 0) return null;", true },
+        .{ decimal_pattern, "if (!decimal.withinPrecision(r.unscaled, p)) return error.X;", false },
+        .{ decimal_pattern, "std.math.mul(i128, x.unscaled, plan.fl)", false },
+        .{ decimal_pattern, "const p = decimal.pow10Checked(s) orelse return off_max;", false },
+        .{ decimal_pattern, "std.math.pow(f64, 10, @floatFromInt(scale))", false },
         .{ jsontext_pattern, "std.json.encodeJsonString(s, .{}, w)", true },
         .{ jsontext_pattern, "std.json.encodeJsonStringChars(s, .{}, w)", true },
         .{ jsontext_pattern, "jsontext.string(w, s)", false },

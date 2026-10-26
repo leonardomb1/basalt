@@ -23,6 +23,7 @@
 //! cell, as strict OOXML writes it, stays text.
 
 const std = @import("std");
+const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
 const Value = @import("../../exec/value.zig").Value;
 const column = @import("../../exec/column.zig");
@@ -363,7 +364,7 @@ pub const Reader = struct {
             defer closePart(&p);
             while (try p.tk.next()) |t| switch (t) {
                 .open => |o| if (std.mem.eql(u8, o.name, "workbookPr")) {
-                    if (o.attr("date1904")) |v| self.date1904 = std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+                    if (o.attr("date1904")) |v| self.date1904 = textconv.boolText(.ooxml_flag, v).?;
                 } else if (std.mem.eql(u8, o.name, "sheet")) {
                     const name = try decodeAttr(arena, o.attr("name") orelse continue);
                     const rid = o.attr("id") orelse continue;
