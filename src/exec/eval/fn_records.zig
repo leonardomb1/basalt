@@ -849,6 +849,16 @@ test "decoders read fields and encoders write them back" {
     try testing.expectEqualStrings("c", (try lit(a, "byte_slice('abc', 2, 1)")).bytes);
 }
 
+test "decode, text_at and encode read cp1252's unassigned bytes as C1 controls and write them back (D5)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    try testing.expectEqualStrings("\u{81}\u{8d}\u{8f}\u{90}\u{9d}\u{20ac}", (try lit(a, "decode(x'818D8F909D80', 'cp1252')")).string);
+    try testing.expectEqualStrings("\u{8f}\u{90}", (try lit(a, "text_at(x'818D8F909D', 2, 2, 'cp1252')")).string);
+    try testing.expectEqualStrings("\x81\x8d\x8f\x90\x9d\x80", (try lit(a, "encode(decode(x'818D8F909D80', 'cp1252'), 'cp1252')")).bytes);
+}
+
 test "record functions check their literal lengths, scales, charsets and patterns" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

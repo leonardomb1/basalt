@@ -16,7 +16,8 @@
 //! parallel reader's byte-range chunking. Byte `b` of latin-1 is U+00`b`, so no
 //! byte sequence can hold a delimiter or newline. Files labelled latin-1 are
 //! often really cp1252, whose 0x80–0x9F block holds curly quotes, dashes and the
-//! euro sign (its five undefined slots decode to U+FFFD).
+//! euro sign (its five unassigned slots decode to their C1 controls, as Windows'
+//! bestfit1252 table, WHATWG and MySQL read them, and encode back).
 //!
 //! Where the bytes come from (a file, a URL, an object, SFTP, SMB, a zip member)
 //! and their gzip or zstd decoding is `stream.zig`'s; the reader parses its
@@ -1788,7 +1789,8 @@ test "encodeField: UTF-8 narrows to latin-1 and cp1252, a character neither hold
     try std.testing.expectEqualStrings("\x93hi\x94 \x80", try encodeField(a, .cp1252, "“hi” €"));
     try std.testing.expectEqualStrings("“hi”", try encodeField(a, .utf8, "“hi”"));
     try std.testing.expectError(error.Unencodable, encodeField(a, .latin1, "€"));
-    try std.testing.expectError(error.Unencodable, encodeField(a, .cp1252, "\u{0081}"));
+    try std.testing.expectEqualStrings("\x81\x9d", try encodeField(a, .cp1252, "\u{0081}\u{009D}"));
+    try std.testing.expectError(error.Unencodable, encodeField(a, .cp1252, "\u{0080}"));
     try std.testing.expectError(error.Unencodable, encodeField(a, .latin1, "caf\xe9"));
 }
 
@@ -1804,7 +1806,7 @@ test "decodeField: latin-1 and cp1252 widen to UTF-8, ASCII is passed through" {
     try std.testing.expectEqualStrings("LIQUIDAÇÃO", try decodeField(a, .latin1, "LIQUIDA\xC7\xC3O"));
     try std.testing.expectEqualStrings("“hi”", try decodeField(a, .cp1252, "\x93hi\x94"));
     try std.testing.expectEqualStrings("€", try decodeField(a, .cp1252, "\x80"));
-    try std.testing.expectEqualStrings("\u{FFFD}", try decodeField(a, .cp1252, "\x81"));
+    try std.testing.expectEqualStrings("\u{0081}\u{008D}\u{008F}\u{0090}\u{009D}", try decodeField(a, .cp1252, "\x81\x8d\x8f\x90\x9d"));
     try std.testing.expectEqualStrings("ção éáíóúâêô x", try decodeField(a, .latin1, "\xe7\xe3o \xe9\xe1\xed\xf3\xfa\xe2\xea\xf4 x"));
     try std.testing.expectEqualStrings("€€€€€€€€€€ ok", try decodeField(a, .cp1252, "\x80" ** 10 ++ " ok"));
 }
@@ -1833,6 +1835,21 @@ test "csv dialect: a semicolon latin-1 file reads as UTF-8 columns" {
     try std.testing.expectEqualStrings("LIQUIDAÇÃO", b.columns[0].data.bytes.at(0));
     try std.testing.expectEqualStrings("AÇÕES", b.columns[1].data.bytes.at(0));
     try std.testing.expectEqualStrings("CANCELADA", b.columns[0].data.bytes.at(1));
+}
+
+test "csv dialect: a cp1252 file reads its unassigned bytes as C1 controls, as WHATWG and MySQL do (D5)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "A;B\r\n\x93x\x94;\x81\x8d\x8f\x90\x9d\r\n" });
+    const path = try tmp.dir.realpathAlloc(a, "c.csv");
+    const r = try CsvReader.open(a, path, .{ .delim = ';', .encoding = .cp1252 });
+    defer r.close();
+    const b = (try r.next(a)).?;
+    try std.testing.expectEqualStrings("“x”", b.columns[0].data.bytes.at(0));
+    try std.testing.expectEqualStrings("\u{81}\u{8d}\u{8f}\u{90}\u{9d}", b.columns[1].data.bytes.at(0));
 }
 
 test "csv dialect: the same file read with the default dialect is one column" {

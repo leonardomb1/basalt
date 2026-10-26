@@ -19,7 +19,10 @@ account's (empty for one local to the server), and `port` is 445. Without a
 connection, `smb://[domain;]user@host/share/path` logs in as that user with
 `SMB_PASSWORD` (`SMB_USER` and `SMB_DOMAIN` filling what the URL leaves out).
 Paths use `/`; names are matched as the server matches them, without regard to
-case on Windows.
+case on Windows. A name holding an unpaired UTF-16 surrogate half, which Windows
+allows in a file name but Unicode does not, is listed with U+FFFD in its place,
+as Windows itself converts it, so one such file does not hide the rest of a
+folder; that file cannot be opened by the listed name.
 
 The login is NTLMv2, or Kerberos when the connection names a `realm` — the
 domain's DNS name in capitals (`CORP.LOCAL`), not its NetBIOS name. Kerberos is

@@ -32,9 +32,11 @@
 //!
 //! Decoding notes: `tinyint` is the only 1-byte integer and is unsigned (sign
 //! extension once turned 200 into -56). MONEY is a scaled integer of
-//! ten-thousandths, the 8-byte form sent high word first. Non-Unicode text is
-//! transcoded from Windows-1252, the code page behind the common Latin collations,
-//! so accented text does not reach a UTF-8 sink as invalid bytes. `uniqueidentifier`
+//! ten-thousandths, the 8-byte form sent high word first. Non-Unicode text reads by
+//! its column's collation: Windows-1252, the code page behind the common Latin
+//! collations, is transcoded so accented text does not reach a UTF-8 sink as invalid
+//! bytes; a UTF-8 collation's bytes are validated; any other code page fails on its
+//! first non-ASCII value rather than turn into mojibake. `uniqueidentifier`
 //! renders as a canonical GUID and binary as `0x...` hex, since raw bytes would
 //! carry separators and newlines into a delimited bulk load.
 //!
@@ -55,6 +57,7 @@ const charset = @import("../../format/charset.zig");
 const hex = @import("../../format/hex.zig");
 const uuid = @import("../../format/uuid.zig");
 const utf16 = @import("../../format/utf16.zig");
+const eval = @import("../../exec/eval.zig");
 const driver = @import("../../connect/driver.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
@@ -830,7 +833,7 @@ const TdsCursor = struct {
             d.decode = decodeOf(d);
             const namelen: usize = try self.reader.readByte();
             const nbytes = try self.reader.readSlice(ma, namelen * 2);
-            d.name = try utf16.decodeLeAlloc(.question, ma, nbytes);
+            d.name = try utf16.decodeLeAlloc(.replacement, ma, nbytes);
             self.cols[k] = d;
             fields[k] = .{ .name = d.name, .ty = d.engine_type };
         }
@@ -951,7 +954,7 @@ const TdsCursor = struct {
             },
             0xA7, 0xAF => {
                 const ml = try self.reader.readU16();
-                try self.reader.skip(5);
+                try self.readCollation(&d);
                 d.kind = if (ml == 0xFFFF) .plp else .ushortlen;
                 d.engine_type = strT;
             },
@@ -980,7 +983,8 @@ const TdsCursor = struct {
             },
             0x22, 0x23, 0x63 => {
                 _ = try self.reader.readU32();
-                if (t == 0x23 or t == 0x63) try self.reader.skip(5);
+                if (t == 0x23) try self.readCollation(&d);
+                if (t == 0x63) try self.reader.skip(5);
                 var parts = try self.reader.readByte();
                 while (parts > 0) : (parts -= 1) try self.reader.skip(@as(usize, try self.reader.readU16()) * 2);
                 d.kind = .textptr;
@@ -991,6 +995,12 @@ const TdsCursor = struct {
             else => return error.UnsupportedTdsType,
         }
         return d;
+    }
+
+    /// A varchar, char or text column's COLLATION, and the encoding its bytes read in.
+    fn readCollation(self: *TdsCursor, d: *ColumnDesc) !void {
+        try self.reader.readBytes(&d.collation);
+        d.text_enc = textEncoding(d.collation);
     }
 
     fn parseRow(self: *TdsCursor, arena: std.mem.Allocator, builders: []column.Builder, nbc: bool) !void {
@@ -1029,11 +1039,19 @@ const TdsCursor = struct {
         if ((col.kind == .bytelen and len == 0) or (col.kind == .ushortlen and len == 0xFFFF)) return b.append(.null);
         const dst = try b.reserveBytes(len);
         try self.reader.readBytes(dst);
-        if (isAscii(dst)) return b.commitBytes(len);
+        if (charset.isAscii(dst)) return b.commitBytes(len);
+        switch (col.text_enc) {
+            .cp1252 => {},
+            .utf8 => {
+                if (!std.unicode.utf8ValidateSlice(dst)) return badUtf8(col.name);
+                return b.commitBytes(len);
+            },
+            .other => return otherCodePage(col),
+        }
         const raw = self.cell[0..len];
         @memcpy(raw, dst);
-        const out = try b.reserveBytes(win1252Len(raw));
-        return b.commitBytes(win1252Encode(out, raw));
+        const out = try b.reserveBytes(charset.decodedLen(.cp1252, raw));
+        return b.commitBytes(charset.decodeInto(.cp1252, out, raw));
     }
 
     /// Fixed and length-prefixed cells, never longer than the cell buffer, are read
@@ -1125,14 +1143,14 @@ const BulkProto = struct {
         var buf: [celltext.scalar_bound]u8 = undefined;
         for (0..batch.len) |r| {
             try w.writeByte(0xD1);
-            for (batch.columns) |*col| {
+            for (batch.columns, batch.schema.fields) |*col, f| {
                 if (celltext.isNull(col, r)) {
                     try writeU16(w, 0xFFFF);
                     continue;
                 }
                 const s = celltext.text(col, r, &buf, sql.BulkText(.{ .bool_true = "1", .bool_false = "0" }){});
                 try units.resize(2 * s.len);
-                const le = units.items[0..try utf16.encodeLe(units.items, s)];
+                const le = units.items[0 .. utf16.encodeLe(units.items, s) catch return notUtf8(f.name)];
                 const blen = utf16.cutLe(le, NVARCHAR_MAX_BYTES);
                 try writeU16(w, @intCast(blen));
                 try w.writeAll(le[0..blen]);
@@ -1197,7 +1215,7 @@ test "INSERT BULK rows of every kind" {
     }, got);
 }
 
-test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8" {
+test "INSERT BULK cuts a long cell before a split surrogate pair and refuses invalid UTF-8, never repairs it (D7)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1227,6 +1245,7 @@ test "INSERT BULK cuts a long cell before a split surrogate pair and refuses inv
     try std.testing.expectEqual(got.items.len, off);
     try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" })));
     try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"})));
+    try std.testing.expectEqualStrings("column `c` holds text that is not valid UTF-8, which SQL Server's nvarchar cannot take unaltered; repair or drop it before the load", eval.takeFailure(error.InvalidUtf8).?);
 }
 
 fn writeU16(w: anytype, v: u16) !void {
@@ -1251,8 +1270,55 @@ const ColumnDesc = struct {
     is_guid: bool = false,
     is_binary: bool = false,
     is_money: bool = false,
+    collation: [5]u8 = .{ 0, 0, 0, 0, 0 },
+    text_enc: TextEnc = .cp1252,
     decode: Decode = .raw_text,
 };
+
+/// The encoding of a varchar, char or text column's bytes, from its COLLATION
+/// ([MS-TDS] 2.2.5.1.2: a 20-bit LCID, eight flags of which fUTF8 is u32 bit 26,
+/// a 4-bit version, then a SortId byte). ASCII reads the same in every one.
+const TextEnc = enum { cp1252, utf8, other };
+
+/// Windows collations (SortId 0) whose code page is 1252, by the low 16 bits of the
+/// LCID (the high four are a sort variant, as German_PhoneBook's 0x10407).
+const cp1252_lcids = [_]u16{
+    0x0403, 0x0406, 0x0407, 0x0409, 0x040a, 0x040b, 0x040c, 0x040f, 0x0410, 0x0413,
+    0x0414, 0x0416, 0x0417, 0x041d, 0x0421, 0x042d, 0x042e, 0x0436, 0x0437, 0x0438,
+    0x043b, 0x043e, 0x0441, 0x0452, 0x0456, 0x0462, 0x047a, 0x047c, 0x047e, 0x0483,
+    0x0807, 0x0809, 0x080a, 0x080c, 0x0810, 0x0813, 0x0814, 0x0816, 0x081d, 0x083b,
+    0x083e, 0x085f, 0x0c07, 0x0c09, 0x0c0a, 0x0c0c, 0x1007, 0x1009, 0x100a, 0x100c,
+    0x1407, 0x1409, 0x140a, 0x140c, 0x1809, 0x180a, 0x180c, 0x1c09, 0x1c0a, 0x2009,
+    0x200a, 0x2409, 0x240a, 0x2809, 0x280a, 0x2c09, 0x2c0a, 0x3009, 0x300a, 0x3409,
+    0x340a, 0x380a, 0x3c0a, 0x400a, 0x440a, 0x480a, 0x4c0a, 0x500a,
+};
+
+/// The UTF-8 flag wins; a SQL collation (SortId not 0) is cp1252 only for the
+/// SQL_*_CP1_* sort orders 51-54 and 183-186; a Windows one by its LCID. Anything
+/// not known to be 1252 is `other`, never guessed.
+fn textEncoding(c: [5]u8) TextEnc {
+    if (c[3] & 0x04 != 0) return .utf8;
+    if (c[4] != 0) return switch (c[4]) {
+        51...54, 183...186 => .cp1252,
+        else => .other,
+    };
+    const lcid = std.mem.readInt(u16, c[0..2], .little);
+    return if (std.mem.indexOfScalar(u16, &cp1252_lcids, lcid) != null) .cp1252 else .other;
+}
+
+/// Fails a read on a varchar cell in a UTF-8 collation holding bytes that are not UTF-8.
+fn badUtf8(name: []const u8) error{InvalidUtf8} {
+    var buf: [480]u8 = undefined;
+    return @errorCast(eval.explain(error.InvalidUtf8, std.fmt.bufPrint(&buf, "SQL Server column `{s}` has a UTF-8 collation but holds bytes that are not valid UTF-8; repair it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}) catch unreachable));
+}
+
+/// Fails a read on a non-ASCII varchar cell whose collation's code page is not
+/// windows-1252, rather than guess its characters.
+fn otherCodePage(d: ColumnDesc) error{UnsupportedCollation} {
+    var buf: [480]u8 = undefined;
+    const lcid = std.mem.readInt(u32, d.collation[0..4], .little) & 0xFFFFF;
+    return @errorCast(eval.explain(error.UnsupportedCollation, std.fmt.bufPrint(&buf, "SQL Server column `{s}` is non-Unicode text in a collation (LCID 0x{x:0>5}, sort id {d}) whose code page basalt does not read; read the column CAST(... AS nvarchar(...))", .{ eval.clip(d.name), lcid, d.collation[4] }) catch unreachable));
+}
 
 /// How a column's cells reach its builder, chosen once from its metadata
 /// (`decodeOf`); each is an `appendRaw` instantiated at compile time.
@@ -1287,14 +1353,38 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .time => try b.appendInt(try decodeTime(d, raw)),
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
         .plain_text, .win1252 => {
-            if (isAscii(raw)) return b.appendStr(raw);
-            return b.commitBytes(win1252Encode(try b.reserveBytes(win1252Len(raw)), raw));
+            if (charset.isAscii(raw)) return b.appendStr(raw);
+            switch (d.text_enc) {
+                .cp1252 => {},
+                .utf8 => {
+                    if (!std.unicode.utf8ValidateSlice(raw)) return badUtf8(d.name);
+                    return b.appendStr(raw);
+                },
+                .other => return otherCodePage(d),
+            }
+            return b.commitBytes(charset.decodeInto(.cp1252, try b.reserveBytes(charset.decodedLen(.cp1252, raw)), raw));
         },
-        .unicode_text => try b.commitBytes(utf16.decodeLe(.question, try b.reserveBytes(utf16.decodedBound(raw.len)), raw)),
+        .unicode_text => try b.commitBytes(utf16.decodeLe(.fail, try b.reserveBytes(utf16.decodedBound(raw.len)), raw) catch |e| return notUtf16(d.name, e)),
         .guid => try b.appendStr(if (raw.len < 16) "" else &uuid.text(raw[0..16], .mixed)),
         .hex => try b.appendStr(try bytesToHex(arena, raw)),
         .bytes, .raw_text => try b.appendStr(raw),
     }
+}
+
+/// Fails a read on an nvarchar cell that is not UTF-16 text, naming its column.
+fn notUtf16(name: []const u8, e: utf16.DecodeError) utf16.DecodeError {
+    var buf: [480]u8 = undefined;
+    const msg = switch (e) {
+        error.LoneSurrogate => std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds an unpaired UTF-16 surrogate half, which is not Unicode text; REPLACE it at the source or read the column CAST(... AS varbinary)", .{eval.clip(name)}),
+        error.OddUtf16 => std.fmt.bufPrint(&buf, "SQL Server column `{s}` holds a value of an odd number of bytes, which is not UTF-16 text; read the column CAST(... AS varbinary)", .{eval.clip(name)}),
+    } catch unreachable;
+    return @errorCast(eval.explain(e, msg));
+}
+
+/// Fails a bulk load on text that is not valid UTF-8, naming its column.
+fn notUtf8(name: []const u8) error{InvalidUtf8} {
+    var buf: [480]u8 = undefined;
+    return @errorCast(eval.explain(error.InvalidUtf8, std.fmt.bufPrint(&buf, "column `{s}` holds text that is not valid UTF-8, which SQL Server's nvarchar cannot take unaltered; repair or drop it before the load", .{eval.clip(name)}) catch unreachable));
 }
 
 /// `appendRaw` for a column whose decode is known only at run time.
@@ -1394,63 +1484,6 @@ fn readIntLE(bytes: []const u8) i64 {
     };
 }
 
-const Utf8Seq = struct { len: u8, bytes: [3]u8 };
-
-/// UTF-8 of each byte 0x80-0xFF; the five bytes Windows-1252 leaves undefined
-/// read as their C1 control, as SQL Server converts them.
-const win1252_high: [128]Utf8Seq = blk: {
-    @setEvalBranchQuota(10_000);
-    var t: [128]Utf8Seq = undefined;
-    for (&t, 0..) |*e, k| {
-        var buf: [4]u8 = undefined;
-        const cp: u21 = if (k < 32 and charset.cp1252_high[k] != 0) charset.cp1252_high[k] else 0x80 + k;
-        const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
-        e.* = .{ .len = n, .bytes = buf[0..3].* };
-    }
-    break :blk t;
-};
-
-/// Whether every byte is below 0x80, sixteen bytes at a time.
-fn isAscii(bytes: []const u8) bool {
-    const V = @Vector(16, u8);
-    var acc: V = @splat(0);
-    var i: usize = 0;
-    while (i + 16 <= bytes.len) : (i += 16) acc |= @as(V, bytes[i..][0..16].*);
-    var tail: u8 = @reduce(.Or, acc);
-    for (bytes[i..]) |b| tail |= b;
-    return tail < 0x80;
-}
-
-/// Writes the UTF-8 form of Windows-1252 `src` into `dst`, which holds at least
-/// `win1252Len(src)` bytes, and returns that length.
-fn win1252Encode(dst: []u8, src: []const u8) usize {
-    var o: usize = 0;
-    for (src) |b| {
-        if (b < 0x80) {
-            dst[o] = b;
-            o += 1;
-        } else {
-            const e = win1252_high[b - 0x80];
-            @memcpy(dst[o..][0..e.len], e.bytes[0..e.len]);
-            o += e.len;
-        }
-    }
-    return o;
-}
-
-fn win1252Len(src: []const u8) usize {
-    var n: usize = 0;
-    for (src) |b| n += if (b < 0x80) 1 else win1252_high[b - 0x80].len;
-    return n;
-}
-
-fn win1252ToUtf8(arena: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    if (isAscii(bytes)) return arena.dupe(u8, bytes);
-    const out = try arena.alloc(u8, win1252Len(bytes));
-    _ = win1252Encode(out, bytes);
-    return out;
-}
-
 fn bytesToHex(arena: std.mem.Allocator, b: []const u8) ![]const u8 {
     const out = try arena.alloc(u8, 2 + b.len * 2);
     out[0..2].* = "0x".*;
@@ -1519,96 +1552,62 @@ test "tds: binary text is 0x and lower-case hex, as the old bytesToHex wrote it"
     }
 }
 
-test "tds: the varchar table maps every high byte as the old cp1252High switch did, undefined bytes to C1 (D5)" {
-    const old = struct {
-        fn cp1252High(b: u8) u21 {
-            return switch (b) {
-                0x80 => 0x20AC,
-                0x82 => 0x201A,
-                0x83 => 0x0192,
-                0x84 => 0x201E,
-                0x85 => 0x2026,
-                0x86 => 0x2020,
-                0x87 => 0x2021,
-                0x88 => 0x02C6,
-                0x89 => 0x2030,
-                0x8A => 0x0160,
-                0x8B => 0x2039,
-                0x8C => 0x0152,
-                0x8E => 0x017D,
-                0x91 => 0x2018,
-                0x92 => 0x2019,
-                0x93 => 0x201C,
-                0x94 => 0x201D,
-                0x95 => 0x2022,
-                0x96 => 0x2013,
-                0x97 => 0x2014,
-                0x98 => 0x02DC,
-                0x99 => 0x2122,
-                0x9A => 0x0161,
-                0x9B => 0x203A,
-                0x9C => 0x0153,
-                0x9E => 0x017E,
-                0x9F => 0x0178,
-                else => b,
-            };
-        }
-    };
-    for (0..128) |k| {
-        var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(old.cp1252High(@intCast(0x80 + k)), &buf);
-        const e = win1252_high[k];
-        try std.testing.expectEqualSlices(u8, buf[0..n], e.bytes[0..e.len]);
+/// One varchar cell's wire bytes through the read path's decode, as text.
+fn varcharCell(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var d = ColumnDesc{ .tds_type = 0xA7, .engine_type = types.Type.init(.string).asNullable(), .kind = .ushortlen };
+    d.decode = decodeOf(d);
+    return (try cellValue(a, d, raw)).string;
+}
+
+test "tds: a varchar cell decodes as charset's cp1252 does, the unassigned bytes to their C1 controls (D5)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for (0..256) |i| {
+        const b = [1]u8{@intCast(i)};
+        try std.testing.expectEqualStrings(try charset.decode(a, .cp1252, &b), try varcharCell(a, &b));
     }
-    for ([_]u8{ 0x81, 0x8D, 0x8F, 0x90, 0x9D }) |b| {
-        const e = win1252_high[b - 0x80];
-        var want: [2]u8 = undefined;
-        _ = try std.unicode.utf8Encode(b, &want);
-        try std.testing.expectEqualSlices(u8, &want, e.bytes[0..e.len]);
-    }
+    try std.testing.expectEqualStrings("\xc2\x81\xc2\x8d\xc2\x8f\xc2\x90\xc2\x9d", try varcharCell(a, "\x81\x8d\x8f\x90\x9d"));
+    try std.testing.expectEqualStrings("\xc2\x81\xc2\x8d\xc2\x8f\xc2\x90\xc2\x9d", try charset.decode(a, .cp1252, "\x81\x8d\x8f\x90\x9d"));
 }
 
 test "win1252 transcode to utf8" {
-    const alloc = std.testing.allocator;
-    const out = try win1252ToUtf8(alloc, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' });
-    defer alloc.free(out);
-    try std.testing.expectEqualStrings("RELÓGIO", out);
-    const a = try win1252ToUtf8(alloc, "plain");
-    defer alloc.free(a);
-    try std.testing.expectEqualStrings("plain", a);
-    const e = try win1252ToUtf8(alloc, &[_]u8{0x80});
-    defer alloc.free(e);
-    try std.testing.expectEqualStrings("€", e);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("RELÓGIO", try varcharCell(a, &[_]u8{ 'R', 'E', 'L', 0xD3, 'G', 'I', 'O' }));
+    try std.testing.expectEqualStrings("plain", try varcharCell(a, "plain"));
+    try std.testing.expectEqualStrings("€", try varcharCell(a, &[_]u8{0x80}));
 }
 
 test "win1252 decodes every byte" {
-    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
     var all: [256]u8 = undefined;
     for (&all, 0..) |*b, k| b.* = @intCast(k);
-    const got = try win1252ToUtf8(alloc, &all);
-    defer alloc.free(got);
+    const got = try varcharCell(ar.allocator(), &all);
     try std.testing.expectEqualStrings("\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\x7f\xe2\x82\xac\xc2\x81\xe2\x80\x9a\xc6\x92\xe2\x80\x9e\xe2\x80\xa6\xe2\x80\xa0\xe2\x80\xa1\xcb\x86\xe2\x80\xb0\xc5\xa0\xe2\x80\xb9\xc5\x92\xc2\x8d\xc5\xbd\xc2\x8f\xc2\x90\xe2\x80\x98\xe2\x80\x99\xe2\x80\x9c\xe2\x80\x9d\xe2\x80\xa2\xe2\x80\x93\xe2\x80\x94\xcb\x9c\xe2\x84\xa2\xc5\xa1\xe2\x80\xba\xc5\x93\xc2\x9d\xc5\xbe\xc5\xb8\xc2\xa0\xc2\xa1\xc2\xa2\xc2\xa3\xc2\xa4\xc2\xa5\xc2\xa6\xc2\xa7\xc2\xa8\xc2\xa9\xc2\xaa\xc2\xab\xc2\xac\xc2\xad\xc2\xae\xc2\xaf\xc2\xb0\xc2\xb1\xc2\xb2\xc2\xb3\xc2\xb4\xc2\xb5\xc2\xb6\xc2\xb7\xc2\xb8\xc2\xb9\xc2\xba\xc2\xbb\xc2\xbc\xc2\xbd\xc2\xbe\xc2\xbf\xc3\x80\xc3\x81\xc3\x82\xc3\x83\xc3\x84\xc3\x85\xc3\x86\xc3\x87\xc3\x88\xc3\x89\xc3\x8a\xc3\x8b\xc3\x8c\xc3\x8d\xc3\x8e\xc3\x8f\xc3\x90\xc3\x91\xc3\x92\xc3\x93\xc3\x94\xc3\x95\xc3\x96\xc3\x97\xc3\x98\xc3\x99\xc3\x9a\xc3\x9b\xc3\x9c\xc3\x9d\xc3\x9e\xc3\x9f\xc3\xa0\xc3\xa1\xc3\xa2\xc3\xa3\xc3\xa4\xc3\xa5\xc3\xa6\xc3\xa7\xc3\xa8\xc3\xa9\xc3\xaa\xc3\xab\xc3\xac\xc3\xad\xc3\xae\xc3\xaf\xc3\xb0\xc3\xb1\xc3\xb2\xc3\xb3\xc3\xb4\xc3\xb5\xc3\xb6\xc3\xb7\xc3\xb8\xc3\xb9\xc3\xba\xc3\xbb\xc3\xbc\xc3\xbd\xc3\xbe\xc3\xbf", got);
 }
 
 test "win1252 text decodes as its pieces decode, split anywhere" {
-    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
     var prng = std.Random.DefaultPrng.init(0x1252);
     const rnd = prng.random();
     var buf: [80]u8 = undefined;
     for (0..4000) |it| {
+        _ = ar.reset(.retain_capacity);
         const len = rnd.uintLessThan(usize, buf.len + 1);
         for (buf[0..len]) |*b| b.* = if (it % 3 == 0) rnd.int(u8) else rnd.uintLessThan(u8, 0x80);
         if (it % 5 == 0 and len > 0) buf[rnd.uintLessThan(usize, len)] = 0x80 + rnd.uintLessThan(u8, 0x80);
         const cut = rnd.uintAtMost(usize, len);
-        const whole = try win1252ToUtf8(alloc, buf[0..len]);
-        defer alloc.free(whole);
-        const head = try win1252ToUtf8(alloc, buf[0..cut]);
-        defer alloc.free(head);
-        const tail = try win1252ToUtf8(alloc, buf[cut..len]);
-        defer alloc.free(tail);
+        const whole = try varcharCell(a, buf[0..len]);
+        const head = try varcharCell(a, buf[0..cut]);
+        const tail = try varcharCell(a, buf[cut..len]);
         try std.testing.expectEqualSlices(u8, head, whole[0..head.len]);
         try std.testing.expectEqualSlices(u8, tail, whole[head.len..]);
-        try std.testing.expectEqual(whole.len == len, isAscii(buf[0..len]));
+        try std.testing.expectEqual(whole.len == len, charset.isAscii(buf[0..len]));
     }
 }
 
@@ -1708,7 +1707,7 @@ test "rows split across packets of every small size decode as each cell decoded 
                 raw[8] = 0;
             }
             if (col.is_unicode) for (0..len / 2) |k| {
-                if (rnd.uintLessThan(u8, 4) != 0) raw[2 * k + 1] = 0;
+                if (rnd.uintLessThan(u8, 4) != 0 or raw[2 * k + 1] & 0xF8 == 0xD8) raw[2 * k + 1] = 0;
             };
             const is_null = col.kind != .fixed and rnd.uintLessThan(u8, 8) == 0;
             switch (col.kind) {
@@ -2115,10 +2114,7 @@ fn featureExtAck(r: *Body) Body.Error![]const u8 {
 fn errorText(gpa: std.mem.Allocator, body: []const u8) ![]const u8 {
     if (body.len < 8) return gpa.dupe(u8, "the server sent a malformed error");
     const msglen: usize = std.mem.readInt(u16, body[6..8], .little);
-    const msg = body[8..@min(body.len, 8 + msglen * 2)];
-    const out = try gpa.alloc(u8, msg.len / 2);
-    for (out, 0..) |*c, k| c.* = msg[k * 2];
-    return out;
+    return utf16.decodeLeAlloc(.replacement, gpa, body[8..@min(body.len, 8 + msglen * 2)]);
 }
 
 test "PLP and text values past SQL Server's 2 GiB limit are refused before room is made for them" {
@@ -2300,70 +2296,155 @@ test "fuzz: row cell decode survives arbitrary bytes" {
     try @import("../../testing/fuzzutil.zig").pound(fuzzCell, &fuzzCell_corpus);
 }
 
-test "tds: an nvarchar cell decodes as the old utf16Encode did, lone halves as `?` (D7)" {
+test "tds: an nvarchar cell with an unpaired surrogate half fails the read, never `?` or U+FFFD (D7)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const old = struct {
-        fn utf16Encode(out: []u8, bytes: []const u8) usize {
-            const V = @Vector(16, u8);
-            const ascii_mask: V = @bitCast([_]u8{ 0x80, 0xFF } ** 8);
-            const lows = [8]i32{ 0, 2, 4, 6, 8, 10, 12, 14 };
-            var o: usize = 0;
-            var k: usize = 0;
-            while (k + 1 < bytes.len) {
-                if (k + 16 <= bytes.len) {
-                    const v: V = bytes[k..][0..16].*;
-                    if (@reduce(.Or, v & ascii_mask) == 0) {
-                        out[o..][0..8].* = @shuffle(u8, v, undefined, lows);
-                        o += 8;
-                        k += 16;
-                        continue;
-                    }
-                }
-                var cp: u21 = @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8);
-                k += 2;
-                if (cp < 0x80) {
-                    out[o] = @intCast(cp);
-                    o += 1;
-                    continue;
-                }
-                if (std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
-                    const lo: u16 = if (k + 1 < bytes.len) @as(u16, bytes[k]) | (@as(u16, bytes[k + 1]) << 8) else 0;
-                    if (!std.unicode.utf16IsLowSurrogate(lo)) {
-                        out[o] = '?';
-                        o += 1;
-                        continue;
-                    }
-                    cp = 0x10000 + ((cp & 0x03ff) << 10) | (lo & 0x03ff);
-                    k += 2;
-                }
-                o += std.unicode.utf8Encode(cp, out[o..]) catch blk: {
-                    out[o] = '?';
-                    break :blk 1;
-                };
-            }
-            return o;
-        }
-    };
     var d = ColumnDesc{ .tds_type = 0xE7, .engine_type = types.Type.init(.string).asNullable(), .kind = .ushortlen, .is_unicode = true };
     d.decode = decodeOf(d);
     try std.testing.expectEqual(Decode.unicode_text, d.decode);
-    try std.testing.expectEqualStrings("?a\u{e9}?", (try cellValue(a, d, "\x3d\xd8a\x00\xe9\x00\x00\xde")).string);
+    try std.testing.expectEqualStrings("a\u{e9}😀?", (try cellValue(a, d, "a\x00\xe9\x00\x3d\xd8\x00\xde?\x00")).string);
+    d.name = "nm";
+    for ([_][]const u8{ "\x3d\xd8a\x00", "a\x00\x00\xde", "a\x00\x3d\xd8", "\x3d\xd8\x3d\xd8\x00\xde" }) |raw| {
+        try std.testing.expectError(error.LoneSurrogate, cellValue(a, d, raw));
+        try std.testing.expect(std.mem.startsWith(u8, eval.takeFailure(error.LoneSurrogate).?, "SQL Server column `nm` holds an unpaired UTF-16 surrogate half"));
+    }
+    for ([_][]const u8{ "a", "a\x00b", "a\x00\x3d\xd8\x00\xde" ++ "b" }) |raw| {
+        try std.testing.expectError(error.OddUtf16, cellValue(a, d, raw));
+        try std.testing.expect(std.mem.startsWith(u8, eval.takeFailure(error.OddUtf16).?, "SQL Server column `nm` holds a value of an odd number of bytes"));
+    }
     var prng = std.Random.DefaultPrng.init(0x16_16);
     const r = prng.random();
     const pool = [_]u16{ 'a', 'Z', ' ', 0x7F, 0x80, 0xE7, 0x20AC, 0x4E2D, 0xFFFD, 0xFFFF, 0xD83D, 0xDE00, 0xDBFF, 0xDC00 };
     for (0..20_000) |_| {
         _ = ar.reset(.retain_capacity);
         const n = r.uintLessThan(usize, 48);
-        const bytes = try a.alloc(u8, n * 2 + r.uintAtMost(usize, 1));
-        for (0..n) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], if (r.boolean()) r.intRangeAtMost(u16, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)], .little);
-        if (bytes.len % 2 == 1) bytes[bytes.len - 1] = r.int(u8);
-        const want = try a.alloc(u8, bytes.len / 2 * 3);
-        const got = (try cellValue(a, d, bytes)).string;
-        try std.testing.expectEqualStrings(want[0..old.utf16Encode(want, bytes)], got);
-        try std.testing.expectEqualStrings(got, try utf16.decodeLeAlloc(.question, a, bytes));
+        const units = try a.alloc(u16, n);
+        for (units) |*u| u.* = if (r.boolean()) r.intRangeAtMost(u16, 0x20, 0x7E) else pool[r.uintLessThan(usize, pool.len)];
+        const bytes = try a.alloc(u8, n * 2);
+        for (units, 0..) |u, i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], u, .little);
+        if (std.unicode.utf16LeToUtf8Alloc(a, units)) |want| {
+            try std.testing.expectEqualStrings(want, (try cellValue(a, d, bytes)).string);
+        } else |_| try std.testing.expectError(error.LoneSurrogate, cellValue(a, d, bytes));
     }
+    _ = eval.takeFailure(error.LoneSurrogate);
+}
+
+test "tds: a column name with an unpaired surrogate half reads with U+FFFD, not `?` (D7)" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const col = [_]u8{ 0, 0, 0, 0, 0, 0, 0xE7, 0x40, 0x00, 0x09, 0x04, 0xD0, 0x00, 0x34 };
+    const payload = [_]u8{ 2, 0 } ++ col ++ [_]u8{ 3, 'a', 0, 0x3d, 0xd8, 'b', 0 } ++ col ++ [_]u8{ 3, 'c', 0, 0x3d, 0xd8, 0x00, 0xde };
+    var src = std.Io.Reader.fixed(try framePackets(a, &payload, 64));
+    const cur = try gpa.create(TdsCursor);
+    defer gpa.destroy(cur);
+    cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &.{}, .schema = undefined, .done = false };
+    defer cur.reader.deinit();
+    try cur.parseColMeta(a);
+    try std.testing.expectEqualStrings("a\u{FFFD}b", cur.schema.fields[0].name);
+    try std.testing.expectEqualStrings("c😀", cur.schema.fields[1].name);
+}
+
+/// COLMETADATA for one varchar(64) named `name` in collation `c`, as [MS-TDS] 2.2.7.4 lays it.
+fn varcharMeta(comptime name: u8, c: [5]u8) [17]u8 {
+    return [_]u8{ 0, 0, 0, 0, 0, 0, 0xA7, 0x40, 0x00 } ++ c ++ [_]u8{ 1, name, 0 };
+}
+
+/// One ROW of single-byte-length-prefixed varchar cells.
+fn varcharRow(comptime cells: []const []const u8) []const u8 {
+    comptime var out: []const u8 = &.{0xD1};
+    inline for (cells) |v| out = out ++ [_]u8{ @intCast(v.len), 0 } ++ v;
+    return out;
+}
+
+const latin1_cp1 = [5]u8{ 0x09, 0x04, 0xD0, 0x00, 0x34 };
+const latin1_utf8 = [5]u8{ 0x09, 0x04, 0xD0, 0x24, 0x00 };
+const cyrillic = [5]u8{ 0x19, 0x04, 0xD0, 0x00, 0x00 };
+
+/// The rows after a three-column COLMETADATA in cp1252, UTF-8 and Cyrillic collations,
+/// fetched as a run reads them.
+fn collatedFetch(a: std.mem.Allocator, rows: []const u8) !Batch {
+    const gpa = std.testing.allocator;
+    const meta = [_]u8{ 3, 0 } ++ varcharMeta('p', latin1_cp1) ++ varcharMeta('u', latin1_utf8) ++ varcharMeta('r', cyrillic);
+    const payload = try std.mem.concat(a, u8, &.{ &meta, rows, &done_final });
+    var src = std.Io.Reader.fixed(try framePackets(a, payload, 64));
+    const cur = try gpa.create(TdsCursor);
+    defer gpa.destroy(cur);
+    cur.* = .{ .gpa = gpa, .conn = undefined, .reader = PacketReader.init(gpa, &src), .meta_arena = undefined, .cols = &.{}, .schema = undefined, .done = false };
+    defer cur.reader.deinit();
+    try cur.parseColMeta(a);
+    try std.testing.expectEqual(TextEnc.cp1252, cur.cols[0].text_enc);
+    try std.testing.expectEqual(TextEnc.utf8, cur.cols[1].text_enc);
+    try std.testing.expectEqual(TextEnc.other, cur.cols[2].text_enc);
+    return (try cur.fetchBatch(a)).?;
+}
+
+test "tds: a varchar reads in its collation's encoding: 1252, UTF-8, or a failure naming it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ok = try collatedFetch(a, varcharRow(&.{ "caf\xe9", "caf\xc3\xa9 \xf0\x9f\x98\x80", "plain" }));
+    try std.testing.expectEqualStrings("caf\u{e9}", ok.columns[0].getValue(0).string);
+    try std.testing.expectEqualStrings("caf\u{e9} \u{1F600}", ok.columns[1].getValue(0).string);
+    try std.testing.expectEqualStrings("plain", ok.columns[2].getValue(0).string);
+    try std.testing.expectError(error.InvalidUtf8, collatedFetch(a, varcharRow(&.{ "a", "caf\xe9", "b" })));
+    try std.testing.expectEqualStrings("SQL Server column `u` has a UTF-8 collation but holds bytes that are not valid UTF-8; repair it at the source or read the column CAST(... AS varbinary)", eval.takeFailure(error.InvalidUtf8).?);
+    try std.testing.expectError(error.UnsupportedCollation, collatedFetch(a, varcharRow(&.{ "a", "b", "\xcf\xf0\xe8" })));
+    try std.testing.expectEqualStrings("SQL Server column `r` is non-Unicode text in a collation (LCID 0x00419, sort id 0) whose code page basalt does not read; read the column CAST(... AS nvarchar(...))", eval.takeFailure(error.UnsupportedCollation).?);
+}
+
+test "tds: varchar(max) and text cells follow their collation too" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const strT = types.Type.init(.string).asNullable();
+    for ([_]ColKind{ .plp, .textptr }) |kind| {
+        var d = ColumnDesc{ .tds_type = if (kind == .plp) 0xA7 else 0x23, .engine_type = strT, .kind = kind, .name = "m" };
+        d.decode = decodeOf(d);
+        try std.testing.expectEqual(Decode.win1252, d.decode);
+        d.collation = latin1_cp1;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("\u{e9}", (try cellValue(a, d, "\xe9")).string);
+        d.collation = latin1_utf8;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("\u{e9}", (try cellValue(a, d, "\xc3\xa9")).string);
+        try std.testing.expectError(error.InvalidUtf8, cellValue(a, d, "\xe9"));
+        _ = eval.takeFailure(error.InvalidUtf8);
+        d.collation = cyrillic;
+        d.text_enc = textEncoding(d.collation);
+        try std.testing.expectEqualStrings("ok", (try cellValue(a, d, "ok")).string);
+        try std.testing.expectError(error.UnsupportedCollation, cellValue(a, d, "\xe9"));
+        _ = eval.takeFailure(error.UnsupportedCollation);
+    }
+}
+
+test "tds: textEncoding knows 1252 only where it is sure" {
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(latin1_cp1));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x07, 0x04, 0x01, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x0a, 0x0c, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.cp1252, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 183 }));
+    try std.testing.expectEqual(TextEnc.utf8, textEncoding(latin1_utf8));
+    try std.testing.expectEqual(TextEnc.utf8, textEncoding(.{ 0x19, 0x04, 0x00, 0x04, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(cyrillic));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 42 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x09, 0x04, 0x00, 0x00, 106 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x08, 0x04, 0x00, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0x11, 0x04, 0x01, 0x00, 0x00 }));
+    try std.testing.expectEqual(TextEnc.other, textEncoding(.{ 0, 0, 0, 0, 0 }));
+}
+
+test "tds: a server error message keeps its non-ASCII text, an unpaired half as U+FFFD (D7)" {
+    const gpa = std.testing.allocator;
+    const body = [_]u8{ 0x10, 0x27, 0, 0, 1, 16, 5, 0 } ++ "N\x00\xe3\x00o\x00\x00\xde\x20\xac".*;
+    const msg = try errorText(gpa, &body);
+    defer gpa.free(msg);
+    try std.testing.expectEqualStrings("N\u{e3}o\u{FFFD}\u{ac20}", msg);
+    const ascii = try errorText(gpa, &([_]u8{ 0x10, 0x27, 0, 0, 1, 16, 2, 0 } ++ "o\x00k\x00".*));
+    defer gpa.free(ascii);
+    try std.testing.expectEqualStrings("ok", ascii);
 }
 
 test "tds: INSERT BULK names a column by its UTF-16 unit count, a pair counting two" {

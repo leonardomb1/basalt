@@ -2,6 +2,10 @@
 //! and EBCDIC code page 037. `decode` turns bytes into UTF-8 text, repairing invalid
 //! UTF-8 and mapping each single-byte character; `encode` turns UTF-8 text into a
 //! charset's bytes, refusing a character it cannot hold rather than substituting one.
+//!
+//! The five bytes windows-1252 leaves unassigned (0x81, 0x8D, 0x8F, 0x90, 0x9D) are
+//! their C1 controls, as Windows' bestfit1252 table, the WHATWG Encoding standard and
+//! MySQL read them: lossless, so every byte decodes and encodes back to itself.
 
 const std = @import("std");
 const celltext = @import("../exec/celltext.zig");
@@ -44,11 +48,11 @@ fn eqNorm(a: []const u8, b: []const u8) bool {
     }
 }
 
-pub const cp1252_high = [32]u21{
-    0x20AC, 0,      0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0,      0x017D, 0,
-    0,      0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0,      0x017E, 0x0178,
+const cp1252_high = [32]u21{
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
 };
 
 const cp037_to_unicode = [256]u21{
@@ -86,18 +90,11 @@ const cp037_to_unicode = [256]u21{
     0x0038, 0x0039, 0x00B3, 0x00DB, 0x00DC, 0x00D9, 0x00DA, 0x009F,
 };
 
-/// What a byte a charset leaves undefined (five in windows-1252) decodes to: U+FFFD,
-/// or the C1 control of the same number, as SQL Server and Windows decode them.
-pub const Undefined = enum { replacement, c1 };
-
 /// The code point one byte of a single-byte charset stands for.
-fn codePoint(cs: Charset, comptime undef: Undefined, c: u8) u21 {
+fn codePoint(cs: Charset, c: u8) u21 {
     return switch (cs) {
         .utf8, .latin1 => c,
-        .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] != 0) cp1252_high[c - 0x80] else switch (undef) {
-            .replacement => 0xFFFD,
-            .c1 => c,
-        },
+        .cp1252 => if (c < 0x80 or c > 0x9F) c else cp1252_high[c - 0x80],
         .cp037 => cp037_to_unicode[c],
     };
 }
@@ -106,7 +103,7 @@ fn codePoint(cs: Charset, comptime undef: Undefined, c: u8) u21 {
 pub const Seq = struct { len: u8, bytes: [3]u8 };
 
 /// Each byte of single-byte charset `cs` as its UTF-8 sequence, built at compile time.
-pub fn utf8Table(comptime cs: Charset, comptime undef: Undefined) *const [256]Seq {
+pub fn utf8Table(comptime cs: Charset) *const [256]Seq {
     comptime std.debug.assert(cs != .utf8);
     return &struct {
         const table: [256]Seq = blk: {
@@ -114,7 +111,7 @@ pub fn utf8Table(comptime cs: Charset, comptime undef: Undefined) *const [256]Se
             var t: [256]Seq = undefined;
             for (&t, 0..) |*e, b| {
                 var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(codePoint(cs, undef, @intCast(b)), &buf) catch unreachable;
+                const n = std.unicode.utf8Encode(codePoint(cs, @intCast(b)), &buf) catch unreachable;
                 e.* = .{ .len = n, .bytes = buf[0..3].* };
             }
             break :blk t;
@@ -127,17 +124,17 @@ fn asciiCompatible(comptime cs: Charset) bool {
 }
 
 /// The length of `src` in `cs` decoded to UTF-8.
-pub fn decodedLen(comptime cs: Charset, comptime undef: Undefined, src: []const u8) usize {
-    const t = utf8Table(cs, undef);
+pub fn decodedLen(comptime cs: Charset, src: []const u8) usize {
+    const t = utf8Table(cs);
     var n: usize = 0;
     for (src) |b| n += if (asciiCompatible(cs) and b < 0x80) 1 else t[b].len;
     return n;
 }
 
-/// `src` in `cs` as UTF-8 into `dst`, which holds at least `decodedLen(cs, undef,
-/// src)`; returns that length.
-pub fn decodeInto(comptime cs: Charset, comptime undef: Undefined, dst: []u8, src: []const u8) usize {
-    const t = utf8Table(cs, undef);
+/// `src` in `cs` as UTF-8 into `dst`, which holds at least `decodedLen(cs, src)`;
+/// returns that length.
+pub fn decodeInto(comptime cs: Charset, dst: []u8, src: []const u8) usize {
+    const t = utf8Table(cs);
     var o: usize = 0;
     for (src) |b| {
         if (asciiCompatible(cs) and b < 0x80) {
@@ -176,8 +173,8 @@ pub fn decode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const
         },
         inline else => |c| {
             if (asciiCompatible(c) and isAscii(bytes)) return bytes;
-            const out = try arena.alloc(u8, decodedLen(c, .replacement, bytes));
-            _ = decodeInto(c, .replacement, out, bytes);
+            const out = try arena.alloc(u8, decodedLen(c, bytes));
+            _ = decodeInto(c, out, bytes);
             return out;
         },
     }
@@ -204,7 +201,7 @@ fn byteOf(cs: Charset, cp: u21) !u8 {
         .latin1 => return if (cp <= 0xFF) @intCast(cp) else error.Unencodable,
         .cp1252 => {
             if (cp < 0x80 or (cp >= 0xA0 and cp <= 0xFF)) return @intCast(cp);
-            for (cp1252_high, 0..) |m, i| if (m == cp and m != 0) return @intCast(0x80 + i);
+            for (cp1252_high, 0..) |m, i| if (m == cp) return @intCast(0x80 + i);
             return error.Unencodable;
         },
         .cp037 => {
@@ -233,7 +230,7 @@ test "decode by table equals the per-byte encoder it replaced, every byte and a 
         fn oracleCodePoint(cs: Charset, c: u8) u21 {
             return switch (cs) {
                 .utf8, .latin1 => c,
-                .cp1252 => if (c < 0x80 or c > 0x9F) c else if (cp1252_high[c - 0x80] == 0) 0xFFFD else cp1252_high[c - 0x80],
+                .cp1252 => if (c < 0x80 or c > 0x9F) c else cp1252_high[c - 0x80],
                 .cp037 => cp037_to_unicode[c],
             };
         }
@@ -279,7 +276,7 @@ test "decode by table equals the per-byte encoder it replaced, every byte and a 
     }
 }
 
-test "cp1252 with C1 undefined bytes equals SQL Server's table; the default policy gives U+FFFD" {
+test "cp1252 decodes every byte as Microsoft's bestfit1252 table, the five unassigned bytes to C1 (D5)" {
     const Orig = struct {
         fn tdsCp1252High(b: u8) u21 {
             return switch (b) {
@@ -314,18 +311,37 @@ test "cp1252 with C1 undefined bytes equals SQL Server's table; the default poli
             };
         }
     };
-    const t = utf8Table(.cp1252, .c1);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const t = utf8Table(.cp1252);
     for (0..256) |i| {
         const b: u8 = @intCast(i);
         var want: [4]u8 = undefined;
         const n = try std.unicode.utf8Encode(if (b < 0x80) b else Orig.tdsCp1252High(b), &want);
         try std.testing.expectEqualSlices(u8, want[0..n], t[b].bytes[0..t[b].len]);
+        try std.testing.expectEqualStrings(want[0..n], try decode(a, .cp1252, &.{b}));
     }
     var out: [16]u8 = undefined;
-    try std.testing.expectEqualStrings("\xc2\x81a", out[0..decodeInto(.cp1252, .c1, &out, "\x81a")]);
-    try std.testing.expectEqualStrings("\u{FFFD}a", out[0..decodeInto(.cp1252, .replacement, &out, "\x81a")]);
-    try std.testing.expectEqual(@as(usize, 3), decodedLen(.cp1252, .c1, "\x81a"));
-    try std.testing.expectEqual(@as(usize, 4), decodedLen(.cp1252, .replacement, "\x81a"));
+    try std.testing.expectEqualStrings("\xc2\x81a", out[0..decodeInto(.cp1252, &out, "\x81a")]);
+    try std.testing.expectEqual(@as(usize, 3), decodedLen(.cp1252, "\x81a"));
+    try std.testing.expectEqualStrings("\xc2\x81\xc2\x8d\xc2\x8f\xc2\x90\xc2\x9d", try decode(a, .cp1252, "\x81\x8d\x8f\x90\x9d"));
+    try std.testing.expectEqualStrings("\x81\x8d\x8f\x90\x9d", try encode(a, .cp1252, "\u{81}\u{8d}\u{8f}\u{90}\u{9d}"));
+    try std.testing.expectError(error.Unencodable, encode(a, .cp1252, "\u{80}"));
+    try std.testing.expectError(error.Unencodable, encode(a, .cp1252, "\u{FFFD}"));
+}
+
+test "every single-byte charset decodes each byte and encodes it back to itself (D5)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*b, i| b.* = @intCast(i);
+    for ([_]Charset{ .latin1, .cp1252, .cp037 }) |cs| {
+        const text = try decode(a, cs, &all);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        try std.testing.expectEqualSlices(u8, &all, try encode(a, cs, text));
+    }
 }
 
 test "isAscii agrees with a byte loop at every length and position of a high byte" {
