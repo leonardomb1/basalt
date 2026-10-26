@@ -63,7 +63,7 @@ pub const epoch = struct {
     pub const julian_unix: i64 = -daysFromCivil(-4713, 11, 24);
 };
 
-/// A day's midnight in microseconds, saturating past the ±290,000 years a
+/// A day's midnight in microseconds, saturating past the ±292,277 years a
 /// timestamp holds.
 pub fn dayMicros(days: i64) i64 {
     return days *| us_per_day;

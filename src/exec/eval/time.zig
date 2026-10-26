@@ -26,7 +26,7 @@ pub fn timeUnit(name: []const u8) ?TimeUnit {
 }
 
 /// A DATE as its midnight's microseconds, as `CAST(d AS TIMESTAMP)` reads it: a
-/// date past the ±290,000 years a timestamp holds is CastFailed, never clamped;
+/// date past the ±292,277 years a timestamp holds is CastFailed, never clamped;
 /// a TIMESTAMP as itself.
 pub fn temporalMicros(v: Value) error{ CastFailed, TypeMismatch }!i64 {
     return switch (v) {

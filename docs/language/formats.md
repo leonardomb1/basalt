@@ -444,7 +444,7 @@ all three string layouts (`utf8`, `large_utf8`, polars' default `utf8_view`)
 as `string` and the binary ones as `bytes`, `decimal128` as `decimal`, and
 dates, times, timestamps and durations in any unit as basalt's own
 (nanoseconds floor to the microsecond; a zoned timestamp is its UTC
-wall-clock; a count of seconds or milliseconds past the ±292,000 years a
+wall-clock; a count of seconds or milliseconds past the ±292,277 years a
 microsecond timestamp holds is a corrupt file, never clamped). Dictionary-encoded columns — a polars `Categorical` — read as
 their values. Lists, structs and maps read as JSON text, so `json_get` and
 `CROSS JOIN UNNEST(JSON_EACH(col))` reach inside them. A union is refused with the
@@ -476,7 +476,7 @@ GROUP BY status;
 logical types read as basalt's own: `date` as `date`, `time-millis` and
 `time-micros` as `time`, `timestamp-*` and `local-timestamp-*` in any unit as
 `timestamp` (nanoseconds floor to the microsecond, a UTC timestamp reads as
-its UTC wall-clock, and milliseconds past the ±292,000 years a microsecond
+its UTC wall-clock, and milliseconds past the ±292,277 years a microsecond
 timestamp holds are a corrupt file, never clamped), `decimal` on `bytes` or `fixed` as `decimal(p,s)`, `uuid` as
 `string`. A decimal wider than 38 digits is refused naming its field rather than
 read inexactly. A union of `null` and one type is that type, nullable; a union of
@@ -533,7 +533,7 @@ timestamp and on every nanosecond one, so without the logical type those
 columns would read as bare `int`. `TIMESTAMP` and `TIME` in milliseconds,
 microseconds or nanoseconds all read as basalt's microsecond `timestamp`/`time`;
 nanoseconds floor to the microsecond. A millisecond or legacy `INT96` value past
-the ±292,000 years a microsecond timestamp holds is a corrupt page, an error,
+the ±292,277 years a microsecond timestamp holds is a corrupt page, an error,
 never clamped to the last instant, as DuckDB refuses it too.
 A UTC-adjusted timestamp reads as its UTC
 wall-clock time: basalt has no zoned timestamp, so `isAdjustedToUTC` is not
