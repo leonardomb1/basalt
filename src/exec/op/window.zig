@@ -23,7 +23,8 @@
 //! NULLS reads through the positions of the non-null values and their prefix counts.
 //! Each aggregate is a state with `add`, `remove` and `finish` (the invertible ones
 //! are `aggregate/funcs.zig`'s own), and `Slider` generates the one loop that slides
-//! it, per aggregate and argument kind, reading the sorted column as typed values.
+//! it, per aggregate and lane of argument kinds read alike (`read.Lane`), reading the
+//! sorted column as typed values; every kind read as a value shares one loop.
 //!
 //! The default frame (`Frame{}`) is RANGE from the partition's start to the current
 //! row's peers. A RANGE offset (`Off.int` / `Off.float`) is in the order key's units
@@ -603,31 +604,33 @@ pub const Window = struct {
         }
     };
 
-    /// SUM (or AVG) of floats in two stacks, so a row that left leaves no rounding
-    /// behind. The total adds zero, as the exact integer part once did, so -0 reads 0.
-    fn FloatSum(comptime avg: bool) type {
-        return struct {
-            pub const In = f64;
-            pub const State = struct { n: i64 = 0, t: TwoStack(f64, 0, addF) = .{} };
-            pub fn reset(s: *State) void {
-                s.n = 0;
-                s.t.reset();
-            }
-            pub fn add(s: *State, x: f64, cx: Ctx) !void {
-                try s.t.push(cx.alloc, x);
-                s.n += 1;
-            }
-            pub fn remove(s: *State, _: f64, cx: Ctx) !void {
-                try s.t.pop(cx.alloc);
-                s.n -= 1;
-            }
-            pub fn finish(s: *const State, _: Ctx) !Value {
-                if (s.n == 0) return .null;
-                const t = s.t.get() + @as(f64, 0);
-                return .{ .float = if (avg) t / @as(f64, @floatFromInt(s.n)) else t };
-            }
-        };
-    }
+    /// SUM or AVG (`agg`) of floats in two stacks, so a row that left leaves no
+    /// rounding behind. The total adds zero, as the exact integer part once did, so -0
+    /// reads 0.
+    const FloatSum = struct {
+        pub const In = f64;
+        pub const State = struct { n: i64 = 0, avg: bool, t: TwoStack(f64, 0, addF) = .{} };
+        pub fn init(_: Ctx, agg: ast.AggFunc) State {
+            return .{ .avg = agg == .avg };
+        }
+        pub fn reset(s: *State) void {
+            s.n = 0;
+            s.t.reset();
+        }
+        pub fn add(s: *State, x: f64, cx: Ctx) !void {
+            try s.t.push(cx.alloc, x);
+            s.n += 1;
+        }
+        pub fn remove(s: *State, _: f64, cx: Ctx) !void {
+            try s.t.pop(cx.alloc);
+            s.n -= 1;
+        }
+        pub fn finish(s: *const State, _: Ctx) !Value {
+            if (s.n == 0) return .null;
+            const t = s.t.get() + @as(f64, 0);
+            return .{ .float = if (s.avg) t / @as(f64, @floatFromInt(s.n)) else t };
+        }
+    };
 
     /// MIN (`want` .lt) or MAX by a monotonic deque of the values that can still win,
     /// in `aggregate/funcs.zig`'s `order`, a later equal value displacing an earlier one.
@@ -682,17 +685,21 @@ pub const Window = struct {
 
     /// A variance (`func`) from the frame's moments in two stacks; over ints (`exact`)
     /// from `IntSquares` while they hold, as the GROUP BY aggregate has it.
-    fn Spread(comptime func: ast.AggFunc, comptime exact: bool) type {
+    fn Spread(comptime exact: bool) type {
         return struct {
             pub const In = if (exact) i64 else f64;
             pub const State = struct {
+                func: ast.AggFunc,
                 n: i64 = 0,
                 sq: aggFuncs.IntSquares = .{},
                 mom: TwoStack(Moments, .{}, Moments.merge) = .{},
             };
+            pub fn init(_: Ctx, agg: ast.AggFunc) State {
+                return .{ .func = agg };
+            }
             pub fn reset(s: *State) void {
                 s.mom.reset();
-                s.* = .{ .mom = s.mom };
+                s.* = .{ .func = s.func, .mom = s.mom };
             }
             pub fn add(s: *State, x: In, cx: Ctx) !void {
                 if (exact) s.sq.add(x, false);
@@ -706,7 +713,7 @@ pub const Window = struct {
             }
             pub fn finish(s: *const State, _: Ctx) !Value {
                 const m2 = (if (exact) s.sq.m2(s.n) else null) orelse s.mom.get().m2;
-                return aggFuncs.spreadOf(func, s.n, m2);
+                return aggFuncs.spreadOf(s.func, s.n, m2);
             }
         };
     }
@@ -714,7 +721,7 @@ pub const Window = struct {
     const Median = struct {
         pub const In = f64;
         pub const State = Halves;
-        pub fn init(cx: Ctx) State {
+        pub fn init(cx: Ctx, _: ast.AggFunc) State {
             return Halves.init(cx.alloc);
         }
         pub const reset = Halves.reset;
@@ -729,18 +736,20 @@ pub const Window = struct {
         }
     };
 
-    const Run = *const fn (?column.Column, Frames, Layout, Ctx, *column.Builder) anyerror!void;
+    const Run = *const fn (?column.Column, Frames, Layout, Ctx, ast.AggFunc, *column.Builder) anyerror!void;
 
     /// The one loop every window aggregate runs, generated per aggregate `A` (a
     /// `State` with `add`, `remove` and `finish`, each optionally taking the row's
-    /// position) and the kind its argument reads as: per partition, rows enter at the
-    /// frame's end edge and leave at its start edge, as the file header describes.
-    fn Slider(comptime A: type, comptime kind: types.TypeKind) type {
+    /// position, and an optional `init` from the call's `agg`) and the column kind its
+    /// argument reads as directly, or null for a kind read as a value (`valueAt`): per
+    /// partition, rows enter at the frame's end edge and leave at its start edge, as
+    /// the file header describes.
+    fn Slider(comptime A: type, comptime kind: ?types.TypeKind) type {
         return struct {
-            fn run(col: ?column.Column, fr: Frames, l: Layout, given: Ctx, bd: *column.Builder) anyerror!void {
+            fn run(col: ?column.Column, fr: Frames, l: Layout, given: Ctx, agg: ast.AggFunc, bd: *column.Builder) anyerror!void {
                 var cx = given;
                 cx.ty = read.inType(A.In, cx.out);
-                var s: A.State = if (@hasDecl(A, "init")) A.init(cx) else .{};
+                var s: A.State = if (@hasDecl(A, "init")) A.init(cx, agg) else .{};
                 const n = fr.fs.len;
                 var k: usize = 0;
                 while (k < n) {
@@ -764,9 +773,10 @@ pub const Window = struct {
             inline fn at(col: ?column.Column, p: usize, cx: Ctx) !?A.In {
                 if (A.In == void) {
                     const c = col orelse return {};
-                    return read.at(void, kind, c, p, cx);
+                    return read.at(void, .int, c, p, cx);
                 }
-                return read.at(A.In, kind, col.?, p, cx);
+                if (comptime kind) |k| return read.at(A.In, k, col.?, p, cx);
+                return valueAt(A.In, col.?, p, cx);
             }
 
             inline fn step(comptime f: anytype, s: *A.State, x: A.In, p: usize, cx: Ctx) !void {
@@ -776,22 +786,39 @@ pub const Window = struct {
         };
     }
 
+    /// Row `p` of a column whose kind `In` is not read from directly, as `read.at`
+    /// has it: NULL when null, else its value cast to `In`. Out of line and one per
+    /// `In`, as the cast outweighs the call.
+    noinline fn valueAt(comptime In: type, c: column.Column, p: usize, cx: Ctx) anyerror!?In {
+        if (!c.validity.get(p)) return null;
+        return try read.fromValue(In, c.getValue(p), cx);
+    }
+
+    /// `A`'s loop over a column of kind `k`: one per lane of kinds `A.In` reads alike,
+    /// and one for every kind read as a value.
+    fn runAt(comptime A: type, comptime k: types.TypeKind) Run {
+        return switch (comptime read.lane(A.In, k)) {
+            .slow, .value => Slider(A, null).run,
+            else => |l| Slider(A, comptime read.laneKind(A.In, l)).run,
+        };
+    }
+
     fn runOf(comptime A: type, kind: types.TypeKind) Run {
         return switch (kind) {
-            inline else => |k| Slider(A, k).run,
+            inline else => |k| runAt(A, k),
         };
     }
 
     /// The sliding aggregate for `f` over an argument column of `kind`, chosen once.
     fn slider(f: Func, agg: ast.AggFunc, kind: types.TypeKind, out: types.Type) Run {
-        if (f.arg == null) return runOf(aggFuncs.Count, .int);
+        if (f.arg == null) return runAt(aggFuncs.Count, .int);
         return switch (agg) {
             .count => if (f.distinct) runOf(CountDistinct, kind) else runOf(aggFuncs.Count, kind),
             .count_if => runOf(aggFuncs.CountIf, kind),
-            .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runOf(SumInt, kind) else runOf(FloatSum(false), kind),
-            .avg => if (kind == .int) runOf(aggFuncs.AvgInt, kind) else runOf(FloatSum(true), kind),
+            .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runAt(SumInt, .int) else runOf(FloatSum, kind),
+            .avg => if (kind == .int) runAt(aggFuncs.AvgInt, .int) else runOf(FloatSum, kind),
             inline .min, .max => |m| switch (kind) {
-                inline else => |k| runOf(Deque(read.Phys(k) orelse Value, if (m == .min) .lt else .gt), k),
+                inline else => |k| runAt(Deque(read.Phys(k) orelse Value, if (m == .min) .lt else .gt), k),
             },
             .median => runOf(Median, kind),
             .bool_and => runOf(aggFuncs.BoolFold(true), kind),
@@ -799,7 +826,7 @@ pub const Window = struct {
             .bit_and => runOf(BitStack(.@"and"), kind),
             .bit_or => runOf(BitStack(.@"or"), kind),
             .bit_xor => runOf(aggFuncs.Bits(.xor), kind),
-            inline .var_samp, .var_pop, .stddev_samp, .stddev_pop => |g| if (kind == .int) runOf(Spread(g, true), kind) else runOf(Spread(g, false), kind),
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (kind == .int) runAt(Spread(true), .int) else runOf(Spread(false), kind),
         };
     }
 
@@ -988,7 +1015,7 @@ pub const Window = struct {
                     const fr = try frames(work, l, f.frame, rk);
                     const col: ?column.Column = if (arg) |x| try read.castText(work, agg, out_ty, x) else null;
                     const cx = Ctx{ .out = out_ty, .ty = if (col) |x| x.ty else out_ty, .alloc = work, .scratch = work };
-                    slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, &bd) catch |e| {
+                    slider(f, agg, if (col) |x| x.ty.kind else .int, out_ty)(col, fr, l, cx, agg, &bd) catch |e| {
                         if (e == error.IntOverflow and agg == .sum and out_ty.kind == .int) if (self.err) |ec| ec.set("{s}: in window SUM", .{errLabel(e)});
                         return e;
                     };
