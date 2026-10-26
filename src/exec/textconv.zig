@@ -55,10 +55,6 @@ pub const Words = struct {
     /// A WITH hint (analyze/targets.zig:197): any case, untrimmed, `true`/`false`.
     pub const hint: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true };
 
-    /// A connection option string or a PARAM override (connect/register.zig:148,
-    /// analyze.zig:722): exactly `true`, anything else is false.
-    pub const true_or_false: Words = .{ .yes = &.{.whole("true")}, .otherwise = false };
-
     /// An `xsi:nil` attribute (xml/read.zig:518): exactly `true` or `1`, else false.
     pub const xsd_nil: Words = .{ .yes = &.{ .whole("true"), .whole("1") }, .otherwise = false };
 
@@ -169,10 +165,6 @@ fn oracleHint(s: []const u8) ?bool {
     return if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else null;
 }
 
-fn oracleTrueOrFalse(s: []const u8) ?bool {
-    return std.mem.eql(u8, s, "true");
-}
-
 fn oracleXsdNil(s: []const u8) ?bool {
     return std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1");
 }
@@ -206,7 +198,6 @@ fn expectPreset(comptime w: Words, comptime oracle: fn ([]const u8) ?bool) !void
 test "each bool preset reads exactly what the reader it replaces reads" {
     try expectPreset(Words.sql, oracleSql);
     try expectPreset(Words.hint, oracleHint);
-    try expectPreset(Words.true_or_false, oracleTrueOrFalse);
     try expectPreset(Words.xsd_nil, oracleXsdNil);
     try expectPreset(Words.ooxml_flag, oracleOoxmlFlag);
     try expectPreset(Words.delta_property, oracleDeltaProperty);
@@ -220,7 +211,6 @@ test "SQL reads a BOOL in one word set: DuckDB's and PostgreSQL's shared words, 
         try testing.expectEqual(@as(?bool, false), boolText(Words.sql, s));
     for ([_][]const u8{ "", "tr", "tru", "ye", "fa", "on", "off", "of", "o", "2", "-1", "10", "truee", "yess", "nil" }) |s|
         try testing.expectEqual(@as(?bool, null), boolText(Words.sql, s));
-    try testing.expectEqual(@as(?bool, false), boolText(Words.true_or_false, "TRUE"));
     try testing.expectEqual(@as(?bool, null), boolText(Words.hint, " true "));
 }
 
