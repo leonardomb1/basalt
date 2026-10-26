@@ -12,7 +12,11 @@ inside it, and a record may run to 64 MiB — past that the read stops with an e
 naming the file and line, as a file that is not CSV or a quote left open would
 otherwise be read into memory whole. Every row must have one field per
 header column: a row with more or fewer is an error naming the file, the line and
-both counts, never padded with nulls or cut short.
+both counts, never padded with nulls or cut short. A cell that is not valid UTF-8
+is an error naming the file, the line, the column and the first bad byte, never
+repaired, as DuckDB's reader refuses it: read a file that is not UTF-8 `WITH
+(encoding = 'latin1')` or `'cp1252'`, which decode every byte. A header name that
+is not UTF-8 is repaired (each invalid byte U+FFFD), so it cannot hide the rest.
 
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
@@ -331,8 +335,9 @@ is the empty string in a text column and NULL in a typed one; an absent element
 or `xsi:nil="true"` is NULL. Namespace prefixes are dropped, and names encoded as
 SQL Server's `FOR XML` writes them (`Valor_x0020_Total`) are decoded. The
 declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252; `WITH (encoding =
-'latin1')` overrides a wrong declaration), UTF-16 is refused, and invalid UTF-8 is
-repaired. An XML file streams, row by row, on one lane; a folder of `.xml` files
+'latin1')` overrides a wrong declaration), UTF-16 is refused, and text or an
+attribute value that is not valid UTF-8 is an error naming the file, the row and
+the element or attribute, as a CSV cell is (a name is repaired). An XML file streams, row by row, on one lane; a folder of `.xml` files
 reads as one table, and `.xml.gz`, objects, SFTP and SMB work as for CSV. A
 document that ends before its root closes, holds no element or has text outside
 its root is an error, never a shorter table, and so is one row past 64 MB or

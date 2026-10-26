@@ -4,6 +4,7 @@
 const std = @import("std");
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const expectRunRefuses = @import("harness.zig").expectRunRefuses;
 
 fn out(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
@@ -54,4 +55,17 @@ test "an XML file is not appended to; root and row apply to an XML target only" 
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.xml' APPEND AS SELECT 1 AS a;", "root element closes on its last line");
     try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' WITH (row = 'r') AS SELECT 1 AS a;", "`row` is an option of an XML file");
     try expectRefusedAlike(alloc, &tmp, "SELECT * FROM '$B/x.xml' WITH (items = 'a');", "does not apply to an XML read");
+}
+
+test "XML text that is not UTF-8 fails the run naming row and element; read as latin-1 it decodes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "o.xml", .data = "<orders><order><city>S\u{e3}o Paulo</city></order><order><city>Bel\xe9m</city></order></orders>" });
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT city FROM '$B/o.xml';", 1, "o.xml`: XML row 2, `city`: not valid UTF-8 (byte 0xe9 at offset 3); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8");
+    try tmp.dir.writeFile(.{ .sub_path = "l.xml", .data = "<orders><order><city>Bel\xe9m</city></order></orders>" });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT city FROM '$B/l.xml' WITH (encoding = 'latin1');", 1, &.{});
+    const got = try out(alloc, &tmp);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("city\nBel\u{e9}m\n", got);
 }

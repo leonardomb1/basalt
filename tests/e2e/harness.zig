@@ -134,6 +134,30 @@ pub fn expectRefusedAlike(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tm
     }
 }
 
+/// `run` with `threads` refuses the script (`$B` the tmp dir), naming `want`; for a
+/// failure only the data shows, which `check` cannot see.
+pub fn expectRunRefuses(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const u8, threads: usize, want: []const u8) !void {
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var rdiag: Diag = .{};
+    if (run(alloc, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag)) |_| {
+        std.debug.print("run accepted: {s}\n", .{script});
+        return error.TestUnexpectedResult;
+    } else |e| {
+        const msg = if (rdiag.msg.len > 0) rdiag.msg else basalt.eval.peekFailure(e) orelse @errorName(e);
+        if (std.mem.indexOf(u8, msg, want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ want, msg });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 pub fn expectFile(tmp: *std.testing.TmpDir, name: []const u8, want: []const u8) !void {
     const alloc = std.testing.allocator;
     const got = try tmp.dir.readFileAlloc(alloc, name, 1 << 16);

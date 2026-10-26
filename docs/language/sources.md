@@ -186,8 +186,10 @@ source is asked to do are on [Pushdown](pushdown.md).
   text writes back to the same bytes. A local file read with a dialect
   still fans out over byte-range chunks under `-j`, each lane decoding its chunk
   in that dialect. Multi-byte encodings are not supported: they would break that
-  chunking. A file whose bytes are not what you claimed does not fail, it just yields
-  mojibake, so prefer the publisher's stated encoding over guessing. The delimiter
+  chunking. Read as `utf8`, a cell that is not valid UTF-8 fails the read, naming
+  the file, line and column. `latin1` and `cp1252` decode every byte, so a file
+  whose bytes are not what you claimed does not fail there, it just yields
+  mojibake: prefer the publisher's stated encoding over guessing. The delimiter
   is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
   always writes UTF-8, and being told otherwise is an error rather than ignored.
 - **`WITH (format = 'csv' | 'parquet' | 'arrow' | 'xlsx')`** — read or write a

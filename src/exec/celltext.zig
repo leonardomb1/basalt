@@ -57,7 +57,8 @@ pub const Utf8Runs = struct {
         return replacement;
     }
 
-    fn seqLen(s: []const u8) usize {
+    /// The length of the valid UTF-8 sequence `s` starts with; 0 when it starts none.
+    pub fn seqLen(s: []const u8) usize {
         if (s[0] < 0x80) return 1;
         const n = std.unicode.utf8ByteSequenceLength(s[0]) catch return 0;
         if (n > s.len) return 0;

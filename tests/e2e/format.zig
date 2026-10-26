@@ -10,6 +10,8 @@ const runToString = @import("harness.zig").runToString;
 const exec = @import("harness.zig").exec;
 const runScript = @import("harness.zig").runScript;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const expectRunRefuses = @import("harness.zig").expectRunRefuses;
+const checkAndRun = @import("harness.zig").checkAndRun;
 
 test "read a semicolon latin-1 file end to end" {
     const alloc = std.testing.allocator;
@@ -23,6 +25,27 @@ test "read a semicolon latin-1 file end to end" {
     );
     defer alloc.free(out);
     try std.testing.expectEqualStrings("SIT,N\nLIQUIDAÇÃO,2\nCANCELADA,1\n", out);
+}
+
+test "a CSV cell that is not UTF-8 fails the run naming file, line and column, serial and in lanes; latin-1 reads it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,cidade\n");
+    for (0..5000) |i| try input.writer().print("{d},S\u{e3}o Paulo \u{20ac}\n", .{i});
+    try tmp.dir.writeFile(.{ .sub_path = "ok.csv", .data = input.items });
+    try input.appendSlice("5000,Bel\xe9m\n");
+    try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = input.items });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, MAX(cidade) AS c FROM '$B/ok.csv';", 4, &.{});
+    try @import("harness.zig").expectFile(&tmp, "out.csv", "n,c\n5000,S\u{e3}o Paulo \u{20ac}\n");
+    const want = "bad.csv` line 5002, column `cidade`: not valid UTF-8 (byte 0xe9 at offset 3); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8";
+    for ([_]usize{ 1, 4 }) |threads|
+        try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n, MAX(cidade) AS c FROM '$B/bad.csv';", threads, want);
+    try tmp.dir.writeFile(.{ .sub_path = "l1.csv", .data = "id,cidade\n1,Bel\xe9m\n" });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT cidade FROM '$B/l1.csv' WITH (encoding = 'latin1');", 1, &.{});
+    try @import("harness.zig").expectFile(&tmp, "out.csv", "cidade\nBel\u{e9}m\n");
 }
 
 test "an unreadable extension is refused by run, not just check" {
