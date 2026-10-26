@@ -448,7 +448,10 @@ if runs postgres; then
     echo "4,,"; } >"$out/pg_bytea_expected.csv"
   for fmt in hex escape; do
     pgq -c "ALTER DATABASE it SET bytea_output = '$fmt';" >/dev/null 2>&1
-    if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+    want='\x01ff5c'; [ "$fmt" = escape ] && want='\001\377\\'
+    if [ "$(pgq -c "SELECT b FROM it_bytea WHERE k = 1;")" != "$want" ]; then
+      report "postgres-bytea-time-$fmt (server not in $fmt output)" bad
+    elif brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
 LOAD INTO '$out/pg_bytea_$fmt.csv' AS SELECT k, hex(b) AS b, t FROM db.it_bytea ORDER BY k;"; then
       check "postgres-bytea-time-$fmt" "$out/pg_bytea_$fmt.csv" "$out/pg_bytea_expected.csv"
     else
