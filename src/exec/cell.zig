@@ -161,7 +161,12 @@ fn appendPgBytea(b: *column.Builder, raw: []const u8, bad: Error) Error!void {
             i += 2;
         } else {
             if (i + 4 > raw.len) return bad;
-            out[n] = std.fmt.parseInt(u8, raw[i + 1 .. i + 4], 8) catch return bad;
+            var v: u16 = 0;
+            for (raw[i + 1 .. i + 4]) |c| {
+                if (c < '0' or c > '7') return bad;
+                v = v * 8 + (c - '0');
+            }
+            out[n] = std.math.cast(u8, v) orelse return bad;
             i += 4;
         }
     }
@@ -398,7 +403,7 @@ test "a BYTES cell is MySQL's raw bytes, and PostgreSQL's bytea decoded from hex
     try converter(.bytes, wire)(&my, "\\x01");
     var pg = column.Builder.init(a, types.Type.init(.bytes).asNullable());
     for ([_][]const u8{ "\\x01ff5C", "\\x", "\\001a\\\\b\\377", "" }) |raw| try converter(.bytes, pg_wire)(&pg, raw);
-    for ([_][]const u8{ "\\x1", "\\xzz", "\\01", "\\", "a\\9zz", "\\400" }) |raw| {
+    for ([_][]const u8{ "\\x1", "\\xzz", "\\01", "\\", "a\\9zz", "\\400", "\\1_2", "\\+12", "\\-00", "\\08a" }) |raw| {
         try testing.expectError(error.UnparseableNumber, converter(.bytes, pg_wire)(&pg, raw));
     }
     const mc = try my.finish();
