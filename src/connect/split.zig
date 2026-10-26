@@ -13,8 +13,9 @@
 //! after the probe still land in a lane. Slice 0 also claims NULL keys (`OR col IS
 //! NULL`): every range test is UNKNOWN for NULL, so a nullable split column once
 //! made those rows match no lane and vanish from a `-j > 1` read. Date keys (DATE and
-//! DATETIME/TIMESTAMP alike) are sliced by day with date literals, which every dialect
-//! compares against either type. UUID keys are sliced evenly over the 128-bit space,
+//! DATETIME/TIMESTAMP alike) are sliced by day with date literals (`sql.dateLit`,
+//! `0044-03-15 BC` on PostgreSQL), which every dialect compares against either
+//! type; bounds past what the dialect can name read serially. UUID keys are sliced evenly over the 128-bit space,
 //! balanced for random v4 ids with no bounds probe.
 //!
 //! Below `min_rows_to_split` estimated rows the planner stays serial: each lane
@@ -25,7 +26,6 @@ const std = @import("std");
 const sql = @import("../db/sql.zig");
 const civil = @import("../exec/civil.zig");
 const uuid = @import("../format/uuid.zig");
-const eval = @import("../exec/eval.zig");
 const Value = @import("../exec/value.zig").Value;
 
 const Conn = sql.Conn;
@@ -334,13 +334,17 @@ fn dayOf(v: Value) ?i64 {
     };
 }
 
+/// Up to `m_in` covering, disjoint day-range predicates over [min_day, max_day],
+/// each bound a `sql.dateLit`; a single whole-range predicate (a serial read)
+/// when a bound is a day the dialect cannot name, rather than one it misreads.
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
+    const whole = try std.fmt.allocPrint(arena, "({s} IS NULL OR {s} IS NOT NULL)", .{ qcol, qcol });
     const span: i128 = @as(i128, max_day) - @as(i128, min_day) + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
-        const one = try std.fmt.allocPrint(arena, "({s} >= '{s}' OR {s} IS NULL)", .{ qcol, try eval.formatDate(arena, min_day), qcol });
+        const one = try std.fmt.allocPrint(arena, "({s} >= {s} OR {s} IS NULL)", .{ qcol, (try sql.dateLit(arena, dialect, min_day)) orelse return dupeOne(arena, whole), qcol });
         return try dupeOne(arena, one);
     }
     const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
@@ -348,14 +352,16 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     var k: usize = 0;
     while (k < m) : (k += 1) {
         const lo: i64 = @intCast(@as(i128, min_day) + @as(i128, @intCast(k)) * width);
+        const lo_lit = (try sql.dateLit(arena, dialect, lo)) orelse return dupeOne(arena, whole);
         if (k == m - 1) {
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}'", .{ qcol, try eval.formatDate(arena, lo) }));
+            try list.append(try std.fmt.allocPrint(arena, "{s} >= {s}", .{ qcol, lo_lit }));
         } else {
             const hi: i64 = @intCast(@as(i128, lo) + width);
+            const hi_lit = (try sql.dateLit(arena, dialect, hi)) orelse return dupeOne(arena, whole);
             if (k == 0) {
-                try list.append(try std.fmt.allocPrint(arena, "(({s} >= '{s}' AND {s} < '{s}') OR {s} IS NULL)", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi), qcol }));
+                try list.append(try std.fmt.allocPrint(arena, "(({s} >= {s} AND {s} < {s}) OR {s} IS NULL)", .{ qcol, lo_lit, qcol, hi_lit, qcol }));
             } else {
-                try list.append(try std.fmt.allocPrint(arena, "{s} >= '{s}' AND {s} < '{s}'", .{ qcol, try eval.formatDate(arena, lo), qcol, try eval.formatDate(arena, hi) }));
+                try list.append(try std.fmt.allocPrint(arena, "{s} >= {s} AND {s} < {s}", .{ qcol, lo_lit, qcol, hi_lit }));
             }
         }
     }
@@ -818,6 +824,35 @@ test "a DECIMAL(38,0) key whose span overflows i128 reads serially; one that fit
     }
     try std.testing.expectEqual(@as(usize, 1), (try intRangePreds(a, .postgres, "id", std.math.minInt(i128), std.math.maxInt(i128), 4)).len);
     try std.testing.expectEqual(@as(usize, 1), (try intRangePreds(a, .postgres, "id", std.math.maxInt(i128) - 5, std.math.maxInt(i128), 4)).len);
+}
+
+test "a date or timestamp key with a bound before year 1 splits with BC on PostgreSQL, serially elsewhere (D3)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+    const ides = civil.daysFromCivil(-43, 3, 15);
+    const end = civil.daysFromCivil(2024, 1, 1);
+    const bounds = [_][2]Value{
+        .{ .{ .date = @intCast(ides) }, .{ .date = @intCast(end) } },
+        .{ .{ .timestamp = civil.dayMicros(ides) + 5 }, .{ .timestamp = civil.dayMicros(end) + 7 } },
+    };
+    for (bounds) |b| for ([_]KeyKind{ .date, .auto }) |kind| {
+        var f = FakeConn{ .arena = a, .rows = &.{&.{ b[0], b[1] }} };
+        const p = (try plan(a, f.prober(), .postgres, base, .{ .col = "d", .kind = kind }, 2)).?;
+        try std.testing.expectEqual(@as(usize, 2), p.predicates.len);
+        try std.testing.expectEqualStrings("((\"d\" >= '0044-03-15 BC' AND \"d\" < '0990-08-08') OR \"d\" IS NULL)", p.predicates[0]);
+        try std.testing.expectEqualStrings("\"d\" >= '0990-08-08'", p.predicates[1]);
+        for ([_]Dialect{ .mysql, .sqlserver, .starrocks, .doris }) |d| {
+            var g = FakeConn{ .arena = a, .rows = &.{&.{ b[0], b[1] }} };
+            try std.testing.expectEqual(@as(?Plan, null), try plan(a, g.prober(), d, base, .{ .col = "d", .kind = kind }, 2));
+        }
+    };
+    var far = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = @intCast(end) }, .{ .date = @intCast(civil.daysFromCivil(10000, 1, 1)) } }} };
+    const pf = (try plan(a, far.prober(), .mysql, base, .{ .col = "d", .kind = .date }, 2)).?;
+    try std.testing.expectEqualStrings("`d` >= '6012-01-02'", pf.predicates[1]);
+    var past = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = @intCast(civil.daysFromCivil(-5000, 1, 1)) }, .{ .date = @intCast(end) } }} };
+    try std.testing.expectEqual(@as(?Plan, null), try plan(a, past.prober(), .postgres, base, .{ .col = "d", .kind = .date }, 2));
 }
 
 test "plan stays serial when the bounds probe finds nothing to slice" {

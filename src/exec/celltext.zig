@@ -183,15 +183,22 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
         .date, .time, .timestamp => {
             const q = if (@hasDecl(P, "quote_temporal")) P.quote_temporal else "";
             try w.writeAll(q);
-            const bc = @hasDecl(P, "bc_years") and P.bc_years;
-            switch (c.ty.kind) {
-                .date => if (bc) try civil.writeLayout(w, c.data.i32[r], .pg_date) else try format.writeDate(w, c.data.i32[r]),
-                .time => try format.writeTime(w, c.data.i64[r]),
-                else => if (bc) try civil.writeLayout(w, c.data.i64[r], .pg_timestamp) else try format.writeTimestamp(w, c.data.i64[r]),
-            }
+            try writeTemporal(w, c.ty.kind, if (c.ty.kind == .date) c.data.i32[r] else c.data.i64[r], P);
             try w.writeAll(q);
         },
         .string, .bytes, .array, .@"struct" => unreachable,
+    }
+}
+
+/// A date, time or timestamp of `kind` as policy `P` spells it, unquoted: `x` is
+/// days for a date, microseconds otherwise.
+pub fn writeTemporal(w: anytype, kind: types.TypeKind, x: i64, comptime P: type) !void {
+    const bc = @hasDecl(P, "bc_years") and P.bc_years;
+    switch (kind) {
+        .date => if (bc) try civil.writeLayout(w, x, .pg_date) else try format.writeDate(w, x),
+        .time => try format.writeTime(w, x),
+        .timestamp => if (bc) try civil.writeLayout(w, x, .pg_timestamp) else try format.writeTimestamp(w, x),
+        else => unreachable,
     }
 }
 

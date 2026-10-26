@@ -41,6 +41,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
+const civil = @import("../exec/civil.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const retry = @import("../connect/retry.zig");
@@ -998,6 +999,53 @@ fn Literal(comptime dialect: Dialect) type {
     };
 }
 
+/// The first and last day a date literal may name on `dialect`: years 1..9999, or
+/// on PostgreSQL 4714-11-24 BC through 294276-12-31, its timestamp's range, so the
+/// literal reads alike against a DATE or a TIMESTAMP column.
+fn literalDays(dialect: Dialect) [2]i64 {
+    return switch (dialect) {
+        .postgres => comptime .{ civil.daysFromCivil(-4713, 11, 24), civil.daysFromCivil(294276, 12, 31) },
+        .mysql, .sqlserver, .starrocks, .doris => comptime .{ civil.epoch.ce1, civil.daysFromCivil(9999, 12, 31) },
+    };
+}
+
+/// Day `d` as a quoted date literal, spelled as an INSERT spells a date cell
+/// (`Literal`); null when `dialect` holds no such day (`literalDays`).
+pub fn dateLit(arena: std.mem.Allocator, dialect: Dialect, d: i64) !?[]const u8 {
+    const span = literalDays(dialect);
+    if (d < span[0] or d > span[1]) return null;
+    var out = std.Io.Writer.Allocating.init(arena);
+    switch (dialect) {
+        inline else => |dl| {
+            const L = Literal(dl);
+            try out.writer.writeAll(L.quote_temporal);
+            try celltext.writeTemporal(&out.writer, .date, d, L);
+            try out.writer.writeAll(L.quote_temporal);
+        },
+    }
+    return out.written();
+}
+
+test "dateLit spells a date as INSERT does, null past what the dialect holds (D3)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const ides = civil.daysFromCivil(-43, 3, 15);
+    try std.testing.expectEqualStrings("'2024-01-01'", (try dateLit(a, .mysql, 19723)).?);
+    try std.testing.expectEqualStrings("'2024-01-01'", (try dateLit(a, .postgres, 19723)).?);
+    try std.testing.expectEqualStrings("'0044-03-15 BC'", (try dateLit(a, .postgres, ides)).?);
+    try std.testing.expectEqualStrings("'10000-01-01'", (try dateLit(a, .postgres, civil.daysFromCivil(10000, 1, 1))).?);
+    try std.testing.expectEqualStrings("'4714-11-24 BC'", (try dateLit(a, .postgres, civil.daysFromCivil(-4713, 11, 24))).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try dateLit(a, .postgres, civil.daysFromCivil(-4713, 11, 23)));
+    try std.testing.expectEqual(@as(?[]const u8, null), try dateLit(a, .postgres, civil.daysFromCivil(294277, 1, 1)));
+    try std.testing.expectEqualStrings("'0001-01-01'", (try dateLit(a, .sqlserver, civil.epoch.ce1)).?);
+    for ([_]Dialect{ .mysql, .sqlserver, .starrocks, .doris }) |d| {
+        try std.testing.expectEqual(@as(?[]const u8, null), try dateLit(a, d, ides));
+        try std.testing.expectEqual(@as(?[]const u8, null), try dateLit(a, d, civil.epoch.ce1 - 1));
+        try std.testing.expectEqual(@as(?[]const u8, null), try dateLit(a, d, civil.daysFromCivil(10000, 1, 1)));
+    }
+}
+
 /// A float as a literal the target keeps: `-0` as a float, not the integer 0, and
 /// NaN and the infinities as PostgreSQL spells them; elsewhere they have no value.
 fn floatLiteral(w: anytype, dialect: Dialect, x: f64) !void {
@@ -1330,7 +1378,6 @@ test "a date or timestamp before year 1 is spelled with BC for PostgreSQL only (
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const civil = @import("../exec/civil.zig");
     const ides: i32 = @intCast(civil.daysFromCivil(-43, 3, 15));
     const noon = @as(i64, ides) * civil.us_per_day + 12 * 3_600_000_000;
     try std.testing.expectEqualStrings("'0044-03-15 BC'", try literalOf(a, .postgres, .date, .{ .date = ides }));
