@@ -170,10 +170,13 @@ pub fn resolveFolderFmt(env: *Env, path: []const u8, want: ?analyze.FileFormat, 
 
 fn resolveTable(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake.At) !?FolderRead {
     if (want != null and lake.Kind.of(want) == null) return null;
+    if (env.tables) |m| if (m.find(path, lake.Kind.of(want), at)) |t|
+        return .{ .kind = .parquet, .files = try t.layout.paths(env.arena), .table = t };
     const found: lake.Found = if (lake.Kind.of(want)) |k| .{ .kind = k } else (lake.detect(env.arena, path) catch |e|
         return listFailed(env, path, e)) orelse return null;
     const kind = found.kind;
-    const t = lake.resolve(env.arena, path, kind, at, found.listed) catch |e| {
+    const got = if (env.tables) |m| m.resolve(path, kind, at, found.listed) else lake.resolve(env.arena, path, kind, at, found.listed);
+    const t = got catch |e| {
         if (eval.takeFailure(e)) |why| return planErrT(env.diag, e, try env.arena.dupe(u8, why));
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read {s} table `{s}` ({s})", .{ kind.label(), path, try pathFail(env.arena, path, e) }));
     };

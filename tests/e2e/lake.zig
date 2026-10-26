@@ -747,3 +747,45 @@ test "Delta column mapping: a struct field dropped inside a list element or a ma
         try testing.expectEqualStrings("a,l,m\n1,\"[{\"\"y\"\":10},{\"\"y\"\":11}]\",\"{\"\"7\"\":{\"\"y\"\":30}}\"\n", try rows(a, &tmp, "SELECT * FROM '$B/n/'", 1));
     }
 }
+
+/// `script` (its `$B` the tmp dir) run on `threads` lanes without a separate
+/// `check`, and the Delta logs it replayed, `check`'s included; `out.csv` read back.
+fn replayed(a: std.mem.Allocator, tmp: *std.testing.TmpDir, tmpl: []const u8, threads: usize) !struct { n: u64, out: []const u8 } {
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const script = try std.mem.replaceOwned(u8, a, tmpl, "$B", base);
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a, script, &pd);
+    var rdiag: Diag = .{};
+    tmp.dir.deleteFile("out.csv") catch {};
+    const before = basalt.lake.replays();
+    _ = run(testing.allocator, prog, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag) catch |e| {
+        std.debug.print("run failed: {s}\n", .{rdiag.msg});
+        return e;
+    };
+    return .{ .n = basalt.lake.replays() - before, .out = tmp.dir.readFileAlloc(a, "out.csv", 1 << 20) catch "" };
+}
+
+test "a statement replays a Delta log once: check's snapshot is the read's, a self-join and lanes share it, a write makes the next read replay" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try basicTable(a, &tmp);
+
+    for ([_]usize{ 1, 4 }) |threads| {
+        const r = try replayed(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT * FROM '$B/t/' ORDER BY id;", threads);
+        try testing.expectEqual(@as(u64, 1), r.n);
+        try testing.expectEqualStrings("id,name\n3,cy\n4,dee\n5,eve\n", r.out);
+    }
+    try testing.expectEqual(@as(u64, 1), (try replayed(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT name FROM '$B/t/' WHERE id = 4;", 1)).n);
+    const join = try replayed(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n FROM '$B/t/' x JOIN '$B/t/' y ON x.id = y.id;", 1);
+    try testing.expectEqual(@as(u64, 1), join.n);
+    try testing.expectEqualStrings("n\n3\n", join.out);
+    try testing.expectEqual(@as(u64, 2), (try replayed(a, &tmp, "LOAD INTO '$B/out2.csv' AS SELECT * FROM '$B/t/'; LOAD INTO '$B/out.csv' AS SELECT * FROM '$B/t/';", 1)).n);
+
+    try tmp.dir.writeFile(.{ .sub_path = "w.csv", .data = "id,name\n1,ann\n2,bob\n" });
+    _ = try replayed(a, &tmp, "LOAD INTO '$B/w/' WITH (format = 'delta') AS SELECT id, name FROM '$B/w.csv';", 1);
+    const after = try replayed(a, &tmp, "LOAD INTO '$B/./w/' APPEND AS SELECT id + 10 AS id, name FROM '$B/w.csv'; LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n FROM '$B/w/';", 1);
+    try testing.expectEqualStrings("n\n4\n", after.out);
+}

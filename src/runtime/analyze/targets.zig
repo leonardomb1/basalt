@@ -472,13 +472,13 @@ fn recordLanes(call: ast.BuiltinRead) bool {
 /// A local CSV header, parquet footer, Parquet folder's first file, workbook's first
 /// pass or JSON file's (or JSON folder's first file's) sampled rows, as the run reads
 /// them; everything else stays unresolved.
-pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint) ?types.Schema {
+pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint, tables: ?*lake.Memo) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
     if (rd.form == .builtin) return .{ .fields = arena.dupe(types.Schema.Field, table_builtins.of(rd.form.builtin).schema.fields) catch return null };
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path) or ftp.isUrl(rd.form.path)) return null;
         if (folder.isFolder(rd.form.path)) {
-            if (offlineTable(arena, rd.form.path, hints) catch null) |t| return t.layout.schema;
+            if (offlineTable(arena, rd.form.path, hints, tables) catch null) |t| return t.layout.schema;
             var fdiag = Diag{};
             const explicit = formatFromHints(hints, &fdiag) catch return null;
             if (lake.Kind.of(explicit) != null) return null;
@@ -543,7 +543,8 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
 
 /// A local lake table resolved as a run would, for `check` to type and to refuse
 /// what a run refuses; null for a plain folder, a remote one, or one not there yet.
-pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const ast.Hint) !?*const lake.Resolved {
+/// With `tables` the run's, it is resolved there, once for the statement reading it.
+pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const ast.Hint, tables: ?*lake.Memo) !?*const lake.Resolved {
     var d = Diag{};
     const explicit = formatFromHints(hints, &d) catch return null;
     const named = lake.Kind.of(explicit);
@@ -551,9 +552,11 @@ pub fn offlineTable(arena: std.mem.Allocator, path: []const u8, hints: []const a
     if (!lake.isTablePath(path) or std.mem.indexOf(u8, path, "://") != null) return null;
     std.fs.cwd().access(path, .{}) catch return null;
     const at = lakeAt(hints, &d) catch return null;
+    if (tables) |m| if (m.find(path, named, at)) |t| return t;
     const found: lake.Found = if (named) |k| .{ .kind = k } else (lake.detect(arena, path) catch |e| return if (e == lake.Error.LakeTableRefused) e else null) orelse
         (if (at.pinned()) return lake.notPinnable(path) else return null);
-    return lake.resolve(arena, path, found.kind, at, found.listed) catch |e| if (e == lake.Error.LakeTableRefused) e else null;
+    const got = if (tables) |m| m.resolve(path, found.kind, at, found.listed) else lake.resolve(arena, path, found.kind, at, found.listed);
+    return got catch |e| if (e == lake.Error.LakeTableRefused) e else null;
 }
 
 fn xmlSchema(arena: std.mem.Allocator, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) ?types.Schema {

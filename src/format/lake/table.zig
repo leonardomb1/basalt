@@ -147,6 +147,100 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At, l
     };
 }
 
+/// How many table logs this process has replayed.
+pub fn replays() u64 {
+    return delta.replays.load(.monotonic);
+}
+
+/// The tables one run resolved, so a statement replays each table's log once:
+/// `check` resolves a script's local tables before the run starts, and planning a
+/// statement resolves its tables again for pushdown, the source and its lanes. The
+/// statement that first uses an entry `check` resolved reads that same snapshot,
+/// its schema and its files alike. A used entry is retired as its statement ends,
+/// so the next statement replays the log anew, and is kept until the run ends with
+/// what that statement opened over it. A write retires every entry, and one no
+/// statement used is freed then: it may hold the files the write replaced. Each
+/// entry has its own arena. A sequential loop row has a memo of its own, freed
+/// with the row; not thread-safe, so a PARALLEL loop's rows resolve alone.
+pub const Memo = struct {
+    gpa: std.mem.Allocator,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    /// Set as the run starts, after `check`: an entry found or resolved from then
+    /// on is the running statement's.
+    running: bool = false,
+
+    const State = enum { unused, used, retired };
+
+    const Entry = struct {
+        root: []const u8,
+        kind: Kind,
+        at: At,
+        table: *const Resolved,
+        arena: *std.heap.ArenaAllocator,
+        state: State,
+    };
+
+    pub fn init(gpa: std.mem.Allocator) Memo {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *Memo) void {
+        for (self.entries.items) |e| self.free(e.arena);
+        self.entries.deinit(self.gpa);
+    }
+
+    /// The live entry for `root` at `at`, of `kind` or, without one, of any kind.
+    pub fn find(self: *Memo, root: []const u8, kind: ?Kind, at: At) ?*const Resolved {
+        for (self.entries.items) |*e| {
+            if (e.state == .retired or !e.at.eql(at) or !std.mem.eql(u8, e.root, root)) continue;
+            if (kind) |k| if (e.kind != k) continue;
+            if (self.running) e.state = .used;
+            return e.table;
+        }
+        return null;
+    }
+
+    /// `root` read as a `kind` table at `at`, its log replayed only when no live
+    /// entry holds it.
+    pub fn resolve(self: *Memo, root: []const u8, kind: Kind, at: At, listed: ?[]const []const u8) !*const Resolved {
+        if (self.find(root, kind, at)) |t| return t;
+        try self.entries.ensureUnusedCapacity(self.gpa, 1);
+        const ar = try self.gpa.create(std.heap.ArenaAllocator);
+        ar.* = .init(self.gpa);
+        errdefer self.free(ar);
+        const a = ar.allocator();
+        const own = try a.dupe(u8, root);
+        const t = switch (kind) {
+            .delta => try delta.resolve(a, own, at, listed),
+        };
+        self.entries.appendAssumeCapacity(.{ .root = own, .kind = kind, .at = at, .table = t, .arena = ar, .state = if (self.running) .used else .unused });
+        return t;
+    }
+
+    /// A statement ended: the entries it used are retired, and after a write every
+    /// entry is, one no statement used freed.
+    pub fn endStatement(self: *Memo, wrote: bool) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            if (e.state == .used or (wrote and e.state == .unused)) {
+                if (e.state == .unused) {
+                    self.free(e.arena);
+                    _ = self.entries.swapRemove(i);
+                    continue;
+                }
+                e.state = .retired;
+            }
+            i += 1;
+        }
+    }
+
+    fn free(self: *Memo, ar: *std.heap.ArenaAllocator) void {
+        ar.deinit();
+        self.gpa.destroy(ar);
+    }
+};
+
 pub fn isHttp(path: []const u8) bool {
     return scheme.ofCased(path).has(.http);
 }

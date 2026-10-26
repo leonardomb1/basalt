@@ -24,6 +24,7 @@ pub const fld = @import("testing_util.zig").fld;
 const intLit = @import("testing_util.zig").intLit;
 const joinStage = @import("testing_util.zig").joinStage;
 const offlineSchema = @import("../analyze/targets.zig").offlineSchema;
+const Tables = @import("../../format/lake/table.zig").Memo;
 const projStage = @import("testing_util.zig").projStage;
 pub const qfld = @import("testing_util.zig").qfld;
 const readStage = @import("testing_util.zig").readStage;
@@ -41,10 +42,11 @@ fn bindingNames(
     arena: std.mem.Allocator,
     bindings: *const std.StringHashMap(ast.Pipeline),
     name: []const u8,
+    tables: ?*Tables,
 ) !?[]const []const u8 {
     const pipe = bindings.get(name) orelse return null;
     var out = std.array_list.Managed([]const u8).init(arena);
-    if (!try stageNames(bindings, pipe.stages, &out, 0)) return null;
+    if (!try stageNames(bindings, pipe.stages, &out, 0, tables)) return null;
     for (out.items) |n| if (std.mem.indexOf(u8, n, "${") != null) return null;
     return try out.toOwnedSlice();
 }
@@ -56,6 +58,7 @@ fn stageNames(
     stages: []const ast.Stage,
     out: *std.array_list.Managed([]const u8),
     depth: usize,
+    tables: ?*Tables,
 ) !bool {
     if (depth > 16) return false;
     var i = stages.len;
@@ -67,7 +70,7 @@ fn stageNames(
                 var input = std.array_list.Managed([]const u8).init(out.allocator);
                 for (items) |it| switch (it) {
                     .star, .star_except, .star_rename => {
-                        if (input.items.len == 0 and !try stageNames(bindings, stages[0..i], &input, depth + 1)) return false;
+                        if (input.items.len == 0 and !try stageNames(bindings, stages[0..i], &input, depth + 1, tables)) return false;
                         break;
                     },
                     .star_of => return false,
@@ -100,13 +103,13 @@ fn stageNames(
                 return true;
             },
             .read => |rd| {
-                const sch = offlineSchema(out.allocator, rd, stages[i].hints) orelse return false;
+                const sch = offlineSchema(out.allocator, rd, stages[i].hints, tables) orelse return false;
                 for (sch.fields) |f| try out.append(f.name);
                 return true;
             },
             .ref => |r| {
                 const pipe = bindings.get(r) orelse return false;
-                return stageNames(bindings, pipe.stages, out, depth + 1);
+                return stageNames(bindings, pipe.stages, out, depth + 1, tables);
             },
             else => return false,
         }
@@ -118,23 +121,23 @@ fn stageNames(
 /// header or footer says them, through refs and each joined side. A select over a
 /// source only its database can name (or a union) keeps every item, so a column the
 /// database lacks still fails the read rather than vanishing with a pruned item.
-pub fn sourcesKnown(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage) bool {
-    return sourcesKnownAt(arena, bindings, stages, 0);
+pub fn sourcesKnown(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage, tables: ?*Tables) bool {
+    return sourcesKnownAt(arena, bindings, stages, 0, tables);
 }
 
-fn sourcesKnownAt(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage, depth: usize) bool {
+fn sourcesKnownAt(arena: std.mem.Allocator, bindings: *const std.StringHashMap(ast.Pipeline), stages: []const ast.Stage, depth: usize, tables: ?*Tables) bool {
     if (depth > 16 or stages.len == 0) return false;
     switch (stages[0].node) {
-        .read => |rd| if (offlineSchema(arena, rd, stages[0].hints) == null) return false,
+        .read => |rd| if (offlineSchema(arena, rd, stages[0].hints, tables) == null) return false,
         .ref => |r| {
             const pipe = bindings.get(r) orelse return false;
-            if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1)) return false;
+            if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1, tables)) return false;
         },
         else => return false,
     }
     for (stages[1..]) |st| if (st.node == .join) {
         const pipe = bindings.get(st.node.join.binding) orelse return false;
-        if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1)) return false;
+        if (!sourcesKnownAt(arena, bindings, pipe.stages, depth + 1, tables)) return false;
     };
     return true;
 }
@@ -193,6 +196,7 @@ fn fromTableCols(
     arena: std.mem.Allocator,
     bindings: *const std.StringHashMap(ast.Pipeline),
     stages: []const ast.Stage,
+    tables: ?*Tables,
 ) !Own {
     var own = std.array_list.Managed([]const u8).init(arena);
     for (stages[1..]) |st| switch (st.node) {
@@ -202,7 +206,7 @@ fn fromTableCols(
     };
     if (own.items.len == 0) return .{};
     var head = std.array_list.Managed([]const u8).init(arena);
-    if (!try stageNames(bindings, stages[0..1], &head, 0)) return .{};
+    if (!try stageNames(bindings, stages[0..1], &head, 0, tables)) return .{};
     var has = std.array_list.Managed([]const u8).init(arena);
     for (own.items) |n| for (head.items) |h| {
         if (std.mem.eql(u8, n, h)) {
@@ -316,6 +320,7 @@ pub fn hoistThroughJoins(
     gpa: std.mem.Allocator,
     stages: []const ast.Stage,
     bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
 ) !?[]const ast.Stage {
     if (stages.len < 3) return null;
     var list = std.array_list.Managed(ast.Stage).init(arena);
@@ -334,8 +339,8 @@ pub fn hoistThroughJoins(
             const right: []const []const u8 = if (j.kind == .semi or j.kind == .anti)
                 &.{}
             else
-                (try bindingNames(arena, bindings, j.binding)) orelse continue;
-            const own = try fromTableCols(arena, bindings, list.items[0..i]);
+                (try bindingNames(arena, bindings, j.binding, tables)) orelse continue;
+            const own = try fromTableCols(arena, bindings, list.items[0..i], tables);
             const f = list.items[i];
             var parts = std.array_list.Managed(*ast.Expr).init(arena);
             try splitAnd(f.node.filter, &parts);
@@ -383,6 +388,7 @@ pub fn hoistFilters(
     gpa: std.mem.Allocator,
     stages: []const ast.Stage,
     bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
 ) !?[]const ast.Stage {
     var cur = stages;
     var changed = false;
@@ -390,7 +396,7 @@ pub fn hoistFilters(
         cur = s;
         changed = true;
     }
-    if (try hoistThroughJoins(arena, gpa, cur, bindings)) |s| {
+    if (try hoistThroughJoins(arena, gpa, cur, bindings, tables)) |s| {
         cur = s;
         changed = true;
         if (try hoistThroughSelects(arena, cur)) |t| cur = t;
@@ -721,7 +727,7 @@ test "hoist: a WHERE splits at its ANDs; the left's conjuncts go below the join,
     const across = try bin(a, .@"or", try bin(a, .gt, try fld(a, "w"), try intLit(a, 3)), try bin(a, .eq, try fld(a, "rk"), try intLit(a, 4)));
     const pred = try bin(a, .@"and", try bin(a, .@"and", left, right), across);
     const stages = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(pred), writeStage() };
-    const out = (try hoistThroughJoins(a, a, &stages, &binds)).?;
+    const out = (try hoistThroughJoins(a, a, &stages, &binds, null)).?;
     try std.testing.expectEqual(@as(usize, 5), out.len);
     try std.testing.expect(out[1].node == .filter and out[2].node == .join and out[3].node == .filter);
     try std.testing.expectEqual(left, out[1].node.filter);
@@ -740,7 +746,7 @@ test "hoist: a conjunct that may fail on a row stays above the join, beside one 
     const div = try bin(a, .gt, try bin(a, .div, try intLit(a, 10), try fld(a, "v")), try intLit(a, 1));
     const pred = try bin(a, .@"and", try bin(a, .@"and", plain, cast), div);
     const stages = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(pred), writeStage() };
-    const out = (try hoistThroughJoins(a, a, &stages, &binds)).?;
+    const out = (try hoistThroughJoins(a, a, &stages, &binds, null)).?;
     try std.testing.expectEqual(plain, out[1].node.filter);
     try std.testing.expectEqual(cast, out[3].node.filter.binary.l);
     try std.testing.expectEqual(div, out[3].node.filter.binary.r);
@@ -760,11 +766,11 @@ test "hoist: a filter after a semi or anti join moves below it, whatever the rig
     defer binds.deinit();
     for ([_]ast.JoinKind{ .semi, .anti }) |kind| {
         const stages = [_]ast.Stage{ readStage(), try joinStage(a, kind, "unknown", "k", "rk"), try eqFilter(a, &.{"rk"}, 1), writeStage() };
-        const out = (try hoistThroughJoins(a, a, &stages, &binds)).?;
+        const out = (try hoistThroughJoins(a, a, &stages, &binds, null)).?;
         try std.testing.expect(out[1].node == .filter and out[2].node == .join);
     }
     const inner = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "unknown", "k", "rk"), try eqFilter(a, &.{"v"}, 1), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &inner, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, &inner, &binds, null)) == null);
 }
 
 test "hoist: a name written with the FROM table's alias goes below though the right side has it; a bare one stays" {
@@ -780,19 +786,19 @@ test "hoist: a name written with the FROM table's alias goes below though the ri
     var j = try joinStage(a, .inner, "r", "k", "rk");
     j.node.join.own_cols = &.{ try qual(a, &.{"name"}), try qual(a, &.{"zz"}) };
     const own = [_]ast.Stage{ fact, j, try eqFilter(a, &.{"name"}, 1), writeStage() };
-    const out = (try hoistThroughJoins(a, a, &own, &binds)).?;
+    const out = (try hoistThroughJoins(a, a, &own, &binds, null)).?;
     try std.testing.expect(out[1].node == .filter and out[2].node == .join);
 
     const lacking = [_]ast.Stage{ fact, j, try eqFilter(a, &.{"zz"}, 1), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &lacking, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, &lacking, &binds, null)) == null);
     const unknown = [_]ast.Stage{ readStage(), j, try eqFilter(a, &.{"name"}, 1), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &unknown, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, &unknown, &binds, null)) == null);
 
     var bare_q = try qual(a, &.{"name"});
     bare_q.sides = &.{"r"};
     const bare_e = try mkExpr(a, .{ .field = bare_q });
     const bare = [_]ast.Stage{ fact, j, filterStage(try bin(a, .eq, bare_e, try intLit(a, 1))), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &bare, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, &bare, &binds, null)) == null);
 }
 
 test "hoist: a right side read from a local file is asked its names" {
@@ -810,9 +816,9 @@ test "hoist: a right side read from a local file is asked its names" {
     try binds.put("r", .{ .stages = rs, .pos = .{ .line = 0, .col = 0 } });
 
     const left = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try eqFilter(a, &.{"v"}, 1), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &left, &binds)).?[1].node == .filter);
+    try std.testing.expect((try hoistThroughJoins(a, a, &left, &binds, null)).?[1].node == .filter);
     const right = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try eqFilter(a, &.{"name"}, 1), writeStage() };
-    try std.testing.expect((try hoistThroughJoins(a, a, &right, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, &right, &binds, null)) == null);
 }
 
 test "hoist: a probe-only filter moves below an inner join" {
@@ -828,7 +834,7 @@ test "hoist: a probe-only filter moves below an inner join" {
     stages[2] = try eqFilter(a, &.{"v"}, 1);
     stages[3] = writeStage();
 
-    const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
+    const out = (try hoistThroughJoins(a, a, stages, &binds, null)).?;
     try std.testing.expectEqual(@as(usize, 4), out.len);
     try std.testing.expect(out[1].node == .filter);
     try std.testing.expect(out[2].node == .join);
@@ -855,7 +861,7 @@ test "hoist: a filter naming a right-side column stays put" {
         stages[1] = try joinStage(a, .inner, "r", "k", "rk");
         stages[2] = try eqFilter(a, parts, 1);
         stages[3] = writeStage();
-        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) == null);
     }
 }
 
@@ -872,7 +878,7 @@ test "hoist: refused for the join kinds that null-extend the probe side" {
         stages[1] = try joinStage(a, kind, "r", "k", "rk");
         stages[2] = try eqFilter(a, &.{"v"}, 1);
         stages[3] = writeStage();
-        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) == null);
     }
     for ([_]ast.JoinKind{ .inner, .left, .semi, .anti, .cross }) |kind| {
         const stages = try a.alloc(ast.Stage, 4);
@@ -880,7 +886,7 @@ test "hoist: refused for the join kinds that null-extend the probe side" {
         stages[1] = try joinStage(a, kind, "r", "k", "rk");
         stages[2] = try eqFilter(a, &.{"v"}, 1);
         stages[3] = writeStage();
-        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) != null);
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) != null);
     }
 }
 
@@ -903,7 +909,7 @@ test "hoist: a binding with an open name set is left alone" {
     stages[1] = try joinStage(a, .inner, "r", "k", "rk");
     stages[2] = try eqFilter(a, &.{"v"}, 1);
     stages[3] = writeStage();
-    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) == null);
 }
 
 test "derive: a predicate on the join key gains a probe-side twin" {
@@ -919,7 +925,7 @@ test "derive: a predicate on the join key gains a probe-side twin" {
     stages[2] = try eqFilter(a, &.{ "r", "rk" }, 7);
     stages[3] = writeStage();
 
-    const out = (try hoistThroughJoins(a, a, stages, &binds)).?;
+    const out = (try hoistThroughJoins(a, a, stages, &binds, null)).?;
     try std.testing.expectEqual(@as(usize, 5), out.len);
     try std.testing.expect(out[1].node == .filter);
     try std.testing.expect(out[2].node == .join);
@@ -942,7 +948,7 @@ test "derive: only for an inner join, and only when every ref is a right-side ke
         stages[1] = try joinStage(a, kind, "r", "k", "rk");
         stages[2] = try eqFilter(a, &.{ "r", "rk" }, 7);
         stages[3] = writeStage();
-        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+        try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) == null);
     }
 
     const stages = try a.alloc(ast.Stage, 4);
@@ -950,7 +956,7 @@ test "derive: only for an inner join, and only when every ref is a right-side ke
     stages[1] = try joinStage(a, .inner, "r", "k", "rk");
     stages[2] = try eqFilter(a, &.{ "r", "name" }, 7);
     stages[3] = writeStage();
-    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds)) == null);
+    try std.testing.expect((try hoistThroughJoins(a, a, stages, &binds, null)) == null);
 
     const j = (try joinStage(a, .inner, "r", "k", "rk")).node.join;
     try std.testing.expect((try deriveProbePredicate(a, a, (try eqFilter(a, &.{ "r", "rk" }, 7)).node.filter, j)) != null);

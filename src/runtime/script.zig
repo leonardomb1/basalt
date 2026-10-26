@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
+const lake = @import("../format/lake/table.zig");
 const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
@@ -381,15 +382,17 @@ const RowScope = struct {
     arena: std.mem.Allocator,
     materialized: @FieldType(Env, "materialized"),
     folder_memo: @FieldType(Env, "folder_memo"),
+    tables: @FieldType(Env, "tables"),
     sql_desc: @FieldType(Env, "sql_desc"),
     mem_sink: @FieldType(Env, "mem_sink"),
     sink_label_prefix: @FieldType(Env, "sink_label_prefix"),
     last_target: []const u8,
 
-    fn enter(env: *Env, row: std.mem.Allocator) RowScope {
-        const kept = RowScope{ .arena = env.arena, .materialized = env.materialized, .folder_memo = env.folder_memo, .sql_desc = env.sql_desc, .mem_sink = env.mem_sink, .sink_label_prefix = env.sink_label_prefix, .last_target = env.last_target };
+    fn enter(env: *Env, row: std.mem.Allocator, row_tables: *lake.Memo) RowScope {
+        const kept = RowScope{ .arena = env.arena, .materialized = env.materialized, .folder_memo = env.folder_memo, .tables = env.tables, .sql_desc = env.sql_desc, .mem_sink = env.mem_sink, .sink_label_prefix = env.sink_label_prefix, .last_target = env.last_target };
         env.arena = row;
         env.folder_memo = .empty;
+        if (env.tables != null) env.tables = row_tables;
         return kept;
     }
 
@@ -397,6 +400,7 @@ const RowScope = struct {
         env.arena = self.arena;
         env.materialized = self.materialized;
         env.folder_memo = self.folder_memo;
+        env.tables = self.tables;
         env.sql_desc = self.sql_desc;
         env.mem_sink = self.mem_sink;
         env.sink_label_prefix = self.sink_label_prefix;
@@ -432,6 +436,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         var w_env = ctx.base.*;
         w_env.arena = w_arena.allocator();
         w_env.folder_memo = .empty;
+        w_env.tables = null;
         w_env.gpa = gpa;
         w_env.sources = &w_sources;
         w_env.diag = &w_diag;
@@ -665,7 +670,9 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 const lr = LoopRow{ .names = needles, .types = fe.var_types, .cells = row, .outer = outer };
                 var row_mem = std.heap.ArenaAllocator.init(env.gpa);
                 defer row_mem.deinit();
-                const kept = RowScope.enter(env, row_mem.allocator());
+                var row_tables = lake.Memo{ .gpa = env.gpa, .running = true };
+                defer row_tables.deinit();
+                const kept = RowScope.enter(env, row_mem.allocator(), &row_tables);
                 const ran = run_body(env, fe.body, lr, opts, stats, lanes_used, batch_arena);
                 kept.leave(env);
                 if (ran) |_| {

@@ -462,7 +462,7 @@ fn pruneFor(arena: std.mem.Allocator, stages: []const ast.Stage, after: []const 
 /// (`pushdown.sourcesKnown`); elsewhere unchanged, so a column a database lacks still
 /// reaches its read and fails there.
 pub fn pruneKnown(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
-    if (!pushdown.sourcesKnown(env.arena, env.bindings, stages)) return stages;
+    if (!pushdown.sourcesKnown(env.arena, env.bindings, stages, env.tables)) return stages;
     return pruneSelects(env.arena, stages);
 }
 
@@ -996,8 +996,8 @@ fn prepareSide(env: *Env, stages_in: []const ast.Stage, after: []const ast.Stage
     if (stages_in.len == 0) return stages_in;
     var stages = try inlineHeadBindings(env, stages_in);
     stages = try analyze.substFilterParams(env.arena, stages, env.params_expr);
-    if (try pushdown.hoistFilters(env.arena, env.gpa, stages, env.bindings)) |h| stages = h;
-    if (pushdown.sourcesKnown(env.arena, env.bindings, stages)) stages = try pruneFor(env.arena, stages, after);
+    if (try pushdown.hoistFilters(env.arena, env.gpa, stages, env.bindings, env.tables)) |h| stages = h;
+    if (pushdown.sourcesKnown(env.arena, env.bindings, stages, env.tables)) stages = try pruneFor(env.arena, stages, after);
     stages = try projectSqlRead(env, stages);
     return descendLeadingWhere(env, stages);
 }
@@ -1245,7 +1245,7 @@ test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its qu
     const fns = std.StringHashMap(ast.FnDecl).init(a);
     var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
 
-    const hoisted = (try pushdown.hoistFilters(a, a, stages, &bindings)).?;
+    const hoisted = (try pushdown.hoistFilters(a, a, stages, &bindings, null)).?;
     const out = try descendLeadingWhere(&env, hoisted);
     try std.testing.expect(std.mem.indexOf(u8, out[0].node.read.where, "\"status\" = 1") != null);
     try std.testing.expect(out[1].node == .filter and out[2].node == .join);

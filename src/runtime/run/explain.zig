@@ -35,6 +35,7 @@ const types = @import("../../lang/types.zig");
 /// form renders the static plan through `analyze.render`. Both are scoped to this
 /// one statement.
 pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    defer env.endStatement(false);
     if (e.mode == .describe) return runDescribe(env, e.pipeline, stats);
     if (e.mode == .analyze) {
         const outer = env.explain;
@@ -46,7 +47,7 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     }
 
     var adiag = analyze.Diag{};
-    const plan = analyze.analyzeOne(env.arena, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag) catch |err| return aErr(env, &adiag, err);
+    const plan = analyze.analyzeOne(env.arena, e.pipeline, env.bindings, env.connections, env.params_expr, &adiag, env.tables) catch |err| return aErr(env, &adiag, err);
 
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();

@@ -90,6 +90,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
     if (is_load) env.last_target = try targetLabel(arena, last.write);
+    defer env.endStatement(is_load);
     const moving = env.progress != null and (is_load or env.progress.?.mode == .hook);
     if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
     const load_t0 = std.time.milliTimestamp();
@@ -345,7 +346,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     stages = try analyze.substFilterParams(arena, stages, env.params_expr);
 
-    if (try pushdown.hoistFilters(arena, env.gpa, stages, env.bindings)) |hoisted| {
+    if (try pushdown.hoistFilters(arena, env.gpa, stages, env.bindings, env.tables)) |hoisted| {
         env.log.log(.debug, "filter hoisted through a projection or join: {d} -> {d} stages", .{ stages.len, hoisted.len });
         stages = hoisted;
     }
@@ -393,7 +394,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         head_stages = joined;
     }
     if (inlined > 0) {
-        if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings)) |h| head_stages = h;
+        if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings, env.tables)) |h| head_stages = h;
         head_stages = try pruneKnown(env, head_stages);
     }
     if (env.profile) |p| {

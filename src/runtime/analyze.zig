@@ -839,6 +839,9 @@ pub const Options = struct {
     known_tables: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
     declarations_only: bool = false,
+    /// The run's tables, which a local lake table `check` reads is resolved into,
+    /// for the run's first statement reading it to read as is.
+    tables: ?*lake.Memo = null,
 };
 
 pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
@@ -967,7 +970,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     try writtenFiles(arena, program.stmts[1..], &written);
     var json_params = std.array_list.Managed([]const u8).init(arena);
     for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.append(s.param.name);
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items, .tables = opts.tables };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -1105,8 +1108,9 @@ pub fn analyzeOne(
     connections: *std.StringHashMap(ast.Connection),
     params: *const std.StringHashMap(*const ast.Expr),
     diag: *Diag,
+    tables: ?*lake.Memo,
 ) Error!Plan {
-    var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag };
+    var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag, .tables = tables };
     const outs = try arena.alloc(Output, 1);
     outs[0] = try ctx.analyzeOutput(pipe);
     return .{ .outputs = outs };
@@ -1123,6 +1127,7 @@ const Ctx = struct {
     issues: ?*std.array_list.Managed(Issue) = null,
     written: []const []const u8 = &.{},
     json_params: ?[]const []const u8 = null,
+    tables: ?*lake.Memo = null,
 
     /// A table function's body, typed where it is declared with each parameter a null
     /// of its declared type, so one nothing calls is checked too. A problem a call
@@ -1315,7 +1320,7 @@ const Ctx = struct {
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
         const head = try self.inlineHead(try bindLimits(self.arena, pipe.stages, self.params, self.diag));
         const via = head.via;
-        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
+        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings, self.tables) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
             return fail(self.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`", .{});
         for (stages) |st| {
@@ -1496,7 +1501,7 @@ const Ctx = struct {
                 }
                 const rewritten = rd.form == .path and ast.nameIn(self.written, rd.form.path);
                 if (!rewritten and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
-                    const t = offlineTable(self.arena, rd.form.path, lead.hints) catch |e|
+                    const t = offlineTable(self.arena, rd.form.path, lead.hints, self.tables) catch |e|
                         return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
                     if (t) |tb| return .{
                         .connector = connector,
@@ -1505,7 +1510,7 @@ const Ctx = struct {
                         .format = @tagName(tb.kind),
                     };
                 }
-                const schema = if (rewritten) null else offlineSchema(self.arena, rd, lead.hints);
+                const schema = if (rewritten) null else offlineSchema(self.arena, rd, lead.hints, self.tables);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
@@ -1675,7 +1680,7 @@ const Ctx = struct {
         const b = self.bindings.get(j.binding) orelse return st;
         if (b.stages.len == 0) return st;
         const head = try self.inlineHead(try j.rightStages(self.arena, b.stages));
-        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings) catch null) orelse head.stages;
+        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings, self.tables) catch null) orelse head.stages;
         if (stages[0].node != .read) return st;
         var src = self.resolveSource(stages[0]) catch return st;
         st.right_scan = try msgfmt.allocPrint(self.arena, "{s} {s} (via binding {s})", .{ sinkKind(src), src.detail, head.via orelse j.binding });

@@ -53,6 +53,7 @@ const arrow = @import("../format/arrow/write.zig");
 const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const analyze = @import("analyze.zig");
+const lake = @import("../format/lake/table.zig");
 const obs = @import("obs.zig");
 const Value = @import("../exec/value.zig").Value;
 
@@ -129,7 +130,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
 
-    try checkFirst(gpa, raw_program, opts, diag);
+    var tables = lake.Memo.init(gpa);
+    defer tables.deinit();
+    try checkFirst(gpa, raw_program, opts, &tables, diag);
+    tables.running = true;
 
     var expand_msg: []const u8 = "";
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
@@ -216,6 +220,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var batch_arena = std.heap.ArenaAllocator.init(gpa);
     defer batch_arena.deinit();
 
+    env.tables = &tables;
     env.space = scratch.space();
     env.op_memory = opts.op_memory;
     env.stdin_free = opts.stdin_free;
@@ -249,24 +254,27 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer if (opts.summary_out) |so| {
         so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(@max(0, std.time.milliTimestamp() - t0)), lanes_used, &loads, &scan, runnable == 1);
     };
-    for (program.stmts[1..]) |s| switch (s) {
-        .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
-        .output => |p| {
-            env.noteResult(if (p.show) "show" else "select", p.pos);
-            try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena);
-        },
-        .explain => |e| {
-            env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
-            try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena);
-        },
-        .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
-        .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
-        .print => |p| try runPrint(&env, p, no_loop_vars),
-        .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
-        .throw => |t| try runThrow(&env, t, no_loop_vars),
-        .let_const => |l| if (l.query != null) try runScalarLet(&env, l),
-        else => {},
-    };
+    for (program.stmts[1..]) |s| {
+        switch (s) {
+            .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
+            .output => |p| {
+                env.noteResult(if (p.show) "show" else "select", p.pos);
+                try runOutput(&env, try renderScriptScope(&env, p), opts, &stats, &lanes_used, &batch_arena);
+            },
+            .explain => |e| {
+                env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
+                try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena);
+            },
+            .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
+            .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
+            .print => |p| try runPrint(&env, p, no_loop_vars),
+            .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
+            .throw => |t| try runThrow(&env, t, no_loop_vars),
+            .let_const => |l| if (l.query != null) try runScalarLet(&env, l),
+            else => {},
+        }
+        env.endStatement(env.wrote_sink);
+    }
 
     stats.rows_read = rows_read.load(.monotonic);
     stats.elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - t0));
@@ -291,16 +299,17 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 /// The whole script through `check`'s analysis before anything runs, so a run
 /// refuses what `check` refuses, and a statement's static error stops the run
 /// before an earlier statement has written anything. The analysis gets its own
-/// arena, freed on return: it replays a local Delta log the run replays again,
-/// and nothing it builds outlives it, its refusal copied into `diag`.
-fn checkFirst(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, diag: *Diag) !void {
+/// arena, freed on return, its refusal copied into `diag`; only the local lake
+/// tables it resolves outlive it, in `tables`, for the statement reading each to
+/// read the snapshot `check` typed rather than replay the log again.
+fn checkFirst(gpa: std.mem.Allocator, program: ast.Program, opts: RunOptions, tables: *lake.Memo, diag: *Diag) !void {
     var analysis_arena = std.heap.ArenaAllocator.init(gpa);
     defer analysis_arena.deinit();
     const arena = analysis_arena.allocator();
     const overrides = try arena.alloc(analyze.ParamOverride, opts.params.len);
     for (opts.params, overrides) |kv, *o| o.* = .{ .name = kv.key, .value = kv.val };
     var adiag = analyze.Diag{};
-    _ = analyze.analyzeOpts(arena, program, .{ .overrides = overrides, .declarations_only = opts.declarations_only }, &adiag) catch |e| switch (e) {
+    _ = analyze.analyzeOpts(arena, program, .{ .overrides = overrides, .declarations_only = opts.declarations_only, .tables = tables }, &adiag) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.AnalyzeFailed => {
             const err = planErr(diag, adiag.msg);
@@ -391,6 +400,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
 fn runScalarLet(env: *Env, l: ast.LetConst) !void {
+    defer env.endStatement(false);
     const what = try analyze.queryLetLabel(env.arena, l.name);
     const pipe = try buildPipeline(env, try ownClock(env, l.query.?.stages));
     defer pipe.op.release();
@@ -649,7 +659,7 @@ test {
     _ = @import("run/params.zig");
 }
 
-test "checkFirst frees its analysis, a local Delta log's replay included, before the run builds its plan" {
+test "checkFirst frees its analysis; the local Delta table it resolved is kept for the run, and a write frees it unused" {
     const sql_parser = @import("../lang/sql_parser.zig");
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -667,5 +677,11 @@ test "checkFirst frees its analysis, a local Delta log's replay included, before
     var pd: sql_parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try sql_parser.parseSource(a, script, &pd);
     var diag: Diag = .{};
-    try checkFirst(std.testing.allocator, prog, .{}, &diag);
+    var tables = lake.Memo.init(std.testing.allocator);
+    defer tables.deinit();
+    try checkFirst(std.testing.allocator, prog, .{}, &tables, &diag);
+    const root = try msgfmt.allocPrint(a, "{s}/t/", .{base});
+    try std.testing.expect(tables.find(root, null, .{}) != null);
+    tables.endStatement(true);
+    try std.testing.expect(tables.find(root, null, .{}) == null);
 }
