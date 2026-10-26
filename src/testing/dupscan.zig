@@ -406,6 +406,7 @@ pub const plan = [_]Rule{
     .{ .home = "widen", .pattern = widen_pattern, .exact = true, .allow = &.{
         "lang/types.zig",
     } },
+    .{ .home = "clamp", .pattern = clamp_pattern, .exact = true },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -444,6 +445,9 @@ pub const sql_pattern = "\"''\"|== '\\\\''|'\\\\'' =>";
 pub const guard_pattern = "errdefer \\w+\\.abort\\(\\);([^{}]|\\{[^{}]*\\})*try \\w+\\.close\\(";
 pub const delta_types_pattern = "\"timestamp_ntz\"|\"decimal\\(\"";
 pub const unsigned_pattern = "decimal\\(20, ?0\\)";
+/// A DATE's midnight past what a timestamp holds is an error (D1, D2), so no
+/// saturating day-to-micros helper or multiply may return.
+pub const clamp_pattern = "dayMicros\\(|\\*\\| ?(civil\\.)?us_per_day";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
@@ -663,7 +667,7 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
     try expectStarts(guard_pattern, "errdefer w.abort();\n    if (a) { b(); }\n    try w.close();", .file, &.{0});
 }
 
-test "dupscan queue, sql, guard, delta_types, unsigned and widen patterns" {
+test "dupscan queue, sql, guard, delta_types, unsigned, widen and clamp patterns" {
     try expectNeedles(queue_pattern, &.{"next.fetchAdd("});
     try expectNeedles(delta_types_pattern, &.{ "\"timestamp_ntz\"", "\"decimal(\"" });
     try expectNeedles(unsigned_pattern, &.{"decimal(20,"});
@@ -696,6 +700,11 @@ test "dupscan queue, sql, guard, delta_types, unsigned and widen patterns" {
         .{ widen_pattern, "if ((build == .int and p == .float) or (build == .float and p == .int)) return f;", false },
         .{ widen_pattern, "if (a.kind == .int and b.kind == .decimal) return unify(d, b);", false },
         .{ widen_pattern, "if (p.ty.kind == .int and (raw == .float or raw == .decimal))", false },
+        .{ clamp_pattern, "return civil.dayMicros(days) + t;", true },
+        .{ clamp_pattern, "return days *| us_per_day;", true },
+        .{ clamp_pattern, "const us = d *| civil.us_per_day;", true },
+        .{ clamp_pattern, "return civil.dayMicrosChecked(days) orelse error.CastFailed;", false },
+        .{ clamp_pattern, "const us = d * civil.us_per_day;", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

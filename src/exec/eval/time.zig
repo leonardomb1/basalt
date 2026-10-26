@@ -390,7 +390,7 @@ test "strftime prints the true year outside 0..9999, as a date prints it (D14)" 
         .{ 9999, "9999-06-01|99" },
     }) |c| {
         out.clearRetainingCapacity();
-        try strftimeInto(&out, civil.dayMicros(daysFromCivil(c[0], 6, 1)), "%Y-%m-%d|%y");
+        try strftimeInto(&out, civil.dayMicrosChecked(daysFromCivil(c[0], 6, 1)).?, "%Y-%m-%d|%y");
         try std.testing.expectEqualStrings(c[1], out.items);
     }
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);

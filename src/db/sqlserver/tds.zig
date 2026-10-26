@@ -1349,7 +1349,7 @@ fn appendRaw(comptime c: Decode, b: *column.Builder, d: ColumnDesc, raw: []const
         .float => try b.appendFloat(if (raw.len == 4) @as(f64, @as(f32, @bitCast(@as(u32, @truncate(readULE(raw)))))) else @bitCast(readULE(raw))),
         .decimal => try b.appendDecimal(try decodeDecimal(d, raw)),
         .money => try b.appendDecimal(try decodeMoney(raw)),
-        .date => if (std.math.cast(i32, @as(i64, @bitCast(readULE(raw))) + civil.epoch.ce1)) |days| try b.appendAs(.i32, days) else try b.appendNull(),
+        .date => try b.appendAs(.i32, try decodeDate(raw)),
         .time => try b.appendInt(try decodeTime(d, raw)),
         .datetime => try b.appendInt(try decodeDateTime(d, raw)),
         .plain_text, .win1252 => {
@@ -1419,6 +1419,19 @@ fn decodeTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
     return @divTrunc(tu * 1_000_000, scaleDivisor(d.scale));
 }
 
+/// DATENTYPE: 3 little-endian bytes counting days since 0001-01-01.
+fn decodeDate(bytes: []const u8) MalformedValue!i32 {
+    if (bytes.len > 3) return error.MalformedTdsValue;
+    return @intCast(@as(i64, @intCast(readULE(bytes))) + civil.epoch.ce1);
+}
+
+/// A day count and the microseconds into it as a timestamp; one past what a
+/// timestamp holds is malformed, never clamped.
+fn stamp(days: i64, micros: i64) MalformedValue!i64 {
+    const midnight = civil.dayMicrosChecked(days) orelse return error.MalformedTdsValue;
+    return std.math.add(i64, midnight, micros) catch error.MalformedTdsValue;
+}
+
 /// DATETIME2/DATETIMEOFFSET: 3-5 bytes of time, 3 of date (and 2 of offset);
 /// DATETIME: 8 bytes; SMALLDATETIME: 4.
 fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
@@ -1429,18 +1442,18 @@ fn decodeDateTime(d: ColumnDesc, bytes: []const u8) MalformedValue!i64 {
             const tlen = bytes.len - 3 - off_bytes;
             const time_micros = try decodeTime(d, bytes[0..tlen]);
             const days: i64 = @intCast(readULE(bytes[tlen .. tlen + 3]));
-            return civil.dayMicros(days + civil.epoch.ce1) +| time_micros;
+            return stamp(days + civil.epoch.ce1, time_micros);
         },
         else => switch (bytes.len) {
             8 => {
                 const date4 = readIntLE(bytes[0..4]);
                 const ticks: i64 = @intCast(readULE(bytes[4..8]));
-                return civil.dayMicros(date4 + civil.epoch.sql1900) +| @divTrunc(ticks * 1_000_000, 300);
+                return stamp(date4 + civil.epoch.sql1900, @divTrunc(ticks * 1_000_000, 300));
             },
             4 => {
                 const days: i64 = std.mem.readInt(u16, bytes[0..2], .little);
                 const mins: i64 = std.mem.readInt(u16, bytes[2..4], .little);
-                return civil.dayMicros(days + civil.epoch.sql1900) + mins * 60_000_000;
+                return stamp(days + civil.epoch.sql1900, mins * 60_000_000);
             },
             else => return error.MalformedTdsValue,
         },
@@ -1778,6 +1791,22 @@ test "a body of a length its type cannot have is an error, never a cut-off value
     try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt2, &long_dt));
     try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt2, &.{ 1, 2, 3, 4 }));
 
+    const dt = ColumnDesc{ .tds_type = 0x3D, .engine_type = types.Type.init(.timestamp).asNullable(), .kind = .fixed, .fixed_len = 8 };
+    var absurd: [8]u8 = undefined;
+    std.mem.writeInt(i32, absurd[0..4], std.math.maxInt(i32), .little);
+    std.mem.writeInt(u32, absurd[4..8], 0, .little);
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt, &absurd));
+    std.mem.writeInt(i32, absurd[0..4], std.math.minInt(i32), .little);
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt, &absurd));
+    std.mem.writeInt(i32, absurd[0..4], 106_777_558, .little);
+    try std.testing.expectEqual(@as(i64, 9_223_372_022_400_000_000), try decodeDateTime(dt, &absurd));
+    std.mem.writeInt(u32, absurd[4..8], 5_000_000, .little);
+    try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt, &absurd));
+
+    try std.testing.expectError(error.MalformedTdsValue, decodeDate(&.{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80 }));
+    try std.testing.expectError(error.MalformedTdsValue, decodeDate(&.{ 1, 2, 3, 4 }));
+    try std.testing.expectEqual(@as(i32, 0xFFFFFF - 719162), try decodeDate(&.{ 0xFF, 0xFF, 0xFF }));
+
     const tm = ColumnDesc{ .tds_type = 0x29, .engine_type = types.Type.init(.time).asNullable(), .kind = .bytelen, .scale = 7 };
     try std.testing.expectError(error.MalformedTdsValue, decodeTime(tm, &.{ 1, 2 }));
     try std.testing.expectError(error.MalformedTdsValue, decodeTime(tm, &.{ 1, 2, 3, 4, 5, 6 }));
@@ -1877,10 +1906,16 @@ test "tds: epochs from civil are the day counts the decoders used before" {
         r.bytes(&b8);
         const tu: i64 = @intCast(std.mem.readInt(u40, b8[0..5], .little));
         const days: i64 = std.mem.readInt(u24, b8[5..8], .little);
-        try std.testing.expectEqual((days - 719162) *| 86_400_000_000 +| @divTrunc(tu * 1_000_000, 10_000_000), try decodeDateTime(dt2, &b8));
+        try std.testing.expectEqual((days - 719162) * 86_400_000_000 + @divTrunc(tu * 1_000_000, 10_000_000), try decodeDateTime(dt2, &b8));
         const date4: i64 = std.mem.readInt(i32, b8[0..4], .little);
         const ticks: i64 = std.mem.readInt(u32, b8[4..8], .little);
-        try std.testing.expectEqual((date4 - 25567) *| 86_400_000_000 +| @divTrunc(ticks * 1_000_000, 300), try decodeDateTime(dt, &b8));
+        const want: ?i64 = blk: {
+            const mid = std.math.mul(i64, date4 - 25567, 86_400_000_000) catch break :blk null;
+            break :blk std.math.add(i64, mid, @divTrunc(ticks * 1_000_000, 300)) catch null;
+        };
+        if (want) |w| {
+            try std.testing.expectEqual(w, try decodeDateTime(dt, &b8));
+        } else try std.testing.expectError(error.MalformedTdsValue, decodeDateTime(dt, &b8));
         const sdays: i64 = std.mem.readInt(u16, b8[0..2], .little);
         const mins: i64 = std.mem.readInt(u16, b8[2..4], .little);
         try std.testing.expectEqual((sdays - 25567) * 86_400_000_000 + mins * 60_000_000, try decodeDateTime(sdt, b8[0..4]));

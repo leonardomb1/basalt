@@ -237,7 +237,8 @@ fn Typed(comptime E: type) type {
     };
 }
 
-/// A DATE or TIMESTAMP argument across a batch, read as microseconds row by row.
+/// A DATE or TIMESTAMP argument across a batch, read as microseconds row by row;
+/// `days` is built only once `allStamps` passed, so every midnight fits.
 const Temporal = union(enum) {
     days: Typed(i32),
     micros: Typed(i64),
@@ -537,7 +538,7 @@ pub fn Scalar(comptime F: type) type {
             };
             if (comptime a == .unit) return op;
             if (comptime a == .temporal) return switch (op) {
-                .days => |d| civil.dayMicros(typedAt(i32, d, i) orelse return null),
+                .days => |d| civil.dayMicrosChecked(typedAt(i32, d, i) orelse return null) orelse unreachable,
                 .micros => |us| typedAt(i64, us, i),
             };
             return if (numValid(op, i)) numAt(a.Base(), op, i) else null;

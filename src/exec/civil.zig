@@ -63,12 +63,8 @@ pub const epoch = struct {
     pub const julian_unix: i64 = -daysFromCivil(-4713, 11, 24);
 };
 
-/// A day's midnight in microseconds, saturating past the ±292,277 years a
-/// timestamp holds.
-pub fn dayMicros(days: i64) i64 {
-    return days *| us_per_day;
-}
-
+/// A day's midnight in microseconds, or null past the ±292,277 years a
+/// timestamp holds; there is no saturating form, an overflow is never a clamp.
 pub fn dayMicrosChecked(days: i64) ?i64 {
     return std.math.mul(i64, days, us_per_day) catch null;
 }
@@ -654,11 +650,9 @@ test "civil: epochs agree with the literals the readers count from" {
 }
 
 test "civil: midnights, days and times of day at the edges" {
-    try testing.expectEqual(@as(i64, 0), dayMicros(0));
-    try testing.expectEqual(@as(i64, -us_per_day), dayMicros(-1));
-    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), dayMicros(106_751_992));
-    try testing.expectEqual(@as(i64, std.math.minInt(i64)), dayMicros(-106_751_992));
-    try testing.expectEqual(@as(i64, 106_751_991 * us_per_day), dayMicros(106_751_991));
+    try testing.expectEqual(@as(?i64, 0), dayMicrosChecked(0));
+    try testing.expectEqual(@as(?i64, -us_per_day), dayMicrosChecked(-1));
+    try testing.expectEqual(@as(?i64, -106_751_991 * us_per_day), dayMicrosChecked(-106_751_991));
     try testing.expectEqual(@as(?i64, 106_751_991 * us_per_day), dayMicrosChecked(106_751_991));
     try testing.expectEqual(@as(?i64, null), dayMicrosChecked(106_751_992));
     try testing.expectEqual(@as(?i64, null), dayMicrosChecked(-106_751_992));
