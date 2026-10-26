@@ -23,8 +23,8 @@
 //! length may be at most 1024 times its frame (plus 1 MiB), so a hostile length cannot become a
 //! huge allocation before a byte is decoded.
 //!
-//! Types map as the engine can hold them: every integer width to `int` (a
-//! UInt64 above 2^63-1 is an error, never a wrap), floats to `float`, the
+//! Types map as the engine can hold them: every integer width to `int` but a
+//! UInt64, which is the exact `DECIMAL(20,0)` (`types.unsignedType`), floats to `float`, the
 //! three string layouts (`utf8`, `large_utf8`, `utf8_view`) to `string` and the
 //! binary ones to `bytes`, `decimal128` to `decimal`, dates, times and
 //! timestamps in any unit to basalt's day / microsecond types (a zoned
@@ -116,7 +116,8 @@ const Field = struct {
 
     fn basaltType(self: Field) types.Type {
         const t: types.Type = switch (self.kind) {
-            .int, .duration => types.Type.init(.int),
+            .int => if (self.signed) types.Type.init(.int) else types.unsignedType(@intCast(self.bit_width)),
+            .duration => types.Type.init(.int),
             .float => types.Type.init(.float),
             .bool_ => types.Type.init(.bool),
             .decimal => types.Type.decimal(self.precision, self.scale),
@@ -970,7 +971,10 @@ const Cursor = struct {
         return switch (f.kind) {
             .null_ => .null,
             .union_ => Error.UnsupportedArrow,
-            .int => .{ .int = try intAt(self.data, i, f.bit_width, f.signed) },
+            .int => if (f.bit_width == 64 and !f.signed)
+                .{ .decimal = .{ .unscaled = std.mem.readInt(u64, self.data[i * 8 ..][0..8], .little), .scale = 0 } }
+            else
+                .{ .int = try intAt(self.data, i, f.bit_width, f.signed) },
             .duration => .{ .int = f.unit.toMicros(std.mem.readInt(i64, self.data[i * 8 ..][0..8], .little), .saturate) },
             .float => .{ .float = if (f.bit_width == 32)
                 @as(f32, @bitCast(std.mem.readInt(u32, self.data[i * 4 ..][0..4], .little)))
@@ -1076,6 +1080,8 @@ fn widened(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) E
         .int => switch (f.bit_width) {
             inline 8, 16, 32, 64 => |w| if (f.signed)
                 .{ .i64 = try widen(std.meta.Int(.signed, w), i64, arena, cur, off, n, ToInt(i64){}) }
+            else if (w == 64)
+                column.decimalData(try widen(u64, column.Elem(.dec), arena, cur, off, n, ToDec{ .scale = 0 }))
             else
                 .{ .i64 = try widen(std.meta.Int(.unsigned, w), i64, arena, cur, off, n, ToInt(i64){}) },
             else => return Error.CorruptArrow,
@@ -1298,6 +1304,42 @@ test "a projection reads only the columns asked for, in the file's order" {
     try std.testing.expectEqualStrings("i=1 dec=1.50\ni=2 dec=-2.25\ni=null dec=null\n", got);
 }
 
+test "a UInt64 reads as DECIMAL(20,0), every value exact past 2^63-1, on the window and row paths" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const fields = [_]types.Schema.Field{.{ .name = "u", .ty = types.Type.init(.int).asNullable() }};
+    const schema = types.Schema{ .fields = &fields };
+    var b = column.Builder.init(a, fields[0].ty);
+    for ([_]Value{ .{ .int = -1 }, .{ .int = 5 }, .null, .{ .int = std.math.minInt(i64) } }) |v| try b.append(v);
+    var cols = [_]column.Column{try b.finish()};
+    var out = std.Io.Writer.Allocating.init(a);
+    var sw = try @import("write.zig").StreamWriter.init(a, &out.writer, schema, &.{});
+    try sw.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
+    try sw.finish();
+    const bytes = try a.dupe(u8, out.written());
+    const signed_int64 = "\x01\x40\x00\x00\x00";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, signed_int64));
+    bytes[std.mem.indexOf(u8, bytes, signed_int64).?] = 0;
+
+    const r = try Reader.openBytes(a, bytes, null);
+    defer r.close();
+    try std.testing.expectEqual(types.TypeKind.decimal, r.schema.fields[0].ty.kind);
+    try std.testing.expectEqual(@as(u8, 20), r.schema.fields[0].ty.precision);
+    try std.testing.expectEqual(@as(u8, 0), r.schema.fields[0].ty.scale);
+    const got = (try r.next(a)).?;
+    const want = [_]?i128{ 18446744073709551615, 5, null, 9223372036854775808 };
+    for (want, 0..) |w, i| {
+        const v = got.columns[0].getValue(i);
+        if (w) |x| try std.testing.expectEqual(Value{ .decimal = .{ .unscaled = x, .scale = 0 } }, v) else try std.testing.expect(v.isNull());
+    }
+
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, std.math.maxInt(u64), .little);
+    const cur = Cursor{ .f = .{ .name = "u", .kind = .int, .bit_width = 64, .signed = false }, .a = .{ .len = 1, .null_count = 0, .bufs = &.{} }, .reader = undefined, .data = &raw };
+    try std.testing.expectEqual(Value{ .decimal = .{ .unscaled = 18446744073709551615, .scale = 0 } }, try cur.value(a, 0));
+}
+
 test "types map onto the engine's, every column nullable" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1305,7 +1347,7 @@ test "types map onto the engine's, every column nullable" {
     defer r.close();
     const Want = struct { name: []const u8, kind: types.TypeKind };
     const want = [_]Want{
-        .{ .name = "i8", .kind = .int },      .{ .name = "u64", .kind = .int },
+        .{ .name = "i8", .kind = .int },      .{ .name = "u64", .kind = .decimal },
         .{ .name = "f32", .kind = .float },   .{ .name = "d64", .kind = .date },
         .{ .name = "t32s", .kind = .time },   .{ .name = "ts_ns_utc", .kind = .timestamp },
         .{ .name = "dec", .kind = .decimal }, .{ .name = "ls", .kind = .string },

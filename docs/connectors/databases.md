@@ -22,6 +22,11 @@ the column, rather than read as midnight; a `timetz` reads as text. A MySQL
 `TIME` reads as text: it may hold an elapsed time (`-838:59:59` to `838:59:59`)
 that no time of day can, and `CAST(t AS TIME)` reads one that is a time of day.
 
+A MySQL `BIGINT UNSIGNED` reads as `DECIMAL(20,0)`, as a Parquet `UINT64` and an
+Arrow `UInt64` do, so every value up to 18446744073709551615 reads exactly. A
+`BIGINT UNSIGNED` primary key still splits a read under `-j`, over its whole
+unsigned range.
+
 ## StarRocks
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load

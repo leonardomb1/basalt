@@ -96,7 +96,8 @@ fn readPages(
     max_rep: u32,
     base_offset: u64,
 ) ReadError!struct { vals: column.Column, levels: ?Levels } {
-    const cast: Cast = .{ .ty = (try basaltType(elem)).asNullable(), .tick = temporalTick(elem) };
+    var cast = try castOf(elem);
+    cast.ty = cast.ty.asNullable();
     const entries = rows orelse std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
     var levels: ?Levels = if (rows == null) .{
         .reps = std.array_list.Managed(u32).init(arena),
@@ -126,7 +127,7 @@ fn readPages(
     }
     if (rows != null and produced != entries) return Error.CorruptParquetPage;
     const vals = try b.finish();
-    try readUnsigned(elem, vals);
+    readUnsigned(elem, vals);
     return .{ .vals = vals, .levels = levels };
 }
 
@@ -139,19 +140,21 @@ fn readPageOf(arena: std.mem.Allocator, file_bytes: []const u8, offset: usize, m
     };
 }
 
-/// Every decode path sign-extends a physical int, so an unsigned column is mended
-/// once here; a UINT64 past 2^63-1 is refused rather than read negative.
-fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) Error!void {
+/// Every decode path sign-extends a physical int, so an unsigned INT column, one
+/// narrower than 64 bits, is mended once here; a UINT64 is a DECIMAL(20,0) its
+/// `Cast` reads unsigned.
+fn readUnsigned(elem: parquet.SchemaElement, col: column.Column) void {
     if (col.ty.kind != .int) return;
     const bits = unsignedBits(elem) orelse return;
     for (col.data.i64, 0..) |*x, i| {
-        if (!col.validity.get(i)) continue;
-        x.* = types.unsignedOf(bits, x.*) orelse {
-            var buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` holds the UINT64 {d}, past 2^63-1, the largest basalt int", .{ elem.name, @as(u64, @bitCast(x.*)) }) catch "a parquet UINT64 past 2^63-1";
-            return @errorCast(eval.explain(Error.ParquetIntOverflow, msg));
-        };
+        if (col.validity.get(i)) x.* = types.unsignedOf(bits, x.*);
     }
+}
+
+/// The page kernel's cast for a leaf: its type, its temporal unit, and whether its
+/// 64-bit ints are UINT64s.
+fn castOf(elem: parquet.SchemaElement) Error!Cast {
+    return .{ .ty = try basaltType(elem), .tick = temporalTick(elem), .unsigned = unsignedBits(elem) == 64 };
 }
 
 /// A dictionary decoded once into a typed column; a byte dictionary also keeps its
@@ -298,6 +301,7 @@ fn appendDataPage(
 const Cast = struct {
     ty: types.Type,
     tick: civil.Tick,
+    unsigned: bool = false,
 
     fn same(_: Cast, x: anytype) @TypeOf(x) {
         return x;
@@ -323,6 +327,10 @@ const Cast = struct {
 
     fn decimal(c: Cast, x: i64) Decimal {
         return .{ .unscaled = x, .scale = c.ty.scale };
+    }
+
+    fn unsignedDecimal(c: Cast, x: i64) Decimal {
+        return .{ .unscaled = types.u64Unscaled(x), .scale = c.ty.scale };
     }
 
     fn bytesDecimal(c: Cast, s: []const u8) Decimal {
@@ -383,7 +391,7 @@ const One = struct {
 /// page kernel so pruning and scans agree: the first PLAIN value of `raw`, except a
 /// BYTE_ARRAY statistic, which is the value's bytes with no length prefix.
 pub fn plainValue(elem: parquet.SchemaElement, phys: parquet.PhysicalType, raw: []const u8) Error!Value {
-    const cast: Cast = .{ .ty = try basaltType(elem), .tick = temporalTick(elem) };
+    const cast = try castOf(elem);
     var slot: [1][]const u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(std.mem.sliceAsBytes(&slot));
     var v: Value = .null;
@@ -411,7 +419,7 @@ fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
             inline else => |t| sink.put(i64, cast, Cast.micros(t), src, n),
         },
         .date => sink.put(i32, cast, Cast.date, src, n),
-        .decimal => sink.put(Decimal, cast, Cast.decimal, src, n),
+        .decimal => if (cast.unsigned) sink.put(Decimal, cast, Cast.unsignedDecimal, src, n) else sink.put(Decimal, cast, Cast.decimal, src, n),
         .bool => sink.put(bool, cast, Cast.truthy, src, n),
         else => Error.UnsupportedParquetEncoding,
     };

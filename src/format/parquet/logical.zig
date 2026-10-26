@@ -136,15 +136,12 @@ pub fn unsignedBits(e: parquet.SchemaElement) ?u8 {
     };
 }
 
-/// An integer column's type: an unsigned one is an INT whose values past 2^63-1
-/// are refused when read (`readUnsigned`).
+/// An integer column's type: `types.unsignedType` for an unsigned one, so a UINT64
+/// is the exact DECIMAL(20,0).
 fn intType(e: parquet.SchemaElement) types.Type {
     const bits = unsignedBits(e) orelse return types.Type.init(.int);
-    return types.unsignedType(bits, .int_checked);
+    return types.unsignedType(bits);
 }
-
-/// `types.unsignedOf`, kept under its old name for the oracle test in lang/types.zig.
-pub const asUnsigned = types.unsignedOf;
 
 fn decimalOf(e: parquet.SchemaElement) types.Type {
     const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
@@ -180,17 +177,20 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
 }
 
-test "unsigned columns read their stored value, a UINT64 past 2^63-1 none" {
+test "unsigned columns know their width; a UINT64 is DECIMAL(20,0) and a narrower one INT" {
     const u32c = logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = false } });
     try testing.expectEqual(@as(?u8, 32), unsignedBits(u32c));
     try testing.expectEqual(@as(?u8, null), unsignedBits(logical(.int32, .{ .integer = .{ .bit_width = 32, .signed = true } })));
     try testing.expectEqual(@as(?u8, 16), unsignedBits(.{ .ty = .int32, .converted_type = 12 }));
     try testing.expectEqual(@as(?u8, null), unsignedBits(.{ .ty = .int32 }));
-    try testing.expectEqual(@as(?i64, 3_000_000_000), asUnsigned(32, -1_294_967_296));
-    try testing.expectEqual(@as(?i64, 255), asUnsigned(8, -1));
-    try testing.expectEqual(@as(?i64, 65535), asUnsigned(16, -1));
-    try testing.expectEqual(@as(?i64, 7), asUnsigned(64, 7));
-    try testing.expectEqual(@as(?i64, null), asUnsigned(64, -1));
+    const u64c = logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = false } });
+    try testing.expectEqual(@as(?u8, 64), unsignedBits(u64c));
+    const dec = try basaltType(u64c);
+    try testing.expectEqual(types.TypeKind.decimal, dec.kind);
+    try testing.expectEqual(@as(u8, 20), dec.precision);
+    try testing.expectEqual(@as(u8, 0), dec.scale);
+    try testing.expectEqual(types.TypeKind.decimal, (try basaltType(.{ .ty = .int64, .converted_type = 14 })).kind);
+    try testing.expectEqual(types.TypeKind.int, (try basaltType(u32c)).kind);
 }
 
 fn micros(t: civil.Tick, x: i64) i64 {

@@ -199,12 +199,12 @@ pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []
         },
         .auto => {
             const lh = (try minMax(arena, prober, dialect, base, key.col)) orelse return null;
-            if (lh[0] == .int and lh[1] == .int) {
-                if (lh[1].int <= lh[0].int) return null;
-                const preds = try intRangePreds(arena, dialect, key.col, lh[0].int, lh[1].int, m);
+            if (intKey(lh[0])) |min| if (intKey(lh[1])) |max| {
+                if (max <= min) return null;
+                const preds = try intRangePreds(arena, dialect, key.col, min, max, m);
                 if (preds.len <= 1) return null;
                 return Plan{ .key = .{ .col = key.col, .kind = .int }, .predicates = preds, .base_sql = base };
-            }
+            };
             const lo = dayOf(lh[0]) orelse return null;
             const hi = dayOf(lh[1]) orelse return null;
             if (hi <= lo) return null;
@@ -248,8 +248,19 @@ fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
 }
 
 const Bounds = struct { min: i64, max: i64 };
+const IntBounds = struct { min: i128, max: i128 };
 
-fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
+/// An integer key's value: an INT, or a scale-0 DECIMAL such as the DECIMAL(20,0)
+/// a MySQL BIGINT UNSIGNED reads as (`types.unsignedType`).
+fn intKey(v: Value) ?i128 {
+    return switch (v) {
+        .int => |x| x,
+        .decimal => |d| if (d.scale == 0) d.unscaled else null,
+        else => null,
+    };
+}
+
+fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?IntBounds {
     const q = try std.fmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
     var cur = conn.queryCursor(q) catch {
@@ -261,14 +272,15 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
     if (b.len == 0) return null;
     const lo = b.columns[0].getValue(0);
     const hi = b.columns[1].getValue(0);
-    if (lo.isNull() or hi.isNull() or lo != .int or hi != .int) return null;
-    if (hi.int <= lo.int) return null;
-    return Bounds{ .min = lo.int, .max = hi.int };
+    const min = intKey(lo) orelse return null;
+    const max = intKey(hi) orelse return null;
+    if (max <= min) return null;
+    return IntBounds{ .min = min, .max = max };
 }
 
-fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i64, max: i64, m_in: usize) ![]const []const u8 {
+fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i128, max: i128, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
-    const span: i128 = @as(i128, max) - @as(i128, min) + 1;
+    const span: i128 = max - min + 1;
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
     if (m <= 1) {
@@ -279,7 +291,7 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
-        const lo: i128 = @as(i128, min) + @as(i128, @intCast(k)) * width;
+        const lo: i128 = min + @as(i128, @intCast(k)) * width;
         if (k == m - 1) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
         } else if (k == 0) {
@@ -682,16 +694,19 @@ const FakeConn = struct {
         const cols = try arena.alloc(column.Column, ncols);
         for (0..ncols) |c| {
             var kind: types.TypeKind = .int;
+            var scale: u8 = 0;
             for (self.rows) |r| if (!r[c].isNull()) {
+                if (r[c] == .decimal) scale = r[c].decimal.scale;
                 kind = switch (r[c]) {
                     .string => .string,
                     .date => .date,
                     .timestamp => .timestamp,
+                    .decimal => .decimal,
                     else => .int,
                 };
                 break;
             };
-            const ty = types.Type.init(kind).asNullable();
+            const ty = (if (kind == .decimal) types.Type.decimal(20, scale) else types.Type.init(kind)).asNullable();
             fields[c] = .{ .name = "c", .ty = ty };
             var b = column.Builder.init(arena, ty);
             for (self.rows) |r| try b.append(r[c]);
@@ -753,6 +768,31 @@ test "plan probes the key's bounds and slices them per kind, the NULL keys in sl
     try std.testing.expectEqualStrings("SELECT 1 FROM (SELECT * FROM t) _e LIMIT 1", f.queries.items[0]);
     try std.testing.expectEqualStrings("(\"u\" < '80000000-0000-0000-0000-000000000000' OR \"u\" IS NULL)", pu.predicates[0]);
     try std.testing.expectEqualStrings("\"u\" >= '80000000-0000-0000-0000-000000000000'", pu.predicates[1]);
+}
+
+test "a BIGINT UNSIGNED key, read as DECIMAL(20,0), splits over its whole unsigned range" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+    const top: i128 = std.math.maxInt(u64);
+    const lo = Value{ .decimal = .{ .unscaled = 0, .scale = 0 } };
+    const hi = Value{ .decimal = .{ .unscaled = top, .scale = 0 } };
+    for ([_]KeyKind{ .int, .auto }) |kind| {
+        var f = FakeConn{ .arena = a, .rows = &.{&.{ lo, hi }} };
+        const p = (try plan(a, f.prober(), .mysql, base, .{ .col = "id", .kind = kind }, 4)).?;
+        try std.testing.expectEqual(KeyKind.int, p.key.kind);
+        const want = [_][]const u8{
+            "((`id` >= 0 AND `id` < 4611686018427387904) OR `id` IS NULL)",
+            "`id` >= 4611686018427387904 AND `id` < 9223372036854775808",
+            "`id` >= 9223372036854775808 AND `id` < 13835058055282163712",
+            "`id` >= 13835058055282163712",
+        };
+        try std.testing.expectEqual(want.len, p.predicates.len);
+        for (want, p.predicates) |w, g| try std.testing.expectEqualStrings(w, g);
+    }
+    var frac = FakeConn{ .arena = a, .rows = &.{&.{ Value{ .decimal = .{ .unscaled = 15, .scale = 1 } }, Value{ .decimal = .{ .unscaled = 95, .scale = 1 } } }} };
+    try std.testing.expectEqual(@as(?Plan, null), try plan(a, frac.prober(), .mysql, base, .{ .col = "id", .kind = .int }, 4));
 }
 
 test "plan stays serial when the bounds probe finds nothing to slice" {

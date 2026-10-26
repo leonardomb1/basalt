@@ -670,7 +670,7 @@ fn engineTypeFor(mtype: u8, decimals: u8, flags: u16, charset: u16) types.Type {
     return (if (kind != .decimal)
         types.Type.init(kind)
     else if (w.unsigned)
-        types.unsignedType(64, .decimal)
+        types.unsignedType(64)
     else
         types.Type.decimal(38, decimals)).asNullable();
 }
