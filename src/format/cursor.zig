@@ -30,6 +30,14 @@ pub fn Reader(comptime endian: std.builtin.Endian, comptime short: anytype) type
             return std.mem.readInt(T, (try self.bytes(@sizeOf(T)))[0..@sizeOf(T)], endian);
         }
 
+        /// Bytes preceded by their count as a `L` (SSH's `string` is `u32`).
+        pub fn prefixed(self: *Self, comptime L: type) Error![]const u8 {
+            const start = self.i;
+            errdefer self.i = start;
+            const n = try self.int(L);
+            return self.bytes(n);
+        }
+
         /// A NUL-terminated string, the NUL consumed.
         pub fn cstr(self: *Self) Error![]const u8 {
             const end = std.mem.indexOfScalarPos(u8, self.p, self.i, 0) orelse return short;
@@ -73,6 +81,19 @@ test "cursor: both byte orders, a failed read leaves the position alone" {
     try testing.expectError(error.Short, e.cstr());
     try testing.expectEqualStrings("", try e.bytes(0));
     try testing.expectEqual(@as(u0, 0), try e.int(u0));
+}
+
+test "cursor: prefixed reads SSH's u32-length string, and a short one leaves the position alone" {
+    var c: Reader(.big, error.Short) = .{ .p = "\x00\x00\x00\x02ab\x00\x00\x00\x05xy" };
+    try testing.expectEqualStrings("ab", try c.prefixed(u32));
+    try testing.expectError(error.Short, c.prefixed(u32));
+    try testing.expectEqual(@as(usize, 6), c.i);
+    var e: Reader(.big, error.Short) = .{ .p = "\x00\x00" };
+    try testing.expectError(error.Short, e.prefixed(u32));
+    try testing.expectEqual(@as(usize, 0), e.i);
+    var z: Reader(.big, error.Short) = .{ .p = "\x00\x00\x00\x00" };
+    try testing.expectEqualStrings("", try z.prefixed(u32));
+    try testing.expectEqual(@as(usize, 4), z.i);
 }
 
 test "cursor: the same type for the same arguments, so wire can re-export it" {

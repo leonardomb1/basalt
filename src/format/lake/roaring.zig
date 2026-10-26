@@ -105,26 +105,12 @@ pub const Bitmap = struct {
     }
 };
 
-/// Reads little-endian integers off a buffer, every read bounds-checked.
-const Cursor = struct {
-    b: []const u8,
-    at: usize = 0,
-
-    fn take(self: *Cursor, n: usize) Error![]const u8 {
-        if (n > self.b.len - self.at) return error.DeletionVectorCorrupt;
-        defer self.at += n;
-        return self.b[self.at..][0..n];
-    }
-
-    fn int(self: *Cursor, comptime T: type) Error!T {
-        return std.mem.readInt(T, (try self.take(@sizeOf(T)))[0..@sizeOf(T)], .little);
-    }
-};
+const Cursor = @import("../cursor.zig").Reader(.little, error.DeletionVectorCorrupt);
 
 /// The bitmap `bytes` (the portable format, its magic already taken off) holds,
 /// checked whole and indexed by container into `arena`; `bytes` must outlive it.
 pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Bitmap {
-    var cur = Cursor{ .b = bytes };
+    var cur = Cursor{ .p = bytes };
     const buckets = try cur.int(u64);
     if (buckets > bytes.len / 12) return error.DeletionVectorCorrupt;
     var out = std.ArrayListUnmanaged(Container).empty;
@@ -143,12 +129,12 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Bitmap {
             offsets = true;
         } else if (cookie & 0xFFFF == with_runs) {
             n = (cookie >> 16) + 1;
-            flags = try cur.take((n + 7) / 8);
+            flags = try cur.bytes((n + 7) / 8);
             offsets = n >= no_offset_threshold;
         } else return error.DeletionVectorCorrupt;
         if (n > 1 << 16) return error.DeletionVectorCorrupt;
-        const header = try cur.take(n * 4);
-        if (offsets) _ = try cur.take(n * 4);
+        const header = try cur.bytes(n * 4);
+        if (offsets) _ = try cur.bytes(n * 4);
         try out.ensureUnusedCapacity(arena, n);
         for (0..n) |k| {
             const low = std.mem.readInt(u16, header[k * 4 ..][0..2], .little);
@@ -160,10 +146,10 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Bitmap {
             var c = Container{ .high = high, .kind = undefined, .data = undefined };
             var top: u32 = 0;
             if (is_run) {
-                const head = cur.at;
+                const head = cur.i;
                 const runs = try cur.int(u16);
-                _ = try cur.take(@as(usize, runs) * 4);
-                c = .{ .high = high, .kind = .run, .data = bytes[head..cur.at] };
+                _ = try cur.bytes(@as(usize, runs) * 4);
+                c = .{ .high = high, .kind = .run, .data = bytes[head..cur.i] };
                 var sum: u32 = 0;
                 var after: u32 = 0;
                 var i: usize = 2;
@@ -177,7 +163,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Bitmap {
                 }
                 if (runs == 0 or sum != count) return error.DeletionVectorCorrupt;
             } else if (count <= max_array) {
-                c = .{ .high = high, .kind = .array, .data = try cur.take(count * 2) };
+                c = .{ .high = high, .kind = .array, .data = try cur.bytes(count * 2) };
                 var i: usize = 0;
                 while (i < c.data.len) : (i += 2) {
                     const v = std.mem.readInt(u16, c.data[i..][0..2], .little);
@@ -185,7 +171,7 @@ pub fn parse(arena: std.mem.Allocator, bytes: []const u8) Error!Bitmap {
                     top = v;
                 }
             } else {
-                c = .{ .high = high, .kind = .bitset, .data = try cur.take(bitset_len) };
+                c = .{ .high = high, .kind = .bitset, .data = try cur.bytes(bitset_len) };
                 var sum: u32 = 0;
                 var w: usize = 0;
                 while (w < bitset_len) : (w += 8) {

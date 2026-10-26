@@ -49,21 +49,20 @@ pub const ListHeader = struct { elem: Type, size: usize };
 
 pub const max_depth = 32;
 
+const Cursor = @import("../cursor.zig").Reader(.little, Error.CorruptThrift);
+
 pub const Reader = struct {
-    buf: []const u8,
-    pos: usize = 0,
+    c: Cursor,
     last_id: i16 = 0,
     id_stack: [max_depth]i16 = undefined,
     depth: usize = 0,
 
     pub fn init(buf: []const u8) Reader {
-        return .{ .buf = buf };
+        return .{ .c = .{ .p = buf } };
     }
 
     fn take(self: *Reader, n: usize) Error![]const u8 {
-        if (self.pos + n > self.buf.len) return Error.CorruptThrift;
-        defer self.pos += n;
-        return self.buf[self.pos..][0..n];
+        return self.c.bytes(n);
     }
 
     pub fn readByte(self: *Reader) Error!u8 {
@@ -71,7 +70,7 @@ pub const Reader = struct {
     }
 
     pub fn readVarint(self: *Reader) Error!u64 {
-        return varint.read(self.buf, &self.pos) catch Error.CorruptThrift;
+        return varint.read(self.c.p, &self.c.i) catch Error.CorruptThrift;
     }
 
     pub fn readZigZag(self: *Reader) Error!i64 {
@@ -86,7 +85,7 @@ pub const Reader = struct {
 
     pub fn readBinary(self: *Reader) Error![]const u8 {
         const n = try self.readVarint();
-        if (n > self.buf.len) return Error.CorruptThrift;
+        if (n > self.c.p.len) return Error.CorruptThrift;
         return self.take(@intCast(n));
     }
 
@@ -123,7 +122,7 @@ pub const Reader = struct {
         var size: usize = (b >> 4) & 0x0F;
         if (size == 15) {
             const n = try self.readVarint();
-            if (n > self.buf.len - self.pos) return Error.CorruptThrift;
+            if (n > self.c.left()) return Error.CorruptThrift;
             size = @intCast(n);
         }
         return .{ .elem = elem, .size = size };
@@ -146,7 +145,7 @@ pub const Reader = struct {
             },
             .map => {
                 const n = try self.readVarint();
-                if (n > self.buf.len - self.pos) return Error.CorruptThrift;
+                if (n > self.c.left()) return Error.CorruptThrift;
                 if (n > 0) {
                     const kv = try self.readByte();
                     const k: Type = @enumFromInt((kv >> 4) & 0x0F);
@@ -314,7 +313,7 @@ test "skip walks past every type, including nested lists and structs" {
     }
     try r.structEnd();
     try t.expectEqual(@as(i16, 11), seen);
-    try t.expectEqual(bytes.len, r.pos);
+    try t.expectEqual(bytes.len, r.c.i);
 }
 
 test "truncated input errors instead of reading past the buffer" {
@@ -338,7 +337,7 @@ test "a container's count past the bytes left is corrupt, and its bools take a b
     const bools = [_]u8{ 0x21, 0x01, 0x02 };
     var b = Reader.init(&bools);
     try b.skip(.list);
-    try t.expectEqual(bools.len, b.pos);
+    try t.expectEqual(bools.len, b.c.i);
 }
 
 test "a short-form field id past the i16 range is corrupt, not an overflow" {
@@ -492,7 +491,7 @@ test "writer output round-trips through the reader" {
     try t.expectEqualStrings("", try r.readBinary());
     try t.expectEqual(Type.stop, (try r.readField()).ty);
     try r.structEnd();
-    try t.expectEqual(buf.items.len, r.pos);
+    try t.expectEqual(buf.items.len, r.c.i);
 }
 
 test "lists round-trip in both the short and escaped size forms" {

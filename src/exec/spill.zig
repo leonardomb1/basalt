@@ -28,6 +28,7 @@ const space_mod = @import("space.zig");
 
 const Space = space_mod.Space;
 const Batch = @import("batch.zig").Batch;
+const Cursor = @import("../format/cursor.zig").Reader(@import("builtin").cpu.arch.endian(), error.CorruptSpill);
 const Column = column.Column;
 const Bitmap = column.Bitmap;
 const Tag = column.Tag;
@@ -200,7 +201,7 @@ pub const Writer = struct {
 pub const Reader = struct {
     map: []align(std.heap.page_size_min) const u8,
     schema: *const types.Schema,
-    pos: usize = ALIGN,
+    c: Cursor,
 
     /// Memory-maps the run's file.
     pub fn open(run: Run) !Reader {
@@ -212,22 +213,16 @@ pub const Reader = struct {
         const map = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
         errdefer std.posix.munmap(map);
         if (!std.mem.eql(u8, map[0..MAGIC.len], MAGIC)) return error.CorruptSpill;
-        return .{ .map = map, .schema = run.schema };
+        return .{ .map = map, .schema = run.schema, .c = .{ .p = map, .i = ALIGN } };
     }
 
     fn take(self: *Reader, n: u64) ![]u8 {
-        const p = pad(n);
-        if (p > self.map.len - self.pos) return error.CorruptSpill;
-        const s = @constCast(self.map[self.pos..][0..@intCast(n)]);
-        self.pos += @intCast(p);
-        return s;
+        const s = try self.c.bytes(@intCast(pad(n)));
+        return @constCast(s[0..@intCast(n)]);
     }
 
     fn takeU64(self: *Reader) !u64 {
-        if (self.map.len - self.pos < 8) return error.CorruptSpill;
-        const x = std.mem.bytesToValue(u64, self.map[self.pos..][0..8]);
-        self.pos += 8;
-        return x;
+        return self.c.int(u64);
     }
 
     fn takeSlice(self: *Reader, comptime T: type, count: u64) ![]T {
@@ -239,7 +234,7 @@ pub const Reader = struct {
     /// The batches in the order written. Columns point into the mapping and stay
     /// valid until `close`; `arena` holds only the small per-batch structs.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
-        if (self.pos >= self.map.len) return null;
+        if (self.c.left() == 0) return null;
         const rows = try self.takeU64();
         const ncols = try self.takeU64();
         const fields = self.schema.fields;
@@ -279,6 +274,7 @@ pub const Reader = struct {
     pub fn close(self: *Reader) void {
         if (self.map.len > 0) std.posix.munmap(self.map);
         self.map = self.map[0..0];
+        self.c = .{ .p = self.map };
     }
 };
 

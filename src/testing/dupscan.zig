@@ -267,7 +267,8 @@ pub fn explain(rule: Rule, report: Report, mode: Mode) void {
 }
 
 /// Fails the calling test when any rule finds a stray copy, or under `.exact`
-/// a stale allowlist entry; every failure is printed before returning.
+/// (`mode`, or the rule's own `exact`) a stale allowlist entry; every failure is
+/// printed before returning.
 pub fn expectConfined(rules: []const Rule, mode: Mode) !void {
     const gpa = std.testing.allocator;
     var src = try openSrc();
@@ -357,33 +358,24 @@ pub const plan = [_]Rule{
     .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &textconv_allow },
     .{ .home = "floatord", .pattern = floatord_pattern, .exact = true, .allow = &.{"exec/floatord.zig"} },
     .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
-    .{ .home = "jsontext", .pattern = jsontext_pattern, .allow = &.{
+    .{ .home = "jsontext", .pattern = jsontext_pattern, .exact = true, .allow = &.{
         "exec/jsontext.zig",
-        "format/lake/delta_types.zig",
-        "cli/args.zig",
-        "cli/cmd_complete.zig",
-        "cli/kernel.zig",
-        "exec/eval/fn_row.zig",
-        "exec/eval/fn_scalar.zig",
-        "exec/eval/row.zig",
-        "exec/json.zig",
-        "exec/trace.zig",
-        "format/lake/delta_write.zig",
-        "format/parquet/nested.zig",
-        "runtime/obs.zig",
     } },
-    .{ .home = "hex", .pattern = hex_pattern, .allow = &.{
+    .{ .home = "hex", .pattern = hex_pattern, .exact = true, .allow = &.{
         "format/hex.zig",
         "format/uuid.zig",
-        "store/scheme.zig",
-        "exec/eval/fn_records.zig",
-        "format/xml/token.zig",
     } },
-    .{ .home = "utf16", .pattern = utf16_pattern, .allow = &.{
+    .{ .home = "utf16", .pattern = utf16_pattern, .exact = true, .allow = &.{
         "format/utf16.zig",
-        "db/sqlserver/tds.zig",
-        "net/auth/ntlm.zig",
-        "store/smb.zig",
+    } },
+    .{ .home = "charset", .pattern = charset_pattern, .exact = true, .allow = &.{
+        "format/charset.zig",
+    } },
+    .{ .home = "cursor", .pattern = cursor_pattern, .exact = true, .allow = &.{
+        "format/cursor.zig",
+    } },
+    .{ .home = "typemap", .pattern = typemap_pattern, .exact = true, .allow = &.{
+        "db/typemap.zig",
     } },
     .{ .home = "scheme", .pattern = scheme_pattern, .exact = true },
     .{ .home = "dial", .pattern = dial_pattern, .exact = true, .allow = &.{
@@ -421,9 +413,12 @@ pub const part_pattern = "\"(year|month|week|day|hour|minute|second)s?\", \\.(ye
 pub const textconv_pattern = "(eqlIgnoreCase\\(|eql\\(u8, )[^\"]*\"(true|false|yes|no)\"\\)|\\[0\\] == '[tTyY]'|0x1p63";
 pub const floatord_pattern = "0x7[fF][fF]8|>> 63 != 0\\) ~|\\| \\(1 << 63\\)|std\\.math\\.order\\([^)]*\\.float";
 pub const decimal_pattern = "fn pow10|std\\.math\\.powi?\\(i(64|128|256), 10,|@(divTrunc|rem|mod|divFloor|divExact)\\(\\w+\\.unscaled, ";
-pub const jsontext_pattern = "encodeJsonString(Chars)?";
-pub const hex_pattern = "parseInt\\(.*16\\)";
-pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc";
+pub const jsontext_pattern = "encodeJsonString(Chars)?|\\\\\\\\u(\\{[xX]:0>4|00\\{[xX]:0>2)\\}";
+pub const hex_pattern = "parseInt\\(.*16\\)|- 'a' \\+ 10|\"0123456789(abcdef|ABCDEF)\";|i == 8 or i == 13 or i == 18|i == 4 or i == 6 or i == 8";
+pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc|utf16IsHighSurrogate|0xD800 \\+";
+pub const charset_pattern = "0x201[aA], 0x0192|0x80 => 0x20[aA][cC]|0x009[cC], 0x0009,";
+pub const cursor_pattern = "> self\\.left\\(\\)|if \\(self\\.\\w+ \\+ \\w+ > self\\.\\w+\\.len\\) return|if \\(\\w+ > self\\.\\w+\\.len - self\\.\\w+\\) return";
+pub const typemap_pattern = "1114, 1184|0x00, 0xf6";
 pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|az|smb|ftp|https?)://";
 pub const dial_pattern = "tcpConnectToHost";
 pub const options_pattern = "@intCast\\(try evalCfgInt|\\.str_lit => \\|\\w+\\| .*(parseInt\\(i64, \\w+, 10\\)|IgnoreCase\\(\\w+, \"true\"\\))";
@@ -486,10 +481,14 @@ test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles(textconv_pattern, &.{ "\")", "[0] == '", "0x1p63" });
     try expectNeedles(floatord_pattern, &.{ "0x7", ">> 63 != 0) ~", "| (1 << 63)", "std.math.order(" });
     try expectNeedles(decimal_pattern, &.{ "fn pow10", "std.math.pow", ".unscaled, " });
-    try expectNeedles(jsontext_pattern, &.{"encodeJsonString"});
+    try expectNeedles(jsontext_pattern, &.{ "encodeJsonString", "\\\\u" });
+    try expectNeedles(utf16_pattern, &.{ "utf16LeToUtf8Alloc", "utf8ToUtf16LeAlloc", "utf16IsHighSurrogate", "0xD800 +" });
+    try expectNeedles(charset_pattern, &.{ ", 0x0192", "0x80 => 0x20", ", 0x0009," });
+    try expectNeedles(cursor_pattern, &.{ "> self.left()", ".len) return", ".len - self." });
+    try expectNeedles(typemap_pattern, &.{ "1114, 1184", "0x00, 0xf6" });
     try expectNeedles(scheme_pattern, &.{"startsWith(u8, "});
     try expectNeedles(sql_pattern, &.{ "\"''\"", "== '\\''", "'\\'' =>" });
-    try expectNeedles(hex_pattern, &.{"parseInt("});
+    try expectNeedles(hex_pattern, &.{ "parseInt(", "- 'a' + 10", "\"0123456789", "i == 8 or i == 13 or i == 18", "i == 4 or i == 6 or i == 8" });
     try expectNeedles(guard_pattern, &.{"errdefer "});
     try expectNeedles(options_pattern, &.{ "@intCast(try evalCfgInt", ".str_lit => |" });
     try expectNeedles(retry_pattern, &.{"sleep("});
@@ -570,11 +569,41 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ jsontext_pattern, "std.json.encodeJsonString(s, .{}, w)", true },
         .{ jsontext_pattern, "std.json.encodeJsonStringChars(s, .{}, w)", true },
         .{ jsontext_pattern, "jsontext.string(w, s)", false },
+        .{ jsontext_pattern, "else try w.print(\"\\\\u{x:0>4}\", .{c});", true },
+        .{ jsontext_pattern, "try out.print(\"\\\\u00{X:0>2}\", .{c});", true },
+        .{ jsontext_pattern, "try w.print(\"{x:0>4}\", .{c});", false },
+        .{ jsontext_pattern, "try w.writeAll(\"\\\\u\");", false },
         .{ hex_pattern, "std.fmt.parseInt(u8, s[i..][0..2], 16)", true },
         .{ hex_pattern, "std.fmt.parseInt(u8, s, 10)", false },
+        .{ hex_pattern, "'a'...'f' => c - 'a' + 10,", true },
+        .{ hex_pattern, "'a'...'z' => c - 'a',", false },
+        .{ hex_pattern, "const digits = \"0123456789abcdef\";", true },
+        .{ hex_pattern, "else \"0123456789ABCDEF\";", true },
+        .{ hex_pattern, "pub const sync = \"0123456789abcdef\".*;", false },
+        .{ hex_pattern, "const dash = i == 8 or i == 13 or i == 18 or i == 23;", true },
+        .{ hex_pattern, "if (i == 4 or i == 6 or i == 8 or i == 10) {", true },
+        .{ hex_pattern, "if (i == 4 or i == 6) {", false },
         .{ utf16_pattern, "std.unicode.utf16LeToUtf8Alloc(a, w)", true },
         .{ utf16_pattern, "std.unicode.utf8ToUtf16LeAlloc(a, s)", true },
         .{ utf16_pattern, "std.unicode.utf8ToUtf16Le(buf, s)", false },
+        .{ utf16_pattern, "if (std.unicode.utf16IsHighSurrogate(u)) {", true },
+        .{ utf16_pattern, "hi = @intCast(0xD800 + (v >> 10));", true },
+        .{ utf16_pattern, "cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);", false },
+        .{ charset_pattern, "0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,", true },
+        .{ charset_pattern, "0x20AC, 0xFFFD, 0x201a, 0x0192,", true },
+        .{ charset_pattern, "0x80 => 0x20AC,", true },
+        .{ charset_pattern, "0x0000, 0x0001, 0x0002, 0x0003, 0x009C, 0x0009, 0x0086, 0x007F,", true },
+        .{ charset_pattern, "const pool = [_]u21{ 0x7FF, 0x800, 0x20AC, 0x4E2D, 0xFFFD };", false },
+        .{ cursor_pattern, "if (n > self.left()) return short;", true },
+        .{ cursor_pattern, "if (self.pos + n > self.buf.len) return Error.CorruptThrift;", true },
+        .{ cursor_pattern, "if (self.i + 4 > self.s.len) return error.SshProtocol;", true },
+        .{ cursor_pattern, "if (n > self.b.len - self.at) return error.DeletionVectorCorrupt;", true },
+        .{ cursor_pattern, "if (n > self.c.left()) return Error.CorruptThrift;", false },
+        .{ cursor_pattern, "const avail = self.buf.items.len - self.pos;", false },
+        .{ typemap_pattern, ".wire = codes(&.{ 1114, 1184 }) },", true },
+        .{ typemap_pattern, "1114, 1184 => .timestamp,", true },
+        .{ typemap_pattern, "0x00, 0xf6 => .decimal,", true },
+        .{ typemap_pattern, "1114 => .timestamp,", false },
         .{ scheme_pattern, "if (std.mem.startsWith(u8, url, \"sftp://\")) {", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"https://\")", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"http://\")", true },
