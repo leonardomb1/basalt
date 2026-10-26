@@ -889,9 +889,10 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
     var n: usize = 0;
     while (i <= line.len) : (n += 1) {
         const raw = nextField(line, &i, d.delim);
-        if (e != error.TextTypeMismatch or n >= ncols) continue;
+        if ((e != error.TextTypeMismatch and e != error.InvalidUtf8) or n >= ncols) continue;
         const f = if (slot) |sl| (if (sl[n] >= 0) schema.fields[@intCast(sl[n])] else continue) else schema.fields[n];
-        if (texttype.cellParses(f.ty.kind, raw)) continue;
+        if (charset.badUtf8(raw)) |bad| return notUtf8(where, f.name, bad);
+        if (e != error.TextTypeMismatch or texttype.cellParses(f.ty.kind, raw)) continue;
         const want: []const u8 = switch (f.ty.kind) {
             .int => "an INT",
             .float => "a FLOAT",
@@ -902,7 +903,17 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
     }
     if (e == error.CsvRaggedRow)
         return explainf(e, "{s} has {d} fields, the header {d} — a row must have one field per column", .{ where, n, ncols });
+    if (e == error.InvalidUtf8) {
+        const bad = charset.badUtf8(line) orelse charset.BadByte{ .offset = 0, .byte = 0 };
+        return explainf(e, "{s}: not valid UTF-8 (byte 0x{x:0>2} at offset {d} of the line); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ where, bad.byte, bad.offset });
+    }
     return e;
+}
+
+/// A data cell that is not UTF-8, named by file, line and column: it is refused,
+/// never repaired, as DuckDB's reader refuses it, so a value is never altered.
+fn notUtf8(where: []const u8, col: []const u8, bad: charset.BadByte) anyerror {
+    return explainf(error.InvalidUtf8, "{s}, column `{s}`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ where, clip(col), bad.byte, bad.offset });
 }
 
 /// One field's text from `line[i.*]` (a quoted one without its quotes, `""` kept),
@@ -940,26 +951,8 @@ inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?
 
 inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8, quoted: bool, enc: Encoding) !void {
     if (enc != .utf8) return texttype.appendCell(b, try decodeField(arena, enc, raw), quoted);
-    return texttype.appendCell(b, if (b.ty.kind == .string) try utf8Repair(arena, raw) else raw, quoted);
-}
-
-/// `s` when it is valid UTF-8, else a copy with each invalid byte as U+FFFD, as
-/// pyarrow reads one: a text value basalt holds is always UTF-8, so a Parquet or
-/// JSON file written from a mislabelled CSV stays readable everywhere.
-fn utf8Repair(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    return charset.decode(arena, .utf8, s);
-}
-
-test "utf8Repair keeps valid text and replaces each invalid byte" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const ok = "café ção";
-    try std.testing.expect((try utf8Repair(a, ok)).ptr == ok.ptr);
-    try std.testing.expectEqualStrings("caf\u{FFFD}", try utf8Repair(a, "caf\xe9"));
-    try std.testing.expectEqualStrings("\u{FFFD}(", try utf8Repair(a, "\xc3\x28"));
-    try std.testing.expectEqualStrings("\u{FFFD}x", try utf8Repair(a, "\xffx"));
-    try std.testing.expectEqualStrings("a\u{FFFD}\u{FFFD}", try utf8Repair(a, "a\xe2\x82"));
+    if (b.ty.kind == .string and !charset.validUtf8(raw)) return error.InvalidUtf8;
+    return texttype.appendCell(b, raw, quoted);
 }
 
 const source_vtable = driver.sourceVTable(CsvReader);
@@ -1557,6 +1550,80 @@ test "a cell past the sample that only lenient parsers accept is named with its 
         try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
         try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.TextTypeMismatch).?, c.want) != null);
     }
+}
+
+test "a data cell that is not UTF-8 fails the read naming file, line and column; a header name is repaired" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ base, "u.csv" });
+
+    const cases = [_]struct { head: []const u8, row: []const u8, at: usize, want: []const u8 }{
+        .{ .head = "id,name\n", .row = "7,caf\xe9\n", .at = 3, .want = "u.csv` line 4, column `name`: not valid UTF-8 (byte 0xe9 at offset 3); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8" },
+        .{ .head = "id,name\n", .row = "7,\"a,\xff\"\n", .at = 3, .want = "u.csv` line 4, column `name`: not valid UTF-8 (byte 0xff at offset 2)" },
+        .{ .head = "id,name\n", .row = "\xc3\x28,x\n", .at = 3, .want = "u.csv` line 4, column `id`: not valid UTF-8 (byte 0xc3 at offset 0)" },
+        .{ .head = "id,name\n", .row = "8,a\xe2\x82\n", .at = 1030, .want = "u.csv` line 1031, column `name`: not valid UTF-8 (byte 0xe2 at offset 1)" },
+        .{ .head = "id,n\xe9\n", .row = "7,ok\n", .at = 3, .want = "" },
+    };
+    for (cases) |c| {
+        var data = std.array_list.Managed(u8).init(a);
+        try data.appendSlice(c.head);
+        for (0..c.at - 1) |i| try data.writer().print("{d},\u{e7}\u{20ac}{d}\n", .{ i, i });
+        try data.appendSlice(c.row);
+        try tmp.dir.writeFile(.{ .sub_path = "u.csv", .data = data.items });
+
+        const r = try CsvReader.open(a, path, .{});
+        defer r.close();
+        var err: ?anyerror = null;
+        var rows: usize = 0;
+        while (r.next(a) catch |e| blk: {
+            err = e;
+            break :blk null;
+        }) |b| rows += b.len;
+        const why: ?[]const u8 = if (err != null) try a.dupe(u8, eval.takeFailure(error.InvalidUtf8) orelse "") else null;
+        const m = try MappedCsv.open(a, path, .{});
+        defer m.close();
+        var sr = m.reader(0, 1, &m.schema);
+        var merr: ?anyerror = null;
+        while (sr.next(a) catch |e| blk: {
+            merr = e;
+            break :blk null;
+        }) |_| {}
+        if (c.want.len == 0) {
+            try std.testing.expectEqual(@as(?anyerror, null), err);
+            try std.testing.expectEqual(@as(?anyerror, null), merr);
+            try std.testing.expectEqualStrings("n\u{FFFD}", r.schema.fields[1].name);
+            try std.testing.expectEqual(c.at, rows);
+            continue;
+        }
+        try std.testing.expectEqual(@as(?anyerror, error.InvalidUtf8), err);
+        try std.testing.expect(std.mem.indexOf(u8, why.?, c.want) != null);
+        try std.testing.expectEqual(@as(?anyerror, error.InvalidUtf8), merr);
+        try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.InvalidUtf8).?, c.want) != null);
+    }
+
+    try tmp.dir.writeFile(.{ .sub_path = "u.csv", .data = "id,name\n1,caf\xe9\n2,\x80\n" });
+    for ([_]Encoding{ .latin1, .cp1252 }, [_][]const u8{ "\u{80}", "\u{20ac}" }) |enc, euro| {
+        const r = try CsvReader.open(a, path, .{ .encoding = enc });
+        defer r.close();
+        const b = (try r.next(a)).?;
+        try std.testing.expectEqualStrings("caf\u{e9}", b.columns[1].data.bytes.at(0));
+        try std.testing.expectEqualStrings(euro, b.columns[1].data.bytes.at(1));
+    }
+}
+
+test "TypeSniffer: a sample cell that is not UTF-8 types the column as text, without a crash" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    var ts = try TypeSniffer.init(ar.allocator(), 3, ',');
+    ts.feed("1,2020-01-01,a");
+    ts.feed("\xff,2020-01-0\xe9,\"\xc3\"");
+    ts.feed("\xf0\x9f,\xe2\x82,\xed\xa0\x80");
+    for (0..3) |j| try std.testing.expectEqual(types.TypeKind.string, ts.resolve(j).kind);
 }
 
 fn readAllRows(a: std.mem.Allocator, path: []const u8) ![]const []const u8 {

@@ -18,17 +18,18 @@
 //!
 //! Names lose their namespace prefix and have FOR XML's `_xHHHH_` decoded. The
 //! document's declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252, or
-//! `encoding` overriding it); a UTF-16 document is refused, and text that is not
-//! valid UTF-8 is repaired. The input streams, a row at a time.
+//! `encoding` overriding it); a UTF-16 document is refused, and text or an attribute
+//! value that is not valid UTF-8 is an error naming the row and element, never
+//! repaired (a name is repaired). The input streams, a row at a time.
 
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
-const celltext = @import("../../exec/celltext.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const csv = @import("../csv.zig");
+const charset = @import("../charset.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const textconv = @import("../../exec/textconv.zig");
 const texttype = @import("../texttype.zig");
@@ -351,8 +352,8 @@ pub const Reader = struct {
                         try children.append(leaf);
                     } else try children.append(try self.readBody(arena, cname, cattrs, cnil, depth + 1));
                 },
-                .text => |raw| try text.add(self, arena, raw, true),
-                .cdata => |raw| try text.add(self, arena, raw, false),
+                .text => |raw| try text.add(self, arena, raw, true, name),
+                .cdata => |raw| try text.add(self, arena, raw, false, name),
                 .close => break,
             }
         } else return self.malformed("it ends inside a row; is it cut short?");
@@ -367,15 +368,15 @@ pub const Reader = struct {
         one: []const u8 = "",
         many: ?std.array_list.Managed(u8) = null,
 
-        fn add(t: *Text, r: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool) !void {
-            if (t.many) |*m| return r.appendText(arena, m, raw, entities);
+        fn add(t: *Text, r: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool, owner: []const u8) !void {
+            if (t.many) |*m| return r.appendText(arena, m, raw, entities, owner);
             if (t.one.len == 0) {
-                t.one = try r.textOf(arena, raw, entities);
+                t.one = try r.textOf(arena, raw, entities, owner);
                 return;
             }
             var m = std.array_list.Managed(u8).init(arena);
             try m.appendSlice(t.one);
-            try r.appendText(arena, &m, raw, entities);
+            try r.appendText(arena, &m, raw, entities, owner);
             t.many = m;
         }
 
@@ -385,34 +386,37 @@ pub const Reader = struct {
     };
 
     /// `raw` decoded as `appendText` does, copied once when nothing needs decoding.
-    fn textOf(self: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool) ![]const u8 {
-        if (self.enc == .utf8 and (!entities or std.mem.indexOfScalar(u8, raw, '&') == null) and std.unicode.utf8ValidateSlice(raw))
+    fn textOf(self: *Reader, arena: std.mem.Allocator, raw: []const u8, entities: bool, owner: []const u8) ![]const u8 {
+        if (self.enc == .utf8 and (!entities or std.mem.indexOfScalar(u8, raw, '&') == null)) {
+            if (!charset.validUtf8(raw)) return self.notUtf8(owner, raw);
             return arena.dupe(u8, raw);
+        }
         var m = std.array_list.Managed(u8).init(arena);
-        try self.appendText(arena, &m, raw, entities);
+        try self.appendText(arena, &m, raw, entities, owner);
         return m.items;
     }
 
-    /// `raw` decoded from the document's encoding and, unless CDATA, its entities.
-    fn appendText(self: *Reader, arena: std.mem.Allocator, out: *std.array_list.Managed(u8), raw: []const u8, entities: bool) !void {
-        const start = out.items.len;
+    /// `raw` decoded from the document's encoding and, unless CDATA, its entities. In a
+    /// UTF-8 document, text that is not UTF-8 is refused, as a CSV cell is.
+    fn appendText(self: *Reader, arena: std.mem.Allocator, out: *std.array_list.Managed(u8), raw: []const u8, entities: bool, owner: []const u8) !void {
+        if (self.enc == .utf8 and !charset.validUtf8(raw)) return self.notUtf8(owner, raw);
         const s = if (self.enc == .utf8) raw else try csv.decodeField(arena, self.enc, raw);
         if (entities) try token.decodeInto(out, s, false) else try out.appendSlice(s);
-        if (self.enc == .utf8 and !std.unicode.utf8ValidateSlice(out.items[start..])) {
-            const bad = try arena.dupe(u8, out.items[start..]);
-            out.shrinkRetainingCapacity(start);
-            var runs = celltext.Utf8Runs{ .s = bad };
-            while (runs.next()) |r| try out.appendSlice(r);
-        }
+    }
+
+    fn notUtf8(self: *Reader, owner: []const u8, raw: []const u8) anyerror {
+        const bad = charset.badUtf8(raw) orelse charset.BadByte{ .offset = 0, .byte = 0 };
+        return eval.explain(error.InvalidUtf8, std.fmt.allocPrint(self.arena, "{s}{s}XML row {d}, `{s}`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, eval.clip(owner), bad.byte, bad.offset }) catch "XML text is not valid UTF-8");
     }
 
     /// A name decoded once and kept, as the same few names recur on every row; past
-    /// `max_names` distinct ones, a document of unique names is decoded per use.
+    /// `max_names` distinct ones, a document of unique names is decoded per use. A
+    /// name that is not UTF-8 is repaired, so it cannot hide the rest.
     fn nameOf(self: *Reader, arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
         if (self.names.get(raw)) |n| return n;
         const keep = self.names.count() < max_names;
         const a = if (keep) self.arena else arena;
-        const s = if (self.enc == .utf8) raw else try csv.decodeField(a, self.enc, raw);
+        const s = try csv.decodeField(a, self.enc, raw);
         const name = try a.dupe(u8, try escape.decodeName(a, s));
         if (keep) try self.names.put(self.arena, try self.arena.dupe(u8, raw), name);
         return name;
@@ -429,7 +433,8 @@ pub const Reader = struct {
         var it = o.iterator();
         while (it.next()) |a| {
             if (std.mem.eql(u8, a.name, "xmlns") or std.mem.startsWith(u8, a.name, "xmlns:") or std.mem.startsWith(u8, a.name, "xsi:")) continue;
-            try out.append(.{ .name = try self.nameOf(arena, token.localName(a.name)), .value = try self.textOf(arena, a.value, true) });
+            const name = try self.nameOf(arena, token.localName(a.name));
+            try out.append(.{ .name = name, .value = try self.textOf(arena, a.value, true, name) });
         }
         return out.items;
     }
@@ -628,6 +633,41 @@ test "a value past the sample its typed column cannot read is an error; UTF-16 i
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>abc</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>2</n><n>3</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.XmlUnsupportedEncoding, readAll(a, "\xff\xfe<\x00r\x00>\x00", .{}));
+}
+
+test "text or an attribute that is not UTF-8 fails the read naming row and element; latin-1 decodes it; a name is repaired" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cases = [_]struct { doc: []const u8, want: []const u8 }{
+        .{ .doc = "<r><x><n>caf\u{e9}</n></x><x><n>caf\xe9</n></x></r>", .want = "f.xml: XML row 2, `n`: not valid UTF-8 (byte 0xe9 at offset 3); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8" },
+        .{ .doc = "<r><x c=\"a\xff\"><n>1</n></x></r>", .want = "f.xml: XML row 1, `c`: not valid UTF-8 (byte 0xff at offset 1)" },
+        .{ .doc = "<r><x><n>a &amp; \xc3\x28</n></x></r>", .want = "f.xml: XML row 1, `n`: not valid UTF-8 (byte 0xc3 at offset 8)" },
+        .{ .doc = "<r><x><n><![CDATA[\xe2\x82]]></n></x></r>", .want = "f.xml: XML row 1, `n`: not valid UTF-8 (byte 0xe2 at offset 0)" },
+        .{ .doc = "<r><x><n><i>1</i>\xf0</n></x></r>", .want = "f.xml: XML row 1, `n`: not valid UTF-8 (byte 0xf0 at offset 0)" },
+    };
+    for (cases) |c| {
+        try testing.expectError(error.InvalidUtf8, readAll(a, c.doc, .{ .source_name = "f.xml" }));
+        const why = eval.takeFailure(error.InvalidUtf8).?;
+        if (std.mem.indexOf(u8, why, c.want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ c.want, why });
+            return error.TestUnexpectedResult;
+        }
+    }
+    const latin = try readAll(a, "<r><x c=\"\xe9\"><n>caf\xe9</n></x></r>", .{ .encoding = .latin1 });
+    try testing.expectEqualStrings("\u{e9}", latin.rows[0][0].?);
+    try testing.expectEqualStrings("caf\u{e9}", latin.rows[0][1].?);
+    const cp = try readAll(a, "<r><x><n>\x80</n></x></r>", .{ .encoding = .cp1252 });
+    try testing.expectEqualStrings("\u{20ac}", cp.rows[0][0].?);
+    const named = try readAll(a, "<r><x><n\xe9>\u{1F600}\u{e7}</n\xe9></x></r>", .{});
+    try testing.expectEqualStrings("n\u{FFFD}", named.schema.fields[0].name);
+    try testing.expectEqualStrings("\u{1F600}\u{e7}", named.rows[0][0].?);
+    var big = std.array_list.Managed(u8).init(a);
+    try big.appendSlice("<r><x><n>");
+    for (0..40_000) |_| try big.appendSlice("\u{e7}\u{20ac}");
+    try big.appendSlice("</n></x></r>");
+    const long = try readAll(a, big.items, .{});
+    try testing.expectEqual(@as(usize, 200_000), long.rows[0][0].?.len);
 }
 
 test "a document cut short, with no element or text outside its root, is an error, not fewer rows" {

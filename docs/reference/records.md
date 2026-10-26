@@ -28,9 +28,9 @@ spaces decodes as `NULL`.
 Charsets are `utf8`, `latin1` (`iso-8859-1`), `cp1252` (`windows-1252`) and
 `cp037` (`ebcdic`). cp1252's five unassigned bytes (0x81, 0x8D, 0x8F, 0x90, 0x9D)
 decode to the C1 controls of the same number and encode back, so every byte of a
-single-byte charset survives `encode(decode(b, cs), cs)`. `decode` repairs invalid
-UTF-8; `encode` refuses a character
-the charset cannot hold.
+single-byte charset survives `encode(decode(b, cs), cs)`. `decode` and `text_at`
+refuse bytes read as `utf8` that are not valid UTF-8, naming the first bad byte,
+rather than repair them; `encode` refuses a character the charset cannot hold.
 
 ## Reading a file by range
 

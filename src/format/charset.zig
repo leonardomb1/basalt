@@ -1,7 +1,10 @@
 //! Character sets bytes are read in and written out of: UTF-8, ISO-8859-1, windows-1252
 //! and EBCDIC code page 037. `decode` turns bytes into UTF-8 text, repairing invalid
-//! UTF-8 and mapping each single-byte character; `encode` turns UTF-8 text into a
-//! charset's bytes, refusing a character it cannot hold rather than substituting one.
+//! UTF-8 (for names and messages) and mapping each single-byte character; a data cell
+//! read as UTF-8 is checked with `validUtf8` instead, and one that is not is an error
+//! (`badUtf8` says where), as data is never silently altered. `encode` turns UTF-8
+//! text into a charset's bytes, refusing a character it cannot hold rather than
+//! substituting one.
 //!
 //! The five bytes windows-1252 leaves unassigned (0x81, 0x8D, 0x8F, 0x90, 0x9D) are
 //! their C1 controls, as Windows' bestfit1252 table, the WHATWG Encoding standard and
@@ -160,6 +163,26 @@ pub fn isAscii(bytes: []const u8) bool {
     return tail < 0x80;
 }
 
+/// Whether a data cell is valid UTF-8: one SIMD ASCII scan, the full check only
+/// past it.
+pub inline fn validUtf8(bytes: []const u8) bool {
+    return isAscii(bytes) or std.unicode.utf8ValidateSlice(bytes);
+}
+
+pub const BadByte = struct { offset: usize, byte: u8 };
+
+/// The first byte of `bytes` that starts no valid UTF-8 sequence, for an error
+/// message; null when it is all valid.
+pub fn badUtf8(bytes: []const u8) ?BadByte {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const n = celltext.Utf8Runs.seqLen(bytes[i..]);
+        if (n == 0) return .{ .offset = i, .byte = bytes[i] };
+        i += n;
+    }
+    return null;
+}
+
 /// `bytes` in `cs` as UTF-8: invalid UTF-8 repaired, each single-byte character mapped;
 /// `bytes` itself when it needs no change.
 pub fn decode(arena: std.mem.Allocator, cs: Charset, bytes: []const u8) ![]const u8 {
@@ -222,6 +245,11 @@ test "charsets decode and encode back, refusing what they cannot hold" {
     try std.testing.expectEqualStrings("\xc1\xc2\xc3\x40\xf1\xf2\xf3", try encode(a, .cp037, "ABC 123"));
     try std.testing.expectEqualStrings("a\u{FFFD}", try decode(a, .utf8, "a\xff"));
     try std.testing.expectEqual(Charset.cp037, Charset.parse("EBCDIC").?);
+    try std.testing.expect(validUtf8("caf\u{e9} \u{20ac} \u{1F600}"));
+    try std.testing.expect(!validUtf8("caf\xe9"));
+    try std.testing.expectEqual(BadByte{ .offset = 3, .byte = 0xe9 }, badUtf8("caf\xe9").?);
+    try std.testing.expectEqual(BadByte{ .offset = 3, .byte = 0xe2 }, badUtf8("\u{e7}a\xe2\x82").?);
+    try std.testing.expectEqual(@as(?BadByte, null), badUtf8("\u{e7}\u{20ac}"));
     try std.testing.expectEqual(Charset.latin1, Charset.parse("ISO-8859-1").?);
 }
 

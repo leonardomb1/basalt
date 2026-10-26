@@ -86,6 +86,16 @@ fn wantCharset(self: *TypeCtx, c: ast.Expr.Call, i: usize) TypeError!void {
     if (charset.Charset.parse(s) == null) return self.err("`{s}`: unknown charset `{s}` (" ++ charset.names ++ ")", .{ c.name, s });
 }
 
+/// `b` in `cs` as text; bytes read as UTF-8 that are not valid UTF-8 are an error
+/// naming the first bad byte, never repaired, as a CSV cell is.
+fn decodeData(comptime name: []const u8, cx: Cx, cs: charset.Charset, b: []const u8) EvalError![]const u8 {
+    if (cs == .utf8 and !charset.validUtf8(b)) {
+        const at = charset.badUtf8(b) orelse charset.BadByte{ .offset = 0, .byte = 0 };
+        return failWith(error.CastFailed, "`" ++ name ++ "`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); name the charset, 'latin1' or 'cp1252', if it is not UTF-8", .{ at.byte, at.offset });
+    }
+    return charset.decode(cx.arena, cs, b);
+}
+
 fn charsetArg(comptime name: []const u8, s: ?[]const u8) EvalError!charset.Charset {
     const n = s orelse return .utf8;
     return charset.Charset.parse(n) orelse failWith(error.CastFailed, "`" ++ name ++ "`: unknown charset `{s}`", .{n});
@@ -155,7 +165,7 @@ pub const Decode = struct {
         try wantCharset(self, c, 1);
     }
     pub fn apply(cx: Cx, b: []const u8, cs: []const u8) EvalError![]const u8 {
-        return charset.decode(cx.arena, try charsetArg("decode", cs), b);
+        return decodeData("decode", cx, try charsetArg("decode", cs), b);
     }
 };
 
@@ -184,7 +194,7 @@ pub const TextAt = struct {
     pub fn apply(cx: Cx, rec: []const u8, pos: i64, len: i64, cs: ?[]const u8) EvalError!?[]const u8 {
         const which = try charsetArg("text_at", cs);
         const raw = try fieldOf("text_at", rec, pos, len);
-        const t = std.mem.trimRight(u8, try charset.decode(cx.arena, which, raw), " ");
+        const t = std.mem.trimRight(u8, try decodeData("text_at", cx, which, raw), " ");
         return if (t.len == 0) null else t;
     }
 };
@@ -857,6 +867,21 @@ test "decode, text_at and encode read cp1252's unassigned bytes as C1 controls a
     try testing.expectEqualStrings("\u{81}\u{8d}\u{8f}\u{90}\u{9d}\u{20ac}", (try lit(a, "decode(x'818D8F909D80', 'cp1252')")).string);
     try testing.expectEqualStrings("\u{8f}\u{90}", (try lit(a, "text_at(x'818D8F909D', 2, 2, 'cp1252')")).string);
     try testing.expectEqualStrings("\x81\x8d\x8f\x90\x9d\x80", (try lit(a, "encode(decode(x'818D8F909D80', 'cp1252'), 'cp1252')")).bytes);
+}
+
+test "decode and text_at refuse bytes read as UTF-8 that are not UTF-8; latin-1 decodes them" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lit = @import("testing_util.zig").evalLit;
+    try testing.expectEqualStrings("\u{e7}\u{20ac}", (try lit(a, "decode(x'C3A7E282AC', 'utf8')")).string);
+    try testing.expectEqualStrings("\u{e7}", (try lit(a, "text_at(x'41C3A72020', 1, 4)")).string);
+    try testing.expectError(error.CastFailed, lit(a, "decode(x'4142E9', 'utf8')"));
+    try testing.expectEqualStrings("`decode`: not valid UTF-8 (byte 0xe9 at offset 2); name the charset, 'latin1' or 'cp1252', if it is not UTF-8", @import("support.zig").takeFailure(error.CastFailed).?);
+    try testing.expectError(error.CastFailed, lit(a, "text_at(x'41E9FF', 1, 2)"));
+    try testing.expectEqualStrings("`text_at`: not valid UTF-8 (byte 0xe9 at offset 0); name the charset, 'latin1' or 'cp1252', if it is not UTF-8", @import("support.zig").takeFailure(error.CastFailed).?);
+    try testing.expectEqualStrings("\u{e9}", (try lit(a, "decode(x'E9', 'latin1')")).string);
+    try testing.expectEqualStrings("\u{e9}\u{ff}", (try lit(a, "text_at(x'41E9FF', 1, 2, 'latin1')")).string);
 }
 
 test "record functions check their literal lengths, scales, charsets and patterns" {
