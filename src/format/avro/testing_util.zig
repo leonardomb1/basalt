@@ -8,6 +8,7 @@ const read = @import("read.zig");
 const write = @import("write.zig");
 const varint = @import("../varint.zig");
 const pow10_i128 = @import("../../exec/decimal.zig").pow10_i128;
+const civil = @import("../../exec/civil.zig");
 
 const Node = schema.Node;
 
@@ -127,7 +128,7 @@ pub const Gen = struct {
                 else => g.edge(i32),
             }),
             .long => try long(out, switch (n.logical) {
-                .time_micros => r.intRangeLessThan(i64, 0, 86_400_000_000),
+                .time_micros => r.intRangeLessThan(i64, 0, civil.us_per_day),
                 .timestamp_millis => r.intRangeAtMost(i64, -9_000_000_000_000_000 / 1000, 9_000_000_000_000_000 / 1000),
                 else => g.edge(i64),
             }),

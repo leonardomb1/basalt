@@ -191,6 +191,7 @@ const testing_util = @import("testing_util.zig");
 const column = @import("../column.zig");
 const types = @import("../../lang/types.zig");
 const Decimal = @import("../value.zig").Decimal;
+const civil = @import("../civil.zig");
 
 fn testBatch(a: std.mem.Allocator) !Batch {
     const nan = std.math.nan(f64);
@@ -198,7 +199,7 @@ fn testBatch(a: std.mem.Allocator) !Batch {
     const fs = [_]?f64{ 2.5, -2.5, null, nan, -0.0, inf, -inf, 0.125, 1234.5678 };
     const ds = [_]?Decimal{ .{ .unscaled = 125, .scale = 2 }, .{ .unscaled = -15, .scale = 1 }, null, .{ .unscaled = 3, .scale = 0 }, .{ .unscaled = -5, .scale = 2 }, .{ .unscaled = 255, .scale = 2 }, .{ .unscaled = 5, .scale = 1 }, .{ .unscaled = -1235, .scale = 2 }, .{ .unscaled = 99999, .scale = 2 } };
     const ss = [_]?[]const u8{ "pear", null, "apple", "", "fig", "b", "zz", "b", "kiwi" };
-    const dts = [_]?i32{ 18000, -1, null, 0, 19357, -719162, 11016, 18321, 2932896 };
+    const dts = [_]?i32{ 18000, -1, null, 0, 19357, civil.epoch.ce1, 11016, 18321, 2932896 };
     const ts = [_]?i64{ 1_600_000_123_456_789, -1, null, 0, 1_672_531_199_999_999, -62_135_596_800_000_000, 951_782_400_000_000, 1_000_000_000_000_000, 253_402_300_799_999_999 };
     const us = [_]?[]const u8{ "2024-02-29", "2023-02-29", null, "1999-12-31", "abc", "", "2000-01-01", "20-1-1", "2024-13-01" };
     var fb = column.Builder.init(a, Type.init(.float).asNullable());

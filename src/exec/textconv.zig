@@ -13,7 +13,8 @@ const column = @import("column.zig");
 const value = @import("value.zig");
 
 const Decimal = value.Decimal;
-const pow10_i128 = @import("decimal.zig").pow10_i128;
+const decimal = @import("decimal.zig");
+const pow10_i128 = decimal.pow10_i128;
 
 /// A spelling that reads as one truth value. Input matches when it is a prefix of
 /// `text` at least `min` bytes long, so `min == text.len` is a whole-word match.
@@ -52,8 +53,17 @@ pub const Words = struct {
         .trim = true,
     };
 
-    /// A WITH hint (analyze/targets.zig:197): any case, untrimmed, `true`/`false`.
+    /// A WITH hint (analyze/targets.zig) or a bool option given as text
+    /// (analyze/options.zig): any case, untrimmed, `true`/`false`.
     pub const hint: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true };
+
+    /// The `key_pushdown` hint (plan/keypush.zig): `false` or `off` in any case
+    /// turn it off; anything else leaves it on.
+    pub const key_pushdown: Words = .{ .yes = &.{}, .no = &.{ .whole("false"), .whole("off") }, .fold = true, .otherwise = true };
+
+    /// A BOOL cell as the engine printed it, read back by the terminal grid
+    /// (connect/table.zig, cli/repl/view.zig): exactly `true`, else false.
+    pub const printed: Words = .{ .yes = &.{.whole("true")}, .otherwise = false };
 
     /// An `xsi:nil` attribute (xml/read.zig:518): exactly `true` or `1`, else false.
     pub const xsd_nil: Words = .{ .yes = &.{ .whole("true"), .whole("1") }, .otherwise = false };
@@ -98,7 +108,7 @@ inline fn sameByte(comptime fold: bool, a: u8, b: u8) bool {
 /// How a number with a fraction becomes an int. `half_even` is PostgreSQL's float8
 /// cast (column.floatToInt), `half_away` is `@round` and the decimal cast
 /// (eval/cast.zig rescaleTo), and `exact` refuses any fraction (keytable intOf).
-pub const Round = enum { half_even, half_away, exact };
+pub const Round = decimal.Round;
 
 /// `x` rounded by `r`, or null when it is NaN, infinite or outside i64.
 pub fn floatToInt(x: f64, comptime r: Round) ?i64 {
@@ -127,21 +137,7 @@ fn halfEven(x: f64) f64 {
 /// A decimal value, at its own scale, rounded by `r` to an int in exact i128
 /// arithmetic; null when the result is outside i64 or, for `exact`, has a fraction.
 pub fn decimalToInt(d: Decimal, comptime r: Round) ?i64 {
-    if (d.scale == 0) return std.math.cast(i64, d.unscaled);
-    if (d.scale >= pow10_i128.len) return switch (r) {
-        .exact => if (d.unscaled == 0) 0 else null,
-        else => 0,
-    };
-    const p = pow10_i128[d.scale];
-    const q = @divTrunc(d.unscaled, p);
-    const rem2 = @abs(@rem(d.unscaled, p)) * 2;
-    const away = switch (r) {
-        .exact => if (rem2 != 0) return null else false,
-        .half_away => rem2 >= @abs(p),
-        .half_even => rem2 > @abs(p) or (rem2 == @abs(p) and @rem(q, 2) != 0),
-    };
-    const n = if (!away) q else if (d.unscaled < 0) q - 1 else q + 1;
-    return std.math.cast(i64, n);
+    return std.math.cast(i64, decimal.roundedWhole(d, r) orelse return null);
 }
 
 const testing = std.testing;
@@ -311,7 +307,7 @@ const dec_corpus = [_]Decimal{
     dec(@as(i128, std.math.maxInt(i64)) * 10 + 5, 1), dec(@as(i128, std.math.minInt(i64)) * 10 - 5, 1), dec(@as(i128, std.math.minInt(i64)) * 10 - 4, 1),
     dec(std.math.maxInt(i128), 38),                   dec(std.math.minInt(i128) + 1, 38),               dec(std.math.maxInt(i128), 20),
     dec(std.math.maxInt(i128), 0),                    dec(7, 39),                                       dec(-7, 200),
-    dec(0, 255),                                      dec(5 * std.math.pow(i128, 10, 37), 38),          dec(-5 * std.math.pow(i128, 10, 37), 38),
+    dec(0, 255),                                      dec(5 * pow10_i128[37], 38),                      dec(-5 * pow10_i128[37], 38),
 };
 
 test "decimalToInt half_away is the CAST(decimal AS INT) path" {

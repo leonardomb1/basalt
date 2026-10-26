@@ -171,12 +171,7 @@ pub fn cfgIntIn(comptime T: type, e: *const ast.Expr) Read(T) {
 pub fn cfgBool(e: *const ast.Expr) Read(bool) {
     return switch (e.*) {
         .bool_lit => |b| .{ .ok = b },
-        .str_lit => |s| if (std.ascii.eqlIgnoreCase(s, "true"))
-            .{ .ok = true }
-        else if (std.ascii.eqlIgnoreCase(s, "false"))
-            .{ .ok = false }
-        else
-            .{ .problem = .not_bool },
+        .str_lit => |s| if (options.cfgBoolText(s)) |b| .{ .ok = b } else .{ .problem = .not_bool },
         else => .{ .problem = .not_bool },
     };
 }

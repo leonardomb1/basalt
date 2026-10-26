@@ -21,6 +21,7 @@ const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
 const decimal = @import("decimal.zig");
+const textconv = @import("textconv.zig");
 const cast = @import("eval/cast.zig");
 const civil = @import("civil.zig");
 const hex = @import("../format/hex.zig");
@@ -126,7 +127,7 @@ pub fn parse(comptime k: types.TypeKind, comptime rules: Rules, raw: []const u8)
         .int => int(rules, raw) orelse bad,
         .float => float(rules, raw) orelse bad,
         .decimal => decimal.parse(raw) orelse bad,
-        .bool => raw.len > 0 and (raw[0] == '1' or raw[0] == 't' or raw[0] == 'T' or raw[0] == 'y' or raw[0] == 'Y'),
+        .bool => textconv.boolText(.wire, raw).?,
         .date => switch (rules.dates) {
             .iso => @as(?i32, @intCast(Iso.date(raw) orelse return bad)),
             .wire => if (zeroDate(raw)) null else std.math.cast(i32, Wire.date(raw) orelse return bad) orelse bad,

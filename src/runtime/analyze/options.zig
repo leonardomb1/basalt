@@ -14,6 +14,7 @@ const registry = @import("../../connect/registry.zig");
 const http_client = @import("../../net/http_client.zig");
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const sql = @import("../../db/sql.zig");
+const textconv = @import("../../exec/textconv.zig");
 const std = @import("std");
 const streamload = @import("../../db/streamload.zig");
 
@@ -131,9 +132,7 @@ fn intProblem(e: *const ast.Expr) ?[]const u8 {
 
 /// A bool option written as text: `true` or `false` in any case, else null.
 pub fn cfgBoolText(s: []const u8) ?bool {
-    if (std.ascii.eqlIgnoreCase(s, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(s, "false")) return false;
-    return null;
+    return textconv.boolText(.hint, s);
 }
 
 fn intValue(e: *const ast.Expr) ?i64 {
