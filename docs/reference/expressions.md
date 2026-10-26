@@ -60,7 +60,12 @@ columns it has not seen.
   The year is what a date prints as: four to seven digits and `-` before year 0
   (`'-0044-03-15'` is 45 BC, `'12345-01-01'` past 9999), so every date reads
   back from its own text; one past what a `DATE` holds fails. A PostgreSQL sink
-  is sent a year before 1 its own way, `'0045-03-15 BC'`.
+  is sent a year before 1 its own way, `'0045-03-15 BC'`. A CAST or literal
+  also takes a zero-led year past four digits (`'01234-05-06'` is year 1234)
+  and `'-0000'` as year 0, which a date never prints as. A CSV column of
+  five- to seven-digit years with no leading zero (`'12345-01-02'`) is sniffed
+  as `DATE`, which prints each back as it was written; a zero-led one
+  (`'02024-01-05'`) stays text.
   Text to a number is **strict**: surrounding spaces aside, an optional sign,
   digits and at most one `.` (an `INT` takes no `.`), and anything else — `1_000`,
   `0x10`, `1 000` — fails rather than being guessed at. A `FLOAT` also reads an
@@ -147,7 +152,8 @@ columns it has not seen.
 - `CAST(x AS TIME)` takes `'HH:MM:SS[.ffffff]'` or `'HH:MM'` text, or a
   timestamp (its time of day). Fraction digits past the microsecond are
   dropped, for a `TIME` as for a `TIMESTAMP`, in a CAST and in a file alike,
-  as DuckDB and StarRocks do: `'12:00:00.1234567'` is `12:00:00.123456`, never
-  rounded up into the next second or day.
+  as DuckDB does for a `TIME` and StarRocks for a `DATETIME`:
+  `'12:00:00.1234567'` is `12:00:00.123456`, never rounded up into the next
+  second or day.
 - Scalar functions are listed on [Scalar functions](functions.md), and the JSON
   ones on [JSON functions](json.md).
