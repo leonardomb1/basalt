@@ -7,7 +7,7 @@ an `http` connection takes the REST source clauses ([Sources](../language/source
 ```sql
 CREATE CONNECTION gh TYPE http OPTIONS (base_url = 'https://api.github.com',
     auth = 'bearer', token = env('GH_TOKEN'))
-  RETRY 3 ON (429, 503)
+  RETRY 3
   WITH (header = 'Accept: application/vnd.github+json');
 ```
 

@@ -342,6 +342,35 @@ test "a ranged read replays a 503, a reset and a 504 before the 206" {
     try testing.expectEqual(@as(usize, 5), srv.requests());
 }
 
+test "a ranged read replays a 408 and a 507, fails a 501 at once, and a 408 that outlasts the retries is busy" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const reply = http_fake.FakeServer.reply;
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{
+        reply("408 Request Timeout", "", ""),
+        reply("507 Insufficient Storage", "", ""),
+        reply("206 Partial Content", "content-range: bytes 2-5/100\r\n", "2345"),
+        reply("501 Not Implemented", "", ""),
+        reply("408 Request Timeout", "", ""),
+        reply("408 Request Timeout", "", ""),
+        reply("408 Request Timeout", "", ""),
+        reply("408 Request Timeout", "", ""),
+        reply("408 Request Timeout", "", ""),
+    });
+    defer srv.stop();
+    var client = std.http.Client{ .allocator = testing.allocator };
+    defer client.deinit();
+    var r = Remote{ .arena = a, .client = &client, .url = try srv.url(a, "/x.parquet"), .total = 100, .sleep = noSleep };
+    try testing.expectEqualStrings("2345", try r.read(a, 2, 4));
+    try testing.expectEqual(@as(usize, 3), srv.requests());
+    try testing.expectError(error.HttpRequestFailed, r.read(a, 2, 4));
+    try testing.expectEqual(@as(usize, 4), srv.requests());
+    try testing.expectError(error.HttpServerBusy, r.read(a, 2, 4));
+    try testing.expectEqual(@as(usize, 9), srv.requests());
+}
+
 test "a range whose offset plus length would wrap is out of the file, never a slice past it" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

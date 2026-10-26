@@ -191,12 +191,15 @@ pub fn transientRun(e: anyerror) bool {
     };
 }
 
-/// The HTTP statuses a connector's retry loop retries: timeouts, throttling and
-/// gateways. `http_client.statusError` still counts 501 and 505+ and not 408 (D12).
+/// The HTTP statuses every connector retries, and that exit 75 once retries run out:
+/// 408, 429 and every 5xx except those that describe the request or the server's
+/// abilities rather than a passing condition (501, 505, 511). DuckDB's rule less its
+/// 418; the AWS SDK (StarRocks) and ClickHouse agree on 408, 429 and 501.
 pub fn transientStatus(code: u16) bool {
     return switch (code) {
-        408, 429, 500, 502, 503, 504 => true,
-        else => false,
+        408, 429 => true,
+        501, 505, 511 => false,
+        else => code >= 500 and code < 600,
     };
 }
 
@@ -441,21 +444,21 @@ test "classify: transientNet keeps its socket set and transientRun matches the r
     try testing.expectEqual(Class.other, classify(error.HttpConnectionClosing));
 }
 
-test "transientStatus is the object stores' set; HTTP() differs on 408, 501 and 505+ until D12" {
+test "transientStatus retries 408, 429 and every 5xx but 501, 505 and 511, alike on every HTTP path and in the exit code" {
     const http_client = @import("../net/http_client.zig");
     const objstore = @import("../store/objstore.zig");
-    var differ: std.ArrayList(u16) = .empty;
-    defer differ.deinit(testing.allocator);
-    var code: u16 = 100;
-    while (code < 600) : (code += 1) {
-        try testing.expectEqual(objstore.retriable(code), transientStatus(code));
-        const busy = http_client.statusError(code) == error.HttpServerBusy;
-        if (busy != transientStatus(code)) try differ.append(testing.allocator, code);
+    const env = @import("../runtime/env.zig");
+    var code: u16 = 0;
+    while (code < 1000) : (code += 1) {
+        const want = code == 408 or code == 429 or (code >= 500 and code < 600 and code != 501 and code != 505 and code != 511);
+        try testing.expectEqual(want, transientStatus(code));
+        try testing.expectEqual(want, objstore.retriable(code));
+        try testing.expectEqual(want, http_client.statusError(code) == error.HttpServerBusy);
+        try testing.expectEqual(want, env.isTransient(http_client.statusError(code)));
+        try testing.expectEqual(want, transientRun(http_client.statusError(code)));
     }
-    try testing.expectEqual(@as(usize, 2 + 95), differ.items.len);
-    try testing.expectEqual(@as(u16, 408), differ.items[0]);
-    try testing.expectEqual(@as(u16, 501), differ.items[1]);
-    for (differ.items[2..], 505..) |c, want| try testing.expectEqual(@as(u16, @intCast(want)), c);
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 507, 509, 598, 599 }) |c| try testing.expect(transientStatus(c));
+    for ([_]u16{ 400, 404, 418, 501, 505, 511, 600, 999 }) |c| try testing.expect(!transientStatus(c));
 }
 
 test "connectorNote: layer, error and the server's words, each part left out when empty" {

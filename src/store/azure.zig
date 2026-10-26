@@ -233,8 +233,8 @@ fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8,
 }
 
 /// Maps a status plus Azure's error code onto a distinct Zig error. Every status
-/// the retry loop replays as an outage (429 and the 5xx gateways) is `AzureThrottled`,
-/// so a run that exhausts its retries on one exits as transient; 408 and 501 are not (D12).
+/// the retry loop replays (`objstore.retriable`) is `AzureThrottled`, so a run that
+/// exhausts its retries on one exits as transient.
 pub fn statusToError(code: u16, body: []const u8) Error {
     if (objstore.parseError(body)) |e| {
         if (std.mem.eql(u8, e.code, "AuthenticationFailed")) return Error.AzureAuthFailed;
@@ -242,10 +242,10 @@ pub fn statusToError(code: u16, body: []const u8) Error {
         if (std.mem.eql(u8, e.code, "BlobNotFound")) return Error.AzureBlobNotFound;
         if (std.mem.eql(u8, e.code, "AuthorizationFailure")) return Error.AzureAuthFailed;
     }
+    if (objstore.retriable(code)) return Error.AzureThrottled;
     return switch (code) {
         401, 403 => Error.AzureAuthFailed,
         404 => Error.AzureContainerMissing,
-        429, 500, 502, 503, 504 => Error.AzureThrottled,
         else => Error.AzureRequestFailed,
     };
 }
@@ -891,16 +891,21 @@ fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.h
     };
 }
 
-test "a retried-out 5xx gateway is AzureThrottled, which a run exits on as transient; 408 and 501 stay RequestFailed (D12)" {
-    for ([_]u16{ 429, 500, 502, 503, 504 }) |c| {
+test "every retried status is AzureThrottled, which a run exits on as transient; 501, 505 and 511 are RequestFailed" {
+    const env = @import("../runtime/env.zig");
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 507, 509, 599 }) |c| {
         try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, ""));
         try std.testing.expectEqual(Error.AzureThrottled, statusToError(c, "<Error><Code>InternalError</Code></Error>"));
+        try std.testing.expect(env.isTransient(statusToError(c, "")));
     }
-    for ([_]u16{ 400, 405, 408, 409, 412, 418, 501, 505, 599 }) |c| try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(c, ""));
-    for (0..600) |c| {
-        const e = statusToError(@intCast(c), "");
-        if (objstore.retriable(@intCast(c)) and c != 408) try std.testing.expectEqual(Error.AzureThrottled, e);
-        if (e == Error.AzureThrottled) try std.testing.expect(objstore.retriable(@intCast(c)));
+    for ([_]u16{ 400, 405, 409, 412, 418, 501, 505, 511, 600 }) |c| {
+        try std.testing.expectEqual(Error.AzureRequestFailed, statusToError(c, ""));
+        try std.testing.expect(!env.isTransient(statusToError(c, "")));
+    }
+    try std.testing.expectEqual(Error.AzureAuthFailed, statusToError(503, "<Error><Code>AuthenticationFailed</Code></Error>"));
+    for (0..1000) |c| {
+        const code: u16 = @intCast(c);
+        try std.testing.expectEqual(objstore.retriable(code), statusToError(code, "") == Error.AzureThrottled);
     }
 }
 

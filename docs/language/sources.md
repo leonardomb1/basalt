@@ -172,7 +172,9 @@ source is asked to do are on [Pushdown](pushdown.md).
   own name. A
   cursor that is a full `http(s)://` URL is fetched as given; any other is
   URL-encoded into the cursor parameter.
-- **`RETRY n [ON (429, 503)]`** — retries + retryable statuses.
+- **`RETRY n [ON (404, 501)]`** — retries + extra retryable statuses. 408, 429
+  and every 5xx except 501, 505 and 511 are retried without being listed; `ON`
+  adds codes an API misuses for an outage.
 - **`WITH (delimiter = ';', encoding = 'latin1')`** — the CSV dialect. The
   delimiter is one character, or the word `tab`; the encodings are `utf8`
   (default), `latin1` / `iso-8859-1`, and `cp1252` / `windows-1252`. Non-UTF-8
@@ -241,7 +243,7 @@ error rather than ignored.
 | `stop_short` | off | a flag: stop after a page shorter than `page_size` |
 | `prefetch` | `1` | pages kept in flight at once, in `page` and `offset` modes |
 | `retries` | `2` | retries of a transient failure (`RETRY n`) |
-| `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,408'` (`RETRY n ON (...)`) |
+| `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,501'`, on top of 408, 429 and every 5xx but 501, 505 and 511 (`RETRY n ON (...)`) |
 | `retry_base_ms` | `500` | the first retry's back-off, doubled each time, ±30% jitter |
 | `timeout_ms` | `300000` | the limit on one page's fetch |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
@@ -263,7 +265,7 @@ A complete REST read, for orientation:
 
 ```sql
 CREATE CONNECTION crates TYPE http OPTIONS (base_url = 'https://crates.io/api/v1')
-  RETRY 2 ON (429, 503);
+  RETRY 2;
 
 SELECT id AS crate, downloads, json_get(links, 'owners') AS owners
 FROM crates.GET('/crates', sort = 'downloads', per_page = 100)
