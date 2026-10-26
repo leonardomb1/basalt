@@ -294,6 +294,43 @@ test "a parquet UINT64 is DECIMAL(20,0): it joins and compares against an INT, a
     }
 }
 
+test "a parquet folder mixing a UINT64 and an INT64 file is refused naming the retyped column, in either order" {
+    const alloc = std.testing.allocator;
+    const Order = struct { uint: []const u8, int: []const u8, why: []const u8 };
+    const orders = [_]Order{
+        .{ .uint = "a.parquet", .int = "b.parquet", .why = "column `big` is int there, not decimal(20,0)" },
+        .{ .uint = "b.parquet", .int = "a.parquet", .why = "column `big` is decimal(20,0) there, not int" },
+    };
+    for (orders) |o| for ([_][]const u8{ "SELECT big FROM '$B/d/'", "SELECT SUM(big) AS s FROM '$B/d/'" }) |sel| for ([_]usize{ 1, 4 }) |threads| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.makeDir("d");
+        const upath = try std.fmt.allocPrint(alloc, "d/{s}", .{o.uint});
+        defer alloc.free(upath);
+        try tmp.dir.writeFile(.{ .sub_path = upath, .data = fixtures.unsigned_big_parquet });
+        const base = try tmp.dir.realpathAlloc(alloc, ".");
+        defer alloc.free(base);
+        const mk = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/d/{s}' AS SELECT CAST(7 AS INT) AS big;", .{ base, o.int });
+        defer alloc.free(mk);
+        var mdiag: Diag = .{};
+        _ = try exec(alloc, mk, .{ .log = .{ .quiet = true } }, &mdiag);
+        const q = try std.mem.replaceOwned(u8, alloc, sel, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var rdiag: Diag = .{};
+        const msg = if (exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag)) |_|
+            return error.TestExpectedError
+        else |e| if (rdiag.msg.len > 0) rdiag.msg else basalt.eval.takeFailure(e) orelse "";
+        const want = try std.fmt.allocPrint(alloc, "`b.parquet` in folder `{s}/d/` does not match `a.parquet`, its first file: {s}", .{ base, o.why });
+        defer alloc.free(want);
+        if (std.mem.indexOf(u8, msg, want) == null) {
+            std.debug.print("want `{s}` in `{s}`\n", .{ want, msg });
+            return error.TestUnexpectedResult;
+        }
+    };
+}
+
 test "LogicalType-only parquet timestamps and times read back as wall-clock values" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

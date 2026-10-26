@@ -42,7 +42,9 @@ ignored; a folder holding two of these kinds is refused unless `WITH (format =
 'parquet')`, `'csv'` or `'json'` picks one. Every Parquet file must have the first one's columns, in its
 order and of its types, among those the query reads: a file with one missing,
 moved or retyped fails the read naming it, rather than putting values under the
-wrong name. Each file still skips the columns and row groups the query does
+wrong name. Types are compared as basalt reads them and are not widened across
+files, so a `UINT64` column (`DECIMAL(20,0)`) in one file and an `INT64` one in
+another fail the read, whichever sorts first. Each file still skips the columns and row groups the query does
 not need. CSV files must repeat the first one's header. JSON files take the
 first file's columns, as a REST read's later pages do.
 
