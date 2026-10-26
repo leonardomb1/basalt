@@ -644,7 +644,7 @@ fn pathLayer(path: []const u8) []const u8 {
     if (sftp.isUrl(path)) return "sftp";
     if (smb.isUrl(path)) return "smb";
     if (ftp.isUrl(path)) return "ftp";
-    if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://")) return "http";
+    if (lake.isHttp(path)) return "http";
     return "local file";
 }
 

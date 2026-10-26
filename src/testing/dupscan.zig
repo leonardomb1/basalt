@@ -354,7 +354,7 @@ pub fn mask(gpa: std.mem.Allocator, source: [:0]const u8, tests: bool) ![]u8 {
 pub const plan = [_]Rule{
     .{ .home = "civil", .pattern = civil_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
     .{ .home = "civil.Part", .pattern = part_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
-    .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &.{"exec/textconv.zig"} },
+    .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &textconv_allow },
     .{ .home = "floatord", .pattern = floatord_pattern, .exact = true, .allow = &.{"exec/floatord.zig"} },
     .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
     .{ .home = "jsontext", .pattern = jsontext_pattern, .allow = &.{
@@ -385,35 +385,16 @@ pub const plan = [_]Rule{
         "net/auth/ntlm.zig",
         "store/smb.zig",
     } },
-    .{ .home = "scheme", .pattern = scheme_pattern, .allow = &.{
-        "store/scheme.zig",
-        "format/bytes.zig",
-        "format/lake/table.zig",
-        "format/stream.zig",
-        "net/http_client.zig",
-        "runtime/env.zig",
-        "store/s3.zig",
-        "store/sftp.zig",
-    } },
-    .{ .home = "dial", .pattern = dial_pattern, .allow = &.{
+    .{ .home = "scheme", .pattern = scheme_pattern, .exact = true },
+    .{ .home = "dial", .pattern = dial_pattern, .exact = true, .allow = &.{
         "connect/driver.zig",
-        "db/wire.zig",
-        "net/auth/krb5.zig",
-        "net/http_client.zig",
-        "net/ssh.zig",
-        "store/ftp.zig",
-        "store/smb.zig",
     } },
-    .{ .home = "options", .pattern = options_pattern, .allow = &.{
-        "runtime/connect/options_schema.zig",
-        "runtime/connect/dbconfig.zig",
-        "runtime/connect/sink.zig",
-    } },
-    .{ .home = "retry", .pattern = retry_pattern, .allow = &.{
+    .{ .home = "options", .pattern = options_pattern, .exact = true, .allow = &options_allow },
+    .{ .home = "retry", .pattern = retry_pattern, .exact = true, .allow = &.{
         "connect/retry.zig",
-        "db/sql.zig",
-        "db/streamload.zig",
-        "net/http_client.zig",
+    } },
+    .{ .home = "transient", .pattern = transient_pattern, .exact = true, .allow = &.{
+        "connect/driver.zig",
     } },
     .{ .home = "queue", .pattern = queue_pattern, .exact = true, .allow = &.{
         "runtime/parallel.zig",
@@ -443,10 +424,26 @@ pub const decimal_pattern = "fn pow10|std\\.math\\.powi?\\(i(64|128|256), 10,|@(
 pub const jsontext_pattern = "encodeJsonString(Chars)?";
 pub const hex_pattern = "parseInt\\(.*16\\)";
 pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc";
-pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|https?)://";
+pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|az|smb|ftp|https?)://";
 pub const dial_pattern = "tcpConnectToHost";
-pub const options_pattern = "@intCast\\(try evalCfgInt";
-pub const retry_pattern = "std\\.Thread\\.sleep\\(";
+pub const options_pattern = "@intCast\\(try evalCfgInt|\\.str_lit => \\|\\w+\\| .*(parseInt\\(i64, \\w+, 10\\)|IgnoreCase\\(\\w+, \"true\"\\))";
+pub const retry_pattern = "(^|[^a-zA-Z_])sleep\\([a-z_@]";
+pub const transient_pattern = "== (408|429|50[0234])([^0-9]|$)|!= (408|429|50[0234])([^0-9]|$)|>= 500([^0-9]|$)|408, 429 ?(,|=>)";
+
+/// testing_util.zig keeps the option readers as they were before options_schema,
+/// the oracle the home's tests compare it against; reading through the home would
+/// make those tests compare the home with itself.
+/// testing_util.zig's option oracle reads `true`/`false` as it did before the
+/// homes, for the same reason it keeps its own option readers (`options_allow`).
+const textconv_allow = [_][]const u8{
+    "exec/textconv.zig",
+    "runtime/connect/testing_util.zig",
+};
+
+const options_allow = [_][]const u8{
+    "runtime/connect/options_schema.zig",
+    "runtime/connect/testing_util.zig",
+};
 pub const queue_pattern = "next\\.fetchAdd\\(";
 pub const sql_pattern = "\"''\"|== '\\\\''|'\\\\'' =>";
 pub const guard_pattern = "errdefer \\w+\\.abort\\(\\);([^{}]|\\{[^{}]*\\})*try \\w+\\.close\\(";
@@ -494,6 +491,9 @@ test "dupscan requiredLiterals: the longest literal each alternative needs" {
     try expectNeedles(sql_pattern, &.{ "\"''\"", "== '\\''", "'\\'' =>" });
     try expectNeedles(hex_pattern, &.{"parseInt("});
     try expectNeedles(guard_pattern, &.{"errdefer "});
+    try expectNeedles(options_pattern, &.{ "@intCast(try evalCfgInt", ".str_lit => |" });
+    try expectNeedles(retry_pattern, &.{"sleep("});
+    try expectNeedles(transient_pattern, &.{ "== ", "!= ", ">= 500", "408, 429" });
     try expectNeedles("ab+c", &.{"a"});
     try expectNeedles("ab+cd", &.{"cd"});
     try expectNeedles("a{2,3}bc", &.{"bc"});
@@ -583,7 +583,38 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ dial_pattern, "std.net.tcpConnectToHost(gpa, host, port)", true },
         .{ options_pattern, "const p: u16 = @intCast(try evalCfgInt(cx, e));", true },
         .{ options_pattern, "std.math.cast(u16, try evalCfgInt(cx, e))", false },
+        .{ scheme_pattern, "std.mem.startsWith(u8, p, \"az://\")", true },
+        .{ scheme_pattern, "for ([_][]const u8{ \"sftp://\", \"smb://\" }) |pre| if (std.mem.startsWith(u8, root, pre))", false },
+        .{ options_pattern, ".str_lit => |s| std.fmt.parseInt(i64, s, 10) catch null,", true },
+        .{ options_pattern, ".str_lit => |s| if (std.fmt.parseInt(i64, s, 10)) |_| null else |_| int_cfg_msg,", true },
+        .{ options_pattern, ".str_lit => |s| if (std.ascii.eqlIgnoreCase(s, \"true\"))", true },
+        .{ options_pattern, ".str, .ident => |s| std.fmt.parseInt(i64, s, 10) catch null,", false },
+        .{ options_pattern, "return if (std.ascii.eqlIgnoreCase(s, \"true\")) true else null;", false },
+        .{ options_pattern, ".str_lit => |s| cfgBool(s),", false },
         .{ retry_pattern, "std.Thread.sleep(backoff_ns);", true },
+        .{ retry_pattern, "std.Thread.sleep(delay * std.time.ns_per_ms);", true },
+        .{ retry_pattern, "std.Thread.sleep(@min(wait, cap) * std.time.ns_per_ms);", true },
+        .{ retry_pattern, "sleep(step * std.time.ns_per_ms);", true },
+        .{ retry_pattern, "std.Thread.sleep(25 * std.time.ns_per_ms);", false },
+        .{ retry_pattern, "while (!done and waited < 500) : (waited += 1) std.Thread.sleep(20 * std.time.ns_per_ms);", false },
+        .{ retry_pattern, "if (!retry.pauseWith(std.Thread.sleep, 500)) return e;", false },
+        .{ retry_pattern, "sleep: objstore.Sleep = std.Thread.sleep,", false },
+        .{ retry_pattern, "std.posix.nanosleep(s, ns);", false },
+        .{ transient_pattern, "if (code == 429) return true;", true },
+        .{ transient_pattern, "if (status == 503 or status == 504)", true },
+        .{ transient_pattern, "return r.code != 503", true },
+        .{ transient_pattern, "else => code >= 500 and code < 600,", true },
+        .{ transient_pattern, "408, 429 => true,", true },
+        .{ transient_pattern, "408, 429, 500, 502, 503, 504 => true,", true },
+        .{ transient_pattern, "if (code >= 400 and code < 500) return error.FtpServerBusy;", false },
+        .{ transient_pattern, "if (code == 530) return error.FtpLoginFailed;", false },
+        .{ transient_pattern, "if (code == 550) return error.FileNotFound;", false },
+        .{ transient_pattern, "if (r.code != 125 and r.code != 150) return refusal(r.code, r.text);", false },
+        .{ transient_pattern, "if (hello.code != 220) return refusal(hello.code, hello.text);", false },
+        .{ transient_pattern, "501 => {", false },
+        .{ transient_pattern, "while (waited < 500) : (waited += 1)", false },
+        .{ transient_pattern, "if (n == 5000) break;", false },
+        .{ transient_pattern, "base_ms: u64 = 500,", false },
         .{ queue_pattern, "const i = queue.next.fetchAdd(1, .monotonic);", true },
         .{ sql_pattern, "try w.writeAll(\"''\");", true },
         .{ sql_pattern, "try w.writeAll(\"'\");", false },

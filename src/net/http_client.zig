@@ -161,7 +161,7 @@ pub fn repairOnce(client: *std.http.Client, done: *bool, url: []const u8) bool {
 /// Captures the chain a server presents over an unverified handshake. SNI and the
 /// hostname are still sent and checked; only the CA path is not verified.
 fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *ChainCapture) !void {
-    const stream = try std.net.tcpConnectToHost(gpa, host, port);
+    const stream = try driver.dial(gpa, host, port, .{ .tune = false });
     defer stream.close();
     var in_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
     var out_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;

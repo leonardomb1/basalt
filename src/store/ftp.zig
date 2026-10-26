@@ -100,14 +100,6 @@ fn refusal(code: u16, text: []const u8) anyerror {
     return error.FtpRefused;
 }
 
-/// `driver.tuneSocket`, plus read and write timeouts so a silent server fails the call.
-fn tune(handle: std.posix.socket_t) void {
-    driver.tuneSocket(handle);
-    const tv = std.posix.timeval{ .sec = timeout_s, .usec = 0 };
-    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-}
-
 const Reply = struct { code: u16, text: []const u8 };
 
 pub const Session = struct {
@@ -121,9 +113,8 @@ pub const Session = struct {
     text_buf: [256]u8 = undefined,
 
     pub fn open(gpa: std.mem.Allocator, u: Url) !*Session {
-        const stream = try std.net.tcpConnectToHost(gpa, u.host, u.port);
+        const stream = try driver.dial(gpa, u.host, u.port, .{ .io_timeout_s = timeout_s });
         errdefer stream.close();
-        tune(stream.handle);
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .host = u.host, .stream = stream };
@@ -185,9 +176,7 @@ pub const Session = struct {
             if (p.code != 227) return refusal(p.code, p.text);
             break :blk pasvPort(p.text) orelse return error.FtpProtocol;
         };
-        const s = try std.net.tcpConnectToHost(self.gpa, self.host, port);
-        tune(s.handle);
-        return s;
+        return driver.dial(self.gpa, self.host, port, .{ .io_timeout_s = timeout_s });
     }
 
     /// Opens the data connection, sends `verb path`, and returns it once the

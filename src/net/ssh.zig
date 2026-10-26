@@ -388,8 +388,7 @@ pub const Session = struct {
         var owned = cfg;
         const text = try ownConfig(gpa, &owned);
         errdefer gpa.free(text);
-        const stream = try std.net.tcpConnectToHost(gpa, cfg.host, cfg.port);
-        driver.tuneSocket(stream.handle);
+        const stream = try driver.dial(gpa, cfg.host, cfg.port, .{});
         self.* = .{
             .gpa = gpa,
             .stream = stream,

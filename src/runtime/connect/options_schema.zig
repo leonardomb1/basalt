@@ -7,6 +7,7 @@
 
 const ast = @import("../../lang/ast.zig");
 const options = @import("../analyze/options.zig");
+const textconv = @import("../../exec/textconv.zig");
 const registry = @import("../../connect/registry.zig");
 const std = @import("std");
 
@@ -171,7 +172,7 @@ pub fn cfgIntIn(comptime T: type, e: *const ast.Expr) Read(T) {
 pub fn cfgBool(e: *const ast.Expr) Read(bool) {
     return switch (e.*) {
         .bool_lit => |b| .{ .ok = b },
-        .str_lit => |s| if (options.cfgBoolText(s)) |b| .{ .ok = b } else .{ .problem = .not_bool },
+        .str_lit => |s| if (textconv.boolText(.hint, s)) |b| .{ .ok = b } else .{ .problem = .not_bool },
         else => .{ .problem = .not_bool },
     };
 }
