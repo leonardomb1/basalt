@@ -220,7 +220,14 @@ test "an unsigned annotation is refused on any physical type but its own: UINT64
         .{ .ty = .int64, .converted_type = conv_uint32 },
         .{ .ty = .double, .converted_type = conv_uint32 },
     };
-    for (bad) |e| try testing.expectError(Error.CorruptParquetPage, basaltType(e));
+    for (bad) |e| {
+        var named = e;
+        named.name = "qty";
+        try testing.expectError(Error.CorruptParquetPage, basaltType(named));
+        const msg = eval.takeFailure(Error.CorruptParquetPage) orelse return error.TestExpectedFailNote;
+        try testing.expect(std.mem.indexOf(u8, msg, "parquet column `qty` is a ") != null);
+        try testing.expect(std.mem.indexOf(u8, msg, "-bit unsigned integer stored as ") != null);
+    }
     const good = [_]parquet.SchemaElement{
         logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = false } }),
         logical(.int32, .{ .integer = .{ .bit_width = 16, .signed = false } }),
