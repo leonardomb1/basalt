@@ -278,28 +278,31 @@ fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: [
     return IntBounds{ .min = min, .max = max };
 }
 
+/// Up to `m_in` covering, disjoint range predicates over [min, max]; a single
+/// whole-range predicate (a serial read) when the slicing arithmetic would
+/// overflow i128, as bounds near a DECIMAL(38,0)'s limits can.
 fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min: i128, max: i128, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
-    const span: i128 = max - min + 1;
+    const one = try std.fmt.allocPrint(arena, "({s} >= {d} OR {s} IS NULL)", .{ qcol, min, qcol });
+    const span: i128 = std.math.add(i128, std.math.sub(i128, max, min) catch return dupeOne(arena, one), 1) catch return dupeOne(arena, one);
     var m: usize = m_in;
     if (@as(i128, @intCast(m)) > span) m = @intCast(span);
-    if (m <= 1) {
-        const one = try std.fmt.allocPrint(arena, "({s} >= {d} OR {s} IS NULL)", .{ qcol, min, qcol });
-        return try dupeOne(arena, one);
-    }
-    const width: i128 = @divTrunc(span + @as(i128, @intCast(m)) - 1, @as(i128, @intCast(m)));
+    if (m <= 1) return try dupeOne(arena, one);
+    const width: i128 = @divTrunc(span - 1, @as(i128, @intCast(m))) + 1;
     var list = std.array_list.Managed([]const u8).init(arena);
     var k: usize = 0;
     while (k < m) : (k += 1) {
-        const lo: i128 = min + @as(i128, @intCast(k)) * width;
+        const off: i128 = std.math.mul(i128, @intCast(k), width) catch return dupeOne(arena, one);
+        const lo: i128 = std.math.add(i128, min, off) catch return dupeOne(arena, one);
         if (k == m - 1) {
             try list.append(try std.fmt.allocPrint(arena, "{s} >= {d}", .{ qcol, lo }));
-        } else if (k == 0) {
-            const hi: i128 = lo + width;
-            try list.append(try std.fmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
         } else {
-            const hi: i128 = lo + width;
-            try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
+            const hi: i128 = std.math.add(i128, lo, width) catch return dupeOne(arena, one);
+            if (k == 0) {
+                try list.append(try std.fmt.allocPrint(arena, "(({s} >= {d} AND {s} < {d}) OR {s} IS NULL)", .{ qcol, lo, qcol, hi, qcol }));
+            } else {
+                try list.append(try std.fmt.allocPrint(arena, "{s} >= {d} AND {s} < {d}", .{ qcol, lo, qcol, hi }));
+            }
         }
     }
     return list.toOwnedSlice();
@@ -793,6 +796,28 @@ test "a BIGINT UNSIGNED key, read as DECIMAL(20,0), splits over its whole unsign
     }
     var frac = FakeConn{ .arena = a, .rows = &.{&.{ Value{ .decimal = .{ .unscaled = 15, .scale = 1 } }, Value{ .decimal = .{ .unscaled = 95, .scale = 1 } } }} };
     try std.testing.expectEqual(@as(?Plan, null), try plan(a, frac.prober(), .mysql, base, .{ .col = "id", .kind = .int }, 4));
+}
+
+test "a DECIMAL(38,0) key whose span overflows i128 reads serially; one that fits still splits" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+    const top: i128 = std.math.pow(i128, 10, 38) - 1;
+    const neg = Value{ .decimal = .{ .unscaled = -top, .scale = 0 } };
+    const zero = Value{ .decimal = .{ .unscaled = 0, .scale = 0 } };
+    const pos = Value{ .decimal = .{ .unscaled = top, .scale = 0 } };
+    for ([_]KeyKind{ .int, .auto }) |kind| {
+        var f = FakeConn{ .arena = a, .rows = &.{&.{ neg, pos }} };
+        try std.testing.expectEqual(@as(?Plan, null), try plan(a, f.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4));
+        var g = FakeConn{ .arena = a, .rows = &.{&.{ zero, pos }} };
+        const p = (try plan(a, g.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4)).?;
+        try std.testing.expectEqual(KeyKind.int, p.key.kind);
+        try std.testing.expectEqual(@as(usize, 4), p.predicates.len);
+        try std.testing.expectEqualStrings("\"id\" >= 75000000000000000000000000000000000000", p.predicates[3]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), (try intRangePreds(a, .postgres, "id", std.math.minInt(i128), std.math.maxInt(i128), 4)).len);
+    try std.testing.expectEqual(@as(usize, 1), (try intRangePreds(a, .postgres, "id", std.math.maxInt(i128) - 5, std.math.maxInt(i128), 4)).len);
 }
 
 test "plan stays serial when the bounds probe finds nothing to slice" {
