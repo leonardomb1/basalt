@@ -15,6 +15,14 @@ is stored as that UTC instant, and a pushed-down timestamp literal compares in
 UTC. A `DATETIME`, a PostgreSQL `timestamp` and StarRocks' and Doris' columns
 carry no zone and read as written.
 
+The session zone also sets the server's own clock in basalt's sessions. On
+MySQL, StarRocks and Doris, `NOW()`, `CURRENT_TIMESTAMP` and `FROM_UNIXTIME` in
+a query basalt sends give UTC, and so does a `DATETIME` column's `DEFAULT` or
+`ON UPDATE CURRENT_TIMESTAMP` filled by a row basalt writes; on PostgreSQL a
+`timestamp` column's `DEFAULT now()` is the UTC wall-clock time. Other sessions
+on the same server keep their own zone, so a row they write may differ by the
+offset.
+
 A PostgreSQL `bytea` reads as `BYTES`, decoded from whichever `bytea_output`
 format the server uses, and a PostgreSQL `time` as `TIME`. A basalt `TIME` is a
 time of day below `24:00:00`, so PostgreSQL's `24:00:00` fails the read, naming
