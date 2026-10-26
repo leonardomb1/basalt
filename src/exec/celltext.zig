@@ -8,7 +8,8 @@
 //! - `string(w, s)`: how a string is escaped or quoted;
 //! - optionally `bytes(w, s)` (else as a string), `float(w, x)` (else `{d}`),
 //!   `quote_decimal` and `quote_temporal` (text around a decimal, or a date, time
-//!   or timestamp), and `escape_scalars`, which passes every other cell's text
+//!   or timestamp), `bc_years` (a year before 1 spelled PostgreSQL's way,
+//!   `0044-03-15 BC`), and `escape_scalars`, which passes every other cell's text
 //!   through `string` too, a nested cell's as the empty text.
 //!
 //! A nested cell is otherwise null, as `Column.getValue` has it.
@@ -18,6 +19,7 @@ const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const format = @import("eval/format.zig");
 const decimal = @import("decimal.zig");
+const civil = @import("civil.zig");
 const Batch = @import("batch.zig").Batch;
 const Value = @import("value.zig").Value;
 
@@ -180,10 +182,11 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
         .date, .time, .timestamp => {
             const q = if (@hasDecl(P, "quote_temporal")) P.quote_temporal else "";
             try w.writeAll(q);
+            const bc = @hasDecl(P, "bc_years") and P.bc_years;
             switch (c.ty.kind) {
-                .date => try format.writeDate(w, c.data.i32[r]),
+                .date => if (bc) try civil.writeLayout(w, c.data.i32[r], .pg_date) else try format.writeDate(w, c.data.i32[r]),
                 .time => try format.writeTime(w, c.data.i64[r]),
-                else => try format.writeTimestamp(w, c.data.i64[r]),
+                else => if (bc) try civil.writeLayout(w, c.data.i64[r], .pg_timestamp) else try format.writeTimestamp(w, c.data.i64[r]),
             }
             try w.writeAll(q);
         },

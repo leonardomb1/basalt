@@ -11,6 +11,7 @@ pub const bin = @import("testing_util.zig").bin;
 const builtins = @import("../../exec/builtins.zig");
 const litAs = @import("../../exec/eval.zig").litAs;
 const eval = @import("../../exec/eval.zig");
+const civil = @import("../../exec/civil.zig");
 const callExpr = @import("testing_util.zig").callExpr;
 pub const fld = @import("testing_util.zig").fld;
 const intLit = @import("testing_util.zig").intLit;
@@ -122,6 +123,19 @@ fn looseTemporal(s: []const u8) bool {
     if (plainIso(s)) return false;
     return eval.parseIsoDate(s) != null or eval.parseIsoTimestamp(s) != null or
         eval.parseDateText(s) != null or eval.parseTimestampText(s) != null;
+}
+
+/// Whether day `d` falls in years 1..9999, which every source spells as basalt
+/// does; a signed or longer year stays in the engine, as a source may refuse it or
+/// read it as another date.
+fn everySourceYear(d: i64) bool {
+    return d >= civil.epoch.ce1 and d <= comptime civil.daysFromCivil(9999, 12, 31);
+}
+
+/// Whether date or timestamp text names a day in years 1..9999; text that reads
+/// as no date is left to the cast to refuse.
+fn everySourceYearText(s: []const u8) bool {
+    return everySourceYear(eval.parseDateText(s) orelse return true);
 }
 
 /// ISO text every source reads alike: a four-digit year and at most six fraction digits.
@@ -280,6 +294,7 @@ const Tx = struct {
                 if (c.safe) return null;
                 if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
                 if (c.ty.kind == .string and !provablyText(c.e, self.o.schema)) return null;
+                if ((c.ty.kind == .date or c.ty.kind == .timestamp) and c.e.* == .str_lit and !everySourceYearText(c.e.str_lit)) return null;
                 const inner = (try self.value(c.e)) orelse return null;
                 const ty = (try self.dialect.castType(self.arena, c.ty)) orelse return null;
                 return try self.fmt("CAST({s} AS {s})", .{ inner, ty });
@@ -442,10 +457,12 @@ const Tx = struct {
             },
             .date => {
                 const d = eval.parseDateText(t) orelse return null;
+                if (!everySourceYear(d)) return null;
                 return self.value(&.{ .str_lit = try eval.formatDate(self.arena, d) });
             },
             .timestamp => {
                 const us = eval.parseTimestampText(t) orelse return null;
+                if (!everySourceYear(civil.dayOf(us))) return null;
                 return self.value(&.{ .str_lit = try eval.formatTimestamp(self.arena, us) });
             },
             else => return self.value(&.{ .str_lit = lit }),
@@ -709,6 +726,39 @@ test "translateExpr: loose date text against a column of unknown type stays in t
     iso.* = .{ .str_lit = "2024-01-05 05:00:00" };
     const e = try bin(a, .eq, try fld(a, "ts"), iso);
     try testing.expectEqualStrings("(\"ts\" = '2024-01-05 05:00:00')", (try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)).?);
+}
+
+test "translateExpr: a date or timestamp outside years 1..9999 stays in the engine, against a known or unknown column (D3)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "d", .ty = types.Type.init(.date) },
+        .{ .name = "ts", .ty = types.Type.init(.timestamp) },
+    } };
+    for ([_][2][]const u8{
+        .{ "d", "-0001-01-01" },           .{ "d", "0000-12-31" },         .{ "d", "10000-01-01" },
+        .{ "ts", "-0001-01-01 00:00:00" }, .{ "ts", "12345-01-01 00:00" }, .{ "x", "-0001-01-01" },
+        .{ "x", "11000-01-01 00:00:00" },
+    }) |c| {
+        const lit = try a.create(ast.Expr);
+        lit.* = .{ .str_lit = c[1] };
+        inline for (.{ .postgres, .mysql }) |dialect| {
+            try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, c[0]), lit), dialect, schema, false)) == null);
+        }
+    }
+    for ([_]types.TypeKind{ .date, .timestamp }) |k| {
+        const far = try a.create(ast.Expr);
+        far.* = .{ .str_lit = "-0001-01-01" };
+        const cast = try a.create(ast.Expr);
+        cast.* = .{ .cast = .{ .e = far, .ty = types.Type.init(k) } };
+        try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .mysql, schema, false)) == null);
+        far.* = .{ .str_lit = "2024-01-01" };
+        try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .mysql, schema, false)) != null);
+    }
+    const ok = try a.create(ast.Expr);
+    ok.* = .{ .str_lit = "0001-01-01" };
+    try testing.expectEqualStrings("(\"d\" = '0001-01-01')", (try translateExpr(a, try bin(a, .eq, try fld(a, "d"), ok), .postgres, schema, false)).?);
 }
 
 test "translateExpr: concat stays NULL on a NULL argument in every dialect" {

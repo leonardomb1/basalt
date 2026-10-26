@@ -981,6 +981,7 @@ fn Literal(comptime dialect: Dialect) type {
         pub const bool_true = dialect.boolLit(true);
         pub const bool_false = dialect.boolLit(false);
         pub const quote_temporal = "'";
+        pub const bc_years = dialect == .postgres;
 
         pub fn string(_: @This(), w: anytype, s: []const u8) !void {
             return dialect.writeStrLit(w, s, .data);
@@ -1047,10 +1048,14 @@ fn writeHex(w: anytype, s: []const u8) !void {
 /// a BLOB), or PostgreSQL's bytea hex `\x...` with its backslash escaped (COPY).
 pub const BulkBytes = enum { escaped, pg_hex };
 
+/// `pg` is PostgreSQL's COPY: bytea hex, and a year before 1 spelled with ` BC`.
 pub const BulkFormat = struct {
     bool_true: []const u8 = "t",
     bool_false: []const u8 = "f",
     bytes: BulkBytes = .escaped,
+    bc_years: bool = false,
+
+    pub const pg: BulkFormat = .{ .bytes = .pg_hex, .bc_years = true };
 };
 
 /// The `celltext.write` policy for COPY and LOAD DATA text: `\N` for null, and a
@@ -1060,6 +1065,7 @@ pub fn BulkText(comptime fmt: BulkFormat) type {
         pub const null_text = "\\N";
         pub const bool_true = fmt.bool_true;
         pub const bool_false = fmt.bool_false;
+        pub const bc_years = fmt.bc_years;
 
         pub fn string(_: @This(), w: anytype, s: []const u8) !void {
             return bulkEscaped(w, s);
@@ -1319,6 +1325,26 @@ fn literalOf(a: std.mem.Allocator, dialect: Dialect, kind: types.TypeKind, v: Va
     return row[1 .. row.len - 1];
 }
 
+test "a date or timestamp before year 1 is spelled with BC for PostgreSQL only (D3)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const civil = @import("../exec/civil.zig");
+    const ides: i32 = @intCast(civil.daysFromCivil(-43, 3, 15));
+    const noon = @as(i64, ides) * civil.us_per_day + 12 * 3_600_000_000;
+    try std.testing.expectEqualStrings("'0044-03-15 BC'", try literalOf(a, .postgres, .date, .{ .date = ides }));
+    try std.testing.expectEqualStrings("'0044-03-15 12:00:00 BC'", try literalOf(a, .postgres, .timestamp, .{ .timestamp = noon }));
+    try std.testing.expectEqualStrings("'-0043-03-15'", try literalOf(a, .mysql, .date, .{ .date = ides }));
+    try std.testing.expectEqualStrings("'-0043-03-15 12:00:00'", try literalOf(a, .sqlserver, .timestamp, .{ .timestamp = noon }));
+    var w = std.Io.Writer.Allocating.init(a);
+    var b = column.Builder.init(a, types.Type.init(.timestamp).asNullable());
+    try b.append(.{ .timestamp = noon });
+    var cols = [_]column.Column{try b.finish()};
+    var schema = types.Schema{ .fields = &.{.{ .name = "c", .ty = cols[0].ty }} };
+    try appendBulkText(&w.writer, .{ .schema = &schema, .columns = &cols, .len = 1 }, .pg);
+    try std.testing.expectEqualStrings("0044-03-15 12:00:00 BC\n", w.written());
+}
+
 test "INSERT literals: dialect-specific escaping, bools, bytes, null" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -1376,7 +1402,7 @@ test "INSERT literals of every kind, in every dialect" {
             decimals,
             strings,
             "('\\x') ('\\x706c61696e') ('\\x0102205c20090a22') ('\\xc3b3') (NULL)",
-            dates,
+            "('1970-01-01') ('2024-01-01') ('0001-01-01 BC') ('5877642-06-24 BC') (NULL)",
             times,
             stamps,
             nested,
@@ -1433,7 +1459,9 @@ test "COPY and LOAD DATA text of every kind" {
     };
     try celltext.expectGolden(&want, try goldenBulkText(a, .{}));
     want[5] = "\\\\x\n\\\\x706c61696e\n\\\\x0102205c20090a22\n\\\\xc3b3\n\\N\n";
-    try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bytes = .pg_hex }));
+    want[6] = "1970-01-01\n2024-01-01\n0001-01-01 BC\n5877642-06-24 BC\n\\N\n";
+    try celltext.expectGolden(&want, try goldenBulkText(a, .pg));
+    want[6] = "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\\N\n";
     want[0] = "1\n0\n\\N\n";
     want[5] = "\nplain\n\x01\x02 \\\\ \\t\\n\"\n\xc3\xb3\n\\N\n";
     try celltext.expectGolden(&want, try goldenBulkText(a, .{ .bool_true = "1", .bool_false = "0" }));

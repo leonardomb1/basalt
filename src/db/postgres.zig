@@ -660,7 +660,7 @@ const CopyProto = struct {
     }
 
     pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {
-        try sql.appendBulkText(w, batch, .{ .bytes = .pg_hex });
+        try sql.appendBulkText(w, batch, .pg);
     }
 
     pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {

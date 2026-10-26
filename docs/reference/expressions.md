@@ -57,6 +57,10 @@ columns it has not seen.
   FLOAT `f` is a FLOAT). Text
   parses as `YYYY-MM-DD[ HH:MM:SS]`, and a day the month does not have
   (`'2023-02-29'`, `'2024-04-31'`) fails rather than rolling into the next month.
+  The year is what a date prints as: four to seven digits and `-` before year 0
+  (`'-0044-03-15'` is 45 BC, `'12345-01-01'` past 9999), so every date reads
+  back from its own text; one past what a `DATE` holds fails. A PostgreSQL sink
+  is sent a year before 1 its own way, `'0045-03-15 BC'`.
   Text to a number is **strict**: surrounding spaces aside, an optional sign,
   digits and at most one `.` (an `INT` takes no `.`), and anything else — `1_000`,
   `0x10`, `1 000` — fails rather than being guessed at. A `FLOAT` also reads an

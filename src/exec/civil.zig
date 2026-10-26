@@ -209,6 +209,10 @@ pub const Spelling = struct {
     month_day_min: u8,
     hour_min: u8,
     bc_suffix: bool = false,
+    year_sign: bool = false,
+    /// A year spelled only as `writeLayout` spells one: past four digits no leading
+    /// `0`, and no `-` before year 0, so `'01234-05-06'`, a code, is no date.
+    canonical_year: bool = false,
     any_separator: bool = false,
     date_tail: bool = false,
     stamp_seconds: bool,
@@ -218,12 +222,15 @@ pub const Spelling = struct {
     zone: enum { none, pg, wire } = .none,
     strict_end: bool = true,
 
-    /// `YYYY-MM-DD[?HH:MM:SS[.f+]]` with any byte between date and time, and a
-    /// time `HH:MM[:SS[.f+]]`, each fraction cut to the microsecond; strict, so
+    /// `[-]YYYY-MM-DD[?HH:MM:SS[.f+]]` with a four- to seven-digit year, as
+    /// `writeLayout` spells one, any byte between date and time, and a time
+    /// `HH:MM[:SS[.f+]]`, each fraction cut to the microsecond; strict, so
     /// `'01/07/2013'` is no date.
     pub const iso: Spelling = .{
         .trim = true,
-        .year_digits = .{ 4, 4 },
+        .year_digits = .{ 4, 7 },
+        .year_sign = true,
+        .canonical_year = true,
         .month_day_min = 2,
         .hour_min = 2,
         .any_separator = true,
@@ -235,9 +242,11 @@ pub const Spelling = struct {
     /// As PostgreSQL reads a literal: one- or two-digit month, day and hour, `T` or
     /// space, optional seconds, any fraction (cut to microseconds), and a zone
     /// `Z`/`±HH[[:]MM]` folded into UTC; a date may carry a valid time it drops.
+    /// The year is `iso`'s, signed and four to seven digits.
     pub const pg_text: Spelling = .{
         .trim = true,
-        .year_digits = .{ 4, 4 },
+        .year_digits = .{ 4, 7 },
+        .year_sign = true,
         .month_day_min = 1,
         .hour_min = 1,
         .date_tail = true,
@@ -266,7 +275,8 @@ pub const Spelling = struct {
 };
 
 /// The parser for one spelling: `date` as days, `timestamp` and `time` as
-/// microseconds, null for text that spelling does not read or that overflows.
+/// microseconds, null for text that spelling does not read or that overflows: a
+/// date past the i32 days a DATE holds, or a timestamp past i64 microseconds.
 pub fn Text(comptime sp: Spelling) type {
     return struct {
         const Clock = struct { secs: i64, frac: i64 };
@@ -303,13 +313,19 @@ pub fn Text(comptime sp: Spelling) type {
             }
 
             fn date(c: *Scan, bc: bool) ?i64 {
-                const y = c.num(sp.year_digits[0], sp.year_digits[1]) orelse return null;
+                const neg = sp.year_sign and c.eat('-');
+                const start = c.i;
+                const n = c.num(sp.year_digits[0], sp.year_digits[1]) orelse return null;
+                if (sp.canonical_year and ((c.i - start > 4 and c.s[start] == '0') or (neg and n == 0))) return null;
+                const y = if (bc) 1 - n else if (neg) -n else n;
                 if (!c.eat('-')) return null;
                 const m = c.num(sp.month_day_min, 2) orelse return null;
                 if (!c.eat('-')) return null;
                 const d = c.num(sp.month_day_min, 2) orelse return null;
                 if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
-                return daysFromCivil(if (bc) 1 - y else y, @intCast(m), @intCast(d));
+                const days = daysFromCivil(y, @intCast(m), @intCast(d));
+                if (days < std.math.minInt(i32) or days > std.math.maxInt(i32)) return null;
+                return days;
             }
 
             fn fraction(c: *Scan) ?i64 {
@@ -393,8 +409,7 @@ pub fn Text(comptime sp: Spelling) type {
         }
 
         fn combine(days: i64, secs: i64, frac: i64) ?i64 {
-            const d = dayMicrosChecked(days) orelse return null;
-            return std.math.add(i64, d, secs * us_per_sec + frac) catch null;
+            return std.math.cast(i64, @as(i128, days) * us_per_day + secs * us_per_sec + frac);
         }
 
         pub fn date(s0: []const u8) ?i64 {
@@ -433,7 +448,7 @@ pub fn Text(comptime sp: Spelling) type {
 /// How `writeLayout` spells a date, time or timestamp.
 pub const Layout = struct {
     parts: enum { date, time, timestamp },
-    year: enum { expanded, four_digit, clamp_zero } = .expanded,
+    year: enum { expanded, four_digit, clamp_zero, bc } = .expanded,
     date_sep: []const u8 = "-",
     between: []const u8 = " ",
     time_sep: []const u8 = ":",
@@ -452,6 +467,8 @@ pub const Layout = struct {
     pub const kerberos: Layout = .{ .parts = .timestamp, .date_sep = "", .between = "", .time_sep = "", .frac = .none, .suffix = "Z" };
     pub const aad: Layout = .{ .parts = .timestamp, .between = "T", .frac = .none, .suffix = ".000Z" };
     pub const xlsx_date: Layout = .{ .parts = .date, .year = .clamp_zero };
+    pub const pg_date: Layout = .{ .parts = .date, .year = .bc };
+    pub const pg_timestamp: Layout = .{ .parts = .timestamp, .year = .bc };
     pub const xlsx_time: Layout = .{ .parts = .time, .frac = .ms_nonzero };
 };
 
@@ -482,10 +499,12 @@ fn putYear(out: []u8, y: u64) usize {
 /// `x` (days for a date, microseconds otherwise) in layout `l`, set down in one
 /// write. `expanded` years are at least four digits, `-` before year 0;
 /// `four_digit` years outside 1..9999 are YearOutOfRange; `clamp_zero` prints a
-/// year before 0 as 0000.
+/// year before 0 as 0000; `bc` prints a year before 1 as PostgreSQL does, `1 - y`
+/// and ` BC` at the end (year 0 is `0001 ... BC`).
 pub fn writeLayout(w: anytype, x: i64, comptime l: Layout) !void {
     var buf: [80]u8 = undefined;
     var n: usize = 0;
+    var bc = false;
     if (l.parts != .time) {
         const c = civilFromDays(if (l.parts == .date) x else dayOf(x));
         switch (l.year) {
@@ -501,6 +520,10 @@ pub fn writeLayout(w: anytype, x: i64, comptime l: Layout) !void {
                 n += putYear(buf[n..], @intCast(c.y));
             },
             .clamp_zero => n += putYear(buf[n..], @intCast(@max(c.y, 0))),
+            .bc => {
+                bc = c.y < 1;
+                n += putYear(buf[n..], @intCast(if (bc) 1 - c.y else c.y));
+            },
         }
         @memcpy(buf[n..][0..l.date_sep.len], l.date_sep);
         n += l.date_sep.len;
@@ -541,6 +564,10 @@ pub fn writeLayout(w: anytype, x: i64, comptime l: Layout) !void {
             putDigits(buf[n + 1 ..][0..digits], v);
             n += 1 + digits;
         }
+    }
+    if (bc) {
+        @memcpy(buf[n..][0..3], " BC");
+        n += 3;
     }
     @memcpy(buf[n..][0..l.suffix.len], l.suffix);
     n += l.suffix.len;
@@ -776,14 +803,20 @@ fn expectGolden(comptime f: fn ([]const u8) ?i64, cases: []const Golden) !void {
 test "civil: Text(.iso) pins parseIsoDate, parseIsoTimestamp and parseIsoTime" {
     const T = Text(.iso);
     try expectGolden(T.date, &.{
-        .{ "2024-01-05", testDay(2024, 1, 5) },   .{ " 2024-01-05\t", testDay(2024, 1, 5) },
-        .{ "2000-02-29", testDay(2000, 2, 29) },  .{ "0000-01-01", testDay(0, 1, 1) },
-        .{ "9999-12-31", testDay(9999, 12, 31) }, .{ "1900-02-29", null },
-        .{ "2023-02-29", null },                  .{ "2024-04-31", null },
-        .{ "2024-1-05", null },                   .{ "2024-01-5", null },
-        .{ "10000-01-01", null },                 .{ "+024-01-05", null },
-        .{ "2024-01-05 12:00:00", null },         .{ "01/07/2013", null },
-        .{ "2024-13-01", null },                  .{ "", null },
+        .{ "2024-01-05", testDay(2024, 1, 5) },       .{ " 2024-01-05\t", testDay(2024, 1, 5) },
+        .{ "2000-02-29", testDay(2000, 2, 29) },      .{ "0000-01-01", testDay(0, 1, 1) },
+        .{ "9999-12-31", testDay(9999, 12, 31) },     .{ "1900-02-29", null },
+        .{ "2023-02-29", null },                      .{ "2024-04-31", null },
+        .{ "2024-1-05", null },                       .{ "2024-01-5", null },
+        .{ "10000-01-01", testDay(10000, 1, 1) },     .{ "+024-01-05", null },
+        .{ "-0001-01-01", testDay(-1, 1, 1) },        .{ "-12345-06-07", testDay(-12345, 6, 7) },
+        .{ "5000000-01-01", testDay(5000000, 1, 1) }, .{ "9999999-12-31", null },
+        .{ "-9999999-01-01", null },                  .{ "12345678-01-01", null },
+        .{ "--0001-01-01", null },                    .{ "0044-03-15 BC", null },
+        .{ "01234-05-06", null },                     .{ "-0000-01-01", null },
+        .{ "0044-03-15", testDay(44, 3, 15) },        .{ "-01234-05-06", null },
+        .{ "2024-01-05 12:00:00", null },             .{ "01/07/2013", null },
+        .{ "2024-13-01", null },                      .{ "", null },
     });
     try expectGolden(T.timestamp, &.{
         .{ "2024-01-05", testStamp(2024, 1, 5, 0, 0, 0, 0) },
@@ -821,13 +854,14 @@ test "civil: Text(.pg_text) pins parseDateText and parseTimestampText" {
     const day = testDay(2024, 1, 5);
     const noon = testStamp(2024, 1, 5, 12, 0, 0, 0);
     try expectGolden(T.date, &.{
-        .{ "2024-01-05", day },            .{ "2024-1-5", day },
-        .{ "2024-01-05 12:00:00", day },   .{ "2024-01-05T00:00:00Z", day },
-        .{ "2024-01-05 23:00-05", day },   .{ " 2024-01-05 ", day },
-        .{ "01/05/2024", null },           .{ "2024-02-30", null },
-        .{ "2024-01-05 25:00", null },     .{ "2024-01-05x12:00", null },
-        .{ "24-01-05", null },             .{ "02024-01-05", null },
-        .{ "2024-01-05 12:00 UTC", null }, .{ "2024-001-05", null },
+        .{ "2024-01-05", day },              .{ "2024-1-5", day },
+        .{ "2024-01-05 12:00:00", day },     .{ "2024-01-05T00:00:00Z", day },
+        .{ "2024-01-05 23:00-05", day },     .{ " 2024-01-05 ", day },
+        .{ "01/05/2024", null },             .{ "2024-02-30", null },
+        .{ "2024-01-05 25:00", null },       .{ "2024-01-05x12:00", null },
+        .{ "24-01-05", null },               .{ "02024-01-05", day },
+        .{ "-0001-1-5", testDay(-1, 1, 5) }, .{ "11000-01-01", testDay(11000, 1, 1) },
+        .{ "2024-01-05 12:00 UTC", null },   .{ "2024-001-05", null },
     });
     try expectGolden(T.timestamp, &.{
         .{ "2024-01-05 12:00:00", noon },
@@ -869,8 +903,10 @@ test "civil: Text(.wire) pins cell's wireDate and wireDatetime" {
         .{ "10000-01-01", testDay(10000, 1, 1) },
         .{ "1234567-01-01", testDay(1234567, 1, 1) },
         .{ "0000-01-01", testDay(0, 1, 1) },
-        .{ "0004-02-29 BC", testDay(-3, 3, 1) },
-        .{ "0001-02-29 BC", null },
+        .{ "0004-02-29 BC", null },
+        .{ "0001-02-29 BC", testDay(0, 2, 29) },
+        .{ "-0001-01-01", null },
+        .{ "9999999-01-01", null },
         .{ "12345678-01-01", null },
         .{ "2024-01-05 12:00:00", null },
         .{ " 2024-01-05", null },
@@ -906,7 +942,7 @@ test "civil: Text(.wire) pins cell's wireDate and wireDatetime" {
     });
 }
 
-test "civil: Text parses what writeLayout writes, over the i32 day range" {
+test "civil: Text parses what writeLayout writes, over the i32 day range; iso and pg_text read back every year (D3)" {
     const Iso = Text(.iso);
     const Pg = Text(.pg_text);
     const Wire = Text(.wire);
@@ -925,9 +961,8 @@ test "civil: Text parses what writeLayout writes, over the i32 day range" {
         try writeLayout(&w, days, .date);
         const text = w.buffered();
         const y = civilFromDays(days).y;
-        const four: ?i64 = if (y >= 0 and y <= 9999) days else null;
-        try testing.expectEqual(four, Iso.date(text));
-        try testing.expectEqual(four, Pg.date(text));
+        try testing.expectEqual(@as(?i64, days), Iso.date(text));
+        try testing.expectEqual(@as(?i64, days), Pg.date(text));
         try testing.expectEqual(if (y >= 0) @as(?i64, days) else null, Wire.date(text));
     }
     for (0..200_000) |i| {
@@ -936,9 +971,8 @@ test "civil: Text parses what writeLayout writes, over the i32 day range" {
         try writeLayout(&w, us, .timestamp);
         const text = w.buffered();
         const y = civilFromDays(dayOf(us)).y;
-        const four: ?i64 = if (y >= 0 and y <= 9999) us else null;
-        try testing.expectEqual(four, Iso.timestamp(text));
-        try testing.expectEqual(four, Pg.timestamp(text));
+        try testing.expectEqual(@as(?i64, us), Iso.timestamp(text));
+        try testing.expectEqual(@as(?i64, us), Pg.timestamp(text));
         try testing.expectEqual(if (y >= 0) @as(?i64, us) else null, Wire.timestamp(text));
         const tod = timeOfDay(us);
         w = std.Io.Writer.fixed(&buf);
@@ -1014,6 +1048,26 @@ test "civil: writeLayout's default layouts match format.zig byte for byte" {
             },
         }
         try testing.expectEqualStrings(fb.buffered(), fa.buffered());
+    }
+}
+
+test "civil: the PostgreSQL layouts spell a year before 1 with BC, and the wire reads it back (D3)" {
+    try expectLayout(.pg_date, testDay(2024, 1, 5), "2024-01-05");
+    try expectLayout(.pg_date, testDay(1, 1, 1), "0001-01-01");
+    try expectLayout(.pg_date, testDay(0, 2, 29), "0001-02-29 BC");
+    try expectLayout(.pg_date, testDay(-43, 3, 15), "0044-03-15 BC");
+    try expectLayout(.pg_date, testDay(12345, 6, 7), "12345-06-07");
+    try expectLayout(.pg_timestamp, testStamp(-43, 3, 15, 12, 0, 0, 5), "0044-03-15 12:00:00.000005 BC");
+    try expectLayout(.pg_timestamp, testStamp(2024, 1, 5, 12, 0, 0, 0), "2024-01-05 12:00:00");
+    const W = Text(.wire);
+    var buf: [80]u8 = undefined;
+    for ([_]i64{ testDay(0, 2, 29), testDay(-4712, 1, 1), testDay(-3, 3, 1), testDay(1, 1, 1), testDay(2024, 2, 29) }) |d| {
+        var w = std.Io.Writer.fixed(&buf);
+        try writeLayout(&w, d, .pg_date);
+        try testing.expectEqual(@as(?i64, d), W.date(w.buffered()));
+        w = std.Io.Writer.fixed(&buf);
+        try writeLayout(&w, d * us_per_day + 1, .pg_timestamp);
+        try testing.expectEqual(@as(?i64, d * us_per_day + 1), W.timestamp(w.buffered()));
     }
 }
 

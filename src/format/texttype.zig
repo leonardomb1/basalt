@@ -144,3 +144,15 @@ test "a sniffed cell types as it did before the sniffer read it through cell.par
         try std.testing.expectEqual(old.all_date, new.all_date);
     }
 }
+
+test "a column of signed or long years sniffs as DATE, one of zero-led codes stays text (D3)" {
+    for ([_]struct { []const []const u8, types.TypeKind }{
+        .{ &.{ "-0044-03-15", "12345-01-02", "2024-01-05" }, .date },
+        .{ &.{ "01234-05-06", "02024-01-05" }, .string },
+        .{ &.{ "2024-01-05", "-0000-01-01" }, .string },
+    }) |c| {
+        var col = Column{};
+        for (c[0]) |raw| col.note(raw, false);
+        try std.testing.expectEqual(c[1], col.resolve(true).kind);
+    }
+}

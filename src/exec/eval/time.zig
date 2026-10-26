@@ -321,11 +321,25 @@ test "an impossible day of the month is rejected, not rolled into the next month
     try std.testing.expect(parseIsoDate("1900-02-29") == null);
 }
 
-test "kept until decided: text readers refuse 5-digit and signed years (D3)" {
-    try std.testing.expectEqual(@as(?i64, null), parseDateText("11000-01-01"));
-    try std.testing.expectEqual(@as(?i64, null), parseDateText("-0001-01-01"));
-    try std.testing.expectEqual(@as(?i64, null), parseTimestampText("11000-01-01 00:00:00"));
-    try std.testing.expectEqual(@as(?i64, null), parseIsoDate("-0001-01-01"));
+test "text readers take the signed and long years a date prints as, up to what a DATE holds (D3)" {
+    try std.testing.expectEqual(@as(?i64, daysFromCivil(11000, 1, 1)), parseDateText("11000-01-01"));
+    try std.testing.expectEqual(@as(?i64, daysFromCivil(-1, 1, 1)), parseDateText("-0001-01-01"));
+    try std.testing.expectEqual(@as(?i64, daysFromCivil(11000, 1, 1) * us_per_day), parseTimestampText("11000-01-01 00:00:00"));
+    try std.testing.expectEqual(@as(?i64, daysFromCivil(-1, 1, 1)), parseIsoDate("-0001-01-01"));
+    try std.testing.expectEqual(@as(?i64, daysFromCivil(-44, 3, 15) * us_per_day + 3_600_000_000), parseIsoTimestamp("-0044-03-15 01:00:00"));
+    try std.testing.expectEqual(@as(?i64, null), parseDateText("9999999-12-31"));
+    try std.testing.expectEqual(@as(?i64, null), parseTimestampText("300000-01-01 00:00:00"));
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const evalLit = @import("testing_util.zig").evalLit;
+    for ([_][]const u8{ "make_date(-1, 6, 1)", "make_date(0, 2, 29)", "make_date(12345, 1, 2)", "make_date(-5000000, 12, 31)" }) |e| {
+        const d = (try evalLit(a, e)).date;
+        const text = try std.fmt.allocPrint(a, "CAST(CAST({s} AS STRING) AS DATE)", .{e});
+        try std.testing.expectEqual(d, (try evalLit(a, text)).date);
+    }
+    try std.testing.expectError(error.CastFailed, evalLit(a, "CAST('9999999-12-31' AS DATE)"));
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "extract(year FROM CAST('-0001-06-01 12:00:00' AS TIMESTAMP))")).int);
 }
 
 test "a TIME's digits past the microsecond are dropped, as a TIMESTAMP's are (D4)" {
@@ -399,14 +413,35 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
             return v;
         }
 
+        /// The length of a `[-]Y{4,7}-MM-DD` head, the signed and long years being D3's.
+        fn isoDateLen(s: []const u8) ?usize {
+            const sign: usize = if (s.len > 0 and s[0] == '-') 1 else 0;
+            var i = sign;
+            while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+            if (i - sign < 4 or i - sign > 7) return null;
+            return i + 6;
+        }
+
         fn isoDate(s0: []const u8) ?i64 {
             const s = trim(s0);
-            if (s.len != 10 or s[4] != '-' or s[7] != '-') return null;
-            const y = isoNum(s[0..4]) orelse return null;
-            const m = isoNum(s[5..7]) orelse return null;
-            const d = isoNum(s[8..10]) orelse return null;
+            const n = isoDateLen(s) orelse return null;
+            if (s.len != n or s[n - 6] != '-' or s[n - 3] != '-') return null;
+            const sign: usize = if (s[0] == '-') 1 else 0;
+            const v = isoNum(s[sign .. n - 6]) orelse return null;
+            if ((n - 6 - sign > 4 and s[sign] == '0') or (sign == 1 and v == 0)) return null;
+            const y = if (sign == 1) -v else v;
+            const m = isoNum(s[n - 5 .. n - 3]) orelse return null;
+            const d = isoNum(s[n - 2 .. n]) orelse return null;
             if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
-            return daysFromCivil(y, @intCast(m), @intCast(d));
+            return i32Days(daysFromCivil(y, @intCast(m), @intCast(d)));
+        }
+
+        fn i32Days(days: i64) ?i64 {
+            return if (std.math.cast(i32, days) != null) days else null;
+        }
+
+        fn micros(days: i128, us: i128) ?i64 {
+            return std.math.cast(i64, days * 86_400_000_000 + us);
         }
 
         fn isoTime(s0: []const u8) ?i64 {
@@ -425,24 +460,25 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
 
         fn isoTimestamp(s0: []const u8) ?i64 {
             const s = trim(s0);
-            if (s.len == 10) return (isoDate(s) orelse return null) * 86_400_000_000;
-            if (s.len < 19 or s[13] != ':' or s[16] != ':') return null;
-            const days = isoDate(s[0..10]) orelse return null;
-            const hh = isoNum(s[11..13]) orelse return null;
-            const mm = isoNum(s[14..16]) orelse return null;
-            const ss = isoNum(s[17..19]) orelse return null;
+            const n = isoDateLen(s) orelse return null;
+            if (s.len == n) return micros(isoDate(s) orelse return null, 0);
+            if (s.len < n + 9 or s[n + 3] != ':' or s[n + 6] != ':') return null;
+            const days = isoDate(s[0..n]) orelse return null;
+            const hh = isoNum(s[n + 1 .. n + 3]) orelse return null;
+            const mm = isoNum(s[n + 4 .. n + 6]) orelse return null;
+            const ss = isoNum(s[n + 7 .. n + 9]) orelse return null;
             if (hh > 23 or mm > 59 or ss > 59) return null;
             var frac: i64 = 0;
-            if (s.len > 20 and s[19] == '.') {
-                var i: usize = 20;
+            if (s.len > n + 10 and s[n + 9] == '.') {
+                var i: usize = n + 10;
                 var scale: i64 = 100_000;
                 while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
                     frac += @as(i64, s[i] - '0') * scale;
                     scale = @divTrunc(scale, 10);
                 }
                 if (i != s.len) return null;
-            } else if (s.len != 19) return null;
-            return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac;
+            } else if (s.len != n + 9) return null;
+            return micros(days, (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac);
         }
 
         fn pgDate(s0: []const u8) ?i64 {
@@ -459,7 +495,7 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
             const s = trim(s0);
             var p = TextParser{ .s = s };
             const days = p.date() orelse return null;
-            if (p.i == s.len) return days * 86_400_000_000;
+            if (p.i == s.len) return micros(days, 0);
             if (s[p.i] != ' ' and s[p.i] != 'T') return null;
             p.i += 1;
             const hh = p.num(1, 2) orelse return null;
@@ -495,7 +531,7 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
                 }
             }
             if (p.i != s.len) return null;
-            return days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss - off_s) * 1_000_000 + frac;
+            return micros(days, (hh * 3600 + mm * 60 + ss - off_s) * 1_000_000 + frac);
         }
 
         const TextParser = struct {
@@ -503,13 +539,15 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
             i: usize = 0,
 
             fn date(p: *TextParser) ?i64 {
-                const y = p.num(4, 4) orelse return null;
+                const neg = p.eat('-');
+                const v = p.num(4, 7) orelse return null;
+                const y = if (neg) -v else v;
                 if (!p.eat('-')) return null;
                 const m = p.num(1, 2) orelse return null;
                 if (!p.eat('-')) return null;
                 const d = p.num(1, 2) orelse return null;
                 if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, @intCast(m))) return null;
-                return daysFromCivil(y, @intCast(m), @intCast(d));
+                return i32Days(daysFromCivil(y, @intCast(m), @intCast(d)));
             }
 
             fn num(p: *TextParser, min: usize, max: usize) ?i64 {
@@ -540,9 +578,9 @@ test "civil.Text agrees with the parsers it replaced on 300k spellings; past i64
             var y = atoiN(body[0..i]);
             const m: u32 = @intCast(atoiN(body[i + 1 .. i + 3]));
             const d: u32 = @intCast(atoiN(body[i + 4 .. i + 6]));
-            if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
             if (bc) y = 1 - y;
-            return .{ .days = daysFromCivil(y, m, d), .rest = body[i + 6 ..] };
+            if (m < 1 or m > 12 or d < 1 or d > daysInMonth(y, m)) return null;
+            return .{ .days = i32Days(daysFromCivil(y, m, d)) orelse return null, .rest = body[i + 6 ..] };
         }
 
         fn wireDate(t: []const u8) ?i64 {
