@@ -835,7 +835,7 @@ test "a date or timestamp key with a bound before year 1 splits with BC on Postg
     const end = civil.daysFromCivil(2024, 1, 1);
     const bounds = [_][2]Value{
         .{ .{ .date = @intCast(ides) }, .{ .date = @intCast(end) } },
-        .{ .{ .timestamp = civil.dayMicros(ides) + 5 }, .{ .timestamp = civil.dayMicros(end) + 7 } },
+        .{ .{ .timestamp = civil.dayMicrosChecked(ides).? + 5 }, .{ .timestamp = civil.dayMicrosChecked(end).? + 7 } },
     };
     for (bounds) |b| for ([_]KeyKind{ .date, .auto }) |kind| {
         var f = FakeConn{ .arena = a, .rows = &.{&.{ b[0], b[1] }} };
