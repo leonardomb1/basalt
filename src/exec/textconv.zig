@@ -4,8 +4,9 @@
 //! and `floatToInt`/`floatToIntScaled`/`decimalToInt` guard the i64 range, NaN and
 //! infinities, which `@intFromFloat` treats as illegal behaviour.
 //!
-//! The presets reproduce today's readers exactly so callers can switch with no
-//! behaviour change; unifying the word sets is a later decision (D6).
+//! SQL reads a boolean one way (`Words.sql`) in a CAST, a literal met by a BOOL and
+//! a PARAM; the other presets are config and file-format flags, each as its source
+//! spells them.
 
 const std = @import("std");
 const column = @import("column.zig");
@@ -40,23 +41,19 @@ pub const Words = struct {
     lead: bool = false,
     otherwise: ?bool = null,
 
-    /// `CAST(s AS BOOL)` (eval/cast.zig:245): trimmed, any case, `true`/`false`.
-    pub const cast: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true, .trim = true };
-
-    /// A string literal compared with a BOOL (eval.zig:325, PostgreSQL's bool
-    /// input): any case, untrimmed, a unique prefix of `true`/`yes`/`false`/`no`,
-    /// `on`/`off` (at least `of`), `1`/`0`.
-    pub const pg_input: Words = .{
-        .yes = &.{ .prefix("true", 1), .prefix("yes", 1), .whole("on"), .whole("1") },
-        .no = &.{ .prefix("false", 1), .prefix("no", 1), .prefix("off", 2), .whole("0") },
+    /// Text as SQL reads a BOOL, in `CAST(s AS BOOL)`, a literal met by a BOOL and a
+    /// PARAM: `true`/`t`/`yes`/`y`/`1` and `false`/`f`/`no`/`n`/`0`, any case,
+    /// trimmed, the words DuckDB's cast and PostgreSQL's input both read; no
+    /// prefix and no `on`/`off`, which PostgreSQL alone reads.
+    pub const sql: Words = .{
+        .yes = &.{ .whole("true"), .whole("t"), .whole("yes"), .whole("y"), .whole("1") },
+        .no = &.{ .whole("false"), .whole("f"), .whole("no"), .whole("n"), .whole("0") },
         .fold = true,
+        .trim = true,
     };
 
     /// A WITH hint (analyze/targets.zig:197): any case, untrimmed, `true`/`false`.
     pub const hint: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")}, .fold = true };
-
-    /// A PARAM's text (run/params.zig:102, analyze.zig:702): exactly `true`/`false`.
-    pub const exact: Words = .{ .yes = &.{.whole("true")}, .no = &.{.whole("false")} };
 
     /// A connection option string or a PARAM override (connect/register.zig:148,
     /// analyze.zig:722): exactly `true`, anything else is false.
@@ -161,30 +158,15 @@ const bool_corpus = [_][]const u8{
     "N",        "no",    "NO", "nil", "x",   "-1",    "\xff",  "t\x00",  "1 ",        " 1",
 };
 
-fn oracleCast(s: []const u8) ?bool {
+fn oracleSql(s: []const u8) ?bool {
     const t = std.mem.trim(u8, s, " \t\r\n");
-    if (std.ascii.eqlIgnoreCase(t, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(t, "false")) return false;
-    return null;
-}
-
-fn oraclePgInput(s: []const u8) ?bool {
-    if (s.len == 0 or s.len > 5) return null;
-    var buf: [5]u8 = undefined;
-    const w = std.ascii.lowerString(&buf, s);
-    if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
-    if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
-    for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
-    for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
+    for ([_][]const u8{ "true", "t", "yes", "y", "1" }) |w| if (std.ascii.eqlIgnoreCase(t, w)) return true;
+    for ([_][]const u8{ "false", "f", "no", "n", "0" }) |w| if (std.ascii.eqlIgnoreCase(t, w)) return false;
     return null;
 }
 
 fn oracleHint(s: []const u8) ?bool {
     return if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else null;
-}
-
-fn oracleExact(s: []const u8) ?bool {
-    return if (std.mem.eql(u8, s, "true")) true else if (std.mem.eql(u8, s, "false")) false else null;
 }
 
 fn oracleTrueOrFalse(s: []const u8) ?bool {
@@ -222,10 +204,8 @@ fn expectPreset(comptime w: Words, comptime oracle: fn ([]const u8) ?bool) !void
 }
 
 test "each bool preset reads exactly what the reader it replaces reads" {
-    try expectPreset(Words.cast, oracleCast);
-    try expectPreset(Words.pg_input, oraclePgInput);
+    try expectPreset(Words.sql, oracleSql);
     try expectPreset(Words.hint, oracleHint);
-    try expectPreset(Words.exact, oracleExact);
     try expectPreset(Words.true_or_false, oracleTrueOrFalse);
     try expectPreset(Words.xsd_nil, oracleXsdNil);
     try expectPreset(Words.ooxml_flag, oracleOoxmlFlag);
@@ -233,24 +213,15 @@ test "each bool preset reads exactly what the reader it replaces reads" {
     try expectPreset(Words.wire, oracleWire);
 }
 
-test "the bool readers disagree today on the spellings the plan names" {
-    try testing.expectEqual(@as(?bool, true), boolText(Words.pg_input, "t"));
-    try testing.expectEqual(@as(?bool, null), boolText(Words.cast, "t"));
-    try testing.expectEqual(@as(?bool, true), boolText(Words.cast, "TRUE"));
-    try testing.expectEqual(@as(?bool, null), boolText(Words.exact, "TRUE"));
+test "SQL reads a BOOL in one word set: DuckDB's and PostgreSQL's shared words, trimmed, any case (D6)" {
+    for ([_][]const u8{ "t", "T", "true", "TRUE", "yes", " Yes ", "y", "1", "\ttrue\n" }) |s|
+        try testing.expectEqual(@as(?bool, true), boolText(Words.sql, s));
+    for ([_][]const u8{ "f", "F", "false", "no", "NO", "n", "0", " false " }) |s|
+        try testing.expectEqual(@as(?bool, false), boolText(Words.sql, s));
+    for ([_][]const u8{ "", "tr", "tru", "ye", "fa", "on", "off", "of", "o", "2", "-1", "10", "truee", "yess", "nil" }) |s|
+        try testing.expectEqual(@as(?bool, null), boolText(Words.sql, s));
     try testing.expectEqual(@as(?bool, false), boolText(Words.true_or_false, "TRUE"));
-    try testing.expectEqual(@as(?bool, true), boolText(Words.cast, " true "));
     try testing.expectEqual(@as(?bool, null), boolText(Words.hint, " true "));
-    try testing.expectEqual(@as(?bool, null), boolText(Words.pg_input, " true"));
-}
-
-test "pg_input takes unique prefixes and refuses the ambiguous o" {
-    for ([_][]const u8{ "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1", "TrU", "On" }) |s|
-        try testing.expectEqual(@as(?bool, true), boolText(Words.pg_input, s));
-    for ([_][]const u8{ "f", "fal", "false", "n", "no", "of", "off", "0", "OFF" }) |s|
-        try testing.expectEqual(@as(?bool, false), boolText(Words.pg_input, s));
-    for ([_][]const u8{ "", "o", "O", "truex", "yess", "onn", "offf", "00", "11", "falsey" }) |s|
-        try testing.expectEqual(@as(?bool, null), boolText(Words.pg_input, s));
 }
 
 test "a custom Words set: lead without fold is case-sensitive" {

@@ -1987,6 +1987,8 @@ test "where: a quoted literal against a number or bool is read as one, exactly; 
         .{ .q = "SELECT id FROM '$IN' WHERE id IN ('1', '3')", .want = "id\n1\n3\n" },
         .{ .q = "SELECT id FROM '$IN' WHERE f >= '2.5'", .want = "id\n2\n" },
         .{ .q = "SELECT id FROM '$IN' WHERE CAST(ok AS BOOL) = 'yes'", .want = "id\n1\n" },
+        .{ .q = "SELECT id FROM '$IN' WHERE CAST(ok AS BOOL) = ' T '", .want = "id\n1\n" },
+        .{ .q = "SELECT id, CAST(CASE WHEN id = 1 THEN 't' ELSE 'n' END AS BOOL) AS b FROM '$IN' WHERE id < 3", .want = "id,b\n1,true\n2,false\n" },
         .{ .q = "SELECT id, id = '2' AS two FROM '$IN' WHERE id < 3", .want = "id,two\n1,false\n2,true\n" },
     };
     for (cases) |c| {
@@ -2001,6 +2003,7 @@ test "where: a quoted literal against a number or bool is read as one, exactly; 
     const refuse = @import("harness.zig").expectRefusedAlike;
     try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(amt AS DECIMAL(10,2)) = '1,5';", "`1,5` is not a valid decimal literal");
     try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE id = '1.5';", "`1.5` is not a valid int literal");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(ok AS BOOL) = 'on';", "`on` is not a valid bool literal");
     try refuse(alloc, &tmp, "SELECT * FROM '$B/d.csv' WHERE CAST(id AS STRING) = id;", "cannot compare");
 }
 

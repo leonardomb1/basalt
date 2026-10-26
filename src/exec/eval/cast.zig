@@ -158,7 +158,7 @@ pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKin
         },
         .bool => switch (from) {
             .int => x != 0,
-            .string => textconv.boolText(.cast, x) orelse error.CastFailed,
+            .string => textconv.boolText(.sql, x) orelse error.CastFailed,
             else => comptime unreachable,
         },
         else => comptime unreachable,
@@ -257,7 +257,8 @@ test "castValue: conversions succeed and failures are CastFailed specifically" {
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.nan(f64) }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = 1e19 }, .int));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .float = std.math.inf(f64) }, .int));
-    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "yes" }, .bool));
+    try std.testing.expect((try castValue(a, .{ .string = "yes" }, .bool)).bool);
+    try std.testing.expectError(error.CastFailed, castValue(a, .{ .string = "on" }, .bool));
     try std.testing.expectError(error.CastFailed, castValue(a, .{ .bool = true }, .float));
 }
 
@@ -302,7 +303,7 @@ test "a date past the TIMESTAMP range fails the cast instead of overflowing" {
     try std.testing.expectEqual(civil.us_per_day - 1, (try castValue(a, .{ .timestamp = -1 }, .time)).time);
 }
 
-test "castValue on castElem gives what the per-kind switch gave, for every kind pair and every short BOOL text" {
+test "castValue on castElem gives what the per-kind switch gave, for every kind pair and every short BOOL text, less the words D6 added" {
     const Orig = struct {
         fn oldCastValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalError!Value {
             const column = @import("../column.zig");
@@ -344,16 +345,17 @@ test "castValue on castElem gives what the per-kind switch gave, for every kind 
                 .bool => switch (v) {
                     .bool => v,
                     .int => |x| .{ .bool = x != 0 },
-                    .string => |s| if (std.ascii.eqlIgnoreCase(trim(s), "true"))
-                        Value{ .bool = true }
-                    else if (std.ascii.eqlIgnoreCase(trim(s), "false"))
-                        Value{ .bool = false }
-                    else
-                        error.CastFailed,
+                    .string => |s| sqlBool(trim(s)),
                     else => error.CastFailed,
                 },
                 else => error.CastFailed,
             };
+        }
+        /// D6: `t`/`f`, `yes`/`no`, `y`/`n` and `1`/`0` join `true`/`false`.
+        fn sqlBool(s: []const u8) EvalError!Value {
+            for ([_][]const u8{ "true", "t", "yes", "y", "1" }) |w| if (std.ascii.eqlIgnoreCase(s, w)) return .{ .bool = true };
+            for ([_][]const u8{ "false", "f", "no", "n", "0" }) |w| if (std.ascii.eqlIgnoreCase(s, w)) return .{ .bool = false };
+            return error.CastFailed;
         }
         fn expectSameCast(a: std.mem.Allocator, v: Value, kind: types.TypeKind) !void {
             const want = oldCastValue(a, v, kind);
@@ -394,7 +396,7 @@ test "castValue on castElem gives what the per-kind switch gave, for every kind 
         std.debug.print("CAST({any} AS {s})\n", .{ v, @tagName(k) });
         return e;
     };
-    const alphabet = "tRuEfalsTx01 \t";
+    const alphabet = "tRuEfalsyNo01 \t";
     var buf: [6]u8 = undefined;
     for (0..6) |len| {
         var idx = [_]usize{0} ** 6;

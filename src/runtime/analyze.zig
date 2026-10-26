@@ -700,7 +700,7 @@ pub fn paramTextProblem(arena: std.mem.Allocator, ty: types.Type, text: []const 
     return switch (ty.kind) {
         .int => "an integer",
         .float, .decimal => "a number",
-        .bool => "`true` or `false`",
+        .bool => "a boolean (true/false, t/f, yes/no, y/n or 1/0)",
         .date => "a date (YYYY-MM-DD)",
         .time => "a time (HH:MM[:SS[.ffffff]])",
         .timestamp => "a timestamp (YYYY-MM-DD[ HH:MM:SS[.ffffff]])",

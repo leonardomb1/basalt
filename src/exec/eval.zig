@@ -304,8 +304,8 @@ pub const TypeCtx = struct {
 
 /// A quoted literal read as a number or bool of `ty`'s kind, as SQL types an untyped
 /// literal by the operand it meets: an INT strictly, a FLOAT or DECIMAL as written
-/// (a decimal at its own scale, so `'1.005'` stays exact), a bool as PostgreSQL
-/// reads one (`t`, `yes`, `on`, `1`, any case). Null when it does not read so.
+/// (a decimal at its own scale, so `'1.005'` stays exact), a bool as CAST reads one
+/// (`t`, `yes`, `1`, any case). Null when it does not read so.
 pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMemory}!?ast.Expr {
     const s = std.mem.trim(u8, text, " \t\r\n");
     switch (ty.kind) {
@@ -317,7 +317,7 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
             inner.* = .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) };
             return .{ .cast = .{ .e = inner, .ty = Type.decimal(38, d.scale) } };
         },
-        .bool => return .{ .bool_lit = textconv.boolText(.pg_input, s) orelse return null },
+        .bool => return .{ .bool_lit = textconv.boolText(.sql, s) orelse return null },
         else => return null,
     }
 }
@@ -325,7 +325,7 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
 /// A PARAM's text (`-p name=text`, a PARAM default) as a value of its declared
 /// type, read as CAST reads text: an INT or FLOAT strictly after trimming (no `_`
 /// or hex), a DATE, TIME, TIMESTAMP or DECIMAL through the cast, a STRING or
-/// BYTES as the text itself; a BOOL is exactly `true` or `false`. A FLOAT past
+/// BYTES as the text itself; a BOOL as CAST reads one. A FLOAT past
 /// the f64 range is an infinity, as PARAMs always bound it. Null when the text
 /// does not read as `ty` or `ty` is not bound from text.
 pub fn paramFromText(arena: std.mem.Allocator, ty: Type, text: []const u8) error{OutOfMemory}!?Value {
@@ -333,7 +333,7 @@ pub fn paramFromText(arena: std.mem.Allocator, ty: Type, text: []const u8) error
     return switch (ty.kind) {
         .int => .{ .int = parseIntStrict(s) orelse return null },
         .float => .{ .float = paramFloat(s) orelse return null },
-        .bool => .{ .bool = textconv.boolText(.exact, text) orelse return null },
+        .bool => .{ .bool = textconv.boolText(.sql, text) orelse return null },
         .string => .{ .string = text },
         .bytes => .{ .bytes = text },
         .date, .time, .timestamp, .decimal => castValueTyped(arena, .{ .string = text }, ty) catch |e| switch (e) {
@@ -774,39 +774,35 @@ test "division: INT / INT truncates, a DECIMAL quotient takes PostgreSQL's scale
     try std.testing.expectError(error.DivByZero, evalLit(a, "1.5 % 0"));
 }
 
-test "a quoted literal met by a BOOL reads the words it read before, over every short spelling" {
-    const old = struct {
-        fn f(s: []const u8) ?bool {
-            if (s.len == 0 or s.len > 5) return null;
-            var buf: [5]u8 = undefined;
-            const w = std.ascii.lowerString(&buf, s);
-            if (std.mem.eql(u8, w, "1") or std.mem.eql(u8, w, "on")) return true;
-            if (std.mem.eql(u8, w, "0") or std.mem.eql(u8, w, "of") or std.mem.eql(u8, w, "off")) return false;
-            for ([_][]const u8{ "true", "yes" }) |word| if (std.mem.startsWith(u8, word, w)) return true;
-            for ([_][]const u8{ "false", "no" }) |word| if (std.mem.startsWith(u8, word, w)) return false;
-            return null;
-        }
-    }.f;
-    const alphabet = "truefalsyonTRFNO01x";
-    var buf: [6]u8 = undefined;
-    for (0..6) |len| {
-        var idx = [_]usize{0} ** 6;
-        while (true) {
-            for (0..len) |i| buf[i] = alphabet[idx[i]];
-            const s = buf[0..len];
-            std.testing.expectEqual(old(s), textconv.boolText(.pg_input, s)) catch |e| {
-                std.debug.print("'{s}'\n", .{s});
-                return e;
-            };
-            var i: usize = 0;
-            while (i < len) : (i += 1) {
-                idx[i] += 1;
-                if (idx[i] < alphabet.len) break;
-                idx[i] = 0;
-            }
-            if (i == len) break;
-        }
+test "a BOOL reads one word set as a CAST, a literal it meets and a PARAM, on the row and the batch path (D6)" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "t", " Yes ", "Y", "1", "TRUE" }) |w| {
+        const src = try std.fmt.allocPrint(a, "CAST('{s}' AS BOOL)", .{w});
+        try std.testing.expectEqual(true, (try evalLit(a, src)).bool);
+        try std.testing.expectEqual(true, (try paramFromText(a, Type.init(.bool), w)).?.bool);
+        try std.testing.expectEqual(true, (try litAs(a, w, Type.init(.bool))).?.bool_lit);
     }
+    for ([_][]const u8{ "f", "no", "N", "0", " false" }) |w| {
+        const src = try std.fmt.allocPrint(a, "CAST('{s}' AS BOOL)", .{w});
+        try std.testing.expectEqual(false, (try evalLit(a, src)).bool);
+        try std.testing.expectEqual(false, (try paramFromText(a, Type.init(.bool), w)).?.bool);
+        try std.testing.expectEqual(false, (try litAs(a, w, Type.init(.bool))).?.bool_lit);
+    }
+    for ([_][]const u8{ "on", "off", "tr", "fa", "ye", "2", "" }) |w| {
+        const src = try std.fmt.allocPrint(a, "CAST('{s}' AS BOOL)", .{w});
+        try std.testing.expectError(error.CastFailed, evalLit(a, src));
+        try std.testing.expectEqual(@as(?Value, null), try paramFromText(a, Type.init(.bool), w));
+        try std.testing.expectEqual(@as(?ast.Expr, null), try litAs(a, w, Type.init(.bool)));
+    }
+    const column = @import("column.zig");
+    var sb = column.Builder.init(a, Type.init(.string).asNullable());
+    for ([_]?[]const u8{ "t", " yes ", "0", null, "N", "on" }) |w| try sb.append(if (w) |x| .{ .string = x } else .null);
+    var cols = [_]column.Column{try sb.finish()};
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = cols[0].ty }} };
+    const batch = Batch{ .schema = &schema, .columns = &cols, .len = 6 };
+    try @import("eval/testing_util.zig").expectVecMatchesRows(a, batch, &.{ "CAST(s AS BOOL)", "TRY_CAST(s AS BOOL)" }, false);
 }
 
 test "now() and today() read their own statement's clock on every row and batch, alternately and on two threads" {
@@ -894,8 +890,8 @@ test "a PARAM's text reads as CAST reads it: no `_`, hex or untrimmed failures" 
     }
     try std.testing.expect((try paramFromText(a, Type.init(.bool), "true")).?.bool);
     try std.testing.expect(!(try paramFromText(a, Type.init(.bool), "false")).?.bool);
-    try std.testing.expect(try paramFromText(a, Type.init(.bool), "TRUE") == null);
-    try std.testing.expect(try paramFromText(a, Type.init(.bool), "t") == null);
+    try std.testing.expect((try paramFromText(a, Type.init(.bool), "TRUE")).?.bool);
+    try std.testing.expect(try paramFromText(a, Type.init(.bool), "on") == null);
     try std.testing.expectEqual(@as(i32, 20729), (try paramFromText(a, Type.init(.date), "2026-10-03")).?.date);
     try std.testing.expect(try paramFromText(a, Type.init(.date), "2026-13-03") == null);
     try std.testing.expectEqual(@as(i128, 1250), (try paramFromText(a, Type.decimal(10, 2), "12.5")).?.decimal.unscaled);

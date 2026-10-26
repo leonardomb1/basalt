@@ -124,7 +124,9 @@ columns it has not seen.
   an untyped literal by the other operand: `amount < '100000'` compares
   numbers (a decimal one exactly, at the literal's own scale), `id IN ('1',
   '2')` ints, `active = 'yes'` bools (`true`/`false`, `t`/`f`, `yes`/`no`,
-  `on`/`off`, `1`/`0`, any case). Surrounding spaces are ignored; anything else
+  `y`/`n`, `1`/`0`, any case — the words `CAST(x AS BOOL)` and a `BOOL` PARAM
+  read too, the ones DuckDB and PostgreSQL share; PostgreSQL's `on`/`off` and
+  prefixes such as `'tr'` are refused). Surrounding spaces are ignored; anything else
   that does not read as the type — `'1,5'`, or `'1.5'` against an INT — is an
   error from `check`. Pushed down to a SQL source whose column types are known,
   it is sent as that number or bool; where they are not yet, PostgreSQL and SQL

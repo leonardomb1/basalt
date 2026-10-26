@@ -143,14 +143,18 @@ test "PARAM text binds as CAST reads it: trimmed, no `_` separators, no hex floa
         try std.testing.expectEqual((try bindOne(a, float_decl, t)) == null, analyze.paramTextProblem(a, float_ty, t) != null);
 }
 
-test "PARAM BOOL text is exactly `true` or `false` (the word set awaits decision D6)" {
+test "PARAM BOOL text reads as CAST reads it, and anything else is refused at check and run alike (D6)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const decl = "PARAM p BOOL; SELECT $p AS p;";
-    try std.testing.expectEqual(true, (try bindOne(a, decl, "true")).?.bool);
-    try std.testing.expectEqual(false, (try bindOne(a, decl, "false")).?.bool);
-    for ([_][]const u8{ "TRUE", "True", " true", "t", "1", "yes", "on", "" }) |t| {
+    for ([_][]const u8{ "true", "TRUE", "True", " true", "t", "1", "yes", "Y" }) |t| {
+        try std.testing.expectEqual(true, (try bindOne(a, decl, t)).?.bool);
+        try std.testing.expect(analyze.paramTextProblem(a, types.Type.init(.bool), t) == null);
+    }
+    for ([_][]const u8{ "false", "F", "0", "no", "n" }) |t|
+        try std.testing.expectEqual(false, (try bindOne(a, decl, t)).?.bool);
+    for ([_][]const u8{ "on", "off", "tr", "2", "" }) |t| {
         try std.testing.expect((try bindOne(a, decl, t)) == null);
         try std.testing.expect(analyze.paramTextProblem(a, types.Type.init(.bool), t) != null);
     }
