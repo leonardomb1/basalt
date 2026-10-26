@@ -11,6 +11,7 @@ const ast = @import("../../lang/ast.zig");
 const env_mod = @import("../env.zig");
 const fail = @import("../analyze.zig").fail;
 const registry = @import("../../connect/registry.zig");
+const schema = @import("../connect/options_schema.zig");
 const http_client = @import("../../net/http_client.zig");
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const sql = @import("../../db/sql.zig");
@@ -120,30 +121,6 @@ fn isEnvCall(e: *const ast.Expr) bool {
     return (std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit;
 }
 
-/// An integer option as the run's `evalCfgInt` reads it, its refusal or null.
-fn intProblem(e: *const ast.Expr) ?[]const u8 {
-    return switch (e.*) {
-        .int_lit => null,
-        .str_lit => |s| if (std.fmt.parseInt(i64, s, 10)) |_| null else |_| int_cfg_msg,
-        else => int_cfg_kind_msg,
-    };
-}
-
-/// A bool option written as text: `true` or `false` in any case, else null.
-pub fn cfgBoolText(s: []const u8) ?bool {
-    if (std.ascii.eqlIgnoreCase(s, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(s, "false")) return false;
-    return null;
-}
-
-fn intValue(e: *const ast.Expr) ?i64 {
-    return switch (e.*) {
-        .int_lit => |i| i,
-        .str_lit => |s| std.fmt.parseInt(i64, s, 10) catch null,
-        else => null,
-    };
-}
-
 /// Why the run would refuse a connection's declaration before any statement runs:
 /// an unknown connector type, a SQL connection's literal `tls` and `auth`, an SFTP,
 /// SMB or FTP connection's keys, port and literal values. Null when it would not.
@@ -155,8 +132,10 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
         for (c.config) |attr| {
             if (!containsKey(connectionKeys(c.connector).?, attr.key)) return try unknownOptionMsg(arena, c, attr.key);
             if (!std.mem.eql(u8, attr.key, "port") and !std.mem.eql(u8, attr.key, "fe_port")) continue;
-            if (intProblem(attr.value)) |why| return why;
-            if (std.math.cast(u16, intValue(attr.value).?) == null) return try rangeMsg(arena, c.connector, attr.key);
+            switch (schema.cfgIntIn(u16, attr.value)) {
+                .ok => {},
+                .problem => |p| return p.fixedMsg() orelse try rangeMsg(arena, c.connector, attr.key),
+            }
         }
         if (sqlOptionProblem(c)) |why| return why;
         return try sqlLiteralProblem(arena, c);
@@ -171,8 +150,10 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
     for (c.config) |attr| {
         const k = attr.key;
         if (std.mem.eql(u8, k, "port")) {
-            if (intProblem(attr.value)) |why| return why;
-            if (std.math.cast(u16, intValue(attr.value).?) == null) return try portRangeMsg(arena, c.connector);
+            switch (schema.cfgIntIn(u16, attr.value)) {
+                .ok => {},
+                .problem => |p| return p.fixedMsg() orelse try portRangeMsg(arena, c.connector),
+            }
             continue;
         }
         const text = try literalText(arena, attr.value);
@@ -275,19 +256,18 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
     for (conn.config) |attr| {
         const k = attr.key;
         if (containsKey(&stream_int_keys, k)) {
-            if (intProblem(attr.value)) |why| return fail(diag, "{s}", .{why});
-            const v = intValue(attr.value).?;
-            const fits = if (std.mem.endsWith(u8, k, "port")) std.math.cast(u16, v) != null else std.math.cast(u32, v) != null;
-            if (!fits) return fail(diag, "{s}", .{try rangeMsg(arena, conn.connector, k)});
+            const problem: ?schema.Problem = if (std.mem.endsWith(u8, k, "port")) switch (schema.cfgIntIn(u16, attr.value)) {
+                .ok => null,
+                .problem => |p| p,
+            } else switch (schema.cfgIntIn(u32, attr.value)) {
+                .ok => null,
+                .problem => |p| p,
+            };
+            if (problem) |p| return fail(diag, "{s}", .{p.fixedMsg() orelse try rangeMsg(arena, conn.connector, k)});
             continue;
         }
         if (std.mem.eql(u8, k, "auto_create")) {
-            const ok = switch (attr.value.*) {
-                .bool_lit => true,
-                .str_lit => |s| cfgBoolText(s) != null,
-                else => false,
-            };
-            if (!ok) return fail(diag, "{s}", .{bool_cfg_msg});
+            if (schema.cfgBool(attr.value) == .problem) return fail(diag, "{s}", .{bool_cfg_msg});
             continue;
         }
         if (!containsKey(&stream_str_keys, k)) continue;

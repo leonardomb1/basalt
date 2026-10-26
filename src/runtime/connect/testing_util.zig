@@ -194,9 +194,16 @@ pub const old = struct {
     pub fn evalCfgBool(env: *Env, expr: *const ast.Expr) !bool {
         return switch (expr.*) {
             .bool_lit => |b| b,
-            .str_lit => |s| options.cfgBoolText(s) orelse planErr(env.diag, options.bool_cfg_msg),
+            .str_lit => |s| cfgBoolText(s) orelse planErr(env.diag, options.bool_cfg_msg),
             else => planErr(env.diag, options.bool_cfg_msg),
         };
+    }
+
+    /// A bool option written as text: `true` or `false` in any case, else null.
+    fn cfgBoolText(s: []const u8) ?bool {
+        if (std.ascii.eqlIgnoreCase(s, "true")) return true;
+        if (std.ascii.eqlIgnoreCase(s, "false")) return false;
+        return null;
     }
 
     pub fn parseDbConfig(conn: ast.Connection, default_port: u16, f: anytype) anyerror!DbConfig {

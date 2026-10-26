@@ -212,9 +212,8 @@ pub const Session = struct {
         errdefer gpa.free(own.host);
         own.user = try gpa.dupe(u8, cfg.user);
         errdefer gpa.free(own.user);
-        const stream = std.net.tcpConnectToHost(gpa, cfg.host, cfg.port) catch |e|
+        const stream = driver.dial(gpa, cfg.host, cfg.port, .{}) catch |e|
             return fail(error.SmbDisconnected, "cannot reach {s}:{d}: {s}", .{ cfg.host, cfg.port, @errorName(e) });
-        driver.tuneSocket(stream.handle);
         self.* = .{
             .gpa = gpa,
             .stream = stream,

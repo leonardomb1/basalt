@@ -22,6 +22,7 @@ const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const formats = @import("../formats.zig");
 const s3 = @import("../../store/s3.zig");
+const scheme = @import("../../store/scheme.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -146,7 +147,7 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, kind: Kind, at: At, l
 }
 
 pub fn isHttp(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://");
+    return scheme.ofCased(path).has(.http);
 }
 
 /// A refusal carrying its account, which the read reports as is.

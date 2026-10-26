@@ -502,7 +502,7 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
             host = hp[0..c];
             port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch 88;
         }
-        const stream = std.net.tcpConnectToHost(gpa, host, port) catch |e| {
+        const stream = @import("../../connect/driver.zig").dial(gpa, host, port, .{ .tune = false }) catch |e| {
             last = e;
             continue;
         };

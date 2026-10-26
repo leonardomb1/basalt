@@ -127,11 +127,24 @@ pub fn tuneSocket(handle: std.posix.socket_t) void {
     }
 }
 
-/// A TCP connection to `host:port`, tuned by `tuneSocket`: the one way a connector
-/// opens a socket.
-pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16) !std.net.Stream {
+/// How `dial` sets a socket up. `tune = false` keeps the OS defaults, for a one-shot
+/// exchange that neither idles nor streams (a KDC request, a TLS chain probe);
+/// `io_timeout_s` adds read and write timeouts so a silent server fails the call.
+pub const Dial = struct {
+    tune: bool = true,
+    io_timeout_s: ?u31 = null,
+};
+
+/// A TCP connection to `host:port`, tuned by `tuneSocket` and set up as `opts` asks:
+/// the one way a connector opens a socket.
+pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Dial) !std.net.Stream {
     const stream = try std.net.tcpConnectToHost(gpa, host, port);
-    tuneSocket(stream.handle);
+    if (opts.tune) tuneSocket(stream.handle);
+    if (opts.io_timeout_s) |s| {
+        const tv = std.posix.timeval{ .sec = s, .usec = 0 };
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+    }
     return stream;
 }
 
@@ -478,12 +491,38 @@ test "dial connects and tunes the socket: no Nagle, keepalive on" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try addr.listen(.{});
     defer server.deinit();
-    const stream = try dial(testing.allocator, "127.0.0.1", server.listen_address.getPort());
+    const stream = try dial(testing.allocator, "127.0.0.1", server.listen_address.getPort(), .{});
     defer stream.close();
     var one: c_int = 0;
     try std.posix.getsockopt(stream.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
     try testing.expect(one != 0);
     one = 0;
     try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&one));
+    try testing.expect(one != 0);
+}
+
+test "dial leaves an untuned socket at the OS defaults and sets io timeouts when asked" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    const plain = try dial(testing.allocator, "127.0.0.1", port, .{ .tune = false });
+    defer plain.close();
+    var one: c_int = 1;
+    try std.posix.getsockopt(plain.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
+    try testing.expectEqual(@as(c_int, 0), one);
+    var tv = std.posix.timeval{ .sec = 0, .usec = 0 };
+    try std.posix.getsockopt(plain.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
+
+    const timed = try dial(testing.allocator, "127.0.0.1", port, .{ .io_timeout_s = 60 });
+    defer timed.close();
+    try std.posix.getsockopt(timed.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 60), tv.sec);
+    tv.sec = 0;
+    try std.posix.getsockopt(timed.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 60), tv.sec);
+    one = 0;
+    try std.posix.getsockopt(timed.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one));
     try testing.expect(one != 0);
 }

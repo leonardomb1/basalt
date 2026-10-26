@@ -89,6 +89,13 @@ pub fn of(path: []const u8) Scheme {
     return Scheme.of(path);
 }
 
+/// `of` for a reader that matches a prefix case-sensitively, as lake's `isHttp`
+/// always has: a known prefix spelled other than in lowercase is `.other`.
+pub fn ofCased(path: []const u8) Scheme {
+    const s = of(path);
+    return if (std.mem.startsWith(u8, path, s.prefix())) s else .other;
+}
+
 /// `url` as a URI whose scheme is spelled in lowercase when it is one the table
 /// knows, since std.http matches a scheme case-sensitively.
 pub fn parseUri(url: []const u8) std.Uri.ParseError!std.Uri {
@@ -184,6 +191,16 @@ test "of reads every prefix in any case, an unknown scheme as other, else local"
         .{ "xs3://b/k", .other },     .{ " s3://b/k", .other },
     };
     for (cases) |c| try testing.expectEqual(c[1], of(c[0]));
+}
+
+test "ofCased is of for a lowercase prefix and other for any other spelling" {
+    for (corpus) |p| {
+        const want = if (lowerPrefix(p)) of(p) else .other;
+        try testing.expectEqual(want, ofCased(p));
+    }
+    try testing.expectEqual(Scheme.https, ofCased("https://h/a"));
+    try testing.expectEqual(Scheme.other, ofCased("HTTPS://h/a"));
+    try testing.expectEqual(Scheme.local, ofCased("/data/a.parquet"));
 }
 
 test "rest drops the prefix whatever its case; prefix is canonical lowercase" {

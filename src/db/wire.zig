@@ -32,9 +32,8 @@ pub const Conn = struct {
     /// A heap `T` whose `wire` is connected to `host:port`; every other field of
     /// `T` takes its default. Built in place: the readers point into the buffers.
     pub fn dial(comptime T: type, gpa: std.mem.Allocator, host: []const u8, port: u16) !*T {
-        const stream = try std.net.tcpConnectToHost(gpa, host, port);
+        const stream = try driver.dial(gpa, host, port, .{});
         errdefer stream.close();
-        driver.tuneSocket(stream.handle);
         const self = try gpa.create(T);
         self.* = .{ .wire = .{ .gpa = gpa, .stream = stream, .msg = .init(gpa) } };
         self.wire.sr = .init(stream, &self.wire.read_buf);
