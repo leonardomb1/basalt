@@ -140,3 +140,13 @@ test "D8: a BYTES value is the same base64 at the top of a JSON row and nested i
     defer alloc.free(back);
     try std.testing.expectEqualStrings("h\n01FF61\n", back);
 }
+
+test "json_object keeps two distinct BYTES keys distinct, each as its base64" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT json_get(json_object(x'ff', 1, x'fe', 2), '/w==') AS a, json_get(json_object(x'ff', 1, x'fe', 2), '/g==') AS b;", 1, &.{});
+    const got = try out(alloc, &tmp);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("a,b\n1,2\n", got);
+}

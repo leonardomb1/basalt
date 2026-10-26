@@ -517,3 +517,11 @@ test "D8: json_object and json_array write BYTES as base64, a nested BYTES list 
     try writeJsonValue(a, .{ .bytes = "{\"a\":1}" }, &w.writer);
     try std.testing.expectEqualStrings("\"eyJhIjoxfQ==\"", w.written());
 }
+
+test "json_object writes a BYTES key as base64, so distinct binary keys stay distinct" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("{\"/w==\":1,\"/g==\":2}", (try evalLit(a, "json_object(x'ff', 1, x'fe', 2)")).string);
+    try std.testing.expectEqualStrings("{\"7\":1,\"2024-01-01\":2}", (try evalLit(a, "json_object(7, 1, CAST('2024-01-01' AS DATE), 2)")).string);
+}
