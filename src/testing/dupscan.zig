@@ -382,9 +382,7 @@ pub const plan = [_]Rule{
         "connect/driver.zig",
     } },
     .{ .home = "options", .pattern = options_pattern, .exact = true, .allow = &options_allow },
-    .{ .home = "retry", .pattern = retry_pattern, .exact = true, .allow = &.{
-        "connect/retry.zig",
-    } },
+    .{ .home = "retry", .pattern = retry_pattern, .exact = true, .allow = &retry_allow },
     .{ .home = "transient", .pattern = transient_pattern, .exact = true, .allow = &.{
         "connect/driver.zig",
     } },
@@ -434,6 +432,13 @@ pub const transient_pattern = "== (408|429|50[0234])([^0-9]|$)|!= (408|429|50[02
 const textconv_allow = [_][]const u8{
     "exec/textconv.zig",
     "runtime/connect/testing_util.zig",
+};
+
+/// postgres_fake.zig sleeps a configured delay before answering a query, so tests
+/// can hold a result past a timeout; it waits, it does not retry.
+const retry_allow = [_][]const u8{
+    "connect/retry.zig",
+    "testing/postgres_fake.zig",
 };
 
 const options_allow = [_][]const u8{
