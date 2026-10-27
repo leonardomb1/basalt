@@ -117,11 +117,11 @@ pub fn ThreadNote(comptime n: usize) type {
 /// TCP_NODELAY, since drivers flush whole messages then wait (Nagle + delayed ACK
 /// stalls each exchange); SO_KEEPALIVE so idle multi-hour loads behind NATs surface
 /// a dead peer as an error, not a hang. On Linux the probes start after 60 s idle,
-/// every 15 s, 16 of them, and TCP_USER_TIMEOUT drops a peer that leaves sent data
+/// every 15 s, 56 of them, and TCP_USER_TIMEOUT drops a peer that leaves sent data
 /// unacknowledged as long (it also overrides the probe count): idle or writing, a
 /// dead peer fails the call within `dead_peer_s`. A live peer that answers is never
 /// dropped, but one that stops reading (a zero window) while we write is, after the
-/// same time. Best-effort: never fails a connect.
+/// same time, long enough for a server stalled on locks or log growth. Best-effort: never fails a connect.
 pub fn tuneSocket(handle: std.posix.socket_t) void {
     const one: c_int = 1;
     std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
@@ -140,7 +140,7 @@ pub fn tuneSocket(handle: std.posix.socket_t) void {
 
 pub const keep_idle_s: c_int = 60;
 pub const keep_intvl_s: c_int = 15;
-pub const keep_cnt: c_int = 16;
+pub const keep_cnt: c_int = 56;
 pub const dead_peer_s: c_int = keep_idle_s + keep_intvl_s * keep_cnt;
 
 /// How long one request may take, its retries included, unless its read says
@@ -563,7 +563,7 @@ test "connectorNote: layer, error and the server's words, each part left out whe
     try testing.expectError(error.WriteFailed, connectorNote(&w, "sftp", error.EndOfStream, "x"));
 }
 
-test "dial connects and tunes the socket: no Nagle, keepalive on, a dead peer dropped in five minutes on Linux" {
+test "dial connects and tunes the socket: no Nagle, keepalive on, a dead peer dropped in fifteen minutes on Linux" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try addr.listen(.{});
     defer server.deinit();
@@ -577,7 +577,7 @@ test "dial connects and tunes the socket: no Nagle, keepalive on, a dead peer dr
     try testing.expect(one != 0);
     if (@import("builtin").os.tag != .linux) return;
     const TCP = std.os.linux.TCP;
-    const want = [_]struct { u32, c_int }{ .{ TCP.KEEPIDLE, 60 }, .{ TCP.KEEPINTVL, 15 }, .{ TCP.KEEPCNT, 16 }, .{ TCP.USER_TIMEOUT, 300_000 } };
+    const want = [_]struct { u32, c_int }{ .{ TCP.KEEPIDLE, 60 }, .{ TCP.KEEPINTVL, 15 }, .{ TCP.KEEPCNT, 56 }, .{ TCP.USER_TIMEOUT, 900_000 } };
     for (want) |w| {
         var v: c_int = 0;
         try std.posix.getsockopt(stream.handle, std.posix.IPPROTO.TCP, w[0], std.mem.asBytes(&v));

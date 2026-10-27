@@ -23,10 +23,11 @@ alive. What fails is a server that never answers, or one that is gone.
   query: a query that takes longer than this before its first row fails too, as
   does a load the server stops reading for that long.
 - On Linux, a server that dies or drops off the network mid-query is noticed by
-  TCP keepalive (probes after 60 s idle, every 15 s) and by a five-minute limit
-  on sent data left unacknowledged: either way the run fails within about five
-  minutes instead of hanging. That limit also ends a load into a server that is
-  up but has stopped reading for five minutes. Elsewhere the operating system's
+  TCP keepalive (probes after 60 s idle, every 15 s) and by a fifteen-minute
+  limit on sent data left unacknowledged: either way the run fails within about
+  fifteen minutes instead of hanging. That limit also ends a load into a server
+  that is up but has stopped reading for fifteen minutes; a shorter stall, such as
+  a lock wait or log growth, is ridden out. Elsewhere the operating system's
   keepalive defaults apply (about two hours idle on macOS).
 
 These failures, and a server that resets or closes the connection, exit with
