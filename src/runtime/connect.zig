@@ -101,13 +101,13 @@ pub fn SqlDriver(comptime kind: SqlKind) type {
         .postgres => struct {
             pub const Bulk = postgres.CopySink;
             pub fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*postgres.Conn {
-                return postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e| return sql.onWire(e);
+                return postgres.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls, cfg.timeouts()) catch |e| return sql.onWire(e);
             }
         },
         .mysql => struct {
             pub const Bulk = mysql.LoadDataSink;
             pub fn connect(gpa: std.mem.Allocator, cfg: DbConfig) !*mysql.Conn {
-                return mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls) catch |e| return sql.onWire(e);
+                return mysql.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls, cfg.timeouts()) catch |e| return sql.onWire(e);
             }
         },
         .sqlserver => struct {

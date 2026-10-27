@@ -20,11 +20,11 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const streamload = @import("../../db/streamload.zig");
 
-const sftp_keys = [_][]const u8{ "host", "port", "user", "password", "key_file", "key_passphrase", "known_hosts", "host_key" };
-const smb_keys = [_][]const u8{ "host", "port", "user", "password", "domain", "share", "auth", "realm", "kdc", "spn" };
-const ftp_keys = [_][]const u8{ "host", "port", "user", "password" };
+const sftp_keys = schema.keyNames(&schema.sftp);
+const smb_keys = schema.keyNames(&schema.smb);
+const ftp_keys = schema.keyNames(&schema.ftp);
 
-const stream_int_keys = [_][]const u8{ "port", "fe_port", "buckets", "replication_num" };
+const stream_int_keys = [_][]const u8{ "port", "fe_port", "buckets", "replication_num", "connect_timeout", "query_timeout" };
 const stream_str_keys = [_][]const u8{ "host", "fe_host", "be_url", "load_url", "database", "user", "password", "label_prefix", "load_size", "compression" };
 
 pub const int_cfg_msg = "invalid integer config value";
@@ -32,9 +32,9 @@ pub const int_cfg_kind_msg = "config value must be an integer";
 pub const bool_cfg_msg = "config value must be a bool";
 pub const literal_cfg_msg = "config value must be a literal or env()/secret()";
 
-const sql_keys = [_][]const u8{ "host", "port", "database", "user", "password", "tls" };
-const sqlserver_keys = sql_keys ++ [_][]const u8{ "auth", "domain", "realm", "kdc", "spn", "client_id", "resource", "token" };
-const stream_keys = sql_keys ++ [_][]const u8{ "fe_host", "fe_port", "be_url", "load_url", "buckets", "replication_num", "auto_create", "label_prefix", "load_size", "compression" };
+const sql_keys = schema.keyNames(&schema.sql);
+const sqlserver_keys = schema.keyNames(&schema.sqlserver);
+const stream_keys = schema.keyNames(&schema.stream);
 
 fn fileKeys(connector: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, connector, "sftp")) return &sftp_keys;
@@ -123,6 +123,22 @@ fn isEnvCall(e: *const ast.Expr) bool {
     return (std.mem.eql(u8, c.name, "env") or std.mem.eql(u8, c.name, "secret")) and c.args.len == 1 and c.args[0].* == .str_lit;
 }
 
+const timeout_keys = schema.keyNames(&schema.timeouts);
+
+fn isTimeoutKey(k: []const u8) bool {
+    return containsKey(&timeout_keys, k);
+}
+
+/// A `connect_timeout` or `query_timeout` that is not a whole number of seconds
+/// fitting u32, as the run refuses it; null for any other key.
+fn timeoutProblem(arena: std.mem.Allocator, c: ast.Connection, attr: ast.Attr) Error!?[]const u8 {
+    if (!isTimeoutKey(attr.key)) return null;
+    return switch (schema.cfgIntIn(u32, attr.value)) {
+        .ok => null,
+        .problem => |p| p.fixedMsg() orelse try rangeMsg(arena, c.connector, attr.key),
+    };
+}
+
 /// Why the run would refuse a connection's declaration before any statement runs:
 /// an unknown connector type, a SQL connection's literal `tls` and `auth`, an SFTP,
 /// SMB or FTP connection's keys, port and literal values. Null when it would not.
@@ -133,6 +149,7 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
     if (conn.sqlRead() != null) {
         for (c.config) |attr| {
             if (!containsKey(connectionKeys(c.connector).?, attr.key)) return try unknownOptionMsg(arena, c, attr.key);
+            if (try timeoutProblem(arena, c, attr)) |why| return why;
             if (!std.mem.eql(u8, attr.key, "port") and !std.mem.eql(u8, attr.key, "fe_port")) continue;
             switch (schema.cfgIntIn(u16, attr.value)) {
                 .ok => {},
@@ -156,6 +173,10 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
                 .ok => {},
                 .problem => |p| return p.fixedMsg() orelse try portRangeMsg(arena, c.connector),
             }
+            continue;
+        }
+        if (containsKey(keys, k) and isTimeoutKey(k)) {
+            if (try timeoutProblem(arena, c, attr)) |why| return why;
             continue;
         }
         const text = try literalText(arena, attr.value);

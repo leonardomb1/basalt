@@ -93,10 +93,46 @@ pub const Conn = struct {
     pkt_payload: usize = BULK_PKT_PAYLOAD,
     last_done_count: ?u64 = null,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
         rejected.clear();
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
+        return open(gpa, host, port, to, sqlLogin, .{ user, password, database, host, tls_mode });
+    }
+
+    /// Azure AD access token (Dataverse / Azure SQL): PRELOGIN advertises
+    /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
+    /// caller fetches the token (see aad.ropcToken).
+    pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        rejected.clear();
+        if (tls_mode == .off) return error.EncryptionRequired;
+        return open(gpa, host, port, to, aadLogin, .{ token, database, host, tls_mode });
+    }
+
+    /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
+    pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        rejected.clear();
+        if (tls_mode == .off) return error.EncryptionRequired;
+        return open(gpa, host, port, to, ntlmLogin, .{ cred, database, host, tls_mode });
+    }
+
+    /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
+    /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
+    pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        rejected.clear();
+        if (tls_mode == .off) return error.EncryptionRequired;
+        return open(gpa, host, port, to, kerberosLogin, .{ cred, spn, database, host, tls_mode });
+    }
+
+    /// Dials `host:port` and runs `login_fn(self, args...)` as the login phase:
+    /// PRELOGIN, TLS, LOGIN7 and the session's SET options, under the login deadline.
+    fn open(gpa: std.mem.Allocator, host: []const u8, port: u16, to: driver.Timeouts, comptime login_fn: anytype, args: anytype) !*Conn {
+        const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
+        @call(.auto, login_fn, .{self} ++ args) catch |e| return self.wire.loginFailed(e, host, port);
+        self.wire.sessionUp();
+        return self;
+    }
+
+    fn sqlLogin(self: *Conn, user: []const u8, password: []const u8, database: []const u8, host: []const u8, tls_mode: sql.TlsMode) !void {
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         self.login(user, password, database, host) catch |e| {
@@ -104,21 +140,13 @@ pub const Conn = struct {
             return e;
         };
         try self.afterLogin();
-        return self;
     }
 
-    /// Azure AD access token (Dataverse / Azure SQL): PRELOGIN advertises
-    /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
-    /// caller fetches the token (see aad.ropcToken).
-    pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        rejected.clear();
-        if (tls_mode == .off) return error.EncryptionRequired;
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
-        errdefer self.close();
+    fn aadLogin(self: *Conn, token: []const u8, database: []const u8, host: []const u8, tls_mode: sql.TlsMode) !void {
         try self.preloginFed();
         try self.startTls(host, tls_mode);
-        const payload = try buildLogin7Fedauth(gpa, token, database, host, self.fed_required, self.fed_nonce);
-        defer gpa.free(payload);
+        const payload = try buildLogin7Fedauth(self.wire.gpa, token, database, host, self.fed_required, self.fed_nonce);
+        defer self.wire.gpa.free(payload);
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
@@ -126,29 +154,16 @@ pub const Conn = struct {
             return e;
         };
         try self.afterLogin();
-        return self;
     }
 
-    /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
-    pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        rejected.clear();
-        if (tls_mode == .off) return error.EncryptionRequired;
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
-        errdefer self.close();
+    fn ntlmLogin(self: *Conn, cred: ntlm.Credential, database: []const u8, host: []const u8, tls_mode: sql.TlsMode) !void {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         try self.loginNtlm(cred, database, host);
         try self.afterLogin();
-        return self;
     }
 
-    /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
-    /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
-    pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        rejected.clear();
-        if (tls_mode == .off) return error.EncryptionRequired;
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
-        errdefer self.close();
+    fn kerberosLogin(self: *Conn, cred: krb5.Credential, spn: []const u8, database: []const u8, host: []const u8, tls_mode: sql.TlsMode) !void {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         self.loginKerberos(cred, spn, database, host) catch |e| {
@@ -156,7 +171,6 @@ pub const Conn = struct {
             return e;
         };
         try self.afterLogin();
-        return self;
     }
 
     fn startTls(self: *Conn, host: []const u8, mode: sql.TlsMode) !void {

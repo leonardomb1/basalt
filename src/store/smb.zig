@@ -68,6 +68,7 @@ pub const Config = struct {
     realm: []const u8 = "",
     kdc: []const u8 = "",
     spn: []const u8 = "",
+    timeouts: driver.Timeouts = .{},
 };
 
 pub const Auth = enum { ntlm, kerberos };
@@ -204,7 +205,9 @@ pub const Session = struct {
     held: std.AutoHashMap(u64, Msg),
     trees: std.StringHashMap(u32),
 
-    /// The host and user are copied, as a pooled session outlives the URL they came from.
+    /// The host and user are copied, as a pooled session outlives the URL they came
+    /// from. NEGOTIATE and SESSION_SETUP run under `connect_s`, the session after
+    /// them under `query_s`.
     pub fn connect(gpa: std.mem.Allocator, cfg: Config) !*Session {
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
@@ -213,7 +216,7 @@ pub const Session = struct {
         errdefer gpa.free(own.host);
         own.user = try gpa.dupe(u8, cfg.user);
         errdefer gpa.free(own.user);
-        const stream = driver.dial(gpa, cfg.host, cfg.port, .{}) catch |e|
+        const stream = driver.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts()) catch |e|
             return fail(error.SmbDisconnected, "cannot reach {s}:{d}: {s}", .{ cfg.host, cfg.port, @errorName(e) });
         self.* = .{
             .gpa = gpa,
@@ -227,9 +230,17 @@ pub const Session = struct {
         self.sr = stream.reader(&self.rbuf);
         self.sw = stream.writer(&self.wbuf);
         errdefer self.release();
-        try self.negotiate();
-        try self.login();
+        self.negotiate() catch |e| return self.loginFailed(e, "negotiate");
+        self.login() catch |e| return self.loginFailed(e, "login");
+        cfg.timeouts.sessionUp(stream.handle);
         return self;
+    }
+
+    /// `e`, or `ConnectionTimedOut` naming the host and `phase` when the login deadline fired.
+    fn loginFailed(self: *Session, e: anytype, phase: []const u8) (@TypeOf(e) || error{ConnectionTimedOut}) {
+        const out = driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
+        if (out == error.ConnectionTimedOut) why_note.set(driver.loginNote());
+        return out;
     }
 
     fn release(self: *Session) void {
@@ -972,6 +983,8 @@ pub const Conn = struct {
     realm: ?[]const u8 = null,
     kdc: ?[]const u8 = null,
     spn: ?[]const u8 = null,
+    connect_timeout: u32 = driver.default_connect_timeout_s,
+    query_timeout: u32 = 0,
 };
 
 const Names = remotefs.Registry(Conn, true);
@@ -1024,6 +1037,7 @@ const Proto = struct {
                 .kdc = c.kdc orelse "",
                 .spn = c.spn orelse "",
                 .auth = c.auth orelse if (c.realm != null) .kerberos else .ntlm,
+                .timeouts = .{ .connect_s = c.connect_timeout, .query_s = c.query_timeout },
             };
             share = c.share orelse try splitShare(&path);
         } else {
@@ -1051,6 +1065,7 @@ const Proto = struct {
         h.update(cfg.realm);
         h.update(&[_]u8{0});
         h.update(cfg.spn);
+        h.update(std.mem.asBytes(&cfg.timeouts));
         return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
     }
 
@@ -1470,4 +1485,15 @@ fn liveRoundTripOn(s: *Session, arena: std.mem.Allocator, share: []const u8) !vo
     s.closeHandle(r);
     try std.testing.expectError(error.SmbNoSuchFile, s.open(share, "basalt_live.bin", Access.read_data, disposition_open, option_non_directory));
     try std.testing.expectError(error.SmbBadShare, s.tree("nope"));
+}
+
+test "a server that accepts and never answers fails the SMB login within connect_timeout, naming host and phase" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    const cfg = Config{ .host = "127.0.0.1", .port = port, .user = "u", .password = "p", .timeouts = .{ .connect_s = 1 } };
+    try std.testing.expectError(error.ConnectionTimedOut, Session.connect(std.testing.allocator, cfg));
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), lastError());
 }

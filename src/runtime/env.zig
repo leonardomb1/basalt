@@ -84,6 +84,8 @@ pub fn isTransient(e: anyerror) bool {
         error.HttpTransportFailed,
         error.ServerClosedConnection,
         error.ConnectionIoFailed,
+        error.SmbDisconnected,
+        error.SshConnectionLost,
         error.S3Throttled,
         error.AzureThrottled,
         => true,
@@ -598,6 +600,12 @@ pub const DbConfig = struct {
     client_id: []const u8 = "",
     resource: []const u8 = "",
     token: []const u8 = "",
+    connect_timeout: u32 = driver.default_connect_timeout_s,
+    query_timeout: u32 = 0,
+
+    pub fn timeouts(self: DbConfig) driver.Timeouts {
+        return .{ .connect_s = self.connect_timeout, .query_s = self.query_timeout };
+    }
 };
 
 pub fn eqlAny(k: []const u8, opts: []const []const u8) bool {

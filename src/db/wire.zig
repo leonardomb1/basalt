@@ -10,6 +10,10 @@
 //! TLS rides over a carrier: the raw socket for postgres and mysql, a shim that
 //! wraps the handshake in PRELOGIN packets for tds. A flush goes TLS, then the
 //! carrier, then the socket, so bytes buffered at any layer leave together.
+//!
+//! Login runs under the connection's `connect_timeout`: a driver's `connect` passes
+//! any failure through `loginFailed`, which names a fired deadline with the host and
+//! the phase, then calls `sessionUp` to swap it for the `query_timeout` (none by default).
 
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -29,17 +33,31 @@ pub const Conn = struct {
     last_error: []const u8 = "",
     tls: ?*sql.TlsState = null,
     carrier: *std.Io.Writer = undefined,
+    timeouts: driver.Timeouts = .{},
+    phase: []const u8 = "login",
 
-    /// A heap `T` whose `wire` is connected to `host:port`; every other field of
-    /// `T` takes its default. Built in place: the readers point into the buffers.
-    pub fn dial(comptime T: type, gpa: std.mem.Allocator, host: []const u8, port: u16) !*T {
-        const stream = try driver.dial(gpa, host, port, .{});
+    /// A heap `T` whose `wire` is connected to `host:port`, its login deadline set;
+    /// every other field of `T` takes its default. Built in place: the readers point
+    /// into the buffers.
+    pub fn dial(comptime T: type, gpa: std.mem.Allocator, host: []const u8, port: u16, to: driver.Timeouts) !*T {
+        const stream = try driver.dial(gpa, host, port, to.dialOpts());
         errdefer stream.close();
         const self = try gpa.create(T);
-        self.* = .{ .wire = .{ .gpa = gpa, .stream = stream, .msg = .init(gpa) } };
+        self.* = .{ .wire = .{ .gpa = gpa, .stream = stream, .msg = .init(gpa), .timeouts = to } };
         self.wire.sr = .init(stream, &self.wire.read_buf);
         self.wire.sw = .init(stream, &self.wire.write_buf);
         return self;
+    }
+
+    /// A login failure as the caller sees it: `ConnectionTimedOut`, naming `host:port`
+    /// and the phase, when the login deadline fired, else `e`.
+    pub fn loginFailed(self: *const Conn, e: anytype, host: []const u8, port: u16) (@TypeOf(e) || error{ConnectionTimedOut}) {
+        return driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), host, port, self.phase, self.timeouts.connect_s);
+    }
+
+    /// The session is up: the login deadline gives way to the query one.
+    pub fn sessionUp(self: *Conn) void {
+        self.timeouts.sessionUp(self.stream.handle);
     }
 
     /// Frees what the wire holds and destroys `owner`, the struct it is embedded in.
@@ -61,7 +79,9 @@ pub const Conn = struct {
     pub fn startTlsOver(self: *Conn, host: []const u8, mode: sql.TlsMode, r: *std.Io.Reader, w: *std.Io.Writer) !void {
         const ts = try self.gpa.create(sql.TlsState);
         errdefer self.gpa.destroy(ts);
+        self.phase = "TLS handshake";
         try ts.start(self.gpa, r, w, host, mode);
+        self.phase = "login";
         self.carrier = w;
         self.tls = ts;
     }

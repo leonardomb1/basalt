@@ -30,6 +30,7 @@ const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const ssh = @import("../net/ssh.zig");
+const driver = @import("../connect/driver.zig");
 
 pub const Error = error{
     SftpProtocol,
@@ -92,6 +93,8 @@ pub const Conn = struct {
     key_passphrase: ?[]const u8 = null,
     known_hosts: ?[]const u8 = null,
     host_key: ?[]const u8 = null,
+    connect_timeout: u32 = driver.default_connect_timeout_s,
+    query_timeout: u32 = 0,
 };
 
 const Names = remotefs.Registry(Conn, false);
@@ -111,14 +114,25 @@ pub const Client = struct {
     posix_rename: bool = false,
     why: std.array_list.Managed(u8),
 
+    /// The SSH login and the SFTP version exchange run under the connection's
+    /// `connect_timeout`, the session after them under its `query_timeout`.
     fn open(gpa: std.mem.Allocator, cfg: ssh.Config) !*Client {
         const session = try ssh.Session.connect(gpa, cfg);
-        errdefer session.close();
-        try session.openSubsystem("sftp");
-        const self = try gpa.create(Client);
+        const self = gpa.create(Client) catch |e| {
+            session.close();
+            return e;
+        };
         self.* = .{ .gpa = gpa, .ssh = session, .inbuf = .init(gpa), .out = .init(gpa), .why = .init(gpa) };
         errdefer self.destroy();
-        var b = ssh.Buf.init(gpa);
+        self.start() catch |e| return session.loginFailed(e, "sftp session setup");
+        session.sessionUp();
+        return self;
+    }
+
+    fn start(self: *Client) !void {
+        const session = self.ssh;
+        try session.openSubsystem("sftp");
+        var b = ssh.Buf.init(self.gpa);
         defer b.deinit();
         try b.u32be(5);
         try b.byte(fxp.init);
@@ -136,7 +150,6 @@ pub const Client = struct {
             if (std.mem.eql(u8, n, "limits@openssh.com")) limits = true;
         }
         if (limits) self.readLimits() catch {};
-        return self;
     }
 
     /// `limits@openssh.com`: the largest read and write the server takes.
@@ -495,6 +508,7 @@ const Proto = struct {
             .key_passphrase = c.key_passphrase,
             .known_hosts = c.known_hosts,
             .host_key = c.host_key,
+            .timeouts = .{ .connect_s = c.connect_timeout, .query_s = c.query_timeout },
         } };
         var key_file: ?[]const u8 = null;
         if (std.posix.getenv("HOME")) |home| {
@@ -520,6 +534,7 @@ const Proto = struct {
             h.update(v);
             h.update(&[_]u8{@intFromBool(@field(cfg, f) != null)});
         }
+        h.update(std.mem.asBytes(&cfg.timeouts));
         return std.fmt.bufPrint(buf, "{s}@{s}:{d}#{x}", .{ cfg.user, cfg.host, cfg.port, h.final() }) catch cfg.host;
     }
 
@@ -706,4 +721,15 @@ test "live: upload, list, read back whole, by range and streaming; an aborted up
     for (after) |n| try std.testing.expect(std.mem.indexOf(u8, n, "aborted") == null);
 
     try std.testing.expectError(error.SftpNoSuchFile, File.open(a, "sftp://probe/~/t/missing.bin"));
+}
+
+test "a server that accepts and never answers fails the SSH login within connect_timeout, naming host and phase" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    Proto.clearNotes();
+    try std.testing.expectError(error.ConnectionTimedOut, Proto.connect(.{ .host = "127.0.0.1", .port = port, .user = "u", .timeouts = .{ .connect_s = 1 } }));
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: handshake did not answer within 1 s", .{port}), lastError());
 }

@@ -116,18 +116,32 @@ pub fn ThreadNote(comptime n: usize) type {
 
 /// TCP_NODELAY, since drivers flush whole messages then wait (Nagle + delayed ACK
 /// stalls each exchange); SO_KEEPALIVE so idle multi-hour loads behind NATs surface
-/// a dead peer as an error, not a hang. Best-effort: never fails a connect.
+/// a dead peer as an error, not a hang. On Linux the probes start after 60 s idle,
+/// every 15 s, 16 of them, and TCP_USER_TIMEOUT drops a peer that leaves sent data
+/// unacknowledged as long (it also overrides the probe count): idle or writing, a
+/// dead peer fails the call within `dead_peer_s`. A live peer that answers is never
+/// dropped, but one that stops reading (a zero window) while we write is, after the
+/// same time. Best-effort: never fails a connect.
 pub fn tuneSocket(handle: std.posix.socket_t) void {
     const one: c_int = 1;
     std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
     std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
     if (@import("builtin").os.tag == .linux) {
-        const idle: c_int = 60;
-        const intvl: c_int = 15;
-        std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.KEEPIDLE, std.mem.asBytes(&idle)) catch {};
-        std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.os.linux.TCP.KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+        const TCP = std.os.linux.TCP;
+        const opts = [_]struct { u32, c_int }{
+            .{ TCP.KEEPIDLE, keep_idle_s },
+            .{ TCP.KEEPINTVL, keep_intvl_s },
+            .{ TCP.KEEPCNT, keep_cnt },
+            .{ TCP.USER_TIMEOUT, dead_peer_s * 1000 },
+        };
+        for (opts) |o| std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, o[0], std.mem.asBytes(&o[1])) catch {};
     }
 }
+
+pub const keep_idle_s: c_int = 60;
+pub const keep_intvl_s: c_int = 15;
+pub const keep_cnt: c_int = 16;
+pub const dead_peer_s: c_int = keep_idle_s + keep_intvl_s * keep_cnt;
 
 /// How long one request may take, its retries included, unless its read says
 /// otherwise: an HTTP page or login, an identity provider's token call, a KDC exchange.
@@ -138,20 +152,74 @@ pub const request_timeout_ms: i64 = 300_000;
 /// `io_timeout_s` adds read and write timeouts so a silent server fails the call.
 pub const Dial = struct {
     tune: bool = true,
-    io_timeout_s: ?u31 = null,
+    io_timeout_s: ?u32 = null,
 };
 
 /// A TCP connection to `host:port`, tuned by `tuneSocket` and set up as `opts` asks:
-/// the one way a connector opens a socket.
+/// the one way a connector opens a socket. Clears this thread's `loginNote`.
 pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Dial) !std.net.Stream {
+    login_note.clear();
     const stream = try std.net.tcpConnectToHost(gpa, host, port);
     if (opts.tune) tuneSocket(stream.handle);
-    if (opts.io_timeout_s) |s| {
-        const tv = std.posix.timeval{ .sec = s, .usec = 0 };
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-        std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
-    }
+    if (opts.io_timeout_s) |s| setIoTimeout(stream.handle, s);
     return stream;
+}
+
+/// Read and write timeouts of `s` seconds on a socket, 0 clearing them: a recv or
+/// send blocked that long fails with `WouldBlock`. Best-effort.
+pub fn setIoTimeout(handle: std.posix.socket_t, s: u32) void {
+    const tv = std.posix.timeval{ .sec = s, .usec = 0 };
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+}
+
+/// The `connect_timeout` a database, SMB or SSH connection gets unless it says otherwise.
+pub const default_connect_timeout_s: u32 = 60;
+
+/// A connection's two deadlines in seconds, 0 for none. `connect_s` bounds every
+/// read and write from the dial until the session is up (TLS, authentication,
+/// session setup); `query_s` bounds each one after that, so by default a live
+/// query is never timed out.
+pub const Timeouts = struct {
+    connect_s: u32 = default_connect_timeout_s,
+    query_s: u32 = 0,
+
+    /// The `Dial` that opens the login phase.
+    pub fn dialOpts(self: Timeouts) Dial {
+        return .{ .io_timeout_s = self.connect_s };
+    }
+
+    /// The session is up: the login deadline gives way to `query_s`.
+    pub fn sessionUp(self: Timeouts, handle: std.posix.socket_t) void {
+        setIoTimeout(handle, self.query_s);
+    }
+};
+
+/// Whether a socket reader or writer failed because a `setIoTimeout` deadline fired.
+pub fn ioTimedOut(sr: *const std.net.Stream.Reader, sw: *const std.net.Stream.Writer) bool {
+    if (sr.getError()) |e| if (e == error.WouldBlock) return true;
+    if (sw.err) |e| if (e == error.WouldBlock) return true;
+    return false;
+}
+
+threadlocal var login_note: ThreadNote(256) = .{};
+
+/// What this thread's last login timeout said, or empty.
+pub fn loginNote() []const u8 {
+    return login_note.get();
+}
+
+/// `ConnectionTimedOut` for a connection to `host:port` whose `phase` (`login`, `TLS
+/// handshake`, …) went `s` seconds without an answer; `loginNote` keeps the words.
+pub fn loginTimedOut(host: []const u8, port: u16, phase: []const u8, s: u32) error{ConnectionTimedOut} {
+    login_note.print("{s}:{d}: {s} did not answer within {d} s", .{ host, port, phase, s });
+    return error.ConnectionTimedOut;
+}
+
+/// `e`, or the login timeout it stands for when `timed_out`.
+pub fn loginFailed(e: anytype, timed_out: bool, host: []const u8, port: u16, phase: []const u8, s: u32) (@TypeOf(e) || error{ConnectionTimedOut}) {
+    if (timed_out) return loginTimedOut(host, port, phase, s);
+    return e;
 }
 
 /// What kind of failure an error is, for the two retry levels. `net`: the socket
@@ -173,6 +241,8 @@ pub fn classify(e: anyerror) Class {
         error.TemporaryNameServerFailure,
         error.ServerClosedConnection,
         error.ConnectionIoFailed,
+        error.SmbDisconnected,
+        error.SshConnectionLost,
         => .net,
         error.EndOfStream,
         error.ReadFailed,
@@ -493,7 +563,7 @@ test "connectorNote: layer, error and the server's words, each part left out whe
     try testing.expectError(error.WriteFailed, connectorNote(&w, "sftp", error.EndOfStream, "x"));
 }
 
-test "dial connects and tunes the socket: no Nagle, keepalive on" {
+test "dial connects and tunes the socket: no Nagle, keepalive on, a dead peer dropped in five minutes on Linux" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 0);
     var server = try addr.listen(.{});
     defer server.deinit();
@@ -505,6 +575,53 @@ test "dial connects and tunes the socket: no Nagle, keepalive on" {
     one = 0;
     try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&one));
     try testing.expect(one != 0);
+    if (@import("builtin").os.tag != .linux) return;
+    const TCP = std.os.linux.TCP;
+    const want = [_]struct { u32, c_int }{ .{ TCP.KEEPIDLE, 60 }, .{ TCP.KEEPINTVL, 15 }, .{ TCP.KEEPCNT, 16 }, .{ TCP.USER_TIMEOUT, 300_000 } };
+    for (want) |w| {
+        var v: c_int = 0;
+        try std.posix.getsockopt(stream.handle, std.posix.IPPROTO.TCP, w[0], std.mem.asBytes(&v));
+        try testing.expectEqual(w[1], v);
+    }
+}
+
+test "setIoTimeout sets both deadlines and 0 clears them; a fired one reads as a timeout" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const stream = try dial(testing.allocator, "127.0.0.1", server.listen_address.getPort(), (Timeouts{ .connect_s = 1 }).dialOpts());
+    defer stream.close();
+    var rb: [64]u8 = undefined;
+    var wb: [64]u8 = undefined;
+    var sr = stream.reader(&rb);
+    var sw = stream.writer(&wb);
+    try testing.expect(!ioTimedOut(&sr, &sw));
+    try testing.expectError(error.ReadFailed, sr.interface().takeByte());
+    try testing.expect(ioTimedOut(&sr, &sw));
+    (Timeouts{ .connect_s = 1 }).sessionUp(stream.handle);
+    for ([_]u32{ std.posix.SO.RCVTIMEO, std.posix.SO.SNDTIMEO }) |opt| {
+        var tv = std.posix.timeval{ .sec = 9, .usec = 9 };
+        try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, opt, std.mem.asBytes(&tv));
+        try testing.expectEqual(@as(@TypeOf(tv.sec), 0), tv.sec);
+        try testing.expectEqual(@as(@TypeOf(tv.usec), 0), tv.usec);
+    }
+    (Timeouts{ .query_s = 7 }).sessionUp(stream.handle);
+    var tv = std.posix.timeval{ .sec = 0, .usec = 0 };
+    try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try testing.expectEqual(@as(@TypeOf(tv.sec), 7), tv.sec);
+}
+
+test "a login timeout names host, port and phase; it and the dead-peer errors are transient, run and connector alike" {
+    try testing.expectEqual(error.ConnectionTimedOut, loginTimedOut("db.internal", 5432, "login", 60));
+    try testing.expectEqualStrings("db.internal:5432: login did not answer within 60 s", loginNote());
+    const env = @import("../runtime/env.zig");
+    for ([_]anyerror{ error.ConnectionTimedOut, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionIoFailed, error.SmbDisconnected, error.SshConnectionLost }) |e| {
+        try testing.expect(transientNet(e));
+        try testing.expect(transientRun(e));
+        try testing.expect(env.isTransient(e));
+    }
+    try testing.expect(!env.isTransient(error.SshDisconnected));
+    try testing.expect(!transientRun(error.SshDisconnected));
 }
 
 test "dial leaves an untuned socket at the OS defaults and sets io timeouts when asked" {

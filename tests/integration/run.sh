@@ -304,6 +304,21 @@ runs mysql     && paramrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($M
 runs postgres  && paramrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
 runs sqlserver && paramrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
 
+# connect_timeout bounds the login and is lifted once the session is up;
+# query_timeout stays on after it. A real server must log in and answer under both.
+timeoutrt() { # $1 connector, $2 OPTIONS(...) body
+  if $B run --format csv -q -c "CREATE CONNECTION db TYPE $1 OPTIONS ($2, connect_timeout = 30, query_timeout = 600);
+SELECT id FROM db.it_topn WHERE id = 1;" >"$out/timeout_$1.csv" 2>"$out/timeout_$1.log" &&
+     [ "$(tr '\n' ' ' <"$out/timeout_$1.csv")" = "id 1 " ]; then
+    report "$1-timeouts" ok
+  else
+    report "$1-timeouts" bad; tail -5 "$out/timeout_$1.log"
+  fi
+}
+runs mysql     && timeoutrt mysql     "$MYSQL_OPTS"
+runs postgres  && timeoutrt postgres  "$PG_OPTS"
+runs sqlserver && timeoutrt sqlserver "$MSSQL_OPTS"
+
 runs mysql     && catalogrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      it
 runs postgres  && catalogrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      public
 runs sqlserver && catalogrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo
@@ -603,6 +618,13 @@ LOAD INTO '$out/starrocks.csv' AS SELECT * FROM fe.basalt_it ORDER BY id;"; then
     check starrocks "$out/starrocks.csv" tests/integration/expected.csv
   else
     report "starrocks (run error)" bad
+  fi
+
+  if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, database = 'it', user = 'root', password = '', connect_timeout = 30, query_timeout = 600);
+LOAD INTO '$out/timeout_starrocks.csv' AS SELECT id FROM sr.basalt_it ORDER BY id LIMIT 1;"; then
+    report starrocks-timeouts ok
+  else
+    report starrocks-timeouts bad
   fi
 
   # `\N` is the Stream Load null marker and StarRocks CSV has no escape for it —

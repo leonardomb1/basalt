@@ -11,7 +11,8 @@
 //! WHERE is ignored, so it may return more rows than match, never fewer. A column
 //! or table it does not hold is an ErrorResponse, as is any query holding `fail_on`,
 //! which then carries `fail_msg`; a query holding `drop_on` has its connection
-//! closed unanswered, as a server that went away mid-query.
+//! closed unanswered, as a server that went away mid-query; one holding `delay_on`
+//! is answered `delay_ms` late, as a slow query.
 
 const std = @import("std");
 
@@ -30,6 +31,8 @@ pub const FakePg = struct {
     fail_on: ?[]const u8 = null,
     fail_msg: []const u8 = "",
     drop_on: ?[]const u8 = null,
+    delay_on: ?[]const u8 = null,
+    delay_ms: u64 = 0,
     stop: std.atomic.Value(bool) = .init(false),
     mutex: std.Thread.Mutex = .{},
     queries: std.array_list.Managed([]u8),
@@ -151,6 +154,7 @@ pub const FakePg = struct {
                         try self.queries.append(try self.gpa.dupe(u8, text));
                     }
                     if (self.drop_on) |d| if (std.mem.indexOf(u8, text, d) != null) return;
+                    if (self.delay_on) |d| if (std.mem.indexOf(u8, text, d) != null) std.Thread.sleep(self.delay_ms * std.time.ns_per_ms);
                     try self.answer(a, w, text);
                     try message(w, 'Z', "I");
                     try w.flush();
@@ -279,7 +283,7 @@ test "the fake server answers a table read, narrows by IN, refuses an unknown co
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
 
-    const c1 = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off);
+    const c1 = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off, .{});
     var cur = try c1.sqlConn().queryCursor("SELECT \"v\", \"id\" FROM \"public\".\"t\" WHERE \"id\" IN (1, 3)");
     var n: usize = 0;
     while (try cur.nextBatch(ar.allocator())) |b| {
@@ -290,7 +294,7 @@ test "the fake server answers a table read, narrows by IN, refuses an unknown co
     cur.close();
     try std.testing.expectEqual(@as(usize, 2), n);
 
-    const c2 = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off);
+    const c2 = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off, .{});
     defer c2.close();
     try std.testing.expectError(error.PgQueryFailed, c2.sqlConn().queryCursor("SELECT \"nope\" FROM t"));
     try std.testing.expectEqualStrings("column \"nope\" does not exist", c2.wire.last_error);
@@ -299,4 +303,27 @@ test "the fake server answers a table read, narrows by IN, refuses an unknown co
     defer gpa.free(got);
     try std.testing.expectEqual(@as(usize, 2), got.len);
     try std.testing.expectEqualStrings("SELECT \"nope\" FROM t", got[1]);
+}
+
+test "the login deadline is lifted once the session is up: a query slower than connect_timeout succeeds unless query_timeout is set" {
+    const gpa = std.testing.allocator;
+    const rows = [_][]const ?[]const u8{&.{"1"}};
+    const tables = [_]Table{.{ .name = "t", .cols = &.{.{ .name = "id", .oid = 20 }}, .rows = &rows }};
+    const srv = try FakePg.start(gpa, &tables);
+    defer srv.finish();
+    srv.delay_on = "'slow'";
+    srv.delay_ms = 1500;
+    const pg = @import("../db/postgres.zig");
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const q = "SELECT * FROM t WHERE 'slow' <> ''";
+
+    const live = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off, .{ .connect_s = 1 });
+    var cur = try live.sqlConn().queryCursor(q);
+    defer cur.close();
+    try std.testing.expectEqual(@as(usize, 1), (try cur.nextBatch(ar.allocator())).?.len);
+
+    const capped = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off, .{ .connect_s = 1, .query_s = 1 });
+    defer capped.close();
+    try std.testing.expectError(error.ConnectionIoFailed, capped.sqlConn().queryCursor(q));
 }

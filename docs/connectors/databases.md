@@ -4,6 +4,37 @@ Postgres, MySQL, SQL Server, StarRocks and Doris are read with a SQL query and
 written by bulk load or insert; their options are listed under
 [Connections](../language/connections.md). What is particular to each follows.
 
+## Timeouts and dead peers
+
+A long extraction is not cut short by a clock: once a session is up, a query
+may run, and wait for its first row, as long as the server keeps the connection
+alive. What fails is a server that never answers, or one that is gone.
+
+- `connect_timeout` (seconds, default 60, `0` for none) bounds each read and
+  write once the TCP connection is open until the session is up: TLS, the login
+  and the session's setup. A server that accepts the connection and then goes
+  silent fails with `ConnectionTimedOut` naming the host and phase, as
+  `db.internal:5432: login did not answer within 60 s`. The TCP connect itself
+  is left to the operating system, which gives up on a host that never answers
+  after about two minutes on Linux.
+- `query_timeout` (seconds, default `0`, none) keeps a limit on once the session
+  is up, for a server that is alive but wedged. It is the longest a read may wait
+  for a byte, or a write for the server to take one, not a deadline for the whole
+  query: a query that takes longer than this before its first row fails too, as
+  does a load the server stops reading for that long.
+- On Linux, a server that dies or drops off the network mid-query is noticed by
+  TCP keepalive (probes after 60 s idle, every 15 s) and by a five-minute limit
+  on sent data left unacknowledged: either way the run fails within about five
+  minutes instead of hanging. That limit also ends a load into a server that is
+  up but has stopped reading for five minutes. Elsewhere the operating system's
+  keepalive defaults apply (about two hours idle on macOS).
+
+These failures, and a server that resets or closes the connection, exit with
+code 75, so a scheduler can rerun. Both options are whole numbers, checked
+before the run like `port`, and also taken by `sftp` and `smb` connections.
+StarRocks' and Doris' `connect_timeout` and `query_timeout` cover the FE's
+MySQL port; a stream load's HTTP request keeps its own limit.
+
 ## PostgreSQL and MySQL
 
 Every session runs in UTC, the zone basalt's timestamps are in: PostgreSQL's

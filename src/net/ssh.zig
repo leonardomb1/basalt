@@ -48,6 +48,7 @@ const HmacSha1 = crypto.auth.hmac.HmacSha1;
 pub const Error = error{
     SshProtocol,
     SshDisconnected,
+    SshConnectionLost,
     SshNoCommonAlgorithm,
     SshBadMac,
     SshHostKeyUnknown,
@@ -71,6 +72,7 @@ pub const Config = struct {
     key_passphrase: ?[]const u8 = null,
     known_hosts: ?[]const u8 = null,
     host_key: ?[]const u8 = null,
+    timeouts: driver.Timeouts = .{},
 };
 
 const client_version = "SSH-2.0-basalt";
@@ -358,7 +360,7 @@ pub const Session = struct {
         var owned = cfg;
         const text = try ownConfig(gpa, &owned);
         errdefer gpa.free(text);
-        const stream = try driver.dial(gpa, cfg.host, cfg.port, .{});
+        const stream = try driver.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts());
         self.* = .{
             .gpa = gpa,
             .stream = stream,
@@ -376,9 +378,22 @@ pub const Session = struct {
         self.sw = stream.writer(&self.wbuf);
         errdefer self.release();
         self.orderHostKeys();
-        try self.handshake();
-        try self.authenticate();
+        self.handshake() catch |e| return self.loginFailed(e, "handshake");
+        self.authenticate() catch |e| return self.loginFailed(e, "login");
         return self;
+    }
+
+    /// `e`, or `ConnectionTimedOut` naming the host and `phase` when the login
+    /// deadline fired: from the dial through `sessionUp`.
+    pub fn loginFailed(self: *Session, e: anytype, phase: []const u8) (@TypeOf(e) || error{ConnectionTimedOut}) {
+        const out = driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
+        if (out == error.ConnectionTimedOut) failure.set(driver.loginNote());
+        return out;
+    }
+
+    /// The caller's session setup is done: the login deadline gives way to the query one.
+    pub fn sessionUp(self: *Session) void {
+        self.cfg.timeouts.sessionUp(self.stream.handle);
     }
 
     fn release(self: *Session) void {
@@ -493,12 +508,12 @@ pub const Session = struct {
             },
         }
         d.seq +%= 1;
-        self.sw.interface.writeAll(o.items) catch return error.SshDisconnected;
-        self.sw.interface.flush() catch return error.SshDisconnected;
+        self.sw.interface.writeAll(o.items) catch return error.SshConnectionLost;
+        self.sw.interface.flush() catch return error.SshConnectionLost;
     }
 
     fn take(self: *Session, n: usize) ![]const u8 {
-        return self.reader().take(n) catch error.SshDisconnected;
+        return self.reader().take(n) catch error.SshConnectionLost;
     }
 
     /// The next packet's payload, decrypted and verified, into `self.packet`.
@@ -584,11 +599,11 @@ pub const Session = struct {
     /// Reads the server's version line inclusive of its `\n`: the exclusive form left
     /// that byte unread ahead of the first binary packet.
     fn handshake(self: *Session) !void {
-        self.sw.interface.writeAll(client_version ++ "\r\n") catch return error.SshDisconnected;
-        self.sw.interface.flush() catch return error.SshDisconnected;
+        self.sw.interface.writeAll(client_version ++ "\r\n") catch return error.SshConnectionLost;
+        self.sw.interface.flush() catch return error.SshConnectionLost;
         var tries: usize = 0;
         while (tries < 64) : (tries += 1) {
-            const line = self.reader().takeDelimiterInclusive('\n') catch return error.SshDisconnected;
+            const line = self.reader().takeDelimiterInclusive('\n') catch return error.SshConnectionLost;
             const l = std.mem.trimRight(u8, line, "\r\n");
             if (std.mem.startsWith(u8, l, "SSH-")) {
                 if (!std.mem.startsWith(u8, l, "SSH-2.0-") and !std.mem.startsWith(u8, l, "SSH-1.99-"))

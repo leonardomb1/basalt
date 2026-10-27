@@ -67,7 +67,7 @@ const FileCfg = struct {
     }
 
     pub fn value(self: FileCfg, comptime F: type, opt: schema.Opt, e: *const ast.Expr) !?F {
-        if (F == u16) return try self.run.int(u16, e, opt.key);
+        if (F == u16 or F == u32) return try self.run.int(F, e, opt.key);
         const v = try self.run.optText(e);
         if (F == []const u8) return v orelse "";
         if (F == ?smb.Auth) {

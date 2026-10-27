@@ -18,6 +18,9 @@ The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
 - `starrocks` and `doris`: `fe_host`/`host`, `fe_port`/`port`, `user`
   `password`, a required `database`, and for loading `be_url` (also `load_url`)
   `buckets replication_num auto_create label_prefix load_size compression`.
+- Every database, `sftp` and `smb` connection also takes `connect_timeout`
+  (seconds, default 60) and `query_timeout` (seconds, default none); see
+  [Timeouts and dead peers](../connectors/databases.md#timeouts-and-dead-peers).
 - An option the type does not read is a plan-time error, as is a database
   connection with no `host`.
 - `http`, `sftp`, `smb` and `ftp` have pages of their own: [HTTP APIs](../connectors/http.md),

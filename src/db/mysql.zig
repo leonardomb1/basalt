@@ -32,6 +32,7 @@ const cell = @import("../exec/cell.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
 const wire = @import("wire.zig");
+const driver = @import("../connect/driver.zig");
 const typemap = @import("typemap.zig");
 
 const CLIENT_LONG_PASSWORD = 0x00000001;
@@ -58,10 +59,16 @@ pub const Conn = struct {
     done: bool = false,
     ld_seq: u8 = 0,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
+    /// The login phase runs from the dial through the session's time zone.
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
+        self.login(host, user, password, database, tls_mode) catch |e| return self.wire.loginFailed(e, host, port);
+        self.wire.sessionUp();
+        return self;
+    }
 
+    fn login(self: *Conn, host: []const u8, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !void {
         const seq = try self.readPacket();
         const hs = try parseHandshake(self.wire.msg.items);
 
@@ -124,7 +131,6 @@ pub const Conn = struct {
             }
         }
         try self.exec(session_time_zone);
-        return self;
     }
 
     /// Run a statement that returns no result set (DDL). Errors on an ERR packet.
@@ -822,7 +828,7 @@ test "a server asking for the password in clear text on a plain connection is re
     var n: usize = 0;
     const t = try std.Thread.spawn(.{}, Srv.serve, .{ &listener, &got, &n });
     const port = listener.listen_address.getPort();
-    try std.testing.expectError(error.MysqlAuthFailed, Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "s3cret", "", .off));
+    try std.testing.expectError(error.MysqlAuthFailed, Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "s3cret", "", .off, .{}));
     t.join();
     try std.testing.expect(std.mem.indexOf(u8, got[0..n], "s3cret") == null);
 }
@@ -875,7 +881,7 @@ test "a session is set to UTC before connect returns, so a TIMESTAMP reads as Po
     var n: usize = 0;
     const t = try std.Thread.spawn(.{}, Srv.serve, .{ &listener, &first, &n });
     const port = listener.listen_address.getPort();
-    const c = Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "", "", .off);
+    const c = Conn.connect(std.testing.allocator, "127.0.0.1", port, "u", "", "", .off, .{});
     if (c) |x| x.close() else |_| {}
     t.join();
     _ = try c;

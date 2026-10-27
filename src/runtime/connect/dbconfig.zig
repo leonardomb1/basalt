@@ -23,8 +23,10 @@ pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 
 /// A connect failure's error name, with the server's or identity provider's own words
-/// when they refused the login.
+/// when they refused the login, or the host and phase when the login timed out.
 pub fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) ![]const u8 {
+    if (e == error.ConnectionTimedOut and driver.loginNote().len > 0)
+        return driver.connectorNoteAlloc(arena, "", e, driver.loginNote());
     if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver"))
         return driver.connectorNoteAlloc(arena, "", e, tds.lastError());
     if (e == error.AadTokenFailed) return driver.connectorNoteAlloc(arena, "", e, aad.lastError());
@@ -40,17 +42,17 @@ pub fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
         cfg.host = hi.host;
         if (!cfg.port_explicit) cfg.port = try ssrp.resolveInstancePort(gpa, hi.host, inst);
     }
-    if (cfg.auth == .sql) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls);
+    if (cfg.auth == .sql) return tds.Conn.connect(gpa, cfg.host, cfg.port, cfg.user, cfg.password, cfg.database, cfg.tls, cfg.timeouts());
     const mode: sql.TlsMode = if (cfg.tls == .off) .require else cfg.tls;
-    if (cfg.auth == .ntlm) return tds.Conn.connectNtlm(gpa, cfg.host, cfg.port, ntlmCredential(cfg), cfg.database, mode);
+    if (cfg.auth == .ntlm) return tds.Conn.connectNtlm(gpa, cfg.host, cfg.port, ntlmCredential(cfg), cfg.database, mode, cfg.timeouts());
     if (cfg.auth == .kerberos) {
         var realm_buf: [256]u8 = undefined;
         var spn_buf: [300]u8 = undefined;
         const cred = krb5.credential(cfg.user, cfg.password, cfg.realm, cfg.kdc, &realm_buf) orelse return error.LoginFailed;
         const spn = if (cfg.spn.len > 0) cfg.spn else try std.fmt.bufPrint(&spn_buf, "MSSQLSvc/{s}:{d}", .{ cfg.host, cfg.port });
-        return tds.Conn.connectKerberos(gpa, cfg.host, cfg.port, cred, spn, cfg.database, mode);
+        return tds.Conn.connectKerberos(gpa, cfg.host, cfg.port, cred, spn, cfg.database, mode, cfg.timeouts());
     }
-    if (cfg.token.len > 0) return tds.Conn.connectAad(gpa, cfg.host, cfg.port, cfg.token, cfg.database, mode);
+    if (cfg.token.len > 0) return tds.Conn.connectAad(gpa, cfg.host, cfg.port, cfg.token, cfg.database, mode, cfg.timeouts());
     const client_id = if (cfg.client_id.len > 0) cfg.client_id else aad.ado_client_id;
     var rbuf: ?[]u8 = null;
     defer if (rbuf) |b| gpa.free(b);
@@ -60,7 +62,7 @@ pub fn tdsConnect(gpa: std.mem.Allocator, cfg_in: DbConfig) !*tds.Conn {
     } else aad.sql_resource;
     const token = try aad.passwordToken(gpa, client_id, cfg.user, cfg.password, resource, .{});
     defer gpa.free(token);
-    return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode);
+    return tds.Conn.connectAad(gpa, cfg.host, cfg.port, token, cfg.database, mode, cfg.timeouts());
 }
 
 /// `user = 'DOMAIN\me'` carries the domain inline; an explicit `domain` wins,
@@ -80,8 +82,9 @@ fn ntlmCredential(cfg: DbConfig) ntlm.Credential {
 const DbCfg = struct {
     run: RunCfg,
 
-    pub fn value(self: DbCfg, comptime F: type, _: schema.Opt, e: *const ast.Expr) !?F {
+    pub fn value(self: DbCfg, comptime F: type, opt: schema.Opt, e: *const ast.Expr) !?F {
         if (F == u16) return try self.run.int(u16, e, "port");
+        if (F == u32) return try self.run.int(u32, e, opt.key);
         const v = try self.run.text(e);
         if (F == []const u8) return v;
         if (F == sql.TlsMode) return std.meta.stringToEnum(sql.TlsMode, v) orelse planErr(self.run.env.diag, env_mod.tls_values_msg);
@@ -126,4 +129,44 @@ test "a starrocks connection reads over MySQL: FE host and port, default 9030" {
         .{ .key = "fe_port", .value = &port, .pos = pos },
     } };
     try std.testing.expectEqual(@as(u16, 9031), (try resolveDbConfig(env, explicit, info.port)).port);
+}
+
+test "a server that accepts and never answers fails each database login within connect_timeout, naming host and phase" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const want = try msgfmt.allocPrint(a, "ConnectionTimedOut: 127.0.0.1:{d}: login did not answer within 1 s", .{port});
+    for ([_]SqlKind{ .postgres, .mysql, .sqlserver }) |kind| {
+        const cfg = DbConfig{ .host = "127.0.0.1", .port = port, .connect_timeout = 1 };
+        const e = if (@import("../connect.zig").connectSql(std.testing.allocator, kind, cfg)) |c| {
+            c.close();
+            return error.TestUnexpectedResult;
+        } else |e| e;
+        try std.testing.expectEqual(error.ConnectionTimedOut, e);
+        try std.testing.expectEqualStrings(want, try connectWhy(a, @tagName(kind), e));
+        try std.testing.expect(env_mod.isTransient(e));
+    }
+}
+
+test "connect_timeout and query_timeout are read as seconds into the connection's deadlines" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const env = try @import("testing_util.zig").testEnv(ar.allocator());
+    var host = ast.Expr{ .str_lit = "db" };
+    var ct = ast.Expr{ .int_lit = 5 };
+    var qt = ast.Expr{ .str_lit = "3600" };
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    const conn = ast.Connection{ .name = "pg", .connector = "postgres", .pos = pos, .config = &.{
+        .{ .key = "host", .value = &host, .pos = pos },
+        .{ .key = "connect_timeout", .value = &ct, .pos = pos },
+        .{ .key = "query_timeout", .value = &qt, .pos = pos },
+    } };
+    const cfg = try resolveDbConfig(env, conn, 5432);
+    try std.testing.expectEqual(driver.Timeouts{ .connect_s = 5, .query_s = 3600 }, cfg.timeouts());
+    const plain = try resolveDbConfig(env, .{ .name = "pg", .connector = "postgres", .pos = pos, .config = &.{.{ .key = "host", .value = &host, .pos = pos }} }, 5432);
+    try std.testing.expectEqual(driver.Timeouts{ .connect_s = 60, .query_s = 0 }, plain.timeouts());
 }

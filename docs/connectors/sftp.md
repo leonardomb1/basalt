@@ -14,7 +14,10 @@ LOAD INTO 'sftp://bank/remessa/pagamentos.csv' AS SELECT * FROM pagamentos;
 ```
 
 Options are `host port user password key_file key_passphrase known_hosts
-host_key`; `user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, and
+host_key connect_timeout query_timeout`; the timeouts work as a database's
+([Timeouts and dead peers](databases.md#timeouts-and-dead-peers)), the login
+deadline covering the SSH handshake, authentication and the SFTP version
+exchange. `user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, and
 the password is optional when a `key_file` logs in. The key is an OpenSSH
 Ed25519 key, passphrase-protected or not; an RSA key file is refused with that
 advice. Password and keyboard-interactive logins both work. Without a

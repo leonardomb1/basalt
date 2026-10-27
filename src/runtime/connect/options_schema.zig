@@ -29,21 +29,25 @@ pub const Kind = enum {
 
 pub const Opt = struct { key: []const u8, kind: Kind = .text };
 
+/// Seconds the login may go without an answer, and each read or write after it
+/// (`driver.Timeouts`); 0 is no limit.
+pub const timeouts = [_]Opt{ .{ .key = "connect_timeout", .kind = .count }, .{ .key = "query_timeout", .kind = .count } };
+
 pub const sftp = [_]Opt{
     .{ .key = "host" },     .{ .key = "port", .kind = .port }, .{ .key = "user" },        .{ .key = "password" },
     .{ .key = "key_file" }, .{ .key = "key_passphrase" },      .{ .key = "known_hosts" }, .{ .key = "host_key" },
-};
+} ++ timeouts;
 
 pub const smb = [_]Opt{
     .{ .key = "host" },  .{ .key = "port", .kind = .port }, .{ .key = "user" },  .{ .key = "password" }, .{ .key = "domain" },
     .{ .key = "share" }, .{ .key = "auth" },                .{ .key = "realm" }, .{ .key = "kdc" },      .{ .key = "spn" },
-};
+} ++ timeouts;
 
 pub const ftp = [_]Opt{ .{ .key = "host" }, .{ .key = "port", .kind = .port }, .{ .key = "user" }, .{ .key = "password" } };
 
 pub const sql = [_]Opt{
     .{ .key = "host" }, .{ .key = "port", .kind = .port }, .{ .key = "database" }, .{ .key = "user" }, .{ .key = "password" }, .{ .key = "tls" },
-};
+} ++ timeouts;
 
 pub const sqlserver = sql ++ [_]Opt{
     .{ .key = "auth" }, .{ .key = "domain" },    .{ .key = "realm" },    .{ .key = "kdc" },
@@ -344,14 +348,14 @@ test "every table lists its keys in the order unknownOptionMsg names them today"
     defer ar.deinit();
     const a = ar.allocator();
     const want = [_]struct { []const u8, []const u8 }{
-        .{ "sftp", "host, port, user, password, key_file, key_passphrase, known_hosts, host_key" },
-        .{ "smb", "host, port, user, password, domain, share, auth, realm, kdc, spn" },
+        .{ "sftp", "host, port, user, password, key_file, key_passphrase, known_hosts, host_key, connect_timeout, query_timeout" },
+        .{ "smb", "host, port, user, password, domain, share, auth, realm, kdc, spn, connect_timeout, query_timeout" },
         .{ "ftp", "host, port, user, password" },
-        .{ "postgres", "host, port, database, user, password, tls" },
-        .{ "mysql", "host, port, database, user, password, tls" },
-        .{ "sqlserver", "host, port, database, user, password, tls, auth, domain, realm, kdc, spn, client_id, resource, token" },
-        .{ "starrocks", "host, port, database, user, password, tls, fe_host, fe_port, be_url, load_url, buckets, replication_num, auto_create, label_prefix, load_size, compression" },
-        .{ "doris", "host, port, database, user, password, tls, fe_host, fe_port, be_url, load_url, buckets, replication_num, auto_create, label_prefix, load_size, compression" },
+        .{ "postgres", "host, port, database, user, password, tls, connect_timeout, query_timeout" },
+        .{ "mysql", "host, port, database, user, password, tls, connect_timeout, query_timeout" },
+        .{ "sqlserver", "host, port, database, user, password, tls, connect_timeout, query_timeout, auth, domain, realm, kdc, spn, client_id, resource, token" },
+        .{ "starrocks", "host, port, database, user, password, tls, connect_timeout, query_timeout, fe_host, fe_port, be_url, load_url, buckets, replication_num, auto_create, label_prefix, load_size, compression" },
+        .{ "doris", "host, port, database, user, password, tls, connect_timeout, query_timeout, fe_host, fe_port, be_url, load_url, buckets, replication_num, auto_create, label_prefix, load_size, compression" },
     };
     for (want) |w| {
         const c = try Fx.opts(a, w[0], "host = 'h'");
@@ -371,11 +375,11 @@ test "every table lists its keys in the order unknownOptionMsg names them today"
     try testing.expectEqual(@as(usize, 4), fileOpts("ftp").?.len);
 }
 
-test "integer kinds: port is u16, buckets and replication_num u32, the rest of the stream table text or flag" {
+test "integer kinds: port is u16, buckets, replication_num and the timeouts u32, the rest of the stream table text or flag" {
     for (stream) |o| {
         const want: Kind = if (std.mem.endsWith(u8, o.key, "port"))
             .port
-        else if (std.mem.eql(u8, o.key, "buckets") or std.mem.eql(u8, o.key, "replication_num"))
+        else if (std.mem.eql(u8, o.key, "buckets") or std.mem.eql(u8, o.key, "replication_num") or std.mem.endsWith(u8, o.key, "_timeout"))
             .count
         else if (std.mem.eql(u8, o.key, "auto_create"))
             .flag
@@ -386,7 +390,7 @@ test "integer kinds: port is u16, buckets and replication_num u32, the rest of t
     try testing.expectEqual(u16, Kind.port.Int());
     try testing.expectEqual(u32, Kind.count.Int());
     for ([_][]const Opt{ &sftp, &smb, &ftp, &sql, &sqlserver }) |tbl| for (tbl) |o|
-        try testing.expectEqual(if (std.mem.eql(u8, o.key, "port")) Kind.port else Kind.text, o.kind);
+        try testing.expectEqual(if (std.mem.eql(u8, o.key, "port")) Kind.port else if (std.mem.endsWith(u8, o.key, "_timeout")) Kind.count else Kind.text, o.kind);
 }
 
 test "cfgInt reads every value as the run's evalCfgInt did" {
@@ -572,6 +576,34 @@ test "checkLiterals on a SQL connection refuses a bad port and a computed text; 
     try testing.expectEqualStrings(options.literal_cfg_msg, try findingMsg(a, (try checkLiterals(a, &sql, order.config, .refuse)).?, order));
 }
 
+test "connect_timeout and query_timeout take whole seconds on every SQL, SMB and SFTP connection; check refuses anything else" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_][]const u8{ "postgres", "mysql", "sqlserver", "starrocks", "doris", "smb", "sftp" }) |connector| {
+        for ([_][]const u8{ "connect_timeout", "query_timeout" }) |key| {
+            for ([_][]const u8{ "0", "30", "'86400'" }) |v| {
+                const c = try Fx.opts(a, connector, try msgfmt.allocPrint(a, "host = 'h', {s} = {s}", .{ key, v }));
+                try testing.expect((try options.connectionProblem(a, c)) == null);
+                try testing.expect((try checkLiterals(a, forConnector(connector).?, c.config, .refuse)) == null);
+            }
+            const refused = [_]struct { []const u8, []const u8 }{
+                .{ "-1", options.int_cfg_kind_msg },
+                .{ "'soon'", options.int_cfg_msg },
+                .{ "env('T')", options.int_cfg_kind_msg },
+                .{ "4294967296", try options.rangeMsg(a, connector, key) },
+            };
+            for (refused) |w| {
+                const c = try Fx.opts(a, connector, try msgfmt.allocPrint(a, "host = 'h', {s} = {s}", .{ key, w[0] }));
+                try testing.expectEqualStrings(w[1], (try options.connectionProblem(a, c)).?);
+                try testing.expectEqualStrings(w[1], try findingMsg(a, (try checkLiterals(a, forConnector(connector).?, c.config, .refuse)).?, c));
+            }
+        }
+    }
+    const ftp_c = try Fx.opts(a, "ftp", "host = 'h', connect_timeout = 5");
+    try testing.expect(std.mem.indexOf(u8, (try options.connectionProblem(a, ftp_c)).?, "unknown option `connect_timeout`") != null);
+}
+
 test "checkLiterals on a StarRocks load agrees with checkSinkConnection, except a computed tls; a non-bool auto_create is refused" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -624,6 +656,10 @@ const LitReader = struct {
     pub fn value(_: LitReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
         const lit = Fx.LitCfg{};
         if (F == u16) return lit.port(e);
+        if (F == u32) return switch (cfgIntIn(u32, e)) {
+            .ok => |v| v,
+            .problem => error.BadOption,
+        };
         if (F == []const u8) return lit.str(e);
         const v = (try lit.str(e)) orelse return null;
         if (F == Fx.sqlmod.TlsMode) return try lit.tls(v);
@@ -660,7 +696,7 @@ const FileReader = struct {
         return error.UnknownOption;
     }
     pub fn value(self: FileReader, comptime F: type, _: Opt, e: *const ast.Expr) !?F {
-        if (F == u16) return switch (cfgIntIn(u16, e)) {
+        if (F == u16 or F == u32) return switch (cfgIntIn(F, e)) {
             .ok => |v| v,
             .problem => error.BadOption,
         };

@@ -22,6 +22,7 @@ const cell = @import("../exec/cell.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("sql.zig");
 const wire = @import("wire.zig");
+const driver = @import("../connect/driver.zig");
 const typemap = @import("typemap.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
@@ -33,13 +34,19 @@ pub const Conn = struct {
     cur_schema: *types.Schema = undefined,
     done: bool = false,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !*Conn {
-        const self = try wire.Conn.dial(Conn, gpa, host, port);
+    /// The login phase runs from the dial to the first ReadyForQuery.
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
+        self.login(host, user, password, database, tls_mode) catch |e| return self.wire.loginFailed(e, host, port);
+        self.wire.sessionUp();
+        return self;
+    }
+
+    fn login(self: *Conn, host: []const u8, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode) !void {
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         try self.startup(user, database);
         try self.authenticate(user, password);
-        return self;
     }
 
     /// SSLRequest (code 80877103): the server answers 'S' to start the TLS handshake
@@ -736,7 +743,7 @@ test "a bytea reads as BYTES in either output format and a time as TIME; timetz 
     const a = ar.allocator();
 
     {
-        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off);
+        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off, .{});
         const cur = try c.sqlConn().queryCursor("SELECT * FROM t");
         defer cur.close();
         const b = (try cur.nextBatch(a)).?;
@@ -758,7 +765,7 @@ test "a bytea reads as BYTES in either output format and a time as TIME; timetz 
         .{ .q = "SELECT * FROM late", .msg = "column \"at\": unparseable time value \"24:00:00\"" },
         .{ .q = "SELECT * FROM odd", .msg = "column \"raw\": unparseable bytes value \"\\x1\"" },
     }) |bad| {
-        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off);
+        const c = try Conn.connect(std.testing.allocator, "127.0.0.1", srv.port(), "u", "", "d", .off, .{});
         const cur = try c.sqlConn().queryCursor(bad.q);
         try std.testing.expectError(error.UnparseableNumber, cur.nextBatch(a));
         try std.testing.expectEqualStrings(bad.msg, cur.lastError());

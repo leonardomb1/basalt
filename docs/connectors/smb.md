@@ -13,8 +13,10 @@ SELECT * FROM 'smb://fs/fechamento/2026-10.xlsx';
 LOAD INTO 'smb://fs/exportacao/vendas.parquet' AS SELECT * FROM vendas;
 ```
 
-Options are `host port user password domain share realm kdc spn auth`;
-`user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, `domain` is the
+Options are `host port user password domain share realm kdc spn auth
+connect_timeout query_timeout`; the timeouts work as a database's
+([Timeouts and dead peers](databases.md#timeouts-and-dead-peers)), the login
+deadline covering NEGOTIATE and SESSION_SETUP. `user`/`password` follow the `NAME_USER`/`NAME_PASS` convention, `domain` is the
 account's (empty for one local to the server), and `port` is 445. Without a
 connection, `smb://[domain;]user@host/share/path` logs in as that user with
 `SMB_PASSWORD` (`SMB_USER` and `SMB_DOMAIN` filling what the URL leaves out).
