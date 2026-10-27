@@ -579,7 +579,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     errdefer parallel.abortLanes(sink_mode);
 
     var ctx = SqlMapJoinCtx{
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema },
         .predicates = sp.predicates,
         .src_schema = src_schema,
         .prefix = shape.prefix,

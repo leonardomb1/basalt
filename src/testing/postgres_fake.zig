@@ -12,7 +12,8 @@
 //! or table it does not hold is an ErrorResponse, as is any query holding `fail_on`,
 //! which then carries `fail_msg`; a query holding `drop_on` has its connection
 //! closed unanswered, as a server that went away mid-query; one holding `delay_on`
-//! is answered `delay_ms` late, as a slow query.
+//! is answered `delay_ms` late, as a slow query; one holding `retype_on` describes
+//! every column as `retype_oid`, as a server typing one query otherwise.
 //!
 //! For a key-range split it also reads a read wrapped as `(<read>) _alias` (the
 //! outer WHERE ignored but for `1 = 0`), an `ORDER BY …`/`LIMIT n` tail (ignored),
@@ -40,6 +41,8 @@ pub const FakePg = struct {
     drop_on: ?[]const u8 = null,
     delay_on: ?[]const u8 = null,
     delay_ms: u64 = 0,
+    retype_on: ?[]const u8 = null,
+    retype_oid: i32 = 25,
     stop: std.atomic.Value(bool) = .init(false),
     mutex: std.Thread.Mutex = .{},
     queries: std.array_list.Managed([]u8),
@@ -251,6 +254,9 @@ pub const FakePg = struct {
 
         const cols = try a.alloc(Col, picks.items.len);
         for (picks.items, cols) |i, *c| c.* = tbl.cols[i];
+        if (self.retype_on) |r| if (std.mem.indexOf(u8, text, r) != null) {
+            for (cols) |*c| c.oid = self.retype_oid;
+        };
         try describe(a, w, cols);
         const vals = try a.alloc(?[]const u8, picks.items.len);
         var sent: usize = 0;

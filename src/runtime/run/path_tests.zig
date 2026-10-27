@@ -225,3 +225,47 @@ test "path oracle: EXPLAIN names the path EXPLAIN ANALYZE takes" {
     for (select_cases) |c| held = try caseHolds(a, &tmp, base, srv.port(), c, false) and held;
     try testing.expect(held);
 }
+
+test "a key range typed otherwise than the probe fails its lane, on every split path" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "g,label\na,A\nb,B\nc,C\n" });
+
+    const cols = [_]@import("../../testing/postgres_fake.zig").Col{ .{ .name = "id", .oid = 20 }, .{ .name = "g" }, .{ .name = "v", .oid = 20 } };
+    const tables = [_]Table{.{ .name = "t", .cols = &cols, .rows = try pgRows(a), .key = "id", .est_rows = 3_000_000 }};
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+    srv.retype_on = " >= ";
+    srv.retype_oid = 701;
+
+    const queries = [_][]const u8{
+        "SELECT id, v FROM pg.public.t WHERE v > 1",
+        "SELECT t.id, k.label FROM pg.public.t t JOIN '$B/k.csv' k ON t.g = k.g",
+        "SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g",
+    };
+    for (queries) |q| {
+        const script = try msgfmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\nLOAD INTO '{s}/out.csv' SPLIT BY (id) AS {s};", .{ srv.port(), base, try std.mem.replaceOwned(u8, a, q, "$B", base) });
+        var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, script, &pd);
+        var diag = env_mod.Diag{};
+        var out = try Capture.begin(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+        var err = try Capture.begin(tmp.dir, std.posix.STDERR_FILENO, "stderr.txt");
+        const res = run(testing.allocator, prog, .{ .threads = 4, .log = .{ .quiet = true, .summary = .none } }, &diag);
+        const printed = try err.end(a);
+        _ = try out.end(a);
+        if (res) |_| {
+            std.debug.print("{s}\n{s}\n", .{ q, printed });
+            return error.TestExpectedError;
+        } else |e| {
+            testing.expectEqual(error.SplitSchemaChanged, e) catch |x| {
+                std.debug.print("{s}\n{s}\n{s}\n", .{ q, diag.msg, printed });
+                return x;
+            };
+            try testing.expect(std.mem.indexOf(u8, diag.msg, "as float, the probe as") != null);
+        }
+    }
+}

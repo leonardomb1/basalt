@@ -885,7 +885,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     defer freeMergeParts(env.gpa, parts);
     var ctx = SqlAggCtx{
         .agg = la,
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)) },
+        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = eff },
         .predicates = sp.predicates,
         .proj_select = pd.proj_select,
         .where_extra = pd.where_extra,

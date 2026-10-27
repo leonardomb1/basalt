@@ -75,6 +75,7 @@ pub const SplitCtx = struct {
     proj_select: ?[]const u8 = null,
     where_extra: ?[]const u8 = null,
     report: ?sql.Report = null,
+    want: ?*const types.Schema = null,
 };
 
 const ReadReport = struct {
@@ -132,12 +133,37 @@ pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []cons
     return openSqlQuery(ctx, gpa, q);
 }
 
+/// One key range's query, checked against `want`, the columns the lanes were planned
+/// on, when set.
 pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8) anyerror!driver.Source {
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
-    errdefer conn.close();
-    const s = try sql.Source.open(gpa, conn, query);
+    const s = sql.Source.open(gpa, conn, query) catch |e| {
+        conn.close();
+        return e;
+    };
     s.report = ctx.report;
+    if (ctx.want) |want| {
+        errdefer s.close();
+        try sameColumns(ctx.report, want.*, s.schema());
+    }
     return s.source();
+}
+
+/// A key range whose query came back with fewer columns, or a column of another
+/// type, than the probe read is an error: the lanes would read its values as the
+/// probed types. Extra trailing columns (a split key taken back) are not read.
+fn sameColumns(report: ?sql.Report, want: types.Schema, got: types.Schema) !void {
+    var buf: [256]u8 = undefined;
+    var names: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&names);
+    const msg = if (got.fields.len < want.fields.len)
+        msgfmt.clipPrint(&buf, "a key range's query returned {d} columns, the probe {d}", .{ got.fields.len, want.fields.len })
+    else for (want.fields, got.fields[0..want.fields.len]) |w, g| {
+        if (w.ty.eql(g.ty)) continue;
+        break msgfmt.clipPrint(&buf, "a key range's query returned column {s} as {s}, the probe as {s}", .{ g.name, try g.ty.name(fba.allocator()), try w.ty.name(fba.allocator()) });
+    } else return;
+    if (report) |r| r.f(r.ctx, error.SplitSchemaChanged, msg);
+    return error.SplitSchemaChanged;
 }
 
 pub const buildParallelSink = @import("connect/lane_sink.zig").buildParallelSink;

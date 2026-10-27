@@ -449,8 +449,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 var lane_stages = lin.stages;
                 var proj_select: ?[]const u8 = null;
                 var where_extra: ?[]const u8 = null;
+                var want: ?*const types.Schema = null;
                 if (stages[0].node == .read) {
                     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
+                    want = try schemaPtr(arena, src_schema);
                     const out_cols = try arena.alloc([]const u8, schema.fields.len);
                     for (schema.fields, out_cols) |f, *o| o.* = f.name;
                     const facts = try factsIfWanted(env, stages[0].node.read, env.sql_desc.?.dialect, middle, src_schema, true, .superset);
@@ -460,13 +462,14 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                         if (rebuildMapStages(env, mp.stages orelse middle, try schemaPtr(arena, ps))) |rs| {
                             lane_stages = rs;
                             proj_select = mp.proj_select;
+                            want = try schemaPtr(arena, ps);
                         }
                     }
                 }
 
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)) };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)), .want = want };
                 lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
