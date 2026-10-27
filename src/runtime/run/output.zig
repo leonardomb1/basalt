@@ -11,10 +11,6 @@ const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const buildPipeline = @import("../plan.zig").buildPipeline;
-const classifyAggPipeline = @import("../lanes.zig").classifyAggPipeline;
-const classifyLaneShape = @import("../lanes.zig").classifyLaneShape;
-const classifyMapJoinPipeline = @import("../lanes.zig").classifyMapJoinPipeline;
-const classifyWholeAgg = @import("../lanes.zig").classifyWholeAgg;
 const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
@@ -28,12 +24,7 @@ const hasFlagHint = @import("../env.zig").hasFlagHint;
 const hasSort = @import("../run.zig").hasSort;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const stampedBinding = @import("../plan.zig").stampedBinding;
-const isFolderRead = @import("../connect.zig").isFolderRead;
-const isLocalCsvRead = @import("../connect.zig").isLocalCsvRead;
-const isRecordRead = @import("../connect.zig").isRecordRead;
-const isParquetFileRead = @import("../connect.zig").isParquetFileRead;
 const keysPreferSerial = @import("../plan.zig").keysPreferSerial;
-const laneEligible = @import("../lanes.zig").laneEligible;
 const localRead = @import("../connect/source.zig").localRead;
 const mem_connector = @import("../connect.zig").mem_connector;
 const moveLabel = @import("../run.zig").moveLabel;
@@ -44,6 +35,7 @@ const openSink = @import("../connect.zig").openSink;
 const openSource = @import("../connect.zig").openSource;
 const openSplitSource = @import("../connect.zig").openSplitSource;
 const parallel = @import("../parallel.zig");
+const path = @import("../path.zig");
 const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
@@ -70,9 +62,7 @@ const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
 const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
-const unionBranchesAreReads = @import("../run.zig").unionBranchesAreReads;
 const unionCanon = @import("../plan.zig").unionCanon;
-const unionDownstreamMapOnly = @import("../plan.zig").unionDownstreamMapOnly;
 const unionExceptNames = @import("../plan.zig").unionExceptNames;
 const unionSpecs = @import("../plan.zig").unionSpecs;
 const wholeAggStages = @import("../lanes.zig").wholeAggStages;
@@ -162,10 +152,7 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
     const b = (try stampedBinding(env, name)) orelse return null;
-    if (b.stages.len < 2 or b.stages[0].node != .read) return null;
-    for (b.stages) |st| {
-        if (st.node == .aggregate) break;
-    } else return null;
+    if (!path.materializes(b.stages, opts.lanes())) return null;
 
     const inner = try env.arena.alloc(ast.Stage, b.stages.len + 1);
     @memcpy(inner[0..b.stages.len], b.stages);
@@ -214,8 +201,7 @@ fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
 const window_input = "__window_input";
 
 /// A window (or full sort) over a file reads its input first, in parallel, into
-/// memory, since built in place the read ran on one thread. Not when a filter follows
-/// the window: `WHERE rn <= k` keeps only `k` rows a partition as they stream.
+/// memory, since built in place the read ran on one thread (`path.windowInputAt`).
 fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const ast.Stage {
     var stages = stages_in;
     if (stages.len > 0 and stages[0].node == .ref) {
@@ -227,25 +213,11 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
         @memcpy(joined[b.stages.len..], stages[1..]);
         stages = joined;
     }
-    if (opts.lanes() < 2 or stages.len < 3 or !laneEligible(stages, opts)) return null;
-    const rd = stages[0].node.read;
-    if (!isLocalCsvRead(rd) and !isParquetFileRead(rd) and !isFolderRead(rd)) return null;
-    var wi: usize = 1;
-    var narrowed = false;
-    while (wi < stages.len - 1) : (wi += 1) switch (stages[wi].node) {
-        .filter => {},
-        .select => narrowed = true,
-        else => break,
-    };
-    switch (stages[wi].node) {
-        .window => |w| {
-            if (w.top_k != null) return null;
-            for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
-        },
-        .sort => if (wi + 1 < stages.len and stages[wi + 1].node == .limit and op.TopN.fits(stages[wi + 1].node.limit)) return null,
-        else => return null,
-    }
+    const wi = path.windowInputAt(stages, opts.lanes()) orelse return null;
     if (env.materialized.contains(window_input)) return null;
+    const narrowed = for (stages[1..wi]) |st| {
+        if (st.node == .select) break true;
+    } else false;
 
     var keep = std.array_list.Managed(ast.SelectItem).init(env.arena);
     if (!narrowed) if (try projectedColumns(env, stages[1..])) |cols| {
@@ -373,15 +345,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     stages = try descendLeadingWhere(env, stages);
 
-    if (stages[0].node == .union_ and opts.lanes() > 1 and
-        !std.mem.eql(u8, last.write.connector, "csv") and
-        unionBranchesAreReads(stages[0].node.union_) and
-        unionDownstreamMapOnly(stages[1 .. stages.len - 1]))
-    {
-        delegated.* = true;
-        return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
-    }
-
     var head_stages = stages;
     var inlined: usize = 0;
     while (head_stages[0].node == .ref and inlined < 16) : (inlined += 1) {
@@ -397,20 +360,27 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings, env.tables)) |h| head_stages = h;
         head_stages = try pruneKnown(env, head_stages);
     }
+    const chosen = try path.choose(arena, stages, head_stages, .{
+        .lanes = opts.lanes(),
+        .sink = last.write,
+        .source = path.sourceOf(stages[0], env.connections),
+        .head_source = path.sourceOf(head_stages[0], env.connections),
+    });
+    if (chosen == .union_split) {
+        delegated.* = true;
+        return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
+    }
     if (env.profile) |p| {
         try notePlan(env, p, head_stages);
         try notePlan(env, p, stages);
     }
-    if (laneEligible(head_stages, opts) and !try keysPreferSerial(env, head_stages)) {
-        if (classifyLaneShape(head_stages)) |shape| {
-            const rd = head_stages[0].node.read;
-            if (isParquetFileRead(rd) or isFolderRead(rd)) {
-                if (try runParquetLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
-            } else if (isLocalCsvRead(rd) or isRecordRead(rd)) {
-                if (try runCsvLane(env, head_stages, shape, last.write, opts, stats, lanes_used)) return;
-            }
-        }
+    if (chosen == .lanes and !try keysPreferSerial(env, head_stages)) {
+        const ln = chosen.lanes;
+        if (ln.source == .parquet) {
+            if (try runParquetLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
+        } else if (try runCsvLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
     }
+    const sql: ?path.Sql = if (chosen == .sql) chosen.sql else null;
 
     env.sql_desc = null;
     env.src_name = "";
@@ -425,7 +395,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     var whole_agg = false;
     if (env.sql_desc != null and src_base < env.sources.items.len) {
         var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
-        if (classifyWholeAgg(stages)) |shape| {
+        if (sql) |s| if (s.whole_agg) |shape| {
             if (try wholeAggStages(env, stages, shape, src_base, &why)) |ns| {
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
@@ -436,7 +406,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                 whole_agg = true;
                 if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
             }
-        }
+        };
         if (!whole_agg and hasAggregate(stages))
             env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.dialect), why });
     }
@@ -459,18 +429,18 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
 
     if (!whole_agg and !top_n and opts.lanes() > 1 and env.sql_desc != null) {
-        if (stages[0].node == .read) {
-            if (classifyAggPipeline(stages)) |shape| {
-                if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return;
-            } else if (classifyMapJoinPipeline(stages)) |js| {
+        if (sql) |s| switch (s.split) {
+            .agg => |shape| if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
+            .map_join => |js| {
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
                 if (env.sources.items.len == src_base) {
                     env.sql_desc = null;
                     res.op.release();
                     res = try buildPipeline(env, stages[0 .. stages.len - 1]);
                 }
-            }
-        }
+            },
+            .map, .none => {},
+        };
         if (try op.linearize(arena, res.op)) |lin| {
             if (try planSplit(env, env.sql_desc.?, stages[0], opts.lanes(), wr)) |sp| {
                 const schema = try dupeSchema(arena, res.schema);
@@ -618,4 +588,5 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         try bstages.append(.{ .node = .{ .write = bw }, .hints = write_stage.hints, .pos = write_stage.pos });
         try runOutput(env, .{ .stages = try bstages.toOwnedSlice(), .pos = u.pos }, opts, stats, lanes_used, batch_arena);
     }
+    if (env.profile) |p| p.path = try msgfmt.allocPrint(arena, "union split-parallel, {d} branches", .{specs.len});
 }

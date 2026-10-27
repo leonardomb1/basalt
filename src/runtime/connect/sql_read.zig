@@ -279,6 +279,16 @@ fn splitHints(stage: ast.Stage) SplitHints {
     return h;
 }
 
+/// Whether `lead`'s SQL read may be cut into key ranges as far as its hints and the
+/// sink tell: a key named, or a table's primary key asked; into a PostgreSQL COPY
+/// sink only when a key or a count is named. The key and the size are the run's.
+pub fn splitMayCut(lead: ast.Stage, pg_copy: bool) bool {
+    const h = splitHints(lead);
+    if (h.count) |n| if (n < 2) return false;
+    if (h.col == null and h.count == null and pg_copy) return false;
+    return h.col != null or (lead.node == .read and lead.node.read.form == .table);
+}
+
 fn isPostgresCopySink(env: *Env, w: ast.Write) bool {
     return w.mode != .upsert and std.mem.eql(u8, connectorType(env, w.connector), "postgres");
 }
@@ -288,9 +298,8 @@ fn isPostgresCopySink(env: *Env, w: ast.Write) bool {
 pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: ast.Write) !?split.Plan {
     const hints = splitHints(lead);
     const forced = hints.col != null or hints.count != null;
+    if (!splitMayCut(lead, isPostgresCopySink(env, w))) return null;
     const m: usize = hints.count orelse @min(@as(usize, 64), threads * 4);
-    if (m < 2) return null;
-    if (!forced and isPostgresCopySink(env, w)) return null;
 
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };

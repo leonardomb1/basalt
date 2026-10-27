@@ -72,7 +72,7 @@ const dupeSchema = @import("connect.zig").dupeSchema;
 
 const projectedColumns = @import("plan.zig").projectedColumns;
 
-const LaneShape = union(enum) {
+pub const LaneShape = union(enum) {
     agg: AggShape,
     agg_join: AggJoinShape,
     distinct: DistinctShape,
@@ -93,21 +93,12 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
     return null;
 }
 
-/// Preconditions every lane path shares. A hinted read is left to the paths that honour
-/// the hint: any hint used to keep a read serial while EXPLAIN called it morsel-parallel.
-pub fn laneEligible(stages: []const ast.Stage, opts: RunOptions) bool {
-    return opts.lanes() > 1 and stages.len >= 2 and
-        stages[0].node == .read and analyze.laneHints(stages[0]);
-}
-
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!shapeLaneSafe(shape)) return false;
     const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse return false;
     return runShape(env, split, shape, w, opts, stats, lanes_used);
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    if (!shapeLaneSafe(shape)) return false;
     var rd = stages[0].node.read;
     if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
     const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse return false;
@@ -125,7 +116,7 @@ fn pushStages(stages: []const ast.Stage, shape: LaneShape) []const ast.Stage {
     };
 }
 
-fn shapeLaneSafe(shape: LaneShape) bool {
+pub fn shapeLaneSafe(shape: LaneShape) bool {
     return switch (shape) {
         .map_join => |x| mapJoinKindLaneSafe(x.join.kind),
         else => true,
@@ -143,7 +134,7 @@ fn runShape(env: *Env, split: LaneSplit, shape: LaneShape, w: ast.Write, opts: R
     };
 }
 
-const AggShape = struct { prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage };
+pub const AggShape = struct { prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage };
 
 /// Recognize `read … | (filter|select)* | aggregate | tail | write`. A `select` or
 /// `filter` after the aggregate (a reordering projection, HAVING) is applied by `writeTail`;
@@ -250,7 +241,7 @@ const classifyAggJoinPipeline = @import("lanes/agg.zig").classifyAggJoinPipeline
 const runParallelAgg = @import("lanes/agg.zig").runParallelAgg;
 pub const runParallelSqlAgg = @import("lanes/agg.zig").runParallelSqlAgg;
 const classifyMapPipeline = @import("lanes/map.zig").classifyMapPipeline;
-const MapJoinShape = @import("lanes/map.zig").MapJoinShape;
+pub const MapJoinShape = @import("lanes/map.zig").MapJoinShape;
 pub const classifyMapJoinPipeline = @import("lanes/map.zig").classifyMapJoinPipeline;
 pub const joinKindLaneSafe = @import("lanes/map.zig").joinKindLaneSafe;
 const mapJoinKindLaneSafe = @import("lanes/map.zig").mapJoinKindLaneSafe;

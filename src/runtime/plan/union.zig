@@ -238,14 +238,6 @@ fn dropExcept(arena: std.mem.Allocator, schema: types.Schema, except: []const []
     return .{ .fields = try kept.toOwnedSlice() };
 }
 
-pub fn unionDownstreamMapOnly(stages: []const ast.Stage) bool {
-    for (stages) |s| switch (s.node) {
-        .filter, .select, .explode => {},
-        else => return false,
-    };
-    return true;
-}
-
 /// `... WHERE rn <= k` over a `ROW_NUMBER()` binding: rebuild its window with
 /// `top_k`. Sorting every row took 2 GB and 6 s over 10M rows; null if inapplicable.
 /// Past `Window.max_top_k` the window's parallel sort is as fast (k = 1M of 2M rows

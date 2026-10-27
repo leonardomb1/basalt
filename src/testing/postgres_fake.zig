@@ -13,6 +13,11 @@
 //! which then carries `fail_msg`; a query holding `drop_on` has its connection
 //! closed unanswered, as a server that went away mid-query; one holding `delay_on`
 //! is answered `delay_ms` late, as a slow query.
+//!
+//! For a key-range split it also reads a read wrapped as `(<read>) _alias` (the
+//! outer WHERE ignored but for `1 = 0`), an `ORDER BY …`/`LIMIT n` tail (ignored),
+//! `SELECT MIN("k") AS lo, MAX("k") AS hi` over an integer column, and the
+//! `pg_index` primary-key question for a table given a `key` and `est_rows`.
 
 const std = @import("std");
 
@@ -22,6 +27,8 @@ pub const Table = struct {
     name: []const u8,
     cols: []const Col,
     rows: []const []const ?[]const u8,
+    key: ?[]const u8 = null,
+    est_rows: i64 = 0,
 };
 
 pub const FakePg = struct {
@@ -164,18 +171,70 @@ pub const FakePg = struct {
         }
     }
 
-    fn answer(self: *FakePg, a: std.mem.Allocator, w: *std.Io.Writer, text: []const u8) !void {
-        if (self.fail_on) |f| if (std.mem.indexOf(u8, text, f) != null) return failure(a, w, self.fail_msg);
-        if (!std.mem.startsWith(u8, text, "SELECT ")) return failure(a, w, "syntax error");
-        const from = std.mem.indexOf(u8, text, " FROM ") orelse return failure(a, w, "syntax error");
-        const list = text["SELECT ".len..from];
-        const rest = text[from + " FROM ".len ..];
+    const Src = struct { tbl: ?Table, where: []const u8, name: []const u8, list: []const u8 = "*" };
+
+    /// The table, WHERE and columns a query's text past ` FROM ` reads: a table, or
+    /// a read wrapped as `(<read>) _alias`, whose own WHERE and columns apply.
+    fn source(self: *FakePg, a: std.mem.Allocator, rest_in: []const u8) !Src {
+        var rest = rest_in;
+        if (rest.len > 0 and rest[0] == '(') {
+            var depth: usize = 0;
+            const close = for (rest, 0..) |c, i| {
+                if (c == '(') depth += 1;
+                if (c == ')') {
+                    depth -= 1;
+                    if (depth == 0) break i;
+                }
+            } else rest.len;
+            const inner = rest[1..@min(close, rest.len)];
+            const from = std.mem.indexOf(u8, inner, " FROM ") orelse return .{ .tbl = null, .where = "", .name = inner };
+            var in_src = try self.source(a, inner[from + " FROM ".len ..]);
+            if (std.mem.startsWith(u8, inner, "SELECT ")) in_src.list = inner["SELECT ".len..from];
+            const outer = if (close < rest.len) rest[close + 1 ..] else "";
+            const ow = std.mem.indexOf(u8, outer, " WHERE ") orelse return in_src;
+            if (std.mem.indexOf(u8, outer[ow..], "1 = 0") == null) return in_src;
+            in_src.where = try std.fmt.allocPrint(a, "{s} AND 1 = 0", .{in_src.where});
+            return in_src;
+        }
+        for ([_][]const u8{ " ORDER BY ", " LIMIT " }) |tail| {
+            if (std.mem.indexOf(u8, rest, tail)) |i| rest = rest[0..i];
+        }
         const where_at = std.mem.indexOf(u8, rest, " WHERE ");
         const tname = unquote(lastPart(rest[0 .. where_at orelse rest.len]));
         const where = if (where_at) |i| rest[i + " WHERE ".len ..] else "";
-        const tbl = for (self.tables) |tb| {
-            if (std.mem.eql(u8, tb.name, tname)) break tb;
-        } else return failure(a, w, try std.fmt.allocPrint(a, "relation \"{s}\" does not exist", .{tname}));
+        for (self.tables) |tb| {
+            if (std.mem.eql(u8, tb.name, tname)) return .{ .tbl = tb, .where = where, .name = tname };
+        }
+        return .{ .tbl = null, .where = where, .name = tname };
+    }
+
+    /// The primary-key question a split asks: the key's name and type and the
+    /// table's estimated rows, for the first keyed table the query names.
+    fn answerKey(self: *FakePg, a: std.mem.Allocator, w: *std.Io.Writer, text: []const u8) !void {
+        const cols = [_]Col{ .{ .name = "attname" }, .{ .name = "typname" }, .{ .name = "reltuples", .oid = 20 } };
+        try describe(a, w, &cols);
+        var sent: usize = 0;
+        for (self.tables) |tb| {
+            const k = tb.key orelse continue;
+            if (std.mem.indexOf(u8, text, try std.fmt.allocPrint(a, "\"{s}\"", .{tb.name})) == null) continue;
+            try dataRow(a, w, &.{ k, "int8", try std.fmt.allocPrint(a, "{d}", .{tb.est_rows}) });
+            sent = 1;
+            break;
+        }
+        try message(w, 'C', try std.fmt.allocPrint(a, "SELECT {d}\x00", .{sent}));
+    }
+
+    fn answer(self: *FakePg, a: std.mem.Allocator, w: *std.Io.Writer, text: []const u8) !void {
+        if (self.fail_on) |f| if (std.mem.indexOf(u8, text, f) != null) return failure(a, w, self.fail_msg);
+        if (std.mem.indexOf(u8, text, "pg_index") != null) return self.answerKey(a, w, text);
+        if (!std.mem.startsWith(u8, text, "SELECT ")) return failure(a, w, "syntax error");
+        const from = std.mem.indexOf(u8, text, " FROM ") orelse return failure(a, w, "syntax error");
+        const src = try self.source(a, text[from + " FROM ".len ..]);
+        const outer_list = text["SELECT ".len..from];
+        const list = if (std.mem.eql(u8, outer_list, "*")) src.list else outer_list;
+        const tbl = src.tbl orelse return failure(a, w, try std.fmt.allocPrint(a, "relation \"{s}\" does not exist", .{src.name}));
+        const where = src.where;
+        if (std.mem.startsWith(u8, list, "MIN(")) return answerMinMax(a, w, tbl, list, where);
 
         var picks = std.array_list.Managed(usize).init(a);
         if (std.mem.eql(u8, list, "*")) {
@@ -190,37 +249,70 @@ pub const FakePg = struct {
             }
         }
 
-        var desc = std.array_list.Managed(u8).init(a);
-        try desc.writer().writeInt(i16, @intCast(picks.items.len), .big);
-        for (picks.items) |i| {
-            try desc.appendSlice(tbl.cols[i].name);
-            try desc.append(0);
-            try desc.writer().writeInt(i32, 0, .big);
-            try desc.writer().writeInt(i16, 0, .big);
-            try desc.writer().writeInt(i32, tbl.cols[i].oid, .big);
-            try desc.writer().writeInt(i16, -1, .big);
-            try desc.writer().writeInt(i32, -1, .big);
-            try desc.writer().writeInt(i16, 0, .big);
-        }
-        try message(w, 'T', desc.items);
-
+        const cols = try a.alloc(Col, picks.items.len);
+        for (picks.items, cols) |i, *c| c.* = tbl.cols[i];
+        try describe(a, w, cols);
+        const vals = try a.alloc(?[]const u8, picks.items.len);
         var sent: usize = 0;
         for (tbl.rows) |row| {
             if (!try keeps(a, tbl, row, where)) continue;
-            var d = std.array_list.Managed(u8).init(a);
-            try d.writer().writeInt(i16, @intCast(picks.items.len), .big);
-            for (picks.items) |i| {
-                if (row[i]) |v| {
-                    try d.writer().writeInt(i32, @intCast(v.len), .big);
-                    try d.appendSlice(v);
-                } else try d.writer().writeInt(i32, -1, .big);
-            }
-            try message(w, 'D', d.items);
+            for (picks.items, vals) |i, *v| v.* = row[i];
+            try dataRow(a, w, vals);
             sent += 1;
         }
         try message(w, 'C', try std.fmt.allocPrint(a, "SELECT {d}\x00", .{sent}));
     }
 };
+
+/// `SELECT MIN("k") AS lo, MAX("k") AS hi` over the rows `where` keeps, `k` an
+/// integer column; nulls when none is.
+fn answerMinMax(a: std.mem.Allocator, w: *std.Io.Writer, tbl: Table, list: []const u8, where: []const u8) !void {
+    const close = std.mem.indexOfScalar(u8, list, ')') orelse return failure(a, w, "syntax error");
+    const ci = colIndex(tbl, unquote(list["MIN(".len..close])) orelse return failure(a, w, "column does not exist");
+    var lo: ?i64 = null;
+    var hi: ?i64 = null;
+    for (tbl.rows) |row| {
+        if (!try keeps(a, tbl, row, where)) continue;
+        const v = std.fmt.parseInt(i64, row[ci] orelse continue, 10) catch continue;
+        lo = if (lo) |x| @min(x, v) else v;
+        hi = if (hi) |x| @max(x, v) else v;
+    }
+    const cols = [_]Col{ .{ .name = "lo", .oid = 20 }, .{ .name = "hi", .oid = 20 } };
+    try describe(a, w, &cols);
+    try dataRow(a, w, &.{
+        if (lo) |x| try std.fmt.allocPrint(a, "{d}", .{x}) else null,
+        if (hi) |x| try std.fmt.allocPrint(a, "{d}", .{x}) else null,
+    });
+    try message(w, 'C', "SELECT 1\x00");
+}
+
+fn describe(a: std.mem.Allocator, w: *std.Io.Writer, cols: []const Col) !void {
+    var desc = std.array_list.Managed(u8).init(a);
+    try desc.writer().writeInt(i16, @intCast(cols.len), .big);
+    for (cols) |c| {
+        try desc.appendSlice(c.name);
+        try desc.append(0);
+        try desc.writer().writeInt(i32, 0, .big);
+        try desc.writer().writeInt(i16, 0, .big);
+        try desc.writer().writeInt(i32, c.oid, .big);
+        try desc.writer().writeInt(i16, -1, .big);
+        try desc.writer().writeInt(i32, -1, .big);
+        try desc.writer().writeInt(i16, 0, .big);
+    }
+    try message(w, 'T', desc.items);
+}
+
+fn dataRow(a: std.mem.Allocator, w: *std.Io.Writer, vals: []const ?[]const u8) !void {
+    var d = std.array_list.Managed(u8).init(a);
+    try d.writer().writeInt(i16, @intCast(vals.len), .big);
+    for (vals) |v| {
+        if (v) |x| {
+            try d.writer().writeInt(i32, @intCast(x.len), .big);
+            try d.appendSlice(x);
+        } else try d.writer().writeInt(i32, -1, .big);
+    }
+    try message(w, 'D', d.items);
+}
 
 /// Whether `row` passes the parts of `where` this server reads: `1 = 0`, and each
 /// `"col" IN (…)` of literals.

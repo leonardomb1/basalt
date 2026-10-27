@@ -30,7 +30,7 @@ the schema it yields, `EXPLAIN ANALYZE` with what it measured.
 $ basalt run -c "EXPLAIN SELECT g, COUNT(*) AS c FROM 'x.parquet' GROUP BY g;"
 Summary
   Sink: stdout (default)
-  Path: morsel-parallel candidate (per-lane partials, combined)
+  Path: parquet parallel aggregate, unless it holds one row group
 plan
 └─ aggregate (#1)  by g; count(*)
    │  schema: g:string?  c:int
@@ -63,13 +63,21 @@ plan (actuals)
             rows: 500.0K (500000)   batches: 6   rows per lane [min=83.3K (83333), max=166.7K (166667)]
 ```
 
-`EXPLAIN`'s `Path:` line names the fan-out the plan is eligible for: `split-parallel`
-for a SQL read divided into key ranges, `morsel-parallel` for a local CSV divided
-into byte-range chunks or a parquet divided into row groups, `serial` for
-everything else (a CSV over HTTP is fetched whole, so it parses serially). Both
-stay "candidate" because what settles it is inside the source — a table's key and
-size, a CSV that quotes a newline, a parquet with one row group — and neither
-`EXPLAIN` nor `check` reads that far.
+`EXPLAIN`'s `Path:` line names the path the run takes, in the words `EXPLAIN
+ANALYZE` uses once it has: both come from the one decision the run dispatches on.
+`csv parallel …` / `parquet parallel …` is a local CSV cut into byte-range chunks
+or a Parquet into row groups, with the shape the lanes run (`map`, `map+join`,
+`aggregate`, `aggregate over joins`, `distinct`, `top-n`); `postgres
+split-parallel …` is a SQL read divided into key ranges; a SQL source's aggregate
+or `ORDER BY … LIMIT` sent to the source comes first, then the split, each
+`unless` what would send it to the next; `… read into memory first (…), then
+serial` is a window's input or an aggregating CTE read on its own path ahead of a
+serial rest; `serial` is everything else (a CSV over HTTP is fetched whole, so it
+parses serially; an `UNNEST` or a `LIMIT` without `ORDER BY` over a file streams
+on one lane). A parallel path names what only the source can settle — a table's
+key and size, a CSV that quotes a newline, a Parquet with one row group, a join
+build past `--op-memory` — as the condition that would keep it serial, since
+neither `EXPLAIN` nor `check` reads that far. At `-j 1` every path is `serial`.
 
 A source whose schema only the source itself can describe — a database table, a
 remote object — reads `schema: unresolved`, said once at the scan rather than
@@ -84,7 +92,7 @@ shows that it filters at the source:
 $ basalt run -c "... EXPLAIN SELECT o.id, c.nm FROM pg.orders o JOIN active(1) c ON o.cid = c.cid;"
 Summary
   Sink: stdout (default)
-  Path: split-parallel candidate
+  Path: postgres split-parallel map+join, unless the table has no integer, date or uuid key or under 2M rows or the join's build side is past --op-memory
 plan
 └─ project (#1)  id, nm
    └─ join (#2)  inner on cid = cid

@@ -775,7 +775,6 @@ pub const synthReconcile = @import("plan/union.zig").synthReconcile;
 pub const unionSpecs = @import("plan/union.zig").unionSpecs;
 pub const unionCanon = @import("plan/union.zig").unionCanon;
 pub const setOpName = @import("plan/union.zig").setOpName;
-pub const unionDownstreamMapOnly = @import("plan/union.zig").unionDownstreamMapOnly;
 const windowTopK = @import("plan/union.zig").windowTopK;
 pub const unionExceptNames = @import("plan/union.zig").unionExceptNames;
 const buildUnion = @import("plan/union.zig").buildUnion;

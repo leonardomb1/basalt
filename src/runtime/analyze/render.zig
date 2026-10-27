@@ -16,14 +16,15 @@ const Stage = @import("../analyze.zig").Stage;
 const Output = @import("../analyze.zig").Output;
 const Source = @import("../analyze.zig").Source;
 const Physical = @import("../analyze.zig").Physical;
+const op = @import("../../exec/op.zig");
 const analyze = @import("../analyze.zig").analyze;
 const parse = @import("../analyze.zig").parse;
 
 /// The plan as `EXPLAIN ANALYZE` lays it out, without the figures: a summary naming
 /// the sink and the path, then the operators as a tree, root first and source
 /// deepest, numbered in the order they print, each with its SQL and the schema it
-/// yields. A split or morsel fan-out prints as a candidate: only the source or file
-/// can settle it.
+/// yields. The path is the one the run takes (`path.choose`); what only the source
+/// or the file can settle prints as the condition that would keep it serial.
 pub fn render(plan: Plan, w: anytype) !void {
     for (plan.outputs) |o| {
         try w.writeAll("Summary\n  Sink: ");
@@ -92,19 +93,54 @@ fn childPrefix(buf: []u8, prefix: []const u8, last: bool) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, if (last) "   " else "│  " }) catch prefix;
 }
 
+/// The path in the words `EXPLAIN ANALYZE` names the one it took, each parallel one
+/// with what the run may still find that keeps it serial, and a SQL source's chain in
+/// the order the run tries it.
 fn physical(w: anytype, ph: Physical) !void {
-    if (ph.splittable) {
-        try w.writeAll("split-parallel candidate");
-        if (ph.sink_parallel) try w.writeAll(", per-lane sink");
-    } else if (ph.morsel_parallel) {
-        try w.writeAll("morsel-parallel candidate");
-        if (ph.has_breaker) try w.writeAll(" (per-lane partials, combined)");
-    } else {
-        try w.writeAll("serial");
-        if (ph.top_n) |n| {
-            if (ph.has_breaker) try w.print(" (top-N pushed, sorts at most {d} rows)", .{n}) else try w.print(" (limit pushed, at most {d} rows arrive)", .{n});
-        } else if (ph.has_breaker) try w.writeAll(" (has breaker, materializes)");
+    if (ph.prelude) |p| {
+        try w.print("{s} read into memory first (", .{p.what});
+        try physical(w, p.inner.*);
+        return w.writeAll("), then serial");
     }
+    switch (ph.path) {
+        .serial => try serial(w, ph),
+        .union_split => try w.writeAll("union split-parallel, each branch split on its own"),
+        .lanes => |l| {
+            try w.print("{s} parallel {s}, unless {s}", .{ @tagName(l.source), switch (l.shape) {
+                .map => "map",
+                .map_join => "map+join",
+                .agg => "aggregate",
+                .agg_join => "aggregate over joins",
+                .top_n => "top-n",
+                .distinct => "distinct",
+            }, if (ph.veto.len > 0) ph.veto else "the file cannot be mapped" });
+            if (ph.keys_serial) try w.print(" or the file is under {d} MB, so the join's SQL side takes its keys", .{op.default_prefetch_bytes >> 20});
+            if (l.shape == .map_join or l.shape == .agg_join) try w.writeAll(" or the join's build side is past --op-memory");
+        },
+        .sql => |s| {
+            if (s.whole_agg != null) {
+                try w.print("serial; the aggregate runs in the source, unless {s} cannot run it; else ", .{ph.sql_kind});
+            } else if (s.top_n) if (ph.top_n) |t| {
+                try w.print("serial; ORDER BY ... LIMIT runs in the source ({s} at most {d} rows)", .{ if (t.sorted) "sorts" else "reads", t.rows });
+                if (t.sorted) try w.print(", unless a sort key is text, which {s} orders by collation", .{ph.sql_kind});
+                try w.writeAll("; else ");
+            };
+            const what = switch (s.split) {
+                .none => return serial(w, ph),
+                .map => "",
+                .agg => " aggregate",
+                .map_join => " map+join",
+            };
+            try w.print("{s} split-parallel{s}{s}, unless ", .{ ph.sql_kind, what, if (ph.sink_parallel) " with a per-lane sink" else "" });
+            try w.writeAll(if (ph.split_forced) "the key holds fewer than two values" else "the table has no integer, date or uuid key or under 2M rows");
+            if (s.split == .map_join) try w.writeAll(" or the join's build side is past --op-memory");
+        },
+    }
+}
+
+fn serial(w: anytype, ph: Physical) !void {
+    try w.writeAll("serial");
+    if (ph.has_breaker) try w.writeAll(" (has breaker, materializes)");
 }
 
 /// Why `APPEND` cannot be honoured for a file target, or null: a parquet footer is

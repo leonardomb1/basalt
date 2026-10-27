@@ -12,11 +12,11 @@
 //! `EXPLAIN` prints the plan that runs: the same param substitution into filters
 //! (a `$param` reaches pushdown as its value, never as a column), the same binding
 //! inlining and pushdown rewrite, the same `joinPlan`, the same `THROW` guards and
-//! body-statement rule, and the same physical labels. `splittable` is the SQL
-//! key-range fan-out (map-only, an aggregate with a sort/limit tail, map+join);
-//! `morsel_parallel` is a file read cut into byte ranges or row groups. Both were
-//! once mislabelled `serial` while the run fanned out, so the predicates here are
-//! the ones the runtime asks.
+//! body-statement rule, and the same path: `Physical.path` is `path.choose`, the
+//! function the run dispatches on, asked over the stages as the run holds them at
+//! each step (an aggregating binding or a window's input read first, the head
+//! binding laid out for lanes, a `SPLIT BY` key on the read). Separate heuristics
+//! here once named a parallel path the run never took, and the reverse.
 //!
 //! Binding order: PARAMs (with `-p` overrides typed as the run binds them), then
 //! statement-level LETs in declaration order as expressions; a query LET is an
@@ -65,6 +65,10 @@ const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
 const holes = @import("analyze/holes.zig");
 const msgfmt = @import("../format/msgfmt.zig");
+const pathmod = @import("path.zig");
+const splitMayCut = @import("connect/sql_read.zig").splitMayCut;
+const connect = @import("connect.zig");
+const csv = @import("../format/csv.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -337,8 +341,9 @@ pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
 pub const archiveProblem = @import("analyze/targets.zig").archiveProblem;
-pub const laneHints = @import("analyze/targets.zig").laneHints;
-const morselParallelRead = @import("analyze/targets.zig").morselParallelRead;
+const mayDivide = @import("analyze/targets.zig").mayDivide;
+const sourceVeto = @import("analyze/targets.zig").sourceVeto;
+const downloaded = @import("analyze/targets.zig").downloaded;
 const offlineSchema = @import("analyze/targets.zig").offlineSchema;
 const offlineTable = @import("analyze/targets.zig").offlineTable;
 pub const lakeAt = @import("analyze/targets.zig").lakeAt;
@@ -377,12 +382,23 @@ pub const Stage = struct {
     out_schema: ?types.Schema = null,
 };
 
+/// The path `path.choose` picks for the run, with what EXPLAIN says of the
+/// conditions only the run settles.
 pub const Physical = struct {
-    has_breaker: bool,
-    splittable: bool,
-    sink_parallel: bool,
-    morsel_parallel: bool,
-    top_n: ?u64 = null,
+    path: pathmod.Path,
+    /// A binding or the window's input read into memory first, on `inner`'s path.
+    prelude: ?struct { what: []const u8, inner: *const Physical } = null,
+    has_breaker: bool = false,
+    sink_parallel: bool = false,
+    /// The `ORDER BY … LIMIT` a SQL read is sent, as far as offline analysis tells.
+    top_n: ?struct { rows: u64, sorted: bool } = null,
+    /// The SQL driver a descent or split names, as the run does (`postgres`).
+    sql_kind: []const u8 = "",
+    split_forced: bool = false,
+    /// What only the run learns of a file that keeps its lanes serial.
+    veto: []const u8 = "",
+    /// A join's SQL side may take a small local file's keys, which keeps it serial.
+    keys_serial: bool = false,
 };
 
 pub const Output = struct {
@@ -842,6 +858,8 @@ pub const Options = struct {
     /// The run's tables, which a local lake table `check` reads is resolved into,
     /// for the run's first statement reading it to read as is.
     tables: ?*lake.Memo = null,
+    /// The lanes the run takes (`-j`), which EXPLAIN names the path for.
+    lanes: usize = 2,
 };
 
 pub fn analyzeOpts(arena: std.mem.Allocator, raw_program: ast.Program, opts: Options, diag: *Diag) error{ AnalyzeFailed, OutOfMemory }!Plan {
@@ -970,7 +988,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     try writtenFiles(arena, program.stmts[1..], &written);
     var json_params = std.array_list.Managed([]const u8).init(arena);
     for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.append(s.param.name);
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items, .tables = opts.tables };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items, .tables = opts.tables, .lanes = opts.lanes };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -1109,8 +1127,9 @@ pub fn analyzeOne(
     params: *const std.StringHashMap(*const ast.Expr),
     diag: *Diag,
     tables: ?*lake.Memo,
+    lanes: usize,
 ) Error!Plan {
-    var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag, .tables = tables };
+    var ctx = Ctx{ .arena = arena, .bindings = bindings, .connections = connections, .params = params, .diag = diag, .tables = tables, .lanes = lanes };
     const outs = try arena.alloc(Output, 1);
     outs[0] = try ctx.analyzeOutput(pipe);
     return .{ .outputs = outs };
@@ -1128,6 +1147,8 @@ const Ctx = struct {
     written: []const []const u8 = &.{},
     json_params: ?[]const []const u8 = null,
     tables: ?*lake.Memo = null,
+    /// The lanes the run takes; past one, a pipeline may fan out.
+    lanes: usize = 2,
 
     /// A table function's body, typed where it is declared with each parameter a null
     /// of its declared type, so one nothing calls is checked too. A problem a call
@@ -1318,7 +1339,8 @@ const Ctx = struct {
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
         errdefer self.diag.stamp(pipe.pos);
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
-        const head = try self.inlineHead(try bindLimits(self.arena, pipe.stages, self.params, self.diag));
+        const raw = try bindLimits(self.arena, pipe.stages, self.params, self.diag);
+        const head = try self.inlineHead(raw);
         const via = head.via;
         const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings, self.tables) catch null) orelse head.stages;
         if (stages[stages.len - 1].node != .write)
@@ -1349,10 +1371,6 @@ const Ctx = struct {
 
         var stage_infos = std.array_list.Managed(Stage).init(self.arena);
         var has_breaker = false;
-        var breakers: usize = 0;
-        var map_only = true;
-        var sql_fanout = true;
-        var seen_breaker = false;
         var cur: ?types.Schema = source.schema;
         for (stages[1 .. stages.len - 1], 1..) |st, si_at| {
             errdefer self.diag.stamp(st.pos);
@@ -1360,20 +1378,7 @@ const Ctx = struct {
             si.sql = profile.stageText(self.arena, st) catch return error.OutOfMemory;
             if (st.node == .join) si.key_pushdown = try self.keyPushNote(stages[0..si_at], st);
             if (st.node == .join) si.join_order = joinorder.staticNote(st, stages[si_at + 1 ..]);
-            if (si.breaker) {
-                has_breaker = true;
-                breakers += 1;
-            }
-            if (!isMapStage(st.node)) map_only = false;
-            switch (st.node) {
-                .aggregate, .join => seen_breaker = true,
-                .sort, .limit => if (!seen_breaker) {
-                    sql_fanout = false;
-                },
-                else => if (si.breaker) {
-                    sql_fanout = false;
-                },
-            }
+            if (si.breaker) has_breaker = true;
             var how: ?[]const u8 = null;
             if (cur) |c| {
                 cur = try self.propagate(c, st.node);
@@ -1410,23 +1415,90 @@ const Ctx = struct {
         var sink_out = sink;
         if (try self.offlineDelta(w, stages[stages.len - 1].hints, cur)) |label| sink_out.mode = try msgfmt.allocPrint(self.arena, "{s}; {s}", .{ sink.mode, label });
 
-        const src_is_sql = isSqlSource(source.connector);
-        const sink_is_parallel = isSqlConnector(sink.connector) or
+        var ph = try self.physicalOf(raw, stages);
+        ph.has_breaker = has_breaker;
+        ph.sink_parallel = isSqlConnector(sink.connector) or
             (if (registry.Connector.parse(sink.connector)) |c| c.streamLoad() else false);
-        const splittable = src_is_sql and sql_fanout and splittableRead(stages[0].node);
-
+        if (top_n) |t| ph.top_n = .{ .rows = t.rows, .sorted = t.sorted };
         return .{
             .source = source,
             .stages = try stage_infos.toOwnedSlice(),
             .sink = sink_out,
-            .physical = .{
-                .has_breaker = has_breaker,
-                .splittable = splittable,
-                .sink_parallel = sink_is_parallel,
-                .morsel_parallel = !splittable and laneHints(stages[0]) and morselParallelRead(source.connector, stages[0].node),
-                .top_n = if (top_n) |t| (if (!t.sorted or breakers == 1) t.rows else null) else null,
-            },
+            .physical = ph,
         };
+    }
+
+    /// The path the run takes, as `path.choose` picks it for the run over the
+    /// stages as the run holds them at each step: an aggregating binding or a
+    /// window's input read into memory first, else the chain from the leading read.
+    /// `raw` is before the head binding is laid out.
+    fn physicalOf(self: *Ctx, raw: []const ast.Stage, stages_in: []const ast.Stage) Error!Physical {
+        if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes(b.stages, self.lanes))
+            return self.prelude(raw[0].node.ref, b.stages, b.stages.len);
+        var joined = stages_in;
+        if (stages_in[0].node == .ref) if (self.bindings.get(stages_in[0].node.ref)) |b| if (b.stages.len > 0 and b.stages[0].node == .read) {
+            joined = try std.mem.concat(self.arena, ast.Stage, &.{ b.stages, stages_in[1..] });
+        };
+        if (pathmod.windowInputAt(joined, self.lanes)) |wi| return self.prelude("the window's input", joined, wi);
+
+        const w = stages_in[stages_in.len - 1].node.write;
+        var stages = stages_in;
+        if (w.split) |sp| if (stages[0].node == .read) {
+            const copy = try self.arena.dupe(ast.Stage, stages);
+            copy[0].hints = try std.mem.concat(self.arena, ast.Hint, &.{ &.{.{ .key = "split", .value = .{ .ident = sp.col }, .pos = sp.pos }}, stages[0].hints });
+            stages = copy;
+        };
+        var head = stages;
+        var n: usize = 0;
+        while (head[0].node == .ref and n < 16) : (n += 1) {
+            const b = self.bindings.get(head[0].node.ref) orelse break;
+            if (b.stages.len == 0) break;
+            head = try std.mem.concat(self.arena, ast.Stage, &.{ b.stages, head[1..] });
+        }
+        if (n > 0) head = (pushdown.hoistFilters(self.arena, self.arena, head, self.bindings, self.tables) catch null) orelse head;
+
+        var ph = Physical{ .path = try pathmod.choose(self.arena, stages, head, .{
+            .lanes = self.lanes,
+            .sink = w,
+            .source = pathmod.sourceOf(downloaded(stages[0]), self.connections),
+            .head_source = pathmod.sourceOf(downloaded(head[0]), self.connections),
+        }) };
+        switch (ph.path) {
+            .lanes => |l| {
+                const rd = head[0].node.read;
+                if (!mayDivide(rd) or (w.mode == .upsert and w.mode.upsert.keys.len == 0)) {
+                    ph.path = .serial;
+                    return ph;
+                }
+                ph.veto = sourceVeto(l.source == .parquet, rd);
+                if (rd.form == .path and !csv.CsvReader.isUrl(rd.form.path)) for (head[1..]) |st| {
+                    if (st.node != .join or keypush.disabled(st.hints) or !keypush.rightMayNarrow(st.node.join)) continue;
+                    const b = self.bindings.get(st.node.join.binding) orelse continue;
+                    if (self.sqlSide((try self.inlineHead(try st.node.join.rightStages(self.arena, b.stages))).stages)) ph.keys_serial = true;
+                };
+            },
+            .sql => |*s| {
+                const rd = stages[0].node.read;
+                const conn = self.connections.get(rd.connector).?;
+                ph.sql_kind = @tagName(registry.Connector.parse(conn.connector).?.sqlRead().?.kind);
+                ph.split_forced = env_mod.forHintIdent(stages[0].hints, "split") != null;
+                const copy_sink = w.mode != .upsert and if (self.connections.get(w.connector)) |c| std.mem.eql(u8, c.connector, "postgres") else false;
+                const bare_upsert = w.mode == .upsert and w.mode.upsert.keys.len == 0;
+                if (!splitMayCut(stages[0], copy_sink) or (bare_upsert and s.split != .map)) s.split = .none;
+            },
+            else => {},
+        }
+        return ph;
+    }
+
+    /// `stages[0..n]` written into memory, on its own path, ahead of a serial rest.
+    fn prelude(self: *Ctx, what: []const u8, stages: []const ast.Stage, n: usize) Error!Physical {
+        const inner = try self.arena.alloc(ast.Stage, n + 1);
+        @memcpy(inner[0..n], stages[0..n]);
+        inner[n] = .{ .node = .{ .write = .{ .connector = connect.mem_connector, .form = null, .target = "", .mode = .overwrite } }, .hints = &.{}, .pos = stages[0].pos };
+        const ph = try self.arena.create(Physical);
+        ph.* = try self.physicalOf(inner, (try self.inlineHead(inner)).stages);
+        return .{ .path = .serial, .prelude = .{ .what = what, .inner = ph } };
     }
 
     /// A local Delta target planned as a run would, so `check` refuses a table it
@@ -1991,26 +2063,6 @@ fn composePushdown(arena: std.mem.Allocator, raw: []const u8, implicit: ?[]const
         return msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ raw, implicit.? });
     if (raw.len > 0) return raw;
     return implicit orelse "";
-}
-
-fn isMapStage(node: ast.Stage.Node) bool {
-    return switch (node) {
-        .filter, .select, .explode => true,
-        else => false,
-    };
-}
-
-/// A `table` (PK introspection) or a `query` with `@[split]`; key and size are
-/// checked at run time.
-fn splittableRead(node: ast.Stage.Node) bool {
-    return switch (node) {
-        .read => |rd| switch (rd.form) {
-            .table => true,
-            .query => false,
-            else => false,
-        },
-        else => false,
-    };
 }
 
 pub fn lastPart(q: ast.QualName) []const u8 {

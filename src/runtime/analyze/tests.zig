@@ -46,25 +46,28 @@ test "analyze a CSV map pipeline: structure, offline schema, physical" {
     try std.testing.expectEqualStrings("filter", o.stages[0].kind);
     try std.testing.expectEqualStrings("select", o.stages[1].kind);
     try std.testing.expect(!o.physical.has_breaker);
-    try std.testing.expect(!o.physical.splittable);
-    try std.testing.expect(o.physical.morsel_parallel);
+    try std.testing.expect(o.physical.path == .lanes);
 }
 
-test "physical plan: which SQL shapes report a key-range split" {
+test "physical plan: a SQL source's descents and key-range split, as the run tries them" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const conn = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\n";
+    const Split = std.meta.Tag(@import("../path.zig").Split);
 
-    const cases = [_]struct { q: []const u8, split: bool, breaker: ?bool = null }{
-        .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = true, .breaker = false },
-        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g", .split = true },
-        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g ORDER BY n DESC LIMIT 5", .split = true },
-        .{ .q = "SELECT a FROM pg.t ORDER BY a DESC LIMIT 10", .split = false },
-        .{ .q = "SELECT * FROM pg.orders ORDER BY id", .split = false, .breaker = true },
-        .{ .q = "SELECT DISTINCT a FROM pg.t", .split = false },
-        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.QUERY($$SELECT * FROM t$$) GROUP BY g", .split = false },
-        .{ .q = "SELECT * FROM pg.QUERY($$SELECT 1 AS x$$)", .split = false, .breaker = false },
+    const cases = [_]struct { q: []const u8, split: Split, whole: bool = false, top_n: bool = false, breaker: ?bool = null }{
+        .{ .q = "SELECT a FROM pg.t WHERE b > 0", .split = .map, .breaker = false },
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g", .split = .agg, .whole = true },
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.t GROUP BY g ORDER BY n DESC LIMIT 5", .split = .agg, .whole = true },
+        .{ .q = "SELECT DISTINCT COUNT(*) AS n FROM pg.t GROUP BY g", .split = .agg, .whole = true },
+        .{ .q = "SELECT a FROM pg.t ORDER BY a DESC LIMIT 10", .split = .none, .top_n = true },
+        .{ .q = "SELECT * FROM pg.orders ORDER BY id", .split = .none, .breaker = true },
+        .{ .q = "SELECT DISTINCT a FROM pg.t", .split = .none },
+        .{ .q = "WITH k AS (SELECT * FROM 'k.csv') SELECT t.a, k.b FROM pg.t t JOIN k ON t.a = k.a", .split = .map_join },
+        .{ .q = "WITH k AS (SELECT * FROM 'k.csv') SELECT k.b, COUNT(*) AS n FROM pg.t t JOIN k ON t.a = k.a GROUP BY k.b", .split = .none },
+        .{ .q = "SELECT g, COUNT(*) AS n FROM pg.QUERY($$SELECT * FROM t$$) GROUP BY g", .split = .none, .whole = true },
+        .{ .q = "SELECT * FROM pg.QUERY($$SELECT 1 AS x$$)", .split = .none, .breaker = false },
     };
 
     for (cases) |c| {
@@ -72,7 +75,10 @@ test "physical plan: which SQL shapes report a key-range split" {
         const prog = try parse(a, src);
         var diag = Diag{};
         const plan = try analyze(a, prog, &diag);
-        try std.testing.expectEqual(c.split, plan.outputs[0].physical.splittable);
+        const s = plan.outputs[0].physical.path.sql;
+        try std.testing.expectEqual(c.split, std.meta.activeTag(s.split));
+        try std.testing.expectEqual(c.whole, s.whole_agg != null);
+        try std.testing.expectEqual(c.top_n, s.top_n);
         if (c.breaker) |b| try std.testing.expectEqual(b, plan.outputs[0].physical.has_breaker);
     }
 }
@@ -95,6 +101,8 @@ test "physical plan: which file reads divide into morsels" {
         .{ .from = "lines('sftp://h/x.log')", .morsel = false },
         .{ .from = "split('/data/x.edi', '~')", .morsel = true },
         .{ .from = "split('/data/x.edi', '<>')", .morsel = false },
+        .{ .from = "'ftp://h/x.csv'", .morsel = true },
+        .{ .from = "'/data/x.csv.gz'", .morsel = false },
     };
 
     for (cases) |c| {
@@ -102,7 +110,7 @@ test "physical plan: which file reads divide into morsels" {
         const prog = try parse(a, src);
         var diag = Diag{};
         const plan = try analyze(a, prog, &diag);
-        try std.testing.expectEqual(c.morsel, plan.outputs[0].physical.morsel_parallel);
+        try std.testing.expectEqual(c.morsel, plan.outputs[0].physical.path == .lanes);
     }
 }
 

@@ -136,5 +136,6 @@ crosses the wire. The answer never changes, only where the work happens;
   sorted, and the run log says so in a `warn` line naming the rule. `EXPLAIN`
   shows it on the scan's `pushdown:` line — `order by id desc limit 1000 (if
   the keys are numeric or temporal)`, since analysis does not connect to learn
-  the key's type — and `Path: serial (top-N pushed, sorts at most 1000
-  rows)` in place of `materializes`.
+  the key's type — and `Path: serial; ORDER BY ... LIMIT runs in the source
+  (sorts at most 1000 rows), unless a sort key is text, …`, the words
+  `EXPLAIN ANALYZE` uses when it does.

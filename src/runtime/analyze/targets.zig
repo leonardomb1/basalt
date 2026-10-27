@@ -434,25 +434,36 @@ pub fn laneHints(st: ast.Stage) bool {
     return true;
 }
 
-/// A parquet is cut into row groups anywhere; a CSV into byte ranges only locally. A
-/// compressed stream or archive member has no offset-to-row mapping, matching
-/// `MappedCsv.open`'s `NotMappable`; Arrow and workbooks read serially.
-pub fn morselParallelRead(connector: []const u8, node: ast.Stage.Node) bool {
-    if (node == .read and node.read.form == .builtin) return recordLanes(node.read.form.builtin);
-    if (!std.mem.eql(u8, connector, "csv")) return false;
-    const path = switch (node) {
-        .read => |rd| switch (rd.form) {
-            .path => |p| p,
-            else => return false,
-        },
-        else => return false,
+/// Whether a read the lanes could cut is not ruled out by its literal path: a
+/// compressed stream or archive member has no offset-to-row mapping (`MappedCsv.open`'s
+/// `NotMappable`), and a record reader's literal arguments may say it reads in order.
+pub fn mayDivide(rd: ast.Read) bool {
+    return switch (rd.form) {
+        .builtin => |b| recordLanes(b),
+        .path => |p| csv.splitCodec(p).codec == .none and csv.splitArchive(p) == null,
+        else => true,
     };
-    if (csv.splitCodec(path).codec != .none or csv.splitArchive(path) != null) return false;
-    return switch (formats.of(readFormat(path, null)).lanes) {
-        .row_groups => true,
-        .local_ranges => std.mem.indexOf(u8, path, "://") == null,
-        .serial => false,
+}
+
+/// What only the run learns of a file the lanes cut that keeps it on one lane.
+pub fn sourceVeto(parquet: bool, rd: ast.Read) []const u8 {
+    const p = switch (rd.form) {
+        .path => |p| p,
+        else => return if (rd.form == .builtin and rd.form.builtin.args[0].* != .str_lit) "its path is remote or compressed" else "",
     };
+    if (!parquet) return if (readFormat(p, null) == .json) "the file is one JSON array" else "a quoted field holds a newline";
+    if (lake.isTablePath(p)) return "it holds fewer than two Parquet row groups or files";
+    if (csv.CsvReader.isUrl(p)) return "its server ignores range requests or it holds one row group";
+    return "it holds one row group";
+}
+
+/// `st` as the run reads it: a file on an FTP server is downloaded first, so its
+/// read is a local one.
+pub fn downloaded(st: ast.Stage) ast.Stage {
+    if (st.node != .read or st.node.read.form != .path or !ftp.isUrl(st.node.read.form.path)) return st;
+    var out = st;
+    out.node.read.form = .{ .path = std.fs.path.basename(st.node.read.form.path) };
+    return out;
 }
 
 /// Whether a record builtin's read maps for lanes, as far as its literal arguments

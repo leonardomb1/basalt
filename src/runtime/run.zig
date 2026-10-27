@@ -439,11 +439,6 @@ pub const printPlanArrow = @import("run/explain.zig").printPlanArrow;
 const resolveParams = @import("run/params.zig").resolveParams;
 const resolveLets = @import("run/params.zig").resolveLets;
 
-pub fn unionBranchesAreReads(u: ast.Union) bool {
-    for (u.branches) |b| if (b.pipeline != null) return false;
-    return true;
-}
-
 const describe_fields = [_]types.Schema.Field{
     .{ .name = "column", .ty = types.Type.init(.string) },
     .{ .name = "type", .ty = types.Type.init(.string) },
@@ -657,6 +652,7 @@ test {
     _ = @import("run/explain.zig");
     _ = @import("run/output.zig");
     _ = @import("run/params.zig");
+    _ = @import("run/path_tests.zig");
 }
 
 test "checkFirst frees its analysis; the local Delta table it resolved is kept for the run, and a write frees it unused" {

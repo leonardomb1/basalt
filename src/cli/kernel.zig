@@ -766,7 +766,7 @@ fn runScript(
     var failed: ?anyerror = null;
     if (entry.prog.explain == .plan) {
         var adiag: analyze.Diag = .{};
-        if (analyze.analyzeWith(a, entry.prog, &.{}, &adiag)) |plan| {
+        if (analyze.analyzeOpts(a, entry.prog, .{ .lanes = (runtime.RunOptions{ .threads = opts.threads }).lanes() }, &adiag)) |plan| {
             var aw = std.Io.Writer.Allocating.init(a);
             try analyze.render(plan, &aw.writer);
             if (format == .arrow) {

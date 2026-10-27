@@ -93,7 +93,7 @@ $ basalt run -c "EXPLAIN SELECT region, SUM(amount) AS revenue FROM 'orders.csv'
                  WHERE amount > 50 GROUP BY region;"
 Summary
   Sink: stdout (default)
-  Path: morsel-parallel candidate (per-lane partials, combined)
+  Path: csv parallel aggregate, unless a quoted field holds a newline
 plan
 └─ aggregate (#1)  by region; sum(amount)
    │  schema: region:string?  revenue:float?

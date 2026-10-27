@@ -102,7 +102,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         const eout = &efile.interface;
         defer eout.flush() catch {};
         var adiag2 = analyze.Diag{};
-        const plan = analyze.analyze(arena.allocator(), prog, &adiag2) catch |e| switch (e) {
+        const plan = analyze.analyzeOpts(arena.allocator(), prog, .{ .lanes = (runtime.RunOptions{ .threads = fl.threads }).lanes() }, &adiag2) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.AnalyzeFailed => {
                 try eo.report(.{ .msg = adiag2.msg, .pos = adiag2.pos, .end = adiag2.end });
