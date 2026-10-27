@@ -266,19 +266,6 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
     return .{ .part = part, .ord = ord, .funcs = funcs, .range = conv, .schema = .{ .fields = fields } };
 }
 
-/// The input then one column per function, the planner's rule, so `EXPLAIN` shows
-/// the schema past a window instead of `unresolved`.
-pub fn windowSchema(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!types.Schema {
-    const wp = try windowPlan(arena, in, wd, diag);
-    for (wd.funcs) |f| {
-        if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty, diag);
-        if (f.offset_expr) |e| if (!try exprHasDollar(arena, e)) {
-            _ = try windowOffset(arena, f, e, diag);
-        };
-    }
-    return wp.schema;
-}
-
 /// A constant NTILE count, NTH_VALUE position or LAG/LEAD offset, folded from `e`
 /// (its parameters already substituted) and checked as the literal would be.
 pub fn windowOffset(arena: std.mem.Allocator, f: ast.WindowFunc, e: *const ast.Expr, diag: *Diag) Error!i64 {
@@ -620,20 +607,11 @@ fn qualOne(arena: std.mem.Allocator, name: []const u8) !ast.QualName {
     return .{ .parts = parts };
 }
 
-/// The schema `stages` (filters and selects, as `orientKeys` makes) leave of `in`.
-pub fn prepSchema(arena: std.mem.Allocator, in: types.Schema, stages: []const ast.Stage, params: *const ParamMap, diag: *Diag) Error!types.Schema {
-    var sch = in;
-    for (stages) |st| switch (st.node) {
-        .filter => |e| _ = try checkFilter(arena, sch, e, params, diag),
-        .select => |items| sch = try schemaOfCols(arena, try selectCols(arena, sch, items, params, diag)),
-        else => unreachable,
-    };
-    return sch;
-}
+pub const Residual = struct { pred: *const ast.Expr, schema: types.Schema };
 
 /// A join's residual ON condition checked over both sides' columns side by side,
 /// laid out as an inner join lays them out, with that schema; null without one.
-pub fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, params: *const ParamMap, diag: *Diag) Error!?struct { pred: *const ast.Expr, schema: types.Schema } {
+fn residualPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, params: *const ParamMap, diag: *Diag) Error!?Residual {
     const res = j.residual orelse return null;
     var pj = j;
     pj.kind = .inner;
@@ -703,6 +681,133 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         .right_nullable = right_nullable,
         .left_nullable = left_nullable,
     };
+}
+
+/// A stage typed over its input: what its operator is built from. `resolve` (and
+/// `resolveJoin` for a join) is the one place a stage is typed; the checker, the plan
+/// builder and the lanes all read its records, which are never changed once made, so
+/// lanes share them and each builds only its own operators.
+pub const Resolved = struct {
+    stage: ast.Stage,
+    in: *const types.Schema,
+    out: *const types.Schema,
+    plan: Plan,
+
+    pub const Plan = union(enum) {
+        filter: *const ast.Expr,
+        project: []const op.Project.Col,
+        explode: usize,
+        limit,
+        distinct: ?[]const usize,
+        sort: []const op.Sort.Key,
+        window: WindowPlan,
+        aggregate: struct { by: []const usize, aggs: []const op.Aggregate.Agg },
+    };
+};
+
+/// Records of `stages`, each over the schema the one before leaves; `out` is the last's.
+pub const Chain = struct { recs: []const Resolved, out: *const types.Schema };
+
+/// A filter or select, and an explode when `explode`: a stage that maps each batch
+/// on its own. File lanes take no explode yet (`lanes.classifyMapPipeline`).
+pub fn isMap(node: ast.Stage.Node, explode: bool) bool {
+    return switch (node) {
+        .filter, .select => true,
+        .explode => explode,
+        else => false,
+    };
+}
+
+fn schemaRef(arena: std.mem.Allocator, s: types.Schema) Error!*const types.Schema {
+    const p = try arena.create(types.Schema);
+    p.* = s;
+    return p;
+}
+
+/// `st`, any stage but a join, typed over `in`. A window's literal LAG/LEAD default
+/// and offset are checked here; one over `$params` is left to the run.
+pub fn resolve(arena: std.mem.Allocator, in: types.Schema, st: ast.Stage, params: *const ParamMap, diag: *Diag) Error!Resolved {
+    const in_ref = try schemaRef(arena, in);
+    var out = in_ref;
+    const plan: Resolved.Plan = switch (st.node) {
+        .filter => |p| .{ .filter = try checkFilter(arena, in, p, params, diag) },
+        .select => |items| blk: {
+            const rcols = try selectCols(arena, in, items, params, diag);
+            const cols = try arena.alloc(op.Project.Col, rcols.len);
+            for (rcols, cols) |rc, *c| c.* = .{ .source = switch (rc.source) {
+                .passthrough => |x| .{ .passthrough = x },
+                .expr => |e| .{ .expr = e },
+            }, .ty = rc.ty };
+            out = try schemaRef(arena, try schemaOfCols(arena, rcols));
+            break :blk .{ .project = cols };
+        },
+        .limit => .limit,
+        .explode => |ex| blk: {
+            const ep = try explodePlan(arena, in, ex, diag);
+            out = try schemaRef(arena, ep.schema);
+            break :blk .{ .explode = ep.idx };
+        },
+        .distinct => |d| .{ .distinct = if (d.on) |f| try fieldIndices(arena, in, f, diag) else null },
+        .sort => |s| blk: {
+            const qs = try arena.alloc(ast.QualName, s.keys.len);
+            for (s.keys, qs) |sk, *q| q.* = sk.field;
+            const idxs = try fieldIndices(arena, in, qs, diag);
+            const ks = try arena.alloc(op.Sort.Key, s.keys.len);
+            for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
+            break :blk .{ .sort = ks };
+        },
+        .window => |wd| blk: {
+            const wp = try windowPlan(arena, in, wd, diag);
+            for (wd.funcs) |f| {
+                if (f.default) |d| if (f.arg) |q| try checkLagDefault(arena, d, q, in.fields[(try fieldIndices(arena, in, &[_]ast.QualName{q}, diag))[0]].ty, diag);
+                if (f.offset_expr) |e| if (!try exprHasDollar(arena, e)) {
+                    _ = try windowOffset(arena, f, e, diag);
+                };
+            }
+            out = try schemaRef(arena, wp.schema);
+            break :blk .{ .window = wp };
+        },
+        .aggregate => |ag| blk: {
+            const ap = try aggregatePlan(arena, in, ag, params, diag);
+            const aggs = try arena.alloc(op.Aggregate.Agg, ap.aggs.len);
+            for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
+            out = try schemaRef(arena, ap.schema);
+            break :blk .{ .aggregate = .{ .by = ap.by, .aggs = aggs } };
+        },
+        .join, .read, .ref, .write, .union_ => return fail(diag, "unexpected operator in the middle of a pipeline", .{}),
+    };
+    return .{ .stage = st, .in = in_ref, .out = out, .plan = plan };
+}
+
+/// `stages`, none a join, resolved in turn over `in`; an error is placed at its stage.
+pub fn resolveChain(arena: std.mem.Allocator, in: types.Schema, stages: []const ast.Stage, params: *const ParamMap, diag: *Diag) Error!Chain {
+    const recs = try arena.alloc(Resolved, stages.len);
+    var sch = in;
+    for (stages, recs) |st, *r| {
+        errdefer diag.stamp(st.pos);
+        r.* = try resolve(arena, sch, st, params, diag);
+        sch = r.out.*;
+    }
+    return .{ .recs = recs, .out = if (recs.len > 0) recs[recs.len - 1].out else try schemaRef(arena, in) };
+}
+
+/// A join resolved over both sides: its keys placed (`keys`), the stages each side
+/// runs first to compute them (`left`, `right`), its key plan over what they leave,
+/// and its residual ON.
+pub const JoinResolved = struct {
+    keys: KeyPrep,
+    left: Chain,
+    right: Chain,
+    plan: JoinPlan,
+    residual: ?Residual,
+};
+
+pub fn resolveJoin(arena: std.mem.Allocator, left: types.Schema, right: types.Schema, j: ast.Join, params: *const ParamMap, diag: *Diag) Error!JoinResolved {
+    const keys = try orientKeys(arena, left, right, j, diag);
+    const l = try resolveChain(arena, left, keys.left, params, diag);
+    const r = try resolveChain(arena, right, keys.right, params, diag);
+    const plan = try joinPlan(arena, l.out.*, r.out.*, keys.join, diag);
+    return .{ .keys = keys, .left = l, .right = r, .plan = plan, .residual = try residualPlan(arena, l.out.*, r.out.*, keys.join, params, diag) };
 }
 
 /// A join key for a message: its column; a USING side's copy by the key's name

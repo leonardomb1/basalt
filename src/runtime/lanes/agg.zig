@@ -17,13 +17,13 @@ const LaneMem = @import("../parallel.zig").LaneMem;
 const LaneSplit = @import("sources.zig").LaneSplit;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const orderedWorker = @import("map.zig").orderedWorker;
-const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
-const buildMapChain = @import("../plan.zig").buildMapChain;
-const buildStage = @import("../plan.zig").buildStage;
+const buildOp = @import("../plan.zig").buildOp;
 const buildTopN = @import("../plan.zig").buildTopN;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const connect_mod = @import("../connect.zig");
 const csv = @import("../../format/csv.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
@@ -31,7 +31,6 @@ const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const eval = @import("../../exec/eval.zig");
 const joinKindLaneSafe = @import("map.zig").joinKindLaneSafe;
-const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
@@ -43,6 +42,7 @@ const pqdecode = @import("../../format/parquet/read.zig");
 const profile = @import("../../exec/profile.zig");
 const pushdown = @import("../pushdown.zig");
 const resolveLaneJoins = @import("join.zig").resolveLaneJoins;
+const resolveAt = @import("../plan.zig").resolveAt;
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
@@ -50,7 +50,6 @@ const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
-const tailSchema = @import("../plan.zig").tailSchema;
 const topNTail = @import("topn.zig").topNTail;
 const types = @import("../../lang/types.zig");
 const wrapProjected = @import("../../connect/split.zig").wrapProjected;
@@ -201,14 +200,8 @@ const LaneAgg = struct {
     aggs: []const op.Aggregate.Agg,
     prof: ?*Profile = null,
 
-    fn plan(env: *Env, in_schema: types.Schema, ag: ast.Aggregate, strs: *op.Aggregate.StrTable) !LaneAgg {
-        const arena = env.arena;
-        const agg_in = try schemaPtr(arena, in_schema);
-        var ad = analyze.Diag{};
-        const apl = analyze.aggregatePlan(arena, agg_in.*, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-        const aggs = try arena.alloc(op.Aggregate.Agg, apl.aggs.len);
-        for (apl.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
-        return .{ .strs = strs, .in_schema = agg_in, .out_schema = try schemaPtr(arena, apl.schema), .by = apl.by, .aggs = aggs, .prof = env.profile };
+    fn of(env: *Env, r: analyze.Resolved, strs: *op.Aggregate.StrTable) LaneAgg {
+        return .{ .strs = strs, .in_schema = r.in, .out_schema = r.out, .by = r.plan.aggregate.by, .aggs = r.plan.aggregate.aggs, .prof = env.profile };
     }
 
     /// Fold `child` into private group tables, one per hash partition of `parts`.
@@ -250,9 +243,9 @@ const LaneAgg = struct {
     }
 };
 
-/// The sink for `w`, typed by what `tail` makes of `schema`.
-pub fn openTailSink(env: *Env, w: ast.Write, tail: []const ast.Stage, schema: types.Schema) !driver.Sink {
-    return openSink(env, try resolveUpsertKeys(env, w), try tailSchema(env, tail, schema));
+/// The sink for `w`, typed `schema`: what a parallel breaker's tail leaves.
+pub fn openTailSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
+    return openSink(env, try resolveUpsertKeys(env, w), schema);
 }
 
 /// Emit merged groups and write them through `tail`: a partition at a time across lanes
@@ -264,14 +257,14 @@ fn writeGroups(
     emitter: op.Aggregate,
     sets: []const op.Aggregate.GroupSet,
     sel: ?[]const []const u32,
-    tail: []const ast.Stage,
+    tail: []const analyze.Resolved,
     threads: usize,
     stats: *Stats,
 ) !void {
     var total: usize = 0;
     for (sets) |st| total += st.len;
-    const rowwise = for (tail) |st| switch (st.node) {
-        .filter, .select => {},
+    const rowwise = for (tail) |r| switch (r.plan) {
+        .filter, .project => {},
         else => break false,
     } else true;
     if (sel != null or emitter.by.len == 0 or threads < 2 or sets.len < 2 or total < agg_combine_parallel_min or !rowwise) {
@@ -286,7 +279,6 @@ fn writeGroups(
         .emitter = emitter,
         .sets = sets,
         .tail = tail,
-        .params = env.params_expr,
         .errctx = env.errctx,
         .queue = .{ .nitems = sets.len },
         .ordered = &ord,
@@ -301,8 +293,7 @@ fn writeGroups(
 const GroupWriteCtx = struct {
     emitter: op.Aggregate,
     sets: []const op.Aggregate.GroupSet,
-    tail: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    tail: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     ordered: ?*OrderedOut,
@@ -326,7 +317,7 @@ fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem) !void {
         var ob = OneBatch{ .b = try em.emitSets(wa, ctx.sets[i..][0..1], null), .sch = out_schema.* };
         var scan = op.Scan{ .src = ob.source() };
         scan.stats.at = profile.merged_at;
-        const chain = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.tail, &scan, out_schema);
+        const chain = try chainOps(wa, ctx.errctx, ctx.tail, .{ .scan = &scan });
         while (try chain.next(wa)) |b| try f.add(ord.snk, wa, b);
         if (ctx.prof) |p| {
             const top = try p.absorb(chain);
@@ -341,7 +332,7 @@ fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem) !void {
 
 /// Write a parallel breaker's merged result through `tail`; under a profile the tail's
 /// operators stand above the lanes' `feeds` operators, whose result they read.
-pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const ast.Stage, stats: *Stats, feeds: profile.Kind) !void {
+pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const analyze.Resolved, stats: *Stats, feeds: profile.Kind) !void {
     const arena = env.arena;
     if (tail.len == 0) {
         if (batch.len > 0) {
@@ -355,16 +346,14 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
     scan.stats.at = profile.merged_at;
     var cur: op.Op = .{ .scan = &scan };
     defer cur.release();
-    var sch = schema;
     var i: usize = 0;
     while (i < tail.len) : (i += 1) {
-        const r = if (tail[i].node == .sort and i + 1 < tail.len and tail[i + 1].node == .limit) blk: {
+        const r = if (tail[i].plan == .sort and i + 1 < tail.len and tail[i + 1].plan == .limit) blk: {
             i += 1;
-            break :blk try buildTopN(env, tail[i - 1].node.sort, tail[i].node.limit, cur, sch);
-        } else try buildStage(env, tail[i], cur, sch);
+            break :blk try buildTopN(env, tail[i - 1], tail[i].stage.node.limit, cur);
+        } else try buildOp(env, tail[i], cur);
         cur = r.op;
-        cur.stampNew(profile.keyOf(tail[if (cur == .top_n) i - 1 else i].pos));
-        sch = r.schema;
+        cur.stampNew(profile.keyOf(tail[if (cur == .top_n) i - 1 else i].stage.pos));
     }
     while (try cur.next(arena)) |outb| {
         try snk.writeBatch(arena, outb);
@@ -380,8 +369,7 @@ const AggCtx = struct {
     agg: LaneAgg,
     mapped: *csv.MappedCsv,
     csv_schema: *const types.Schema,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     slots: []AggSlot,
@@ -397,8 +385,8 @@ fn aggWorkOne(ctx: *AggCtx, i: usize) !void {
 
     var cs = obs.CountingSource{ .inner = try ctx.mapped.lane(wa, i, ctx.queue.nitems, ctx.csv_schema), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    var child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.csv_schema);
-    for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, child);
+    var child = try chainOps(wa, ctx.errctx, ctx.prefix, .{ .scan = &scan });
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(wa, ctx.errctx, lj, child);
     slot.sets = try ctx.agg.fold(child, wa, slot.gpa.allocator(), &slot.parts);
 }
 
@@ -420,8 +408,7 @@ pub const pq_min_lanes: usize = 2;
 const PqAggCtx = struct {
     agg: LaneAgg,
     morsels: PqMorsels,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     lanes: []PqLane,
     rows_read: *obs.RowCounter,
@@ -554,8 +541,8 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     defer ms.slicer.deinit();
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    var child = try buildMapChain(la, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.morsels.src_schema);
-    for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.params, ctx.errctx, lj, child);
+    var child = try chainOps(la, ctx.errctx, ctx.prefix, .{ .scan = &scan });
+    for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.errctx, lj, child);
     ls.sets = try ctx.agg.fold(child, la, ls.arena.child_allocator, &ls.parts);
 }
 
@@ -609,7 +596,7 @@ fn mergeRadixPart(dst: *PqPart, srcs: anytype, aggs: []const op.Aggregate.Agg, p
 pub const AggJoinShape = struct {
     map_stages: []const ast.Stage,
     join_span: []const ast.Stage,
-    ag: ast.Aggregate,
+    agg: ast.Stage,
     tail: []const ast.Stage,
 };
 
@@ -638,15 +625,16 @@ pub fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
     return .{
         .map_stages = middle[0..j],
         .join_span = middle[j..a],
-        .ag = middle[a].node.aggregate,
+        .agg = middle[a],
         .tail = middle[a + 1 ..],
     };
 }
 
 /// Parallel aggregate over a split read, folded into private tables and merged by hash
 /// partition. False when a join in the span cannot run on lanes.
-pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    var agg_in_schema = try mapChainSchema(env, prefix, split.schema().*);
+pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    const pre = try chainAt(env, split.schema().*, prefix);
+    var agg_in_schema = pre.out.*;
     var lane_joins: []const LaneJoin = &.{};
     if (jshape) |js| {
         const chain = (try resolveLaneJoins(env, js.join_span, agg_in_schema)) orelse return false;
@@ -655,7 +643,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     }
     var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
     defer strs.deinit();
-    const la = try LaneAgg.plan(env, agg_in_schema, ag, &strs);
+    const la = LaneAgg.of(env, try resolveAt(env, agg_in_schema, agg), &strs);
 
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
@@ -676,8 +664,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
                 .agg = la,
                 .mapped = c.mapped,
                 .csv_schema = c.schema,
-                .prefix = prefix,
-                .params = env.params_expr,
+                .prefix = pre.recs,
                 .errctx = env.errctx,
                 .queue = .{ .nitems = nthreads },
                 .slots = slots,
@@ -695,17 +682,18 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
         },
         .parquet => |m| blk: {
             pq_lanes = try allocPqLanes(env.gpa, nthreads);
-            sel = try foldParquet(env, la, m, prefix, lane_joins, tail, pq_lanes, parts, lanes_used);
+            sel = try foldParquet(env, la, m, pre.recs, lane_joins, tail, pq_lanes, parts, lanes_used);
             break :blk .{ try partSets(env.arena, parts), nthreads };
         },
     };
 
-    const snk = try openTailSink(env, w, tail, la.out_schema.*);
+    const after = try chainAt(env, la.out_schema.*, tail);
+    const snk = try openTailSink(env, w, after.out.*);
     var guard = SinkGuard.init(snk);
     defer guard.abort();
     const t_emit0 = std.time.Instant.now() catch unreachable;
     const emit_span = trace.begin("aggregate emit and write", 0);
-    try writeGroups(env, snk, la.emitter(env), sets, sel, tail, write_threads, stats);
+    try writeGroups(env, snk, la.emitter(env), sets, sel, after.recs, write_threads, stats);
     emit_span.end();
     const t_emit1 = std.time.Instant.now() catch unreachable;
     if (split == .parquet) {
@@ -742,7 +730,7 @@ fn freePqLanes(gpa: std.mem.Allocator, lanes: []PqLane) void {
 
 /// Fold parquet morsels on `lanes`, one fixed slice of row groups each, and merge them
 /// into `parts`; returns each partition's top-N selection when the tail allows one.
-fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.Stage, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, lanes_used: *usize) !?[]const []const u32 {
+fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const analyze.Resolved, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, lanes_used: *usize) !?[]const []const u32 {
     const arena = env.arena;
     const ngroups = morsels.queue.nitems;
     const nthreads = lanes.len;
@@ -750,7 +738,6 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const ast.S
         .agg = la,
         .morsels = morsels,
         .prefix = prefix,
-        .params = env.params_expr,
         .errctx = env.errctx,
         .lanes = lanes,
         .rows_read = env.rows_read,
@@ -828,8 +815,7 @@ const SqlAggCtx = struct {
     proj_select: ?[]const u8,
     where_extra: ?[]const u8,
     src_schema: *const types.Schema,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     slots: []AggSlot,
@@ -848,13 +834,13 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
 
     var cs = obs.CountingSource{ .inner = src, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
+    const child = try chainOps(wa, ctx.errctx, ctx.prefix, .{ .scan = &scan });
     slot.sets = try ctx.agg.fold(child, wa, slot.gpa.allocator(), &slot.parts);
 }
 
 /// Parallel SQL aggregate over key-range lanes, one connection and one `AggSlot` per
 /// range (ranges are stolen, so only the range index is stable). False falls back.
-pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
+pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
     const desc = env.sql_desc orelse return false;
     if (stages[0].node != .read) return false;
@@ -864,12 +850,13 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
 
     const facts = try connect_mod.factsIfWanted(env, stages[0].node.read, desc.dialect, prefix, src_schema.*, true, .superset);
-    const pd = try pushdown.planAgg(arena, desc.dialect, src_schema.*, prefix, ag, facts);
+    const pd = try pushdown.planAgg(arena, desc.dialect, src_schema.*, prefix, agg.node.aggregate, facts);
     const eff = if (pd.proj_schema) |ps| try schemaPtr(arena, ps) else src_schema;
 
     var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
     defer strs.deinit();
-    const la = try LaneAgg.plan(env, try mapChainSchema(env, prefix, eff.*), ag, &strs);
+    const pre = try chainAt(env, eff.*, prefix);
+    const la = LaneAgg.of(env, try resolveAt(env, pre.out.*, agg), &strs);
 
     const sp = (try planSplit(env, desc, stages[0], opts.lanes(), w)) orelse return false;
 
@@ -890,8 +877,7 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
         .proj_select = pd.proj_select,
         .where_extra = pd.where_extra,
         .src_schema = eff,
-        .prefix = prefix,
-        .params = env.params_expr,
+        .prefix = pre.recs,
         .errctx = env.errctx,
         .queue = .{ .nitems = sp.predicates.len },
         .slots = slots,
@@ -914,10 +900,11 @@ pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const a
     const csets = try combineAggSlots(env, slots, la.aggs, opts.lanes(), parts);
     const t_emit0 = std.time.Instant.now() catch unreachable;
 
-    const snk = try openTailSink(env, w, tail, la.out_schema.*);
+    const after = try chainAt(env, la.out_schema.*, tail);
+    const snk = try openTailSink(env, w, after.out.*);
     var guard = SinkGuard.init(snk);
     defer guard.abort();
-    try writeGroups(env, snk, la.emitter(env), csets, null, tail, opts.lanes(), stats);
+    try writeGroups(env, snk, la.emitter(env), csets, null, after.recs, opts.lanes(), stats);
     if (env.profile) |p| {
         try p.phase("merge the lanes' groups", t_emit0.since(t_mrg0));
         try p.phase("emit and write the groups", (std.time.Instant.now() catch unreachable).since(t_emit0));

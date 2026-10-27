@@ -3,10 +3,10 @@
 //! per-stage schema derivations, and row discovery (a pipeline drained for the
 //! rows a `for`/`union` expands over).
 //!
-//! Parallel plans rebuild the map-only `filter`/`select` prefix per worker on a
-//! thread arena from the shared AST stages. Resolution is pure and plan-time
-//! cheap, so no mutable operator state is shared across threads; the prefix
-//! schema is validated once serially first so a worker cannot hit an analyze error.
+//! Each stage is typed once (`analyze.resolve`) into the record its operator is
+//! built from. Parallel plans build their map chains per worker on a thread arena
+//! from the shared records (`chainOps`), so no mutable operator state is shared
+//! across threads and a worker never types a stage.
 //!
 //! Source-side optimisations are only allowed to lose speed, never rows:
 //! `projectedColumns` and `filterBounds` under-report rather than guess (a missed
@@ -66,99 +66,63 @@ const sourceLabel = @import("connect.zig").sourceLabel;
 /// Rebuild a map-only `filter`/`select` chain against the projected source schema
 /// for `parallel.run`, keeping column indices in step; null if anything does not fit.
 pub fn rebuildMapStages(env: *Env, middle: []const ast.Stage, proj_schema: *const types.Schema) ?[]const op.Stage {
-    for (middle) |st| switch (st.node) {
-        .filter, .select => {},
-        else => return null,
-    };
+    for (middle) |st| if (!analyze.isMap(st.node, false)) return null;
+    var ad = analyze.Diag{};
+    const c = analyze.resolveChain(env.arena, proj_schema.*, middle, env.params_expr, &ad) catch return null;
     const ob = env.arena.create(OneBatch) catch return null;
     ob.* = .{ .b = null, .sch = proj_schema.* };
     const scan = env.arena.create(op.Scan) catch return null;
     scan.* = .{ .src = ob.source() };
-    const chain = buildMapChain(env.arena, env.params_expr, env.errctx, middle, scan, proj_schema) catch return null;
+    const chain = chainOps(env.arena, env.errctx, c.recs, .{ .scan = scan }) catch return null;
     const lin = (op.linearize(env.arena, chain) catch return null) orelse return null;
     return lin.stages;
 }
 
-pub fn buildMapChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, prefix: []const ast.Stage, scan: *op.Scan, csv_schema: *const types.Schema) !op.Op {
-    return buildChainFrom(ta, params, errctx, prefix, .{ .scan = scan }, csv_schema.*);
+/// `analyze.resolve` for the run, its error the run's.
+pub fn resolveAt(env: *Env, in: types.Schema, st: ast.Stage) !analyze.Resolved {
+    var ad = analyze.Diag{};
+    return analyze.resolve(env.arena, in, st, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
 }
 
-/// `buildMapChain` rooted at any operator, e.g. the stages after a join. `errctx`
-/// says where a row failed; without it a lane's error was a bare `cast failed`.
-pub fn buildChainFrom(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, stages: []const ast.Stage, start: op.Op, in_schema: types.Schema) !op.Op {
-    var cur: op.Op = start;
-    var sch = in_schema;
-    for (stages) |st| {
-        switch (st.node) {
-            .filter => |pred0| {
-                var ad = analyze.Diag{};
-                const pred = try analyze.checkFilter(ta, sch, pred0, params, &ad);
-                const f = try ta.create(op.Filter);
-                f.* = .{ .child = cur, .pred = pred, .err = errctx, .back = ta };
-                cur = .{ .filter = f };
-            },
-            .select => |items| {
-                var ad = analyze.Diag{};
-                const rcols = try analyze.selectCols(ta, sch, items, params, &ad);
-                const cols = try ta.alloc(op.Project.Col, rcols.len);
-                for (rcols, cols) |rc, *c| c.* = .{ .source = switch (rc.source) {
-                    .passthrough => |x| .{ .passthrough = x },
-                    .expr => |e| .{ .expr = e },
-                }, .ty = rc.ty };
-                const out = try ta.create(types.Schema);
-                out.* = try analyze.schemaOfCols(ta, rcols);
-                const p = try ta.create(op.Project);
-                p.* = .{ .child = cur, .cols = cols, .out_schema = out, .err = errctx };
-                cur = .{ .project = p };
-                sch = out.*;
-            },
-            else => unreachable,
-        }
-        cur.stats().at = profile.keyOf(st.pos);
+/// `analyze.resolveChain` for the run, its error the run's, placed at its stage.
+pub fn chainAt(env: *Env, in: types.Schema, stages: []const ast.Stage) !analyze.Chain {
+    var ad = analyze.Diag{};
+    return analyze.resolveChain(env.arena, in, stages, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+}
+
+/// The streaming operator map record `r` stands for over `child`, made on `ta` (a
+/// lane's arena) from the shared record. `errctx` says where a row failed; without it
+/// a lane's error was a bare `cast failed`.
+pub fn mapOp(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, r: analyze.Resolved, child: op.Op) !op.Op {
+    switch (r.plan) {
+        .filter => |pred| {
+            const f = try ta.create(op.Filter);
+            f.* = .{ .child = child, .pred = pred, .err = errctx, .back = ta };
+            return .{ .filter = f };
+        },
+        .project => |cols| {
+            const p = try ta.create(op.Project);
+            p.* = .{ .child = child, .cols = cols, .out_schema = r.out, .err = errctx };
+            return .{ .project = p };
+        },
+        .explode => |idx| {
+            const ex = r.stage.node.explode;
+            const o = try ta.create(op.Explode);
+            o.* = .{ .child = child, .field_idx = idx, .delim = ex.delim orelse ",", .json = ex.json, .out_schema = r.out };
+            return .{ .explode = o };
+        },
+        else => unreachable,
+    }
+}
+
+/// The map records `recs` as operators over `start`, each keyed to its stage.
+pub fn chainOps(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, recs: []const analyze.Resolved, start: op.Op) !op.Op {
+    var cur = start;
+    for (recs) |r| {
+        cur = try mapOp(ta, errctx, r, cur);
+        cur.stats().at = profile.keyOf(r.stage.pos);
     }
     return cur;
-}
-
-pub fn mapChainSchema(env: *Env, prefix: []const ast.Stage, csv_schema: types.Schema) !types.Schema {
-    var sch = csv_schema;
-    for (prefix) |st| {
-        errdefer env.diag.stamp(st.pos);
-        switch (st.node) {
-            .filter => |pred0| {
-                var ad = analyze.Diag{};
-                _ = analyze.checkFilter(env.arena, sch, pred0, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-            },
-            .select => |items| {
-                var ad = analyze.Diag{};
-                const rcols = analyze.selectCols(env.arena, sch, items, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-                sch = analyze.schemaOfCols(env.arena, rcols) catch |e| return aErr(env, &ad, e);
-            },
-            else => unreachable,
-        }
-    }
-    return sch;
-}
-
-/// The sink's schema after a parallel breaker's tail. A tail may hold a projection,
-/// aggregate or window (HAVING, `COUNT(*) FROM (SELECT DISTINCT …)`), which change it.
-pub fn tailSchema(env: *Env, tail: []const ast.Stage, in: types.Schema) !types.Schema {
-    var sch = in;
-    for (tail) |st| switch (st.node) {
-        .select => {
-            const one = [_]ast.Stage{st};
-            sch = try mapChainSchema(env, &one, sch);
-        },
-        .aggregate => |ag| {
-            var ad = analyze.Diag{};
-            sch = (analyze.aggregatePlan(env.arena, sch, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)).schema;
-        },
-        .window => |wd| {
-            var ad = analyze.Diag{};
-            sch = analyze.windowSchema(env.arena, sch, wd, &ad) catch |e| return aErr(env, &ad, e);
-        },
-        else => {},
-    };
-    return sch;
 }
 
 /// Source columns the stages after a read need, or null when unprovable. A join
@@ -544,11 +508,12 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
 
     const rdr = pqdecode.Reader.open(env.arena, path) catch return null;
     var ad = analyze.Diag{};
-    const ap = analyze.aggregatePlan(env.arena, rdr.schema, ag, env.params_expr, &ad) catch return null;
+    const r = analyze.resolve(env.arena, rdr.schema, stages[1], env.params_expr, &ad) catch return null;
+    const aggs = r.plan.aggregate.aggs;
 
-    const vals = try env.arena.alloc(Value, ap.aggs.len);
-    for (ap.aggs, ag.aggs, vals) |ra, item, *out| {
-        if (item.distinct) return null;
+    const vals = try env.arena.alloc(Value, aggs.len);
+    for (aggs, vals) |ra, *out| {
+        if (ra.distinct) return null;
         switch (ra.func) {
             .count => {
                 if (ra.arg != null) return null;
@@ -564,9 +529,9 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
         }
     }
 
-    const out = try schemaPtr(env.arena, ap.schema);
-    const cols = try env.arena.alloc(column.Column, ap.aggs.len);
-    for (ap.aggs, vals, cols) |ra, v, *c| {
+    const out = r.out;
+    const cols = try env.arena.alloc(column.Column, aggs.len);
+    for (aggs, vals, cols) |ra, v, *c| {
         var bd = column.Builder.init(env.arena, ra.ty);
         try bd.append(v);
         c.* = try bd.finish();
@@ -716,7 +681,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
     while (si < stages.len) : (si += 1) {
         const stage = stages[si];
         if (stage.node == .sort and si + 1 < stages.len and stages[si + 1].node == .limit and op.TopN.fits(stages[si + 1].node.limit)) {
-            const r = try buildTopN(env, stage.node.sort, stages[si + 1].node.limit, current, schema);
+            const r = try buildTopN(env, try resolveAt(env, schema, stage), stages[si + 1].node.limit, current);
             current = r.op;
             schema = r.schema;
             current.stampNew(profile.keyOf(stage.pos));
@@ -741,16 +706,12 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
 
 /// Pushes the running K-th-best bound into a single parquet source with one sort
 /// key, so it can skip row groups its statistics rule out.
-pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: types.Schema) anyerror!PipeRes {
+/// `srt` is the sort's record.
+pub fn buildTopN(env: *Env, srt: analyze.Resolved, lim: ast.Limit, child: op.Op) anyerror!PipeRes {
     const arena = env.arena;
-    const qs = try arena.alloc(ast.QualName, s.keys.len);
-    for (s.keys, qs) |sk, *q| q.* = sk.field;
-    var ad = analyze.Diag{};
-    const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
-    const ks = try arena.alloc(op.Sort.Key, s.keys.len);
-    for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
+    const s = srt.stage.node.sort;
     const o = try arena.create(op.TopN);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
+    o.* = .{ .child = child, .in_schema = srt.in, .keys = srt.plan.sort, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
 
     if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
         if (env.pq_reader != null or env.pq_folder != null) {
@@ -761,7 +722,7 @@ pub fn buildTopN(env: *Env, s: ast.Sort, lim: ast.Limit, child: op.Op, schema: t
             o.threshold = t;
         }
     }
-    return .{ .op = .{ .top_n = o }, .schema = schema };
+    return .{ .op = .{ .top_n = o }, .schema = srt.in.* };
 }
 
 pub fn readName(rd: ast.Read) []const u8 {
@@ -784,111 +745,83 @@ pub const discoverRowsJson = @import("plan/discover.zig").discoverRowsJson;
 
 pub fn buildStage(env: *Env, stage: ast.Stage, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     errdefer env.diag.stamp(stage.pos);
+    if (stage.node == .join) return buildJoin(env, stage.node.join, stage.hints, schema, child, null);
+    return buildOp(env, try resolveAt(env, schema, stage), child);
+}
+
+/// The operator record `r` stands for over `child`. A window's `$param` offsets and
+/// LAG/LEAD defaults are folded here, from the run's values.
+pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
+    errdefer env.diag.stamp(r.stage.pos);
     const arena = env.arena;
-    switch (stage.node) {
-        .filter => |pred0| {
-            var ad = analyze.Diag{};
-            const pred = analyze.checkFilter(arena, schema, pred0, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-            const f = try arena.create(op.Filter);
-            f.* = .{ .child = child, .pred = pred, .err = env.errctx, .back = arena };
-            return .{ .op = .{ .filter = f }, .schema = schema };
-        },
-        .select => |items| return buildProject(env, items, schema, child),
-        .limit => |lim| {
+    const o: op.Op = switch (r.plan) {
+        .filter, .project, .explode => try mapOp(arena, env.errctx, r, child),
+        .limit => blk: {
+            const lim = r.stage.node.limit;
             const l = try arena.create(op.Limit);
             l.* = .{ .child = child, .remaining = lim.count, .to_skip = lim.offset };
-            return .{ .op = .{ .limit = l }, .schema = schema };
+            break :blk .{ .limit = l };
         },
-        .distinct => |d| {
-            var keys: ?[]const usize = null;
-            if (d.on) |fields| {
-                var ad = analyze.Diag{};
-                keys = analyze.fieldIndices(arena, schema, fields, &ad) catch |e| return aErr(env, &ad, e);
-            }
-            const o = try arena.create(op.Distinct);
+        .distinct => |keys| blk: {
+            const d = try arena.create(op.Distinct);
             const st = try ownState(env);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = keys, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .err = env.errctx, .space = env.space, .spill_at = env.op_memory };
-            return .{ .op = .{ .distinct = o }, .schema = schema };
+            d.* = .{ .child = child, .in_schema = r.in, .keys = keys, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .err = env.errctx, .space = env.space, .spill_at = env.op_memory };
+            break :blk .{ .distinct = d };
         },
-        .sort => |s| {
-            const qs = try arena.alloc(ast.QualName, s.keys.len);
-            for (s.keys, qs) |sk, *q| q.* = sk.field;
-            var ad = analyze.Diag{};
-            const idxs = analyze.fieldIndices(arena, schema, qs, &ad) catch |e| return aErr(env, &ad, e);
-            const ks = try arena.alloc(op.Sort.Key, s.keys.len);
-            for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
-            const o = try arena.create(op.Sort);
-            o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .keys = ks, .threads = env.sort_threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
-            return .{ .op = .{ .sort = o }, .schema = schema };
+        .sort => |ks| blk: {
+            const so = try arena.create(op.Sort);
+            so.* = .{ .child = child, .in_schema = r.in, .keys = ks, .threads = env.sort_threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
+            break :blk .{ .sort = so };
         },
-        .window => |wd| {
-            var ad = analyze.Diag{};
-            const wp = analyze.windowPlan(arena, schema, wd, &ad) catch |e| return aErr(env, &ad, e);
+        .window => |wp| blk: {
+            const wd = r.stage.node.window;
             const pk = try arena.alloc(op.Sort.Key, wp.part.len);
             for (wp.part, pk) |idx, *k| k.* = .{ .idx = idx, .desc = false, .nulls_first = false };
             const ok = try arena.alloc(op.Sort.Key, wp.ord.len);
             for (wd.order_by, wp.ord, ok) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
-            for (wd.funcs, wp.funcs, 0..) |f, *out, i| {
+            const funcs = try arena.dupe(op.Window.Func, wp.funcs);
+            for (wd.funcs, funcs, 0..) |f, *out, i| {
                 if (f.offset_expr) |e| {
                     var od = analyze.Diag{};
                     out.offset = analyze.windowOffset(arena, f, try analyze.substExpr(arena, e, env.params_expr), &od) catch |err| return aErr(env, &od, err);
                 }
                 const d = f.default orelse continue;
                 const q = f.arg orelse continue;
-                const ty = wp.schema.fields[schema.fields.len + i].ty;
+                const ty = r.out.fields[r.in.fields.len + i].ty;
                 out.default = switch (try analyze.lagDefault(arena, try analyze.substExpr(arena, d, env.params_expr), q, ty)) {
                     .value => |v| v,
                     .problem => |why| return planErr(env.diag, why),
                 };
             }
-            const o = try arena.create(op.Window);
-            o.* = .{
+            const w = try arena.create(op.Window);
+            w.* = .{
                 .child = child,
-                .in_schema = try schemaPtr(arena, schema),
-                .out_schema = try schemaPtr(arena, wp.schema),
+                .in_schema = r.in,
+                .out_schema = r.out,
                 .part = pk,
                 .ord = ok,
-                .funcs = wp.funcs,
+                .funcs = funcs,
                 .range = wp.range,
                 .err = env.errctx,
                 .top_k = wd.top_k,
                 .gpa = env.gpa,
                 .threads = env.sort_threads,
             };
-            return .{ .op = .{ .window = o }, .schema = wp.schema };
+            break :blk .{ .window = w };
         },
-        .aggregate => |ag| return buildAggregate(env, ag, schema, child),
-        .join => |j| return buildJoin(env, j, stage.hints, schema, child, null),
-        .explode => |ex| {
-            var ad = analyze.Diag{};
-            const ep = analyze.explodePlan(arena, schema, ex, &ad) catch |e| return aErr(env, &ad, e);
-            const out = try schemaPtr(arena, ep.schema);
-            const o = try arena.create(op.Explode);
-            o.* = .{ .child = child, .field_idx = ep.idx, .delim = ex.delim orelse ",", .json = ex.json, .out_schema = out };
-            return .{ .op = .{ .explode = o }, .schema = out.* };
+        .aggregate => |ag| blk: {
+            const a = try arena.create(op.Aggregate);
+            const st = try ownState(env);
+            a.* = .{ .child = child, .in_schema = r.in, .by = ag.by, .aggs = ag.aggs, .out_schema = r.out, .err = env.errctx, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
+            break :blk .{ .aggregate = a };
         },
-        .read, .ref, .write, .union_ => return planErr(env.diag, "unexpected operator in the middle of a pipeline"),
-    }
+    };
+    return .{ .op = o, .schema = r.out.* };
 }
 
 pub fn buildProject(env: *Env, items: []const ast.SelectItem, in_schema: types.Schema, child: op.Op) anyerror!PipeRes {
-    const arena = env.arena;
-    var ad = analyze.Diag{};
-    const rcols = analyze.selectCols(arena, in_schema, items, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-
-    const cols = try arena.alloc(op.Project.Col, rcols.len);
-    for (rcols, cols) |rc, *c| c.* = .{
-        .source = switch (rc.source) {
-            .passthrough => |idx| .{ .passthrough = idx },
-            .expr => |e| .{ .expr = e },
-        },
-        .ty = rc.ty,
-    };
-    const out = try arena.create(types.Schema);
-    out.* = try analyze.schemaOfCols(arena, rcols);
-    const p = try arena.create(op.Project);
-    p.* = .{ .child = child, .cols = cols, .out_schema = out, .err = env.errctx };
-    return .{ .op = .{ .project = p }, .schema = out.* };
+    const r = try resolveAt(env, in_schema, .{ .node = .{ .select = items }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } });
+    return .{ .op = try mapOp(env.arena, env.errctx, r, child), .schema = r.out.* };
 }
 
 /// A grouping operator's own state arena on the run's gpa, freed by the operator's
@@ -898,19 +831,6 @@ fn ownState(env: *Env) !*std.heap.ArenaAllocator {
     const st = try env.arena.create(std.heap.ArenaAllocator);
     st.* = std.heap.ArenaAllocator.init(env.gpa);
     return st;
-}
-
-fn buildAggregate(env: *Env, ag: ast.Aggregate, schema: types.Schema, child: op.Op) anyerror!PipeRes {
-    const arena = env.arena;
-    var ad = analyze.Diag{};
-    const ap = analyze.aggregatePlan(arena, schema, ag, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
-    const aggs = try arena.alloc(op.Aggregate.Agg, ap.aggs.len);
-    for (ap.aggs, aggs) |ra, *a| a.* = .{ .func = ra.func, .arg = ra.arg, .ty = ra.ty, .distinct = ra.distinct, .arg_ty = ra.arg_ty };
-    const out = try schemaPtr(arena, ap.schema);
-    const o = try arena.create(op.Aggregate);
-    const st = try ownState(env);
-    o.* = .{ .child = child, .in_schema = try schemaPtr(arena, schema), .by = ap.by, .aggs = aggs, .out_schema = out, .err = env.errctx, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
-    return .{ .op = .{ .aggregate = o }, .schema = out.* };
 }
 
 pub fn joinBuildCap(env: *Env, hints: []const ast.Hint) !usize {
@@ -1070,21 +990,21 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
     const right_late = side.right_late;
 
     var ad = analyze.Diag{};
-    const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
-    const lsch = try mapChainSchema(env, prep.left, left_schema);
-    const rsch = try mapChainSchema(env, prep.right, build.schema);
-    const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
-    const out = try schemaPtr(arena, jp.schema);
-    if (prep.join.keyless()) return .{ .schema = out.*, .nl = try buildNLJoin(env, prep, hints, lsch, rsch, out, try buildChainFrom(arena, env.params_expr, env.errctx, prep.left, probe, left_schema), try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema)) };
+    const jr = analyze.resolveJoin(arena, left_schema, build.schema, j, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const prep = jr.keys;
+    const out = try schemaPtr(arena, jr.plan.schema);
+    const probe_chain = try chainOps(arena, env.errctx, jr.left.recs, probe);
+    const build_chain = try chainOps(arena, env.errctx, jr.right.recs, build.op);
+    if (prep.join.keyless()) return .{ .schema = out.*, .nl = try buildNLJoin(env, jr, hints, out, probe_chain, build_chain) };
     const o = try arena.create(op.Join);
     o.* = .{
-        .probe = try buildChainFrom(arena, env.params_expr, env.errctx, prep.left, probe, left_schema),
-        .build = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema),
+        .probe = probe_chain,
+        .build = build_chain,
         .index = null,
-        .left_keys = jp.lks,
-        .right_keys = jp.rks,
-        .left_schema = try schemaPtr(arena, lsch),
-        .right_schema = try schemaPtr(arena, rsch),
+        .left_keys = jr.plan.lks,
+        .right_keys = jr.plan.rks,
+        .left_schema = jr.left.out,
+        .right_schema = jr.right.out,
         .out_schema = out,
         .kind = j.kind,
         .null_aware = j.null_aware,
@@ -1095,7 +1015,7 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         .space = env.space,
         .spill_at = try joinSpillAt(env, hints),
     };
-    if (analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)) |rp| {
+    if (jr.residual) |rp| {
         o.residual = rp.pred;
         o.pair_schema = try schemaPtr(arena, rp.schema);
     }
@@ -1112,25 +1032,24 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
 
 /// A join with no key: a nested loop over its ON, with the range path when the ON
 /// bounds a left value by right ones. It takes no key pushdown and never spills.
-fn buildNLJoin(env: *Env, prep: analyze.KeyPrep, hints: []const ast.Hint, lsch: types.Schema, rsch: types.Schema, out: *const types.Schema, probe: op.Op, build: op.Op) anyerror!PipeRes {
+fn buildNLJoin(env: *Env, jr: analyze.JoinResolved, hints: []const ast.Hint, out: *const types.Schema, probe: op.Op, build: op.Op) anyerror!PipeRes {
     const arena = env.arena;
-    var ad = analyze.Diag{};
     const o = try arena.create(op.NLJoin);
     o.* = .{
         .probe = probe,
         .build = build,
-        .left_schema = try schemaPtr(arena, lsch),
-        .right_schema = try schemaPtr(arena, rsch),
+        .left_schema = jr.left.out,
+        .right_schema = jr.right.out,
         .out_schema = out,
-        .kind = prep.join.kind,
+        .kind = jr.keys.join.kind,
         .state = arena,
         .err = env.errctx,
         .build_cap = try joinBuildCap(env, hints),
     };
-    if (analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e)) |rp| {
+    if (jr.residual) |rp| {
         o.cond = rp.pred;
         o.pair_schema = try schemaPtr(arena, rp.schema);
-        o.range = try op.nlRangeOf(arena, rp.pred, rp.schema, lsch.fields.len);
+        o.range = try op.nlRangeOf(arena, rp.pred, rp.schema, jr.left.out.fields.len);
     }
     return .{ .op = .{ .nl_join = o }, .schema = out.* };
 }

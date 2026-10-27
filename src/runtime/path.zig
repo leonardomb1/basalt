@@ -11,7 +11,7 @@
 //! `windowInputAt` and `materializes` over the stages as they stand at that point.
 //!
 //! Each path keeps its own set of streaming stages: a SQL split and a union branch
-//! run explode, file lanes do not (`lanes.classifyMapPipeline`). The run takes the
+//! run explode, file lanes do not (`analyze.isMap`). The run takes the
 //! plain SQL split off the built operators (`op.linearize`), which `Split.map`
 //! states over the stages; `run/path_tests.zig` holds the two to one answer.
 
@@ -19,6 +19,7 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const connect = @import("connect.zig");
 const lanes = @import("lanes.zig");
+const isMap = @import("analyze/schema.zig").isMap;
 const laneHints = @import("analyze/targets.zig").laneHints;
 const op = @import("../exec/op.zig");
 const pushdown = @import("pushdown.zig");
@@ -126,9 +127,6 @@ fn branchesAreReads(u: ast.Union) bool {
 }
 
 fn streamsOnly(stages: []const ast.Stage) bool {
-    for (stages) |s| switch (s.node) {
-        .filter, .select, .explode => {},
-        else => return false,
-    };
+    for (stages) |s| if (!isMap(s.node, true)) return false;
     return true;
 }

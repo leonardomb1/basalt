@@ -11,22 +11,21 @@ const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
-const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
-const buildMapChain = @import("../plan.zig").buildMapChain;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const column = @import("../../exec/column.zig");
 const keyhash = @import("../../exec/keyhash.zig");
 const keytable = @import("../../exec/keytable.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const laneRowSource = @import("sources.zig").laneRowSource;
-const mapChainSchema = @import("../plan.zig").mapChainSchema;
+const resolveAt = @import("../plan.zig").resolveAt;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
-const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
@@ -34,7 +33,7 @@ const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 
-pub const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Distinct, tail: []const ast.Stage };
+pub const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Stage, tail: []const ast.Stage };
 
 pub fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
     const middle = stages[1 .. stages.len - 1];
@@ -49,7 +48,7 @@ pub fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
         else => return null,
     };
     const d = di orelse return null;
-    return .{ .prefix = middle[0..d], .dist = middle[d].node.distinct, .tail = middle[d + 1 ..] };
+    return .{ .prefix = middle[0..d], .dist = middle[d], .tail = middle[d + 1 ..] };
 }
 
 /// The key columns of the DISTINCT and how they are keyed: encoded fixed-width words
@@ -96,8 +95,7 @@ const Lane = struct {
 const DistinctCtx = struct {
     split: LaneSplit,
     row_schema: *const types.Schema,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     local_keys: ?[]const usize,
     keys: Keys,
@@ -134,7 +132,7 @@ fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: u
     defer inner.close();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
+    const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
     var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .partial = true, .shared_strs = in };
     defer d.release();
     const dop: op.Op = .{ .distinct = &d };
@@ -262,7 +260,7 @@ pub fn runParallelDistinct(
     env: *Env,
     split: LaneSplit,
     prefix: []const ast.Stage,
-    dist: ast.Distinct,
+    dist: ast.Stage,
     tail: []const ast.Stage,
     w: ast.Write,
     opts: RunOptions,
@@ -270,14 +268,12 @@ pub fn runParallelDistinct(
     lanes_used: *usize,
 ) anyerror!bool {
     const arena = env.arena;
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, split.schema().*));
+    const pre = try chainAt(env, split.schema().*, prefix);
+    const row_schema = pre.out;
 
-    var local_keys: ?[]const usize = null;
+    const local_keys = (try resolveAt(env, row_schema.*, dist)).plan.distinct;
     var key_idx: []const usize = undefined;
-    if (dist.on) |fields| {
-        var ad = analyze.Diag{};
-        const ks = analyze.fieldIndices(arena, row_schema.*, fields, &ad) catch |e| return aErr(env, &ad, e);
-        local_keys = ks;
+    if (local_keys) |ks| {
         key_idx = ks;
     } else {
         const all = try arena.alloc(usize, row_schema.fields.len);
@@ -302,8 +298,7 @@ pub fn runParallelDistinct(
     var ctx = DistinctCtx{
         .split = split,
         .row_schema = row_schema,
-        .prefix = prefix,
-        .params = env.params_expr,
+        .prefix = pre.recs,
         .errctx = env.errctx,
         .local_keys = local_keys,
         .keys = try Keys.of(arena, row_schema, key_idx),
@@ -330,10 +325,11 @@ pub fn runParallelDistinct(
         p.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ split.label(), nitems, split.unitName() });
     }
 
-    const snk = try openTailSink(env, w, tail, row_schema.*);
+    const after = try chainAt(env, row_schema.*, tail);
+    const snk = try openTailSink(env, w, after.out.*);
     var guard = SinkGuard.init(snk);
     defer guard.abort();
-    try writeTail(env, snk, merged, row_schema.*, tail, stats, .distinct);
+    try writeTail(env, snk, merged, row_schema.*, after.recs, stats, .distinct);
     try guard.close();
     return true;
 }

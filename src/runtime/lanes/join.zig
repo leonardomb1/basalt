@@ -6,13 +6,13 @@ const Profile = @import("../../exec/profile.zig").Profile;
 const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
-const buildChainFrom = @import("../plan.zig").buildChainFrom;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const buildPipeline = @import("../plan.zig").buildPipeline;
 const joinMaySpill = @import("../plan.zig").joinMaySpill;
 const joinSpillAt = @import("../plan.zig").joinSpillAt;
 const stampedBinding = @import("../plan.zig").stampedBinding;
 const laneJoinCap = @import("../plan.zig").laneJoinCap;
-const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const op = @import("../../exec/op.zig");
 const planErr = @import("../env.zig").planErr;
 const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
@@ -27,7 +27,6 @@ const LaneMem = @import("../parallel.zig").LaneMem;
 const LaneSplit = @import("sources.zig").LaneSplit;
 const ReaderSource = @import("sources.zig").ReaderSource;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
-const buildMapChain = @import("../plan.zig").buildMapChain;
 const HeldFile = @import("agg.zig").HeldFile;
 const openItem = @import("agg.zig").openItem;
 const obs = @import("../obs.zig");
@@ -61,22 +60,13 @@ pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: ty
     return .{ .joins = list.items, .out_schema = schema };
 }
 
-/// A key-index field of `analyze.JoinPlan` as a slice, accepting both the single and
-/// the multi-key spelling so this builds against either snapshot.
-fn planKeys(a: std.mem.Allocator, jp: analyze.JoinPlan, comptime which: []const u8) ![]const usize {
-    const name: []const u8 = comptime if (@hasField(analyze.JoinPlan, which)) which else if (std.mem.eql(u8, which, "lk")) "lks" else "rks";
-    const v = @field(jp, name);
-    return if (@TypeOf(v) == usize) try a.dupe(usize, &[_]usize{v}) else v;
-}
-
 pub const LaneJoin = struct {
     index: *op.JoinIndex,
     left_keys: []const usize,
     right_keys: []const usize,
     /// What each lane's probe rows go through before the join (computing keys whose
-    /// side the plan placed), and their schema before it.
-    probe_prep: []const ast.Stage = &.{},
-    probe_schema: *const types.Schema,
+    /// side the plan placed).
+    probe_prep: []const analyze.Resolved = &.{},
     /// The probe side's key columns by name, for tracing them to its read.
     left_key_names: []const ast.QualName = &.{},
     residual: ?*const ast.Expr = null,
@@ -86,7 +76,7 @@ pub const LaneJoin = struct {
     out_schema: *const types.Schema,
     kind: ast.JoinKind,
     null_aware: bool,
-    suffix: []const ast.Stage,
+    suffix: []const analyze.Resolved,
     shared_matched: ?[]std.atomic.Value(u64) = null,
     /// The join stage, for the profile; 0 takes the pipeline's one join.
     at: u64 = 0,
@@ -102,10 +92,7 @@ const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 /// and the build side reads serially.
 fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
     if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
-    for (rstages[1..]) |st| switch (st.node) {
-        .filter, .select => {},
-        else => return null,
-    };
+    for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
     return parquetSplit(env, rstages[0].node.read, rstages[0].hints, rstages[1..], w, .{ .threads = env.sort_threads });
 }
@@ -119,8 +106,7 @@ const BuildPart = struct {
 
 const BuildCtx = struct {
     split: *LaneSplit,
-    stages: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    recs: []const analyze.Resolved,
     errctx: ?*op.ErrCtx,
     queue: WorkQueue,
     parts: []BuildPart,
@@ -160,7 +146,7 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
         var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
         var scan = op.Scan{ .src = cs.source() };
         scan.stats.at = ctx.read_at;
-        const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.stages, &scan, m.src_schema);
+        const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.recs, .{ .scan = &scan });
         const part = &ctx.parts[i];
         const a = part.arena.allocator();
         while (true) {
@@ -182,13 +168,13 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
-fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const ast.Stage, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
+fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, recs: []const analyze.Resolved, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
     const nitems = split.count(env.sort_threads);
     const parts = try arena.alloc(BuildPart, nitems);
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();
-    var ctx = BuildCtx{ .split = split, .stages = stages, .params = env.params_expr, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
+    var ctx = BuildCtx{ .split = split, .recs = recs, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
     _ = try parallel.spawnJoin(arena, env.sort_threads, buildLane, &ctx);
     if (ctx.queue.failure()) |e| return e;
     root.* = ctx.root;
@@ -198,7 +184,7 @@ fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, stages: []const a
 }
 
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
-/// (the pulls are scratch) and prevalidate the suffix. Returns the lane recipe and the
+/// (the pulls are scratch) and resolve the suffix once. Returns the lane recipe and the
 /// sink's output schema, or null when the build side is past the spill threshold of
 /// a join that could spill serially, or when its keys all turned out to be filters
 /// (a nested-loop join): its reads are closed and the caller falls back to the
@@ -210,41 +196,34 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const src_base = env.sources.items.len;
     const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
     var split = try buildSplit(env, rstages);
-    const build: struct { op: op.Op = undefined, schema: types.Schema } = if (split) |*sp|
-        .{ .schema = try mapChainSchema(env, rstages[1..], sp.schema().*) }
-    else blk: {
+    const build: struct { op: op.Op = undefined, schema: types.Schema, pre: []const analyze.Resolved = &.{} } = if (split) |*sp| blk: {
+        const pre = try chainAt(env, sp.schema().*, rstages[1..]);
+        break :blk .{ .schema = pre.out.*, .pre = pre.recs };
+    } else blk: {
         const pr = try buildPipeline(env, rstages);
         break :blk .{ .op = pr.op, .schema = pr.schema };
     };
 
     var ad = analyze.Diag{};
-    const prep = analyze.orientKeys(arena, left_schema, build.schema, j, &ad) catch |e| return aErr(env, &ad, e);
-    const lsch = try mapChainSchema(env, prep.left, left_schema);
-    const rsch = try mapChainSchema(env, prep.right, build.schema);
-    const jp = analyze.joinPlan(arena, lsch, rsch, prep.join, &ad) catch |e| return aErr(env, &ad, e);
-    if (prep.join.keyless()) {
+    const jr = analyze.resolveJoin(arena, left_schema, build.schema, j, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    if (jr.keys.join.keyless()) {
         for (env.sources.items[src_base..]) |sc| sc.close();
         env.sources.shrinkRetainingCapacity(src_base);
         return null;
     }
-    const out = try schemaPtr(arena, jp.schema);
-    const right_schema = try schemaPtr(arena, rsch);
-    const right_keys = try planKeys(arena, jp, "rk");
-    const left_keys = try planKeys(arena, jp, "lk");
-    const left_kinds = try arena.alloc(types.TypeKind, left_keys.len);
-    for (left_kinds, left_keys) |*x, k| x.* = lsch.fields[k].ty.kind;
-
-    const final_schema = try mapChainSchema(env, suffix, out.*);
-    const rp = analyze.residualPlan(arena, lsch, rsch, prep.join, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    const out = try schemaPtr(arena, jr.plan.schema);
+    const left_kinds = try arena.alloc(types.TypeKind, jr.plan.lks.len);
+    for (left_kinds, jr.plan.lks) |*x, k| x.* = jr.left.out.fields[k].ty.kind;
+    const after = try chainAt(env, out.*, suffix);
 
     const cap = try laneJoinCap(env, j, join_hints);
     var build_root: ?profile.Id = null;
     var build_chain: ?op.Op = null;
     const built = if (split) |*sp|
-        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), right_schema, right_keys, left_kinds, cap, &build_root)
+        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, analyze.Resolved, &.{ build.pre, jr.right.recs }), jr.right.out, jr.plan.rks, left_kinds, cap, &build_root)
     else blk: {
-        build_chain = try buildChainFrom(arena, env.params_expr, env.errctx, prep.right, build.op, build.schema);
-        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, right_schema, right_keys, left_kinds, cap, env.sort_threads);
+        build_chain = try chainOps(arena, env.errctx, jr.right.recs, build.op);
+        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, jr.right.out, jr.plan.rks, left_kinds, cap, env.sort_threads);
     };
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
@@ -269,30 +248,29 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     return .{
         .lane = .{
             .index = index,
-            .left_keys = left_keys,
-            .right_keys = right_keys,
-            .probe_prep = prep.left,
-            .left_key_names = prep.join.left_keys,
-            .residual = if (rp) |r| r.pred else null,
-            .pair_schema = if (rp) |r| try schemaPtr(arena, r.schema) else null,
-            .probe_schema = try schemaPtr(arena, left_schema),
-            .left_schema = try schemaPtr(arena, lsch),
-            .right_schema = right_schema,
+            .left_keys = jr.plan.lks,
+            .right_keys = jr.plan.rks,
+            .probe_prep = jr.left.recs,
+            .left_key_names = jr.keys.join.left_keys,
+            .residual = if (jr.residual) |r| r.pred else null,
+            .pair_schema = if (jr.residual) |r| try schemaPtr(arena, r.schema) else null,
+            .left_schema = jr.left.out,
+            .right_schema = jr.right.out,
             .out_schema = out,
             .kind = j.kind,
             .null_aware = j.null_aware,
-            .suffix = suffix,
+            .suffix = after.recs,
             .shared_matched = shared_matched,
             .build_root = build_root,
         },
-        .out_schema = final_schema,
+        .out_schema = after.out.*,
     };
 }
 
-pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin, probe: op.Op) !op.Op {
+pub fn buildLaneJoinChain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJoin, probe: op.Op) !op.Op {
     const j = try ta.create(op.Join);
     j.* = .{
-        .probe = try buildChainFrom(ta, params, errctx, lj.probe_prep, probe, lj.probe_schema.*),
+        .probe = try chainOps(ta, errctx, lj.probe_prep, probe),
         .build = null,
         .index = lj.index,
         .left_keys = lj.left_keys,
@@ -308,7 +286,7 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .state = ta,
     };
     j.stats.at = lj.at;
-    return buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
+    return chainOps(ta, errctx, lj.suffix, .{ .join = j });
 }
 
 /// A right/full lane join's unmatched build rows, left side null, in build order
@@ -316,7 +294,7 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
 /// read from `shared_matched`, the one bitset (made by `resolveLaneJoin`) every
 /// lane's probe marks. Null for every other kind. Call it once, after every lane
 /// has finished probing.
-pub fn buildLaneJoinDrain(ta: std.mem.Allocator, params: *std.StringHashMap(*const ast.Expr), errctx: ?*op.ErrCtx, lj: LaneJoin) !?op.Op {
+pub fn buildLaneJoinDrain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJoin) !?op.Op {
     const words = lj.shared_matched orelse return null;
     const matched = try ta.alloc(bool, lj.index.rows());
     for (matched, 0..) |*m, r| m.* = words[r >> 6].load(.monotonic) & (@as(u64, 1) << @intCast(r & 63)) != 0;
@@ -341,7 +319,7 @@ pub fn buildLaneJoinDrain(ta: std.mem.Allocator, params: *std.StringHashMap(*con
         .state = ta,
     };
     j.stats.at = lj.at;
-    return try buildChainFrom(ta, params, errctx, lj.suffix, .{ .join = j }, lj.out_schema.*);
+    return try chainOps(ta, errctx, lj.suffix, .{ .join = j });
 }
 
 const op_testing = @import("../../exec/op/testing_util.zig");
@@ -349,7 +327,6 @@ const op_testing = @import("../../exec/op/testing_util.zig");
 const TestLane = struct {
     lj: LaneJoin,
     probe: []const op.Batch,
-    params: *std.StringHashMap(*const ast.Expr),
     rows: usize = 0,
     err: ?anyerror = null,
 
@@ -365,7 +342,7 @@ const TestLane = struct {
         const a = ar.allocator();
         var ts = op_testing.TestSource{ .schema_ = op_testing.join_left_schema, .batches = self.probe };
         var scan = op.Scan{ .src = ts.src() };
-        const chain = try buildLaneJoinChain(a, self.params, null, self.lj, .{ .scan = &scan });
+        const chain = try buildLaneJoinChain(a, null, self.lj, .{ .scan = &scan });
         while (try chain.next(a)) |b| self.rows += b.len;
     }
 };
@@ -374,7 +351,6 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var params = std.StringHashMap(*const ast.Expr).init(a);
 
     const rv = try a.create(ast.Expr);
     rv.* = .{ .field = .{ .parts = &.{"rv"} } };
@@ -406,7 +382,6 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
             .index = index,
             .left_keys = &.{0},
             .right_keys = &.{0},
-            .probe_schema = &op_testing.join_left_schema,
             .residual = case.residual,
             .pair_schema = if (case.residual != null) &op_testing.join_both_schema else null,
             .left_schema = &op_testing.join_left_schema,
@@ -421,7 +396,7 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
         var lanes: [probes.len]TestLane = undefined;
         var threads: [probes.len]std.Thread = undefined;
         for (&lanes, &threads, probes) |*l, *t, p| {
-            l.* = .{ .lj = lj, .probe = p, .params = &params };
+            l.* = .{ .lj = lj, .probe = p };
             t.* = try std.Thread.spawn(.{}, TestLane.run, .{l});
         }
         var lane_rows: usize = 0;
@@ -432,7 +407,7 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
         }
         try std.testing.expectEqual(case.lane_rows, lane_rows);
 
-        const drain = (try buildLaneJoinDrain(a, &params, null, lj)).?;
+        const drain = (try buildLaneJoinDrain(a, null, lj)).?;
         const got = try op_testing.JoinRows.collect(a, drain, 3);
         const no_left = try a.alloc(?i64, case.drained.len);
         @memset(no_left, null);
@@ -444,14 +419,12 @@ test "lane joins: only right and full joins get a drain" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var params = std.StringHashMap(*const ast.Expr).init(a);
     const build = try op_testing.kvBatch(a, &op_testing.join_right_schema, &.{1}, &.{"x"});
     const index = try op.JoinIndex.fromBatches(a, &.{build}, &op_testing.join_right_schema, &.{0}, 0, std.math.maxInt(usize), 1);
     const lj = LaneJoin{
         .index = index,
         .left_keys = &.{0},
         .right_keys = &.{0},
-        .probe_schema = &op_testing.join_left_schema,
         .left_schema = &op_testing.join_left_schema,
         .right_schema = &op_testing.join_right_schema,
         .out_schema = &op_testing.join_both_schema,
@@ -459,5 +432,5 @@ test "lane joins: only right and full joins get a drain" {
         .null_aware = false,
         .suffix = &.{},
     };
-    try std.testing.expect((try buildLaneJoinDrain(a, &params, null, lj)) == null);
+    try std.testing.expect((try buildLaneJoinDrain(a, null, lj)) == null);
 }

@@ -16,14 +16,15 @@ const WorkQueue = @import("../parallel.zig").WorkQueue;
 const ast = @import("../../lang/ast.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
 const buildLaneJoinDrain = @import("join.zig").buildLaneJoinDrain;
-const buildMapChain = @import("../plan.zig").buildMapChain;
+const analyze = @import("../analyze.zig");
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const connect_mod = @import("../connect.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const laneRowSource = @import("sources.zig").laneRowSource;
-const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
@@ -47,8 +48,7 @@ const wrapProjected = @import("../../connect/split.zig").wrapProjected;
 
 const MapCtx = struct {
     split: LaneSplit,
-    map_stages: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    map: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     sink_mode: parallel.SinkMode,
@@ -255,8 +255,8 @@ fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
 }
 
 fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
-    const mapped = try buildMapChain(wa, ctx.params, ctx.errctx, ctx.map_stages, scan, ctx.split.schema());
-    return if (ctx.join) |lj| buildLaneJoinChain(wa, ctx.params, ctx.errctx, lj, mapped) else mapped;
+    const mapped = try chainOps(wa, ctx.errctx, ctx.map, .{ .scan = scan });
+    return if (ctx.join) |lj| buildLaneJoinChain(wa, ctx.errctx, lj, mapped) else mapped;
 }
 
 /// Pour `chain` into the sink: the shared one, or a lane sink numbered `lane_idx`,
@@ -319,7 +319,8 @@ pub fn runParallelMap(
 ) anyerror!bool {
     const arena = env.arena;
     var split = split_in;
-    var out_schema = try mapChainSchema(env, map_stages, split.schema().*);
+    const map = try chainAt(env, split.schema().*, map_stages);
+    var out_schema = map.out.*;
 
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
@@ -342,8 +343,7 @@ pub fn runParallelMap(
     const nthreads = split.lanes(opts);
     var ctx = MapCtx{
         .split = split,
-        .map_stages = map_stages,
-        .params = env.params_expr,
+        .map = map.recs,
         .errctx = env.errctx,
         .queue = .{ .nitems = nthreads },
         .sink_mode = sink_mode,
@@ -394,7 +394,7 @@ fn writeLaneJoinDrain(env: *Env, lj: LaneJoin, sink_mode: parallel.SinkMode, mtx
     defer state.deinit();
     var batch_arena = std.heap.ArenaAllocator.init(env.gpa);
     defer batch_arena.deinit();
-    const chain = (try buildLaneJoinDrain(state.allocator(), env.params_expr, env.errctx, lj)) orelse return 0;
+    const chain = (try buildLaneJoinDrain(state.allocator(), env.errctx, lj)) orelse return 0;
     const rows = try pourLane(sink_mode, mtx, env.gpa, lane_idx, chain, &batch_arena, null);
     if (env.profile) |p| _ = try p.absorb(chain);
     return rows;
@@ -417,7 +417,9 @@ fn laneParquetKeys(env: *Env, js: MapJoinShape, lane: LaneJoin, map_stages: []co
 /// join's build keys may narrow its left side; null otherwise.
 fn narrowingKeyExprs(arena: std.mem.Allocator, js: MapJoinShape, lane: LaneJoin, map_stages: []const ast.Stage) !?[]const ?*ast.Expr {
     if (!keypush.leftMayNarrow(js.join) or keypush.disabled(js.join_hints)) return null;
-    const stages = try std.mem.concat(arena, ast.Stage, &.{ map_stages, lane.probe_prep });
+    const stages = try arena.alloc(ast.Stage, map_stages.len + lane.probe_prep.len);
+    @memcpy(stages[0..map_stages.len], map_stages);
+    for (lane.probe_prep, stages[map_stages.len..]) |r, *st| st.* = r.stage;
     return keyExprs(arena, stages, lane.left_key_names);
 }
 
@@ -434,10 +436,7 @@ const ordered_chunk_bytes = 4 << 20;
 
 pub fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     const middle = stages[1 .. stages.len - 1];
-    for (middle) |st| switch (st.node) {
-        .filter, .select => {},
-        else => return null,
-    };
+    for (middle) |st| if (!analyze.isMap(st.node, false)) return null;
     return middle;
 }
 
@@ -481,9 +480,8 @@ const SqlMapJoinCtx = struct {
     split: SplitCtx,
     predicates: []const []const u8,
     src_schema: *const types.Schema,
-    prefix: []const ast.Stage,
+    prefix: []const analyze.Resolved,
     join: LaneJoin,
-    params: *std.StringHashMap(*const ast.Expr),
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
     sink_mode: parallel.SinkMode,
@@ -536,8 +534,8 @@ fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
     defer SplitSource.closeFn(&ss);
     var cs = obs.CountingSource{ .inner = .{ .ptr = &ss, .vtable = &SplitSource.vtable }, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const probe = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.src_schema);
-    const chain = try buildLaneJoinChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.join, probe);
+    const probe = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
+    const chain = try buildLaneJoinChain(mem.work.allocator(), ctx.errctx, ctx.join, probe);
     const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
     if (ctx.prof) |p| _ = try p.absorb(chain);
@@ -555,14 +553,14 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     if (src_base >= env.sources.items.len) return false;
 
     const src_schema = try schemaPtr(arena, try dupeSchema(arena, env.sources.items[src_base].schema()));
-    const probe_schema = try mapChainSchema(env, shape.prefix, src_schema.*);
+    const pre = try chainAt(env, src_schema.*, shape.prefix);
 
     const sp = (try planSplit(env, desc, stages[0], opts.lanes(), w)) orelse return false;
 
     for (env.sources.items[src_base..]) |sc| sc.close();
     env.sources.shrinkRetainingCapacity(src_base);
 
-    const lp = (try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, probe_schema)) orelse return false;
+    const lp = (try resolveLaneJoin(env, shape.join, shape.join_hints, shape.suffix, pre.out.*)) orelse return false;
 
     var where_extra: ?[]const u8 = null;
     if (try narrowingKeyExprs(arena, shape, lp.lane, shape.prefix)) |exprs| {
@@ -582,9 +580,8 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
         .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema },
         .predicates = sp.predicates,
         .src_schema = src_schema,
-        .prefix = shape.prefix,
+        .prefix = pre.recs,
         .join = lp.lane,
-        .params = env.params_expr,
         .errctx = env.errctx,
         .queue = .{ .nitems = sp.predicates.len },
         .sink_mode = sink_mode,

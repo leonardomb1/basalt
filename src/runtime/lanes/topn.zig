@@ -10,19 +10,18 @@ const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
-const aErr = @import("../env.zig").aErr;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
-const buildMapChain = @import("../plan.zig").buildMapChain;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const laneRowSource = @import("sources.zig").laneRowSource;
-const mapChainSchema = @import("../plan.zig").mapChainSchema;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
+const resolveAt = @import("../plan.zig").resolveAt;
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
-const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
@@ -100,7 +99,7 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
     ctx.sel[p] = idx[0..@min(idx.len, ctx.n)];
 }
 
-pub const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Sort, lim: ast.Limit };
+pub const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Stage, lim: ast.Limit };
 
 pub fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     const middle = stages[1 .. stages.len - 1];
@@ -108,18 +107,14 @@ pub fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     if (middle[middle.len - 1].node != .limit or middle[middle.len - 2].node != .sort) return null;
     if (!op.TopN.fits(middle[middle.len - 1].node.limit)) return null;
     const prefix = middle[0 .. middle.len - 2];
-    for (prefix) |st| switch (st.node) {
-        .filter, .select => {},
-        else => return null,
-    };
-    return .{ .prefix = prefix, .srt = middle[middle.len - 2].node.sort, .lim = middle[middle.len - 1].node.limit };
+    for (prefix) |st| if (!analyze.isMap(st.node, false)) return null;
+    return .{ .prefix = prefix, .srt = middle[middle.len - 2], .lim = middle[middle.len - 1].node.limit };
 }
 
 const TopNCtx = struct {
     split: LaneSplit,
     row_schema: *const types.Schema,
-    prefix: []const ast.Stage,
-    params: *std.StringHashMap(*const ast.Expr),
+    prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     keys: []const op.Sort.Key,
     cap: u64,
@@ -142,7 +137,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
     errdefer ctx.split.abort();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
-    const child = try buildMapChain(mem.work.allocator(), ctx.params, ctx.errctx, ctx.prefix, &scan, ctx.split.schema());
+    const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
     var tn = op.TopN{
         .child = child,
         .in_schema = ctx.row_schema,
@@ -173,7 +168,7 @@ pub fn runParallelTopN(
     env: *Env,
     split: LaneSplit,
     prefix: []const ast.Stage,
-    srt: ast.Sort,
+    srt: ast.Stage,
     lim: ast.Limit,
     w: ast.Write,
     opts: RunOptions,
@@ -181,14 +176,9 @@ pub fn runParallelTopN(
     lanes_used: *usize,
 ) anyerror!bool {
     const arena = env.arena;
-    const row_schema = try schemaPtr(arena, try mapChainSchema(env, prefix, split.schema().*));
-
-    const qs = try arena.alloc(ast.QualName, srt.keys.len);
-    for (srt.keys, qs) |sk, *q| q.* = sk.field;
-    var ad = analyze.Diag{};
-    const idxs = analyze.fieldIndices(arena, row_schema.*, qs, &ad) catch |e| return aErr(env, &ad, e);
-    const ks = try arena.alloc(op.Sort.Key, srt.keys.len);
-    for (srt.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
+    const pre = try chainAt(env, split.schema().*, prefix);
+    const row_schema = pre.out;
+    const ks = (try resolveAt(env, row_schema.*, srt)).plan.sort;
 
     env.src_name = split.label();
     env.sink_name = sinkLabel(env, w);
@@ -199,8 +189,7 @@ pub fn runParallelTopN(
     var ctx = TopNCtx{
         .split = split,
         .row_schema = row_schema,
-        .prefix = prefix,
-        .params = env.params_expr,
+        .prefix = pre.recs,
         .errctx = env.errctx,
         .keys = ks,
         .cap = lim.offset + lim.count,
@@ -224,7 +213,7 @@ pub fn runParallelTopN(
         p.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ split.label(), split.count(nthreads), split.unitName() });
     }
 
-    const snk = try openTailSink(env, w, &.{}, row_schema.*);
+    const snk = try openTailSink(env, w, row_schema.*);
     var guard = SinkGuard.init(snk);
     defer guard.abort();
     if (top) |b| {

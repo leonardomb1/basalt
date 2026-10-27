@@ -15,8 +15,8 @@
 //! shared match bitset and the driver drains the unmatched rows once, after the
 //! lanes, through the join's suffix; under an aggregate they stay serial. A join's
 //! build side is materialized once into a read-only index before any lane exists,
-//! and its post-join stages are prevalidated so a lane rebuild cannot fail; each
-//! lane still builds its own `op.Join` for its mutable stats and scratch.
+//! and the join and the stages after it are resolved once into records; each lane builds
+//! its own `op.Join` and stage operators from them, for its mutable stats and scratch.
 //!
 //! Determinism. Results do not depend on thread timing. Aggregates fold into one
 //! `AggSlot` per work item (or one fixed arithmetic slice of parquet morsels per
@@ -125,8 +125,8 @@ pub fn shapeLaneSafe(shape: LaneShape) bool {
 
 fn runShape(env: *Env, split: LaneSplit, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return switch (shape) {
-        .agg => |x| runParallelAgg(env, split, x.prefix, x.ag, x.tail, null, w, opts, stats, lanes_used),
-        .agg_join => |x| runParallelAgg(env, split, x.map_stages, x.ag, x.tail, x, w, opts, stats, lanes_used),
+        .agg => |x| runParallelAgg(env, split, x.prefix, x.agg, x.tail, null, w, opts, stats, lanes_used),
+        .agg_join => |x| runParallelAgg(env, split, x.map_stages, x.agg, x.tail, x, w, opts, stats, lanes_used),
         .distinct => |x| runParallelDistinct(env, split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
         .top_n => |x| runParallelTopN(env, split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
         .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
@@ -134,7 +134,7 @@ fn runShape(env: *Env, split: LaneSplit, shape: LaneShape, w: ast.Write, opts: R
     };
 }
 
-pub const AggShape = struct { prefix: []const ast.Stage, ag: ast.Aggregate, tail: []const ast.Stage };
+pub const AggShape = struct { prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage };
 
 /// Recognize `read … | (filter|select)* | aggregate | tail | write`. A `select` or
 /// `filter` after the aggregate (a reordering projection, HAVING) is applied by `writeTail`;
@@ -152,7 +152,7 @@ pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
         else => return null,
     };
     const a = ai orelse return null;
-    return .{ .prefix = middle[0..a], .ag = middle[a].node.aggregate, .tail = middle[a + 1 ..] };
+    return .{ .prefix = middle[0..a], .agg = middle[a], .tail = middle[a + 1 ..] };
 }
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
@@ -164,7 +164,7 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| switch (st.node) {
         .filter => {},
-        .aggregate => |ag| return .{ .prefix = middle[0..i], .ag = ag, .tail = middle[i + 1 ..] },
+        .aggregate => return .{ .prefix = middle[0..i], .agg = st, .tail = middle[i + 1 ..] },
         else => return null,
     };
     return null;
@@ -190,13 +190,13 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
     const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
 
     var ad = analyze.Diag{};
-    const apl = analyze.aggregatePlan(arena, src_schema, shape.ag, env.params_expr, &ad) catch {
+    const apl = analyze.resolve(arena, src_schema, shape.agg, env.params_expr, &ad) catch {
         why.* = ad.msg;
         return null;
     };
 
     const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .exact);
-    const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.ag, apl.schema, facts, why)) orelse return null;
+    const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.agg.node.aggregate, apl.out.*, facts, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
     out[0] = .{

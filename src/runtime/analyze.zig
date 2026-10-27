@@ -288,27 +288,19 @@ pub const checkSinkConnection = @import("analyze/options.zig").checkSinkConnecti
 pub const unknownConnectionMsg = @import("analyze/options.zig").unknownConnectionMsg;
 pub const checkBareUpsert = @import("analyze/options.zig").checkBareUpsert;
 const options = @import("analyze/options.zig");
-pub const Col = @import("analyze/schema.zig").Col;
-pub const selectCols = @import("analyze/schema.zig").selectCols;
-pub const schemaOfCols = @import("analyze/schema.zig").schemaOfCols;
-pub const checkFilter = @import("analyze/schema.zig").checkFilter;
-pub const fieldIndices = @import("analyze/schema.zig").fieldIndices;
-pub const Agg = @import("analyze/schema.zig").Agg;
-pub const AggregatePlan = @import("analyze/schema.zig").AggregatePlan;
-pub const aggregatePlan = @import("analyze/schema.zig").aggregatePlan;
 pub const windowFuncType = @import("analyze/schema.zig").windowFuncType;
-pub const windowSchema = @import("analyze/schema.zig").windowSchema;
-pub const windowPlan = @import("analyze/schema.zig").windowPlan;
 pub const windowOffset = @import("analyze/schema.zig").windowOffset;
 pub const lagDefault = @import("analyze/schema.zig").lagDefault;
-pub const ExplodePlan = @import("analyze/schema.zig").ExplodePlan;
-pub const explodePlan = @import("analyze/schema.zig").explodePlan;
 pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;
 pub const joinPlan = @import("analyze/schema.zig").joinPlan;
-pub const orientKeys = @import("analyze/schema.zig").orientKeys;
-pub const residualPlan = @import("analyze/schema.zig").residualPlan;
-pub const prepSchema = @import("analyze/schema.zig").prepSchema;
 pub const KeyPrep = @import("analyze/schema.zig").KeyPrep;
+pub const Resolved = @import("analyze/schema.zig").Resolved;
+pub const Chain = @import("analyze/schema.zig").Chain;
+pub const JoinResolved = @import("analyze/schema.zig").JoinResolved;
+pub const isMap = @import("analyze/schema.zig").isMap;
+pub const resolve = @import("analyze/schema.zig").resolve;
+pub const resolveChain = @import("analyze/schema.zig").resolveChain;
+pub const resolveJoin = @import("analyze/schema.zig").resolveJoin;
 const bindBodyVars = @import("analyze/schema.zig").bindBodyVars;
 const typedZero = @import("analyze/schema.zig").typedZero;
 pub const render = @import("analyze/render.zig").render;
@@ -1381,7 +1373,7 @@ const Ctx = struct {
             if (si.breaker) has_breaker = true;
             var how: ?[]const u8 = null;
             if (cur) |c| {
-                cur = try self.propagate(c, st.node);
+                cur = try self.propagate(c, st);
                 si.out_schema = cur;
                 if (cur != null and st.node == .join) how = try self.joinStrategy(c, st.node.join);
             } else try self.checkUnbound(st.node);
@@ -1648,7 +1640,7 @@ const Ctx = struct {
         for (b.stages[1..]) |st| {
             errdefer self.diag.stamp(st.pos);
             if (cur) |c| {
-                cur = try self.propagate(c, st.node);
+                cur = try self.propagate(c, st);
             } else try self.checkUnbound(st.node);
         }
         return cur;
@@ -1669,61 +1661,36 @@ const Ctx = struct {
     }
 
     /// Output schema after a stage, type-checking along the way; null where the flow
-    /// becomes unresolvable. A join is planned with `joinPlan` so later stages are checked
-    /// (it once stopped there, and `check` passed a missing column).
-    fn propagate(self: *Ctx, in: types.Schema, node: ast.Stage.Node) Error!?types.Schema {
-        if (hasDynamicName(node)) return null;
-        switch (node) {
-            .filter => |p| {
-                _ = try checkFilter(self.arena, in, p, self.params, self.diag);
-                return in;
-            },
-            .select => |items| return try schemaOfCols(self.arena, try selectCols(self.arena, in, items, self.params, self.diag)),
-            .limit => return in,
-            .distinct => |d| {
-                if (d.on) |f| _ = try fieldIndices(self.arena, in, f, self.diag);
-                return in;
-            },
-            .sort => |s| {
-                const qs = try self.arena.alloc(ast.QualName, s.keys.len);
-                for (s.keys, qs) |sk, *q| q.* = sk.field;
-                _ = try fieldIndices(self.arena, in, qs, self.diag);
-                return in;
-            },
-            .explode => |ex| return (try explodePlan(self.arena, in, ex, self.diag)).schema,
-            .aggregate => |ag| return (try aggregatePlan(self.arena, in, ag, self.params, self.diag)).schema,
-            .window => |wd| return try windowSchema(self.arena, in, wd, self.diag),
-            .join => |j| {
-                const s = (try self.joinSides(in, j)) orelse return null;
-                _ = try residualPlan(self.arena, s.left, s.right, s.join, self.params, self.diag);
-                return (try joinPlan(self.arena, s.left, s.right, s.join, self.diag)).schema;
-            },
-            else => return null,
-        }
+    /// becomes unresolvable. A join is resolved over both sides so later stages are
+    /// checked (it once stopped there, and `check` passed a missing column).
+    fn propagate(self: *Ctx, in: types.Schema, st: ast.Stage) Error!?types.Schema {
+        if (hasDynamicName(st.node)) return null;
+        return switch (st.node) {
+            .join => |j| if (try self.joinOf(in, j)) |r| r.plan.schema else null,
+            .read, .ref, .write, .union_ => null,
+            else => (try resolve(self.arena, in, st, self.params, self.diag)).out.*,
+        };
     }
 
-    /// A join's two sides as the plan joins them, its keys placed; null where the
-    /// right side's columns are not known before the run.
-    fn joinSides(self: *Ctx, in: types.Schema, j: ast.Join) Error!?struct { left: types.Schema, right: types.Schema, join: ast.Join } {
+    /// A join resolved as the plan joins it; null where the right side's columns are
+    /// not known before the run.
+    fn joinOf(self: *Ctx, in: types.Schema, j: ast.Join) Error!?JoinResolved {
         const right = if (self.bindings.get(j.binding)) |b|
             (try self.bindingSchema(b)) orelse return null
         else if (self.knownTable(j.binding)) |k|
             k.schema orelse return null
         else
             return fail(self.diag, "unknown binding `{s}` in join", .{j.binding});
-        const prep = try orientKeys(self.arena, in, right, j, self.diag);
-        const l2 = try prepSchema(self.arena, in, prep.left, self.params, self.diag);
-        const r2 = try prepSchema(self.arena, right, prep.right, self.params, self.diag);
-        return .{ .left = l2, .right = r2, .join = prep.join };
+        return try resolveJoin(self.arena, in, right, j, self.params, self.diag);
     }
 
     /// `nested-loop` or `range` for a join with no key, as `plan.buildNLJoin` runs
     /// it; null for a hash join.
     fn joinStrategy(self: *Ctx, in: types.Schema, j: ast.Join) Error!?[]const u8 {
-        const s = (try self.joinSides(in, j)) orelse return null;
-        if (!s.join.keyless()) return null;
-        const rp = (try residualPlan(self.arena, s.left, s.right, s.join, self.params, self.diag)) orelse return "nested-loop";
-        return if (try op.nlRangeOf(self.arena, rp.pred, rp.schema, s.left.fields.len) != null) "range" else "nested-loop";
+        const r = (try self.joinOf(in, j)) orelse return null;
+        if (!r.keys.join.keyless()) return null;
+        const rp = r.residual orelse return "nested-loop";
+        return if (try op.nlRangeOf(self.arena, rp.pred, rp.schema, r.left.out.fields.len) != null) "range" else "nested-loop";
     }
 
     fn stageInfo(self: *Ctx, st: ast.Stage) !Stage {

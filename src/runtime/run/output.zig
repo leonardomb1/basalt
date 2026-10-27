@@ -430,7 +430,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     if (!whole_agg and !top_n and opts.lanes() > 1 and env.sql_desc != null) {
         if (sql) |s| switch (s.split) {
-            .agg => |shape| if (try runParallelSqlAgg(env, stages, shape.prefix, shape.ag, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
+            .agg => |shape| if (try runParallelSqlAgg(env, stages, shape.prefix, shape.agg, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
             .map_join => |js| {
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
                 if (env.sources.items.len == src_base) {
