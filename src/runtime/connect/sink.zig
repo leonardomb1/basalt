@@ -170,6 +170,7 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         env.mem_sink.?.schema = try dupeSchema(env.arena, schema);
         return env.mem_sink.?.sink();
     }
+    if (env.union_sink) |s| return s;
     if (env.explain) return DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
         var info = env.takeResult();

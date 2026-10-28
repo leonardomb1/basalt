@@ -167,6 +167,7 @@ fn sameColumns(report: ?sql.Report, want: types.Schema, got: types.Schema) !void
 }
 
 pub const buildParallelSink = @import("connect/lane_sink.zig").buildParallelSink;
+pub const opensPerLane = @import("connect/lane_sink.zig").opensPerLane;
 pub const ConstSource = @import("connect/source.zig").ConstSource;
 pub const openSource = @import("connect/source.zig").openSource;
 pub const openSourceProjected = @import("connect/source.zig").openSourceProjected;

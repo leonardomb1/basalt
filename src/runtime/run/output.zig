@@ -11,6 +11,9 @@ const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const buildPipeline = @import("../plan.zig").buildPipeline;
+const buildProject = @import("../plan.zig").buildProject;
+const buildStage = @import("../plan.zig").buildStage;
+const driver = @import("../../connect/driver.zig");
 const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
@@ -32,6 +35,7 @@ const noteLoad = @import("../run.zig").noteLoad;
 const notePlan = @import("explain.zig").notePlan;
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
+const opensPerLane = @import("../connect.zig").opensPerLane;
 const openSource = @import("../connect.zig").openSource;
 const openSplitSource = @import("../connect.zig").openSplitSource;
 const parallel = @import("../parallel.zig");
@@ -267,7 +271,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.pq_folder = null;
     const outer_stop = env.stop;
     defer env.stop = outer_stop;
-    env.stop = if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
+    env.stop = if (env.union_sink != null) outer_stop else if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
         const f = try arena.create(std.atomic.Value(bool));
         f.* = .init(false);
         break :blk f;
@@ -544,8 +548,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (env.profile) |p| _ = try p.absorb(res.op);
 }
 
-/// Split-parallel union: each branch runs as its own split pipeline into the shared
-/// sink; the first keeps the write mode (so `overwrite` truncates once), later ones append.
+/// Split-parallel union: each branch runs as its own split pipeline. A target with
+/// per-lane sinks takes each branch on its own, the first keeping the write mode (so
+/// `overwrite` truncates once) and later ones appending; any other is opened once, on
+/// the union's schema, and every branch writes to it, so the union is one result.
 fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: []const ast.Stage, write_stage: ast.Stage, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
@@ -555,17 +561,45 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
 
     const except = unionExceptNames(downstream);
     const schemas = try arena.alloc(types.Schema, specs.len);
-    for (specs, schemas) |*s, *sch| {
+    const probes = try arena.alloc(driver.Source, specs.len);
+    var opened: usize = 0;
+    defer for (probes[0..opened]) |p| p.close();
+    for (specs, schemas, probes) |*s, *sch, *p| {
         if (except.len > 0) {
             if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
         }
         var probe = s.read;
         probe.where = "1 = 0";
-        const src = try openSource(env, probe, hints);
-        sch.* = try dupeSchema(arena, src.schema());
-        src.close();
+        p.* = try openSource(env, probe, hints);
+        opened += 1;
+        sch.* = try dupeSchema(arena, p.schema());
     }
     const canon = try unionCanon(env, specs, schemas, canon_opt, except);
+    const w = write_stage.node.write;
+    const outer_sink = env.union_sink;
+    defer env.union_sink = outer_sink;
+    var shared: SinkGuard = .empty;
+    defer shared.abort();
+    if (!opensPerLane(env, w)) {
+        var out_fields: []types.Schema.Field = &.{};
+        for (specs, schemas, probes, 0..) |s, sch, p, i| {
+            const scan = try arena.create(op.Scan);
+            scan.* = .{ .src = p };
+            var r = try buildProject(env, try synthReconcile(arena, sch, canon, tag_col, s.tag), sch, .{ .scan = scan });
+            for (downstream) |st| r = try buildStage(env, st, r.op, r.schema);
+            r.op.release();
+            if (i == 0) {
+                out_fields = try arena.dupe(types.Schema.Field, r.schema.fields);
+            } else for (out_fields, r.schema.fields) |*f, b| {
+                f.ty.nullable = f.ty.nullable or b.ty.nullable;
+            }
+        }
+        const snk = try openSink(env, w, .{ .fields = out_fields });
+        shared.arm(snk);
+        env.union_sink = try keptOpen(arena, snk);
+    }
+    for (probes[0..opened]) |p| p.close();
+    opened = 0;
 
     var split_hints = std.array_list.Managed(ast.Hint).init(arena);
     for (hints) |h| {
@@ -574,12 +608,12 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     }
     const branch_hints = try split_hints.toOwnedSlice();
 
-    const w = write_stage.node.write;
     const outer_scope = if (env.profile) |p| p.scope else 0;
     defer if (env.profile) |p| {
         p.scope = outer_scope;
     };
     for (specs, schemas, 0..) |s, sch, i| {
+        if (env.stop) |f| if (f.load(.monotonic)) break;
         if (env.profile) |p| p.scope = std.hash.Wyhash.hash(outer_scope, std.mem.asBytes(&i));
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
         var bstages = std.array_list.Managed(ast.Stage).init(arena);
@@ -591,5 +625,20 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         try bstages.append(.{ .node = .{ .write = bw }, .hints = write_stage.hints, .pos = write_stage.pos });
         try runOutput(env, .{ .stages = try bstages.toOwnedSlice(), .pos = u.pos }, opts, stats, lanes_used, batch_arena);
     }
+    try shared.close();
     if (env.profile) |p| p.path = try msgfmt.allocPrint(arena, "union split-parallel, {d} branches", .{specs.len});
+}
+
+/// `s` with close and abort doing nothing, for the branches of a union whose
+/// owner closes it once.
+fn keptOpen(arena: std.mem.Allocator, s: driver.Sink) !driver.Sink {
+    const vt = try arena.create(driver.Sink.VTable);
+    vt.* = s.vtable.*;
+    vt.close = struct {
+        fn f(_: *anyopaque) anyerror!void {}
+    }.f;
+    vt.abort = struct {
+        fn f(_: *anyopaque) void {}
+    }.f;
+    return .{ .ptr = s.ptr, .vtable = vt };
 }
