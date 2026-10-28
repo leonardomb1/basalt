@@ -586,7 +586,7 @@ fn curSchema(ptr: *anyopaque) types.Schema {
 }
 fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
-    return self.fetchBatch(arena);
+    return self.fetchBatch(arena) catch |e| self.conn.wire.queryFailed(e);
 }
 fn curClose(ptr: *anyopaque) void {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));

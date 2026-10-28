@@ -403,7 +403,7 @@ test "the fake server answers a table read, narrows by IN, refuses an unknown co
     try std.testing.expectEqualStrings("SELECT \"nope\" FROM t", got[1]);
 }
 
-test "the login deadline is lifted once the session is up: a query slower than connect_timeout succeeds unless query_timeout is set" {
+test "the login deadline is lifted once the session is up: a query slower than connect_timeout succeeds unless query_timeout is set, whose firing names the host" {
     const gpa = std.testing.allocator;
     const rows = [_][]const ?[]const u8{&.{"1"}};
     const tables = [_]Table{.{ .name = "t", .cols = &.{.{ .name = "id", .oid = 20 }}, .rows = &rows }};
@@ -424,4 +424,6 @@ test "the login deadline is lifted once the session is up: a query slower than c
     const capped = try pg.Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "", "d", .off, .{ .connect_s = 1, .query_s = 1 });
     defer capped.close();
     try std.testing.expectError(error.ConnectionIoFailed, capped.sqlConn().queryCursor(q));
+    const want = try std.fmt.allocPrint(ar.allocator(), "127.0.0.1:{d}: no reply within query_timeout (1 s)", .{srv.port()});
+    try std.testing.expectEqualStrings(want, capped.sqlConn().lastError());
 }
