@@ -396,12 +396,13 @@ fn uuidAt(arena: std.mem.Allocator, k: usize, m: usize) ![]const u8 {
     return arena.dupe(u8, &uuid.text(&bytes, .canonical));
 }
 
-/// A name as a catalog lookup's string literal: `N'…'` on SQL Server, so a name
-/// outside the database's code page still resolves. Stands in for
-/// `sql.writeStrLit(.catalog_name)` until sql.zig has it.
+/// A name as a catalog lookup's string literal, `writeStrLit(.catalog_name)`
+/// allocated: `N'…'` on SQL Server, so a name outside the database's code page
+/// still resolves.
 pub fn catalogNameLit(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
-    const lit = try dialect.strLit(arena, name);
-    return if (dialect == .sqlserver) std.mem.concat(arena, u8, &.{ "N", lit }) else lit;
+    var out = std.array_list.Managed(u8).init(arena);
+    try dialect.writeStrLit(out.writer(), name, .catalog_name);
+    return out.toOwnedSlice();
 }
 
 /// A table as a catalog lookup names it: its quoted parts as one literal, the way a

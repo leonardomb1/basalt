@@ -1663,6 +1663,27 @@ test "a string literal keeps a name from data inside it in every dialect" {
     try std.testing.expectEqualStrings("'a\\\\'' OR 1=1 -- '", try Dialect.mysql.strLit(a, "a\\' OR 1=1 -- "));
 }
 
+test "a backslash and a quote in a string literal per dialect" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = "it's C:\\new";
+    const cases = [_]struct { Dialect, []const u8, []const u8, bool }{
+        .{ .mysql, "'it''s C:\\\\new'", "'it''s C:\\\\new'", false },
+        .{ .starrocks, "'it''s C:\\\\new'", "'it''s C:\\\\new'", false },
+        .{ .doris, "'it''s C:\\\\new'", "'it''s C:\\\\new'", false },
+        .{ .postgres, "'it''s C:\\new'", "'it''s C:\\new'", true },
+        .{ .sqlserver, "'it''s C:\\new'", "N'it''s C:\\new'", true },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqualStrings(c[1], try c[0].strLit(a, s));
+        var w: std.Io.Writer.Allocating = .init(a);
+        try c[0].writeStrLit(&w.writer, s, .data);
+        try std.testing.expectEqualStrings(c[2], w.written());
+        try std.testing.expectEqual(c[3], c[0].textLitOk(s));
+    }
+}
+
 test "the literal writers equal their pre-writeStrLit bodies, but for SQL Server's N on a value" {
     const Orig = struct {
         /// The literal writers at 10e697a, before `writeStrLit`: `quoteString`, `strLit`,

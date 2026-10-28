@@ -119,7 +119,7 @@ fn readPages(
         switch (pg.header.ty) {
             .dictionary_page => dict = try readDict(arena, pg, meta, elem, cast),
             .data_page, .data_page_v2 => {
-                produced += try appendDataPage(arena, &b, pg, meta, elem, cast, max_def, dict, max_rep, if (levels) |*l| l else null);
+                produced += try appendDataPage(arena, &b, pg, meta, elem, cast, max_def, dict, max_rep, if (levels) |*l| l else null, entries - produced);
             },
             .index_page => {},
             else => return Error.CorruptParquetPage,
@@ -197,7 +197,9 @@ fn readDict(arena: std.mem.Allocator, pg: parquet.Page, meta: parquet.ColumnMeta
 
 /// v1 length-prefixes each level section; v2 keeps them unprefixed with lengths
 /// in the header. Every encoding hands the kernel only the present values; the
-/// definition levels place them and mark the rest null.
+/// definition levels place them and mark the rest null. A page counting more than
+/// the `room` entries its chunk has left is corrupt before anything is decoded, as
+/// an RLE run of a few bytes may claim any count and is sized from it.
 fn appendDataPage(
     arena: std.mem.Allocator,
     b: *column.Builder,
@@ -209,8 +211,10 @@ fn appendDataPage(
     dict: ?Dict,
     max_rep: u32,
     levels: ?*Levels,
+    room: usize,
 ) Error!usize {
     const n = std.math.cast(usize, pg.header.num_values) orelse return Error.CorruptParquetPage;
+    if (n > room) return Error.CorruptParquetPage;
     var body = pg.data;
 
     var reps: ?[]u32 = null;
@@ -745,6 +749,17 @@ test "a nested leaf's page with no level streams pads its levels only after its 
     var b = column.Builder.init(a, cast.ty);
     const body = [_]u8{ 1, 0, 0, 0, 2, 0, 0, 0 };
     const pg: parquet.Page = .{ .header = .{ .ty = .data_page_v2, .num_values = 1 << 30, .encoding = .plain }, .data = &body, .next_offset = 0 };
-    try testing.expectError(Error.CorruptParquetPage, appendDataPage(a, &b, pg, .{ .ty = .int32 }, .{ .ty = .int32 }, cast, 0, null, 0, &levels));
+    try testing.expectError(Error.CorruptParquetPage, appendDataPage(a, &b, pg, .{ .ty = .int32 }, .{ .ty = .int32 }, cast, 0, null, 0, &levels, std.math.maxInt(usize)));
     try testing.expectEqual(@as(usize, 0), levels.reps.items.len);
+}
+
+test "a data page claiming more values than its chunk has left fails before its levels are sized" {
+    var buf: [64 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const cast: Cast = .{ .ty = types.Type.init(.int).asNullable(), .tick = .us };
+    var b = column.Builder.init(a, cast.ty);
+    const body = [_]u8{ 6, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x08, 1, 1, 0, 0, 0 };
+    const pg: parquet.Page = .{ .header = .{ .ty = .data_page, .num_values = 1 << 30, .encoding = .plain }, .data = &body, .next_offset = 0 };
+    try testing.expectError(Error.CorruptParquetPage, appendDataPage(a, &b, pg, .{ .ty = .int32 }, .{ .ty = .int32 }, cast, 1, null, 0, null, 4));
 }
