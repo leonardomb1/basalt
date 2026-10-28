@@ -100,9 +100,10 @@ pub fn laneEligible(stages: []const ast.Stage, n: usize) bool {
 }
 
 /// Whether a binding of `stages` that a pipeline reads is aggregated first, in
-/// parallel, into memory: built where it is read it ran on one thread.
-pub fn materializes(stages: []const ast.Stage, n: usize) bool {
-    if (n < 2 or stages.len < 2 or stages[0].node != .read) return false;
+/// parallel, into memory: built where it is read it ran on one thread. At `-j 1`
+/// too, so its aggregate folds as at every other `-j`.
+pub fn materializes(stages: []const ast.Stage) bool {
+    if (stages.len < 2 or stages[0].node != .read) return false;
     for (stages) |st| {
         if (st.node == .aggregate) return true;
     }

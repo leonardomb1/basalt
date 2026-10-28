@@ -526,6 +526,7 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
     var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
     defer strs.deinit();
     const la = LaneAgg.of(env, try resolveAt(env, agg_in, shape.agg), &strs);
+    if (opts.lanes() == 1 and joins.len == 0 and exact(la.aggs)) return false;
     if (m.* != .sql) env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
@@ -547,6 +548,19 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
             try pr.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
         } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", m.count(), m.unitName() });
     }
+    return true;
+}
+
+/// Whether every accumulator's result is the same in any order its rows add in: no
+/// float sum or mean, no variance. Such an aggregate on one lane runs serially, which
+/// gives the morsels' answer without their partials (a GROUP BY over keys spread
+/// across the file ran 60% slower on them and held every morsel's groups).
+fn exact(aggs: []const op.Aggregate.Agg) bool {
+    for (aggs) |a| switch (a.func) {
+        .sum, .avg => if ((a.arg_ty orelse return false).kind == .float) return false,
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => return false,
+        else => {},
+    };
     return true;
 }
 

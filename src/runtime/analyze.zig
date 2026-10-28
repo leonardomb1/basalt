@@ -1425,7 +1425,7 @@ const Ctx = struct {
     /// window's input read into memory first, else the chain from the leading read.
     /// `raw` is before the head binding is laid out.
     fn physicalOf(self: *Ctx, raw: []const ast.Stage, stages_in: []const ast.Stage) Error!Physical {
-        if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes(b.stages, self.lanes))
+        if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes(b.stages))
             return self.prelude(raw[0].node.ref, b.stages, b.stages.len);
         var joined = stages_in;
         if (stages_in[0].node == .ref) if (self.bindings.get(stages_in[0].node.ref)) |b| if (b.stages.len > 0 and b.stages[0].node == .read) {

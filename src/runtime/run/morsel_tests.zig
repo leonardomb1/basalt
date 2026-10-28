@@ -45,6 +45,12 @@ fn writeCsv(dir: std.fs.Dir, name: []const u8, a: std.mem.Allocator) !void {
     try dir.writeFile(.{ .sub_path = name, .data = out.items });
 }
 
+fn writeNdjson(dir: std.fs.Dir, name: []const u8, a: std.mem.Allocator) !void {
+    var out = std.array_list.Managed(u8).init(a);
+    for (0..rows / 4) |i| try out.writer().print("{{\"id\":{d},\"k\":{d},\"g\":\"{s}\",\"f\":{e}}}\n", .{ i, key(i), group(i), value(i) });
+    try dir.writeFile(.{ .sub_path = name, .data = out.items });
+}
+
 fn writeParquet(a: std.mem.Allocator, path: []const u8, lo: usize, hi: usize) !void {
     var w = try pqwrite.Writer.open(a, path, schema, .snappy, .truncate);
     w.group_rows = 997;
@@ -71,6 +77,7 @@ const queries = [_][]const u8{
     "SELECT SUM(CAST(f AS DECIMAL(18,3))) AS ds, COUNT(DISTINCT g) AS dg FROM $IN",
     "SELECT l.label, SUM(t.f) AS s, COUNT(*) AS n FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g GROUP BY l.label ORDER BY l.label",
     "SELECT id % 3 AS r, SUM(f) AS s FROM $IN WHERE k > 100 GROUP BY r ORDER BY r",
+    "SELECT COUNT(*) AS n, SUM(s) AS t FROM (SELECT g, SUM(f) AS s FROM $IN GROUP BY g) d",
 };
 
 /// The file `q` writes over `input` at `threads`, morsels of `morsel_bytes`.
@@ -120,11 +127,13 @@ test "an aggregate over many morsels is byte-identical at -j 1, 4 and 16" {
     try tmp.dir.makeDir("pf");
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "a.parquet" }), 0, rows / 3);
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "b.parquet" }), rows / 3, rows);
+    try writeNdjson(tmp.dir, "in.ndjson", a);
 
     const inputs = [_][]const u8{
         try msgfmt.allocPrint(a, "'{s}/in.csv'", .{base}),
         try msgfmt.allocPrint(a, "'{s}/in.parquet'", .{base}),
         try msgfmt.allocPrint(a, "'{s}/pf/'", .{base}),
+        try msgfmt.allocPrint(a, "'{s}/in.ndjson'", .{base}),
     };
     try sameAtEveryJ(a, tmp.dir, base, &inputs, .{ .morsel_bytes = 16 << 10 });
 }
@@ -138,7 +147,7 @@ test "an aggregate past --op-memory runs serially and spills, the same at -j 1 a
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeCsv(tmp.dir, "in.csv", a);
 
-    const q = try msgfmt.allocPrint(a, "SELECT k, COUNT(*) AS n, MIN(id) AS lo FROM '{s}/in.csv' GROUP BY k ORDER BY k", .{base});
+    const q = try msgfmt.allocPrint(a, "SELECT k, COUNT(*) AS n, MIN(id) AS lo, SUM(f) AS s FROM '{s}/in.csv' GROUP BY k ORDER BY k", .{base});
     const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10, .op_memory = 64 << 10, .spill_dir = base };
     const one = try resultOf(a, tmp.dir, base, "", q, 1, opts);
     const four = try resultOf(a, tmp.dir, base, "", q, 4, opts);
