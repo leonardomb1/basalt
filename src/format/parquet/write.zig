@@ -1210,7 +1210,7 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
             return encodeFixedSlice(i32, cb, sa, m.optional, col, d, lo, hi),
         .bytes => if (m.phys == .byte_array and (k == .string or k == .bytes))
             return encodeBytesSlice(cb, sa, m.optional, col, lo, hi),
-        .dec => if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
+        .dec, .d64 => if (k == .decimal and m.phys != .byte_array and m.phys != .boolean and m.phys != .double)
             return encodeDecimalSlice(cb, sa, m, col, column.decimals(col), lo, hi),
         else => {},
     }

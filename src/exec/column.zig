@@ -22,6 +22,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const decimal = @import("decimal.zig");
+const Dec64 = decimal.Dec64;
 const par = @import("par.zig");
 const textconv = @import("textconv.zig");
 
@@ -323,7 +324,7 @@ pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
             return selectBytes(o.arena, o.c.data.bytes, o.sel);
         }
     };
-    var out = Column.derived(c.ty, sel.kept, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .sel = sel }));
+    var out = Column.derived(c.ty, sel.kept, bm, try mapTag(Shape.of(c.data), Op{ .arena = arena, .c = c, .sel = sel }));
     if (c.dict) |d| if (d.values.len <= dict_carry_max) {
         out.dict = try carryDict(arena, d, try selectSlice(u32, arena, d.codes, sel));
     };
@@ -369,8 +370,9 @@ fn concatValidity(arena: std.mem.Allocator, chunks: []const Column, total: usize
     return bm;
 }
 
-pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !Column {
-    std.debug.assert(chunks.len > 0);
+pub fn concat(arena: std.mem.Allocator, chunks_in: []const Column, total: usize) !Column {
+    std.debug.assert(chunks_in.len > 0);
+    const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
     const Op = struct {
         arena: std.mem.Allocator,
@@ -389,13 +391,14 @@ pub fn concat(arena: std.mem.Allocator, chunks: []const Column, total: usize) !C
             return concatBytes(o.arena, o.chunks, o.total);
         }
     };
-    return Column.derived(chunks[0].ty, total, bm, try mapTag(chunks[0].data, Op{ .arena = arena, .chunks = chunks, .total = total }));
+    return Column.derived(chunks[0].ty, total, bm, try mapTag(Shape.of(chunks[0].data), Op{ .arena = arena, .chunks = chunks, .total = total }));
 }
 
 /// `concat` copying the chunks on up to `threads` threads, each chunk to its place;
 /// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
-pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: usize, threads: usize) !Column {
-    if (threads < 2 or chunks.len < 2 or total < 1 << 17) return concat(arena, chunks, total);
+pub fn concatThreads(arena: std.mem.Allocator, chunks_in: []const Column, total: usize, threads: usize) !Column {
+    if (threads < 2 or chunks_in.len < 2 or total < 1 << 17) return concat(arena, chunks_in, total);
+    const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
     const rows = try arena.alloc(usize, chunks.len);
     const bytes = try arena.alloc(usize, chunks.len);
@@ -407,7 +410,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks: []const Column, total: us
         off += c.len;
         if (c.data == .bytes) span += c.data.bytes.span(c.len);
     }
-    const out = try allocData(arena, chunks[0].data, total, span);
+    const out = try allocData(arena, Shape.of(chunks[0].data), total, span);
     const Copy = struct {
         chunks: []const Column,
         rows: []const usize,
@@ -473,7 +476,7 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
             return o.c.data.bytes.take(o.arena, o.idx);
         }
     };
-    var out = Column.derived(c.ty, idx.len, bm, try mapTag(c.data, Op{ .arena = arena, .c = c, .idx = idx }));
+    var out = Column.derived(c.ty, idx.len, bm, try mapTag(Shape.of(c.data), Op{ .arena = arena, .c = c, .idx = idx }));
     if (c.dict) |d| if (d.values.len <= dict_carry_max) {
         const codes = try arena.alloc(u32, idx.len);
         for (codes, idx) |*o, r| o.* = d.codes[r];
@@ -487,7 +490,8 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
 /// emits its chunks or a merge interleaves its sources. Rows taken from sources not
 /// much longer than they are skip the per-row validity when no source holds a null,
 /// as `permuteValidity` does. Dictionary views are dropped, as each chunk's differs.
-pub fn takeAcross(a: std.mem.Allocator, srcs: []const Column, refs: anytype) !Column {
+pub fn takeAcross(a: std.mem.Allocator, srcs_in: []const Column, refs: anytype) !Column {
+    const srcs = try sameLayout(a, srcs_in);
     var bm = try Bitmap.initFull(a, refs.len);
     var total: usize = 0;
     for (srcs) |s| total += s.len;
@@ -539,7 +543,7 @@ pub fn takeAcross(a: std.mem.Allocator, srcs: []const Column, refs: anytype) !Co
             return .{ .offsets = offsets, .values = values };
         }
     };
-    const data = try mapTag(srcs[0].data, Op{ .a = a, .srcs = srcs, .refs = refs });
+    const data = try mapTag(Shape.of(srcs[0].data), Op{ .a = a, .srcs = srcs, .refs = refs });
     return Column.derived(srcs[0].ty, refs.len, bm, data);
 }
 
@@ -553,7 +557,7 @@ pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) !Colum
     out.validity = .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n };
     out.data = switch (c.data) {
         .bytes => |b| .{ .bytes = .{ .offsets = b.offsets[start..][0 .. n + 1], .values = b.values } },
-        inline else => |_, tag| dataOf(tag, fixedOf(tag, c.data)[start..][0..n]),
+        inline else => |_, tag| dataLike(tag, Shape.of(c.data), fixedOf(tag, c.data)[start..][0..n]),
     };
     if (c.dict) |d| {
         const v = try arena.create(Column.Dict);
@@ -592,7 +596,7 @@ pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
             for (offs, b.offsets[0 .. c.len + 1]) |*o, x| o.* = x - b.offsets[0];
             break :blk .{ .bytes = .{ .offsets = offs, .values = try arena.dupe(u8, b.values[lo..hi]) } };
         },
-        inline else => |_, tag| dataOf(tag, try arena.dupe(Elem(tag), fixedOf(tag, c.data)[0..c.len])),
+        inline else => |_, tag| dataLike(tag, Shape.of(c.data), try arena.dupe(Elem(tag), fixedOf(tag, c.data)[0..c.len])),
     };
     return out;
 }
@@ -624,7 +628,7 @@ pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, t
             span += len;
         }
     }
-    const out = try allocData(arena, c.data, n, span);
+    const out = try allocData(arena, Shape.of(c.data), n, span);
     const Gather = struct {
         c: Column,
         idx: []const usize,
@@ -679,46 +683,80 @@ pub fn storageOf(kind: types.TypeKind) Tag {
 
 /// The element type of a fixed-width storage.
 pub fn Elem(comptime t: Tag) type {
-    return if (t == .dec) value.Decimal else std.meta.Elem(@FieldType(Column.Data, @tagName(t)));
+    return switch (t) {
+        .dec => value.Decimal,
+        .d64 => Dec64,
+        else => std.meta.Elem(@FieldType(Column.Data, @tagName(t))),
+    };
 }
 
 /// A fixed-width storage's elements as a plain slice, for layout-generic code that
 /// moves elements without reading them as numbers: copies, gathers, spills, sizes.
 /// Decimal values are read through `decimals`.
 pub inline fn fixedOf(comptime t: Tag, d: Column.Data) []Elem(t) {
-    return if (t == .dec) d.dec.wide_cells else @field(d, @tagName(t));
+    return switch (t) {
+        .dec => d.dec.wide_cells,
+        .d64 => d.d64.narrow_cells,
+        else => @field(d, @tagName(t)),
+    };
 }
 
-/// Fixed-width storage over `s`, the one way generic code builds a `Data`.
+/// Fixed-width storage over `s`. A narrow decimal needs its scale, so it is built
+/// with `dataLike`.
 pub inline fn dataOf(comptime t: Tag, s: []Elem(t)) Column.Data {
+    if (t == .d64) @compileError("a narrow decimal is built with dataLike");
     return if (t == .dec) decimalData(s) else @unionInit(Column.Data, @tagName(t), s);
 }
 
-/// The one constructor of decimal storage.
+/// Fixed-width storage over `s`, in the layout `shape` names: the one way generic
+/// code builds a `Data` that may be a narrow decimal.
+pub inline fn dataLike(comptime t: Tag, shape: Shape, s: []Elem(t)) Column.Data {
+    return if (t == .d64) .{ .d64 = .{ .narrow_cells = s, .scale = shape.scale } } else dataOf(t, s);
+}
+
+/// The one constructor of wide decimal storage.
 pub inline fn decimalData(s: []value.Decimal) Column.Data {
     return .{ .dec = .{ .wide_cells = s } };
 }
 
-/// Decimal storage. Its slice is reachable only through `decimals` (to read values)
-/// and `fixedOf` (to move elements), so a tagged capture, `@field` or an `inline
-/// else` over `Data` cannot index it without naming one of them.
+/// Decimal storage, wide (`DecStore`, each cell its own scale) or narrow
+/// (`D64Store`, every cell an i64 at the column's one scale, a third the bytes).
+/// Their slices are reachable only through `decimals` (to read values) and `fixedOf`
+/// (to move elements), so a tagged capture, `@field` or an `inline else` over `Data`
+/// cannot index one without naming either.
 pub const DecStore = struct {
     wide_cells: []value.Decimal,
 };
 
-/// A `Data` of storage `tag`, from `op.fixed(t)` for a fixed-width one and
+pub const D64Store = struct {
+    narrow_cells: []Dec64,
+    scale: u8,
+};
+
+/// What building a `Data` like another's takes besides its elements: the storage,
+/// and a narrow decimal's scale.
+pub const Shape = struct {
+    tag: Tag,
+    scale: u8 = 0,
+
+    pub fn of(d: Column.Data) Shape {
+        return .{ .tag = d, .scale = if (d == .d64) d.d64.scale else 0 };
+    }
+};
+
+/// A `Data` of `shape`, from `op.fixed(t)` for a fixed-width storage and
 /// `op.bytes()` for bytes: the per-storage dispatch every column copy, merge and
 /// spill read goes through, so none can miss a storage.
-pub fn mapTag(tag: Tag, op: anytype) !Column.Data {
-    return switch (tag) {
+pub fn mapTag(shape: Shape, op: anytype) !Column.Data {
+    return switch (shape.tag) {
         .bytes => .{ .bytes = try op.bytes() },
-        inline else => |t| dataOf(t, try op.fixed(t)),
+        inline else => |t| dataLike(t, shape, try op.fixed(t)),
     };
 }
 
-/// Unfilled buffers for `n` rows of storage `tag`; a bytes one gets `span` value
-/// bytes and `n + 1` offsets, the first set to 0.
-pub fn allocData(arena: std.mem.Allocator, tag: Tag, n: usize, span: usize) !Column.Data {
+/// Unfilled buffers for `n` rows of `shape`; a bytes one gets `span` value bytes and
+/// `n + 1` offsets, the first set to 0.
+pub fn allocData(arena: std.mem.Allocator, shape: Shape, n: usize, span: usize) !Column.Data {
     const Op = struct {
         arena: std.mem.Allocator,
         n: usize,
@@ -732,7 +770,7 @@ pub fn allocData(arena: std.mem.Allocator, tag: Tag, n: usize, span: usize) !Col
             return .{ .offsets = offsets, .values = try o.arena.alloc(u8, try checkSpan(o.span)) };
         }
     };
-    return mapTag(tag, Op{ .arena = arena, .n = n, .span = span });
+    return mapTag(shape, Op{ .arena = arena, .n = n, .span = span });
 }
 
 pub const Column = struct {
@@ -752,6 +790,7 @@ pub const Column = struct {
         i64: []i64,
         f64: []f64,
         dec: DecStore,
+        d64: D64Store,
         bytes: Bytes,
     };
 
@@ -759,6 +798,7 @@ pub const Column = struct {
         if (!self.validity.get(i)) return .null;
         return switch (self.ty.kind) {
             .array, .@"struct" => .null,
+            .decimal => .{ .decimal = decimals(self).at(i) },
             inline else => |k| blk: {
                 const t = comptime storageOf(k);
                 break :blk @unionInit(Value, @tagName(k), if (t == .bytes) self.data.bytes.at(i) else fixedOf(t, self.data)[i]);
@@ -777,17 +817,71 @@ pub const Column = struct {
 /// with `inline else`, so each layout gets its own specialized loop.
 pub const DecView = union(enum) {
     wide: []value.Decimal,
+    narrow: Narrow,
+
+    pub const Narrow = struct {
+        cells: []Dec64,
+        scale: u8,
+    };
 
     pub inline fn at(v: DecView, i: usize) value.Decimal {
         return switch (v) {
-            inline else => |s| s[i],
+            .wide => |s| s[i],
+            .narrow => |n| n.cells[i].at(n.scale),
         };
     }
 };
 
-/// The one way to read a decimal column's values; `DecStore` admits no other.
+/// The one way to read a decimal column's values; `DecStore` and `D64Store` admit
+/// no other.
 pub inline fn decimals(c: Column) DecView {
-    return .{ .wide = c.data.dec.wide_cells };
+    return switch (c.data) {
+        .d64 => |n| .{ .narrow = .{ .cells = n.narrow_cells, .scale = n.scale } },
+        else => .{ .wide = c.data.dec.wide_cells },
+    };
+}
+
+/// Wide decimal cells as narrow storage when every present one has the same scale
+/// and an i64 holds it, else as they are; a null's cell reads 0.
+pub fn packDecimals(arena: std.mem.Allocator, validity: Bitmap, cells: []value.Decimal) !Column.Data {
+    const all = validity.allSet(cells.len);
+    var scale: ?u8 = null;
+    for (cells, 0..) |d, i| {
+        if (!all and !validity.get(i)) continue;
+        if (std.math.cast(i64, d.unscaled) == null) return decimalData(cells);
+        if (scale) |sc| {
+            if (d.scale != sc) return decimalData(cells);
+        } else scale = d.scale;
+    }
+    const out = try arena.alloc(Dec64, cells.len);
+    for (cells, out, 0..) |d, *o, i|
+        o.* = if (all or validity.get(i)) Dec64.of(@intCast(d.unscaled)) else Dec64.of(0);
+    return .{ .d64 = .{ .narrow_cells = out, .scale = scale orelse 0 } };
+}
+
+/// `c` with wide decimal storage: as it is unless narrow.
+pub fn widened(arena: std.mem.Allocator, c: Column) !Column {
+    if (c.data != .d64) return c;
+    const cells = try arena.alloc(value.Decimal, c.len);
+    const v = decimals(c);
+    for (cells, 0..) |*o, i| o.* = v.at(i);
+    var out = c;
+    out.data = decimalData(cells);
+    return out;
+}
+
+/// `cols` all in one layout, for code copying cells from one into another's: as
+/// they are when their shapes agree, else each decimal one widened.
+pub fn sameLayout(arena: std.mem.Allocator, cols: []const Column) ![]const Column {
+    if (cols.len < 2) return cols;
+    const s0 = Shape.of(cols[0].data);
+    for (cols[1..]) |c| {
+        const sh = Shape.of(c.data);
+        if (sh.tag != s0.tag or sh.scale != s0.scale) break;
+    } else return cols;
+    const out = try arena.alloc(Column, cols.len);
+    for (cols, out) |c, *o| o.* = try widened(arena, c);
+    return out;
 }
 
 pub const Builder = struct {
@@ -799,6 +893,7 @@ pub const Builder = struct {
     bits: std.array_list.Managed(u8),
     rows: usize = 0,
     store: Store,
+    nscale: u8 = 0,
 
     pub const BytesStore = struct {
         values: std.array_list.Managed(u8),
@@ -811,6 +906,7 @@ pub const Builder = struct {
         i64: std.array_list.Managed(i64),
         f64: std.array_list.Managed(f64),
         dec: std.array_list.Managed(value.Decimal),
+        d64: std.array_list.Managed(Dec64),
         bytes: BytesStore,
     };
 
@@ -819,11 +915,36 @@ pub const Builder = struct {
             .values = std.array_list.Managed(u8).init(arena),
             .ends = std.array_list.Managed(i32).init(arena),
         } };
-        const store: Store = switch (storageOf(ty.kind)) {
+        const narrow = ty.kind == .decimal and ty.precision >= 1 and ty.precision <= 18;
+        const store: Store = if (narrow) .{ .d64 = std.array_list.Managed(Dec64).init(arena) } else switch (storageOf(ty.kind)) {
             .bytes => bytes_store,
             inline else => |t| @unionInit(Store, @tagName(t), std.array_list.Managed(Elem(t)).init(arena)),
         };
-        return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store };
+        return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store, .nscale = ty.scale };
+    }
+
+    /// Whether this builder holds its decimals narrow, as `Dec64` cells at `nscale`;
+    /// a DECIMAL of 18 digits or fewer starts so and widens at the first value that
+    /// is not at that scale or not held by an i64.
+    pub fn narrowDecimals(self: *const Builder) bool {
+        return self.store == .d64;
+    }
+
+    inline fn narrowOf(self: *const Builder, d: value.Decimal) ?Dec64 {
+        if (d.scale != self.nscale) return null;
+        return Dec64.of(std.math.cast(i64, d.unscaled) orelse return null);
+    }
+
+    /// The narrow cells moved to wide ones, capacity kept, for a value they cannot hold.
+    fn widen(self: *Builder) !void {
+        const l = self.store.d64;
+        var w = try std.array_list.Managed(value.Decimal).initCapacity(self.arena, @max(l.capacity, l.items.len + 1));
+        for (l.items) |x| w.appendAssumeCapacity(x.at(self.nscale));
+        self.store = .{ .dec = w };
+    }
+
+    inline fn wideFor(self: *Builder, comptime T: type) !void {
+        if (T == value.Decimal and self.store == .d64) try self.widen();
     }
 
     fn pushValid(self: *Builder, ok: bool) !void {
@@ -873,6 +994,7 @@ pub const Builder = struct {
     }
 
     pub fn appendBulk(self: *Builder, comptime T: type, vals: []const T) !void {
+        try self.wideFor(T);
         switch (self.store) {
             inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
@@ -886,6 +1008,7 @@ pub const Builder = struct {
     /// Room for `n` more values of a fixed-width store, written in place and then
     /// counted, all valid, by `commitSlots`; skips the copy a temporary would cost.
     pub fn reserveSlots(self: *Builder, comptime T: type, n: usize) ![]T {
+        try self.wideFor(T);
         switch (self.store) {
             inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
@@ -897,6 +1020,7 @@ pub const Builder = struct {
     }
 
     pub fn commitSlots(self: *Builder, comptime T: type, n: usize) !void {
+        try self.wideFor(T);
         switch (self.store) {
             inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
@@ -996,6 +1120,7 @@ pub const Builder = struct {
         max_def: u32,
     ) !void {
         if (defs.len == vals.len) return self.appendBulk(T, vals);
+        try self.wideFor(T);
         switch (self.store) {
             inline else => |*l| {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
@@ -1036,25 +1161,33 @@ pub const Builder = struct {
     }
     /// A decimal goes through `appendDecimal` or `appendDecimalAssumeCapacity`.
     pub fn appendAs(self: *Builder, comptime t: Tag, x: Elem(t)) !void {
-        if (t == .dec) @compileError("a decimal is appended with appendDecimal");
+        if (t == .dec or t == .d64) @compileError("a decimal is appended with appendDecimal");
         try self.pushValid(true);
         try @field(self.store, @tagName(t)).append(x);
     }
     pub fn appendDecimal(self: *Builder, d: value.Decimal) !void {
         try self.pushValid(true);
+        if (self.store == .d64) {
+            if (self.narrowOf(d)) |x| return self.store.d64.append(x);
+            try self.widen();
+        }
         try self.store.dec.append(d);
     }
     /// `appendAs` for a builder `initCapacity` sized for this row, checked only by
     /// the list's own assertion in safe builds.
     pub fn appendAsAssumeCapacity(self: *Builder, comptime t: Tag, x: Elem(t)) void {
-        if (t == .dec) @compileError("a decimal is appended with appendDecimal");
+        if (t == .dec or t == .d64) @compileError("a decimal is appended with appendDecimal");
         if (self.rows & 7 == 0) self.bits.appendAssumeCapacity(0xFF);
         self.rows += 1;
         @field(self.store, @tagName(t)).appendAssumeCapacity(x);
     }
-    pub fn appendDecimalAssumeCapacity(self: *Builder, d: value.Decimal) void {
+    pub fn appendDecimalAssumeCapacity(self: *Builder, d: value.Decimal) !void {
         if (self.rows & 7 == 0) self.bits.appendAssumeCapacity(0xFF);
         self.rows += 1;
+        if (self.store == .d64) {
+            if (self.narrowOf(d)) |x| return self.store.d64.appendAssumeCapacity(x);
+            try self.widen();
+        }
         self.store.dec.appendAssumeCapacity(d);
     }
     pub fn appendNull(self: *Builder) !void {
@@ -1086,6 +1219,13 @@ pub const Builder = struct {
             .i64 => |*l| try l.append(int orelse 0),
             .f64 => |*l| try l.append(if (ok) self.asF64(v) else 0),
             .dec => |*l| try l.append(self.asDec(v)),
+            .d64 => |*l| {
+                const d = self.asDec(v);
+                if (self.narrowOf(d)) |x| try l.append(x) else {
+                    try self.widen();
+                    try self.store.dec.append(d);
+                }
+            },
             .bytes => |*l| {
                 if (ok) try l.values.appendSlice(self.asBytes(v));
                 try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
@@ -1175,6 +1315,8 @@ pub const Builder = struct {
                 @memcpy(offsets[1..], l.ends.items);
                 break :blk .{ .bytes = .{ .offsets = offsets, .values = try l.values.toOwnedSlice() } };
             },
+            .dec => |*l| try packDecimals(self.arena, bm, try l.toOwnedSlice()),
+            .d64 => |*l| .{ .d64 = .{ .narrow_cells = try l.toOwnedSlice(), .scale = self.nscale } },
             inline else => |*l, t| dataOf(t, try l.toOwnedSlice()),
         };
         var dict: ?*const Column.Dict = null;
@@ -1599,14 +1741,51 @@ fn eqlValue(x: Value, y: Value) bool {
 /// Whether `text` names `DecStore`'s slice: the field not followed by more of an
 /// identifier, so a longer name sharing its start does not count.
 fn namesDecimalSlice(text: []const u8) bool {
-    const needle = "wide_" ++ "cells";
-    var from: usize = 0;
-    while (std.mem.indexOfPos(u8, text, from, needle)) |at| {
-        const end = at + needle.len;
-        if (end == text.len or !(std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) return true;
-        from = end;
+    for ([_][]const u8{ "wide_" ++ "cells", "narrow_" ++ "cells" }) |needle| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, needle)) |at| {
+            const end = at + needle.len;
+            if (end == text.len or !(std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) return true;
+            from = end;
+        }
     }
     return false;
+}
+
+test "a decimal column of one scale that i64 holds is stored narrow, any other wide, and reads alike" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const D = value.Decimal;
+    const ty = types.Type.decimal(12, 2).asNullable();
+
+    var nb = Builder.init(a, ty);
+    for ([_]Value{ .{ .decimal = D{ .unscaled = 150, .scale = 2 } }, .null, .{ .decimal = D{ .unscaled = -7, .scale = 2 } } }) |v| try nb.append(v);
+    const narrow = try nb.finish();
+    try std.testing.expect(narrow.data == .d64);
+    try std.testing.expectEqual(D{ .unscaled = 150, .scale = 2 }, narrow.getValue(0).decimal);
+    try std.testing.expect(narrow.getValue(1) == .null);
+    try std.testing.expectEqual(D{ .unscaled = -7, .scale = 2 }, narrow.getValue(2).decimal);
+
+    var mb = Builder.init(a, ty);
+    for ([_]D{ .{ .unscaled = 15, .scale = 1 }, .{ .unscaled = 150, .scale = 2 } }) |d| try mb.appendDecimal(d);
+    const mixed = try mb.finish();
+    try std.testing.expect(mixed.data == .dec);
+    try std.testing.expectEqual(D{ .unscaled = 15, .scale = 1 }, mixed.getValue(0).decimal);
+
+    var wb = Builder.init(a, ty);
+    try wb.appendDecimal(.{ .unscaled = @as(i128, std.math.maxInt(i64)) + 1, .scale = 2 });
+    try std.testing.expect((try wb.finish()).data == .dec);
+
+    const joined = try concat(a, &.{ narrow, mixed }, 5);
+    try std.testing.expect(joined.data == .dec);
+    for ([_]usize{ 0, 2, 3, 4 }, [_]D{ .{ .unscaled = 150, .scale = 2 }, .{ .unscaled = -7, .scale = 2 }, .{ .unscaled = 15, .scale = 1 }, .{ .unscaled = 150, .scale = 2 } }) |r, want|
+        try std.testing.expectEqual(want, joined.getValue(r).decimal);
+    try std.testing.expect(joined.getValue(1) == .null);
+
+    const kept = try copy(a, try slice(a, narrow, 0, 3));
+    try std.testing.expect(kept.data == .d64);
+    try std.testing.expectEqual(D{ .unscaled = -7, .scale = 2 }, kept.getValue(2).decimal);
 }
 
 test "only column.zig names DecStore's slice; the rest go through decimals() and fixedOf()" {
@@ -1632,6 +1811,7 @@ test "only column.zig names DecStore's slice; the rest go through decimals() and
         return error.TestUnexpectedResult;
     }
     try std.testing.expect(namesDecimalSlice("c.data.dec." ++ "wide_" ++ "cells[i]"));
+    try std.testing.expect(namesDecimalSlice("c.data.d64." ++ "narrow_" ++ "cells"));
     try std.testing.expect(!namesDecimalSlice("wide_" ++ "cellsx"));
 }
 

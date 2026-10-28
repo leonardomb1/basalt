@@ -442,7 +442,8 @@ pub const TopK = struct {
     /// The rows `entries` name as columns of `fields`, in that order.
     pub fn columns(self: *const TopK, arena: std.mem.Allocator, entries: []const Entry, fields: []const types.Schema.Field, out: []column.Column) !void {
         for (fields, out, 0..) |f, *o, ci| {
-            if (entries.len > 0 and std.meta.activeTag(self.chunks.items[0].cols[ci].data) == column.storageOf(f.ty.kind)) {
+            const tag = if (entries.len > 0) std.meta.activeTag(self.chunks.items[0].cols[ci].data) else null;
+            if (tag != null and (tag == column.storageOf(f.ty.kind) or tag == .d64)) {
                 o.* = try self.take(arena, entries, ci);
                 o.ty = f.ty;
                 continue;

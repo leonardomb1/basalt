@@ -345,7 +345,7 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
         .float => try body.push(std.mem.sliceAsBytes((try store(col.data, .f64))[0..n])),
         .date => try body.push(std.mem.sliceAsBytes((try store(col.data, .i32))[0..n])),
         .decimal => {
-            if (col.data != .dec) return error.ArrowColumnStoreMismatch;
+            if (col.data != .dec and col.data != .d64) return error.ArrowColumnStoreMismatch;
             const src = column.decimals(col.*);
             const out = try arena.alloc(u8, n * 16);
             @memset(out, 0);

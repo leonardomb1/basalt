@@ -651,10 +651,16 @@ pub const KeyArr = struct {
             .float => .{ .floats = col.data.f64 },
             .decimal => blk: {
                 switch (column.decimals(col)) {
-                    inline else => |v| {
+                    .wide => |v| {
                         scale = decimal.widestScale(v[0..n], col.validity);
                         const out = try arena.alloc(i128, n);
                         if (!decimal.unscaledAt(out, v[0..n], col.validity, scale)) break :blk Data{ .boxed = col };
+                        break :blk .{ .decs = out };
+                    },
+                    .narrow => |nw| {
+                        scale = nw.scale;
+                        const out = try arena.alloc(i128, n);
+                        for (out, nw.cells[0..n]) |*o, x| o.* = x.int();
                         break :blk .{ .decs = out };
                     },
                 }

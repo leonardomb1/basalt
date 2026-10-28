@@ -327,7 +327,11 @@ fn typedArg(comptime a: Arg, arena: std.mem.Allocator, v: Vec, n: usize) VecErro
         .col => |c| switch (a) {
             .dec => switch (c.ty.kind) {
                 .decimal => switch (column.decimals(c)) {
-                    inline else => |ds| return .{ .col = .{ .d = ds, .v = c.validity } },
+                    .wide => |ds| return .{ .col = .{ .d = ds, .v = c.validity } },
+                    .narrow => {
+                        const w = try column.widened(arena, c);
+                        return .{ .col = .{ .d = column.decimals(w).wide, .v = c.validity } };
+                    },
                 },
                 .int => {
                     const out = try arena.alloc(E, n);

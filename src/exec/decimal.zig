@@ -74,6 +74,25 @@ pub const Decimal = struct {
     }
 };
 
+/// A cell of a narrow decimal column: the unscaled value alone, at the one scale
+/// its column's storage records. A type of its own, not `i64`, so code generic over
+/// storage cannot read it as an integer by accident.
+pub const Dec64 = enum(i64) {
+    _,
+
+    pub inline fn of(u: i64) Dec64 {
+        return @enumFromInt(u);
+    }
+
+    pub inline fn int(self: Dec64) i64 {
+        return @intFromEnum(self);
+    }
+
+    pub inline fn at(self: Dec64, scale: u8) Decimal {
+        return .{ .unscaled = self.int(), .scale = scale };
+    }
+};
+
 pub const pow10_i128 = blk: {
     var t: [39]i128 = undefined;
     var r: i128 = 1;
@@ -648,13 +667,14 @@ pub inline fn negate(d: Decimal) Decimal {
     return .{ .unscaled = -d.unscaled, .scale = d.scale };
 }
 
-/// How a lane operand is held: an INT column, a decimal column, or one constant.
-pub const Side = enum { int, dec, one };
+/// How a lane operand is held: an INT column, a wide or narrow decimal column, or
+/// one constant.
+pub const Side = enum { int, dec, d64, one };
 
-/// One operand of a lane kernel: its column's elements (`ints` or `decs`), the
-/// scale it is read at, the factor `f` that brings it to the result scale, and,
-/// for a constant, `c`, its unscaled value already brought there.
-pub const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{}, scale: u8, f: i128, c: i128 };
+/// One operand of a lane kernel: its column's elements (`ints`, `decs` or `narrow`
+/// at `nscale`), the scale it is read at, the factor `f` that brings it to the
+/// result scale, and, for a constant, `c`, its unscaled value already brought there.
+pub const LaneSrc = struct { ints: []const i64 = &.{}, decs: []const Decimal = &.{}, narrow: []const Dec64 = &.{}, nscale: u8 = 0, scale: u8, f: i128, c: i128 };
 
 /// The result scale `s` of `op` over operands read at scales `ls` and `rs`, and
 /// the factors that raise each to it; null when the lane cannot hold it (past 38
@@ -740,6 +760,11 @@ inline fn laneAt(comptime op: ast.BinOp, comptime k: Side, src: LaneSrc, i: usiz
             const d = src.decs[i];
             if (d.scale != src.scale) break :blk null;
             break :blk if (op == .mul or src.f == 1) d.unscaled else mulOrNull(d.unscaled, src.f);
+        },
+        .d64 => blk: {
+            if (src.nscale != src.scale) break :blk null;
+            const u: i128 = src.narrow[i].int();
+            break :blk if (op == .mul) u else u * src.f;
         },
     };
 }

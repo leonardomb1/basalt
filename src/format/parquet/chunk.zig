@@ -5,6 +5,7 @@
 //! statistic's value goes through the same kernel into `One`.
 
 const Decimal = @import("../../exec/value.zig").Decimal;
+const Dec64 = @import("../../exec/decimal.zig").Dec64;
 const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
 const Levels = @import("nested.zig").Levels;
@@ -334,6 +335,10 @@ const Cast = struct {
         return .{ .unscaled = x, .scale = c.ty.scale };
     }
 
+    fn dec64(_: Cast, x: i64) Dec64 {
+        return Dec64.of(x);
+    }
+
     fn unsignedDecimal(c: Cast, x: i64) Decimal {
         return .{ .unscaled = types.u64Unscaled(x), .scale = c.ty.scale };
     }
@@ -365,6 +370,11 @@ const Rows = struct {
 
     fn bytes(s: Rows, _: Cast, vals: []const []const u8) Error!void {
         s.b.appendBytesScattered(vals, s.defs, s.max_def) catch |e| return landed(e);
+    }
+
+    /// Whether decimals at `scale` land as narrow cells, unconverted.
+    fn narrowAt(s: Rows, scale: u8) bool {
+        return s.b.narrowDecimals() and s.b.nscale == scale;
     }
 };
 
@@ -427,7 +437,12 @@ fn pushInts(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
             },
         },
         .date => sink.put(i32, cast, Cast.date, src, n),
-        .decimal => if (cast.unsigned) sink.put(Decimal, cast, Cast.unsignedDecimal, src, n) else sink.put(Decimal, cast, Cast.decimal, src, n),
+        .decimal => if (cast.unsigned)
+            sink.put(Decimal, cast, Cast.unsignedDecimal, src, n)
+        else if (@TypeOf(sink) == Rows and sink.narrowAt(cast.ty.scale))
+            sink.put(Dec64, cast, Cast.dec64, src, n)
+        else
+            sink.put(Decimal, cast, Cast.decimal, src, n),
         .bool => sink.put(bool, cast, Cast.truthy, src, n),
         else => Error.UnsupportedParquetEncoding,
     };
@@ -579,6 +594,16 @@ fn Gather(comptime T: type) type {
     };
 }
 
+/// A narrow decimal dictionary's entries, read back at their one scale.
+const NarrowGather = struct {
+    view: column.DecView.Narrow,
+    idx: []const u32,
+
+    inline fn get(s: @This(), i: usize) Decimal {
+        return s.view.cells[s.idx[i]].at(s.view.scale);
+    }
+};
+
 /// Byte arrays are slices of the page body.
 fn plainByteArrays(arena: std.mem.Allocator, body: []const u8, count: usize) Error![]const []const u8 {
     const out = try arena.alloc([]const u8, count);
@@ -612,6 +637,13 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
         .bytes => {
             rows.b.appendDictBytes(d.flat, d.offs, idx, rows.defs, rows.max_def) catch |e| return landed(e);
             try rows.b.noteDict(d.id, d.entries, idx, rows.defs, rows.max_def);
+        },
+        .d64 => {
+            const view = column.decimals(d.col).narrow;
+            if (rows.narrowAt(view.scale))
+                try rows.put(Dec64, cast, Cast.same, Gather(Dec64){ .vals = view.cells, .idx = idx }, idx.len)
+            else
+                try rows.put(Decimal, cast, Cast.same, NarrowGather{ .view = view, .idx = idx }, idx.len);
         },
         inline else => |_, tag| {
             const vals = column.fixedOf(tag, d.col.data);

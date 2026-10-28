@@ -670,6 +670,7 @@ fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena
     const out = try arena.alloc(Out, n);
     const At = struct {
         inline fn at(v: @TypeOf(xs), i: usize) cast.Elem(from) {
+            if (@TypeOf(v) == column.DecView.Narrow) return v.cells[i].at(v.scale);
             return if (from == .string) v.at(i) else v[i];
         }
     };
@@ -679,7 +680,8 @@ fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena
         o.* = if (straight or col.validity.get(i)) try cast.castElem(from, to, At.at(xs, i), ty) else zero;
     }
     const t = if (to == .decimal) Type.decimal(ty.precision, ty.scale) else Type.init(to);
-    return mkCol(t.withNull(col.ty.nullable), n, col.validity, column.dataOf(comptime column.storageOf(to), out));
+    const data = if (to == .decimal) try column.packDecimals(arena, col.validity, out) else column.dataOf(comptime column.storageOf(to), out);
+    return mkCol(t.withNull(col.ty.nullable), n, col.validity, data);
 }
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {
@@ -692,8 +694,12 @@ fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Ve
     return pickVec(arena, take, tv, ev);
 }
 
-fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column) VecError!Vec {
+fn mergeCols(arena: std.mem.Allocator, take: []const bool, t_in: Column, e_in: Column) VecError!Vec {
     const n = take.len;
+    const pair = [_]Column{ t_in, e_in };
+    const both = try column.sameLayout(arena, &pair);
+    const t = both[0];
+    const e = both[1];
     var bm = try Bitmap.initFull(arena, n);
     const Op = struct {
         arena: std.mem.Allocator,
@@ -710,7 +716,7 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t: Column, e: Column)
             return mergeBytes(o.arena, o.bm, o.take, o.t.data.bytes, o.e.data.bytes, o.t.validity, o.e.validity);
         }
     };
-    const data = try column.mapTag(t.data, Op{ .arena = arena, .take = take, .t = t, .e = e, .bm = &bm });
+    const data = try column.mapTag(column.Shape.of(t.data), Op{ .arena = arena, .take = take, .t = t, .e = e, .bm = &bm });
     return .{ .col = Column.derived(t.ty.withNull(true), n, bm, data) };
 }
 
@@ -779,8 +785,11 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
             .decimal => blk: {
                 const out = try arena.alloc(f64, n);
                 switch (column.decimals(c)) {
-                    inline else => |ds| for (ds, 0..) |d, i| {
+                    .wide => |ds| for (ds, 0..) |d, i| {
                         out[i] = d.keyF64();
+                    },
+                    .narrow => |nw| for (nw.cells, 0..) |x, i| {
+                        out[i] = x.at(nw.scale).keyF64();
                     },
                 }
                 break :blk Num{ .fcol = .{ .d = out, .v = c.validity } };
@@ -873,13 +882,13 @@ const Side = decimal.Side;
 fn laneShape(comptime op: ast.BinOp, comptime lk: Side, comptime rk: Side) bool {
     if (lk == .one and rk == .one or lk == .int and rk == .int) return false;
     if (op == .sub or op == .mod) return true;
-    return lk == .dec or (lk == .int and rk == .one);
+    return lk == .dec or lk == .d64 or (lk == .int and rk == .one);
 }
 
 fn sideOf(v: Vec) Side {
     return switch (v) {
         .scalar => .one,
-        .col => |c| if (c.ty.kind == .int) .int else .dec,
+        .col => |c| if (c.ty.kind == .int) .int else if (c.data == .d64) .d64 else .dec,
     };
 }
 
@@ -914,7 +923,7 @@ const DecLane = struct {
 /// columns, or a scale `lanePlan` refuses), and the rows take `decimalOp`.
 noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
     if (op != .add and op != .sub and op != .mul and op != .mod) return null;
-    const swap = (op == .add or op == .mul) and (sideOf(l0) == .one or sideOf(l0) == .int and sideOf(r0) == .dec);
+    const swap = (op == .add or op == .mul) and (sideOf(l0) == .one or sideOf(l0) == .int and (sideOf(r0) == .dec or sideOf(r0) == .d64));
     const l = if (swap) r0 else l0;
     const r = if (swap) l0 else r0;
     const lk = sideOf(l);
@@ -946,9 +955,10 @@ noinline fn decRow(op: ast.BinOp, l: *const Vec, r: *const Vec, i: usize) VecErr
 fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) decimal.LaneSrc {
     return switch (v) {
         .scalar => .{ .scale = scale, .f = f, .c = c },
-        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else .{ .decs = switch (column.decimals(col)) {
-            inline else => |ds| ds,
-        }, .scale = scale, .f = f, .c = c },
+        .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else switch (column.decimals(col)) {
+            .wide => |ds| .{ .decs = ds, .scale = scale, .f = f, .c = c },
+            .narrow => |nw| .{ .narrow = nw.cells, .nscale = nw.scale, .scale = scale, .f = f, .c = c },
+        },
     };
 }
 
@@ -1054,8 +1064,13 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     var f = try Filled(bool).masked(arena, n, try copyBits(arena, c.validity, n));
     switch (pick.op) {
         inline .eq, .ne, .lt, .le, .gt, .ge => |cop| switch (column.decimals(c)) {
-            inline else => |v| for (v[0..n], f.d) |x, *o| {
+            .wide => |v| for (v[0..n], f.d) |x, *o| {
                 o.* = decimal.cmpAtScale(x, cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
+            },
+            .narrow => |nw| if (nw.scale == c.ty.scale) {
+                for (nw.cells[0..n], f.d) |x, *o| o.* = cmpResult(cop, std.math.order(@as(i128, x.int()), pick.bound));
+            } else for (nw.cells[0..n], f.d) |x, *o| {
+                o.* = decimal.cmpAtScale(x.at(nw.scale), cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
             },
         },
         else => unreachable,
@@ -1343,7 +1358,7 @@ fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) E
             return .{ .offsets = offsets, .values = values };
         }
     };
-    const data = try column.mapTag(std.meta.activeTag(one.data), Op{ .arena = arena, .one = one, .n = n });
+    const data = try column.mapTag(column.Shape.of(one.data), Op{ .arena = arena, .one = one, .n = n });
     return Column.derived(one.ty, n, bm, data);
 }
 

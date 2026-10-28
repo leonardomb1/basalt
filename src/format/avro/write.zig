@@ -189,7 +189,7 @@ fn encoderFor(data: Column.Data) Encoder {
                     .i64 => try long(out, col.data.i64[row]),
                     .f64 => try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(col.data.f64[row])))),
                     .bytes => try bytesOf(out, col.data.bytes.at(row)),
-                    .dec => try decimalBytes(out, decimals(col.*).at(row), fld),
+                    .dec, .d64 => try decimalBytes(out, decimals(col.*).at(row), fld),
                 }
             }
         }.f,

@@ -241,6 +241,7 @@ fn Read(comptime c: Code) type {
         .f64 => f64,
         .bytes => []const u8,
         .dec => Decimal,
+        .d64 => unreachable,
     };
 }
 
@@ -293,6 +294,7 @@ fn valueOf(comptime c: Code, kind: types.TypeKind, x: Read(c)) Value {
         .f64 => .{ .float = x },
         .bytes => if (kind == .string) .{ .string = x } else .{ .bytes = x },
         .dec => .{ .decimal = x },
+        .d64 => unreachable,
     };
 }
 
@@ -494,7 +496,7 @@ pub const Machine = struct {
         const b = &m.out[op.col];
         const t = comptime Code.storageOf(c);
         if (t == null) return b.appendNull();
-        if (t.? == .bytes) try b.appendStr(v) else if (t.? == .dec) b.appendDecimalAssumeCapacity(v) else b.appendAsAssumeCapacity(t.?, v);
+        if (t.? == .bytes) try b.appendStr(v) else if (t.? == .dec) try b.appendDecimalAssumeCapacity(v) else b.appendAsAssumeCapacity(t.?, v);
     }
 
     /// A value whose column the table types otherwise, decoded and cast to it.

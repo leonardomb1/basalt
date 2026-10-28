@@ -162,6 +162,7 @@ const Outs = struct {
                     sa.* = try column.BytesAppender.init(arena, n);
                     d.* = .{ .bytes = undefined };
                 },
+                .d64 => unreachable,
                 inline else => |t| d.* = column.dataOf(t, try arena.alloc(column.Elem(t), n)),
             }
         }

@@ -266,9 +266,10 @@ pub const Merge = struct {
         }
         if (c.ty.kind != .decimal) return out;
         const same = switch (column.decimals(in)) {
-            inline else => |v| for (v[0..b.len], 0..) |d, r| {
+            .wide => |v| for (v[0..b.len], 0..) |d, r| {
                 if (in.validity.get(r) and d.scale != c.ty.scale) break false;
             } else true,
+            .narrow => |nw| nw.scale == c.ty.scale,
         };
         if (same) return out;
         var bd = try column.Builder.initCapacity(t, c.ty.asNullable(), b.len);

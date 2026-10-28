@@ -7,8 +7,8 @@
 //!
 //!   magic       "BSPILL\x00\x01", padded to 16 bytes
 //!   per batch   header: rows u64, column count u64, then per column the `Data`
-//!               tag u64 and the byte length of its values buffer u64 (0 unless
-//!               bytes); then per column its validity bits (`(rows + 7) / 8`
+//!               tag u64 and the byte length of its values buffer u64 (a narrow
+//!               decimal's scale instead, 0 for any other); then per column its validity bits (`(rows + 7) / 8`
 //!               bytes), its data buffer (`rows` elements, or `rows + 1` offsets
 //!               for bytes rebased to 0) and, for bytes, the values buffer
 //!
@@ -147,7 +147,7 @@ pub const Writer = struct {
         try self.putU64(b.columns.len);
         for (b.columns) |c| {
             try self.putU64(@intFromEnum(@as(Tag, c.data)));
-            try self.putU64(valuesLen(c, rows));
+            try self.putU64(if (c.data == .d64) c.data.d64.scale else valuesLen(c, rows));
         }
         for (b.columns) |c| {
             try self.putPadded(c.validity.bits[0 .. (rows + 7) / 8]);
@@ -260,7 +260,8 @@ pub const Reader = struct {
                     return .{ .offsets = offsets, .values = try o.r.take(o.vlen) };
                 }
             };
-            const data = try column.mapTag(t, Op{ .r = self, .rows = rows, .vlen = vlen });
+            const shape: column.Shape = .{ .tag = t, .scale = if (t == .d64) std.math.cast(u8, vlen) orelse return error.CorruptSpill else 0 };
+            const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .vlen = vlen });
             c.* = .{
                 .ty = f.ty,
                 .len = @intCast(rows),
