@@ -271,7 +271,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.pq_folder = null;
     const outer_stop = env.stop;
     defer env.stop = outer_stop;
-    env.stop = if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
+    env.stop = if (env.union_sink != null) outer_stop else if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
         const f = try arena.create(std.atomic.Value(bool));
         f.* = .init(false);
         break :blk f;
@@ -613,6 +613,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         p.scope = outer_scope;
     };
     for (specs, schemas, 0..) |s, sch, i| {
+        if (env.stop) |f| if (f.load(.monotonic)) break;
         if (env.profile) |p| p.scope = std.hash.Wyhash.hash(outer_scope, std.mem.asBytes(&i));
         const items = try synthReconcile(arena, sch, canon, tag_col, s.tag);
         var bstages = std.array_list.Managed(ast.Stage).init(arena);
