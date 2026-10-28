@@ -195,12 +195,14 @@ pub fn connVTable(comptime T: type) Conn.VTable {
     return .{
         .queryCursor = struct {
             fn f(p: *anyopaque, q: []const u8) anyerror!Cursor {
-                return @as(*T, @ptrCast(@alignCast(p))).queryCursor(q);
+                const self: *T = @ptrCast(@alignCast(p));
+                return self.queryCursor(q) catch |e| self.wire.queryFailed(e);
             }
         }.f,
         .exec = struct {
             fn f(p: *anyopaque, q: []const u8) anyerror!void {
-                return @as(*T, @ptrCast(@alignCast(p))).exec(q);
+                const self: *T = @ptrCast(@alignCast(p));
+                return self.exec(q) catch |e| self.wire.queryFailed(e);
             }
         }.f,
         .close = struct {
@@ -234,7 +236,8 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
         }.f,
         .nextBatch = struct {
             fn f(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-                return fetchTextBatch(@as(*T, @ptrCast(@alignCast(p))), arena);
+                const self: *T = @ptrCast(@alignCast(p));
+                return fetchTextBatch(self, arena) catch |e| self.wire.queryFailed(e);
             }
         }.f,
         .close = struct {

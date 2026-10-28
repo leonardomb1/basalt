@@ -134,10 +134,12 @@ pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []cons
 }
 
 /// One key range's query, checked against `want`, the columns the lanes were planned
-/// on, when set.
+/// on, when set. A query that fails to open reports the server's words, or a fired
+/// `query_timeout` with the host, as a serial read does.
 pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8) anyerror!driver.Source {
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
     const s = sql.Source.open(gpa, conn, query) catch |e| {
+        if (ctx.report) |r| if (conn.lastError().len > 0) r.f(r.ctx, e, conn.lastError());
         conn.close();
         return e;
     };

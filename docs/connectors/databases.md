@@ -10,18 +10,19 @@ A long extraction is not cut short by a clock: once a session is up, a query
 may run, and wait for its first row, as long as the server keeps the connection
 alive. What fails is a server that never answers, or one that is gone.
 
-- `connect_timeout` (seconds, default 60, `0` for none) bounds each read and
-  write once the TCP connection is open until the session is up: TLS, the login
-  and the session's setup. A server that accepts the connection and then goes
-  silent fails with `ConnectionTimedOut` naming the host and phase, as
-  `db.internal:5432: login did not answer within 60 s`. The TCP connect itself
-  is left to the operating system, which gives up on a host that never answers
-  after about two minutes on Linux.
+- `connect_timeout` (seconds, default 60, `0` for none) bounds the TCP connect,
+  then each read and write until the session is up: TLS, the login and the
+  session's setup. A host that never answers, or a server that accepts the
+  connection and then goes silent, fails with `ConnectionTimedOut` naming the
+  host and phase, as `db.internal:5432: connect did not answer within 60 s` or
+  `db.internal:5432: login did not answer within 60 s`. On macOS the TCP connect
+  is left to the operating system, which gives up after about 75 s.
 - `query_timeout` (seconds, default `0`, none) keeps a limit on once the session
   is up, for a server that is alive but wedged. It is the longest a read may wait
   for a byte, or a write for the server to take one, not a deadline for the whole
   query: a query that takes longer than this before its first row fails too, as
-  does a load the server stops reading for that long.
+  does a load the server stops reading for that long. A read's error names the
+  host, as `db.internal:5432: no reply within query_timeout (300 s)`.
 - On Linux, a server that dies or drops off the network mid-query is noticed by
   TCP keepalive (probes after 60 s idle, every 15 s) and by a fifteen-minute
   limit on sent data left unacknowledged: either way the run fails within about

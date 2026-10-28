@@ -14,6 +14,8 @@
 //! Login runs under the connection's `connect_timeout`: a driver's `connect` passes
 //! any failure through `loginFailed`, which names a fired deadline with the host and
 //! the phase, then calls `sessionUp` to swap it for the `query_timeout` (none by default).
+//! A query or fetch that outlives that deadline leaves `last_error` naming the host
+//! (`queryFailed`), which the read and load messages carry.
 
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -35,6 +37,7 @@ pub const Conn = struct {
     carrier: *std.Io.Writer = undefined,
     timeouts: driver.Timeouts = .{},
     phase: []const u8 = "login",
+    peer: driver.ThreadNote(288) = .{},
 
     /// A heap `T` whose `wire` is connected to `host:port`, its login deadline set;
     /// every other field of `T` takes its default. Built in place: the readers point
@@ -44,6 +47,7 @@ pub const Conn = struct {
         errdefer stream.close();
         const self = try gpa.create(T);
         self.* = .{ .wire = .{ .gpa = gpa, .stream = stream, .msg = .init(gpa), .timeouts = to } };
+        self.wire.peer.print("{s}:{d}", .{ host, port });
         self.wire.sr = .init(stream, &self.wire.read_buf);
         self.wire.sw = .init(stream, &self.wire.write_buf);
         return self;
@@ -58,6 +62,14 @@ pub const Conn = struct {
     /// The session is up: the login deadline gives way to the query one.
     pub fn sessionUp(self: *Conn) void {
         self.timeouts.sessionUp(self.stream.handle);
+    }
+
+    /// `e` from a query or fetch; when the `query_timeout` deadline fired, `last_error`
+    /// says so with the host, e.g. `db:5432: no reply within query_timeout (300 s)`.
+    pub fn queryFailed(self: *Conn, e: anyerror) anyerror {
+        if (self.timeouts.query_s > 0 and driver.ioTimedOut(&self.sr, &self.sw))
+            self.printError("{s}: no reply within query_timeout ({d} s)", .{ self.peer.get(), self.timeouts.query_s }) catch {};
+        return e;
     }
 
     /// Frees what the wire holds and destroys `owner`, the struct it is embedded in.

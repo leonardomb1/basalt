@@ -338,6 +338,9 @@ fn dayOf(v: Value) ?i64 {
 /// Up to `m_in` covering, disjoint day-range predicates over [min_day, max_day],
 /// each bound a `sql.dateLit`; a single whole-range predicate (a serial read)
 /// when a bound is a day the dialect cannot name, rather than one it misreads.
+/// Every bound is a day in [min_day, max_day], days the key column holds, so its
+/// type can name each literal: a SMALLDATETIME ending 2079-06-06 never meets a
+/// `'2079-06-07'` it cannot convert; the lane that would overshoot runs open-ended.
 fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, min_day: i64, max_day: i64, m_in: usize) ![]const []const u8 {
     const qcol = try sql.quoteName(arena, dialect, col);
     const whole = try msgfmt.allocPrint(arena, "({s} IS NULL OR {s} IS NOT NULL)", .{ qcol, qcol });
@@ -354,10 +357,11 @@ fn dateRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, m
     while (k < m) : (k += 1) {
         const lo: i64 = @intCast(@as(i128, min_day) + @as(i128, @intCast(k)) * width);
         const lo_lit = (try sql.dateLit(arena, dialect, lo)) orelse return dupeOne(arena, whole);
-        if (k == m - 1) {
+        const hi: i64 = @intCast(@as(i128, lo) + width);
+        if (k == m - 1 or hi > max_day) {
             try list.append(try msgfmt.allocPrint(arena, "{s} >= {s}", .{ qcol, lo_lit }));
+            break;
         } else {
-            const hi: i64 = @intCast(@as(i128, lo) + width);
             const hi_lit = (try sql.dateLit(arena, dialect, hi)) orelse return dupeOne(arena, whole);
             if (k == 0) {
                 try list.append(try msgfmt.allocPrint(arena, "(({s} >= {s} AND {s} < {s}) OR {s} IS NULL)", .{ qcol, lo_lit, qcol, hi_lit, qcol }));
@@ -547,6 +551,23 @@ test "date range clamps slice count to the day span" {
         const lo_pos = std.mem.indexOf(u8, preds[k + 1], ">= '").?;
         const lo = preds[k + 1][lo_pos + 4 ..][0..10];
         try std.testing.expectEqualStrings(hi, lo);
+    }
+}
+
+test "date range bounds stay within the probed days, so a SMALLDATETIME key ending at its last day gets no literal it cannot convert" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const max = civil.daysFromCivil(2079, 6, 6);
+    const preds = try dateRangePreds(a, .sqlserver, "d", max - 9, max, 6);
+    try std.testing.expectEqual(@as(usize, 5), preds.len);
+    try std.testing.expectEqualStrings("[d] >= '2079-06-05'", preds[4]);
+    for (preds) |p| try std.testing.expect(std.mem.indexOf(u8, p, "2079-06-07") == null);
+    var k: usize = 0;
+    while (k + 1 < preds.len) : (k += 1) {
+        const hi_pos = std.mem.lastIndexOf(u8, preds[k], "< '").?;
+        const lo_pos = std.mem.indexOf(u8, preds[k + 1], ">= '").?;
+        try std.testing.expectEqualStrings(preds[k][hi_pos + 3 ..][0..10], preds[k + 1][lo_pos + 4 ..][0..10]);
     }
 }
 
