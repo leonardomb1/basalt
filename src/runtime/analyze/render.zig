@@ -115,7 +115,7 @@ fn physical(w: anytype, ph: Physical) !void {
             }, if (ph.veto.len > 0) ph.veto else "the file cannot be mapped" });
             if (ph.keys_serial) try w.print(" or the file is under {d} MB, so the join's SQL side takes its keys", .{op.default_prefetch_bytes >> 20});
             if (l.shape == .map_join or (l.shape == .sink and l.shape.sink.joins.len > 0)) try w.writeAll(" or the join's build side is past --op-memory");
-            if (l.shape == .sink) try w.writeAll(if (l.shape.sink.joins.len > 0) " or its partials pass --op-memory" else " or its partials pass --op-memory or, on one lane, every accumulator is exact");
+            if (l.shape == .sink) try w.writeAll(" or its partials pass --op-memory");
         },
         .sql => |s| {
             if (s.whole_agg != null) {

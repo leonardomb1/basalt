@@ -1,8 +1,9 @@
-//! The aggregate's results at every `-j`: the same queries over a CSV, a Parquet
-//! file and a Parquet folder cut into many small morsels give byte-identical files
-//! at -j 1, 4 and 16, float sums included. Keys run just past the lane table's and
-//! the parallel combine's bounds, single and multi-column, so the parallel merge and
-//! the partitioned write run on small inputs.
+//! The aggregate's results across `-j`: the same queries over a CSV, a Parquet
+//! file, a Parquet folder and an NDJSON file cut into many small morsels give
+//! byte-identical files at -j 4 and 16, float sums included, and exact ones the
+//! same at -j 1, whose one lane runs the serial aggregate. Keys run just past the
+//! lane table's and the parallel combine's bounds, single and multi-column, so the
+//! parallel merge and the partitioned write run on small inputs.
 
 const std = @import("std");
 const column = @import("../../exec/column.zig");
@@ -68,16 +69,24 @@ fn writeParquet(a: std.mem.Allocator, path: []const u8, lo: usize, hi: usize) !v
     try w.close();
 }
 
-const queries = [_][]const u8{
-    "SELECT k, g, SUM(f) AS s, AVG(f) AS m, COUNT(*) AS n, MIN(f) AS lo FROM $IN GROUP BY k, g ORDER BY k, g",
-    "SELECT COUNT(*) AS n, SUM(f) AS s, AVG(f) AS m, VARIANCE(f) AS v, STDDEV(f) AS d FROM $IN",
-    "SELECT g, SUM(f) AS s, COUNT(DISTINCT k) AS dk, MEDIAN(f) AS md FROM $IN GROUP BY g HAVING COUNT(*) > 10 ORDER BY g",
-    "SELECT k, SUM(f) AS s FROM $IN GROUP BY k ORDER BY s DESC, k LIMIT 7",
-    "SELECT CAST(k AS VARCHAR) AS ks, CAST(f AS DECIMAL(18,3)) AS fd, COUNT(*) AS n FROM $IN GROUP BY ks, fd ORDER BY ks, fd",
-    "SELECT SUM(CAST(f AS DECIMAL(18,3))) AS ds, COUNT(DISTINCT g) AS dg FROM $IN",
-    "SELECT l.label, SUM(t.f) AS s, COUNT(*) AS n FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g GROUP BY l.label ORDER BY l.label",
-    "SELECT id % 3 AS r, SUM(f) AS s FROM $IN WHERE k > 100 GROUP BY r ORDER BY r",
-    "SELECT COUNT(*) AS n, SUM(s) AS t FROM (SELECT g, SUM(f) AS s FROM $IN GROUP BY g) d",
+/// A query, and whether its every column is exact, so one lane's serial aggregate
+/// gives it byte for byte too.
+const Query = struct { q: []const u8, exact: bool = false };
+
+const queries = [_]Query{
+    .{ .q = "SELECT k, g, SUM(f) AS s, AVG(f) AS m, COUNT(*) AS n, MIN(f) AS lo FROM $IN GROUP BY k, g ORDER BY k, g" },
+    .{ .q = "SELECT COUNT(*) AS n, SUM(f) AS s, AVG(f) AS m, VARIANCE(f) AS v, STDDEV(f) AS d FROM $IN" },
+    .{ .q = "SELECT g, SUM(f) AS s, COUNT(DISTINCT k) AS dk, MEDIAN(f) AS md FROM $IN GROUP BY g HAVING COUNT(*) > 10 ORDER BY g" },
+    .{ .q = "SELECT k, SUM(f) AS s FROM $IN GROUP BY k ORDER BY s DESC, k LIMIT 7" },
+    .{ .q = "SELECT l.label, SUM(t.f) AS s, COUNT(*) AS n FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g GROUP BY l.label ORDER BY l.label" },
+    .{ .q = "SELECT id % 3 AS r, SUM(f) AS s FROM $IN WHERE k > 100 GROUP BY r ORDER BY r" },
+    .{ .q = "SELECT COUNT(*) AS n, SUM(s) AS t FROM (SELECT g, SUM(f) AS s FROM $IN GROUP BY g) d" },
+    .{ .q = "SELECT CAST(k AS VARCHAR) AS ks, CAST(f AS DECIMAL(18,3)) AS fd, COUNT(*) AS n FROM $IN GROUP BY ks, fd ORDER BY ks, fd", .exact = true },
+    .{ .q = "SELECT SUM(CAST(f AS DECIMAL(18,3))) AS ds, COUNT(DISTINCT g) AS dg FROM $IN", .exact = true },
+    .{ .q = "SELECT k, g, COUNT(*) AS n, MIN(f) AS lo, MAX(id) AS hi, COUNT(DISTINCT id % 5) AS d, MEDIAN(f) AS md FROM $IN GROUP BY k, g HAVING COUNT(*) > 1 ORDER BY k, g", .exact = true },
+    .{ .q = "SELECT l.label, COUNT(*) AS n, MAX(t.f) AS mx FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g GROUP BY l.label ORDER BY l.label", .exact = true },
+    .{ .q = "SELECT k, MAX(f) AS mx FROM $IN GROUP BY k ORDER BY mx DESC, k LIMIT 7", .exact = true },
+    .{ .q = "SELECT COUNT(*) AS n, MAX(c) AS t FROM (SELECT g, COUNT(*) AS c FROM $IN GROUP BY g) d", .exact = true },
 };
 
 /// The file `q` writes over `input` at `threads`, morsels of `morsel_bytes`.
@@ -100,20 +109,23 @@ fn resultOf(a: std.mem.Allocator, dir: std.fs.Dir, base: []const u8, input: []co
 
 fn sameAtEveryJ(a: std.mem.Allocator, dir: std.fs.Dir, base: []const u8, inputs: []const []const u8, opts: env_mod.RunOptions) !void {
     var held = true;
-    for (inputs) |input| for (queries) |q| {
-        const one = try resultOf(a, dir, base, input, q, 1, opts);
-        for ([_]usize{ 4, 16 }) |j| {
-            const many = try resultOf(a, dir, base, input, q, j, opts);
-            if (!std.mem.eql(u8, one, many)) {
-                held = false;
-                std.debug.print("{s} over {s}: -j {d} differs from -j 1\n", .{ q, input, j });
-            }
+    for (inputs) |input| for (queries) |c| {
+        const four = try resultOf(a, dir, base, input, c.q, 4, opts);
+        const sixteen = try resultOf(a, dir, base, input, c.q, 16, opts);
+        if (!std.mem.eql(u8, four, sixteen)) {
+            held = false;
+            std.debug.print("{s} over {s}: -j 16 differs from -j 4\n", .{ c.q, input });
+        }
+        if (!c.exact) continue;
+        if (!std.mem.eql(u8, four, try resultOf(a, dir, base, input, c.q, 1, opts))) {
+            held = false;
+            std.debug.print("{s} over {s}: -j 1 differs from -j 4\n", .{ c.q, input });
         }
     };
     try testing.expect(held);
 }
 
-test "an aggregate over many morsels is byte-identical at -j 1, 4 and 16" {
+test "an aggregate over many morsels is byte-identical at -j 4 and 16, and at -j 1 where exact" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

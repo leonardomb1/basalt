@@ -8,8 +8,8 @@
 //! and falls back to the serial driver explicitly. Every shape reads `Morsels`:
 //! Parquet row groups or files, CSV byte ranges, SQL key ranges, one interface. An
 //! aggregate is the first breaker run as a `ParallelSink` (`.sink`): map stages and
-//! join probes per morsel, then the sink's combine and finalize; it runs at every
-//! `-j`, `-j 1` included, so its result does not depend on `-j`.
+//! join probes per morsel, then the sink's combine and finalize, so its result is
+//! the same at every `-j` of 2 or more; one lane runs the serial aggregate.
 //! Right and full joins must emit unmatched build rows, and each lane tracking its
 //! own matches emitted them once per lane (a `RIGHT JOIN` under `COUNT(*)` returned
 //! 160 instead of 10 at `-j 16`). On the map+join paths every lane marks one
@@ -20,7 +20,7 @@
 //! its own `op.Join` and stage operators from them, for its mutable stats and scratch.
 //!
 //! Determinism. Results do not depend on thread timing, and an aggregate's not on
-//! `-j`: it folds one partial per morsel and merges them in morsel order
+//! a `-j` of 2 or more: it folds one partial per morsel and merges them in morsel order
 //! (`lanes/agg.zig`), because float addition is not associative and merging as lanes
 //! finished made a float SUM differ between runs. Distinct dedups per positional
 //! morsel and breaks ties by input position, keeping the row a serial run keeps. A shared

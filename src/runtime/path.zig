@@ -9,8 +9,6 @@
 //! and EXPLAIN names those as conditions. A window's input or an aggregating
 //! binding read into memory first is a prelude ahead of the path, decided by
 //! `windowInputAt` and `materializes` over the stages as they stand at that point.
-//! A file's aggregate takes its lanes at `-j 1` too, so its morsels fold and merge
-//! alike at every `-j` and a float sum does not change with it.
 //!
 //! A map stage is a filter, select or explode (`analyze.isMap`) on a map path: a
 //! file's map lanes, a SQL split and a union branch; the stages ahead of a lane
@@ -68,8 +66,8 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     if (stages[0].node == .union_ and f.lanes > 1 and !std.mem.eql(u8, f.sink.connector, "csv") and
         branchesAreReads(stages[0].node.union_) and streamsOnly(middle))
         return .union_split;
-    if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, @max(f.lanes, 2))) {
-        if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape) and (f.lanes > 1 or shape == .sink))
+    if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, f.lanes)) {
+        if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape))
             return .{ .lanes = .{ .source = f.head_source, .shape = shape } };
     }
     if (f.source != .sql) return .serial;
@@ -100,10 +98,9 @@ pub fn laneEligible(stages: []const ast.Stage, n: usize) bool {
 }
 
 /// Whether a binding of `stages` that a pipeline reads is aggregated first, in
-/// parallel, into memory: built where it is read it ran on one thread. At `-j 1`
-/// too, so its aggregate folds as at every other `-j`.
-pub fn materializes(stages: []const ast.Stage) bool {
-    if (stages.len < 2 or stages[0].node != .read) return false;
+/// parallel, into memory: built where it is read it ran on one thread.
+pub fn materializes(stages: []const ast.Stage, n: usize) bool {
+    if (n < 2 or stages.len < 2 or stages[0].node != .read) return false;
     for (stages) |st| {
         if (st.node == .aggregate) return true;
     }

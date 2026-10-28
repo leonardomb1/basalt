@@ -152,11 +152,11 @@ fn scanCounts(env: *Env) [4]u64 {
 /// into memory, since built where it is read it ran on one thread. Returns the
 /// binding's name when materialized, for the caller to drop afterwards.
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
-    if (stages[0].node != .ref) return null;
+    if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
     if (env.materialized.contains(name)) return null;
     const b = (try stampedBinding(env, name)) orelse return null;
-    if (!path.materializes(b.stages)) return null;
+    if (!path.materializes(b.stages, opts.lanes())) return null;
 
     const inner = try env.arena.alloc(ast.Stage, b.stages.len + 1);
     @memcpy(inner[0..b.stages.len], b.stages);
