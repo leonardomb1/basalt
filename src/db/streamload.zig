@@ -624,6 +624,7 @@ pub const StreamLoadSink = struct {
     /// send and receive timeouts so a server that stops reading cannot hang the lane.
     fn begin(self: *StreamLoadSink) !void {
         const uri = try std.Uri.parse(self.url);
+        try self.reachable(uri);
         const req = try self.client.request(.PUT, uri, .{
             .redirect_behavior = .unhandled,
             .keep_alive = false,
@@ -640,6 +641,18 @@ pub const StreamLoadSink = struct {
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
         t.req.transfer_encoding = .chunked;
         t.body = t.req.sendBodyUnflushed(&.{}) catch return self.writeErr();
+    }
+
+    /// std's client connects with no deadline, so the load host is first dialled
+    /// under `connect_timeout`: one that does not answer fails as a database
+    /// driver's does, not after the OS's SYN retries.
+    fn reachable(self: *StreamLoadSink, uri: std.Uri) !void {
+        if (self.cfg.connect_timeout == 0) return;
+        var buf: [std.Uri.host_name_max]u8 = undefined;
+        const host = try uri.getHost(&buf);
+        const port = uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) @as(u16, 443) else 80;
+        const probe = try driver.dial(self.gpa, host, port, .{ .tune = false, .io_timeout_s = self.cfg.connect_timeout });
+        probe.close();
     }
 
     fn dropTxn(self: *StreamLoadSink) void {
@@ -1273,4 +1286,25 @@ test "a gzip body is announced as each flavor spells it" {
     const x = Flavor.doris.formatExtra(.gzip).?;
     try std.testing.expectEqualStrings("compress_type", x.name);
     try std.testing.expectEqualStrings("gz", x.value);
+}
+
+test "a stream-load host that never completes the connect fails within connect_timeout" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .kernel_backlog = 0 });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var held: [16]std.net.Stream = undefined;
+    var n: usize = 0;
+    defer for (held[0..n]) |h| h.close();
+    while (n < held.len) : (n += 1) {
+        held[n] = driver.dial(std.testing.allocator, "127.0.0.1", port, .{ .tune = false, .io_timeout_s = 1 }) catch break;
+    }
+    var url: [64]u8 = undefined;
+    const schema = types.Schema{ .fields = &.{.{ .name = "a", .ty = types.Type.init(.int) }} };
+    const s = try StreamLoadSink.open(std.testing.allocator, .{ .database = "d", .load_url = try std.fmt.bufPrint(&url, "http://127.0.0.1:{d}", .{port}), .connect_timeout = 1, .auto_create = false }, "t", schema, .append);
+    defer s.abort();
+    var t = try std.time.Timer.start();
+    try std.testing.expectError(error.ConnectionTimedOut, s.begin());
+    try std.testing.expect(t.read() < 3 * std.time.ns_per_s);
 }

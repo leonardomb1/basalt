@@ -35,7 +35,8 @@ These failures, and a server that resets or closes the connection, exit with
 code 75, so a scheduler can rerun. Both options are whole numbers, checked
 before the run like `port`, and also taken by `sftp` and `smb` connections.
 StarRocks' and Doris' `connect_timeout` and `query_timeout` cover the FE's
-MySQL port; a stream load's HTTP request keeps its own limit.
+MySQL port. `connect_timeout` also bounds each stream load's connect to its
+load URL; once connected, the HTTP request keeps its own limit.
 
 ## PostgreSQL and MySQL
 
