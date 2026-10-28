@@ -419,7 +419,7 @@ pub const charset_pattern = "0x201[aA], 0x0192|0x80 => 0x20[aA][cC]|0x009[cC], 0
 pub const cursor_pattern = "> self\\.left\\(\\)|if \\(self\\.\\w+ \\+ \\w+ > self\\.\\w+\\.len\\) return|if \\(\\w+ > self\\.\\w+\\.len - self\\.\\w+\\) return";
 pub const typemap_pattern = "1114, 1184|0x00, 0xf6";
 pub const scheme_pattern = "startsWith\\(u8, .*\"(sftp|s3|az|smb|ftp|https?)://";
-pub const dial_pattern = "tcpConnectToHost";
+pub const dial_pattern = "tcpConnectToHost|posix\\.connect\\(";
 pub const options_pattern = "@intCast\\(try evalCfgInt|\\.str_lit => \\|\\w+\\| .*(parseInt\\(i64, \\w+, 10\\)|IgnoreCase\\(\\w+, \"true\"\\))";
 pub const retry_pattern = "(^|[^a-zA-Z_])sleep\\([a-z_@]";
 pub const transient_pattern = "== (408|429|50[0234])([^0-9]|$)|!= (408|429|50[0234])([^0-9]|$)|>= 500([^0-9]|$)|408, 429 ?(,|=>)";
@@ -619,6 +619,8 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"s3://\")", true },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"abfss://\")", false },
         .{ dial_pattern, "std.net.tcpConnectToHost(gpa, host, port)", true },
+        .{ dial_pattern, "try posix.connect(sock, &addr.any, addr.getOsSockLen());", true },
+        .{ dial_pattern, "std.net.tcpConnectToAddress(listener.listen_address)", false },
         .{ options_pattern, "const p: u16 = @intCast(try evalCfgInt(cx, e));", true },
         .{ options_pattern, "std.math.cast(u16, try evalCfgInt(cx, e))", false },
         .{ scheme_pattern, "std.mem.startsWith(u8, p, \"az://\")", true },

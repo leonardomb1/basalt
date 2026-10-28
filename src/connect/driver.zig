@@ -149,20 +149,43 @@ pub const request_timeout_ms: i64 = 300_000;
 
 /// How `dial` sets a socket up. `tune = false` keeps the OS defaults, for a one-shot
 /// exchange that neither idles nor streams (a KDC request, a TLS chain probe);
-/// `io_timeout_s` adds read and write timeouts so a silent server fails the call.
+/// `io_timeout_s` adds read and write timeouts so a silent server fails the call,
+/// and bounds the TCP connect itself.
 pub const Dial = struct {
     tune: bool = true,
     io_timeout_s: ?u32 = null,
 };
 
 /// A TCP connection to `host:port`, tuned by `tuneSocket` and set up as `opts` asks:
-/// the one way a connector opens a socket. Clears this thread's `loginNote`.
+/// the one way a connector opens a socket. Each address the name resolves to is
+/// tried in turn while it refuses, as `std.net.tcpConnectToHost` does. A connect
+/// that outlasts `io_timeout_s` fails as `loginTimedOut` in phase `connect`: the
+/// send timeout is set before `connect`, which Linux honours (EINPROGRESS); macOS
+/// ignores it there and gives up after its own SYN retries, about 75 s. Clears this
+/// thread's `loginNote`.
 pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Dial) !std.net.Stream {
     login_note.clear();
-    const stream = try std.net.tcpConnectToHost(gpa, host, port);
-    if (opts.tune) tuneSocket(stream.handle);
-    if (opts.io_timeout_s) |s| setIoTimeout(stream.handle, s);
-    return stream;
+    const list = try std.net.getAddressList(gpa, host, port);
+    defer list.deinit();
+    if (list.addrs.len == 0) return error.UnknownHostName;
+    for (list.addrs) |addr| {
+        return dialAddress(addr, opts) catch |e| switch (e) {
+            error.ConnectionRefused => continue,
+            error.WouldBlock => loginTimedOut(host, port, "connect", opts.io_timeout_s orelse 0),
+            else => e,
+        };
+    }
+    return error.ConnectionRefused;
+}
+
+fn dialAddress(addr: std.net.Address, opts: Dial) !std.net.Stream {
+    const posix = std.posix;
+    const sock = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer posix.close(sock);
+    if (opts.io_timeout_s) |s| setIoTimeout(sock, s);
+    try posix.connect(sock, &addr.any, addr.getOsSockLen());
+    if (opts.tune) tuneSocket(sock);
+    return .{ .handle = sock };
 }
 
 /// Read and write timeouts of `s` seconds on a socket, 0 clearing them: a recv or
@@ -609,6 +632,30 @@ test "setIoTimeout sets both deadlines and 0 clears them; a fired one reads as a
     var tv = std.posix.timeval{ .sec = 0, .usec = 0 };
     try std.posix.getsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
     try testing.expectEqual(@as(@TypeOf(tv.sec), 7), tv.sec);
+}
+
+test "a TCP connect the server never completes fails within io_timeout_s, naming host and phase" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .kernel_backlog = 0 });
+    defer server.deinit();
+    const port = server.listen_address.getPort();
+    var held: [16]std.net.Stream = undefined;
+    var n: usize = 0;
+    defer for (held[0..n]) |h| h.close();
+    const e = while (n < held.len) {
+        var t = try std.time.Timer.start();
+        if (dial(testing.allocator, "127.0.0.1", port, .{ .tune = false, .io_timeout_s = 1 })) |st| {
+            held[n] = st;
+            n += 1;
+        } else |e| {
+            try testing.expect(t.read() < 3 * std.time.ns_per_s);
+            break e;
+        }
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(error.ConnectionTimedOut, e);
+    var want: [64]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "127.0.0.1:{d}: connect did not answer within 1 s", .{port}), loginNote());
 }
 
 test "a login timeout names host, port and phase; it and the dead-peer errors are transient, run and connector alike" {
