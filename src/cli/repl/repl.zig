@@ -553,7 +553,7 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
 
     if (prog.explain == .plan) {
         var adiag: analyze.Diag = .{};
-        const plan = analyze.analyze(a, prepared, &adiag) catch |e| switch (e) {
+        const plan = analyze.analyzeOpts(a, prepared, .{ .lanes = (runtime.RunOptions{}).lanes() }, &adiag) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.AnalyzeFailed => {
                 try msg.print("error: {s}\n", .{adiag.msg});
@@ -951,4 +951,26 @@ test "a REPL temp path is fresh each time, and the saved startup file is private
     try saveDecls(std.testing.allocator, path, &sess, &aw.writer);
     const st = try tmp.dir.statFile("init.sql");
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), st.mode & 0o777);
+}
+
+test "REPL EXPLAIN names the path for the lanes the REPL runs on, not two" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "k,v\n1,2\n3,4\n" });
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const block = try msgfmt.allocPrint(a, "EXPLAIN SELECT k, v + 1 AS w FROM '{s}/t.csv' WHERE k > 0;", .{dir});
+
+    var sess = Session{ .decls = DeclStore.init(std.testing.allocator), .catalog = Catalog.init(std.testing.allocator), .announce = false };
+    defer sess.decls.deinit();
+    defer sess.catalog.deinit();
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try runBlock(std.testing.allocator, block, &sess, &aw.writer);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "error") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "serial") != null);
+    try std.testing.expectEqual((runtime.RunOptions{}).lanes() > 1, std.mem.indexOf(u8, out, "parallel") != null);
 }
