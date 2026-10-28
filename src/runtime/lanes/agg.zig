@@ -6,11 +6,12 @@
 //! Each morsel folds from fresh state, so a group's records depend on that morsel's
 //! rows alone (a lane's table is bounded and clears when full), and the merge adds a
 //! group's records morsel by morsel: float addition is not associative, and since the
-//! cut follows the input, not `-j`, a float sum is the same at every `-j`. A
+//! cut follows the input, not `-j`, a float sum is the same at every `-j` of 2 or
+//! more (one lane runs the serial aggregate, whose last bits may differ). A
 //! morsel's fold tables go as it is sealed; its stores and DISTINCT pairs stay until
-//! their partition is merged. With a spill directory, partials past `--op-memory`
-//! send the aggregate to the serial plan, which spills: their total follows the input
-//! too, so that choice does not depend on `-j` either.
+//! each partition takes them, once every earlier morsel's are in. With a spill
+//! directory, partials totalling past `--op-memory` send the aggregate to the serial
+//! plan, which spills: that total follows the input too, so neither does the choice.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
@@ -89,9 +90,13 @@ const LaneParts = struct {
 
 pub const agg_combine_parallel_min: usize = 1 << 14;
 
+/// One radix partition of the merged groups; `next` is the first morsel not yet
+/// merged into it, both under `mtx`.
 pub const PqPart = struct {
     arena: std.heap.ArenaAllocator,
     merge: ?op.Aggregate.GroupMerge = null,
+    mtx: std.Thread.Mutex = .{},
+    next: usize = 0,
 };
 
 const pq_parts: usize = op.Aggregate.fold_parts;
@@ -108,55 +113,6 @@ const Partial = struct {
         return n;
     }
 };
-
-/// Merge radix partition `p` of the partials into `dst`: one table built from every
-/// partial in morsel order, each freed once merged. A partial may hold a group in
-/// several records (its table is bounded), so no partial's store is adopted.
-fn mergeRadixPart(dst: *PqPart, partials: []const ?*Partial, aggs: []const op.Aggregate.Agg, p: usize) !void {
-    var total: usize = 0;
-    var ndistinct: usize = 0;
-    for (partials) |pt| {
-        const ls = pt orelse continue;
-        if (ls.sets.len > p) ndistinct = @max(ndistinct, ls.sets[p].pairs.len);
-    }
-    const npairs = try dst.arena.allocator().alloc(usize, ndistinct);
-    @memset(npairs, 0);
-    for (partials) |pt| {
-        const ls = pt orelse continue;
-        if (ls.sets.len <= p) continue;
-        total += ls.sets[p].len;
-        for (ls.sets[p].pairs, npairs[0..ls.sets[p].pairs.len]) |*pp, *np| np.* += pp.count(p);
-    }
-    for (partials) |pt| {
-        const ls = pt orelse continue;
-        if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
-        const st = &ls.sets[p];
-        if (dst.merge == null) {
-            dst.merge = try op.Aggregate.GroupMerge.initFor(dst.arena.allocator(), st, aggs, .{ .groups = total, .pairs = npairs });
-            dst.merge.?.own = true;
-        }
-        try dst.merge.?.addSet(st);
-        st.freeTable();
-        ls.parts.free(p);
-    }
-    if (dst.merge) |*m| {
-        try m.settle();
-        m.deinit();
-    }
-}
-
-const MergeCtx = struct {
-    partials: []const ?*Partial,
-    parts: []PqPart,
-    aggs: []const op.Aggregate.Agg,
-    queue: WorkQueue,
-};
-
-const mergeWorker = dispatchWorker(MergeCtx, mergeOne);
-
-fn mergeOne(ctx: *MergeCtx, p: usize) !void {
-    return mergeRadixPart(&ctx.parts[p], ctx.partials, ctx.aggs, p);
-}
 
 fn partSets(a: std.mem.Allocator, parts: []PqPart) ![]const op.Aggregate.GroupSet {
     var sets = std.array_list.Managed(op.Aggregate.GroupSet).init(a);
@@ -358,11 +314,14 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
 }
 
 /// The aggregate's Global: a partial per morsel, the merged radix partitions, and
-/// what `finalize` writes them through. A Local is the worker's `LaneMem`.
+/// what `finalize` writes them through. A Local is the worker's `LaneMem`. Each
+/// partition merges the partials in morsel order as they are done, so what is held
+/// is the merged groups and the partials that finished ahead of an earlier one.
 const AggSink = struct {
     env: *Env,
     la: LaneAgg,
     partials: []?*Partial,
+    done: []std.atomic.Value(bool),
     parts: []PqPart,
     tail: []const ast.Stage,
     w: ast.Write,
@@ -379,10 +338,14 @@ const AggSink = struct {
         const partials = try env.gpa.alloc(?*Partial, morsels);
         @memset(partials, null);
         errdefer env.gpa.free(partials);
+        const done = try env.gpa.alloc(std.atomic.Value(bool), morsels);
+        @memset(done, .init(false));
+        errdefer env.gpa.free(done);
         return .{
             .env = env,
             .la = la,
             .partials = partials,
+            .done = done,
             .parts = try allocMergeParts(env.gpa),
             .tail = tail,
             .w = w,
@@ -402,6 +365,7 @@ const AggSink = struct {
             gpa.destroy(ls);
         };
         gpa.free(self.partials);
+        gpa.free(self.done);
         freeMergeParts(gpa, self.parts);
     }
 
@@ -413,7 +377,8 @@ const AggSink = struct {
         return mem;
     }
 
-    /// Fold morsel `i` into partial `i`, whose fold tables go once it is sealed.
+    /// Fold morsel `i` into partial `i`, whose fold tables go once it is sealed, then
+    /// merge what each partition not busy can take in order.
     fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
         const self: *AggSink = @ptrCast(@alignCast(ptr));
         const mem: *LaneMem = @ptrCast(@alignCast(local));
@@ -427,9 +392,66 @@ const AggSink = struct {
             t.deinit();
             st.table = null;
         };
-        if (self.budget == 0) return;
-        const n = ls.bytes();
-        if (self.held.fetchAdd(n, .monotonic) + n > self.budget) return error.AggregatePastMemory;
+        if (self.budget > 0) {
+            const n = ls.bytes();
+            if (self.held.fetchAdd(n, .monotonic) + n > self.budget) return error.AggregatePastMemory;
+        }
+        self.done[i].store(true, .release);
+        const n = self.mergedParts();
+        for (0..n) |k| {
+            const p = (i + k) % n;
+            if (!self.parts[p].mtx.tryLock()) continue;
+            defer self.parts[p].mtx.unlock();
+            try self.drain(p);
+        }
+    }
+
+    fn mergedParts(self: *const AggSink) usize {
+        return if (self.la.by.len == 0) 1 else pq_parts;
+    }
+
+    /// Merge into partition `p`, its lock held, the partials from its watermark on
+    /// that are done, in morsel order, freeing each one's share as merged. An
+    /// ungrouped aggregate merges into partition 0 alone (it has no key to hash, and
+    /// the radix merge once dropped every partial, so COUNT(*) returned 0), keeping
+    /// its partials, whose DISTINCT pairs its merge reads when it settles.
+    fn drain(self: *AggSink, p: usize) !void {
+        const dst = &self.parts[p];
+        while (dst.next < self.partials.len and self.done[dst.next].load(.acquire)) : (dst.next += 1) {
+            const ls = self.partials[dst.next].?;
+            if (self.la.by.len == 0) {
+                for (ls.sets) |*st| {
+                    if (dst.merge == null) {
+                        dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, self.la.aggs);
+                        dst.merge.?.threads = self.threads;
+                    }
+                    try dst.merge.?.addSet(st);
+                }
+                continue;
+            }
+            if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
+            const st = &ls.sets[p];
+            if (dst.merge == null) {
+                dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, self.la.aggs);
+                dst.merge.?.own = true;
+            }
+            try dst.merge.?.addSet(st);
+            st.freeTable();
+            ls.parts.free(p);
+        }
+    }
+
+    /// Partition `p`'s last partials, merged and settled once every morsel is done.
+    fn finishPart(self: *AggSink, p: usize) !void {
+        const dst = &self.parts[p];
+        dst.mtx.lock();
+        defer dst.mtx.unlock();
+        try self.drain(p);
+        if (self.la.by.len == 0) return;
+        if (dst.merge) |*m| {
+            try m.settle();
+            m.deinit();
+        }
     }
 
     fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
@@ -461,26 +483,21 @@ const AggSink = struct {
         try guard.close();
     }
 
-    /// The partials merged in morsel order: an ungrouped aggregate into partition 0
-    /// (it has no key to hash, and the radix merge once dropped every partial, so
-    /// COUNT(*) returned 0), a grouped one a partition per task.
+    /// What the workers left unmerged, a partition per task.
     fn merge(self: *AggSink) !void {
         const span = trace.begin("aggregate merge", 0);
         defer span.end();
-        if (self.la.by.len == 0) {
-            const dst = &self.parts[0];
-            for (self.partials) |pt| for ((pt orelse continue).sets) |*st| {
-                if (dst.merge == null) {
-                    dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, self.la.aggs);
-                    dst.merge.?.threads = self.threads;
-                }
-                try dst.merge.?.addSet(st);
-            };
-            return;
-        }
-        var ctx = MergeCtx{ .partials = self.partials, .parts = self.parts, .aggs = self.la.aggs, .queue = .{ .nitems = pq_parts } };
-        _ = try parallel.spawnJoin(self.env.arena, @min(self.threads, pq_parts), mergeWorker, &ctx);
+        var ctx = FinishCtx{ .g = self, .queue = .{ .nitems = self.mergedParts() } };
+        _ = try parallel.spawnJoin(self.env.arena, @min(self.threads, ctx.queue.nitems), finishWorker, &ctx);
         if (ctx.queue.failure()) |e| return e;
+    }
+
+    const FinishCtx = struct { g: *AggSink, queue: WorkQueue };
+
+    const finishWorker = dispatchWorker(FinishCtx, finishOne);
+
+    fn finishOne(ctx: *FinishCtx, p: usize) !void {
+        return ctx.g.finishPart(p);
     }
 
     /// Each partition's best groups when the tail is only ORDER BY and LIMIT, so the
