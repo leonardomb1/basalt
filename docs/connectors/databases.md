@@ -21,8 +21,8 @@ alive. What fails is a server that never answers, or one that is gone.
   is up, for a server that is alive but wedged. It is the longest a read may wait
   for a byte, or a write for the server to take one, not a deadline for the whole
   query: a query that takes longer than this before its first row fails too, as
-  does a load the server stops reading for that long. The read or load error
-  names the host, as `db.internal:5432: no reply within query_timeout (300 s)`.
+  does a load the server stops reading for that long. A read's error names the
+  host, as `db.internal:5432: no reply within query_timeout (300 s)`.
 - On Linux, a server that dies or drops off the network mid-query is noticed by
   TCP keepalive (probes after 60 s idle, every 15 s) and by a fifteen-minute
   limit on sent data left unacknowledged: either way the run fails within about
