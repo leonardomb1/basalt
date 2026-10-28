@@ -29,9 +29,10 @@ const types = @import("../../lang/types.zig");
 
 /// One open Parquet reader as a lane source, its row groups handed on in
 /// `Batch.max_rows` slices. `own` says whether closing the source closes the reader
-/// and whether a spent reader gives the slicer's rows back at once; a join build lane
-/// keeps its reader open across items, points `r` at each in turn, and releases the
-/// slicer when it finishes.
+/// and gives the slicer's rows back; a lane that keeps its reader open across items
+/// (a morsel worker, a join build lane) points `r` at each in turn and keeps the
+/// slicer's pages warm across them (a fresh slicer per row group faulted its pages in
+/// anew, and a -j 1 scan ran 2x slower), releasing it when it finishes.
 pub const ReaderSource = struct {
     r: *pqdecode.Reader,
     schema_: *const types.Schema,
@@ -50,7 +51,11 @@ pub const ReaderSource = struct {
     }
     fn closeFn(ptr: *anyopaque) void {
         const self: *ReaderSource = @ptrCast(@alignCast(ptr));
-        if (self.own) self.r.close();
+        if (!self.own) {
+            self.slicer.pend = null;
+            return;
+        }
+        self.r.close();
         self.slicer.deinit();
     }
     pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };

@@ -91,7 +91,8 @@ pub const Morsels = union(enum) {
             .csv => |c| return try c.mapped.lane(scratch, i, c.count, c.schema),
             .parquet => |*m| {
                 const r = (try openItem(m, rd.keep.allocator(), &rd.held, i)) orelse return null;
-                rd.item = .{ .r = r, .schema_ = m.src_schema, .own = false };
+                rd.item.r = r;
+                rd.item.schema_ = m.src_schema;
                 return .{ .ptr = &rd.item, .vtable = &ReaderSource.vtable };
             },
             .sql => |s| {
@@ -103,13 +104,13 @@ pub const Morsels = union(enum) {
 };
 
 /// A worker's reading state across the morsels it claims: the Parquet file it has
-/// open (reopening a file per row group re-parsed its footer) and the allocator a
-/// key range's connection lives in. Init in place; it must not move.
+/// open (reopening a file per row group re-parsed its footer) and its slicer, and
+/// the allocator a key range's connection lives in. Init in place; it must not move.
 pub const Reader = struct {
     gpa: std.mem.Allocator,
     keep: std.heap.ArenaAllocator,
     held: ?HeldFile = null,
-    item: ReaderSource = undefined,
+    item: ReaderSource = .{ .r = undefined, .schema_ = undefined, .own = false },
 
     pub fn init(gpa: std.mem.Allocator) Reader {
         return .{ .gpa = gpa, .keep = .init(gpa) };
@@ -118,6 +119,7 @@ pub const Reader = struct {
     pub fn deinit(self: *Reader) void {
         if (self.held) |h| h.r.close();
         self.held = null;
+        self.item.slicer.deinit();
         self.keep.deinit();
     }
 };
