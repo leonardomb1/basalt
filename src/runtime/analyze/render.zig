@@ -119,7 +119,7 @@ fn physical(w: anytype, ph: Physical) !void {
         },
         .sql => |s| {
             if (s.whole_agg != null) {
-                try w.print("serial; the aggregate runs in the source, unless {s} cannot run it; else ", .{ph.sql_kind});
+                try w.print("serial; the aggregate runs in the source, unless part of the WHERE has no {s} SQL; else ", .{ph.sql_kind});
             } else if (s.top_n) if (ph.top_n) |t| {
                 try w.print("serial; ORDER BY ... LIMIT runs in the source ({s} at most {d} rows)", .{ if (t.sorted) "sorts" else "reads", t.rows });
                 if (t.sorted) try w.print(", unless a sort key is text, which {s} orders by collation", .{ph.sql_kind});

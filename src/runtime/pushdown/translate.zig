@@ -20,24 +20,32 @@ const strLit = @import("testing_util.zig").strLit;
 const testSchema = @import("testing_util.zig").testSchema;
 const testing = std.testing;
 
+/// The rows a translation keeps: at least the engine's (`superset`), at most them
+/// (`subset`), exactly them (`exact`), or what the source's own collation and
+/// padding make of the predicate (`source`): every piece sent as written, none
+/// dropped, the source deciding text comparisons, for a query whose rows never
+/// come back to be filtered again.
 pub const Need = enum {
     superset,
     subset,
     exact,
+    source,
 
     fn flip(n: Need) Need {
         return switch (n) {
             .superset => .subset,
             .subset => .superset,
             .exact => .exact,
+            .source => .source,
         };
     }
 };
 
 /// An equality a folding collation can only widen (`=` under superset) or narrow
-/// (`<>` under subset), so it is sent whatever the collation.
+/// (`<>` under subset), so it is sent whatever the collation; under `source`
+/// every comparison is.
 fn foldSafe(op: ast.BinOp, need: Need) bool {
-    return (op == .eq and need == .superset) or (op == .ne and need == .subset);
+    return need == .source or (op == .eq and need == .superset) or (op == .ne and need == .subset);
 }
 
 pub const ColFacts = struct {
@@ -499,10 +507,10 @@ const Tx = struct {
         const k = self.kind(col);
         if (k == .other) {
             const cs = (try self.value(col)) orelse return null;
-            const ls = (try self.typedLit(col, lit)) orelse return null;
+            const ls = (try self.typedLit(col, lit)) orelse if (need == .source) (try self.value(&.{ .str_lit = lit })) orelse return null else return null;
             return try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
         }
-        if (k == .unknown and looseTemporal(std.mem.trim(u8, lit, " \t\r\n"))) return null;
+        if (k == .unknown and need != .source and looseTemporal(std.mem.trim(u8, lit, " \t\r\n"))) return null;
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
         const f = known orelse ColFacts{ .text = true };
         const is_fn = k == .text and k.text.fn_;
@@ -511,6 +519,7 @@ const Tx = struct {
         const cs = (try self.value(col)) orelse return null;
         const ls = (try self.value(&.{ .str_lit = lit })) orelse return null;
         const plain = try self.fmt("({s} {s} {s})", .{ cs, opSql(op), ls });
+        if (need == .source) return plain;
         const ascii = asciiPrintable(lit);
 
         if (is_fn) {
@@ -595,7 +604,7 @@ const Tx = struct {
         const k = self.kind(c.args[0]);
         if (k != .text and k != .unknown) return null;
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
-        if (need != .superset) {
+        if (need != .superset and need != .source) {
             const f = known orelse {
                 self.want();
                 return null;

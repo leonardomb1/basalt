@@ -94,21 +94,19 @@ crosses the wire. The answer never changes, only where the work happens;
   collation at run time` where the catalog will decide.
 - **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
   one grouped query when every filter translates, the group keys are bare
-  columns, and the aggregates are `COUNT[(DISTINCT)] SUM MIN MAX` with types
-  the engine can pin via explicit casts (`AVG`, summed floats/decimals, and
-  collation-dependent string extremes deliberately stay engine-side — the
-  result must be bit-identical, not merely close). `HAVING`/sort/limit still
-  run in the engine on the tiny grouped result.
-  Nothing re-applies the `WHERE` over a grouped result, so each filter must
-  keep *exactly* basalt's rows: a text comparison descends only where the
-  column's collation compares bytes — on a Protheus binary collation as
-  `D2_FILIAL = '01' AND DATALENGTH(D2_FILIAL) = 2`, since SQL Server would also
-  count `'01 '`. The top-N descent below holds its filters to the same rule.
-  When an aggregate over a SQL source does *not* descend, every matching row
-  is streamed to the engine to be grouped — the run log says so in a `warn`
-  line that names the rule that refused it (`the WHERE predicate does not
-  translate exactly to mysql SQL (…)`, ``group key `x` is renamed by the
-  aggregate``, …).
+  columns, and the aggregates are `COUNT SUM AVG MIN MAX` of bare columns,
+  `DISTINCT` or not. The source computes them with its own semantics: `AVG`
+  averages the column cast to a float, sums and extremes of decimals, floats,
+  text and timestamps are the source's, and each result is cast to the type
+  the engine planned. `HAVING`/sort/limit still run in the engine on the tiny
+  grouped result.
+  The `WHERE` goes as written, so a text comparison or `LIKE` keeps the rows
+  the column's collation keeps (`'a' = 'A'` under a case-insensitive one, `'01 '
+  = '01'` under padding) — the grouped result is the source's answer. Only a
+  piece with no SQL (`now()`, a function the source lacks) keeps the aggregate
+  in the engine; then every matching row is streamed to be grouped, and the
+  run log says so in a `warn` line naming the rule (`the WHERE predicate has a
+  piece with no mysql SQL`, ``group key `x` is renamed by the aggregate``, …).
 - **`LIMIT` and top-N pushdown** — `read <sql> | filters | [SELECT] | [ORDER BY]
   | LIMIT n [OFFSET m]` asks the source for `n + m` rows: `LIMIT` on
   postgres/mysql/StarRocks, `TOP` on sqlserver. Without `ORDER BY` any `n + m`

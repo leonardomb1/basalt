@@ -156,15 +156,18 @@ pub fn classifySinkPipeline(stages: []const ast.Stage) ?SinkShape {
 }
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
-/// filters only before it (a `select` renames the keys) and no hint on the read; any
-/// tail. `pushdown.planWholeAggWhy` decides whether the aggregate itself renders.
+/// filters only before it (a `select` renames the keys), no hint on the read, and
+/// keys and aggregates `pushdown.wholeAggShape` takes; any tail.
 pub fn classifyWholeAgg(stages: []const ast.Stage) ?SinkShape {
     if (stages.len < 3 or stages[0].node != .read) return null;
     if (stages[0].hints.len != 0) return null;
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| switch (st.node) {
         .filter => {},
-        .aggregate => return .{ .prefix = middle[0..i], .joins = &.{}, .agg = st, .tail = middle[i + 1 ..] },
+        .aggregate => {
+            if (!pushdown.wholeAggShape(st.node.aggregate)) return null;
+            return .{ .prefix = middle[0..i], .joins = &.{}, .agg = st, .tail = middle[i + 1 ..] };
+        },
         else => return null,
     };
     return null;
@@ -195,7 +198,7 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, sr
         return null;
     };
 
-    const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .exact);
+    const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .source);
     const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.agg.node.aggregate, apl.out.*, facts, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
@@ -269,7 +272,9 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     const rd = ast.Stage{ .node = .{ .read = .{ .connector = "db", .form = .{ .table = .{ .parts = &.{"t"} } } } }, .hints = &.{}, .pos = p };
     const flt = ast.Stage{ .node = .{ .filter = pred }, .hints = &.{}, .pos = p };
     const sel = ast.Stage{ .node = .{ .select = items }, .hints = &.{}, .pos = p };
-    const agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = &.{}, .by = &.{} } }, .hints = &.{}, .pos = p };
+    const by = try a.alloc(ast.QualName, 1);
+    by[0] = .{ .parts = &.{"b"} };
+    const agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = &.{}, .by = by } }, .hints = &.{}, .pos = p };
     const wrt = ast.Stage{ .node = .{ .write = .{ .connector = "csv", .form = null, .target = "o.csv", .mode = .default } }, .hints = &.{}, .pos = p };
 
     const simple = [_]ast.Stage{ rd, flt, agg, wrt };
@@ -290,6 +295,14 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
 
     const no_agg = [_]ast.Stage{ rd, flt, wrt };
     try std.testing.expect(classifyWholeAgg(&no_agg) == null);
+
+    const arg = try a.create(ast.Expr);
+    arg.* = .{ .field = .{ .parts = &.{"c"} } };
+    const med = try a.alloc(ast.AggItem, 1);
+    med[0] = .{ .name = "m", .func = .median, .arg = arg };
+    const med_agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = med, .by = by } }, .hints = &.{}, .pos = p };
+    const median = [_]ast.Stage{ rd, med_agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&median) == null);
 
     const hints = try a.alloc(ast.Hint, 1);
     hints[0] = .{ .key = "split", .value = .{ .ident = "id" }, .pos = p };
