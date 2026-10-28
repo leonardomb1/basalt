@@ -313,8 +313,8 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
     }
 }
 
-/// The aggregate's Global: a partial per morsel, the merged radix partitions, and
-/// what `finalize` writes them through. A Local is the worker's `LaneMem`. Each
+/// The aggregate's Global: a partial per morsel (per worker when `exact`), the
+/// merged radix partitions, and what `finalize` writes them through. A Local is the worker's `LaneMem`. Each
 /// partition merges the partials in morsel order as they are done, so what is held
 /// is the merged groups and the partials that finished ahead of an earlier one.
 const AggSink = struct {
@@ -326,6 +326,8 @@ const AggSink = struct {
     tail: []const ast.Stage,
     w: ast.Write,
     threads: usize,
+    /// One partial per worker, merged only once all are in, its tables sized for them.
+    whole: bool = false,
     stats: *Stats,
     /// Bytes of partials past which the sink gives up; 0 never does.
     budget: usize,
@@ -334,11 +336,11 @@ const AggSink = struct {
 
     const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize };
 
-    fn init(env: *Env, la: LaneAgg, morsels: usize, tail: []const ast.Stage, w: ast.Write, threads: usize, stats: *Stats) !AggSink {
-        const partials = try env.gpa.alloc(?*Partial, morsels);
+    fn init(env: *Env, la: LaneAgg, slots: usize, tail: []const ast.Stage, w: ast.Write, threads: usize, stats: *Stats) !AggSink {
+        const partials = try env.gpa.alloc(?*Partial, slots);
         @memset(partials, null);
         errdefer env.gpa.free(partials);
-        const done = try env.gpa.alloc(std.atomic.Value(bool), morsels);
+        const done = try env.gpa.alloc(std.atomic.Value(bool), slots);
         @memset(done, .init(false));
         errdefer env.gpa.free(done);
         return .{
@@ -377,8 +379,8 @@ const AggSink = struct {
         return mem;
     }
 
-    /// Fold morsel `i` into partial `i`, whose fold tables go once it is sealed, then
-    /// merge what each partition not busy can take in order.
+    /// Fold morsel (or worker) `i` into partial `i`, whose fold tables go once it is
+    /// sealed, then merge what each partition not busy can take in order.
     fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
         const self: *AggSink = @ptrCast(@alignCast(ptr));
         const mem: *LaneMem = @ptrCast(@alignCast(local));
@@ -397,6 +399,7 @@ const AggSink = struct {
             if (self.held.fetchAdd(n, .monotonic) + n > self.budget) return error.AggregatePastMemory;
         }
         self.done[i].store(true, .release);
+        if (self.whole) return;
         const n = self.mergedParts();
         for (0..n) |k| {
             const p = (i + k) % n;
@@ -432,13 +435,36 @@ const AggSink = struct {
             if (ls.sets.len <= p or ls.sets[p].len == 0) continue;
             const st = &ls.sets[p];
             if (dst.merge == null) {
-                dst.merge = try op.Aggregate.GroupMerge.init(dst.arena.allocator(), st, self.la.aggs);
+                dst.merge = try op.Aggregate.GroupMerge.initFor(dst.arena.allocator(), st, self.la.aggs, try self.expect(p));
                 dst.merge.?.own = true;
             }
             try dst.merge.?.addSet(st);
             st.freeTable();
             ls.parts.free(p);
         }
+    }
+
+    /// What partition `p` will be handed by the partials done from its watermark on:
+    /// all of them at finalize, so its merge's indexes are sized once.
+    fn expect(self: *AggSink, p: usize) !op.Aggregate.GroupMerge.Expect {
+        var groups: usize = 0;
+        var ndistinct: usize = 0;
+        var i = self.parts[p].next;
+        while (i < self.partials.len and self.done[i].load(.acquire)) : (i += 1) {
+            const ls = self.partials[i].?;
+            if (ls.sets.len <= p) continue;
+            groups += ls.sets[p].len;
+            ndistinct = @max(ndistinct, ls.sets[p].pairs.len);
+        }
+        const pairs = try self.parts[p].arena.allocator().alloc(usize, ndistinct);
+        @memset(pairs, 0);
+        i = self.parts[p].next;
+        while (i < self.partials.len and self.done[i].load(.acquire)) : (i += 1) {
+            const ls = self.partials[i].?;
+            if (ls.sets.len <= p) continue;
+            for (ls.sets[p].pairs, pairs[0..ls.sets[p].pairs.len]) |*pp, *np| np.* += pp.count(p);
+        }
+        return .{ .groups = groups, .pairs = pairs };
     }
 
     /// Partition `p`'s last partials, merged and settled once every morsel is done.
@@ -546,9 +572,12 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
     if (m.* != .sql) env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    var g = try AggSink.init(env, la, m.count(), shape.tail, w, opts.lanes(), stats);
+    const lane_local = exact(la.aggs);
+    const mm = if (lane_local) m.* else m.coarser();
+    var g = try AggSink.init(env, la, if (lane_local) mm.workers(opts.lanes()) else mm.count(), shape.tail, w, opts.lanes(), stats);
+    g.whole = lane_local;
     defer g.deinit();
-    const p: Pipeline = .{ .m = m, .recs = pre.recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read };
+    const p: Pipeline = .{ .m = &mm, .recs = pre.recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local };
     const used = drive(env.arena, p, g.parallelSink(), opts.lanes()) catch |e| {
         if (e != error.AggregatePastMemory) return e;
         for (env.sources.items[src_base..]) |sc| sc.close();
@@ -562,8 +591,22 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
         if (m.* == .sql) {
             pr.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ m.label(), m.count() });
             try pr.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
-        } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", m.count(), m.unitName() });
+        } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", mm.count(), m.unitName() });
     }
+    return true;
+}
+
+/// Whether every accumulator's result is the same in any order its rows add in,
+/// so a worker may fold all its morsels into one partial: no float sum or mean, no
+/// variance. Per-morsel partials, merged in morsel order, keep the rest the same at
+/// every `-j`, at the cost of a partial per morsel (a spread-key GROUP BY merged six
+/// times the records of one partial per lane).
+fn exact(aggs: []const op.Aggregate.Agg) bool {
+    for (aggs) |a| switch (a.func) {
+        .count, .count_if, .min, .max, .median, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor => {},
+        .sum, .avg => if ((a.arg_ty orelse return false).kind == .float) return false,
+        else => return false,
+    };
     return true;
 }
 

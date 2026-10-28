@@ -147,7 +147,7 @@ test "an aggregate over many morsels is byte-identical at -j 4 and 16, and at -j
         try msgfmt.allocPrint(a, "'{s}/pf/'", .{base}),
         try msgfmt.allocPrint(a, "'{s}/in.ndjson'", .{base}),
     };
-    try sameAtEveryJ(a, tmp.dir, base, &inputs, .{ .morsel_bytes = 16 << 10 });
+    try sameAtEveryJ(a, tmp.dir, base, &inputs, .{ .morsel_bytes = 8 << 10 });
 }
 
 test "an aggregate past --op-memory runs serially and spills, the same at -j 1 and 4" {

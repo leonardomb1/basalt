@@ -33,6 +33,8 @@ const wrapProjected = @import("../../connect/split.zig").wrapProjected;
 
 const max_csv_morsels: usize = 1 << 16;
 
+const coarse_min: usize = 32;
+
 pub const Morsels = union(enum) {
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, count: usize },
     parquet: PqMorsels,
@@ -42,6 +44,14 @@ pub const Morsels = union(enum) {
     pub fn ofCsv(mapped: *csv.MappedCsv, sch: *const types.Schema, bytes: usize) Morsels {
         const n = std.math.clamp(mapped.body.len / @max(bytes, 1) + 1, 1, max_csv_morsels);
         return .{ .csv = .{ .mapped = mapped, .schema = sch, .count = n } };
+    }
+
+    /// A file cut four times coarser when that still leaves `coarse_min` ranges, for a
+    /// sink that keeps a partial per morsel; the cut stays the file's alone, not -j's.
+    pub fn coarser(self: *const Morsels) Morsels {
+        var m = self.*;
+        if (m == .csv and m.csv.count / 4 >= coarse_min) m.csv.count /= 4;
+        return m;
     }
 
     pub fn count(self: *const Morsels) usize {
@@ -190,13 +200,16 @@ pub const ParallelSink = struct {
 };
 
 /// A pipeline into a parallel sink: each morsel of `m` through the map stages `recs`
-/// and then the probes of `joins`.
+/// and then the probes of `joins`. `per_lane` hands the sink one chain per worker,
+/// over every morsel it claims in turn, with the worker's index for the morsel's:
+/// for a sink whose result does not depend on the order its rows come in.
 pub const Pipeline = struct {
     m: *const Morsels,
     recs: []const analyze.Resolved,
     joins: []const LaneJoin = &.{},
     errctx: ?*op.ErrCtx,
     rows_read: *obs.RowCounter,
+    per_lane: bool = false,
 };
 
 const Drive = struct { p: Pipeline, snk: ParallelSink, queue: WorkQueue };
@@ -212,11 +225,11 @@ pub fn drive(arena: std.mem.Allocator, p: Pipeline, snk: ParallelSink, lanes: us
     return used;
 }
 
-fn driveLane(ctx: *Drive, _: usize) void {
-    driveRun(ctx) catch |e| ctx.queue.fail(e);
+fn driveLane(ctx: *Drive, lane: usize) void {
+    driveRun(ctx, lane) catch |e| ctx.queue.fail(e);
 }
 
-fn driveRun(ctx: *Drive) !void {
+fn driveRun(ctx: *Drive, lane: usize) !void {
     var mem: LaneMem = .{};
     mem.init();
     defer mem.deinit();
@@ -224,7 +237,11 @@ fn driveRun(ctx: *Drive) !void {
     defer rd.deinit();
     const vt = ctx.snk.vtable;
     const local = try vt.initLocal(ctx.snk.ptr, &mem);
-    while (ctx.queue.take()) |i| {
+    if (ctx.p.per_lane) {
+        var st = Stream{ .m = ctx.p.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
+        defer st.source().close();
+        try vt.sink(ctx.snk.ptr, local, lane, try chainOver(ctx.p, st.source(), mem.work.allocator()));
+    } else while (ctx.queue.take()) |i| {
         const span = trace.begin("morsel", i);
         defer span.end();
         _ = mem.work.reset(.retain_capacity);
@@ -233,13 +250,20 @@ fn driveRun(ctx: *Drive) !void {
         var none = OneBatch{ .b = null, .sch = ctx.p.m.schema().* };
         const src = (try ctx.p.m.open(i, &rd, wa)) orelse none.source();
         defer src.close();
-        var cs = obs.CountingSource{ .inner = src, .count = ctx.p.rows_read };
-        var scan = op.Scan{ .src = cs.source() };
-        var chain = try chainOps(wa, ctx.p.errctx, ctx.p.recs, .{ .scan = &scan });
-        for (ctx.p.joins) |lj| chain = try buildLaneJoinChain(wa, ctx.p.errctx, lj, chain);
-        try vt.sink(ctx.snk.ptr, local, i, chain);
+        try vt.sink(ctx.snk.ptr, local, i, try chainOver(ctx.p, src, wa));
     }
     if (!ctx.queue.failed.load(.seq_cst)) try vt.combine(ctx.snk.ptr, local);
+}
+
+/// `src` counted, then through `p`'s map stages and join probes, on `wa`.
+fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
+    const cs = try wa.create(obs.CountingSource);
+    cs.* = .{ .inner = src, .count = p.rows_read };
+    const scan = try wa.create(op.Scan);
+    scan.* = .{ .src = cs.source() };
+    var chain = try chainOps(wa, p.errctx, p.recs, .{ .scan = scan });
+    for (p.joins) |lj| chain = try buildLaneJoinChain(wa, p.errctx, lj, chain);
+    return chain;
 }
 
 pub const PqMorsels = struct {
