@@ -1,21 +1,21 @@
 //! Top-N lanes: each lane keeps its best rows, merged into the final N.
 
 const Env = @import("../env.zig").Env;
-const LaneSplit = @import("sources.zig").LaneSplit;
-const MorselSource = @import("agg.zig").MorselSource;
+const Morsels = @import("morsels.zig").Morsels;
+const Reader = @import("morsels.zig").Reader;
+const Stream = @import("morsels.zig").Stream;
 const PqPart = @import("agg.zig").PqPart;
 const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
 const LaneMem = @import("../parallel.zig").LaneMem;
+const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
 const chainOps = @import("../plan.zig").chainOps;
-const dispatchWorker = @import("../parallel.zig").dispatchWorker;
-const laneRowSource = @import("sources.zig").laneRowSource;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
@@ -112,7 +112,7 @@ pub fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
 }
 
 const TopNCtx = struct {
-    split: LaneSplit,
+    m: *const Morsels,
     row_schema: *const types.Schema,
     prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
@@ -126,16 +126,21 @@ const TopNCtx = struct {
     prof: ?*Profile = null,
 };
 
-const topnWorker = dispatchWorker(TopNCtx, topnWorkOne);
+fn topnLane(ctx: *TopNCtx, _: usize) void {
+    topnLaneRun(ctx) catch |e| ctx.queue.fail(e);
+}
 
-fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
+/// A lane's best rows over the morsels it claims, each row placed by its morsel and
+/// position there, so ties keep the rows a serial run keeps.
+fn topnLaneRun(ctx: *TopNCtx) !void {
     var mem: LaneMem = .{};
     mem.init();
     defer mem.deinit();
-    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
-    defer inner.close();
-    errdefer ctx.split.abort();
-    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
+    var rd = Reader.init(mem.gpa.allocator());
+    defer rd.deinit();
+    var st = Stream{ .m = ctx.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
+    defer st.source().close();
+    var cs = obs.CountingSource{ .inner = st.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
     var tn = op.TopN{
@@ -146,8 +151,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
         .offset = 0,
         .state = mem.batch.allocator(),
         .gpa = mem.gpa.allocator(),
-        .seq_base = @as(u64, i) << 40,
-        .item = if (ctx.split == .parquet) &@as(*MorselSource, @ptrCast(@alignCast(inner.ptr))).cur_item else null,
+        .item = &st.cur_item,
     };
     const t0 = if (ctx.prof != null) std.time.Instant.now() catch null else null;
     const kept = try tn.nextKept(mem.batch.allocator());
@@ -166,7 +170,7 @@ fn topnWorkOne(ctx: *TopNCtx, i: usize) !void {
 
 pub fn runParallelTopN(
     env: *Env,
-    split: LaneSplit,
+    m: *const Morsels,
     prefix: []const ast.Stage,
     srt: ast.Stage,
     lim: ast.Limit,
@@ -176,24 +180,24 @@ pub fn runParallelTopN(
     lanes_used: *usize,
 ) anyerror!bool {
     const arena = env.arena;
-    const pre = try chainAt(env, split.schema().*, prefix);
+    const pre = try chainAt(env, m.schema().*, prefix);
     const row_schema = pre.out;
     const ks = (try resolveAt(env, row_schema.*, srt)).plan.sort;
 
-    env.src_name = split.label();
+    env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = split.lanes(opts);
+    const nthreads = m.workers(opts.lanes());
     var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer kept_arena.deinit();
     var ctx = TopNCtx{
-        .split = split,
+        .m = m,
         .row_schema = row_schema,
         .prefix = pre.recs,
         .errctx = env.errctx,
         .keys = ks,
         .cap = lim.offset + lim.count,
-        .queue = .{ .nitems = nthreads },
+        .queue = .{ .nitems = m.count() },
         .kept = .init(env.gpa),
         .kept_arena = kept_arena.allocator(),
         .rows_read = env.rows_read,
@@ -201,16 +205,16 @@ pub fn runParallelTopN(
     };
     defer ctx.kept.deinit();
 
-    const lanes = try parallel.spawnJoin(arena, nthreads, topnWorker, &ctx);
+    const lanes = try parallel.spawnJoin(arena, nthreads, topnLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ split.label(), split.count(nthreads), split.unitName(), lanes });
+    env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ m.label(), m.count(), m.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
     const top = try op.TopN.combine(env.gpa, arena, row_schema, ks, lim.count, lim.offset, ctx.kept.items);
     if (env.profile) |p| {
         try p.phase("combine the lanes' best rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ split.label(), split.count(nthreads), split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ m.label(), m.count(), m.unitName() });
     }
 
     const snk = try openTailSink(env, w, row_schema.*);

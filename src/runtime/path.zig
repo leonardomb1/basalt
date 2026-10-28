@@ -10,8 +10,9 @@
 //! binding read into memory first is a prelude ahead of the path, decided by
 //! `windowInputAt` and `materializes` over the stages as they stand at that point.
 //!
-//! Each path keeps its own set of streaming stages: a SQL split and a union branch
-//! run explode, file lanes do not (`analyze.isMap`). The run takes the
+//! A map stage is a filter, select or explode (`analyze.isMap`) on a map path: a
+//! file's map lanes, a SQL split and a union branch; the stages ahead of a lane
+//! breaker or join stay filters and selects. The run takes the
 //! plain SQL split off the built operators (`op.linearize`), which `Split.map`
 //! states over the stages; `run/path_tests.zig` holds the two to one answer.
 

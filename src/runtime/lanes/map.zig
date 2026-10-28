@@ -1,16 +1,20 @@
-//! Map lanes (filter, project, a join probe): each lane maps its share, and the
-//! output is written in file order, as a serial run writes it. A right or full
-//! join's lanes mark one shared match bitset; its unmatched build rows are written
-//! once by the driver after every lane is done, so they come last, as serially.
+//! Map lanes (filter, project, explode, a join probe): workers claim morsels and map
+//! them. Into a shared sink a file's output is written in file order, as a serial
+//! run writes it, one unit per morsel; a SQL source's key ranges, or a sink each lane
+//! opens for itself, take rows as they come. A right or full join's lanes mark one
+//! shared match bitset; its unmatched build rows are written once by the driver after
+//! every lane is done, so they come last, as serially.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const LaneJoin = @import("join.zig").LaneJoin;
-const LaneSplit = @import("sources.zig").LaneSplit;
+const Morsels = @import("morsels.zig").Morsels;
 const Profile = @import("../../exec/profile.zig").Profile;
+const Reader = @import("morsels.zig").Reader;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
+const Stream = @import("morsels.zig").Stream;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const ast = @import("../../lang/ast.zig");
@@ -21,14 +25,11 @@ const chainAt = @import("../plan.zig").chainAt;
 const chainOps = @import("../plan.zig").chainOps;
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const connect_mod = @import("../connect.zig");
-const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
-const laneRowSource = @import("sources.zig").laneRowSource;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
-const openSqlQuery = @import("../connect.zig").openSqlQuery;
 const parallel = @import("../parallel.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const planSplit = @import("../connect.zig").planSplit;
@@ -44,10 +45,9 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
-const wrapProjected = @import("../../connect/split.zig").wrapProjected;
 
 const MapCtx = struct {
-    split: LaneSplit,
+    m: *const Morsels,
     map: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     queue: WorkQueue,
@@ -212,19 +212,21 @@ pub const OrderedOut = struct {
     }
 };
 
-/// The worker loop of an ordered shape: one `LaneMem` for the lane's whole run, reset
-/// between units (per-unit arenas left every unit decoding into cold pages), and a
-/// failure wakes the lanes waiting on the window.
+/// The worker loop of an ordered shape: one `LaneMem` and morsel `Reader` for the
+/// lane's whole run, reset between units (per-unit arenas left every unit decoding
+/// into cold pages), and a failure wakes the lanes waiting on the window.
 pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usize) void {
     return struct {
         fn go(ctx: *Ctx, _: usize) void {
             var mem: LaneMem = .{};
             mem.init();
             defer mem.deinit();
+            var rd = Reader.init(mem.gpa.allocator());
+            defer rd.deinit();
             while (ctx.queue.take()) |i| {
                 const span = trace.begin(comptime trace.short(Ctx), i);
                 defer span.end();
-                unitFn(ctx, i, &mem) catch |e| {
+                unitFn(ctx, i, &mem, &rd) catch |e| {
                     ctx.queue.fail(e);
                     ctx.ordered.?.wake();
                     return;
@@ -236,20 +238,26 @@ pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usi
     }.go;
 }
 
-const mapWorker = dispatchWorker(MapCtx, mapWorkOne);
 const orderedMapWorker = orderedWorker(MapCtx, mapOrderedUnit);
 
-fn mapWorkOne(ctx: *MapCtx, i: usize) !void {
+fn mapLane(ctx: *MapCtx, lane_idx: usize) void {
+    mapLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
+}
+
+/// An unordered lane: the morsels it claims as one stream through one chain and,
+/// for a lane sink, one connection.
+fn mapLaneRun(ctx: *MapCtx, lane_idx: usize) !void {
     var mem: LaneMem = .{};
     mem.init();
     defer mem.deinit();
-    const inner = (try laneRowSource(ctx.split.unorderedRows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
-    defer inner.close();
-    errdefer ctx.split.abort();
-    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
+    var rd = Reader.init(mem.gpa.allocator());
+    defer rd.deinit();
+    var st = Stream{ .m = ctx.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
+    defer st.source().close();
+    var cs = obs.CountingSource{ .inner = st.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
-    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), i, chain, &mem.batch, &ctx.queue.failed);
+    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
     _ = ctx.rows_out.fetchAdd(out, .monotonic);
     if (ctx.prof) |p| _ = try p.absorb(chain);
 }
@@ -282,15 +290,14 @@ fn pourLane(mode: parallel.SinkMode, mtx: *std.Thread.Mutex, gpa: std.mem.Alloca
     return out;
 }
 
-/// One positional unit of an ordered map, formatted (or unit-encoded) on the lane. A unit
+/// One morsel of an ordered map, formatted (or unit-encoded) on the lane. A unit
 /// with no rows is still handed over: the writer waits on every position.
-fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem) !void {
-    errdefer ctx.split.abort();
+fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem, rd: *Reader) !void {
     const ord = ctx.ordered.?;
     var f = (try ord.begin(i, &ctx.queue.failed)) orelse return;
     {
         errdefer f.drop();
-        if (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) |inner| {
+        if (try ctx.m.open(i, rd, mem.work.allocator())) |inner| {
             defer inner.close();
             var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
             var scan = op.Scan{ .src = cs.source() };
@@ -307,55 +314,48 @@ fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem) !void {
     try ord.hand(i, f);
 }
 
-pub fn runParallelMap(
-    env: *Env,
-    split_in: LaneSplit,
-    map_stages: []const ast.Stage,
-    jshape: ?MapJoinShape,
-    w: ast.Write,
-    opts: RunOptions,
-    stats: *Stats,
-    lanes_used: *usize,
-) anyerror!bool {
-    const arena = env.arena;
-    var split = split_in;
-    const map = try chainAt(env, split.schema().*, map_stages);
-    var out_schema = map.out.*;
-
-    env.src_name = split.label();
+/// A file's map, or map and one join, on lanes.
+pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    var m = m_in;
+    const map = try chainAt(env, m.schema().*, map_stages);
+    env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
-
     var lane_join: ?LaneJoin = null;
+    var out_schema = map.out.*;
     if (jshape) |js| {
         const lp = (try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema)) orelse return false;
         lane_join = lp.lane;
         out_schema = lp.out_schema;
-        if (split == .parquet) split.parquet.keys = try laneParquetKeys(env, js, lp.lane, map_stages);
+        if (m == .parquet) m.parquet.keys = try laneParquetKeys(env, js, lp.lane, map_stages);
     }
+    try mapDrive(env, &m, map.recs, lane_join, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used);
+    return true;
+}
 
-    const wr = try resolveUpsertKeys(env, w);
+/// Run `m` through `recs` and `lane_join` into the sink: in file order through
+/// `OrderedOut` when it is shared and the morsels are a file's, else as lanes pour.
+fn mapDrive(env: *Env, m: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) !void {
+    const arena = env.arena;
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
     var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
     defer shared.abort();
     errdefer parallel.abortLanes(sink_mode);
 
-    const nthreads = split.lanes(opts);
+    const nthreads = m.workers(opts.lanes());
     var ctx = MapCtx{
-        .split = split,
-        .map = map.recs,
+        .m = m,
+        .map = recs,
         .errctx = env.errctx,
-        .queue = .{ .nitems = nthreads },
+        .queue = .{ .nitems = m.count() },
         .sink_mode = sink_mode,
         .rows_read = env.rows_read,
         .join = lane_join,
         .prof = env.profile,
     };
     var ordered: OrderedOut = undefined;
-    if (sink_mode == .shared) {
-        const nunits = orderedUnits(split, nthreads);
-        ordered = try OrderedOut.init(arena, nunits, 2 * nthreads, sink_mode.shared);
-        ctx.queue.nitems = nunits;
+    if (sink_mode == .shared and m.* != .sql) {
+        ordered = try OrderedOut.init(arena, m.count(), 2 * nthreads, sink_mode.shared);
         ctx.ordered = &ordered;
     }
     defer if (ctx.ordered) |o| o.freeRest();
@@ -363,26 +363,25 @@ pub fn runParallelMap(
     const lanes = if (ctx.ordered != null)
         try parallel.spawnJoin(arena, nthreads, orderedMapWorker, &ctx)
     else
-        try parallel.spawnJoin(arena, nthreads, mapWorker, &ctx);
+        try parallel.spawnJoin(arena, nthreads, mapLane, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
     if (lane_join) |lj| if (ctx.queue.failure() == null) {
-        const drained = try writeLaneJoinDrain(env, lj, sink_mode, &ctx.sink_mtx, ctx.queue.nitems);
+        const drained = try writeLaneJoinDrain(env, lj, sink_mode, &ctx.sink_mtx, nthreads);
         _ = ctx.rows_out.fetchAdd(drained, .monotonic);
     };
-    const units = ctx.queue.nitems;
-    env.log.log(.debug, "parallel {s} map{s}: {d} {s} over {d} lanes ({s} sink)", .{
-        split.label(), if (lane_join != null) "+join" else "", units, split.unitName(), lanes, @tagName(sink_mode),
-    });
+    const how = if (m.* == .sql) "split-parallel" else "parallel";
+    const what = if (lane_join != null) "map+join" else "map";
+    env.log.log(.debug, "{s} {s} {s}: {d} {s} over {d} lanes ({s} sink)", .{ m.label(), how, what, m.count(), m.unitName(), lanes, @tagName(sink_mode) });
     if (env.profile) |p| {
         if (lane_join) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel map{s}, {d} {s}", .{ split.label(), if (lane_join != null) "+join" else "", units, split.unitName() });
+        p.path = try msgfmt.allocPrint(arena, "{s} {s} {s}, {d} {s}", .{ m.label(), how, what, m.count(), m.unitName() });
+        if (m.* == .sql) try p.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
     }
 
     if (ctx.queue.failure()) |e| return e;
     stats.rows_out += ctx.rows_out.load(.monotonic);
     try shared.close();
     try parallel.finishLanes(sink_mode);
-    return true;
 }
 
 /// Once every lane is done, a right/full join's unmatched build rows go through
@@ -424,19 +423,9 @@ fn narrowingKeyExprs(arena: std.mem.Allocator, js: MapJoinShape, lane: LaneJoin,
 }
 
 /// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`
-/// ranges, at least one per lane, so the reorder window holds a few MB per lane.
-fn orderedUnits(split: LaneSplit, nthreads: usize) usize {
-    return switch (split) {
-        .csv => |c| std.math.clamp(c.mapped.body.len / ordered_chunk_bytes + 1, nthreads, 1 << 16),
-        .parquet => split.count(nthreads),
-    };
-}
-
-const ordered_chunk_bytes = 4 << 20;
-
 pub fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     const middle = stages[1 .. stages.len - 1];
-    for (middle) |st| if (!analyze.isMap(st.node, false)) return null;
+    for (middle) |st| if (!analyze.isMap(st.node, true)) return null;
     return middle;
 }
 
@@ -476,74 +465,10 @@ pub fn mapJoinKindLaneSafe(kind: ast.JoinKind) bool {
     return joinKindLaneSafe(kind) or kind == .right or kind == .full;
 }
 
-const SqlMapJoinCtx = struct {
-    split: SplitCtx,
-    predicates: []const []const u8,
-    src_schema: *const types.Schema,
-    prefix: []const analyze.Resolved,
-    join: LaneJoin,
-    errctx: ?*op.ErrCtx = null,
-    queue: WorkQueue,
-    sink_mode: parallel.SinkMode,
-    sink_mtx: std.Thread.Mutex = .{},
-    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rows_read: *obs.RowCounter,
-    prof: ?*Profile = null,
-};
-
-const SplitSource = struct {
-    ctx: *SqlMapJoinCtx,
-    gpa: std.mem.Allocator,
-    cur: ?driver.Source = null,
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *SplitSource = @ptrCast(@alignCast(ptr));
-        return self.ctx.src_schema.*;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *SplitSource = @ptrCast(@alignCast(ptr));
-        while (true) {
-            if (self.cur) |src| {
-                if (try src.next(arena)) |b| return b;
-                src.close();
-                self.cur = null;
-            }
-            const i = self.ctx.queue.take() orelse return null;
-            const q = try wrapProjected(self.gpa, self.ctx.split.base_sql, self.ctx.split.proj_select, self.ctx.predicates[i], self.ctx.split.where_extra);
-            defer self.gpa.free(q);
-            self.cur = try openSqlQuery(&self.ctx.split, self.gpa, q);
-        }
-    }
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *SplitSource = @ptrCast(@alignCast(ptr));
-        if (self.cur) |src| src.close();
-        self.cur = null;
-    }
-    const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-};
-
-fn sqlMapJoinLane(ctx: *SqlMapJoinCtx, lane_idx: usize) void {
-    sqlMapJoinLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
-}
-
-fn sqlMapJoinLaneRun(ctx: *SqlMapJoinCtx, lane_idx: usize) !void {
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
-    var ss = SplitSource{ .ctx = ctx, .gpa = mem.gpa.allocator() };
-    defer SplitSource.closeFn(&ss);
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &ss, .vtable = &SplitSource.vtable }, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const probe = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
-    const chain = try buildLaneJoinChain(mem.work.allocator(), ctx.errctx, ctx.join, probe);
-    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
-    _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    if (ctx.prof) |p| _ = try p.absorb(chain);
-}
-
-/// Split-parallel SQL map+join. The serial plan's sources are closed before the shared
-/// index opens its own. No projection narrowing under a join (planMap's liveness is
-/// map-shaped), so lanes select `*`; join-aware liveness would fix that.
+/// Split-parallel SQL map+join: the read's key ranges as morsels. The serial plan's
+/// sources are closed before the shared index opens its own. No projection narrowing
+/// under a join (planMap's liveness is map-shaped), so lanes select `*`; join-aware
+/// liveness would fix that.
 pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
     if (stages[0].node != .read) return false;
@@ -570,40 +495,10 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     }
 
     env.sink_name = sinkLabel(env, w);
-    const sink_mode: parallel.SinkMode = (try buildParallelSink(env, w, lp.out_schema)) orelse
-        .{ .shared = try openSink(env, w, lp.out_schema) };
-    var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
-    defer shared.abort();
-    errdefer parallel.abortLanes(sink_mode);
-
-    var ctx = SqlMapJoinCtx{
-        .split = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema },
-        .predicates = sp.predicates,
-        .src_schema = src_schema,
-        .prefix = pre.recs,
-        .join = lp.lane,
-        .errctx = env.errctx,
-        .queue = .{ .nitems = sp.predicates.len },
-        .sink_mode = sink_mode,
-        .rows_read = env.rows_read,
-        .prof = env.profile,
-    };
-
-    const nlanes = @min(@max(@as(usize, 1), opts.lanes()), sp.predicates.len);
-    const lanes = try parallel.spawnJoin(arena, nlanes, sqlMapJoinLane, &ctx);
-    lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "split-parallel map+join: {d} splits over {d} lanes", .{ sp.predicates.len, lanes });
-    if (env.profile) |p| {
-        if (lp.lane.build_root) |b| try p.graftBuild(lp.lane.at, b);
-        p.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel map+join, {d} key ranges", .{ @tagName(desc.kind), sp.predicates.len });
-        try p.noteSent("{s}, once per key range: {s}", .{ @tagName(desc.kind), sp.base_sql });
-    }
-
-    if (ctx.queue.failure()) |e| return e;
-    stats.rows_out += ctx.rows_out.load(.monotonic);
-    stats.rows_out += try writeLaneJoinDrain(env, lp.lane, sink_mode, &ctx.sink_mtx, nlanes);
-    try shared.close();
-    try parallel.finishLanes(sink_mode);
+    const split = try arena.create(SplitCtx);
+    split.* = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema };
+    const m = Morsels{ .sql = .{ .split = split, .predicates = sp.predicates, .schema = src_schema } };
+    try mapDrive(env, &m, pre.recs, lp.lane, lp.out_schema, w, opts, stats, lanes_used);
     return true;
 }
 

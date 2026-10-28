@@ -24,11 +24,11 @@ const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const LaneMem = @import("../parallel.zig").LaneMem;
-const LaneSplit = @import("sources.zig").LaneSplit;
+const Morsels = @import("morsels.zig").Morsels;
 const ReaderSource = @import("sources.zig").ReaderSource;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
-const HeldFile = @import("agg.zig").HeldFile;
-const openItem = @import("agg.zig").openItem;
+const HeldFile = @import("morsels.zig").HeldFile;
+const openItem = @import("morsels.zig").openItem;
 const obs = @import("../obs.zig");
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
@@ -90,8 +90,8 @@ const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 /// The build side's Parquet split when it is a local Parquet read followed only by
 /// filters and projections, so the lanes read it as they read a probe side; else null
 /// and the build side reads serially.
-fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
-    if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
+fn buildSplit(env: *Env, rstages: []const ast.Stage) !?Morsels {
+    if (env.pipe.threads < 2 or rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
     for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
     return parquetSplit(env, rstages[0].node.read, rstages[0].hints, rstages[1..], w, .{ .threads = env.pipe.threads });
@@ -105,7 +105,7 @@ const BuildPart = struct {
 };
 
 const BuildCtx = struct {
-    split: *LaneSplit,
+    split: *Morsels,
     recs: []const analyze.Resolved,
     errctx: ?*op.ErrCtx,
     queue: WorkQueue,
@@ -168,9 +168,9 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
-fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, recs: []const analyze.Resolved, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
+fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analyze.Resolved, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
-    const nitems = split.count(env.pipe.threads);
+    const nitems = split.count();
     const parts = try arena.alloc(BuildPart, nitems);
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();

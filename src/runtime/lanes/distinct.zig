@@ -4,7 +4,8 @@
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
-const LaneSplit = @import("sources.zig").LaneSplit;
+const Morsels = @import("morsels.zig").Morsels;
+const Reader = @import("morsels.zig").Reader;
 const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
@@ -19,7 +20,6 @@ const column = @import("../../exec/column.zig");
 const keyhash = @import("../../exec/keyhash.zig");
 const keytable = @import("../../exec/keytable.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
-const laneRowSource = @import("sources.zig").laneRowSource;
 const resolveAt = @import("../plan.zig").resolveAt;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
@@ -93,7 +93,7 @@ const Lane = struct {
 };
 
 const DistinctCtx = struct {
-    split: LaneSplit,
+    m: *const Morsels,
     row_schema: *const types.Schema,
     prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
@@ -114,21 +114,23 @@ fn distinctWorker(ctx: *DistinctCtx, lane_idx: usize) void {
     const in = keytable.Interner{ .table = ctx.strs, .cache = &lane.cache, .alloc = lane.arena.allocator() };
     lane.mem.init();
     defer lane.mem.deinit();
+    var rd = Reader.init(lane.mem.gpa.allocator());
+    defer rd.deinit();
     while (ctx.queue.take()) |i| {
         _ = lane.mem.work.reset(.retain_capacity);
         _ = lane.mem.batch.reset(.retain_capacity);
         const span = trace.begin("distinct item", i);
         defer span.end();
-        distinctWorkOne(ctx, &lane.mem, in, i) catch |e| return ctx.queue.fail(e);
+        distinctWorkOne(ctx, &lane.mem, &rd, in, i) catch |e| return ctx.queue.fail(e);
     }
 }
 
 /// Dedups per item rather than per lane, so the item index is a file position and the
 /// merge keeps the row a serial run would; then keys the item's first rows for it.
-fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, in: keytable.Interner, i: usize) !void {
+fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, rd: *Reader, in: keytable.Interner, i: usize) !void {
     const item = &ctx.items[i];
     const ia = item.arena.allocator();
-    const inner = (try laneRowSource(ctx.split.rows(i, ctx.queue.nitems), mem.work.allocator())) orelse return;
+    const inner = (try ctx.m.open(i, rd, mem.work.allocator())) orelse return;
     defer inner.close();
     var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
@@ -258,7 +260,7 @@ fn gatherKept(arena: std.mem.Allocator, row_schema: *const types.Schema, items: 
 
 pub fn runParallelDistinct(
     env: *Env,
-    split: LaneSplit,
+    m: *const Morsels,
     prefix: []const ast.Stage,
     dist: ast.Stage,
     tail: []const ast.Stage,
@@ -268,7 +270,7 @@ pub fn runParallelDistinct(
     lanes_used: *usize,
 ) anyerror!bool {
     const arena = env.arena;
-    const pre = try chainAt(env, split.schema().*, prefix);
+    const pre = try chainAt(env, m.schema().*, prefix);
     const row_schema = pre.out;
 
     const local_keys = (try resolveAt(env, row_schema.*, dist)).plan.distinct;
@@ -281,11 +283,11 @@ pub fn runParallelDistinct(
         key_idx = all;
     }
 
-    env.src_name = split.label();
+    env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = split.lanes(opts);
-    const nitems = split.count(nthreads);
+    const nthreads = m.workers(opts.lanes());
+    const nitems = m.count();
     const items = try arena.alloc(Item, nitems);
     for (items) |*it| it.* = .{ .arena = .init(env.gpa) };
     defer for (items) |*it| it.arena.deinit();
@@ -296,7 +298,7 @@ pub fn runParallelDistinct(
     defer strs_table.deinit();
     var strs: ?*keytable.StrTable = &strs_table;
     var ctx = DistinctCtx{
-        .split = split,
+        .m = m,
         .row_schema = row_schema,
         .prefix = pre.recs,
         .errctx = env.errctx,
@@ -312,7 +314,7 @@ pub fn runParallelDistinct(
 
     const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ split.label(), nitems, split.unitName(), lanes });
+    env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ m.label(), nitems, m.unitName(), lanes });
     if (ctx.queue.failure()) |e| return e;
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
@@ -322,7 +324,7 @@ pub fn runParallelDistinct(
     const merged = try gatherKept(arena, row_schema, items);
     if (env.profile) |p| {
         try p.phase("merge the lanes' rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ split.label(), nitems, split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ m.label(), nitems, m.unitName() });
     }
 
     const after = try chainAt(env, row_schema.*, tail);

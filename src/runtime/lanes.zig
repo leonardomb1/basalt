@@ -103,7 +103,7 @@ pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast
     if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
     const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse return false;
     defer mapped.close();
-    return runShape(env, .{ .csv = .{ .mapped = mapped, .schema = &mapped.schema } }, shape, w, opts, stats, lanes_used);
+    return runShape(env, .ofCsv(mapped, &mapped.schema, opts.morsel_bytes), shape, w, opts, stats, lanes_used);
 }
 
 /// The stages a read may push down: a map path stops before its join, whose names are the join's.
@@ -123,12 +123,12 @@ pub fn shapeLaneSafe(shape: LaneShape) bool {
     };
 }
 
-fn runShape(env: *Env, split: LaneSplit, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+fn runShape(env: *Env, split: Morsels, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return switch (shape) {
         .agg => |x| runParallelAgg(env, split, x.prefix, x.agg, x.tail, null, w, opts, stats, lanes_used),
         .agg_join => |x| runParallelAgg(env, split, x.map_stages, x.agg, x.tail, x, w, opts, stats, lanes_used),
-        .distinct => |x| runParallelDistinct(env, split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
-        .top_n => |x| runParallelTopN(env, split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
+        .distinct => |x| runParallelDistinct(env, &split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
+        .top_n => |x| runParallelTopN(env, &split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
         .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
         .map_join => |x| runParallelMap(env, split, x.prefix, x, w, opts, stats, lanes_used),
     };
@@ -253,7 +253,7 @@ const runParallelTopN = @import("lanes/topn.zig").runParallelTopN;
 const DistinctShape = @import("lanes/distinct.zig").DistinctShape;
 const classifyDistinctPipeline = @import("lanes/distinct.zig").classifyDistinctPipeline;
 const runParallelDistinct = @import("lanes/distinct.zig").runParallelDistinct;
-const LaneSplit = @import("lanes/sources.zig").LaneSplit;
+const Morsels = @import("lanes/morsels.zig").Morsels;
 const parquetSplit = @import("lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("lanes/sources.zig").csvSplitFile;
 
@@ -306,6 +306,7 @@ test {
     _ = @import("lanes/distinct.zig");
     _ = @import("lanes/join.zig");
     _ = @import("lanes/map.zig");
+    _ = @import("lanes/morsels.zig");
     _ = @import("lanes/sources.zig");
     _ = @import("lanes/topn.zig");
     _ = @import("lanes/testing_util.zig");

@@ -102,7 +102,7 @@ test "an input read into memory first is read once, and the run still names the 
         for ([_]usize{ 1, 4 }) |threads| {
             var diag: Diag = .{};
             var summary: basalt.obs.Summary = .{ .run_id = 0 };
-            _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true }, .summary_out = &summary }, &diag);
+            _ = try exec(alloc, script, .{ .threads = threads, .morsel_bytes = 1 << 10, .log = .{ .quiet = true }, .summary_out = &summary }, &diag);
             try std.testing.expectEqual(@as(u64, 6000), summary.rows_read);
             try std.testing.expectEqualStrings("csv", summary.sink);
             const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 16);
@@ -123,7 +123,7 @@ test "WITH (buffer) drains the source before the sink opens, so a load may rewri
         const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/in.csv' AS SELECT id, v * 2 AS v FROM '{0s}/in.csv' WITH (buffer) WHERE v > 5 ORDER BY id DESC;", .{base});
         defer alloc.free(script);
         var diag: Diag = .{};
-        const stats = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &diag);
+        const stats = try exec(alloc, script, .{ .threads = threads, .morsel_bytes = 1 << 10, .log = .{ .quiet = true } }, &diag);
         try std.testing.expectEqual(@as(u64, 3), stats.rows_out);
         const out = try tmp.dir.readFileAlloc(alloc, "in.csv", 1 << 16);
         defer alloc.free(out);
@@ -170,7 +170,7 @@ fn runParquetThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, query:
     const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}' AS {s};", .{ out_path, q });
     defer alloc.free(script);
     var rdiag: Diag = .{};
-    _ = try exec(alloc, script, .{ .threads = threads }, &rdiag);
+    _ = try exec(alloc, script, .{ .threads = threads, .morsel_bytes = 1 << 10 }, &rdiag);
     return tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
 }
 
@@ -569,7 +569,7 @@ fn runJoinLanes(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, body: []cons
 
     var rdiag: Diag = .{};
     var summary: basalt.obs.Summary = .{ .run_id = 0 };
-    _ = try exec(alloc, script, .{ .threads = threads, .summary_out = &summary }, &rdiag);
+    _ = try exec(alloc, script, .{ .threads = threads, .morsel_bytes = 1 << 10, .summary_out = &summary }, &rdiag);
     lanes.* = summary.threads;
     return tmp.dir.readFileAlloc(alloc, out_name, 1 << 20);
 }
@@ -832,7 +832,7 @@ test "parallel join: a FULL join's drained rows land after the lanes' row groups
 
         var rdiag: Diag = .{};
         var summary: basalt.obs.Summary = .{ .run_id = 0 };
-        _ = try exec(alloc, load, .{ .threads = threads, .summary_out = &summary }, &rdiag);
+        _ = try exec(alloc, load, .{ .threads = threads, .morsel_bytes = 1 << 10, .summary_out = &summary }, &rdiag);
         if (threads > 1) try std.testing.expect(summary.threads > 1);
         _ = try exec(alloc, back, .{ .threads = 1 }, &rdiag);
         out.* = try tmp.dir.readFileAlloc(alloc, "back.csv", 1 << 20);

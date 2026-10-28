@@ -175,6 +175,8 @@ pub const RunOptions = struct {
     spill_cap: u64 = 8 << 30,
     op_memory: usize = 2 << 30,
     stdin_free: bool = false,
+    /// The bytes of a CSV, NDJSON or record file one morsel covers; tests shrink it.
+    morsel_bytes: usize = 4 << 20,
 
     /// The lanes a query may fan out on: the `-j` given, or one per physical core.
     pub fn lanes(self: RunOptions) usize {

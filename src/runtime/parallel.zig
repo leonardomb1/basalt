@@ -206,8 +206,12 @@ fn firstAllowedSibling(list: []const u8, set: std.posix.cpu_set_t) ?usize {
 }
 
 /// Spawn up to `n` copies of `worker(ctx, lane_idx)`, join them, and return the
-/// lane count (>= 1). When no thread can be spawned the worker runs inline as lane 0.
+/// lane count (>= 1). One lane, or none that could be spawned, runs inline as lane 0.
 pub fn spawnJoin(alloc: std.mem.Allocator, n: usize, comptime worker: anytype, ctx: anytype) !usize {
+    if (n <= 1) {
+        worker(ctx, 0);
+        return 1;
+    }
     const threads = try alloc.alloc(std.Thread, n);
     defer alloc.free(threads);
     var spawned: usize = 0;

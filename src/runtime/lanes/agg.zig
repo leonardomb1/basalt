@@ -15,7 +15,9 @@ const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
 const LaneMem = @import("../parallel.zig").LaneMem;
-const LaneSplit = @import("sources.zig").LaneSplit;
+const Morsels = @import("morsels.zig").Morsels;
+const Reader = @import("morsels.zig").Reader;
+const Stream = @import("morsels.zig").Stream;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const orderedWorker = @import("map.zig").orderedWorker;
 const analyze = @import("../analyze.zig");
@@ -306,7 +308,7 @@ const GroupWriteCtx = struct {
 
 const groupWriteWorker = orderedWorker(GroupWriteCtx, groupWriteUnit);
 
-fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem) !void {
+fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem, _: *Reader) !void {
     const ord = ctx.ordered.?;
     var f = (try ord.begin(i, &ctx.queue.failed)) orelse return;
     {
@@ -404,11 +406,10 @@ pub const PqPart = struct {
 
 const pq_parts: usize = op.Aggregate.fold_parts;
 
-pub const pq_min_lanes: usize = 2;
-
 const PqAggCtx = struct {
     agg: LaneAgg,
-    morsels: PqMorsels,
+    morsels: *const Morsels,
+    queue: WorkQueue,
     prefix: []const analyze.Resolved,
     errctx: ?*op.ErrCtx = null,
     lanes: []PqLane,
@@ -416,116 +417,8 @@ const PqAggCtx = struct {
     joins: []const LaneJoin = &.{},
 };
 
-pub const PqMorsels = struct {
-    files: []const []const u8,
-    root: ?[]const u8 = null,
-    items: []const PqItem,
-    project: ?[][]const u8,
-    bounds: []const pqdecode.Bound,
-    keys: []const pqdecode.KeyBound = &.{},
-    src_schema: *const types.Schema,
-    queue: WorkQueue,
-    tally: ?*driver.ScanTally = null,
-    max_lanes: usize = std.math.maxInt(usize),
-    check_in_lane: bool = false,
-    /// A single remote file's reader as planning opened it: lanes reuse its footer
-    /// and size, each on its own connection.
-    like: ?*const pqdecode.Reader = null,
-    /// A table's files, each opened fitted to `view`, the table's projected columns.
-    layout: ?*const pqdecode.Layout = null,
-    view: ?*const pqdecode.View = null,
-};
-
-pub const PqItem = struct { file: u32, rg: u32, rg_end: ?u32 };
-
-pub const HeldFile = struct { file: u32, r: *pqdecode.Reader };
-
-/// The reader positioned on item `i`, reusing `held` when it is the same file (reopening
-/// per row group re-parsed the footer); null when a file shrank since it was planned.
-pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFile, i: usize) !?*pqdecode.Reader {
-    const it = m.items[i];
-    if (held.*) |h| if (h.file != it.file) {
-        h.r.close();
-        held.* = null;
-    };
-    if (held.* == null) {
-        const path = m.files[it.file];
-        if (m.layout) |lay| {
-            held.* = .{ .file = it.file, .r = try lay.open(scratch, m.view.?, it.file, m.bounds) orelse return null };
-            return positioned(m, held.*.?.r, it);
-        }
-        const r = if (m.like) |l| try pqdecode.Reader.openLike(scratch, path, l) else try pqdecode.Reader.openProjected(scratch, path, m.project);
-        if (m.check_in_lane and it.file != 0) if (pqdecode.schemaMismatch(scratch, m.src_schema.*, r.schema, m.project)) |why| {
-            r.close();
-            return eval.explain(error.ParquetFolderMismatch, pqdecode.mismatchMessage(scratch, m.root orelse "", path, m.files[0], why));
-        };
-        held.* = .{ .file = it.file, .r = r };
-    }
-    return positioned(m, held.*.?.r, it);
-}
-
-fn positioned(m: *const PqMorsels, r: *pqdecode.Reader, it: PqItem) ?*pqdecode.Reader {
-    r.bounds = m.bounds;
-    r.keys = m.keys;
-    r.tally = m.tally;
-    r.rg = it.rg;
-    r.rg_end = if (it.rg_end) |e| e else null;
-    if (r.rg >= r.md.row_groups.len) return null;
-    return r;
-}
-
-pub const MorselSource = struct {
-    m: *PqMorsels,
-    scratch: std.mem.Allocator,
-    held: ?HeldFile = null,
-    cur: ?*pqdecode.Reader = null,
-    cur_item: usize = 0,
-    fixed: ?struct { next: usize, step: usize } = null,
-    span: trace.Span = .{ .name = "", .arg = 0, .start = null },
-    slicer: Slicer = .{},
-
-    fn nextIndex(self: *MorselSource) ?usize {
-        if (self.fixed) |*f| {
-            if (self.m.queue.failed.load(.seq_cst) or f.next >= self.m.queue.nitems) return null;
-            defer f.next += f.step;
-            return f.next;
-        }
-        return self.m.queue.take();
-    }
-
-    fn schemaFn(ptr: *anyopaque) types.Schema {
-        const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        return self.m.src_schema.*;
-    }
-    fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
-        const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        while (true) {
-            if (self.cur) |r| {
-                if (try self.slicer.read(arena, r)) |b| return b;
-                self.cur = null;
-                self.span.end();
-            }
-            const i = self.nextIndex() orelse {
-                self.slicer.deinit();
-                return null;
-            };
-            self.span = trace.begin("row group", i);
-            self.cur = try openItem(self.m, self.scratch, &self.held, i);
-            self.cur_item = i;
-        }
-    }
-    fn closeFn(ptr: *anyopaque) void {
-        const self: *MorselSource = @ptrCast(@alignCast(ptr));
-        if (self.held) |h| h.r.close();
-        self.held = null;
-        self.cur = null;
-        self.slicer.deinit();
-    }
-    pub const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
-};
-
 fn pqAggLane(ctx: *PqAggCtx, lane_idx: usize) void {
-    pqAggLaneRun(ctx, lane_idx) catch |e| ctx.morsels.queue.fail(e);
+    pqAggLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
 }
 
 fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
@@ -534,13 +427,11 @@ fn pqAggLaneRun(ctx: *PqAggCtx, lane_idx: usize) !void {
     const ls = &ctx.lanes[lane_idx];
     const la = ls.arena.allocator();
 
-    var ms = MorselSource{
-        .m = &ctx.morsels,
-        .scratch = la,
-        .fixed = .{ .next = lane_idx, .step = ctx.lanes.len },
-    };
-    defer ms.slicer.deinit();
-    var cs = obs.CountingSource{ .inner = .{ .ptr = &ms, .vtable = &MorselSource.vtable }, .count = ctx.rows_read };
+    var rd = Reader.init(ls.arena.child_allocator);
+    defer rd.deinit();
+    var ms = Stream{ .m = ctx.morsels, .queue = &ctx.queue, .rd = &rd, .scratch = la, .fixed = .{ .next = lane_idx, .step = ctx.lanes.len } };
+    defer ms.source().close();
+    var cs = obs.CountingSource{ .inner = ms.source(), .count = ctx.rows_read };
     var scan = op.Scan{ .src = cs.source() };
     var child = try chainOps(la, ctx.errctx, ctx.prefix, .{ .scan = &scan });
     for (ctx.joins) |lj| child = try buildLaneJoinChain(la, ctx.errctx, lj, child);
@@ -633,7 +524,7 @@ pub fn classifyAggJoinPipeline(stages: []const ast.Stage) ?AggJoinShape {
 
 /// Parallel aggregate over a split read, folded into private tables and merged by hash
 /// partition. False when a join in the span cannot run on lanes.
-pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+pub fn runParallelAgg(env: *Env, split: Morsels, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, jshape: ?AggJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const pre = try chainAt(env, split.schema().*, prefix);
     var agg_in_schema = pre.out.*;
     var lane_joins: []const LaneJoin = &.{};
@@ -656,7 +547,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     const parts = try allocMergeParts(env.gpa);
     defer freeMergeParts(env.gpa, parts);
 
-    const nthreads = split.lanes(opts);
+    const nthreads = split.workers(opts.lanes());
     var sel: ?[]const []const u32 = null;
     const sets, const write_threads = switch (split) {
         .csv => |c| blk: {
@@ -681,11 +572,12 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
             if (env.profile) |p| try p.phase("merge the lanes' groups", (std.time.Instant.now() catch unreachable).since(t_mrg0));
             break :blk .{ combined, opts.lanes() };
         },
-        .parquet => |m| blk: {
+        .parquet => blk: {
             pq_lanes = try allocPqLanes(env.gpa, nthreads);
-            sel = try foldParquet(env, la, m, pre.recs, lane_joins, tail, pq_lanes, parts, lanes_used);
+            sel = try foldParquet(env, la, &split, pre.recs, lane_joins, tail, pq_lanes, parts, lanes_used);
             break :blk .{ try partSets(env.arena, parts), nthreads };
         },
+        .sql => unreachable,
     };
 
     const after = try chainAt(env, la.out_schema.*, tail);
@@ -705,7 +597,7 @@ pub fn runParallelAgg(env: *Env, split: LaneSplit, prefix: []const ast.Stage, ag
     if (env.profile) |p| {
         try p.phase("emit and write the groups", t_emit1.since(t_emit0));
         for (lane_joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", split.count(nthreads), split.unitName() });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ split.label(), if (lane_joins.len > 0) " over joins" else "", if (split == .csv) nthreads else split.count(), split.unitName() });
     }
     try guard.close();
     return true;
@@ -731,13 +623,14 @@ fn freePqLanes(gpa: std.mem.Allocator, lanes: []PqLane) void {
 
 /// Fold parquet morsels on `lanes`, one fixed slice of row groups each, and merge them
 /// into `parts`; returns each partition's top-N selection when the tail allows one.
-fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const analyze.Resolved, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, lanes_used: *usize) !?[]const []const u32 {
+fn foldParquet(env: *Env, la: LaneAgg, morsels: *const Morsels, prefix: []const analyze.Resolved, joins: []const LaneJoin, tail: []const ast.Stage, lanes: []PqLane, parts: []PqPart, lanes_used: *usize) !?[]const []const u32 {
     const arena = env.arena;
-    const ngroups = morsels.queue.nitems;
+    const ngroups = morsels.count();
     const nthreads = lanes.len;
     var ctx = PqAggCtx{
         .agg = la,
         .morsels = morsels,
+        .queue = .{ .nitems = morsels.count() },
         .prefix = prefix,
         .errctx = env.errctx,
         .lanes = lanes,
@@ -749,7 +642,7 @@ fn foldParquet(env: *Env, la: LaneAgg, morsels: PqMorsels, prefix: []const analy
     const used = try parallel.spawnJoin(arena, nthreads, pqAggLane, &ctx);
     const t_fold1 = std.time.Instant.now() catch unreachable;
     lanes_used.* = @max(lanes_used.*, used);
-    if (ctx.morsels.queue.failure()) |e| return e;
+    if (ctx.queue.failure()) |e| return e;
 
     const t_mrg0 = std.time.Instant.now() catch unreachable;
     const merge_span = trace.begin("aggregate merge", 0);
