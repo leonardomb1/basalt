@@ -383,13 +383,13 @@ const RowScope = struct {
     materialized: @FieldType(Env, "materialized"),
     folder_memo: @FieldType(Env, "folder_memo"),
     tables: @FieldType(Env, "tables"),
-    sql_desc: @FieldType(Env, "sql_desc"),
+    pipe: @FieldType(Env, "pipe"),
     mem_sink: @FieldType(Env, "mem_sink"),
     sink_label_prefix: @FieldType(Env, "sink_label_prefix"),
     last_target: []const u8,
 
     fn enter(env: *Env, row: std.mem.Allocator, row_tables: *lake.Memo) RowScope {
-        const kept = RowScope{ .arena = env.arena, .materialized = env.materialized, .folder_memo = env.folder_memo, .tables = env.tables, .sql_desc = env.sql_desc, .mem_sink = env.mem_sink, .sink_label_prefix = env.sink_label_prefix, .last_target = env.last_target };
+        const kept = RowScope{ .arena = env.arena, .materialized = env.materialized, .folder_memo = env.folder_memo, .tables = env.tables, .pipe = env.pipe, .mem_sink = env.mem_sink, .sink_label_prefix = env.sink_label_prefix, .last_target = env.last_target };
         env.arena = row;
         env.folder_memo = .empty;
         if (env.tables != null) env.tables = row_tables;
@@ -401,12 +401,9 @@ const RowScope = struct {
         env.materialized = self.materialized;
         env.folder_memo = self.folder_memo;
         env.tables = self.tables;
-        env.sql_desc = self.sql_desc;
+        env.pipe = self.pipe;
         env.mem_sink = self.mem_sink;
         env.sink_label_prefix = self.sink_label_prefix;
-        env.pq_readers = 0;
-        env.pq_reader = null;
-        env.pq_folder = null;
         env.last_target = self.keep(env.last_target, self.last_target);
     }
 

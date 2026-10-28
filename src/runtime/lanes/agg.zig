@@ -5,6 +5,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const Slicer = @import("../../exec/batch.zig").Slicer;
 const Env = @import("../env.zig").Env;
+const Pipe = @import("../env.zig").Pipe;
 const LaneJoin = @import("join.zig").LaneJoin;
 const OneBatch = @import("../connect.zig").OneBatch;
 const OrderedOut = @import("map.zig").OrderedOut;
@@ -840,9 +841,9 @@ fn sqlAggWorkOne(ctx: *SqlAggCtx, i: usize) !void {
 
 /// Parallel SQL aggregate over key-range lanes, one connection and one `AggSlot` per
 /// range (ranges are stolen, so only the range index is stable). False falls back.
-pub fn runParallelSqlAgg(env: *Env, stages: []const ast.Stage, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
+pub fn runParallelSqlAgg(env: *Env, pipe: *const Pipe, stages: []const ast.Stage, prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, src_base: usize) anyerror!bool {
     const arena = env.arena;
-    const desc = env.sql_desc orelse return false;
+    const desc = pipe.sql_desc orelse return false;
     if (stages[0].node != .read) return false;
     if (w.mode == .upsert and w.mode.upsert.keys.len == 0) return false;
     if (src_base >= env.sources.items.len) return false;

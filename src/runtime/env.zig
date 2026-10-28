@@ -305,6 +305,24 @@ pub const SqlDesc = struct {
     read: ast.Read = .{ .connector = "", .form = .unit },
 };
 
+/// What planning one output pipeline learns for the drivers that run it: the lanes it
+/// may use, the SQL source its read opened, and the Parquet readers a top-N publishes
+/// its threshold to. Scoped to the pipeline, so a binding read into memory first plans
+/// in its own and leaves the outer's as it was.
+pub const Pipe = struct {
+    /// The `-j` lanes: the lane cap, and sort, window, join build and merge threads.
+    threads: usize = 1,
+    /// The SQL source a read opened, last writer wins (a keyed join's right side too).
+    sql_desc: ?SqlDesc = null,
+    pq_readers: usize = 0,
+    pq_reader: ?*pqdecode.Reader = null,
+    pq_folder: ?*pqdecode.Folder = null,
+    /// A single remote Parquet file planning opened to decide its lanes and then read
+    /// serially: its bytes, kept open for the serial read, so the size is not asked
+    /// again and a body a server sent whole is not downloaded twice.
+    pq_held: ?struct { path: []const u8, src: pqdecode.Bytes } = null,
+};
+
 /// A folder's format and files; for a lake table, the files its log keeps live and
 /// the table they were resolved from.
 pub const FolderRead = struct {
@@ -350,7 +368,6 @@ pub const Env = struct {
     script_scope: LoopRow = no_loop_vars,
     call_depth: usize = 0,
     sink_label_prefix: ?[]const u8 = null,
-    sql_desc: ?SqlDesc = null,
     csv_in: csv.Dialect = .{},
     csv_out: csv.Dialect = .{},
     fmt_in: ?analyze.FileFormat = null,
@@ -358,14 +375,9 @@ pub const Env = struct {
     write_opts: analyze.WriteOptions = .csv,
     cutover: @import("../db/replace.zig").Cutover = .truncate,
     src_name: []const u8 = "",
-    pq_readers: usize = 0,
-    pq_reader: ?*pqdecode.Reader = null,
-    /// A single remote Parquet file planning opened to decide its lanes and then read
-    /// serially: its bytes, kept open for the serial read, so the size is not asked
-    /// again and a body a server sent whole is not downloaded twice.
-    pq_held: ?struct { path: []const u8, src: pqdecode.Bytes } = null,
-    pq_folder: ?*pqdecode.Folder = null,
-    sort_threads: usize = 1,
+    /// The running output pipeline's plan state; `runOutputBody` installs a fresh one
+    /// and puts the outer back when it returns.
+    pipe: Pipe = .{},
     folder_memo: std.ArrayListUnmanaged(FolderMemo) = .empty,
     /// The run's lake tables, each replayed once per statement; null in a PARALLEL
     /// loop's row, which resolves its own.

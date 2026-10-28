@@ -265,10 +265,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = stages_in;
-    env.sort_threads = opts.lanes();
-    env.pq_readers = 0;
-    env.pq_reader = null;
-    env.pq_folder = null;
+    const outer_pipe = env.pipe;
+    env.pipe = .{ .threads = opts.lanes() };
+    defer {
+        if (env.pipe.pq_held) |h| h.src.close();
+        env.pipe = outer_pipe;
+    }
+    const pipe = &env.pipe;
     const outer_stop = env.stop;
     defer env.stop = outer_stop;
     env.stop = if (env.union_sink != null) outer_stop else if (env.max_rows != null and last == .write and std.mem.eql(u8, last.write.connector, "stdout")) blk: {
@@ -276,10 +279,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         f.* = .init(false);
         break :blk f;
     } else null;
-    defer if (env.pq_held) |h| {
-        h.src.close();
-        env.pq_held = null;
-    };
 
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {
@@ -334,7 +333,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             try extra.append(.{ .key = "split", .value = .{ .ident = sp.col }, .pos = sp.pos });
             if (sp.jobs) |n| {
                 opts.threads = n;
-                env.sort_threads = opts.lanes();
+                pipe.threads = opts.lanes();
             }
         }
         if (extra.items.len > 0) {
@@ -386,7 +385,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
     const sql: ?path.Sql = if (chosen == .sql) chosen.sql else null;
 
-    env.sql_desc = null;
+    pipe.sql_desc = null;
     env.src_name = "";
     const src_base = env.sources.items.len;
     const t_open = std.time.Instant.now() catch null;
@@ -397,13 +396,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const wr = try resolveUpsertKeys(env, last.write);
 
     var whole_agg = false;
-    if (env.sql_desc != null and src_base < env.sources.items.len) {
+    if (pipe.sql_desc != null and src_base < env.sources.items.len) {
         var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
         if (sql) |s| if (s.whole_agg) |shape| {
             if (try wholeAggStages(env, stages, shape, src_base, &why)) |ns| {
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                env.sql_desc = null;
+                pipe.sql_desc = null;
                 stages = ns;
                 res.op.release();
                 res = try buildPipeline(env, ns[0 .. ns.len - 1]);
@@ -412,17 +411,17 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             }
         };
         if (!whole_agg and hasAggregate(stages))
-            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(env.sql_desc.?.dialect), why });
+            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(pipe.sql_desc.?.dialect), why });
     }
 
     var top_n = false;
-    if (!whole_agg and env.sql_desc != null and src_base < env.sources.items.len) {
+    if (!whole_agg and pipe.sql_desc != null and src_base < env.sources.items.len) {
         var why: []const u8 = "";
-        const dialect = env.sql_desc.?.dialect;
+        const dialect = pipe.sql_desc.?.dialect;
         if (try topNStages(env, stages, src_base, &why)) |ns| {
             for (env.sources.items[src_base..]) |sc| sc.close();
             env.sources.shrinkRetainingCapacity(src_base);
-            env.sql_desc = null;
+            pipe.sql_desc = null;
             stages = ns;
             res.op.release();
             res = try buildPipeline(env, ns[0 .. ns.len - 1]);
@@ -432,13 +431,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
     }
 
-    if (!whole_agg and !top_n and opts.lanes() > 1 and env.sql_desc != null) {
+    if (!whole_agg and !top_n and opts.lanes() > 1 and pipe.sql_desc != null) {
         if (sql) |s| switch (s.split) {
-            .agg => |shape| if (try runParallelSqlAgg(env, stages, shape.prefix, shape.agg, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
+            .agg => |shape| if (try runParallelSqlAgg(env, pipe, stages, shape.prefix, shape.agg, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
             .map_join => |js| {
                 if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
                 if (env.sources.items.len == src_base) {
-                    env.sql_desc = null;
+                    pipe.sql_desc = null;
                     res.op.release();
                     res = try buildPipeline(env, stages[0 .. stages.len - 1]);
                 }
@@ -446,7 +445,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             .map, .none => {},
         };
         if (try op.linearize(arena, res.op)) |lin| {
-            if (try planSplit(env, env.sql_desc.?, stages[0], opts.lanes(), wr)) |sp| {
+            if (try planSplit(env, pipe.sql_desc.?, stages[0], opts.lanes(), wr)) |sp| {
                 const schema = try dupeSchema(arena, res.schema);
 
                 const middle = stages[1 .. stages.len - 1];
@@ -459,8 +458,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     want = try schemaPtr(arena, src_schema);
                     const out_cols = try arena.alloc([]const u8, schema.fields.len);
                     for (schema.fields, out_cols) |f, *o| o.* = f.name;
-                    const facts = try factsIfWanted(env, stages[0].node.read, env.sql_desc.?.dialect, middle, src_schema, true, .superset);
-                    const mp = try pushdown.planMap(arena, env.sql_desc.?.dialect, src_schema, middle, out_cols, facts);
+                    const facts = try factsIfWanted(env, stages[0].node.read, pipe.sql_desc.?.dialect, middle, src_schema, true, .superset);
+                    const mp = try pushdown.planMap(arena, pipe.sql_desc.?.dialect, src_schema, middle, out_cols, facts);
                     where_extra = mp.where_extra;
                     if (mp.proj_schema) |ps| {
                         if (rebuildMapStages(env, mp.stages orelse middle, try schemaPtr(arena, ps))) |rs| {
@@ -473,14 +472,14 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = env.sql_desc.?.kind, .cfg = env.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(env.sql_desc.?.kind)), .want = want };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = pipe.sql_desc.?.kind, .cfg = pipe.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(pipe.sql_desc.?.kind)), .want = want };
                 lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
                 env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
                     const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
                     const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
-                    p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(env.sql_desc.?.kind), sp.predicates.len });
-                    try p.noteSent("{s}, once per key range: {s}", .{ @tagName(env.sql_desc.?.kind), sp.base_sql });
+                    p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(pipe.sql_desc.?.kind), sp.predicates.len });
+                    try p.noteSent("{s}, once per key range: {s}", .{ @tagName(pipe.sql_desc.?.kind), sp.base_sql });
                     break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
                 } else null;
                 if (try buildParallelSink(env, wr, schema)) |mode| {

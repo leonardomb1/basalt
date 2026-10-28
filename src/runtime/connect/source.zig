@@ -111,8 +111,8 @@ fn openSourceOf(
             env.forgetFolder(rd.form.path);
             const pf = try openParquetFolder(env, rd.form.path, fr, project);
             pf.bounds = bounds;
-            env.pq_readers += 1;
-            env.pq_folder = pf;
+            env.pipe.pq_readers += 1;
+            env.pipe.pq_folder = pf;
             return pf.source();
         };
     }
@@ -123,8 +123,8 @@ fn openSourceOf(
             return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
         noteParquet(env, pr);
-        env.pq_readers += 1;
-        env.pq_reader = pr;
+        env.pipe.pq_readers += 1;
+        env.pipe.pq_reader = pr;
         return pr.source();
     }
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and project != null) {
@@ -139,8 +139,8 @@ fn openSourceOf(
 /// A Parquet file's reader, over the bytes planning kept open for it when it
 /// opened this file and chose not to split it (`Env.pq_held`).
 fn openParquetFile(env: *Env, path: []const u8, project: ?[]const []const u8) !*pqdecode.Reader {
-    if (env.pq_held) |h| if (std.mem.eql(u8, h.path, path)) {
-        env.pq_held = null;
+    if (env.pipe.pq_held) |h| if (std.mem.eql(u8, h.path, path)) {
+        env.pipe.pq_held = null;
         return pqdecode.Reader.openProjectedOn(env.arena, h.src, path, project);
     };
     return pqdecode.Reader.openProjected(env.arena, path, project);
@@ -470,7 +470,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
                     return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
                 };
                 s.report = try readReport(env, conn.connector);
-                env.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
+                env.pipe.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
                 return s.source();
             },
         }

@@ -240,7 +240,7 @@ pub fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig,
     return .{ .kind = kind, .dialect = dialect, .cfg = cfg, .base_sql = base_sql, .table = table, .read = rd };
 }
 
-/// Recomputed rather than read from `env.sql_desc`, which is last-writer-wins: a
+/// Recomputed rather than read from `env.pipe.sql_desc`, which is last-writer-wins: a
 /// join plans its build side after the probe read. Null for a non-splittable read.
 pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     if (stage.node != .read) return null;

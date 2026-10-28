@@ -94,7 +94,7 @@ fn buildSplit(env: *Env, rstages: []const ast.Stage) !?LaneSplit {
     if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
     for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
-    return parquetSplit(env, rstages[0].node.read, rstages[0].hints, rstages[1..], w, .{ .threads = env.sort_threads });
+    return parquetSplit(env, rstages[0].node.read, rstages[0].hints, rstages[1..], w, .{ .threads = env.pipe.threads });
 }
 
 /// One item of a parallel build read: the rows it kept, copied out of the read's
@@ -170,17 +170,17 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
 /// order a serial read gives) and indexed.
 fn indexInParallel(env: *Env, split: *LaneSplit, read_at: u64, recs: []const analyze.Resolved, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
-    const nitems = split.count(env.sort_threads);
+    const nitems = split.count(env.pipe.threads);
     const parts = try arena.alloc(BuildPart, nitems);
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();
     var ctx = BuildCtx{ .split = split, .recs = recs, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
-    _ = try parallel.spawnJoin(arena, env.sort_threads, buildLane, &ctx);
+    _ = try parallel.spawnJoin(arena, env.pipe.threads, buildLane, &ctx);
     if (ctx.queue.failure()) |e| return e;
     root.* = ctx.root;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);
-    return op.JoinIndex.fromBatchesMeeting(arena, chunks.items, right_schema, right_keys, left_kinds, ctx.bytes.load(.monotonic), cap, env.sort_threads);
+    return op.JoinIndex.fromBatchesMeeting(arena, chunks.items, right_schema, right_keys, left_kinds, ctx.bytes.load(.monotonic), cap, env.pipe.threads);
 }
 
 /// Hoist the join out of the fan-out: materialize the build side into a shared index
@@ -223,7 +223,7 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
         indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, analyze.Resolved, &.{ build.pre, jr.right.recs }), jr.right.out, jr.plan.rks, left_kinds, cap, &build_root)
     else blk: {
         build_chain = try chainOps(arena, env.errctx, jr.right.recs, build.op);
-        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, jr.right.out, jr.plan.rks, left_kinds, cap, env.sort_threads);
+        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, jr.right.out, jr.plan.rks, left_kinds, cap, env.pipe.threads);
     };
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);

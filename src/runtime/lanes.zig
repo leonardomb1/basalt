@@ -175,7 +175,7 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
 /// means not eligible, and the caller keeps the pipeline it built.
 pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
-    const desc = env.sql_desc orelse return null;
+    const desc = env.pipe.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
     if (!sql_read.pushableRead(desc.dialect, rd)) {
@@ -216,7 +216,7 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src
 /// built, with `why` set when there was a limit to push.
 pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
-    const desc = env.sql_desc orelse return null;
+    const desc = env.pipe.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
     if (!sql_read.pushableRead(desc.dialect, rd)) return null;

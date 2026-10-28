@@ -600,13 +600,13 @@ fn openTaker(env: *Env, stages: []const ast.Stage, want: keypush.Want) !Taken {
             return .{ .src = l.source(), .taker = .{ .sql = l } };
         },
         .parquet => {
-            const r0 = env.pq_reader;
-            const f0 = env.pq_folder;
+            const r0 = env.pipe.pq_reader;
+            const f0 = env.pipe.pq_folder;
             const src = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
             const pk = try env.arena.create(keypush.ParquetKeys);
             pk.* = .{ .arena = env.arena };
-            if (env.pq_reader != r0) pk.reader = env.pq_reader;
-            if (env.pq_folder != f0) pk.folder = env.pq_folder;
+            if (env.pipe.pq_reader != r0) pk.reader = env.pipe.pq_reader;
+            if (env.pipe.pq_folder != f0) pk.folder = env.pipe.pq_folder;
             if (pk.reader == null and pk.folder == null) return .{ .src = src, .taker = null };
             return .{ .src = src, .taker = .{ .parquet = pk } };
         },
@@ -713,12 +713,12 @@ pub fn buildTopN(env: *Env, srt: analyze.Resolved, lim: ast.Limit, child: op.Op)
     const o = try arena.create(op.TopN);
     o.* = .{ .child = child, .in_schema = srt.in, .keys = srt.plan.sort, .count = lim.count, .offset = lim.offset, .state = arena, .gpa = env.gpa };
 
-    if (env.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
-        if (env.pq_reader != null or env.pq_folder != null) {
+    if (env.pipe.pq_readers == 1 and s.keys.len == 1 and s.keys[0].field.parts.len == 1) {
+        if (env.pipe.pq_reader != null or env.pipe.pq_folder != null) {
             const t = try arena.create(Threshold);
             t.* = .{ .column = s.keys[0].field.last(), .desc = s.keys[0].desc, .nulls_first = s.keys[0].nulls_first };
-            if (env.pq_reader) |pr| pr.threshold = t;
-            if (env.pq_folder) |f| f.threshold = t;
+            if (env.pipe.pq_reader) |pr| pr.threshold = t;
+            if (env.pipe.pq_folder) |f| f.threshold = t;
             o.threshold = t;
         }
     }
@@ -770,7 +770,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
         },
         .sort => |ks| blk: {
             const so = try arena.create(op.Sort);
-            so.* = .{ .child = child, .in_schema = r.in, .keys = ks, .threads = env.sort_threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
+            so.* = .{ .child = child, .in_schema = r.in, .keys = ks, .threads = env.pipe.threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
             break :blk .{ .sort = so };
         },
         .window => |wp| blk: {
@@ -805,7 +805,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
                 .err = env.errctx,
                 .top_k = wd.top_k,
                 .gpa = env.gpa,
-                .threads = env.sort_threads,
+                .threads = env.pipe.threads,
             };
             break :blk .{ .window = w };
         },
@@ -1011,7 +1011,7 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         .state = arena,
         .err = env.errctx,
         .build_cap = try hashJoinCap(env, j, hints),
-        .threads = env.sort_threads,
+        .threads = env.pipe.threads,
         .space = env.space,
         .spill_at = try joinSpillAt(env, hints),
     };

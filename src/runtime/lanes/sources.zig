@@ -134,8 +134,8 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
     var like: ?*const pqdecode.Reader = null;
     if (remote and root == null) {
         if (!probe.src.rangesHonoured() or probe.md.row_groups.len < 2) {
-            if (env.pq_held) |h| h.src.close();
-            env.pq_held = .{ .path = files[0], .src = probe.src };
+            if (env.pipe.pq_held) |h| h.src.close();
+            env.pipe.pq_held = .{ .path = files[0], .src = probe.src };
             hold = true;
             return null;
         }

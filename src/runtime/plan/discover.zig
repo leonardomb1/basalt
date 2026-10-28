@@ -60,18 +60,12 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
     if (pipe.stages.len == 0) return planErr(env.diag, "for-each: empty discovery query");
     const src_base = env.sources.items.len;
     const saved_src_name = env.src_name;
-    const saved_sql_desc = env.sql_desc;
-    const saved_pq_readers = env.pq_readers;
-    const saved_pq_reader = env.pq_reader;
-    const saved_pq_folder = env.pq_folder;
+    const saved_pipe = env.pipe;
     defer {
         for (env.sources.items[src_base..]) |sc| sc.close();
         env.sources.shrinkRetainingCapacity(src_base);
         env.src_name = saved_src_name;
-        env.sql_desc = saved_sql_desc;
-        env.pq_readers = saved_pq_readers;
-        env.pq_reader = saved_pq_reader;
-        env.pq_folder = saved_pq_folder;
+        env.pipe = saved_pipe;
     }
 
     const res = buildPipeline(env, try ownClock(env, pipe.stages)) catch |e| {

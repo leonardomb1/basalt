@@ -55,7 +55,7 @@ const delta_write = @import("../../format/lake/delta_write.zig");
 /// source gets an error pointing at `upsert on <col>`.
 pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
-    const desc = env.sql_desc orelse return planErr(env.diag, options.bare_upsert_source_msg);
+    const desc = env.pipe.sql_desc orelse return planErr(env.diag, options.bare_upsert_source_msg);
     const table = desc.table orelse return planErr(env.diag, options.bare_upsert_query_msg);
     var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
@@ -266,7 +266,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
                 const p = delta_write.plan(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
-                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.sort_threads, .err = env.errctx }) catch |e|
+                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx }) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 return ds.sink();
             },

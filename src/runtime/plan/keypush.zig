@@ -354,7 +354,7 @@ pub const LateSql = struct {
         const src = try connect.openSourceProjected(env, probe, hints, null, &.{});
         const sch = try connect.dupeSchema(env.arena, src.schema());
         src.close();
-        env.sql_desc = try connect.sqlDescForStage(env, .{ .node = .{ .read = rd }, .hints = hints, .pos = .{ .line = 0, .col = 0 } });
+        env.pipe.sql_desc = try connect.sqlDescForStage(env, .{ .node = .{ .read = rd }, .hints = hints, .pos = .{ .line = 0, .col = 0 } });
         const self = try env.arena.create(LateSql);
         self.* = .{ .env = env, .rd = rd, .hints = hints, .schema_ = sch, .dialect = dialect };
         return self;
