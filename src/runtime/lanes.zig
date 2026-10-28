@@ -1,14 +1,15 @@
 //! Parallel lane drivers: the shape classifiers that decide whether a pipeline
 //! can fan out, and the per-shape drivers (map, aggregate, top-N, distinct,
-//! SQL split, parquet/CSV morsels) plus their merge machinery.
+//! SQL split) over a source cut into morsels (`lanes/morsels.zig`).
 //!
-//! Shapes. `classifyLaneShape` picks one `LaneShape` per pipeline and each source's
-//! runner switches exhaustively over it, so a new shape does not compile until both
-//! parquet and CSV decide what to do with it; a source that cannot fan a shape out
-//! returns false and falls back to the serial driver explicitly. Below the shape,
-//! `LaneRows` is the only difference between the parquet and CSV copies of a lane
-//! body (row-group morsels off a shared queue vs one newline-aligned byte range),
-//! and `LaneSplit` names how the input divides so a shape has one implementation.
+//! Shapes. `classifyLaneShape` picks one `LaneShape` per pipeline and `runShape`
+//! switches exhaustively over it, so a new shape does not compile until it decides
+//! what to do with every source; a source that cannot fan a shape out returns false
+//! and falls back to the serial driver explicitly. Every shape reads `Morsels`:
+//! Parquet row groups or files, CSV byte ranges, SQL key ranges, one interface. An
+//! aggregate is the first breaker run as a `ParallelSink` (`.sink`): map stages and
+//! join probes per morsel, then the sink's combine and finalize; it runs at every
+//! `-j`, `-j 1` included, so its result does not depend on `-j`.
 //! Right and full joins must emit unmatched build rows, and each lane tracking its
 //! own matches emitted them once per lane (a `RIGHT JOIN` under `COUNT(*)` returned
 //! 160 instead of 10 at `-j 16`). On the map+join paths every lane marks one
@@ -18,44 +19,38 @@
 //! and the join and the stages after it are resolved once into records; each lane builds
 //! its own `op.Join` and stage operators from them, for its mutable stats and scratch.
 //!
-//! Determinism. Results do not depend on thread timing. Aggregates fold into one
-//! `AggSlot` per work item (or one fixed arithmetic slice of parquet morsels per
-//! lane, `MorselSource.fixed`) and are combined in item order, because float
-//! addition is not associative and merging as lanes finished made a float SUM
-//! differ between runs; a different `-j` still cuts the input differently, so only
-//! a DECIMAL cast is identical everywhere. An ungrouped aggregate folds straight
-//! into partition 0 in lane order (it has no key to hash, and the radix merge once
-//! dropped every lane, so COUNT(*) returned 0). Distinct dedups per positional item
-//! and breaks ties by input position, keeping the row a serial run keeps. A shared
+//! Determinism. Results do not depend on thread timing, and an aggregate's not on
+//! `-j`: it folds one partial per morsel and merges them in morsel order
+//! (`lanes/agg.zig`), because float addition is not associative and merging as lanes
+//! finished made a float SUM differ between runs. Distinct dedups per positional
+//! morsel and breaks ties by input position, keeping the row a serial run keeps. A shared
 //! sink's map output goes through `OrderedOut`: lanes format units outside any
 //! lock, and whichever lane completes the next unit due writes it and the finished
 //! units behind it, at most `window` units ahead, so output is in file order at any
 //! `-j`. Writing under the lock had stalled every lane (parquet to CSV ran 50%
 //! slower), and reusing written units' arenas avoids faulting in fresh pages.
 //!
-//! Merging. Above `agg_combine_parallel_min` partial groups the combine is radix
-//! partitioned by key hash (`pq_parts`, the fold's own partition count), each
-//! partition owned by one task with no lock: a single O(partials) pass over a
-//! unique-key GROUP BY was slower at `-j 16` than serial. The largest source is
-//! merged into in place and the others freed as folded, since copying all of them
-//! doubled memory. Lane partition arenas use the thread-safe gpa, not per-slot or
-//! page allocators (64 page-backed arenas per lane cost 12% at -j 8). Merged groups
-//! under a tail that only filters and projects are written a partition at a time
-//! across lanes; ORDER BY + LIMIT in the tail fuse into a per-partition top-N (a
-//! full sort of the merged groups was 3x slower than serial).
+//! Merging. Partial groups are combined radix partitioned by key hash (`pq_parts`,
+//! the fold's own partition count), each partition owned by one task with no lock:
+//! a single O(partials) pass over a unique-key GROUP BY was slower at `-j 16` than
+//! serial. Partials are freed as folded, since keeping them doubled memory. Lane
+//! partition arenas use the thread-safe gpa, not per-slot or page allocators (64
+//! page-backed arenas per lane cost 12% at -j 8). Merged groups under a tail that
+//! only filters and projects are written a partition at a time across lanes; ORDER
+//! BY + LIMIT in the tail fuse into a per-partition top-N (a full sort of the merged
+//! groups was 3x slower than serial).
 //!
 //! Descent. `wholeAggStages` and `topNStages` rewrite a SQL read into one grouped
 //! or capped QUERY-form read, dropping hints (a hinted `@[where]` would be reapplied
 //! to the wrong columns, a split has nothing left to split), and the caller rebuilds
 //! the pipeline through the ordinary serial path. The SQL split paths
-//! (`runParallelSqlAgg`, `runParallelSqlMapJoin`) run only against a live DB; the
-//! local tests cover them through the shared CSV/parquet machinery they reuse.
-//! A SQL map+join lane's `SplitSource` rolls to the next key range when one runs
-//! dry, so the lane builds its chain and opens its sink once.
+//! (`runParallelSqlAgg`, `runParallelSqlMapJoin`) run the file paths' drivers over
+//! key-range morsels, each range on its own connection.
 //!
-//! This file classifies a pipeline's shape and holds the shared work queue; each
-//! shape runs in lanes/: `map.zig`, `agg.zig`, `topn.zig` and `distinct.zig`, with
-//! `join.zig` for the joins a lane probes and `sources.zig` for how a read divides.
+//! This file classifies a pipeline's shape; each shape runs in lanes/: `map.zig`,
+//! `agg.zig`, `topn.zig` and `distinct.zig`, with `join.zig` for the joins a lane
+//! probes, `sources.zig` for how a file divides and `morsels.zig` for the morsels,
+//! their workers and the parallel sink they drive.
 
 const std = @import("std");
 const ast = @import("../lang/ast.zig");
@@ -73,19 +68,15 @@ const dupeSchema = @import("connect.zig").dupeSchema;
 const projectedColumns = @import("plan.zig").projectedColumns;
 
 pub const LaneShape = union(enum) {
-    agg: AggShape,
-    agg_join: AggJoinShape,
+    sink: SinkShape,
     distinct: DistinctShape,
     top_n: TopNShape,
     map: []const ast.Stage,
     map_join: MapJoinShape,
 };
 
-/// Order matters: `classifyAggPipeline` rejects a join, so the join-carrying variant
-/// is tried after it, and the map shapes last.
 pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
-    if (classifyAggPipeline(stages)) |x| return .{ .agg = x };
-    if (classifyAggJoinPipeline(stages)) |x| return .{ .agg_join = x };
+    if (classifySinkPipeline(stages)) |x| return .{ .sink = x };
     if (classifyDistinctPipeline(stages)) |x| return .{ .distinct = x };
     if (classifyTopNPipeline(stages)) |x| return .{ .top_n = x };
     if (classifyMapPipeline(stages)) |x| return .{ .map = x };
@@ -125,8 +116,7 @@ pub fn shapeLaneSafe(shape: LaneShape) bool {
 
 fn runShape(env: *Env, split: Morsels, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return switch (shape) {
-        .agg => |x| runParallelAgg(env, split, x.prefix, x.agg, x.tail, null, w, opts, stats, lanes_used),
-        .agg_join => |x| runParallelAgg(env, split, x.map_stages, x.agg, x.tail, x, w, opts, stats, lanes_used),
+        .sink => |x| runParallelAgg(env, &split, x, w, opts, stats, lanes_used),
         .distinct => |x| runParallelDistinct(env, &split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
         .top_n => |x| runParallelTopN(env, &split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
         .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
@@ -134,37 +124,47 @@ fn runShape(env: *Env, split: Morsels, shape: LaneShape, w: ast.Write, opts: Run
     };
 }
 
-pub const AggShape = struct { prefix: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage };
+/// A pipeline whose breaker is a parallel sink, the aggregate: map stages, then
+/// lane-safe keyed joins, the aggregate, and a tail its finalize writes through.
+pub const SinkShape = struct { prefix: []const ast.Stage, joins: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage };
 
-/// Recognize `read … | (filter|select)* | aggregate | tail | write`. A `select` or
-/// `filter` after the aggregate (a reordering projection, HAVING) is applied by `writeTail`;
-/// refusing them sent such queries serial (TPC-H q01's shape: 379ms vs 88ms).
-pub fn classifyAggPipeline(stages: []const ast.Stage) ?AggShape {
+/// Recognize `read … | (filter|select)* | join* | aggregate | tail | write`. A
+/// `select` or `filter` after the aggregate (a reordering projection, HAVING) is
+/// applied by the tail; refusing them sent such queries serial (TPC-H q01's shape:
+/// 379ms vs 88ms). A distinct or window in the tail is taken only without joins.
+pub fn classifySinkPipeline(stages: []const ast.Stage) ?SinkShape {
     const middle = stages[1 .. stages.len - 1];
+    var ji: ?usize = null;
     var ai: ?usize = null;
     for (middle, 0..) |st, i| switch (st.node) {
         .filter, .select => {},
+        .join => |j| {
+            if (ai != null or !joinKindLaneSafe(j.kind) or j.keyless()) return null;
+            if (ji == null) ji = i;
+        },
         .aggregate => {
             if (ai != null) return null;
             ai = i;
         },
-        .sort, .limit, .distinct, .window => if (ai == null) return null,
+        .sort, .limit => if (ai == null) return null,
+        .distinct, .window => if (ai == null or ji != null) return null,
         else => return null,
     };
     const a = ai orelse return null;
-    return .{ .prefix = middle[0..a], .agg = middle[a], .tail = middle[a + 1 ..] };
+    const j = ji orelse a;
+    return .{ .prefix = middle[0..j], .joins = middle[j..a], .agg = middle[a], .tail = middle[a + 1 ..] };
 }
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
 /// filters only before it (a `select` renames the keys) and no hint on the read; any
 /// tail. `pushdown.planWholeAggWhy` decides whether the aggregate itself renders.
-pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
+pub fn classifyWholeAgg(stages: []const ast.Stage) ?SinkShape {
     if (stages.len < 3 or stages[0].node != .read) return null;
     if (stages[0].hints.len != 0) return null;
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| switch (st.node) {
         .filter => {},
-        .aggregate => return .{ .prefix = middle[0..i], .agg = st, .tail = middle[i + 1 ..] },
+        .aggregate => return .{ .prefix = middle[0..i], .joins = &.{}, .agg = st, .tail = middle[i + 1 ..] },
         else => return null,
     };
     return null;
@@ -173,7 +173,7 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?AggShape {
 /// Descend the whole aggregate into the source: a QUERY-form read of the grouped SQL
 /// (cast to the engine's own output schema), the untouched tail, then the write. Null
 /// means not eligible, and the caller keeps the pipeline it built.
-pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: AggShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
+pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
     const desc = env.pipe.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
@@ -236,8 +236,6 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
 }
 
 pub const agg_combine_parallel_min = @import("lanes/agg.zig").agg_combine_parallel_min;
-const AggJoinShape = @import("lanes/agg.zig").AggJoinShape;
-const classifyAggJoinPipeline = @import("lanes/agg.zig").classifyAggJoinPipeline;
 const runParallelAgg = @import("lanes/agg.zig").runParallelAgg;
 pub const runParallelSqlAgg = @import("lanes/agg.zig").runParallelSqlAgg;
 const classifyMapPipeline = @import("lanes/map.zig").classifyMapPipeline;
@@ -283,7 +281,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     const s2 = classifyWholeAgg(&having).?;
     try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
-    const lane = classifyAggPipeline(&having).?;
+    const lane = classifySinkPipeline(&having).?;
     try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
 
@@ -299,6 +297,26 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     hinted_rd.hints = hints;
     const hinted = [_]ast.Stage{ hinted_rd, flt, agg, wrt };
     try std.testing.expect(classifyWholeAgg(&hinted) == null);
+}
+
+test "classifySinkPipeline takes a HAVING tail over joins, and a distinct tail only without them" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const testStages = @import("lanes/testing_util.zig").testStages;
+    const having = try testStages(a,
+        \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
+        \\SELECT g, COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g HAVING COUNT(*) > 1;
+    );
+    const shape = classifySinkPipeline(having) orelse return error.TestExpectedLanes;
+    try std.testing.expect(shape.joins.len == 1 and shape.tail[0].node == .filter);
+    const plain = try testStages(a, "LOAD INTO 'o.csv' AS SELECT DISTINCT COUNT(*) AS n FROM 'x.parquet' GROUP BY g;");
+    try std.testing.expect(classifySinkPipeline(plain).?.joins.len == 0);
+    const joined = try testStages(a,
+        \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
+        \\SELECT DISTINCT COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g;
+    );
+    try std.testing.expect(classifySinkPipeline(joined) == null);
 }
 
 test {

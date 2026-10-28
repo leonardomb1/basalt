@@ -109,13 +109,13 @@ fn physical(w: anytype, ph: Physical) !void {
             try w.print("{s} parallel {s}, unless {s}", .{ @tagName(l.source), switch (l.shape) {
                 .map => "map",
                 .map_join => "map+join",
-                .agg => "aggregate",
-                .agg_join => "aggregate over joins",
+                .sink => |x| if (x.joins.len > 0) "aggregate over joins" else "aggregate",
                 .top_n => "top-n",
                 .distinct => "distinct",
             }, if (ph.veto.len > 0) ph.veto else "the file cannot be mapped" });
             if (ph.keys_serial) try w.print(" or the file is under {d} MB, so the join's SQL side takes its keys", .{op.default_prefetch_bytes >> 20});
-            if (l.shape == .map_join or l.shape == .agg_join) try w.writeAll(" or the join's build side is past --op-memory");
+            if (l.shape == .map_join or (l.shape == .sink and l.shape.sink.joins.len > 0)) try w.writeAll(" or the join's build side is past --op-memory");
+            if (l.shape == .sink) try w.writeAll(" or its partials pass --op-memory");
         },
         .sql => |s| {
             if (s.whole_agg != null) {

@@ -432,18 +432,19 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
 
     if (!whole_agg and !top_n and opts.lanes() > 1 and pipe.sql_desc != null) {
-        if (sql) |s| switch (s.split) {
-            .agg => |shape| if (try runParallelSqlAgg(env, pipe, stages, shape.prefix, shape.agg, shape.tail, wr, opts, stats, lanes_used, src_base)) return,
-            .map_join => |js| {
-                if (try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base)) return;
-                if (env.sources.items.len == src_base) {
-                    pipe.sql_desc = null;
-                    res.op.release();
-                    res = try buildPipeline(env, stages[0 .. stages.len - 1]);
-                }
-            },
-            .map, .none => {},
-        };
+        if (sql) |s| {
+            const ran = switch (s.split) {
+                .agg => |shape| try runParallelSqlAgg(env, pipe, stages, shape, wr, opts, stats, lanes_used, src_base),
+                .map_join => |js| try runParallelSqlMapJoin(env, stages, js, wr, opts, stats, lanes_used, src_base),
+                .map, .none => false,
+            };
+            if (ran) return;
+            if (env.sources.items.len == src_base) {
+                pipe.sql_desc = null;
+                res.op.release();
+                res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+            }
+        }
         if (try op.linearize(arena, res.op)) |lin| {
             if (try planSplit(env, pipe.sql_desc.?, stages[0], opts.lanes(), wr)) |sp| {
                 const schema = try dupeSchema(arena, res.schema);

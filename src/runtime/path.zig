@@ -9,6 +9,8 @@
 //! and EXPLAIN names those as conditions. A window's input or an aggregating
 //! binding read into memory first is a prelude ahead of the path, decided by
 //! `windowInputAt` and `materializes` over the stages as they stand at that point.
+//! A file's aggregate takes its lanes at `-j 1` too, so its morsels fold and merge
+//! alike at every `-j` and a float sum does not change with it.
 //!
 //! A map stage is a filter, select or explode (`analyze.isMap`) on a map path: a
 //! file's map lanes, a SQL split and a union branch; the stages ahead of a lane
@@ -46,11 +48,11 @@ pub const Facts = struct {
     head_source: Source,
 };
 
-pub const Split = union(enum) { none, map, agg: lanes.AggShape, map_join: lanes.MapJoinShape };
+pub const Split = union(enum) { none, map, agg: lanes.SinkShape, map_join: lanes.MapJoinShape };
 
 /// A SQL source's chain: the aggregate, else the `ORDER BY … LIMIT`, sent to the
 /// source; else the read cut into key ranges.
-pub const Sql = struct { whole_agg: ?lanes.AggShape, top_n: bool, split: Split };
+pub const Sql = struct { whole_agg: ?lanes.SinkShape, top_n: bool, split: Split };
 
 pub const Path = union(enum) {
     serial,
@@ -66,8 +68,8 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     if (stages[0].node == .union_ and f.lanes > 1 and !std.mem.eql(u8, f.sink.connector, "csv") and
         branchesAreReads(stages[0].node.union_) and streamsOnly(middle))
         return .union_split;
-    if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, f.lanes)) {
-        if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape))
+    if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, @max(f.lanes, 2))) {
+        if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape) and (f.lanes > 1 or shape == .sink))
             return .{ .lanes = .{ .source = f.head_source, .shape = shape } };
     }
     if (f.source != .sql) return .serial;
@@ -77,12 +79,18 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
         .top_n = try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], &why) != null,
         .split = if (f.lanes < 2)
             .none
-        else if (lanes.classifyAggPipeline(stages)) |s|
+        else if (sqlAgg(stages)) |s|
             .{ .agg = s }
         else if (lanes.classifyMapJoinPipeline(stages)) |s|
             .{ .map_join = s }
         else if (streamsOnly(middle)) .map else .none,
     } };
+}
+
+/// A SQL read's aggregate with no join ahead of it, which its key ranges can fold.
+fn sqlAgg(stages: []const ast.Stage) ?lanes.SinkShape {
+    const s = lanes.classifySinkPipeline(stages) orelse return null;
+    return if (s.joins.len == 0) s else null;
 }
 
 /// Preconditions every lane path shares. A hinted read is left to the paths that honour

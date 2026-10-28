@@ -653,6 +653,7 @@ test {
     _ = @import("run/output.zig");
     _ = @import("run/params.zig");
     _ = @import("run/path_tests.zig");
+    _ = @import("run/morsel_tests.zig");
 }
 
 test "checkFirst frees its analysis; the local Delta table it resolved is kept for the run, and a write frees it unused" {

@@ -6,9 +6,19 @@
 //! file alone, never on `-j`, so what is built per morsel and combined in morsel order
 //! is the same at every `-j`; a CSV cut once per thread left a P/E-core run waiting
 //! on its slowest core. The workers number min(-j, morsels); one runs on the caller.
+//! `drive` runs a pipeline of them into a `ParallelSink`, a breaker's input side.
 
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
+const LaneJoin = @import("join.zig").LaneJoin;
+const LaneMem = @import("../parallel.zig").LaneMem;
+const OneBatch = @import("../connect.zig").OneBatch;
+const analyze = @import("../analyze.zig");
+const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
+const chainOps = @import("../plan.zig").chainOps;
+const obs = @import("../obs.zig");
+const op = @import("../../exec/op.zig");
+const parallel = @import("../parallel.zig");
 const ReaderSource = @import("sources.zig").ReaderSource;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
@@ -123,20 +133,9 @@ pub const Stream = struct {
     cur: ?driver.Source = null,
     cur_item: usize = 0,
     span: trace.Span = .{ .name = "", .arg = 0, .start = null },
-    /// A fixed slice of the morsels instead of claimed ones: `next`, `next + step`, …
-    fixed: ?struct { next: usize, step: usize } = null,
 
     pub fn source(self: *Stream) driver.Source {
         return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn nextIndex(self: *Stream) ?usize {
-        if (self.fixed) |*f| {
-            if (self.queue.failed.load(.seq_cst) or f.next >= self.queue.nitems) return null;
-            defer f.next += f.step;
-            return f.next;
-        }
-        return self.queue.take();
     }
 
     fn schemaFn(ptr: *anyopaque) types.Schema {
@@ -153,7 +152,7 @@ pub const Stream = struct {
                 self.cur = null;
                 self.span.end();
             }
-            const i = self.nextIndex() orelse return null;
+            const i = self.queue.take() orelse return null;
             self.span = trace.begin("morsel", i);
             self.cur_item = i;
             self.cur = try self.m.open(i, self.rd, self.scratch);
@@ -168,6 +167,78 @@ pub const Stream = struct {
 
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 };
+
+/// A blocking operator's input side (DuckDB's Sink, Combine and Finalize): every
+/// worker gets a Local, each morsel it claims is handed to `sink` as that morsel's
+/// chain with its index, `combine` takes the Local once its worker ran out of
+/// morsels, and `finalize` runs once, on the caller, after every worker joined; it
+/// may fan its own work out. The Global is `ptr`, made by the sink's own constructor.
+pub const ParallelSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        initLocal: *const fn (global: *anyopaque, mem: *LaneMem) anyerror!*anyopaque,
+        sink: *const fn (global: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void,
+        combine: *const fn (global: *anyopaque, local: *anyopaque) anyerror!void,
+        finalize: *const fn (global: *anyopaque) anyerror!void,
+        /// What the Global holds, for the per-query memory pool still to come.
+        sizeHint: ?*const fn (global: *anyopaque) usize = null,
+    };
+};
+
+/// A pipeline into a parallel sink: each morsel of `m` through the map stages `recs`
+/// and then the probes of `joins`.
+pub const Pipeline = struct {
+    m: *const Morsels,
+    recs: []const analyze.Resolved,
+    joins: []const LaneJoin = &.{},
+    errctx: ?*op.ErrCtx,
+    rows_read: *obs.RowCounter,
+};
+
+const Drive = struct { p: Pipeline, snk: ParallelSink, queue: WorkQueue };
+
+/// Run `p` into `snk` on min(`lanes`, morsels) workers, then finalize it; returns the
+/// workers used. A morsel that holds nothing is still sunk, empty, so a sink sees
+/// every index.
+pub fn drive(arena: std.mem.Allocator, p: Pipeline, snk: ParallelSink, lanes: usize) !usize {
+    var ctx = Drive{ .p = p, .snk = snk, .queue = .{ .nitems = p.m.count() } };
+    const used = try parallel.spawnJoin(arena, p.m.workers(lanes), driveLane, &ctx);
+    if (ctx.queue.failure()) |e| return e;
+    try snk.vtable.finalize(snk.ptr);
+    return used;
+}
+
+fn driveLane(ctx: *Drive, _: usize) void {
+    driveRun(ctx) catch |e| ctx.queue.fail(e);
+}
+
+fn driveRun(ctx: *Drive) !void {
+    var mem: LaneMem = .{};
+    mem.init();
+    defer mem.deinit();
+    var rd = Reader.init(mem.gpa.allocator());
+    defer rd.deinit();
+    const vt = ctx.snk.vtable;
+    const local = try vt.initLocal(ctx.snk.ptr, &mem);
+    while (ctx.queue.take()) |i| {
+        const span = trace.begin("morsel", i);
+        defer span.end();
+        _ = mem.work.reset(.retain_capacity);
+        _ = mem.batch.reset(.retain_capacity);
+        const wa = mem.work.allocator();
+        var none = OneBatch{ .b = null, .sch = ctx.p.m.schema().* };
+        const src = (try ctx.p.m.open(i, &rd, wa)) orelse none.source();
+        defer src.close();
+        var cs = obs.CountingSource{ .inner = src, .count = ctx.p.rows_read };
+        var scan = op.Scan{ .src = cs.source() };
+        var chain = try chainOps(wa, ctx.p.errctx, ctx.p.recs, .{ .scan = &scan });
+        for (ctx.p.joins) |lj| chain = try buildLaneJoinChain(wa, ctx.p.errctx, lj, chain);
+        try vt.sink(ctx.snk.ptr, local, i, chain);
+    }
+    if (!ctx.queue.failed.load(.seq_cst)) try vt.combine(ctx.snk.ptr, local);
+}
 
 pub const PqMorsels = struct {
     files: []const []const u8,
