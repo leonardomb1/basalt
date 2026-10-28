@@ -59,12 +59,24 @@ pub fn Phys(comptime kind: types.TypeKind) ?type {
     };
 }
 
-pub inline fn get(comptime S: type, c: column.Column, i: usize) S {
+/// How a loop reads a decimal column: settled once per column as `wide` or
+/// `narrow` (`layoutOf`), or `any`, asked per row.
+pub const Layout = enum { any, wide, narrow };
+
+pub inline fn layoutOf(c: column.Column) Layout {
+    return if (c.data == .d64) .narrow else .wide;
+}
+
+pub inline fn get(comptime S: type, comptime lay: Layout, c: column.Column, i: usize) S {
     return switch (S) {
         i64 => c.data.i64[i],
         i32 => c.data.i32[i],
         f64 => c.data.f64[i],
-        Decimal => column.decimals(c).at(i),
+        Decimal => switch (lay) {
+            .any => column.decimals(c).at(i),
+            .wide => column.wideCells(c)[i],
+            .narrow => column.narrowCells(c).cells[i].at(column.narrowCells(c).scale),
+        },
         bool => c.data.b[i],
         []const u8 => c.data.bytes.at(i),
         else => unreachable,
@@ -166,14 +178,23 @@ pub fn laneKind(comptime In: type, comptime l: Lane) ?types.TypeKind {
 /// counts as present but reads as NULL otherwise. The one per-row read every
 /// aggregate loop makes.
 pub inline fn at(comptime In: type, comptime kind: types.TypeKind, c: column.Column, i: usize, cx: Ctx) !?In {
+    return atIn(In, kind, .any, c, i, cx);
+}
+
+/// `at` for a loop that settled the column's decimal layout as `lay`.
+pub inline fn atIn(comptime In: type, comptime kind: types.TypeKind, comptime lay: Layout, c: column.Column, i: usize, cx: Ctx) !?In {
     if (!c.validity.get(i)) return null;
-    return atValid(In, kind, c, i, cx);
+    return atValidIn(In, kind, lay, c, i, cx);
 }
 
 /// `at` for a row known not NULL.
 pub inline fn atValid(comptime In: type, comptime kind: types.TypeKind, c: column.Column, i: usize, cx: Ctx) !?In {
+    return atValidIn(In, kind, .any, c, i, cx);
+}
+
+pub inline fn atValidIn(comptime In: type, comptime kind: types.TypeKind, comptime lay: Layout, c: column.Column, i: usize, cx: Ctx) !?In {
     if (In == void) return {};
     const S = comptime Phys(kind) orelse return null;
-    if (comptime In != Value and converts(S, In)) return conv(S, In, get(S, c, i));
+    if (comptime In != Value and converts(S, In)) return conv(S, In, get(S, lay, c, i));
     return try fromValue(In, c.getValue(i), cx);
 }

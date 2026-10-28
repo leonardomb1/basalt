@@ -22,7 +22,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const decimal = @import("decimal.zig");
-const Dec64 = decimal.Dec64;
+pub const Dec64 = decimal.Dec64;
 const par = @import("par.zig");
 const textconv = @import("textconv.zig");
 
@@ -839,6 +839,16 @@ pub inline fn decimals(c: Column) DecView {
         .d64 => |n| .{ .narrow = .{ .cells = n.narrow_cells, .scale = n.scale } },
         else => .{ .wide = c.data.dec.wide_cells },
     };
+}
+
+/// A decimal column's cells when its layout is already known, for a loop that
+/// settles it once (`decimals` switches on every call).
+pub inline fn wideCells(c: Column) []value.Decimal {
+    return c.data.dec.wide_cells;
+}
+
+pub inline fn narrowCells(c: Column) DecView.Narrow {
+    return .{ .cells = c.data.d64.narrow_cells, .scale = c.data.d64.scale };
 }
 
 /// Wide decimal cells as narrow storage when every present one has the same scale

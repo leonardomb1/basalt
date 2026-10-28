@@ -108,15 +108,22 @@ pub fn make(comptime Op: type) Kernel {
             switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
                 inline else => |l| if (comptime read.laneKind(Op.In, l)) |kind| {
                     if (comptime read.Phys(kind)) |S| if (comptime S == Op.In and hasAddAll(Op)) if (all) return Op.addAll(s, read.slice(S, c, n), cx);
-                    if (all) {
-                        for (0..n) |i| if (try read.atValid(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
-                    } else for (0..n) |i| if (try read.at(Op.In, kind, c, i, cx)) |x| try Op.add(s, x, cx);
+                    if (comptime kind != .decimal) return foldLoop(kind, .any, s, c, n, all, cx);
+                    return switch (read.layoutOf(c)) {
+                        inline .wide, .narrow => |lay| foldLoop(kind, lay, s, c, n, all, cx),
+                        .any => unreachable,
+                    };
                 } else unreachable,
             }
         }
 
+        inline fn foldLoop(comptime kind: types.TypeKind, comptime lay: read.Layout, s: *Op.State, c: column.Column, n: usize, all: bool, cx: Ctx) anyerror!void {
+            if (all) {
+                for (0..n) |i| if (try read.atValidIn(Op.In, kind, lay, c, i, cx)) |x| try Op.add(s, x, cx);
+            } else for (0..n) |i| if (try read.atIn(Op.In, kind, lay, c, i, cx)) |x| try Op.add(s, x, cx);
+        }
+
         fn foldRows(tails: []const ?[*]u8, off: usize, col: ?column.Column, rows: Rows) anyerror!void {
-            const needs_alloc = @hasDecl(Op, "needs_alloc") and Op.needs_alloc;
             const c = col orelse {
                 if (Op.In != void) unreachable;
                 for (tails) |t| if (t) |tp| try Op.add(st(tp + off), {}, rows.cx);
@@ -125,13 +132,22 @@ pub fn make(comptime Op: type) Kernel {
             const all = c.validity.allSet(tails.len);
             switch (lanes(Op.In)[@intFromEnum(c.ty.kind)]) {
                 inline else => |l| if (comptime read.laneKind(Op.In, l)) |kind| {
-                    for (tails, 0..) |t, r| {
-                        const tp = t orelse continue;
-                        const cx = if (needs_alloc) rows.at(r) else rows.cx;
-                        const x = (if (all) try read.atValid(Op.In, kind, c, r, cx) else try read.at(Op.In, kind, c, r, cx)) orelse continue;
-                        try Op.add(st(tp + off), x, cx);
-                    }
+                    if (comptime kind != .decimal) return foldRowsLoop(kind, .any, tails, off, c, rows, all);
+                    return switch (read.layoutOf(c)) {
+                        inline .wide, .narrow => |lay| foldRowsLoop(kind, lay, tails, off, c, rows, all),
+                        .any => unreachable,
+                    };
                 } else unreachable,
+            }
+        }
+
+        inline fn foldRowsLoop(comptime kind: types.TypeKind, comptime lay: read.Layout, tails: []const ?[*]u8, off: usize, c: column.Column, rows: Rows, all: bool) anyerror!void {
+            const needs_alloc = @hasDecl(Op, "needs_alloc") and Op.needs_alloc;
+            for (tails, 0..) |t, r| {
+                const tp = t orelse continue;
+                const cx = if (needs_alloc) rows.at(r) else rows.cx;
+                const x = (if (all) try read.atValidIn(Op.In, kind, lay, c, r, cx) else try read.atIn(Op.In, kind, lay, c, r, cx)) orelse continue;
+                try Op.add(st(tp + off), x, cx);
             }
         }
 

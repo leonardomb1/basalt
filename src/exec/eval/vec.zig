@@ -803,11 +803,42 @@ pub fn asNum(arena: std.mem.Allocator, v: Vec, n: usize) VecError!?Num {
 /// not its case, and the float kernels take over.
 fn decOpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usize) VecError!?Vec {
     const ty = decimalArithType(op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
-    var f = try Filled(Decimal).masked(arena, n, try bothValid(arena, l, r, n));
-    var sink = StoreSink{ .out = f.d };
-    try decApply(op, l, r, &sink, f.bm, f.any);
-    return f.finish(ty);
+    const bm = try bothValid(arena, l, r, n);
+    const any = !bm.allSet(n);
+    const cells = try arena.alloc(column.Dec64, n);
+    if (any) @memset(cells, column.Dec64.of(0));
+    var sink = NarrowSink{ .arena = arena, .out = cells, .scale = ty.scale };
+    try decApply(op, l, r, &sink, bm, any);
+    const data = if (sink.odd.items.len == 0)
+        column.dataLike(.d64, .{ .tag = .d64, .scale = ty.scale }, cells)
+    else wide: {
+        const wide = try arena.alloc(Decimal, n);
+        for (wide, cells) |*o, x| o.* = x.at(ty.scale);
+        for (sink.odd.items) |e| wide[e.row] = e.d;
+        break :wide column.decimalData(wide);
+    };
+    return mkCol(ty.withNull(any), n, bm, data);
 }
+
+/// A decimal result written narrow at `scale`; a row it cannot hold there (another
+/// scale, or past i64) is kept aside, and any such row makes the result wide.
+const NarrowSink = struct {
+    arena: std.mem.Allocator,
+    out: []column.Dec64,
+    scale: u8,
+    odd: std.ArrayListUnmanaged(Odd) = .empty,
+
+    const Odd = struct { row: usize, d: Decimal };
+
+    pub inline fn put(self: *NarrowSink, i: usize, d: Decimal) VecError!void {
+        if (d.scale == self.scale) if (std.math.cast(i64, d.unscaled)) |u| {
+            self.out[i] = column.Dec64.of(u);
+            return;
+        };
+        self.out[i] = column.Dec64.of(0);
+        try self.odd.append(self.arena, .{ .row = i, .d = d });
+    }
+};
 
 /// Each valid row's `l op r` handed to `sink.put(row, value)`, the values `evalColumn`
 /// would hold, with no decimal column built between; false, before evaluating
@@ -843,14 +874,6 @@ fn bothValid(arena: std.mem.Allocator, l: Vec, r: Vec, n: usize) VecError!Bitmap
     };
     return bm;
 }
-
-const StoreSink = struct {
-    out: []Decimal,
-
-    pub inline fn put(self: *StoreSink, i: usize, d: Decimal) VecError!void {
-        self.out[i] = d;
-    }
-};
 
 /// Every valid row's `decimalOp` handed to `sink` in row order: through a lane
 /// kernel when `decLane` plans one, else row by row.
