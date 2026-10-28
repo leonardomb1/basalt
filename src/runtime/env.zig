@@ -344,6 +344,9 @@ pub const Env = struct {
     fns: *const std.StringHashMap(ast.FnDecl),
     materialized: std.StringHashMapUnmanaged(Materialized) = .{},
     mem_sink: ?*MemSink = null,
+    /// The one sink a split-parallel union's branches all write to, so the union is
+    /// one result: `openSink` hands it to each branch, and the union closes it.
+    union_sink: ?driver.Sink = null,
     script_scope: LoopRow = no_loop_vars,
     call_depth: usize = 0,
     sink_label_prefix: ?[]const u8 = null,

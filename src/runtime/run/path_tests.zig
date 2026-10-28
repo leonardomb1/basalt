@@ -269,3 +269,41 @@ test "a key range typed otherwise than the probe fails its lane, on every split 
         }
     }
 }
+
+test "a split-parallel union shown on stdout is one result, as the serial union is" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cols = [_]@import("../../testing/postgres_fake.zig").Col{ .{ .name = "id", .oid = 20 }, .{ .name = "g" }, .{ .name = "v", .oid = 20 } };
+    const rows = (try pgRows(a))[0..3];
+    const tables = [_]Table{
+        .{ .name = "t", .cols = &cols, .rows = rows, .key = "id", .est_rows = 3_000_000 },
+        .{ .name = "t2", .cols = &cols, .rows = rows, .key = "id", .est_rows = 3_000_000 },
+    };
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+
+    const script = try msgfmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\nSELECT 'a' AS tag, t.* FROM pg.public.t t UNION ALL BY NAME SELECT 'b' AS tag, t.* FROM pg.public.t2 t;", .{srv.port()});
+    for ([_]usize{ 1, 4 }) |threads| {
+        var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const prog = try parser.parseSource(a, script, &pd);
+        var diag = env_mod.Diag{};
+        var out = try Capture.begin(tmp.dir, std.posix.STDOUT_FILENO, "stdout.txt");
+        var err = try Capture.begin(tmp.dir, std.posix.STDERR_FILENO, "stderr.txt");
+        const res = run(testing.allocator, prog, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &diag);
+        const printed = try err.end(a);
+        const shown = try out.end(a);
+        _ = res catch |e| {
+            std.debug.print("{s}\n{s}\n", .{ diag.msg, printed });
+            return e;
+        };
+        testing.expect(std.mem.count(u8, shown, "tag  id") == 1 and std.mem.count(u8, shown, " rows)") == 1 and
+            std.mem.indexOf(u8, shown, "a    1") != null and std.mem.indexOf(u8, shown, "b    1") != null) catch |e| {
+            std.debug.print("-j {d}:\n{s}\n", .{ threads, shown });
+            return e;
+        };
+    }
+}

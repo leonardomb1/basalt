@@ -188,15 +188,22 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
 
 /// A per-lane Stream Load or SQL sink for a split pipeline, or null for the
 /// shared-mutex path. Null under `EXPLAIN ANALYZE`, whose lanes write to the one
-/// discarding sink: a lane sink's setup alone creates the target table.
+/// discarding sink: a lane sink's setup alone creates the target table. Null too
+/// inside a union whose branches share one sink (`Env.union_sink`).
 pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
     try @import("sink.zig").uniqueTargetColumns(env, w, schema);
-    if (env.explain) return null;
+    if (env.explain or env.union_sink != null) return null;
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
     if (try buildSqlSinkSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec, .finish = finishLaneReplace, .abort = abortLaneReplace } };
     return null;
+}
+
+/// Whether `w` goes to a target `buildParallelSink` opens one sink per lane for.
+pub fn opensPerLane(env: *Env, w: ast.Write) bool {
+    const conn = env.connections.get(w.connector) orelse return false;
+    return streamload.Flavor.of(conn.connector) != null or sqlConnInfo(conn) != null;
 }
 
 fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpec {
