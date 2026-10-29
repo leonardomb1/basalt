@@ -137,12 +137,17 @@ folder, a SQL query, a REST read, a side that aggregates or joins before this
 join, a table never analyzed — keeps the join as written. A left side whose
 estimated bytes pass the join's spill threshold is not moved into memory.
 
-Only inner joins are turned around; left, right, full, semi, anti, cross and
-`NOT IN` joins always index their right side. The choice applies where a join
-runs serially; a pipeline whose joins run in parallel lanes (see above) probes
-with its head read in every lane and keeps the written order — a right side too
-big for the lanes sends the pipeline back to the serial plan, where the choice is
-made. Key pushdown follows the sides: a SQL right side streamed through an
+Inner, left, right and full joins are turned around; a `LEFT JOIN` run that way
+indexes its left rows, streams the right side through them, and emits the left
+rows that matched nothing once the right side ends, with nulls for the right
+columns, as written. Semi, anti, cross and `NOT IN` joins always index their
+right side. Where a pipeline's joins run in parallel lanes (see above), the first
+join of a `GROUP BY` pipeline whose right side is a local Parquet or CSV read is
+turned around the same way: its left side is indexed once and the lanes read the
+right side, the unmatched left rows folded in last, so the result is the same at
+every `-j`. Any other lane pipeline probes with its head read in every lane and
+keeps the written order — a right side too big for the lanes sends the pipeline
+back to the serial plan, where the choice is made. Key pushdown follows the sides: a SQL right side streamed through an
 indexed left side takes the left side's keys once that side is indexed, with no
 read-ahead. `EXPLAIN ANALYZE` (and `run --explain`) prints the choice under the
 join, e.g. `build: left (est. 1.2k rows vs 3.4M rows)`; plain `EXPLAIN` only says

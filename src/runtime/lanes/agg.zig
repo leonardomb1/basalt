@@ -64,6 +64,9 @@ const trace = @import("../../exec/trace.zig");
 const topNTail = @import("topn.zig").topNTail;
 const types = @import("../../lang/types.zig");
 const agg_spill = @import("agg_spill.zig");
+const Flip = @import("join.zig").Flip;
+const flipFirstJoin = @import("join.zig").flipFirstJoin;
+const drainChain = @import("join.zig").drainChain;
 const obs = @import("../obs.zig");
 
 const LaneParts = struct {
@@ -337,6 +340,10 @@ const AggSink = struct {
     threads: usize,
     /// One partial per worker, merged only once all are in, its tables sized for them.
     whole: bool = false,
+    /// Lane joins whose first keeps its unmatched build rows (`drainChain`): those
+    /// rows fold into the last partial, once every lane is done, so they come after
+    /// every morsel at every `-j`.
+    unmatched: []const LaneJoin = &.{},
     stats: *Stats,
     /// Bytes of partials past which the sink gives up; 0 never does.
     budget: usize,
@@ -494,6 +501,13 @@ const AggSink = struct {
     fn finalize(ptr: *anyopaque) anyerror!void {
         const self: *AggSink = @ptrCast(@alignCast(ptr));
         const env = self.env;
+        if (self.unmatched.len > 0) {
+            var mem: LaneMem = .{};
+            mem.init();
+            defer mem.deinit();
+            const chain = (try drainChain(mem.work.allocator(), env.errctx, self.unmatched)).?;
+            try sink(ptr, &mem, self.partials.len - 1, chain);
+        }
         const t_mrg0 = std.time.Instant.now() catch unreachable;
         try self.merge();
         const t_mrg1 = std.time.Instant.now() catch unreachable;
@@ -565,14 +579,35 @@ const AggSink = struct {
 /// The aggregate pipeline `shape` over `m`: the morsels through its map stages and
 /// joins into the aggregate sink. False sends it to the serial plan: a join's build
 /// side past its lane threshold, or partials past --op-memory.
-pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+pub fn runParallelAgg(env: *Env, m_in: *const Morsels, head: ?ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const src_base = env.sources.items.len;
-    const pre = try chainAt(env, m.schema().*, shape.prefix);
-    var agg_in = pre.out.*;
+    var flip: ?Flip = null;
+    var rest = shape.joins;
+    if (head) |h| if (shape.joins.len > 0) {
+        var k: usize = 1;
+        while (k < shape.joins.len and shape.joins[k].node != .join) k += 1;
+        const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{h}, shape.prefix });
+        flip = try flipFirstJoin(env, left, shape.joins[0], shape.joins[1..k], w, opts);
+        if (flip != null) rest = shape.joins[k..];
+    };
+    defer if (flip) |f| if (f.mapped) |mc| mc.close();
+    const m: *const Morsels = if (flip) |*f| &f.m else m_in;
+    var pre_recs: []const analyze.Resolved = undefined;
+    var agg_in: types.Schema = undefined;
     var joins: []const LaneJoin = &.{};
-    if (shape.joins.len > 0) {
-        const chain = (try resolveLaneJoins(env, shape.joins, agg_in)) orelse return false;
-        joins = chain.joins;
+    if (flip) |f| {
+        pre_recs = f.pre;
+        agg_in = f.out_schema;
+        joins = try env.arena.dupe(LaneJoin, &.{f.lane});
+        env.log.log(.info, "join with `{s}`: the left side is held in memory and the right side read on the lanes, {s}", .{ shape.joins[0].node.join.alias, f.note["build: left ".len..] });
+    } else {
+        const pre = try chainAt(env, m.schema().*, shape.prefix);
+        pre_recs = pre.recs;
+        agg_in = pre.out.*;
+    }
+    if (rest.len > 0) {
+        const chain = (try resolveLaneJoins(env, rest, agg_in)) orelse return false;
+        joins = try std.mem.concat(env.arena, LaneJoin, &.{ joins, chain.joins });
         agg_in = chain.out_schema;
     }
     var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
@@ -583,11 +618,14 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
 
     const lane_local = exact(la.aggs);
     const mm = if (lane_local) m.* else m.coarser();
-    var g = try AggSink.init(env, la, if (lane_local) mm.workers(opts.lanes()) else mm.count(), shape.tail, w, opts.lanes(), stats);
+    const drains = joins.len > 0 and joins[0].shared_matched != null;
+    const slots = if (lane_local) mm.workers(opts.lanes()) else mm.count();
+    var g = try AggSink.init(env, la, slots + @intFromBool(drains), shape.tail, w, opts.lanes(), stats);
     g.whole = lane_local;
+    if (drains) g.unmatched = joins;
     var g_live = true;
     defer if (g_live) g.deinit();
-    const p: Pipeline = .{ .m = &mm, .recs = pre.recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local };
+    const p: Pipeline = .{ .m = &mm, .recs = pre_recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local };
     const read0 = env.rows_read.load(.monotonic);
     const used = drive(env.arena, p, g.parallelSink(), opts.lanes()) catch |e| {
         if (e != error.AggregatePastMemory) return e;
@@ -685,5 +723,5 @@ pub fn runParallelSqlAgg(env: *Env, pipe: *const Pipe, stages: []const ast.Stage
         if (pd.where_extra != null) "yes" else "no",
     });
     const m = Morsels{ .sql = .{ .split = split, .predicates = sp.predicates, .schema = eff } };
-    return runParallelAgg(env, &m, shape, w, opts, stats, lanes_used);
+    return runParallelAgg(env, &m, null, shape, w, opts, stats, lanes_used);
 }

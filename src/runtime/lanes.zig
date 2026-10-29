@@ -86,7 +86,7 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse return false;
-    return runShape(env, split, shape, w, opts, stats, lanes_used);
+    return runShape(env, split, stages[0], shape, w, opts, stats, lanes_used);
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
@@ -94,7 +94,7 @@ pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast
     if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
     const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse return false;
     defer mapped.close();
-    return runShape(env, .ofCsv(mapped, &mapped.schema, opts.morsel_bytes), shape, w, opts, stats, lanes_used);
+    return runShape(env, .ofCsv(mapped, &mapped.schema, opts.morsel_bytes), stages[0], shape, w, opts, stats, lanes_used);
 }
 
 /// The stages a read may push down: a map path stops before its join, whose names are the join's.
@@ -114,9 +114,9 @@ pub fn shapeLaneSafe(shape: LaneShape) bool {
     };
 }
 
-fn runShape(env: *Env, split: Morsels, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return switch (shape) {
-        .sink => |x| runParallelAgg(env, &split, x, w, opts, stats, lanes_used),
+        .sink => |x| runParallelAgg(env, &split, head, x, w, opts, stats, lanes_used),
         .distinct => |x| runParallelDistinct(env, &split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
         .top_n => |x| runParallelTopN(env, &split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
         .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),

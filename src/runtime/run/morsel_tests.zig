@@ -179,3 +179,33 @@ test "a grouped aggregate past --op-memory partitions its rows to disk and gives
     const whole = try msgfmt.allocPrint(a, "SELECT COUNT(DISTINCT k) AS ks, SUM(f) AS s FROM '{s}/in.csv'", .{base});
     try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", whole, 1, opts), try resultOf(a, tmp.dir, base, "", whole, 4, opts));
 }
+
+test "a lane LEFT JOIN whose left side is smaller indexes it, reads the right side on the lanes and keeps every unmatched left row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeCsv(tmp.dir, "in.csv", a);
+    var small = std.array_list.Managed(u8).init(a);
+    try small.appendSlice("sk,c\n,none\n");
+    for (0..2000) |i| try small.writer().print("{d},c{d}\n", .{ if (i % 10 == 0) 20_000 + i else i * 3, i % 4 });
+    try tmp.dir.writeFile(.{ .sub_path = "small.csv", .data = small.items });
+    const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10 };
+
+    const exact = "SELECT s.c, COUNT(*) AS n, COUNT(b.id) AS m, SUM(b.id) AS t, MIN(b.g) AS lo FROM '$B/small.csv' s LEFT JOIN '$B/in.csv' b ON s.sk = b.k {s} GROUP BY s.c ORDER BY s.c";
+    const auto = try resultOf(a, tmp.dir, base, "", try msgfmt.allocPrint(a, exact, .{""}), 4, opts);
+    const written = try resultOf(a, tmp.dir, base, "", try msgfmt.allocPrint(a, exact, .{"WITH (join_order = 'written')"}), 4, opts);
+    try testing.expectEqualStrings(written, auto);
+    try testing.expect(std.mem.indexOf(u8, auto, "none,1,0,,") != null);
+
+    const floats = "SELECT s.c, SUM(b.f) AS t, AVG(b.f) AS m FROM '$B/small.csv' s LEFT JOIN '$B/in.csv' b ON s.sk = b.k GROUP BY s.c ORDER BY s.c";
+    try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", floats, 2, opts), try resultOf(a, tmp.dir, base, "", floats, 4, opts));
+
+    var tight = opts;
+    tight.op_memory = 256 << 10;
+    tight.spill_dir = base;
+    const keyed = "SELECT b.k, s.c, COUNT(*) AS n, SUM(b.id) AS t FROM '$B/small.csv' s LEFT JOIN '$B/in.csv' b ON s.sk = b.k GROUP BY b.k, s.c ORDER BY b.k, s.c";
+    try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", keyed, 4, opts), try resultOf(a, tmp.dir, base, "", keyed, 4, tight));
+}

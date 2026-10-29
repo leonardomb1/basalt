@@ -4,17 +4,21 @@
 //! rows; only the order of the rows may change, so either choice is made only
 //! where something after the join reorders them anyway.
 //!
-//! Build side. An inner join whose left side is estimated at least `flip_ratio`
-//! times smaller than its right (rows against rows, else bytes against bytes) is
-//! flipped: the left side is indexed and the right side streams through it. The
-//! flipped `op.Join` sees the right side as its probe; a `Project` above it puts
-//! the columns back as left then right, under the written join's names (`_r`
-//! suffixes included). Key pushdown follows the sides: a SQL (or Parquet) right
+//! Build side. An inner, left, right or full join whose left side is estimated at
+//! least `flip_ratio` times smaller than its right (rows against rows, else bytes
+//! against bytes) is flipped: the left side is indexed and the right side streams
+//! through it. The flipped `op.Join` sees the right side as its probe, and a left
+//! join turns into a right one (and back), so the left rows that match nothing are
+//! the index's unmatched rows, emitted once the right side has streamed; a `Project`
+//! above it puts the columns back as left then right, under the written join's
+//! names (`_r` suffixes included). Key pushdown follows the sides: a SQL (or Parquet) right
 //! side that takes the left side's keys gets them once the left side is indexed,
 //! not from a read-ahead, and a SQL (or Parquet) left read that takes the right
 //! side's keys gets them from the right side's read-ahead. A left side whose estimated bytes pass the join's
 //! spill threshold is not flipped, so the side moved into memory never spills;
-//! a flipped join that spills anyway is still correct, inner joins being symmetric.
+//! a flipped join that spills anyway is still correct, as the hash join spills
+//! every kind. Key pushdown stays with the written kind: only a side that may lose
+//! its unmatched rows takes the other's keys, whichever side is indexed.
 //!
 //! Star chains. A run of two or more consecutive inner joins, nothing between them,
 //! each keyed only on the columns of what precedes the run (the head), is run
@@ -29,8 +33,8 @@
 //! filters, selects, explodes and joins between (`orderFree`). A float `SUM` may
 //! then differ in its last digits, as it does between `-j` runs.
 //!
-//! Not chosen here: semi, anti, outer and cross joins, NOT IN, a join with a
-//! residual condition, a join under `WITH (join_order = 'written')`, and joins the
+//! Not chosen here: semi, anti and cross joins, outer joins in a star chain, NOT
+//! IN, a join with a residual condition, a join under `WITH (join_order = 'written')`, and joins the
 //! parallel lanes run (`lanes/join.zig` indexes the right side and probes with the
 //! head read in every lane; a right side too large for that already sends the
 //! pipeline back to the serial plan, where this applies). `EXPLAIN ANALYZE` (and
@@ -81,11 +85,30 @@ pub fn orderFree(after: []const ast.Stage) bool {
     return false;
 }
 
-/// A join that may be flipped or moved in a chain, its estimates aside.
+/// A join that may be moved in a star chain, its estimates aside.
 pub fn eligible(st: ast.Stage) bool {
+    return flippable(st) and st.node.join.kind == .inner;
+}
+
+/// A join whose build side may be chosen, its estimates aside: its kind has a
+/// mirror (`mirror`), and the hash join runs both.
+pub fn flippable(st: ast.Stage) bool {
     if (st.node != .join) return false;
     const j = st.node.join;
-    return j.kind == .inner and !j.null_aware and j.residual == null and !j.keyless() and mode(st.hints) == .auto;
+    const kind_ok = switch (j.kind) {
+        .inner, .left, .right, .full => true,
+        else => false,
+    };
+    return kind_ok and !j.null_aware and j.residual == null and !j.keyless() and mode(st.hints) == .auto;
+}
+
+/// The kind a join is run as with its sides swapped.
+fn mirror(kind: ast.JoinKind) ast.JoinKind {
+    return switch (kind) {
+        .left => .right,
+        .right => .left,
+        else => kind,
+    };
 }
 
 /// Past the run of consecutive chainable joins starting at `si`.
@@ -109,7 +132,7 @@ pub fn staticNote(st: ast.Stage, after: []const ast.Stage) []const u8 {
     return switch (mode(st.hints)) {
         .written => "as written (join_order = 'written')",
         .invalid => "",
-        .auto => if (eligible(st) and orderFree(after)) "the side estimated smaller is held in memory, decided at run time" else "",
+        .auto => if (flippable(st) and orderFree(after)) "the side estimated smaller is held in memory, decided at run time" else "",
     };
 }
 
@@ -131,7 +154,7 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     const a = try plan.assembleJoin(env, j, st.hints, side, schema, probe, take);
     if (a.nl) |r| return .{ .res = r, .next = si + 1 };
     const plain: Built = .{ .res = .{ .op = .{ .join = a.o }, .schema = a.schema }, .next = si + 1 };
-    if (!eligible(st) or a.o.residual != null or !orderFree(stages[si + 1 ..])) return plain;
+    if (!flippable(st) or a.o.residual != null or !orderFree(stages[si + 1 ..])) return plain;
     const left = estimate.ofSide(env, stages[0..si]);
     const right = estimate.ofSide(env, side.rstages);
     const spill_at = try plan.joinSpillAt(env, st.hints);
@@ -157,6 +180,7 @@ pub fn flipped(arena: std.mem.Allocator, o: *const op.Join, schema: types.Schema
     f.* = o.*;
     f.probe = o.build.?;
     f.build = o.probe;
+    f.kind = mirror(o.kind);
     f.left_keys = o.right_keys;
     f.right_keys = o.left_keys;
     f.left_schema = o.right_schema;
@@ -305,6 +329,11 @@ test "joinorder: join_order hint and which joins are eligible" {
     try testing.expect(eligible(stage(.{ .join = ij }, &auto)));
     try testing.expect(!eligible(stage(.{ .join = ij }, &written)));
     try testing.expect(!eligible(stage(.{ .join = lj }, &.{})));
+    try testing.expect(flippable(stage(.{ .join = lj }, &.{})));
+    try testing.expect(!flippable(stage(.{ .join = lj }, &written)));
+    var sj = ij;
+    sj.kind = .semi;
+    try testing.expect(!flippable(stage(.{ .join = sj }, &.{})));
     try testing.expect(!eligible(stage(.{ .join = na }, &.{})));
     try testing.expect(!eligible(stage(.{ .join = keyless }, &.{})));
 
@@ -333,7 +362,7 @@ test "joinorder: the left side is indexed only when known to be flip_ratio times
     try testing.expect(decide(.{ .rows = std.math.maxInt(u64) / 2 }, .{ .rows = std.math.maxInt(u64) }, 1 << 30) == null);
 }
 
-test "joinorder: a flipped join gives the written columns and rows, and each side's keys go where they did" {
+test "joinorder: a flipped join of every kind gives the written columns and rows, and each side's keys go where they did" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -371,36 +400,41 @@ test "joinorder: a flipped join gives the written columns and rows, and each sid
         }
     };
 
-    var got: [2][]const []const u8 = undefined;
-    var to_left: [2]Rec = .{ .{}, .{} };
-    var to_right: [2]Rec = .{ .{}, .{} };
-    for (0..2) |flip| {
-        const lb = [_]tu.Batch{try tu.kvBatch(a, &tu.join_left_schema, &.{ 1, 2, null, 1 }, &.{ "a", "b", "n", "c" })};
-        const rb = [_]tu.Batch{ try tu.kvBatch(a, &tu.join_right_schema, &.{ 1, 1, 4 }, &.{ "x", "y", "z" }), try tu.kvBatch(a, &tu.join_right_schema, &.{ null, 2, 5 }, &.{ "m", "w", "q" }) };
-        var lts = tu.TestSource{ .schema_ = tu.join_left_schema, .batches = &lb };
-        var rts = tu.TestSource{ .schema_ = tu.join_right_schema, .batches = &rb };
-        var lscan = op.Scan{ .src = lts.src() };
-        var rscan = op.Scan{ .src = rts.src() };
-        var jn = op.Join{
-            .probe = .{ .scan = &lscan },
-            .build = .{ .scan = &rscan },
-            .left_keys = &.{0},
-            .right_keys = &.{0},
-            .left_schema = &tu.join_left_schema,
-            .right_schema = &tu.join_right_schema,
-            .out_schema = &tu.join_both_schema,
-            .kind = .inner,
-            .state = a,
-            .push_build = .{ .ctx = &to_right[flip], .apply = Rec.apply },
-            .push_probe = .{ .ctx = &to_left[flip], .apply = Rec.apply },
+    const kinds = [_]ast.JoinKind{ .inner, .left, .right, .full };
+    const want = [_]usize{ 5, 6, 8, 9 };
+    for (kinds, want) |kind, n| {
+        var got: [2][]const []const u8 = undefined;
+        var to_left: [2]Rec = .{ .{}, .{} };
+        var to_right: [2]Rec = .{ .{}, .{} };
+        for (0..2) |flip| {
+            const lb = [_]tu.Batch{try tu.kvBatch(a, &tu.join_left_schema, &.{ 1, 2, null, 1 }, &.{ "a", "b", "n", "c" })};
+            const rb = [_]tu.Batch{ try tu.kvBatch(a, &tu.join_right_schema, &.{ 1, 1, 4 }, &.{ "x", "y", "z" }), try tu.kvBatch(a, &tu.join_right_schema, &.{ null, 2, 5 }, &.{ "m", "w", "q" }) };
+            var lts = tu.TestSource{ .schema_ = tu.join_left_schema, .batches = &lb };
+            var rts = tu.TestSource{ .schema_ = tu.join_right_schema, .batches = &rb };
+            var lscan = op.Scan{ .src = lts.src() };
+            var rscan = op.Scan{ .src = rts.src() };
+            var jn = op.Join{
+                .probe = .{ .scan = &lscan },
+                .build = .{ .scan = &rscan },
+                .left_keys = &.{0},
+                .right_keys = &.{0},
+                .left_schema = &tu.join_left_schema,
+                .right_schema = &tu.join_right_schema,
+                .out_schema = &tu.join_both_schema,
+                .kind = kind,
+                .state = a,
+                .push_build = if (kind == .inner) .{ .ctx = &to_right[flip], .apply = Rec.apply } else null,
+                .push_probe = if (kind == .inner) .{ .ctx = &to_left[flip], .apply = Rec.apply } else null,
+            };
+            const top: op.Op = if (flip == 1) (try flipped(a, &jn, tu.join_both_schema, "build: left", null)).op else .{ .join = &jn };
+            got[flip] = try Rows.of(a, top);
+        }
+        try testing.expectEqual(n, got[0].len);
+        try testing.expectEqual(got[0].len, got[1].len);
+        for (got[0], got[1]) |x, y| try testing.expectEqualStrings(x, y);
+        if (kind == .inner) for (0..2) |flip| {
+            try testing.expectEqual(@as(usize, 2), to_right[flip].got.?[0].values.len);
+            try testing.expectEqual(@as(usize, 4), to_left[flip].got.?[0].values.len);
         };
-        const top: op.Op = if (flip == 1) (try flipped(a, &jn, tu.join_both_schema, "build: left", null)).op else .{ .join = &jn };
-        got[flip] = try Rows.of(a, top);
-    }
-    try testing.expectEqual(@as(usize, 5), got[0].len);
-    for (got[0], got[1]) |x, y| try testing.expectEqualStrings(x, y);
-    for (0..2) |flip| {
-        try testing.expectEqual(@as(usize, 2), to_right[flip].got.?[0].values.len);
-        try testing.expectEqual(@as(usize, 4), to_left[flip].got.?[0].values.len);
     }
 }

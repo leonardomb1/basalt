@@ -32,6 +32,11 @@ const openItem = @import("morsels.zig").openItem;
 const obs = @import("../obs.zig");
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
+const csvSplitFile = @import("sources.zig").csvSplitFile;
+const csv = @import("../../format/csv.zig");
+const estimate = @import("../plan/estimate.zig");
+const joinorder = @import("../plan/joinorder.zig");
+const RunOptions = @import("../env.zig").RunOptions;
 
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
@@ -83,6 +88,10 @@ pub const LaneJoin = struct {
     /// The profile's node for the chain that built `index`, which the lanes' joins
     /// show as their build side.
     build_root: ?profile.Id = null,
+    /// A flipped join's projection back to the written columns (`flipFirstJoin`),
+    /// applied before `suffix`, which is resolved against `restore_schema`.
+    restore: ?[]const op.Project.Col = null,
+    restore_schema: ?*const types.Schema = null,
 };
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
@@ -286,7 +295,15 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJo
         .state = ta,
     };
     j.stats.at = lj.at;
-    return chainOps(ta, errctx, lj.suffix, .{ .join = j });
+    return chainOps(ta, errctx, lj.suffix, try restored(ta, errctx, lj, .{ .join = j }));
+}
+
+/// `o`, a lane join's output, under its `restore` projection when it was flipped.
+fn restored(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJoin, o: op.Op) !op.Op {
+    const cols = lj.restore orelse return o;
+    const p = try ta.create(op.Project);
+    p.* = .{ .child = o, .cols = cols, .out_schema = lj.restore_schema.?, .err = errctx };
+    return .{ .project = p };
 }
 
 /// A right/full lane join's unmatched build rows, left side null, in build order
@@ -319,7 +336,133 @@ pub fn buildLaneJoinDrain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJo
         .state = ta,
     };
     j.stats.at = lj.at;
-    return try chainOps(ta, errctx, lj.suffix, .{ .join = j });
+    return try chainOps(ta, errctx, lj.suffix, try restored(ta, errctx, lj, .{ .join = j }));
+}
+
+/// The unmatched build rows of the first of `joins`, through the joins after it:
+/// what a lane chain adds once every lane is done. Null when the first join keeps
+/// none (only a right or full one does).
+pub fn drainChain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, joins: []const LaneJoin) !?op.Op {
+    if (joins.len == 0) return null;
+    var chain = (try buildLaneJoinDrain(ta, errctx, joins[0])) orelse return null;
+    for (joins[1..]) |lj| chain = try buildLaneJoinChain(ta, errctx, lj, chain);
+    return chain;
+}
+
+/// A first lane join run the other way round: its left side, the pipeline's head
+/// read and prefix, indexed, and its right side read on the lanes (`m`, then `pre`)
+/// as the probe; `out_schema` is after the join's suffix.
+pub const Flip = struct {
+    m: Morsels,
+    mapped: ?*csv.MappedCsv = null,
+    pre: []const analyze.Resolved,
+    lane: LaneJoin,
+    out_schema: types.Schema,
+    note: []const u8,
+};
+
+/// The first join of a lane aggregate flipped, as the serial plan flips one
+/// (`joinorder.zig`), when its kind has a mirror, nothing forbids it, its left side
+/// (`left`, the head read and the stages before the join) is estimated `flip_ratio`
+/// times smaller than its right and within the lane cap, and its right side is a
+/// local Parquet or CSV read followed only by map stages, which the lanes read as
+/// they read a head. The join is resolved as written; the flipped one indexes the
+/// left rows on the written left keys and probes with the right rows, its kind
+/// mirrored, under a projection that gives back the written columns, so the suffix
+/// and everything after see the written join. A left join turned right leaves its
+/// unmatched left rows in the shared match bitset, for `buildLaneJoinDrain` once
+/// every lane is done. Null runs the join as written; nothing it opened stays open.
+pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?Flip {
+    const arena = env.arena;
+    if (!joinorder.flippable(js)) return null;
+    const j = js.node.join;
+    const binding = (try stampedBinding(env, j.binding)) orelse return null;
+    const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+    if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
+    for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
+    const cap = try laneJoinCap(env, j, js.hints);
+    const p = joinorder.decide(estimate.ofSide(env, left), estimate.ofSide(env, rstages), cap) orelse return null;
+
+    const src_base = env.sources.items.len;
+    var done = false;
+    defer if (!done) {
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+    };
+    var mapped: ?*csv.MappedCsv = null;
+    defer if (!done) if (mapped) |mc| mc.close();
+    const rd = rstages[0].node.read;
+    const m: Morsels = if (try parquetSplit(env, rd, rstages[0].hints, rstages[1..], w, opts)) |pm| pm else blk: {
+        mapped = (try csvSplitFile(env, rd, rstages[0].hints, w)) orelse return null;
+        break :blk Morsels.ofCsv(mapped.?, &mapped.?.schema, opts.morsel_bytes);
+    };
+    if (m.count() < 2) return null;
+    const pre = try chainAt(env, m.schema().*, rstages[1..]);
+
+    const lp = try buildPipeline(env, left);
+    var ad = analyze.Diag{};
+    const jr = analyze.resolveJoin(arena, lp.schema, pre.out.*, j, env.params_expr, &ad) catch |e| return aErr(env, &ad, e);
+    if (jr.keys.join.keyless() or jr.residual != null) return null;
+    const nl = jr.left.out.fields.len;
+    const nr = jr.right.out.fields.len;
+    const written = try schemaPtr(arena, jr.plan.schema);
+    if (written.fields.len != nl + nr) return null;
+
+    const probe_kinds = try arena.alloc(types.TypeKind, jr.plan.rks.len);
+    for (probe_kinds, jr.plan.rks) |*x, k| x.* = jr.right.out.fields[k].ty.kind;
+    const build_chain = try chainOps(arena, env.errctx, jr.left.recs, lp.op);
+    const index = op.JoinIndex.createMeeting(arena, build_chain, jr.left.out, jr.plan.lks, probe_kinds, cap, env.pipe.threads) catch |e| {
+        if (e == error.JoinBuildTooLarge) return null;
+        return e;
+    };
+
+    const fields = try arena.alloc(types.Schema.Field, nr + nl);
+    @memcpy(fields[0..nr], jr.right.out.fields);
+    @memcpy(fields[nr..], jr.left.out.fields);
+    const cols = try arena.alloc(op.Project.Col, nl + nr);
+    for (cols, 0..) |*c, i| c.* = .{
+        .source = .{ .passthrough = if (i < nl) nr + i else i - nl },
+        .ty = written.fields[i].ty,
+    };
+    const kind = mirror(j.kind);
+    const shared_matched: ?[]std.atomic.Value(u64) = if (kind == .right or kind == .full) blk: {
+        const words = try arena.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
+        @memset(words, std.atomic.Value(u64).init(0));
+        break :blk words;
+    } else null;
+    const after = try chainAt(env, written.*, suffix);
+    const note = try msgfmt.allocPrint(arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(arena, p.left, p.unit), try estimate.describe(arena, p.right, p.unit) });
+    done = true;
+    return .{
+        .m = m,
+        .mapped = mapped,
+        .pre = pre.recs,
+        .lane = .{
+            .index = index,
+            .left_keys = jr.plan.rks,
+            .right_keys = jr.plan.lks,
+            .probe_prep = jr.right.recs,
+            .left_schema = jr.right.out,
+            .right_schema = jr.left.out,
+            .out_schema = try schemaPtr(arena, .{ .fields = fields }),
+            .kind = kind,
+            .null_aware = false,
+            .suffix = after.recs,
+            .shared_matched = shared_matched,
+            .restore = cols,
+            .restore_schema = written,
+        },
+        .out_schema = after.out.*,
+        .note = note,
+    };
+}
+
+fn mirror(kind: ast.JoinKind) ast.JoinKind {
+    return switch (kind) {
+        .left => .right,
+        .right => .left,
+        else => kind,
+    };
 }
 
 const op_testing = @import("../../exec/op/testing_util.zig");

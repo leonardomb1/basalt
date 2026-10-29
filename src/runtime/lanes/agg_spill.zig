@@ -9,7 +9,8 @@
 //! it still outgrows a `fanout`th of `--op-memory`, a share that does not follow `-j`,
 //! so neither does where it spills nor the order its groups come out in. Each
 //! partition's groups go to a file of their own, and the tail reads them back in
-//! partition order.
+//! partition order. A first join that keeps its unmatched build rows routes them
+//! last, as the morsel after every other.
 
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -32,6 +33,7 @@ const spill = @import("../../exec/spill.zig");
 const spill_parts = @import("../../exec/op/spill_parts.zig");
 const types = @import("../../lang/types.zig");
 const writeTailFrom = @import("agg.zig").writeTailFrom;
+const drainChain = @import("join.zig").drainChain;
 
 const fanout = spill_parts.fanout;
 
@@ -314,6 +316,16 @@ pub fn run(
     var pp = p;
     pp.per_lane = false;
     const used = try drive(env.arena, pp, rs.parallelSink(), lanes);
+    {
+        var mem: LaneMem = .{};
+        mem.init();
+        defer mem.deinit();
+        if (try drainChain(mem.work.allocator(), env.errctx, p.joins)) |chain| {
+            const local = try RouteSink.initLocal(&rs, &mem);
+            try RouteSink.sink(&rs, local, p.m.count(), chain);
+            try RouteSink.combine(&rs, local);
+        }
+    }
 
     const results = try env.arena.alloc(?spill.Run, fanout);
     @memset(results, null);

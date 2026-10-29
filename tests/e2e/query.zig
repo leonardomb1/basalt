@@ -1751,6 +1751,28 @@ test "join order: a left side four times smaller is held in memory, with the wri
     try expectSameFiles(alloc, &tmp, "unsorted.csv", "unsorted_written.csv");
 }
 
+test "join order: a left join whose left side is four times smaller is held in memory, unmatched left rows kept" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeJoinOrderInputs(alloc, &tmp);
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/auto.csv' AS
+        \\SELECT * FROM '$B/small.csv' s LEFT JOIN '$B/big.csv' b ON s.k = b.k ORDER BY s.k, s.v, b.w;
+        \\LOAD INTO '$B/written.csv' AS
+        \\SELECT * FROM '$B/small.csv' s LEFT JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') ORDER BY s.k, s.v, b.w;
+        \\LOAD INTO '$B/auto_agg.csv' AS
+        \\SELECT s.v, COUNT(*) AS n, COUNT(b.w) AS m, SUM(b.w) AS t FROM '$B/small.csv' s LEFT JOIN '$B/big.csv' b ON s.k = b.k GROUP BY s.v ORDER BY s.v;
+        \\LOAD INTO '$B/written_agg.csv' AS
+        \\SELECT s.v, COUNT(*) AS n, COUNT(b.w) AS m, SUM(b.w) AS t FROM '$B/small.csv' s LEFT JOIN '$B/big.csv' b ON s.k = b.k WITH (join_order = 'written') GROUP BY s.v ORDER BY s.v;
+    , 1, &.{});
+    const agg = try readOut(alloc, &tmp, "auto_agg.csv");
+    defer alloc.free(agg);
+    try std.testing.expectEqualStrings("v,n,m,t\na,80,80,15880\nb,80,80,15880\nc,80,80,15960\nn,1,0,\nz,1,0,\n", agg);
+    try expectSameFiles(alloc, &tmp, "auto.csv", "written.csv");
+    try expectSameFiles(alloc, &tmp, "auto_agg.csv", "written_agg.csv");
+}
+
 test "join order: a turned-around join that spills gives the written rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
