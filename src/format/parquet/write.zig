@@ -63,6 +63,7 @@ const Part = @import("../../store/part.zig").Part;
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
+const keyhash = @import("../../exec/keyhash.zig");
 const Decimal = @import("../../exec/value.zig").Decimal;
 const Value = @import("../../exec/value.zig").Value;
 
@@ -150,6 +151,17 @@ fn flbaLen(p: i32) i32 {
 /// A chunk gives up its dictionary past either cap and is written PLAIN: 1 MiB is
 /// Arrow's default dictionary page limit, and the entry cap holds 8-byte values to it.
 pub const dict_max_entries = 1 << 17;
+
+/// A fixed-width value's PLAIN bytes as the dictionary keys them, hashed with two
+/// integer mixes: the default hash ran Wyhash over all 16 bytes of every value.
+const FixedKey = struct {
+    pub fn hash(_: FixedKey, k: u128) u64 {
+        return keyhash.fmix64(@as(u64, @truncate(k)) ^ keyhash.fmix64(@truncate(k >> 64)));
+    }
+    pub fn eql(_: FixedKey, a: u128, b: u128) bool {
+        return a == b;
+    }
+};
 pub const dict_max_bytes = 1 << 20;
 
 const PendingPage = struct {
@@ -172,7 +184,7 @@ const ColBuf = struct {
     dict_order: List([]const u8),
     /// A fixed-width column's dictionary: its PLAIN bytes (at most 16) as an integer
     /// key, and the entries back to back in `fixed_raw`, the dictionary page's body.
-    fixed: std.AutoHashMap(u128, u32),
+    fixed: std.HashMap(u128, u32, FixedKey, 80),
     fixed_raw: List(u8),
     dict_idx: List(u32),
     dict_ok: bool = false,
@@ -191,7 +203,7 @@ const ColBuf = struct {
             .defs = List(u8).init(a),
             .dict = std.StringHashMap(u32).init(a),
             .dict_order = List([]const u8).init(a),
-            .fixed = std.AutoHashMap(u128, u32).init(a),
+            .fixed = std.HashMap(u128, u32, FixedKey, 80).init(a),
             .fixed_raw = List(u8).init(a),
             .dict_idx = List(u32).init(a),
         };
@@ -250,8 +262,15 @@ const ColBuf = struct {
     /// Records a fixed-width value, given as its PLAIN bytes, against the dictionary.
     /// Returns false, leaving it unrecorded, when it would take the dictionary past a cap.
     fn dictPutFixed(self: *ColBuf, v: []const u8) !bool {
-        var key: u128 = 0;
-        for (v, 0..) |b, k| key |= @as(u128, b) << @intCast(8 * k);
+        const key: u128 = switch (v.len) {
+            4 => std.mem.readInt(u32, v[0..4], .little),
+            8 => std.mem.readInt(u64, v[0..8], .little),
+            else => blk: {
+                var raw: [16]u8 = @splat(0);
+                @memcpy(raw[0..v.len], v);
+                break :blk std.mem.readInt(u128, &raw, .little);
+            },
+        };
         const gop = try self.fixed.getOrPut(key);
         if (!gop.found_existing) {
             if (self.dictFull(v.len)) {

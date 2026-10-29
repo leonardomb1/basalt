@@ -334,10 +334,15 @@ pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, j
 
 /// Run `m` through `recs` and `lane_join` into the sink: in file order through
 /// `OrderedOut` when it is shared and the morsels are a file's, else as lanes pour.
-fn mapDrive(env: *Env, m: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) !void {
+/// A shared sink that encodes each unit on its lane (Parquet) takes a file cut
+/// `coarser`: a 4 MB CSV range held under the encoder's half row group, so every
+/// unit went to the writer's one thread to be encoded.
+fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) !void {
     const arena = env.arena;
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
+    const cut = if (sink_mode == .shared and sink_mode.shared.encodesUnits()) m_in.coarser() else m_in.*;
+    const m = &cut;
     var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
     defer shared.abort();
     errdefer parallel.abortLanes(sink_mode);

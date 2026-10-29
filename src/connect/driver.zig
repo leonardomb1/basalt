@@ -372,6 +372,11 @@ pub const Sink = struct {
         openUnit: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!UnitEncoder = null,
     };
 
+    /// Whether the sink encodes an ordered unit on the lane that read it (`openUnit`).
+    pub fn encodesUnits(self: Sink) bool {
+        return self.vtable.openUnit != null;
+    }
+
     pub fn openUnit(self: Sink, arena: std.mem.Allocator) ?anyerror!UnitEncoder {
         const f = self.vtable.openUnit orelse return null;
         return f(self.ptr, arena);
