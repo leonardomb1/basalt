@@ -10,8 +10,10 @@
 //! more (one lane runs the serial aggregate, whose last bits may differ). A
 //! morsel's fold tables go as it is sealed; its stores and DISTINCT pairs stay until
 //! each partition takes them, once every earlier morsel's are in. With a spill
-//! directory, partials totalling past `--op-memory` send the aggregate to the serial
-//! plan, which spills: that total follows the input too, so neither does the choice.
+//! directory, partials totalling past `--op-memory` send a grouped aggregate to
+//! `agg_spill.zig`, which reads the input again with its rows partitioned to disk by
+//! key, and an ungrouped one to the serial plan: that total follows the input too, so
+//! neither does the choice.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
@@ -61,6 +63,8 @@ const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const topNTail = @import("topn.zig").topNTail;
 const types = @import("../../lang/types.zig");
+const agg_spill = @import("agg_spill.zig");
+const obs = @import("../obs.zig");
 
 const LaneParts = struct {
     arenas: [pq_parts]std.heap.ArenaAllocator,
@@ -281,16 +285,21 @@ fn groupWriteUnit(ctx: *GroupWriteCtx, i: usize, mem: *LaneMem, _: *Reader) !voi
 /// Write a parallel breaker's merged result through `tail`; under a profile the tail's
 /// operators stand above the lanes' `feeds` operators, whose result they read.
 pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema, tail: []const analyze.Resolved, stats: *Stats, feeds: profile.Kind) !void {
-    const arena = env.arena;
     if (tail.len == 0) {
         if (batch.len > 0) {
-            try snk.writeBatch(arena, batch);
+            try snk.writeBatch(env.arena, batch);
             stats.rows_out += batch.len;
         }
         return;
     }
     var ob = OneBatch{ .b = batch, .sch = schema };
-    var scan = op.Scan{ .src = ob.source() };
+    return writeTailFrom(env, snk, ob.source(), tail, stats, feeds);
+}
+
+/// `writeTail` over the batches of `src`.
+pub fn writeTailFrom(env: *Env, snk: driver.Sink, src: driver.Source, tail: []const analyze.Resolved, stats: *Stats, feeds: profile.Kind) !void {
+    const arena = env.arena;
+    var scan = op.Scan{ .src = src };
     scan.stats.at = profile.merged_at;
     var cur: op.Op = .{ .scan = &scan };
     defer cur.release();
@@ -576,14 +585,21 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
     const mm = if (lane_local) m.* else m.coarser();
     var g = try AggSink.init(env, la, if (lane_local) mm.workers(opts.lanes()) else mm.count(), shape.tail, w, opts.lanes(), stats);
     g.whole = lane_local;
-    defer g.deinit();
+    var g_live = true;
+    defer if (g_live) g.deinit();
     const p: Pipeline = .{ .m = &mm, .recs = pre.recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local };
+    const read0 = env.rows_read.load(.monotonic);
     const used = drive(env.arena, p, g.parallelSink(), opts.lanes()) catch |e| {
         if (e != error.AggregatePastMemory) return e;
-        for (env.sources.items[src_base..]) |sc| sc.close();
-        env.sources.shrinkRetainingCapacity(src_base);
-        env.log.log(.info, "the aggregate's partials are past {d} bytes (--op-memory); it runs serially, where it can spill to disk", .{env.op_memory});
-        return false;
+        if (la.by.len == 0) {
+            for (env.sources.items[src_base..]) |sc| sc.close();
+            env.sources.shrinkRetainingCapacity(src_base);
+            env.log.log(.info, "the aggregate's partials are past {d} bytes (--op-memory); it runs serially, where it can spill to disk", .{env.op_memory});
+            return false;
+        }
+        g.deinit();
+        g_live = false;
+        return runSpilled(env, p, la, shape.tail, w, opts, stats, lanes_used, env.rows_read.load(.monotonic) - read0);
     };
     lanes_used.* = @max(lanes_used.*, used);
     if (env.profile) |pr| {
@@ -593,6 +609,37 @@ pub fn runParallelAgg(env: *Env, m: *const Morsels, shape: SinkShape, w: ast.Wri
             try pr.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
         } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", mm.count(), m.unitName() });
     }
+    return true;
+}
+
+/// A grouped aggregate whose partials passed --op-memory, read again with its rows
+/// partitioned to disk by key (`agg_spill.zig`); `first` rows were read before it
+/// gave up, so the read count ends at one pass.
+fn runSpilled(env: *Env, p: Pipeline, la: LaneAgg, tail: []const ast.Stage, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, first: u64) !bool {
+    env.log.log(.info, "the aggregate's partials are past {d} bytes (--op-memory); its rows are partitioned to disk by key and each partition aggregated on its own", .{env.op_memory});
+    var again = obs.RowCounter{};
+    var pp = p;
+    pp.rows_read = &again;
+    const template = op.Aggregate{
+        .child = undefined,
+        .in_schema = la.in_schema,
+        .by = la.by,
+        .aggs = la.aggs,
+        .out_schema = la.out_schema,
+        .err = la.err,
+        .state = undefined,
+        .gpa = env.gpa,
+        .space = env.space,
+    };
+    const after = try chainAt(env, la.out_schema.*, tail);
+    const snk = try openTailSink(env, w, after.out.*);
+    var guard = SinkGuard.init(snk);
+    defer guard.abort();
+    const used = try agg_spill.run(env, pp, template, opts.lanes(), snk, after.recs, stats);
+    try guard.close();
+    _ = env.rows_read.fetchAdd(again.load(.monotonic) -| first, .monotonic);
+    lanes_used.* = @max(lanes_used.*, used);
+    if (env.profile) |pr| pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate partitioned to disk, {d} {s}", .{ p.m.label(), p.m.count(), p.m.unitName() });
     return true;
 }
 

@@ -116,5 +116,8 @@ folding in memory, and rows of new groups go to disk by a hash of their key, to 
 aggregated once the input ends. Every result is exact — a float `SUM` included,
 since each group still sees its rows in input order — but the groups come out in
 another order, so add `ORDER BY` if the order matters. The disk it may use is
-bounded by `--spill-cap`. Spilling happens on a `-j 1` run and on any aggregate
-the parallel lanes do not take; the lanes' own per-lane tables do not spill.
+bounded by `--spill-cap`. On parallel lanes, a `GROUP BY` whose groups pass
+`--op-memory` reads its input again with each row sent to one of 16 files by its
+key, and the lanes aggregate the files side by side, each with a sixteenth of
+`--op-memory`: the result is the one `-j 1` gives, and the same at every `-j`. An
+aggregate with no `GROUP BY` that outgrows memory runs on one lane instead.

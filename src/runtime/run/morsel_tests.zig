@@ -150,7 +150,7 @@ test "an aggregate over many morsels is byte-identical at -j 4 and 16, and at -j
     try sameAtEveryJ(a, tmp.dir, base, &inputs, .{ .morsel_bytes = 8 << 10 });
 }
 
-test "an aggregate past --op-memory runs serially and spills, the same at -j 1 and 4" {
+test "a grouped aggregate past --op-memory partitions its rows to disk and gives -j 1's result, floats and DISTINCT included" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -158,11 +158,24 @@ test "an aggregate past --op-memory runs serially and spills, the same at -j 1 a
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeCsv(tmp.dir, "in.csv", a);
+    const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10, .op_memory = 1 << 20, .spill_dir = base };
 
-    const q = try msgfmt.allocPrint(a, "SELECT k, COUNT(*) AS n, MIN(id) AS lo, SUM(f) AS s FROM '{s}/in.csv' GROUP BY k ORDER BY k", .{base});
-    const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10, .op_memory = 64 << 10, .spill_dir = base };
+    const q = try msgfmt.allocPrint(a, "SELECT k, COUNT(*) AS n, MIN(id) AS lo, SUM(f) AS s, AVG(f) AS m FROM '{s}/in.csv' GROUP BY k ORDER BY k", .{base});
     const one = try resultOf(a, tmp.dir, base, "", q, 1, opts);
     const four = try resultOf(a, tmp.dir, base, "", q, 4, opts);
     try testing.expectEqualStrings(one, four);
     try testing.expect(std.mem.count(u8, one, "\n") == 17_001);
+
+    const dq = try msgfmt.allocPrint(a, "SELECT k, COUNT(DISTINCT g) AS gs FROM '{s}/in.csv' GROUP BY k ORDER BY k", .{base});
+    var roomy = opts;
+    roomy.op_memory = 4 << 20;
+    try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", dq, 1, roomy), try resultOf(a, tmp.dir, base, "", dq, 4, roomy));
+
+    const unordered = try msgfmt.allocPrint(a, "SELECT k, SUM(f) AS s FROM '{s}/in.csv' GROUP BY k", .{base});
+    const four_u = try resultOf(a, tmp.dir, base, "", unordered, 4, opts);
+    const sixteen_u = try resultOf(a, tmp.dir, base, "", unordered, 16, opts);
+    try testing.expectEqualStrings(four_u, sixteen_u);
+
+    const whole = try msgfmt.allocPrint(a, "SELECT COUNT(DISTINCT k) AS ks, SUM(f) AS s FROM '{s}/in.csv'", .{base});
+    try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", whole, 1, opts), try resultOf(a, tmp.dir, base, "", whole, 4, opts));
 }

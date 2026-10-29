@@ -216,11 +216,10 @@ million a second from Parquet to CSV. The numbers come from
 
 - **Continuous replication.** basalt runs a script to completion; it does not
   follow a change log. Schedule it with cron, Airflow or the like.
-- **Inputs far larger than memory in a parallel aggregation.** A sort, a join's
-  build side, `DISTINCT` and a one-lane `GROUP BY` spill to disk past
-  `--op-memory`; the per-lane tables of a parallel `GROUP BY` and
-  `count(DISTINCT)` do not yet, so run such a `GROUP BY` with `-j 1` when it
-  outgrows memory.
+- **An ungrouped `count(DISTINCT)` far larger than memory.** A sort, a join's
+  build side, `DISTINCT` and a `GROUP BY` spill to disk past `--op-memory`, a
+  parallel `GROUP BY` staying parallel, one partition of its keys per lane; an
+  aggregate with no `GROUP BY` that outgrows memory runs on one lane.
 - **Interactive analytics where milliseconds matter.** On analytical queries
   DuckDB is still about two to six times faster; basalt's edge is everything around
   the query: sources, sinks, scripts and checks.
