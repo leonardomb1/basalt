@@ -45,6 +45,14 @@ const CLIENT_PLUGIN_AUTH = 0x00080000;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
 
+threadlocal var rejected: driver.ThreadNote(512) = .{};
+
+/// Why the last login on this thread was refused, the server's own words or
+/// basalt's reason for not sending the password, or "".
+pub fn lastError() []const u8 {
+    return rejected.get();
+}
+
 /// Sent once a session is authenticated: a TIMESTAMP column reads, and a loaded or
 /// pushed timestamp is stored and compared, in UTC, as basalt's timestamps are and
 /// as a PostgreSQL session's (`TimeZone=UTC`) are, whatever the server's zone is.
@@ -61,9 +69,13 @@ pub const Conn = struct {
 
     /// The login phase runs from the dial through the session's time zone.
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+        rejected.clear();
         const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
-        self.login(host, user, password, database, tls_mode) catch |e| return self.wire.loginFailed(e, host, port);
+        self.login(host, user, password, database, tls_mode) catch |e| {
+            if (e == error.MysqlAuthFailed) rejected.set(self.wire.last_error);
+            return self.wire.loginFailed(e, host, port);
+        };
         self.wire.sessionUp();
         return self;
     }

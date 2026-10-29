@@ -19,6 +19,7 @@ const ssrp = @import("../../db/sqlserver/ssrp.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const tds = @import("../../db/sqlserver/tds.zig");
+const mysql = @import("../../db/mysql.zig");
 pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 
@@ -30,6 +31,7 @@ pub fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) 
     if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver"))
         return driver.connectorNoteAlloc(arena, "", e, tds.lastError());
     if (e == error.AadTokenFailed) return driver.connectorNoteAlloc(arena, "", e, aad.lastError());
+    if (e == error.MysqlAuthFailed) return driver.connectorNoteAlloc(arena, "", e, mysql.lastError());
     return @errorName(e);
 }
 
