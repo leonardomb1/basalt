@@ -30,6 +30,7 @@ const pqdecode = @import("../../format/parquet/read.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const wrapProjected = @import("../../connect/split.zig").wrapProjected;
+const runtime_filters = @import("../plan/runtime_filters.zig");
 
 const max_csv_morsels: usize = 1 << 16;
 
@@ -255,7 +256,8 @@ fn driveRun(ctx: *Drive, lane: usize) !void {
     if (!ctx.queue.failed.load(.seq_cst)) try vt.combine(ctx.snk.ptr, local);
 }
 
-/// `src` counted, then through `p`'s map stages and join probes, on `wa`.
+/// `src` counted, then through `p`'s map stages and join probes, on `wa`, with the
+/// runtime filters the probes own.
 fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
     const cs = try wa.create(obs.CountingSource);
     cs.* = .{ .inner = src, .count = p.rows_read };
@@ -263,6 +265,7 @@ fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
     scan.* = .{ .src = cs.source() };
     var chain = try chainOps(wa, p.errctx, p.recs, .{ .scan = scan });
     for (p.joins) |lj| chain = try buildLaneJoinChain(wa, p.errctx, lj, chain);
+    try runtime_filters.wire(wa, &chain);
     return chain;
 }
 

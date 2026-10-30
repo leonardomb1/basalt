@@ -262,7 +262,7 @@ fn derivedName(self: *Parser, alias: ?[]const u8) Error![]const u8 {
     return msgfmt.allocPrint(self.arena, "__derived{d}_{s}", .{ self.derived_n, al });
 }
 
-const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
+const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown", "runtime_filter" };
 
 /// A join's reading right side (path, `IDENTIFIER`, table or query), lowered as
 /// `(SELECT * FROM it) alias` would be, with its read hints; the join's own

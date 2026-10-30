@@ -61,6 +61,9 @@ pub const Words = struct {
     /// turn it off; anything else leaves it on.
     pub const key_pushdown: Words = .{ .yes = &.{}, .no = &.{ .whole("false"), .whole("off") }, .fold = true, .otherwise = true };
 
+    /// The `runtime_filter` hint (plan/runtime_filters.zig), read as `key_pushdown` is.
+    pub const runtime_filter: Words = .{ .yes = &.{}, .no = &.{ .whole("false"), .whole("off") }, .fold = true, .otherwise = true };
+
     /// A BOOL cell as the engine printed it, read back by the terminal grid
     /// (connect/table.zig, cli/repl/view.zig): exactly `true`, else false.
     pub const printed: Words = .{ .yes = &.{.whole("true")}, .otherwise = false };

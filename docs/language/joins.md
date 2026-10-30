@@ -242,3 +242,39 @@ FROM 'today.csv' c
 JOIN 'orders/' o ON o.customer_id = c.id;
 -- reads only the row groups of orders/ whose customer_id range holds a c.id
 ```
+
+## Runtime filters
+
+In a chain of joins over one read, the keys a later join holds also narrow that
+read, before the joins in between see its rows:
+
+```sql
+SELECT count(*) AS n
+FROM 'lineitem.csv' l
+JOIN 'orders.csv' o ON o.o_orderkey = l.l_orderkey
+JOIN 'part.csv' p ON p.p_partkey = l.l_partkey
+WHERE p.p_brand = 'Brand#23';
+-- the lineitem rows whose l_partkey is no Brand#23 part are dropped as they are
+-- read: the orders join never hashes, probes or copies them
+```
+
+Once a join has indexed its side, a filter directly above the read checks each row
+against a compact summary of that side's keys (a Bloom filter): a row whose key is
+null, or certainly not there, is dropped. The summary never misses a key that is
+there, and the join still checks every row it gets, so the answer and its row
+order are the same with the filter or without, at any `-j`.
+
+A join's filter reaches the read when each of its keys is a column of the read,
+followed through filters, through selects that pass it on unchanged, and through
+the left side of the joins before it; and when at least one join lies between,
+since the first join's own lookup is the same check, exact. Only a join that drops
+rows matching nothing has one: an inner, semi or right join, never `NOT IN`. A
+computed key, or a key from an earlier join's right side (`o.o_custkey` for a
+customer join after orders), has none, and nothing that counts, orders or numbers
+rows (`LIMIT`, a window, `DISTINCT`, an aggregate) may lie between. A join whose
+side spilled to disk has none either.
+
+A filter that drops fewer than one row in eight of its first 65,536 turns itself
+off: checking costs a hash per row. `EXPLAIN ANALYZE` shows each filter above its
+read, the joins it stands for, and the rows it checked and dropped;
+`WITH (runtime_filter = false)` on a join keeps it from having one.

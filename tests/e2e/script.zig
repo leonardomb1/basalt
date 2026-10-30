@@ -279,6 +279,61 @@ test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan,
     }
 }
 
+test "runtime filters: a chain of joins over CSV gives the same rows, in the same order, with them and without, serial and on lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fact = std.array_list.Managed(u8).init(alloc);
+    defer fact.deinit();
+    try fact.appendSlice("id,a,b,v\n");
+    for (0..20000) |i| try fact.writer().print("{d},{d},{d},{d}\n", .{ i, i % 50, i % 37, i % 10 });
+    try tmp.dir.writeFile(.{ .sub_path = "fact.csv", .data = fact.items });
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "a,an\n3,three\n9,nine\n20,twenty\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "b,bn\n1,one\n5,five\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const queries = [_][]const u8{
+        "SELECT f.id, x.an, y.bn FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF",
+        "SELECT y.bn, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF GROUP BY y.bn ORDER BY y.bn",
+    };
+    for (queries) |tmpl| {
+        var outs: [4][]u8 = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |o| alloc.free(o);
+        for ([_]usize{ 1, 4 }) |threads| for ([_][]const u8{ "", " WITH (runtime_filter = false)" }) |off| {
+            const q0 = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+            defer alloc.free(q0);
+            const q = try std.mem.replaceOwned(u8, alloc, q0, "$OFF", off);
+            defer alloc.free(q);
+            const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+            defer alloc.free(script);
+            var rdiag: Diag = .{};
+            _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+            outs[n] = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
+            n += 1;
+        };
+        try std.testing.expect(std.mem.count(u8, outs[0], "\n") > 1);
+        for (outs[1..]) |o| try std.testing.expectEqualStrings(outs[0], o);
+    }
+
+    const q = try std.mem.replaceOwned(u8, alloc, queries[1], "$B", base);
+    defer alloc.free(q);
+    const plain = try std.mem.replaceOwned(u8, alloc, q, "$OFF", "");
+    defer alloc.free(plain);
+    const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, plain });
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = exec(alloc, script, .{ .threads = 1, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const prof = try cap.end(alloc);
+    defer alloc.free(prof);
+    _ = try res;
+    errdefer std.debug.print("{s}\n", .{prof});
+    try std.testing.expect(std.mem.indexOf(u8, prof, "runtime filter (#") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prof, "for the join with ") != null);
+}
+
 test "for-each over a JSON array param iterates and binds fields by name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

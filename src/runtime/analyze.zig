@@ -1996,7 +1996,7 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
     }
 }
 
-const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown" };
+const join_hint_keys = [_][]const u8{ "max_build", "join_order", "key_pushdown", "runtime_filter" };
 
 pub const connection_types = "http, postgres, mysql, sqlserver, starrocks, doris, sftp, smb, ftp";
 

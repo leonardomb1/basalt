@@ -39,6 +39,7 @@ const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const failLabel = @import("../op.zig").failLabel;
 const keyhash = @import("../keyhash.zig");
+const Bloom = @import("bloom.zig").Bloom;
 const keyset = @import("keyset.zig");
 const par = @import("../par.zig");
 const keytable = @import("../keytable.zig");
@@ -362,6 +363,20 @@ pub const JoinIndex = struct {
     want: []const types.TypeKind = &.{},
     strs: ?*keytable.StrTable = null,
     str_cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
+    /// Each build row's key hash, as `probe` hashes a probe row, and whether its key
+    /// has a null: what `filter` is built from.
+    hashes: []const u64 = &.{},
+    null_keys: []const bool = &.{},
+    /// The allocator the index lives in; `filter` takes its Bloom filter from it under
+    /// `bloom_mtx`, as the lanes allocate nothing else from it while they run.
+    state: std.mem.Allocator = undefined,
+    bloom: ?Bloom = null,
+    bloom_mtx: std.Thread.Mutex = .{},
+    /// What the runtime filters standing for this join checked and dropped, over
+    /// every lane and morsel, and whether they gave up (`exec/op/runtime_filter.zig`).
+    filter_checked: std.atomic.Value(u64) = .init(0),
+    filter_dropped: std.atomic.Value(u64) = .init(0),
+    filter_off: std.atomic.Value(bool) = .init(false),
 
     const Part = struct {
         table: keytable.GroupTable,
@@ -437,7 +452,7 @@ pub const JoinIndex = struct {
         const batch = try concatBatches(state, chunks, right_schema, n);
 
         const self = try state.create(JoinIndex);
-        self.* = .{ .build_batch = batch, .keys = right_keys };
+        self.* = .{ .build_batch = batch, .keys = right_keys, .state = state };
         if (right_keys.len == 0) return self;
 
         const want = try state.alloc(types.TypeKind, right_keys.len);
@@ -494,7 +509,24 @@ pub const JoinIndex = struct {
             break;
         };
         self.unique = std.mem.allEqual(u32, chain, 0);
+        self.hashes = b.hashes;
+        self.null_keys = b.nulls;
         return self;
+    }
+
+    /// A Bloom filter of the build side's non-null keys, made on the first call; the
+    /// lanes probing one index share it.
+    pub fn filter(self: *JoinIndex) !*const Bloom {
+        self.bloom_mtx.lock();
+        defer self.bloom_mtx.unlock();
+        if (self.bloom == null) {
+            var n: usize = 0;
+            for (self.null_keys) |nl| n += @intFromBool(!nl);
+            const f = try Bloom.init(self.state, n);
+            for (self.hashes, self.null_keys) |h, nl| if (!nl) f.insert(h);
+            self.bloom = f;
+        }
+        return &self.bloom.?;
     }
 
     /// The parallel build's shared state: each row's hash and partition order, filled
@@ -701,6 +733,10 @@ pub const Join = struct {
     err: ?*ErrCtx = null,
     build_cap: ?usize = null,
     note: []const u8 = "",
+    /// The join's right side as written, which a runtime filter standing for it
+    /// is named by; `filter_off` keeps it from having one (`runtime_filter = false`).
+    name: []const u8 = "",
+    filter_off: bool = false,
 
     /// Spilling: with a `space`, a build side past `spill_at` bytes switches the
     /// join to grace mode instead of failing, splitting a partition at most

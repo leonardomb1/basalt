@@ -37,6 +37,7 @@ const csv = @import("../../format/csv.zig");
 const estimate = @import("../plan/estimate.zig");
 const joinorder = @import("../plan/joinorder.zig");
 const RunOptions = @import("../env.zig").RunOptions;
+const runtime_filters = @import("../plan/runtime_filters.zig");
 
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
@@ -92,6 +93,9 @@ pub const LaneJoin = struct {
     /// applied before `suffix`, which is resolved against `restore_schema`.
     restore: ?[]const op.Project.Col = null,
     restore_schema: ?*const types.Schema = null,
+    /// As `op.Join`'s: what a runtime filter for it is named by, and whether it may own one.
+    name: []const u8 = "",
+    filter_off: bool = false,
 };
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
@@ -271,6 +275,8 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .suffix = after.recs,
             .shared_matched = shared_matched,
             .build_root = build_root,
+            .name = if (j.alias.len > 0) j.alias else j.binding,
+            .filter_off = runtime_filters.disabled(join_hints),
         },
         .out_schema = after.out.*,
     };
@@ -293,6 +299,8 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJo
         .pair_schema = lj.pair_schema,
         .shared_matched = lj.shared_matched,
         .state = ta,
+        .name = lj.name,
+        .filter_off = lj.filter_off,
     };
     j.stats.at = lj.at;
     return chainOps(ta, errctx, lj.suffix, try restored(ta, errctx, lj, .{ .join = j }));
@@ -451,6 +459,8 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
             .shared_matched = shared_matched,
             .restore = cols,
             .restore_schema = written,
+            .name = if (j.alias.len > 0) j.alias else j.binding,
+            .filter_off = runtime_filters.disabled(js.hints),
         },
         .out_schema = after.out.*,
         .note = note,

@@ -40,6 +40,7 @@ const pqdecode = @import("../format/parquet/read.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
 const keypush = @import("plan/keypush.zig");
+const runtime_filters = @import("plan/runtime_filters.zig");
 const joinorder = @import("plan/joinorder.zig");
 const obs = @import("obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
@@ -701,6 +702,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
         schema = r.schema;
         current.stampNew(profile.keyOf(stage.pos));
     }
+    try runtime_filters.wire(env.arena, &current);
     return .{ .op = current, .schema = schema };
 }
 
@@ -1014,6 +1016,8 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
         .threads = env.pipe.threads,
         .space = env.space,
         .spill_at = try joinSpillAt(env, hints),
+        .name = if (j.alias.len > 0) j.alias else j.binding,
+        .filter_off = runtime_filters.disabled(hints),
     };
     if (jr.residual) |rp| {
         o.residual = rp.pred;
@@ -1317,6 +1321,7 @@ test "pruneFor: a joined CTE keeps only the columns the join and what follows ma
 test {
     _ = @import("plan/estimate.zig");
     _ = @import("plan/joinorder.zig");
+    _ = @import("plan/runtime_filters.zig");
     _ = @import("plan/discover.zig");
     _ = @import("plan/union.zig");
 }

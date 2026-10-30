@@ -195,6 +195,7 @@ pub const Op = union(enum) {
     nl_join: *NLJoin,
     explode: *Explode,
     union_: *Union,
+    runtime_filter: *RuntimeFilter,
 
     pub fn stats(self: Op) *Stats {
         return switch (self) {
@@ -252,6 +253,16 @@ pub const Op = union(enum) {
                 buf[0] = .{ .name = "sorted runs spilled", .value = s.runs };
                 n = 1;
             },
+            .runtime_filter => |f| {
+                const t = f.tally();
+                buf[0] = .{ .name = "rows checked", .value = t.checked };
+                buf[1] = .{ .name = "rows dropped", .value = t.dropped };
+                n = 2;
+                if (t.off > 0) {
+                    buf[2] = .{ .name = "joins turned off, too few dropped", .value = t.off, .fold = .max };
+                    n = 3;
+                }
+            },
             else => {},
         }
         return buf[0..n];
@@ -262,6 +273,7 @@ pub const Op = union(enum) {
     pub fn note(self: Op) []const u8 {
         return switch (self) {
             .join => |j| j.note,
+            .runtime_filter => |f| f.note,
             .nl_join => |j| if (j.range != null) "range join: the right side sorted by its bound" else "nested loop: every left row against every right row",
             else => "",
         };
@@ -331,6 +343,7 @@ pub const Op = union(enum) {
             .nl_join => |j| j.next(arena),
             .explode => |e| e.next(arena),
             .union_ => |u| u.next(arena),
+            .runtime_filter => |f| f.next(arena),
         };
     }
 };
@@ -417,6 +430,7 @@ pub const JoinIndex = @import("op/join.zig").JoinIndex;
 pub const Join = @import("op/join.zig").Join;
 pub const notInTooLarge = @import("op/join.zig").notInTooLarge;
 pub const NLJoin = @import("op/nljoin.zig").NLJoin;
+pub const RuntimeFilter = @import("op/runtime_filter.zig").RuntimeFilter;
 pub const nlRangeOf = @import("op/nljoin.zig").rangeOf;
 pub const KeyValues = @import("op/keyset.zig").KeyValues;
 pub const KeyPush = @import("op/keyset.zig").KeyPush;
@@ -825,6 +839,8 @@ test {
     _ = @import("op/explode.zig");
     _ = @import("op/join.zig");
     _ = @import("op/keyset.zig");
+    _ = @import("op/bloom.zig");
+    _ = @import("op/runtime_filter.zig");
     _ = @import("op/nljoin.zig");
     _ = @import("op/sort.zig");
     _ = @import("op/topk.zig");

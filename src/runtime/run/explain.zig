@@ -302,7 +302,7 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
 /// Whether rows out over rows in is the operator's selectivity, worth a percentage.
 fn keepsRows(k: profile.Kind) bool {
     return switch (k) {
-        .filter, .join, .nl_join, .distinct, .limit, .top_n => true,
+        .filter, .join, .nl_join, .distinct, .limit, .top_n, .runtime_filter => true,
         else => false,
     };
 }
@@ -364,6 +364,7 @@ fn kindName(k: profile.Kind) []const u8 {
         .union_ => "union",
         .top_n => "top-n",
         .nl_join => "nested-loop join",
+        .runtime_filter => "runtime filter",
         else => @tagName(k),
     };
 }
