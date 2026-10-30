@@ -1521,9 +1521,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try needed.appendSlice(group);
             for (needed.items) |q0| {
                 const q = stripQual(q0, &aliases);
-                if (q.parts.len != 1) continue;
                 const have = for (kept.items) |it| {
-                    if (std.mem.eql(u8, itemLabel(it), q.last())) break true;
+                    if (it == .field and qualEql(it.field, q)) break true;
+                    if (q.parts.len == 1 and std.mem.eql(u8, itemLabel(it), q.last())) break true;
                 } else false;
                 if (!have) try kept.append(.{ .field = q });
             }
@@ -1626,6 +1626,13 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         .final_names = final_names,
         .where_end = where_end,
     };
+}
+
+/// Whether two column names are the same name, part by part.
+fn qualEql(a: ast.QualName, b: ast.QualName) bool {
+    if (a.parts.len != b.parts.len) return false;
+    for (a.parts, b.parts) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
 }
 
 const KeySide = enum { left, right, loose };

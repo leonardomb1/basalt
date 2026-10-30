@@ -589,3 +589,28 @@ test "a sequential loop's GROUP BY and DISTINCT free their groups each row, so t
     }
     try std.testing.expect(peaks[1] < peaks[0] * 2);
 }
+
+test "a computed GROUP BY key beside aggregates of a joined side's qualified columns, two sides naming a column alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "k,v\n1,10\n2,20\n3,30\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "k,c\n1,5\n2,6\n3,7\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "k,c,d\n1,50,2026-01-04\n2,60,2025-03-01\n3,70,2026-07-09\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const cases = [_]struct { q: []const u8, want: []const u8 }{
+        .{ .q = "SELECT x.v + 1 AS u, sum(y.c) AS s FROM '$B/a.csv' x JOIN '$B/b.csv' y ON y.k = x.k GROUP BY x.v + 1 ORDER BY u", .want = "u,s\n11,5\n21,6\n31,7\n" },
+        .{ .q = "SELECT y.c * 2 AS u, count(*) AS n, sum(y.c) AS s FROM '$B/a.csv' x JOIN '$B/b.csv' y ON y.k = x.k GROUP BY y.c * 2 ORDER BY u", .want = "u,n,s\n10,1,5\n12,1,6\n14,1,7\n" },
+        .{ .q = "SELECT extract(year FROM z.d) AS yr, sum(y.c) AS s, sum(z.c) AS t FROM '$B/a.csv' x JOIN '$B/b.csv' y ON y.k = x.k JOIN '$B/c.csv' z ON z.k = x.k GROUP BY extract(year FROM z.d) ORDER BY yr", .want = "yr,s,t\n2025,6,60\n2026,12,120\n" },
+    };
+    for (cases) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+}
