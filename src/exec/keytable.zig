@@ -53,20 +53,28 @@ pub fn report(w: *std.Io.Writer) !void {
     });
 }
 
-/// A direct array for one small-range integer key: a key `base + i` finds its record
-/// at `recs[i]` with no hashing. `base` is the smallest key of the first batch, so a
-/// range starting anywhere sits wholly inside.
+/// A direct array for up to `max_keys` small-range keys: each key word, less its
+/// `base`, takes `bits` bits of the slot (all 14 for one key, 7 each for two), so a
+/// row finds its record at `recs[slot]` with no hashing. A key's `base` is its
+/// smallest word in the first batch, so a range starting anywhere sits wholly inside;
+/// a row past any key's range, or with a NULL key, is probed as before. Two string
+/// keys (TPC-H Q1's flags, interned to small ids) skip the hash table this way.
 pub const Direct = struct {
     recs: []?[*]u8,
     parts: []u8,
-    base: ?i64 = null,
+    nk: usize,
+    bits: u6,
+    base: [max_keys]i64 = undefined,
+    primed: bool = false,
 
     pub const len = 1 << 14;
+    pub const max_keys = 4;
 
-    pub fn init(gpa: std.mem.Allocator) !Direct {
+    pub fn init(gpa: std.mem.Allocator, nk: usize) !Direct {
+        std.debug.assert(nk >= 1 and nk <= max_keys);
         const recs = try gpa.alloc(?[*]u8, len);
         @memset(recs, null);
-        return .{ .recs = recs, .parts = try gpa.alloc(u8, len) };
+        return .{ .recs = recs, .parts = try gpa.alloc(u8, len), .nk = nk, .bits = @intCast(14 / nk) };
     }
 
     pub fn deinit(self: Direct, gpa: std.mem.Allocator) void {
@@ -74,36 +82,46 @@ pub const Direct = struct {
         gpa.free(self.parts);
     }
 
-    /// Whether `keys` (one word a row, of kinds this array serves) can use one.
+    /// Whether `keys` (one word a row a key, of kinds this array serves) can use one.
+    /// A float's word is its bits, never a small range; a lone BOOLEAN has two groups.
     pub fn serves(kinds: []const keyhash.KeyKind) bool {
-        return kinds.len == 1 and kinds[0] != .f64k and kinds[0] != .boolk;
+        if (kinds.len == 0 or kinds.len > max_keys) return false;
+        for (kinds) |k| if (k == .f64k) return false;
+        return kinds.len > 1 or kinds[0] != .boolk;
     }
 
-    fn slot(self: *const Direct, k: i64, m: u64) ?usize {
+    inline fn slot(self: *const Direct, keys: []const i64, m: u64) ?usize {
         if (m != 0) return null;
-        const off = k -% self.base.?;
-        return if (off < 0 or off >= len) null else @intCast(off);
+        const span: i64 = @as(i64, 1) << self.bits;
+        var at: usize = 0;
+        for (keys[0..self.nk], self.base[0..self.nk]) |k, b| {
+            const off = k -% b;
+            if (off < 0 or off >= span) return null;
+            at = (at << self.bits) | @as(usize, @intCast(off));
+        }
+        return at;
     }
 
-    /// Sets `base` from the first batch seen.
+    /// Sets each key's `base` from the first batch seen.
     pub fn prime(self: *Direct, e: Encoded) void {
-        if (self.base != null) return;
-        var lo: i64 = std.math.maxInt(i64);
-        for (e.keys, 0..) |k, r| if (e.mask(r) == 0 and k < lo) {
-            lo = k;
+        if (self.primed) return;
+        self.primed = true;
+        var lo: [max_keys]i64 = @splat(std.math.maxInt(i64));
+        const rows = e.keys.len / self.nk;
+        for (0..rows) |r| if (e.mask(r) == 0) {
+            for (e.keys[r * self.nk ..][0..self.nk], lo[0..self.nk]) |k, *l| l.* = @min(l.*, k);
         };
-        self.base = if (lo == std.math.maxInt(i64)) 0 else lo;
+        for (lo[0..self.nk], self.base[0..self.nk]) |l, *b| b.* = if (l == std.math.maxInt(i64)) 0 else l;
     }
 
     /// The rows whose key the array does not hold, in order, after one tight pass.
     pub fn misses(self: *Direct, e: Encoded, a: std.mem.Allocator) ![]u32 {
         self.prime(e);
-        const out = try a.alloc(u32, e.keys.len);
-        const base = self.base.?;
+        const rows = e.keys.len / self.nk;
+        const out = try a.alloc(u32, rows);
         var n: usize = 0;
-        for (e.keys, 0..) |k, r| {
-            const off = k -% base;
-            const held = e.mask(r) == 0 and off >= 0 and off < len and self.recs[@intCast(off)] != null;
+        for (0..rows) |r| {
+            const held = if (self.slot(e.keys[r * self.nk ..][0..self.nk], e.mask(r))) |i| self.recs[i] != null else false;
             out[n] = @intCast(r);
             n += @intFromBool(!held);
         }
@@ -112,20 +130,20 @@ pub const Direct = struct {
 
     /// `key`'s record, when the array holds it.
     pub inline fn lookup(self: *const Direct, key: FixedKey) ?[*]u8 {
-        return self.recs[self.slot(key.vals[0], key.mask) orelse return null];
+        return self.recs[self.slot(key.vals, key.mask) orelse return null];
     }
 
     /// `key`'s record and partition, when the array holds it.
     pub inline fn find(self: *const Direct, key: FixedKey) ?struct { tail: [*]u8, part: u8 } {
-        const i = self.slot(key.vals[0], key.mask) orelse return null;
+        const i = self.slot(key.vals, key.mask) orelse return null;
         return .{ .tail = self.recs[i] orelse return null, .part = self.parts[i] };
     }
 
     /// The record and partition of each row whose key the array holds.
     pub fn hits(self: *Direct, e: Encoded, tails: []?[*]u8, pidx: []u8) void {
         self.prime(e);
-        for (e.keys, tails, pidx, 0..) |k, *t, *pi, r| {
-            const i = self.slot(k, e.mask(r)) orelse continue;
+        for (tails, pidx, 0..) |*t, *pi, r| {
+            const i = self.slot(e.keys[r * self.nk ..][0..self.nk], e.mask(r)) orelse continue;
             t.* = self.recs[i] orelse continue;
             pi.* = self.parts[i];
         }
@@ -133,7 +151,7 @@ pub const Direct = struct {
 
     /// Notes `key`'s record, when its key falls in the array's range.
     pub fn note(self: *Direct, key: FixedKey, tail: [*]u8, part: u8) void {
-        const i = self.slot(key.vals[0], key.mask) orelse return;
+        const i = self.slot(key.vals, key.mask) orelse return;
         self.recs[i] = tail;
         self.parts[i] = part;
     }
@@ -1037,6 +1055,39 @@ fn TestSide(comptime Store: type) type {
             c.misses += 1;
         }
     };
+}
+
+test "Direct: two and three keys each take their own bits, from their own base; a key past its range, a NULL or a float misses" {
+    var recs: [3]u8 = undefined;
+    for ([_]usize{ 2, 3 }) |nk| {
+        var d = try Direct.init(std.testing.allocator, nk);
+        defer d.deinit(std.testing.allocator);
+        const span: i64 = @as(i64, 1) << d.bits;
+        var keys: [6]i64 = undefined;
+        for (0..2) |r| for (0..nk) |j| {
+            keys[r * nk + j] = 100 * @as(i64, @intCast(j)) + @as(i64, @intCast(r)) - 5;
+        };
+        d.prime(.{ .nk = nk, .keys = keys[0 .. 2 * nk], .hkeys = &.{}, .masks = &.{}, .absent = &.{} });
+        const a = [_]i64{ -5, 95, 195 };
+        const b = [_]i64{ -4, 95, 195 };
+        const c = [_]i64{ -5, 96, 195 };
+        const far = [_]i64{ -5 + span, 95, 195 };
+        const below = [_]i64{ -6, 95, 195 };
+        d.note(.{ .vals = a[0..nk], .mask = 0 }, recs[0..].ptr, 1);
+        d.note(.{ .vals = b[0..nk], .mask = 0 }, recs[1..].ptr, 2);
+        d.note(.{ .vals = c[0..nk], .mask = 0 }, recs[2..].ptr, 3);
+        try std.testing.expectEqual(@as(?[*]u8, recs[0..].ptr), d.lookup(.{ .vals = a[0..nk], .mask = 0 }));
+        try std.testing.expectEqual(@as(u8, 2), d.find(.{ .vals = b[0..nk], .mask = 0 }).?.part);
+        try std.testing.expectEqual(@as(?[*]u8, recs[2..].ptr), d.lookup(.{ .vals = c[0..nk], .mask = 0 }));
+        try std.testing.expectEqual(@as(?[*]u8, null), d.lookup(.{ .vals = far[0..nk], .mask = 0 }));
+        try std.testing.expectEqual(@as(?[*]u8, null), d.lookup(.{ .vals = below[0..nk], .mask = 0 }));
+        try std.testing.expectEqual(@as(?[*]u8, null), d.lookup(.{ .vals = a[0..nk], .mask = 1 }));
+    }
+    try std.testing.expect(Direct.serves(&.{ .i64k, .i64k }));
+    try std.testing.expect(!Direct.serves(&.{ .i64k, .f64k }));
+    try std.testing.expect(!Direct.serves(&.{.boolk}));
+    try std.testing.expect(Direct.serves(&.{ .boolk, .i32k }));
+    try std.testing.expect(!Direct.serves(&.{ .i64k, .i64k, .i64k, .i64k, .i64k }));
 }
 
 test "probe: two-column keys with NULLs just past each table bound keep one record a key, frozen tables miss new keys" {

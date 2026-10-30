@@ -65,8 +65,8 @@
 //! cache line, since at high cardinality the lines a probe touches are the cost;
 //! a batch is hashed first and probed `prefetch_ahead` rows behind a prefetch.
 //! Groups split over `fold_parts` radix partitions by the hash's top bits (the
-//! bucket uses the bottom bits, the salt bits 32-37). A single small-range int key
-//! skips hashing through a `Direct` array. String keys are interned ids in a
+//! bucket uses the bottom bits, the salt bits 32-37). Up to four small-range keys
+//! (ints, or interned strings) skip hashing through a `Direct` array. String keys are interned ids in a
 //! `StrTable` shared by the lanes, but placement hashes the string itself so output
 //! order does not follow thread timing. Parallel lanes fold partial `GroupSet`s that
 //! `GroupMerge` combines by their raw accumulators; `emitSets` finalizes once.

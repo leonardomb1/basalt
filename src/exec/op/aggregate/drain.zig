@@ -241,7 +241,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     errdefer for (parts) |*p| p.table.deinit();
     try initPairs(self, true);
     errdefer for (self.pairs) |*pp| pp.deinit();
-    var direct: ?Direct = if (Direct.serves(kinds)) try Direct.init(self.gpa) else null;
+    var direct: ?Direct = if (Direct.serves(kinds)) try Direct.init(self.gpa, kinds.len) else null;
     defer if (direct) |d| d.deinit(self.gpa);
     const enc = try Encoder.init(self.state, self.by, kinds);
 
