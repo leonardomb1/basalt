@@ -520,12 +520,13 @@ pub const Flip = struct {
 /// and everything after see the written join. A left join turned right leaves its
 /// unmatched left rows in the shared match bitset, for `buildLaneJoinDrain` once
 /// every lane is done. Null runs the join as written; nothing it opened stays open.
-pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?Flip {
+/// `rest` is every stage after the join, so the right side reads only what it takes.
+pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: []const ast.Stage, rest: []const ast.Stage, w: ast.Write, opts: RunOptions) anyerror!?Flip {
     const arena = env.arena;
     if (!joinorder.flippable(js)) return null;
     const j = js.node.join;
-    const binding = (try stampedBinding(env, j.binding)) orelse return null;
-    const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+    if ((try stampedBinding(env, j.binding)) == null) return null;
+    const rstages = try rightStagesFor(env, j, rest);
     if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
     for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const cap = try laneJoinCap(env, j, js.hints);

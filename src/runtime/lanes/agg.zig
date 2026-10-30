@@ -54,6 +54,7 @@ const profile = @import("../../exec/profile.zig");
 const pushdown = @import("../pushdown.zig");
 const resolveLaneJoins = @import("join.zig").resolveLaneJoins;
 const resolveAt = @import("../plan.zig").resolveAt;
+const projectedColumns = @import("../plan.zig").projectedColumns;
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
@@ -576,6 +577,21 @@ const AggSink = struct {
     }
 };
 
+/// The head read asked for only the columns the pipeline after it takes, for a
+/// first join turned around (`flipFirstJoin`), which reads its left side, the head,
+/// into memory: read whole, a wide head was held with every column. The list names
+/// the joined sides' columns too, which the Parquet and CSV readers pass over.
+fn narrowHead(env: *Env, h: ast.Stage, shape: SinkShape) !ast.Stage {
+    if (h.node != .read or h.node.read.cols.len > 0) return h;
+    const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.prefix, shape.joins, &.{shape.agg}, shape.tail });
+    const cols = (try projectedColumns(env, after)) orelse return h;
+    var out = h;
+    var rd = h.node.read;
+    rd.cols = cols;
+    out.node = .{ .read = rd };
+    return out;
+}
+
 /// The aggregate pipeline `shape` over `m`: the morsels through its map stages and
 /// joins into the aggregate sink. False sends it to the serial plan: a join's build
 /// side past its lane threshold, or partials past --op-memory.
@@ -586,8 +602,8 @@ pub fn runParallelAgg(env: *Env, m_in: *const Morsels, head: ?ast.Stage, shape: 
     if (head) |h| if (shape.joins.len > 0) {
         var k: usize = 1;
         while (k < shape.joins.len and shape.joins[k].node != .join) k += 1;
-        const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{h}, shape.prefix });
-        flip = try flipFirstJoin(env, left, shape.joins[0], shape.joins[1..k], w, opts);
+        const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{try narrowHead(env, h, shape)}, shape.prefix });
+        flip = try flipFirstJoin(env, left, shape.joins[0], shape.joins[1..k], try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[1..], &.{shape.agg}, shape.tail }), w, opts);
         if (flip != null) rest = shape.joins[k..];
     };
     defer if (flip) |f| if (f.mapped) |mc| mc.close();
