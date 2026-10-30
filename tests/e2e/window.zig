@@ -9,6 +9,7 @@ const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
 const runToString = @import("harness.zig").runToString;
 const runScript = @import("harness.zig").runScript;
+const runScriptOpts = @import("harness.zig").runScriptOpts;
 
 test "windows: each function keeps its own frame; DISTINCT and * see the window's output once" {
     const alloc = std.testing.allocator;
@@ -642,4 +643,36 @@ test "rn <= k and ORDER BY … LIMIT through the top-k core match a full sort, s
         defer alloc.free(want_top);
         try std.testing.expectEqualStrings(want_top, got_top);
     };
+}
+
+test "window: a top-k ROW_NUMBER over a file split into morsels gives the serial rows in the serial order, ties, null and string keys, several keys or none" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var in = std.array_list.Managed(u8).init(alloc);
+    defer in.deinit();
+    try in.appendSlice("id,k,g,v\n");
+    const ks = [_][]const u8{ "alpha", "beta", "", "gamma", "delta", "e" };
+    for (0..30000) |i| try in.writer().print("{d},{s},{d},{d}\n", .{ i, ks[(i * 7) % ks.len], i % 5, (i * 13) % 50 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = in.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const queries = [_][]const u8{
+        "SELECT * FROM (SELECT k, id, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS rn FROM '$B/in.csv') t WHERE rn <= 3",
+        "SELECT * FROM (SELECT k, g, id, v, ROW_NUMBER() OVER (PARTITION BY k, g ORDER BY v) AS rn FROM '$B/in.csv') t WHERE rn <= 2",
+        "SELECT * FROM (SELECT id, v, ROW_NUMBER() OVER (ORDER BY v DESC) AS rn FROM '$B/in.csv') t WHERE rn <= 7",
+        "SELECT * FROM (SELECT g, id, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v, id DESC) AS rn FROM '$B/in.csv' WHERE id % 3 <> 0) t WHERE rn <= 4",
+    };
+    for (queries) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const serial = try runScriptOpts(alloc, &tmp, script, .{ .threads = 1 });
+        defer alloc.free(serial);
+        const lanes = try runScriptOpts(alloc, &tmp, script, .{ .threads = 4, .morsel_bytes = 16 << 10 });
+        defer alloc.free(lanes);
+        try std.testing.expect(std.mem.count(u8, serial, "\n") > 2);
+        try std.testing.expectEqualStrings(serial, lanes);
+    }
 }

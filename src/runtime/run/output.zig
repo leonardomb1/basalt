@@ -61,6 +61,12 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const windowTopK = @import("../plan/union.zig").windowTopK;
+const runWindowTopK = @import("../lanes/window.zig").runWindowTopK;
+const Morsels = @import("../lanes/morsels.zig").Morsels;
+const parquetSplit = @import("../lanes/sources.zig").parquetSplit;
+const csvSplitFile = @import("../lanes/sources.zig").csvSplitFile;
+const connect = @import("../connect.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
@@ -260,6 +266,55 @@ fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_
     return outer;
 }
 
+const window_topk = "__window_topk";
+
+/// A top-k window (a lone ROW_NUMBER filtered `rn <= k`) over a local file runs on
+/// lanes, its output held in memory and the rest of the pipeline read from it
+/// (`lanes/window.zig`): serially, every row went through one top-k core. Only map
+/// stages may sit between the read and the window. The read takes the columns the
+/// whole pipeline needs; row groups are skipped by the filters before the window
+/// alone, as one after it filters the window's output, not its input.
+fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize) anyerror!?[]const ast.Stage {
+    if (opts.lanes() < 2 or env.materialized.contains(window_topk)) return null;
+    var stages = stages_in;
+    if (stages.len > 0 and stages[0].node == .ref) {
+        if (env.materialized.contains(stages[0].node.ref)) return null;
+        const b = (try stampedBinding(env, stages[0].node.ref)) orelse return null;
+        if (b.stages.len == 0 or b.stages[0].node != .read) return null;
+        stages = try std.mem.concat(env.arena, ast.Stage, &.{ b.stages, stages[1..] });
+    }
+    if (stages.len < 3 or stages[0].node != .read or !path.laneEligible(stages, opts.lanes())) return null;
+    const rd = stages[0].node.read;
+    if (!connect.isLocalCsvRead(rd) and !connect.isParquetFileRead(rd) and !connect.isFolderRead(rd)) return null;
+    var wi: usize = 1;
+    while (wi < stages.len and (stages[wi].node == .filter or stages[wi].node == .select)) wi += 1;
+    if (wi >= stages.len or stages[wi].node != .window) return null;
+    var j = wi + 1;
+    while (j < stages.len and stages[j].node == .select) j += 1;
+    const topped = (try windowTopK(env.arena, stages[0..j], stages[j..])) orelse return null;
+
+    const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
+    var mapped: ?*@import("../../format/csv.zig").MappedCsv = null;
+    defer if (mapped) |mc| mc.close();
+    var crd = rd;
+    if (crd.cols.len == 0) if (try projectedColumns(env, stages[1..])) |cols| {
+        crd.cols = cols;
+    };
+    const m: Morsels = if (try parquetSplit(env, crd, stages[0].hints, stages[1..wi], w, opts)) |pm| pm else blk: {
+        mapped = (try csvSplitFile(env, crd, stages[0].hints, w)) orelse return null;
+        break :blk Morsels.ofCsv(mapped.?, &mapped.?.schema, opts.morsel_bytes);
+    };
+    if (m.count() < 2) return null;
+    const mat = try runWindowTopK(env, &m, stages[1..wi], topped[wi], opts, lanes_used);
+    try notePrelude(env, "the top-k window", stages[0].pos);
+    try env.materialized.put(env.arena, window_topk, mat);
+
+    const outer = try env.arena.alloc(ast.Stage, stages.len - wi);
+    outer[0] = .{ .node = .{ .ref = window_topk }, .hints = &.{}, .pos = stages[0].pos };
+    @memcpy(outer[1..], stages[wi + 1 ..]);
+    return outer;
+}
+
 fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
     var opts = opts_in;
     const arena = env.arena;
@@ -285,6 +340,11 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         _ = env.materialized.remove(name);
     };
     stages = try inlineHeadBindings(env, stages);
+    const wtk = try windowTopKLanes(env, opts, stages, lanes_used);
+    defer if (wtk != null) {
+        _ = env.materialized.remove(window_topk);
+    };
+    if (wtk) |w| stages = w;
     const win = try windowInput(env, opts, stages, lanes_used, batch_arena);
     defer if (win != null) {
         _ = env.materialized.remove(window_input);

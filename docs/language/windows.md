@@ -186,6 +186,11 @@ That shape is recognized: a lone `ROW_NUMBER` filtered with `rn <= k` (or `<`, `
 keeps only each partition's best `k` rows as they stream, rather than sorting them
 all.
 
+Over a local CSV or Parquet file, with only filters and selects between the read
+and the window, that work runs on the lanes: each row goes to one of several
+buckets by its partition key, and each bucket keeps its partitions' best `k` on its
+own. The rows come out as one serial run gives them, in the same order.
+
 ## Several windows
 
 Functions with the same `PARTITION BY` and `ORDER BY` share one window stage, each

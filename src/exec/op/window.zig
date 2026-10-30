@@ -117,6 +117,12 @@ pub const Window = struct {
             _ = pull.reset(.retain_capacity);
         }
 
+        return topKRows(&core, arena, self.in_schema, self.out_schema);
+    }
+
+    /// What a top-k window outputs from a core every row has been offered to: each
+    /// partition's best rows, partitions in key order, each row with its number.
+    pub fn topKRows(core: *TopK, arena: std.mem.Allocator, in_schema: *const types.Schema, out_schema: *const types.Schema) !?Batch {
         const groups = try core.finish(arena);
         var total: usize = 0;
         for (groups) |g| total += g.len;
@@ -129,13 +135,13 @@ pub const Window = struct {
             for (rn[at..][0..g.len], 1..) |*x, i| x.* = @intCast(i);
             at += g.len;
         }
-        const ncols = self.in_schema.fields.len;
-        const cols = try arena.alloc(column.Column, self.out_schema.fields.len);
-        try core.columns(arena, rows, self.out_schema.fields[0..ncols], cols[0..ncols]);
-        var bd = try column.Builder.initCapacity(arena, self.out_schema.fields[ncols].ty, total);
+        const ncols = in_schema.fields.len;
+        const cols = try arena.alloc(column.Column, out_schema.fields.len);
+        try core.columns(arena, rows, out_schema.fields[0..ncols], cols[0..ncols]);
+        var bd = try column.Builder.initCapacity(arena, out_schema.fields[ncols].ty, total);
         for (rn) |x| try bd.append(.{ .int = x });
         cols[ncols] = try bd.finish();
-        return Batch{ .schema = self.out_schema, .columns = cols, .len = total };
+        return Batch{ .schema = out_schema, .columns = cols, .len = total };
     }
 
     pub const Layout = struct {
