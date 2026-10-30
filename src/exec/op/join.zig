@@ -758,6 +758,9 @@ pub const Join = struct {
 
     push_build: ?keyset.KeyPush = null,
     push_probe: ?keyset.KeyPush = null,
+    /// `push_build` only skips Parquet row groups, so a runtime filter that needs
+    /// this join's index first may drop it (`runtime/plan/runtime_filters.zig`).
+    push_build_yields: bool = false,
     prefetch_rows: usize = default_prefetch_rows,
     prefetch_bytes: usize = default_prefetch_bytes,
     push_cap: usize = default_push_cap,

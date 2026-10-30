@@ -279,7 +279,7 @@ test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan,
     }
 }
 
-test "runtime filters: a chain of joins over CSV gives the same rows, in the same order, with them and without, serial and on lanes" {
+test "runtime filters: chains of joins over CSV, star and snowflake, give the same rows, in the same order, with them and without, serial and on lanes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -288,14 +288,21 @@ test "runtime filters: a chain of joins over CSV gives the same rows, in the sam
     try fact.appendSlice("id,a,b,v\n");
     for (0..20000) |i| try fact.writer().print("{d},{d},{d},{d}\n", .{ i, i % 50, i % 37, i % 10 });
     try tmp.dir.writeFile(.{ .sub_path = "fact.csv", .data = fact.items });
-    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "a,an\n3,three\n9,nine\n20,twenty\n" });
+    var dim = std.array_list.Managed(u8).init(alloc);
+    defer dim.deinit();
+    try dim.appendSlice("a,an,c\n");
+    for (0..40) |i| try dim.writer().print("{d},n{d},{d}\n", .{ i, i, i % 7 });
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = dim.items });
     try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "b,bn\n1,one\n5,five\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "c,cn\n2,two\n5,five\n" });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
 
     const queries = [_][]const u8{
         "SELECT f.id, x.an, y.bn FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF",
         "SELECT y.bn, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF GROUP BY y.bn ORDER BY y.bn",
+        "SELECT f.id, x.an, z.cn FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/c.csv' z ON z.c = x.c$OFF",
+        "SELECT z.cn, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/c.csv' z ON z.c = x.c$OFF GROUP BY z.cn ORDER BY z.cn",
     };
     for (queries) |tmpl| {
         var outs: [4][]u8 = undefined;
@@ -317,21 +324,27 @@ test "runtime filters: a chain of joins over CSV gives the same rows, in the sam
         for (outs[1..]) |o| try std.testing.expectEqualStrings(outs[0], o);
     }
 
-    const q = try std.mem.replaceOwned(u8, alloc, queries[1], "$B", base);
-    defer alloc.free(q);
-    const plain = try std.mem.replaceOwned(u8, alloc, q, "$OFF", "");
-    defer alloc.free(plain);
-    const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, plain });
-    defer alloc.free(script);
-    var rdiag: Diag = .{};
-    var cap = try StderrCapture.begin(tmp.dir);
-    const res = exec(alloc, script, .{ .threads = 1, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
-    const prof = try cap.end(alloc);
-    defer alloc.free(prof);
-    _ = try res;
-    errdefer std.debug.print("{s}\n", .{prof});
-    try std.testing.expect(std.mem.indexOf(u8, prof, "runtime filter (#") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prof, "for the join with ") != null);
+    for ([_]struct { q: usize, threads: usize, want: []const u8 }{
+        .{ .q = 1, .threads = 1, .want = "<probe> runtime filter (#" },
+        .{ .q = 3, .threads = 1, .want = "<build> runtime filter (#" },
+        .{ .q = 3, .threads = 4, .want = "<build> runtime filter (#" },
+    }) |c| {
+        const q = try std.mem.replaceOwned(u8, alloc, queries[c.q], "$B", base);
+        defer alloc.free(q);
+        const plain = try std.mem.replaceOwned(u8, alloc, q, "$OFF", "");
+        defer alloc.free(plain);
+        const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, plain });
+        defer alloc.free(script);
+        var rdiag: Diag = .{};
+        var cap = try StderrCapture.begin(tmp.dir);
+        const res = exec(alloc, script, .{ .threads = c.threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const prof = try cap.end(alloc);
+        defer alloc.free(prof);
+        _ = try res;
+        errdefer std.debug.print("{s}\n", .{prof});
+        try std.testing.expect(std.mem.indexOf(u8, prof, c.want) != null);
+        try std.testing.expect(std.mem.indexOf(u8, prof, "for the join with ") != null);
+    }
 }
 
 test "for-each over a JSON array param iterates and binds fields by name" {

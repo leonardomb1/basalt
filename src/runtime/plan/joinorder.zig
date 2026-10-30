@@ -188,6 +188,7 @@ pub fn flipped(arena: std.mem.Allocator, o: *const op.Join, schema: types.Schema
     f.out_schema = try schemaPtr(arena, .{ .fields = fields });
     f.push_build = o.push_probe;
     f.push_probe = o.push_build;
+    f.push_build_yields = false;
     f.note = note;
     const cols = try arena.alloc(op.Project.Col, nl + nr);
     for (cols, 0..) |*c, i| c.* = .{

@@ -1025,8 +1025,10 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
     }
     const right_takes = if (right_late) |rl| rl == .sql or take == null else false;
     if (right_takes) {
-        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex|
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ rstages[1..], prep.right }), prep.join.right_keys)) |ex| {
             o.push_build = try right_late.?.bind(ex);
+            o.push_build_yields = right_late.? == .parquet;
+        }
     } else if (take) |t| {
         if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex|
             o.push_probe = try t.late.bind(ex);

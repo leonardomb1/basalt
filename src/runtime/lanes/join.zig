@@ -38,13 +38,20 @@ const estimate = @import("../plan/estimate.zig");
 const joinorder = @import("../plan/joinorder.zig");
 const RunOptions = @import("../env.zig").RunOptions;
 const runtime_filters = @import("../plan/runtime_filters.zig");
+const connect_mod = @import("../connect.zig");
 
 const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema };
 
 /// Null when one join's build side sends the pipeline back to the serial plan; the
-/// reads of the joins indexed before it are closed too.
+/// reads of every join are closed too. The joins are planned in order, then indexed
+/// last first, so a later join's runtime filter narrows an earlier join's build side
+/// as it is read (`plan/runtime_filters.zig`): a stand-in of the lanes' chain, over
+/// the real build sides, is wired as the serial plan is, and each stand-in join
+/// takes its index once built.
 pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinChain {
-    var list = std.array_list.Managed(LaneJoin).init(env.arena);
+    const arena = env.arena;
+    var plans = std.array_list.Managed(PlannedJoin).init(arena);
+    var ats = std.array_list.Managed(u64).init(arena);
     var schema = left_schema;
     const src_base = env.sources.items.len;
     var i: usize = 0;
@@ -52,18 +59,78 @@ pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: ty
         std.debug.assert(join_span[i].node == .join);
         var k = i + 1;
         while (k < join_span.len and join_span[k].node != .join) k += 1;
-        const lp = (try resolveLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema)) orelse {
-            for (env.sources.items[src_base..]) |sc| sc.close();
-            env.sources.shrinkRetainingCapacity(src_base);
-            return null;
-        };
-        var lane = lp.lane;
-        lane.at = profile.keyOf(join_span[i].pos);
-        try list.append(lane);
-        schema = lp.out_schema;
+        const pj = (try planLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema)) orelse
+            return closeFrom(env, src_base);
+        try plans.append(pj);
+        try ats.append(profile.keyOf(join_span[i].pos));
+        schema = pj.after.out.*;
         i = k;
     }
-    return .{ .joins = list.items, .out_schema = schema };
+    const stand = try standIn(env, plans.items, left_schema);
+    const lanes = try arena.alloc(LaneJoin, plans.items.len);
+    var n = plans.items.len;
+    while (n > 0) {
+        n -= 1;
+        const lp = (try indexLaneJoin(env, &plans.items[n], stand[n].build.?)) orelse return closeFrom(env, src_base);
+        stand[n].index = lp.lane.index;
+        lanes[n] = lp.lane;
+        lanes[n].at = ats.items[n];
+    }
+    return .{ .joins = lanes, .out_schema = schema };
+}
+
+fn closeFrom(env: *Env, src_base: usize) ?LaneJoinChain {
+    for (env.sources.items[src_base..]) |sc| sc.close();
+    env.sources.shrinkRetainingCapacity(src_base);
+    return null;
+}
+
+/// The lanes' chain as one serial tree over an empty head of `head` and the real
+/// build sides (a build side the lanes read in parallel as its chain over an empty
+/// read of its split), wired with its runtime filters; its joins, in order, which
+/// hold no index yet.
+fn standIn(env: *Env, plans: []const PlannedJoin, head: types.Schema) ![]*op.Join {
+    const arena = env.arena;
+    const hb = try arena.create(connect_mod.OneBatch);
+    hb.* = .{ .b = null, .sch = head };
+    const hs = try arena.create(op.Scan);
+    hs.* = .{ .src = hb.source() };
+    var cur: op.Op = .{ .scan = hs };
+    const joins = try arena.alloc(*op.Join, plans.len);
+    for (plans, joins) |*p, *out| {
+        const j = try arena.create(op.Join);
+        j.* = .{
+            .probe = try chainOps(arena, null, p.jr.left.recs, cur),
+            .build = p.build,
+            .left_keys = p.jr.plan.lks,
+            .right_keys = p.jr.plan.rks,
+            .left_schema = p.jr.left.out,
+            .right_schema = p.jr.right.out,
+            .out_schema = p.out,
+            .kind = p.j.kind,
+            .null_aware = p.j.null_aware,
+            .state = arena,
+            .name = p.name(),
+            .filter_off = runtime_filters.disabled(p.hints),
+        };
+        cur = try chainOps(arena, null, p.after.recs, .{ .join = j });
+        out.* = j;
+    }
+    try runtime_filters.wire(arena, &cur);
+    return joins;
+}
+
+/// The runtime filter wired above the read at the bottom of a split build side's
+/// stand-in chain, whose slots each lane of the parallel read takes.
+fn splitSlots(build: op.Op) []const op.RuntimeFilter.Slot {
+    var cur = build;
+    while (true) switch (cur) {
+        .runtime_filter => |rf| return if (rf.child == .scan) rf.slots.items else &.{},
+        .filter => |f| cur = f.child,
+        .project => |p| cur = p.child,
+        .explode => |e| cur = e.child,
+        else => return &.{},
+    };
 }
 
 pub const LaneJoin = struct {
@@ -100,6 +167,26 @@ pub const LaneJoin = struct {
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
 
+/// A lane join planned, its build side not yet read: `build` is the chain the index
+/// drains (for a split build side, its stand-in over an empty read of the split).
+const PlannedJoin = struct {
+    j: ast.Join,
+    hints: []const ast.Hint,
+    rstages: []const ast.Stage,
+    split: ?Morsels,
+    split_recs: []const analyze.Resolved = &.{},
+    build: op.Op,
+    jr: analyze.JoinResolved,
+    out: *const types.Schema,
+    left_kinds: []const types.TypeKind,
+    after: analyze.Chain,
+    src_base: usize,
+
+    fn name(self: *const PlannedJoin) []const u8 {
+        return if (self.j.alias.len > 0) self.j.alias else self.j.binding;
+    }
+};
+
 /// The build side's Parquet split when it is a local Parquet read followed only by
 /// filters and projections, so the lanes read it as they read a probe side; else null
 /// and the build side reads serially.
@@ -120,6 +207,10 @@ const BuildPart = struct {
 const BuildCtx = struct {
     split: *Morsels,
     recs: []const analyze.Resolved,
+    /// The runtime filters each lane puts above its read (`splitSlots`), and what
+    /// `EXPLAIN ANALYZE` names them by.
+    slots: []const op.RuntimeFilter.Slot = &.{},
+    note: []const u8 = "",
     errctx: ?*op.ErrCtx,
     queue: WorkQueue,
     parts: []BuildPart,
@@ -159,7 +250,12 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
         var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
         var scan = op.Scan{ .src = cs.source() };
         scan.stats.at = ctx.read_at;
-        const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.recs, .{ .scan = &scan });
+        var rf = op.RuntimeFilter{ .child = .{ .scan = &scan }, .back = mem.work.allocator() };
+        rf.stats.at = ctx.read_at;
+        for (ctx.slots) |sl| try rf.slots.append(mem.work.allocator(), .{ .index = sl.index, .cols = sl.cols, .label = sl.label });
+        rf.note = ctx.note;
+        const read: op.Op = if (ctx.slots.len > 0) .{ .runtime_filter = &rf } else .{ .scan = &scan };
+        const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.recs, read);
         const part = &ctx.parts[i];
         const a = part.arena.allocator();
         while (true) {
@@ -181,13 +277,18 @@ fn buildLaneRun(ctx: *BuildCtx) !void {
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
-fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analyze.Resolved, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
+fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analyze.Resolved, slots: []const op.RuntimeFilter.Slot, right_schema: *const types.Schema, right_keys: []const usize, left_kinds: []const types.TypeKind, cap: usize, root: *?profile.Id) !*op.JoinIndex {
     const arena = env.arena;
     const nitems = split.count();
     const parts = try arena.alloc(BuildPart, nitems);
     for (parts) |*p| p.* = .{ .arena = .init(env.gpa) };
     defer for (parts) |*p| p.arena.deinit();
-    var ctx = BuildCtx{ .split = split, .recs = recs, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
+    var note = std.array_list.Managed(u8).init(arena);
+    for (slots, 0..) |sl, i| {
+        try note.appendSlice(if (i > 0) ", " else if (slots.len == 1) "for the join with " else "for the joins with ");
+        try note.appendSlice(sl.label);
+    }
+    var ctx = BuildCtx{ .split = split, .recs = recs, .slots = slots, .note = note.items, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
     _ = try parallel.spawnJoin(arena, env.pipe.threads, buildLane, &ctx);
     if (ctx.queue.failure()) |e| return e;
     root.* = ctx.root;
@@ -203,13 +304,20 @@ fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analy
 /// (a nested-loop join): its reads are closed and the caller falls back to the
 /// serial plan, which reads that side again.
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
+    var pj = (try planLaneJoin(env, j, join_hints, suffix, left_schema)) orelse return null;
+    return indexLaneJoin(env, &pj, pj.build);
+}
+
+/// The join resolved over its planned build side, nothing read yet; null, its reads
+/// closed, for a join whose keys all turned out to be filters.
+fn planLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?PlannedJoin {
     const arena = env.arena;
     const binding = (try stampedBinding(env, j.binding)) orelse
         return planErr(env.diag, try msgfmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const src_base = env.sources.items.len;
     const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
-    var split = try buildSplit(env, rstages);
-    const build: struct { op: op.Op = undefined, schema: types.Schema, pre: []const analyze.Resolved = &.{} } = if (split) |*sp| blk: {
+    const split = try buildSplit(env, rstages);
+    const build: struct { op: op.Op = undefined, schema: types.Schema, pre: []const analyze.Resolved = &.{} } = if (split) |sp| blk: {
         const pre = try chainAt(env, sp.schema().*, rstages[1..]);
         break :blk .{ .schema = pre.out.*, .pre = pre.recs };
     } else blk: {
@@ -227,30 +335,55 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
     const out = try schemaPtr(arena, jr.plan.schema);
     const left_kinds = try arena.alloc(types.TypeKind, jr.plan.lks.len);
     for (left_kinds, jr.plan.lks) |*x, k| x.* = jr.left.out.fields[k].ty.kind;
-    const after = try chainAt(env, out.*, suffix);
-
-    const cap = try laneJoinCap(env, j, join_hints);
-    var build_root: ?profile.Id = null;
-    var build_chain: ?op.Op = null;
-    const built = if (split) |*sp|
-        indexInParallel(env, sp, profile.keyOf(rstages[0].pos), try std.mem.concat(arena, analyze.Resolved, &.{ build.pre, jr.right.recs }), jr.right.out, jr.plan.rks, left_kinds, cap, &build_root)
-    else blk: {
-        build_chain = try chainOps(arena, env.errctx, jr.right.recs, build.op);
-        break :blk op.JoinIndex.createMeeting(arena, build_chain.?, jr.right.out, jr.plan.rks, left_kinds, cap, env.pipe.threads);
+    var pj = PlannedJoin{
+        .j = j,
+        .hints = join_hints,
+        .rstages = rstages,
+        .split = split,
+        .build = undefined,
+        .jr = jr,
+        .out = out,
+        .left_kinds = left_kinds,
+        .after = try chainAt(env, out.*, suffix),
+        .src_base = src_base,
     };
+    if (split) |sp| {
+        pj.split_recs = try std.mem.concat(arena, analyze.Resolved, &.{ build.pre, jr.right.recs });
+        const none = try arena.create(connect_mod.OneBatch);
+        none.* = .{ .b = null, .sch = sp.schema().* };
+        const scan = try arena.create(op.Scan);
+        scan.* = .{ .src = none.source() };
+        pj.build = try chainOps(arena, env.errctx, pj.split_recs, .{ .scan = scan });
+    } else pj.build = try chainOps(arena, env.errctx, jr.right.recs, build.op);
+    return pj;
+}
+
+/// The planned join's index, `build` drained (for a split build side, read on the
+/// lanes, each under the runtime filter wired into its stand-in), and its lane
+/// recipe; null as `resolveLaneJoin` says.
+fn indexLaneJoin(env: *Env, pj: *PlannedJoin, build: op.Op) anyerror!?LaneJoinPlan {
+    const arena = env.arena;
+    const j = pj.j;
+    const jr = pj.jr;
+    const cap = try laneJoinCap(env, j, pj.hints);
+    var build_root: ?profile.Id = null;
+    const built = if (pj.split) |*sp|
+        indexInParallel(env, sp, profile.keyOf(pj.rstages[0].pos), pj.split_recs, splitSlots(build), jr.right.out, jr.plan.rks, pj.left_kinds, cap, &build_root)
+    else
+        op.JoinIndex.createMeeting(arena, build, jr.right.out, jr.plan.rks, pj.left_kinds, cap, env.pipe.threads);
     const index = built catch |e| {
         if (e == error.JoinBuildTooLarge and j.null_aware) op.notInTooLarge(env.errctx, cap);
         if (e != error.JoinBuildTooLarge or !joinMaySpill(env, j)) {
             if (e == error.JoinBuildTooLarge) env.errctx.set("{s}", .{op.failLabel(e)});
             return e;
         }
-        for (env.sources.items[src_base..]) |sc| sc.close();
-        env.sources.shrinkRetainingCapacity(src_base);
-        env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, join_hints) });
+        for (env.sources.items[pj.src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(pj.src_base);
+        env.log.log(.info, "join build side `{s}` is past {d} bytes; the join runs serially, where it can spill to disk", .{ j.binding, try joinSpillAt(env, pj.hints) });
         return null;
     };
-    if (env.profile) |p| if (build_chain) |bc| {
-        build_root = try p.absorb(bc);
+    if (env.profile) |p| if (pj.split == null) {
+        build_root = try p.absorb(build);
     };
     const shared_matched: ?[]std.atomic.Value(u64) = if (j.kind == .right or j.kind == .full) blk: {
         const words = try arena.alloc(std.atomic.Value(u64), (index.rows() + 63) / 64);
@@ -269,16 +402,16 @@ pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suf
             .pair_schema = if (jr.residual) |r| try schemaPtr(arena, r.schema) else null,
             .left_schema = jr.left.out,
             .right_schema = jr.right.out,
-            .out_schema = out,
+            .out_schema = pj.out,
             .kind = j.kind,
             .null_aware = j.null_aware,
-            .suffix = after.recs,
+            .suffix = pj.after.recs,
             .shared_matched = shared_matched,
             .build_root = build_root,
-            .name = if (j.alias.len > 0) j.alias else j.binding,
-            .filter_off = runtime_filters.disabled(join_hints),
+            .name = pj.name(),
+            .filter_off = runtime_filters.disabled(pj.hints),
         },
-        .out_schema = after.out.*,
+        .out_schema = pj.after.out.*,
     };
 }
 

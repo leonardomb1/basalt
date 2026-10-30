@@ -2,19 +2,30 @@
 //! tree. A hash join that drops the probe rows matching nothing (run as inner,
 //! semi or right, never `NOT IN`) is an owner. Each owner's probe key columns are
 //! followed down its probe side: through filters, through projections where they
-//! pass through, and through earlier hash joins' probe sides where they are left
-//! columns. Where every key reaches one scan with at least one join in between,
-//! that scan gets a runtime filter (one per scan) holding a slot for the owner. The
-//! first join over a scan gets none: its own probe is that check, exact.
+//! pass through, and through each earlier hash join, into its probe side when they
+//! are all its left columns, or into its build side when they are all its right
+//! columns and it outputs them (inner, left, right or full). Where every key reaches
+//! one scan with at least one join in between, that scan gets a runtime filter (one
+//! per scan) holding a slot for the owner. The first join over a scan gets none: its
+//! own probe is that check, exact. Through a build side the filter narrows what the
+//! earlier join indexes: `orders` read already without the orders of customers a
+//! later customer join rejects.
 //!
 //! Sound because a row dropped at the scan reaches the owner, in every row made from
-//! it, with the same key values: only probe-side columns are followed, through
-//! operators that keep a row's columns. An earlier outer join may then emit a build
-//! row unmatched, with this side null, and the owner drops that too, a null key
-//! matching nothing. Nothing that counts, orders or numbers rows (limit, top-N,
-//! window, distinct, aggregate, sort) lies on the path, nor an explode or a union,
-//! so the owner's output, and its order, is what it was. `WITH (runtime_filter =
-//! false)` on a join keeps it from owning a filter.
+//! it, with the same key values: only the side holding the keys is followed, through
+//! operators that keep a row's columns. A row the earlier join then leaves
+//! unmatched, and an outer join emits with this side null, reaches the owner with a
+//! null key, which matches nothing. Nothing that counts, orders or numbers rows
+//! (limit, top-N, window, distinct, aggregate, sort) lies on the path, nor an
+//! explode or a union, so the owner's output, and its order, is what it was. `WITH
+//! (runtime_filter = false)` on a join keeps it from owning a filter.
+//!
+//! A filter through a build side helps only if the owner indexes its own side
+//! before that build side is read, which pulling top-down gives, unless the owner
+//! first reads its probe ahead for key pushdown (`op.Join.push_build`). For a
+//! Parquet right side, which only skips row groups by it, the filter wins and the
+//! read-ahead is dropped; a SQL right side keeps its read-ahead, saving a remote
+//! read, and the filter is not placed.
 
 const ast = @import("../../lang/ast.zig");
 const op = @import("../../exec/op.zig");
@@ -62,6 +73,15 @@ fn owns(j: *const op.Join) bool {
     };
 }
 
+/// Whether a join outputs its build side's columns, after its probe side's.
+fn keepsRight(j: *const op.Join) bool {
+    if (j.build == null) return false;
+    return switch (j.kind) {
+        .inner, .left, .right, .full => true,
+        else => false,
+    };
+}
+
 /// The owner's probe keys followed to a scan; a slot there when they all reach it
 /// past another join.
 fn own(arena: std.mem.Allocator, j: *op.Join) !void {
@@ -69,6 +89,7 @@ fn own(arena: std.mem.Allocator, j: *op.Join) !void {
     const cols = try arena.dupe(usize, j.left_keys);
     var cur: *op.Op = &j.probe;
     var joins: usize = 0;
+    var built = false;
     while (true) switch (cur.*) {
         .filter => |f| cur = &f.child,
         .project => |p| {
@@ -79,20 +100,28 @@ fn own(arena: std.mem.Allocator, j: *op.Join) !void {
             cur = &p.child;
         },
         .join => |pj| {
-            for (cols) |c| if (c >= pj.left_schema.fields.len) return;
+            const nl = pj.left_schema.fields.len;
+            var left: usize = 0;
+            for (cols) |c| left += @intFromBool(c < nl);
             joins += 1;
-            cur = &pj.probe;
+            if (left == cols.len) {
+                cur = &pj.probe;
+            } else if (left == 0 and keepsRight(pj)) {
+                for (cols) |*c| c.* -= nl;
+                built = true;
+                cur = &pj.build.?;
+            } else return;
         },
         .runtime_filter => |rf| {
             if (rf.child != .scan) {
                 cur = &rf.child;
                 continue;
             }
-            if (joins == 0) return;
+            if (joins == 0 or !readsFirst(j, built)) return;
             return addSlot(arena, rf, j, cols);
         },
         .scan => |s| {
-            if (joins == 0) return;
+            if (joins == 0 or !readsFirst(j, built)) return;
             const rf = try arena.create(op.RuntimeFilter);
             rf.* = .{ .child = cur.*, .back = arena };
             rf.stats.at = s.stats.at;
@@ -101,6 +130,16 @@ fn own(arena: std.mem.Allocator, j: *op.Join) !void {
         },
         else => return,
     };
+}
+
+/// Whether the owner's index is built before a filter through a build side reads:
+/// a Parquet read-ahead for key pushdown is dropped for it, a SQL one is kept and
+/// the filter not placed.
+fn readsFirst(j: *op.Join, built: bool) bool {
+    if (!built or j.push_build == null) return true;
+    if (!j.push_build_yields) return false;
+    j.push_build = null;
+    return true;
 }
 
 /// The owner's slot in `rf`, once: a tree is wired again when a pipeline wired on
@@ -136,11 +175,17 @@ const Chain = struct {
     head: []const util.Batch,
     b1: []const util.Batch,
     b2: []const util.Batch,
+    kind1: ast.JoinKind = .inner,
     kind2: ast.JoinKind = .inner,
-    key: usize = 0,
+    keys: []const usize = &.{0},
     off: bool = false,
+    /// The owner reads its probe ahead for key pushdown: true for a Parquet right
+    /// side, which yields to a filter, false for a SQL one.
+    push: ?bool = null,
 
-    fn run(self: Chain, a: std.mem.Allocator, wired: bool) !struct { rows: util.JoinRows, rf: ?*op.RuntimeFilter } {
+    const Ran = struct { rows: util.JoinRows, rf: ?*op.RuntimeFilter, rf_build: ?*op.RuntimeFilter };
+
+    fn run(self: Chain, a: std.mem.Allocator, wired: bool) !Ran {
         var hs = util.TestSource{ .schema_ = util.join_left_schema, .batches = self.head };
         var s1 = util.TestSource{ .schema_ = util.join_right_schema, .batches = self.b1 };
         var s2 = util.TestSource{ .schema_ = util.join_right_schema, .batches = self.b2 };
@@ -151,19 +196,28 @@ const Chain = struct {
         const scan2 = try a.create(op.Scan);
         scan2.* = .{ .src = s2.src() };
         const j1 = try a.create(op.Join);
-        j1.* = .{ .probe = .{ .scan = hscan }, .build = .{ .scan = scan1 }, .left_keys = &.{0}, .right_keys = &.{0}, .left_schema = &util.join_left_schema, .right_schema = &util.join_right_schema, .out_schema = &util.join_both_schema, .kind = .inner, .state = a, .name = "b1" };
-        const keys = try a.dupe(usize, &.{self.key});
+        j1.* = .{ .probe = .{ .scan = hscan }, .build = .{ .scan = scan1 }, .left_keys = &.{0}, .right_keys = &.{0}, .left_schema = &util.join_left_schema, .right_schema = &util.join_right_schema, .out_schema = &util.join_both_schema, .kind = self.kind1, .state = a, .name = "b1" };
+        const keys = try a.dupe(usize, self.keys);
+        const rkeys = try a.alloc(usize, keys.len);
+        @memset(rkeys, 0);
         const j2 = try a.create(op.Join);
-        j2.* = .{ .probe = .{ .join = j1 }, .build = .{ .scan = scan2 }, .left_keys = keys, .right_keys = &.{0}, .left_schema = &util.join_both_schema, .right_schema = &util.join_right_schema, .out_schema = &chain_schema, .kind = self.kind2, .state = a, .name = "b2", .filter_off = self.off };
+        j2.* = .{ .probe = .{ .join = j1 }, .build = .{ .scan = scan2 }, .left_keys = keys, .right_keys = rkeys, .left_schema = &util.join_both_schema, .right_schema = &util.join_right_schema, .out_schema = &chain_schema, .kind = self.kind2, .state = a, .name = "b2", .filter_off = self.off };
+        if (self.push) |yields| {
+            j2.push_build = .{ .ctx = j2, .apply = ignoreKeys };
+            j2.push_build_yields = yields;
+        }
         var root: op.Op = .{ .join = j2 };
         if (wired) {
             try wire(a, &root);
             try wire(a, &root);
         }
         const rf: ?*op.RuntimeFilter = if (j1.probe == .runtime_filter) j1.probe.runtime_filter else null;
-        return .{ .rows = try util.JoinRows.collect(a, root, 5), .rf = rf };
+        const rf_build: ?*op.RuntimeFilter = if (j1.build.? == .runtime_filter) j1.build.?.runtime_filter else null;
+        return .{ .rows = try util.JoinRows.collect(a, root, 5), .rf = rf, .rf_build = rf_build };
     }
 };
+
+fn ignoreKeys(_: *anyopaque, _: []const op.KeyValues) anyerror!void {}
 
 fn headRows(a: std.mem.Allocator, n: usize) ![]const util.Batch {
     const ks = try a.alloc(?i64, n + 1);
@@ -215,7 +269,25 @@ test "runtime filters: the later join's filter sits on the head scan, drops what
     try testing.expect(plain.rf == null);
 }
 
-test "runtime filters: none for a key from an earlier join's build side, an owner that keeps unmatched rows, or one turned off" {
+test "runtime filters: a key from an earlier join's right side filters that join's build side, for every kind that outputs it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const all = try a.alloc(?i64, 120);
+    for (all, 0..) |*k, i| k.* = @intCast(i);
+    for ([_]ast.JoinKind{ .inner, .left, .right, .full }) |kind1| {
+        const c = Chain{ .head = try headRows(a, 100), .b1 = try buildRows(a, all), .b2 = try buildRows(a, &.{ 3, 7, 110, null }), .kind1 = kind1, .keys = &.{2} };
+        const plain = try c.run(a, false);
+        const wired = try c.run(a, true);
+        try expectSame(plain.rows, wired.rows);
+        try testing.expect(wired.rf == null);
+        const t = wired.rf_build.?.tally();
+        try testing.expectEqual(@as(u64, 120), t.checked);
+        try testing.expect(t.dropped >= 110);
+    }
+}
+
+test "runtime filters: none for keys split over both sides of an earlier join, an owner that keeps unmatched rows, or one turned off" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -225,7 +297,7 @@ test "runtime filters: none for a key from an earlier join's build side, an owne
     for ([_]Chain{
         blk: {
             var c = base;
-            c.key = 2;
+            c.keys = &.{ 0, 2 };
             break :blk c;
         },
         blk: {
@@ -242,6 +314,7 @@ test "runtime filters: none for a key from an earlier join's build side, an owne
         const plain = try c.run(a, false);
         const wired = try c.run(a, true);
         try testing.expect(wired.rf == null);
+        try testing.expect(wired.rf_build == null);
         try expectSame(plain.rows, wired.rows);
     }
 }
@@ -257,4 +330,22 @@ test "runtime filters: a filter that drops almost nothing turns itself off, rows
     const wired = try c.run(a, true);
     try testing.expectEqual(@as(usize, n), wired.rows.keys.items.len);
     try testing.expectEqual(@as(u64, 1), wired.rf.?.tally().off);
+}
+
+test "runtime filters: through a build side only when the owner indexes first: a Parquet read-ahead yields, a SQL one stays" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const all = try a.alloc(?i64, 40);
+    for (all, 0..) |*k, i| k.* = @intCast(i);
+    const base = Chain{ .head = try headRows(a, 40), .b1 = try buildRows(a, all), .b2 = try buildRows(a, &.{ 3, 7 }), .keys = &.{2} };
+    var pq = base;
+    pq.push = true;
+    const yielded = try pq.run(a, true);
+    try testing.expect(yielded.rf_build != null);
+    var sq = base;
+    sq.push = false;
+    const kept = try sq.run(a, true);
+    try testing.expect(kept.rf_build == null);
+    try expectSame(yielded.rows, kept.rows);
 }

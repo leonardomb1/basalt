@@ -264,15 +264,32 @@ null, or certainly not there, is dropped. The summary never misses a key that is
 there, and the join still checks every row it gets, so the answer and its row
 order are the same with the filter or without, at any `-j`.
 
-A join's filter reaches the read when each of its keys is a column of the read,
-followed through filters, through selects that pass it on unchanged, and through
-the left side of the joins before it; and when at least one join lies between,
-since the first join's own lookup is the same check, exact. Only a join that drops
-rows matching nothing has one: an inner, semi or right join, never `NOT IN`. A
-computed key, or a key from an earlier join's right side (`o.o_custkey` for a
-customer join after orders), has none, and nothing that counts, orders or numbers
-rows (`LIMIT`, a window, `DISTINCT`, an aggregate) may lie between. A join whose
-side spilled to disk has none either.
+A join's filter reaches the read its keys come from: followed through filters,
+through selects that pass them on unchanged, and through each join before it,
+into its left side when the keys are left columns, or into its right side when
+they are right columns of an inner, left, right or full join. There the filter
+narrows what that join holds in memory:
+
+```sql
+SELECT count(*) AS n
+FROM 'lineitem.csv' l
+JOIN 'orders.csv' o ON o.o_orderkey = l.l_orderkey
+JOIN 'customer.csv' c ON c.c_custkey = o.o_custkey
+WHERE c.c_mktsegment = 'BUILDING';
+-- orders is read without the orders of customers outside BUILDING, so the orders
+-- join indexes a fifth of them and most lineitem rows find no match at once
+```
+
+A filter needs at least one join between it and its owner, since the first join's
+own lookup is the same check, exact. Only a join that drops rows matching nothing
+has one: an inner, semi or right join, never `NOT IN`. Keys split over both sides
+of an earlier join, or computed, have none, and nothing that counts, orders or
+numbers rows (`LIMIT`, a window, `DISTINCT`, an aggregate) may lie between. A join
+whose side spilled to disk has none either. A filter on an earlier join's right
+side needs its owner's side in memory first, so the joins are indexed last first;
+an owner whose right side is a SQL table that takes the left side's keys reads its
+left side ahead for them instead, and gets no such filter. A Parquet right side
+gives its read-ahead up to the filter.
 
 A filter that drops fewer than one row in eight of its first 65,536 turns itself
 off: checking costs a hash per row. `EXPLAIN ANALYZE` shows each filter above its
