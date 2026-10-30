@@ -280,8 +280,9 @@ pub const PqMorsels = struct {
     tally: ?*driver.ScanTally = null,
     max_lanes: usize = std.math.maxInt(usize),
     check_in_lane: bool = false,
-    /// A single remote file's reader as planning opened it: lanes reuse its footer
-    /// and size, each on its own connection.
+    /// A single file's reader as planning opened it: lanes reuse its footer and size,
+    /// each on its own handle (a lineitem footer parsed again per lane was a quarter
+    /// of a scan's page faults).
     like: ?*const pqdecode.Reader = null,
     /// A table's files, each opened fitted to `view`, the table's projected columns.
     layout: ?*const pqdecode.Layout = null,

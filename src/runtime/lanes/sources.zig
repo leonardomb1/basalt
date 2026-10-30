@@ -125,6 +125,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
             for (0..r.md.row_groups.len) |g| try items.append(.{ .file = @intCast(k), .rg = @intCast(g), .rg_end = @intCast(g + 1) });
         }
         if (items.items.len < 2) return null;
+        if (root == null) like = probe;
     }
     if (root != null) env.forgetFolder(path);
     if (env.scan) |t| {
