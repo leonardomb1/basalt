@@ -221,8 +221,10 @@ the keys; `WITH (key_pushdown = false)` on the join turns it off.
 
 The SQL side also asks only for the columns the join and what follows it use:
 above, the table is read as `SELECT code, name FROM …`, since the key reads
-`code` and the output `name`. A query that keeps every column (`SELECT *`, or a
-join with nothing after it) reads them all.
+`code` and the output `name`. A Parquet, Arrow or CSV file joined in is read the
+same way, decoding only those columns and the ones its own filters name, serial
+or on lanes. A query that keeps every column (`SELECT *`, or a join with nothing
+after it) reads them all.
 
 A Parquet file or folder, local or remote (`https://`, `s3://`, `az://`, SFTP,
 SMB), takes keys on the same terms, when no SQL side does: on the right of the

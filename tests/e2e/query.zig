@@ -1476,13 +1476,15 @@ test "spill: a LIMIT over a spilled sort, join, GROUP BY or DISTINCT gives its d
         defer alloc.free(early);
         const full = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/out.csv' AS " ++ c.full ++ ";\n", .{base});
         defer alloc.free(full);
+        const early_alone = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/out.csv' AS " ++ c.early ++ ";\n", .{base});
+        defer alloc.free(early_alone);
         var cap: u64 = 1024;
-        while (true) : (cap *= 2) {
-            if (runScriptOpts(alloc, &tmp, full, .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir, .spill_cap = cap, .log = .{ .quiet = true } })) |out| {
+        for ([_][]const u8{ early_alone, full }) |one| while (true) : (cap *= 2) {
+            if (runScriptOpts(alloc, &tmp, one, .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir, .spill_cap = cap, .log = .{ .quiet = true } })) |out| {
                 alloc.free(out);
                 break;
             } else |e| try std.testing.expectEqual(error.SpillCapExceeded, e);
-        }
+        };
         const script = try std.mem.concat(alloc, u8, &.{ early, early, early, full });
         defer alloc.free(script);
         const out = try runScriptOpts(alloc, &tmp, script, .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir, .spill_cap = cap, .log = .{ .quiet = true } });

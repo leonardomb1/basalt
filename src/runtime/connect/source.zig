@@ -84,8 +84,10 @@ pub fn openSource(env: *Env, rd: ast.Read, hints: []const ast.Hint) !driver.Sour
     return openSourceProjected(env, rd, hints, null, &.{});
 }
 
-/// Only the parquet and Arrow readers act on `project`. Parquet readers are counted
-/// so a top-N bound is pushed only into a pipeline with exactly one of them.
+/// Only the Parquet, Arrow and CSV readers act on `project`. A file read's `cols`
+/// (a joined side narrowed to what follows it) stands in for a `project` not given.
+/// Parquet readers are counted so a top-N bound is pushed only into a pipeline with
+/// exactly one of them.
 pub fn openSourceProjected(
     env: *Env,
     rd_in: ast.Read,
@@ -93,7 +95,8 @@ pub fn openSourceProjected(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
-    var src = try openSourceOf(env, rd_in, hints, project, bounds);
+    const own: ?[][]const u8 = if (project == null and rd_in.form == .path and rd_in.cols.len > 0) @constCast(rd_in.cols) else null;
+    var src = try openSourceOf(env, rd_in, hints, project orelse own, bounds);
     src.stop = env.stop;
     return src;
 }

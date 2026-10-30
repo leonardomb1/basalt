@@ -16,6 +16,7 @@ const laneJoinCap = @import("../plan.zig").laneJoinCap;
 const op = @import("../../exec/op.zig");
 const planErr = @import("../env.zig").planErr;
 const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
+const rightStagesFor = @import("../plan.zig").rightStagesFor;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
@@ -48,7 +49,9 @@ const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema
 /// as it is read (`plan/runtime_filters.zig`): a stand-in of the lanes' chain, over
 /// the real build sides, is wired as the serial plan is, and each stand-in join
 /// takes its index once built.
-pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinChain {
+/// `after` is what follows the span (the aggregate and its tail): each join's build
+/// side then reads only the columns it and what follows take.
+pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema, after: []const ast.Stage) anyerror!?LaneJoinChain {
     const arena = env.arena;
     var plans = std.array_list.Managed(PlannedJoin).init(arena);
     var ats = std.array_list.Managed(u64).init(arena);
@@ -59,7 +62,8 @@ pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: ty
         std.debug.assert(join_span[i].node == .join);
         var k = i + 1;
         while (k < join_span.len and join_span[k].node != .join) k += 1;
-        const pj = (try planLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema)) orelse
+        const rest = try std.mem.concat(arena, ast.Stage, &.{ join_span[i + 1 ..], after });
+        const pj = (try planLaneJoin(env, join_span[i].node.join, join_span[i].hints, join_span[i + 1 .. k], schema, rest)) orelse
             return closeFrom(env, src_base);
         try plans.append(pj);
         try ats.append(profile.keyOf(join_span[i].pos));
@@ -304,18 +308,21 @@ fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analy
 /// (a nested-loop join): its reads are closed and the caller falls back to the
 /// serial plan, which reads that side again.
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
-    var pj = (try planLaneJoin(env, j, join_hints, suffix, left_schema)) orelse return null;
+    var pj = (try planLaneJoin(env, j, join_hints, suffix, left_schema, null)) orelse return null;
     return indexLaneJoin(env, &pj, pj.build);
 }
 
 /// The join resolved over its planned build side, nothing read yet; null, its reads
-/// closed, for a join whose keys all turned out to be filters.
-fn planLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?PlannedJoin {
+/// closed, for a join whose keys all turned out to be filters. `after`, when known,
+/// is every stage after the join: the build side is narrowed to what they take.
+fn planLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema, after: ?[]const ast.Stage) anyerror!?PlannedJoin {
     const arena = env.arena;
-    const binding = (try stampedBinding(env, j.binding)) orelse
-        return planErr(env.diag, try msgfmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
     const src_base = env.sources.items.len;
-    const rstages = try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+    const rstages = if (after) |rest| try rightStagesFor(env, j, rest) else blk: {
+        const binding = (try stampedBinding(env, j.binding)) orelse
+            return planErr(env.diag, try msgfmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
+        break :blk try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+    };
     const split = try buildSplit(env, rstages);
     const build: struct { op: op.Op = undefined, schema: types.Schema, pre: []const analyze.Resolved = &.{} } = if (split) |sp| blk: {
         const pre = try chainAt(env, sp.schema().*, rstages[1..]);

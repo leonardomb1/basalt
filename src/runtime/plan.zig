@@ -962,12 +962,7 @@ pub const JoinSide = struct { rstages: []const ast.Stage, build: PipeRes, right_
 /// the left side's keys. `after` is what follows the join in its pipeline, when
 /// known: a SQL table read then asks only for the columns those stages may take.
 pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const ast.Stage) anyerror!JoinSide {
-    if (env.bindings.get(j.binding) == null)
-        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
-    const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
-    const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
-    var rstages = try prepareSide(env, try j.rightStages(env.arena, (try stampedBinding(env, j.binding)).?.stages), tail);
-    if (needs) |n| rstages = try projectJoinedSqlRead(env, rstages, n);
+    const rstages = try rightStagesFor(env, j, after);
     var right_late: ?keypush.Taker = null;
     const a_want: ?keypush.Want = if (keypush.disabled(hints) or !keypush.rightMayNarrow(j))
         null
@@ -978,6 +973,41 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const
     else
         try buildPipeline(env, rstages);
     return .{ .rstages = rstages, .build = build, .right_late = right_late };
+}
+
+/// A join's right side prepared to be planned: when `after` (what follows the join)
+/// is known, narrowed to the columns the join and those stages may take, so a read
+/// decodes or fetches no other column.
+pub fn rightStagesFor(env: *Env, j: ast.Join, after: ?[]const ast.Stage) ![]const ast.Stage {
+    const b = (try stampedBinding(env, j.binding)) orelse
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
+    const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
+    const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
+    var rstages = try prepareSide(env, try j.rightStages(env.arena, b.stages), tail);
+    if (needs) |n| {
+        rstages = try projectJoinedSqlRead(env, rstages, n);
+        rstages = try projectJoinedFileRead(env, rstages, n);
+    }
+    return rstages;
+}
+
+/// A joined side's file read, with nothing but filters after it, asked for only the
+/// columns those filters and `needs` name. `needs` holds the other side's names too,
+/// which the Parquet, Arrow and CSV readers pass over as names they lack, so no
+/// probe of the file is needed; the other formats read every column regardless.
+fn projectJoinedFileRead(env: *Env, stages: []const ast.Stage, needs: []const []const u8) ![]const ast.Stage {
+    if (stages.len == 0 or stages[0].node != .read) return stages;
+    const rd = stages[0].node.read;
+    if (rd.form != .path or rd.cols.len > 0 or !std.mem.eql(u8, rd.connector, "csv")) return stages;
+    for (stages[1..]) |st| if (st.node != .filter) return stages;
+    const cols = (try projectedColumns(env, try std.mem.concat(env.arena, ast.Stage, &.{ stages[1..], try needsTail(env.arena, needs) }))) orelse return stages;
+    if (cols.len == 0) return stages;
+    for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
+    const out = try env.arena.dupe(ast.Stage, stages);
+    var nrd = rd;
+    nrd.cols = cols;
+    out[0].node = .{ .read = nrd };
+    return out;
 }
 
 /// A hash join (`o`), or for a join with no key the nested-loop plan (`nl`).

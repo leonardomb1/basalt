@@ -606,7 +606,7 @@ pub fn runParallelAgg(env: *Env, m_in: *const Morsels, head: ?ast.Stage, shape: 
         agg_in = pre.out.*;
     }
     if (rest.len > 0) {
-        const chain = (try resolveLaneJoins(env, rest, agg_in)) orelse return false;
+        const chain = (try resolveLaneJoins(env, rest, agg_in, try std.mem.concat(env.arena, ast.Stage, &.{ &.{shape.agg}, shape.tail }))) orelse return false;
         joins = try std.mem.concat(env.arena, LaneJoin, &.{ joins, chain.joins });
         agg_in = chain.out_schema;
     }
