@@ -476,7 +476,12 @@ const test_schema = types.Schema{ .fields = &.{
 fn randomRow(rnd: std.Random, id: i64, out: []Value) void {
     const strs = [_][]const u8{ "", "a", "ab", "abcdefghij", "abcdefghik", "abcdefgh", "b" };
     const floats = [_]f64{ std.math.nan(f64), -0.0, 0.0, 1.5, -2, std.math.inf(f64) };
-    const decs = [_]Value{ .{ .decimal = .{ .unscaled = 10, .scale = 1 } }, .{ .decimal = .{ .unscaled = 100, .scale = 2 } }, .{ .decimal = .{ .unscaled = 5, .scale = 1 } }, .{ .decimal = .{ .unscaled = -3, .scale = 0 } } };
+    const decs = [_]Value{
+        .{ .decimal = .{ .unscaled = 10, .scale = 1 } },  .{ .decimal = .{ .unscaled = 100, .scale = 2 } },  .{ .decimal = .{ .unscaled = 5, .scale = 1 } },
+        .{ .decimal = .{ .unscaled = -3, .scale = 0 } },  .{ .decimal = .{ .unscaled = -50, .scale = 2 } },  .{ .decimal = .{ .unscaled = -150, .scale = 2 } },
+        .{ .decimal = .{ .unscaled = 199, .scale = 2 } }, .{ .decimal = .{ .unscaled = 201, .scale = 2 } },  .{ .decimal = .{ .unscaled = 225, .scale = 2 } },
+        .{ .decimal = .{ .unscaled = 275, .scale = 2 } }, .{ .decimal = .{ .unscaled = -199, .scale = 2 } }, .{ .decimal = .{ .unscaled = 123456, .scale = 2 } },
+    };
     const parts = [_][]const u8{ "x", "y", "zz" };
     out[0] = .{ .int = id };
     out[1] = if (rnd.uintLessThan(u8, 8) == 0) .null else .{ .int = rnd.intRangeLessThan(i64, 0, 4) };

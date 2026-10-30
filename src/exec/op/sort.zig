@@ -1105,7 +1105,8 @@ fn orderedWord(k: KeyArr, i: usize) u64 {
 /// Row `i`'s key as one number whose unsigned order is the key's on its leading word:
 /// the null flag `sortRows` writes above the first word `encWord` writes, a null's
 /// word 0. The whole key for an integer, date, bool or float (`leadExact`); a
-/// string's 8-byte prefix and any other kind's 0, so equal leads still compare.
+/// string's 8-byte prefix, a decimal's integer part (`decWord`) and any other kind's
+/// 0, so equal leads still compare.
 pub inline fn leadKey(k: KeyArr, i: usize) u128 {
     const valid = k.valid.get(i);
     const flag: u128 = @intFromBool(valid == k.nulls_first);
@@ -1113,9 +1114,28 @@ pub inline fn leadKey(k: KeyArr, i: usize) u128 {
     const w: u64 = switch (k.data) {
         .ints, .floats => orderedWord(k, i),
         .strs => encWord(k, .{ .words = 1, .exact = false, .nulls = false }, 0, i),
-        .decs, .boxed => 0,
+        .decs => |v| decWord(k, v[i]),
+        .boxed => 0,
     };
     return flag << 64 | w;
+}
+
+/// A decimal's integer part, `floor(unscaled / 10^scale)` clamped to an i64, as an
+/// ordered word: floor and clamp keep order, so whatever two rows' scales, a lower
+/// word is a lower decimal, and rows with one integer part compare in full. Leading
+/// with 0 sent every comparison of a decimal key through the full compare.
+fn decWord(k: KeyArr, u: i128) u64 {
+    const narrow = std.math.cast(i64, u);
+    const whole: i128 = if (k.scale == 0)
+        u
+    else if (narrow != null and k.scale <= 18)
+        @divFloor(narrow.?, @as(i64, @intCast(decimal.pow10_i128[k.scale])))
+    else if (k.scale < decimal.pow10_i128.len)
+        @divFloor(u, decimal.pow10_i128[k.scale])
+    else if (u < 0) -1 else 0;
+    const c: i64 = @intCast(std.math.clamp(whole, std.math.minInt(i64), std.math.maxInt(i64)));
+    const w = @as(u64, @bitCast(c)) ^ (1 << 63);
+    return if (k.desc) ~w else w;
 }
 
 /// Whether `leadKey` of a column of `kind` is its whole key.
