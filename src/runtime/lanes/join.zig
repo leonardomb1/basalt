@@ -309,7 +309,7 @@ fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analy
 /// (a nested-loop join): its reads are closed and the caller falls back to the
 /// serial plan, which reads that side again.
 pub fn resolveLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, left_schema: types.Schema) anyerror!?LaneJoinPlan {
-    var pj = (try planLaneJoin(env, j, join_hints, suffix, left_schema, null)) orelse return null;
+    var pj = (try planLaneJoin(env, j, join_hints, suffix, left_schema, suffix)) orelse return null;
     return indexLaneJoin(env, &pj, pj.build);
 }
 

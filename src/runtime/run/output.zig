@@ -67,6 +67,12 @@ const Morsels = @import("../lanes/morsels.zig").Morsels;
 const parquetSplit = @import("../lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("../lanes/sources.zig").csvSplitFile;
 const connect = @import("../connect.zig");
+const SinkShape = @import("../lanes.zig").SinkShape;
+const runParallelAgg = @import("../lanes/agg.zig").runParallelAgg;
+const rightStagesFor = @import("../plan.zig").rightStagesFor;
+const joinorder = @import("../plan/joinorder.zig");
+const estimate = @import("../plan/estimate.zig");
+const offlineSchema = @import("../analyze/targets.zig").offlineSchema;
 const msgfmt = @import("../../format/msgfmt.zig");
 const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
@@ -338,6 +344,166 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
     return outer;
 }
 
+const flip_left = "__flip_left";
+const min_flip_rows: u64 = 1 << 16;
+
+/// A lane aggregate's last join run the other way round, decided on the sizes the
+/// run meets: the joins before it can leave few rows (q03's customers and orders,
+/// 147K) while its right side is a large file (3.2M filtered lineitem rows, indexed
+/// to be probed 147K times). Only the last join, its right side a local CSV or
+/// Parquet file: a join after it would lose its runtime filter on that file (q18's
+/// IN). What comes before it, the head and the joins ahead, narrowed to the columns
+/// the rest reads, is run on lanes into memory first, while it stays under that
+/// side's estimated rows over `joinorder.flip_ratio`. Then the first join of what is
+/// left, this one, turns around (`lanes/join.zig` `flipFirstJoin`): those rows
+/// indexed, the file read on the lanes. Past the cap the rows are dropped and the run
+/// goes as planned, having spent at most that many; so does one where the turn is
+/// declined.
+fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
+    if (env.materialized.contains(flip_left)) return false;
+    var last: ?usize = null;
+    for (shape.joins, 0..) |st, i| if (st.node == .join) {
+        last = i;
+    };
+    const ji = last orelse return false;
+    const st = shape.joins[ji];
+    if (ji == 0 or !joinorder.flippable(st)) return false;
+    const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[ji + 1 ..], &.{shape.agg}, shape.tail });
+    const rst = try rightStagesFor(env, st.node.join, after);
+    if (rst.len == 0 or rst[0].node != .read or rst[0].hints.len > 0) return false;
+    const rd = rst[0].node.read;
+    if (!connect.isLocalCsvRead(rd) and !connect.isParquetFileRead(rd)) return false;
+    for (rst[1..]) |x| if (!analyze.isMap(x.node, false)) return false;
+    const rows = estimate.ofSide(env, rst).rows orelse return false;
+    const cap = rows / joinorder.flip_ratio;
+    if (cap < min_flip_rows) return false;
+    const side = if (st.node.join.alias.len > 0) st.node.join.alias else st.node.join.binding;
+
+    const pre_len = 1 + shape.prefix.len + ji;
+    const keep = (try flipKeeps(env, stages[0..pre_len], stages[pre_len .. stages.len - 1])) orelse return false;
+    const inner = try env.arena.alloc(ast.Stage, pre_len + 2);
+    @memcpy(inner[0..pre_len], stages[0..pre_len]);
+    const pos = st.pos;
+    inner[pre_len] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
+    const mw = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
+    inner[pre_len + 1] = .{ .node = .{ .write = mw }, .hints = &.{}, .pos = pos };
+    var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena), .cap_rows = cap, .keep_rels = true };
+    {
+        const outer_sink = env.mem_sink;
+        const outer_name = env.sink_name;
+        env.mem_sink = &ms;
+        defer env.mem_sink = outer_sink;
+        defer env.sink_name = outer_name;
+        var scratch: Stats = .{};
+        var delegated = false;
+        const outer_scope = enterScope(env, flip_left);
+        defer leaveScope(env, outer_scope);
+        runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena, &delegated) catch |e| {
+            if (e != error.PastMemCap) return e;
+            env.log.log(.debug, "the joins before `{s}` leave over {d} rows; it is held in memory as written", .{ side, cap });
+            return false;
+        };
+    }
+    try env.materialized.put(env.arena, flip_left, .{ .schema = ms.schema, .batches = ms.batches.items });
+    defer _ = env.materialized.remove(flip_left);
+    const head = ast.Stage{ .node = .{ .ref = flip_left }, .hints = &.{}, .pos = pos };
+    const rest = SinkShape{ .prefix = &.{}, .joins = shape.joins[ji..], .agg = shape.agg, .tail = shape.tail };
+    if (!try runParallelAgg(env, null, head, rest, w, opts, stats, lanes_used)) return false;
+    if (env.profile) |p| {
+        const what = try msgfmt.allocPrint(env.arena, "the joins before `{s}` ({d} rows)", .{ side, ms.rows });
+        p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first, then {s}, that join turned around", .{ what, p.path });
+        try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
+    }
+    return true;
+}
+
+/// The columns `rest` reads from what `pre` leaves, as select items written the way
+/// `rest` names them, so `o.o_orderdate` keeps its side. A name qualified by a join in
+/// `rest` is that join's; a bare one is kept when a read of `pre` has it and dropped
+/// when only a read of `rest` does. Null when `rest` reads every column or a bare
+/// name's side cannot be told from the files.
+fn flipKeeps(env: *Env, pre: []const ast.Stage, rest: []const ast.Stage) !?[]const ast.SelectItem {
+    var quals = std.array_list.Managed(ast.QualName).init(env.arena);
+    var made = std.StringHashMap(void).init(env.arena);
+    var later = std.array_list.Managed([]const u8).init(env.arena);
+    var later_reads = std.array_list.Managed(?types.Schema).init(env.arena);
+    walk: for (rest, 0..) |st, i| switch (st.node) {
+        .filter => |e| try pushdown.collectQuals(env.arena, e, &quals),
+        .join => |j| {
+            try quals.appendSlice(j.left_keys);
+            for (j.deferred) |d| {
+                try pushdown.collectQuals(env.arena, d.a, &quals);
+                try pushdown.collectQuals(env.arena, d.b, &quals);
+                try made.put(d.left_name, {});
+                try made.put(d.right_name, {});
+            }
+            if (j.residual) |e| try pushdown.collectQuals(env.arena, e, &quals);
+            try later.append(if (j.alias.len > 0) j.alias else j.binding);
+            try later_reads.append(try sideSchema(env, j, rest[i + 1 ..]));
+        },
+        .select => |items| {
+            for (items) |it| switch (it) {
+                .field => |q| try quals.append(q),
+                .computed => |c| try pushdown.collectQuals(env.arena, c.expr, &quals),
+                else => return null,
+            };
+            break :walk;
+        },
+        .aggregate => |ag| {
+            try quals.appendSlice(ag.by);
+            for (ag.aggs) |a| if (a.arg) |e| try pushdown.collectQuals(env.arena, e, &quals);
+            break :walk;
+        },
+        else => return null,
+    };
+    var own = std.array_list.Managed(?types.Schema).init(env.arena);
+    if (pre[0].node == .read) try own.append(offlineSchema(env.arena, pre[0].node.read, pre[0].hints, env.tables));
+    for (pre[1..], 1..) |st, i| if (st.node == .join) try own.append(try sideSchema(env, st.node.join, pre[i + 1 ..]));
+
+    var seen = std.StringHashMap(void).init(env.arena);
+    var out = std.array_list.Managed(ast.SelectItem).init(env.arena);
+    next: for (quals.items) |q| {
+        if (q.parts.len > 1) {
+            for (later.items) |a| if (std.ascii.eqlIgnoreCase(a, q.parts[0])) continue :next;
+        } else {
+            if (made.contains(q.parts[0])) continue;
+            switch (sideOf(own.items, q.parts[0])) {
+                .yes => {},
+                .unknown => return null,
+                .no => switch (sideOf(later_reads.items, q.parts[0])) {
+                    .yes => continue,
+                    else => return null,
+                },
+            }
+        }
+        const key = try std.mem.join(env.arena, ".", q.parts);
+        if ((try seen.getOrPut(key)).found_existing) continue;
+        try out.append(.{ .field = q });
+    }
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice();
+}
+
+/// A joined side's columns when it is a file read with only filters after it.
+fn sideSchema(env: *Env, j: ast.Join, after: []const ast.Stage) !?types.Schema {
+    const rst = try rightStagesFor(env, j, after);
+    if (rst.len == 0 or rst[0].node != .read) return null;
+    for (rst[1..]) |x| if (x.node != .filter) return null;
+    return offlineSchema(env.arena, rst[0].node.read, rst[0].hints, env.tables);
+}
+
+fn sideOf(schemas: []const ?types.Schema, name: []const u8) enum { yes, no, unknown } {
+    var all_known = true;
+    for (schemas) |sc| {
+        const s = sc orelse {
+            all_known = false;
+            continue;
+        };
+        if (s.indexOf(name) != null) return .yes;
+    }
+    return if (all_known) .no else .unknown;
+}
+
 fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
     var opts = opts_in;
     const arena = env.arena;
@@ -466,6 +632,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
     if (chosen == .lanes and !try keysPreferSerial(env, head_stages)) {
         const ln = chosen.lanes;
+        if (ln.shape == .sink) if (try flipLaterJoin(env, head_stages, ln.shape.sink, last.write, opts, stats, lanes_used, batch_arena)) return;
         if (ln.source == .parquet) {
             if (try runParquetLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
         } else if (try runCsvLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;

@@ -449,6 +449,13 @@ pub const MemSink = struct {
     arena: std.mem.Allocator,
     batches: std.array_list.Managed(Batch),
     schema: types.Schema = .{ .fields = &.{} },
+    /// The rows it takes before failing with `error.PastMemCap`, which abandons a
+    /// run held only as long as it stays small (`run/output.zig`'s `flipLaterJoin`).
+    cap_rows: ?u64 = null,
+    rows: u64 = 0,
+    /// Whether its columns keep the join sides they came from, so that the rest of a
+    /// pipeline split there still reads `o.o_orderkey` (`flipLaterJoin`).
+    keep_rels: bool = false,
 
     pub fn sink(self: *MemSink) driver.Sink {
         return .{ .ptr = self, .vtable = &vtable };
@@ -458,6 +465,8 @@ pub const MemSink = struct {
         .writeBatch = struct {
             fn f(p: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
                 const self: *MemSink = @ptrCast(@alignCast(p));
+                self.rows += b.len;
+                if (self.cap_rows) |cap| if (self.rows > cap) return error.PastMemCap;
                 try self.batches.append(try b.deepCopy(self.arena));
             }
         }.f,

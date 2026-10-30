@@ -145,7 +145,14 @@ right side. Where a pipeline's joins run in parallel lanes (see above), the firs
 join of a `GROUP BY` pipeline whose right side is a local Parquet or CSV read is
 turned around the same way: its left side is indexed once and the lanes read the
 right side, the unmatched left rows folded in last, so the result is the same at
-every `-j`. Any other lane pipeline probes with its head read in every lane and
+every `-j`. The last join of such a pipeline, past the first, is decided on what
+the run meets instead: the joins before it run on the lanes first, into memory and
+narrowed to the columns the rest reads, and if they leave fewer rows than a
+quarter of its right side's estimate they are indexed and the lanes read that
+side (TPC-H Q3: customers and orders indexed, lineitem streamed). Past that many
+rows the held rows are dropped and the pipeline runs as planned; a join after it,
+such as an `IN`, would lose its [runtime filter](#runtime-filters), so only the
+last join is taken. Any other lane pipeline probes with its head read in every lane and
 keeps the written order — a right side too big for the lanes sends the pipeline
 back to the serial plan, where the choice is made. Key pushdown follows the sides: a SQL right side streamed through an
 indexed left side takes the left side's keys once that side is indexed, with no

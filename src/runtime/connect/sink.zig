@@ -167,7 +167,13 @@ const StdoutSink = struct {
 
 pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, mem_connector)) {
-        env.mem_sink.?.schema = try dupeSchema(env.arena, schema);
+        const ms = env.mem_sink.?;
+        ms.schema = try dupeSchema(env.arena, schema);
+        if (ms.keep_rels) for (@constCast(ms.schema.fields), schema.fields) |*o, f| {
+            o.rel = f.rel;
+            o.base = f.base;
+            o.clash = f.clash;
+        };
         return env.mem_sink.?.sink();
     }
     if (env.union_sink) |s| return s;

@@ -347,6 +347,67 @@ test "runtime filters: chains of joins over CSV, star and snowflake, give the sa
     }
 }
 
+test "a last join turned around on lanes, the joins before it held in memory first, gives the serial rows, and past its cap runs as planned" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var c = std.array_list.Managed(u8).init(alloc);
+    defer c.deinit();
+    try c.appendSlice("ck,seg\n");
+    for (0..3000) |i| try c.writer().print("{d},{c}\n", .{ i, "ABCDE"[i % 5] });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = c.items });
+    var o = std.array_list.Managed(u8).init(alloc);
+    defer o.deinit();
+    try o.appendSlice("ok,ck,d,pri\n");
+    for (0..120000) |i| try o.writer().print("{d},{d},{d},{d}\n", .{ i, (i * 7) % 3000, i % 40, i % 3 });
+    try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = o.items });
+    var l = std.array_list.Managed(u8).init(alloc);
+    defer l.deinit();
+    try l.appendSlice("lk,price,ship\n");
+    for (0..400000) |i| try l.writer().print("{d},{d},{d}\n", .{ (i * 13) % 150000, i % 1000, i % 50 });
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = l.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const queries = [_][]const u8{
+        "SELECT l.lk, sum(l.price) AS rev, o.d, o.pri FROM '$B/c.csv' c JOIN '$B/o.csv' o ON o.ck = c.ck JOIN '$B/l.csv' l ON l.lk = o.ok WHERE c.seg = 'B' AND o.d < 20 AND l.ship > 10 GROUP BY l.lk, o.d, o.pri ORDER BY rev DESC, l.lk LIMIT 50",
+        "SELECT o.pri, count(*) AS n, count(l.lk) AS m, sum(l.price) AS rev FROM '$B/c.csv' c JOIN '$B/o.csv' o ON o.ck = c.ck LEFT JOIN '$B/l.csv' l ON l.lk = o.ok WHERE c.seg = 'C' GROUP BY o.pri ORDER BY o.pri",
+        "SELECT o.pri, count(*) AS n, sum(l.price) AS rev FROM '$B/c.csv' c JOIN '$B/o.csv' o ON o.ck = c.ck JOIN '$B/l.csv' l ON l.lk = o.ok GROUP BY o.pri ORDER BY o.pri",
+    };
+    for (queries) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var outs: [2][]u8 = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |x| alloc.free(x);
+        for ([_]usize{ 1, 4 }) |threads| {
+            var rdiag: Diag = .{};
+            _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+            outs[n] = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
+            n += 1;
+        }
+        try std.testing.expect(std.mem.count(u8, outs[0], "\n") > 2);
+        try std.testing.expectEqualStrings(outs[0], outs[1]);
+    }
+
+    for ([_]struct { q: usize, flips: bool }{ .{ .q = 0, .flips = true }, .{ .q = 1, .flips = true }, .{ .q = 2, .flips = false } }) |cs| {
+        const q = try std.mem.replaceOwned(u8, alloc, queries[cs.q], "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var rdiag: Diag = .{};
+        var cap = try StderrCapture.begin(tmp.dir);
+        const res = exec(alloc, script, .{ .threads = 4, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const prof = try cap.end(alloc);
+        defer alloc.free(prof);
+        _ = try res;
+        errdefer std.debug.print("{s}\n", .{prof});
+        try std.testing.expectEqual(cs.flips, std.mem.indexOf(u8, prof, "the joins before `l`") != null);
+    }
+}
+
 test "for-each over a JSON array param iterates and binds fields by name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

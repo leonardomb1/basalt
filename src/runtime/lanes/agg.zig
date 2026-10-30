@@ -594,8 +594,10 @@ fn narrowHead(env: *Env, h: ast.Stage, shape: SinkShape) !ast.Stage {
 
 /// The aggregate pipeline `shape` over `m`: the morsels through its map stages and
 /// joins into the aggregate sink. False sends it to the serial plan: a join's build
-/// side past its lane threshold, or partials past --op-memory.
-pub fn runParallelAgg(env: *Env, m_in: *const Morsels, head: ?ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+/// side past its lane threshold, or partials past --op-memory. Without `m_in` the
+/// head is held in memory (`run/output.zig`'s `flipLaterJoin`) and the first join
+/// must turn around, the lanes reading its right side; false when it does not.
+pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const src_base = env.sources.items.len;
     var flip: ?Flip = null;
     var rest = shape.joins;
@@ -607,7 +609,7 @@ pub fn runParallelAgg(env: *Env, m_in: *const Morsels, head: ?ast.Stage, shape: 
         if (flip != null) rest = shape.joins[k..];
     };
     defer if (flip) |f| if (f.mapped) |mc| mc.close();
-    const m: *const Morsels = if (flip) |*f| &f.m else m_in;
+    const m: *const Morsels = if (flip) |*f| &f.m else m_in orelse return false;
     var pre_recs: []const analyze.Resolved = undefined;
     var agg_in: types.Schema = undefined;
     var joins: []const LaneJoin = &.{};
