@@ -160,9 +160,33 @@ fn scanCounts(env: *Env) [4]u64 {
 fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
     if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
-    if (env.materialized.contains(name)) return null;
-    const b = (try stampedBinding(env, name)) orelse return null;
-    if (!path.materializes(b.stages, opts.lanes())) return null;
+    if (!try materializeNamed(env, opts, name, lanes_used, batch_arena)) return null;
+    try notePrelude(env, name, stages[0].pos);
+    return name;
+}
+
+/// The bindings the pipeline's joins read that aggregate a file or table, each run
+/// first, in parallel, into memory, as `materializeBinding` runs a head one: as a
+/// join's build side it was built serially, an `IN (SELECT ... GROUP BY ...)`'s
+/// aggregate over a whole table on one thread. The join then reads it from memory
+/// (`plan.joinBindingStages`). Returns their names, for the caller to drop.
+fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror![]const []const u8 {
+    if (opts.lanes() < 2) return &.{};
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    for (stages) |st| {
+        if (st.node != .join) continue;
+        const name = st.node.join.binding;
+        if (try materializeNamed(env, opts, name, lanes_used, batch_arena)) try names.append(name);
+    }
+    return names.toOwnedSlice();
+}
+
+/// Binding `name` run on lanes into memory when it aggregates a file or table and is
+/// not there yet; whether it was.
+fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
+    if (env.materialized.contains(name)) return false;
+    const b = (try stampedBinding(env, name)) orelse return false;
+    if (!path.materializes(b.stages, opts.lanes())) return false;
 
     const inner = try env.arena.alloc(ast.Stage, b.stages.len + 1);
     @memcpy(inner[0..b.stages.len], b.stages);
@@ -181,9 +205,8 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
         defer leaveScope(env, outer_scope);
         try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
     }
-    try notePrelude(env, name, stages[0].pos);
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
-    return name;
+    return true;
 }
 
 /// Under `EXPLAIN ANALYZE`, a run inside the pipeline's (an input read into memory
@@ -337,6 +360,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {
+        _ = env.materialized.remove(name);
+    };
+    const sides = try materializeJoinSides(env, opts, stages, lanes_used, batch_arena);
+    defer for (sides) |name| {
         _ = env.materialized.remove(name);
     };
     stages = try inlineHeadBindings(env, stages);

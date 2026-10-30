@@ -9,6 +9,7 @@ const agg_combine_parallel_min = basalt.lanes.agg_combine_parallel_min;
 const runToString = @import("harness.zig").runToString;
 const exec = @import("harness.zig").exec;
 const runCsvThreaded = @import("harness.zig").runCsvThreaded;
+const runScriptOpts = @import("harness.zig").runScriptOpts;
 
 test "parallel map keeps file order: a threaded load writes the rows a serial one does" {
     const alloc = std.testing.allocator;
@@ -988,5 +989,43 @@ test "parallel parquet: string columns sliced from row groups past their first r
         try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.{s}' AS SELECT id, s FROM '$B/t.parquet';", .{ext}), 4, &.{});
         try harness.checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/got.csv' AS SELECT id, s FROM '$B/out.{s}' ORDER BY id;", .{ext}), 1, &.{});
         try std.testing.expectEqualStrings(want, try tmp.dir.readFileAlloc(a, "got.csv", 1 << 24));
+    }
+}
+
+test "parallel join sides: an IN or NOT IN over a grouped subquery, run on lanes into memory first, gives the serial rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var o = std.array_list.Managed(u8).init(alloc);
+    defer o.deinit();
+    var l = std.array_list.Managed(u8).init(alloc);
+    defer l.deinit();
+    try o.appendSlice("ok,cust,price\n");
+    try l.appendSlice("lk,qty\n");
+    for (0..4000) |i| {
+        try o.writer().print("{d},{d},{d}\n", .{ i, i % 97, (i * 31) % 1000 });
+        for (0..(i % 7) + 1) |n| try l.writer().print("{d},{d}\n", .{ i, (i + n * 13) % 50 });
+    }
+    try l.appendSlice(",5\n");
+    try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = o.items });
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = l.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const queries = [_][]const u8{
+        "SELECT o.cust, count(*) AS n, sum(l.qty) AS q FROM '$B/o.csv' o JOIN '$B/l.csv' l ON l.lk = o.ok WHERE o.ok IN (SELECT lk FROM '$B/l.csv' GROUP BY lk HAVING sum(qty) > 150) GROUP BY o.cust ORDER BY o.cust",
+        "SELECT count(*) AS n, sum(o.price) AS p FROM '$B/o.csv' o WHERE o.ok NOT IN (SELECT lk FROM '$B/l.csv' GROUP BY lk HAVING count(*) > 5)",
+        "SELECT count(*) AS n FROM '$B/o.csv' o JOIN (SELECT lk, sum(qty) AS s FROM '$B/l.csv' GROUP BY lk) t ON t.lk = o.ok JOIN (SELECT lk, sum(qty) AS s FROM '$B/l.csv' GROUP BY lk) u ON u.lk = o.ok WHERE t.s > 100",
+    };
+    for (queries) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        const serial = try runScriptOpts(alloc, &tmp, script, .{ .threads = 1 });
+        defer alloc.free(serial);
+        const lanes = try runScriptOpts(alloc, &tmp, script, .{ .threads = 4, .morsel_bytes = 8 << 10 });
+        defer alloc.free(lanes);
+        try std.testing.expect(std.mem.count(u8, serial, "\n") >= 2);
+        try std.testing.expectEqualStrings(serial, lanes);
     }
 }

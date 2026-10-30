@@ -17,6 +17,7 @@ const op = @import("../../exec/op.zig");
 const planErr = @import("../env.zig").planErr;
 const prepareJoinSide = @import("../plan.zig").prepareJoinSide;
 const rightStagesFor = @import("../plan.zig").rightStagesFor;
+const joinBindingStages = @import("../plan.zig").joinBindingStages;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
@@ -319,9 +320,9 @@ fn planLaneJoin(env: *Env, j: ast.Join, join_hints: []const ast.Hint, suffix: []
     const arena = env.arena;
     const src_base = env.sources.items.len;
     const rstages = if (after) |rest| try rightStagesFor(env, j, rest) else blk: {
-        const binding = (try stampedBinding(env, j.binding)) orelse
+        const bstages = (try joinBindingStages(env, j)) orelse
             return planErr(env.diag, try msgfmt.allocPrint(arena, "unknown binding `{s}` in join", .{j.binding}));
-        break :blk try prepareJoinSide(env, try j.rightStages(arena, binding.stages));
+        break :blk try prepareJoinSide(env, try j.rightStages(arena, bstages));
     };
     const split = try buildSplit(env, rstages);
     const build: struct { op: op.Op = undefined, schema: types.Schema, pre: []const analyze.Resolved = &.{} } = if (split) |sp| blk: {

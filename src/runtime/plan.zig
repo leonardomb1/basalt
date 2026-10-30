@@ -979,11 +979,11 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const
 /// is known, narrowed to the columns the join and those stages may take, so a read
 /// decodes or fetches no other column.
 pub fn rightStagesFor(env: *Env, j: ast.Join, after: ?[]const ast.Stage) ![]const ast.Stage {
-    const b = (try stampedBinding(env, j.binding)) orelse
+    const bstages = (try joinBindingStages(env, j)) orelse
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}` in join", .{j.binding}));
     const needs = if (after) |rest| try rightNeeds(env, j, rest) else null;
     const tail: []const ast.Stage = if (needs) |n| try needsTail(env.arena, n) else &.{};
-    var rstages = try prepareSide(env, try j.rightStages(env.arena, b.stages), tail);
+    var rstages = try prepareSide(env, try j.rightStages(env.arena, bstages), tail);
     if (needs) |n| {
         rstages = try projectJoinedSqlRead(env, rstages, n);
         rstages = try projectJoinedFileRead(env, rstages, n);
@@ -1008,6 +1008,17 @@ fn projectJoinedFileRead(env: *Env, stages: []const ast.Stage, needs: []const []
     nrd.cols = cols;
     out[0].node = .{ .read = nrd };
     return out;
+}
+
+/// The stages a join's right side starts from: a reference to its binding when the
+/// binding is held in memory (`run/output.zig` ran it on lanes first), else the
+/// binding's own; null for an unknown binding.
+pub fn joinBindingStages(env: *Env, j: ast.Join) !?[]const ast.Stage {
+    const b = (try stampedBinding(env, j.binding)) orelse return null;
+    if (!env.materialized.contains(j.binding)) return b.stages;
+    const one = try env.arena.alloc(ast.Stage, 1);
+    one[0] = .{ .node = .{ .ref = j.binding }, .hints = &.{}, .pos = b.pos };
+    return one;
 }
 
 /// A hash join (`o`), or for a join with no key the nested-loop plan (`nl`).

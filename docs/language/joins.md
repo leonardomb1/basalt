@@ -269,8 +269,11 @@ order are the same with the filter or without, at any `-j`.
 A join's filter reaches the read its keys come from: followed through filters,
 through selects that pass them on unchanged, and through each join before it,
 into its left side when the keys are left columns, or into its right side when
-they are right columns of an inner, left, right or full join. There the filter
-narrows what that join holds in memory:
+they are right columns of an inner, left, right or full join. A key that is also
+one of an earlier join's `=` keys crosses to that join's other side too, as the key
+it equals: `WHERE o.o_orderkey IN (SELECT ...)` narrows the lineitem a join on
+`l.l_orderkey = o.o_orderkey` holds. On the right side the filter narrows what that
+join holds in memory:
 
 ```sql
 SELECT count(*) AS n

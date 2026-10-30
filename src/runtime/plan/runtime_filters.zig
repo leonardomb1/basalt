@@ -4,7 +4,10 @@
 //! followed down its probe side: through filters, through projections where they
 //! pass through, and through each earlier hash join, into its probe side when they
 //! are all its left columns, or into its build side when they are all its right
-//! columns and it outputs them (inner, left, right or full). Where every key reaches
+//! columns and it outputs them (inner, left, right or full); and through any join
+//! whose equality keys they all are, across to its other side as the keys they
+//! equal there (`across`): `IN (subquery)`'s keys on `o.o_orderkey` narrow the
+//! lineitem a join on `l.l_orderkey = o.o_orderkey` indexes. Where every key reaches
 //! one scan with at least one join in between, that scan gets a runtime filter (one
 //! per scan) holding a slot for the owner. The first join over a scan gets none: its
 //! own probe is that check, exact. Through a build side the filter narrows what the
@@ -82,14 +85,19 @@ fn keepsRight(j: *const op.Join) bool {
     };
 }
 
-/// The owner's probe keys followed to a scan; a slot there when they all reach it
-/// past another join.
+/// The owner's probe keys followed to the scans they come from; a slot at each.
 fn own(arena: std.mem.Allocator, j: *op.Join) !void {
     if (!owns(j)) return;
-    const cols = try arena.dupe(usize, j.left_keys);
-    var cur: *op.Op = &j.probe;
-    var joins: usize = 0;
-    var built = false;
+    try follow(arena, j, &j.probe, try arena.dupe(usize, j.left_keys), 0, false);
+}
+
+/// The owner's keys, columns `cols` of what `at` yields, followed down: a slot
+/// where they reach a scan past another join. A join they are all equality keys of
+/// sends them across too, to its other side as that side's keys (`across`).
+fn follow(arena: std.mem.Allocator, j: *op.Join, at: *op.Op, cols: []usize, joins_in: usize, built_in: bool) !void {
+    var cur = at;
+    var joins = joins_in;
+    var built = built_in;
     while (true) switch (cur.*) {
         .filter => |f| cur = &f.child,
         .project => |p| {
@@ -105,6 +113,7 @@ fn own(arena: std.mem.Allocator, j: *op.Join) !void {
             for (cols) |c| left += @intFromBool(c < nl);
             joins += 1;
             if (left == cols.len) {
+                if (try across(arena, pj, cols)) |other| try follow(arena, j, &pj.build.?, other, joins, true);
                 cur = &pj.probe;
             } else if (left == 0 and keepsRight(pj)) {
                 for (cols) |*c| c.* -= nl;
@@ -130,6 +139,24 @@ fn own(arena: std.mem.Allocator, j: *op.Join) !void {
         },
         else => return,
     };
+}
+
+/// The owner's keys as columns of `pj`'s build side, when each is one of `pj`'s probe
+/// keys and the build key it equals is of its kind; else null. A row of either side
+/// whose key the owner's side lacks is then dropped: every row made from it carries
+/// that key into the owner, on both sides of the equality, and the owner drops it,
+/// whatever `pj`'s kind, a row an outer join then emits unmatched included. Never
+/// across `NOT IN`, whose answer a dropped null key on its build side changes.
+fn across(arena: std.mem.Allocator, pj: *op.Join, cols: []const usize) !?[]usize {
+    if (pj.build == null or pj.null_aware or pj.kind == .cross) return null;
+    const out = try arena.alloc(usize, cols.len);
+    for (cols, out) |c, *o| {
+        const at = std.mem.indexOfScalar(usize, pj.left_keys, c) orelse return null;
+        const rk = pj.right_keys[at];
+        if (pj.left_schema.fields[c].ty.kind != pj.right_schema.fields[rk].ty.kind) return null;
+        o.* = rk;
+    }
+    return out;
 }
 
 /// Whether the owner's index is built before a filter through a build side reads:
@@ -249,7 +276,7 @@ fn expectSame(x: util.JoinRows, y: util.JoinRows) !void {
     }
 }
 
-test "runtime filters: the later join's filter sits on the head scan, drops what it will drop, and changes nothing" {
+test "runtime filters: the later join's filter sits on the head scan and, across the first join's key, on its build scan; it drops what it will drop and changes nothing" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -267,6 +294,9 @@ test "runtime filters: the later join's filter sits on the head scan, drops what
     try testing.expectEqual(@as(u64, 201), t.checked);
     try testing.expect(t.dropped >= 190);
     try testing.expect(plain.rf == null);
+    const across_build = wired.rf_build.?.tally();
+    try testing.expectEqual(@as(u64, 200), across_build.checked);
+    try testing.expect(across_build.dropped >= 190);
 }
 
 test "runtime filters: a key from an earlier join's right side filters that join's build side, for every kind that outputs it" {
