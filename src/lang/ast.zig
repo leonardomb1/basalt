@@ -146,7 +146,9 @@ pub const Expr = union(enum) {
     };
     pub const Unary = struct { op: UnOp, e: *Expr };
     pub const Binary = struct { op: BinOp, l: *Expr, r: *Expr };
-    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null, now_us: ?i64 = null };
+    /// `acc`: a top-level `json_reduce`'s accumulator type, settled at plan time over
+    /// its input's schema (`analyze.coerceLits`); unset, the run types it per row.
+    pub const Call = struct { name: []const u8, args: []const *Expr, distinct: bool = false, span: ?Span = null, now_us: ?i64 = null, acc: ?types.Type = null };
     pub const Cond = struct { cond: *Expr, then: *Expr, els: *Expr };
     pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
     pub const Lambda = struct { params: []const []const u8, body: *Expr };
@@ -189,7 +191,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .call => |c| blk: {
             const args = try arena.alloc(*Expr, c.args.len);
             for (c.args, args) |a, *out| out.* = try recur(ctx, a);
-            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span, .now_us = c.now_us } });
+            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span, .now_us = c.now_us, .acc = c.acc } });
         },
         .match => |m| blk: {
             const subject = if (m.subject) |s| try recur(ctx, s) else null;

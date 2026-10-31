@@ -92,6 +92,7 @@ const registerSftp = @import("connect.zig").registerSftp;
 const registerFtp = @import("connect.zig").registerFtp;
 const registerSmb = @import("connect.zig").registerSmb;
 const openSink = @import("connect.zig").openSink;
+const SinkGuard = @import("../connect/guard.zig").SinkGuard;
 const env_mod = @import("env.zig");
 
 const buildPipeline = @import("plan.zig").buildPipeline;
@@ -480,12 +481,10 @@ pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
 
     const schema = types.Schema{ .fields = &describe_fields };
     const batch = try csv.parseSlice(arena, &schema, try describeRows(arena, res.schema));
-    const snk = try openSink(env, pipe.stages[pipe.stages.len - 1].node.write, schema);
-    snk.writeBatch(arena, batch) catch |e| {
-        snk.abort();
-        return e;
-    };
-    try snk.close();
+    var guard = SinkGuard.init(try openSink(env, pipe.stages[pipe.stages.len - 1].node.write, schema));
+    defer guard.abort();
+    try guard.get().?.writeBatch(arena, batch);
+    try guard.close();
     stats.rows_out += batch.len;
 }
 

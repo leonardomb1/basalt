@@ -393,13 +393,20 @@ pub fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory
     }
 }
 
-/// The accumulator type, typed afresh per row: a memo keyed by the call's address
-/// would hand a re-planned call at a reused address the old plan's type.
+/// The accumulator type the plan settled (`Call.acc`), else typed afresh per row: a
+/// memo keyed by the call's address would hand a re-planned call at a reused address
+/// the old plan's type.
 pub fn reduceTypeAt(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) EvalError!Type {
-    var tc = TypeCtx{ .schema = batch.schema.*, .arena = arena };
+    if (c.acc) |t| return t;
+    return (try reduceType(arena, c, batch.schema.*)) orelse error.TypeMismatch;
+}
+
+/// A `json_reduce` call's accumulator type over `schema`; null when it does not type.
+pub fn reduceType(arena: std.mem.Allocator, c: ast.Expr.Call, schema: types.Schema) error{OutOfMemory}!?Type {
+    var tc = TypeCtx{ .schema = schema, .arena = arena };
     return typing.reduceAcc(&tc, c) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.TypeError => return error.TypeMismatch,
+        error.TypeError => return null,
     };
 }
 

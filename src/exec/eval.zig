@@ -308,6 +308,8 @@ pub const TypeCtx = struct {
 /// literal by the operand it meets: an INT strictly, a FLOAT or DECIMAL as written
 /// (a decimal at its own scale, so `'1.005'` stays exact), a bool as CAST reads one
 /// (`t`, `yes`, `1`, any case). Null when it does not read so.
+pub const reduceType = @import("eval/row.zig").reduceType;
+
 pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMemory}!?ast.Expr {
     const s = std.mem.trim(u8, text, " \t\r\n");
     switch (ty.kind) {

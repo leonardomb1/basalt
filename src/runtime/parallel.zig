@@ -31,6 +31,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
 const connectorNote = @import("env.zig").connectorNote;
 const SinkGuard = @import("../connect/guard.zig").SinkGuard;
+const Guard = @import("../connect/guard.zig").Guard;
 
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
 
@@ -46,15 +47,25 @@ pub const SinkMode = union(enum) {
         finish: ?*const fn (*anyopaque) anyerror!void = null,
         abort: ?*const fn (*anyopaque) void = null,
     },
+
+    /// Closes the shared sink, or finishes the lanes' once each lane closed its own.
+    pub fn close(self: SinkMode) !void {
+        switch (self) {
+            .shared => |s| try s.close(),
+            .per_lane => |pl| if (pl.finish) |f| try f(pl.ctx),
+        }
+    }
+
+    pub fn abort(self: SinkMode) void {
+        switch (self) {
+            .shared => |s| s.abort(),
+            .per_lane => |pl| if (pl.abort) |f| f(pl.ctx),
+        }
+    }
 };
 
-pub fn finishLanes(mode: SinkMode) !void {
-    if (mode == .per_lane) if (mode.per_lane.finish) |f| try f(mode.per_lane.ctx);
-}
-
-pub fn abortLanes(mode: SinkMode) void {
-    if (mode == .per_lane) if (mode.per_lane.abort) |f| f(mode.per_lane.ctx);
-}
+/// A sink mode closed on success and aborted otherwise, as `SinkGuard` a sink.
+pub const ModeGuard = Guard(SinkMode);
 
 /// Formats outside the lock and holds `mtx` only for the append: locking the whole
 /// write made 6M rows of parquet to CSV slower at -j 16 (835ms) than at -j 1 (752ms).
@@ -84,8 +95,7 @@ pub const PipelinedSink = struct {
     busy: bool = false,
     stop: bool = false,
     err: ?anyerror = null,
-    note_buf: [480]u8 = undefined,
-    note_len: usize = 0,
+    note: ThreadNote = .{},
     thread: ?std.Thread = null,
 
     pub fn start(self: *PipelinedSink) !void {
@@ -96,20 +106,14 @@ pub const PipelinedSink = struct {
         self.mtx.lock();
         defer self.mtx.unlock();
         while ((self.slot != null or self.busy) and self.err == null) self.cv.wait(&self.mtx);
-        if (self.err) |e| return self.explained(e);
+        if (self.err) |e| return self.note.explained(e);
         self.slot = b;
         self.cv.broadcast();
     }
 
     pub fn finish(self: *PipelinedSink) !void {
         self.shutdown();
-        if (self.err) |e| return self.explained(e);
-    }
-
-    /// The sink's own account of its failure (`eval.explain`) is thread-local to the
-    /// writer thread, so it is carried over to the caller's.
-    fn explained(self: *PipelinedSink, e: anyerror) anyerror {
-        return if (self.note_len > 0) eval.explain(e, self.note_buf[0..self.note_len]) else e;
+        if (self.err) |e| return self.note.explained(e);
     }
 
     pub fn shutdown(self: *PipelinedSink) void {
@@ -140,10 +144,7 @@ pub const PipelinedSink = struct {
             self.cv.broadcast();
             r catch |e| {
                 self.err = e;
-                if (eval.takeFailure(e)) |why| {
-                    self.note_len = @min(why.len, self.note_buf.len);
-                    @memcpy(self.note_buf[0..self.note_len], why[0..self.note_len]);
-                }
+                self.note.capture(e);
                 break;
             };
         }
@@ -264,25 +265,39 @@ const LaneTally = struct {
     }
 };
 
+/// A failure's account (`eval.takeFailure`, else the connector's), thread-local to
+/// the thread that failed, copied so the thread reporting the error can give it.
+const ThreadNote = struct {
+    buf: [480]u8 = undefined,
+    len: usize = 0,
+
+    fn capture(self: *ThreadNote, e: anyerror) void {
+        if (eval.takeFailure(e)) |why| {
+            self.len = @min(why.len, self.buf.len);
+            @memcpy(self.buf[0..self.len], why[0..self.len]);
+        } else if (connectorNote(e, null)) |n| {
+            self.len = (std.fmt.bufPrint(&self.buf, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why }) catch self.buf[0..0]).len;
+        }
+    }
+
+    fn explained(self: *const ThreadNote, e: anyerror) anyerror {
+        return if (self.len > 0) eval.explain(e, self.buf[0..self.len]) else e;
+    }
+};
+
 pub const WorkQueue = struct {
     nitems: usize,
     next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     err_mtx: std.Thread.Mutex = .{},
     first_err: ?anyerror = null,
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    note_buf: [480]u8 = undefined,
-    note_len: usize = 0,
+    note: ThreadNote = .{},
 
     pub fn fail(q: *WorkQueue, e: anyerror) void {
         q.err_mtx.lock();
         if (q.first_err == null) {
             q.first_err = e;
-            if (eval.takeFailure(e)) |why| {
-                q.note_len = @min(why.len, q.note_buf.len);
-                @memcpy(q.note_buf[0..q.note_len], why[0..q.note_len]);
-            } else if (connectorNote(e, null)) |n| {
-                q.note_len = (std.fmt.bufPrint(&q.note_buf, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why }) catch q.note_buf[0..0]).len;
-            }
+            q.note.capture(e);
         }
         q.err_mtx.unlock();
         q.failed.store(true, .seq_cst);
@@ -290,7 +305,7 @@ pub const WorkQueue = struct {
 
     pub fn failure(q: *WorkQueue) ?anyerror {
         const e = q.first_err orelse return null;
-        return if (q.note_len > 0) eval.explain(e, q.note_buf[0..q.note_len]) else e;
+        return q.note.explained(e);
     }
 
     /// The next item for a lane, or null once every item is taken or a lane failed.

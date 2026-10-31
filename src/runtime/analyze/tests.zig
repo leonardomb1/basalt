@@ -729,3 +729,17 @@ test "a FLOAT PARAM takes what parseFloat took, less `_` and hex; an INT one is 
     for ([_][]const u8{ "1_000", "0x10", "0x1p3", "1e3", "" }) |s| try std.testing.expect(paramFromText(a, int, s) == null);
     try std.testing.expectEqual(@as(i64, 5), paramFromText(a, int, " 5").?.int);
 }
+
+test "analyze: a json_reduce's accumulator type is settled at plan time, but not one inside a lambda" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const in = types.Schema{ .fields = &.{.{ .name = "n", .ty = types.Type.init(.int) }} };
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const e = try parser.parseExprStr(a, "json_any('[[1]]', y -> json_reduce(y, 0, (s, x) -> s + x) > 0) OR json_reduce('[1.5]', CAST(0 AS DECIMAL(10,2)), (s, x) -> s + CAST(x AS DECIMAL(10,2))) > n", &pd);
+    const out = try @import("../analyze.zig").coerceLits(a, in, e);
+    const outer = out.binary.r.binary.l.call;
+    try std.testing.expectEqual(types.TypeKind.decimal, outer.acc.?.kind);
+    try std.testing.expectEqual(@as(u8, 38), outer.acc.?.precision);
+    try std.testing.expect(out.binary.l.call.args[1].lambda.body.binary.l.call.acc == null);
+}

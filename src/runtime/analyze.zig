@@ -244,17 +244,23 @@ pub fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, 
     };
 }
 
-const CoerceCtx = struct { arena: std.mem.Allocator, schema: types.Schema };
+const CoerceCtx = struct { arena: std.mem.Allocator, schema: types.Schema, in_lambda: bool = false };
 
 /// `e` with each quoted literal compared against a number or a bool made that
 /// type's literal (`eval.litAs`), as SQL types an untyped literal by the other
-/// operand: run after type checking, which refuses one that does not read so.
+/// operand: run after type checking, which refuses one that does not read so. A
+/// `json_reduce` outside any lambda has its accumulator type settled (`Call.acc`);
+/// inside one, its operands are bound per row and the run types it.
 pub fn coerceLits(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr) Error!*const ast.Expr {
     return coerceRecur(.{ .arena = arena, .schema = in }, e);
 }
 
 fn coerceRecur(cx: CoerceCtx, e: *const ast.Expr) Error!*ast.Expr {
-    const out = try ast.rebuildExpr(cx.arena, e, cx, coerceRecur);
+    var inner = cx;
+    if (e.* == .lambda) inner.in_lambda = true;
+    const out = try ast.rebuildExpr(cx.arena, e, inner, coerceRecur);
+    if (out.* == .call and !cx.in_lambda and std.ascii.eqlIgnoreCase(out.call.name, "json_reduce") and out.call.args.len == 3 and out.call.args[2].* == .lambda)
+        out.call.acc = try eval.reduceType(cx.arena, out.call, cx.schema);
     if (out.* != .binary) return out;
     switch (out.binary.op) {
         .eq, .ne, .lt, .le, .gt, .ge, .distinct, .not_distinct => {},

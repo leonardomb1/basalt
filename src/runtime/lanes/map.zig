@@ -337,9 +337,8 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
     const cut = if (sink_mode == .shared and sink_mode.shared.encodesUnits()) m_in.coarser() else m_in.*;
     const m = &cut;
-    var shared: SinkGuard = if (sink_mode == .shared) .init(sink_mode.shared) else .empty;
-    defer shared.abort();
-    errdefer parallel.abortLanes(sink_mode);
+    var guard = parallel.ModeGuard.init(sink_mode);
+    defer guard.abort();
 
     const nthreads = m.workers(opts.lanes());
     var g = MapSink{ .env = env, .sink_mode = sink_mode, .join = lane_join, .threads = nthreads };
@@ -364,8 +363,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     }
 
     stats.rows_out += g.rows_out.load(.monotonic);
-    try shared.close();
-    try parallel.finishLanes(sink_mode);
+    try guard.close();
 }
 
 /// Once every lane is done, a right/full join's unmatched build rows go through

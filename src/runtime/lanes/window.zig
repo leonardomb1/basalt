@@ -19,20 +19,18 @@ const KeyArr = @import("../../exec/op/sort.zig").KeyArr;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const Materialized = @import("../env.zig").Materialized;
 const Morsels = @import("morsels.zig").Morsels;
-const Profile = @import("../../exec/profile.zig").Profile;
-const Reader = @import("morsels.zig").Reader;
+const ParallelSink = @import("morsels.zig").ParallelSink;
+const Pipeline = @import("morsels.zig").Pipeline;
+const drive = @import("morsels.zig").drive;
 const RunOptions = @import("../env.zig").RunOptions;
-const Stream = @import("morsels.zig").Stream;
 const TopK = @import("../../exec/op/topk.zig").TopK;
 const WorkQueue = @import("../parallel.zig").WorkQueue;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
-const chainOps = @import("../plan.zig").chainOps;
 const column = @import("../../exec/column.zig");
 const keyhash = @import("../../exec/keyhash.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
-const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const parallel = @import("../parallel.zig");
 const resolveAt = @import("../plan.zig").resolveAt;
@@ -43,28 +41,107 @@ const types = @import("../../lang/types.zig");
 /// Rows one lane sent to one bucket, with their positions.
 const Part = struct { rows: Batch, seqs: []const u64 };
 
-const Bucket = struct {
-    parts: std.ArrayListUnmanaged(Part) = .empty,
-    out: ?Batch = null,
-};
-
-const Ctx = struct {
-    m: *const Morsels,
-    prefix: []const analyze.Resolved,
+/// The top-k window's Global: every worker's buckets, kept until the window's rows are
+/// out. A Local is the worker's `Lane`.
+const TopKSink = struct {
+    env: *Env,
     in_schema: *const types.Schema,
     out_schema: *const types.Schema,
     part: []const usize,
     ord: []const op.Sort.Key,
     k: usize,
-    errctx: ?*op.ErrCtx = null,
-    queue: WorkQueue,
-    /// `sent[lane * nb + b]` is what lane `lane` sent to bucket `b`; bucket `b`'s
-    /// window rows end in `sent[b].out`.
-    sent: []Bucket,
     nb: usize,
-    lane_arenas: []std.heap.ArenaAllocator,
-    rows_read: *obs.RowCounter,
-    prof: ?*Profile = null,
+    threads: usize,
+    mtx: std.Thread.Mutex = .{},
+    lanes: std.ArrayListUnmanaged(*Lane) = .empty,
+    /// Bucket `b`'s window rows, set by `finalize`.
+    outs: []?Batch = &.{},
+    out_arenas: []std.heap.ArenaAllocator = &.{},
+
+    /// What one worker sent to each bucket, copied into its own arena.
+    const Lane = struct { keep: std.heap.ArenaAllocator, sent: []std.ArrayListUnmanaged(Part), mem: *LaneMem };
+
+    fn parallelSink(self: *TopKSink) ParallelSink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn deinit(self: *TopKSink) void {
+        const gpa = self.env.gpa;
+        for (self.lanes.items) |l| {
+            l.keep.deinit();
+            gpa.destroy(l);
+        }
+        self.lanes.deinit(gpa);
+        for (self.out_arenas) |*oa| oa.deinit();
+    }
+
+    fn initLocal(ptr: *anyopaque, mem: *LaneMem) anyerror!*anyopaque {
+        const self: *TopKSink = @ptrCast(@alignCast(ptr));
+        const gpa = self.env.gpa;
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        try self.lanes.ensureUnusedCapacity(gpa, 1);
+        const l = try gpa.create(Lane);
+        l.* = .{ .keep = .init(std.heap.page_allocator), .sent = &.{}, .mem = mem };
+        self.lanes.appendAssumeCapacity(l);
+        l.sent = try l.keep.allocator().alloc(std.ArrayListUnmanaged(Part), self.nb);
+        for (l.sent) |*x| x.* = .empty;
+        return l;
+    }
+
+    /// Phase 1: the worker's morsels through the map stages, each batch's rows sent to
+    /// their buckets with their positions, `at` the morsel they come from.
+    fn sink(ptr: *anyopaque, local: *anyopaque, _: usize, chain: op.Op, at: *const usize) anyerror!void {
+        const self: *TopKSink = @ptrCast(@alignCast(ptr));
+        const l: *Lane = @ptrCast(@alignCast(local));
+        const keep = l.keep.allocator();
+        var last: usize = std.math.maxInt(usize);
+        var base: u64 = 0;
+        var seen: u64 = 0;
+        const idx = try l.mem.work.allocator().alloc(std.ArrayListUnmanaged(usize), self.nb);
+        while (true) {
+            _ = l.mem.batch.reset(.retain_capacity);
+            const a = l.mem.batch.allocator();
+            const b = (try chain.next(a)) orelse break;
+            if (b.len == 0) continue;
+            if (at.* != last) {
+                last = at.*;
+                base = @as(u64, last) << 40;
+                seen = 0;
+            }
+            for (idx) |*x| x.* = .empty;
+            for (0..b.len) |r| try idx[bucketOf(b, self.part, r, self.nb)].append(a, r);
+            for (idx, l.sent) |x, *bk| {
+                if (x.items.len == 0) continue;
+                const cols = try keep.alloc(column.Column, b.columns.len);
+                for (b.columns, cols) |c, *o| o.* = try column.permute(keep, c, x.items);
+                const seqs = try keep.alloc(u64, x.items.len);
+                for (seqs, x.items) |*q, r| q.* = base + seen + r;
+                try bk.append(keep, .{ .rows = .{ .schema = b.schema, .columns = cols, .len = x.items.len }, .seqs = seqs });
+            }
+            seen += b.len;
+        }
+        if (self.env.profile) |p| _ = try p.absorb(chain);
+    }
+
+    fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
+
+    /// Phase 2: every bucket, on a lane, through its own top-k core.
+    fn finalize(ptr: *anyopaque) anyerror!void {
+        const self: *TopKSink = @ptrCast(@alignCast(ptr));
+        const arena = self.env.arena;
+        const t0 = std.time.Instant.now() catch null;
+        self.outs = try arena.alloc(?Batch, self.nb);
+        @memset(self.outs, null);
+        self.out_arenas = try arena.alloc(std.heap.ArenaAllocator, self.threads);
+        for (self.out_arenas) |*oa| oa.* = .init(self.env.gpa);
+        var ctx = BucketCtx{ .g = self, .queue = .{ .nitems = self.nb } };
+        _ = try parallel.spawnJoin(arena, @min(self.threads, self.nb), bucketLane, &ctx);
+        if (ctx.queue.failure()) |e| return e;
+        if (self.env.profile) |p| if (t0) |st| try p.phase("top-k each bucket's partitions, in key order", (std.time.Instant.now() catch st).since(st));
+    }
+
+    const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize };
 };
 
 /// The bucket of row `r`: its partition key's hash, a null hashed as itself, so
@@ -80,87 +157,32 @@ fn bucketOf(b: Batch, part: []const usize, r: usize, nb: usize) usize {
     return @intCast(h.final() % nb);
 }
 
-fn scatterLane(ctx: *Ctx, lane_idx: usize) void {
-    scatterRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
-}
-
-/// Phase 1: a lane's morsels through the map stages, each batch's rows sent to their
-/// buckets, copied into the lane's own arena with their positions.
-fn scatterRun(ctx: *Ctx, me: usize) !void {
-    const keep = ctx.lane_arenas[me].allocator();
-    const sent = ctx.sent[me * ctx.nb ..][0..ctx.nb];
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
-    var rd = Reader.init(mem.gpa.allocator());
-    defer rd.deinit();
-    var st = Stream{ .m = ctx.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
-    defer st.source().close();
-    var cs = obs.CountingSource{ .inner = st.source(), .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
-
-    var last: usize = std.math.maxInt(usize);
-    var base: u64 = 0;
-    var seen: u64 = 0;
-    const idx = try mem.work.allocator().alloc(std.ArrayListUnmanaged(usize), ctx.nb);
-    for (idx) |*x| x.* = .empty;
-    while (true) {
-        _ = mem.batch.reset(.retain_capacity);
-        const a = mem.batch.allocator();
-        const b = (try child.next(a)) orelse break;
-        if (b.len == 0) continue;
-        if (st.cur_item != last) {
-            last = st.cur_item;
-            base = @as(u64, last) << 40;
-            seen = 0;
-        }
-        for (idx) |*x| x.* = .empty;
-        for (0..b.len) |r| try idx[bucketOf(b, ctx.part, r, ctx.nb)].append(a, r);
-        for (idx, sent) |x, *bk| {
-            if (x.items.len == 0) continue;
-            const cols = try keep.alloc(column.Column, b.columns.len);
-            for (b.columns, cols) |c, *o| o.* = try column.permute(keep, c, x.items);
-            const seqs = try keep.alloc(u64, x.items.len);
-            for (seqs, x.items) |*s, r| s.* = base + seen + r;
-            try bk.parts.append(keep, .{ .rows = .{ .schema = b.schema, .columns = cols, .len = x.items.len }, .seqs = seqs });
-        }
-        seen += b.len;
-    }
-    if (ctx.prof) |p| _ = try p.absorb(child);
-}
-
-/// Phase 2: bucket `bi`'s rows from every lane through one top-k core, its window
-/// rows into `out_arena`.
-fn bucketTask(ctx: *Ctx, bi: usize, out_arena: std.mem.Allocator) !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
-    var core = TopK.init(gpa, ctx.in_schema, ctx.ord, ctx.part, ctx.k);
-    defer core.deinit();
-    var scratch = std.heap.ArenaAllocator.init(gpa);
-    defer scratch.deinit();
-    const nlanes = ctx.sent.len / ctx.nb;
-    for (0..nlanes) |l| for (ctx.sent[l * ctx.nb + bi].parts.items) |p| {
-        try core.add(scratch.allocator(), p.rows, 0, p.seqs);
-        _ = scratch.reset(.retain_capacity);
-    };
-    ctx.sent[bi].out = try op.Window.topKRows(&core, out_arena, ctx.in_schema, ctx.out_schema);
-}
-
-const BucketCtx = struct {
-    w: *Ctx,
-    queue: WorkQueue,
-    arenas: []std.heap.ArenaAllocator,
-};
+const BucketCtx = struct { g: *TopKSink, queue: WorkQueue };
 
 fn bucketLane(bc: *BucketCtx, lane_idx: usize) void {
     while (bc.queue.take()) |bi| {
-        bucketTask(bc.w, bi, bc.arenas[lane_idx].allocator()) catch |e| {
+        bucketTask(bc.g, bi, bc.g.out_arenas[lane_idx].allocator()) catch |e| {
             bc.queue.fail(e);
             return;
         };
     }
+}
+
+/// Bucket `bi`'s rows from every worker through one top-k core, its window rows into
+/// `out_arena`.
+fn bucketTask(g: *TopKSink, bi: usize, out_arena: std.mem.Allocator) !void {
+    var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var core = TopK.init(gpa, g.in_schema, g.ord, g.part, g.k);
+    defer core.deinit();
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    for (g.lanes.items) |l| for (l.sent[bi].items) |p| {
+        try core.add(scratch.allocator(), p.rows, 0, p.seqs);
+        _ = scratch.reset(.retain_capacity);
+    };
+    g.outs[bi] = try op.Window.topKRows(&core, out_arena, g.in_schema, g.out_schema);
 }
 
 /// The window stage `ws` (its `top_k` set) over `m` through the map stages `prefix`,
@@ -171,58 +193,33 @@ pub fn runWindowTopK(env: *Env, m: *const Morsels, prefix: []const ast.Stage, ws
     const r = try resolveAt(env, pre.out.*, ws);
     const wp = r.plan.window;
     const wd = ws.node.window;
-    const part = try arena.dupe(usize, wp.part);
     const ord = try arena.alloc(op.Sort.Key, wp.ord.len);
     for (wd.order_by, wp.ord, ord) |sk, idx, *key| key.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
 
     const nlanes = m.workers(opts.lanes());
-    const nb = if (part.len == 0) 1 else nlanes * 4;
-    const lane_arenas = try arena.alloc(std.heap.ArenaAllocator, nlanes);
-    for (lane_arenas) |*la| la.* = .init(std.heap.page_allocator);
-    defer for (lane_arenas) |*la| la.deinit();
-    const sent = try arena.alloc(Bucket, nlanes * nb);
-    for (sent) |*s| s.* = .{};
-    var ctx = Ctx{
-        .m = m,
-        .prefix = pre.recs,
+    var g = TopKSink{
+        .env = env,
         .in_schema = r.in,
         .out_schema = r.out,
-        .part = part,
+        .part = try arena.dupe(usize, wp.part),
         .ord = ord,
         .k = @intCast(wd.top_k.?),
-        .errctx = env.errctx,
-        .queue = .{ .nitems = m.count() },
-        .sent = sent,
-        .nb = nb,
-        .lane_arenas = lane_arenas,
-        .rows_read = env.rows_read,
-        .prof = env.profile,
+        .nb = if (wp.part.len == 0) 1 else nlanes * 4,
+        .threads = nlanes,
     };
-    const used = try parallel.spawnJoin(arena, nlanes, scatterLane, &ctx);
-    lanes_used.* = @max(lanes_used.*, used);
-    if (ctx.queue.failure()) |e| return e;
-
-    const t0 = std.time.Instant.now() catch null;
-    const out_arenas = try arena.alloc(std.heap.ArenaAllocator, nlanes);
-    for (out_arenas) |*oa| oa.* = .init(env.gpa);
-    defer for (out_arenas) |*oa| oa.deinit();
-    var bc = BucketCtx{ .w = &ctx, .queue = .{ .nitems = nb }, .arenas = out_arenas };
-    _ = try parallel.spawnJoin(arena, @min(nlanes, nb), bucketLane, &bc);
-    if (bc.queue.failure()) |e| return e;
-
-    const out = try keyOrder(env.shared orelse env.arena, &ctx);
-    if (env.profile) |p| {
-        if (t0) |s| try p.phase("top-k each bucket's partitions, in key order", (std.time.Instant.now() catch s).since(s));
-        p.path = try msgfmt.allocPrint(arena, "{s} parallel top-k window, {d} {s}, {d} buckets", .{ m.label(), m.count(), m.unitName(), nb });
-    }
+    defer g.deinit();
+    const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = true };
+    lanes_used.* = @max(lanes_used.*, try drive(arena, p, g.parallelSink(), opts.lanes()));
+    const out = try keyOrder(env.shared orelse env.arena, &g);
+    if (env.profile) |pr| pr.path = try msgfmt.allocPrint(arena, "{s} parallel top-k window, {d} {s}, {d} buckets", .{ m.label(), m.count(), m.unitName(), g.nb });
     return .{ .schema = r.out.*, .batches = out };
 }
 
 /// Phase 3: the buckets' runs of rows, one per partition, in partition key order, as
 /// one batch in `a`.
-fn keyOrder(a: std.mem.Allocator, ctx: *Ctx) ![]const Batch {
+fn keyOrder(a: std.mem.Allocator, ctx: *const TopKSink) ![]const Batch {
     var outs = std.array_list.Managed(Batch).init(a);
-    for (ctx.sent[0..ctx.nb]) |bk| if (bk.out) |b| try outs.append(b);
+    for (ctx.outs) |o| if (o) |b| try outs.append(b);
     var total: usize = 0;
     for (outs.items) |b| total += b.len;
     if (total == 0) return &.{};

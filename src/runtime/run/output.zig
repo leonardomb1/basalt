@@ -730,17 +730,11 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     try p.noteSent("{s}, once per key range: {s}", .{ @tagName(pipe.sql_desc.?.kind), sp.base_sql });
                     break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
                 } else null;
-                if (try buildParallelSink(env, wr, schema)) |mode| {
-                    errdefer parallel.abortLanes(mode);
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read, profiled);
-                    try parallel.finishLanes(mode);
-                } else {
-                    const snk = try openSink(env, wr, schema);
-                    var guard = SinkGuard.init(snk);
-                    defer guard.abort();
-                    stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, .{ .shared = snk }, opts.lanes(), env.rows_read, profiled);
-                    try guard.close();
-                }
+                const mode = (try buildParallelSink(env, wr, schema)) orelse parallel.SinkMode{ .shared = try openSink(env, wr, schema) };
+                var guard = parallel.ModeGuard.init(mode);
+                defer guard.abort();
+                stats.rows_out += try parallel.run(gpa, sp.predicates, openSplitSource, &ctx, lane_stages, mode, opts.lanes(), env.rows_read, profiled);
+                try guard.close();
                 return;
             }
         }
