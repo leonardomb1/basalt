@@ -22,16 +22,13 @@ const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
-const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const Morsels = @import("morsels.zig").Morsels;
-const ReaderSource = @import("sources.zig").ReaderSource;
-const WorkQueue = @import("../parallel.zig").WorkQueue;
-const HeldFile = @import("morsels.zig").HeldFile;
-const openItem = @import("morsels.zig").openItem;
-const obs = @import("../obs.zig");
+const ParallelSink = @import("morsels.zig").ParallelSink;
+const Pipeline = @import("morsels.zig").Pipeline;
+const drive = @import("morsels.zig").drive;
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
 const csvSplitFile = @import("sources.zig").csvSplitFile;
@@ -209,76 +206,52 @@ const BuildPart = struct {
     batches: std.ArrayListUnmanaged(Batch) = .empty,
 };
 
-const BuildCtx = struct {
-    split: *Morsels,
-    recs: []const analyze.Resolved,
-    /// The runtime filters each lane puts above its read (`splitSlots`), and what
-    /// `EXPLAIN ANALYZE` names them by.
-    slots: []const op.RuntimeFilter.Slot = &.{},
-    note: []const u8 = "",
-    errctx: ?*op.ErrCtx,
-    queue: WorkQueue,
+/// A join's build side as a parallel sink: each morsel's kept rows filed under its
+/// index, so the index sees them in file order (the order a serial read gives),
+/// against one byte cap over every morsel.
+const BuildSink = struct {
     parts: []BuildPart,
     bytes: std.atomic.Value(usize) = .init(0),
     cap: usize,
-    rows_read: *obs.RowCounter,
     prof: ?*Profile = null,
-    read_at: u64 = 0,
     root: ?profile.Id = null,
     root_mtx: std.Thread.Mutex = .{},
-};
 
-/// A lane: items taken from the queue in turn, each row group read through the lane's
-/// one open reader (reopening a file per row group re-parses its footer), its kept
-/// rows filed under the item's index so the index sees them in file order.
-fn buildLane(ctx: *BuildCtx, lane_idx: usize) void {
-    const span = trace.begin("join build lane", lane_idx);
-    defer span.end();
-    buildLaneRun(ctx) catch |e| ctx.queue.fail(e);
-}
+    fn parallelSink(self: *BuildSink) ParallelSink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
 
-fn buildLaneRun(ctx: *BuildCtx) !void {
-    const m = &ctx.split.parquet;
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
-    var keep = std.heap.ArenaAllocator.init(mem.gpa.allocator());
-    defer keep.deinit();
-    var held: ?HeldFile = null;
-    defer if (held) |h| h.r.close();
-    var item = ReaderSource{ .r = undefined, .schema_ = m.src_schema, .own = false };
-    defer item.slicer.deinit();
-    while (ctx.queue.take()) |i| {
-        _ = mem.work.reset(.retain_capacity);
-        const r = (try openItem(m, keep.allocator(), &held, i)) orelse continue;
-        item.r = r;
-        var cs = obs.CountingSource{ .inner = .{ .ptr = &item, .vtable = &ReaderSource.vtable }, .count = ctx.rows_read };
-        var scan = op.Scan{ .src = cs.source() };
-        scan.stats.at = ctx.read_at;
-        var rf = op.RuntimeFilter{ .child = .{ .scan = &scan }, .back = mem.work.allocator() };
-        rf.stats.at = ctx.read_at;
-        for (ctx.slots) |sl| try rf.slots.append(mem.work.allocator(), .{ .index = sl.index, .cols = sl.cols, .label = sl.label });
-        rf.note = ctx.note;
-        const read: op.Op = if (ctx.slots.len > 0) .{ .runtime_filter = &rf } else .{ .scan = &scan };
-        const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.recs, read);
-        const part = &ctx.parts[i];
+    fn initLocal(_: *anyopaque, mem: *LaneMem) anyerror!*anyopaque {
+        return mem;
+    }
+
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, _: *const usize) anyerror!void {
+        const self: *BuildSink = @ptrCast(@alignCast(ptr));
+        const mem: *LaneMem = @ptrCast(@alignCast(local));
+        const part = &self.parts[i];
         const a = part.arena.allocator();
         while (true) {
             _ = mem.batch.reset(.retain_capacity);
-            const b = (try child.next(mem.batch.allocator())) orelse break;
+            const b = (try chain.next(mem.batch.allocator())) orelse break;
             if (b.len == 0) continue;
             const kept = try b.deepCopy(a);
             try part.batches.append(a, kept);
-            if (ctx.bytes.fetchAdd(kept.heapBytes(), .monotonic) + kept.heapBytes() > ctx.cap) return error.JoinBuildTooLarge;
+            if (self.bytes.fetchAdd(kept.heapBytes(), .monotonic) + kept.heapBytes() > self.cap) return error.JoinBuildTooLarge;
         }
-        if (ctx.prof) |p| {
-            const id = try p.absorb(child);
-            ctx.root_mtx.lock();
-            defer ctx.root_mtx.unlock();
-            ctx.root = id;
+        if (self.prof) |p| {
+            const id = try p.absorb(chain);
+            self.root_mtx.lock();
+            defer self.root_mtx.unlock();
+            self.root = id;
         }
     }
-}
+
+    fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
+
+    fn finalize(_: *anyopaque) anyerror!void {}
+
+    const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize };
+};
 
 /// The build side read by the lanes, its items' rows concatenated in file order (the
 /// order a serial read gives) and indexed.
@@ -293,13 +266,13 @@ fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analy
         try note.appendSlice(if (i > 0) ", " else if (slots.len == 1) "for the join with " else "for the joins with ");
         try note.appendSlice(sl.label);
     }
-    var ctx = BuildCtx{ .split = split, .recs = recs, .slots = slots, .note = note.items, .errctx = env.errctx, .queue = .{ .nitems = nitems }, .parts = parts, .cap = cap, .rows_read = env.rows_read, .prof = env.profile, .read_at = read_at };
-    _ = try parallel.spawnJoin(arena, env.pipe.threads, buildLane, &ctx);
-    if (ctx.queue.failure()) |e| return e;
-    root.* = ctx.root;
+    var g = BuildSink{ .parts = parts, .cap = cap, .prof = env.profile };
+    const pl: Pipeline = .{ .m = split, .recs = recs, .errctx = env.errctx, .rows_read = env.rows_read, .read_at = read_at, .slots = slots, .slots_note = note.items };
+    _ = try drive(arena, pl, g.parallelSink(), env.pipe.threads);
+    root.* = g.root;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);
-    return op.JoinIndex.fromBatchesMeeting(arena, chunks.items, right_schema, right_keys, left_kinds, ctx.bytes.load(.monotonic), cap, env.pipe.threads);
+    return op.JoinIndex.fromBatchesMeeting(arena, chunks.items, right_schema, right_keys, left_kinds, g.bytes.load(.monotonic), cap, env.pipe.threads);
 }
 
 /// Hoist the join out of the fan-out: materialize the build side into a shared index

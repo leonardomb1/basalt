@@ -214,3 +214,30 @@ test "a lane LEFT JOIN whose left side is smaller indexes it, reads the right si
     const keyed = "SELECT b.k, s.c, COUNT(*) AS n, SUM(b.id) AS t FROM '$B/small.csv' s LEFT JOIN '$B/in.csv' b ON s.sk = b.k GROUP BY b.k, s.c ORDER BY b.k, s.c";
     try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", keyed, 4, opts), try resultOf(a, tmp.dir, base, "", keyed, 4, tight));
 }
+test "a later join's runtime filter narrows a Parquet build side the lanes read, rows the same with it and without, at every -j" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeCsv(tmp.dir, "in.csv", a);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "in.parquet" }), 0, rows);
+    try tmp.dir.writeFile(.{ .sub_path = "one.csv", .data = "g,label\nc,C\n" });
+
+    const shapes = [_][]const u8{
+        "SELECT l.label, COUNT(*) AS n, SUM(p.k) AS s FROM '$B/in.csv' t JOIN '$B/in.parquet' p ON p.id = t.id$OFF JOIN '$B/one.csv' l ON l.g = p.g$OFF GROUP BY l.label ORDER BY l.label",
+        "SELECT t.id, p.k, l.label FROM '$B/in.csv' t JOIN '$B/in.parquet' p ON p.id = t.id$OFF JOIN '$B/one.csv' l ON l.g = p.g$OFF",
+    };
+    for (shapes) |shape| {
+        var want: ?[]const u8 = null;
+        for ([_][]const u8{ "", " WITH (runtime_filter = false)" }) |off| {
+            const q = try std.mem.replaceOwned(u8, a, shape, "$OFF", off);
+            for ([_]usize{ 1, 4, 16 }) |threads| {
+                const got = try resultOf(a, tmp.dir, base, "", q, threads, .{ .morsel_bytes = 16 << 10 });
+                if (want) |w| try testing.expectEqualStrings(w, got) else want = got;
+            }
+        }
+        try testing.expect(std.mem.count(u8, want.?, "\n") > 1);
+    }
+}

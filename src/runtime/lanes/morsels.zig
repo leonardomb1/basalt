@@ -215,6 +215,10 @@ pub const Pipeline = struct {
     per_lane: bool = false,
     /// The read the morsels stand for, for the profile; 0 takes the pipeline's head.
     read_at: u64 = 0,
+    /// Runtime filters a planner placed directly above the read (a join build side's),
+    /// each morsel's chain taking its own copy, and what `EXPLAIN ANALYZE` names them by.
+    slots: []const op.RuntimeFilter.Slot = &.{},
+    slots_note: []const u8 = "",
 };
 
 const Drive = struct { p: Pipeline, snk: ParallelSink, queue: WorkQueue };
@@ -268,7 +272,15 @@ fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
     const scan = try wa.create(op.Scan);
     scan.* = .{ .src = cs.source() };
     scan.stats.at = p.read_at;
-    var chain = try chainOps(wa, p.errctx, p.recs, .{ .scan = scan });
+    var read: op.Op = .{ .scan = scan };
+    if (p.slots.len > 0) {
+        const rf = try wa.create(op.RuntimeFilter);
+        rf.* = .{ .child = read, .back = wa, .note = p.slots_note };
+        rf.stats.at = p.read_at;
+        for (p.slots) |sl| try rf.slots.append(wa, .{ .index = sl.index, .cols = sl.cols, .label = sl.label });
+        read = .{ .runtime_filter = rf };
+    }
+    var chain = try chainOps(wa, p.errctx, p.recs, read);
     for (p.joins) |lj| chain = try buildLaneJoinChain(wa, p.errctx, lj, chain);
     try runtime_filters.wire(wa, &chain);
     return chain;
