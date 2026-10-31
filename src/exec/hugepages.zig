@@ -25,7 +25,7 @@ fn eligible(len: usize) bool {
 }
 
 fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-    if (!eligible(len)) return small.rawAlloc(len, alignment, ra);
+    if (builtin.os.tag != .linux or !eligible(len)) return small.rawAlloc(len, alignment, ra);
     if (alignment.toByteUnits() > huge) return null;
     const size = std.mem.alignForward(usize, len, huge);
     const raw = std.posix.mmap(null, size + huge, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return null;
@@ -51,7 +51,7 @@ fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: us
 /// kernel, its pages kept, as the page allocator's are; the new place may lose the
 /// 2 MiB alignment, which costs only the huge pages.
 fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
-    if (!eligible(memory.len) and !eligible(new_len)) return small.rawRemap(memory, alignment, new_len, ra);
+    if (builtin.os.tag != .linux or (!eligible(memory.len) and !eligible(new_len))) return small.rawRemap(memory, alignment, new_len, ra);
     if (!eligible(memory.len) or !eligible(new_len)) return null;
     if (resize(ctx, memory, alignment, new_len, ra)) return memory.ptr;
     const old: []align(std.heap.page_size_min) u8 = @alignCast(memory.ptr[0..std.mem.alignForward(usize, memory.len, huge)]);

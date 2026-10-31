@@ -189,11 +189,13 @@ pub const Parts = struct {
     }
 };
 
-/// A spill file read back as a source, deleted once read to the end. A batch stays
-/// valid until the next pull.
+/// A spill file read back as a source, deleted by `end` or close. A batch, a view of
+/// the file's mapping, stays valid through the next pull, the one that finds the file
+/// drained included, so the file outlives the last batch's reader.
 pub const RunSource = struct {
     run: spill.Run,
     reader: ?spill.Reader = null,
+    drained: bool = false,
     done: bool = false,
 
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
@@ -209,10 +211,10 @@ pub const RunSource = struct {
 
     fn nextFn(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
         const self: *RunSource = @ptrCast(@alignCast(p));
-        if (self.done) return null;
+        if (self.done or self.drained) return null;
         if (self.reader == null) self.reader = try spill.Reader.open(self.run);
         if (try self.reader.?.next(arena)) |b| return b;
-        self.end();
+        self.drained = true;
         return null;
     }
 

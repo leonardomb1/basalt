@@ -1006,8 +1006,17 @@ pub inline fn addAvg(sum: *align(8) i256, frac: *f64, d: Decimal, scale: u8) voi
 
 /// The mean of `n` decimals summed by `addAvg` into `sum` at `scale` and `frac`.
 pub inline fn avgOf(sum: i256, frac: f64, n: i64, scale: u8) f64 {
-    const whole_part = @as(f64, @floatFromInt(sum)) / std.math.pow(f64, 10, @floatFromInt(scale));
+    const whole_part = wideToF64(sum) / std.math.pow(f64, 10, @floatFromInt(scale));
     return (whole_part + frac) / @as(f64, @floatFromInt(n));
+}
+
+/// `x` as the nearest f64, as `@floatFromInt` gives it; past i128, from its halves, as
+/// an i256 conversion has no library call on some targets (LLVM fails on aarch64).
+pub fn wideToF64(x: i256) f64 {
+    if (std.math.cast(i128, x)) |n| return @floatFromInt(n);
+    const hi: i128 = @intCast(x >> 128);
+    const lo: u128 = @truncate(@as(u256, @bitCast(x)));
+    return @as(f64, @floatFromInt(hi)) * 0x1p128 + @as(f64, @floatFromInt(lo));
 }
 
 /// Whether `d` has a nonzero digit past `scale` places.
@@ -1206,5 +1215,14 @@ test "toF64 and toInt give what the i128 conversion and rescaleTo(d, 0) gave, bi
         const f: f64 = @as(f64, @floatFromInt(u)) / pow10f(d.scale);
         try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(d.toF64())));
         try testing.expectEqual(if (rescaleTo(d, 0)) |w| std.math.cast(i64, w.unscaled) else null, toInt(d));
+    }
+}
+
+test "wideToF64 gives what @floatFromInt gives, in i128 and past it" {
+    const xs = [_]i256{ 0, -1, std.math.maxInt(i128), std.math.minInt(i128), @as(i256, std.math.maxInt(i128)) * 1000 + 7, -(@as(i256, 1) << 200) + 12345, std.math.maxInt(i256) };
+    for (xs) |x| {
+        const want: f64 = @floatFromInt(x);
+        const got = wideToF64(x);
+        try std.testing.expect(@abs(got - want) <= @abs(want) * 0x1p-52);
     }
 }

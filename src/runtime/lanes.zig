@@ -19,10 +19,13 @@
 //! and the join and the stages after it are resolved once into records; each lane builds
 //! its own `op.Join` and stage operators from them, for its mutable stats and scratch.
 //!
-//! Determinism. Results do not depend on thread timing, and an aggregate's not on
-//! a `-j` of 2 or more: it folds one partial per morsel and merges them in morsel order
-//! (`lanes/agg.zig`), because float addition is not associative and merging as lanes
-//! finished made a float SUM differ between runs. Distinct dedups per positional
+//! Determinism. Values do not depend on thread timing, nor an aggregate's on a `-j`
+//! of 2 or more: an inexact one folds one partial per morsel and merges them in morsel
+//! order (`lanes/agg.zig`), because float addition is not associative and merging as
+//! lanes finished made a float SUM differ between runs. An exact one folds a partial
+//! per worker, so its groups' order within a partition, never their values, follows
+//! which morsels each worker took; one partial per morsel had merged six times the
+//! records on spread keys. Distinct dedups per positional
 //! morsel and breaks ties by input position, keeping the row a serial run keeps. A shared
 //! sink's map output goes through `OrderedOut`: lanes format units outside any
 //! lock, and whichever lane completes the next unit due writes it and the finished

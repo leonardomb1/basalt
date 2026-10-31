@@ -469,14 +469,15 @@ fn clashBase(n: []const u8) ?[]const u8 {
 }
 
 /// `column <op> literal` conjuncts of a filter, AND-joined only, usable to skip
-/// row groups from their statistics.
+/// row groups from their statistics: only the filters a read's rows meet before any
+/// stage that changes which rows reach them (a LIMIT, a window's numbering) or names.
 pub fn filterBounds(env: *Env, stages: []const ast.Stage) ![]pqdecode.Bound {
     var out = std.array_list.Managed(pqdecode.Bound).init(env.arena);
     for (stages) |st| {
         switch (st.node) {
             .filter => |e| try collectBounds(e, &out),
-            .select, .aggregate, .join, .explode, .union_ => break,
-            else => {},
+            .read, .ref, .sort => {},
+            else => break,
         }
     }
     return out.toOwnedSlice();
@@ -1419,4 +1420,22 @@ test {
     _ = @import("plan/runtime_filters.zig");
     _ = @import("plan/discover.zig");
     _ = @import("plan/union.zig");
+}
+
+test "filterBounds: a filter past a LIMIT prunes no row group, one past a sort still does" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../lang/sql_parser.zig");
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const pos = ast.Pos{ .line = 0, .col = 0 };
+    const gt = ast.Stage{ .node = .{ .filter = try parser.parseExprStr(a, "x > 5", &pd) }, .hints = &.{}, .pos = pos };
+    const lt = ast.Stage{ .node = .{ .filter = try parser.parseExprStr(a, "x < 9", &pd) }, .hints = &.{}, .pos = pos };
+    const lim = ast.Stage{ .node = .{ .limit = .{ .count = 5 } }, .hints = &.{}, .pos = pos };
+    const srt = ast.Stage{ .node = .{ .sort = .{ .keys = &.{} } }, .hints = &.{}, .pos = pos };
+    var env: Env = undefined;
+    env.arena = a;
+    try std.testing.expectEqual(@as(usize, 2), (try filterBounds(&env, &.{ gt, srt, lt })).len);
+    try std.testing.expectEqual(@as(usize, 1), (try filterBounds(&env, &.{ gt, lim, lt })).len);
+    try std.testing.expectEqual(@as(usize, 0), (try filterBounds(&env, &.{ lim, gt })).len);
 }

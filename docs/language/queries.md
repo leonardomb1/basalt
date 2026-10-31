@@ -47,7 +47,9 @@ LIMIT 100 OFFSET 20;
 | `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function ([user functions](user-functions.md)); see [Joins](joins.md) |
 
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
-in hash-partition order. A pipeline that only filters, projects or joins keeps the
+in hash-partition order; at `-j` above 1, groups whose aggregates are all exact
+(counts, integer and decimal sums, `MIN`/`MAX`) can come in another order within a
+partition from one run to the next, their values the same. A pipeline that only filters, projects or joins keeps the
 source's order at any `-j` — to the terminal, a CSV, a parquet or an Arrow file —
 so the same run writes the same rows in the same order; lanes still read in
 parallel, and their output is put back in order before it is written. A parquet

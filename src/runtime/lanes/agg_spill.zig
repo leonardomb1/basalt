@@ -256,7 +256,8 @@ fn aggregatePart(ctx: *PartCtx, p: usize) !void {
 const partWorker = dispatchWorker(PartCtx, aggregatePart);
 
 /// Every partition's groups, in partition order, as one source. A partition's file is
-/// dropped a pull after its last batch, which a pipelined writer may still be writing.
+/// dropped a pull after it is found drained, as its last batch, which a pipelined
+/// writer may still be writing, stays valid through that one.
 const GroupsSource = struct {
     schema: *const types.Schema,
     results: []?spill.Run,
@@ -281,8 +282,7 @@ const GroupsSource = struct {
         self.spent = null;
         while (true) {
             if (self.cur) |*c| {
-                if (c.reader == null) c.reader = try spill.Reader.open(c.run);
-                if (try c.reader.?.next(arena)) |b| return b;
+                if (try c.src().next(arena)) |b| return b;
                 self.spent = c.*;
                 self.cur = null;
             }
