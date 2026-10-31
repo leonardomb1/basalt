@@ -36,6 +36,7 @@ const Batch = @import("../batch.zig").Batch;
 const ErrCtx = @import("../op.zig").ErrCtx;
 const Held = @import("sort.zig").Held;
 const KeyArr = @import("sort.zig").KeyArr;
+const Marks = @import("sort.zig").Marks;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
 const TopK = @import("topk.zig").TopK;
@@ -156,7 +157,9 @@ pub const Window = struct {
     /// to `threads` threads, in chunks: each marks where a partition or a peer group
     /// begins, one pass carries every chunk's last and first boundary to its
     /// neighbours, and each fills its starts forward and its ends backward.
-    fn layout(arena: std.mem.Allocator, n: usize, parts: []const KeyArr, ords: []const KeyArr, threads: usize) !Layout {
+    /// With `marks` (the sort's own, `Held.orderMarked`), the partitions and peer
+    /// groups start where they say and `parts`/`ords` are not read.
+    fn layout(arena: std.mem.Allocator, n: usize, parts: []const KeyArr, ords: []const KeyArr, marks: ?*const Marks, threads: usize) !Layout {
         const nc = par.chunks(n, 1 << 16);
         var lc = LayoutCtx{
             .l = .{
@@ -169,11 +172,11 @@ pub const Window = struct {
             .ords = ords,
             .n = n,
             .nc = nc,
-            .pnew = try arena.alloc(bool, n),
-            .gnew = try arena.alloc(bool, n),
+            .pnew = if (marks) |m| m.part else try arena.alloc(bool, n),
+            .gnew = if (marks) |m| m.peer else try arena.alloc(bool, n),
             .carry = try arena.alloc(LayoutCtx.Carry, nc),
         };
-        par.each(threads, nc, &lc, LayoutCtx.mark);
+        if (marks == null) par.each(threads, nc, &lc, LayoutCtx.mark);
         var ps: usize = 0;
         var gs: usize = 0;
         for (lc.carry, 0..) |*c, i| {
@@ -884,24 +887,29 @@ pub const Window = struct {
         const keys = try work.alloc(Sort.Key, self.part.len + self.ord.len);
         @memcpy(keys[0..self.part.len], self.part);
         @memcpy(keys[self.part.len..], self.ord);
-        try h.order(keys, self.threads);
+        var mk = Marks{ .np = self.part.len, .part = try work.alloc(bool, n), .peer = try work.alloc(bool, n) };
+        const marked = try h.orderMarked(keys, self.threads, &mk);
 
         const sc = try work.alloc(?column.Column, self.in_schema.fields.len);
         @memset(sc, null);
-        for (keys) |k| {
-            if (sc[k.idx] == null) sc[k.idx] = try h.sortedColumn(work, k.idx);
-        }
         for (self.funcs) |f| if (f.arg) |ai| {
             if (sc[ai] == null) sc[ai] = try h.sortedColumn(work, ai);
         };
-        const sorted_keys = try work.alloc(KeyArr, keys.len);
-        for (keys, sorted_keys) |k, *x| x.* = try KeyArr.prepareThreads(work, sc[k.idx].?, k, self.threads);
-        const l = try layout(work, n, sorted_keys[0..self.part.len], sorted_keys[self.part.len..], self.threads);
+        const l = if (marked) |m| try layout(work, n, &.{}, &.{}, m, self.threads) else blk: {
+            for (keys) |k| {
+                if (sc[k.idx] == null) sc[k.idx] = try h.sortedColumn(work, k.idx);
+            }
+            const sorted_keys = try work.alloc(KeyArr, keys.len);
+            for (keys, sorted_keys) |k, *x| x.* = try KeyArr.prepareThreads(work, sc[k.idx].?, k, self.threads);
+            break :blk try layout(work, n, sorted_keys[0..self.part.len], sorted_keys[self.part.len..], null, self.threads);
+        };
 
         var rk: ?RangeKeys = null;
         for (self.funcs) |f| {
             if (f.frame.range and (f.frame.start == .preceding or f.frame.start == .following or f.frame.end == .preceding or f.frame.end == .following)) {
-                rk = try self.rangeKeys(work, sc[self.ord[0].idx].?);
+                const oi = self.ord[0].idx;
+                if (sc[oi] == null) sc[oi] = try h.sortedColumn(work, oi);
+                rk = try self.rangeKeys(work, sc[oi].?);
                 break;
             }
         }
@@ -1387,6 +1395,36 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
     };
 }
 
+/// The bytes asked of `child` since `bytes` was last cleared: what a batch costs,
+/// whatever the arena behind it reserves.
+const Counted = struct {
+    child: std.mem.Allocator,
+    bytes: usize = 0,
+
+    fn allocator(self: *Counted) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Counted = @ptrCast(@alignCast(ctx));
+        self.bytes += len;
+        return self.child.rawAlloc(len, al, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *Counted = @ptrCast(@alignCast(ctx));
+        if (len > m.len) self.bytes += len - m.len;
+        return self.child.rawResize(m, al, len, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *Counted = @ptrCast(@alignCast(ctx));
+        if (len > m.len) self.bytes += len - m.len;
+        return self.child.rawRemap(m, al, len, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *Counted = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, al, ra);
+    }
+};
+
 test "window: output streams in bounded batches gathered from one held copy, freed early or at the end" {
     const util = @import("testing_util.zig");
     const funcs = [_]Window.Func{ .{ .func = .{ .win = .row_number } }, .{ .func = .{ .win = .lag }, .arg = 1 } };
@@ -1406,11 +1444,13 @@ test "window: output streams in bounded batches gathered from one held copy, fre
         errdefer top.release();
         var pull = std.heap.ArenaAllocator.init(testing.allocator);
         defer pull.deinit();
+        var counted = Counted{ .child = pull.allocator() };
         var want: i64 = 1;
         var n: usize = 0;
         while (n < pulls) : (n += 1) {
             _ = pull.reset(.retain_capacity);
-            const b = (try top.next(pull.allocator())) orelse break;
+            counted.bytes = 0;
+            const b = (try top.next(counted.allocator())) orelse break;
             try testing.expect(b.len <= 1000);
             for (0..b.len) |r| {
                 try testing.expectEqual(want, b.columns[0].getValue(r).int);
@@ -1420,7 +1460,7 @@ test "window: output streams in bounded batches gathered from one held copy, fre
                 if (want == 1) try testing.expect(prev.isNull()) else try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d:0>48}", .{@as(u64, @intCast(want - 1))}), prev.string);
                 want += 1;
             }
-            try testing.expect(pull.queryCapacity() < 256 * 1024);
+            try testing.expect(counted.bytes < 256 * 1024);
         }
         if (pulls > 3) try testing.expectEqual(@as(i64, 64 * 256 + 1), want);
         top.release();
@@ -1514,7 +1554,7 @@ test "layout across chunks and threads marks the same partitions and peer groups
     const key = Sort.Key{ .idx = 0, .desc = false, .nulls_first = false };
     const parts = [_]KeyArr{try KeyArr.prepare(a, try pb.finish(), key)};
     const ords = [_]KeyArr{try KeyArr.prepare(a, try ob.finish(), key)};
-    const l = try Window.layout(a, n, &parts, &ords, 4);
+    const l = try Window.layout(a, n, &parts, &ords, null, 4);
     var ps: usize = 0;
     var gs: usize = 0;
     for (0..n) |k| {

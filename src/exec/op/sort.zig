@@ -324,6 +324,13 @@ pub const Held = struct {
     /// them out from the first. The key columns are laid end to end in a scratch
     /// arena, freed once sorted.
     pub fn order(self: *Held, keys: []const Sort.Key, threads: usize) !void {
+        _ = try self.orderMarked(keys, threads, null);
+    }
+
+    /// `order`, and where the ordered rows start a new group of the first `m.np` keys
+    /// and of all of them (`Marks`), into `m`'s arrays, sized to the rows; null when the
+    /// sort could not read them off its key words.
+    pub fn orderMarked(self: *Held, keys: []const Sort.Key, threads: usize, m: ?*Marks) !?*Marks {
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
         defer tmp.deinit();
         const t = tmp.allocator();
@@ -331,7 +338,7 @@ pub const Held = struct {
         for (idx, 0..) |*x, i| x.* = i;
         const arrs = try t.alloc(KeyArr, keys.len);
         for (keys, arrs) |k, *x| x.* = try KeyArr.prepareThreads(t, try self.whole(t, k.idx, threads), k, threads);
-        try sortIdxThreads(t, idx, arrs, threads);
+        try sortIdxMarked(t, idx, arrs, threads, m);
         const chunks = self.chunks.items;
         const starts = try t.alloc(usize, chunks.len);
         const chunk_of = try t.alloc(u32, self.rows);
@@ -349,6 +356,8 @@ pub const Held = struct {
         }
         self.refs = refs;
         self.pos = 0;
+        const mk = m orelse return null;
+        return if (mk.ok) mk else null;
     }
 
     /// Column `ci` of every row, in order, gathered into `a`.
@@ -745,6 +754,17 @@ pub fn sortIdx(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr)
 }
 
 pub fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, threads: usize) !void {
+    return sortIdxMarked(out_arena, idx, arrs, threads, null);
+}
+
+/// Where sorted rows start a new group, read off the sort's own key words: `part[r]`
+/// when row r's first `np` keys differ from row r-1's, `peer[r]` when any key does.
+/// `ok` only when every key's words are the whole key (no long string prefix, no
+/// comparison sort), so equal words are equal keys, as `KeyArr.order` tells them.
+pub const Marks = struct { np: usize, part: []bool, peer: []bool, ok: bool = false };
+
+/// `sortIdxThreads`, with `marks` filled where the keys' words tell them.
+pub fn sortIdxMarked(out_arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, threads: usize, marks: ?*Marks) !void {
     _ = out_arena;
     const n = idx.len;
     if (n == 0 or arrs.len == 0) return;
@@ -764,14 +784,20 @@ pub fn sortIdxThreads(out_arena: std.mem.Allocator, idx: []usize, arrs: []const 
         std.mem.sortUnstable(usize, idx, SortCtx{ .arrs = arrs }, SortCtx.lessThan);
         return;
     }
-    if (try sortIdxParallel(arena, idx, arrs, plans, exact, threads)) return;
-    try sortRows(arena, idx, arrs, plans, exact);
+    const m: ?*Marks = if (exact) marks else null;
+    if (try sortIdxParallel(arena, idx, arrs, plans, exact, threads, m)) return;
+    try sortRows(arena, idx, arrs, plans, exact, m, 0);
+    if (m) |mk| {
+        mk.part[0] = true;
+        mk.peer[0] = true;
+        mk.ok = true;
+    }
 }
 
 /// Sorts `idx` stably: every row's key words (a null flag word first for a key
 /// with nulls) and its row number are packed once, in `idx` order, into records
 /// that an MSD byte radix then orders without reading a column again.
-fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool) !void {
+fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, marks: ?*Marks, at: usize) !void {
     const n = idx.len;
     var stride: usize = 1;
     for (plans) |p| stride += p.words + @intFromBool(p.nulls);
@@ -793,6 +819,24 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
     msdSort(recs, tmp, stride, 0);
     for (idx, 0..) |*x, r| x.* = @intCast(recs[r * stride + stride - 1]);
     if (!exact) fixTies(idx, arrs, plans);
+    if (marks) |mk| markGroups(recs, stride, plans, mk, at);
+}
+
+/// `mk`'s marks for rows 1.. of `recs` (sorted, `stride` words each, the row number
+/// last), at `at` onwards: a row's first words up to the end of the leading `mk.np`
+/// keys against the row before it, then the rest of its key words.
+fn markGroups(recs: []const u64, stride: usize, plans: []const KeyPlan, mk: *Marks, at: usize) void {
+    var po: usize = 0;
+    for (plans[0..mk.np]) |p| po += p.words + @intFromBool(p.nulls);
+    const nk = stride - 1;
+    const n = recs.len / stride;
+    for (1..n) |r| {
+        const a = recs[(r - 1) * stride ..][0..nk];
+        const b = recs[r * stride ..][0..nk];
+        const part = !std.mem.eql(u64, a[0..po], b[0..po]);
+        mk.part[at + r] = part;
+        mk.peer[at + r] = part or !std.mem.eql(u64, a[po..], b[po..]);
+    }
 }
 
 /// MSD radix over `recs`' key words a byte at a time from digit `d0`, the trailing
@@ -881,6 +925,7 @@ const Deal = struct {
     arrs: []const KeyArr,
     plans: []const KeyPlan,
     exact: bool,
+    marks: ?*Marks = null,
     start: [max_ranges + 1]usize = undefined,
     errs: [max_ranges]?anyerror = @splat(null),
 
@@ -946,7 +991,7 @@ const Deal = struct {
         if (part.len < 2) return;
         var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer ar.deinit();
-        sortRows(ar.allocator(), part, d.arrs, d.plans, d.exact) catch |e| {
+        sortRows(ar.allocator(), part, d.arrs, d.plans, d.exact, d.marks, d.start[g]) catch |e| {
             d.errs[g] = e;
         };
     }
@@ -956,7 +1001,7 @@ const Deal = struct {
 /// puts about an even share in each, a few per thread so a slow core takes fewer
 /// (nulls in a range of their own, first or last as the key places them), and sort
 /// each range. False when not worth it or the first key cannot split.
-fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize) !bool {
+fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize, marks: ?*Marks) !bool {
     const n = idx.len;
     if (threads < 2 or n < 1 << 17) return false;
     const nc = par.chunks(n, 1 << 16);
@@ -973,6 +1018,7 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
         .arrs = arrs,
         .plans = plans,
         .exact = exact,
+        .marks = marks,
     };
     par.each(threads, nc, &d, Deal.scan);
     var lo: u64 = std.math.maxInt(u64);
@@ -1022,6 +1068,13 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
     par.each(threads, nc, &d, Deal.scatter);
     par.each(threads, nranges, &d, Deal.sortRange);
     for (d.errs[0..nranges]) |e| if (e) |err| return err;
+    if (marks) |mk| {
+        for (0..nranges) |g| if (d.start[g] < d.start[g + 1]) {
+            mk.part[d.start[g]] = d.start[g] == 0 or mk.np > 0;
+            mk.peer[d.start[g]] = true;
+        };
+        mk.ok = true;
+    }
     return true;
 }
 
@@ -1229,6 +1282,78 @@ test "sortIdxThreads: the parallel split places the null range first or last as 
         try testing.expectEqualSlices(usize, want, got);
         try testing.expectEqual(nf, !col.validity.get(got[0]));
     };
+}
+
+test "sortIdxMarked: the marks read off the key words start a group exactly where the keys change, serial or split; a long string key gives none" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0x3a5c);
+    const rnd = prng.random();
+    for (0..48) |round| {
+        const n = if (round % 8 == 7) (1 << 17) + rnd.uintLessThan(usize, 9000) else 1 + rnd.uintLessThan(usize, 500);
+        const nkeys = 1 + rnd.uintLessThan(usize, 3);
+        const long = round % 12 == 5;
+        const arrs = try a.alloc(KeyArr, nkeys);
+        for (arrs) |*k| {
+            const kind = rnd.uintLessThan(u8, 5);
+            const ty: types.Type = switch (kind) {
+                0 => types.Type.init(.int),
+                1 => types.Type.init(.float),
+                2 => types.Type.decimal(18, 3),
+                3 => types.Type.decimal(12, 2),
+                else => types.Type.init(.string),
+            };
+            var b = column.Builder.init(a, ty.asNullable());
+            for (0..n) |_| {
+                if (rnd.uintLessThan(u8, 8) == 0) {
+                    try b.append(.null);
+                    continue;
+                }
+                try b.append(switch (kind) {
+                    0 => Value{ .int = rnd.intRangeAtMost(i64, -4, 4) },
+                    1 => Value{ .float = switch (rnd.uintLessThan(u8, 6)) {
+                        0 => std.math.nan(f64),
+                        1 => -0.0,
+                        2 => 0.0,
+                        else => @as(f64, @floatFromInt(rnd.intRangeAtMost(i64, -2, 2))) / 2,
+                    } },
+                    2 => Value{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -6, 6) * 10, .scale = rnd.uintLessThan(u8, 2) + 1 } },
+                    3 => Value{ .decimal = .{ .unscaled = rnd.intRangeAtMost(i128, -5, 5), .scale = 2 } },
+                    else => Value{ .string = blk: {
+                        const len = rnd.uintLessThan(usize, 3);
+                        const tail = try a.alloc(u8, len);
+                        for (tail) |*c| c.* = "ab"[rnd.uintLessThan(usize, 2)];
+                        break :blk if (long) try std.mem.concat(a, u8, &.{ "a-key-longer-than-thirty-one-bytes-", tail }) else tail;
+                    } },
+                });
+            }
+            k.* = try KeyArr.prepare(a, try b.finish(), .{ .idx = 0, .desc = rnd.boolean(), .nulls_first = rnd.boolean() });
+        }
+        const idx = try a.alloc(usize, n);
+        for (idx, 0..) |*x, i| x.* = i;
+        var mk = Marks{ .np = rnd.uintLessThan(usize, nkeys + 1), .part = try a.alloc(bool, n), .peer = try a.alloc(bool, n) };
+        try sortIdxMarked(a, idx, arrs, if (round % 8 == 7 or round % 2 == 0) 4 else 1, &mk);
+        var has_long = false;
+        for (arrs) |k| has_long = has_long or (k.data == .strs and (KeyPlan.of(k, n) orelse continue).exact == false);
+        try testing.expectEqual(!has_long, mk.ok);
+        if (!mk.ok) continue;
+        try testing.expect(mk.part[0] and mk.peer[0]);
+        for (1..n) |r| {
+            var same_p = true;
+            for (arrs[0..mk.np]) |k| same_p = same_p and k.order(idx[r - 1], idx[r]) == .eq;
+            var same_all = same_p;
+            for (arrs[mk.np..]) |k| same_all = same_all and k.order(idx[r - 1], idx[r]) == .eq;
+            testing.expectEqual(!same_p, mk.part[r]) catch |e| {
+                std.debug.print("round {d} row {d} part\n", .{ round, r });
+                return e;
+            };
+            testing.expectEqual(!same_all, mk.peer[r]) catch |e| {
+                std.debug.print("round {d} row {d} peer\n", .{ round, r });
+                return e;
+            };
+        }
+    }
 }
 
 test "linearize decomposes map-only pipelines source-to-sink; breakers refuse" {
