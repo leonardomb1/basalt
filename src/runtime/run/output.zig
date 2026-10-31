@@ -64,6 +64,11 @@ const std = @import("std");
 const windowTopK = @import("../plan/union.zig").windowTopK;
 const runWindowTopK = @import("../lanes/window.zig").runWindowTopK;
 const Morsels = @import("../lanes/morsels.zig").Morsels;
+const Reader = @import("../lanes/morsels.zig").Reader;
+const MappedCsv = @import("../../format/csv.zig").MappedCsv;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
+const obs = @import("../obs.zig");
 const parquetSplit = @import("../lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("../lanes/sources.zig").csvSplitFile;
 const connect = @import("../connect.zig");
@@ -323,7 +328,7 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
     const topped = (try windowTopK(env.arena, stages[0..j], stages[j..])) orelse return null;
 
     const w = ast.Write{ .connector = "", .form = null, .target = "", .mode = .append };
-    var mapped: ?*@import("../../format/csv.zig").MappedCsv = null;
+    var mapped: ?*MappedCsv = null;
     defer if (mapped) |mc| mc.close();
     var crd = rd;
     if (crd.cols.len == 0) if (try projectedColumns(env, stages[1..])) |cols| {
@@ -358,7 +363,9 @@ const min_flip_rows: u64 = 1 << 16;
 /// left, this one, turns around (`lanes/join.zig` `flipFirstJoin`): those rows
 /// indexed, the file read on the lanes. Past the cap the rows are dropped and the run
 /// goes as planned, having spent at most that many; so does one where the turn is
-/// declined.
+/// declined. A first join is taken the same way when a filter on the head can leave
+/// few rows (q12: 31K of 6M lineitem rows against 1.5M orders), and its first rows'
+/// pass rate does not put it past the cap (`headPasses`).
 fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
     if (env.materialized.contains(flip_left)) return false;
     var last: ?usize = null;
@@ -367,7 +374,7 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     };
     const ji = last orelse return false;
     const st = shape.joins[ji];
-    if (ji == 0 or !joinorder.flippable(st)) return false;
+    if (!joinorder.flippable(st)) return false;
     const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[ji + 1 ..], &.{shape.agg}, shape.tail });
     const rst = try rightStagesFor(env, st.node.join, after);
     if (rst.len == 0 or rst[0].node != .read or rst[0].hints.len > 0) return false;
@@ -377,6 +384,14 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     const rows = estimate.ofSide(env, rst).rows orelse return false;
     const cap = rows / joinorder.flip_ratio;
     if (cap < min_flip_rows) return false;
+    var head_rows: u64 = 0;
+    if (ji == 0) {
+        for (shape.prefix) |x| {
+            if (x.node == .filter) break;
+        } else return false;
+        head_rows = estimate.ofSide(env, stages[0..1]).rows orelse return false;
+        if (head_rows <= cap) return false;
+    }
     const side = if (st.node.join.alias.len > 0) st.node.join.alias else st.node.join.binding;
 
     const pre_len = 1 + shape.prefix.len + ji;
@@ -387,7 +402,9 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     inner[pre_len] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
     const mw = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
     inner[pre_len + 1] = .{ .node = .{ .write = mw }, .hints = &.{}, .pos = pos };
+    if (ji == 0 and try headPasses(env, inner[0 .. pre_len + 1], mw, opts, head_rows) > cap) return false;
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena), .cap_rows = cap, .keep_rels = true };
+    const before = if (ji == 0) "the filtered rows before" else "the joins before";
     {
         const outer_sink = env.mem_sink;
         const outer_name = env.sink_name;
@@ -400,21 +417,58 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
         defer leaveScope(env, outer_scope);
         runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena, &delegated) catch |e| {
             if (e != error.PastMemCap) return e;
-            env.log.log(.debug, "the joins before `{s}` leave over {d} rows; it is held in memory as written", .{ side, cap });
+            env.log.log(.debug, "{s} `{s}` leave over {d} rows; it is held in memory as written", .{ before, side, cap });
             return false;
         };
     }
     try env.materialized.put(env.arena, flip_left, .{ .schema = ms.schema, .batches = ms.batches.items });
     defer _ = env.materialized.remove(flip_left);
     const head = ast.Stage{ .node = .{ .ref = flip_left }, .hints = &.{}, .pos = pos };
-    const rest = SinkShape{ .prefix = &.{}, .joins = shape.joins[ji..], .agg = shape.agg, .tail = shape.tail };
+    const joins = try env.arena.dupe(ast.Stage, shape.joins[ji..]);
+    joins[0].node.join.own_cols = &.{};
+    const rest = SinkShape{ .prefix = &.{}, .joins = joins, .agg = shape.agg, .tail = shape.tail };
     if (!try runParallelAgg(env, null, head, rest, w, opts, stats, lanes_used)) return false;
     if (env.profile) |p| {
-        const what = try msgfmt.allocPrint(env.arena, "the joins before `{s}` ({d} rows)", .{ side, ms.rows });
+        const what = try msgfmt.allocPrint(env.arena, "{s} `{s}` ({d} rows)", .{ before, side, ms.rows });
         p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first, then {s}, that join turned around", .{ what, p.path });
         try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
     }
     return true;
+}
+
+/// The rows the filtered head `pre` is estimated to leave of its `total`: its first
+/// morsel run through it on this thread, the pass rate scaled up. A head the lanes
+/// cannot split counts as passing every row.
+fn headPasses(env: *Env, pre: []const ast.Stage, w: ast.Write, opts: RunOptions, total: u64) !u64 {
+    const src_base = env.sources.items.len;
+    defer {
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+    }
+    const rd = pre[0].node.read;
+    var mapped: ?*MappedCsv = null;
+    defer if (mapped) |mc| mc.close();
+    const m: Morsels = if (try parquetSplit(env, rd, pre[0].hints, pre[1..], w, opts)) |pm| pm else blk: {
+        mapped = (try csvSplitFile(env, rd, pre[0].hints, w)) orelse return total;
+        break :blk Morsels.ofCsv(mapped.?, &mapped.?.schema, opts.morsel_bytes);
+    };
+    if (m.count() == 0) return 0;
+    const recs = (try chainAt(env, m.schema().*, pre[1..])).recs;
+    var ar = std.heap.ArenaAllocator.init(env.gpa);
+    defer ar.deinit();
+    var rdr = Reader.init(env.gpa);
+    defer rdr.deinit();
+    const src = (try m.open(0, &rdr, ar.allocator())) orelse return total;
+    defer src.close();
+    var seen = obs.RowCounter{};
+    var cs = obs.CountingSource{ .inner = src, .count = &seen };
+    var scan = op.Scan{ .src = cs.source() };
+    const chain = try chainOps(ar.allocator(), env.errctx, recs, .{ .scan = &scan });
+    var kept: u64 = 0;
+    while (try chain.next(ar.allocator())) |b| kept += b.len;
+    const n = seen.load(.monotonic);
+    if (n == 0) return total;
+    return @intCast(std.math.mulWide(u64, kept, total) / n);
 }
 
 /// The columns `rest` reads from what `pre` leaves, as select items written the way

@@ -152,7 +152,11 @@ quarter of its right side's estimate they are indexed and the lanes read that
 side (TPC-H Q3: customers and orders indexed, lineitem streamed). Past that many
 rows the held rows are dropped and the pipeline runs as planned; a join after it,
 such as an `IN`, would lose its [runtime filter](#runtime-filters), so only the
-last join is taken. Any other lane pipeline probes with its head read in every lane and
+last join is taken. A single join whose head is filtered is decided the same way:
+the filtered head is read into memory first, and indexed if it stays under that
+cap (TPC-H Q12: 31K of 6M lineitem rows indexed, the 1.5M orders streamed). It
+is tried only when the head's first row group or chunk passes rows at a rate that
+stays under the cap. Any other lane pipeline probes with its head read in every lane and
 keeps the written order — a right side too big for the lanes sends the pipeline
 back to the serial plan, where the choice is made. Key pushdown follows the sides: a SQL right side streamed through an
 indexed left side takes the left side's keys once that side is indexed, with no
