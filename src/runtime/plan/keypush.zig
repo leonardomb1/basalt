@@ -8,6 +8,9 @@
 //! inner, left, semi and anti joins, the left side for inner, right and semi ones.
 //! A null-aware anti join (`NOT IN`) is left alone, as a NULL it would filter out
 //! changes its answer. `WITH (key_pushdown = false)` on the join turns it off.
+//! A SQL read heading a chain also takes each later join's keys (`laterReach`):
+//! each join binds its own predicate and they are AND-ed into the one query, which
+//! goes out once the innermost join pulls, after every join above it has pushed.
 //!
 //! The taking side's SQL read is a `LateSql`: its schema comes from a `WHERE 1 = 0`
 //! probe while planning, and the real query goes out on its first pull, with the
@@ -18,8 +21,10 @@
 //!
 //! The predicate may only ever keep more rows than match, never fewer, so a
 //! value the dialect cannot spell drops that key's predicate rather than the
-//! value: up to `op.Join.push_cap` distinct values go as `IN (…)`; past it a
-//! number, decimal, date or timestamp key goes as its min/max range and a text
+//! value: up to `op.Join.push_cap` distinct values go as `IN (…)`; past it an
+//! integer key goes as a few ranges when they cover well under its span
+//! (`keyset.ranged`), else a number, decimal, date or timestamp key goes as its
+//! min/max range and a text
 //! key as nothing, since a collation orders text otherwise than basalt. Text
 //! compared under a case- or trailing-space-insensitive collation keeps more rows
 //! than match, which the join then discards.
