@@ -228,10 +228,11 @@ AND-ed into the one query it sends, so files or other databases joined further
 on narrow what the database returns:
 
 ```sql
+CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', database = 'erp');
 SELECT o.id, s.qty, t.label
 FROM pg.orders o
 JOIN 'sheet.csv' s ON s.cr = o.code
-JOIN 'tags.csv' t ON t.k = o.kind
+JOIN 'tags.csv' t ON t.k = o.kind;
 -- orders is read as … WHERE "code" IN (…) AND "kind" IN (…)
 ```
 
