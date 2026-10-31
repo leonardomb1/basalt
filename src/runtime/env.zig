@@ -487,6 +487,12 @@ pub const MemSource = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    /// Whether `src` hands out materialized batches as they are held: compact copies
+    /// that outlive the output reading them, which an operator may keep uncopied.
+    pub fn holds(src: driver.Source) bool {
+        return src.vtable == &vtable;
+    }
+
     const vtable = driver.Source.VTable{
         .schema = struct {
             fn f(p: *anyopaque) types.Schema {

@@ -808,7 +808,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
         },
         .sort => |ks| blk: {
             const so = try arena.create(op.Sort);
-            so.* = .{ .child = child, .in_schema = r.in, .keys = ks, .threads = env.pipe.threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa };
+            so.* = .{ .child = child, .in_schema = r.in, .keys = ks, .threads = env.pipe.threads, .space = env.space, .spill_at = env.op_memory, .gpa = env.gpa, .adopt_input = heldInput(child) };
             break :blk .{ .sort = so };
         },
         .window => |wp| blk: {
@@ -844,6 +844,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
                 .top_k = wd.top_k,
                 .gpa = env.gpa,
                 .threads = env.pipe.threads,
+                .adopt_input = heldInput(child),
             };
             break :blk .{ .window = w };
         },
@@ -855,6 +856,12 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
         },
     };
     return .{ .op = o, .schema = r.out.* };
+}
+
+/// Whether `child` scans a materialized binding, whose batches a sort or window may
+/// hold as they are rather than copy a second time.
+fn heldInput(child: op.Op) bool {
+    return child == .scan and MemSource.holds(child.scan.src);
 }
 
 pub fn buildProject(env: *Env, items: []const ast.SelectItem, in_schema: types.Schema, child: op.Op) anyerror!PipeRes {

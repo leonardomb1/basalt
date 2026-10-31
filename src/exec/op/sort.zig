@@ -58,6 +58,8 @@ pub const Sort = struct {
     gpa: std.mem.Allocator = std.heap.page_allocator,
     merge: ?*Merge = null,
     held: ?*Held = null,
+    /// The child's batches are a materialized binding's, held uncopied (`Held.adopt`).
+    adopt_input: bool = false,
     /// Sorted runs written to disk, kept past the merge for `EXPLAIN ANALYZE`.
     runs: usize = 0,
 
@@ -77,7 +79,7 @@ pub const Sort = struct {
         const space = self.space orelse {
             const h = try Held.create(self.gpa);
             self.held = h;
-            while (try self.child.next(h.pull())) |b| try h.add(b);
+            while (try self.child.next(h.pull())) |b| try h.takeIn(b, self.adopt_input);
             return self.start(arena, h);
         };
         return self.external(arena, space);
@@ -147,7 +149,7 @@ pub const Sort = struct {
         errdefer if (runs_owned) deleteRuns(runs.items);
 
         while (try self.child.next(h.pull())) |b| {
-            try h.add(b);
+            try h.takeIn(b, self.adopt_input);
             if (h.bytes <= self.spill_at) continue;
             try h.order(self.keys, self.threads);
             try runs.ensureUnusedCapacity(self.gpa, 1);
@@ -299,6 +301,20 @@ pub const Held = struct {
         try self.chunks.append(a, try b.deepCopy(a));
         self.rows += b.len;
         self.bytes += b.heapBytes();
+    }
+
+    /// Keeps `b` as it is, uncopied: a batch that outlives the held rows and holds only
+    /// its own rows (a materialized binding's), still counted towards `bytes`.
+    pub fn adopt(self: *Held, b: Batch) !void {
+        if (b.len == 0) return;
+        try self.chunks.append(self.ar.allocator(), b);
+        self.rows += b.len;
+        self.bytes += b.heapBytes();
+    }
+
+    /// `adopt` when `keep`, else `add`.
+    pub fn takeIn(self: *Held, b: Batch, keep: bool) !void {
+        return if (keep) self.adopt(b) else self.add(b);
     }
 
     /// Drops every row held, keeping the arena's capacity for the next.

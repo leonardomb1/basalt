@@ -75,6 +75,8 @@ pub const Window = struct {
     /// Rows per output batch, a multiple of 8.
     batch_rows: usize = 1 << 16,
     held: ?*Held = null,
+    /// The child's batches are a materialized binding's, held uncopied (`Held.adopt`).
+    adopt_input: bool = false,
     fcols: []column.Column = &.{},
 
     pub const max_top_k: u64 = 1 << 19;
@@ -848,7 +850,7 @@ pub const Window = struct {
         const gpa = self.gpa orelse std.heap.page_allocator;
         const h = try Held.create(gpa);
         self.held = h;
-        while (try self.child.next(h.pull())) |b| try h.add(b);
+        while (try self.child.next(h.pull())) |b| try h.takeIn(b, self.adopt_input);
         if (h.rows == 0) {
             self.release();
             return null;
