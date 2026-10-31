@@ -6,9 +6,9 @@
 //! serial run parallel and the reverse. What only the run learns can still veto a
 //! parallel path (a file's size, quoting or row groups, a table's key and rows, a
 //! join build past `--op-memory`); the run then falls to the next path in the chain
-//! and EXPLAIN names those as conditions. A window's input or an aggregating
-//! binding read into memory first is a prelude ahead of the path, decided by
-//! `windowInputAt` and `materializes` over the stages as they stand at that point.
+//! and EXPLAIN names those as conditions. An aggregating binding read into memory
+//! first is a prelude ahead of the path, decided by `materializes` over the stages
+//! as they stand at that point.
 //!
 //! A map stage is a filter, select or explode (`analyze.isMap`) on a map path: a
 //! file's map lanes, a SQL split and a union branch; the stages ahead of a lane
@@ -116,25 +116,6 @@ pub fn materializes(stages: []const ast.Stage, n: usize) bool {
         if (st.node == .aggregate) return true;
     }
     return false;
-}
-
-/// Where the window is that a file pipeline reads its input for first, in parallel,
-/// into memory; null when it does not. Not when a filter follows the window
-/// (`WHERE rn <= k` keeps only `k` rows a partition as they stream).
-pub fn windowInputAt(stages: []const ast.Stage, n: usize) ?usize {
-    if (n < 2 or stages.len < 3 or !laneEligible(stages, n)) return null;
-    const rd = stages[0].node.read;
-    if (!connect.isLocalCsvRead(rd) and !connect.isParquetFileRead(rd) and !connect.isFolderRead(rd)) return null;
-    var wi: usize = 1;
-    while (wi < stages.len - 1 and (stages[wi].node == .filter or stages[wi].node == .select)) wi += 1;
-    switch (stages[wi].node) {
-        .window => |w| {
-            if (w.top_k != null) return null;
-            for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
-        },
-        else => return null,
-    }
-    return wi;
 }
 
 fn branchesAreReads(u: ast.Union) bool {

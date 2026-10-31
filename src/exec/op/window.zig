@@ -31,6 +31,11 @@
 //! as `RangeConv` reads it: a float key as itself, any other as an integer — an int
 //! times `mul` (10^scale of the offsets), a date's days times `mul` (microseconds a
 //! day), a timestamp's or time's microseconds, a decimal rescaled to `scale`.
+//!
+//! With a `space`, an input past `spill_at` bytes is sorted to disk by partition and
+//! order keys (`Sort.fill`) and read back in that order a segment of whole
+//! partitions at a time, so what is held is about `spill_at` and the largest
+//! partition; an input that fits is held and sorted once, as without a space.
 
 const Batch = @import("../batch.zig").Batch;
 const ErrCtx = @import("../op.zig").ErrCtx;
@@ -39,6 +44,7 @@ const KeyArr = @import("sort.zig").KeyArr;
 const Marks = @import("sort.zig").Marks;
 const Op = @import("../op.zig").Op;
 const Sort = @import("sort.zig").Sort;
+const Space = @import("../space.zig").Space;
 const TopK = @import("topk.zig").TopK;
 const TopKEntry = @import("topk.zig").Entry;
 const Stats = @import("../op.zig").Stats;
@@ -78,6 +84,18 @@ pub const Window = struct {
     /// The child's batches are a materialized binding's, held uncopied (`Held.adopt`).
     adopt_input: bool = false,
     fcols: []column.Column = &.{},
+    /// With a `space`, input past `spill_at` bytes is sorted to disk (`Sort.fill`) and
+    /// read back in order from `src` a segment at a time (`nextSorted`).
+    space: ?Space = null,
+    spill_at: usize = std.math.maxInt(usize),
+    src: ?*Sort = null,
+    /// Whether `src` is the window's own, made by `spilled`, rather than a parallel
+    /// sort's (`runtime/lanes/sort.zig`).
+    own_src: bool = false,
+    seg: ?*Held = null,
+    cut: usize = 0,
+    carried: ?*Held = null,
+    drained: bool = false,
 
     pub const max_top_k: u64 = 1 << 19;
 
@@ -843,54 +861,183 @@ pub const Window = struct {
 
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
         errdefer self.release();
-        if (self.held) |h| return self.emit(arena, h);
+        if (self.held) |h| return self.emit(arena, h, h.refs.len);
+        if (self.src != null) return self.nextSorted(arena);
         if (self.done) return null;
         self.done = true;
         if (self.top_k) |k| return self.topK(arena, k, self.gpa.?);
-        const gpa = self.gpa orelse std.heap.page_allocator;
-        const h = try Held.create(gpa);
+        const gpa = self.alloc();
+        const h = if (self.space) |space| (try self.spilled(space)) orelse return self.nextSorted(arena) else blk: {
+            const h = try Held.create(gpa);
+            self.held = h;
+            while (try self.child.next(h.pull())) |b| try h.takeIn(b, self.adopt_input);
+            break :blk h;
+        };
         self.held = h;
-        while (try self.child.next(h.pull())) |b| try h.takeIn(b, self.adopt_input);
         if (h.rows == 0) {
             self.release();
             return null;
         }
         var work = std.heap.ArenaAllocator.init(gpa);
         defer work.deinit();
-        self.fcols = try self.compute(work.allocator(), h);
-        return self.emit(arena, h);
+        self.fcols = try self.compute(work.allocator(), h, false);
+        return self.emit(arena, h, h.refs.len);
+    }
+
+    fn alloc(self: *const Window) std.mem.Allocator {
+        return self.gpa orelse std.heap.page_allocator;
+    }
+
+    /// Drains the child through a sort by partition and order keys that writes runs
+    /// past `spill_at` (`Sort.fill`): the input held when none was written, else null,
+    /// the runs left merging in `src`.
+    fn spilled(self: *Window, space: Space) !?*Held {
+        const gpa = self.alloc();
+        const keys = try gpa.alloc(Sort.Key, self.part.len + self.ord.len);
+        @memcpy(keys[0..self.part.len], self.part);
+        @memcpy(keys[self.part.len..], self.ord);
+        const so = gpa.create(Sort) catch |e| {
+            gpa.free(keys);
+            return e;
+        };
+        so.* = .{ .child = self.child, .in_schema = self.in_schema, .keys = keys, .threads = self.threads, .space = space, .spill_at = self.spill_at, .gpa = gpa, .adopt_input = self.adopt_input };
+        self.src = so;
+        self.own_src = true;
+        const h = (try so.fill(space)) orelse return null;
+        self.dropSrc();
+        return h;
+    }
+
+    fn dropSrc(self: *Window) void {
+        const so = self.src orelse return;
+        so.release();
+        if (self.own_src) {
+            const gpa = self.alloc();
+            gpa.free(so.keys);
+            gpa.destroy(so);
+        }
+        self.src = null;
     }
 
     /// Frees the input and function values held for a consumer that stopped pulling.
     pub fn release(self: *Window) void {
-        if (self.held) |h| h.destroy();
+        for ([_]?*Held{ self.held, self.seg, self.carried }) |x| if (x) |h| h.destroy();
         self.held = null;
+        self.seg = null;
+        self.carried = null;
+        self.dropSrc();
         self.fcols = &.{};
         self.done = true;
     }
 
-    /// The next `batch_rows` input rows in window order with their function values,
-    /// gathered into `arena`; what is held is freed with the last.
-    fn emit(self: *Window, arena: std.mem.Allocator, h: *Held) !?Batch {
+    /// The next up to `batch_rows` of `h`'s rows before `end`, in window order with
+    /// their function values, gathered into `arena`; the input held is freed with its
+    /// last.
+    fn emit(self: *Window, arena: std.mem.Allocator, h: *Held, end: usize) !?Batch {
         const ncols = self.in_schema.fields.len;
         const lo = h.pos;
         const cols = try arena.alloc(column.Column, self.out_schema.fields.len);
-        const n = try h.gather(arena, self.batch_rows, cols[0..ncols]);
+        const n = try h.gather(arena, @min(self.batch_rows, end - lo), cols[0..ncols]);
         for (self.fcols, cols[ncols..]) |f, *o| o.* = try column.copy(arena, try column.slice(arena, f, lo, n));
-        if (h.pos == h.refs.len) self.release();
+        if (h == self.held and h.pos == h.refs.len) self.release();
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 
-    /// Orders `h`'s rows by partition and order keys and computes every function over
-    /// them, into `h`'s arena; the sorted copies of only the key and argument columns
-    /// and the frames are scratch in `work`.
-    fn compute(self: *Window, work: std.mem.Allocator, h: *Held) ![]column.Column {
+    /// A spilled input read back in window order a segment at a time: rows are held
+    /// until they pass `spill_at` with a partition begun after the first, every
+    /// function is computed over them, the rows before that last partition go out,
+    /// and that partition, perhaps incomplete, is carried into the next segment. A
+    /// partition is held whole, so one past `spill_at` (every row, without PARTITION
+    /// BY) is held whole as well.
+    fn nextSorted(self: *Window, arena: std.mem.Allocator) !?Batch {
+        const so = self.src.?;
+        const gpa = self.alloc();
+        while (true) {
+            if (self.seg) |h| {
+                if (h.pos < self.cut) return self.emit(arena, h, self.cut);
+                self.seg = null;
+                defer h.destroy();
+                if (self.cut < h.rows) self.carried = try carry(h, self.in_schema);
+            }
+            const h = self.carried orelse if (self.drained) {
+                self.release();
+                return null;
+            } else try Held.create(gpa);
+            self.carried = null;
+            self.seg = h;
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            var start: usize = 0;
+            var cut: ?usize = null;
+            while (cut == null) {
+                const b = (try so.next(h.pull())) orelse {
+                    self.drained = true;
+                    break;
+                };
+                if (b.len == 0) continue;
+                try h.add(b);
+                _ = scratch.reset(.retain_capacity);
+                start = try self.lastPartStart(scratch.allocator(), h, start);
+                if (h.bytes > self.spill_at and start > 0) cut = start;
+            }
+            if (h.rows == 0) {
+                self.release();
+                return null;
+            }
+            self.cut = cut orelse h.rows;
+            try h.inOrder();
+            var work = std.heap.ArenaAllocator.init(gpa);
+            defer work.deinit();
+            self.fcols = try self.compute(work.allocator(), h, true);
+        }
+    }
+
+    /// Where the last partition of `h`'s rows, pulled in order, starts once its last
+    /// chunk is added: within that chunk, or `start` when the chunk continues the
+    /// partition before it.
+    fn lastPartStart(self: *const Window, t: std.mem.Allocator, h: *const Held, start: usize) !usize {
+        const chunks = h.chunks.items;
+        const b = chunks[chunks.len - 1];
+        const at = h.rows - b.len;
+        const arrs = try t.alloc(KeyArr, self.part.len);
+        for (self.part, arrs) |k, *x| x.* = try KeyArr.prepare(t, b.columns[k.idx], k);
+        var r = b.len - 1;
+        while (r > 0) : (r -= 1) if (!sameOn(arrs, r - 1, r)) return at + r;
+        if (chunks.len == 1) return start;
+        const p = chunks[chunks.len - 2];
+        for (self.part, arrs) |k, x| {
+            const last = try KeyArr.prepare(t, try column.slice(t, p.columns[k.idx], p.len - 1, 1), k);
+            if (last.orderAcross(0, x, 0) != .eq) return at;
+        }
+        return start;
+    }
+
+    /// The rows of `h` from its position on, copied into a new `Held` in order.
+    fn carry(h: *Held, schema: *const types.Schema) !*Held {
+        const c = try Held.create(h.gpa);
+        errdefer c.destroy();
+        const a = c.allocator();
+        const cols = try a.alloc(column.Column, schema.fields.len);
+        const n = try h.gather(a, h.rows - h.pos, cols);
+        try c.adopt(.{ .schema = schema, .columns = cols, .len = n });
+        return c;
+    }
+
+    /// Orders `h`'s rows by partition and order keys, unless they are `ordered`
+    /// already, and computes every function over them, into `h`'s arena; the sorted
+    /// copies of only the key and argument columns and the frames are scratch in
+    /// `work`.
+    fn compute(self: *Window, work: std.mem.Allocator, h: *Held, ordered: bool) ![]column.Column {
         const n = h.rows;
         const keys = try work.alloc(Sort.Key, self.part.len + self.ord.len);
         @memcpy(keys[0..self.part.len], self.part);
         @memcpy(keys[self.part.len..], self.ord);
-        var mk = Marks{ .np = self.part.len, .part = try work.alloc(bool, n), .peer = try work.alloc(bool, n) };
-        const marked = try h.orderMarked(keys, self.threads, &mk);
+        var mk = Marks{ .np = self.part.len, .part = &.{}, .peer = &.{} };
+        const marked = if (ordered) null else blk: {
+            mk.part = try work.alloc(bool, n);
+            mk.peer = try work.alloc(bool, n);
+            break :blk try h.orderMarked(keys, self.threads, &mk);
+        };
 
         const sc = try work.alloc(?column.Column, self.in_schema.fields.len);
         @memset(sc, null);
@@ -1045,6 +1192,7 @@ pub const Window = struct {
 
 const testing = std.testing;
 const Scan = @import("../op.zig").Scan;
+const SpillDir = @import("../spill.zig").TestDir;
 const TestSource = @import("testing_util.zig").TestSource;
 
 const BruteRow = struct { p: ?i64, o: ?i64, v: ?i64 };
@@ -1227,8 +1375,9 @@ fn windowOutType(f: Window.Func) types.Type {
     };
 }
 
-/// The operator's output for `funcs` over `rows` (columns p, o, v), in its order.
-fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window.Func, dir: Dir, with_order: bool) ![]Batch {
+/// The operator's output for `funcs` over `rows` (columns p, o, v), in its order. With
+/// `spill`, the rows come three a batch and every batch passes `spill_at`.
+fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window.Func, dir: Dir, with_order: bool, spill: ?Space) ![]Batch {
     const in_schema = try a.create(types.Schema);
     in_schema.* = .{ .fields = &.{
         .{ .name = "p", .ty = types.Type.init(.int).asNullable() },
@@ -1241,11 +1390,14 @@ fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window
     const out_schema = try a.create(types.Schema);
     out_schema.* = .{ .fields = fields };
     var batches = std.array_list.Managed(Batch).init(a);
-    if (rows.len > 0) {
-        const ps = try a.alloc(?i64, rows.len);
-        const os = try a.alloc(?i64, rows.len);
-        const vs = try a.alloc(?i64, rows.len);
-        for (rows, ps, os, vs) |r, *p, *o, *v| {
+    const per = if (spill != null) 3 else @max(rows.len, 1);
+    var lo: usize = 0;
+    while (lo < rows.len) : (lo += per) {
+        const part = rows[lo..@min(rows.len, lo + per)];
+        const ps = try a.alloc(?i64, part.len);
+        const os = try a.alloc(?i64, part.len);
+        const vs = try a.alloc(?i64, part.len);
+        for (part, ps, os, vs) |r, *p, *o, *v| {
             p.* = r.p;
             o.* = r.o;
             v.* = r.v;
@@ -1254,7 +1406,7 @@ fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window
         cols[0] = try column.intColumn(a, ps);
         cols[1] = try column.intColumn(a, os);
         cols[2] = try column.intColumn(a, vs);
-        try batches.append(.{ .schema = in_schema, .columns = cols, .len = rows.len });
+        try batches.append(.{ .schema = in_schema, .columns = cols, .len = part.len });
     }
     const ts = try a.create(TestSource);
     ts.* = .{ .schema_ = in_schema.*, .batches = batches.items };
@@ -1270,13 +1422,15 @@ fn runWindow(a: std.mem.Allocator, rows: []const BruteRow, funcs: []const Window
         .funcs = funcs,
         .gpa = testing.allocator,
         .batch_rows = 8,
+        .space = spill,
+        .spill_at = if (spill != null) 1 else std.math.maxInt(usize),
     };
     var out = std.array_list.Managed(Batch).init(a);
     while (try w.next(a)) |b| {
         try testing.expect(b.len <= 8);
         try out.append(b);
     }
-    try testing.expect(w.held == null);
+    try testing.expect(w.held == null and w.src == null and w.seg == null and w.carried == null);
     return out.toOwnedSlice();
 }
 
@@ -1336,13 +1490,17 @@ test "window frames: every bound pair, ROWS and RANGE, ties, nulls and edges mat
             for ([_]ast.WinKind{ .first_value, .last_value, .nth_value }) |vk| for ([_]bool{ false, true }) |ign|
                 try funcs.append(.{ .func = .{ .win = vk }, .arg = 2, .offset = 2, .ignore_nulls = ign, .frame = fr });
         };
-        const out = try runWindow(a, rows, funcs.items, dir, true);
-        var at: usize = 0;
-        for (out) |b| for (0..b.len) |r| {
-            for (funcs.items, 0..) |f, fi| try expectSameValue(try bruteValue(a, sorted, at, f, dir), b.columns[3 + fi].getValue(r));
-            at += 1;
-        };
-        try testing.expectEqual(n, at);
+        for ([_]bool{ false, true }) |spilled| {
+            const td = try SpillDir.init(std.math.maxInt(u64));
+            defer td.deinit();
+            const out = try runWindow(a, rows, funcs.items, dir, true, if (spilled) td.ds.space() else null);
+            var at: usize = 0;
+            for (out) |b| for (0..b.len) |r| {
+                for (funcs.items, 0..) |f, fi| try expectSameValue(try bruteValue(a, sorted, at, f, dir), b.columns[3 + fi].getValue(r));
+                at += 1;
+            };
+            try testing.expectEqual(n, at);
+        }
     };
 }
 
@@ -1364,36 +1522,40 @@ test "window offsets and ranking: LAG/LEAD (IGNORE NULLS), NTILE, PERCENT_RANK a
         try funcs.append(.{ .func = .{ .win = .rank } });
         try funcs.append(.{ .func = .{ .win = .percent_rank } });
         try funcs.append(.{ .func = .{ .win = .cume_dist } });
-        const out = try runWindow(a, rows, funcs.items, dir, true);
-        var at: usize = 0;
-        for (out) |b| for (0..b.len) |r| {
-            const ps, const pe = partitionOf(sorted, at);
-            var rk: usize = ps;
-            while (rk < at and !sameP(sorted[rk].o, sorted[at].o)) rk += 1;
-            var ge = at + 1;
-            while (ge < pe and sameP(sorted[ge].o, sorted[at].o)) ge += 1;
-            const size = pe - ps;
-            for (funcs.items, 0..) |f, fi| {
-                const want: Value = switch (f.func.win) {
-                    .lag, .lead => try bruteValue(a, sorted, at, f, dir),
-                    .ntile => blk: {
-                        const bk: usize = @intCast(f.offset);
-                        const q = size / bk;
-                        const rem = size % bk;
-                        const i = at - ps;
-                        const big = rem * (q + 1);
-                        break :blk .{ .int = @intCast(if (i < big) i / (q + 1) + 1 else rem + (i - big) / q + 1) };
-                    },
-                    .rank => .{ .int = @intCast(rk - ps + 1) },
-                    .percent_rank => .{ .float = if (size <= 1) 0 else @as(f64, @floatFromInt(rk - ps)) / @as(f64, @floatFromInt(size - 1)) },
-                    .cume_dist => .{ .float = @as(f64, @floatFromInt(ge - ps)) / @as(f64, @floatFromInt(size)) },
-                    else => unreachable,
-                };
-                try expectSameValue(want, b.columns[3 + fi].getValue(r));
-            }
-            at += 1;
-        };
-        try testing.expectEqual(n, at);
+        for ([_]bool{ false, true }) |spilled| {
+            const td = try SpillDir.init(std.math.maxInt(u64));
+            defer td.deinit();
+            const out = try runWindow(a, rows, funcs.items, dir, true, if (spilled) td.ds.space() else null);
+            var at: usize = 0;
+            for (out) |b| for (0..b.len) |r| {
+                const ps, const pe = partitionOf(sorted, at);
+                var rk: usize = ps;
+                while (rk < at and !sameP(sorted[rk].o, sorted[at].o)) rk += 1;
+                var ge = at + 1;
+                while (ge < pe and sameP(sorted[ge].o, sorted[at].o)) ge += 1;
+                const size = pe - ps;
+                for (funcs.items, 0..) |f, fi| {
+                    const want: Value = switch (f.func.win) {
+                        .lag, .lead => try bruteValue(a, sorted, at, f, dir),
+                        .ntile => blk: {
+                            const bk: usize = @intCast(f.offset);
+                            const q = size / bk;
+                            const rem = size % bk;
+                            const i = at - ps;
+                            const big = rem * (q + 1);
+                            break :blk .{ .int = @intCast(if (i < big) i / (q + 1) + 1 else rem + (i - big) / q + 1) };
+                        },
+                        .rank => .{ .int = @intCast(rk - ps + 1) },
+                        .percent_rank => .{ .float = if (size <= 1) 0 else @as(f64, @floatFromInt(rk - ps)) / @as(f64, @floatFromInt(size - 1)) },
+                        .cume_dist => .{ .float = @as(f64, @floatFromInt(ge - ps)) / @as(f64, @floatFromInt(size)) },
+                        else => unreachable,
+                    };
+                    try expectSameValue(want, b.columns[3 + fi].getValue(r));
+                }
+                at += 1;
+            };
+            try testing.expectEqual(n, at);
+        }
     };
 }
 
@@ -1486,7 +1648,7 @@ test "window without ORDER BY: the default frame is the whole partition, a ROWS 
         .{ .func = .{ .agg = .sum }, .arg = 2, .frame = .{ .range = false, .start = .{ .preceding = .{ .rows = 1 } }, .end = .current_row } },
         .{ .func = .{ .win = .last_value }, .arg = 2 },
     };
-    const out = try runWindow(a, &rows, &funcs, dirs[0], false);
+    const out = try runWindow(a, &rows, &funcs, dirs[0], false, null);
     const want = [_][3]?i64{ .{ 3, 1, 2 }, .{ 3, 3, 2 }, .{ 10, 4, 6 }, .{ 10, 4, 6 }, .{ 10, 6, 6 } };
     var at: usize = 0;
     for (out) |b| for (0..b.len) |r| {

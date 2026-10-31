@@ -845,6 +845,8 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
                 .gpa = env.gpa,
                 .threads = env.pipe.threads,
                 .adopt_input = heldInput(child),
+                .space = env.space,
+                .spill_at = env.op_memory,
             };
             break :blk .{ .window = w };
         },

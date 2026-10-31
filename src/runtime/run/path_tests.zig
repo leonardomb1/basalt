@@ -36,7 +36,7 @@ const cases = [_]Case{
     .{ .q = "SELECT id, v FROM '$B/in.csv' ORDER BY v DESC, id LIMIT 5", .want = "csv parallel top-n" },
     .{ .q = "SELECT id FROM '$B/in.csv' ORDER BY v DESC, id LIMIT 5", .want = "serial" },
     .{ .q = "SELECT id FROM '$B/in.csv' ORDER BY v, id", .want = "csv parallel sort" },
-    .{ .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'", .want = "the window's input read into memory first (csv parallel map)" },
+    .{ .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'", .want = "csv parallel window" },
     .{ .q = "SELECT * FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM '$B/in.csv') r WHERE rn <= 2", .want = "serial" },
     .{ .q = "SELECT id, x FROM '$B/in.csv' CROSS JOIN UNNEST(SPLIT(g, ',')) AS x", .want = "csv parallel map" },
     .{ .q = "SELECT id, x FROM '$B/p.parquet' CROSS JOIN UNNEST(SPLIT(g, ',')) AS x WHERE v > 2", .want = "parquet parallel map" },

@@ -242,64 +242,6 @@ fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
     try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
 }
 
-const window_input = "__window_input";
-
-/// A window over a file reads its input first, in parallel, into
-/// memory, since built in place the read ran on one thread (`path.windowInputAt`).
-fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const ast.Stage {
-    var stages = stages_in;
-    if (stages.len > 0 and stages[0].node == .ref) {
-        if (env.materialized.contains(stages[0].node.ref)) return null;
-        const b = (try stampedBinding(env, stages[0].node.ref)) orelse return null;
-        if (b.stages.len == 0 or b.stages[0].node != .read) return null;
-        const joined = try env.arena.alloc(ast.Stage, b.stages.len + stages.len - 1);
-        @memcpy(joined[0..b.stages.len], b.stages);
-        @memcpy(joined[b.stages.len..], stages[1..]);
-        stages = joined;
-    }
-    const wi = path.windowInputAt(stages, opts.lanes()) orelse return null;
-    if (env.materialized.contains(window_input)) return null;
-    const narrowed = for (stages[1..wi]) |st| {
-        if (st.node == .select) break true;
-    } else false;
-
-    var keep = std.array_list.Managed(ast.SelectItem).init(env.arena);
-    if (!narrowed) if (try projectedColumns(env, stages[1..])) |cols| {
-        names: for (cols) |c| {
-            if (stages[wi].node == .window) for (stages[wi].node.window.funcs) |f| if (std.mem.eql(u8, f.out, c)) continue :names;
-            const parts = try env.arena.alloc([]const u8, 1);
-            parts[0] = c;
-            try keep.append(.{ .field = .{ .parts = parts } });
-        }
-    };
-    const inner = try env.arena.alloc(ast.Stage, wi + @as(usize, if (keep.items.len > 0) 2 else 1));
-    @memcpy(inner[0..wi], stages[0..wi]);
-    if (keep.items.len > 0) inner[wi] = .{ .node = .{ .select = keep.items }, .hints = &.{}, .pos = stages[wi].pos };
-    const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
-    inner[inner.len - 1] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = stages[wi].pos };
-
-    var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
-    const outer_sink = env.mem_sink;
-    const outer_name = env.sink_name;
-    env.mem_sink = &ms;
-    defer env.mem_sink = outer_sink;
-    defer env.sink_name = outer_name;
-    var scratch: Stats = .{};
-    var delegated = false;
-    {
-        const outer_scope = enterScope(env, window_input);
-        defer leaveScope(env, outer_scope);
-        try runOutputBody(env, opts, inner, inner[inner.len - 1].node, &scratch, lanes_used, batch_arena, &delegated);
-    }
-    try notePrelude(env, "the window's input", stages[0].pos);
-    try env.materialized.put(env.arena, window_input, .{ .schema = ms.schema, .batches = ms.batches.items });
-
-    const outer = try env.arena.alloc(ast.Stage, stages.len - wi + 1);
-    outer[0] = .{ .node = .{ .ref = window_input }, .hints = &.{}, .pos = stages[0].pos };
-    @memcpy(outer[1..], stages[wi..]);
-    return outer;
-}
-
 const window_topk = "__window_topk";
 
 /// A top-k window (a lone ROW_NUMBER filtered `rn <= k`) over a local file runs on
@@ -592,11 +534,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         _ = env.materialized.remove(window_topk);
     };
     if (wtk) |w| stages = w;
-    const win = try windowInput(env, opts, stages, lanes_used, batch_arena);
-    defer if (win != null) {
-        _ = env.materialized.remove(window_input);
-    };
-    if (win) |w| stages = w;
     if (stages[0].node == .read and stages[0].node.read.form == .path and ftp.isUrl(stages[0].node.read.form.path)) {
         const copy = try env.arena.dupe(ast.Stage, stages);
         copy[0].node.read = try localRead(env, copy[0].node.read);

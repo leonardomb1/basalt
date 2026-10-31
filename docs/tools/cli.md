@@ -86,7 +86,7 @@ trailer, and in a kernel status. A `LOAD` is never capped.
 
 ## Spilling to disk
 
-A blocking operator — a join's build side, a sort, an aggregate — holds its
+A blocking operator — a join's build side, a sort, a window, an aggregate — holds its
 input in memory up to `--op-memory` (default `2GB`) and spills the rest to
 disk. Spill files go in a directory of the run's own under `--spill-dir`
 (default `$TMPDIR`, else `/tmp`), made only when something first spills and

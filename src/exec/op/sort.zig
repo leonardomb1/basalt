@@ -132,12 +132,21 @@ pub const Sort = struct {
         return .{ .idx = idx, .arrs = arrs };
     }
 
-    /// Drains the child into `held`, writing a sorted run whenever the bytes held pass
-    /// `spill_at`. With no run written the input is sorted in memory as without a
-    /// space; otherwise the remainder stays in memory as the last run, groups of runs
-    /// are merged into new ones until `fan_in` sources remain, and the final merge is
-    /// left in `merge` for the following pulls.
+    /// The input sorted in memory when it never passed `spill_at`, else the merge of its
+    /// runs, handed out a batch at a time.
     fn external(self: *Sort, arena: std.mem.Allocator, space: Space) !?Batch {
+        if (try self.fill(space)) |h| return self.start(arena, h);
+        if (try self.merge.?.next(arena, @max(self.batch_rows, 1))) |b| return b;
+        self.dropMerge();
+        return null;
+    }
+
+    /// Drains the child, writing a sorted run whenever the bytes held pass `spill_at`.
+    /// With no run written, the input held, unordered, which the caller takes;
+    /// otherwise the remainder stays in memory as the last run, groups of runs are
+    /// merged into new ones until `fan_in` sources remain, and the final merge is left
+    /// in `merge` for the following pulls.
+    pub fn fill(self: *Sort, space: Space) !?*Held {
         var h = try Held.create(self.gpa);
         var h_owned = true;
         defer if (h_owned) h.destroy();
@@ -160,7 +169,7 @@ pub const Sort = struct {
 
         if (runs.items.len == 0) {
             h_owned = false;
-            return self.start(arena, h);
+            return h;
         }
 
         var mem: ?Merge.Mem = null;
@@ -180,10 +189,7 @@ pub const Sort = struct {
         runs_owned = false;
         const give: ?*Held = if (mem != null) h else null;
         if (give != null) h_owned = false;
-        const m = try Merge.init(self.gpa, self.in_schema, self.keys, runs.items, mem, give);
-        self.merge = m;
-        if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
-        self.dropMerge();
+        self.merge = try Merge.init(self.gpa, self.in_schema, self.keys, runs.items, mem, give);
         return null;
     }
 
@@ -279,10 +285,10 @@ pub const Shared = struct {
     }
 
     /// Sets `sort` up to hand out the rows of every part, which keep holding the rows
-    /// they did not spill until `sort` is released: ordered in memory when no part
-    /// spilled, else the rows left written as one more run and every run merged. The
-    /// parts' runs are taken whatever happens.
-    pub fn finish(self: *Shared, parts: []const *Part) !void {
+    /// they did not spill until `sort` is released: held in input order, and ordered
+    /// when `order`, when no part spilled, else the rows left written as one more run
+    /// and every run merged. The parts' runs are taken whatever happens.
+    pub fn finish(self: *Shared, parts: []const *Part, order: bool) !void {
         const s = &self.sort;
         const gpa = s.gpa;
         var runs: std.ArrayListUnmanaged(spill.Run) = .empty;
@@ -317,7 +323,7 @@ pub const Shared = struct {
         }
         if (runs.items.len == 0) {
             if (h.rows == 0) return;
-            try h.order(s.keys, s.threads);
+            if (order) try h.order(s.keys, s.threads);
             s.held = h;
             h_owned = false;
             return;
@@ -493,6 +499,18 @@ pub const Held = struct {
     /// `adopt` when `keep`, else `add`.
     pub fn takeIn(self: *Held, b: Batch, keep: bool) !void {
         return if (keep) self.adopt(b) else self.add(b);
+    }
+
+    /// Takes the rows as they were pulled for their order, already sorted.
+    pub fn inOrder(self: *Held) !void {
+        const refs = try self.ar.allocator().alloc(Ref, self.rows);
+        var at: usize = 0;
+        for (self.chunks.items, 0..) |b, c| for (0..b.len) |r| {
+            refs[at] = .{ .chunk = @intCast(c), .row = @intCast(r) };
+            at += 1;
+        };
+        self.refs = refs;
+        self.pos = 0;
     }
 
     /// Drops every row held, keeping the arena's capacity for the next.

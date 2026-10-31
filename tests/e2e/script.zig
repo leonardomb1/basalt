@@ -244,9 +244,9 @@ test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan,
         },
         .{
             .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'",
-            .rows = "Rows read: 6.0K (6000)   Rows out: 6.0K (6000)   Path: the window's input read into memory first (csv parallel map, ",
-            .path = "), then serial\n",
-            .scan = "  the window's input, in memory\n",
+            .rows = "Rows read: 6.0K (6000)   Rows out: 6.0K (6000)   Path: csv parallel window, ",
+            .path = " chunks\n",
+            .scan = "  the lanes' partial results, merged\n",
         },
         .{
             .q = "SELECT t.id, k.label FROM '$B/in.csv' t JOIN '$B/k.csv' k ON t.g = k.g",

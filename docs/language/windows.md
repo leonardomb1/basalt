@@ -236,8 +236,12 @@ nulls, has no value.
 ## How it runs
 
 A window is a **breaker**: a row's value is not known until its whole partition has
-arrived, so memory is bounded by the input, as for `ORDER BY`, `DISTINCT` and
-`GROUP BY` (a window does not spill). Each stage sorts once, then resolves every
+arrived. An input past `--op-memory` is sorted to disk by partition and order keys
+and read back a run of whole partitions at a time, so memory is bounded by
+`--op-memory` and the largest partition — without `PARTITION BY`, the whole input
+is one ([Spilling to disk](../tools/cli.md#spilling-to-disk)). Over a local file at
+`-j` above 1 every lane sorts the rows it reads; the rows come out the same at
+every `-j`. Each stage sorts once, then resolves every
 row's frame by two forward-moving edges, so a frame of any size costs the same:
 an aggregate adds the rows entering and takes back the rows leaving — exactly for
 integer and decimal sums, counts and the variances over integers, `MIN`/`MAX`

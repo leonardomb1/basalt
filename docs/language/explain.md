@@ -67,11 +67,11 @@ plan (actuals)
 ANALYZE` uses once it has: both come from the one decision the run dispatches on.
 `csv parallel …` / `parquet parallel …` is a local CSV cut into byte-range chunks
 or a Parquet into row groups, with the shape the lanes run (`map`, `map+join`,
-`aggregate`, `aggregate over joins`, `distinct`, `top-n`, `sort`); `postgres
+`aggregate`, `aggregate over joins`, `distinct`, `top-n`, `sort`, `window`); `postgres
 split-parallel …` is a SQL read divided into key ranges; a SQL source's aggregate
 or `ORDER BY … LIMIT` sent to the source comes first, then the split, each
 `unless` what would send it to the next; `… read into memory first (…), then
-serial` is a window's input or an aggregating CTE read on its own path ahead of a
+serial` is an aggregating CTE read on its own path ahead of a
 serial rest; `serial` is everything else (a CSV over HTTP is fetched whole, so it
 parses serially; an `UNNEST` or a `LIMIT` without `ORDER BY` over a file streams
 on one lane). A parallel path names what only the source can settle — a table's

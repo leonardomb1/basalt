@@ -14,9 +14,9 @@
 //! inlining and pushdown rewrite, the same `joinPlan`, the same `THROW` guards and
 //! body-statement rule, and the same path: `Physical.path` is `path.choose`, the
 //! function the run dispatches on, asked over the stages as the run holds them at
-//! each step (an aggregating binding or a window's input read first, the head
-//! binding laid out for lanes, a `SPLIT BY` key on the read). Separate heuristics
-//! here once named a parallel path the run never took, and the reverse.
+//! each step (an aggregating binding read first, the head binding laid out for
+//! lanes, a `SPLIT BY` key on the read). Separate heuristics here once named a
+//! parallel path the run never took, and the reverse.
 //!
 //! Binding order: PARAMs (with `-p` overrides typed as the run binds them), then
 //! statement-level LETs in declaration order as expressions; a query LET is an
@@ -378,7 +378,7 @@ pub const Stage = struct {
 /// conditions only the run settles.
 pub const Physical = struct {
     path: pathmod.Path,
-    /// A binding or the window's input read into memory first, on `inner`'s path.
+    /// A binding read into memory first, on `inner`'s path.
     prelude: ?struct { what: []const u8, inner: *const Physical } = null,
     has_breaker: bool = false,
     sink_parallel: bool = false,
@@ -1423,17 +1423,12 @@ const Ctx = struct {
     }
 
     /// The path the run takes, as `path.choose` picks it for the run over the
-    /// stages as the run holds them at each step: an aggregating binding or a
-    /// window's input read into memory first, else the chain from the leading read.
+    /// stages as the run holds them at each step: an aggregating binding read into
+    /// memory first, else the chain from the leading read.
     /// `raw` is before the head binding is laid out.
     fn physicalOf(self: *Ctx, raw: []const ast.Stage, stages_in: []const ast.Stage) Error!Physical {
         if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes(b.stages, self.lanes))
             return self.prelude(raw[0].node.ref, b.stages, b.stages.len);
-        var joined = stages_in;
-        if (stages_in[0].node == .ref) if (self.bindings.get(stages_in[0].node.ref)) |b| if (b.stages.len > 0 and b.stages[0].node == .read) {
-            joined = try std.mem.concat(self.arena, ast.Stage, &.{ b.stages, stages_in[1..] });
-        };
-        if (pathmod.windowInputAt(joined, self.lanes)) |wi| return self.prelude("the window's input", joined, wi);
 
         const w = stages_in[stages_in.len - 1].node.write;
         var stages = stages_in;

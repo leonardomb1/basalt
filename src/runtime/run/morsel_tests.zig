@@ -96,6 +96,8 @@ const queries = [_]Query{
     .{ .q = "SELECT id, g, k FROM $IN ORDER BY g", .exact = true },
     .{ .q = "SELECT id, k, g FROM $IN WHERE k > 100 ORDER BY k DESC, g", .exact = true },
     .{ .q = "SELECT g, id + k AS x FROM $IN ORDER BY g DESC, x LIMIT 30000 OFFSET 3", .exact = true },
+    .{ .q = "SELECT id, g, ROW_NUMBER() OVER (PARTITION BY g ORDER BY k) AS rn, SUM(k) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM $IN", .exact = true },
+    .{ .q = "SELECT id, RANK() OVER (ORDER BY k DESC) AS r, LAG(f) OVER (PARTITION BY k % 10 ORDER BY id) AS lf FROM $IN WHERE k < 5000", .exact = true },
     .{ .q = "SELECT t.id, l.label FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g", .exact = true },
     .{ .q = "SELECT t.id, l.label FROM $IN t LEFT JOIN '$B/labels.csv' l ON t.g = l.g WHERE t.k < 500", .exact = true },
 };
@@ -191,7 +193,7 @@ test "a grouped aggregate past --op-memory partitions its rows to disk and gives
     try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", whole, 1, opts), try resultOf(a, tmp.dir, base, "", whole, 4, opts));
 }
 
-test "a parallel ORDER BY past --op-memory writes runs from every lane, merges more than its fan-in, and gives -j 1's rows, ties in input order" {
+test "a parallel ORDER BY or window past --op-memory writes runs from every lane, merges more than its fan-in, and gives -j 1's rows, ties in input order" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -203,11 +205,17 @@ test "a parallel ORDER BY past --op-memory writes runs from every lane, merges m
     try tmp.dir.makeDir("spill");
     const opts = env_mod.RunOptions{ .morsel_bytes = 8 << 10, .op_memory = 32 << 10, .spill_dir = try std.fs.path.join(a, &.{ base, "spill" }) };
     for ([_][]const u8{ "in.csv", "in.parquet" }) |file| {
-        const q = try msgfmt.allocPrint(a, "SELECT id, g, k FROM '{s}/{s}' ORDER BY g DESC, k % 5", .{ base, file });
-        const one = try resultOf(a, tmp.dir, base, "", q, 1, .{});
-        try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 4, opts));
-        try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 16, opts));
-        try testing.expect(std.mem.count(u8, one, "\n") == rows + 1);
+        for ([_][]const u8{
+            "SELECT id, g, k FROM '{s}/{s}' ORDER BY g DESC, k % 5",
+            "SELECT id, k, ROW_NUMBER() OVER (PARTITION BY k % 300 ORDER BY g) AS rn, MAX(id) OVER (PARTITION BY k % 300) AS mx FROM '{s}/{s}'",
+        }) |shape| {
+            const q = try std.mem.replaceOwned(u8, a, try std.mem.replaceOwned(u8, a, shape, "{s}/{s}", "$B/$F"), "$F", file);
+            const one = try resultOf(a, tmp.dir, base, "", q, 1, .{});
+            try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 1, opts));
+            try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 4, opts));
+            try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 16, opts));
+            try testing.expect(std.mem.count(u8, one, "\n") == rows + 1);
+        }
     }
     var out = std.array_list.Managed(u8).init(a);
     try out.appendSlice("id,x\n");

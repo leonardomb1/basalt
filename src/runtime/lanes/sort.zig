@@ -1,7 +1,10 @@
-//! ORDER BY lanes, a `ParallelSink` that `morsels.drive` feeds: each worker holds the
-//! rows of the morsels it claims as an `op.SortPart`, written as sorted runs past
-//! its share of `--op-memory`; finalize orders what the workers hold, or merges it
-//! with every run, and writes the rows through the tail in a serial run's order.
+//! ORDER BY and window lanes, a `ParallelSink` that `morsels.drive` feeds: each worker
+//! holds the rows of the morsels it claims as an `op.SortPart`, written as sorted
+//! runs past its share of `--op-memory`; finalize orders what the workers hold, or
+//! merges it with every run, and writes the rows through the tail in a serial run's
+//! order. A window sorts by its partition and order keys: the rows held, uncopied,
+//! are its input as a serial run's would be, and merged runs it reads a segment of
+//! whole partitions at a time (`op.Window.nextSorted`).
 
 const Env = @import("../env.zig").Env;
 const Morsels = @import("morsels.zig").Morsels;
@@ -12,6 +15,8 @@ const OneBatch = @import("../connect.zig").OneBatch;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const LaneMem = @import("../parallel.zig").LaneMem;
+const MemSource = @import("../env.zig").MemSource;
+const buildOp = @import("../plan.zig").buildOp;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
@@ -27,16 +32,25 @@ const writeTailOver = @import("agg.zig").writeTailOver;
 
 pub const SortShape = struct { prefix: []const ast.Stage, srt: ast.Stage, tail: []const ast.Stage };
 
-/// Recognize `read … | map* | ORDER BY | tail | write`, but not a sort a `LIMIT` the
-/// top-N takes follows, which keeps only its rows as they stream.
+/// Recognize `read … | map* | ORDER BY or window | tail | write`, but not a sort a
+/// `LIMIT` the top-N takes follows, nor a window a filter follows (`WHERE rn <= k`
+/// keeps only `k` rows a partition as they stream), which keep only their rows.
 pub fn classifySortPipeline(stages: []const ast.Stage) ?SortShape {
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| {
-        if (st.node == .sort) {
-            if (i + 1 < middle.len and middle[i + 1].node == .limit and op.TopN.fits(middle[i + 1].node.limit)) return null;
-            return .{ .prefix = middle[0..i], .srt = st, .tail = middle[i + 1 ..] };
+        const tail = middle[i + 1 ..];
+        switch (st.node) {
+            .sort => {
+                if (tail.len > 0 and tail[0].node == .limit and op.TopN.fits(tail[0].node.limit)) return null;
+                return .{ .prefix = middle[0..i], .srt = st, .tail = tail };
+            },
+            .window => |wd| {
+                if (wd.top_k != null) return null;
+                for (tail) |t| if (t.node == .filter) return null;
+                return .{ .prefix = middle[0..i], .srt = st, .tail = tail };
+            },
+            else => if (!analyze.isMap(st.node, false)) return null,
         }
-        if (!analyze.isMap(st.node, false)) return null;
     }
     return null;
 }
@@ -46,6 +60,8 @@ pub fn classifySortPipeline(stages: []const ast.Stage) ?SortShape {
 const SortSink = struct {
     env: *Env,
     shared: *op.SortShared,
+    /// Whether rows that fit are ordered here; a window orders them itself.
+    order: bool,
     parts: std.ArrayListUnmanaged(*op.SortPart) = .empty,
     mtx: std.Thread.Mutex = .{},
     /// The kind of the lanes' top operator, which the tail stands above in a profile.
@@ -79,7 +95,7 @@ const SortSink = struct {
             row += b.len;
         }
         const prof = self.env.profile orelse return;
-        _ = try prof.absorb(chain);
+        _ = try prof.absorbBelow(chain);
         self.mtx.lock();
         defer self.mtx.unlock();
         self.feeds = chain;
@@ -93,7 +109,7 @@ const SortSink = struct {
     fn finalize(ptr: *anyopaque) anyerror!void {
         const self: *SortSink = @ptrCast(@alignCast(ptr));
         const t0 = std.time.Instant.now() catch unreachable;
-        try self.shared.finish(self.parts.items);
+        try self.shared.finish(self.parts.items, self.order);
         if (self.env.profile) |p| try p.phase("order the lanes' rows", (std.time.Instant.now() catch t0).since(t0));
     }
 
@@ -104,38 +120,53 @@ pub fn runParallelSort(env: *Env, m: *const Morsels, shape: SortShape, w: ast.Wr
     const arena = env.arena;
     const pre = try chainAt(env, m.schema().*, shape.prefix);
     const row_schema = pre.out;
-    const keys = (try resolveAt(env, row_schema.*, shape.srt)).plan.sort;
 
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    const workers = m.workers(opts.lanes());
     var none = OneBatch{ .b = null, .sch = row_schema.* };
     var scan = op.Scan{ .src = none.source() };
     scan.stats.at = profile.merged_at;
+    const built = try buildOp(env, try resolveAt(env, row_schema.*, shape.srt), .{ .scan = &scan });
+    var base: op.Sort = switch (built.op) {
+        .sort => |so| so.*,
+        .window => |wo| .{ .child = .{ .scan = &scan }, .in_schema = row_schema, .keys = try std.mem.concat(arena, op.Sort.Key, &.{ wo.part, wo.ord }), .threads = opts.lanes(), .space = env.space, .gpa = env.gpa },
+        else => unreachable,
+    };
+    base.spill_at = env.op_memory / @max(m.workers(opts.lanes()), 1);
     const shared = try arena.create(op.SortShared);
-    shared.* = try .init(arena, .{
-        .child = .{ .scan = &scan },
-        .in_schema = row_schema,
-        .keys = keys,
-        .threads = opts.lanes(),
-        .space = env.space,
-        .spill_at = env.op_memory / @max(workers, 1),
-        .gpa = env.gpa,
-    });
-    const after = try chainAt(env, row_schema.*, shape.tail);
-    var g = SortSink{ .env = env, .shared = shared };
+    shared.* = try .init(arena, base);
+    defer shared.sort.release();
+    const after = try chainAt(env, built.schema, shape.tail);
+    var g = SortSink{ .env = env, .shared = shared, .order = built.op == .sort };
     defer g.deinit();
     const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = env.rows_read };
-    const lanes = drive(arena, p, g.parallelSink(), opts.lanes()) catch |e| {
-        shared.sort.release();
-        return e;
-    };
+    const lanes = try drive(arena, p, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
-    env.log.log(.debug, "parallel {s} sort: {d} {s} over {d} lanes, {d} runs", .{ m.label(), m.count(), m.unitName(), lanes, shared.sort.runs });
-    if (env.profile) |pr| pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel sort, {d} {s}", .{ m.label(), m.count(), m.unitName() });
+    const what = if (built.op == .sort) "sort" else "window";
+    env.log.log(.debug, "parallel {s} {s}: {d} {s} over {d} lanes, {d} runs", .{ m.label(), what, m.count(), m.unitName(), lanes, shared.sort.runs });
+    if (env.profile) |pr| pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel {s}, {d} {s}", .{ m.label(), what, m.count(), m.unitName() });
 
-    const start: op.Op = .{ .sort = &shared.sort };
+    var held: MemSource = undefined;
+    var held_scan = op.Scan{ .src = undefined };
+    held_scan.stats.at = profile.merged_at;
+    const start: op.Op = switch (built.op) {
+        .sort => .{ .sort = &shared.sort },
+        .window => |wo| blk: {
+            wo.done = shared.sort.merge != null;
+            if (wo.done) {
+                wo.src = &shared.sort;
+            } else if (shared.sort.held) |h| {
+                held = .{ .m = .{ .schema = row_schema.*, .batches = h.chunks.items } };
+                held_scan.src = held.source();
+                wo.child = .{ .scan = &held_scan };
+                wo.adopt_input = true;
+                wo.space = null;
+            }
+            break :blk built.op;
+        },
+        else => unreachable,
+    };
     start.stampNew(profile.keyOf(shape.srt.pos));
     const snk = openTailSink(env, w, after.out.*) catch |e| {
         start.release();

@@ -24,6 +24,7 @@ pub const Kind = std.meta.Tag(op.Op);
 pub const Id = struct { at: u64, kind: Kind, path: u64 = root_path, scope: u64 = 0 };
 
 const root_path: u64 = 1;
+const below_path: u64 = 2;
 
 const Said = struct { at: u64, kind: Kind, scope: u64 = 0 };
 
@@ -172,21 +173,28 @@ pub const Profile = struct {
     /// Fold a finished chain into the profile, on the lane of the calling thread, and
     /// return its root's id.
     pub fn absorb(self: *Profile, root: op.Op) !Id {
-        return self.fold(root, true);
+        return self.fold(root, true, root_path);
+    }
+
+    /// `absorb` for the lanes' chain a breaker's tail is grafted above (`graftLeaf`):
+    /// its ids kept apart from the tail's, which may share a stage with it (a SELECT
+    /// computes a window's arguments before it and projects after it).
+    pub fn absorbBelow(self: *Profile, root: op.Op) !Id {
+        return self.fold(root, true, below_path);
     }
 
     /// Register a chain's shape and no figures: for a path that runs the operators'
     /// work without pulling them (the SQL split lanes apply a plan's filters and
     /// projections batch by batch), whose lanes then `credit` each node.
     pub fn shape(self: *Profile, root: op.Op) !Id {
-        return self.fold(root, false);
+        return self.fold(root, false, root_path);
     }
 
-    fn fold(self: *Profile, root: op.Op, count: bool) !Id {
+    fn fold(self: *Profile, root: op.Op, count: bool, path: u64) !Id {
         self.mtx.lock();
         defer self.mtx.unlock();
         const lane = try self.laneOfCaller();
-        const id = try self.walk(root, lane, root_path, count);
+        const id = try self.walk(root, lane, path, count);
         for (self.roots.items) |r| if (std.meta.eql(r, id)) return id;
         try self.roots.append(self.gpa, id);
         return id;
