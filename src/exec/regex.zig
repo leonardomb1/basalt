@@ -122,6 +122,20 @@ pub const Regex = struct {
     alt: []const []const Item,
     ngroups: u8,
     lead_any: bool = false,
+    /// Every branch opens with `^`: only `from` can start a match.
+    anchored: bool = false,
+    /// The literal every branch opens with, as UTF-8: a match starts only where it
+    /// occurs. Lead bytes never occur inside a character, so each place it is found
+    /// is a character's start.
+    prefix: []const u8 = "",
+    /// A literal every match holds (one branch's longest run of exact literals): a
+    /// subject without it has no match.
+    need: []const u8 = "",
+    /// The bytes a match can start with, when every branch opens with a literal or
+    /// a class; never a continuation byte, so a byte found in it starts a character.
+    /// These three only skip starts that cannot match, and are left out when the
+    /// compile's allocator has no room for them.
+    first: ?*const [256]bool = null,
 
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) Error!Regex {
         return compileOpts(gpa, pattern, .{});
@@ -131,7 +145,88 @@ pub const Regex = struct {
         var p = Parser{ .src = pattern, .gpa = gpa, .icase = opts.icase };
         const alt = try p.parseAlt();
         if (p.i != pattern.len) return Error.BadPattern;
-        return .{ .alt = alt, .ngroups = p.ngroup, .lead_any = leadsWithAny(alt) };
+        var re = Regex{ .alt = alt, .ngroups = p.ngroup, .lead_any = leadsWithAny(alt) };
+        re.anchored = for (alt) |branch| {
+            if (branch.len == 0 or branch[0].atom != .bol or branch[0].min == 0) break false;
+        } else alt.len > 0;
+        re.prefix = commonPrefix(gpa, alt) catch "";
+        if (alt.len == 1) re.need = longestLiteral(gpa, alt[0]) catch "";
+        if (re.prefix.len == 0 and !re.anchored) re.first = firstBytes(gpa, alt) catch null;
+        return re;
+    }
+
+    fn appendLit(gpa: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) !void {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &buf) catch return error.BadPattern;
+        try out.appendSlice(gpa, buf[0..n]);
+    }
+
+    fn exactLit(it: Item) ?u21 {
+        if (it.min != 1 or it.max != 1) return null;
+        return if (it.atom == .lit) it.atom.lit else null;
+    }
+
+    /// The exact literals every branch opens with.
+    fn commonPrefix(gpa: std.mem.Allocator, alt: []const []const Item) ![]const u8 {
+        if (alt.len == 0) return "";
+        var out: std.ArrayList(u8) = .empty;
+        var k: usize = 0;
+        while (true) : (k += 1) {
+            const cp = if (k < alt[0].len) exactLit(alt[0][k]) orelse break else break;
+            for (alt[1..]) |b| {
+                if (k >= b.len or exactLit(b[k]) != cp) return out.items;
+            }
+            try appendLit(gpa, &out, cp);
+        }
+        return out.items;
+    }
+
+    /// The longest run of exact literals in `branch`'s own items, each of which a
+    /// match must pass through once.
+    fn longestLiteral(gpa: std.mem.Allocator, branch: []const Item) ![]const u8 {
+        var best: []const Item = &.{};
+        var at: usize = 0;
+        for (branch, 0..) |it, k| {
+            if (exactLit(it) == null) {
+                at = k + 1;
+                continue;
+            }
+            if (k + 1 - at > best.len) best = branch[at .. k + 1];
+        }
+        var out: std.ArrayList(u8) = .empty;
+        for (best) |it| try appendLit(gpa, &out, it.atom.lit);
+        return out.items;
+    }
+
+    /// The first bytes of what each branch's first item can match, when that item is
+    /// a literal or a class that must match once; null for anything else.
+    fn firstBytes(gpa: std.mem.Allocator, alt: []const []const Item) !?*const [256]bool {
+        if (alt.len == 0) return null;
+        const set = try gpa.create([256]bool);
+        @memset(set, false);
+        for (alt) |branch| {
+            if (branch.len == 0 or branch[0].min == 0) return null;
+            switch (branch[0].atom) {
+                .lit => |cp| {
+                    var buf: [4]u8 = undefined;
+                    _ = std.unicode.utf8Encode(cp, &buf) catch return null;
+                    set[buf[0]] = true;
+                },
+                .class => |cl| {
+                    if (cl.neg) return null;
+                    for (0..128) |c| {
+                        if (cl.has(@intCast(c))) set[c] = true;
+                    }
+                    var wide = cl.ranges.len > 0;
+                    for (128..256) |c| wide = wide or cl.has(@intCast(c));
+                    if (wide) for (0xC2..0x100) |c| {
+                        set[c] = true;
+                    };
+                },
+                else => return null,
+            }
+        }
+        return set;
     }
 
     /// Every branch opens with an unbounded `.`: a match starting later also
@@ -151,8 +246,15 @@ pub const Regex = struct {
         var sfa = std.heap.stackFallback(8 * 1024, std.heap.smp_allocator);
         var m = Machine{ .s = s, .caps = caps, .gpa = sfa.get(), .steps = 10_000_000 + 4 * @as(u64, s.len) };
         defer m.deinit();
+        if (self.need.len > 0 and std.mem.indexOfPos(u8, s, from, self.need) == null) return null;
         var start = from;
         while (start <= s.len) : (start += if (start < s.len) unitAt(s, start).len else 1) {
+            if (self.prefix.len > 0) {
+                start = std.mem.indexOfPos(u8, s, start, self.prefix) orelse return null;
+            } else if (self.first) |set| {
+                while (start < s.len and !set[s[start]]) start += 1;
+                if (start == s.len) return null;
+            }
             caps.* = .{null} ** max_groups;
             for (self.alt) |branch| {
                 if (try m.run(branch, start)) |end| {
@@ -160,7 +262,7 @@ pub const Regex = struct {
                     return .{ start, end };
                 }
             }
-            if (self.lead_any) break;
+            if (self.lead_any or self.anchored) break;
         }
         return null;
     }
@@ -784,10 +886,12 @@ test "regex: a pathological pattern gives up instead of hanging" {
     var caps: Captures = undefined;
 
     const re = try Regex.compile(a, "(a|aa)+b");
-    try std.testing.expectError(Error.PatternTooComplex, re.find("a" ** 40 ++ "c", 0, &caps));
+    try std.testing.expectError(Error.PatternTooComplex, re.find("a" ** 40 ++ "cb", 0, &caps));
+    try std.testing.expect((try re.find("a" ** 40 ++ "c", 0, &caps)) == null);
 
     const deep = try Regex.compile(a, "a{1,1000000}b");
-    try std.testing.expectError(Error.PatternTooComplex, deep.find("a" ** 100_000, 0, &caps));
+    try std.testing.expectError(Error.PatternTooComplex, deep.find("a" ** 100_000 ++ "cb", 0, &caps));
+    try std.testing.expect((try deep.find("a" ** 100_000, 0, &caps)) == null);
 
     const n = 100_000;
     const run = "a" ** n;
@@ -880,4 +984,47 @@ test "regex: icase folds literals and classes, a negated class included; replace
 
     try std.testing.expectEqual(Flags{ .global = true, .icase = true }, parseFlags("gi").?);
     try std.testing.expect(parseFlags("gx") == null);
+}
+
+test "regex: the start prefilters find the match, and the captures, the plain search finds" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const patterns = [_][]const u8{
+        "special.*requests", "pinto beans", "^furiously [a-z]+ ", "[0-9]",   "blithely|quickly",
+        "ab|ac",             "abc|abd|ab",  "a?bc",               "(ab)+c",  "x*y",
+        "^a|b",              "é+",         "[é-ü]x",           "[^a]b",   "",
+        "a$",                "(?:ab|ac)d",  "c(a|b)",             "ab.*?ba", "^$",
+        ".*z",               "[a-c]{2,}d",  "éa|éb",            "\\.a",    "a+",
+    };
+    const pieces = [_][]const u8{ "a", "b", "c", "d", "x", "y", "z", " ", ".", "é", "ü", "\xff", "\xc3", "0", "special", "requests", "pinto beans", "furiously ", "blithely", "quickly" };
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const rnd = prng.random();
+    for (patterns) |pat| for ([_]bool{ false, true }) |icase| {
+        const re = Regex.compileOpts(a, pat, .{ .icase = icase }) catch |e| {
+            std.debug.print("{s}: {s}\n", .{ pat, @errorName(e) });
+            return e;
+        };
+        var plain = re;
+        plain.anchored = false;
+        plain.prefix = "";
+        plain.need = "";
+        plain.first = null;
+        for (0..400) |_| {
+            var s = std.ArrayList(u8).empty;
+            for (0..rnd.uintLessThan(usize, 8)) |_| try s.appendSlice(a, pieces[rnd.uintLessThan(usize, pieces.len)]);
+            for ([_]usize{ 0, 1, 3 }) |from| {
+                if (from > s.items.len) continue;
+                var c1: Captures = undefined;
+                var c2: Captures = undefined;
+                const got = try re.find(s.items, from, &c1);
+                const want = try plain.find(s.items, from, &c2);
+                std.testing.expectEqual(want, got) catch |e| {
+                    std.debug.print("pattern `{s}` icase {} subject `{s}` from {d}\n", .{ pat, icase, s.items, from });
+                    return e;
+                };
+                if (want != null) try std.testing.expectEqualDeep(c2, c1);
+            }
+        }
+    };
 }
