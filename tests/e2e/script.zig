@@ -1913,3 +1913,55 @@ test "a buffered read frees what it drained once written, so a loop's twenty row
     try std.testing.expectEqualStrings(csv.items, out);
     try std.testing.expect(peaks[1] < peaks[0] * 2);
 }
+
+test "a one-key join indexed in slots gives the rows, in the order, a two-key join's table gives, serial and on lanes, past the parallel build" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var l = std.array_list.Managed(u8).init(alloc);
+    defer l.deinit();
+    try l.appendSlice("id,k,d,z\n");
+    for (0..30000) |i| {
+        if (i % 97 == 0) {
+            try l.writer().print("{d},,,1\n", .{i});
+        } else try l.writer().print("{d},{d},{d}.0,1\n", .{ i, (i * 7919) % 90000, (i * 31) % 500 });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "l.csv", .data = l.items });
+    var r = std.array_list.Managed(u8).init(alloc);
+    defer r.deinit();
+    try r.appendSlice("k,tag,d,z\n");
+    for (0..100000) |i| {
+        if (i % 1000 == 1) {
+            try r.writer().print(",null{d},,1\n", .{i});
+        } else try r.writer().print("{d},t{d},{d},1\n", .{ i % 70000, i, i % 500 });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "r.csv", .data = r.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const pairs = [_][2][]const u8{
+        .{ "SELECT a.id, b.tag FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k", "SELECT a.id, b.tag FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.k = b.k AND a.z = b.z" },
+        .{ "SELECT a.id, b.tag FROM '$B/l.csv' a LEFT JOIN '$B/r.csv' b ON a.k = b.k", "SELECT a.id, b.tag FROM '$B/l.csv' a LEFT JOIN '$B/r.csv' b ON a.k = b.k AND a.z = b.z" },
+        .{ "SELECT count(*) AS n, sum(b.k) AS s, min(b.tag) AS t FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.d = b.d", "SELECT count(*) AS n, sum(b.k) AS s, min(b.tag) AS t FROM '$B/l.csv' a JOIN '$B/r.csv' b ON a.d = b.d AND a.z = b.z" },
+        .{ "SELECT a.id FROM '$B/l.csv' a WHERE EXISTS (SELECT 1 FROM '$B/r.csv' b WHERE b.k = a.k)", "SELECT a.id FROM '$B/l.csv' a WHERE EXISTS (SELECT 1 FROM '$B/r.csv' b WHERE b.k = a.k AND b.z = a.z)" },
+    };
+    for (pairs) |pr| for ([_]usize{ 1, 4 }) |threads| {
+        var outs: [2][]u8 = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |o| alloc.free(o);
+        for (pr) |tmpl| {
+            const q = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+            defer alloc.free(q);
+            const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+            defer alloc.free(script);
+            var rdiag: Diag = .{};
+            _ = exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag) catch |e| {
+                std.debug.print("{s}\n{s}\n", .{ q, rdiag.msg });
+                return e;
+            };
+            outs[n] = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 26);
+            n += 1;
+        }
+        try std.testing.expect(std.mem.count(u8, outs[0], "\n") > 1);
+        try std.testing.expectEqualStrings(outs[1], outs[0]);
+    };
+}

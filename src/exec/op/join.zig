@@ -379,10 +379,17 @@ pub const JoinIndex = struct {
     filter_off: std.atomic.Value(bool) = .init(false),
 
     const Part = struct {
-        table: keytable.GroupTable,
-        fixed: *keytable.FixedStore(Head),
-        boxed: *keytable.GroupStore(Head),
+        table: keytable.GroupTable = undefined,
+        fixed: *keytable.FixedStore(Head) = undefined,
+        boxed: *keytable.GroupStore(Head) = undefined,
+        /// For one fixed-width key, the table itself: each slot the key word and its
+        /// chain's first row, so a probe reads one slot where `table` reads a slot,
+        /// then a record. Empty otherwise.
+        ints: []Slot = &.{},
     };
+
+    /// A key word and 1 + the first build row holding it; 0 marks an empty slot.
+    const Slot = extern struct { key: i64, row: u32, _pad: u32 = 0 };
 
     /// A build at least this large is partitioned and filled in parallel.
     const parallel_min = 1 << 16;
@@ -590,6 +597,8 @@ pub const JoinIndex = struct {
             var slots: usize = 16;
             while (slots * 7 < (rows_.len + 1) * 10) slots *= 2;
             const pt = &ix.parts[p];
+            pt.* = .{};
+            if (b.enc) |e| if (ix.keys.len == 1) return b.fillInts(pt, rows_, e.keys, slots);
             pt.table = try keytable.GroupTable.init(b.alloc, slots);
             pt.fixed = try b.alloc.create(keytable.FixedStore(Head));
             pt.fixed.* = .init(b.alloc, ix.keys.len, &head_payload);
@@ -605,6 +614,36 @@ pub const JoinIndex = struct {
                 const vals = keytable.ValueRows{ .cols = ix.build_batch.columns, .idx = ix.keys, .buf = b.vals[(b.nc + p) * nk ..][0..nk], .hashes = b.hashes, .rows = rows_ };
                 try keytable.probe(keytable.GroupStore(Head), .alias, &vals, 0, rows_.len, &v);
             }
+        }
+
+        /// One key's partition indexed in `Slot`s: each row prepended to its key's
+        /// chain, the rows taken in reverse so a chain stays in build order.
+        fn fillInts(b: *Build, pt: *Part, rows_: []u32, keys: []const i64, slots: usize) !void {
+            const t = try b.alloc.alloc(Slot, slots);
+            @memset(t, .{ .key = 0, .row = 0 });
+            const m = slots - 1;
+            const next = @constCast(b.ix.next);
+            var j = rows_.len;
+            while (j > 0) {
+                j -= 1;
+                const r = rows_[j];
+                if (j >= 8) @prefetch(&t[b.hashes[rows_[j - 8]] & m], .{ .rw = .write, .locality = 3 });
+                const k = keys[r];
+                var i = b.hashes[r] & m;
+                while (true) : (i = (i + 1) & m) {
+                    const sl = &t[i];
+                    if (sl.row == 0) {
+                        sl.* = .{ .key = k, .row = r + 1 };
+                        break;
+                    }
+                    if (sl.key == k) {
+                        next[r] = sl.row;
+                        sl.row = r + 1;
+                        break;
+                    }
+                }
+            }
+            pt.ints = t;
         }
 
         /// `fill`'s side of `keytable.probe`: each build row prepended to its key's
@@ -678,11 +717,14 @@ pub const JoinIndex = struct {
     }
 
     pub fn prefetch(self: *const JoinIndex, h: u64) void {
-        self.partOfHash(h).table.prefetch(h);
+        const pt = self.partOfHash(h);
+        if (pt.ints.len > 0) return @prefetch(&pt.ints[h & (pt.ints.len - 1)], .{ .rw = .read, .locality = 3 });
+        pt.table.prefetch(h);
     }
 
     pub fn prefetchRecord(self: *const JoinIndex, h: u64) void {
         const pt = self.partOfHash(h);
+        if (pt.ints.len > 0) return;
         if (self.fixed) pt.table.prefetchRecord(h, pt.fixed) else pt.table.prefetchRecord(h, pt.boxed);
     }
 
@@ -692,6 +734,17 @@ pub const JoinIndex = struct {
         if (p.miss[r]) return null;
         const h = p.hashes[r];
         const pt = self.partOfHash(h);
+        if (pt.ints.len > 0) {
+            const k = p.enc.?.key(r);
+            if (k.mask != 0) return null;
+            const m = pt.ints.len - 1;
+            var i = h & m;
+            while (true) : (i = (i + 1) & m) {
+                const sl = pt.ints[i];
+                if (sl.row == 0) return null;
+                if (sl.key == k.vals[0]) return sl.row - 1;
+            }
+        }
         if (self.fixed) {
             const slot = pt.table.find(h, p.enc.?.key(r), pt.fixed) orelse return null;
             return @intCast(Head.of(pt.fixed.at(slot).tail).*);
