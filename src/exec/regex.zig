@@ -136,6 +136,30 @@ pub const Regex = struct {
     /// These three only skip starts that cannot match, and are left out when the
     /// compile's allocator has no room for them.
     first: ?*const [256]bool = null,
+    /// The whole pattern when it is one run of exact literals, perhaps opening with
+    /// `^` and closing with `$`, and captures nothing: matched as bytes, no machine.
+    whole: ?Literal = null,
+
+    const Literal = struct {
+        text: []const u8,
+        bol: bool,
+        eol: bool,
+
+        fn find(self: Literal, s: []const u8, from: usize) ?[2]usize {
+            if (from > s.len) return null;
+            const n = self.text.len;
+            if (self.bol) {
+                if (from != 0 or !std.mem.startsWith(u8, s, self.text) or (self.eol and s.len != n)) return null;
+                return .{ 0, n };
+            }
+            if (self.eol) {
+                if (s.len < from + n or !std.mem.endsWith(u8, s, self.text)) return null;
+                return .{ s.len - n, s.len };
+            }
+            const at = std.mem.indexOfPos(u8, s, from, self.text) orelse return null;
+            return .{ at, at + n };
+        }
+    };
 
     pub fn compile(gpa: std.mem.Allocator, pattern: []const u8) Error!Regex {
         return compileOpts(gpa, pattern, .{});
@@ -152,7 +176,26 @@ pub const Regex = struct {
         re.prefix = commonPrefix(gpa, alt) catch "";
         if (alt.len == 1) re.need = longestLiteral(gpa, alt[0]) catch "";
         if (re.prefix.len == 0 and !re.anchored) re.first = firstBytes(gpa, alt) catch null;
+        if (alt.len == 1 and re.ngroups == 1) re.whole = wholeLiteral(gpa, alt[0]) catch null;
         return re;
+    }
+
+    /// `branch` as a `Literal` when it is nothing but exact literals between an
+    /// optional `^` and `$`.
+    fn wholeLiteral(gpa: std.mem.Allocator, branch: []const Item) !?Literal {
+        var items = branch;
+        const once = struct {
+            fn f(it: Item, a: std.meta.Tag(Atom)) bool {
+                return it.atom == a and it.min == 1 and it.max == 1;
+            }
+        }.f;
+        const bol = items.len > 0 and once(items[0], .bol);
+        if (bol) items = items[1..];
+        const eol = items.len > 0 and once(items[items.len - 1], .eol);
+        if (eol) items = items[0 .. items.len - 1];
+        var out: std.ArrayList(u8) = .empty;
+        for (items) |it| try appendLit(gpa, &out, exactLit(it) orelse return null);
+        return .{ .text = out.items, .bol = bol, .eol = eol };
     }
 
     fn appendLit(gpa: std.mem.Allocator, out: *std.ArrayList(u8), cp: u21) !void {
@@ -243,6 +286,12 @@ pub const Regex = struct {
     /// Leftmost match span at or after `from`, with `caps` filled (index 0 is
     /// the whole match). `PatternTooComplex` means gave up, not no match.
     pub fn find(self: Regex, s: []const u8, from: usize, caps: *Captures) Error!?[2]usize {
+        if (self.whole) |w| {
+            caps.* = .{null} ** max_groups;
+            const span = w.find(s, from) orelse return null;
+            caps[0] = span;
+            return span;
+        }
         var sfa = std.heap.stackFallback(8 * 1024, std.heap.smp_allocator);
         var m = Machine{ .s = s, .caps = caps, .gpa = sfa.get(), .steps = 10_000_000 + 4 * @as(u64, s.len) };
         defer m.deinit();
@@ -996,6 +1045,8 @@ test "regex: the start prefilters find the match, and the captures, the plain se
         "^a|b",              "é+",         "[é-ü]x",           "[^a]b",   "",
         "a$",                "(?:ab|ac)d",  "c(a|b)",             "ab.*?ba", "^$",
         ".*z",               "[a-c]{2,}d",  "éa|éb",            "\\.a",    "a+",
+        "^ab",               "ab$",         "^éa$",              "^",       "$",
+        "^furiously",        "c d",
     };
     const pieces = [_][]const u8{ "a", "b", "c", "d", "x", "y", "z", " ", ".", "é", "ü", "\xff", "\xc3", "0", "special", "requests", "pinto beans", "furiously ", "blithely", "quickly" };
     var prng = std.Random.DefaultPrng.init(0x5eed);
@@ -1009,6 +1060,7 @@ test "regex: the start prefilters find the match, and the captures, the plain se
         plain.anchored = false;
         plain.prefix = "";
         plain.need = "";
+        plain.whole = null;
         plain.first = null;
         for (0..400) |_| {
             var s = std.ArrayList(u8).empty;
@@ -1027,4 +1079,16 @@ test "regex: the start prefilters find the match, and the captures, the plain se
             }
         }
     };
+}
+
+test "regex: a pattern of literals alone, perhaps anchored, is matched as bytes; one that captures or folds case is not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectEqualStrings("pinto beans", (try Regex.compile(a, "pinto beans")).whole.?.text);
+    const fur = (try Regex.compile(a, "^furiously")).whole.?;
+    try std.testing.expect(fur.bol and !fur.eol);
+    try std.testing.expect((try Regex.compile(a, "^a\\.b$")).whole.?.eol);
+    for ([_][]const u8{ "(ab)", "a+", "a|b", "a.b", "^a*" }) |pat| try std.testing.expect((try Regex.compile(a, pat)).whole == null);
+    try std.testing.expect((try Regex.compileOpts(a, "ab", .{ .icase = true })).whole == null);
 }
