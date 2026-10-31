@@ -175,22 +175,7 @@ pub const Sort = struct {
             const s = try self.sorted(h.allocator(), all);
             mem = .{ .cols = all.columns, .arrs = s.arrs, .idx = s.idx };
         }
-        const fan_in = @max(self.fan_in, 2);
-        while (runs.items.len + @intFromBool(mem != null) > fan_in) {
-            var kept: usize = 0;
-            var i: usize = 0;
-            while (i < runs.items.len) : (i += fan_in) {
-                const group = runs.items[i..@min(runs.items.len, i + fan_in)];
-                runs.items[kept] = if (group.len == 1) group[0] else self.mergeRuns(space, paths.allocator(), group) catch |e| {
-                    deleteRuns(runs.items[0..kept]);
-                    deleteRuns(runs.items[i + group.len ..]);
-                    runs_owned = false;
-                    return e;
-                };
-                kept += 1;
-            }
-            runs.shrinkRetainingCapacity(kept);
-        }
+        try self.reduceRuns(space, paths.allocator(), &runs, @max(self.fan_in, 2) - @intFromBool(mem != null));
 
         runs_owned = false;
         const give: ?*Held = if (mem != null) h else null;
@@ -200,6 +185,27 @@ pub const Sort = struct {
         if (try m.next(arena, @max(self.batch_rows, 1))) |b| return b;
         self.dropMerge();
         return null;
+    }
+
+    /// Merges consecutive groups of `fan_in` runs into new runs until at most `room`
+    /// remain; on failure every run is deleted and `runs` left empty.
+    fn reduceRuns(self: *Sort, space: Space, paths: std.mem.Allocator, runs: *std.ArrayListUnmanaged(spill.Run), room: usize) !void {
+        const fan_in = @max(self.fan_in, 2);
+        while (runs.items.len > room) {
+            var kept: usize = 0;
+            var i: usize = 0;
+            while (i < runs.items.len) : (i += fan_in) {
+                const group = runs.items[i..@min(runs.items.len, i + fan_in)];
+                runs.items[kept] = if (group.len == 1) group[0] else self.mergeRuns(space, paths, group) catch |e| {
+                    deleteRuns(runs.items[0..kept]);
+                    deleteRuns(runs.items[i + group.len ..]);
+                    runs.clearRetainingCapacity();
+                    return e;
+                };
+                kept += 1;
+            }
+            runs.shrinkRetainingCapacity(kept);
+        }
     }
 
     /// Writes `h`'s rows, ordered, as a run of `batch_rows`-row batches. The run's path
@@ -246,6 +252,170 @@ pub const Sort = struct {
 
 const Sorted = struct { idx: []usize, arrs: []KeyArr };
 
+/// A sort whose input several workers take at once (`runtime/lanes/sort.zig`), each
+/// into its own `Part`, then pulled from `sort` as one. A part that passes `spill_at`
+/// writes its rows as a run with each row's place in the input (`Part`) as a last
+/// column, `seq_schema`'s, which the merge breaks ties by after `keys`
+/// (`seq_keys`), so the rows come out as a serial stable sort's.
+pub const Shared = struct {
+    sort: Sort,
+    seq_schema: *const types.Schema,
+    seq_keys: []const Sort.Key,
+
+    /// `sort`, set up without a child to pull, gets the parts' rows in `finish`.
+    pub fn init(arena: std.mem.Allocator, sort: Sort) !Shared {
+        const n = sort.in_schema.fields.len;
+        const fields = try arena.alloc(types.Schema.Field, n + 1);
+        @memcpy(fields[0..n], sort.in_schema.fields);
+        fields[n] = .{ .name = "", .ty = types.Type.init(.int) };
+        const sch = try arena.create(types.Schema);
+        sch.* = .{ .fields = fields };
+        const keys = try arena.alloc(Sort.Key, sort.keys.len + 1);
+        @memcpy(keys[0..sort.keys.len], sort.keys);
+        keys[sort.keys.len] = .{ .idx = n, .desc = false, .nulls_first = false };
+        var s = sort;
+        s.done = true;
+        return .{ .sort = s, .seq_schema = sch, .seq_keys = keys };
+    }
+
+    /// Sets `sort` up to hand out the rows of every part, which keep holding the rows
+    /// they did not spill until `sort` is released: ordered in memory when no part
+    /// spilled, else the rows left written as one more run and every run merged. The
+    /// parts' runs are taken whatever happens.
+    pub fn finish(self: *Shared, parts: []const *Part) !void {
+        const s = &self.sort;
+        const gpa = s.gpa;
+        var runs: std.ArrayListUnmanaged(spill.Run) = .empty;
+        defer runs.deinit(gpa);
+        errdefer deleteRuns(runs.items);
+        var nchunks: usize = 0;
+        for (parts) |p| {
+            try runs.appendSlice(gpa, p.runs.items);
+            p.runs.clearRetainingCapacity();
+            nchunks += p.seqs.items.len;
+        }
+        const Chunk = struct { seq: u64, b: Batch };
+        const all = try gpa.alloc(Chunk, nchunks);
+        defer gpa.free(all);
+        var at: usize = 0;
+        for (parts) |p| for (p.seqs.items, p.held.chunks.items) |q, b| {
+            all[at] = .{ .seq = q, .b = b };
+            at += 1;
+        };
+        std.sort.pdq(Chunk, all, {}, struct {
+            fn lt(_: void, a: Chunk, b: Chunk) bool {
+                return a.seq < b.seq;
+            }
+        }.lt);
+        const h = try Held.create(gpa);
+        var h_owned = true;
+        defer if (h_owned) h.destroy();
+        const seqs = try h.allocator().alloc(u64, all.len);
+        for (all, seqs) |c, *q| {
+            try h.adopt(c.b);
+            q.* = c.seq;
+        }
+        if (runs.items.len == 0) {
+            if (h.rows == 0) return;
+            try h.order(s.keys, s.threads);
+            s.held = h;
+            h_owned = false;
+            return;
+        }
+        const space = s.space.?;
+        var paths = std.heap.ArenaAllocator.init(gpa);
+        defer paths.deinit();
+        if (h.rows > 0) {
+            try h.order(s.keys, s.threads);
+            try runs.ensureUnusedCapacity(gpa, 1);
+            runs.appendAssumeCapacity(try writeSeqRun(s, space, paths.allocator(), h, seqs, self.seq_schema));
+            s.runs += 1;
+        }
+        var by_seq = s.*;
+        by_seq.in_schema = self.seq_schema;
+        by_seq.keys = self.seq_keys;
+        try by_seq.reduceRuns(space, paths.allocator(), &runs, @max(s.fan_in, 2));
+        const taken = runs.items;
+        runs.items.len = 0;
+        s.merge = try Merge.init(gpa, s.in_schema, self.seq_keys, taken, null, null);
+    }
+};
+
+/// A worker's share of a `Shared` sort: the rows of the morsels it claims, held in
+/// claim order, with `seqs`, where each chunk starts in the input (its morsel's
+/// index high, its first row's place there low). Past `spill_at` they are written,
+/// ordered, as a run.
+pub const Part = struct {
+    held: *Held,
+    seqs: std.ArrayListUnmanaged(u64) = .empty,
+    runs: std.ArrayListUnmanaged(spill.Run) = .empty,
+    paths: std.heap.ArenaAllocator,
+
+    pub fn create(gpa: std.mem.Allocator) !*Part {
+        const h = try Held.create(gpa);
+        errdefer h.destroy();
+        const p = try gpa.create(Part);
+        p.* = .{ .held = h, .paths = .init(gpa) };
+        return p;
+    }
+
+    /// Frees the rows and deletes the runs not taken by `Shared.finish`.
+    pub fn destroy(self: *Part) void {
+        const gpa = self.held.gpa;
+        deleteRuns(self.runs.items);
+        self.runs.deinit(gpa);
+        self.paths.deinit();
+        self.held.destroy();
+        gpa.destroy(self);
+    }
+
+    /// Keeps a copy of `b`, whose first row is at `seq` in the input, writing the
+    /// rows held as a run once they pass the sort's `spill_at`.
+    pub fn add(self: *Part, sh: *const Shared, b: Batch, seq: u64) !void {
+        if (b.len == 0) return;
+        const h = self.held;
+        try self.seqs.append(h.allocator(), seq);
+        try h.add(b);
+        const s = &sh.sort;
+        if (h.bytes <= s.spill_at) return;
+        const space = s.space orelse return;
+        try h.order(s.keys, 1);
+        const gpa = h.gpa;
+        try self.runs.ensureUnusedCapacity(gpa, 1);
+        self.runs.appendAssumeCapacity(try writeSeqRun(s, space, self.paths.allocator(), h, self.seqs.items, sh.seq_schema));
+        h.reset();
+        self.seqs = .empty;
+    }
+};
+
+/// Writes `h`'s rows, ordered, as a run of `seq_schema`: each row and, last, its
+/// place in the input, `seqs[c] + row` for row `row` of chunk `c`.
+fn writeSeqRun(s: *const Sort, space: Space, paths: std.mem.Allocator, h: *Held, seqs: []const u64, seq_schema: *const types.Schema) !spill.Run {
+    var tmp = std.heap.ArenaAllocator.init(s.gpa);
+    defer tmp.deinit();
+    var chunk = std.heap.ArenaAllocator.init(s.gpa);
+    defer chunk.deinit();
+    var w = try spill.Writer.init(space, tmp.allocator(), seq_schema, "sort");
+    errdefer w.abort();
+    const path = try paths.dupe(u8, w.path);
+    const n = s.in_schema.fields.len;
+    const max_rows = @max(s.batch_rows, 1);
+    while (true) {
+        _ = chunk.reset(.retain_capacity);
+        const a = chunk.allocator();
+        const refs = h.refs[h.pos..@min(h.refs.len, h.pos + max_rows)];
+        const cols = try a.alloc(column.Column, n + 1);
+        if (try h.gather(a, max_rows, cols[0..n]) == 0) break;
+        const at = try a.alloc(i64, refs.len);
+        for (at, refs) |*x, r| x.* = @intCast(seqs[r.chunk] + r.row);
+        cols[n] = .{ .ty = types.Type.init(.int), .len = refs.len, .validity = try column.Bitmap.initFull(a, refs.len), .data = .{ .i64 = at } };
+        try w.write(.{ .schema = seq_schema, .columns = cols, .len = refs.len });
+    }
+    var run = try w.finish();
+    run.path = path;
+    return run;
+}
+
 /// One row of a `Held` input: its chunk and its row there.
 const Ref = struct { row: u32, chunk: u32 };
 
@@ -286,6 +456,14 @@ pub const Held = struct {
         self.turn +%= 1;
         _ = self.pulls[self.turn].reset(.retain_capacity);
         return self.pulls[self.turn].allocator();
+    }
+
+    /// Frees the arenas batches were pulled into, once no more will be.
+    pub fn donePulling(self: *Held) void {
+        for (&self.pulls) |*p| {
+            p.deinit();
+            p.* = .init(self.gpa);
+        }
     }
 
     /// The arena the held rows live in, freed with them.
@@ -612,7 +790,7 @@ pub const Merge = struct {
     fn gather(self: *Merge, arena: std.mem.Allocator, segs: []const []const column.Column, refs: []const Ref, rows: []const usize) !Batch {
         const cols = try arena.alloc(column.Column, self.schema.fields.len);
         if (segs.len == 1) {
-            for (cols, segs[0]) |*o, c| o.* = try column.permute(arena, c, rows);
+            for (cols, segs[0][0..cols.len]) |*o, c| o.* = try column.permute(arena, c, rows);
             return .{ .schema = self.schema, .columns = cols, .len = rows.len };
         }
         const srcs = try arena.alloc(column.Column, segs.len);

@@ -59,8 +59,10 @@ the answer.
 
 An `ORDER BY` whose input passes `--op-memory` sorts it in pieces: each piece is
 written as a sorted run to the scratch directory and the runs are merged as rows
-are read out. The result is the same, ties included, and the disk it takes is
-bounded by `--spill-cap` ([Spilling to disk](../tools/cli.md#spilling-to-disk)).
+are read out. Over a local file at `-j` above 1 every lane holds the rows it reads
+and spills past its share of `--op-memory`. The result is the same, ties included
+and in input order at every `-j`, and the disk it takes is bounded by
+`--spill-cap` ([Spilling to disk](../tools/cli.md#spilling-to-disk)).
 
 A `GROUP BY` or `DISTINCT` whose keys outgrow `--op-memory` spills to disk the
 same way. The rows are the same — `DISTINCT ON` still keeps the first row per

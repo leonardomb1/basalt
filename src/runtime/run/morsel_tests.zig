@@ -93,6 +93,9 @@ const queries = [_]Query{
     .{ .q = "SELECT id, k, f FROM $IN ORDER BY f DESC, k LIMIT 25", .exact = true },
     .{ .q = "SELECT id, g, k FROM $IN WHERE k > 10 ORDER BY g, k LIMIT 40", .exact = true },
     .{ .q = "SELECT id, k * 2 AS k2, g FROM $IN WHERE k % 3 = 1", .exact = true },
+    .{ .q = "SELECT id, g, k FROM $IN ORDER BY g", .exact = true },
+    .{ .q = "SELECT id, k, g FROM $IN WHERE k > 100 ORDER BY k DESC, g", .exact = true },
+    .{ .q = "SELECT g, id + k AS x FROM $IN ORDER BY g DESC, x LIMIT 30000 OFFSET 3", .exact = true },
     .{ .q = "SELECT t.id, l.label FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g", .exact = true },
     .{ .q = "SELECT t.id, l.label FROM $IN t LEFT JOIN '$B/labels.csv' l ON t.g = l.g WHERE t.k < 500", .exact = true },
 };
@@ -186,6 +189,36 @@ test "a grouped aggregate past --op-memory partitions its rows to disk and gives
 
     const whole = try msgfmt.allocPrint(a, "SELECT COUNT(DISTINCT k) AS ks, SUM(f) AS s FROM '{s}/in.csv'", .{base});
     try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", whole, 1, opts), try resultOf(a, tmp.dir, base, "", whole, 4, opts));
+}
+
+test "a parallel ORDER BY past --op-memory writes runs from every lane, merges more than its fan-in, and gives -j 1's rows, ties in input order" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeCsv(tmp.dir, "in.csv", a);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "in.parquet" }), 0, rows);
+    try tmp.dir.makeDir("spill");
+    const opts = env_mod.RunOptions{ .morsel_bytes = 8 << 10, .op_memory = 32 << 10, .spill_dir = try std.fs.path.join(a, &.{ base, "spill" }) };
+    for ([_][]const u8{ "in.csv", "in.parquet" }) |file| {
+        const q = try msgfmt.allocPrint(a, "SELECT id, g, k FROM '{s}/{s}' ORDER BY g DESC, k % 5", .{ base, file });
+        const one = try resultOf(a, tmp.dir, base, "", q, 1, .{});
+        try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 4, opts));
+        try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", q, 16, opts));
+        try testing.expect(std.mem.count(u8, one, "\n") == rows + 1);
+    }
+    var out = std.array_list.Managed(u8).init(a);
+    try out.appendSlice("id,x\n");
+    for (0..rows) |i| try out.writer().print("{d},{s}\n", .{ i, if (i == rows - 5) "oops" else "12" });
+    try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = out.items });
+    const bad = try msgfmt.allocPrint(a, "SELECT id, CAST(x AS INT) AS y FROM '{s}/bad.csv' ORDER BY y, id", .{base});
+    try testing.expectError(error.CastFailed, resultOf(a, tmp.dir, base, "", bad, 4, opts));
+    var left = try tmp.dir.openDir("spill", .{ .iterate = true });
+    defer left.close();
+    var it = left.iterate();
+    try testing.expect(try it.next() == null);
 }
 
 test "a lane LEFT JOIN whose left side is smaller indexes it, reads the right side on the lanes and keeps every unmatched left row" {

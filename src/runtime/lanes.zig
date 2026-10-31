@@ -1,6 +1,6 @@
 //! Parallel lane drivers: the shape classifiers that decide whether a pipeline
 //! can fan out, and the per-shape drivers (map, aggregate, top-N, distinct,
-//! SQL split) over a source cut into morsels (`lanes/morsels.zig`).
+//! sort, SQL split) over a source cut into morsels (`lanes/morsels.zig`).
 //!
 //! Shapes. `classifyLaneShape` picks one `LaneShape` per pipeline and `runShape`
 //! switches exhaustively over it, so a new shape does not compile until it decides
@@ -73,6 +73,7 @@ pub const LaneShape = union(enum) {
     top_n: TopNShape,
     map: []const ast.Stage,
     map_join: MapJoinShape,
+    sort: SortShape,
 };
 
 pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
@@ -81,6 +82,7 @@ pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
     if (classifyTopNPipeline(stages)) |x| return .{ .top_n = x };
     if (classifyMapPipeline(stages)) |x| return .{ .map = x };
     if (classifyMapJoinPipeline(stages)) |x| return .{ .map_join = x };
+    if (classifySortPipeline(stages)) |x| return .{ .sort = x };
     return null;
 }
 
@@ -121,6 +123,7 @@ fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast
         .top_n => |x| runParallelTopN(env, &split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
         .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
         .map_join => |x| runParallelMap(env, split, x.prefix, x, w, opts, stats, lanes_used),
+        .sort => |x| runParallelSort(env, &split, x, w, opts, stats, lanes_used),
     };
 }
 
@@ -254,6 +257,9 @@ const runParallelTopN = @import("lanes/topn.zig").runParallelTopN;
 const DistinctShape = @import("lanes/distinct.zig").DistinctShape;
 const classifyDistinctPipeline = @import("lanes/distinct.zig").classifyDistinctPipeline;
 const runParallelDistinct = @import("lanes/distinct.zig").runParallelDistinct;
+const SortShape = @import("lanes/sort.zig").SortShape;
+const classifySortPipeline = @import("lanes/sort.zig").classifySortPipeline;
+const runParallelSort = @import("lanes/sort.zig").runParallelSort;
 const Morsels = @import("lanes/morsels.zig").Morsels;
 const parquetSplit = @import("lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("lanes/sources.zig").csvSplitFile;

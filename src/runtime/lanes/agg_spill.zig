@@ -255,12 +255,14 @@ fn aggregatePart(ctx: *PartCtx, p: usize) !void {
 
 const partWorker = dispatchWorker(PartCtx, aggregatePart);
 
-/// Every partition's groups, in partition order, as one source.
+/// Every partition's groups, in partition order, as one source. A partition's file is
+/// dropped a pull after its last batch, which a pipelined writer may still be writing.
 const GroupsSource = struct {
     schema: *const types.Schema,
     results: []?spill.Run,
     at: usize = 0,
     cur: ?spill_parts.RunSource = null,
+    spent: ?spill_parts.RunSource = null,
 
     const vtable = driver.Source.VTable{ .schema = schemaFn, .next = nextFn, .close = closeFn };
 
@@ -275,9 +277,13 @@ const GroupsSource = struct {
 
     fn nextFn(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
         const self: *GroupsSource = @ptrCast(@alignCast(ptr));
+        if (self.spent) |*s| s.end();
+        self.spent = null;
         while (true) {
             if (self.cur) |*c| {
-                if (try c.src().next(arena)) |b| return b;
+                if (c.reader == null) c.reader = try spill.Reader.open(c.run);
+                if (try c.reader.?.next(arena)) |b| return b;
+                self.spent = c.*;
                 self.cur = null;
             }
             while (self.at < self.results.len and self.results[self.at] == null) self.at += 1;
@@ -291,7 +297,9 @@ const GroupsSource = struct {
     fn closeFn(ptr: *anyopaque) void {
         const self: *GroupsSource = @ptrCast(@alignCast(ptr));
         if (self.cur) |*c| c.end();
+        if (self.spent) |*s| s.end();
         self.cur = null;
+        self.spent = null;
         for (self.results) |*r| if (r.*) |held| {
             spill.discard(held);
             r.* = null;

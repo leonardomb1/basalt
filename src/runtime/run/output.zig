@@ -244,7 +244,7 @@ fn notePrelude(env: *Env, what: []const u8, pos: ast.Pos) !void {
 
 const window_input = "__window_input";
 
-/// A window (or full sort) over a file reads its input first, in parallel, into
+/// A window over a file reads its input first, in parallel, into
 /// memory, since built in place the read ran on one thread (`path.windowInputAt`).
 fn windowInput(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const ast.Stage {
     var stages = stages_in;

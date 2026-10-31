@@ -302,10 +302,14 @@ pub fn writeTail(env: *Env, snk: driver.Sink, batch: Batch, schema: types.Schema
 
 /// `writeTail` over the batches of `src`.
 pub fn writeTailFrom(env: *Env, snk: driver.Sink, src: driver.Source, tail: []const analyze.Resolved, stats: *Stats, feeds: profile.Kind) !void {
-    const arena = env.arena;
     var scan = op.Scan{ .src = src };
     scan.stats.at = profile.merged_at;
-    var cur: op.Op = .{ .scan = &scan };
+    return writeTailOver(env, snk, .{ .scan = &scan }, tail, stats, feeds);
+}
+
+/// `writeTail` over the rows `start` hands out, released once written or abandoned.
+pub fn writeTailOver(env: *Env, snk: driver.Sink, start: op.Op, tail: []const analyze.Resolved, stats: *Stats, feeds: profile.Kind) !void {
+    var cur = start;
     defer cur.release();
     var i: usize = 0;
     while (i < tail.len) : (i += 1) {
@@ -316,10 +320,19 @@ pub fn writeTailFrom(env: *Env, snk: driver.Sink, src: driver.Source, tail: []co
         cur = r.op;
         cur.stampNew(profile.keyOf(tail[if (cur == .top_n) i - 1 else i].stage.pos));
     }
-    while (try cur.next(arena)) |outb| {
-        try snk.writeBatch(arena, outb);
+    var ping_pong: [2]std.heap.ArenaAllocator = .{ .init(env.gpa), .init(env.gpa) };
+    defer for (&ping_pong) |*a| a.deinit();
+    var pw = parallel.PipelinedSink{ .snk = snk, .gpa = env.gpa };
+    try pw.start();
+    defer pw.shutdown();
+    var at: usize = 0;
+    while (try cur.next(ping_pong[at].allocator())) |outb| {
+        try pw.submit(outb);
         stats.rows_out += outb.len;
+        at ^= 1;
+        _ = ping_pong[at].reset(.retain_capacity);
     }
+    try pw.finish();
     if (env.profile) |p| {
         const top = try p.absorb(cur);
         if (p.rootOf(feeds)) |below| try p.graftLeaf(top, below);

@@ -22,7 +22,6 @@ const connect = @import("connect.zig");
 const lanes = @import("lanes.zig");
 const isMap = @import("analyze/schema.zig").isMap;
 const laneHints = @import("analyze/targets.zig").laneHints;
-const op = @import("../exec/op.zig");
 const pushdown = @import("pushdown.zig");
 
 pub const Source = enum { parquet, csv, sql, other };
@@ -119,10 +118,9 @@ pub fn materializes(stages: []const ast.Stage, n: usize) bool {
     return false;
 }
 
-/// Where the window (or full sort) is that a file pipeline reads its input for
-/// first, in parallel, into memory; null when it does not. Not when a filter
-/// follows the window (`WHERE rn <= k` keeps only `k` rows a partition as they
-/// stream) or a fusing `LIMIT` follows the sort.
+/// Where the window is that a file pipeline reads its input for first, in parallel,
+/// into memory; null when it does not. Not when a filter follows the window
+/// (`WHERE rn <= k` keeps only `k` rows a partition as they stream).
 pub fn windowInputAt(stages: []const ast.Stage, n: usize) ?usize {
     if (n < 2 or stages.len < 3 or !laneEligible(stages, n)) return null;
     const rd = stages[0].node.read;
@@ -134,7 +132,6 @@ pub fn windowInputAt(stages: []const ast.Stage, n: usize) ?usize {
             if (w.top_k != null) return null;
             for (stages[wi + 1 ..]) |st| if (st.node == .filter) return null;
         },
-        .sort => if (wi + 1 < stages.len and stages[wi + 1].node == .limit and op.TopN.fits(stages[wi + 1].node.limit)) return null,
         else => return null,
     }
     return wi;

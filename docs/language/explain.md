@@ -67,7 +67,7 @@ plan (actuals)
 ANALYZE` uses once it has: both come from the one decision the run dispatches on.
 `csv parallel …` / `parquet parallel …` is a local CSV cut into byte-range chunks
 or a Parquet into row groups, with the shape the lanes run (`map`, `map+join`,
-`aggregate`, `aggregate over joins`, `distinct`, `top-n`); `postgres
+`aggregate`, `aggregate over joins`, `distinct`, `top-n`, `sort`); `postgres
 split-parallel …` is a SQL read divided into key ranges; a SQL source's aggregate
 or `ORDER BY … LIMIT` sent to the source comes first, then the split, each
 `unless` what would send it to the next; `… read into memory first (…), then
