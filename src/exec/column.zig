@@ -991,7 +991,7 @@ pub const Builder = struct {
             .values = std.array_list.Managed(u8).init(arena),
             .ends = std.array_list.Managed(i32).init(arena),
         } };
-        const narrow = ty.kind == .decimal and ty.precision >= 1 and ty.precision <= 18;
+        const narrow = ty.kind == .decimal and ty.precision >= 1;
         const store: Store = if (narrow) .{ .d64 = std.array_list.Managed(Dec64).init(arena) } else switch (storageOf(ty.kind)) {
             .bytes => bytes_store,
             inline else => |t| @unionInit(Store, @tagName(t), std.array_list.Managed(Elem(t)).init(arena)),
@@ -1000,8 +1000,9 @@ pub const Builder = struct {
     }
 
     /// Whether this builder holds its decimals narrow, as `Dec64` cells at `nscale`;
-    /// a DECIMAL of 18 digits or fewer starts so and widens at the first value that
-    /// is not at that scale or not held by an i64.
+    /// a DECIMAL of known precision starts so, whatever its digits (a SUM is typed
+    /// 38 wide but nearly always fits), and widens at the first value that is not
+    /// at that scale or not held by an i64, as `finish` would pack it anyway.
     pub fn narrowDecimals(self: *const Builder) bool {
         return self.store == .d64;
     }
