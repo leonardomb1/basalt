@@ -611,6 +611,8 @@ pub const KeyArr = struct {
         ints: []i64,
         floats: []f64,
         decs: []i128,
+        /// A narrow decimal column's unscaled cells, all at `scale`: kept in place.
+        d64: []const i64,
         strs: [][]const u8,
         boxed: column.Column,
     };
@@ -659,9 +661,7 @@ pub const KeyArr = struct {
                     },
                     .narrow => |nw| {
                         scale = nw.scale;
-                        const out = try arena.alloc(i128, n);
-                        for (out, nw.cells[0..n]) |*o, x| o.* = x.int();
-                        break :blk .{ .decs = out };
+                        break :blk .{ .d64 = @ptrCast(nw.cells[0..n]) };
                     },
                 }
             },
@@ -686,11 +686,22 @@ pub const KeyArr = struct {
         const ord: std.math.Order = switch (self.data) {
             .ints => |v| if (other.data == .ints) std.math.order(v[a], other.data.ints[c]) else return self.boxedAcross(a, other, c),
             .floats => |v| if (other.data == .floats) floatord.orderF64(v[a], other.data.floats[c]) else return self.boxedAcross(a, other, c),
-            .decs => |v| if (other.data == .decs) Decimal.order(.{ .unscaled = v[a], .scale = self.scale }, .{ .unscaled = other.data.decs[c], .scale = other.scale }) else return self.boxedAcross(a, other, c),
+            .decs, .d64 => switch (other.data) {
+                .decs, .d64 => Decimal.order(.{ .unscaled = self.unscaledAt(a), .scale = self.scale }, .{ .unscaled = other.unscaledAt(c), .scale = other.scale }),
+                else => return self.boxedAcross(a, other, c),
+            },
             .strs => |v| if (other.data == .strs) std.mem.order(u8, v[a], other.data.strs[c]) else return self.boxedAcross(a, other, c),
             .boxed => return self.boxedAcross(a, other, c),
         };
         return if (self.desc) ord.invert() else ord;
+    }
+
+    fn unscaledAt(self: KeyArr, i: usize) i128 {
+        return switch (self.data) {
+            .decs => |v| v[i],
+            .d64 => |v| v[i],
+            else => unreachable,
+        };
     }
 
     fn boxedAcross(self: KeyArr, a: usize, other: KeyArr, c: usize) std.math.Order {
@@ -705,6 +716,7 @@ pub const KeyArr = struct {
             .ints => |v| std.math.order(v[a], v[c]),
             .floats => |v| floatord.orderF64(v[a], v[c]),
             .decs => |v| std.math.order(v[a], v[c]),
+            .d64 => |v| std.math.order(v[a], v[c]),
             .strs => |v| std.mem.order(u8, v[a], v[c]),
             .boxed => |col| return keyOrder(col.getValue(a), col.getValue(c), self.desc, self.nulls_first),
         };
@@ -1024,7 +1036,7 @@ const KeyPlan = struct {
     fn of(k: KeyArr, n: usize) ?KeyPlan {
         const nulls = !k.valid.allSet(n);
         return switch (k.data) {
-            .ints, .floats => .{ .words = 1, .exact = true, .nulls = nulls },
+            .ints, .floats, .d64 => .{ .words = 1, .exact = true, .nulls = nulls },
             .decs => .{ .words = 2, .exact = true, .nulls = nulls },
             .strs => |v| blk: {
                 var longest: usize = 0;
@@ -1044,7 +1056,7 @@ const KeyPlan = struct {
 fn encWord(k: KeyArr, p: KeyPlan, w: usize, i: usize) u64 {
     if (p.nulls and !k.valid.get(i)) return 0;
     const word: u64 = switch (k.data) {
-        .ints, .floats => return orderedWord(k, i),
+        .ints, .floats, .d64 => return orderedWord(k, i),
         .decs => |v| blk: {
             const u: u128 = @as(u128, @bitCast(v[i])) ^ (@as(u128, 1) << 127);
             break :blk if (w == 0) @intCast(u >> 64) else @truncate(u);
@@ -1095,7 +1107,7 @@ fn sameWords(arrs: []const KeyArr, plans: []const KeyPlan, a: usize, b: usize) b
 /// `floatord.orderedBits`; `desc` complements.
 fn orderedWord(k: KeyArr, i: usize) u64 {
     const w: u64 = switch (k.data) {
-        .ints => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),
+        .ints, .d64 => |v| @as(u64, @bitCast(v[i])) ^ (1 << 63),
         .floats => |v| floatord.orderedBits(v[i]),
         else => unreachable,
     };
@@ -1115,6 +1127,7 @@ pub inline fn leadKey(k: KeyArr, i: usize) u128 {
         .ints, .floats => orderedWord(k, i),
         .strs => encWord(k, .{ .words = 1, .exact = false, .nulls = false }, 0, i),
         .decs => |v| decWord(k, v[i]),
+        .d64 => |v| decWord(k, v[i]),
         .boxed => 0,
     };
     return flag << 64 | w;
