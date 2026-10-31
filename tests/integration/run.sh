@@ -741,7 +741,7 @@ if runs sftp; then
   else report "sftp-parquet-folder (run error)" bad; fi
   # the same folder folded in parallel, a file per lane, against the local file
   if $B run -j 4 --log-level debug -c "$KEY LOAD INTO '$out/sftp_pq_agg.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'sftp://box/~/out/pq/';" 2>"$out/sftp_pq_agg.log" &&
-     grep -q "parallel parquet aggregate" "$out/sftp_pq_agg.log"; then
+     grep -q "parallel aggregate: fold" "$out/sftp_pq_agg.log"; then
     brun run -c "LOAD INTO '$out/sftp_pq_agg_want.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s FROM 'tests/integration/seed.csv';"
     check sftp-parquet-folder-parallel "$out/sftp_pq_agg.csv" "$out/sftp_pq_agg_want.csv"
   else report "sftp-parquet-folder-parallel (run error or not parallel)" bad; cat "$out/sftp_pq_agg.log"; fi
