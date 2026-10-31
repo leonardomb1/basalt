@@ -44,11 +44,12 @@ pub fn readColumnChunk(
     max_def: u32,
     base_offset: u64,
 ) ReadError!column.Column {
-    return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset);
+    return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset, false);
 }
 
 /// With `list` set, the chunk's entries (one per level pair, not per row) are
-/// assembled into a JSON array per row.
+/// assembled into a JSON array per row. `codes_only` keeps dictionary-coded strings
+/// as codes (`column.Column.codes_only`).
 pub fn readColumnChunkLevels(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
@@ -59,8 +60,9 @@ pub fn readColumnChunkLevels(
     max_rep: u32,
     list: ?ListShape,
     base_offset: u64,
+    codes_only: bool,
 ) ReadError!column.Column {
-    const d = try readPages(arena, file_bytes, meta, elem, if (list == null) rows else null, max_def, max_rep, base_offset);
+    const d = try readPages(arena, file_bytes, meta, elem, if (list == null) rows else null, max_def, max_rep, base_offset, codes_only and list == null);
     const shape = list orelse return d.vals;
     return assembleLists(arena, d.vals, d.levels.?.reps.items, d.levels.?.defs.items, max_def, shape, rows);
 }
@@ -76,7 +78,7 @@ pub fn readEntries(
     max_rep: u32,
     base_offset: u64,
 ) ReadError!Entries {
-    const d = try readPages(arena, file_bytes, meta, elem, null, max_def, max_rep, base_offset);
+    const d = try readPages(arena, file_bytes, meta, elem, null, max_def, max_rep, base_offset, false);
     const lv = d.levels.?;
     if (d.vals.len != lv.reps.items.len or d.vals.len != lv.defs.items.len) return Error.CorruptParquetPage;
     return .{ .vals = d.vals, .reps = lv.reps.items, .defs = lv.defs.items };
@@ -96,6 +98,7 @@ fn readPages(
     max_def: u32,
     max_rep: u32,
     base_offset: u64,
+    codes_only: bool,
 ) ReadError!struct { vals: column.Column, levels: ?Levels } {
     var cast = try castOf(elem);
     cast.ty = cast.ty.asNullable();
@@ -106,6 +109,7 @@ fn readPages(
     } else null;
 
     var b = try column.Builder.initCapacity(arena, cast.ty, @min(entries, capacity_hint));
+    b.codes_only = codes_only and rows != null and (cast.ty.kind == .string or cast.ty.kind == .bytes);
     var dict: ?Dict = null;
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
     if (at < base_offset) return Error.CorruptParquetPage;
@@ -257,6 +261,10 @@ fn appendDataPage(
 
     const rows: Rows = .{ .arena = arena, .b = b, .defs = defs, .max_def = max_def };
     const type_length = elem.type_length orelse 0;
+    switch (pg.header.encoding) {
+        .plain_dictionary, .rle_dictionary => {},
+        else => try b.spellSoFar(),
+    }
     switch (pg.header.encoding) {
         .plain => try pushPlain(arena, rows, cast, meta.ty, type_length, body, present),
         .byte_stream_split => {
@@ -635,6 +643,7 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
     if (idx.len > 0 and top >= d.col.len) return Error.CorruptParquetPage;
     switch (d.col.data) {
         .bytes => {
+            if (!rows.b.takesCodes(d.id)) try rows.b.spellSoFar();
             rows.b.appendDictBytes(d.flat, d.offs, idx, rows.defs, rows.max_def) catch |e| return landed(e);
             try rows.b.noteDict(d.id, d.entries, idx, rows.defs, rows.max_def);
         },

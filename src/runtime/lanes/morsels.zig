@@ -283,6 +283,8 @@ pub const PqMorsels = struct {
     tally: ?*driver.ScanTally = null,
     max_lanes: usize = std.math.maxInt(usize),
     check_in_lane: bool = false,
+    /// Columns its readers hand on as dictionary codes only (`plan.codesOnlyColumns`).
+    codes_only: []const []const u8 = &.{},
     /// A single file's reader as planning opened it: lanes reuse its footer and size,
     /// each on its own handle (a lineitem footer parsed again per lane was a quarter
     /// of a scan's page faults).
@@ -324,6 +326,7 @@ pub fn openItem(m: *const PqMorsels, scratch: std.mem.Allocator, held: *?HeldFil
 fn positioned(m: *const PqMorsels, r: *pqdecode.Reader, it: PqItem) ?*pqdecode.Reader {
     r.bounds = m.bounds;
     r.keys = m.keys;
+    r.codes_only = m.codes_only;
     r.tally = m.tally;
     r.rg = it.rg;
     r.rg_end = if (it.rg_end) |e| e else null;

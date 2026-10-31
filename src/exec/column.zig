@@ -312,6 +312,7 @@ fn takeRows(b: Bytes, idx: []const u32, values: []u8, ends: []i32, off: usize) u
 
 /// The rows `sel` keeps of `c`, its dictionary view carried along (`carryDict`).
 pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
+    if (c.codes_only) return codesOf(arena, c, try selectSlice(u32, arena, c.dict.?.codes, sel), try selectValidity(arena, c.validity, c.len, sel));
     const bm = try selectValidity(arena, c.validity, c.len, sel);
     const Op = struct {
         arena: std.mem.Allocator,
@@ -339,6 +340,50 @@ pub fn gather(arena: std.mem.Allocator, c: Column, keep: []const bool, kept: usi
 pub fn gatherColumns(arena: std.mem.Allocator, src: []const Column, out: []Column, keep: []const bool, kept: usize) !void {
     const sel = try Selection.init(arena, keep, kept);
     for (src, out) |c, *o| o.* = try select(arena, c, sel);
+}
+
+/// A codes-only column over `codes`, `c`'s dictionary carried along.
+fn codesOf(arena: std.mem.Allocator, c: Column, codes: []const u32, validity: Bitmap) !Column {
+    const d = try arena.create(Column.Dict);
+    d.* = .{ .values = c.dict.?.values, .codes = codes, .id = c.dict.?.id };
+    const offsets = try arena.alloc(i32, codes.len + 1);
+    @memset(offsets, 0);
+    return .{ .ty = c.ty, .len = codes.len, .validity = validity, .data = .{ .bytes = .{ .offsets = offsets, .values = &.{} } }, .dict = d, .codes_only = true };
+}
+
+/// `c` with its strings written out, when it holds only codes; else `c` itself.
+pub fn spell(arena: std.mem.Allocator, c: Column) !Column {
+    if (!c.codes_only) return c;
+    const d = c.dict.?;
+    var total: usize = 0;
+    for (d.codes[0..c.len], 0..) |k, r| if (c.validity.get(r)) {
+        total += d.values[k].len;
+    };
+    const values = try arena.alloc(u8, try checkSpan(total));
+    const offsets = try arena.alloc(i32, c.len + 1);
+    var w: usize = 0;
+    offsets[0] = 0;
+    for (d.codes[0..c.len], 0..) |k, r| {
+        if (c.validity.get(r)) {
+            const v = d.values[k];
+            @memcpy(values[w..][0..v.len], v);
+            w += v.len;
+        }
+        offsets[r + 1] = @intCast(w);
+    }
+    var out = c;
+    out.codes_only = false;
+    out.data = .{ .bytes = .{ .offsets = offsets, .values = values } };
+    return out;
+}
+
+fn spellAll(arena: std.mem.Allocator, cols: []const Column) ![]const Column {
+    for (cols, 0..) |c, i| if (c.codes_only) {
+        const out = try arena.dupe(Column, cols);
+        for (out[i..]) |*o| o.* = try spell(arena, o.*);
+        return out;
+    };
+    return cols;
 }
 
 /// Past this many entries a dictionary view is dropped rather than copied along.
@@ -370,7 +415,8 @@ fn concatValidity(arena: std.mem.Allocator, chunks: []const Column, total: usize
     return bm;
 }
 
-pub fn concat(arena: std.mem.Allocator, chunks_in: []const Column, total: usize) !Column {
+pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize) !Column {
+    const chunks_in = try spellAll(arena, chunks_raw);
     std.debug.assert(chunks_in.len > 0);
     const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
@@ -396,7 +442,8 @@ pub fn concat(arena: std.mem.Allocator, chunks_in: []const Column, total: usize)
 
 /// `concat` copying the chunks on up to `threads` threads, each chunk to its place;
 /// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
-pub fn concatThreads(arena: std.mem.Allocator, chunks_in: []const Column, total: usize, threads: usize) !Column {
+pub fn concatThreads(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize, threads: usize) !Column {
+    const chunks_in = try spellAll(arena, chunks_raw);
     if (threads < 2 or chunks_in.len < 2 or total < 1 << 17) return concat(arena, chunks_in, total);
     const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
@@ -460,7 +507,8 @@ fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !
     return .{ .offsets = offsets, .values = values };
 }
 
-pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column {
+pub fn permute(arena: std.mem.Allocator, c_in: Column, idx: []const usize) !Column {
+    const c = try spell(arena, c_in);
     const bm = try permuteValidity(arena, c.validity, c.len, idx);
     const Op = struct {
         arena: std.mem.Allocator,
@@ -490,7 +538,8 @@ pub fn permute(arena: std.mem.Allocator, c: Column, idx: []const usize) !Column 
 /// emits its chunks or a merge interleaves its sources. Rows taken from sources not
 /// much longer than they are skip the per-row validity when no source holds a null,
 /// as `permuteValidity` does. Dictionary views are dropped, as each chunk's differs.
-pub fn takeAcross(a: std.mem.Allocator, srcs_in: []const Column, refs: anytype) !Column {
+pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype) !Column {
+    const srcs_in = try spellAll(a, srcs_raw);
     const srcs = try sameLayout(a, srcs_in);
     var bm = try Bitmap.initFull(a, refs.len);
     var total: usize = 0;
@@ -583,6 +632,11 @@ fn permuteValidity(arena: std.mem.Allocator, v: Bitmap, n: usize, idx: []const u
 /// order, without the gather. Only the rows' own span is copied, as `c` may view a
 /// larger buffer; a small dictionary view comes along (`carryDict`).
 pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
+    if (c.codes_only) {
+        const bm = try Bitmap.initFull(arena, c.len);
+        @memcpy(bm.bits, c.validity.bits[0..bm.bits.len]);
+        return codesOf(arena, c, try arena.dupe(u32, c.dict.?.codes[0..c.len]), bm);
+    }
     var out = c;
     out.dict = if (c.dict) |d| try carryDict(arena, d, try arena.dupe(u32, d.codes[0..c.len])) else null;
     out.validity = try Bitmap.initFull(arena, c.len);
@@ -604,7 +658,8 @@ pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
 /// `permute` on up to `threads` threads for a large `idx`, in chunks of rows: each
 /// gathers its own, a string column's chunks first summing their bytes so each knows
 /// where its values start.
-pub fn permuteThreads(arena: std.mem.Allocator, c: Column, idx: []const usize, threads: usize) !Column {
+pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize, threads: usize) !Column {
+    const c = try spell(arena, c_in);
     const n = idx.len;
     const nc = par.chunks(n, 1 << 16);
     if (threads < 2 or nc < 2) return permute(arena, c, idx);
@@ -779,6 +834,10 @@ pub const Column = struct {
     validity: Bitmap,
     data: Data,
     dict: ?*const Dict = null,
+    /// The strings held only as `dict`'s codes: `data` is every row empty. Made for a
+    /// pipeline whose only reader of the column groups by it (`Encoder` reads codes);
+    /// whatever else meets one has it spelled out first (`spell`).
+    codes_only: bool = false,
 
     /// A column's values as codes into `values`; `id`, when not 0, names the
     /// dictionary for the process, so a consumer may remember what it made of it.
@@ -796,6 +855,10 @@ pub const Column = struct {
 
     pub fn getValue(self: Column, i: usize) Value {
         if (!self.validity.get(i)) return .null;
+        if (self.codes_only) {
+            const v = self.dict.?.values[self.dict.?.codes[i]];
+            return if (self.ty.kind == .bytes) .{ .bytes = v } else .{ .string = v };
+        }
         return switch (self.ty.kind) {
             .array, .@"struct" => .null,
             .decimal => .{ .decimal = decimals(self).at(i) },
@@ -904,6 +967,9 @@ pub const Builder = struct {
     rows: usize = 0,
     store: Store,
     nscale: u8 = 0,
+    /// Dictionary-coded strings kept as codes only (`Column.codes_only`), until a row
+    /// arrives otherwise and `spellSoFar` writes them out.
+    codes_only: bool = false,
 
     pub const BytesStore = struct {
         values: std.array_list.Managed(u8),
@@ -1089,6 +1155,13 @@ pub const Builder = struct {
         try l.ends.ensureUnusedCapacity(rows);
         const out = l.values.items.ptr;
         var w = l.values.items.len;
+        if (self.codes_only) {
+            const n = if (defs) |d| d.len else codes.len;
+            for (0..n) |_| l.ends.appendAssumeCapacity(@intCast(w));
+            if (defs == null or defs.?.len == codes.len) return self.pushValidRun(codes.len);
+            for (defs.?) |lvl| try self.pushValid(lvl == max_def);
+            return;
+        }
         if (defs == null or defs.?.len == codes.len) {
             for (codes) |c| {
                 w = moveEntry(out, w, flat, offs[c], offs[c + 1]);
@@ -1315,8 +1388,37 @@ pub const Builder = struct {
         };
     }
 
+    /// Whether the rows of dictionary `src` can stay codes: the builder is codes-only
+    /// and they extend the one dictionary it holds codes of.
+    pub fn takesCodes(self: *const Builder, src: usize) bool {
+        if (!self.codes_only) return false;
+        if (self.dict_src) |prev| return prev == src and self.dict_vals != null;
+        return self.rows == 0;
+    }
+
+    /// The codes-only rows so far written out as strings, and the builder an ordinary
+    /// one from here on.
+    pub fn spellSoFar(self: *Builder) error{OutOfMemory}!void {
+        if (!self.codes_only) return;
+        self.codes_only = false;
+        const vals = self.dict_vals orelse return;
+        std.debug.assert(self.dict_codes.items.len >= self.rows);
+        const l = &self.store.bytes;
+        l.values.clearRetainingCapacity();
+        l.ends.clearRetainingCapacity();
+        var w: usize = 0;
+        for (self.dict_codes.items[0..self.rows], 0..) |k, r| {
+            if ((self.bits.items[r >> 3] >> @intCast(r & 7)) & 1 != 0) {
+                try l.values.appendSlice(vals[k]);
+                w += vals[k].len;
+            }
+            try l.ends.append(@intCast(w));
+        }
+    }
+
     pub fn finish(self: *Builder) !Column {
         const n = self.rows;
+        if (self.codes_only) if (self.dict_vals == null or self.dict_vals.?.len == 0 or self.dict_codes.items.len != n) try self.spellSoFar();
         const bm = Bitmap{ .bits = try self.bits.toOwnedSlice(), .len = n };
         const data: Column.Data = switch (self.store) {
             .bytes => |*l| blk: {
@@ -1335,7 +1437,7 @@ pub const Builder = struct {
             d.* = .{ .values = vals, .codes = self.dict_codes.items, .id = self.dict_src.? };
             dict = d;
         };
-        return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict };
+        return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict, .codes_only = self.codes_only and n > 0 };
     }
 
     /// Records the dictionary the rows just appended came from (`src`, its process-wide
@@ -1849,4 +1951,68 @@ test "floatToInt through textconv gives what its own half-even body gave" {
         const y = @as(f64, @floatFromInt(rng.random().int(i32))) / 4;
         try std.testing.expectEqual(old(y) catch null, floatToInt(y) catch null);
     }
+}
+
+test "a codes-only column keeps its codes through slice, select and copy, and spells out the strings it stands for" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const entries = [_][]const u8{ "red", "", "blue" };
+    const flat = "redblue";
+    const offs = [_]i32{ 0, 3, 3, 7 };
+    const codes = [_]u32{ 2, 0, 1, 2, 0, 0, 2, 1, 0, 2, 1, 1, 0, 2, 2, 0 };
+    const defs = [_]u32{ 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    const present = [_]u32{ 2, 0, 2, 0, 0, 2, 1, 0, 2, 1, 1, 0, 2, 2, 0, 1 };
+    var b = Builder.init(a, types.Type.init(.string).asNullable());
+    b.codes_only = true;
+    try std.testing.expect(b.takesCodes(7));
+    try b.appendDictBytes(flat, &offs, &present, &defs, 1);
+    try b.noteDict(7, &entries, &present, &defs, 1);
+    const c = try b.finish();
+    try std.testing.expect(c.codes_only);
+    try std.testing.expectEqual(@as(usize, defs.len), c.len);
+    try std.testing.expectEqual(Value.null, c.getValue(2));
+    try std.testing.expectEqualStrings("blue", c.getValue(3).string);
+
+    const sp = try spell(a, c);
+    try std.testing.expect(!sp.codes_only);
+    for (0..c.len) |r| {
+        if (!c.validity.get(r)) continue;
+        try std.testing.expectEqualStrings(c.getValue(r).string, sp.data.bytes.at(r));
+    }
+    const sl = try slice(a, c, 8, 8);
+    try std.testing.expect(sl.codes_only);
+    try std.testing.expectEqualStrings(c.getValue(9).string, sl.getValue(1).string);
+    var keep: [defs.len]bool = undefined;
+    for (&keep, 0..) |*k, r| k.* = r % 3 != 0;
+    const g = try gather(a, c, &keep, 11);
+    try std.testing.expect(g.codes_only);
+    try std.testing.expectEqualStrings(c.getValue(1).string, g.getValue(0).string);
+    const cp = try copy(a, c);
+    try std.testing.expect(cp.codes_only);
+    try std.testing.expectEqualStrings(c.getValue(16).string, cp.getValue(16).string);
+    const pm = try permute(a, c, &.{ 3, 0 });
+    try std.testing.expect(!pm.codes_only);
+    try std.testing.expectEqualStrings("blue", pm.data.bytes.at(0));
+    _ = codes;
+}
+
+test "a codes-only builder writes its rows out when a value arrives otherwise, then goes on as an ordinary one" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const entries = [_][]const u8{ "aa", "b" };
+    const flat = "aab";
+    const offs = [_]i32{ 0, 2, 3 };
+    const codes = [_]u32{ 1, 0, 0, 1 };
+    var b = try Builder.initCapacity(a, types.Type.init(.string), 8);
+    b.codes_only = true;
+    try b.appendDictBytes(flat, &offs, &codes, null, 0);
+    try b.noteDict(3, &entries, &codes, null, 0);
+    try b.spellSoFar();
+    try b.appendStr("plain");
+    const c = try b.finish();
+    try std.testing.expect(!c.codes_only);
+    const want = [_][]const u8{ "b", "aa", "aa", "b", "plain" };
+    for (want, 0..) |s, r| try std.testing.expectEqualStrings(s, c.data.bytes.at(r));
 }

@@ -158,6 +158,15 @@ pub const Reader = struct {
     deletes: ?Deletes = null,
     deleted: ?roaring.Bitmap = null,
     firsts: []const u64 = &.{},
+    /// Top-level string columns read as dictionary codes only, by name: a pipeline
+    /// whose only use of them is to group by them asks for it.
+    codes_only: []const []const u8 = &.{},
+
+    fn codesOnly(self: *const Reader, schema_idx: usize) bool {
+        const name = self.md.schema[schema_idx].name;
+        for (self.codes_only) |c| if (std.mem.eql(u8, c, name)) return true;
+        return false;
+    }
 
     pub fn isPath(path: []const u8) bool {
         return std.mem.endsWith(u8, path, ".parquet");
@@ -332,6 +341,7 @@ pub const Reader = struct {
                         lf.max_rep,
                         lf.list,
                         chunk.start,
+                        self.codesOnly(lf.schema_idx),
                     ) catch |e| return self.named(e);
                 },
                 .nested => |n| {

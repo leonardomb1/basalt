@@ -14,6 +14,7 @@ const connect_mod = @import("../connect.zig");
 const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const filterBounds = @import("../plan.zig").filterBounds;
+const codesOnlyColumns = @import("../plan.zig").codesOnlyColumns;
 const lake = @import("../../format/lake/table.zig");
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
@@ -144,6 +145,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
         .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
         .check_in_lane = remote and root != null,
         .like = like,
+        .codes_only = try codesOnlyColumns(arena, push_stages),
     } };
 }
 
@@ -204,6 +206,7 @@ fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, rd: a
         .max_lanes = if (!remote) std.math.maxInt(usize) else if (sftp.isUrl(path)) 4 else 8,
         .layout = layout,
         .view = view,
+        .codes_only = try codesOnlyColumns(arena, push_stages),
     } };
 }
 

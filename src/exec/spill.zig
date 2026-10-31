@@ -123,6 +123,13 @@ pub const Writer = struct {
 
     fn valuesLen(c: Column, rows: usize) u64 {
         if (c.data != .bytes) return 0;
+        if (c.codes_only) {
+            var n: u64 = 0;
+            for (c.dict.?.codes[0..rows], 0..) |k, r| if (c.validity.get(r)) {
+                n += c.dict.?.values[k].len;
+            };
+            return n;
+        }
         const s = bytesSpan(c.data.bytes, rows);
         return s.hi - s.lo;
     }
@@ -152,12 +159,32 @@ pub const Writer = struct {
         for (b.columns) |c| {
             try self.putPadded(c.validity.bits[0 .. (rows + 7) / 8]);
             switch (c.data) {
-                .bytes => |by| try self.putBytes(by, rows),
+                .bytes => |by| if (c.codes_only) try self.putCodes(c, rows) else try self.putBytes(by, rows),
                 inline else => |_, t| try self.putPadded(std.mem.sliceAsBytes(column.fixedOf(t, c.data)[0..rows])),
             }
         }
         self.rows += rows;
         self.bytes += total;
+    }
+
+    /// A codes-only column written as `putBytes` writes its strings: the offsets, then
+    /// each valid row's dictionary value.
+    fn putCodes(self: *Writer, c: Column, rows: usize) !void {
+        const d = c.dict.?;
+        var w: i32 = 0;
+        try self.put(std.mem.asBytes(&w));
+        for (d.codes[0..rows], 0..) |k, r| {
+            if (c.validity.get(r)) w += @intCast(d.values[k].len);
+            try self.put(std.mem.asBytes(&w));
+        }
+        const n = (rows + 1) * @sizeOf(i32);
+        try self.zeros(pad(n) - n);
+        var total: u64 = 0;
+        for (d.codes[0..rows], 0..) |k, r| if (c.validity.get(r)) {
+            try self.put(d.values[k]);
+            total += d.values[k].len;
+        };
+        try self.zeros(pad(total) - total);
     }
 
     fn putBytes(self: *Writer, by: column.Bytes, rows: usize) !void {
@@ -450,6 +477,35 @@ test "spill drops a dictionary and keeps a string column sliced off a larger buf
     try testing.expectEqual(@as(i32, 0), got.columns[1].data.bytes.offsets[0]);
     try testing.expectEqualStrings("alpha", got.columns[1].data.bytes.at(0));
     try testing.expect((try r.next(a)) == null);
+}
+
+test "spill writes a codes-only column's strings, read back as an ordinary column" {
+    var td = try TestDir.init(1 << 20);
+    defer td.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = types.Type.init(.string).asNullable() }} };
+    const entries = [_][]const u8{ "red", "", "blue" };
+    const codes = [_]u32{ 2, 0, 1, 2, 0, 1 };
+    var db = column.Builder.init(a, schema.fields[0].ty);
+    db.codes_only = true;
+    try db.appendDictBytes("redblue", &.{ 0, 3, 3, 7 }, &codes, &.{ 1, 1, 1, 0, 1, 1, 1 }, 1);
+    try db.noteDict(1, &entries, &codes, &.{ 1, 1, 1, 0, 1, 1, 1 }, 1);
+    const col = try db.finish();
+    try testing.expect(col.codes_only);
+    var cols = [_]Column{col};
+    const b = Batch{ .schema = &schema, .columns = &cols, .len = col.len };
+    var w = try Writer.init(td.ds.space(), a, &schema, "codes");
+    errdefer w.abort();
+    try w.write(b);
+    const run = try w.finish();
+    var r = try Reader.open(run);
+    defer r.close();
+    const got = (try r.next(a)).?;
+    try expectSameBatch(b, got);
+    try testing.expect(!got.columns[0].codes_only);
+    try testing.expectEqualStrings("blue", got.columns[0].data.bytes.at(0));
 }
 
 test "spill of no batches reads back empty" {

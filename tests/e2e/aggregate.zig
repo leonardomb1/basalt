@@ -614,3 +614,56 @@ test "a computed GROUP BY key beside aggregates of a joined side's qualified col
         try std.testing.expectEqualStrings(c.want, out);
     }
 }
+
+test "a Parquet string column grouped by and named nowhere else is read as dictionary codes, with the rows a CSV read gives, serial, on lanes and spilled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,g,s,v\n");
+    for (0..20000) |i| {
+        if (i % 13 == 0) {
+            try input.writer().print("{d},{c},,{d}\n", .{ i, "pqr"[i % 3], i % 11 });
+        } else try input.writer().print("{d},{c},name-{d},{d}\n", .{ i, "pqr"[i % 3], i % 1500, i % 11 });
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+    const conv = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/in.parquet' AS SELECT * FROM '{0s}/in.csv';\nLOAD INTO '{0s}/out.csv' AS SELECT 1 AS x;", .{base});
+    defer alloc.free(conv);
+    alloc.free(try runScriptOpts(alloc, &tmp, conv, .{}));
+
+    const queries = [_][]const u8{
+        "SELECT g, s, COUNT(*) AS c, SUM(v) AS sv FROM '$B/in.$F' WHERE v > 3 GROUP BY g, s ORDER BY g, s",
+        "SELECT s, COUNT(*) AS c, MAX(id) AS m FROM '$B/in.$F' GROUP BY s ORDER BY s",
+        "SELECT s, COUNT(*) AS c FROM '$B/in.$F' WHERE s <> 'name-7' GROUP BY s HAVING COUNT(*) > 1 ORDER BY s",
+    };
+    for (queries) |tmpl| {
+        const q0 = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+        defer alloc.free(q0);
+        const qc = try std.mem.replaceOwned(u8, alloc, q0, "$F", "csv");
+        defer alloc.free(qc);
+        const qp = try std.mem.replaceOwned(u8, alloc, q0, "$F", "parquet");
+        defer alloc.free(qp);
+        const sc = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, qc });
+        defer alloc.free(sc);
+        const sp = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, qp });
+        defer alloc.free(sp);
+        const want = try runScriptOpts(alloc, &tmp, sc, .{});
+        defer alloc.free(want);
+        try std.testing.expect(std.mem.count(u8, want, "\n") > 100);
+        for ([_]basalt.env.RunOptions{
+            .{ .threads = 1 },
+            .{ .threads = 4, .morsel_bytes = 4 << 10 },
+            .{ .threads = 1, .op_memory = 1, .spill_dir = spill_dir },
+            .{ .threads = 4, .op_memory = 1, .spill_dir = spill_dir },
+        }) |o| {
+            const got = try runScriptOpts(alloc, &tmp, sp, o);
+            defer alloc.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+    }
+}

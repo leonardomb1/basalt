@@ -401,6 +401,26 @@ fn stageReads(arena: std.mem.Allocator, st: ast.Stage, set: *std.StringHashMap(v
     return .passes;
 }
 
+/// The columns a read may hand on as dictionary codes only (`Column.codes_only`): the
+/// stages after it are filters, then a GROUP BY, and the column is a grouping key no
+/// filter and no aggregate argument names. The grouping reads codes; every other use
+/// would want the strings.
+pub fn codesOnlyColumns(arena: std.mem.Allocator, after: []const ast.Stage) ![]const []const u8 {
+    var i: usize = 0;
+    while (i < after.len and after[i].node == .filter) i += 1;
+    if (i >= after.len or after[i].node != .aggregate) return &.{};
+    const ag = after[i].node.aggregate;
+    var used = std.StringHashMap(void).init(arena);
+    for (after[0..i]) |st| if (!try exprNames(arena, st.node.filter, &used)) return &.{};
+    for (ag.aggs) |a| if (a.arg) |e| if (!try exprNames(arena, e, &used)) return &.{};
+    var out = std.array_list.Managed([]const u8).init(arena);
+    for (ag.by) |q| {
+        if (q.dollar or q.parts.len != 1 or used.contains(q.last())) continue;
+        try out.append(q.last());
+    }
+    return out.items;
+}
+
 fn exprNames(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.StringHashMap(void)) !bool {
     if (ast.hasSearch(e)) return false;
     var quals = std.array_list.Managed(ast.QualName).init(arena);
@@ -639,7 +659,14 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                     take_at = pt.idx;
                 }
                 break :blk t.src;
-            } else try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+            } else blk: {
+                const before = env.pipe.pq_reader;
+                const s = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+                if (env.pipe.pq_reader) |pr| if (pr != before) {
+                    pr.codes_only = try codesOnlyColumns(env.arena, stages[1..]);
+                };
+                break :blk s;
+            };
             const cs = try env.arena.create(obs.CountingSource);
             cs.* = .{ .inner = raw, .count = env.rows_read };
             const src = cs.source();
