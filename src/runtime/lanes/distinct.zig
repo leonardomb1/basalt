@@ -131,7 +131,7 @@ const DistinctSink = struct {
     }
 
     /// Morsel `i`'s first row per key, each batch of them keyed for the merge.
-    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, _: *const usize) anyerror!void {
         const self: *DistinctSink = @ptrCast(@alignCast(ptr));
         const l: *Local = @ptrCast(@alignCast(local));
         const in = keytable.Interner{ .table = self.strs, .cache = &l.cache, .alloc = l.arena.allocator() };

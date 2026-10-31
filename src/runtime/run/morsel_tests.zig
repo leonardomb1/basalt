@@ -90,6 +90,8 @@ const queries = [_]Query{
     .{ .q = "SELECT DISTINCT k, g FROM $IN", .exact = true },
     .{ .q = "SELECT DISTINCT g FROM $IN WHERE k > 50 ORDER BY g", .exact = true },
     .{ .q = "SELECT DISTINCT k FROM $IN ORDER BY k DESC LIMIT 9", .exact = true },
+    .{ .q = "SELECT id, k, f FROM $IN ORDER BY f DESC, k LIMIT 25", .exact = true },
+    .{ .q = "SELECT id, g, k FROM $IN WHERE k > 10 ORDER BY g, k LIMIT 40", .exact = true },
 };
 
 /// The file `q` writes over `input` at `threads`, morsels of `morsel_bytes`.

@@ -398,7 +398,7 @@ const AggSink = struct {
 
     /// Fold morsel (or worker) `i` into partial `i`, whose fold tables go once it is
     /// sealed, then merge what each partition not busy can take in order.
-    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, _: *const usize) anyerror!void {
         const self: *AggSink = @ptrCast(@alignCast(ptr));
         const mem: *LaneMem = @ptrCast(@alignCast(local));
         const gpa = self.env.gpa;
@@ -507,7 +507,8 @@ const AggSink = struct {
             mem.init();
             defer mem.deinit();
             const chain = (try drainChain(mem.work.allocator(), env.errctx, self.unmatched)).?;
-            try sink(ptr, &mem, self.partials.len - 1, chain);
+            const last = self.partials.len - 1;
+            try sink(ptr, &mem, last, chain, &last);
         }
         const t_mrg0 = std.time.Instant.now() catch unreachable;
         try self.merge();

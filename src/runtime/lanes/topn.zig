@@ -1,11 +1,12 @@
-//! Top-N lanes: each lane keeps its best rows, merged into the final N.
+//! Top-N lanes, a `ParallelSink` that `morsels.drive` feeds: each worker keeps its
+//! best rows, combined into the final N.
 
 const Env = @import("../env.zig").Env;
 const Morsels = @import("morsels.zig").Morsels;
-const Reader = @import("morsels.zig").Reader;
-const Stream = @import("morsels.zig").Stream;
+const ParallelSink = @import("morsels.zig").ParallelSink;
+const Pipeline = @import("morsels.zig").Pipeline;
+const drive = @import("morsels.zig").drive;
 const PqPart = @import("agg.zig").PqPart;
-const Profile = @import("../../exec/profile.zig").Profile;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
@@ -15,8 +16,6 @@ const WorkQueue = @import("../parallel.zig").WorkQueue;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
-const chainOps = @import("../plan.zig").chainOps;
-const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
@@ -111,62 +110,68 @@ pub fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
     return .{ .prefix = prefix, .srt = middle[middle.len - 2], .lim = middle[middle.len - 1].node.limit };
 }
 
-const TopNCtx = struct {
-    m: *const Morsels,
+/// Top-N as a parallel sink: a worker keeps its best rows over every morsel it claims,
+/// each row placed by its morsel and position there so ties keep the rows a serial
+/// run keeps; finalize combines the workers' rows into the final N.
+const TopNSink = struct {
+    env: *Env,
     row_schema: *const types.Schema,
-    prefix: []const analyze.Resolved,
-    errctx: ?*op.ErrCtx = null,
     keys: []const op.Sort.Key,
     cap: u64,
-    queue: WorkQueue,
+    lim: ast.Limit,
     kept: std.array_list.Managed(op.TopN.Kept),
     kept_arena: std.mem.Allocator,
     mtx: std.Thread.Mutex = .{},
-    rows_read: *obs.RowCounter,
-    prof: ?*Profile = null,
-};
+    top: ?op.Batch = null,
 
-fn topnLane(ctx: *TopNCtx, _: usize) void {
-    topnLaneRun(ctx) catch |e| ctx.queue.fail(e);
-}
-
-/// A lane's best rows over the morsels it claims, each row placed by its morsel and
-/// position there, so ties keep the rows a serial run keeps.
-fn topnLaneRun(ctx: *TopNCtx) !void {
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
-    var rd = Reader.init(mem.gpa.allocator());
-    defer rd.deinit();
-    var st = Stream{ .m = ctx.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
-    defer st.source().close();
-    var cs = obs.CountingSource{ .inner = st.source(), .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
-    var tn = op.TopN{
-        .child = child,
-        .in_schema = ctx.row_schema,
-        .keys = ctx.keys,
-        .count = ctx.cap,
-        .offset = 0,
-        .state = mem.batch.allocator(),
-        .gpa = mem.gpa.allocator(),
-        .item = &st.cur_item,
-    };
-    const t0 = if (ctx.prof != null) std.time.Instant.now() catch null else null;
-    const kept = try tn.nextKept(mem.batch.allocator());
-    if (ctx.prof) |p| {
-        if (t0) |s| tn.stats.ns = if (std.time.Instant.now()) |now| now.since(s) else |_| 0;
-        tn.stats.rows = if (kept) |k| k.rows.len else 0;
-        tn.stats.calls = 1;
-        _ = try p.absorb(.{ .top_n = &tn });
+    fn parallelSink(self: *TopNSink) ParallelSink {
+        return .{ .ptr = self, .vtable = &vtable };
     }
-    const local = kept orelse return;
 
-    ctx.mtx.lock();
-    defer ctx.mtx.unlock();
-    try ctx.kept.append(.{ .rows = try local.rows.deepCopy(ctx.kept_arena), .seqs = try ctx.kept_arena.dupe(u64, local.seqs) });
-}
+    fn initLocal(_: *anyopaque, mem: *LaneMem) anyerror!*anyopaque {
+        return mem;
+    }
+
+    fn sink(ptr: *anyopaque, local: *anyopaque, _: usize, chain: op.Op, at: *const usize) anyerror!void {
+        const self: *TopNSink = @ptrCast(@alignCast(ptr));
+        const mem: *LaneMem = @ptrCast(@alignCast(local));
+        var tn = op.TopN{
+            .child = chain,
+            .in_schema = self.row_schema,
+            .keys = self.keys,
+            .count = self.cap,
+            .offset = 0,
+            .state = mem.batch.allocator(),
+            .gpa = mem.gpa.allocator(),
+            .item = at,
+        };
+        const prof = self.env.profile;
+        const t0 = if (prof != null) std.time.Instant.now() catch null else null;
+        const kept = try tn.nextKept(mem.batch.allocator());
+        if (prof) |p| {
+            if (t0) |st| tn.stats.ns = if (std.time.Instant.now()) |now| now.since(st) else |_| 0;
+            tn.stats.rows = if (kept) |k| k.rows.len else 0;
+            tn.stats.calls = 1;
+            _ = try p.absorb(.{ .top_n = &tn });
+        }
+        const best = kept orelse return;
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        try self.kept.append(.{ .rows = try best.rows.deepCopy(self.kept_arena), .seqs = try self.kept_arena.dupe(u64, best.seqs) });
+    }
+
+    fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
+
+    fn finalize(ptr: *anyopaque) anyerror!void {
+        const self: *TopNSink = @ptrCast(@alignCast(ptr));
+        const env = self.env;
+        const t0 = std.time.Instant.now() catch unreachable;
+        self.top = try op.TopN.combine(env.gpa, env.arena, self.row_schema, self.keys, self.lim.count, self.lim.offset, self.kept.items);
+        if (env.profile) |p| try p.phase("combine the lanes' best rows", (std.time.Instant.now() catch t0).since(t0));
+    }
+
+    const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize };
+};
 
 pub fn runParallelTopN(
     env: *Env,
@@ -187,35 +192,24 @@ pub fn runParallelTopN(
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = m.workers(opts.lanes());
     var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer kept_arena.deinit();
-    var ctx = TopNCtx{
-        .m = m,
+    var g = TopNSink{
+        .env = env,
         .row_schema = row_schema,
-        .prefix = pre.recs,
-        .errctx = env.errctx,
         .keys = ks,
         .cap = lim.offset + lim.count,
-        .queue = .{ .nitems = m.count() },
+        .lim = lim,
         .kept = .init(env.gpa),
         .kept_arena = kept_arena.allocator(),
-        .rows_read = env.rows_read,
-        .prof = env.profile,
     };
-    defer ctx.kept.deinit();
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, topnLane, &ctx);
+    defer g.kept.deinit();
+    const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = true };
+    const lanes = try drive(arena, p, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel {s} top-n: {d} {s} over {d} lanes", .{ m.label(), m.count(), m.unitName(), lanes });
-    if (ctx.queue.failure()) |e| return e;
-
-    const t_mrg0 = std.time.Instant.now() catch unreachable;
-    const top = try op.TopN.combine(env.gpa, arena, row_schema, ks, lim.count, lim.offset, ctx.kept.items);
-    if (env.profile) |p| {
-        try p.phase("combine the lanes' best rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ m.label(), m.count(), m.unitName() });
-    }
+    if (env.profile) |pr| pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel top-n, {d} {s}", .{ m.label(), m.count(), m.unitName() });
+    const top = g.top;
 
     const snk = try openTailSink(env, w, row_schema.*);
     var guard = SinkGuard.init(snk);

@@ -77,7 +77,7 @@ const RouteSink = struct {
         return l;
     }
 
-    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, _: *const usize) anyerror!void {
         const self: *RouteSink = @ptrCast(@alignCast(ptr));
         const l: *Local = @ptrCast(@alignCast(local));
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
@@ -322,7 +322,8 @@ pub fn run(
         defer mem.deinit();
         if (try drainChain(mem.work.allocator(), env.errctx, p.joins)) |chain| {
             const local = try RouteSink.initLocal(&rs, &mem);
-            try RouteSink.sink(&rs, local, p.m.count(), chain);
+            const last = p.m.count();
+            try RouteSink.sink(&rs, local, last, chain, &last);
             try RouteSink.combine(&rs, local);
         }
     }

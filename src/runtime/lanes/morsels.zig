@@ -192,7 +192,9 @@ pub const ParallelSink = struct {
 
     pub const VTable = struct {
         initLocal: *const fn (global: *anyopaque, mem: *LaneMem) anyerror!*anyopaque,
-        sink: *const fn (global: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void,
+        /// `at` is the morsel the chain's current rows come from: `i` per morsel, the
+        /// one it is reading while a worker's chain runs over every morsel it claims.
+        sink: *const fn (global: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, at: *const usize) anyerror!void,
         combine: *const fn (global: *anyopaque, local: *anyopaque) anyerror!void,
         finalize: *const fn (global: *anyopaque) anyerror!void,
         /// What the Global holds, for the per-query memory pool still to come.
@@ -243,7 +245,7 @@ fn driveRun(ctx: *Drive, lane: usize) !void {
     if (ctx.p.per_lane) {
         var st = Stream{ .m = ctx.p.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
         defer st.source().close();
-        try vt.sink(ctx.snk.ptr, local, lane, try chainOver(ctx.p, st.source(), mem.work.allocator()));
+        try vt.sink(ctx.snk.ptr, local, lane, try chainOver(ctx.p, st.source(), mem.work.allocator()), &st.cur_item);
     } else while (ctx.queue.take()) |i| {
         const span = trace.begin("morsel", i);
         defer span.end();
@@ -253,7 +255,7 @@ fn driveRun(ctx: *Drive, lane: usize) !void {
         var none = OneBatch{ .b = null, .sch = ctx.p.m.schema().* };
         const src = (try ctx.p.m.open(i, &rd, wa)) orelse none.source();
         defer src.close();
-        try vt.sink(ctx.snk.ptr, local, i, try chainOver(ctx.p, src, wa));
+        try vt.sink(ctx.snk.ptr, local, i, try chainOver(ctx.p, src, wa), &i);
     }
     if (!ctx.queue.failed.load(.seq_cst)) try vt.combine(ctx.snk.ptr, local);
 }
