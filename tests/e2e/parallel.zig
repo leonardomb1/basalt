@@ -1029,3 +1029,41 @@ test "parallel join sides: an IN or NOT IN over a grouped subquery, run on lanes
         try std.testing.expectEqualStrings(serial, lanes);
     }
 }
+
+test "a filter under a GROUP BY: dropped rows neither fold, nor group, nor fail an argument they would overflow" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try input.appendSlice("id,k,a,v\n");
+    var n = [_]i64{0} ** 5;
+    var s = [_]i64{0} ** 5;
+    for (0..6000) |i| {
+        if (i % 10 == 3) {
+            try input.writer().print("{d},zz,4000000000,-1\n", .{i});
+            continue;
+        }
+        const g = i % 5;
+        const a: i64 = @intCast(i % 97);
+        try input.writer().print("{d},{c},{d},1\n", .{ i, "abcde"[g], a });
+        n[g] += 1;
+        s[g] += a * a + (if (a > 50) @as(i64, 1) else 0);
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input.items });
+    var want = std.array_list.Managed(u8).init(alloc);
+    defer want.deinit();
+    try want.appendSlice("k,n,s\n");
+    for (0..5) |g| try want.writer().print("{c},{d},{d}\n", .{ "abcde"[g], n[g], s[g] });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{0s}/out.csv' AS SELECT k, COUNT(*) AS n, SUM(a * a + CASE WHEN a > 50 THEN 1 ELSE 0 END) AS s FROM '{0s}/in.csv' WHERE v > 0 GROUP BY k ORDER BY k;", .{base});
+    defer alloc.free(script);
+    for ([_]usize{ 1, 4 }) |threads| {
+        var diag: Diag = .{};
+        _ = try exec(alloc, script, .{ .threads = threads, .morsel_bytes = 4 << 10, .log = .{ .quiet = true } }, &diag);
+        const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 16);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(want.items, out);
+    }
+}
