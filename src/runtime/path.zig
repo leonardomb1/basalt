@@ -85,6 +85,18 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     } };
 }
 
+/// At one lane, a file aggregate over joins whose head is filtered: its first join
+/// still turns around when the filter leaves few rows (`run/output.zig`
+/// `flipLaterJoin`), on one worker, and the plan stays serial otherwise.
+pub fn oneLaneTurn(head: []const ast.Stage, f: Facts) ?lanes.SinkShape {
+    if (f.lanes != 1 or !(f.head_source == .parquet or f.head_source == .csv)) return null;
+    if (head.len < 2 or head[0].node != .read or !laneHints(head[0])) return null;
+    const shape = lanes.classifyLaneShape(head) orelse return null;
+    if (shape != .sink or shape.sink.joins.len == 0 or !lanes.shapeLaneSafe(shape)) return null;
+    for (shape.sink.prefix) |st| if (st.node == .filter) return shape.sink;
+    return null;
+}
+
 /// A SQL read's aggregate with no join ahead of it, which its key ranges can fold.
 fn sqlAgg(stages: []const ast.Stage) ?lanes.SinkShape {
     const s = lanes.classifySinkPipeline(stages) orelse return null;

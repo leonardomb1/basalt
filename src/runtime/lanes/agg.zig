@@ -643,7 +643,7 @@ pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape:
     if (drains) g.unmatched = joins;
     var g_live = true;
     defer if (g_live) g.deinit();
-    const p: Pipeline = .{ .m = &mm, .recs = pre_recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local };
+    const p: Pipeline = .{ .m = &mm, .recs = pre_recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = lane_local, .read_at = if (flip) |f| f.read_at else 0 };
     const read0 = env.rows_read.load(.monotonic);
     const used = drive(env.arena, p, g.parallelSink(), opts.lanes()) catch |e| {
         if (e != error.AggregatePastMemory) return e;

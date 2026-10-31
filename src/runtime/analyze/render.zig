@@ -141,6 +141,7 @@ fn physical(w: anytype, ph: Physical) !void {
 fn serial(w: anytype, ph: Physical) !void {
     try w.writeAll("serial");
     if (ph.has_breaker) try w.writeAll(" (has breaker, materializes)");
+    if (ph.one_lane_turn) try w.writeAll(", unless the filter on its head leaves few rows: then they are read into memory first and its first join turned around");
 }
 
 /// Why `APPEND` cannot be honoured for a file target, or null: a parquet footer is

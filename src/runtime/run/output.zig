@@ -670,12 +670,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (try pushdown.hoistFilters(arena, env.gpa, head_stages, env.bindings, env.tables)) |h| head_stages = h;
         head_stages = try pruneKnown(env, head_stages);
     }
-    const chosen = try path.choose(arena, stages, head_stages, .{
+    const path_facts: path.Facts = .{
         .lanes = opts.lanes(),
         .sink = last.write,
         .source = path.sourceOf(stages[0], env.connections),
         .head_source = path.sourceOf(head_stages[0], env.connections),
-    });
+    };
+    const chosen = try path.choose(arena, stages, head_stages, path_facts);
     if (chosen == .union_split) {
         delegated.* = true;
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
@@ -691,6 +692,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
             if (try runParquetLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
         } else if (try runCsvLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
     }
+    if (chosen == .serial) if (path.oneLaneTurn(head_stages, path_facts)) |sh| if (try flipLaterJoin(env, head_stages, sh, last.write, opts, stats, lanes_used, batch_arena)) return;
     const sql: ?path.Sql = if (chosen == .sql) chosen.sql else null;
 
     pipe.sql_desc = null;

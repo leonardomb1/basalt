@@ -448,20 +448,22 @@ test "a first join whose filtered head leaves few rows indexes those rows on lan
         try std.testing.expectEqualStrings(outs[0], outs[1]);
     }
 
-    for ([_]struct { q: usize, flips: bool }{ .{ .q = 0, .flips = true }, .{ .q = 1, .flips = true }, .{ .q = 2, .flips = false } }) |cs| {
+    for ([_]struct { q: usize, flips: bool }{ .{ .q = 0, .flips = true }, .{ .q = 1, .flips = true }, .{ .q = 2, .flips = false } }) |cs| for ([_]usize{ 1, 4 }) |threads| {
         const q = try std.mem.replaceOwned(u8, alloc, queries[cs.q], "$B", base);
         defer alloc.free(q);
         const script = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q });
         defer alloc.free(script);
         var rdiag: Diag = .{};
         var cap = try StderrCapture.begin(tmp.dir);
-        const res = exec(alloc, script, .{ .threads = 4, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const res = exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
         const prof = try cap.end(alloc);
         defer alloc.free(prof);
         _ = try res;
-        errdefer std.debug.print("{s}\n", .{prof});
+        errdefer std.debug.print("-j {d}\n{s}\n", .{ threads, prof });
         try std.testing.expectEqual(cs.flips, std.mem.indexOf(u8, prof, "the filtered rows before `o`") != null);
-    }
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prof, "/l.csv"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prof, "/o.csv"));
+    };
 }
 
 test "for-each over a JSON array param iterates and binds fields by name" {

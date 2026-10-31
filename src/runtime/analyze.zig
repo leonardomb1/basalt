@@ -391,6 +391,8 @@ pub const Physical = struct {
     veto: []const u8 = "",
     /// A join's SQL side may take a small local file's keys, which keeps it serial.
     keys_serial: bool = false,
+    /// At one lane, the first join may still turn around (`path.oneLaneTurn`).
+    one_lane_turn: bool = false,
 };
 
 pub const Output = struct {
@@ -1449,12 +1451,14 @@ const Ctx = struct {
         }
         if (n > 0) head = (pushdown.hoistFilters(self.arena, self.arena, head, self.bindings, self.tables) catch null) orelse head;
 
-        var ph = Physical{ .path = try pathmod.choose(self.arena, stages, head, .{
+        const facts: pathmod.Facts = .{
             .lanes = self.lanes,
             .sink = w,
             .source = pathmod.sourceOf(downloaded(stages[0]), self.connections),
             .head_source = pathmod.sourceOf(downloaded(head[0]), self.connections),
-        }) };
+        };
+        var ph = Physical{ .path = try pathmod.choose(self.arena, stages, head, facts) };
+        ph.one_lane_turn = ph.path == .serial and pathmod.oneLaneTurn(head, facts) != null;
         switch (ph.path) {
             .lanes => |l| {
                 const rd = head[0].node.read;

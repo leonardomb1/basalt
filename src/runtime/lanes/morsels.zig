@@ -211,6 +211,8 @@ pub const Pipeline = struct {
     errctx: ?*op.ErrCtx,
     rows_read: *obs.RowCounter,
     per_lane: bool = false,
+    /// The read the morsels stand for, for the profile; 0 takes the pipeline's head.
+    read_at: u64 = 0,
 };
 
 const Drive = struct { p: Pipeline, snk: ParallelSink, queue: WorkQueue };
@@ -263,6 +265,7 @@ fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
     cs.* = .{ .inner = src, .count = p.rows_read };
     const scan = try wa.create(op.Scan);
     scan.* = .{ .src = cs.source() };
+    scan.stats.at = p.read_at;
     var chain = try chainOps(wa, p.errctx, p.recs, .{ .scan = scan });
     for (p.joins) |lj| chain = try buildLaneJoinChain(wa, p.errctx, lj, chain);
     try runtime_filters.wire(wa, &chain);

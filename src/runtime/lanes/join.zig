@@ -508,6 +508,7 @@ pub const Flip = struct {
     lane: LaneJoin,
     out_schema: types.Schema,
     note: []const u8,
+    read_at: u64,
 };
 
 /// The first join of a lane aggregate flipped, as the serial plan flips one
@@ -606,6 +607,7 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
         },
         .out_schema = after.out.*,
         .note = note,
+        .read_at = profile.keyOf(rstages[0].pos),
     };
 }
 
