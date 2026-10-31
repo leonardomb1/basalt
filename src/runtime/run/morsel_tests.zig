@@ -92,6 +92,9 @@ const queries = [_]Query{
     .{ .q = "SELECT DISTINCT k FROM $IN ORDER BY k DESC LIMIT 9", .exact = true },
     .{ .q = "SELECT id, k, f FROM $IN ORDER BY f DESC, k LIMIT 25", .exact = true },
     .{ .q = "SELECT id, g, k FROM $IN WHERE k > 10 ORDER BY g, k LIMIT 40", .exact = true },
+    .{ .q = "SELECT id, k * 2 AS k2, g FROM $IN WHERE k % 3 = 1", .exact = true },
+    .{ .q = "SELECT t.id, l.label FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g", .exact = true },
+    .{ .q = "SELECT t.id, l.label FROM $IN t LEFT JOIN '$B/labels.csv' l ON t.g = l.g WHERE t.k < 500", .exact = true },
 };
 
 /// The file `q` writes over `input` at `threads`, morsels of `morsel_bytes`.
@@ -239,5 +242,24 @@ test "a later join's runtime filter narrows a Parquet build side the lanes read,
             }
         }
         try testing.expect(std.mem.count(u8, want.?, "\n") > 1);
+    }
+}
+
+test "a parallel map into a file stops on a lane's error, whether its morsel is first or last, and no lane waits forever" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    for ([_]usize{ 5, rows - 5 }) |bad| {
+        var out = std.array_list.Managed(u8).init(a);
+        try out.appendSlice("id,x\n");
+        for (0..rows) |i| try out.writer().print("{d},{s}\n", .{ i, if (i == bad) "oops" else "12" });
+        try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = out.items });
+        const q = try msgfmt.allocPrint(a, "SELECT id, CAST(x AS INT) + 1 AS y FROM '{s}/bad.csv'", .{base});
+        for ([_]usize{ 1, 4 }) |threads| {
+            try testing.expectError(error.CastFailed, resultOf(a, tmp.dir, base, "", q, threads, .{ .morsel_bytes = 4 << 10 }));
+        }
     }
 }

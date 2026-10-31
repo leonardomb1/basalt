@@ -9,25 +9,22 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const LaneJoin = @import("join.zig").LaneJoin;
 const Morsels = @import("morsels.zig").Morsels;
-const Profile = @import("../../exec/profile.zig").Profile;
+const ParallelSink = @import("morsels.zig").ParallelSink;
+const Pipeline = @import("morsels.zig").Pipeline;
+const drive = @import("morsels.zig").drive;
 const Reader = @import("morsels.zig").Reader;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
-const Stream = @import("morsels.zig").Stream;
 const LaneMem = @import("../parallel.zig").LaneMem;
-const WorkQueue = @import("../parallel.zig").WorkQueue;
 const ast = @import("../../lang/ast.zig");
-const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
 const buildLaneJoinDrain = @import("join.zig").buildLaneJoinDrain;
 const analyze = @import("../analyze.zig");
 const chainAt = @import("../plan.zig").chainAt;
-const chainOps = @import("../plan.zig").chainOps;
 const buildParallelSink = @import("../connect.zig").buildParallelSink;
 const connect_mod = @import("../connect.zig");
 const driver = @import("../../connect/driver.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
-const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSink = @import("../connect.zig").openSink;
 const parallel = @import("../parallel.zig");
@@ -45,20 +42,6 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
-
-const MapCtx = struct {
-    m: *const Morsels,
-    map: []const analyze.Resolved,
-    errctx: ?*op.ErrCtx = null,
-    queue: WorkQueue,
-    sink_mode: parallel.SinkMode,
-    sink_mtx: std.Thread.Mutex = .{},
-    rows_out: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rows_read: *obs.RowCounter,
-    join: ?LaneJoin = null,
-    ordered: ?*OrderedOut = null,
-    prof: ?*Profile = null,
-};
 
 pub const OrderedOut = struct {
     mtx: std.Thread.Mutex = .{},
@@ -238,35 +221,6 @@ pub fn orderedWorker(comptime Ctx: type, comptime unitFn: anytype) fn (*Ctx, usi
     }.go;
 }
 
-const orderedMapWorker = orderedWorker(MapCtx, mapOrderedUnit);
-
-fn mapLane(ctx: *MapCtx, lane_idx: usize) void {
-    mapLaneRun(ctx, lane_idx) catch |e| ctx.queue.fail(e);
-}
-
-/// An unordered lane: the morsels it claims as one stream through one chain and,
-/// for a lane sink, one connection.
-fn mapLaneRun(ctx: *MapCtx, lane_idx: usize) !void {
-    var mem: LaneMem = .{};
-    mem.init();
-    defer mem.deinit();
-    var rd = Reader.init(mem.gpa.allocator());
-    defer rd.deinit();
-    var st = Stream{ .m = ctx.m, .queue = &ctx.queue, .rd = &rd, .scratch = mem.work.allocator() };
-    defer st.source().close();
-    var cs = obs.CountingSource{ .inner = st.source(), .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
-    const out = try pourLane(ctx.sink_mode, &ctx.sink_mtx, mem.gpa.allocator(), lane_idx, chain, &mem.batch, &ctx.queue.failed);
-    _ = ctx.rows_out.fetchAdd(out, .monotonic);
-    if (ctx.prof) |p| _ = try p.absorb(chain);
-}
-
-fn mapLaneChain(ctx: *MapCtx, scan: *op.Scan, wa: std.mem.Allocator) !op.Op {
-    const mapped = try chainOps(wa, ctx.errctx, ctx.map, .{ .scan = scan });
-    return if (ctx.join) |lj| buildLaneJoinChain(wa, ctx.errctx, lj, mapped) else mapped;
-}
-
 /// Pour `chain` into the sink: the shared one, or a lane sink numbered `lane_idx`,
 /// opened at the first row and closed at the end. A set `failed` stops the pour and
 /// aborts that lane sink.
@@ -290,29 +244,69 @@ fn pourLane(mode: parallel.SinkMode, mtx: *std.Thread.Mutex, gpa: std.mem.Alloca
     return out;
 }
 
-/// One morsel of an ordered map, formatted (or unit-encoded) on the lane. A unit
-/// with no rows is still handed over: the writer waits on every position.
-fn mapOrderedUnit(ctx: *MapCtx, i: usize, mem: *LaneMem, rd: *Reader) !void {
-    const ord = ctx.ordered.?;
-    var f = (try ord.begin(i, &ctx.queue.failed)) orelse return;
-    {
-        errdefer f.drop();
-        if (try ctx.m.open(i, rd, mem.work.allocator())) |inner| {
-            defer inner.close();
-            var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
-            var scan = op.Scan{ .src = cs.source() };
-            const chain = try mapLaneChain(ctx, &scan, mem.work.allocator());
+/// A map, or a map and one join's probe, as a parallel sink. Into a shared sink a
+/// file's morsels go in file order, each formatted (or unit-encoded) on its worker
+/// and handed to `OrderedOut`; otherwise each worker pours the morsels it claims as
+/// they come, into the shared sink or its own. A right or full join's unmatched
+/// build rows go last, once every worker is done.
+const MapSink = struct {
+    env: *Env,
+    sink_mode: parallel.SinkMode,
+    sink_mtx: std.Thread.Mutex = .{},
+    rows_out: std.atomic.Value(u64) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    ordered: ?*OrderedOut = null,
+    join: ?LaneJoin = null,
+    threads: usize,
+
+    fn parallelSink(self: *MapSink) ParallelSink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn initLocal(_: *anyopaque, mem: *LaneMem) anyerror!*anyopaque {
+        return mem;
+    }
+
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op, _: *const usize) anyerror!void {
+        const self: *MapSink = @ptrCast(@alignCast(ptr));
+        const mem: *LaneMem = @ptrCast(@alignCast(local));
+        const ord = self.ordered orelse {
+            const out = try pourLane(self.sink_mode, &self.sink_mtx, mem.gpa.allocator(), i, chain, &mem.batch, &self.failed);
+            _ = self.rows_out.fetchAdd(out, .monotonic);
+            if (self.env.profile) |p| _ = try p.absorb(chain);
+            return;
+        };
+        var f = (try ord.begin(i, &self.failed)) orelse return;
+        {
+            errdefer f.drop();
             while (try chain.next(mem.batch.allocator())) |b| {
-                if (ctx.queue.failed.load(.seq_cst)) return f.drop();
+                if (self.failed.load(.seq_cst)) return f.drop();
                 try f.add(ord.snk, mem.batch.allocator(), b);
                 _ = mem.batch.reset(.retain_capacity);
             }
-            if (ctx.prof) |p| _ = try p.absorb(chain);
+            if (self.env.profile) |p| _ = try p.absorb(chain);
         }
+        _ = self.rows_out.fetchAdd(f.rows, .monotonic);
+        try ord.hand(i, f);
     }
-    _ = ctx.rows_out.fetchAdd(f.rows, .monotonic);
-    try ord.hand(i, f);
-}
+
+    fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
+
+    fn finalize(ptr: *anyopaque) anyerror!void {
+        const self: *MapSink = @ptrCast(@alignCast(ptr));
+        const lj = self.join orelse return;
+        const drained = try writeLaneJoinDrain(self.env, lj, self.sink_mode, &self.sink_mtx, self.threads);
+        _ = self.rows_out.fetchAdd(drained, .monotonic);
+    }
+
+    fn abort(ptr: *anyopaque) void {
+        const self: *MapSink = @ptrCast(@alignCast(ptr));
+        self.failed.store(true, .seq_cst);
+        if (self.ordered) |o| o.wake();
+    }
+
+    const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize, .abort = abort };
+};
 
 /// A file's map, or map and one join, on lanes.
 pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
@@ -348,32 +342,18 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     errdefer parallel.abortLanes(sink_mode);
 
     const nthreads = m.workers(opts.lanes());
-    var ctx = MapCtx{
-        .m = m,
-        .map = recs,
-        .errctx = env.errctx,
-        .queue = .{ .nitems = m.count() },
-        .sink_mode = sink_mode,
-        .rows_read = env.rows_read,
-        .join = lane_join,
-        .prof = env.profile,
-    };
+    var g = MapSink{ .env = env, .sink_mode = sink_mode, .join = lane_join, .threads = nthreads };
     var ordered: OrderedOut = undefined;
     if (sink_mode == .shared and m.* != .sql) {
         ordered = try OrderedOut.init(arena, m.count(), 2 * nthreads, sink_mode.shared);
-        ctx.ordered = &ordered;
+        g.ordered = &ordered;
     }
-    defer if (ctx.ordered) |o| o.freeRest();
+    defer if (g.ordered) |o| o.freeRest();
 
-    const lanes = if (ctx.ordered != null)
-        try parallel.spawnJoin(arena, nthreads, orderedMapWorker, &ctx)
-    else
-        try parallel.spawnJoin(arena, nthreads, mapLane, &ctx);
+    const joins: []const LaneJoin = if (lane_join) |lj| try arena.dupe(LaneJoin, &.{lj}) else &.{};
+    const pl: Pipeline = .{ .m = m, .recs = recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = g.ordered == null };
+    const lanes = try drive(arena, pl, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
-    if (lane_join) |lj| if (ctx.queue.failure() == null) {
-        const drained = try writeLaneJoinDrain(env, lj, sink_mode, &ctx.sink_mtx, nthreads);
-        _ = ctx.rows_out.fetchAdd(drained, .monotonic);
-    };
     const how = if (m.* == .sql) "split-parallel" else "parallel";
     const what = if (lane_join != null) "map+join" else "map";
     env.log.log(.debug, "{s} {s} {s}: {d} {s} over {d} lanes ({s} sink)", .{ m.label(), how, what, m.count(), m.unitName(), lanes, @tagName(sink_mode) });
@@ -383,8 +363,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
         if (m.* == .sql) try p.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
     }
 
-    if (ctx.queue.failure()) |e| return e;
-    stats.rows_out += ctx.rows_out.load(.monotonic);
+    stats.rows_out += g.rows_out.load(.monotonic);
     try shared.close();
     try parallel.finishLanes(sink_mode);
 }

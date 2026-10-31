@@ -199,6 +199,9 @@ pub const ParallelSink = struct {
         finalize: *const fn (global: *anyopaque) anyerror!void,
         /// What the Global holds, for the per-query memory pool still to come.
         sizeHint: ?*const fn (global: *anyopaque) usize = null,
+        /// Called once a worker has failed and the run is marked so, for a sink whose
+        /// workers wait on each other (an ordered writer's window) to wake them.
+        abort: ?*const fn (global: *anyopaque) void = null,
     };
 };
 
@@ -235,7 +238,10 @@ pub fn drive(arena: std.mem.Allocator, p: Pipeline, snk: ParallelSink, lanes: us
 }
 
 fn driveLane(ctx: *Drive, lane: usize) void {
-    driveRun(ctx, lane) catch |e| ctx.queue.fail(e);
+    driveRun(ctx, lane) catch |e| {
+        ctx.queue.fail(e);
+        if (ctx.snk.vtable.abort) |f| f(ctx.snk.ptr);
+    };
 }
 
 fn driveRun(ctx: *Drive, lane: usize) !void {
