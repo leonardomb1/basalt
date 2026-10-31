@@ -29,9 +29,10 @@
 //!
 //! `planWholeAggWhy` is the exception to advisory pushdown: the source's GROUP BY
 //! result is what the pipeline emits, computed with the source's own semantics.
-//! Its WHERE translates at `Need.source`, so text compares by the column's
-//! collation, and AVG, SUM and MIN/MAX round, order and fold as the source does;
-//! each aggregate is CAST to the engine's planned output type. Null semantics
+//! Its WHERE translates exactly (`Need.exact`): a text comparison the column's
+//! collation could decide otherwise keeps the aggregate here, as do text MIN/MAX
+//! and COUNT DISTINCT over text, which the collation orders and folds; AVG, SUM and
+//! numeric MIN/MAX round and fold as the source does; each aggregate is CAST to the engine's planned output type. Null semantics
 //! match by construction: NULL keys form one group, COUNT(col)/SUM/AVG/MIN/MAX
 //! skip nulls, and an ungrouped aggregate over no rows yields one row. A top-N (`TopN`) is never authoritative: the
 //! engine re-sorts and re-limits, so the source need only send a sufficient set,
@@ -137,8 +138,8 @@ pub fn planWholeAggWhy(
     var where = std.array_list.Managed(u8).init(arena);
     for (prefix) |st| {
         if (st.node != .filter) return refuse(why, "a stage other than WHERE sits between the read and the aggregate");
-        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts, .need = .source })) orelse
-            return refuse(why, try msgfmt.allocPrint(arena, "the WHERE predicate has a piece with no {s} SQL", .{@tagName(dialect)}));
+        const frag = (try translatePred(arena, st.node.filter, dialect, .{ .schema = src_schema, .check_fields = true, .facts = facts, .need = .exact })) orelse
+            return refuse(why, try msgfmt.allocPrint(arena, "the WHERE predicate does not translate exactly to {s} SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", .{@tagName(dialect)}));
         if (where.items.len > 0) try where.appendSlice(" AND ");
         try where.appendSlice(frag);
     }
@@ -226,6 +227,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
 
     switch (item.func) {
         .count => {
+            if (item.distinct and (src_kind == .string or src_kind == .bytes)) return null;
             if (item.distinct) return try msgfmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, col });
             return try msgfmt.allocPrint(arena, "{s}({s})", .{ count_fn, col });
         },
@@ -249,7 +251,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
         .min, .max => {
             if (out_ty.kind != src_kind) return null;
             switch (src_kind) {
-                .int, .float, .date, .string, .timestamp, .time => {},
+                .int, .float, .date, .timestamp, .time => {},
                 .decimal => if (out_ty.precision == 0 or out_ty.scale > out_ty.precision) return null,
                 else => return null,
             }
@@ -660,22 +662,25 @@ test "planWholeAgg: ungrouped COUNT DISTINCT has no GROUP BY and no WHERE" {
     const a = ar.allocator();
 
     const aggs = try a.alloc(ast.AggItem, 1);
-    aggs[0] = .{ .name = "u", .func = .count, .arg = try fld(a, "b"), .distinct = true };
+    aggs[0] = .{ .name = "u", .func = .count, .arg = try fld(a, "c"), .distinct = true };
     const ag = ast.Aggregate{ .aggs = aggs, .by = &.{} };
     const plan_schema = types.Schema{ .fields = &.{.{ .name = "u", .ty = types.Type.init(.int) }} };
 
     const pg = (try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{}, ag, plan_schema)).?;
     try testing.expectEqualStrings(
-        "SELECT CAST(COUNT(DISTINCT \"b\") AS BIGINT) AS \"u\" FROM (SELECT * FROM t) _g",
+        "SELECT CAST(COUNT(DISTINCT \"c\") AS BIGINT) AS \"u\" FROM (SELECT * FROM t) _g",
         pg.sql,
     );
     try testing.expect(pg.where_sql == null);
 
     const ms = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{}, ag, plan_schema)).?;
     try testing.expectEqualStrings(
-        "SELECT CAST(COUNT_BIG(DISTINCT [b]) AS BIGINT) AS [u] FROM (SELECT * FROM t) _g",
+        "SELECT CAST(COUNT_BIG(DISTINCT [c]) AS BIGINT) AS [u] FROM (SELECT * FROM t) _g",
         ms.sql,
     );
+
+    aggs[0].arg = try fld(a, "b");
+    try expectWholeAggRefused(a, .mysql, ag, plan_schema, "`u` is not pushed down");
 }
 
 test "planWholeAgg: a QUERY-form read is wrapped as the subquery, its own WHERE intact" {
@@ -770,7 +775,7 @@ test "planWholeAggWhy: a refusal names the gate that refused" {
     const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
     try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{bad}, ag, plan_schema, null, &why)) == null);
-    try testing.expectEqualStrings("the WHERE predicate has a piece with no mysql SQL", why);
+    try testing.expectEqualStrings("the WHERE predicate does not translate exactly to mysql SQL (a text comparison the column's collation decides differently, or an untranslatable piece)", why);
 
     const missing = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"zzz"}) };
     try testing.expect((try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, missing, plan_schema, null, &why)) == null);
@@ -809,7 +814,7 @@ test "planWholeAgg: an untranslatable filter falls back instead of pushing a sup
     try testing.expect((try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{sel}, ag, plan_schema)) == null);
 }
 
-test "planWholeAgg: SUM, AVG, MIN and MAX push down with the source's semantics" {
+test "planWholeAgg: SUM, AVG, MIN and MAX push down with the source's arithmetic, text MIN/MAX and COUNT DISTINCT not, a collation orders text" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -819,7 +824,6 @@ test "planWholeAgg: SUM, AVG, MIN and MAX push down with the source's semantics"
         .{ .func = .sum, .col = "c", .distinct = true, .ty = types.Type.init(.int), .d = .sqlserver, .want = "SUM(DISTINCT CAST([c] AS BIGINT))" },
         .{ .func = .avg, .col = "c", .ty = types.Type.init(.float), .d = .sqlserver, .want = "AVG(CAST([c] AS FLOAT))" },
         .{ .func = .avg, .col = "c", .distinct = true, .ty = types.Type.init(.float), .d = .postgres, .want = "AVG(DISTINCT CAST(\"c\" AS DOUBLE PRECISION))" },
-        .{ .func = .min, .col = "b", .ty = types.Type.init(.string), .d = .mysql, .want = "MIN(`b`)" },
         .{ .func = .max, .col = "t", .distinct = true, .ty = types.Type.init(.timestamp), .d = .postgres, .want = "MAX(\"t\")" },
     };
     for (cases) |tc| {
@@ -833,13 +837,17 @@ test "planWholeAgg: SUM, AVG, MIN and MAX push down with the source's semantics"
         };
     }
 
+    const tx = try a.alloc(ast.AggItem, 1);
+    tx[0] = .{ .name = "x", .func = .min, .arg = try fld(a, "b") };
+    try expectWholeAggRefused(a, .mysql, .{ .aggs = tx, .by = &.{} }, .{ .fields = &.{.{ .name = "x", .ty = types.Type.init(.string).withNull(true) }} }, "`x` is not pushed down");
+
     const ma = try a.alloc(ast.AggItem, 1);
     ma[0] = .{ .name = "lo", .func = .min, .arg = try fld(a, "m") };
     const bad = types.Schema{ .fields = &.{.{ .name = "lo", .ty = types.Type.decimal(0, 0).withNull(true) }} };
     try expectWholeAggRefused(a, .mysql, .{ .aggs = ma, .by = &.{} }, bad, "`lo` is not pushed down");
 }
 
-test "planWholeAgg: a text WHERE goes as written, whatever the collation" {
+test "planWholeAgg: a text WHERE the collation may decide otherwise keeps the aggregate in basalt" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -849,8 +857,7 @@ test "planWholeAgg: a text WHERE goes as written, whatever the collation" {
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "n", .func = .count, .arg = null };
     const ps = types.Schema{ .fields = &.{.{ .name = "n", .ty = types.Type.init(.int) }} };
-    const w = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{f}, .{ .aggs = aggs, .by = &.{} }, ps)).?;
-    try testing.expectEqualStrings("(([b] >= 'K') AND ([b] LIKE 'K%'))", w.where_sql.?);
+    try testing.expect((try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{f}, .{ .aggs = aggs, .by = &.{} }, ps)) == null);
 }
 
 test "planWholeAgg: a non-bare aggregate argument falls back" {

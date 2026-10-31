@@ -95,18 +95,19 @@ crosses the wire. The answer never changes, only where the work happens;
 - **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
   one grouped query when every filter translates, the group keys are bare
   columns, and the aggregates are `COUNT SUM AVG MIN MAX` of bare columns,
-  `DISTINCT` or not. The source computes them with its own semantics: `AVG`
-  averages the column cast to a float, sums and extremes of decimals, floats,
-  text and timestamps are the source's, and each result is cast to the type
-  the engine planned. `HAVING`/sort/limit still run in the engine on the tiny
-  grouped result.
-  The `WHERE` goes as written, so a text comparison or `LIKE` keeps the rows
-  the column's collation keeps (`'a' = 'A'` under a case-insensitive one, `'01 '
-  = '01'` under padding) — the grouped result is the source's answer. Only a
-  piece with no SQL (`now()`, a function the source lacks) keeps the aggregate
-  in the engine; then every matching row is streamed to be grouped, and the
-  run log says so in a `warn` line naming the rule (`the WHERE predicate has a
-  piece with no mysql SQL`, ``group key `x` is renamed by the aggregate``, …).
+  `DISTINCT` or not. The source computes the arithmetic: `AVG` averages the
+  column cast to a float, sums and extremes of decimals, floats, dates and
+  timestamps are the source's, and each result is cast to the type the engine
+  planned. `HAVING`/sort/limit still run in the engine on the tiny grouped
+  result.
+  The answer is the one the engine would give: every filter must translate
+  exactly (the rules above), so a text comparison or `LIKE` the column's
+  collation could decide otherwise (`'a' = 'A'` under a case-insensitive one,
+  `'01 ' = '01'` under padding) keeps the aggregate in the engine, as do text
+  `MIN`/`MAX` and `COUNT(DISTINCT text)`, which a collation orders and folds.
+  Then every matching row is streamed to be grouped, and the run log says so in
+  a `warn` line naming the rule (`the WHERE predicate does not translate exactly
+  to mysql SQL …`, ``group key `x` is renamed by the aggregate``, …).
 - **`LIMIT` and top-N pushdown** — `read <sql> | filters | [SELECT] | [ORDER BY]
   | LIMIT n [OFFSET m]` asks the source for `n + m` rows: `LIMIT` on
   postgres/mysql/StarRocks, `TOP` on sqlserver. Without `ORDER BY` any `n + m`
