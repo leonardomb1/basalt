@@ -1,12 +1,14 @@
-//! DISTINCT lanes: each work item keeps the first row per key it saw; the items' rows
-//! are then merged a hash partition at a time on the shared key table, walking items
-//! in file order so the first row overall wins, and gathered back in file order.
+//! DISTINCT lanes, a `ParallelSink` that `morsels.drive` feeds: each morsel keeps the
+//! first row per key it saw; the morsels' rows are then merged a hash partition at a
+//! time on the shared key table, walking morsels in file order so the first row
+//! overall wins, and gathered back in file order.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const Morsels = @import("morsels.zig").Morsels;
-const Reader = @import("morsels.zig").Reader;
-const Profile = @import("../../exec/profile.zig").Profile;
+const ParallelSink = @import("morsels.zig").ParallelSink;
+const Pipeline = @import("morsels.zig").Pipeline;
+const drive = @import("morsels.zig").drive;
 const RunOptions = @import("../env.zig").RunOptions;
 const Stats = @import("../env.zig").Stats;
 const Value = @import("../../exec/value.zig").Value;
@@ -15,13 +17,11 @@ const WorkQueue = @import("../parallel.zig").WorkQueue;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
-const chainOps = @import("../plan.zig").chainOps;
 const column = @import("../../exec/column.zig");
 const keyhash = @import("../../exec/keyhash.zig");
 const keytable = @import("../../exec/keytable.zig");
 const dispatchWorker = @import("../parallel.zig").dispatchWorker;
 const resolveAt = @import("../plan.zig").resolveAt;
-const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
@@ -29,7 +29,6 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
-const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 
@@ -83,93 +82,111 @@ const Item = struct {
     pieces: std.ArrayListUnmanaged(Piece) = .empty,
 };
 
-/// What a lane keeps across the items it takes: its string ids, so a string costs the
-/// shared table's lock once a lane rather than once an item, and its working memory,
-/// reused rather than mapped afresh for every item.
-const Lane = struct {
+/// A worker's memory, reset by `drive` before each morsel, and its string ids, so a
+/// string costs the shared table's lock once a worker rather than once a morsel.
+const Local = struct {
+    mem: *LaneMem,
     arena: std.heap.ArenaAllocator,
     cache: std.StringHashMapUnmanaged(keytable.StrId) = .empty,
-    mem: LaneMem = .{},
 };
 
-const DistinctCtx = struct {
-    m: *const Morsels,
+/// DISTINCT as a parallel sink: each morsel deduped on its own into its item, so the
+/// item index is a file position; finalize keeps each key's first row across items
+/// a hash partition at a time, and gathers the kept rows in file order.
+const DistinctSink = struct {
+    env: *Env,
     row_schema: *const types.Schema,
-    prefix: []const analyze.Resolved,
-    errctx: ?*op.ErrCtx = null,
     local_keys: ?[]const usize,
     keys: Keys,
     strs: *?*keytable.StrTable,
-    queue: WorkQueue,
     items: []Item,
-    lanes: []Lane,
-    rows_read: *obs.RowCounter,
-    prof: ?*Profile = null,
-};
+    threads: usize,
+    merged: Batch = undefined,
+    locals: std.ArrayListUnmanaged(*Local) = .empty,
+    mtx: std.Thread.Mutex = .{},
 
-/// A lane: work items taken from the queue until none are left, with the lane's own
-/// string cache.
-fn distinctWorker(ctx: *DistinctCtx, lane_idx: usize) void {
-    const lane = &ctx.lanes[lane_idx];
-    const in = keytable.Interner{ .table = ctx.strs, .cache = &lane.cache, .alloc = lane.arena.allocator() };
-    lane.mem.init();
-    defer lane.mem.deinit();
-    var rd = Reader.init(lane.mem.gpa.allocator());
-    defer rd.deinit();
-    while (ctx.queue.take()) |i| {
-        _ = lane.mem.work.reset(.retain_capacity);
-        _ = lane.mem.batch.reset(.retain_capacity);
-        const span = trace.begin("distinct item", i);
-        defer span.end();
-        distinctWorkOne(ctx, &lane.mem, &rd, in, i) catch |e| return ctx.queue.fail(e);
+    fn parallelSink(self: *DistinctSink) ParallelSink {
+        return .{ .ptr = self, .vtable = &vtable };
     }
-}
 
-/// Dedups per item rather than per lane, so the item index is a file position and the
-/// merge keeps the row a serial run would; then keys the item's first rows for it.
-fn distinctWorkOne(ctx: *DistinctCtx, mem: *LaneMem, rd: *Reader, in: keytable.Interner, i: usize) !void {
-    const item = &ctx.items[i];
-    const ia = item.arena.allocator();
-    const inner = (try ctx.m.open(i, rd, mem.work.allocator())) orelse return;
-    defer inner.close();
-    var cs = obs.CountingSource{ .inner = inner, .count = ctx.rows_read };
-    var scan = op.Scan{ .src = cs.source() };
-    const child = try chainOps(mem.work.allocator(), ctx.errctx, ctx.prefix, .{ .scan = &scan });
-    var d = op.Distinct{ .child = child, .in_schema = ctx.row_schema, .keys = ctx.local_keys, .state = mem.work.allocator(), .gpa = mem.batch.allocator(), .track_ords = true, .partial = true, .shared_strs = in };
-    defer d.release();
-    const dop: op.Op = .{ .distinct = &d };
+    fn deinit(self: *DistinctSink) void {
+        const gpa = self.env.gpa;
+        for (self.locals.items) |l| {
+            l.arena.deinit();
+            gpa.destroy(l);
+        }
+        self.locals.deinit(gpa);
+    }
 
-    const enc: ?keytable.Encoder = if (ctx.keys.kinds) |k| try keytable.Encoder.init(ia, ctx.keys.idx, k) else null;
-    while (try dop.next(ia)) |b| {
-        const hashes = try ia.alloc(u64, b.len);
-        var e: ?keytable.Encoded = null;
-        if (enc) |en| {
-            e = try en.encode(ia, b.columns, b.len, in, false);
-            for (hashes, 0..) |*h, r| h.* = e.?.hash(r);
-        } else {
-            const probe = try ia.alloc(Value, ctx.keys.idx.len);
-            for (hashes, 0..) |*h, r| {
-                for (ctx.keys.idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
-                h.* = keyhash.MultiKeyCtx.hash(.{}, probe);
+    fn initLocal(ptr: *anyopaque, mem: *LaneMem) anyerror!*anyopaque {
+        const self: *DistinctSink = @ptrCast(@alignCast(ptr));
+        const gpa = self.env.gpa;
+        const l = try gpa.create(Local);
+        errdefer gpa.destroy(l);
+        l.* = .{ .mem = mem, .arena = .init(gpa) };
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        try self.locals.append(gpa, l);
+        return l;
+    }
+
+    /// Morsel `i`'s first row per key, each batch of them keyed for the merge.
+    fn sink(ptr: *anyopaque, local: *anyopaque, i: usize, chain: op.Op) anyerror!void {
+        const self: *DistinctSink = @ptrCast(@alignCast(ptr));
+        const l: *Local = @ptrCast(@alignCast(local));
+        const in = keytable.Interner{ .table = self.strs, .cache = &l.cache, .alloc = l.arena.allocator() };
+        const item = &self.items[i];
+        const ia = item.arena.allocator();
+        var d = op.Distinct{ .child = chain, .in_schema = self.row_schema, .keys = self.local_keys, .state = l.mem.work.allocator(), .gpa = l.mem.batch.allocator(), .track_ords = true, .partial = true, .shared_strs = in };
+        defer d.release();
+        const dop: op.Op = .{ .distinct = &d };
+
+        const enc: ?keytable.Encoder = if (self.keys.kinds) |k| try keytable.Encoder.init(ia, self.keys.idx, k) else null;
+        while (try dop.next(ia)) |b| {
+            const hashes = try ia.alloc(u64, b.len);
+            var e: ?keytable.Encoded = null;
+            if (enc) |en| {
+                e = try en.encode(ia, b.columns, b.len, in, false);
+                for (hashes, 0..) |*h, r| h.* = e.?.hash(r);
+            } else {
+                const probe = try ia.alloc(Value, self.keys.idx.len);
+                for (hashes, 0..) |*h, r| {
+                    for (self.keys.idx, probe) |ci, *v| v.* = b.columns[ci].getValue(r);
+                    h.* = keyhash.MultiKeyCtx.hash(.{}, probe);
+                }
             }
+            const starts = try ia.alloc(u32, keytable.parts + 1);
+            @memset(starts, 0);
+            for (hashes) |h| starts[keytable.partOf(h) + 1] += 1;
+            for (1..starts.len) |p| starts[p] += starts[p - 1];
+            const order = try ia.alloc(u32, b.len);
+            const fill = try ia.dupe(u32, starts[0..keytable.parts]);
+            for (hashes, 0..) |h, r| {
+                const p = keytable.partOf(h);
+                order[fill[p]] = @intCast(r);
+                fill[p] += 1;
+            }
+            const keep = try ia.alloc(bool, b.len);
+            @memset(keep, false);
+            try item.pieces.append(ia, .{ .batch = b, .enc = e, .hashes = hashes, .starts = starts, .order = order, .keep = keep });
         }
-        const starts = try ia.alloc(u32, keytable.parts + 1);
-        @memset(starts, 0);
-        for (hashes) |h| starts[keytable.partOf(h) + 1] += 1;
-        for (1..starts.len) |p| starts[p] += starts[p - 1];
-        const order = try ia.alloc(u32, b.len);
-        const fill = try ia.dupe(u32, starts[0..keytable.parts]);
-        for (hashes, 0..) |h, r| {
-            const p = keytable.partOf(h);
-            order[fill[p]] = @intCast(r);
-            fill[p] += 1;
-        }
-        const keep = try ia.alloc(bool, b.len);
-        @memset(keep, false);
-        try item.pieces.append(ia, .{ .batch = b, .enc = e, .hashes = hashes, .starts = starts, .order = order, .keep = keep });
+        if (self.env.profile) |p| _ = try p.absorb(dop);
     }
-    if (ctx.prof) |p| _ = try p.absorb(dop);
-}
+
+    fn combine(_: *anyopaque, _: *anyopaque) anyerror!void {}
+
+    fn finalize(ptr: *anyopaque) anyerror!void {
+        const self: *DistinctSink = @ptrCast(@alignCast(ptr));
+        const t0 = std.time.Instant.now() catch unreachable;
+        defer if (self.env.profile) |p| p.phase("merge the lanes' rows", (std.time.Instant.now() catch t0).since(t0)) catch {};
+        var mctx = MergeCtx{ .gpa = self.env.gpa, .keys = self.keys, .items = self.items, .queue = .{ .nitems = keytable.parts } };
+        _ = try parallel.spawnJoin(self.env.arena, self.threads, mergeWorker, &mctx);
+        if (mctx.queue.failure()) |e| return e;
+        self.merged = try gatherKept(self.env.arena, self.row_schema, self.items);
+    }
+
+    const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize };
+};
 
 const MergeCtx = struct {
     gpa: std.mem.Allocator,
@@ -286,46 +303,31 @@ pub fn runParallelDistinct(
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    const nthreads = m.workers(opts.lanes());
     const nitems = m.count();
     const items = try arena.alloc(Item, nitems);
     for (items) |*it| it.* = .{ .arena = .init(env.gpa) };
     defer for (items) |*it| it.arena.deinit();
-    const lane_state = try arena.alloc(Lane, @max(nthreads, 1));
-    for (lane_state) |*l| l.* = .{ .arena = .init(env.gpa) };
-    defer for (lane_state) |*l| l.arena.deinit();
     var strs_table = keytable.StrTable.init(std.heap.page_allocator);
     defer strs_table.deinit();
     var strs: ?*keytable.StrTable = &strs_table;
-    var ctx = DistinctCtx{
-        .m = m,
+    var g = DistinctSink{
+        .env = env,
         .row_schema = row_schema,
-        .prefix = pre.recs,
-        .errctx = env.errctx,
         .local_keys = local_keys,
         .keys = try Keys.of(arena, row_schema, key_idx),
         .strs = &strs,
-        .queue = .{ .nitems = nitems },
         .items = items,
-        .lanes = lane_state,
-        .rows_read = env.rows_read,
-        .prof = env.profile,
+        .threads = m.workers(opts.lanes()),
     };
-
-    const lanes = try parallel.spawnJoin(arena, nthreads, distinctWorker, &ctx);
+    defer g.deinit();
+    const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = env.rows_read };
+    const lanes = try drive(arena, p, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
     env.log.log(.debug, "parallel {s} distinct: {d} {s} over {d} lanes", .{ m.label(), nitems, m.unitName(), lanes });
-    if (ctx.queue.failure()) |e| return e;
-
-    const t_mrg0 = std.time.Instant.now() catch unreachable;
-    var mctx = MergeCtx{ .gpa = env.gpa, .keys = ctx.keys, .items = items, .queue = .{ .nitems = keytable.parts } };
-    _ = try parallel.spawnJoin(arena, nthreads, mergeWorker, &mctx);
-    if (mctx.queue.failure()) |e| return e;
-    const merged = try gatherKept(arena, row_schema, items);
-    if (env.profile) |p| {
-        try p.phase("merge the lanes' rows", (std.time.Instant.now() catch unreachable).since(t_mrg0));
-        p.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ m.label(), nitems, m.unitName() });
+    if (env.profile) |pr| {
+        pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel distinct, {d} {s}", .{ m.label(), nitems, m.unitName() });
     }
+    const merged = g.merged;
 
     const after = try chainAt(env, row_schema.*, tail);
     const snk = try openTailSink(env, w, after.out.*);

@@ -87,6 +87,9 @@ const queries = [_]Query{
     .{ .q = "SELECT l.label, COUNT(*) AS n, MAX(t.f) AS mx FROM $IN t JOIN '$B/labels.csv' l ON t.g = l.g GROUP BY l.label ORDER BY l.label", .exact = true },
     .{ .q = "SELECT k, MAX(f) AS mx FROM $IN GROUP BY k ORDER BY mx DESC, k LIMIT 7", .exact = true },
     .{ .q = "SELECT COUNT(*) AS n, MAX(c) AS t FROM (SELECT g, COUNT(*) AS c FROM $IN GROUP BY g) d", .exact = true },
+    .{ .q = "SELECT DISTINCT k, g FROM $IN", .exact = true },
+    .{ .q = "SELECT DISTINCT g FROM $IN WHERE k > 50 ORDER BY g", .exact = true },
+    .{ .q = "SELECT DISTINCT k FROM $IN ORDER BY k DESC LIMIT 9", .exact = true },
 };
 
 /// The file `q` writes over `input` at `threads`, morsels of `morsel_bytes`.
