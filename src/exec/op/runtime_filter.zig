@@ -72,19 +72,33 @@ pub const RuntimeFilter = struct {
                 s.bloom = try ix.filter();
                 s.ready = true;
             }
-            const p = try ix.probe(scratch, b, s.cols, s.enc);
-            const k = keep orelse blk: {
-                const m = try scratch.alloc(bool, b.len);
-                @memset(m, true);
-                keep = m;
-                break :blk m;
-            };
             var dropped: usize = 0;
-            for (k, p.miss, p.hashes) |*live, miss, h| {
-                if (!live.*) continue;
-                if (miss or !s.bloom.mayContain(h)) {
-                    live.* = false;
-                    dropped += 1;
+            if (keep != null and kept * 2 <= b.len) {
+                const k = keep.?;
+                const p = try ix.probe(scratch, try liveKeys(scratch, b, k, kept, s.cols), s.cols, s.enc);
+                var j: usize = 0;
+                for (k) |*live| {
+                    if (!live.*) continue;
+                    if (p.miss[j] or !s.bloom.mayContain(p.hashes[j])) {
+                        live.* = false;
+                        dropped += 1;
+                    }
+                    j += 1;
+                }
+            } else {
+                const p = try ix.probe(scratch, b, s.cols, s.enc);
+                const k = keep orelse blk: {
+                    const m = try scratch.alloc(bool, b.len);
+                    @memset(m, true);
+                    keep = m;
+                    break :blk m;
+                };
+                for (k, p.miss, p.hashes) |*live, miss, h| {
+                    if (!live.*) continue;
+                    if (miss or !s.bloom.mayContain(h)) {
+                        live.* = false;
+                        dropped += 1;
+                    }
                 }
             }
             s.checked += kept;
@@ -103,6 +117,16 @@ pub const RuntimeFilter = struct {
         const cols = try arena.alloc(column.Column, b.columns.len);
         try column.gatherColumns(arena, b.columns, cols, k, kept);
         return .{ .schema = b.schema, .columns = cols, .len = kept };
+    }
+
+    /// `b` with only the key columns `cols`, and only its `kept` live rows: what a
+    /// later slot probes once earlier ones dropped most of the batch, rather than
+    /// hashing rows already gone.
+    fn liveKeys(scratch: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, cols: []const usize) !Batch {
+        const sel = try column.Selection.init(scratch, keep, kept);
+        const out = try scratch.dupe(column.Column, b.columns);
+        for (cols) |c| out[c] = try column.select(scratch, b.columns[c], sel);
+        return .{ .schema = b.schema, .columns = out, .len = kept };
     }
 
     /// The rows the slots checked and dropped, and the slots turned off, summed.

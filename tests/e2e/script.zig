@@ -303,6 +303,8 @@ test "runtime filters: chains of joins over CSV, star and snowflake, give the sa
         "SELECT y.bn, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF GROUP BY y.bn ORDER BY y.bn",
         "SELECT f.id, x.an, z.cn FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/c.csv' z ON z.c = x.c$OFF",
         "SELECT z.cn, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/c.csv' z ON z.c = x.c$OFF GROUP BY z.cn ORDER BY z.cn",
+        "SELECT f.id, y.bn, x.an FROM '$B/fact.csv' f JOIN '$B/b.csv' y ON y.b = f.b$OFF JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/a.csv' w ON w.a = f.a % 45$OFF",
+        "SELECT x.an, count(*) AS n, sum(f.v) AS s FROM '$B/fact.csv' f JOIN '$B/a.csv' w ON w.a = f.a % 45$OFF JOIN '$B/a.csv' x ON x.a = f.a$OFF JOIN '$B/b.csv' y ON y.b = f.b$OFF GROUP BY x.an ORDER BY x.an",
     };
     for (queries) |tmpl| {
         var outs: [4][]u8 = undefined;
