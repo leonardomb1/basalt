@@ -1746,11 +1746,27 @@ const Ctx = struct {
             return try msgfmt.allocPrint(self.arena, "the right read takes the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
         if (keypush.leftMayNarrow(j) and self.sqlSide(before))
             return "the left read takes the right side's keys";
+        if (keypush.leftMayNarrow(j) and keypush.laterReach(before) and try self.headTakes(before))
+            return "the head read takes the right side's keys too, before its query goes out";
         if (keypush.rightMayNarrow(j) and parquetFileSide(right))
             return try msgfmt.allocPrint(self.arena, "the right Parquet read skips row groups by the left side's keys (the left read ahead up to {d} rows / {d} MB, else none)", .{ op.default_prefetch_rows, op.default_prefetch_bytes >> 20 });
         if (keypush.leftMayNarrow(j) and parquetFileSide(before))
             return "the left Parquet read skips row groups by the right side's keys";
         return "";
+    }
+
+    /// Whether the SQL read heading `before` takes its first join's keys, as
+    /// `plan.probeTaker` decides it.
+    fn headTakes(self: *Ctx, before: []const ast.Stage) !bool {
+        const i = for (before, 0..) |st, k| {
+            if (st.node == .join) break k;
+        } else return false;
+        const j1 = before[i];
+        if (keypush.disabled(j1.hints) or !keypush.leftMayNarrow(j1.node.join) or !self.sqlSide(before[0..i])) return false;
+        const b = self.bindings.get(j1.node.join.binding) orelse return true;
+        if (b.stages.len == 0) return true;
+        const right = (try self.inlineHead(try j1.node.join.rightStages(self.arena, b.stages))).stages;
+        return !(keypush.rightMayNarrow(j1.node.join) and self.sqlSide(right));
     }
 
     /// A `.parquet` file, local or read by range, followed by only filters and selects.

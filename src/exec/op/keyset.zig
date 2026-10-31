@@ -17,7 +17,55 @@ pub const KeyValues = struct {
     overflow: bool = false,
     min: ?Value = null,
     max: ?Value = null,
+    /// Past the cap, an integer key's values as a few closed ranges (`ranged`), when
+    /// they cover well under its min..max; empty otherwise.
+    ranges: []const [2]i64 = &.{},
 };
+
+/// At most this many ranges stand for an integer key past the cap.
+pub const max_ranges = 32;
+/// Past the cap, integer keys are gathered for `ranged` up to this many.
+pub const range_values = 1 << 22;
+
+/// `vals`, sorted and with repeats dropped, cut at their `max_ranges - 1` widest gaps
+/// into closed ranges; empty when those cover over half of min..max, where the
+/// min/max bound already says as much.
+pub fn ranged(arena: std.mem.Allocator, vals: []i64) ![]const [2]i64 {
+    if (vals.len < 2) return &.{};
+    std.mem.sortUnstable(i64, vals, {}, std.sort.asc(i64));
+    var n: usize = 1;
+    for (vals[1..]) |v| if (v != vals[n - 1]) {
+        vals[n] = v;
+        n += 1;
+    };
+    const u = vals[0..n];
+    if (n < 2) return &.{};
+    const Gap = struct { at: usize, width: u64 };
+    const gaps = try arena.alloc(Gap, n - 1);
+    for (gaps, 0..) |*g, i| g.* = .{ .at = i, .width = @intCast(@as(i128, u[i + 1]) - u[i]) };
+    const cuts: usize = @min(max_ranges - 1, gaps.len);
+    std.mem.sortUnstable(Gap, gaps, {}, struct {
+        fn wider(_: void, x: Gap, y: Gap) bool {
+            return x.width > y.width or (x.width == y.width and x.at < y.at);
+        }
+    }.wider);
+    const at = try arena.alloc(usize, cuts);
+    for (at, gaps[0..cuts]) |*x, g| x.* = g.at;
+    std.mem.sortUnstable(usize, at, {}, std.sort.asc(usize));
+    const out = try arena.alloc([2]i64, cuts + 1);
+    var lo = u[0];
+    var covered: u128 = 0;
+    for (at, 0..) |i, k| {
+        out[k] = .{ lo, u[i] };
+        covered += @intCast(@as(i128, u[i]) - lo);
+        lo = u[i + 1];
+    }
+    out[cuts] = .{ lo, u[n - 1] };
+    covered += @intCast(@as(i128, u[n - 1]) - lo);
+    const span: u128 = @intCast(@as(i128, u[n - 1]) - u[0]);
+    if (covered * 2 > span) return &.{};
+    return out;
+}
 
 /// Where a join sends the keys of one side: called once, before the other side's
 /// first row is read.
@@ -35,16 +83,26 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
         var vals = std.array_list.Managed(Value).init(arena);
         var overflow = false;
         var bounds = keyhash.MinMax{};
+        var past = std.array_list.Managed(i64).init(arena);
+        var ints = true;
         for (batches) |b| {
             const col = b.columns[ci];
             for (0..b.len) |i| {
                 const v = col.getValue(i);
                 if (v == .null) continue;
                 try bounds.fold(arena, v);
-                if (overflow) continue;
+                if (v != .int) ints = false;
+                if (overflow) {
+                    if (ints and past.items.len < range_values) try past.append(v.int);
+                    continue;
+                }
                 if (seen.contains(v)) continue;
                 if (vals.items.len == cap) {
                     overflow = true;
+                    if (ints) {
+                        for (vals.items) |x| try past.append(x.int);
+                        try past.append(v.int);
+                    }
                     continue;
                 }
                 const o = try keyhash.ownValue(arena, v);
@@ -52,7 +110,8 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
                 try vals.append(o);
             }
         }
-        kv.* = .{ .values = try vals.toOwnedSlice(), .overflow = overflow, .min = bounds.lo(), .max = bounds.hi() };
+        const rs = if (overflow and ints and past.items.len < range_values) try ranged(arena, past.items) else &.{};
+        kv.* = .{ .values = try vals.toOwnedSlice(), .overflow = overflow, .min = bounds.lo(), .max = bounds.hi(), .ranges = rs };
     }
     return out;
 }
@@ -102,4 +161,26 @@ test "collect: values equal under keyhash count once, whatever their scale or ze
         try testing.expectEqual(@as(usize, 1), k.values.len);
         try testing.expect(!k.overflow);
     }
+}
+
+test "ranged: clustered integer keys become a few ranges holding every key; spread ones none" {
+    const testing = std.testing;
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var vals = std.array_list.Managed(i64).init(a);
+    for (0..3000) |i| try vals.append(@intCast(if (i % 3 == 0) i else 5_000_000 + i % 997));
+    try vals.append(9_000_000);
+    const all = try a.dupe(i64, vals.items);
+    const rs = try ranged(a, vals.items);
+    try testing.expect(rs.len > 1 and rs.len <= max_ranges);
+    for (all) |v| {
+        const hit = for (rs) |r| {
+            if (v >= r[0] and v <= r[1]) break true;
+        } else false;
+        try testing.expect(hit);
+    }
+    var spread = std.array_list.Managed(i64).init(a);
+    for (0..3000) |i| try spread.append(@intCast(i * 7));
+    try testing.expectEqual(@as(usize, 0), (try ranged(a, spread.items)).len);
 }

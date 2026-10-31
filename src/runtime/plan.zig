@@ -576,7 +576,9 @@ const LateReq = struct { want: keypush.Want, out: *?keypush.Taker };
 
 /// The pipeline's own read taking the keys of the first join after it, which hands
 /// it the right side's keys; `prefix` is what lies between them.
-pub const ProbeTake = struct { late: keypush.Taker, prefix: []const ast.Stage };
+/// `later` for a join after the first, whose qualified keys name another side's
+/// columns and never reach the read.
+pub const ProbeTake = struct { late: keypush.Taker, prefix: []const ast.Stage, later: bool = false };
 
 /// The first join after `stages[0]` whose right side's keys narrow this SQL or
 /// Parquet read: only filters and selects between, a kind that drops unmatched left
@@ -717,7 +719,14 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             continue;
         }
         if (stage.node == .join) {
-            const j = try joinorder.buildAt(env, stages, si, current, schema, if (take != null and si == take_at) take else null);
+            const tk: ?ProbeTake = if (take) |t| blk: {
+                if (si == take_at) break :blk t;
+                if (t.late != .sql or keypush.disabled(stage.hints) or !keypush.leftMayNarrow(stage.node.join) or !keypush.laterReach(stages[0..si])) break :blk null;
+                var lt = t;
+                lt.later = true;
+                break :blk lt;
+            } else null;
+            const j = try joinorder.buildAt(env, stages, si, current, schema, tk);
             current = j.res.op;
             schema = j.res.schema;
             current.stampNew(profile.keyOf(stage.pos));
@@ -1098,8 +1107,15 @@ pub fn assembleJoin(env: *Env, j: ast.Join, hints: []const ast.Hint, side: JoinS
             o.push_build_yields = right_late.? == .parquet;
         }
     } else if (take) |t| {
-        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex|
-            o.push_probe = try t.late.bind(ex);
+        if (try keyExprs(arena, try std.mem.concat(arena, ast.Stage, &.{ t.prefix, prep.left }), prep.join.left_keys)) |ex| {
+            if (t.later) for (prep.join.left_keys, @constCast(ex)) |q, *e| {
+                if (q.parts.len > 1) e.* = null;
+            };
+            for (ex) |e| if (e != null) {
+                o.push_probe = try t.late.bind(ex);
+                break;
+            };
+        }
     }
     return .{ .o = o, .schema = out.* };
 }

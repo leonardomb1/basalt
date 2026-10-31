@@ -53,6 +53,23 @@ const types = @import("../../lang/types.zig");
 
 pub const Dialect = translate.Dialect;
 
+/// Whether a join after the first can narrow the pipeline's head read too: `before`
+/// (the pipeline up to it) is the read, filters and selects, the first join, then
+/// only joins and filters, so an unqualified left key is still the read's column
+/// under its own name. Its keys reach the read only once each join above it has
+/// indexed its side, as every join pushes before it pulls.
+pub fn laterReach(before: []const ast.Stage) bool {
+    if (before.len < 2 or before[0].node != .read) return false;
+    var i: usize = 1;
+    while (i < before.len and (before[i].node == .filter or before[i].node == .select)) i += 1;
+    if (i >= before.len or before[i].node != .join) return false;
+    for (before[i + 1 ..]) |st| switch (st.node) {
+        .join, .filter => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// Whether `WITH (key_pushdown = false)` turned pushdown off for a join.
 pub fn disabled(hints: []const ast.Hint) bool {
     for (hints) |h| {
@@ -229,6 +246,17 @@ pub fn render(arena: std.mem.Allocator, dialect: Dialect, schema: types.Schema, 
                 continue;
             }
         }
+        if (kv.ranges.len > 0) {
+            var list = std.array_list.Managed(u8).init(arena);
+            try list.append('(');
+            for (kv.ranges, 0..) |rg, i| {
+                if (i > 0) try list.appendSlice(" OR ");
+                try list.print("{s} >= {d} AND {s} <= {d}", .{ key_sql, rg[0], key_sql, rg[1] });
+            }
+            try list.append(')');
+            try parts.append(list.items);
+            continue;
+        }
         const lo = (try literal(arena, dialect, kv.min orelse continue, true)) orelse continue;
         const hi = (try literal(arena, dialect, kv.max orelse continue, true)) orelse continue;
         try parts.append(try msgfmt.allocPrint(arena, "{s} >= {s} AND {s} <= {s}", .{ key_sql, lo, key_sql, hi }));
@@ -295,10 +323,7 @@ pub const Taker = union(enum) {
     /// where the join sends the keys, or null when no key reaches the read.
     pub fn bind(self: Taker, exprs: []const ?*ast.Expr) !?op.KeyPush {
         switch (self) {
-            .sql => |l| {
-                l.exprs = exprs;
-                return l.push();
-            },
+            .sql => |l| return try l.push(exprs),
             .parquet => |p| {
                 p.cols = try plainColumns(p.arena, exprs);
                 for (p.cols) |c| if (c != null) return p.push();
@@ -343,10 +368,13 @@ pub const LateSql = struct {
     hints: []const ast.Hint,
     schema_: types.Schema,
     dialect: Dialect,
-    /// Per join key, its expression over the read's columns; set by the join.
-    exprs: []const ?*ast.Expr = &.{},
-    extra: ?[]const u8 = null,
+    /// Each join's keys rendered as a predicate over the read's columns, AND-ed into
+    /// its `WHERE` when the query goes out.
+    extras: std.ArrayListUnmanaged([]const u8) = .empty,
     inner: ?driver.Source = null,
+
+    /// One join's hold on the read: its keys' expressions over the read's columns.
+    const Bound = struct { late: *LateSql, exprs: []const ?*ast.Expr };
 
     pub fn open(env: *Env, rd: ast.Read, hints: []const ast.Hint, dialect: Dialect) !*LateSql {
         var probe = rd;
@@ -364,15 +392,21 @@ pub const LateSql = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    pub fn push(self: *LateSql) op.KeyPush {
-        return .{ .ctx = self, .apply = apply };
+    /// Where a join sends its keys, `exprs` their expressions over the read's
+    /// columns; several joins may each send theirs before the first pull.
+    pub fn push(self: *LateSql, exprs: []const ?*ast.Expr) !op.KeyPush {
+        const b = try self.env.arena.create(Bound);
+        b.* = .{ .late = self, .exprs = exprs };
+        return .{ .ctx = b, .apply = apply };
     }
 
     fn apply(ctx: *anyopaque, keys: []const op.KeyValues) anyerror!void {
-        const self: *LateSql = @ptrCast(@alignCast(ctx));
-        if (self.exprs.len != keys.len) return;
-        self.extra = try render(self.env.arena, self.dialect, self.schema_, self.exprs, keys);
-        if (self.extra) |x| self.env.log.log(.debug, "key pushdown into {s}: WHERE {s}", .{ self.rd.connector, clip(x) });
+        const b: *Bound = @ptrCast(@alignCast(ctx));
+        const self = b.late;
+        if (b.exprs.len != keys.len) return;
+        const x = (try render(self.env.arena, self.dialect, self.schema_, b.exprs, keys)) orelse return;
+        try self.extras.append(self.env.arena, x);
+        self.env.log.log(.debug, "key pushdown into {s}: WHERE {s}", .{ self.rd.connector, clip(x) });
     }
 
     fn clip(s: []const u8) []const u8 {
@@ -388,7 +422,7 @@ pub const LateSql = struct {
         const self: *LateSql = @ptrCast(@alignCast(ptr));
         if (self.inner == null) {
             var rd = self.rd;
-            if (self.extra) |x| rd.where = if (rd.where.len > 0)
+            for (self.extras.items) |x| rd.where = if (rd.where.len > 0)
                 try msgfmt.allocPrint(self.env.arena, "({s}) AND ({s})", .{ rd.where, x })
             else
                 x;

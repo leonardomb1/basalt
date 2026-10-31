@@ -223,9 +223,27 @@ inner, right or semi one — and not under `NOT IN`. A side with anything but
 filters and selects between its read and the join, or a key that is no
 function of the read's columns, takes nothing.
 
-Up to 1,000 distinct values go as `IN (…)`; past that a number, decimal, date or
-timestamp key goes as its `>= min AND <= max` range, and a text key as nothing,
-since the database's collation may order text otherwise. A value the dialect
+A SQL read that heads a chain of joins takes the keys of every later join too,
+AND-ed into the one query it sends, so files or other databases joined further
+on narrow what the database returns:
+
+```sql
+SELECT o.id, s.qty, t.label
+FROM pg.orders o
+JOIN 'sheet.csv' s ON s.cr = o.code
+JOIN 'tags.csv' t ON t.k = o.kind
+-- orders is read as … WHERE "code" IN (…) AND "kind" IN (…)
+```
+
+A later join hands its keys on only where the joins before it were all on the
+read's side, with nothing but filters in between, and it is of a kind that drops
+unmatched left rows; a key qualified by another side's name is never sent. Such a
+join is not reordered among the others.
+
+Up to 1,000 distinct values go as `IN (…)`; past that an integer key goes as up to
+32 ranges cut at its widest gaps, when they cover under half its span, else, as
+any number, decimal, date or timestamp key does, as its `>= min AND <= max` range,
+and a text key as nothing, since the database's collation may order text otherwise. A value the dialect
 cannot spell exactly drops that key's predicate, never just the value: the
 read may return more rows than match, which the join discards, never fewer. An
 empty side reads nothing (`WHERE 1 = 0`). `EXPLAIN` names the side that takes

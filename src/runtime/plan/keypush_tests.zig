@@ -268,3 +268,50 @@ test "a Parquet left side, a file or a folder, serial or in lanes, skips the row
     const kept = try runPg(a, &tmp, srv.port(), "SELECT l.v FROM '$B/l.parquet' l LEFT JOIN '$B/s.csv' s ON l.id = s.k", 1);
     try testing.expectEqual(@as(u64, 0), kept.summary.pushdown.row_groups_skipped);
 }
+test "a SQL head read takes every later join's keys too, AND-ed into one query; a left join's keys never narrow it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "cr,qty\n2,20\n3,30\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "e.csv", .data = "x,tag\nx,X\nz,Z\n" });
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+
+    const r = try runPg(a, &tmp, srv.port(), "SELECT b.name, s.qty, e.tag FROM pg.public.items b JOIN '$B/s.csv' s ON b.id = s.cr JOIN '$B/e.csv' e ON b.extra = e.x", 1);
+    try testing.expect(r.err == null);
+    try testing.expectEqualStrings("name,qty,tag\ngamma,30,Z\n", r.out);
+    const qs = try itemQueries(a, srv);
+    const last = qs[qs.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last, "\"id\" IN (2, 3)") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "\"extra\" IN ('x', 'z')") != null);
+
+    const l = try runPg(a, &tmp, srv.port(), "SELECT b.name, s.qty, e.tag FROM pg.public.items b JOIN '$B/s.csv' s ON b.id = s.cr LEFT JOIN '$B/e.csv' e ON b.extra = e.x", 1);
+    try testing.expect(l.err == null);
+    try testing.expectEqualStrings("name,qty,tag\nbeta,20,\ngamma,30,Z\n", l.out);
+    const lq = try itemQueries(a, srv);
+    try testing.expect(std.mem.indexOf(u8, lq[lq.len - 1], "\"id\" IN (2, 3)") != null);
+    try testing.expect(std.mem.indexOf(u8, lq[lq.len - 1], "\"extra\"") == null or std.mem.indexOf(u8, lq[lq.len - 1], "\"extra\" IN") == null);
+}
+test "past the cap, clustered integer keys go as a few ranges, not one min/max span" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var s = std.array_list.Managed(u8).init(a);
+    try s.appendSlice("cr,qty\n");
+    for (0..1500) |i| try s.writer().print("{d},{d}\n", .{ if (i % 2 == 0) i else 900_000 + i, i });
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = s.items });
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+
+    const r = try runPg(a, &tmp, srv.port(), "SELECT b.name, s.qty FROM pg.public.items b JOIN '$B/s.csv' s ON b.id = s.cr", 1);
+    try testing.expect(r.err == null);
+    try testing.expectEqualStrings("name,qty\nbeta,2\n", r.out);
+    const qs = try itemQueries(a, srv);
+    const last = qs[qs.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last, " OR \"id\" >= ") != null);
+    try testing.expect(std.mem.indexOf(u8, last, " IN (") == null);
+}

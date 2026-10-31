@@ -225,6 +225,9 @@ test "analyze: EXPLAIN tells which side's SQL read takes the other side's join k
         .{ .join = "FROM pg.orders AS o JOIN 'sheet.csv' s ON s.cr = o.code", .want = "the left read takes the right side's keys" },
         .{ .join = "FROM pg.orders AS o LEFT JOIN 'sheet.csv' s ON s.cr = o.code", .want = "" },
         .{ .join = "FROM 'sheet.csv' s JOIN pg.centers AS c ON c.code = s.cr WITH (key_pushdown = false)", .want = "" },
+        .{ .join = "FROM pg.orders AS o JOIN 'sheet.csv' s ON s.cr = o.code JOIN 'tags.csv' t ON t.k = o.kind", .want = "the head read takes the right side's keys too" },
+        .{ .join = "FROM pg.orders AS o JOIN 'sheet.csv' s ON s.cr = o.code LEFT JOIN 'tags.csv' t ON t.k = o.kind", .want = "" },
+        .{ .join = "FROM pg.orders AS o LEFT JOIN 'sheet.csv' s ON s.cr = o.code JOIN 'tags.csv' t ON t.k = o.kind", .want = "" },
     };
     for (cases) |c| {
         var diag = Diag{};
