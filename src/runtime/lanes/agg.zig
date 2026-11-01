@@ -161,7 +161,7 @@ const LaneAgg = struct {
     }
 
     /// Fold `child` into private group tables, one per hash partition of `parts`.
-    fn fold(self: LaneAgg, child: op.Op, state: std.mem.Allocator, gpa: std.mem.Allocator, parts: *LaneParts) ![]op.Aggregate.GroupSet {
+    fn fold(self: LaneAgg, child: op.Op, state: std.mem.Allocator, gpa: std.mem.Allocator, parts: *LaneParts, past: ?op.Aggregate.Past) ![]op.Aggregate.GroupSet {
         var agg = op.Aggregate{
             .strs = self.strs,
             .child = child,
@@ -174,6 +174,7 @@ const LaneAgg = struct {
             .gpa = gpa,
             .part_state = &parts.allocs,
             .table_gpa = parts.backing(),
+            .past = past,
         };
         const t0 = if (self.prof != null) std.time.Instant.now() catch null else null;
         const sets = try agg.drainParts();
@@ -419,7 +420,8 @@ const AggSink = struct {
         ls.* = .{ .state = .init(gpa) };
         ls.parts.init(gpa);
         self.partials[i] = ls;
-        ls.sets = try self.la.fold(chain, ls.state.allocator(), mem.gpa.allocator(), &ls.parts);
+        var probe = Probe{ .g = self, .ls = ls };
+        ls.sets = try self.la.fold(chain, ls.state.allocator(), mem.gpa.allocator(), &ls.parts, if (self.budget > 0) probe.past() else null);
         for (ls.sets) |*st| if (st.table) |t| {
             t.deinit();
             st.table = null;
@@ -438,6 +440,23 @@ const AggSink = struct {
             try self.drain(p);
         }
     }
+
+    /// A partial in its fold, checked against the budget with what the lanes' sealed
+    /// partials hold: one partial a worker folds the worker's every morsel, so waiting
+    /// for it to seal had held near all the groups past any budget.
+    const Probe = struct {
+        g: *AggSink,
+        ls: *const Partial,
+
+        fn past(self: *Probe) op.Aggregate.Past {
+            return .{ .ctx = self, .f = f };
+        }
+
+        fn f(ctx: *anyopaque) bool {
+            const self: *Probe = @ptrCast(@alignCast(ctx));
+            return self.g.held.load(.monotonic) + self.ls.bytes() > self.g.budget;
+        }
+    };
 
     fn mergedParts(self: *const AggSink) usize {
         return if (self.la.by.len == 0) 1 else pq_parts;

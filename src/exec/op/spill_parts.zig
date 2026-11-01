@@ -212,7 +212,7 @@ pub const RunSource = struct {
     fn nextFn(p: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
         const self: *RunSource = @ptrCast(@alignCast(p));
         if (self.done or self.drained) return null;
-        if (self.reader == null) self.reader = try spill.Reader.open(self.run);
+        if (self.reader) |*r| r.releaseRead() else self.reader = try spill.Reader.open(self.run);
         if (try self.reader.?.next(arena)) |b| return b;
         self.drained = true;
         return null;

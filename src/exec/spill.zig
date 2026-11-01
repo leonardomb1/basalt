@@ -29,6 +29,7 @@ const space_mod = @import("space.zig");
 const Space = space_mod.Space;
 const Batch = @import("batch.zig").Batch;
 const Cursor = @import("../format/cursor.zig").Reader(@import("builtin").cpu.arch.endian(), error.CorruptSpill);
+const release = @import("../format/stream.zig").release;
 const Column = column.Column;
 const Bitmap = column.Bitmap;
 const Tag = column.Tag;
@@ -229,6 +230,15 @@ pub const Reader = struct {
     map: []align(std.heap.page_size_min) const u8,
     schema: *const types.Schema,
     c: Cursor,
+    /// Where the pages already handed back end: a run read once is not held resident
+    /// whole, which a merge of runs as large as its input was.
+    released: usize = 0,
+    /// Where the batch last handed out starts.
+    last: usize = 0,
+
+    /// Small, as a merge reads up to its fan-in of runs at once, each holding what it
+    /// has read since its last release.
+    const release_every = 256 << 10;
 
     /// Memory-maps the run's file.
     pub fn open(run: Run) !Reader {
@@ -258,9 +268,18 @@ pub const Reader = struct {
         return ptr[0..@intCast(count)];
     }
 
+    /// Drops from the process the pages of the batches before the last handed out,
+    /// for a caller done reading them; read again, they fault back in from the file.
+    pub fn releaseRead(self: *Reader) void {
+        if (self.last - self.released < release_every) return;
+        release(self.map[self.released..self.last]);
+        self.released = self.last;
+    }
+
     /// The batches in the order written. Columns point into the mapping and stay
     /// valid until `close`; `arena` holds only the small per-batch structs.
     pub fn next(self: *Reader, arena: std.mem.Allocator) !?Batch {
+        self.last = self.c.i;
         if (self.c.left() == 0) return null;
         const rows = try self.takeU64();
         const ncols = try self.takeU64();

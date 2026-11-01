@@ -47,6 +47,9 @@ pub const Aggregate = struct {
     own_state: ?*std.heap.ArenaAllocator = null,
     gpa: std.mem.Allocator,
     part_state: ?[]const std.mem.Allocator = null,
+    /// A lane's partial asks after each batch whether the lanes' partials are past their
+    /// budget, failing the fold with `AggregatePastMemory` once they are.
+    past: ?Past = null,
     table_gpa: ?std.mem.Allocator = null,
     strs: ?*StrTable = null,
     str_cache: std.StringHashMapUnmanaged(StrId) = .empty,
@@ -67,6 +70,15 @@ pub const Aggregate = struct {
     pub const replayChild = @import("aggregate/spill.zig").replayChild;
     pub const release = @import("aggregate/spill.zig").release;
     pub const overBudget = @import("aggregate/spill.zig").overBudget;
+
+    pub const Past = struct {
+        ctx: *anyopaque,
+        f: *const fn (*anyopaque) bool,
+
+        pub fn check(self: Past) error{AggregatePastMemory}!void {
+            if (self.f(self.ctx)) return error.AggregatePastMemory;
+        }
+    };
     pub const destOf = @import("aggregate/spill.zig").destOf;
     pub const Pairs = @import("aggregate/pairs.zig").Pairs;
     pub const pairsOf = @import("aggregate/drain.zig").pairsOf;

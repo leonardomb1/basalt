@@ -4,7 +4,8 @@
 //! With a `space`, the sort is external once its input passes `spill_at` bytes (the
 //! run's `--op-memory`): input is pulled into the sort's own arena and, each time
 //! the bytes held pass the limit, sorted in memory and written to a spill file as a
-//! sorted run of `batch_rows`-row batches, and the arena is reset. At the end the
+//! sorted run, its batches sized so a merge's sources fit in the limit too
+//! (`runRows`), and the arena is reset. At the end the
 //! remainder is sorted and kept in memory as the last run. Past `fan_in` sources,
 //! consecutive groups of `fan_in` runs are merged into new runs (their files deleted
 //! as each group completes) until few enough remain; the last merge streams out
@@ -214,7 +215,18 @@ pub const Sort = struct {
         }
     }
 
-    /// Writes `h`'s rows, ordered, as a run of `batch_rows`-row batches. The run's path
+    /// Rows a batch of a written run holds, for rows of about `bytes / rows` bytes: a
+    /// merge reads `fan_in` runs at once and holds each one's current batch and the one
+    /// before, so they fit in `spill_at` rather than grow with the runs merged. At least
+    /// 1024 rows, at most `batch_rows`.
+    fn runRows(self: *const Sort, bytes: usize, rows: usize) usize {
+        const most = @max(self.batch_rows, 1);
+        const per_row = @max(1, bytes / @max(rows, 1));
+        const budget = self.spill_at / (2 * @max(self.fan_in, 2));
+        return std.math.clamp(budget / per_row, @min(1024, most), most);
+    }
+
+    /// Writes `h`'s rows, ordered, as a run of `runRows`-row batches. The run's path
     /// is copied into `paths`; the writer's buffer is freed on return.
     fn writeSorted(self: *Sort, space: Space, paths: std.mem.Allocator, h: *Held) !spill.Run {
         var tmp = std.heap.ArenaAllocator.init(self.gpa);
@@ -224,9 +236,10 @@ pub const Sort = struct {
         var w = try spill.Writer.init(space, tmp.allocator(), self.in_schema, "sort");
         errdefer w.abort();
         const path = try paths.dupe(u8, w.path);
+        const rows = self.runRows(h.bytes, h.rows);
         while (true) {
             _ = chunk.reset(.retain_capacity);
-            try w.write((try h.take(chunk.allocator(), self.in_schema, @max(self.batch_rows, 1))) orelse break);
+            try w.write((try h.take(chunk.allocator(), self.in_schema, rows)) orelse break);
         }
         var run = try w.finish();
         run.path = path;
@@ -245,9 +258,16 @@ pub const Sort = struct {
         var w = try spill.Writer.init(space, tmp.allocator(), self.in_schema, "sort");
         errdefer w.abort();
         const path = try paths.dupe(u8, w.path);
+        var bytes: u64 = 0;
+        var total: u64 = 0;
+        for (group) |r| {
+            bytes += r.bytes;
+            total += r.rows;
+        }
+        const rows = self.runRows(@intCast(bytes), @intCast(total));
         while (true) {
             _ = chunk.reset(.retain_capacity);
-            const b = (try m.next(chunk.allocator(), @max(self.batch_rows, 1))) orelse break;
+            const b = (try m.next(chunk.allocator(), rows)) orelse break;
             try w.write(b);
         }
         var run = try w.finish();
@@ -405,7 +425,7 @@ fn writeSeqRun(s: *const Sort, space: Space, paths: std.mem.Allocator, h: *Held,
     errdefer w.abort();
     const path = try paths.dupe(u8, w.path);
     const n = s.in_schema.fields.len;
-    const max_rows = @max(s.batch_rows, 1);
+    const max_rows = s.runRows(h.bytes, h.rows);
     while (true) {
         _ = chunk.reset(.retain_capacity);
         const a = chunk.allocator();
@@ -799,7 +819,9 @@ pub const Merge = struct {
             if (self.live > 0) self.siftDown(0);
         }
         const out = try self.gather(arena, segs.items, refs[0..n], rows[0..n]);
-        for (self.cursors) |*c| if (c.exhausted) c.close(self.gpa);
+        for (self.cursors) |*c| {
+            if (c.exhausted) c.close(self.gpa) else if (c.reader) |*r| r.releaseRead();
+        }
         return out;
     }
 
@@ -1997,4 +2019,12 @@ test "sort spill: a merge pass that fails gives back no more disk than it charge
     try testing.expectError(error.SpillCapExceeded, drainSorted(a, batches, &keys, .{ .space = cs.space(), .spill_at = 0, .fan_in = 2 }));
     try testing.expectEqual(cs.charged, cs.released);
     try testing.expectEqual(@as(usize, 0), try td.count());
+}
+
+test "runRows: a run's batches shrink so a merge's sources fit in spill_at, between 1024 rows and batch_rows" {
+    const s = Sort{ .child = undefined, .in_schema = &int_schema, .keys = &.{}, .spill_at = 8 << 20, .fan_in = 64 };
+    try testing.expectEqual(@as(usize, 2730), s.runRows(24 << 20, 1 << 20));
+    try testing.expectEqual(@as(usize, 1024), s.runRows(1 << 30, 1 << 20));
+    try testing.expectEqual(@as(usize, 1 << 16), (Sort{ .child = undefined, .in_schema = &int_schema, .keys = &.{} }).runRows(24 << 20, 1 << 20));
+    try testing.expectEqual(@as(usize, 7), (Sort{ .child = undefined, .in_schema = &int_schema, .keys = &.{}, .spill_at = 0, .batch_rows = 7 }).runRows(100, 10));
 }

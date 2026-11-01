@@ -641,7 +641,7 @@ pub const CsvSliceReader = struct {
         if (rows == 0) return null;
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
-        if (self.release and self.pos - self.released >= release_every) {
+        if (self.release and (self.pos - self.released >= release_every or self.pos >= self.data.len)) {
             release(self.data[self.released..self.pos]);
             self.released = self.pos;
         }

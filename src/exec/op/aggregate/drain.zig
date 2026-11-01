@@ -246,6 +246,7 @@ pub fn drainFixed(self: *Aggregate, kinds: []const KeyKind, comptime counts_only
     const enc = try Encoder.init(self.state, self.by, kinds);
 
     while (try self.child.next(pull)) |b| {
+        if (self.past) |p| try p.check();
         const frozen = self.overBudget(parts);
         const e = try enc.encode(pull, b.columns, b.len, self.interner(), frozen);
         const hashes = try pull.alloc(u64, b.len);
@@ -329,6 +330,7 @@ pub fn drainImpl(self: *Aggregate) anyerror![]GroupSet {
     try initPairs(self, true);
     errdefer for (self.pairs) |*pp| pp.deinit();
     while (try self.child.next(pull)) |b| {
+        if (self.past) |p| try p.check();
         const frozen = self.overBudget(parts);
         const nk = self.by.len;
         const probes = try pull.alloc(Value, b.len * nk);
