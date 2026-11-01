@@ -57,6 +57,8 @@ const cases = [_]Case{
     .{ .q = "SELECT id, v FROM '$B/p.parquet' ORDER BY v DESC, id LIMIT 5", .want = "parquet parallel top-n" },
     .{ .q = "SELECT DISTINCT g FROM '$B/p.parquet'", .want = "parquet parallel distinct" },
     .{ .q = "SELECT id FROM '$B/p.parquet' ORDER BY v, id", .want = "parquet parallel sort" },
+    .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet'", .want = "serial" },
+    .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet' WHERE v > 0", .want = "parquet parallel aggregate" },
     .{ .q = "SELECT id, v FROM '$B/p1.parquet'", .want = "serial", .static = "parquet parallel map" },
     .{ .q = "SELECT g, SUM(v) AS s FROM '$B/pf/' GROUP BY g", .want = "parquet parallel aggregate" },
     .{ .q = "SELECT id, v FROM '$B/pf/' WHERE v > 2", .want = "parquet parallel map" },

@@ -65,6 +65,7 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     if (stages[0].node == .union_ and f.lanes > 1 and !std.mem.eql(u8, f.sink.connector, "csv") and
         branchesAreReads(stages[0].node.union_) and streamsOnly(middle))
         return .union_split;
+    if (footerCount(head)) return .serial;
     if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, f.lanes)) {
         if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape))
             return .{ .lanes = .{ .source = f.head_source, .shape = shape } };
@@ -82,6 +83,18 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
             .{ .map_join = s }
         else if (streamsOnly(middle)) .map else .none,
     } };
+}
+
+/// An ungrouped `COUNT(*)` alone straight off a local Parquet file, which the plan
+/// answers from its footer (`plan.metaShortcut`); on lanes it decoded a column.
+fn footerCount(head: []const ast.Stage) bool {
+    if (head.len != 3 or head[0].node != .read or head[1].node != .aggregate) return false;
+    const rd = head[0].node.read;
+    if (!connect.isParquetFileRead(rd) or std.mem.indexOf(u8, rd.form.path, "://") != null) return false;
+    const ag = head[1].node.aggregate;
+    if (ag.by.len != 0 or ag.aggs.len == 0) return false;
+    for (ag.aggs) |a| if (a.func != .count or a.arg != null or a.distinct) return false;
+    return true;
 }
 
 /// At one lane, a file aggregate over joins whose head is filtered: its first join
