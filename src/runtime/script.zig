@@ -496,6 +496,30 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
     return .{ .names = names, .cells = cells, .script = true, .nulls = nulls };
 }
 
+/// `c` with its options bound to the script's PARAMs and LETs once, before any read:
+/// a value that is one `$name` becomes that value's literal, and each `${...}` in a
+/// text value, or in a PAGINATE / WITH value, is rendered against `scope`, so a
+/// token a LET computed reaches `header_value = $tok` as written.
+pub fn bindConnection(arena: std.mem.Allocator, c: ast.Connection, params: *const std.StringHashMap(Value), scope: LoopRow) !ast.Connection {
+    var out = c;
+    const config = try arena.alloc(ast.Attr, c.config.len);
+    for (c.config, config) |a, *dst| {
+        dst.* = a;
+        switch (a.value.*) {
+            .field => |q| if (q.dollar and q.parts.len == 1) if (params.get(q.parts[0])) |v| {
+                dst.value = try mkLit(arena, v);
+            },
+            .str_lit => |t| if (std.mem.indexOf(u8, t, "${") != null) {
+                dst.value = try mk(arena, .{ .str_lit = try interpAll(arena, t, scope) });
+            },
+            else => {},
+        }
+    }
+    out.config = config;
+    out.hints = try renderHints(arena, c.hints, scope);
+    return out;
+}
+
 /// Interpolate `${...}` holes against script scope alone, for statements outside
 /// any `FOR EACH`. Runs even with no PARAM or LET, as a hole may be `today()`.
 pub fn renderScriptScope(env: *Env, p: ast.Pipeline) !ast.Pipeline {
@@ -805,6 +829,32 @@ test "PRINT renders literals, `||` over params, and a loop variable" {
     const lr = LoopRow{ .names = &[_][]const u8{"name"}, .cells = &[_][]const u8{"acme"} };
     const row = try parser.parseExprStr(a, "'company ' || $name", &pdiag);
     try std.testing.expectEqualStrings("company acme", (try printText(a, row, lr, &params)).text);
+}
+
+test "bindConnection: a `$name` option becomes its value's literal, a `${...}` in a text option or a WITH value is rendered, the rest kept" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var params = std.StringHashMap(Value).init(a);
+    try params.put("tok", .{ .string = "abc" });
+    try params.put("port", .{ .int = 5433 });
+    const scope = try buildScriptScope(a, &params);
+    const pos: ast.Pos = .{ .line = 1, .col = 1 };
+    const tok_ref = try mk(a, .{ .field = .{ .parts = try a.dupe([]const u8, &.{"tok"}), .dollar = true } });
+    const port_ref = try mk(a, .{ .field = .{ .parts = try a.dupe([]const u8, &.{"port"}), .dollar = true } });
+    const config = [_]ast.Attr{
+        .{ .key = "header_value", .value = tok_ref, .pos = pos },
+        .{ .key = "port", .value = port_ref, .pos = pos },
+        .{ .key = "base_url", .value = try mk(a, .{ .str_lit = "https://h/${upper(tok)}" }), .pos = pos },
+        .{ .key = "user", .value = try mk(a, .{ .str_lit = "plain" }), .pos = pos },
+    };
+    const hints = [_]ast.Hint{.{ .key = "header", .value = .{ .str = "X-T: ${tok}" }, .pos = pos }};
+    const c = try bindConnection(a, .{ .name = "h", .connector = "http", .config = &config, .pos = pos, .hints = &hints }, &params, scope);
+    try std.testing.expectEqualStrings("abc", c.config[0].value.str_lit);
+    try std.testing.expectEqual(@as(i64, 5433), c.config[1].value.int_lit);
+    try std.testing.expectEqualStrings("https://h/ABC", c.config[2].value.str_lit);
+    try std.testing.expectEqual(config[3].value, c.config[3].value);
+    try std.testing.expectEqualStrings("X-T: abc", c.hints[0].value.str);
 }
 
 test "renderHints: a query parameter whose value is a NULL PARAM is left out, as a literal NULL is" {

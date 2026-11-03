@@ -41,5 +41,20 @@ them at an emulator. S3 paths (`s3://...`) resolve `AWS_ACCESS_KEY_ID` /
 `AWS_ENDPOINT_URL` points them at an emulator such as MinIO. Secrets are never
 literals in the script; always environment indirection.
 
+An option's value is a literal, `env('NAME')` / `secret('NAME')`, or the script's
+own: a `$name` that names a PARAM or LET takes its value, and a `${...}` in a text
+option (or in the connection's `PAGINATE` / `WITH`) is filled in from them, once,
+before any read — as in a read's own `WITH`. So a value computed from a secret
+reaches the connection:
+
+```sql
+LET token = sha256(env('API_PASS') || strftime(now(), '%d/%m/%Y'));
+CREATE CONNECTION api TYPE http OPTIONS (base_url = 'https://api.example.com',
+  auth = 'header', header_name = 'X-Token', header_value = $token);
+```
+
+`basalt check` leaves such a value to the run, as it does an `env()`, but refuses
+a `$name` that no PARAM or LET declares.
+
 A second `CREATE CONNECTION` of a name replaces the first from that statement
 on; `CREATE OR REPLACE CONNECTION` says the same thing explicitly.

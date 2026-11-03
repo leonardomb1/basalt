@@ -431,6 +431,25 @@ fn readsFiles(e: *const ast.Expr) bool {
     return ast.anyExpr(e, {}, S.hit);
 }
 
+/// A connection option the run binds to the script (`script.bindConnection`) that
+/// it could not: a `$name` no PARAM or LET declares, or a `${...}` that does not
+/// parse, in an option or a PAGINATE / WITH value.
+fn connectionRefProblem(arena: std.mem.Allocator, c: ast.Connection, params: *const ParamMap) Error!?struct { msg: []const u8, pos: ast.Pos } {
+    for (c.config) |a| switch (a.value.*) {
+        .field => |q| if (q.dollar and q.parts.len == 1 and !params.contains(q.parts[0]))
+            return .{ .pos = a.pos, .msg = try msgfmt.allocPrint(arena, "connection `{s}`: `{s} = ${s}` names no PARAM or LET", .{ c.name, a.key, q.parts[0] }) },
+        .str_lit => |t| if (try holes.problem(arena, t)) |why|
+            return .{ .pos = a.pos, .msg = try msgfmt.allocPrint(arena, "connection `{s}`: `{s}`: {s}", .{ c.name, a.key, why }) },
+        else => {},
+    };
+    for (c.hints) |h| switch (h.value) {
+        .str, .ident => |t| if (try holes.problem(arena, t)) |why|
+            return .{ .pos = h.pos, .msg = try msgfmt.allocPrint(arena, "connection `{s}`: `{s}`: {s}", .{ c.name, h.key, why }) },
+        else => {},
+    };
+    return null;
+}
+
 /// What an expression folds to over `sc`, or the label of why it does not.
 pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folded {
     if (readsFiles(e)) return .{ .failed = "reads a file, which only a run does" };
@@ -979,6 +998,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             ph.* = .null_lit;
             try params_map.put(l.name, ph);
         }
+    };
+    for (program.stmts) |s| if (s == .connection) if (try connectionRefProblem(arena, s.connection, &params_map)) |why| {
+        const e = fail(diag, "{s}", .{why.msg});
+        diag.pos = why.pos;
+        return e;
     };
     for (program.stmts) |s| switch (s) {
         .throw => try checkScriptStmt(arena, s, program, &params_map, .{ .names = known_names.items, .values = known_values.items }, diag),

@@ -202,6 +202,17 @@ pub fn envName(e: *const ast.Expr) ?[]const u8 {
     return c.args[0].str_lit;
 }
 
+/// Whether an option's value is the script's, bound by the run before any read
+/// (`script.bindConnection`): one `$name`, or text holding a `${...}`. A check
+/// leaves it to the run, as it does an env()/secret().
+pub fn scriptBound(e: *const ast.Expr) bool {
+    return switch (e.*) {
+        .field => |q| q.dollar and q.parts.len == 1,
+        .str_lit => |t| std.mem.indexOf(u8, t, "${") != null,
+        else => false,
+    };
+}
+
 /// Whether `e` calls `env('X')` or `secret('X')` anywhere.
 pub fn readsEnv(e: *const ast.Expr) bool {
     const S = struct {
@@ -265,8 +276,9 @@ pub fn cfgText(arena: std.mem.Allocator, e: *const ast.Expr) !Text {
 }
 
 /// Why `check` refuses an option's value before the run, or null; an env()/secret()
-/// text value is left to the run.
+/// text value, or one the script binds (`scriptBound`), is left to the run.
 pub fn checkValue(arena: std.mem.Allocator, opt: Opt, e: *const ast.Expr) !?Problem {
+    if (scriptBound(e)) return null;
     switch (opt.kind) {
         inline .port, .count => |k| return switch (cfgIntIn(k.Int(), e)) {
             .ok => null,

@@ -1751,6 +1751,8 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1');\nLOAD INTO '$B/o.csv' AS SELECT * FROM h.GET('/x', a = 1) WITH (itmes = 'data');", "unknown read option `itmes`: a REST read" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (method = 'fetch');", "REST option `method` is one of get, post, put, patch or delete (given 'fetch')" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT env('PATH') AS p;", "`env()` reads the environment only in a LET or a connection option" },
+        .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1', auth = 'header', header_name = 'X-K', header_value = $nope);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "connection `h`: `header_value = $nope` names no PARAM or LET" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd', password = '${1 +}');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "connection `pg`: `password`:" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (paginate = 'pages');", "REST option `paginate` is one of none, page, offset or cursor (given 'pages')" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (method = 'post', body = 'a=1', body_type = 'jsn');", "REST option `body_type` is `form` or `json` (given 'jsn')" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (stop_short = 'yes');", "REST option `stop_short` is a flag: write it bare, or `= true` / `= false`" },

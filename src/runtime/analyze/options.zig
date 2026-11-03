@@ -180,7 +180,7 @@ pub fn connectionProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]c
             continue;
         }
         const text = try literalText(arena, attr.value);
-        if (text == null and !isEnvCall(attr.value)) return literal_cfg_msg;
+        if (text == null and !isEnvCall(attr.value) and !schema.scriptBound(attr.value)) return literal_cfg_msg;
         for (keys) |known| {
             if (std.mem.eql(u8, k, known)) break;
         } else return try unknownOptionMsg(arena, c, k);
@@ -209,7 +209,7 @@ pub fn sqlOptionProblem(c: ast.Connection) ?[]const u8 {
     if (conn.sqlRead() == null) return null;
     var tls: ?[]const u8 = null;
     var auth: ?[]const u8 = null;
-    for (c.config) |a| if (a.value.* == .str_lit) {
+    for (c.config) |a| if (a.value.* == .str_lit and !schema.scriptBound(a.value)) {
         if (std.mem.eql(u8, a.key, "tls")) tls = a.value.str_lit;
         if (std.mem.eql(u8, a.key, "auth")) auth = a.value.str_lit;
     };
@@ -235,6 +235,7 @@ fn httpProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const u8 {
     for (c.config) |a| if (std.mem.eql(u8, a.key, "auth")) {
         auth = (try literalText(arena, a.value)) orelse return null;
     };
+    for (c.config) |a| if (schema.scriptBound(a.value)) return null;
     var kvs = std.array_list.Managed(http_client.KV).init(arena);
     for (c.config) |a| if (httpAttrUsed(c, auth, a.key))
         try kvs.append(.{ .key = a.key, .value = (try literalText(arena, a.value)) orelse return null });
@@ -299,7 +300,7 @@ pub fn checkSinkConnection(arena: std.mem.Allocator, conn: ast.Connection, diag:
         }
         if (!containsKey(&stream_str_keys, k)) continue;
         const text = try literalText(arena, attr.value);
-        if (text == null and !isEnvCall(attr.value)) return fail(diag, "{s}", .{literal_cfg_msg});
+        if (text == null and !isEnvCall(attr.value) and !schema.scriptBound(attr.value)) return fail(diag, "{s}", .{literal_cfg_msg});
         if (std.mem.eql(u8, k, "database")) database = text == null or text.?.len > 0;
         const t = text orelse continue;
         if (std.mem.eql(u8, k, "load_size") and (env_mod.parseByteSize(t) orelse 0) == 0)

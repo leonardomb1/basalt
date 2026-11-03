@@ -99,6 +99,7 @@ const buildPipeline = @import("plan.zig").buildPipeline;
 const ownClock = @import("plan.zig").ownClock;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
+const bindConnection = @import("script.zig").bindConnection;
 const renderBound = @import("script.zig").renderBound;
 const renderScriptScope = @import("script.zig").renderScriptScope;
 const runCall = @import("script.zig").runCall;
@@ -183,8 +184,9 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var connections = std.StringHashMap(ast.Connection).init(arena);
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     var runnable: usize = 0;
+    const conn_scope = try buildScriptScope(arena, &params);
     for (program.stmts[1..]) |s| switch (s) {
-        .connection => |c| try connections.put(c.name, c),
+        .connection => |c| try connections.put(c.name, try bindConnection(arena, c, &params, conn_scope)),
         .func => |fd| try fns.put(fd.name, fd),
         .print, .binding => {},
         .output, .for_each, .match, .call, .explain => runnable += 1,
@@ -387,7 +389,8 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena, runForBody),
         .throw => |t| try runThrow(env, t, no_loop_vars),
         .binding => |b| try env.bindings.put(b.name, try renderScriptScope(env, b.pipeline)),
-        .connection => |c| {
+        .connection => |raw| {
+            const c = try bindConnection(env.arena, raw, env.params, env.script_scope);
             try env.connections.put(c.name, c);
             try registerSftp(env, c);
             try registerSmb(env, c);
