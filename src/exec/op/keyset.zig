@@ -72,11 +72,17 @@ pub fn ranged(arena: std.mem.Allocator, vals: []i64) ![]const [2]i64 {
 pub const KeyPush = struct {
     ctx: *anyopaque,
     apply: *const fn (ctx: *anyopaque, keys: []const KeyValues) anyerror!void,
+    /// Whether the receiver reads `KeyValues.ranges` (a SQL read's WHERE). Only then
+    /// are keys past the cap gathered and sorted into ranges, which for a Parquet
+    /// read or a runtime filter was a serial sort of every build key, unused (TPC-H
+    /// Q3 lost a quarter of its time to its 727K order keys).
+    ranges: bool = false,
 };
 
 /// The distinct non-null values of each column in `cols` across `batches`, distinct
-/// as `keyhash.valueEq` tells them.
-pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const usize, cap: usize) ![]KeyValues {
+/// as `keyhash.valueEq` tells them; past the cap, integer keys as ranges when
+/// `ranges` asks for them.
+pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const usize, cap: usize, ranges: bool) ![]KeyValues {
     const out = try arena.alloc(KeyValues, cols.len);
     for (cols, out) |ci, *kv| {
         var seen = std.HashMap(Value, void, keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage).init(arena);
@@ -84,7 +90,7 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
         var overflow = false;
         var bounds = keyhash.MinMax{};
         var past = std.array_list.Managed(i64).init(arena);
-        var ints = true;
+        var ints = ranges;
         for (batches) |b| {
             const col = b.columns[ci];
             for (0..b.len) |i| {
@@ -124,14 +130,14 @@ test "collect: distinct non-null values per key, min and max past the cap" {
     const util = @import("testing_util.zig");
     const b1 = try util.kvBatch(a, &util.join_left_schema, &.{ 3, 1, null, 3 }, &.{ "x", "y", null, "x" });
     const b2 = try util.kvBatch(a, &util.join_left_schema, &.{ 2, 7 }, &.{ "y", "z" });
-    const keys = try collect(a, &.{ b1, b2 }, &.{ 0, 1 }, 3);
+    const keys = try collect(a, &.{ b1, b2 }, &.{ 0, 1 }, 3, true);
     try testing.expectEqual(@as(usize, 3), keys[0].values.len);
     try testing.expect(keys[0].overflow);
     try testing.expectEqual(@as(i64, 1), keys[0].min.?.int);
     try testing.expectEqual(@as(i64, 7), keys[0].max.?.int);
     try testing.expectEqual(@as(usize, 3), keys[1].values.len);
     try testing.expect(!keys[1].overflow);
-    const none = try collect(a, &.{}, &.{0}, 3);
+    const none = try collect(a, &.{}, &.{0}, 3, true);
     try testing.expectEqual(@as(usize, 0), none[0].values.len);
     try testing.expect(!none[0].overflow);
 }
@@ -156,7 +162,7 @@ test "collect: values equal under keyhash count once, whatever their scale or ze
     const cols = try a.alloc(column.Column, 2);
     cols[0] = try dec.finish();
     cols[1] = try flt.finish();
-    const keys = try collect(a, &.{.{ .schema = &schema, .columns = cols, .len = 2 }}, &.{ 0, 1 }, 1);
+    const keys = try collect(a, &.{.{ .schema = &schema, .columns = cols, .len = 2 }}, &.{ 0, 1 }, 1, true);
     for (keys) |k| {
         try testing.expectEqual(@as(usize, 1), k.values.len);
         try testing.expect(!k.overflow);

@@ -390,7 +390,7 @@ fn laneParquetKeys(env: *Env, js: MapJoinShape, lane: LaneJoin, map_stages: []co
     for (cols) |c| {
         if (c != null) break;
     } else return &.{};
-    const keys = try op.collectKeys(arena, &.{lane.index.build_batch}, lane.right_keys, op.default_push_cap);
+    const keys = try op.collectKeys(arena, &.{lane.index.build_batch}, lane.right_keys, op.default_push_cap, false);
     return keypush.keyBounds(arena, cols, keys);
 }
 
@@ -471,7 +471,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
 
     var where_extra: ?[]const u8 = null;
     if (try narrowingKeyExprs(arena, shape, lp.lane, shape.prefix)) |exprs| {
-        const keys = try op.collectKeys(arena, &.{lp.lane.index.build_batch}, lp.lane.right_keys, op.default_push_cap);
+        const keys = try op.collectKeys(arena, &.{lp.lane.index.build_batch}, lp.lane.right_keys, op.default_push_cap, true);
         where_extra = try keypush.render(arena, desc.dialect, src_schema.*, exprs, keys);
         if (where_extra) |x| env.log.log(.debug, "key pushdown into {s} splits: WHERE {s}", .{ @tagName(desc.dialect), if (x.len > 400) x[0..400] else x });
     }

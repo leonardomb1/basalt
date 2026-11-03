@@ -402,7 +402,7 @@ pub const LateSql = struct {
     pub fn push(self: *LateSql, exprs: []const ?*ast.Expr) !op.KeyPush {
         const b = try self.env.arena.create(Bound);
         b.* = .{ .late = self, .exprs = exprs };
-        return .{ .ctx = b, .apply = apply };
+        return .{ .ctx = b, .apply = apply, .ranges = true };
     }
 
     fn apply(ctx: *anyopaque, keys: []const op.KeyValues) anyerror!void {

@@ -845,7 +845,7 @@ pub const Join = struct {
         const ix = (try self.ensureIndex()) orelse return self.nextGrace(arena);
         if (self.push_probe) |kp| if (!self.probe_pushed) {
             self.probe_pushed = true;
-            try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap));
+            try kp.apply(kp.ctx, try keyset.collect(self.state, &.{ix.build_batch}, self.right_keys, self.push_cap, kp.ranges));
         };
         if (self.kind == .cross) return self.nextCross(arena, ix);
         if (!self.probe_done) {
@@ -929,7 +929,7 @@ pub const Join = struct {
         }
         self.replay = held.items;
         if (self.probe_ended)
-            try self.push_build.?.apply(self.push_build.?.ctx, try keyset.collect(self.state, self.replay, self.left_keys, self.push_cap));
+            try self.push_build.?.apply(self.push_build.?.ctx, try keyset.collect(self.state, self.replay, self.left_keys, self.push_cap, self.push_build.?.ranges));
     }
 
     /// The index, or null once the join has gone to grace mode.
