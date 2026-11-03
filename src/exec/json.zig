@@ -347,7 +347,7 @@ pub fn setPath(arena: std.mem.Allocator, t: []const u8, p: []const u8, v: SetVal
             const end = valueEnd(t, cur) - 1;
             if (skipWs(t, cur + 1) != end) w.writeByte(',') catch return error.OutOfMemory;
             for (keys.items[i..], i..) |rest, d| {
-                writeJsonString(w, rest) catch return error.OutOfMemory;
+                jsontext.stdString(w, rest) catch return error.OutOfMemory;
                 w.writeByte(':') catch return error.OutOfMemory;
                 if (d + 1 < keys.items.len) w.writeByte('{') catch return error.OutOfMemory;
             }
@@ -370,12 +370,8 @@ pub fn setPath(arena: std.mem.Allocator, t: []const u8, p: []const u8, v: SetVal
 fn writeSet(w: *std.Io.Writer, v: SetValue, as_text: bool) std.Io.Writer.Error!void {
     switch (v) {
         .int => |n| if (as_text) try w.print("\"{d}\"", .{n}) else try w.print("{d}", .{n}),
-        .text => |s| try writeJsonString(w, s),
+        .text => |s| try jsontext.stdString(w, s),
     }
-}
-
-fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
-    try std.json.Stringify.encodeJsonString(s, .{}, w);
 }
 
 pub fn rootKind(t: []const u8) enum { array, null, other } {

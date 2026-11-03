@@ -104,6 +104,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const driver = @import("../connect/driver.zig");
 const fjson = @import("../format/json/read.zig");
 const jt = @import("../exec/json.zig");
+const textconv = @import("../exec/textconv.zig");
 const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
@@ -667,7 +668,7 @@ fn intOf(v: ast.HintVal) ?i64 {
 fn flagOf(v: ast.HintVal) ?bool {
     return switch (v) {
         .flag => true,
-        .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else null,
+        .str, .ident => |s| textconv.boolText(.hint, s),
         else => null,
     };
 }
