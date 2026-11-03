@@ -256,6 +256,23 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `timeout_ms` | `300000` | the limit on one page's fetch or one login, retries included |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
+A value the API wants computed — a token hashed from a password and the date, a
+date window — is a LET, put into any option's text with `${...}`. The holes are
+filled in once, before the first request, from the script's PARAMs and LETs (a
+LET may read `env()`, see [Parameters](parameters.md)), and the option is then
+checked as filled in, so a `page_size = '${n}'` that comes out `0` fails before any
+request:
+
+```sql
+LET token = sha256(env('API_PASS') || strftime(now(), '%d/%m/%Y'));
+SELECT * FROM HTTP('https://api.example.com/v1/items')
+  PAGINATE BY page
+  WITH (method = 'post', body_type = 'json', body = '{"user": "etl", "token": "${token}"}',
+        header = 'X-Token: ${token}');
+```
+
+A connection's options take the same, and a `$name` alone ([Connections](connections.md)).
+
 A page or login reply that decodes past 256 MiB stops the read (`HttpBodyTooLarge`),
 so a compressed bomb cannot exhaust memory; ask the endpoint for smaller pages.
 

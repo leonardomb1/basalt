@@ -1092,6 +1092,24 @@ test "a LET reads env() once before the run, a later LET and a hole build on it,
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
+test "a REST option filled from a LET by a `${...}` is checked as filled in, before any request" {
+    const alloc = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "LET n = 0;\nSELECT * FROM HTTP('http://127.0.0.1:1/x') PAGINATE BY page WITH (page_size = '${n}');", "REST option `page_size` must be at least 1 (given '0')" },
+        .{ "LET m = 'fetch';\nSELECT * FROM HTTP('http://127.0.0.1:1/x') WITH (method = '${m}');", "REST option `method` is one of get, post, put, patch or delete (given 'fetch')" },
+    };
+    for (cases) |c| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        var adiag = analyze.Diag{};
+        _ = try analyze.analyze(parena.allocator(), try parser.parseSource(parena.allocator(), c[0], &pdiag), &adiag);
+        var rdiag: Diag = .{};
+        try std.testing.expectError(error.PlanFailed, exec(alloc, c[0], .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+        try std.testing.expectEqualStrings(c[1], rdiag.msg);
+    }
+}
+
 test "LET reads a param, so `-p` reaches it indirectly" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
