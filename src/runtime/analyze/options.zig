@@ -227,6 +227,10 @@ pub fn httpConnMsg(arena: std.mem.Allocator, name: []const u8, why: []const u8) 
 /// An http connection whose options are all literals, judged by the run's own
 /// `connFromKvs`; one reading `env()` or `secret()` is left to the run.
 fn httpProblem(arena: std.mem.Allocator, c: ast.Connection) Error!?[]const u8 {
+    for (c.hints) |h| if (!containsKey(&analyze.rest_read_keys, h.key) and !std.mem.startsWith(u8, h.key, "query:"))
+        return try msgfmt.allocPrint(arena, "connection `{s}`: unknown REST option `{s}` in its PAGINATE / RETRY / WITH (see docs/language/sources.md)", .{ c.name, h.key });
+    if (try http_client.optionProblem(arena, c.hints, true, false)) |p|
+        return try msgfmt.allocPrint(arena, "connection `{s}`: {s}", .{ c.name, p.msg });
     var auth: []const u8 = "";
     for (c.config) |a| if (std.mem.eql(u8, a.key, "auth")) {
         auth = (try literalText(arena, a.value)) orelse return null;

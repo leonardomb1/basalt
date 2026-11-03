@@ -366,6 +366,7 @@ fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver
 fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
     if (std.mem.eql(u8, rd.connector, "http")) {
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
+        if (try http_client.optionProblem(env.arena, hints, false, true)) |p| return planErr(env.diag, p.msg);
         var hopts = http_client.optsFromHints(hints);
         hopts.logger = env.log;
         const s = http_client.HttpSource.open(env.arena, env.gpa, rd.form.path, hopts) catch |e|
@@ -451,6 +452,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
             return planErr(env.diag, try options.httpConnMsg(env.arena, rd.connector, errmsg));
         const all = try std.mem.concat(env.arena, ast.Hint, &.{ conn.hints, hints });
+        if (try http_client.optionProblem(env.arena, all, false, true)) |p| return planErr(env.diag, p.msg);
         var hopts = http_client.optsFromHints(all);
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));

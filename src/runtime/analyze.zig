@@ -44,6 +44,7 @@ const std = @import("std");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const formats = @import("../format/formats.zig");
+const http_client = @import("../net/http_client.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
@@ -1523,7 +1524,8 @@ const Ctx = struct {
             .union_ => "union",
             else => "",
         };
-        checkSourceForm(lead, connector, self.diag) catch |e| {
+        const conn_hints = if (lead.node == .read) if (self.connections.get(lead.node.read.connector)) |c| c.hints else &.{} else &.{};
+        checkSourceForm(self.arena, lead, connector, conn_hints, self.diag) catch |e| {
             self.diag.stamp(lead.pos);
             return e;
         };
@@ -1538,7 +1540,7 @@ const Ctx = struct {
                 const connector = if (conn) |c| c.connector else rd.connector;
                 if (conn != null and !isSqlSource(connector) and !std.mem.eql(u8, connector, "http"))
                     return fail(self.diag, "{s}", .{try options.unsupportedSourceMsg(self.arena, connector)});
-                try checkSourceForm(lead, connector, self.diag);
+                try checkSourceForm(self.arena, lead, connector, if (conn) |c| c.hints else &.{}, self.diag);
                 const detail = switch (rd.form) {
                     .table => |t| try msgfmt.allocPrint(self.arena, "table {s}", .{lastPart(t)}),
                     .query => "query",
@@ -1583,7 +1585,7 @@ const Ctx = struct {
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {
-                try checkSourceForm(lead, "", self.diag);
+                try checkSourceForm(self.arena, lead, "", &.{}, self.diag);
                 const b = self.bindings.get(name) orelse {
                     if (self.knownTable(name)) |k|
                         return .{ .connector = "session", .detail = try msgfmt.allocPrint(self.arena, "session table {s}", .{name}), .schema = k.schema };
@@ -1595,7 +1597,7 @@ const Ctx = struct {
                 return src;
             },
             .union_ => |un| {
-                try checkSourceForm(lead, "union", self.diag);
+                try checkSourceForm(self.arena, lead, "union", &.{}, self.diag);
                 const detail = if (un.discover_query.len > 0 or un.discover_pipeline != null)
                     try msgfmt.allocPrint(self.arena, "union (tables discovered from {s})", .{un.discover_conn})
                 else
@@ -1952,7 +1954,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
 
 const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
 
-const rest_read_keys = [_][]const u8{
+pub const rest_read_keys = [_][]const u8{
     "items",          "method",        "body",         "body_type",   "header",    "bearer",
     "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
     "page_param",     "start_page",    "start_offset", "size_param",  "page_size", "cursor_param",
@@ -1976,9 +1978,11 @@ const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes
 const other_read = ReadKind{ .what = "this source", .keys = &.{}, .takes = "no options" };
 
 /// A read's `WITH` key that its kind of source does not read is refused rather
-/// than ignored, so a misspelled `delimeter` fails instead of reading commas.
-/// `connector` is the resolved source type: a file is `csv` whatever its format.
-pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Error!void {
+/// than ignored, so a misspelled `delimeter` fails instead of reading commas, and so
+/// is a REST option's value the read cannot use (`http_client.optionProblem`), read
+/// after `conn_hints`, its connection's. `connector` is the resolved source type: a
+/// file is `csv` whatever its format.
+pub fn checkSourceForm(arena: std.mem.Allocator, lead: ast.Stage, connector: []const u8, conn_hints: []const ast.Hint, diag: *Diag) Error!void {
     if (lead.node == .read and (std.mem.eql(u8, connector, "csv") or std.mem.eql(u8, connector, "stdin")))
         if (formatFromHints(lead.hints, diag) catch null) |f| if (formats.readRefused(f)) |why| {
             if (lead.node.read.form == .path) return fail(diag, "cannot read `{s}`: {s}", .{ lead.node.read.form.path, why });
@@ -2014,6 +2018,14 @@ pub fn checkSourceForm(lead: ast.Stage, connector: []const u8, diag: *Diag) Erro
             fail(diag, "unknown read option `{s}`: {s} takes {s}", .{ h.key, kind.what, kind.takes });
         diag.pos = h.pos;
         return e;
+    }
+    if (std.mem.eql(u8, connector, "http")) {
+        const all = try std.mem.concat(arena, ast.Hint, &.{ conn_hints, lead.hints });
+        if (try http_client.optionProblem(arena, all, true, true)) |p| {
+            const e = fail(diag, "{s}", .{p.msg});
+            diag.pos = p.pos;
+            return e;
+        }
     }
 }
 

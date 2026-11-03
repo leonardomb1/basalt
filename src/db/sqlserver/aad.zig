@@ -132,7 +132,7 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
 
     const res = http_client.request(gpa, .{
         .url = sts_url,
-        .post = true,
+        .method = .post,
         .content_type = "application/soap+xml; charset=utf-8",
         .body = envelope,
     }, dl) catch |e| {
@@ -217,7 +217,7 @@ pub fn ropcToken(
 fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8, dl: Deadline) ![]const u8 {
     const res = http_client.request(gpa, .{
         .url = url,
-        .post = true,
+        .method = .post,
         .content_type = "application/x-www-form-urlencoded",
         .body = body,
     }, dl) catch |e| {

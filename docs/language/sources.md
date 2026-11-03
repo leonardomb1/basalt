@@ -206,7 +206,10 @@ source is asked to do are on [Pushdown](pushdown.md).
 A read's `WITH (...)` takes `key = value` pairs and bare flags. `PAGINATE BY` and
 `RETRY` (above) are shorthands that set some of the REST ones. A key the source
 does not read — misspelled, or one of another kind of source — is a plan-time
-error rather than ignored.
+error rather than ignored, and so is a REST option's value the read cannot use: a
+method, body type or paging mode that is none of the names below, text where a
+number goes, a flag that is neither `true` nor `false`, a body on a GET. Names are
+matched in any case; a value holding a loop's `${...}` is checked once filled in.
 
 **Files**
 
@@ -225,9 +228,9 @@ error rather than ignored.
 | option | default | meaning |
 |---|---|---|
 | `items` | the response | dotted path to the array of rows when the response (or a JSON file) nests it, as `'data.rows'` |
-| `method` | `get` | `post` sends `body` |
-| `body` | none | the request body; the page parameter is added to it when paginating a POST |
-| `body_type` | `form` | `json` sends the body as `application/json`, anything else as a form |
+| `method` | `get` | `get`, `post`, `put`, `patch` or `delete` |
+| `body` | none | the request body, sent by `post`, `put` or `patch` (on another method it is an error); the page parameter is added to it when paginating |
+| `body_type` | `form` | `form` sends the body as `application/x-www-form-urlencoded`, `json` as `application/json` |
 | `header` | none | one extra header, `'Name: value'`; a `User-Agent` given this way replaces basalt's |
 | `bearer`, `bearer_env` | none | a bearer token, or the environment variable holding one |
 | `auth`, `auth_env` | none | an `Authorization` value sent verbatim, or the variable holding it |
@@ -242,7 +245,7 @@ error rather than ignored.
 | `cursor_field` | `next` | dotted path to the next cursor or URL in each response (`field`) |
 | `total_field` | none | dotted path to a page count, for APIs that never return an empty page (`total`) |
 | `max_pages` | `10000` | a cap on pages fetched (`max`) |
-| `stop_short` | off | a flag: stop after a page shorter than `page_size` |
+| `stop_short` | off | a flag (bare, or `= true` / `= false`): stop after a page shorter than `page_size` |
 | `prefetch` | `1` | pages kept in flight at once, in `page` and `offset` modes |
 | `retries` | `2` | retries of a transient failure (`RETRY n`) |
 | `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,501'`, on top of 408, 429 and every 5xx but 501, 505 and 511 (`RETRY n ON (...)`) |

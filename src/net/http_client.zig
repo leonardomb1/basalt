@@ -19,8 +19,11 @@
 //!                      a value starting with http(s):// is the next URL, anything
 //!                      else is sent URL-encoded as `?<cursor_param>=<value>`; stops when the
 //!                      field is missing/null/empty or the page is empty.
-//! `max_pages` caps every mode so a misbehaving API can't loop forever. With
-//! `body` (POST) the page param goes into the body, as form-style APIs expect.
+//! `max_pages` caps every mode so a misbehaving API can't loop forever. With a
+//! `body` (POST, PUT or PATCH) the page param goes into the body, as form-style APIs
+//! expect. Every option's value is checked before the first request
+//! (`optionProblem`): a method, mode or body type none of its names is refused, not
+//! read as the default.
 //! `stop_short` ends on a page shorter than page_size; it is opt-in because a
 //! server that caps page size below the requested one makes the short page lie.
 //! An empty body or bare JSON `null` is an empty page.
@@ -430,9 +433,34 @@ pub const Deadline = struct {
 pub const Request = struct {
     url: []const u8,
     body: ?[]const u8 = null,
-    post: bool = false,
+    method: Method = .get,
     content_type: ?[]const u8 = null,
 };
+
+/// A REST read's method, written in any case. Only post, put and patch send a body.
+pub const Method = enum {
+    get,
+    post,
+    put,
+    patch,
+    delete,
+
+    pub fn hasBody(m: Method) bool {
+        return m == .post or m == .put or m == .patch;
+    }
+
+    fn wire(m: Method) std.http.Method {
+        return switch (m) {
+            .get => .GET,
+            .post => .POST,
+            .put => .PUT,
+            .patch => .PATCH,
+            .delete => .DELETE,
+        };
+    }
+};
+
+pub const BodyType = enum { form, json };
 
 pub const Reply = struct { code: u16, body: []u8 };
 
@@ -477,9 +505,9 @@ pub const Options = struct {
     pass_env: ?[]const u8 = null,
     header: ?[]const u8 = null,
     items: ?[]const u8 = null,
-    method: enum { get, post } = .get,
+    method: Method = .get,
     body: ?[]const u8 = null,
-    body_type: []const u8 = "form",
+    body_type: BodyType = .form,
     paginate: Mode = .none,
     page_param: []const u8 = "page",
     start_page: i64 = 1,
@@ -500,6 +528,8 @@ pub const Options = struct {
     stop_short: bool = false,
 };
 
+/// The read's options from its hints, later hints winning; values `optionProblem`
+/// refuses are never seen here, so an unreadable one keeps its default.
 pub fn optsFromHints(hints: []const ast.Hint) Options {
     var o = Options{};
     for (hints) |h| {
@@ -508,7 +538,7 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
             .ident => |s| s,
             else => null,
         };
-        const iv: ?i64 = if (h.value == .int) h.value.int else null;
+        const iv = intOf(h.value);
         if (std.mem.eql(u8, h.key, "bearer")) {
             o.bearer = sv;
         } else if (std.mem.eql(u8, h.key, "bearer_env")) {
@@ -526,17 +556,21 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
         } else if (std.mem.eql(u8, h.key, "items")) {
             o.items = sv;
         } else if (std.mem.eql(u8, h.key, "method")) {
-            if (sv) |v| {
-                if (std.mem.eql(u8, v, "post")) o.method = .post;
-            }
+            if (sv) |v| if (enumNoCase(Method, v)) |m| {
+                o.method = m;
+            };
         } else if (std.mem.eql(u8, h.key, "body")) {
             o.body = sv;
         } else if (std.mem.eql(u8, h.key, "body_type")) {
-            if (sv) |v| o.body_type = v;
+            if (sv) |v| if (enumNoCase(BodyType, v)) |t| {
+                o.body_type = t;
+            };
         } else if (std.mem.eql(u8, h.key, "paginate")) {
-            if (sv) |s| o.paginate = std.meta.stringToEnum(Mode, s) orelse .none;
+            if (sv) |v| if (enumNoCase(Mode, v)) |m| {
+                o.paginate = m;
+            };
         } else if (std.mem.eql(u8, h.key, "page_param")) {
-            if (sv) |s| o.page_param = s;
+            if (sv) |v| o.page_param = v;
         } else if (std.mem.eql(u8, h.key, "start_page")) {
             if (iv) |n| o.start_page = n;
         } else if (std.mem.eql(u8, h.key, "start_offset")) {
@@ -546,15 +580,15 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
         } else if (std.mem.eql(u8, h.key, "page_size")) {
             if (iv) |n| o.page_size = n;
         } else if (std.mem.eql(u8, h.key, "cursor_param")) {
-            if (sv) |s| o.cursor_param = s;
+            if (sv) |v| o.cursor_param = v;
         } else if (std.mem.eql(u8, h.key, "cursor_field")) {
-            if (sv) |s| o.cursor_field = s;
+            if (sv) |v| o.cursor_field = v;
         } else if (std.mem.eql(u8, h.key, "max_pages")) {
             if (iv) |n| o.max_pages = n;
         } else if (std.mem.eql(u8, h.key, "prefetch")) {
             if (iv) |n| o.prefetch = n;
         } else if (std.mem.eql(u8, h.key, "stop_short")) {
-            o.stop_short = (h.value == .flag);
+            if (flagOf(h.value)) |b| o.stop_short = b;
         } else if (std.mem.eql(u8, h.key, "total_field")) {
             o.total_field = sv;
         } else if (std.mem.eql(u8, h.key, "retries")) {
@@ -570,6 +604,127 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
         }
     }
     return o;
+}
+
+/// `v` as one of `E`'s names, whatever its case.
+fn enumNoCase(comptime E: type, v: []const u8) ?E {
+    var buf: [16]u8 = undefined;
+    if (v.len > buf.len) return null;
+    return std.meta.stringToEnum(E, std.ascii.lowerString(&buf, v));
+}
+
+/// A number written bare or quoted, as a loop's `'${n}'` renders.
+fn intOf(v: ast.HintVal) ?i64 {
+    return switch (v) {
+        .int => |n| n,
+        .str => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " "), 10) catch null,
+        else => null,
+    };
+}
+
+/// A flag written bare, or as `= true` / `= false`, quoted or not.
+fn flagOf(v: ast.HintVal) ?bool {
+    return switch (v) {
+        .flag => true,
+        .str, .ident => |s| if (std.ascii.eqlIgnoreCase(s, "true")) true else if (std.ascii.eqlIgnoreCase(s, "false")) false else null,
+        else => null,
+    };
+}
+
+/// What a REST option's value must be; `int` holds the least number it takes.
+const Takes = union(enum) { text, header, statuses, flag, int: i64, method, body_type, paginate };
+
+fn takesOf(key: []const u8) ?Takes {
+    const T = struct { []const u8, Takes };
+    const table = [_]T{
+        .{ "items", .text },               .{ "body", .text },                  .{ "bearer", .text },
+        .{ "bearer_env", .text },          .{ "auth", .text },                  .{ "auth_env", .text },
+        .{ "user_env", .text },            .{ "pass_env", .text },              .{ "page_param", .text },
+        .{ "size_param", .text },          .{ "cursor_param", .text },          .{ "cursor_field", .text },
+        .{ "total_field", .text },         .{ "header", .header },              .{ "retry_statuses", .statuses },
+        .{ "stop_short", .flag },          .{ "method", .method },              .{ "body_type", .body_type },
+        .{ "paginate", .paginate },        .{ "start_page", .{ .int = 0 } },    .{ "start_offset", .{ .int = 0 } },
+        .{ "page_size", .{ .int = 1 } },   .{ "max_pages", .{ .int = 1 } },     .{ "prefetch", .{ .int = 1 } },
+        .{ "retries", .{ .int = 0 } },     .{ "retry_base_ms", .{ .int = 0 } }, .{ "timeout_ms", .{ .int = 1 } },
+        .{ "progress_ms", .{ .int = 0 } },
+    };
+    for (table) |t| if (std.mem.eql(u8, t[0], key)) return t[1];
+    return null;
+}
+
+pub const OptionProblem = struct { msg: []const u8, pos: ast.Pos };
+
+/// The first REST option in `hints` whose value the read could not use as written,
+/// so a typo fails before any request rather than falling back to a default: a
+/// method, body type or paging mode none of its names, a number where text goes or
+/// text where a number does, a flag that is neither true nor false, a header with
+/// no `Name:`, and, when `hints` are a whole read's (`whole`), a body on a method
+/// that sends none. They are in the order the read applies them, a connection's
+/// before its read's. With `holes` a value still holding a loop's `${...}` is left
+/// alone, for the run to check once filled in.
+pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: bool, whole: bool) !?OptionProblem {
+    var method: Method = .get;
+    var method_at: ?ast.Pos = null;
+    var body_at: ?ast.Pos = null;
+    for (hints) |h| {
+        const takes = takesOf(h.key) orelse continue;
+        const text: ?[]const u8 = switch (h.value) {
+            .str, .ident => |v| v,
+            else => null,
+        };
+        if (holes) if (text) |t| if (std.mem.indexOf(u8, t, "${") != null) {
+            if (std.mem.eql(u8, h.key, "body")) body_at = h.pos;
+            continue;
+        };
+        const why: ?[]const u8 = switch (takes) {
+            .text => if (text == null) "takes a quoted string" else null,
+            .header => if (text) |t| headerWhy(t) else "takes one header, as 'Name: value'",
+            .statuses => if (text) |t| statusesWhy(t) else "takes quoted status codes, as '404,501'",
+            .flag => if (flagOf(h.value) == null) "is a flag: write it bare, or `= true` / `= false`" else null,
+            .int => |least| if (intOf(h.value)) |n| (if (n < least) (if (least == 0) "cannot be negative" else "must be at least 1") else null) else "takes a whole number",
+            .method => if (text) |t| (if (enumNoCase(Method, t)) |m| blk: {
+                method = m;
+                method_at = h.pos;
+                break :blk null;
+            } else "is one of get, post, put, patch or delete") else "is one of get, post, put, patch or delete",
+            .body_type => if (text != null and enumNoCase(BodyType, text.?) != null) null else "is `form` or `json`",
+            .paginate => if (text != null and enumNoCase(Mode, text.?) != null) null else "is one of none, page, offset or cursor",
+        };
+        if (why) |w| return .{ .pos = h.pos, .msg = try msgfmt.allocPrint(arena, "REST option `{s}` {s}{s}", .{ h.key, w, try givenText(arena, h.value) }) };
+        if (std.mem.eql(u8, h.key, "body")) body_at = h.pos;
+    }
+    if (whole) if (body_at) |at| if (!method.hasBody()) return .{
+        .pos = method_at orelse at,
+        .msg = try msgfmt.allocPrint(arena, "a REST read with a `body` sends it with `method = 'post'`, `'put'` or `'patch'`, not {s}", .{if (method_at == null) "the default GET" else @tagName(method)}),
+    };
+    return null;
+}
+
+fn givenText(arena: std.mem.Allocator, v: ast.HintVal) ![]const u8 {
+    return switch (v) {
+        .flag => " (given bare)",
+        .int => |n| msgfmt.allocPrint(arena, " (given {d})", .{n}),
+        .str => |s| msgfmt.allocPrint(arena, " (given '{s}')", .{if (s.len > 60) s[0..60] else s}),
+        .ident => |s| msgfmt.allocPrint(arena, " (given `{s}`)", .{s}),
+    };
+}
+
+fn headerWhy(h: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, h, ':') orelse return "takes one header, as 'Name: value'";
+    const name = std.mem.trim(u8, h[0..colon], " ");
+    if (name.len == 0) return "takes one header, as 'Name: value'";
+    for (name) |c| if (c <= ' ' or c >= 0x7f) return "has a header name with a space or control character";
+    if (!lineSafe(h)) return "holds a line break or NUL, which would inject into the request";
+    return null;
+}
+
+fn statusesWhy(list: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |part| {
+        const n = std.fmt.parseInt(u16, std.mem.trim(u8, part, " "), 10) catch return "takes status codes separated by commas, as '404,501'";
+        if (n < 100 or n > 599) return "takes status codes from 100 to 599";
+    }
+    return null;
 }
 
 pub const HttpSource = struct {
@@ -605,7 +760,7 @@ pub const HttpSource = struct {
         gpa: std.mem.Allocator,
         snap: std.heap.ArenaAllocator,
         client: *std.http.Client,
-        method_post: bool,
+        method: Method,
         content_type: ?[]const u8,
         user_agent: []const u8,
         url: []const u8,
@@ -640,7 +795,7 @@ pub const HttpSource = struct {
             .gpa = gpa,
             .snap = std.heap.ArenaAllocator.init(gpa),
             .client = client,
-            .method_post = req.post,
+            .method = req.method,
             .content_type = null,
             .user_agent = undefined,
             .url = undefined,
@@ -802,7 +957,7 @@ pub const HttpSource = struct {
             .page, .offset => {
                 var buf: [32]u8 = undefined;
                 const n = try std.fmt.bufPrint(&buf, "{d}", .{self.page_no});
-                if (self.opts.method == .post) {
+                if (self.opts.method.hasBody()) {
                     var body = try appendParam(arena, self.opts.body orelse "", self.opts.page_param, n);
                     if (self.opts.size_param) |sp| {
                         const sz = try std.fmt.bufPrint(&buf, "{d}", .{self.opts.page_size});
@@ -823,7 +978,7 @@ pub const HttpSource = struct {
 
     fn contentType(self: *HttpSource) ?[]const u8 {
         if (self.opts.body == null) return null;
-        return if (std.mem.eql(u8, self.opts.body_type, "json")) "application/json" else "application/x-www-form-urlencoded";
+        return if (self.opts.body_type == .json) "application/json" else "application/x-www-form-urlencoded";
     }
 
     fn fetchPage(self: *HttpSource, arena: std.mem.Allocator, req: PageReq) ![]const u8 {
@@ -911,7 +1066,7 @@ pub const HttpSource = struct {
     /// and the same retries, so a black-holed token endpoint is ConnectionTimedOut.
     fn login(self: *HttpSource, a: *AuthState) anyerror!void {
         const req = try a.loginRequest();
-        const slot = try self.spawnSlotFor(.{ .url = req.url, .body = req.payload }, true, req.content_type, false);
+        const slot = try self.spawnSlotFor(.{ .url = req.url, .body = req.payload }, .post, req.content_type, false);
         var red_buf: [512]u8 = undefined;
         self.awaitSlot(slot) catch |e| {
             obs.logOr(self.logger, .warn, "login abandoned ({s}): {s}", .{ @errorName(e), redactUrl(&red_buf, req.url) });
@@ -941,13 +1096,13 @@ pub const HttpSource = struct {
     }
 
     fn spawnFetch(self: *HttpSource, req: PageReq) !*Slot {
-        return self.spawnSlotFor(req, self.opts.method == .post, self.contentType(), true);
+        return self.spawnSlotFor(req, self.opts.method, self.contentType(), true);
     }
 
     /// A page carries the source's headers and auth; a login carries neither.
-    fn spawnSlotFor(self: *HttpSource, req: PageReq, post: bool, content_type: ?[]const u8, page: bool) !*Slot {
+    fn spawnSlotFor(self: *HttpSource, req: PageReq, method: Method, content_type: ?[]const u8, page: bool) !*Slot {
         const dl: Deadline = .{ .timeout_ms = self.opts.timeout_ms, .retries = self.opts.retries, .retry_base_ms = self.opts.retry_base_ms };
-        const slot = try makeSlot(self.gpa, self.client, .{ .url = req.url, .body = req.body, .post = post, .content_type = content_type }, dl, userAgentOf(self.opts), self.auth_gen);
+        const slot = try makeSlot(self.gpa, self.client, .{ .url = req.url, .body = req.body, .method = method, .content_type = content_type }, dl, userAgentOf(self.opts), self.auth_gen);
         errdefer freeSlot(slot);
         if (page) try self.snapshotInto(slot);
         try startSlot(slot);
@@ -976,7 +1131,7 @@ pub const HttpSource = struct {
         if (slot.state.load(.acquire) == @intFromEnum(SlotState.abandoned)) return error.Aborted;
         slot.code = 0;
         const res = try objstore.exchange(slot.snap.allocator(), slot.client, .{
-            .method = if (slot.method_post) .POST else .GET,
+            .method = slot.method.wire(),
             .url = slot.url,
             .headers = slot.hdrs[0..slot.nh],
             .payload = slot.req_body,
@@ -1273,6 +1428,66 @@ test "optsFromHints maps hint keys" {
     try std.testing.expectEqual(Mode.cursor, o.paginate);
     try std.testing.expectEqualStrings("meta.next", o.cursor_field);
     try std.testing.expectEqual(@as(i64, 5), o.max_pages);
+}
+
+test "optsFromHints reads a method, paging mode and body type in any case, a flag as true or false, and a quoted number" {
+    const at: ast.Pos = .{ .line = 1, .col = 1 };
+    const hints = [_]ast.Hint{
+        .{ .key = "method", .value = .{ .str = "PUT" }, .pos = at },
+        .{ .key = "paginate", .value = .{ .ident = "Page" }, .pos = at },
+        .{ .key = "body_type", .value = .{ .str = "JSON" }, .pos = at },
+        .{ .key = "stop_short", .value = .flag, .pos = at },
+        .{ .key = "stop_short", .value = .{ .ident = "false" }, .pos = at },
+        .{ .key = "page_size", .value = .{ .str = "50" }, .pos = at },
+    };
+    const o = optsFromHints(&hints);
+    try std.testing.expectEqual(Method.put, o.method);
+    try std.testing.expectEqual(Mode.page, o.paginate);
+    try std.testing.expectEqual(BodyType.json, o.body_type);
+    try std.testing.expect(!o.stop_short);
+    try std.testing.expectEqual(@as(i64, 50), o.page_size);
+}
+
+test "optionProblem: values a read can use pass, a loop's holes wait for the run, and a body needs a method that sends one" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const at: ast.Pos = .{ .line = 2, .col = 3 };
+    const H = ast.Hint;
+    const fine = [_]H{
+        .{ .key = "method", .value = .{ .str = "Patch" }, .pos = at },
+        .{ .key = "body", .value = .{ .str = "{}" }, .pos = at },
+        .{ .key = "body_type", .value = .{ .ident = "json" }, .pos = at },
+        .{ .key = "paginate", .value = .{ .ident = "OFFSET" }, .pos = at },
+        .{ .key = "stop_short", .value = .{ .str = "true" }, .pos = at },
+        .{ .key = "page_size", .value = .{ .str = "${n}" }, .pos = at },
+        .{ .key = "header", .value = .{ .str = "X-Api-Key: ${k}" }, .pos = at },
+        .{ .key = "retry_statuses", .value = .{ .str = "404, 501" }, .pos = at },
+        .{ .key = "start_page", .value = .{ .int = 0 }, .pos = at },
+        .{ .key = "query:limit", .value = .{ .str = "x" }, .pos = at },
+    };
+    try std.testing.expect((try optionProblem(a, &fine, true, true)) == null);
+    const unfilled = (try optionProblem(a, &fine, false, true)).?;
+    try std.testing.expect(std.mem.indexOf(u8, unfilled.msg, "`page_size` takes a whole number") != null);
+
+    const conn_then_read = [_]H{
+        .{ .key = "method", .value = .{ .ident = "post" }, .pos = at },
+        .{ .key = "body", .value = .{ .str = "a=1" }, .pos = .{ .line = 5, .col = 1 } },
+    };
+    try std.testing.expect((try optionProblem(a, &conn_then_read, false, true)) == null);
+    const body_alone = [_]H{.{ .key = "body", .value = .{ .str = "a=${x}" }, .pos = at }};
+    try std.testing.expect((try optionProblem(a, &body_alone, true, false)) == null);
+    const got = (try optionProblem(a, &body_alone, true, true)).?;
+    try std.testing.expect(std.mem.indexOf(u8, got.msg, "not the default GET") != null);
+    try std.testing.expectEqual(at, got.pos);
+
+    const later_wins = [_]H{
+        .{ .key = "method", .value = .{ .ident = "post" }, .pos = at },
+        .{ .key = "body", .value = .{ .str = "a=1" }, .pos = at },
+        .{ .key = "method", .value = .{ .ident = "get" }, .pos = .{ .line = 9, .col = 9 } },
+    };
+    const late = (try optionProblem(a, &later_wins, false, true)).?;
+    try std.testing.expectEqual(@as(u32, 9), late.pos.line);
 }
 
 const TestServer = struct {
@@ -1713,6 +1928,31 @@ test "http source: POST form body carries pagination, content-type set" {
     const r2 = srv.captured[1][0..srv.captured_len[1]];
     try std.testing.expect(std.mem.indexOf(u8, r2, "&page=2") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1, "/rest?") == null);
+}
+
+test "http source: a PUT, PATCH or DELETE goes out under its own method, a body only on the first two" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_]Method{ .put, .patch, .delete }) |m| {
+        const srv = try TestServer.start(&.{
+            "[{\"id\":1}]",
+        });
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{
+            .method = m,
+            .body = if (m.hasBody()) "a=1" else null,
+        });
+        defer s.close();
+        try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+        const r = srv.captured[0][0..srv.captured_len[0]];
+        const line = try msgfmt.allocPrint(a, "{s} /rest", .{@tagName(m.wire())});
+        try std.testing.expect(std.mem.startsWith(u8, r, line));
+        try std.testing.expectEqual(m.hasBody(), std.mem.indexOf(u8, r, "a=1") != null);
+    }
 }
 
 test "http source: total_field bounds the page count exactly" {
