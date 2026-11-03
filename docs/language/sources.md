@@ -229,19 +229,20 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 |---|---|---|
 | `items` | the response | dotted path to the array of rows when the response (or a JSON file) nests it, as `'data.rows'` |
 | `method` | `get` | `get`, `post`, `put`, `patch` or `delete` |
-| `body` | none | the request body, sent by `post`, `put` or `patch` (on another method it is an error); the page parameter is added to it when paginating |
+| `body` | none | the request body, sent by `post`, `put` or `patch` (on another method it is an error); when paginating, the page values go into it (see `paging_in`) |
 | `body_type` | `form` | `form` sends the body as `application/x-www-form-urlencoded`, `json` as `application/json` |
 | `header` | none | one extra header, `'Name: value'`; a `User-Agent` given this way replaces basalt's |
 | `bearer`, `bearer_env` | none | a bearer token, or the environment variable holding one |
 | `auth`, `auth_env` | none | an `Authorization` value sent verbatim, or the variable holding it |
 | `user_env`, `pass_env` | none | variables holding a basic-auth user and password |
 | `paginate` | none | `page`, `offset` or `cursor` (`PAGINATE BY`) |
-| `page_param` | `page` | the query parameter that carries the page number or offset (`param` in `PAGINATE`) |
+| `paging_in` | the body when the method sends one, else the query string | where the page number, offset, size and a cursor go: `query` (the URL's query string) or `body`. In a JSON body each is that key of the object, a dotted `page_param` such as `'paging.page'` a nested one; a key already in the body keeps its kind, so `"page": "1"` goes on as `"page": "2"`, and a missing one is added as a number. In a form body each is appended as `&name=value`, the value URL-encoded |
+| `page_param` | `page` | the parameter, or JSON key, that carries the page number or offset (`param` in `PAGINATE`) |
 | `start_page` | `1` | the first page number (`start`) |
 | `start_offset` | `0` | the first offset, in `offset` mode |
-| `size_param` | none | the query parameter that carries the page size, as OData's `$top` |
+| `size_param` | none | the parameter, or JSON key, that carries the page size, as OData's `$top` |
 | `page_size` | `100` | rows per page, sent in `size_param` and the step of `offset` mode (`size`) |
-| `cursor_param` | `cursor` | the query parameter that carries a cursor (`param` in cursor mode) |
+| `cursor_param` | `cursor` | the parameter, or JSON key, that carries a cursor that is not a URL (`param` in cursor mode) |
 | `cursor_field` | `next` | dotted path to the next cursor or URL in each response (`field`) |
 | `total_field` | none | dotted path to a page count, for APIs that never return an empty page (`total`) |
 | `max_pages` | `10000` | a cap on pages fetched (`max`) |

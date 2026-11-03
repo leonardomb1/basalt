@@ -324,6 +324,60 @@ pub fn path(arena: std.mem.Allocator, t: []const u8, p_in: []const u8) Error!?[]
     return t[cur..valueEnd(t, cur)];
 }
 
+/// What `setPath` writes: a number, or text, which always goes as a JSON string.
+pub const SetValue = union(enum) { int: i64, text: []const u8 };
+
+/// `t`, a JSON object, with the member `p` names (dotted keys, `paging.page`) set to
+/// `v`. A value already there is replaced keeping its kind, a string staying a string,
+/// so a `"page":"1"` an API reads as text goes on as `"page":"2"`; a missing one is
+/// added, a number as a number, inside objects made for the keys missing on the way.
+/// Null when `t` is not an object or a key on the way holds something else.
+pub fn setPath(arena: std.mem.Allocator, t: []const u8, p: []const u8, v: SetValue) Error!?[]const u8 {
+    try validate(arena, t);
+    var cur = skipWs(t, 0);
+    if (cur >= t.len or t[cur] != '{') return null;
+    var keys = std.array_list.Managed([]const u8).init(arena);
+    var it = std.mem.tokenizeScalar(u8, p, '.');
+    while (it.next()) |k| try keys.append(k);
+    if (keys.items.len == 0) return null;
+    for (keys.items, 0..) |k, i| {
+        const at = (try member(arena, t, cur, k)) orelse {
+            var add = std.Io.Writer.Allocating.init(arena);
+            const w = &add.writer;
+            const end = valueEnd(t, cur) - 1;
+            if (skipWs(t, cur + 1) != end) w.writeByte(',') catch return error.OutOfMemory;
+            for (keys.items[i..], i..) |rest, d| {
+                writeJsonString(w, rest) catch return error.OutOfMemory;
+                w.writeByte(':') catch return error.OutOfMemory;
+                if (d + 1 < keys.items.len) w.writeByte('{') catch return error.OutOfMemory;
+            }
+            writeSet(w, v, false) catch return error.OutOfMemory;
+            for (keys.items[i + 1 ..]) |_| w.writeByte('}') catch return error.OutOfMemory;
+            return try std.mem.concat(arena, u8, &.{ t[0..end], add.written(), t[end..] });
+        };
+        if (i + 1 < keys.items.len) {
+            if (t[at] != '{') return null;
+            cur = at;
+            continue;
+        }
+        var put = std.Io.Writer.Allocating.init(arena);
+        writeSet(&put.writer, v, t[at] == '"') catch return error.OutOfMemory;
+        return try std.mem.concat(arena, u8, &.{ t[0..at], put.written(), t[valueEnd(t, at)..] });
+    }
+    unreachable;
+}
+
+fn writeSet(w: *std.Io.Writer, v: SetValue, as_text: bool) std.Io.Writer.Error!void {
+    switch (v) {
+        .int => |n| if (as_text) try w.print("\"{d}\"", .{n}) else try w.print("{d}", .{n}),
+        .text => |s| try writeJsonString(w, s),
+    }
+}
+
+fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try std.json.Stringify.encodeJsonString(s, .{}, w);
+}
+
 pub fn rootKind(t: []const u8) enum { array, null, other } {
     return switch (t[skipWs(t, 0)]) {
         '[' => .array,
@@ -525,6 +579,31 @@ pub fn compactInto(arena: std.mem.Allocator, raw: []const u8, w: *std.Io.Writer)
 const testing = std.testing;
 const eval = @import("eval.zig");
 const Value = @import("value.zig").Value;
+
+test "json: setPath replaces a member keeping its kind, adds a missing one as a number through new objects, and refuses a non-object" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { doc: []const u8, path: []const u8, v: SetValue, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .doc = "{\"q\":\"x\",\"page\":\"1\"}", .path = "page", .v = .{ .int = 2 }, .want = "{\"q\":\"x\",\"page\":\"2\"}" },
+        .{ .doc = "{\"page\": 1, \"q\": 3}", .path = "page", .v = .{ .int = 7 }, .want = "{\"page\": 7, \"q\": 3}" },
+        .{ .doc = "{}", .path = "page", .v = .{ .int = 1 }, .want = "{\"page\":1}" },
+        .{ .doc = " { \"q\" : 1 } ", .path = "$skip", .v = .{ .int = 50 }, .want = " { \"q\" : 1 ,\"$skip\":50} " },
+        .{ .doc = "{\"q\":1}", .path = "paging.page", .v = .{ .int = 3 }, .want = "{\"q\":1,\"paging\":{\"page\":3}}" },
+        .{ .doc = "{\"paging\":{\"page\":1}}", .path = "paging.size", .v = .{ .int = 20 }, .want = "{\"paging\":{\"page\":1,\"size\":20}}" },
+        .{ .doc = "{\"paging\":{\"page\":\"1\",\"n\":[1]}}", .path = "paging.page", .v = .{ .int = 4 }, .want = "{\"paging\":{\"page\":\"4\",\"n\":[1]}}" },
+        .{ .doc = "{\"cursor\":null}", .path = "cursor", .v = .{ .text = "a\"b" }, .want = "{\"cursor\":\"a\\\"b\"}" },
+        .{ .doc = "{\"paging\":5}", .path = "paging.page", .v = .{ .int = 1 }, .want = null },
+        .{ .doc = "[1,2]", .path = "page", .v = .{ .int = 1 }, .want = null },
+    };
+    for (cases) |c| {
+        const got = try setPath(a, c.doc, c.path, c.v);
+        if (c.want) |w| try std.testing.expectEqualStrings(w, got.?) else try std.testing.expect(got == null);
+        if (got) |g| try validate(a, g);
+    }
+    try std.testing.expectError(error.InvalidJson, setPath(a, "{\"a\":", "page", .{ .int = 1 }));
+}
 
 test "json: accepts and refuses what std.json does" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);

@@ -19,9 +19,11 @@
 //!                      a value starting with http(s):// is the next URL, anything
 //!                      else is sent URL-encoded as `?<cursor_param>=<value>`; stops when the
 //!                      field is missing/null/empty or the page is empty.
-//! `max_pages` caps every mode so a misbehaving API can't loop forever. With a
-//! `body` (POST, PUT or PATCH) the page param goes into the body, as form-style APIs
-//! expect. Every option's value is checked before the first request
+//! `max_pages` caps every mode so a misbehaving API can't loop forever. On a
+//! method that sends a body (POST, PUT, PATCH) the page, size and cursor values go
+//! into it, unless `paging_in = 'query'` keeps them in the URL: a JSON body has each
+//! set as its key (`bodyWith`, a dotted key nested, a string kept a string), a form
+//! has `&k=v` appended, URL-encoded. Every option's value is checked before the first request
 //! (`optionProblem`): a method, mode or body type none of its names is refused, not
 //! read as the default.
 //! `stop_short` ends on a page shorter than page_size; it is opt-in because a
@@ -462,6 +464,9 @@ pub const Method = enum {
 
 pub const BodyType = enum { form, json };
 
+/// Where page numbers, offsets and cursors go: the URL's query string, or the body.
+pub const PagingIn = enum { query, body };
+
 pub const Reply = struct { code: u16, body: []u8 };
 
 /// A request outside any read, such as an identity provider's realm or token call,
@@ -508,6 +513,8 @@ pub const Options = struct {
     method: Method = .get,
     body: ?[]const u8 = null,
     body_type: BodyType = .form,
+    /// Null: in the body when the method sends one, else in the query string.
+    paging_in: ?PagingIn = null,
     paginate: Mode = .none,
     page_param: []const u8 = "page",
     start_page: i64 = 1,
@@ -568,6 +575,10 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
         } else if (std.mem.eql(u8, h.key, "paginate")) {
             if (sv) |v| if (enumNoCase(Mode, v)) |m| {
                 o.paginate = m;
+            };
+        } else if (std.mem.eql(u8, h.key, "paging_in")) {
+            if (sv) |v| if (enumNoCase(PagingIn, v)) |w| {
+                o.paging_in = w;
             };
         } else if (std.mem.eql(u8, h.key, "page_param")) {
             if (sv) |v| o.page_param = v;
@@ -632,7 +643,7 @@ fn flagOf(v: ast.HintVal) ?bool {
 }
 
 /// What a REST option's value must be; `int` holds the least number it takes.
-const Takes = union(enum) { text, header, statuses, flag, int: i64, method, body_type, paginate };
+const Takes = union(enum) { text, header, statuses, flag, int: i64, method, body_type, paginate, paging_in };
 
 fn takesOf(key: []const u8) ?Takes {
     const T = struct { []const u8, Takes };
@@ -646,7 +657,7 @@ fn takesOf(key: []const u8) ?Takes {
         .{ "paginate", .paginate },        .{ "start_page", .{ .int = 0 } },    .{ "start_offset", .{ .int = 0 } },
         .{ "page_size", .{ .int = 1 } },   .{ "max_pages", .{ .int = 1 } },     .{ "prefetch", .{ .int = 1 } },
         .{ "retries", .{ .int = 0 } },     .{ "retry_base_ms", .{ .int = 0 } }, .{ "timeout_ms", .{ .int = 1 } },
-        .{ "progress_ms", .{ .int = 0 } },
+        .{ "progress_ms", .{ .int = 0 } }, .{ "paging_in", .paging_in },
     };
     for (table) |t| if (std.mem.eql(u8, t[0], key)) return t[1];
     return null;
@@ -662,10 +673,15 @@ pub const OptionProblem = struct { msg: []const u8, pos: ast.Pos };
 /// that sends none. They are in the order the read applies them, a connection's
 /// before its read's. With `holes` a value still holding a loop's `${...}` is left
 /// alone, for the run to check once filled in.
-pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: bool, whole: bool) !?OptionProblem {
+pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: bool, whole: bool) error{OutOfMemory}!?OptionProblem {
     var method: Method = .get;
     var method_at: ?ast.Pos = null;
     var body_at: ?ast.Pos = null;
+    var body: ?[]const u8 = null;
+    var body_type: BodyType = .form;
+    var paginate: Mode = .none;
+    var paging_in: ?PagingIn = null;
+    var paging_at: ?ast.Pos = null;
     for (hints) |h| {
         const takes = takesOf(h.key) orelse continue;
         const text: ?[]const u8 = switch (h.value) {
@@ -673,7 +689,10 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
             else => null,
         };
         if (holes) if (text) |t| if (std.mem.indexOf(u8, t, "${") != null) {
-            if (std.mem.eql(u8, h.key, "body")) body_at = h.pos;
+            if (std.mem.eql(u8, h.key, "body")) {
+                body_at = h.pos;
+                body = null;
+            }
             continue;
         };
         const why: ?[]const u8 = switch (takes) {
@@ -687,15 +706,45 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
                 method_at = h.pos;
                 break :blk null;
             } else "is one of get, post, put, patch or delete") else "is one of get, post, put, patch or delete",
-            .body_type => if (text != null and enumNoCase(BodyType, text.?) != null) null else "is `form` or `json`",
-            .paginate => if (text != null and enumNoCase(Mode, text.?) != null) null else "is one of none, page, offset or cursor",
+            .paginate => if (text != null and enumNoCase(Mode, text.?) != null) blk: {
+                paginate = enumNoCase(Mode, text.?).?;
+                break :blk null;
+            } else "is one of none, page, offset or cursor",
+            .paging_in => if (text != null and enumNoCase(PagingIn, text.?) != null) blk: {
+                paging_in = enumNoCase(PagingIn, text.?).?;
+                paging_at = h.pos;
+                break :blk null;
+            } else "is `query` or `body`",
+            .body_type => if (text != null and enumNoCase(BodyType, text.?) != null) blk: {
+                body_type = enumNoCase(BodyType, text.?).?;
+                break :blk null;
+            } else "is `form` or `json`",
         };
         if (why) |w| return .{ .pos = h.pos, .msg = try msgfmt.allocPrint(arena, "REST option `{s}` {s}{s}", .{ h.key, w, try givenText(arena, h.value) }) };
-        if (std.mem.eql(u8, h.key, "body")) body_at = h.pos;
+        if (std.mem.eql(u8, h.key, "body")) {
+            body_at = h.pos;
+            body = text;
+        }
     }
     if (whole) if (body_at) |at| if (!method.hasBody()) return .{
         .pos = method_at orelse at,
         .msg = try msgfmt.allocPrint(arena, "a REST read with a `body` sends it with `method = 'post'`, `'put'` or `'patch'`, not {s}", .{if (method_at == null) "the default GET" else @tagName(method)}),
+    };
+    if (whole) if (paging_in) |w| if (w == .body and !method.hasBody()) return .{
+        .pos = paging_at.?,
+        .msg = try msgfmt.allocPrint(arena, "`paging_in = 'body'` needs a method that sends a body, `post`, `put` or `patch`, not {s}", .{if (method_at == null) "the default GET" else @tagName(method)}),
+    };
+    const in_body = if (paging_in) |w| w == .body else method.hasBody();
+    if (whole and paginate != .none and in_body and body_type == .json) if (body) |b| {
+        const t = std.mem.trim(u8, b, " \t\r\n");
+        const object = t.len > 0 and t[0] == '{' and valid: {
+            jt.validate(arena, t) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidJson => break :valid false,
+            };
+            break :valid true;
+        };
+        if (!object) return .{ .pos = body_at.?, .msg = "a JSON `body` that pages takes its page values as keys, so it must be one JSON object, as '{\"query\": \"x\"}'" };
     };
     return null;
 }
@@ -739,6 +788,8 @@ pub const HttpSource = struct {
     first: ?Batch,
     page_no: i64,
     next_url: ?[]const u8 = null,
+    /// A cursor that is no URL, sent in the body (`pagingInBody`) on the next page.
+    cursor_tok: ?[]const u8 = null,
     pages_fetched: i64 = 0,
     done: bool = false,
     repaired: bool = false,
@@ -913,6 +964,7 @@ pub const HttpSource = struct {
             },
             .cursor => {
                 self.next_url = null;
+                self.cursor_tok = null;
                 if (n_items == 0 or self.pages_fetched >= self.opts.max_pages) {
                     self.done = true;
                     return;
@@ -934,6 +986,8 @@ pub const HttpSource = struct {
                     if (!lineSafe(tok)) return eval.explain(error.BadHeaderValue, "the response's next-page URL holds a line break or NUL, which would inject into the request");
                     if (!objstore.sameOrigin(self.base_url, tok)) return eval.explain(error.HttpCrossOriginPage, "the response's next-page URL is on another host or scheme than the first page's, and this read's headers and login go only to its own");
                     self.next_url = try self.arena.dupe(u8, tok);
+                } else if (self.pagingInBody()) {
+                    self.cursor_tok = try self.arena.dupe(u8, tok);
                 } else {
                     self.next_url = try withParam(self.arena, self.base_url, self.opts.cursor_param, tok);
                 }
@@ -957,12 +1011,9 @@ pub const HttpSource = struct {
             .page, .offset => {
                 var buf: [32]u8 = undefined;
                 const n = try std.fmt.bufPrint(&buf, "{d}", .{self.page_no});
-                if (self.opts.method.hasBody()) {
-                    var body = try appendParam(arena, self.opts.body orelse "", self.opts.page_param, n);
-                    if (self.opts.size_param) |sp| {
-                        const sz = try std.fmt.bufPrint(&buf, "{d}", .{self.opts.page_size});
-                        body = try appendParam(arena, body, sp, sz);
-                    }
+                if (self.pagingInBody()) {
+                    var body = try bodyWith(arena, self.opts, self.opts.body, self.opts.page_param, .{ .int = self.page_no });
+                    if (self.opts.size_param) |sp| body = try bodyWith(arena, self.opts, body, sp, .{ .int = self.opts.page_size });
                     return .{ .url = self.base_url, .body = body };
                 }
                 var url = try withParam(arena, self.base_url, self.opts.page_param, n);
@@ -972,12 +1023,21 @@ pub const HttpSource = struct {
                 }
                 return .{ .url = url, .body = self.opts.body };
             },
-            .cursor => return .{ .url = self.next_url orelse self.base_url, .body = self.opts.body },
+            .cursor => {
+                const tok = self.cursor_tok orelse return .{ .url = self.next_url orelse self.base_url, .body = self.opts.body };
+                return .{ .url = self.base_url, .body = try bodyWith(arena, self.opts, self.opts.body, self.opts.cursor_param, .{ .text = tok }) };
+            },
         }
     }
 
-    fn contentType(self: *HttpSource) ?[]const u8 {
-        if (self.opts.body == null) return null;
+    /// Whether page numbers, offsets and cursors go in the body: as `paging_in` says,
+    /// else whenever the method sends one.
+    fn pagingInBody(self: *const HttpSource) bool {
+        return if (self.opts.paging_in) |w| w == .body else self.opts.method.hasBody();
+    }
+
+    fn contentType(self: *HttpSource, body: ?[]const u8) ?[]const u8 {
+        if (body == null) return null;
         return if (self.opts.body_type == .json) "application/json" else "application/x-www-form-urlencoded";
     }
 
@@ -1096,7 +1156,7 @@ pub const HttpSource = struct {
     }
 
     fn spawnFetch(self: *HttpSource, req: PageReq) !*Slot {
-        return self.spawnSlotFor(req, self.opts.method, self.contentType(), true);
+        return self.spawnSlotFor(req, self.opts.method, self.contentType(req.body), true);
     }
 
     /// A page carries the source's headers and auth; a login carries neither.
@@ -1354,9 +1414,34 @@ fn itemsOf(arena: std.mem.Allocator, doc: []const u8, items_path: ?[]const u8) !
     return (try fjson.rowsOf(arena, doc, null)) orelse error.ExpectedJsonArrayOrObject;
 }
 
+/// `base`, a form body, with `key=val` appended, `val` percent-encoded as a query
+/// string's: a cursor token may hold `&`, `+` or spaces.
 fn appendParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: []const u8) ![]const u8 {
-    const sep: []const u8 = if (base.len == 0) "" else "&";
-    return msgfmt.allocPrint(arena, "{s}{s}{s}={s}", .{ base, sep, key, val });
+    var buf = std.array_list.Managed(u8).init(arena);
+    try buf.appendSlice(base);
+    if (base.len > 0) try buf.append('&');
+    try buf.appendSlice(key);
+    try buf.append('=');
+    try formEncode(&buf, val);
+    return buf.toOwnedSlice();
+}
+
+/// `base` (none, or the read's `body`) with `key` set to `v` as its `body_type` says:
+/// a JSON object's member, nested along a dotted key and keeping the kind of one
+/// already there (`jt.setPath`), or a form's `&key=value`.
+fn bodyWith(arena: std.mem.Allocator, opts: Options, base: ?[]const u8, key: []const u8, v: jt.SetValue) ![]const u8 {
+    switch (opts.body_type) {
+        .json => return (try jt.setPath(arena, base orelse "{}", key, v)) orelse
+            eval.explain(error.JsonBodyNotObject, "a JSON `body` that pages takes its page values as keys, so it must be one JSON object, and each dotted step of the key an object in it"),
+        .form => {
+            var buf: [32]u8 = undefined;
+            const text = switch (v) {
+                .int => |n| try std.fmt.bufPrint(&buf, "{d}", .{n}),
+                .text => |t| t,
+            };
+            return appendParam(arena, base orelse "", key, text);
+        },
+    }
 }
 
 /// `base` with `key=val` appended, `val` percent-encoded: a cursor token may hold
@@ -1952,6 +2037,79 @@ test "http source: a PUT, PATCH or DELETE goes out under its own method, a body 
         const line = try msgfmt.allocPrint(a, "{s} /rest", .{@tagName(m.wire())});
         try std.testing.expect(std.mem.startsWith(u8, r, line));
         try std.testing.expectEqual(m.hasBody(), std.mem.indexOf(u8, r, "a=1") != null);
+    }
+}
+
+/// The text of request `i` the server captured, from its request line on.
+fn capturedReq(srv: *TestServer, i: usize) []const u8 {
+    return srv.captured[i][0..srv.captured_len[i]];
+}
+
+test "http source: a JSON body pages by its own keys, a string page staying a string and a dotted one nested" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { body: ?[]const u8, page_param: []const u8, size_param: ?[]const u8, first: []const u8, second: []const u8 };
+    const cases = [_]Case{
+        .{ .body = "{\"q\":\"x\",\"page\":\"1\"}", .page_param = "page", .size_param = null, .first = "{\"q\":\"x\",\"page\":\"1\"}", .second = "{\"q\":\"x\",\"page\":\"2\"}" },
+        .{ .body = null, .page_param = "paging.page", .size_param = "paging.size", .first = "{\"paging\":{\"page\":1,\"size\":2}}", .second = "{\"paging\":{\"page\":2,\"size\":2}}" },
+    };
+    for (cases) |c| {
+        const srv = try TestServer.start(&.{ "[{\"id\":1},{\"id\":2}]", "[{\"id\":3}]", "[]" });
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/search", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{
+            .method = .post,
+            .body = c.body,
+            .body_type = .json,
+            .paginate = .page,
+            .page_param = c.page_param,
+            .size_param = c.size_param,
+            .page_size = 2,
+            .prefetch = 1,
+        });
+        defer s.close();
+        try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+        const r1 = capturedReq(srv, 0);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "content-type: application/json") != null);
+        try std.testing.expect(std.mem.endsWith(u8, r1, c.first));
+        try std.testing.expect(std.mem.endsWith(u8, capturedReq(srv, 1), c.second));
+        try std.testing.expect(std.mem.indexOf(u8, r1, "/search?") == null);
+    }
+}
+
+test "http source: on a POST a cursor goes in the body, URL-encoded in a form, and `paging_in = query` keeps pages in the URL" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    {
+        const srv = try TestServer.start(&.{ "{\"next\":\"a b&c\",\"rows\":[{\"id\":1}]}", "{\"next\":\"\",\"rows\":[{\"id\":2}]}" });
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{ .method = .post, .body = "cmd=get", .items = "rows", .paginate = .cursor });
+        defer s.close();
+        try std.testing.expectEqual(@as(usize, 2), try drain(s, a));
+        try std.testing.expect(std.mem.endsWith(u8, capturedReq(srv, 0), "\r\n\r\ncmd=get"));
+        const r2 = capturedReq(srv, 1);
+        try std.testing.expect(std.mem.startsWith(u8, r2, "POST /rest HTTP"));
+        try std.testing.expect(std.mem.endsWith(u8, r2, "cmd=get&cursor=a%20b%26c"));
+    }
+    {
+        const srv = try TestServer.start(&.{ "[{\"id\":1}]", "[]" });
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{ .method = .post, .body = "{\"q\":1}", .body_type = .json, .paginate = .page, .paging_in = .query, .prefetch = 1 });
+        defer s.close();
+        try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+        const r1 = capturedReq(srv, 0);
+        try std.testing.expect(std.mem.startsWith(u8, r1, "POST /rest?page=1 HTTP"));
+        try std.testing.expect(std.mem.endsWith(u8, r1, "{\"q\":1}"));
     }
 }
 
