@@ -8,6 +8,7 @@ const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const errLabel = @import("../env.zig").errLabel;
 const eval = @import("../../exec/eval.zig");
+const options_schema = @import("../connect/options_schema.zig");
 const mkLit = @import("../env.zig").mkLit;
 const planErr = @import("../env.zig").planErr;
 const std = @import("std");
@@ -77,7 +78,11 @@ pub fn resolveLets(
     for (program.stmts) |s| {
         if (s != .let_const) continue;
         const l = s.let_const;
-        const le = l.expr orelse continue;
+        var unset: []const u8 = "";
+        const le = options_schema.withEnv(arena, l.expr orelse continue, .read, &unset) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EnvUnset => return planErrAt(diag, try msgfmt.allocPrint(arena, "LET `{s}`: environment variable `{s}` is not set", .{ l.name, unset }), l.pos),
+        };
         const v = eval.constEval(arena, le, names.items, values.items) catch |e|
             return planErrAt(diag, try msgfmt.allocPrint(arena, "LET `{s}`: {s}", .{ l.name, eval.takeFailure(e) orelse errLabel(e) }), l.pos);
         try names.append(l.name);

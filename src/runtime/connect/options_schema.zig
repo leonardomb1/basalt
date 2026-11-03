@@ -11,6 +11,7 @@ const textconv = @import("../../exec/textconv.zig");
 const registry = @import("../../connect/registry.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const types = @import("../../lang/types.zig");
 
 pub const Kind = enum {
     text,
@@ -199,6 +200,54 @@ pub fn envName(e: *const ast.Expr) ?[]const u8 {
     if (!std.mem.eql(u8, c.name, "env") and !std.mem.eql(u8, c.name, "secret")) return null;
     if (c.args.len != 1 or c.args[0].* != .str_lit) return null;
     return c.args[0].str_lit;
+}
+
+/// Whether `e` calls `env('X')` or `secret('X')` anywhere.
+pub fn readsEnv(e: *const ast.Expr) bool {
+    const S = struct {
+        fn hit(_: void, n: *const ast.Expr) ?bool {
+            return if (envName(n) != null) true else null;
+        }
+    };
+    return ast.anyExpr(e, {}, S.hit);
+}
+
+/// What `withEnv` puts for each `env('X')` / `secret('X')`: the variable's value, as
+/// a run reads it, or a NULL string, so a check types the expression without
+/// reading the environment.
+pub const EnvMode = enum { read, typed };
+
+const EnvCtx = struct { arena: std.mem.Allocator, mode: EnvMode, unset: *[]const u8 };
+
+/// `e` with each `env('X')` / `secret('X')` call replaced as `mode` says, so a LET
+/// can compute from a secret once before the run (`sha256(env('PASS') || ...)`) the
+/// way a connection option reads one. A variable that is not set is
+/// `error.EnvUnset`, its name in `unset`.
+pub fn withEnv(arena: std.mem.Allocator, e: *const ast.Expr, mode: EnvMode, unset: *[]const u8) error{ OutOfMemory, EnvUnset }!*const ast.Expr {
+    return envRecur(.{ .arena = arena, .mode = mode, .unset = unset }, e);
+}
+
+fn envRecur(cx: EnvCtx, e: *const ast.Expr) error{ OutOfMemory, EnvUnset }!*ast.Expr {
+    if (envName(e)) |name| {
+        const out = try cx.arena.create(ast.Expr);
+        switch (cx.mode) {
+            .typed => {
+                const nul = try cx.arena.create(ast.Expr);
+                nul.* = .null_lit;
+                out.* = .{ .cast = .{ .e = nul, .ty = types.Type.init(.string).asNullable() } };
+            },
+            .read => {
+                const v = std.process.getEnvVarOwned(cx.arena, name) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    cx.unset.* = name;
+                    return error.EnvUnset;
+                };
+                out.* = .{ .str_lit = v };
+            },
+        }
+        return out;
+    }
+    return ast.rebuildExpr(cx.arena, e, cx, envRecur);
 }
 
 pub const Text = union(enum) { ok: []const u8, unset: []const u8, problem: Problem };

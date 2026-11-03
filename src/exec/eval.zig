@@ -245,7 +245,11 @@ pub const TypeCtx = struct {
             _ = try self.typeOf(c.args[0]);
             return (try self.typeOf(c.args[1])).asNullable();
         }
-        const b = lookupBuiltin(name) orelse return self.err("unknown function `{s}`", .{name});
+        const b = lookupBuiltin(name) orelse {
+            if (std.mem.eql(u8, name, "env") or std.mem.eql(u8, name, "secret"))
+                return self.err("`{s}()` reads the environment only in a LET or a connection option, once before the run: `LET k = {s}('NAME')`, then `$k`", .{ name, name });
+            return self.err("unknown function `{s}`", .{name});
+        };
         self.span = null;
         return b.type_fn(self, c) catch |e| {
             if (self.span == null) self.span = c.span;

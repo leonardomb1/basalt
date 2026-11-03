@@ -1055,6 +1055,43 @@ test "LET value is shared across statements" {
     try std.testing.expectEqualStrings("l\nn30\nn30\n", b);
 }
 
+test "a LET reads env() once before the run, a later LET and a hole build on it, and check never reads the environment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const path = try std.process.getEnvVarOwned(alloc, "PATH");
+    defer alloc.free(path);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(path, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+
+    const script = try std.fmt.allocPrint(alloc,
+        \\LET p = env('PATH');
+        \\LET h = sha256($p || '');
+        \\LOAD INTO '{s}/out.csv' AS SELECT $h AS h, '${{h}}' = $h AS same, length($p) = {d} AS n;
+    , .{ base, path.len });
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    _ = try exec(alloc, script, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const want = try std.fmt.allocPrint(alloc, "h,same,n\n{s},true,true\n", .{&hex});
+    defer alloc.free(want);
+    try expectFile(&tmp, "out.csv", want);
+
+    const unset = try std.fmt.allocPrint(alloc, "LET k = env('BASALT_TEST_SURELY_UNSET_9F2C');\nLOAD INTO '{s}/never.csv' AS SELECT $k AS k;", .{base});
+    defer alloc.free(unset);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var adiag = analyze.Diag{};
+    _ = try analyze.analyze(parena.allocator(), try parser.parseSource(parena.allocator(), unset, &pdiag), &adiag);
+    var udiag: Diag = .{};
+    try std.testing.expectError(error.PlanFailed, exec(alloc, unset, .{ .log = .{ .quiet = true, .summary = .none } }, &udiag));
+    try std.testing.expectEqualStrings("LET `k`: environment variable `BASALT_TEST_SURELY_UNSET_9F2C` is not set", udiag.msg);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
+}
+
 test "LET reads a param, so `-p` reaches it indirectly" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1713,6 +1750,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', database = 'd');\nLOAD INTO '$B/o.csv' AS SELECT * FROM pg.t WITH (fetch_size = 10);", "unknown read option `fetch_size`: a SQL table read takes split, splits, split_kind" },
         .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1');\nLOAD INTO '$B/o.csv' AS SELECT * FROM h.GET('/x', a = 1) WITH (itmes = 'data');", "unknown read option `itmes`: a REST read" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (method = 'fetch');", "REST option `method` is one of get, post, put, patch or delete (given 'fetch')" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT env('PATH') AS p;", "`env()` reads the environment only in a LET or a connection option" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (paginate = 'pages');", "REST option `paginate` is one of none, page, offset or cursor (given 'pages')" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (method = 'post', body = 'a=1', body_type = 'jsn');", "REST option `body_type` is `form` or `json` (given 'jsn')" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (stop_short = 'yes');", "REST option `stop_short` is a flag: write it bare, or `= true` / `= false`" },

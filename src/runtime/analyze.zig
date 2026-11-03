@@ -45,6 +45,7 @@ const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const formats = @import("../format/formats.zig");
 const http_client = @import("../net/http_client.zig");
+const options_schema = @import("connect/options_schema.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
@@ -953,7 +954,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             if (diag.pos == null) diag.pos = l.pos;
             return e;
         }
-        if (l.expr) |le| {
+        if (l.expr) |le| if (options_schema.readsEnv(le)) {
+            var unset: []const u8 = "";
+            const typed = options_schema.withEnv(arena, le, .typed, &unset) catch return error.OutOfMemory;
+            try params_map.put(l.name, try substExpr(arena, typed, &params_map));
+        } else {
             const refs = try dollarRefs(arena, le);
             const all_known = for (refs) |q| {
                 if (!ast.nameIn(known_names.items, q.parts[0])) break false;

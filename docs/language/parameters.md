@@ -34,6 +34,20 @@ earlier `$lets`) and referenced as `$name`. It can never be bound externally —
 `-p name=...` is an error. A LET and a PARAM may not share a name. `LET
 run_ts = now();` gives one consistent timestamp across every pipeline of a run.
 
+A LET may read an environment variable with `env('NAME')` (or `secret('NAME')`,
+the same, as in a connection's options), which keeps a password out of the
+script while a value is computed from it once before the run:
+
+```sql
+LET token = sha256(env('API_PASS') || strftime(now(), '%d/%m/%Y'));
+SELECT * FROM HTTP('https://api.example.com/v1/items')
+  WITH (header = 'X-Token: ${token}');
+```
+
+The variable is read when the script runs, never by `basalt check`, which types
+the LET without it; one that is not set fails the run before any statement. A
+query cannot call `env()` itself: read it into a LET and use `$name`.
+
 `LET name = (SELECT ...);` binds the single cell of a query instead, run when
 the statement is reached (so it may read anything the script can) — see
 [Subqueries](subqueries.md). An expression LET cannot reference a query
