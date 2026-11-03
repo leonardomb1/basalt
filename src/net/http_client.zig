@@ -35,9 +35,10 @@
 //! (keeps tokens out of script text); `bearer` prepends "Bearer ", `auth`/`auth_env`
 //! send the Authorization value verbatim (session-token APIs). `bearer`/`auth`
 //! take literals (useful with for-loop `${var}` interpolation), and
-//! `header = "Name: value"` adds one extra raw header; a User-Agent given that way
-//! replaces the client's (`basalt/<version>`) instead of being sent twice, which
-//! some WAFs reject.
+//! `header = "Name: value"` adds an extra raw header, repeated for more, a later one
+//! replacing an earlier of its name; a User-Agent or Accept given that way replaces
+//! the client's (`basalt/<version>`, `application/json`) instead of being sent
+//! twice, which some WAFs reject.
 //!
 //! Connection-level form: `CREATE CONNECTION itsm TYPE http OPTIONS (base_url =
 //! ...)` and `FROM itsm.GET('/path', k = v)`. The path resolves against the
@@ -509,7 +510,8 @@ pub const Options = struct {
     auth_env: ?[]const u8 = null,
     user_env: ?[]const u8 = null,
     pass_env: ?[]const u8 = null,
-    header: ?[]const u8 = null,
+    /// Extra headers, each `Name: value`, a later one replacing an earlier of its name.
+    headers: []const []const u8 = &.{},
     items: ?[]const u8 = null,
     method: Method = .get,
     body: ?[]const u8 = null,
@@ -539,9 +541,11 @@ pub const Options = struct {
 };
 
 /// The read's options from its hints, later hints winning; values `optionProblem`
-/// refuses are never seen here, so an unreadable one keeps its default.
-pub fn optsFromHints(hints: []const ast.Hint) Options {
+/// refuses are never seen here, so an unreadable one keeps its default. Every
+/// `header` counts, a later one replacing an earlier of the same name.
+pub fn optsFromHints(arena: std.mem.Allocator, hints: []const ast.Hint) !Options {
     var o = Options{};
+    var headers = std.array_list.Managed([]const u8).init(arena);
     for (hints) |h| {
         const sv: ?[]const u8 = switch (h.value) {
             .str => |s| s,
@@ -562,7 +566,13 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
         } else if (std.mem.eql(u8, h.key, "pass_env")) {
             o.pass_env = sv;
         } else if (std.mem.eql(u8, h.key, "header")) {
-            o.header = sv;
+            if (sv) |v| {
+                for (headers.items, 0..) |old, i| if (std.ascii.eqlIgnoreCase(headerName(old), headerName(v))) {
+                    _ = headers.orderedRemove(i);
+                    break;
+                };
+                try headers.append(v);
+            }
         } else if (std.mem.eql(u8, h.key, "items")) {
             o.items = sv;
         } else if (std.mem.eql(u8, h.key, "method")) {
@@ -619,8 +629,23 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
             if (iv) |n| o.timeout_ms = n;
         }
     }
+    o.headers = try headers.toOwnedSlice();
     return o;
 }
+
+/// A header's name, the text before its colon, trimmed.
+fn headerName(h: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, h, ':') orelse return h;
+    return std.mem.trim(u8, h[0..colon], " ");
+}
+
+fn headerValue(h: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, h, ':') orelse return "";
+    return std.mem.trim(u8, h[colon + 1 ..], " ");
+}
+
+/// The most `header` options a read sends, past its auth and `Accept`.
+pub const max_headers = 16;
 
 /// `v` as one of `E`'s names, whatever its case.
 fn enumNoCase(comptime E: type, v: []const u8) ?E {
@@ -689,6 +714,7 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
     var paging_at: ?ast.Pos = null;
     var total_at: ?ast.Pos = null;
     var total_rows_at: ?ast.Pos = null;
+    var headers: usize = 0;
     for (hints) |h| {
         const takes = takesOf(h.key) orelse continue;
         const text: ?[]const u8 = switch (h.value) {
@@ -731,6 +757,10 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
         if (std.mem.eql(u8, h.key, "body")) {
             body_at = h.pos;
             body = text;
+        }
+        if (std.mem.eql(u8, h.key, "header")) {
+            headers += 1;
+            if (headers > max_headers) return .{ .pos = h.pos, .msg = try msgfmt.allocPrint(arena, "a REST read sends at most {d} `header` options", .{max_headers}) };
         }
         if (std.mem.eql(u8, h.key, "total_field")) total_at = h.pos;
         if (std.mem.eql(u8, h.key, "total_rows_field")) total_rows_at = h.pos;
@@ -829,7 +859,7 @@ pub const HttpSource = struct {
         user_agent: []const u8,
         url: []const u8,
         req_body: ?[]const u8 = null,
-        hdrs: [12]std.http.Header = undefined,
+        hdrs: [max_headers + 4]std.http.Header = undefined,
         nh: usize = 0,
         gen: u32,
         retries: i64,
@@ -1400,10 +1430,8 @@ pub const HttpSource = struct {
 pub const user_agent = "basalt/" ++ @import("build_options").version;
 
 pub fn userAgentOf(opts: Options) []const u8 {
-    const h = opts.header orelse return user_agent;
-    const colon = std.mem.indexOfScalar(u8, h, ':') orelse return user_agent;
-    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, h[0..colon], " "), "user-agent")) return user_agent;
-    return std.mem.trim(u8, h[colon + 1 ..], " ");
+    for (opts.headers) |h| if (std.ascii.eqlIgnoreCase(headerName(h), "user-agent")) return headerValue(h);
+    return user_agent;
 }
 
 fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Header {
@@ -1421,17 +1449,15 @@ fn buildHeaders(arena: std.mem.Allocator, opts: Options) ![]const std.http.Heade
         _ = enc.encode(b64, raw);
         try hdrs.append(.{ .name = "Authorization", .value = try msgfmt.allocPrint(arena, "Basic {s}", .{b64}) });
     }
-    if (opts.header) |h| {
-        const colon = std.mem.indexOfScalar(u8, h, ':') orelse return error.BadHeaderHint;
-        const name = std.mem.trim(u8, h[0..colon], " ");
-        if (!std.ascii.eqlIgnoreCase(name, "user-agent")) {
-            try hdrs.append(.{
-                .name = name,
-                .value = std.mem.trim(u8, h[colon + 1 ..], " "),
-            });
-        }
+    var accept = false;
+    for (opts.headers) |h| {
+        if (std.mem.indexOfScalar(u8, h, ':') == null) return error.BadHeaderHint;
+        const name = headerName(h);
+        if (std.ascii.eqlIgnoreCase(name, "user-agent")) continue;
+        if (std.ascii.eqlIgnoreCase(name, "accept")) accept = true;
+        try hdrs.append(.{ .name = name, .value = headerValue(h) });
     }
-    try hdrs.append(.{ .name = "Accept", .value = "application/json" });
+    if (!accept) try hdrs.append(.{ .name = "Accept", .value = "application/json" });
     return hdrs.toOwnedSlice();
 }
 
@@ -1543,7 +1569,9 @@ test "optsFromHints maps hint keys" {
         .{ .key = "cursor_field", .value = .{ .str = "meta.next" }, .pos = .{ .line = 1, .col = 1 } },
         .{ .key = "max_pages", .value = .{ .int = 5 }, .pos = .{ .line = 1, .col = 1 } },
     };
-    const o = optsFromHints(&hints);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const o = try optsFromHints(ar.allocator(), &hints);
     try std.testing.expectEqualStrings("tok", o.bearer.?);
     try std.testing.expectEqualStrings("data", o.items.?);
     try std.testing.expectEqual(Mode.cursor, o.paginate);
@@ -1561,7 +1589,9 @@ test "optsFromHints reads a method, paging mode and body type in any case, a fla
         .{ .key = "stop_short", .value = .{ .ident = "false" }, .pos = at },
         .{ .key = "page_size", .value = .{ .str = "50" }, .pos = at },
     };
-    const o = optsFromHints(&hints);
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const o = try optsFromHints(ar.allocator(), &hints);
     try std.testing.expectEqual(Method.put, o.method);
     try std.testing.expectEqual(Mode.page, o.paginate);
     try std.testing.expectEqual(BodyType.json, o.body_type);
@@ -2215,6 +2245,36 @@ test "http source: a total of pages or of rows, bare or quoted, ends the read on
         const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
         try std.testing.expectError(error.HttpTotalNotCount, HttpSource.open(a, std.testing.allocator, url, .{ .items = "r", .paginate = .page, .total_field = "n" }));
     }
+}
+
+test "http source: every `header` is sent, a later one replacing an earlier of its name, a given Accept or User-Agent replacing basalt's" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const at: ast.Pos = .{ .line = 1, .col = 1 };
+    const hints = [_]ast.Hint{
+        .{ .key = "header", .value = .{ .str = "X-One: 1" }, .pos = at },
+        .{ .key = "header", .value = .{ .str = "X-Two: 2" }, .pos = at },
+        .{ .key = "header", .value = .{ .str = "x-one: 3" }, .pos = at },
+        .{ .key = "header", .value = .{ .str = "Accept: application/vnd.api+json" }, .pos = at },
+        .{ .key = "header", .value = .{ .str = "User-Agent: probe/1" }, .pos = at },
+    };
+    const srv = try TestServer.start(&.{"[{\"id\":1}]"});
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer srv.finish(th);
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+    const s = try HttpSource.open(a, std.testing.allocator, url, try optsFromHints(a, &hints));
+    defer s.close();
+    try std.testing.expectEqual(@as(usize, 1), try drain(s, a));
+    const r = capturedReq(srv, 0);
+    try std.testing.expect(std.mem.indexOf(u8, r, "x-one: 3\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "X-One: 1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "X-Two: 2\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "Accept: application/vnd.api+json\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "application/json") == null);
+    try std.testing.expect(std.ascii.indexOfIgnoreCase(r, "user-agent: probe/1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "basalt/") == null);
 }
 
 test "http source: transient 503 retries in place and succeeds" {

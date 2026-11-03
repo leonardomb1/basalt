@@ -232,7 +232,7 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `method` | `get` | `get`, `post`, `put`, `patch` or `delete` |
 | `body` | none | the request body, sent by `post`, `put` or `patch` (on another method it is an error); when paginating, the page values go into it (see `paging_in`) |
 | `body_type` | `form` | `form` sends the body as `application/x-www-form-urlencoded`, `json` as `application/json` |
-| `header` | none | one extra header, `'Name: value'`; a `User-Agent` given this way replaces basalt's |
+| `header` | none | an extra header, `'Name: value'`; repeat it for more (up to 16), a later one replacing an earlier of the same name, so a read's overrides its connection's. A `User-Agent` or `Accept` given this way replaces basalt's |
 | `bearer`, `bearer_env` | none | a bearer token, or the environment variable holding one |
 | `auth`, `auth_env` | none | an `Authorization` value sent verbatim, or the variable holding it |
 | `user_env`, `pass_env` | none | variables holding a basic-auth user and password |
