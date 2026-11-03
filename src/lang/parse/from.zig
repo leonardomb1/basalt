@@ -234,6 +234,8 @@ pub fn parsePaginate(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Er
                 "page_size"
             else if (eqlNoCase(key, "total"))
                 "total_field"
+            else if (eqlNoCase(key, "total_rows"))
+                "total_rows_field"
             else if (eqlNoCase(key, "field"))
                 "cursor_field"
             else if (eqlNoCase(key, "start"))

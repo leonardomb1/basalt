@@ -11,8 +11,9 @@
 //!   (none)             one GET, one batch.
 //!   paginate = page    `?<page_param>=N` (N starts at `start_page`), optionally
 //!                      `&<size_param>=<page_size>`; stops on an empty page, or
-//!                      after exactly `total_field` pages for APIs that never
-//!                      return an empty one.
+//!                      after exactly `total_field` pages (or `total_rows_field`
+//!                      rows over the first page's) for APIs that never return an
+//!                      empty one.
 //!   paginate = offset  like `page`, but the param advances by `page_size` from
 //!                      `start_offset` (OData `$skip`/`$top` style).
 //!   paginate = cursor  reads `<cursor_field>` (dotted path) from each response;
@@ -532,6 +533,8 @@ pub const Options = struct {
     retry_statuses: ?[]const u8 = null,
     logger: ?*obs.Logger = null,
     total_field: ?[]const u8 = null,
+    /// A total of rows, not pages: the pages are it over the first page's rows.
+    total_rows_field: ?[]const u8 = null,
     stop_short: bool = false,
 };
 
@@ -602,6 +605,8 @@ pub fn optsFromHints(hints: []const ast.Hint) Options {
             if (flagOf(h.value)) |b| o.stop_short = b;
         } else if (std.mem.eql(u8, h.key, "total_field")) {
             o.total_field = sv;
+        } else if (std.mem.eql(u8, h.key, "total_rows_field")) {
+            o.total_rows_field = sv;
         } else if (std.mem.eql(u8, h.key, "retries")) {
             if (iv) |n| o.retries = n;
         } else if (std.mem.eql(u8, h.key, "retry_base_ms")) {
@@ -657,7 +662,7 @@ fn takesOf(key: []const u8) ?Takes {
         .{ "paginate", .paginate },        .{ "start_page", .{ .int = 0 } },    .{ "start_offset", .{ .int = 0 } },
         .{ "page_size", .{ .int = 1 } },   .{ "max_pages", .{ .int = 1 } },     .{ "prefetch", .{ .int = 1 } },
         .{ "retries", .{ .int = 0 } },     .{ "retry_base_ms", .{ .int = 0 } }, .{ "timeout_ms", .{ .int = 1 } },
-        .{ "progress_ms", .{ .int = 0 } }, .{ "paging_in", .paging_in },
+        .{ "progress_ms", .{ .int = 0 } }, .{ "paging_in", .paging_in },        .{ "total_rows_field", .text },
     };
     for (table) |t| if (std.mem.eql(u8, t[0], key)) return t[1];
     return null;
@@ -682,6 +687,8 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
     var paginate: Mode = .none;
     var paging_in: ?PagingIn = null;
     var paging_at: ?ast.Pos = null;
+    var total_at: ?ast.Pos = null;
+    var total_rows_at: ?ast.Pos = null;
     for (hints) |h| {
         const takes = takesOf(h.key) orelse continue;
         const text: ?[]const u8 = switch (h.value) {
@@ -725,7 +732,13 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
             body_at = h.pos;
             body = text;
         }
+        if (std.mem.eql(u8, h.key, "total_field")) total_at = h.pos;
+        if (std.mem.eql(u8, h.key, "total_rows_field")) total_rows_at = h.pos;
     }
+    if (whole) if (total_at) |a| if (total_rows_at) |b| return .{
+        .pos = if (a.line > b.line or (a.line == b.line and a.col > b.col)) a else b,
+        .msg = "a REST read takes one of `total_field` (a count of pages) and `total_rows_field` (a count of rows), not both",
+    };
     if (whole) if (body_at) |at| if (!method.hasBody()) return .{
         .pos = method_at orelse at,
         .msg = try msgfmt.allocPrint(arena, "a REST read with a `body` sends it with `method = 'post'`, `'put'` or `'patch'`, not {s}", .{if (method_at == null) "the default GET" else @tagName(method)}),
@@ -913,13 +926,36 @@ pub const HttpSource = struct {
         self.schema = schema;
         self.first = try fjson.batchOf(arena, self.schema, items);
         self.noteProgress(items.len);
-        if (opts.total_field) |tf| {
+        if (opts.total_field orelse opts.total_rows_field) |tf| {
             if (try fjson.field(arena, page.root, tf)) |tv| {
-                if (jt.number(tv) == .int) self.total_pages = jt.number(tv).int;
+                const n = try totalOf(arena, tf, tv);
+                self.total_pages = if (opts.total_field != null) n else pagesOf(n, items.len);
             }
         }
         self.advance(arena, page.root, items.len) catch |e| return e;
         return self;
+    }
+
+    /// A total the first page states: a whole number, written bare or quoted, as
+    /// some APIs send `"totalCount": "12"`. Anything else fails the read, since a
+    /// count misread would stop it early or let it run to `max_pages`.
+    fn totalOf(arena: std.mem.Allocator, name: []const u8, raw: []const u8) !i64 {
+        const text = if (raw[0] == '"') std.mem.trim(u8, try jt.decodeString(arena, raw[1 .. raw.len - 1]), " ") else raw;
+        const n: ?i64 = switch (jt.number(text)) {
+            .int => |i| i,
+            .float => |f| if (f == @trunc(f) and @abs(f) < 1e15) @intFromFloat(f) else null,
+            .text => null,
+        };
+        if (n) |v| if (v >= 0) return v;
+        return eval.explain(error.HttpTotalNotCount, try msgfmt.allocPrint(arena, "the response's `{s}` is `{s}`, not a whole number of pages or rows", .{ name, if (raw.len > 40) raw[0..40] else raw }));
+    }
+
+    /// The pages `rows` fill at the first page's `per` rows each: what the server
+    /// sends, which a cap below the requested `page_size` makes fewer than asked.
+    fn pagesOf(rows: i64, per: usize) i64 {
+        if (per == 0) return 0;
+        const p: i64 = @intCast(per);
+        return @divFloor(rows + p - 1, p);
     }
 
     fn noteProgress(self: *HttpSource, n_rows: usize) void {
@@ -2141,6 +2177,44 @@ test "http source: total_field bounds the page count exactly" {
     defer s.close();
     try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
     try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.seq_cst));
+}
+
+test "http source: a total of pages or of rows, bare or quoted, ends the read on its last page; a total that is no count fails it" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { pages: []const []const u8, rows_total: bool, rows: usize, requests: usize };
+    const cases = [_]Case{
+        .{ .pages = &.{ "{\"n\":\"2\",\"r\":[{\"id\":1}]}", "{\"n\":\"2\",\"r\":[{\"id\":2}]}", "{\"n\":\"2\",\"r\":[{\"id\":9}]}" }, .rows_total = false, .rows = 2, .requests = 2 },
+        .{ .pages = &.{ "{\"n\":5,\"r\":[{\"id\":1},{\"id\":2}]}", "{\"n\":5,\"r\":[{\"id\":3},{\"id\":4}]}", "{\"n\":5,\"r\":[{\"id\":5}]}", "{\"n\":5,\"r\":[{\"id\":9}]}" }, .rows_total = true, .rows = 5, .requests = 3 },
+        .{ .pages = &.{ "{\"n\":\" 4 \",\"r\":[{\"id\":1},{\"id\":2}]}", "{\"n\":4,\"r\":[{\"id\":3},{\"id\":4}]}", "{\"n\":4,\"r\":[{\"id\":9}]}" }, .rows_total = true, .rows = 4, .requests = 2 },
+    };
+    for (cases) |c| {
+        const srv = try TestServer.start(c.pages);
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{
+            .items = "r",
+            .paginate = .page,
+            .page_size = 100,
+            .total_field = if (c.rows_total) null else "n",
+            .total_rows_field = if (c.rows_total) "n" else null,
+            .timeout_ms = 2000,
+        });
+        defer s.close();
+        try std.testing.expectEqual(c.rows, try drain(s, a));
+        try std.testing.expectEqual(c.requests, srv.requests.load(.seq_cst));
+    }
+    {
+        const srv = try TestServer.start(&.{"{\"n\":\"many\",\"r\":[{\"id\":1}]}"});
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/rest", .{srv.port()});
+        try std.testing.expectError(error.HttpTotalNotCount, HttpSource.open(a, std.testing.allocator, url, .{ .items = "r", .paginate = .page, .total_field = "n" }));
+    }
 }
 
 test "http source: transient 503 retries in place and succeeds" {

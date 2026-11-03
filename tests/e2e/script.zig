@@ -1724,6 +1724,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (retry_statuses = '404,99');", "REST option `retry_statuses` takes status codes from 100 to 599" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (items = 3);", "REST option `items` takes a quoted string (given 3)" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') WITH (paging_in = 'sideways');", "REST option `paging_in` is `query` or `body` (given 'sideways')" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') PAGINATE BY page (total = 'n', total_rows = 'm');", "takes one of `total_field` (a count of pages) and `total_rows_field` (a count of rows), not both" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') PAGINATE BY page WITH (paging_in = 'body');", "`paging_in = 'body'` needs a method that sends a body" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM HTTP('http://127.0.0.1/x') PAGINATE BY page WITH (method = 'post', body_type = 'json', body = '[1]');", "a JSON `body` that pages takes its page values as keys, so it must be one JSON object" },
         .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1') WITH (pgsize = 2);\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "connection `h`: unknown REST option `pgsize`" },

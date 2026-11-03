@@ -167,7 +167,8 @@ source is asked to do are on [Pushdown](pushdown.md).
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.
   Friendly keys map to the engine hints (`param`→`page_param`/`cursor_param`,
-  `size`→`page_size`, `total`→`total_field`, `field`→`cursor_field`,
+  `size`→`page_size`, `total`→`total_field`, `total_rows`→`total_rows_field`,
+  `field`→`cursor_field`,
   `start`→`start_page`, `max`→`max_pages`); any other key is a REST option's
   own name. A
   cursor that is a full `http(s)://` URL is fetched as given; any other is
@@ -244,7 +245,8 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `page_size` | `100` | rows per page, sent in `size_param` and the step of `offset` mode (`size`) |
 | `cursor_param` | `cursor` | the parameter, or JSON key, that carries a cursor that is not a URL (`param` in cursor mode) |
 | `cursor_field` | `next` | dotted path to the next cursor or URL in each response (`field`) |
-| `total_field` | none | dotted path to a page count, for APIs that never return an empty page (`total`) |
+| `total_field` | none | dotted path to a page count in the first response, for APIs that never return an empty page (`total`); a number, or a numeric string as `"12"` |
+| `total_rows_field` | none | dotted path to a row count instead: the pages are that count over the first page's rows, so a server that sends fewer per page than `page_size` asks is still read to the end (`total_rows`). A read takes one of the two; a value that is no whole number fails it |
 | `max_pages` | `10000` | a cap on pages fetched (`max`) |
 | `stop_short` | off | a flag (bare, or `= true` / `= false`): stop after a page shorter than `page_size` |
 | `prefetch` | `1` | pages kept in flight at once, in `page` and `offset` modes |

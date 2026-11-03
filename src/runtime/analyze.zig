@@ -1959,7 +1959,7 @@ pub const rest_read_keys = [_][]const u8{
     "bearer_env",     "auth",          "auth_env",     "user_env",    "pass_env",  "paginate",
     "page_param",     "start_page",    "start_offset", "size_param",  "page_size", "cursor_param",
     "cursor_field",   "total_field",   "max_pages",    "stop_short",  "prefetch",  "retries",
-    "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms", "paging_in",
+    "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms", "paging_in", "total_rows_field",
 };
 const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr" };
 
